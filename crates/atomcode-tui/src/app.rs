@@ -1,6 +1,14 @@
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use futures::StreamExt;
+use tokio::sync::mpsc;
+
 use atomcode_core::config::Config;
+use atomcode_core::config::DEFAULT_SYSTEM_PROMPT;
 use atomcode_core::conversation::Conversation;
 use atomcode_core::provider::LlmProvider;
+use atomcode_core::stream::StreamEvent;
+
+use crate::event::AppEvent;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum AppMode {
@@ -32,6 +40,166 @@ impl App {
             provider,
             config,
         }
+    }
+
+    pub fn handle_event(&mut self, event: AppEvent, event_tx: &mpsc::UnboundedSender<AppEvent>) {
+        // Any key press (except Esc) cancels quit confirmation
+        if self.confirm_quit {
+            if let AppEvent::Key(key) = &event {
+                if key.code != KeyCode::Esc {
+                    self.confirm_quit = false;
+                }
+            }
+        }
+
+        match event {
+            AppEvent::Key(key) => self.handle_key(key, event_tx),
+            AppEvent::StreamDelta(text) => {
+                self.conversation.push_delta(&text);
+            }
+            AppEvent::StreamDone => {
+                self.conversation.finalize_stream();
+                self.mode = AppMode::Normal;
+            }
+            AppEvent::StreamError(err) => {
+                self.conversation.push_delta(&format!("\n\n[Error: {}]", err));
+                self.conversation.finalize_stream();
+                self.mode = AppMode::Normal;
+            }
+            AppEvent::Resize(_, _) => {}
+            AppEvent::Tick => {}
+        }
+    }
+
+    fn handle_key(&mut self, key: KeyEvent, event_tx: &mpsc::UnboundedSender<AppEvent>) {
+        match self.mode {
+            AppMode::Normal => self.handle_key_normal(key, event_tx),
+            AppMode::Streaming => self.handle_key_streaming(key),
+            AppMode::Exiting => {}
+        }
+    }
+
+    fn handle_key_normal(&mut self, key: KeyEvent, event_tx: &mpsc::UnboundedSender<AppEvent>) {
+        match (key.modifiers, key.code) {
+            (KeyModifiers::CONTROL, KeyCode::Char('c')) => {
+                self.mode = AppMode::Exiting;
+            }
+            (KeyModifiers::CONTROL, KeyCode::Char('j')) => {
+                self.send_message(event_tx);
+            }
+            (_, KeyCode::Esc) => {
+                if self.conversation.messages.is_empty() || self.confirm_quit {
+                    self.mode = AppMode::Exiting;
+                } else {
+                    self.confirm_quit = true;
+                }
+            }
+            (KeyModifiers::CONTROL, KeyCode::Up) => {
+                self.scroll_offset = self.scroll_offset.saturating_sub(3);
+                self.at_bottom = false;
+            }
+            (KeyModifiers::CONTROL, KeyCode::Down) => {
+                self.scroll_offset += 3;
+                // at_bottom recalculated in render
+            }
+            (_, KeyCode::Enter) => {
+                self.input.insert_newline();
+            }
+            (_, KeyCode::Backspace) => {
+                self.input.backspace();
+            }
+            (_, KeyCode::Up) => {
+                if self.input.cursor_row > 0 {
+                    self.input.cursor_row -= 1;
+                    self.input.cursor_col = self.input.cursor_col
+                        .min(self.input.lines[self.input.cursor_row].len());
+                }
+            }
+            (_, KeyCode::Down) => {
+                if self.input.cursor_row + 1 < self.input.lines.len() {
+                    self.input.cursor_row += 1;
+                    self.input.cursor_col = self.input.cursor_col
+                        .min(self.input.lines[self.input.cursor_row].len());
+                }
+            }
+            (_, KeyCode::Left) => {
+                if self.input.cursor_col > 0 {
+                    self.input.cursor_col -= 1;
+                }
+            }
+            (_, KeyCode::Right) => {
+                if self.input.cursor_col < self.input.lines[self.input.cursor_row].len() {
+                    self.input.cursor_col += 1;
+                }
+            }
+            (_, KeyCode::Char(c)) => {
+                self.input.insert_char(c);
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_key_streaming(&mut self, key: KeyEvent) {
+        match (key.modifiers, key.code) {
+            (KeyModifiers::CONTROL, KeyCode::Char('c')) | (_, KeyCode::Esc) => {
+                self.conversation.finalize_stream();
+                self.mode = AppMode::Normal;
+            }
+            _ => {}
+        }
+    }
+
+    fn send_message(&mut self, event_tx: &mpsc::UnboundedSender<AppEvent>) {
+        let content = self.input.content();
+        if content.trim().is_empty() {
+            return;
+        }
+
+        self.conversation.add_user_message(&content);
+        self.input.clear();
+        self.mode = AppMode::Streaming;
+        self.at_bottom = true;
+
+        let provider_name = &self.config.default_provider;
+        let system_prompt = self.config.providers
+            .get(provider_name)
+            .and_then(|p| p.system_prompt.as_deref())
+            .unwrap_or(DEFAULT_SYSTEM_PROMPT)
+            .to_string();
+
+        let messages = self.conversation.to_provider_messages(&system_prompt);
+
+        let tx = event_tx.clone();
+        let stream_result = self.provider.chat_stream(&messages);
+
+        tokio::spawn(async move {
+            match stream_result {
+                Ok(mut stream) => {
+                    while let Some(event) = stream.next().await {
+                        match event {
+                            Ok(StreamEvent::Delta(text)) => {
+                                let _ = tx.send(AppEvent::StreamDelta(text));
+                            }
+                            Ok(StreamEvent::Done) => {
+                                let _ = tx.send(AppEvent::StreamDone);
+                                break;
+                            }
+                            Ok(StreamEvent::Error(e)) => {
+                                let _ = tx.send(AppEvent::StreamError(e));
+                                break;
+                            }
+                            Err(e) => {
+                                let _ = tx.send(AppEvent::StreamError(e.to_string()));
+                                break;
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(AppEvent::StreamError(e.to_string()));
+                }
+            }
+        });
     }
 }
 
