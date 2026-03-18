@@ -1,1 +1,1 @@
-// UI rendering module — implementation pending
+pub mod markdown;
