@@ -51,7 +51,7 @@ pub fn render(frame: &mut Frame, app: &App) {
     if show_welcome {
         welcome::render(frame, chunks[1], app);
     } else {
-        chat_panel::render(frame, chunks[1], &app.conversation, app.scroll_offset);
+        chat_panel::render(frame, chunks[1], &app.conversation, app.scroll_offset, app.at_bottom);
     }
 
     input_box::render(frame, chunks[2], &app.input, app.mode == AppMode::Streaming);

@@ -65,15 +65,19 @@ impl App {
             AppEvent::Key(key) => self.handle_key(key, event_tx),
             AppEvent::StreamDelta(text) => {
                 self.conversation.push_delta(&text);
+                // Keep at_bottom true during streaming for auto-scroll
+                // (unless user manually scrolled up)
             }
             AppEvent::StreamDone => {
                 self.conversation.finalize_stream();
                 self.mode = AppMode::Normal;
+                self.at_bottom = true;
             }
             AppEvent::StreamError(err) => {
                 self.conversation.push_delta(&format!("\n\n[Error: {}]", err));
                 self.conversation.finalize_stream();
                 self.mode = AppMode::Normal;
+                self.at_bottom = true;
             }
             AppEvent::Resize(_, _) => {}
             AppEvent::Tick => {}
