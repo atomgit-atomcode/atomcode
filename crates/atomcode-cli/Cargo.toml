@@ -13,3 +13,4 @@ atomcode-tui = { path = "../atomcode-tui" }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
+url = "2"

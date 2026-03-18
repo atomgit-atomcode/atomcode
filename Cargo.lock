@@ -90,6 +90,7 @@ dependencies = [
  "atomcode-tui",
  "clap",
  "tokio",
+ "url",
 ]
 
 [[package]]

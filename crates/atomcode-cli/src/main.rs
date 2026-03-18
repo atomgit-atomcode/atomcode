@@ -60,7 +60,8 @@ fn first_run_wizard() -> Result<Config> {
     println!("Select provider:");
     println!("  [1] Claude (Anthropic)");
     println!("  [2] OpenAI");
-    println!("  [3] Ollama (local)");
+    println!("  [3] OpenAI Compatible (Deepseek, Qwen, Zhipu, Moonshot...)");
+    println!("  [4] Ollama (local)");
     print!("\n> ");
     io::stdout().flush()?;
 
@@ -68,10 +69,15 @@ fn first_run_wizard() -> Result<Config> {
     io::stdin().read_line(&mut choice)?;
     let choice = choice.trim();
 
+    // For OpenAI-compatible providers, collect base_url and model interactively
+    if choice == "3" {
+        return setup_openai_compatible();
+    }
+
     let (name, provider_type, default_model, needs_key, default_base_url) = match choice {
         "1" => ("claude", "claude", "claude-sonnet-4-6", true, None),
         "2" => ("openai", "openai", "gpt-4o", true, Some("https://api.openai.com/v1")),
-        "3" => ("ollama", "ollama", "llama3", false, Some("http://localhost:11434")),
+        "4" => ("ollama", "ollama", "llama3", false, Some("http://localhost:11434")),
         _ => anyhow::bail!("Invalid choice: {}", choice),
     };
 
@@ -99,6 +105,58 @@ fn first_run_wizard() -> Result<Config> {
 
     Ok(Config {
         default_provider: name.to_string(),
+        providers,
+    })
+}
+
+fn setup_openai_compatible() -> Result<Config> {
+    println!("\nCommon API base URLs:");
+    println!("  Deepseek:  https://api.deepseek.com/v1");
+    println!("  Qwen:      https://dashscope.aliyuncs.com/compatible-mode/v1");
+    println!("  Zhipu:     https://open.bigmodel.cn/api/paas/v4");
+    println!("  Moonshot:  https://api.moonshot.cn/v1");
+    println!("  SiliconFlow: https://api.siliconflow.cn/v1");
+
+    print!("\nEnter API Base URL: ");
+    io::stdout().flush()?;
+    let mut base_url = String::new();
+    io::stdin().read_line(&mut base_url)?;
+    let base_url = base_url.trim().trim_end_matches('/').to_string();
+
+    print!("Enter API Key: ");
+    io::stdout().flush()?;
+    let mut api_key = String::new();
+    io::stdin().read_line(&mut api_key)?;
+    let api_key = api_key.trim().to_string();
+
+    print!("Enter Model name (e.g. deepseek-chat, qwen-plus, glm-4): ");
+    io::stdout().flush()?;
+    let mut model = String::new();
+    io::stdin().read_line(&mut model)?;
+    let model = model.trim().to_string();
+
+    // Derive a short name from the base_url host
+    let name = url::Url::parse(&base_url)
+        .ok()
+        .and_then(|u| u.host_str().map(|h| {
+            h.split('.').next().unwrap_or("custom").to_string()
+        }))
+        .unwrap_or_else(|| "custom".to_string());
+
+    let mut providers = HashMap::new();
+    providers.insert(
+        name.clone(),
+        ProviderConfig {
+            provider_type: "openai".to_string(), // Use OpenAI-compatible protocol
+            api_key: Some(api_key),
+            model,
+            base_url: Some(base_url),
+            system_prompt: None,
+        },
+    );
+
+    Ok(Config {
+        default_provider: name,
         providers,
     })
 }
