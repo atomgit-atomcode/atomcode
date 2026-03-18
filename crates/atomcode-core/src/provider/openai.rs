@@ -77,7 +77,7 @@ impl LlmProvider for OpenAiProvider {
         &self,
         messages: &[Message],
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
-        let url = format!("{}/chat/completions", self.base_url);
+        let url = normalize_base_url(&self.base_url);
         let body = json!({
             "model": self.model,
             "messages": Self::format_messages(messages),
@@ -106,9 +106,10 @@ impl LlmProvider for OpenAiProvider {
 
             if !response.status().is_success() {
                 let status = response.status();
+                let resp_url = response.url().to_string();
                 let body = response.text().await.unwrap_or_default();
                 let _ = tx.send(Ok(StreamEvent::Error(
-                    format!("OpenAI API error ({}): {}", status, body),
+                    format!("API error ({}) at `{}`:\n{}", status, resp_url, body),
                 )));
                 return;
             }
@@ -162,5 +163,19 @@ impl LlmProvider for OpenAiProvider {
 
     fn model_name(&self) -> &str {
         &self.model
+    }
+}
+
+/// Normalize a user-provided base_url to always end with `/chat/completions`.
+/// Handles common mistakes:
+///   - Trailing slash: "https://api.example.com/v1/" → "https://api.example.com/v1/chat/completions"
+///   - Already has endpoint: "https://api.example.com/v1/chat/completions" → kept as-is
+///   - Missing /v1: "https://api.example.com" → "https://api.example.com/chat/completions"
+fn normalize_base_url(base: &str) -> String {
+    let base = base.trim_end_matches('/');
+    if base.ends_with("/chat/completions") {
+        base.to_string()
+    } else {
+        format!("{}/chat/completions", base)
     }
 }

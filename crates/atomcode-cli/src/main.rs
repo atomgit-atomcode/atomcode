@@ -121,7 +121,12 @@ fn setup_openai_compatible() -> Result<Config> {
     io::stdout().flush()?;
     let mut base_url = String::new();
     io::stdin().read_line(&mut base_url)?;
-    let base_url = base_url.trim().trim_end_matches('/').to_string();
+    let base_url = base_url
+        .trim()
+        .trim_end_matches('/')
+        .trim_end_matches("/chat/completions")
+        .trim_end_matches('/')
+        .to_string();
 
     print!("Enter API Key: ");
     io::stdout().flush()?;
