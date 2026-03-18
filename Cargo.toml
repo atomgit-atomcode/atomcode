@@ -1,0 +1,7 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/atomcode-core",
+    "crates/atomcode-tui",
+    "crates/atomcode-cli",
+]

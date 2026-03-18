@@ -1,0 +1,15 @@
+[package]
+name = "atomcode"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "atomcode"
+path = "src/main.rs"
+
+[dependencies]
+atomcode-core = { path = "../atomcode-core" }
+atomcode-tui = { path = "../atomcode-tui" }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
