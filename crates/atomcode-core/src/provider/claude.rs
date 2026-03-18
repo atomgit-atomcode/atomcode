@@ -64,8 +64,6 @@ struct ClaudeEvent {
 
 #[derive(Deserialize)]
 struct ClaudeDelta {
-    #[serde(rename = "type")]
-    delta_type: Option<String>,
     text: Option<String>,
 }
 
