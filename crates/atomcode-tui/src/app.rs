@@ -24,6 +24,7 @@ pub struct App {
     pub scroll_offset: usize,
     pub at_bottom: bool,
     pub confirm_quit: bool,
+    pub pending_editor: Option<String>,
     pub provider: Box<dyn LlmProvider>,
     pub config: Config,
 }
@@ -37,6 +38,7 @@ impl App {
             scroll_offset: 0,
             at_bottom: true,
             confirm_quit: false,
+            pending_editor: None,
             provider,
             config,
         }
@@ -149,9 +151,63 @@ impl App {
         }
     }
 
+    /// Handle slash commands. Returns true if the input was a command.
+    fn handle_slash_command(&mut self) -> bool {
+        let content = self.input.content();
+        let trimmed = content.trim();
+
+        if trimmed == "/config" {
+            self.input.clear();
+            let config_path = atomcode_core::config::Config::default_path();
+            // Add a system-like message showing the action
+            self.conversation.add_user_message("/config");
+
+            if !config_path.exists() {
+                self.conversation.push_delta(&format!(
+                    "Config file not found at `{}`.\nRun AtomCode without an existing config to create one via the setup wizard.",
+                    config_path.display()
+                ));
+                self.conversation.finalize_stream();
+                return true;
+            }
+
+            // Try to open in editor
+            let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vim".to_string());
+            self.conversation.push_delta(&format!(
+                "Opening config in `{}`...\n\n`{}`\n\nEdit and save the file, then restart AtomCode for changes to take effect.",
+                editor,
+                config_path.display()
+            ));
+            self.conversation.finalize_stream();
+
+            // We need to temporarily leave the TUI to open the editor
+            // Store the command to execute after restoring terminal
+            self.pending_editor = Some(config_path.to_string_lossy().to_string());
+            return true;
+        }
+
+        if trimmed.starts_with('/') {
+            self.input.clear();
+            self.conversation.add_user_message(trimmed);
+            self.conversation.push_delta(&format!(
+                "Unknown command: `{}`\n\nAvailable commands:\n  `/config` — Open configuration file",
+                trimmed
+            ));
+            self.conversation.finalize_stream();
+            return true;
+        }
+
+        false
+    }
+
     fn send_message(&mut self, event_tx: &mpsc::UnboundedSender<AppEvent>) {
         let content = self.input.content();
         if content.trim().is_empty() {
+            return;
+        }
+
+        // Check for slash commands first
+        if self.handle_slash_command() {
             return;
         }
 
