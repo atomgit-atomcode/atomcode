@@ -27,6 +27,10 @@ pub const COMMANDS: &[SlashCommand] = &[
         name: "/help",
         description: "Show available commands and shortcuts",
     },
+    SlashCommand {
+        name: "/quit",
+        description: "Exit AtomCode",
+    },
 ];
 
 /// State of the slash command autocomplete menu.

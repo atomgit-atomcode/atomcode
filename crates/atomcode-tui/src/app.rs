@@ -52,15 +52,6 @@ impl App {
     }
 
     pub fn handle_event(&mut self, event: AppEvent, event_tx: &mpsc::UnboundedSender<AppEvent>) {
-        // Any key press (except Esc) cancels quit confirmation
-        if self.confirm_quit {
-            if let AppEvent::Key(key) = &event {
-                if key.code != KeyCode::Esc {
-                    self.confirm_quit = false;
-                }
-            }
-        }
-
         match event {
             AppEvent::Key(key) => self.handle_key(key, event_tx),
             AppEvent::StreamDelta(text) => {
@@ -208,10 +199,11 @@ impl App {
                 self.send_message(event_tx);
             }
             (_, KeyCode::Esc) => {
-                if self.conversation.messages.is_empty() || self.confirm_quit {
-                    self.mode = AppMode::Exiting;
-                } else {
-                    self.confirm_quit = true;
+                // Esc: clear input if not empty, otherwise do nothing
+                // (use /quit to exit the program)
+                if !self.input.is_empty() {
+                    self.input.clear();
+                    self.slash_menu.close();
                 }
             }
             (KeyModifiers::CONTROL, KeyCode::Up) => {
@@ -283,6 +275,9 @@ impl App {
         self.conversation.add_user_message(&cmd);
 
         match cmd.as_str() {
+            "/quit" => {
+                self.mode = AppMode::Exiting;
+            }
             "/provider" => {
                 self.provider_mgr = Some(ProviderManager::new(&self.config));
                 self.mode = AppMode::ProviderManager;

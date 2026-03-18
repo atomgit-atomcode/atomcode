@@ -77,7 +77,11 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     ]));
     lines.push(Line::from(vec![
         Span::styled("    Esc        ", key_style),
-        Span::styled("Exit", dim),
+        Span::styled("Clear input", dim),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("    /quit      ", key_style),
+        Span::styled("Exit AtomCode", dim),
     ]));
 
     let paragraph = Paragraph::new(lines);

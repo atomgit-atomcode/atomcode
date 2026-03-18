@@ -2,17 +2,19 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols::border;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Padding, Paragraph};
 use ratatui::Frame;
 
 use crate::app::InputState;
+
+/// Left/right inner padding for the input box content.
+const H_PADDING: u16 = 15;
 
 pub fn render(frame: &mut Frame, area: Rect, input: &InputState, is_streaming: bool) {
     let is_empty = input.is_empty();
 
     // Build content lines
     let lines: Vec<Line> = if is_empty && !is_streaming {
-        // Placeholder hint when empty
         vec![Line::from(Span::styled(
             "Ask anything... (Enter to send, / for commands)",
             Style::default().fg(Color::DarkGray),
@@ -47,7 +49,8 @@ pub fn render(frame: &mut Frame, area: Rect, input: &InputState, is_streaming: b
         .borders(Borders::ALL)
         .border_set(border::ROUNDED)
         .border_style(Style::default().fg(border_color))
-        .title(prompt);
+        .title(prompt)
+        .padding(Padding::horizontal(H_PADDING));
 
     let input_widget = Paragraph::new(lines)
         .block(block)
@@ -55,10 +58,12 @@ pub fn render(frame: &mut Frame, area: Rect, input: &InputState, is_streaming: b
 
     frame.render_widget(input_widget, area);
 
-    // Set cursor position (inside the border: +1 for left border)
+    // Set cursor position:
+    //   x = area.x + 1 (left border) + H_PADDING + cursor_col
+    //   y = area.y + 1 (top border) + cursor_row
     if !is_streaming {
-        let cursor_x = area.x + input.cursor_col as u16 + 1;
-        let cursor_y = area.y + input.cursor_row as u16 + 1;
+        let cursor_x = area.x + 1 + H_PADDING + input.cursor_col as u16;
+        let cursor_y = area.y + 1 + input.cursor_row as u16;
         frame.set_cursor_position((cursor_x, cursor_y));
     }
 }
