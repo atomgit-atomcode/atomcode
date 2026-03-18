@@ -10,11 +10,13 @@ use atomcode_core::stream::StreamEvent;
 
 use crate::command::SlashMenu;
 use crate::event::AppEvent;
+use crate::provider_manager::{ManagerAction, ProviderManager};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum AppMode {
     Normal,
     Streaming,
+    ProviderManager,
     Exiting,
 }
 
@@ -27,6 +29,7 @@ pub struct App {
     pub confirm_quit: bool,
     pub pending_editor: Option<String>,
     pub slash_menu: SlashMenu,
+    pub provider_mgr: Option<ProviderManager>,
     pub provider: Box<dyn LlmProvider>,
     pub config: Config,
 }
@@ -42,6 +45,7 @@ impl App {
             confirm_quit: false,
             pending_editor: None,
             slash_menu: SlashMenu::new(),
+            provider_mgr: None,
             provider,
             config,
         }
@@ -80,7 +84,66 @@ impl App {
         match self.mode {
             AppMode::Normal => self.handle_key_normal(key, event_tx),
             AppMode::Streaming => self.handle_key_streaming(key),
+            AppMode::ProviderManager => self.handle_key_provider_manager(key),
             AppMode::Exiting => {}
+        }
+    }
+
+    fn handle_key_provider_manager(&mut self, key: KeyEvent) {
+        let action = if let Some(ref mut mgr) = self.provider_mgr {
+            mgr.handle_key(key, &self.config)
+        } else {
+            return;
+        };
+
+        if let Some(action) = action {
+            match action {
+                ManagerAction::Close => {
+                    // Save config before closing
+                    let config_path = Config::default_path();
+                    let _ = self.config.save(&config_path);
+                    self.provider_mgr = None;
+                    self.mode = AppMode::Normal;
+                }
+                ManagerAction::SetDefault(name) => {
+                    self.config.default_provider = name;
+                    let config_path = Config::default_path();
+                    let _ = self.config.save(&config_path);
+                }
+                ManagerAction::Delete(name) => {
+                    self.config.providers.remove(&name);
+                    if let Some(ref mut mgr) = self.provider_mgr {
+                        mgr.refresh_names(&self.config);
+                    }
+                    let config_path = Config::default_path();
+                    let _ = self.config.save(&config_path);
+                }
+                ManagerAction::Add(name, provider_config) => {
+                    self.config.providers.insert(name, provider_config);
+                    if let Some(ref mut mgr) = self.provider_mgr {
+                        mgr.refresh_names(&self.config);
+                    }
+                    let config_path = Config::default_path();
+                    let _ = self.config.save(&config_path);
+                }
+                ManagerAction::UpdateField(name, field, value) => {
+                    if let Some(p) = self.config.providers.get_mut(&name) {
+                        match field.as_str() {
+                            "type" => p.provider_type = value,
+                            "api_key" => {
+                                p.api_key = if value.is_empty() { None } else { Some(value) }
+                            }
+                            "base_url" => {
+                                p.base_url = if value.is_empty() { None } else { Some(value) }
+                            }
+                            "model" => p.model = value,
+                            _ => {}
+                        }
+                    }
+                    let config_path = Config::default_path();
+                    let _ = self.config.save(&config_path);
+                }
+            }
         }
     }
 
@@ -133,7 +196,10 @@ impl App {
             (KeyModifiers::CONTROL, KeyCode::Char('c')) => {
                 self.mode = AppMode::Exiting;
             }
-            (KeyModifiers::CONTROL, KeyCode::Char('j')) => {
+            (KeyModifiers::SHIFT, KeyCode::Enter) => {
+                self.input.insert_newline();
+            }
+            (KeyModifiers::CONTROL, KeyCode::Char('j')) | (_, KeyCode::Enter) => {
                 self.slash_menu.close();
                 self.send_message(event_tx);
             }
@@ -150,9 +216,6 @@ impl App {
             }
             (KeyModifiers::CONTROL, KeyCode::Down) => {
                 self.scroll_offset += 3;
-            }
-            (_, KeyCode::Enter) => {
-                self.input.insert_newline();
             }
             (_, KeyCode::Backspace) => {
                 self.input.backspace();
@@ -216,6 +279,12 @@ impl App {
         self.conversation.add_user_message(&cmd);
 
         match cmd.as_str() {
+            "/provider" => {
+                self.provider_mgr = Some(ProviderManager::new(&self.config));
+                self.mode = AppMode::ProviderManager;
+                // Remove the /provider message from conversation since we're entering a mode
+                self.conversation.messages.pop();
+            }
             "/config" => {
                 let config_path = atomcode_core::config::Config::default_path();
                 if !config_path.exists() {

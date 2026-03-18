@@ -8,6 +8,10 @@ pub struct SlashCommand {
 /// All available slash commands.
 pub const COMMANDS: &[SlashCommand] = &[
     SlashCommand {
+        name: "/provider",
+        description: "Manage providers (add, edit, delete, set default)",
+    },
+    SlashCommand {
         name: "/config",
         description: "Open configuration file in editor",
     },

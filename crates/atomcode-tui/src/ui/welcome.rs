@@ -64,15 +64,19 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         Span::styled("  Tips: ", Style::default().fg(Color::Gray).add_modifier(Modifier::BOLD)),
     ]));
     lines.push(Line::from(vec![
-        Span::styled("    ctrl+j  ", key_style),
+        Span::styled("    Enter      ", key_style),
         Span::styled("Send message", dim),
     ]));
     lines.push(Line::from(vec![
-        Span::styled("    /config  ", key_style),
-        Span::styled("Edit configuration", dim),
+        Span::styled("    /          ", key_style),
+        Span::styled("Show commands", dim),
     ]));
     lines.push(Line::from(vec![
-        Span::styled("    Esc     ", key_style),
+        Span::styled("    /provider  ", key_style),
+        Span::styled("Manage providers", dim),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("    Esc        ", key_style),
         Span::styled("Exit", dim),
     ]));
 

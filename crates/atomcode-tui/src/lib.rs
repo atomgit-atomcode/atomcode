@@ -1,6 +1,7 @@
 pub mod app;
 pub mod command;
 pub mod event;
+pub mod provider_manager;
 pub mod ui;
 
 use anyhow::Result;

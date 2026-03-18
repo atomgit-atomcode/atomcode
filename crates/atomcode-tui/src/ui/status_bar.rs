@@ -13,6 +13,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         match app.mode {
             AppMode::Normal => Span::styled(" READY ", Style::default().bg(Color::Green).fg(Color::Black)),
             AppMode::Streaming => Span::styled(" STREAMING ", Style::default().bg(Color::Yellow).fg(Color::Black)),
+            AppMode::ProviderManager => Span::styled(" PROVIDERS ", Style::default().bg(Color::Magenta).fg(Color::White)),
             AppMode::Exiting => Span::styled(" EXITING ", Style::default().bg(Color::Red).fg(Color::White)),
         }
     };

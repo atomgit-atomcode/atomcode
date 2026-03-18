@@ -14,7 +14,7 @@ pub fn render(frame: &mut Frame, area: Rect, input: &InputState, is_streaming: b
     let lines: Vec<Line> = if is_empty && !is_streaming {
         // Placeholder hint when empty
         vec![Line::from(Span::styled(
-            "Ask anything... (ctrl+j to send, /config for settings)",
+            "Ask anything... (Enter to send, / for commands)",
             Style::default().fg(Color::DarkGray),
         ))]
     } else {

@@ -1,6 +1,7 @@
 pub mod chat_panel;
 pub mod input_box;
 pub mod markdown;
+pub mod provider_panel;
 pub mod slash_menu;
 pub mod status_bar;
 pub mod welcome;
@@ -11,6 +12,25 @@ use ratatui::Frame;
 use crate::app::App;
 
 pub fn render(frame: &mut Frame, app: &App) {
+    use crate::app::AppMode;
+
+    // Provider manager takes over the full screen (except status bar)
+    if app.mode == AppMode::ProviderManager {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Min(1),
+            ])
+            .split(frame.area());
+
+        status_bar::render(frame, chunks[0], app);
+        if let Some(ref mgr) = app.provider_mgr {
+            provider_panel::render(frame, chunks[1], mgr, &app.config);
+        }
+        return;
+    }
+
     let terminal_height = frame.area().height;
     let input_height = input_box::height(&app.input, terminal_height);
 
@@ -34,7 +54,7 @@ pub fn render(frame: &mut Frame, app: &App) {
         chat_panel::render(frame, chunks[1], &app.conversation, app.scroll_offset);
     }
 
-    input_box::render(frame, chunks[2], &app.input, app.mode == crate::app::AppMode::Streaming);
+    input_box::render(frame, chunks[2], &app.input, app.mode == AppMode::Streaming);
 
     // Render slash menu as overlay above input box
     if app.slash_menu.visible {
