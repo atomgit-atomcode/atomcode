@@ -8,6 +8,7 @@ use atomcode_core::conversation::Conversation;
 use atomcode_core::provider::LlmProvider;
 use atomcode_core::stream::StreamEvent;
 
+use crate::command::SlashMenu;
 use crate::event::AppEvent;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -25,6 +26,7 @@ pub struct App {
     pub at_bottom: bool,
     pub confirm_quit: bool,
     pub pending_editor: Option<String>,
+    pub slash_menu: SlashMenu,
     pub provider: Box<dyn LlmProvider>,
     pub config: Config,
 }
@@ -39,6 +41,7 @@ impl App {
             at_bottom: true,
             confirm_quit: false,
             pending_editor: None,
+            slash_menu: SlashMenu::new(),
             provider,
             config,
         }
@@ -82,11 +85,56 @@ impl App {
     }
 
     fn handle_key_normal(&mut self, key: KeyEvent, event_tx: &mpsc::UnboundedSender<AppEvent>) {
+        // When slash menu is visible, intercept navigation keys
+        if self.slash_menu.visible {
+            match key.code {
+                KeyCode::Up => {
+                    self.slash_menu.prev();
+                    return;
+                }
+                KeyCode::Down => {
+                    self.slash_menu.next();
+                    return;
+                }
+                KeyCode::Tab => {
+                    // Tab accepts the selected command into the input
+                    if let Some(cmd) = self.slash_menu.selected_command() {
+                        self.input.clear();
+                        for c in cmd.name.chars() {
+                            self.input.insert_char(c);
+                        }
+                        self.slash_menu.close();
+                    }
+                    return;
+                }
+                KeyCode::Enter => {
+                    // Enter accepts and immediately executes
+                    if let Some(cmd) = self.slash_menu.selected_command() {
+                        self.input.clear();
+                        for c in cmd.name.chars() {
+                            self.input.insert_char(c);
+                        }
+                        self.slash_menu.close();
+                        self.send_message(event_tx);
+                    }
+                    return;
+                }
+                KeyCode::Esc => {
+                    self.slash_menu.close();
+                    return;
+                }
+                _ => {
+                    // Fall through to normal input handling, menu will update after
+                }
+            }
+        }
+
         match (key.modifiers, key.code) {
             (KeyModifiers::CONTROL, KeyCode::Char('c')) => {
                 self.mode = AppMode::Exiting;
             }
             (KeyModifiers::CONTROL, KeyCode::Char('j')) => {
+                self.slash_menu.close();
                 self.send_message(event_tx);
             }
             (_, KeyCode::Esc) => {
@@ -102,7 +150,6 @@ impl App {
             }
             (KeyModifiers::CONTROL, KeyCode::Down) => {
                 self.scroll_offset += 3;
-                // at_bottom recalculated in render
             }
             (_, KeyCode::Enter) => {
                 self.input.insert_newline();
@@ -139,6 +186,9 @@ impl App {
             }
             _ => {}
         }
+
+        // After any input change, update the slash menu
+        self.slash_menu.update(&self.input.content());
     }
 
     fn handle_key_streaming(&mut self, key: KeyEvent) {
@@ -156,48 +206,79 @@ impl App {
         let content = self.input.content();
         let trimmed = content.trim();
 
-        if trimmed == "/config" {
-            self.input.clear();
-            let config_path = atomcode_core::config::Config::default_path();
-            // Add a system-like message showing the action
-            self.conversation.add_user_message("/config");
+        if !trimmed.starts_with('/') {
+            return false;
+        }
 
-            if !config_path.exists() {
+        let cmd = trimmed.to_string();
+        self.input.clear();
+        self.slash_menu.close();
+        self.conversation.add_user_message(&cmd);
+
+        match cmd.as_str() {
+            "/config" => {
+                let config_path = atomcode_core::config::Config::default_path();
+                if !config_path.exists() {
+                    self.conversation.push_delta(&format!(
+                        "Config file not found at `{}`.\nRun AtomCode without an existing config to create one via the setup wizard.",
+                        config_path.display()
+                    ));
+                    self.conversation.finalize_stream();
+                } else {
+                    let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vim".to_string());
+                    self.conversation.push_delta(&format!(
+                        "Opening config in `{}`...\n\n`{}`",
+                        editor,
+                        config_path.display()
+                    ));
+                    self.conversation.finalize_stream();
+                    self.pending_editor = Some(config_path.to_string_lossy().to_string());
+                }
+            }
+            "/model" => {
+                let model = self.provider.model_name().to_string();
+                let provider = &self.config.default_provider;
                 self.conversation.push_delta(&format!(
-                    "Config file not found at `{}`.\nRun AtomCode without an existing config to create one via the setup wizard.",
-                    config_path.display()
+                    "**Current model:** `{}`\n**Provider:** `{}`",
+                    model, provider
                 ));
                 self.conversation.finalize_stream();
+            }
+            "/clear" => {
+                self.conversation = Conversation::new();
+                self.scroll_offset = 0;
+                self.at_bottom = true;
+                // Don't add any message — just clear everything
                 return true;
             }
-
-            // Try to open in editor
-            let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vim".to_string());
-            self.conversation.push_delta(&format!(
-                "Opening config in `{}`...\n\n`{}`\n\nEdit and save the file, then restart AtomCode for changes to take effect.",
-                editor,
-                config_path.display()
-            ));
-            self.conversation.finalize_stream();
-
-            // We need to temporarily leave the TUI to open the editor
-            // Store the command to execute after restoring terminal
-            self.pending_editor = Some(config_path.to_string_lossy().to_string());
-            return true;
+            "/help" => {
+                let mut help = String::from("**Available commands:**\n\n");
+                for cmd in crate::command::COMMANDS {
+                    help.push_str(&format!("  `{}` — {}\n", cmd.name, cmd.description));
+                }
+                help.push_str("\n**Shortcuts:**\n\n");
+                help.push_str("  `ctrl+j` — Send message\n");
+                help.push_str("  `ctrl+c` — Quit\n");
+                help.push_str("  `Esc` — Quit (with confirmation)\n");
+                help.push_str("  `ctrl+Up/Down` — Scroll chat\n");
+                self.conversation.push_delta(&help);
+                self.conversation.finalize_stream();
+            }
+            _ => {
+                let available: Vec<String> = crate::command::COMMANDS
+                    .iter()
+                    .map(|c| format!("  `{}` — {}", c.name, c.description))
+                    .collect();
+                self.conversation.push_delta(&format!(
+                    "Unknown command: `{}`\n\nAvailable commands:\n{}",
+                    cmd,
+                    available.join("\n")
+                ));
+                self.conversation.finalize_stream();
+            }
         }
 
-        if trimmed.starts_with('/') {
-            self.input.clear();
-            self.conversation.add_user_message(trimmed);
-            self.conversation.push_delta(&format!(
-                "Unknown command: `{}`\n\nAvailable commands:\n  `/config` — Open configuration file",
-                trimmed
-            ));
-            self.conversation.finalize_stream();
-            return true;
-        }
-
-        false
+        true
     }
 
     fn send_message(&mut self, event_tx: &mpsc::UnboundedSender<AppEvent>) {

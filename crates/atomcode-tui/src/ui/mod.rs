@@ -1,6 +1,7 @@
 pub mod chat_panel;
 pub mod input_box;
 pub mod markdown;
+pub mod slash_menu;
 pub mod status_bar;
 pub mod welcome;
 
@@ -34,4 +35,9 @@ pub fn render(frame: &mut Frame, app: &App) {
     }
 
     input_box::render(frame, chunks[2], &app.input, app.mode == crate::app::AppMode::Streaming);
+
+    // Render slash menu as overlay above input box
+    if app.slash_menu.visible {
+        slash_menu::render(frame, chunks[2], &app.slash_menu);
+    }
 }
