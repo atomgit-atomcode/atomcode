@@ -189,7 +189,11 @@ impl App {
 
         match (key.modifiers, key.code) {
             (KeyModifiers::CONTROL, KeyCode::Char('c')) => {
-                self.mode = AppMode::Exiting;
+                // Same as Esc: clear input, don't exit program
+                if !self.input.is_empty() {
+                    self.input.clear();
+                    self.slash_menu.close();
+                }
             }
             (KeyModifiers::SHIFT, KeyCode::Enter) => {
                 self.input.insert_newline();
