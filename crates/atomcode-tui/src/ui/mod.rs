@@ -59,6 +59,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             frame, chunks[1], &app.conversation,
             app.scroll_offset, app.at_bottom, &app.mode, app.tick_count,
             app.turn_tokens, turn_elapsed, turn_seed,
+            app.current_step_count, &app.executing_tool_info,
             &mut app.render_cache, &mut app.render_cache_msg_count,
         );
     }

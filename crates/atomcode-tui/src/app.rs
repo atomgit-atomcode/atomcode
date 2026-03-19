@@ -75,6 +75,12 @@ pub struct App {
     pub history_index: Option<usize>,
     /// Stashed input text when entering history browse mode.
     pub history_stash: Option<String>,
+    /// Cached project context (rebuilt on /cd, not every API call).
+    pub project_context_cache: Option<String>,
+    /// Cached step count for current turn (avoid per-frame O(n) scan).
+    pub current_step_count: usize,
+    /// Cached tool info string for ToolExecuting mode (avoid per-frame JSON parse).
+    pub executing_tool_info: String,
     /// Estimated token counts for the current session.
     pub total_tokens: usize,
     /// Tokens used in the current turn.
@@ -122,6 +128,9 @@ impl App {
             last_ctrl_c: None,
             generation: 0,
             tick_count: 0,
+            project_context_cache: None,
+            current_step_count: 0,
+            executing_tool_info: String::new(),
             turn_start: None,
             tool_start: None,
             last_turn_duration: None,
@@ -151,16 +160,18 @@ impl App {
         // Analyze the last few messages to detect patterns
         let last = &msgs[msgs.len() - 1];
 
-        // Check if any tool calls were made in this conversation
-        let had_write = msgs.iter().any(|m| matches!(&m.content,
+        // Only scan last 20 messages (not entire conversation)
+        let recent = if msgs.len() > 20 { &msgs[msgs.len()-20..] } else { msgs.as_slice() };
+
+        let had_write = recent.iter().any(|m| matches!(&m.content,
             MessageContent::AssistantWithToolCalls { tool_calls, .. }
             if tool_calls.iter().any(|c| c.name == "write_file" || c.name == "edit_file")
         ));
-        let had_bash = msgs.iter().any(|m| matches!(&m.content,
+        let had_bash = recent.iter().any(|m| matches!(&m.content,
             MessageContent::AssistantWithToolCalls { tool_calls, .. }
             if tool_calls.iter().any(|c| c.name == "bash")
         ));
-        let had_error = msgs.iter().rev().take(3).any(|m| matches!(&m.content,
+        let had_error = recent.iter().rev().take(3).any(|m| matches!(&m.content,
             MessageContent::ToolResult(r) if !r.success
         ));
 
@@ -254,6 +265,7 @@ impl App {
 
         if resolved.is_dir() {
             self.working_dir = resolved.clone();
+            self.project_context_cache = None; // Invalidate project context cache
             self.config.default_workdir = Some(resolved.to_string_lossy().to_string());
             let _ = self.config.save(&Config::default_path());
             (true, format!("Changed working directory to {}", resolved.display()))
@@ -333,16 +345,20 @@ impl App {
     }
 
     /// Build system prompt: identity → context → rules (recency effect).
-    fn system_prompt(&self) -> String {
+    fn system_prompt(&mut self) -> String {
         let rules = self.config.providers
             .get(&self.config.default_provider)
             .and_then(|p| p.system_prompt.as_deref())
-            .unwrap_or(DEFAULT_SYSTEM_PROMPT);
+            .unwrap_or(DEFAULT_SYSTEM_PROMPT)
+            .to_string();
 
-        let dir = self.working_dir.display();
-        let project_ctx = crate::project_context::build_project_context(&self.working_dir);
+        let dir = self.working_dir.display().to_string();
 
-        // Identity first, context middle, RULES LAST (strongest position for weaker models)
+        // Cache project context — only rebuild on first call or after /cd
+        let project_ctx = self.project_context_cache
+            .get_or_insert_with(|| crate::project_context::build_project_context(&self.working_dir))
+            .clone();
+
         format!(
             "You are AtomCode, a terminal coding agent.\n\nWorking directory: {}\n\n{}\n\n---\nRULES (follow strictly):\n{}",
             dir, project_ctx, rules
@@ -1103,6 +1119,9 @@ impl App {
 
         // Add to input history
         self.input_history.push(content.clone());
+        if self.input_history.len() > 100 {
+            self.input_history.drain(..self.input_history.len() - 100);
+        }
         self.history_index = None;
         self.history_stash = None;
 
@@ -1136,6 +1155,7 @@ impl App {
         self.mode = AppMode::Streaming;
         self.at_bottom = true;
         self.tool_call_count = 0;
+        self.current_step_count = 0;
         self.retry_count = 0;
         self.turn_start = Some(Instant::now());
         self.last_turn_duration = None;
@@ -1214,6 +1234,8 @@ impl App {
 
     fn execute_tool(&mut self, call: ToolCall, event_tx: &mpsc::UnboundedSender<AppEvent>) {
         self.tool_start = Some(Instant::now());
+        // Cache tool info for display (avoid per-frame JSON parsing)
+        self.executing_tool_info = format_tool_info(&call);
         let tool_name = call.name.clone();
         let call_id = call.id.clone();
         let args = self.resolve_tool_args(&call);
@@ -1279,6 +1301,7 @@ impl App {
 
         self.conversation.add_tool_result(result);
         self.tool_call_count += 1;
+        self.current_step_count += 1;
 
         // Auto-continue: reset counter every 25 calls but keep going
         if self.tool_call_count >= 25 {
@@ -1350,6 +1373,38 @@ fn format_file_size(bytes: u64) -> String {
     else { format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0)) }
 }
 
+
+/// Format tool info for display (called once, cached in App).
+fn format_tool_info(call: &ToolCall) -> String {
+    let name: String = call.name.split('_')
+        .map(|w| {
+            let mut c = w.chars();
+            match c.next() {
+                None => String::new(),
+                Some(f) => f.to_uppercase().to_string() + c.as_str(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    if let Ok(args) = serde_json::from_str::<serde_json::Value>(&call.arguments) {
+        if let Some(cmd) = args.get("command").and_then(|v| v.as_str()) {
+            let short: String = cmd.chars().take(50).collect();
+            return format!("{}: {}", name, short);
+        }
+        if let Some(fp) = args.get("file_path").and_then(|v| v.as_str()) {
+            let fname = std::path::Path::new(fp)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| fp.to_string());
+            return format!("{}: {}", name, fname);
+        }
+        if let Some(path) = args.get("path").and_then(|v| v.as_str()) {
+            return format!("{}: {}", name, path);
+        }
+    }
+    name
+}
 
 fn snap_to_char_boundary(s: &str, pos: usize) -> usize {
     let pos = pos.min(s.len());

@@ -47,6 +47,8 @@ pub fn render(
     turn_tokens: usize,
     turn_elapsed_secs: Option<u64>,
     turn_label_seed: usize,
+    step_count: usize,    // Pre-computed, not scanned per frame
+    tool_info: &str,       // Pre-computed, not parsed per frame
     render_cache: &mut Vec<Line<'static>>,
     render_cache_msg_count: &mut usize,
 ) {
@@ -122,8 +124,7 @@ pub fn render(
     // Build stats string: elapsed | tokens | speed
     let stats = build_turn_stats(turn_elapsed_secs, turn_tokens);
 
-    // Count tool actions this turn for step indicator
-    let step_count = count_turn_steps(conversation);
+    // Step indicator from pre-computed count (no per-frame scan)
     let step_prefix = if step_count > 0 {
         format!("[step {}] ", step_count + 1)
     } else {
@@ -142,7 +143,6 @@ pub fn render(
             ]));
         }
         AppMode::ToolExecuting => {
-            let tool_info = get_executing_tool_info(conversation);
             dynamic.push(Line::from(vec![
                 Span::styled(
                     format!("    {} {}Running {}", spinner, step_prefix, tool_info),
