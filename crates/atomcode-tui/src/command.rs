@@ -17,7 +17,7 @@ pub const COMMANDS: &[SlashCommand] = &[
     },
     SlashCommand {
         name: "/model",
-        description: "Show current model info",
+        description: "Show or switch model (/model <provider> [model])",
     },
     SlashCommand {
         name: "/clear",

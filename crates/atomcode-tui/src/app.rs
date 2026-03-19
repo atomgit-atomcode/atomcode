@@ -830,14 +830,60 @@ impl App {
                     self.pending_editor = Some(config_path.to_string_lossy().to_string());
                 }
             }
-            "/model" => {
-                let model = self.provider.model_name().to_string();
-                let provider = &self.config.default_provider;
-                self.conversation.push_delta(&format!(
-                    "**Current model:** `{}`\n**Provider:** `{}`",
-                    model, provider
-                ));
-                self.conversation.finalize_stream();
+            _ if cmd == "/model" || cmd.starts_with("/model ") => {
+                let arg = cmd.strip_prefix("/model").unwrap().trim();
+                if arg.is_empty() {
+                    // Show current model + available providers
+                    let current = self.provider.model_name();
+                    let default = &self.config.default_provider;
+                    let mut info = format!("Current: {} ({})\n\nAvailable:\n", current, default);
+                    for (name, p) in &self.config.providers {
+                        let marker = if name == default { " *" } else { "  " };
+                        info.push_str(&format!("{}  {} - {}\n", marker, name, p.model));
+                    }
+                    info.push_str("\nSwitch: /model <provider_name> or /model <provider> <model>");
+                    self.conversation.push_delta(&info);
+                    self.conversation.finalize_stream();
+                } else {
+                    // Switch model: "/model <provider>" or "/model <provider> <model>"
+                    let parts: Vec<&str> = arg.splitn(2, ' ').collect();
+                    let provider_name = parts[0];
+                    let new_model = parts.get(1).map(|s| s.trim());
+
+                    if self.config.providers.contains_key(provider_name) {
+                        // Update default provider
+                        self.config.default_provider = provider_name.to_string();
+
+                        // Optionally update model
+                        if let Some(model) = new_model {
+                            if let Some(p) = self.config.providers.get_mut(provider_name) {
+                                p.model = model.to_string();
+                            }
+                        }
+
+                        let _ = self.config.save(&Config::default_path());
+                        self.rebuild_provider();
+
+                        let model = self.provider.model_name().to_string();
+                        self.conversation.push_delta(&format!(
+                            "Switched to {} ({})", model, provider_name
+                        ));
+                        self.conversation.finalize_stream();
+                    } else {
+                        // Treat as model name change for current provider
+                        let current = self.config.default_provider.clone();
+                        if let Some(p) = self.config.providers.get_mut(&current) {
+                            p.model = arg.to_string();
+                        }
+                        let _ = self.config.save(&Config::default_path());
+                        self.rebuild_provider();
+
+                        self.conversation.push_delta(&format!(
+                            "Model changed to {} ({})", arg, current
+                        ));
+                        self.conversation.finalize_stream();
+                    }
+                }
             }
             "/copy" => {
                 // Find the last assistant text and copy to clipboard
