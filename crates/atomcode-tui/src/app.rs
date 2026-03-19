@@ -212,6 +212,14 @@ impl App {
             AppEvent::ToolFinished(result) => {
                 self.handle_tool_result(result, event_tx);
             }
+            AppEvent::ScrollUp(n) => {
+                self.scroll_offset = self.scroll_offset.saturating_sub(n as usize);
+                self.at_bottom = false;
+            }
+            AppEvent::ScrollDown(n) => {
+                self.scroll_offset += n as usize;
+                self.at_bottom = true; // will clamp in render
+            }
             AppEvent::Resize(_, _) => {}
             AppEvent::Tick => {
                 self.tick_count = self.tick_count.wrapping_add(1);

@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use crossterm::event::{self, Event, KeyEvent};
+use crossterm::event::{self, Event, KeyEvent, MouseEvent, MouseEventKind};
 use tokio::sync::mpsc;
 
 use atomcode_core::tool::{ToolCall, ToolResult};
@@ -15,6 +15,8 @@ pub enum AppEvent {
     StreamDone,
     StreamError(String),
     ToolFinished(ToolResult),
+    ScrollUp(u16),
+    ScrollDown(u16),
     Resize(u16, u16),
     Tick,
 }
@@ -45,6 +47,12 @@ impl EventLoop {
                     if let Ok(evt) = event::read() {
                         let app_event = match evt {
                             Event::Key(key) => AppEvent::Key(key),
+                            Event::Mouse(MouseEvent { kind: MouseEventKind::ScrollUp, .. }) => {
+                                AppEvent::ScrollUp(3)
+                            }
+                            Event::Mouse(MouseEvent { kind: MouseEventKind::ScrollDown, .. }) => {
+                                AppEvent::ScrollDown(3)
+                            }
                             Event::Resize(w, h) => AppEvent::Resize(w, h),
                             _ => continue,
                         };

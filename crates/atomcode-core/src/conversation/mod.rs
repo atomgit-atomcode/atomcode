@@ -20,13 +20,24 @@ impl Default for Conversation {
     }
 }
 
+const MAX_MESSAGES: usize = 1000;
+
 impl Conversation {
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Trim old messages to keep within MAX_MESSAGES limit.
+    fn trim(&mut self) {
+        if self.messages.len() > MAX_MESSAGES {
+            let excess = self.messages.len() - MAX_MESSAGES;
+            self.messages.drain(..excess);
+        }
+    }
+
     pub fn add_user_message(&mut self, content: &str) {
         self.messages.push(Message::new(Role::User, content));
+        self.trim();
     }
 
     pub fn push_delta(&mut self, delta: &str) {
@@ -39,6 +50,7 @@ impl Conversation {
     pub fn finalize_stream(&mut self) {
         if let Some(content) = self.stream_buffer.take() {
             self.messages.push(Message::new(Role::Assistant, content));
+            self.trim();
         }
     }
 
@@ -50,6 +62,7 @@ impl Conversation {
                 tool_calls,
             },
         });
+        self.trim();
     }
 
     pub fn add_tool_result(&mut self, result: ToolResult) {
@@ -57,6 +70,7 @@ impl Conversation {
             role: Role::Tool,
             content: MessageContent::ToolResult(result),
         });
+        self.trim();
     }
 
     pub fn finalize_stream_with_tool_call(&mut self, tool_call: ToolCall) {
