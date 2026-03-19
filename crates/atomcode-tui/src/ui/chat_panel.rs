@@ -1,7 +1,7 @@
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Wrap};
+use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use atomcode_core::conversation::Conversation;
@@ -21,8 +21,7 @@ const SUCCESS: Color = Color::Rgb(80, 200, 120);
 const ERROR: Color = Color::Rgb(240, 80, 80);
 const WARN: Color = Color::Rgb(240, 200, 60);
 
-/// Spinner frames for thinking/executing animation
-const SPINNER: &[&str] = &["\u{25dc}", "\u{25dd}", "\u{25de}", "\u{25df}"]; // ◜ ◝ ◞ ◟
+const SPINNER: &[&str] = &["\u{25dc}", "\u{25dd}", "\u{25de}", "\u{25df}"];
 
 pub fn render(
     frame: &mut Frame,
@@ -33,25 +32,32 @@ pub fn render(
     mode: &AppMode,
     tick: usize,
 ) {
-    let mut lines: Vec<Line<'static>> = Vec::new();
+    let width = area.width as usize;
+    let vh = area.height as usize;
+    if vh == 0 || width == 0 {
+        return;
+    }
+
+    // Build all logical lines
+    let mut logical_lines: Vec<Line<'static>> = Vec::new();
 
     for msg in &conversation.messages {
         match &msg.content {
             MessageContent::Text(text) => match msg.role {
-                Role::User => render_user(&mut lines, text),
-                Role::Assistant => render_assistant(&mut lines, text),
+                Role::User => render_user(&mut logical_lines, text),
+                Role::Assistant => render_assistant(&mut logical_lines, text),
                 _ => {}
             },
             MessageContent::AssistantWithToolCalls { text, tool_calls } => {
                 if let Some(t) = text {
-                    render_assistant(&mut lines, t);
+                    render_assistant(&mut logical_lines, t);
                 }
                 for call in tool_calls {
-                    render_tool_call(&mut lines, call);
+                    render_tool_call(&mut logical_lines, call);
                 }
             }
             MessageContent::ToolResult(result) => {
-                render_tool_result(&mut lines, result);
+                render_tool_result(&mut logical_lines, result);
             }
         }
     }
@@ -63,56 +69,74 @@ pub fn render(
             for line in md {
                 let mut spans = vec![Span::raw("    ".to_string())];
                 spans.extend(line.spans);
-                lines.push(Line::from(spans));
+                logical_lines.push(Line::from(spans));
             }
-            // Blinking cursor
             let cursor_char = if tick % 2 == 0 { "\u{2588}" } else { " " };
-            lines.push(Line::from(Span::styled(
+            logical_lines.push(Line::from(Span::styled(
                 format!("    {}", cursor_char),
                 Style::default().fg(ACCENT),
             )));
         }
     }
 
-    // Mode-specific indicators
+    // Mode indicators
     match mode {
-        AppMode::Streaming if conversation.stream_buffer.as_ref().map_or(true, |b| b.is_empty()) => {
-            // LLM is thinking but hasn't produced text yet — show spinner
+        AppMode::Streaming
+            if conversation
+                .stream_buffer
+                .as_ref()
+                .map_or(true, |b| b.is_empty()) =>
+        {
             let spinner = SPINNER[tick % SPINNER.len()];
-            lines.push(Line::from(Span::styled(
+            logical_lines.push(Line::from(Span::styled(
                 format!("    {} Thinking...", spinner),
                 Style::default().fg(ACCENT),
             )));
         }
         AppMode::ToolExecuting => {
             let spinner = SPINNER[tick % SPINNER.len()];
-            lines.push(Line::from(Span::styled(
+            logical_lines.push(Line::from(Span::styled(
                 format!("    {} Executing...", spinner),
                 Style::default().fg(WARN),
             )));
         }
         AppMode::WaitingApproval(call) => {
-            render_approval(&mut lines, call);
+            render_approval(&mut logical_lines, call);
         }
         _ => {}
     }
 
-    // Auto-scroll
-    let total = lines.len();
-    let vh = area.height as usize;
+    // Estimate wrapped line count: each logical line may wrap to multiple display lines
+    let display_line_count: usize = logical_lines
+        .iter()
+        .map(|line| {
+            let line_width: usize = line.spans.iter().map(|s| s.content.len()).sum();
+            if line_width == 0 {
+                1 // empty line still takes 1 row
+            } else {
+                (line_width + width - 1) / width // ceil division
+            }
+        })
+        .sum();
+
+    // Calculate scroll: use Paragraph's native scroll but with correct total
     let scroll = if at_bottom {
-        total.saturating_sub(vh)
+        display_line_count.saturating_sub(vh) as u16
     } else {
-        scroll_offset.min(total.saturating_sub(vh))
+        (scroll_offset.min(display_line_count.saturating_sub(vh))) as u16
     };
 
-    let paragraph = Paragraph::new(lines)
-        .scroll((scroll as u16, 0))
-        .wrap(Wrap { trim: false });
+    // Add padding lines at the bottom to ensure content can scroll up enough
+    // This ensures the last line of content can appear at the top of viewport
+    let padding_needed = vh.saturating_sub(2); // leave some room
+    for _ in 0..padding_needed {
+        logical_lines.push(Line::default());
+    }
+
+    let paragraph = Paragraph::new(logical_lines).scroll((scroll, 0));
     frame.render_widget(paragraph, area);
 }
 
-/// User message — compact, subtle background tint, no label
 fn render_user(lines: &mut Vec<Line<'static>>, content: &str) {
     lines.push(Line::default());
     let style = Style::default().fg(Color::White).bg(USER_BG);
@@ -125,7 +149,6 @@ fn render_user(lines: &mut Vec<Line<'static>>, content: &str) {
     lines.push(Line::default());
 }
 
-/// Assistant text — clean markdown, no label
 fn render_assistant(lines: &mut Vec<Line<'static>>, content: &str) {
     let md = render_markdown(content);
     for line in md {
@@ -135,23 +158,23 @@ fn render_assistant(lines: &mut Vec<Line<'static>>, content: &str) {
     }
 }
 
-/// Tool call box — compact, professional
 fn render_tool_call(lines: &mut Vec<Line<'static>>, call: &ToolCall) {
     let border = Style::default().fg(TOOL_BORDER);
     let name = capitalize(&call.name);
 
-    // Compact: icon + name on one line with border
     lines.push(Line::from(vec![
         Span::styled("    \u{2502} ", border),
         Span::styled(
             format!("\u{25b8} {}", name),
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(format!("  {}", format_args_oneline(&call.arguments)), Style::default().fg(DIM)),
+        Span::styled(
+            format!("  {}", format_args_oneline(&call.arguments)),
+            Style::default().fg(DIM),
+        ),
     ]));
 }
 
-/// Tool result — single compact line
 fn render_tool_result(lines: &mut Vec<Line<'static>>, result: &ToolResult) {
     let (icon, color) = if result.success {
         ("\u{2713}", SUCCESS)
@@ -173,12 +196,10 @@ fn render_tool_result(lines: &mut Vec<Line<'static>>, result: &ToolResult) {
     ]));
 }
 
-/// Approval prompt — inline, urgent
 fn render_approval(lines: &mut Vec<Line<'static>>, call: &ToolCall) {
     let name = capitalize(&call.name);
     let border = Style::default().fg(WARN);
 
-    // Show tool box with warning style
     lines.push(Line::from(vec![
         Span::styled("    \u{256d}\u{2500} ", border),
         Span::styled(
@@ -188,18 +209,16 @@ fn render_approval(lines: &mut Vec<Line<'static>>, call: &ToolCall) {
         Span::styled("\u{2500}".repeat(30), border),
     ]));
 
-    // Show arguments
     if let Ok(args) = serde_json::from_str::<serde_json::Value>(&call.arguments) {
         if let Some(obj) = args.as_object() {
             for (k, v) in obj {
                 let val = match v {
                     serde_json::Value::String(s) => {
                         if k == "content" {
-                            // Show preview for write content
-                            let line_count = s.lines().count();
+                            let lc = s.lines().count();
                             let preview: String = s.lines().take(5).collect::<Vec<_>>().join("\n");
-                            if line_count > 5 {
-                                format!("{}\n    \u{2502}   ... ({} lines)", preview, line_count)
+                            if lc > 5 {
+                                format!("{}\n    \u{2502}   ... ({} lines)", preview, lc)
                             } else {
                                 preview
                             }
@@ -211,7 +230,6 @@ fn render_approval(lines: &mut Vec<Line<'static>>, call: &ToolCall) {
                     }
                     other => other.to_string(),
                 };
-                // Multi-line values (content preview)
                 for (i, vline) in val.lines().enumerate() {
                     if i == 0 {
                         lines.push(Line::from(vec![
@@ -222,7 +240,10 @@ fn render_approval(lines: &mut Vec<Line<'static>>, call: &ToolCall) {
                     } else {
                         lines.push(Line::from(vec![
                             Span::styled("    \u{2502}   ", border),
-                            Span::styled(vline.to_string(), Style::default().fg(Color::Rgb(150, 150, 150))),
+                            Span::styled(
+                                vline.to_string(),
+                                Style::default().fg(Color::Rgb(150, 150, 150)),
+                            ),
                         ]));
                     }
                 }
@@ -235,17 +256,25 @@ fn render_approval(lines: &mut Vec<Line<'static>>, call: &ToolCall) {
         border,
     )));
 
-    // Approval prompt
     lines.push(Line::from(vec![
         Span::raw("    ".to_string()),
-        Span::styled("[Y]", Style::default().fg(SUCCESS).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "[Y]",
+            Style::default()
+                .fg(SUCCESS)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled(" Allow  ", Style::default().fg(Color::Gray)),
-        Span::styled("[N]", Style::default().fg(ERROR).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "[N]",
+            Style::default()
+                .fg(ERROR)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled(" Deny", Style::default().fg(Color::Gray)),
     ]));
 }
 
-/// Capitalize tool name: "read_file" → "Read File", "bash" → "Bash"
 fn capitalize(name: &str) -> String {
     name.split('_')
         .map(|word| {
@@ -259,45 +288,52 @@ fn capitalize(name: &str) -> String {
         .join(" ")
 }
 
-/// Format tool arguments as a compact one-line summary
 fn format_args_oneline(args_json: &str) -> String {
     if let Ok(args) = serde_json::from_str::<serde_json::Value>(args_json) {
         if let Some(obj) = args.as_object() {
-            let parts: Vec<String> = obj.iter().map(|(k, v)| {
-                let val = match v {
-                    serde_json::Value::String(s) => {
-                        if s.chars().count() > 30 {
-                            s.chars().take(27).collect::<String>() + "..."
-                        } else {
-                            s.clone()
+            let parts: Vec<String> = obj
+                .iter()
+                .map(|(k, v)| {
+                    let val = match v {
+                        serde_json::Value::String(s) => {
+                            if s.chars().count() > 30 {
+                                s.chars().take(27).collect::<String>() + "..."
+                            } else {
+                                s.clone()
+                            }
                         }
-                    }
-                    other => {
-                        let s = other.to_string();
-                        if s.len() > 30 { s[..27].to_string() + "..." } else { s }
-                    }
-                };
-                format!("{}={}", k, val)
-            }).collect();
+                        other => {
+                            let s = other.to_string();
+                            if s.len() > 30 {
+                                s[..27].to_string() + "..."
+                            } else {
+                                s
+                            }
+                        }
+                    };
+                    format!("{}={}", k, val)
+                })
+                .collect();
             return parts.join(" ");
         }
     }
     String::new()
 }
 
-/// Calculate total line count for scroll.
 pub fn total_lines(conversation: &Conversation) -> usize {
     let mut count = 0;
     for msg in &conversation.messages {
         match &msg.content {
             MessageContent::Text(text) => match msg.role {
-                Role::User => count += 2 + text.lines().count(), // blank + lines + blank
+                Role::User => count += 2 + text.lines().count(),
                 Role::Assistant => count += render_markdown(text).len(),
                 _ => {}
             },
             MessageContent::AssistantWithToolCalls { text, tool_calls } => {
-                if let Some(t) = text { count += render_markdown(t).len(); }
-                count += tool_calls.len(); // 1 line per call
+                if let Some(t) = text {
+                    count += render_markdown(t).len();
+                }
+                count += tool_calls.len();
             }
             MessageContent::ToolResult(_) => count += 1,
         }
