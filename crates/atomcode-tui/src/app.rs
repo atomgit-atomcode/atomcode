@@ -389,22 +389,28 @@ impl App {
             }
             AgentEvent::ToolCallStarted { name, arguments } => {
                 self.current_step_count += 1;
-                // Build a synthetic ToolCall so format_tool_info works.
-                let fake_call = ToolCall {
-                    id: String::new(),
+                let call = ToolCall {
+                    id: format!("call_{}", self.current_step_count),
                     name: name.clone(),
                     arguments: arguments.clone(),
                 };
-                self.executing_tool_info = format_tool_info(&fake_call);
+                self.executing_tool_info = format_tool_info(&call);
+                // Add tool call to conversation mirror so it renders in the UI
+                self.conversation.finalize_stream_with_tool_call(call);
+                self.render_cache_msg_count = 0; // Invalidate render cache
                 self.mode = AppMode::ToolExecuting;
                 self.tool_start = Some(Instant::now());
                 self.at_bottom = true;
             }
-            AgentEvent::ToolCallResult { name: _, output: _, success: _, duration: _ } => {
-                // The AgentLoop already added the result to its authoritative Conversation.
-                // We just invalidate the render cache so the UI re-renders on the next frame.
-                // The actual conversation mirror update happens on TurnComplete (we reload history).
+            AgentEvent::ToolCallResult { name: _, output, success, duration: _ } => {
+                // Add result to conversation mirror so it renders in the UI
+                self.conversation.add_tool_result(ToolResult {
+                    call_id: format!("call_{}", self.current_step_count),
+                    output,
+                    success,
+                });
                 self.render_cache_msg_count = 0;
+                self.at_bottom = true;
             }
             AgentEvent::ApprovalNeeded { tool_name: _, reason: _, call } => {
                 self.mode = AppMode::WaitingApproval(call);
