@@ -45,6 +45,8 @@ pub struct App {
     pub at_bottom: bool,
     pub confirm_quit: bool,
     pub pending_editor: Option<String>,
+    /// Files attached to the next message (detected from pasted paths).
+    pub attached_files: Vec<crate::file_attach::AttachedFile>,
     pub slash_menu: SlashMenu,
     pub provider_mgr: Option<ProviderManager>,
     /// Model selector: list of (provider_name, model_name), selected index
@@ -109,6 +111,7 @@ impl App {
             at_bottom: true,
             confirm_quit: false,
             pending_editor: None,
+            attached_files: Vec::new(),
             slash_menu: SlashMenu::new(),
             provider_mgr: None,
             model_list: Vec::new(),
@@ -788,6 +791,19 @@ impl App {
 
         // After any input change, update the slash menu
         self.slash_menu.update(&self.input.content());
+
+        // Detect file path — auto-attach if input is a valid file path
+        let content = self.input.content();
+        let trimmed = content.trim();
+        if !trimmed.is_empty() && !trimmed.starts_with('/') || trimmed.starts_with("/file") {
+            // Skip — not a path or it's a slash command
+        } else if let Some(file) = crate::file_attach::detect_file_path(trimmed, &self.working_dir) {
+            // Only attach if not already attached
+            if !self.attached_files.iter().any(|f| f.path == file.path) {
+                self.attached_files.push(file);
+                self.input.clear(); // Clear the path from input
+            }
+        }
     }
 
     /// Handle typing in the input box — works in any mode (Normal, Streaming, etc.)
@@ -1014,7 +1030,31 @@ impl App {
         self.history_stash = None;
 
         self.turn_tokens = 0;
-        self.conversation.add_user_message(&content);
+
+        // Build message with attached files
+        let full_content = if self.attached_files.is_empty() {
+            content.clone()
+        } else {
+            let mut parts = vec![content.clone()];
+            for file in &self.attached_files {
+                let path = std::path::Path::new(&file.path);
+                match crate::file_attach::extract_file(path, &self.working_dir) {
+                    Ok(fc) => {
+                        parts.push(format!(
+                            "\n[Attached: {} ({})]\n{}",
+                            fc.filename, fc.file_type, fc.content
+                        ));
+                    }
+                    Err(e) => {
+                        parts.push(format!("\n[Failed to read {}: {}]", file.filename, e));
+                    }
+                }
+            }
+            self.attached_files.clear();
+            parts.join("\n")
+        };
+
+        self.conversation.add_user_message(&full_content);
         self.input.clear();
         self.mode = AppMode::Streaming;
         self.at_bottom = true;

@@ -9,7 +9,9 @@ use crate::app::InputState;
 
 const H_PADDING: u16 = 3;
 
-pub fn render(frame: &mut Frame, area: Rect, input: &InputState, is_busy: bool, suggestion: Option<&str>) {
+use crate::file_attach::AttachedFile;
+
+pub fn render(frame: &mut Frame, area: Rect, input: &InputState, is_busy: bool, suggestion: Option<&str>, attached: &[AttachedFile]) {
     let is_empty = input.is_empty();
 
     // Always show user's input — even during streaming
@@ -60,13 +62,41 @@ pub fn render(frame: &mut Frame, area: Rect, input: &InputState, is_busy: bool, 
         .title(prompt)
         .padding(Padding::horizontal(H_PADDING));
 
+    // Render attached file tags above the input box
+    let (input_area, _tag_offset) = if !attached.is_empty() {
+        // Draw tags in the first line of the area
+        let tag_area = Rect::new(area.x, area.y, area.width, 1);
+        let mut tag_spans: Vec<Span> = vec![Span::raw(" ".to_string())];
+        for file in attached {
+            tag_spans.push(Span::styled(
+                format!(" {} ", file.file_type),
+                Style::default()
+                    .fg(Color::White)
+                    .bg(Color::Rgb(60, 55, 80)),
+            ));
+            tag_spans.push(Span::styled(
+                format!(" {} ", file.filename),
+                Style::default().fg(Color::Rgb(150, 150, 160)),
+            ));
+            tag_spans.push(Span::raw("  ".to_string()));
+        }
+        let tag_line = Paragraph::new(Line::from(tag_spans));
+        frame.render_widget(tag_line, tag_area);
+
+        // Shrink input area
+        let remaining = Rect::new(area.x, area.y + 1, area.width, area.height.saturating_sub(1));
+        (remaining, 1u16)
+    } else {
+        (area, 0u16)
+    };
+
     let input_widget = Paragraph::new(lines)
         .block(block)
         .style(Style::default().fg(Color::White));
 
-    frame.render_widget(input_widget, area);
+    frame.render_widget(input_widget, input_area);
 
-    // Always show cursor
+    // Always show cursor (offset for tags and input area)
     let current_line = &input.lines[input.cursor_row];
     let safe_col = if input.cursor_col >= current_line.len() {
         current_line.len()
@@ -81,8 +111,8 @@ pub fn render(frame: &mut Frame, area: Rect, input: &InputState, is_busy: bool, 
     };
     let text_before_cursor = &current_line[..safe_col];
     let display_col = unicode_display_width(text_before_cursor);
-    let cursor_x = area.x + 1 + H_PADDING + display_col as u16;
-    let cursor_y = area.y + 1 + input.cursor_row as u16;
+    let cursor_x = input_area.x + 1 + H_PADDING + display_col as u16;
+    let cursor_y = input_area.y + 1 + input.cursor_row as u16;
     frame.set_cursor_position((cursor_x, cursor_y));
 }
 
@@ -108,9 +138,10 @@ fn is_wide_char(c: char) -> bool {
         || (0x3300..=0x33FF).contains(&cp)
 }
 
-pub fn height(input: &InputState, terminal_height: u16) -> u16 {
+pub fn height(input: &InputState, terminal_height: u16, has_attachments: bool) -> u16 {
     let content_lines = input.lines.len() as u16;
     let max_height = terminal_height / 2;
-    let min_height = 3;
-    (content_lines + 2).clamp(min_height, max_height)
+    let tag_height = if has_attachments { 1 } else { 0 };
+    let min_height = 3 + tag_height;
+    (content_lines + 2 + tag_height).clamp(min_height, max_height)
 }

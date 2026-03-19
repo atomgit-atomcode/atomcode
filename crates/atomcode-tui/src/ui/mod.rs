@@ -34,7 +34,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     }
 
     let terminal_height = frame.area().height;
-    let input_height = input_box::height(&app.input, terminal_height);
+    let input_height = input_box::height(&app.input, terminal_height, !app.attached_files.is_empty());
 
     let show_welcome = app.conversation.messages.is_empty()
         && app.conversation.stream_buffer.is_none();
@@ -63,7 +63,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         );
     }
 
-    input_box::render(frame, chunks[2], &app.input, app.mode.is_streaming_or_executing(), app.suggestion.as_deref());
+    input_box::render(frame, chunks[2], &app.input, app.mode.is_streaming_or_executing(), app.suggestion.as_deref(), &app.attached_files);
 
     // Render slash menu as overlay above input box
     if app.slash_menu.visible {

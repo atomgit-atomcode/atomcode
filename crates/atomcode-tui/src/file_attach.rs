@@ -1,12 +1,105 @@
 use std::path::Path;
 use std::process::Command;
 
+/// A file attached to the next message (shown as tag above input).
+#[derive(Debug, Clone)]
+pub struct AttachedFile {
+    pub path: String,
+    pub filename: String,
+    pub file_type: String,
+    pub size_bytes: u64,
+}
+
 /// Result of reading/extracting a file's content.
 pub struct FileContent {
     pub filename: String,
     pub file_type: String,
     pub content: String,
     pub size_bytes: u64,
+}
+
+/// Detect if a string looks like a file path that exists.
+pub fn detect_file_path(input: &str, working_dir: &Path) -> Option<AttachedFile> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() || trimmed.len() < 2 {
+        return None;
+    }
+
+    // Must look like a path: starts with / or ./ or ~/ or contains /
+    let looks_like_path = trimmed.starts_with('/')
+        || trimmed.starts_with("./")
+        || trimmed.starts_with("../")
+        || trimmed.starts_with("~/");
+
+    if !looks_like_path {
+        return None;
+    }
+
+    // Resolve the path
+    let resolved = if trimmed.starts_with('~') {
+        dirs::home_dir()
+            .map(|h| h.join(trimmed.strip_prefix("~/").unwrap_or(&trimmed[1..])))
+            .unwrap_or_else(|| std::path::PathBuf::from(trimmed))
+    } else if trimmed.starts_with('/') {
+        std::path::PathBuf::from(trimmed)
+    } else {
+        working_dir.join(trimmed)
+    };
+
+    if !resolved.exists() || resolved.is_dir() {
+        return None;
+    }
+
+    let filename = resolved.file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "file".to_string());
+
+    let ext = resolved.extension()
+        .map(|e| e.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+
+    let size = std::fs::metadata(&resolved).map(|m| m.len()).unwrap_or(0);
+
+    let file_type = match ext.as_str() {
+        "pdf" => "PDF",
+        "xlsx" | "xls" => "Excel",
+        "pptx" | "ppt" => "PPT",
+        "docx" | "doc" => "Word",
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" => "Image",
+        "zip" | "tar" | "gz" | "tgz" => "Archive",
+        "rs" => "Rust",
+        "py" => "Python",
+        "js" | "jsx" => "JavaScript",
+        "ts" | "tsx" => "TypeScript",
+        "go" => "Go",
+        "java" => "Java",
+        "html" => "HTML",
+        "css" | "scss" => "CSS",
+        "json" => "JSON",
+        "yaml" | "yml" => "YAML",
+        "toml" => "TOML",
+        "md" => "Markdown",
+        "sql" => "SQL",
+        "sh" | "bash" => "Shell",
+        "vue" => "Vue",
+        "csv" => "CSV",
+        "xml" => "XML",
+        "txt" | "log" => "Text",
+        "" => "File",
+        other => return Some(AttachedFile {
+            path: resolved.to_string_lossy().to_string(),
+            filename,
+            file_type: other.to_uppercase(),
+            size_bytes: size,
+        }),
+    }.to_string();
+
+    Some(AttachedFile {
+        path: resolved.to_string_lossy().to_string(),
+        filename,
+        file_type,
+        size_bytes: size,
+    })
 }
 
 /// Read a file and extract its text content.
