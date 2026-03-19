@@ -5,10 +5,11 @@ pub mod file_attach;
 pub mod provider_manager;
 pub mod ui;
 
+use std::io::Write as _;
+
 use anyhow::Result;
 use crossterm::{
     execute,
-    event::{EnableMouseCapture, DisableMouseCapture},
     terminal::{
         disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
         SetTitle, Clear, ClearType,
@@ -30,10 +31,16 @@ pub async fn run(config: Config, provider: Box<dyn LlmProvider>, tool_registry: 
     execute!(
         stdout,
         EnterAlternateScreen,
-        EnableMouseCapture, // Prevents terminal scrolling past alternate screen
         SetTitle("AtomCode"),
         Clear(ClearType::All),
     )?;
+    // Enable mouse button tracking (scroll wheel) but NOT drag tracking
+    // \x1b[?1000h = normal tracking (button press/release only, includes scroll)
+    // \x1b[?1006h = SGR extended mode (for large terminals)
+    // This does NOT capture drag/selection — terminal handles that natively
+    write!(stdout, "\x1b[?1000h\x1b[?1006h")?;
+    stdout.flush()?;
+
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
@@ -47,8 +54,11 @@ pub async fn run(config: Config, provider: Box<dyn LlmProvider>, tool_registry: 
         terminal.draw(|frame| ui::render(frame, &mut app))?;
 
         if let Some(file_path) = app.pending_editor.take() {
+            // Disable mouse tracking before leaving
+            write!(terminal.backend_mut(), "\x1b[?1000l\x1b[?1006l")?;
+            terminal.backend_mut().flush()?;
             disable_raw_mode()?;
-            execute!(terminal.backend_mut(), DisableMouseCapture, LeaveAlternateScreen)?;
+            execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
             terminal.show_cursor()?;
 
             let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vim".to_string());
@@ -60,9 +70,10 @@ pub async fn run(config: Config, provider: Box<dyn LlmProvider>, tool_registry: 
             execute!(
                 terminal.backend_mut(),
                 EnterAlternateScreen,
-                EnableMouseCapture,
                 Clear(ClearType::All),
             )?;
+            write!(terminal.backend_mut(), "\x1b[?1000h\x1b[?1006h")?;
+            terminal.backend_mut().flush()?;
             terminal.clear()?;
             continue;
         }
@@ -82,10 +93,11 @@ pub async fn run(config: Config, provider: Box<dyn LlmProvider>, tool_registry: 
         }
     }
 
+    write!(terminal.backend_mut(), "\x1b[?1000l\x1b[?1006l")?;
+    terminal.backend_mut().flush()?;
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
-        DisableMouseCapture,
         LeaveAlternateScreen,
     )?;
     terminal.show_cursor()?;
