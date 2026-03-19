@@ -6,110 +6,89 @@ use ratatui::Frame;
 
 use crate::app::{App, AppMode};
 
-/// VS Code style bottom-bar aesthetic: dark bg, subtle separators, clean typography
 const BG: Color = Color::Rgb(30, 30, 35);
 const FG: Color = Color::Rgb(160, 160, 170);
+const FG_BRIGHT: Color = Color::Rgb(200, 200, 210);
 const DIM: Color = Color::Rgb(80, 80, 90);
-const SEP: &str = " \u{2502} "; // │ thin separator
+const SEP: &str = " \u{2502} "; // │
 
 pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     let width = area.width as usize;
     let dir = shorten_path(&app.working_dir.to_string_lossy());
     let model = app.provider.model_name();
 
-    // Mode: icon + text
     let (mode_icon, mode_text, mode_fg) = match &app.mode {
-        AppMode::Normal => ("\u{2713}", "", Color::Rgb(80, 180, 100)),  // ✓
-        AppMode::Streaming => ("\u{25b6}", "streaming", Color::Rgb(240, 180, 40)),  // ▶
-        AppMode::WaitingApproval(_) => ("\u{25cf}", "approval", Color::Rgb(240, 180, 40)),  // ●
-        AppMode::ToolExecuting => ("\u{25b6}", "running", Color::Rgb(80, 180, 240)),  // ▶
-        AppMode::ProviderManager => ("\u{2699}", "config", Color::Rgb(180, 140, 255)),  // ⚙
-        AppMode::Exiting => ("\u{00d7}", "exit", Color::Rgb(240, 80, 80)),  // ×
+        AppMode::Normal => ("", "", Color::Rgb(80, 180, 100)),
+        AppMode::Streaming => (">", "streaming", Color::Rgb(240, 180, 40)),
+        AppMode::WaitingApproval(_) => ("?", "approval", Color::Rgb(240, 180, 40)),
+        AppMode::ToolExecuting => (">", "running", Color::Rgb(80, 180, 240)),
+        AppMode::ProviderManager => ("*", "config", Color::Rgb(180, 140, 255)),
+        AppMode::Exiting => ("x", "exit", Color::Rgb(240, 80, 80)),
     };
 
-    // Build left segments
     let mut spans: Vec<Span> = Vec::new();
 
-    // App name
+    // App name — uppercase
     spans.push(Span::styled(
-        " atomcode ",
+        " AtomCode ",
         Style::default().fg(Color::White).bg(Color::Rgb(90, 60, 180)).add_modifier(Modifier::BOLD),
     ));
 
-    // Mode indicator
-    spans.push(Span::styled(
-        format!(" {} ", mode_icon),
-        Style::default().fg(mode_fg),
-    ));
+    // Mode
     if !mode_text.is_empty() {
         spans.push(Span::styled(
-            mode_text.to_string(),
+            format!(" {} {} ", mode_icon, mode_text),
             Style::default().fg(mode_fg),
         ));
+    } else {
+        spans.push(Span::raw(" ".to_string()));
     }
 
-    // Separator + directory
+    // Directory
     spans.push(Span::styled(SEP, Style::default().fg(DIM)));
-    spans.push(Span::styled(
-        dir,
-        Style::default().fg(FG),
-    ));
+    spans.push(Span::styled(dir, Style::default().fg(FG)));
 
-    // Elapsed time (cumulative for current turn)
+    // Timer
     let (time_str, time_color) = if let Some(start) = app.turn_start {
-        let secs = start.elapsed().as_secs();
-        (format_duration(secs), Color::Rgb(240, 180, 40)) // yellow while active
+        (format_duration(start.elapsed().as_secs()), Color::Rgb(240, 180, 40))
     } else if let Some(dur) = app.last_turn_duration {
-        (format_duration(dur.as_secs()), Color::Rgb(80, 180, 100)) // green when done
+        (format_duration(dur.as_secs()), Color::Rgb(80, 180, 100))
     } else {
         (String::new(), DIM)
     };
 
     if !time_str.is_empty() {
         spans.push(Span::styled(SEP, Style::default().fg(DIM)));
-        spans.push(Span::styled(
-            time_str,
-            Style::default().fg(time_color),
-        ));
+        spans.push(Span::styled(time_str, Style::default().fg(time_color)));
     }
 
-    // Right side: tokens + model (right-aligned, like Claude Code)
-    let token_badge = if app.total_tokens > 0 {
-        if app.turn_tokens > 0 && app.turn_start.is_some() {
+    // Right side: token count + model
+    let mut right_spans: Vec<Span> = Vec::new();
+
+    if app.total_tokens > 0 {
+        let token_text = if app.turn_tokens > 0 && app.turn_start.is_some() {
             format!("{} (+{}) tokens", format_tokens(app.total_tokens), format_tokens(app.turn_tokens))
         } else {
             format!("{} tokens", format_tokens(app.total_tokens))
-        }
-    } else {
-        String::new()
-    };
-
-    let right_parts: Vec<String> = vec![token_badge, model.to_string()]
-        .into_iter()
-        .filter(|s| !s.is_empty())
-        .collect();
-    let right = format!(" {} ", right_parts.join("  "));
-
-    let left_len: usize = spans.iter().map(|s| s.content.len()).sum();
-    let pad = width.saturating_sub(left_len + right.len());
-
-    spans.push(Span::styled(" ".repeat(pad), Style::default()));
-
-    // Token count
-    if app.total_tokens > 0 {
-        let badge = if app.turn_tokens > 0 && app.turn_start.is_some() {
-            format!(" {} (+{}) tokens ", format_tokens(app.total_tokens), format_tokens(app.turn_tokens))
-        } else {
-            format!(" {} tokens ", format_tokens(app.total_tokens))
         };
-        spans.push(Span::styled(badge, Style::default().fg(DIM)));
-        spans.push(Span::styled(SEP, Style::default().fg(DIM)));
+        right_spans.push(Span::styled(
+            format!(" {} ", token_text),
+            Style::default().fg(FG),
+        ));
+        right_spans.push(Span::styled(SEP, Style::default().fg(DIM)));
     }
 
-    spans.push(Span::styled(
-        format!(" {} ", model),
-        Style::default().fg(DIM),
+    right_spans.push(Span::styled(
+        format!("{} ", model),
+        Style::default().fg(FG_BRIGHT),
     ));
+
+    let left_len: usize = spans.iter().map(|s| s.content.len()).sum();
+    let right_len: usize = right_spans.iter().map(|s| s.content.len()).sum();
+    let pad = width.saturating_sub(left_len + right_len);
+
+    spans.push(Span::styled(" ".repeat(pad), Style::default()));
+    spans.extend(right_spans);
 
     let bar = Paragraph::new(Line::from(spans))
         .style(Style::default().bg(BG));
@@ -139,9 +118,9 @@ fn shorten_path(path: &str) -> String {
 
 fn format_duration(secs: u64) -> String {
     if secs < 60 {
-        format!(" {}s ", secs)
+        format!("{}s", secs)
     } else {
-        format!(" {}m{}s ", secs / 60, secs % 60)
+        format!("{}m{}s", secs / 60, secs % 60)
     }
 }
 

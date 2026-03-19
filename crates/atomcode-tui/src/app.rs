@@ -246,9 +246,9 @@ impl App {
                 self.conversation.push_delta(&text);
             }
             AppEvent::StreamUsage(usage) => {
-                let total = usage.prompt_tokens + usage.completion_tokens;
-                self.turn_tokens += total;
-                self.total_tokens += total;
+                // Only count completion tokens (prompt is repeated context, not new work)
+                self.turn_tokens += usage.completion_tokens;
+                self.total_tokens += usage.completion_tokens;
             }
             AppEvent::StreamDone => {
                 self.conversation.finalize_stream();
