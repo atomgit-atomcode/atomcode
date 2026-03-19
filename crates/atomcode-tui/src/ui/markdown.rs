@@ -19,12 +19,38 @@ const CODE_BORDER: Color = Color::Rgb(48, 48, 56);
 const BULLET_COLOR: Color = Color::Rgb(120, 130, 150);
 const QUOTE_BAR: Color = Color::Rgb(70, 70, 85);
 const QUOTE_TEXT: Color = Color::Rgb(160, 160, 175);
+const DIM: Color = Color::Rgb(100, 100, 110);
 const RULE_COLOR: Color = Color::Rgb(50, 50, 60);
 
 pub fn render_markdown(input: &str) -> Vec<Line<'static>> {
     static RENDERER: std::sync::OnceLock<MarkdownRenderer> = std::sync::OnceLock::new();
     let renderer = RENDERER.get_or_init(MarkdownRenderer::new);
-    renderer.render(input)
+    // Strip emoji characters before rendering
+    let cleaned = strip_emoji(input);
+    renderer.render(&cleaned)
+}
+
+/// Remove emoji and other decorative unicode from text.
+fn strip_emoji(s: &str) -> String {
+    s.chars().filter(|c| {
+        let cp = *c as u32;
+        // Keep basic ASCII, CJK, and standard unicode
+        // Filter out emoji ranges
+        !(
+            (0x1F600..=0x1F64F).contains(&cp) || // Emoticons
+            (0x1F300..=0x1F5FF).contains(&cp) || // Misc Symbols
+            (0x1F680..=0x1F6FF).contains(&cp) || // Transport
+            (0x1F1E0..=0x1F1FF).contains(&cp) || // Flags
+            (0x2600..=0x26FF).contains(&cp) ||   // Misc symbols
+            (0x2700..=0x27BF).contains(&cp) ||   // Dingbats
+            (0xFE00..=0xFE0F).contains(&cp) ||   // Variation selectors
+            (0x1F900..=0x1F9FF).contains(&cp) || // Supplemental
+            (0x1FA00..=0x1FA6F).contains(&cp) || // Chess symbols etc
+            (0x1FA70..=0x1FAFF).contains(&cp) || // Symbols extended
+            (0x200D == cp) ||                     // Zero-width joiner
+            (0xE0020..=0xE007F).contains(&cp)    // Tags
+        )
+    }).collect()
 }
 
 struct MarkdownRenderer {
@@ -50,6 +76,9 @@ impl MarkdownRenderer {
         let mut in_code_block = false;
         let mut code_lang = String::new();
         let mut code_content = String::new();
+        let mut link_url: Option<String> = None;
+        let mut _in_table = false;
+        let mut table_row: Vec<String> = Vec::new();
         let mut list_depth: usize = 0;
         let mut ordered_index: Option<u64> = None;
         let mut in_blockquote = false;
@@ -105,10 +134,22 @@ impl MarkdownRenderer {
                         .fg(LINK_COLOR)
                         .add_modifier(Modifier::UNDERLINED);
                     style_stack.push(style);
-                    let _ = dest_url;
+                    link_url = Some(dest_url.to_string());
                 }
                 Event::End(TagEnd::Link) => {
                     style_stack.pop();
+                    // Show URL after link text if different from text
+                    if let Some(url) = link_url.take() {
+                        let last_text: String = current_spans.last()
+                            .map(|s| s.content.to_string())
+                            .unwrap_or_default();
+                        if !last_text.is_empty() && last_text != url && !url.is_empty() {
+                            current_spans.push(Span::styled(
+                                format!(" ({})", url),
+                                Style::default().fg(DIM),
+                            ));
+                        }
+                    }
                 }
                 Event::Start(Tag::CodeBlock(kind)) => {
                     in_code_block = true;
@@ -220,6 +261,51 @@ impl MarkdownRenderer {
                         Style::default().fg(RULE_COLOR),
                     )));
                     lines.push(Line::default());
+                }
+                // Table support
+                Event::Start(Tag::Table(_)) => {
+                    _in_table = true;
+                }
+                Event::End(TagEnd::Table) => {
+                    _in_table = false;
+                    lines.push(Line::default());
+                }
+                Event::Start(Tag::TableHead) => {
+                    table_row.clear();
+                }
+                Event::End(TagEnd::TableHead) => {
+                    // Render header row
+                    let header = table_row.join("  \u{2502}  ");
+                    lines.push(Line::from(Span::styled(
+                        header,
+                        Style::default().fg(BOLD_TEXT).add_modifier(Modifier::BOLD),
+                    )));
+                    // Separator
+                    lines.push(Line::from(Span::styled(
+                        "\u{2500}".repeat(50),
+                        Style::default().fg(RULE_COLOR),
+                    )));
+                    table_row.clear();
+                }
+                Event::Start(Tag::TableRow) => {
+                    table_row.clear();
+                }
+                Event::End(TagEnd::TableRow) => {
+                    let row = table_row.join("  \u{2502}  ");
+                    lines.push(Line::from(Span::styled(
+                        row,
+                        Style::default().fg(TEXT),
+                    )));
+                    table_row.clear();
+                }
+                Event::Start(Tag::TableCell) => {}
+                Event::End(TagEnd::TableCell) => {
+                    // Collect cell text from current_spans
+                    let cell_text: String = current_spans.iter()
+                        .map(|s| s.content.to_string())
+                        .collect();
+                    table_row.push(cell_text);
+                    current_spans.clear();
                 }
                 _ => {}
             }

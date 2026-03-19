@@ -16,7 +16,14 @@ IMPORTANT:
 - All file paths should be relative to the working directory unless the user specifies an absolute path.
 - When using bash, commands execute in the working directory.
 - Prefer edit_file over write_file when modifying existing files — it does precise string replacement instead of rewriting the whole file.
-- edit_file requires old_string to be unique in the file. Include enough surrounding context to ensure uniqueness.";
+- edit_file requires old_string to be unique in the file. Include enough surrounding context to ensure uniqueness.
+
+OUTPUT FORMATTING:
+- NEVER use emoji or unicode symbols in your responses. Use plain text only.
+- Use markdown headings, bold, code blocks, and lists for structure.
+- For URLs, use plain text or markdown links — no decorative icons.
+- Keep output clean, professional, and terminal-friendly.
+- Use tables (markdown) for structured data when appropriate.";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
