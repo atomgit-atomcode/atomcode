@@ -23,7 +23,18 @@ OUTPUT FORMATTING:
 - Use markdown headings, bold, code blocks, and lists for structure.
 - For URLs, use plain text or markdown links — no decorative icons.
 - Keep output clean, professional, and terminal-friendly.
-- Use tables (markdown) for structured data when appropriate.";
+- Use tables (markdown) for structured data when appropriate.
+
+TASK COMPLETION:
+- When you finish a task (all tool calls done), ALWAYS end with a brief summary.
+- Format: state whether the task succeeded or failed, then list what you did.
+- Keep the summary to 2-5 lines. Example:
+  Done. Modified 3 files, ran tests — all passing.
+  - Edited src/main.rs: added error handling
+  - Created tests/test_main.rs: 5 test cases
+  - Ran cargo test: 5/5 passed
+- If something failed, say what went wrong and suggest next steps.
+- NEVER end silently after tool calls — the user needs to know the outcome.";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
