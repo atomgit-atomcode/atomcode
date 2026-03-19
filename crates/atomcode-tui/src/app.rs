@@ -59,6 +59,8 @@ pub struct App {
     pub retry_count: usize,
     /// Last Ctrl+C timestamp for double-press detection.
     pub last_ctrl_c: Option<Instant>,
+    /// True during plan phase (LLM called without tools to generate plan text).
+    pub is_planning_phase: bool,
     /// Generation counter — incremented on cancel/new message. Background tasks
     /// with a stale generation are ignored when they send events back.
     pub generation: u64,
@@ -120,6 +122,7 @@ impl App {
             tool_call_count: 0,
             retry_count: 0,
             last_ctrl_c: None,
+            is_planning_phase: false,
             generation: 0,
             tick_count: 0,
             turn_start: None,
@@ -370,6 +373,16 @@ impl App {
             }
             AppEvent::StreamDone => {
                 self.conversation.finalize_stream();
+
+                // If planning phase just finished, auto-trigger execution phase
+                if self.is_planning_phase {
+                    self.is_planning_phase = false;
+                    self.mode = AppMode::Streaming;
+                    self.at_bottom = true;
+                    // Now call LLM WITH tools to execute the plan
+                    self.continue_agent_loop(event_tx);
+                    return;
+                }
 
                 // Auto-generate summary if the turn had tool calls but AI ended without text
                 self.maybe_add_auto_summary();
@@ -1088,19 +1101,30 @@ impl App {
 
         self.conversation.add_user_message(&full_content);
         self.input.clear();
-        self.mode = AppMode::Streaming;
         self.at_bottom = true;
         self.tool_call_count = 0;
         self.retry_count = 0;
         self.turn_start = Some(Instant::now());
         self.last_turn_duration = None;
 
-        let system_prompt = self.system_prompt();
-        let messages = self.conversation.to_provider_messages_windowed(&system_prompt, 30);
-        let tool_defs = self.tool_registry.get_definitions();
+        // Phase 1: Plan — call LLM WITHOUT tools to get a text plan first
+        self.mode = AppMode::Streaming;
+        self.is_planning_phase = true;
+
+        let plan_prompt = format!(
+            "{}\n\nWorking directory: {}\n\n{}\n\nRespond with a brief plan (1-3 lines) describing what you will do. Do NOT use any tools yet.",
+            self.config.providers
+                .get(&self.config.default_provider)
+                .and_then(|p| p.system_prompt.as_deref())
+                .unwrap_or(DEFAULT_SYSTEM_PROMPT),
+            self.working_dir.display(),
+            crate::project_context::build_project_context(&self.working_dir),
+        );
+        let messages = self.conversation.to_provider_messages_windowed(&plan_prompt, 10);
 
         let tx = event_tx.clone();
-        let stream_result = self.provider.chat_stream(&messages, Some(&tool_defs));
+        // No tools — forces text-only response
+        let stream_result = self.provider.chat_stream(&messages, None);
 
         tokio::spawn(async move {
             match stream_result {
