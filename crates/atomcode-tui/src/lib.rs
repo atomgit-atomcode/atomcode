@@ -7,7 +7,11 @@ pub mod ui;
 use anyhow::Result;
 use crossterm::{
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    event::{DisableMouseCapture, EnableMouseCapture},
+    terminal::{
+        disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+        SetTitle, Clear, ClearType,
+    },
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
@@ -20,11 +24,19 @@ use app::App;
 use event::EventLoop;
 
 pub async fn run(config: Config, provider: Box<dyn LlmProvider>, tool_registry: ToolRegistry, working_dir: std::path::PathBuf) -> Result<()> {
+    // Setup terminal
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,       // Captures mouse scroll — prevents scrolling to main screen
+        SetTitle("AtomCode"),
+        Clear(ClearType::All),    // Clear the alternate screen completely
+    )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
+    terminal.clear()?; // Also clear ratatui's buffer
 
     let mut app = App::new(provider, config, tool_registry, working_dir);
     let mut event_loop = EventLoop::new();
@@ -38,7 +50,7 @@ pub async fn run(config: Config, provider: Box<dyn LlmProvider>, tool_registry: 
         if let Some(file_path) = app.pending_editor.take() {
             // Temporarily leave TUI
             disable_raw_mode()?;
-            execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+            execute!(terminal.backend_mut(), DisableMouseCapture, LeaveAlternateScreen)?;
             terminal.show_cursor()?;
 
             // Open editor
@@ -49,7 +61,12 @@ pub async fn run(config: Config, provider: Box<dyn LlmProvider>, tool_registry: 
 
             // Re-enter TUI
             enable_raw_mode()?;
-            execute!(terminal.backend_mut(), EnterAlternateScreen)?;
+            execute!(
+                terminal.backend_mut(),
+                EnterAlternateScreen,
+                EnableMouseCapture,
+                Clear(ClearType::All),
+            )?;
             terminal.clear()?;
             continue;
         }
@@ -63,8 +80,13 @@ pub async fn run(config: Config, provider: Box<dyn LlmProvider>, tool_registry: 
         }
     }
 
+    // Restore terminal
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        DisableMouseCapture,
+        LeaveAlternateScreen,
+    )?;
     terminal.show_cursor()?;
 
     Ok(())
