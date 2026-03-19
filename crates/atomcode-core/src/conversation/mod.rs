@@ -115,6 +115,16 @@ impl Conversation {
         msgs.extend(self.messages.iter().cloned());
         msgs
     }
+
+    /// Like to_provider_messages but only sends the last `window` messages.
+    /// Keeps the conversation payload small for faster API calls during agent loops.
+    pub fn to_provider_messages_windowed(&self, system_prompt: &str, window: usize) -> Vec<Message> {
+        let start = self.messages.len().saturating_sub(window);
+        let mut msgs = Vec::with_capacity(window + 1);
+        msgs.push(Message::new(Role::System, system_prompt));
+        msgs.extend(self.messages[start..].iter().cloned());
+        msgs
+    }
 }
 
 #[cfg(test)]

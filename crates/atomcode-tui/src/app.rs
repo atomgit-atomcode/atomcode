@@ -258,8 +258,17 @@ impl App {
                 self.last_turn_duration = self.turn_start.map(|t| t.elapsed());
                 self.turn_start = None;
                 self.suggestion = self.generate_suggestion();
-                // Persist history
-                self.conversation.save(&Conversation::history_path());
+                // Persist history (async, non-blocking)
+                let msgs = self.conversation.messages.clone();
+                tokio::spawn(async move {
+                    let path = Conversation::history_path();
+                    if let Some(parent) = path.parent() {
+                        let _ = tokio::fs::create_dir_all(parent).await;
+                    }
+                    if let Ok(data) = serde_json::to_string(&msgs) {
+                        let _ = tokio::fs::write(path, data).await;
+                    }
+                });
             }
             AppEvent::StreamError(err) => {
                 if self.retry_count < 3 {
@@ -699,7 +708,9 @@ impl App {
             }
             "/clear" => {
                 self.conversation = Conversation::new();
-                self.conversation.save(&Conversation::history_path());
+                tokio::spawn(async move {
+                    let _ = tokio::fs::write(Conversation::history_path(), "[]").await;
+                });
                 self.scroll_offset = 0;
                 self.at_bottom = true;
                 self.render_cache.clear();
@@ -765,7 +776,7 @@ impl App {
         self.last_turn_duration = None;
 
         let system_prompt = self.system_prompt();
-        let messages = self.conversation.to_provider_messages(&system_prompt);
+        let messages = self.conversation.to_provider_messages_windowed(&system_prompt, 50);
         let tool_defs = self.tool_registry.get_definitions();
 
         let tx = event_tx.clone();
@@ -923,8 +934,10 @@ impl App {
     }
 
     fn continue_agent_loop(&mut self, event_tx: &mpsc::UnboundedSender<AppEvent>) {
+        // Reuse cached system prompt from the turn start
         let system_prompt = self.system_prompt();
-        let messages = self.conversation.to_provider_messages(&system_prompt);
+        // Only send the last N messages to reduce payload size and API latency
+        let messages = self.conversation.to_provider_messages_windowed(&system_prompt, 50);
         let tool_defs = self.tool_registry.get_definitions();
 
         let tx = event_tx.clone();
