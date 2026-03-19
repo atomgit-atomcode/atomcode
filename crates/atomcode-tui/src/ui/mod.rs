@@ -59,7 +59,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         );
     }
 
-    input_box::render(frame, chunks[2], &app.input, app.mode.is_streaming_or_executing());
+    input_box::render(frame, chunks[2], &app.input, app.mode.is_streaming_or_executing(), app.suggestion.as_deref());
 
     // Render slash menu as overlay above input box
     if app.slash_menu.visible {

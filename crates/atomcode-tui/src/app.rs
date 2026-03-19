@@ -49,6 +49,8 @@ pub struct App {
     pub tool_call_count: usize,
     pub tick_count: usize,
     pub working_dir: PathBuf,
+    /// Suggested next prompt shown as ghost text in the input box.
+    pub suggestion: Option<String>,
     /// Cache of rendered lines for completed messages. Invalidated on message count change.
     pub render_cache: Vec<ratatui::text::Line<'static>>,
     pub render_cache_msg_count: usize,
@@ -72,11 +74,96 @@ impl App {
             tool_call_count: 0,
             tick_count: 0,
             working_dir,
+            suggestion: None,
             render_cache: Vec::new(),
             render_cache_msg_count: 0,
             provider,
             config,
         }
+    }
+
+    /// Generate a follow-up suggestion based on conversation context.
+    fn generate_suggestion(&self) -> Option<String> {
+        use atomcode_core::conversation::message::MessageContent;
+
+        let msgs = &self.conversation.messages;
+        if msgs.is_empty() {
+            return None;
+        }
+
+        // Analyze the last few messages to detect patterns
+        let last = &msgs[msgs.len() - 1];
+
+        // Check if any tool calls were made in this conversation
+        let had_write = msgs.iter().any(|m| matches!(&m.content,
+            MessageContent::AssistantWithToolCalls { tool_calls, .. }
+            if tool_calls.iter().any(|c| c.name == "write_file" || c.name == "edit_file")
+        ));
+        let had_bash = msgs.iter().any(|m| matches!(&m.content,
+            MessageContent::AssistantWithToolCalls { tool_calls, .. }
+            if tool_calls.iter().any(|c| c.name == "bash")
+        ));
+        let had_error = msgs.iter().rev().take(3).any(|m| matches!(&m.content,
+            MessageContent::ToolResult(r) if !r.success
+        ));
+
+        // Last assistant text for context
+        let last_text = last.text().unwrap_or("");
+        let last_lower = last_text.to_lowercase();
+
+        // Error happened recently → suggest fix
+        if had_error {
+            return Some("Fix the error".to_string());
+        }
+
+        // Wrote/edited files → suggest testing or running
+        if had_write && !had_bash {
+            // Detect language from file extensions in tool calls
+            for m in msgs.iter().rev().take(5) {
+                if let MessageContent::AssistantWithToolCalls { tool_calls, .. } = &m.content {
+                    for tc in tool_calls {
+                        if let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
+                            if let Some(fp) = args.get("file_path").and_then(|v| v.as_str()) {
+                                if fp.ends_with(".rs") {
+                                    return Some("Run cargo build to check for errors".to_string());
+                                } else if fp.ends_with(".py") {
+                                    return Some("Run the script to test it".to_string());
+                                } else if fp.ends_with(".js") || fp.ends_with(".ts") {
+                                    return Some("Run npm test".to_string());
+                                } else if fp.ends_with(".go") {
+                                    return Some("Run go build to check for errors".to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            return Some("Run the code to test it".to_string());
+        }
+
+        // Ran a command → suggest follow-up
+        if had_bash && !had_write {
+            if last_lower.contains("error") || last_lower.contains("failed") {
+                return Some("Fix the issue".to_string());
+            }
+            if last_lower.contains("test") && last_lower.contains("pass") {
+                return Some("Commit the changes".to_string());
+            }
+        }
+
+        // Wrote files + ran commands successfully → suggest commit
+        if had_write && had_bash && !had_error {
+            if last_lower.contains("success") || last_lower.contains("pass") || last_lower.contains("done") {
+                return Some("Commit the changes with a descriptive message".to_string());
+            }
+        }
+
+        // Generic: conversation has content, suggest continue
+        if msgs.len() >= 2 {
+            return Some("Continue".to_string());
+        }
+
+        None
     }
 
     /// Build system prompt with working directory context.
@@ -100,6 +187,7 @@ impl App {
                 self.conversation.finalize_stream();
                 self.mode = AppMode::Normal;
                 self.at_bottom = true;
+                self.suggestion = self.generate_suggestion();
             }
             AppEvent::StreamError(err) => {
                 self.conversation.push_delta(&format!("\n\n[Error: {}]", err));
@@ -323,10 +411,25 @@ impl App {
                     self.input.cursor_col += 1;
                 }
             }
+            (_, KeyCode::Tab) => {
+                // Accept suggestion into input
+                if let Some(ref suggestion) = self.suggestion.take() {
+                    self.input.clear();
+                    for c in suggestion.chars() {
+                        self.input.insert_char(c);
+                    }
+                }
+                return; // Don't clear suggestion below
+            }
             (_, KeyCode::Char(c)) => {
                 self.input.insert_char(c);
             }
             _ => {}
+        }
+
+        // Clear suggestion on any input change (except Tab which was handled above)
+        if !self.input.is_empty() {
+            self.suggestion = None;
         }
 
         // After any input change, update the slash menu

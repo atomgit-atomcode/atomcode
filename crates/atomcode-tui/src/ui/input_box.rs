@@ -10,15 +10,29 @@ use crate::app::InputState;
 /// Left/right inner padding for the input box content.
 const H_PADDING: u16 = 3;
 
-pub fn render(frame: &mut Frame, area: Rect, input: &InputState, is_streaming: bool) {
+pub fn render(frame: &mut Frame, area: Rect, input: &InputState, is_streaming: bool, suggestion: Option<&str>) {
     let is_empty = input.is_empty();
 
     // Build content lines
     let lines: Vec<Line> = if is_empty && !is_streaming {
-        vec![Line::from(Span::styled(
-            "Ask anything... (Enter to send, / for commands)",
-            Style::default().fg(Color::DarkGray),
-        ))]
+        if let Some(sug) = suggestion {
+            // Show suggestion as ghost text with Tab hint
+            vec![Line::from(vec![
+                Span::styled(
+                    sug.to_string(),
+                    Style::default().fg(Color::Rgb(70, 70, 70)),
+                ),
+                Span::styled(
+                    "  Tab",
+                    Style::default().fg(Color::Rgb(50, 50, 50)),
+                ),
+            ])]
+        } else {
+            vec![Line::from(Span::styled(
+                "Ask anything... (Enter to send, / for commands)",
+                Style::default().fg(Color::DarkGray),
+            ))]
+        }
     } else {
         input
             .lines
