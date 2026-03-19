@@ -109,24 +109,30 @@ pub fn render(
     // Build stats string: elapsed | tokens | speed
     let stats = build_turn_stats(turn_elapsed_secs, turn_tokens);
 
+    // Count tool actions this turn for step indicator
+    let step_count = count_turn_steps(conversation);
+    let step_prefix = if step_count > 0 {
+        format!("[step {}] ", step_count + 1)
+    } else {
+        String::new()
+    };
+
     match mode {
         AppMode::Streaming => {
-            // One label per turn — stable, based on seed (message count at turn start)
             let label = THINKING_LABELS[turn_label_seed % THINKING_LABELS.len()];
             dynamic.push(Line::from(vec![
                 Span::styled(
-                    format!("    {} {}", spinner, label),
+                    format!("    {} {}{}", spinner, step_prefix, label),
                     Style::default().fg(ACCENT),
                 ),
                 Span::styled(stats.clone(), Style::default().fg(DIM)),
             ]));
         }
         AppMode::ToolExecuting => {
-            // Show what tool is running + its key argument
             let tool_info = get_executing_tool_info(conversation);
             dynamic.push(Line::from(vec![
                 Span::styled(
-                    format!("    {} Running {}", spinner, tool_info),
+                    format!("    {} {}Running {}", spinner, step_prefix, tool_info),
                     Style::default().fg(WARN),
                 ),
                 Span::styled(stats.clone(), Style::default().fg(DIM)),
@@ -358,6 +364,20 @@ fn build_turn_stats(elapsed_secs: Option<u64>, tokens: usize) -> String {
     } else {
         format!("  {}", parts.join(" | "))
     }
+}
+
+/// Count tool call steps in the current turn (since the last user message).
+fn count_turn_steps(conversation: &Conversation) -> usize {
+    use atomcode_core::conversation::message::{MessageContent, Role};
+    let mut count = 0;
+    for msg in conversation.messages.iter().rev() {
+        match (&msg.role, &msg.content) {
+            (Role::User, _) => break,
+            (_, MessageContent::ToolResult(_)) => count += 1,
+            _ => {}
+        }
+    }
+    count
 }
 
 /// Get info about the currently executing tool from the last tool call in conversation.
