@@ -6,41 +6,66 @@ use ratatui::Frame;
 
 use crate::app::{App, AppMode};
 
+const BAR_BG: Color = Color::Rgb(20, 20, 25);
+const DIM: Color = Color::Rgb(70, 70, 70);
+const ACCENT: Color = Color::Rgb(130, 100, 255);
+
 pub fn render(frame: &mut Frame, area: Rect, app: &App) {
-    let mode_indicator = match &app.mode {
-        AppMode::Normal => Span::styled(" READY ", Style::default().bg(Color::Green).fg(Color::Black)),
-        AppMode::Streaming => Span::styled(" STREAMING ", Style::default().bg(Color::Yellow).fg(Color::Black)),
-        AppMode::WaitingApproval(_) => Span::styled(" APPROVAL ", Style::default().bg(Color::Yellow).fg(Color::Black)),
-        AppMode::ToolExecuting => Span::styled(" EXECUTING ", Style::default().bg(Color::Cyan).fg(Color::Black)),
-        AppMode::ProviderManager => Span::styled(" PROVIDERS ", Style::default().bg(Color::Magenta).fg(Color::White)),
-        AppMode::Exiting => Span::styled(" EXITING ", Style::default().bg(Color::Red).fg(Color::White)),
+    let width = area.width as usize;
+
+    // Left side: logo + working dir
+    let dir = shorten_path(&app.working_dir.to_string_lossy());
+
+    // Right side: model + mode
+    let model_name = app.provider.model_name();
+    let mode_str = match &app.mode {
+        AppMode::Normal => "",
+        AppMode::Streaming => " \u{25cf} streaming",        // ●
+        AppMode::WaitingApproval(_) => " \u{25cf} approval",
+        AppMode::ToolExecuting => " \u{25cf} executing",
+        AppMode::ProviderManager => " \u{25cf} providers",
+        AppMode::Exiting => " \u{25cf} exiting",
+    };
+    let mode_color = match &app.mode {
+        AppMode::Normal => DIM,
+        AppMode::Streaming => Color::Rgb(240, 200, 60),
+        AppMode::WaitingApproval(_) => Color::Rgb(240, 200, 60),
+        AppMode::ToolExecuting => Color::Rgb(80, 200, 255),
+        AppMode::ProviderManager => Color::Rgb(180, 140, 255),
+        AppMode::Exiting => Color::Rgb(240, 80, 80),
     };
 
-    let model = Span::styled(
-        format!("  {} ", app.provider.model_name()),
-        Style::default().fg(Color::Gray),
-    );
+    let right_text = format!("{}{}", model_name, mode_str);
+    let left_text = format!(" \u{2666} {} ", dir); // ♦ ~/project/foo
 
-    // Show shortened working directory
-    let dir_display = shorten_path(&app.working_dir.to_string_lossy());
-    let dir = Span::styled(
-        format!("  {} ", dir_display),
-        Style::default().fg(Color::Rgb(100, 100, 100)),
-    );
+    // Calculate padding
+    let pad = width.saturating_sub(left_text.len() + right_text.len() + 1);
 
-    let title = Span::styled(
-        " AtomCode ",
-        Style::default()
-            .fg(Color::White)
-            .add_modifier(Modifier::BOLD),
-    );
+    let line = Line::from(vec![
+        Span::styled(
+            " \u{2666} ",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("{} ", dir),
+            Style::default().fg(Color::Rgb(140, 140, 140)),
+        ),
+        Span::styled(" ".repeat(pad), Style::default()),
+        Span::styled(
+            model_name.to_string(),
+            Style::default().fg(DIM),
+        ),
+        Span::styled(
+            mode_str.to_string(),
+            Style::default().fg(mode_color),
+        ),
+        Span::raw(" "),
+    ]);
 
-    let line = Line::from(vec![title, mode_indicator, model, dir]);
-    let bar = Paragraph::new(line).style(Style::default().bg(Color::Rgb(25, 25, 30)));
+    let bar = Paragraph::new(line).style(Style::default().bg(BAR_BG));
     frame.render_widget(bar, area);
 }
 
-/// Shorten home directory to ~ and keep last 2 components if path is long.
 fn shorten_path(path: &str) -> String {
     let home = dirs::home_dir()
         .map(|h| h.to_string_lossy().to_string())
@@ -50,10 +75,10 @@ fn shorten_path(path: &str) -> String {
     } else {
         path.to_string()
     };
-    if shortened.len() > 40 {
+    if shortened.len() > 50 {
         let parts: Vec<&str> = shortened.rsplitn(3, '/').collect();
         if parts.len() >= 3 {
-            format!(".../{}/ {}", parts[1], parts[0])
+            format!(".../{}/{}", parts[1], parts[0])
         } else {
             shortened
         }
