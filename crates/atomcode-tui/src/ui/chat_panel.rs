@@ -31,6 +31,8 @@ pub fn render(
     at_bottom: bool,
     mode: &AppMode,
     tick: usize,
+    render_cache: &mut Vec<Line<'static>>,
+    render_cache_msg_count: &mut usize,
 ) {
     let width = area.width as usize;
     let vh = area.height as usize;
@@ -38,29 +40,35 @@ pub fn render(
         return;
     }
 
-    // Build all logical lines
-    let mut logical_lines: Vec<Line<'static>> = Vec::new();
-
-    for msg in &conversation.messages {
-        match &msg.content {
-            MessageContent::Text(text) => match msg.role {
-                Role::User => render_user(&mut logical_lines, text),
-                Role::Assistant => render_assistant(&mut logical_lines, text),
-                _ => {}
-            },
-            MessageContent::AssistantWithToolCalls { text, tool_calls } => {
-                if let Some(t) = text {
-                    render_assistant(&mut logical_lines, t);
+    // Rebuild cache only when message count changes
+    let msg_count = conversation.messages.len();
+    if msg_count != *render_cache_msg_count {
+        render_cache.clear();
+        for msg in &conversation.messages {
+            match &msg.content {
+                MessageContent::Text(text) => match msg.role {
+                    Role::User => render_user(render_cache, text),
+                    Role::Assistant => render_assistant(render_cache, text),
+                    _ => {}
+                },
+                MessageContent::AssistantWithToolCalls { text, tool_calls } => {
+                    if let Some(t) = text {
+                        render_assistant(render_cache, t);
+                    }
+                    for call in tool_calls {
+                        render_tool_call(render_cache, call);
+                    }
                 }
-                for call in tool_calls {
-                    render_tool_call(&mut logical_lines, call);
+                MessageContent::ToolResult(result) => {
+                    render_tool_result(render_cache, result);
                 }
-            }
-            MessageContent::ToolResult(result) => {
-                render_tool_result(&mut logical_lines, result);
             }
         }
+        *render_cache_msg_count = msg_count;
     }
+
+    // Start with cached lines (clone is cheap — Line is just Vec<Span> with Cow<str>)
+    let mut logical_lines: Vec<Line<'static>> = render_cache.clone();
 
     // Streaming buffer
     if let Some(ref buffer) = conversation.stream_buffer {

@@ -32,7 +32,7 @@ pub async fn run(config: Config, provider: Box<dyn LlmProvider>, tool_registry: 
     event_loop.start();
 
     loop {
-        terminal.draw(|frame| ui::render(frame, &app))?;
+        terminal.draw(|frame| ui::render(frame, &mut app))?;
 
         // Handle pending editor (e.g., /config)
         if let Some(file_path) = app.pending_editor.take() {

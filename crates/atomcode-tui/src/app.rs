@@ -49,6 +49,9 @@ pub struct App {
     pub tool_call_count: usize,
     pub tick_count: usize,
     pub working_dir: PathBuf,
+    /// Cache of rendered lines for completed messages. Invalidated on message count change.
+    pub render_cache: Vec<ratatui::text::Line<'static>>,
+    pub render_cache_msg_count: usize,
     pub provider: Box<dyn LlmProvider>,
     pub config: Config,
 }
@@ -69,6 +72,8 @@ impl App {
             tool_call_count: 0,
             tick_count: 0,
             working_dir,
+            render_cache: Vec::new(),
+            render_cache_msg_count: 0,
             provider,
             config,
         }
@@ -394,7 +399,8 @@ impl App {
                 self.conversation = Conversation::new();
                 self.scroll_offset = 0;
                 self.at_bottom = true;
-                // Don't add any message — just clear everything
+                self.render_cache.clear();
+                self.render_cache_msg_count = 0;
                 return true;
             }
             "/help" => {

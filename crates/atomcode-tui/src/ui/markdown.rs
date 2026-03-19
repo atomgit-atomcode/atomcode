@@ -13,8 +13,10 @@ const LINK_COLOR: Color = Color::Rgb(100, 150, 255);
 const LIST_BULLET_COLOR: Color = Color::Rgb(120, 120, 120);
 
 /// Render a markdown string into a Vec of ratatui Lines.
+/// Uses a cached singleton renderer to avoid reloading syntect on every call.
 pub fn render_markdown(input: &str) -> Vec<Line<'static>> {
-    let renderer = MarkdownRenderer::new();
+    static RENDERER: std::sync::OnceLock<MarkdownRenderer> = std::sync::OnceLock::new();
+    let renderer = RENDERER.get_or_init(MarkdownRenderer::new);
     renderer.render(input)
 }
 

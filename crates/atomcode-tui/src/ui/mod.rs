@@ -11,7 +11,10 @@ use ratatui::Frame;
 
 use crate::app::App;
 
-pub fn render(frame: &mut Frame, app: &App) {
+// Note: render takes &mut App to update render cache. This is fine since
+// render is the only place that reads the cache, called from the main loop.
+
+pub fn render(frame: &mut Frame, app: &mut App) {
     // Provider manager takes over the full screen (except status bar)
     if app.mode.is_provider_manager() {
         let chunks = Layout::default()
@@ -52,6 +55,7 @@ pub fn render(frame: &mut Frame, app: &App) {
         chat_panel::render(
             frame, chunks[1], &app.conversation,
             app.scroll_offset, app.at_bottom, &app.mode, app.tick_count,
+            &mut app.render_cache, &mut app.render_cache_msg_count,
         );
     }
 
