@@ -79,30 +79,25 @@ pub fn render(
                 spans.extend(line.spans);
                 logical_lines.push(Line::from(spans));
             }
-            let cursor_char = if tick % 2 == 0 { "\u{2588}" } else { " " };
-            logical_lines.push(Line::from(Span::styled(
-                format!("    {}", cursor_char),
-                Style::default().fg(ACCENT),
-            )));
         }
     }
 
-    // Mode indicators
+    // Active state indicators — shown whenever the agent is working
+    let spinner = SPINNER[tick % SPINNER.len()];
     match mode {
-        AppMode::Streaming
-            if conversation
-                .stream_buffer
-                .as_ref()
-                .map_or(true, |b| b.is_empty()) =>
-        {
-            let spinner = SPINNER[tick % SPINNER.len()];
+        AppMode::Streaming => {
+            // Show spinner after any streamed text (or alone if no text yet)
+            let label = if conversation.stream_buffer.as_ref().map_or(true, |b| b.is_empty()) {
+                "Thinking..."
+            } else {
+                ""
+            };
             logical_lines.push(Line::from(Span::styled(
-                format!("    {} Thinking...", spinner),
+                format!("    {} {}", spinner, label),
                 Style::default().fg(ACCENT),
             )));
         }
         AppMode::ToolExecuting => {
-            let spinner = SPINNER[tick % SPINNER.len()];
             logical_lines.push(Line::from(Span::styled(
                 format!("    {} Executing...", spinner),
                 Style::default().fg(WARN),
