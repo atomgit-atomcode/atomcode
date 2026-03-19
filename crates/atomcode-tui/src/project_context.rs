@@ -1,38 +1,46 @@
 use std::path::Path;
 
-/// Generate a concise project context by reading key files.
-/// This gives the AI understanding of WHAT the project is, not just the file tree.
+/// Descriptor files to include (filename, max_lines).
+/// The model reads these directly — no interpretation by us.
+const DESCRIPTORS: &[(&str, usize)] = &[
+    ("README.md", 40),
+    ("README", 40),
+    ("Makefile", 50),
+    ("package.json", 30),
+    ("Cargo.toml", 20),
+    ("pyproject.toml", 30),
+    ("go.mod", 5),
+    ("Gemfile", 15),
+    ("docker-compose.yml", 30),
+    ("docker-compose.yaml", 30),
+    ("justfile", 50),
+    ("Taskfile.yml", 40),
+    (".env.example", 10),
+];
+
+const SKIP_DIRS: &[&str] = &[
+    "node_modules", ".git", "target", "__pycache__", ".next",
+    "dist", "build", ".cache", "vendor", ".venv", "venv",
+    ".idea", ".vscode", ".DS_Store", ".env",
+];
+
+/// Build project context by scanning the tree and including raw descriptor file contents.
+/// No hardcoded project-type detection — the model reads the files and figures it out.
 pub fn build_project_context(dir: &Path) -> String {
     let mut ctx = String::new();
 
-    // 1. Directory tree (2 levels, skip noise)
-    ctx.push_str("Files:\n");
-    let tree = scan_tree(dir, 0, 2);
-    ctx.push_str(&tree);
+    // 1. File tree (2 levels)
+    ctx.push_str("Project files:\n");
+    ctx.push_str(&scan_tree(dir, 0, 2));
 
-    // 2. Read key descriptor files to understand the project
-    let key_files = [
-        ("README.md", "Project description"),
-        ("README", "Project description"),
-        ("package.json", "Node.js project"),
-        ("Cargo.toml", "Rust project"),
-        ("pyproject.toml", "Python project"),
-        ("requirements.txt", "Python dependencies"),
-        ("go.mod", "Go project"),
-        ("Makefile", "Build system"),
-        ("docker-compose.yml", "Docker services"),
-        ("docker-compose.yaml", "Docker services"),
-        (".env.example", "Environment config"),
-    ];
-
-    for (filename, desc) in &key_files {
+    // 2. Include raw content of descriptor files the model can read
+    for &(filename, max_lines) in DESCRIPTORS {
         let path = dir.join(filename);
         if path.exists() {
             if let Ok(content) = std::fs::read_to_string(&path) {
-                // Take first 30 lines or 2000 chars max
                 let summary: String = content
                     .lines()
-                    .take(30)
+                    .take(max_lines)
                     .collect::<Vec<_>>()
                     .join("\n");
                 let summary = if summary.len() > 2000 {
@@ -40,74 +48,63 @@ pub fn build_project_context(dir: &Path) -> String {
                 } else {
                     summary
                 };
-                ctx.push_str(&format!("\n{}({}):\n{}\n", filename, desc, summary));
+                ctx.push_str(&format!("\n[{}]\n{}\n", filename, summary));
             }
         }
     }
 
-    // 3. Detect project type — actionable rules
-    let hints = detect_project_hints(dir);
-    if !hints.is_empty() {
-        ctx.push_str(&format!("\nProject rules: {}\n", hints));
+    // 3. List executable/script files at root
+    let executables = find_executables(dir);
+    if !executables.is_empty() {
+        ctx.push_str(&format!("\nExecutable files: {}\n", executables.join(", ")));
     }
 
-    // Keep total context under 4000 chars
-    if ctx.len() > 4000 {
-        ctx.truncate(4000);
+    // Cap total size
+    if ctx.len() > 6000 {
+        ctx.truncate(6000);
         ctx.push_str("\n...(truncated)");
     }
 
     ctx
 }
 
-fn detect_project_hints(dir: &Path) -> String {
-    let mut hints: Vec<String> = Vec::new();
+/// Find executable files and known script files at root level.
+fn find_executables(dir: &Path) -> Vec<String> {
+    let mut result = Vec::new();
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return result,
+    };
 
-    if dir.join("package.json").exists() {
-        hints.push("Node.js — check scripts in package.json".into());
-    }
-    if dir.join("Cargo.toml").exists() {
-        hints.push("Rust — `cargo run` or `cargo build`".into());
-    }
-    if dir.join("requirements.txt").exists() || dir.join("pyproject.toml").exists() {
-        hints.push("Python — check entry point".into());
-    }
-    if dir.join("go.mod").exists() {
-        hints.push("Go — `go run .`".into());
-    }
-    if dir.join("docker-compose.yml").exists() || dir.join("docker-compose.yaml").exists() {
-        hints.push("Docker Compose available".into());
-    }
-    if dir.join("Makefile").exists() {
-        hints.push("Makefile available".into());
-    }
-    if dir.join("start.sh").exists() {
-        hints.push("Has start.sh: when user says 'start', run `nohup bash start.sh &` immediately".into());
-    }
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let path = entry.path();
+        if !path.is_file() { continue; }
 
-    for sub in ["frontend", "backend", "server", "client", "web", "api"] {
-        let sub_dir = dir.join(sub);
-        if sub_dir.is_dir() {
-            if sub_dir.join("package.json").exists() {
-                hints.push(format!("{}/: Node.js sub-project", sub));
-            }
-            if sub_dir.join("requirements.txt").exists() {
-                hints.push(format!("{}/: Python sub-project", sub));
-            }
+        let known = name.ends_with(".sh")
+            || name == "Procfile"
+            || name == "Dockerfile";
+
+        #[cfg(unix)]
+        let is_exec = {
+            use std::os::unix::fs::PermissionsExt;
+            path.metadata()
+                .map(|m| m.permissions().mode() & 0o111 != 0)
+                .unwrap_or(false)
+        };
+        #[cfg(not(unix))]
+        let is_exec = false;
+
+        if known || is_exec {
+            result.push(name);
         }
     }
-
-    hints.join(". ")
+    result.sort();
+    result
 }
 
 fn scan_tree(dir: &Path, depth: usize, max_depth: usize) -> String {
     if depth > max_depth { return String::new(); }
-
-    let skip = [
-        "node_modules", ".git", "target", "__pycache__", ".next",
-        "dist", "build", ".cache", "vendor", ".venv", "venv",
-        ".idea", ".vscode", ".DS_Store", ".env",
-    ];
 
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
@@ -116,7 +113,7 @@ fn scan_tree(dir: &Path, depth: usize, max_depth: usize) -> String {
 
     let mut items: Vec<_> = entries
         .filter_map(|e| e.ok())
-        .filter(|e| !skip.contains(&e.file_name().to_string_lossy().as_ref()))
+        .filter(|e| !SKIP_DIRS.contains(&e.file_name().to_string_lossy().as_ref()))
         .collect();
     items.sort_by_key(|e| e.file_name());
 
@@ -124,8 +121,7 @@ fn scan_tree(dir: &Path, depth: usize, max_depth: usize) -> String {
     for entry in &items {
         let name = entry.file_name().to_string_lossy().to_string();
         let indent = "  ".repeat(depth);
-        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
-        if is_dir {
+        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
             out.push_str(&format!("{}{}/\n", indent, name));
             out.push_str(&scan_tree(&entry.path(), depth + 1, max_depth));
         } else {
