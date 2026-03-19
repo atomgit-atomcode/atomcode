@@ -53,6 +53,9 @@ pub struct App {
     pub retry_count: usize,
     /// Last Ctrl+C timestamp for double-press detection.
     pub last_ctrl_c: Option<Instant>,
+    /// Generation counter — incremented on cancel/new message. Background tasks
+    /// with a stale generation are ignored when they send events back.
+    pub generation: u64,
     /// When the current turn (user message → agent loop) started.
     pub turn_start: Option<Instant>,
     /// When the last tool execution started (for per-step timing).
@@ -89,6 +92,7 @@ impl App {
             tool_call_count: 0,
             retry_count: 0,
             last_ctrl_c: None,
+            generation: 0,
             tick_count: 0,
             turn_start: None,
             tool_start: None,
@@ -243,6 +247,21 @@ impl App {
     }
 
     pub fn handle_event(&mut self, event: AppEvent, event_tx: &mpsc::UnboundedSender<AppEvent>) {
+        // Drop stale stream/tool events after cancellation
+        if self.mode.is_normal() {
+            match &event {
+                AppEvent::StreamDelta(_)
+                | AppEvent::StreamToolCallStart { .. }
+                | AppEvent::StreamToolCallDelta(_)
+                | AppEvent::StreamToolCallDone(_)
+                | AppEvent::StreamUsage(_)
+                | AppEvent::StreamDone
+                | AppEvent::StreamError(_)
+                | AppEvent::ToolFinished(_) => return, // Stale event from cancelled task
+                _ => {}
+            }
+        }
+
         match event {
             AppEvent::Key(key) => self.handle_key(key, event_tx),
             AppEvent::StreamDelta(text) => {
