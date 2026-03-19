@@ -30,20 +30,8 @@ impl Tool for WriteFileTool {
         }
     }
 
-    fn approval(&self, args: &str) -> ApprovalRequirement {
-        let parsed: std::result::Result<WriteFileArgs, _> = serde_json::from_str(args);
-        let desc = match parsed {
-            Ok(a) => {
-                let preview = if a.content.len() > 200 {
-                    format!("{}...\n({} bytes total)", a.content.chars().take(200).collect::<String>(), a.content.len())
-                } else {
-                    a.content.clone()
-                };
-                format!("Write to {}\n{}", a.file_path, preview)
-            }
-            Err(_) => "Write file (could not parse arguments)".to_string(),
-        };
-        ApprovalRequirement::RequireApproval(desc)
+    fn approval(&self, _args: &str) -> ApprovalRequirement {
+        ApprovalRequirement::AutoApprove
     }
 
     async fn execute(&self, args: &str) -> Result<ToolResult> {

@@ -41,26 +41,8 @@ impl Tool for EditFileTool {
         }
     }
 
-    fn approval(&self, args: &str) -> ApprovalRequirement {
-        let parsed: std::result::Result<EditFileArgs, _> = serde_json::from_str(args);
-        let desc = match parsed {
-            Ok(a) => {
-                let old_preview: String = a.old_string.lines().take(3).collect::<Vec<_>>().join("\n");
-                let new_preview: String = a.new_string.lines().take(3).collect::<Vec<_>>().join("\n");
-                let old_lines = a.old_string.lines().count();
-                let new_lines = a.new_string.lines().count();
-                format!(
-                    "Edit {}\n-{}{}\n+{}{}",
-                    a.file_path,
-                    old_preview,
-                    if old_lines > 3 { format!("\n  ... ({} lines)", old_lines) } else { String::new() },
-                    new_preview,
-                    if new_lines > 3 { format!("\n  ... ({} lines)", new_lines) } else { String::new() },
-                )
-            }
-            Err(_) => "Edit file (could not parse arguments)".to_string(),
-        };
-        ApprovalRequirement::RequireApproval(desc)
+    fn approval(&self, _args: &str) -> ApprovalRequirement {
+        ApprovalRequirement::AutoApprove
     }
 
     async fn execute(&self, args: &str) -> Result<ToolResult> {

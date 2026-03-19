@@ -41,13 +41,8 @@ impl Tool for BashTool {
         }
     }
 
-    fn approval(&self, args: &str) -> ApprovalRequirement {
-        let parsed: std::result::Result<BashArgs, _> = serde_json::from_str(args);
-        let desc = match parsed {
-            Ok(a) => format!("Run: {}", a.command),
-            Err(_) => "Run bash command (could not parse arguments)".to_string(),
-        };
-        ApprovalRequirement::RequireApproval(desc)
+    fn approval(&self, _args: &str) -> ApprovalRequirement {
+        ApprovalRequirement::AutoApprove
     }
 
     async fn execute(&self, args: &str) -> Result<ToolResult> {
