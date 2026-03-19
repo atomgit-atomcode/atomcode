@@ -14,7 +14,7 @@ pub fn render(frame: &mut Frame, input_area: Rect, menu: &SlashMenu) {
     }
 
     let item_count = menu.filtered.len();
-    let menu_height = (item_count as u16 + 2).min(10); // +2 for border, max 10
+    let menu_height = (item_count as u16 + 2).min(14); // +2 for border, max 14
     let menu_width = 50u16.min(input_area.width.saturating_sub(2));
 
     // Position: above the input box, aligned to left

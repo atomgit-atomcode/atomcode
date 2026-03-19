@@ -8,40 +8,40 @@ pub struct SlashCommand {
 /// All available slash commands.
 pub const COMMANDS: &[SlashCommand] = &[
     SlashCommand {
-        name: "/provider",
-        description: "Manage providers (add, edit, delete, set default)",
-    },
-    SlashCommand {
-        name: "/config",
-        description: "Open configuration file in editor",
-    },
-    SlashCommand {
         name: "/model",
-        description: "Show or switch model (/model <provider> [model])",
+        description: "Switch model/provider",
     },
     SlashCommand {
-        name: "/clear",
-        description: "Clear conversation history",
-    },
-    SlashCommand {
-        name: "/help",
-        description: "Show available commands and shortcuts",
+        name: "/provider",
+        description: "Manage providers",
     },
     SlashCommand {
         name: "/file",
-        description: "Attach file to conversation (/file <path>)",
-    },
-    SlashCommand {
-        name: "/copy",
-        description: "Copy last AI response to clipboard",
+        description: "Attach file (/file <path>)",
     },
     SlashCommand {
         name: "/cd",
         description: "Change working directory",
     },
     SlashCommand {
+        name: "/copy",
+        description: "Copy last AI response",
+    },
+    SlashCommand {
+        name: "/clear",
+        description: "Clear conversation",
+    },
+    SlashCommand {
+        name: "/config",
+        description: "Edit config file",
+    },
+    SlashCommand {
+        name: "/help",
+        description: "Show commands & shortcuts",
+    },
+    SlashCommand {
         name: "/quit",
-        description: "Exit AtomCode",
+        description: "Exit (or Ctrl+C x2)",
     },
 ];
 
