@@ -79,6 +79,9 @@ impl MarkdownRenderer {
         let mut link_url: Option<String> = None;
         let mut _in_table = false;
         let mut table_row: Vec<String> = Vec::new();
+        let mut table_header: Vec<String> = Vec::new();
+        let mut table_rows: Vec<Vec<String>> = Vec::new();
+        let mut collecting_header = false;
         let mut list_depth: usize = 0;
         let mut ordered_index: Option<u64> = None;
         let mut in_blockquote = false;
@@ -262,49 +265,43 @@ impl MarkdownRenderer {
                     )));
                     lines.push(Line::default());
                 }
-                // Table support
+                // Table: collect all rows first, then render with aligned columns
                 Event::Start(Tag::Table(_)) => {
                     _in_table = true;
+                    table_header.clear();
+                    table_rows.clear();
                 }
                 Event::End(TagEnd::Table) => {
                     _in_table = false;
-                    lines.push(Line::default());
+                    // Render the complete table with aligned columns
+                    render_table(&mut lines, &table_header, &table_rows);
+                    table_header.clear();
+                    table_rows.clear();
                 }
                 Event::Start(Tag::TableHead) => {
+                    collecting_header = true;
                     table_row.clear();
                 }
                 Event::End(TagEnd::TableHead) => {
-                    // Render header row
-                    let header = table_row.join("  \u{2502}  ");
-                    lines.push(Line::from(Span::styled(
-                        header,
-                        Style::default().fg(BOLD_TEXT).add_modifier(Modifier::BOLD),
-                    )));
-                    // Separator
-                    lines.push(Line::from(Span::styled(
-                        "\u{2500}".repeat(50),
-                        Style::default().fg(RULE_COLOR),
-                    )));
+                    collecting_header = false;
+                    table_header = table_row.clone();
                     table_row.clear();
                 }
                 Event::Start(Tag::TableRow) => {
                     table_row.clear();
                 }
                 Event::End(TagEnd::TableRow) => {
-                    let row = table_row.join("  \u{2502}  ");
-                    lines.push(Line::from(Span::styled(
-                        row,
-                        Style::default().fg(TEXT),
-                    )));
+                    if !collecting_header {
+                        table_rows.push(table_row.clone());
+                    }
                     table_row.clear();
                 }
                 Event::Start(Tag::TableCell) => {}
                 Event::End(TagEnd::TableCell) => {
-                    // Collect cell text from current_spans
                     let cell_text: String = current_spans.iter()
                         .map(|s| s.content.to_string())
                         .collect();
-                    table_row.push(cell_text);
+                    table_row.push(cell_text.trim().to_string());
                     current_spans.clear();
                 }
                 _ => {}
@@ -379,6 +376,79 @@ impl MarkdownRenderer {
 
         lines
     }
+}
+
+/// Render a table with properly aligned columns, clean separators.
+fn render_table(lines: &mut Vec<Line<'static>>, header: &[String], rows: &[Vec<String>]) {
+    if header.is_empty() {
+        return;
+    }
+
+    let col_count = header.len();
+
+    // Calculate column widths
+    let mut widths: Vec<usize> = header.iter().map(|h| h.chars().count()).collect();
+    for row in rows {
+        for (i, cell) in row.iter().enumerate() {
+            if i < widths.len() {
+                widths[i] = widths[i].max(cell.chars().count());
+            }
+        }
+    }
+
+    // Pad each width by 2 for breathing room
+    let widths: Vec<usize> = widths.iter().map(|w| w + 2).collect();
+
+    let sep_color = Style::default().fg(RULE_COLOR);
+    let header_style = Style::default().fg(BOLD_TEXT).add_modifier(Modifier::BOLD);
+    let cell_style = Style::default().fg(TEXT);
+    let dim_style = Style::default().fg(DIM);
+
+    lines.push(Line::default());
+
+    // Header row
+    let mut hspans: Vec<Span<'static>> = Vec::new();
+    for (i, h) in header.iter().enumerate() {
+        let w = widths.get(i).copied().unwrap_or(10);
+        hspans.push(Span::styled(format!(" {:<width$}", h, width = w), header_style));
+        if i + 1 < col_count {
+            hspans.push(Span::styled(" ", dim_style));
+        }
+    }
+    lines.push(Line::from(hspans));
+
+    // Separator
+    let mut sep_spans: Vec<Span<'static>> = Vec::new();
+    for (i, w) in widths.iter().enumerate() {
+        sep_spans.push(Span::styled(" ".to_string() + &"\u{2500}".repeat(*w), sep_color));
+        if i + 1 < col_count {
+            sep_spans.push(Span::styled("\u{2500}", sep_color));
+        }
+    }
+    lines.push(Line::from(sep_spans));
+
+    // Data rows
+    for row in rows {
+        let mut rspans: Vec<Span<'static>> = Vec::new();
+        for (i, cell) in row.iter().enumerate() {
+            let w = widths.get(i).copied().unwrap_or(10);
+            rspans.push(Span::styled(format!(" {:<width$}", cell, width = w), cell_style));
+            if i + 1 < col_count {
+                rspans.push(Span::styled(" ", dim_style));
+            }
+        }
+        // Fill missing columns
+        for i in row.len()..col_count {
+            let w = widths.get(i).copied().unwrap_or(10);
+            rspans.push(Span::styled(format!(" {:<width$}", "", width = w), cell_style));
+            if i + 1 < col_count {
+                rspans.push(Span::styled(" ", dim_style));
+            }
+        }
+        lines.push(Line::from(rspans));
+    }
+
+    lines.push(Line::default());
 }
 
 #[cfg(test)]
