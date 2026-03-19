@@ -23,6 +23,18 @@ const WARN: Color = Color::Rgb(240, 200, 60);
 
 const SPINNER: &[&str] = &["\u{25dc}", "\u{25dd}", "\u{25de}", "\u{25df}"];
 
+/// Fun thinking labels, rotated each time
+const THINKING_LABELS: &[&str] = &[
+    "Thinking...",
+    "Pondering...",
+    "Reasoning...",
+    "Contemplating...",
+    "Analyzing...",
+    "Processing...",
+    "Cogitating...",
+    "Deliberating...",
+];
+
 pub fn render(
     frame: &mut Frame,
     area: Rect,
@@ -82,16 +94,13 @@ pub fn render(
         }
     }
 
-    // Active state indicators — shown whenever the agent is working
+    // State indicators — only show when there's nothing else visible
     let spinner = SPINNER[tick % SPINNER.len()];
+    let has_text = conversation.stream_buffer.as_ref().map_or(false, |b| !b.is_empty());
     match mode {
-        AppMode::Streaming => {
-            // Show spinner after any streamed text (or alone if no text yet)
-            let label = if conversation.stream_buffer.as_ref().map_or(true, |b| b.is_empty()) {
-                "Thinking..."
-            } else {
-                ""
-            };
+        AppMode::Streaming if !has_text => {
+            // Only show thinking label when LLM hasn't produced any text yet
+            let label = THINKING_LABELS[(tick / 8) % THINKING_LABELS.len()];
             logical_lines.push(Line::from(Span::styled(
                 format!("    {} {}", spinner, label),
                 Style::default().fg(ACCENT),
