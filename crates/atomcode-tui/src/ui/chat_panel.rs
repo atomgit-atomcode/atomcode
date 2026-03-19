@@ -1,7 +1,7 @@
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Block, Clear, Paragraph};
 use ratatui::Frame;
 
 use atomcode_core::conversation::Conversation;
@@ -140,6 +140,12 @@ pub fn render(
     for _ in 0..padding_needed {
         logical_lines.push(Line::default());
     }
+
+    // Clear the area first to prevent previous terminal content from showing through
+    frame.render_widget(Clear, area);
+
+    let bg = Block::default().style(Style::default().bg(Color::Reset));
+    frame.render_widget(bg, area);
 
     let paragraph = Paragraph::new(logical_lines).scroll((scroll, 0));
     frame.render_widget(paragraph, area);
