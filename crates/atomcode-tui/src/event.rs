@@ -1,6 +1,7 @@
 use std::time::Duration;
 
-use crossterm::event::{self, Event, KeyEvent, MouseEvent, MouseEventKind};
+use crossterm::event::{Event, EventStream, KeyEvent, MouseEvent, MouseEventKind};
+use futures::StreamExt;
 use tokio::sync::mpsc;
 
 use atomcode_core::tool::{ToolCall, ToolResult};
@@ -40,11 +41,12 @@ impl EventLoop {
     /// Start polling crossterm events and tick timer in background tasks.
     pub fn start(&self) {
         let tx = self.tx.clone();
-        // Crossterm event reader
+        // Async crossterm event reader — no blocking of the tokio runtime
         tokio::spawn(async move {
+            let mut reader = EventStream::new();
             loop {
-                if event::poll(Duration::from_millis(10)).unwrap_or(false) {
-                    if let Ok(evt) = event::read() {
+                match reader.next().await {
+                    Some(Ok(evt)) => {
                         let app_event = match evt {
                             Event::Key(key) => AppEvent::Key(key),
                             Event::Mouse(MouseEvent { kind: MouseEventKind::ScrollUp, .. }) => {
@@ -60,6 +62,8 @@ impl EventLoop {
                             break;
                         }
                     }
+                    Some(Err(_)) => break,
+                    None => break,
                 }
             }
         });
@@ -77,8 +81,14 @@ impl EventLoop {
         });
     }
 
-    /// Receive the next event.
+    /// Receive the next event (blocking).
     pub async fn next(&mut self) -> Option<AppEvent> {
         self.rx.recv().await
+    }
+
+    /// Try to receive a pending event without blocking.
+    /// Returns None if no events are queued.
+    pub fn try_next(&mut self) -> Option<AppEvent> {
+        self.rx.try_recv().ok()
     }
 }

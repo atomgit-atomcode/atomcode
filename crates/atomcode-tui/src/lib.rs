@@ -71,8 +71,17 @@ pub async fn run(config: Config, provider: Box<dyn LlmProvider>, tool_registry: 
             continue;
         }
 
+        // Wait for at least one event, then drain all pending events before redrawing.
+        // This coalesces rapid scroll events into a single frame update.
         if let Some(event) = event_loop.next().await {
             app.handle_event(event, &event_tx);
+            // Drain any remaining queued events without blocking
+            loop {
+                match event_loop.try_next() {
+                    Some(event) => app.handle_event(event, &event_tx),
+                    None => break,
+                }
+            }
         }
 
         if app.mode.is_exiting() {

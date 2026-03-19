@@ -312,8 +312,8 @@ impl App {
             }
             AppEvent::ScrollUp(n) => {
                 if self.at_bottom {
-                    // Transition from at_bottom to manual scroll: estimate current position
-                    let total = crate::ui::chat_panel::total_lines(&self.conversation);
+                    // Use cached line count instead of recomputing render_markdown for all messages
+                    let total = self.render_cache.len();
                     self.scroll_offset = total.saturating_sub(n as usize);
                     self.at_bottom = false;
                 } else {
@@ -322,7 +322,11 @@ impl App {
             }
             AppEvent::ScrollDown(n) => {
                 self.scroll_offset += n as usize;
-                // Don't set at_bottom here; render will auto-clamp
+                // Re-engage at_bottom when scrolled past the end
+                let total = self.render_cache.len();
+                if self.scroll_offset >= total {
+                    self.at_bottom = true;
+                }
             }
             AppEvent::Resize(_, _) => {}
             AppEvent::Tick => {
@@ -491,7 +495,8 @@ impl App {
             }
             (KeyModifiers::CONTROL, KeyCode::Up) => {
                 if self.at_bottom {
-                    let total = crate::ui::chat_panel::total_lines(&self.conversation);
+                    // Use cached line count instead of recomputing render_markdown for all messages
+                    let total = self.render_cache.len();
                     self.scroll_offset = total.saturating_sub(3);
                     self.at_bottom = false;
                 } else {
