@@ -36,6 +36,7 @@ const THINKING_LABELS: &[&str] = &[
 /// Full render — builds all lines, scrolls, draws.
 /// Uses render_cache for completed messages (only rebuilt when msg count changes).
 /// Dynamic parts (streaming, mode indicators) are appended fresh each frame.
+/// Returns the actual scroll offset used (for text selection coordinate mapping).
 pub fn render(
     frame: &mut Frame,
     area: Rect,
@@ -51,10 +52,10 @@ pub fn render(
     tool_info: &str,       // Pre-computed, not parsed per frame
     render_cache: &mut Vec<Line<'static>>,
     render_cache_msg_count: &mut usize,
-) {
+) -> usize {
     let vh = area.height as usize;
     if vh == 0 {
-        return;
+        return 0;
     }
 
     // Rebuild cache only when message count changes
@@ -206,6 +207,8 @@ pub fn render(
     // No scroll on Paragraph since we already sliced
     let paragraph = Paragraph::new(visible);
     frame.render_widget(paragraph, area);
+
+    scroll_usize
 }
 
 fn render_user(lines: &mut Vec<Line<'static>>, content: &str) {

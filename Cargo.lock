@@ -117,6 +117,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "atomcode-core",
+ "base64",
  "crossterm",
  "dirs",
  "futures",

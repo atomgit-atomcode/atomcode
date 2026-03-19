@@ -13,9 +13,48 @@ use atomcode_core::provider::LlmProvider;
 use atomcode_core::stream::StreamEvent;
 use atomcode_core::tool::{Tool, ToolCall, ToolCallBuffer, ToolContext, ToolRegistry, ToolResult, PermissionStore, PermissionDecision};
 
+use base64::Engine as _;
+
 use crate::command::SlashMenu;
 use crate::event::AppEvent;
 use crate::provider_manager::{ManagerAction, ProviderManager};
+
+/// App-level text selection state for mouse drag-to-select.
+/// When mouse tracking is enabled, the terminal doesn't do native selection,
+/// so we implement it ourselves: drag to select, auto-copy to clipboard on mouse-up.
+#[derive(Debug, Clone)]
+pub struct TextSelection {
+    /// Whether a drag is currently in progress.
+    pub dragging: bool,
+    /// Start position (column, row) in terminal coordinates.
+    pub start: (u16, u16),
+    /// End position (column, row) in terminal coordinates.
+    pub end: (u16, u16),
+    /// Whether there is a completed (non-empty) selection to highlight.
+    pub has_selection: bool,
+}
+
+impl TextSelection {
+    pub fn new() -> Self {
+        Self {
+            dragging: false,
+            start: (0, 0),
+            end: (0, 0),
+            has_selection: false,
+        }
+    }
+
+    /// Normalize start/end so start <= end in reading order.
+    pub fn normalized(&self) -> ((u16, u16), (u16, u16)) {
+        if self.start.1 < self.end.1
+            || (self.start.1 == self.end.1 && self.start.0 <= self.end.0)
+        {
+            (self.start, self.end)
+        } else {
+            (self.end, self.start)
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub enum AppMode {
@@ -91,6 +130,12 @@ pub struct App {
     /// Cache of rendered lines for completed messages. Invalidated on message count change.
     pub render_cache: Vec<ratatui::text::Line<'static>>,
     pub render_cache_msg_count: usize,
+    /// App-level text selection (mouse drag-to-select with auto-copy).
+    pub selection: TextSelection,
+    /// Actual scroll offset as computed by the last render (for text extraction).
+    pub last_rendered_scroll: usize,
+    /// Chat panel viewport height from the last render.
+    pub last_viewport_height: u16,
     pub provider: Box<dyn LlmProvider>,
     pub config: Config,
     /// CancellationToken for the current streaming/tool task.
@@ -159,6 +204,9 @@ impl App {
             suggestion: None,
             render_cache: Vec::new(),
             render_cache_msg_count: 0,
+            selection: TextSelection::new(),
+            last_rendered_scroll: 0,
+            last_viewport_height: 0,
             // Keep a dummy provider for rebuild_provider path (legacy). The real LLM
             // work is now handled by AgentLoop. This avoids removing all provider refs at once.
             provider: {
@@ -480,7 +528,61 @@ impl App {
         }
 
         match event {
-            AppEvent::Key(key) => self.handle_key(key, event_tx),
+            AppEvent::Key(key) => {
+                // Any keypress clears the current selection
+                self.selection.has_selection = false;
+                self.handle_key(key, event_tx);
+            }
+            AppEvent::ScrollUp(n) => {
+                // Clear selection on scroll
+                self.selection.has_selection = false;
+                self.selection.dragging = false;
+                if self.at_bottom {
+                    let total = self.render_cache.len();
+                    self.scroll_offset = total.saturating_sub(n as usize);
+                    self.at_bottom = false;
+                } else {
+                    self.scroll_offset = self.scroll_offset.saturating_sub(n as usize);
+                }
+            }
+            AppEvent::ScrollDown(n) => {
+                // Clear selection on scroll
+                self.selection.has_selection = false;
+                self.selection.dragging = false;
+                self.scroll_offset += n as usize;
+                let total = self.render_cache.len();
+                if self.scroll_offset >= total {
+                    self.at_bottom = true;
+                }
+            }
+            AppEvent::MouseDown(col, row) => {
+                self.selection = TextSelection {
+                    dragging: true,
+                    start: (col, row),
+                    end: (col, row),
+                    has_selection: false,
+                };
+            }
+            AppEvent::MouseDrag(col, row) => {
+                if self.selection.dragging {
+                    self.selection.end = (col, row);
+                    // Mark as having a selection if start != end
+                    self.selection.has_selection =
+                        self.selection.start != self.selection.end;
+                }
+            }
+            AppEvent::MouseUp(col, row) => {
+                if self.selection.dragging {
+                    self.selection.end = (col, row);
+                    self.selection.dragging = false;
+                    if self.selection.start != self.selection.end {
+                        self.selection.has_selection = true;
+                        self.copy_selection_to_clipboard();
+                    } else {
+                        self.selection.has_selection = false;
+                    }
+                }
+            }
             AppEvent::StreamDelta(text) => {
                 self.conversation.push_delta(&text);
             }
@@ -1029,6 +1131,94 @@ impl App {
             }
             _ => false,
         }
+    }
+
+    /// Extract text from the rendered content between the selection coordinates,
+    /// then copy it to the system clipboard via OSC 52 + pbcopy fallback.
+    fn copy_selection_to_clipboard(&self) {
+        let text = self.extract_selection_text();
+        if text.is_empty() {
+            return;
+        }
+
+        // OSC 52 clipboard (works across SSH and on terminals that support it)
+        let encoded = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
+        let osc = format!("\x1b]52;c;{}\x07", encoded);
+        let _ = std::io::Write::write_all(&mut std::io::stdout(), osc.as_bytes());
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+
+        // Also try pbcopy as fallback (macOS)
+        if let Ok(mut child) = std::process::Command::new("pbcopy")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            if let Some(ref mut stdin) = child.stdin {
+                let _ = std::io::Write::write_all(stdin, text.as_bytes());
+            }
+            // Drop stdin to close pipe, then wait
+            child.stdin.take();
+            let _ = child.wait();
+        }
+    }
+
+    /// Extract the selected text from render cache + dynamic content.
+    /// Maps terminal coordinates to the rendered lines using the current scroll offset.
+    fn extract_selection_text(&self) -> String {
+        let ((start_col, start_row), (end_col, end_row)) = self.selection.normalized();
+
+        // The layout is: row 0 = status bar (1 line), then chat panel, then input box.
+        // Chat panel starts at row 1. We need to map terminal rows to render_cache indices.
+        let chat_start_row: u16 = 1;
+
+        // Convert terminal rows to line indices in the full content
+        let start_line = (start_row.saturating_sub(chat_start_row)) as usize + self.effective_scroll();
+        let end_line = (end_row.saturating_sub(chat_start_row)) as usize + self.effective_scroll();
+
+        let mut result = String::new();
+        for i in start_line..=end_line {
+            let line_text = if i < self.render_cache.len() {
+                // Get text from render cache line
+                self.render_cache[i]
+                    .spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            } else {
+                continue;
+            };
+
+            let chars: Vec<char> = line_text.chars().collect();
+
+            if i == start_line && i == end_line {
+                // Single line selection
+                let s = start_col as usize;
+                let e = end_col as usize;
+                let slice: String = chars[s.min(chars.len())..e.min(chars.len())]
+                    .iter()
+                    .collect();
+                result.push_str(&slice);
+            } else if i == start_line {
+                let s = start_col as usize;
+                let slice: String = chars[s.min(chars.len())..].iter().collect();
+                result.push_str(&slice);
+                result.push('\n');
+            } else if i == end_line {
+                let e = end_col as usize;
+                let slice: String = chars[..e.min(chars.len())].iter().collect();
+                result.push_str(&slice);
+            } else {
+                result.push_str(&line_text);
+                result.push('\n');
+            }
+        }
+        result
+    }
+
+    /// Get the effective scroll offset (uses the value computed during the last render).
+    fn effective_scroll(&self) -> usize {
+        self.last_rendered_scroll
     }
 
     /// Handle typing in the input box — works in any mode (Normal, Streaming, etc.)

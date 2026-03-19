@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use crossterm::event::{Event, EventStream, KeyEvent};
+use crossterm::event::{Event, EventStream, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use futures::StreamExt;
 use tokio::sync::mpsc;
 
@@ -10,6 +10,11 @@ use atomcode_core::tool::{ToolCall, ToolResult};
 #[derive(Debug)]
 pub enum AppEvent {
     Key(KeyEvent),
+    ScrollUp(u16),
+    ScrollDown(u16),
+    MouseDown(u16, u16),   // (column, row) in terminal coordinates
+    MouseDrag(u16, u16),   // (column, row)
+    MouseUp(u16, u16),     // (column, row)
     StreamDelta(String),
     StreamToolCallStart { id: String, name: String },
     StreamToolCallDelta(String),
@@ -47,7 +52,17 @@ impl EventLoop {
                         let app_event = match evt {
                             Event::Key(key) => AppEvent::Key(key),
                             Event::Resize(w, h) => AppEvent::Resize(w, h),
-                            _ => continue, // No mouse tracking — terminal handles everything natively
+                            Event::Mouse(MouseEvent { kind, column, row, .. }) => {
+                                match kind {
+                                    MouseEventKind::ScrollUp => AppEvent::ScrollUp(3),
+                                    MouseEventKind::ScrollDown => AppEvent::ScrollDown(3),
+                                    MouseEventKind::Down(MouseButton::Left) => AppEvent::MouseDown(column, row),
+                                    MouseEventKind::Drag(MouseButton::Left) => AppEvent::MouseDrag(column, row),
+                                    MouseEventKind::Up(MouseButton::Left) => AppEvent::MouseUp(column, row),
+                                    _ => continue,
+                                }
+                            }
+                            _ => continue,
                         };
                         if tx.send(app_event).is_err() {
                             break;
