@@ -15,7 +15,7 @@ pub fn render(frame: &mut Frame, app: &App) {
     use crate::app::AppMode;
 
     // Provider manager takes over the full screen (except status bar)
-    if app.mode == AppMode::ProviderManager {
+    if app.mode.is_provider_manager() {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -51,10 +51,14 @@ pub fn render(frame: &mut Frame, app: &App) {
     if show_welcome {
         welcome::render(frame, chunks[1], app);
     } else {
-        chat_panel::render(frame, chunks[1], &app.conversation, app.scroll_offset, app.at_bottom, None);
+        let waiting_approval = match &app.mode {
+            AppMode::WaitingApproval(call) => Some(call),
+            _ => None,
+        };
+        chat_panel::render(frame, chunks[1], &app.conversation, app.scroll_offset, app.at_bottom, waiting_approval);
     }
 
-    input_box::render(frame, chunks[2], &app.input, app.mode == AppMode::Streaming);
+    input_box::render(frame, chunks[2], &app.input, app.mode.is_streaming_or_executing());
 
     // Render slash menu as overlay above input box
     if app.slash_menu.visible {

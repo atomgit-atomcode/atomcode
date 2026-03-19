@@ -7,17 +7,30 @@ use atomcode_core::config::DEFAULT_SYSTEM_PROMPT;
 use atomcode_core::conversation::Conversation;
 use atomcode_core::provider::LlmProvider;
 use atomcode_core::stream::StreamEvent;
+use atomcode_core::tool::{Tool, ToolCall, ToolCallBuffer, ToolRegistry, ToolResult, ApprovalRequirement};
 
 use crate::command::SlashMenu;
 use crate::event::AppEvent;
 use crate::provider_manager::{ManagerAction, ProviderManager};
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub enum AppMode {
     Normal,
     Streaming,
+    WaitingApproval(ToolCall),
+    ToolExecuting,
     ProviderManager,
     Exiting,
+}
+
+impl AppMode {
+    pub fn is_normal(&self) -> bool { matches!(self, AppMode::Normal) }
+    pub fn is_streaming(&self) -> bool { matches!(self, AppMode::Streaming) }
+    pub fn is_exiting(&self) -> bool { matches!(self, AppMode::Exiting) }
+    pub fn is_provider_manager(&self) -> bool { matches!(self, AppMode::ProviderManager) }
+    pub fn is_streaming_or_executing(&self) -> bool {
+        matches!(self, AppMode::Streaming | AppMode::ToolExecuting)
+    }
 }
 
 pub struct App {
@@ -30,12 +43,14 @@ pub struct App {
     pub pending_editor: Option<String>,
     pub slash_menu: SlashMenu,
     pub provider_mgr: Option<ProviderManager>,
+    pub tool_registry: ToolRegistry,
+    pub tool_call_count: usize,
     pub provider: Box<dyn LlmProvider>,
     pub config: Config,
 }
 
 impl App {
-    pub fn new(provider: Box<dyn LlmProvider>, config: Config) -> Self {
+    pub fn new(provider: Box<dyn LlmProvider>, config: Config, tool_registry: ToolRegistry) -> Self {
         Self {
             mode: AppMode::Normal,
             conversation: Conversation::new(),
@@ -46,6 +61,8 @@ impl App {
             pending_editor: None,
             slash_menu: SlashMenu::new(),
             provider_mgr: None,
+            tool_registry,
+            tool_call_count: 0,
             provider,
             config,
         }
@@ -70,17 +87,22 @@ impl App {
                 self.mode = AppMode::Normal;
                 self.at_bottom = true;
             }
-            AppEvent::StreamToolCallStart { .. } => {
-                // Will be implemented in Task 7
+            AppEvent::StreamToolCallStart { id, name } => {
+                self.conversation.tool_call_buffer = Some(ToolCallBuffer {
+                    id, name, arguments: String::new(),
+                });
             }
-            AppEvent::StreamToolCallDelta(_) => {
-                // Will be implemented in Task 7
+            AppEvent::StreamToolCallDelta(args) => {
+                if let Some(ref mut buf) = self.conversation.tool_call_buffer {
+                    buf.arguments.push_str(&args);
+                }
             }
-            AppEvent::StreamToolCallDone(_) => {
-                // Will be implemented in Task 7
+            AppEvent::StreamToolCallDone(call) => {
+                self.conversation.tool_call_buffer = None;
+                self.handle_tool_call(call, event_tx);
             }
-            AppEvent::ToolFinished(_) => {
-                // Will be implemented in Task 7
+            AppEvent::ToolFinished(result) => {
+                self.handle_tool_result(result, event_tx);
             }
             AppEvent::Resize(_, _) => {}
             AppEvent::Tick => {}
@@ -88,11 +110,34 @@ impl App {
     }
 
     fn handle_key(&mut self, key: KeyEvent, event_tx: &mpsc::UnboundedSender<AppEvent>) {
-        match self.mode {
+        match &self.mode {
             AppMode::Normal => self.handle_key_normal(key, event_tx),
-            AppMode::Streaming => self.handle_key_streaming(key),
+            AppMode::Streaming | AppMode::ToolExecuting => self.handle_key_streaming(key),
+            AppMode::WaitingApproval(_) => self.handle_key_approval(key, event_tx),
             AppMode::ProviderManager => self.handle_key_provider_manager(key),
             AppMode::Exiting => {}
+        }
+    }
+
+    fn handle_key_approval(&mut self, key: KeyEvent, event_tx: &mpsc::UnboundedSender<AppEvent>) {
+        let call = match &self.mode {
+            AppMode::WaitingApproval(c) => c.clone(),
+            _ => return,
+        };
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Enter => {
+                self.mode = AppMode::ToolExecuting;
+                self.execute_tool(call, event_tx);
+            }
+            KeyCode::Char('n') | KeyCode::Esc => {
+                let result = ToolResult {
+                    call_id: call.id.clone(),
+                    output: "Denied by user".to_string(),
+                    success: false,
+                };
+                self.handle_tool_result(result, event_tx);
+            }
+            _ => {}
         }
     }
 
@@ -380,6 +425,7 @@ impl App {
         self.input.clear();
         self.mode = AppMode::Streaming;
         self.at_bottom = true;
+        self.tool_call_count = 0;
 
         let provider_name = &self.config.default_provider;
         let system_prompt = self.config.providers
@@ -389,9 +435,128 @@ impl App {
             .to_string();
 
         let messages = self.conversation.to_provider_messages(&system_prompt);
+        let tool_defs = self.tool_registry.get_definitions();
 
         let tx = event_tx.clone();
-        let stream_result = self.provider.chat_stream(&messages, None);
+        let stream_result = self.provider.chat_stream(&messages, Some(&tool_defs));
+
+        tokio::spawn(async move {
+            match stream_result {
+                Ok(mut stream) => {
+                    while let Some(event) = stream.next().await {
+                        match event {
+                            Ok(StreamEvent::Delta(text)) => {
+                                let _ = tx.send(AppEvent::StreamDelta(text));
+                            }
+                            Ok(StreamEvent::ToolCallStart { id, name }) => {
+                                let _ = tx.send(AppEvent::StreamToolCallStart { id, name });
+                            }
+                            Ok(StreamEvent::ToolCallDelta(args)) => {
+                                let _ = tx.send(AppEvent::StreamToolCallDelta(args));
+                            }
+                            Ok(StreamEvent::ToolCallDone(call)) => {
+                                let _ = tx.send(AppEvent::StreamToolCallDone(call));
+                            }
+                            Ok(StreamEvent::Done) => {
+                                let _ = tx.send(AppEvent::StreamDone);
+                                break;
+                            }
+                            Ok(StreamEvent::Error(e)) => {
+                                let _ = tx.send(AppEvent::StreamError(e));
+                                break;
+                            }
+                            Err(e) => {
+                                let _ = tx.send(AppEvent::StreamError(e.to_string()));
+                                break;
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(AppEvent::StreamError(e.to_string()));
+                }
+            }
+        });
+    }
+
+    fn handle_tool_call(&mut self, call: ToolCall, event_tx: &mpsc::UnboundedSender<AppEvent>) {
+        self.conversation.finalize_stream_with_tool_call(call.clone());
+
+        if let Some(tool) = self.tool_registry.get(&call.name) {
+            match tool.approval(&call.arguments) {
+                ApprovalRequirement::AutoApprove => {
+                    self.mode = AppMode::ToolExecuting;
+                    self.execute_tool(call, event_tx);
+                }
+                ApprovalRequirement::RequireApproval(_) => {
+                    self.mode = AppMode::WaitingApproval(call);
+                }
+            }
+        } else {
+            let result = ToolResult {
+                call_id: call.id.clone(),
+                output: format!("Unknown tool: {}", call.name),
+                success: false,
+            };
+            self.handle_tool_result(result, event_tx);
+        }
+    }
+
+    fn execute_tool(&mut self, call: ToolCall, event_tx: &mpsc::UnboundedSender<AppEvent>) {
+        let tool_name = call.name.clone();
+        let call_id = call.id.clone();
+        let args = call.arguments.clone();
+        let tx = event_tx.clone();
+
+        tokio::spawn(async move {
+            let result = match tool_name.as_str() {
+                "read_file" => atomcode_core::tool::read::ReadFileTool.execute(&args).await,
+                "write_file" => atomcode_core::tool::write::WriteFileTool.execute(&args).await,
+                "bash" => atomcode_core::tool::bash::BashTool.execute(&args).await,
+                _ => Err(anyhow::anyhow!("Unknown tool: {}", tool_name)),
+            };
+            let tool_result = match result {
+                Ok(mut r) => { r.call_id = call_id; r }
+                Err(e) => ToolResult {
+                    call_id,
+                    output: format!("Error: {}", e),
+                    success: false,
+                },
+            };
+            let _ = tx.send(AppEvent::ToolFinished(tool_result));
+        });
+    }
+
+    fn handle_tool_result(&mut self, result: ToolResult, event_tx: &mpsc::UnboundedSender<AppEvent>) {
+        self.conversation.add_tool_result(result);
+        self.tool_call_count += 1;
+
+        if self.tool_call_count >= 25 {
+            self.conversation.push_delta("\n\n[Tool call limit reached (25). Send another message to continue.]");
+            self.conversation.finalize_stream();
+            self.mode = AppMode::Normal;
+            self.tool_call_count = 0;
+            return;
+        }
+
+        self.mode = AppMode::Streaming;
+        self.at_bottom = true;
+        self.continue_agent_loop(event_tx);
+    }
+
+    fn continue_agent_loop(&mut self, event_tx: &mpsc::UnboundedSender<AppEvent>) {
+        let provider_name = &self.config.default_provider;
+        let system_prompt = self.config.providers
+            .get(provider_name)
+            .and_then(|p| p.system_prompt.as_deref())
+            .unwrap_or(DEFAULT_SYSTEM_PROMPT)
+            .to_string();
+
+        let messages = self.conversation.to_provider_messages(&system_prompt);
+        let tool_defs = self.tool_registry.get_definitions();
+
+        let tx = event_tx.clone();
+        let stream_result = self.provider.chat_stream(&messages, Some(&tool_defs));
 
         tokio::spawn(async move {
             match stream_result {

@@ -8,6 +8,10 @@ use clap::Parser;
 use atomcode_core::config::provider::ProviderConfig;
 use atomcode_core::config::Config;
 use atomcode_core::provider::create_provider;
+use atomcode_core::tool::ToolRegistry;
+use atomcode_core::tool::read::ReadFileTool;
+use atomcode_core::tool::write::WriteFileTool;
+use atomcode_core::tool::bash::BashTool;
 
 #[derive(Parser)]
 #[command(name = "atomcode", version = "0.1.0", about = "AI coding assistant in your terminal")]
@@ -52,7 +56,12 @@ async fn main() -> Result<()> {
         .clone();
     let provider = create_provider(&provider_config)?;
 
-    atomcode_tui::run(config, provider).await
+    let mut tool_registry = ToolRegistry::new();
+    tool_registry.register(Box::new(ReadFileTool));
+    tool_registry.register(Box::new(WriteFileTool));
+    tool_registry.register(Box::new(BashTool));
+
+    atomcode_tui::run(config, provider, tool_registry).await
 }
 
 fn first_run_wizard() -> Result<Config> {

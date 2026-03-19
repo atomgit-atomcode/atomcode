@@ -14,18 +14,19 @@ use ratatui::Terminal;
 
 use atomcode_core::config::Config;
 use atomcode_core::provider::LlmProvider;
+use atomcode_core::tool::ToolRegistry;
 
-use app::{App, AppMode};
+use app::App;
 use event::EventLoop;
 
-pub async fn run(config: Config, provider: Box<dyn LlmProvider>) -> Result<()> {
+pub async fn run(config: Config, provider: Box<dyn LlmProvider>, tool_registry: ToolRegistry) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::new(provider, config);
+    let mut app = App::new(provider, config, tool_registry);
     let mut event_loop = EventLoop::new();
     let event_tx = event_loop.sender();
     event_loop.start();
@@ -57,7 +58,7 @@ pub async fn run(config: Config, provider: Box<dyn LlmProvider>) -> Result<()> {
             app.handle_event(event, &event_tx);
         }
 
-        if app.mode == AppMode::Exiting {
+        if app.mode.is_exiting() {
             break;
         }
     }

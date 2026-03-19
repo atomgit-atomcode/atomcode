@@ -7,9 +7,11 @@ use ratatui::Frame;
 use crate::app::{App, AppMode};
 
 pub fn render(frame: &mut Frame, area: Rect, app: &App) {
-    let mode_indicator = match app.mode {
+    let mode_indicator = match &app.mode {
         AppMode::Normal => Span::styled(" READY ", Style::default().bg(Color::Green).fg(Color::Black)),
         AppMode::Streaming => Span::styled(" STREAMING ", Style::default().bg(Color::Yellow).fg(Color::Black)),
+        AppMode::WaitingApproval(_) => Span::styled(" APPROVAL ", Style::default().bg(Color::Yellow).fg(Color::Black)),
+        AppMode::ToolExecuting => Span::styled(" EXECUTING ", Style::default().bg(Color::Cyan).fg(Color::Black)),
         AppMode::ProviderManager => Span::styled(" PROVIDERS ", Style::default().bg(Color::Magenta).fg(Color::White)),
         AppMode::Exiting => Span::styled(" EXITING ", Style::default().bg(Color::Red).fg(Color::White)),
     };
