@@ -10,7 +10,7 @@ use atomcode_core::config::DEFAULT_SYSTEM_PROMPT;
 use atomcode_core::conversation::Conversation;
 use atomcode_core::provider::LlmProvider;
 use atomcode_core::stream::StreamEvent;
-use atomcode_core::tool::{Tool, ToolCall, ToolCallBuffer, ToolRegistry, ToolResult, ApprovalRequirement};
+use atomcode_core::tool::{Tool, ToolCall, ToolCallBuffer, ToolContext, ToolRegistry, ToolResult, ApprovalRequirement};
 
 use crate::command::SlashMenu;
 use crate::event::AppEvent;
@@ -66,6 +66,8 @@ pub struct App {
     /// Duration of the last completed turn.
     pub last_turn_duration: Option<Duration>,
     pub working_dir: PathBuf,
+    /// Shared tool execution context (holds working_dir for cross-thread access).
+    pub tool_context: ToolContext,
     /// Input history — past user prompts for Up/Down navigation.
     pub input_history: Vec<String>,
     /// Current position in input history (-1 = not browsing).
@@ -78,8 +80,6 @@ pub struct App {
     pub current_step_count: usize,
     /// Cached tool info string for ToolExecuting mode (avoid per-frame JSON parse).
     pub executing_tool_info: String,
-    /// Name and arguments of the last dispatched tool call (for post-execution handling).
-    pub last_tool_call: Option<(String, String)>,
     /// Estimated token counts for the current session.
     pub total_tokens: usize,
     /// Tokens used in the current turn.
@@ -129,10 +129,10 @@ impl App {
             project_context_cache: None,
             current_step_count: 0,
             executing_tool_info: String::new(),
-            last_tool_call: None,
             turn_start: None,
             tool_start: None,
             last_turn_duration: None,
+            tool_context: ToolContext::new(working_dir.clone()),
             working_dir,
             input_history,
             history_index: None,
@@ -233,6 +233,10 @@ impl App {
 
         if resolved.is_dir() {
             self.working_dir = resolved.clone();
+            // Sync tool context (best-effort; won't block since we're in the main task)
+            if let Ok(mut wd) = self.tool_context.working_dir.try_write() {
+                *wd = resolved.clone();
+            }
             self.project_context_cache = None; // Invalidate project context cache
             self.config.default_workdir = Some(resolved.to_string_lossy().to_string());
             let _ = self.config.save(&Config::default_path());
@@ -240,6 +244,9 @@ impl App {
         } else if new_path.is_dir() {
             // canonicalize failed but path exists as dir
             self.working_dir = new_path.clone();
+            if let Ok(mut wd) = self.tool_context.working_dir.try_write() {
+                *wd = new_path.clone();
+            }
             self.config.default_workdir = Some(new_path.to_string_lossy().to_string());
             let _ = self.config.save(&Config::default_path());
             (true, format!("Changed working directory to {}", new_path.display()))
@@ -1149,32 +1156,26 @@ impl App {
         self.tool_start = Some(Instant::now());
         // Cache tool info for display (avoid per-frame JSON parsing)
         self.executing_tool_info = format_tool_info(&call);
-        self.last_tool_call = Some((call.name.clone(), call.arguments.clone()));
         let call_id = call.id.clone();
         let args = self.resolve_tool_args(&call);
         let tx = event_tx.clone();
+        let ctx = self.tool_context.clone();
 
-        // BashTool is stateful (needs current working_dir), so create a fresh instance.
-        // All other tools are stateless and dispatched through the registry.
-        let tool: std::sync::Arc<dyn Tool> = if call.name == "bash" {
-            std::sync::Arc::new(atomcode_core::tool::bash::BashTool::new(self.working_dir.clone()))
-        } else {
-            match self.tool_registry.get_arc(&call.name) {
-                Some(t) => t,
-                None => {
-                    let tool_name = call.name.clone();
-                    let _ = tx.send(AppEvent::ToolFinished(ToolResult {
-                        call_id,
-                        output: format!("Unknown tool: {}", tool_name),
-                        success: false,
-                    }));
-                    return;
-                }
+        let tool: std::sync::Arc<dyn Tool> = match self.tool_registry.get_arc(&call.name) {
+            Some(t) => t,
+            None => {
+                let tool_name = call.name.clone();
+                let _ = tx.send(AppEvent::ToolFinished(ToolResult {
+                    call_id,
+                    output: format!("Unknown tool: {}", tool_name),
+                    success: false,
+                }));
+                return;
             }
         };
 
         tokio::spawn(async move {
-            let result = tool.execute(&args).await;
+            let result = tool.execute(&args, &ctx).await;
             let tool_result = match result {
                 Ok(mut r) => { r.call_id = call_id; r }
                 Err(e) => ToolResult {
@@ -1189,11 +1190,14 @@ impl App {
 
     /// Resolve relative file_path in tool arguments to absolute paths based on working_dir.
     fn resolve_tool_args(&self, call: &ToolCall) -> String {
+        let wd = self.tool_context.working_dir.try_read()
+            .map(|g| g.clone())
+            .unwrap_or_else(|_| self.working_dir.clone());
         if let Ok(mut args) = serde_json::from_str::<serde_json::Value>(&call.arguments) {
             if let Some(fp) = args.get("file_path").and_then(|v| v.as_str()) {
                 let path = std::path::Path::new(fp);
                 if !path.is_absolute() {
-                    let resolved = self.working_dir.join(path);
+                    let resolved = wd.join(path);
                     args["file_path"] = serde_json::json!(resolved.to_string_lossy().to_string());
                 }
                 return serde_json::to_string(&args).unwrap_or(call.arguments.clone());
@@ -1203,19 +1207,13 @@ impl App {
     }
 
     fn handle_tool_result(&mut self, mut result: ToolResult, event_tx: &mpsc::UnboundedSender<AppEvent>) {
-        // Intercept change_dir tool: if it succeeded, update our working directory
-        if let Some((ref name, ref args)) = self.last_tool_call {
-            if name == "change_dir" && result.success {
-                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(args) {
-                    if let Some(path) = parsed.get("path").and_then(|v| v.as_str()) {
-                        let (ok, msg) = self.try_change_dir(path);
-                        result.output = msg;
-                        result.success = ok;
-                    }
-                }
+        // Sync working_dir from tool_context (CdTool may have updated it)
+        if let Ok(wd) = self.tool_context.working_dir.try_read() {
+            if *wd != self.working_dir {
+                self.working_dir = wd.clone();
+                self.project_context_cache = None;
             }
         }
-        self.last_tool_call = None;
 
 
 

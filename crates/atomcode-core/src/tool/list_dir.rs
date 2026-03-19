@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::json;
 
-use super::{ApprovalRequirement, Tool, ToolDef, ToolResult};
+use super::{ApprovalRequirement, Tool, ToolContext, ToolDef, ToolResult};
 
 pub struct ListDirTool;
 
@@ -43,7 +43,7 @@ impl Tool for ListDirTool {
         ApprovalRequirement::AutoApprove
     }
 
-    async fn execute(&self, args: &str) -> Result<ToolResult> {
+    async fn execute(&self, args: &str, _ctx: &ToolContext) -> Result<ToolResult> {
         let parsed: ListDirArgs = serde_json::from_str(args)?;
         let path = parsed.path.as_deref().unwrap_or(".");
         let depth = parsed.depth.min(5); // Cap at 5

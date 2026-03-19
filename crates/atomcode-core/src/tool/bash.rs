@@ -1,4 +1,3 @@
-use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -8,17 +7,9 @@ use serde_json::json;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
-use super::{ApprovalRequirement, Tool, ToolDef, ToolResult};
+use super::{ApprovalRequirement, Tool, ToolContext, ToolDef, ToolResult};
 
-pub struct BashTool {
-    working_dir: PathBuf,
-}
-
-impl BashTool {
-    pub fn new(working_dir: PathBuf) -> Self {
-        Self { working_dir }
-    }
-}
+pub struct BashTool;
 
 #[derive(Deserialize)]
 struct BashArgs {
@@ -57,14 +48,16 @@ impl Tool for BashTool {
         ApprovalRequirement::AutoApprove
     }
 
-    async fn execute(&self, args: &str) -> Result<ToolResult> {
+    async fn execute(&self, args: &str, ctx: &ToolContext) -> Result<ToolResult> {
         let parsed: BashArgs = serde_json::from_str(args)?;
         let timeout_secs = parsed.timeout.unwrap_or(30);
+
+        let wd = ctx.working_dir.read().await.clone();
 
         let mut child = Command::new("bash")
             .arg("-c")
             .arg(&parsed.command)
-            .current_dir(&self.working_dir)
+            .current_dir(&wd)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()?;

@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::json;
 
-use super::{ApprovalRequirement, Tool, ToolDef, ToolResult};
+use super::{ApprovalRequirement, Tool, ToolContext, ToolDef, ToolResult};
 
 pub struct ReadFileTool;
 
@@ -36,7 +36,7 @@ impl Tool for ReadFileTool {
         ApprovalRequirement::AutoApprove
     }
 
-    async fn execute(&self, args: &str) -> Result<ToolResult> {
+    async fn execute(&self, args: &str, _ctx: &ToolContext) -> Result<ToolResult> {
         let parsed: ReadFileArgs = serde_json::from_str(args)?;
         let bytes = tokio::fs::read(&parsed.file_path).await?;
 

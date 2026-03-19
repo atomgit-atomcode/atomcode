@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::json;
 
-use super::{ApprovalRequirement, Tool, ToolDef, ToolResult};
+use super::{ApprovalRequirement, Tool, ToolContext, ToolDef, ToolResult};
 
 pub struct WriteFileTool;
 
@@ -79,7 +79,7 @@ impl Tool for WriteFileTool {
         ApprovalRequirement::AutoApprove
     }
 
-    async fn execute(&self, args: &str) -> Result<ToolResult> {
+    async fn execute(&self, args: &str, _ctx: &ToolContext) -> Result<ToolResult> {
         let parsed: WriteFileArgs = serde_json::from_str(args)?;
         if let Some(parent) = std::path::Path::new(&parsed.file_path).parent() {
             tokio::fs::create_dir_all(parent).await?;

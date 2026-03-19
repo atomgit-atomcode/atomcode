@@ -4,7 +4,7 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio::process::Command;
 
-use super::{ApprovalRequirement, Tool, ToolDef, ToolResult};
+use super::{ApprovalRequirement, Tool, ToolContext, ToolDef, ToolResult};
 
 pub struct GrepTool;
 
@@ -40,7 +40,7 @@ impl Tool for GrepTool {
         ApprovalRequirement::AutoApprove
     }
 
-    async fn execute(&self, args: &str) -> Result<ToolResult> {
+    async fn execute(&self, args: &str, _ctx: &ToolContext) -> Result<ToolResult> {
         let parsed: GrepArgs = serde_json::from_str(args)?;
         let path = parsed.path.as_deref().unwrap_or(".");
         let max = parsed.max_results;

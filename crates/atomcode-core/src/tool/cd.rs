@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::json;
 
-use super::{ApprovalRequirement, Tool, ToolDef, ToolResult};
+use super::{ApprovalRequirement, Tool, ToolContext, ToolDef, ToolResult};
 
 pub struct CdTool;
 
@@ -37,22 +37,28 @@ impl Tool for CdTool {
         ApprovalRequirement::AutoApprove
     }
 
-    async fn execute(&self, args: &str) -> Result<ToolResult> {
+    async fn execute(&self, args: &str, ctx: &ToolContext) -> Result<ToolResult> {
         let parsed: CdArgs = serde_json::from_str(args)?;
         let path = parsed.path.as_str();
 
-        // Resolve the path (expand ~ if needed)
+        // Resolve the path (expand ~ if needed, resolve relative to current working_dir)
+        let current_wd = ctx.working_dir.read().await.clone();
         let target = if path.starts_with('~') {
             dirs::home_dir()
                 .map(|h| h.join(path.strip_prefix("~/").unwrap_or(&path[1..])))
                 .unwrap_or_else(|| PathBuf::from(path))
-        } else {
+        } else if path.starts_with('/') {
             PathBuf::from(path)
+        } else {
+            current_wd.join(path)
         };
 
         // Validate the target is a directory
         if target.is_dir() {
             let resolved = std::fs::canonicalize(&target).unwrap_or(target);
+            // Update shared working directory
+            let mut wd = ctx.working_dir.write().await;
+            *wd = resolved.clone();
             Ok(ToolResult {
                 call_id: String::new(),
                 output: format!("Changed working directory to {}", resolved.display()),

@@ -121,7 +121,7 @@ async fn run() -> Result<()> {
     tool_registry.register(Box::new(ReadFileTool));
     tool_registry.register(Box::new(WriteFileTool));
     tool_registry.register(Box::new(EditFileTool));
-    tool_registry.register(Box::new(BashTool::new(working_dir.clone())));
+    tool_registry.register(Box::new(BashTool));
     tool_registry.register(Box::new(CdTool));
     tool_registry.register(Box::new(GrepTool));
     tool_registry.register(Box::new(GlobTool));

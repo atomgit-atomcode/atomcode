@@ -8,10 +8,12 @@ pub mod read;
 pub mod write;
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
+use tokio::sync::RwLock;
 
 #[derive(Debug, Clone)]
 pub struct ToolDef {
@@ -46,11 +48,26 @@ pub enum ApprovalRequirement {
     RequireApproval(String),
 }
 
+/// Shared execution context passed to every tool invocation.
+/// Holds a shared working directory that tools can read (and `CdTool` can write).
+#[derive(Clone)]
+pub struct ToolContext {
+    pub working_dir: Arc<RwLock<PathBuf>>,
+}
+
+impl ToolContext {
+    pub fn new(working_dir: PathBuf) -> Self {
+        Self {
+            working_dir: Arc::new(RwLock::new(working_dir)),
+        }
+    }
+}
+
 #[async_trait]
 pub trait Tool: Send + Sync {
     fn definition(&self) -> ToolDef;
     fn approval(&self, args: &str) -> ApprovalRequirement;
-    async fn execute(&self, args: &str) -> Result<ToolResult>;
+    async fn execute(&self, args: &str, ctx: &ToolContext) -> Result<ToolResult>;
 }
 
 pub struct ToolRegistry {
@@ -106,7 +123,7 @@ mod tests {
             ApprovalRequirement::AutoApprove
         }
 
-        async fn execute(&self, _args: &str) -> anyhow::Result<ToolResult> {
+        async fn execute(&self, _args: &str, _ctx: &ToolContext) -> anyhow::Result<ToolResult> {
             Ok(ToolResult {
                 call_id: "test".to_string(),
                 output: "ok".to_string(),
@@ -135,7 +152,8 @@ mod tests {
     #[tokio::test]
     async fn test_tool_execute() {
         let tool = DummyTool;
-        let result = tool.execute("{}").await.unwrap();
+        let ctx = ToolContext::new(std::env::current_dir().unwrap());
+        let result = tool.execute("{}", &ctx).await.unwrap();
         assert!(result.success);
         assert_eq!(result.output, "ok");
     }
