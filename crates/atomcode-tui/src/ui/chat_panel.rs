@@ -79,8 +79,9 @@ pub fn render(
         *render_cache_msg_count = msg_count;
     }
 
-    // Start with cached lines (clone is cheap — Line is just Vec<Span> with Cow<str>)
-    let mut logical_lines: Vec<Line<'static>> = render_cache.clone();
+    // Start with cached lines
+    let mut logical_lines: Vec<Line<'static>> = Vec::with_capacity(render_cache.len() + 20);
+    logical_lines.extend_from_slice(render_cache);
 
     // Streaming buffer
     if let Some(ref buffer) = conversation.stream_buffer {
@@ -123,30 +124,16 @@ pub fn render(
         _ => {}
     }
 
-    // Estimate wrapped line count: each logical line may wrap to multiple display lines
-    let display_line_count: usize = logical_lines
-        .iter()
-        .map(|line| {
-            let line_width: usize = line.spans.iter().map(|s| s.content.len()).sum();
-            if line_width == 0 {
-                1 // empty line still takes 1 row
-            } else {
-                (line_width + width - 1) / width // ceil division
-            }
-        })
-        .sum();
-
-    // Calculate scroll: use Paragraph's native scroll but with correct total
+    // Use logical line count for scroll (simple, fast)
+    let total = logical_lines.len();
     let scroll = if at_bottom {
-        display_line_count.saturating_sub(vh) as u16
+        total.saturating_sub(vh) as u16
     } else {
-        (scroll_offset.min(display_line_count.saturating_sub(vh))) as u16
+        (scroll_offset.min(total.saturating_sub(vh))) as u16
     };
 
-    // Add padding lines at the bottom to ensure content can scroll up enough
-    // This ensures the last line of content can appear at the top of viewport
-    let padding_needed = vh.saturating_sub(2); // leave some room
-    for _ in 0..padding_needed {
+    // Padding so last content can be at top of viewport
+    for _ in 0..vh {
         logical_lines.push(Line::default());
     }
 
