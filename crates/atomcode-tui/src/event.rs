@@ -3,12 +3,18 @@ use std::time::Duration;
 use crossterm::event::{self, Event, KeyEvent};
 use tokio::sync::mpsc;
 
+use atomcode_core::tool::{ToolCall, ToolResult};
+
 #[derive(Debug)]
 pub enum AppEvent {
     Key(KeyEvent),
     StreamDelta(String),
+    StreamToolCallStart { id: String, name: String },
+    StreamToolCallDelta(String),
+    StreamToolCallDone(ToolCall),
     StreamDone,
     StreamError(String),
+    ToolFinished(ToolResult),
     Resize(u16, u16),
     Tick,
 }

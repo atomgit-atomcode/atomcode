@@ -70,6 +70,18 @@ impl App {
                 self.mode = AppMode::Normal;
                 self.at_bottom = true;
             }
+            AppEvent::StreamToolCallStart { .. } => {
+                // Will be implemented in Task 7
+            }
+            AppEvent::StreamToolCallDelta(_) => {
+                // Will be implemented in Task 7
+            }
+            AppEvent::StreamToolCallDone(_) => {
+                // Will be implemented in Task 7
+            }
+            AppEvent::ToolFinished(_) => {
+                // Will be implemented in Task 7
+            }
             AppEvent::Resize(_, _) => {}
             AppEvent::Tick => {}
         }
@@ -388,6 +400,15 @@ impl App {
                         match event {
                             Ok(StreamEvent::Delta(text)) => {
                                 let _ = tx.send(AppEvent::StreamDelta(text));
+                            }
+                            Ok(StreamEvent::ToolCallStart { id, name }) => {
+                                let _ = tx.send(AppEvent::StreamToolCallStart { id, name });
+                            }
+                            Ok(StreamEvent::ToolCallDelta(args)) => {
+                                let _ = tx.send(AppEvent::StreamToolCallDelta(args));
+                            }
+                            Ok(StreamEvent::ToolCallDone(call)) => {
+                                let _ = tx.send(AppEvent::StreamToolCallDone(call));
                             }
                             Ok(StreamEvent::Done) => {
                                 let _ = tx.send(AppEvent::StreamDone);
