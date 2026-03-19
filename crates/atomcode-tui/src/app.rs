@@ -436,10 +436,9 @@ impl App {
                 self.mode = AppMode::Normal;
                 self.last_turn_duration = Some(duration);
                 self.turn_start = None;
-                // Reload conversation from history file so our local mirror matches AgentLoop's.
-                self.conversation = Conversation::load(&Conversation::history_path());
-                self.render_cache.clear();
-                self.render_cache_msg_count = 0;
+                // Finalize any remaining stream text
+                self.conversation.finalize_stream();
+                self.render_cache_msg_count = 0; // Invalidate cache
                 self.suggestion = self.generate_suggestion();
                 self.at_bottom = true;
             }
