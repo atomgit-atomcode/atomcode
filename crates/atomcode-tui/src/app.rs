@@ -59,10 +59,7 @@ pub struct App {
     pub retry_count: usize,
     /// Last Ctrl+C timestamp for double-press detection.
     pub last_ctrl_c: Option<Instant>,
-    /// Generation counter — incremented on cancel/new message. Background tasks
-    /// with a stale generation are ignored when they send events back.
-    pub generation: u64,
-    /// When the current turn (user message → agent loop) started.
+    /// When the current turn (user message -> agent loop) started.
     pub turn_start: Option<Instant>,
     /// When the last tool execution started (for per-step timing).
     pub tool_start: Option<Instant>,
@@ -126,7 +123,6 @@ impl App {
             tool_call_count: 0,
             retry_count: 0,
             last_ctrl_c: None,
-            generation: 0,
             tick_count: 0,
             project_context_cache: None,
             current_step_count: 0,
@@ -149,6 +145,7 @@ impl App {
     }
 
     /// Generate a follow-up suggestion based on conversation context.
+    /// Language-agnostic: never references specific file extensions or build tools.
     fn generate_suggestion(&self) -> Option<String> {
         use atomcode_core::conversation::message::MessageContent;
 
@@ -157,7 +154,6 @@ impl App {
             return None;
         }
 
-        // Analyze the last few messages to detect patterns
         let last = &msgs[msgs.len() - 1];
 
         // Only scan last 20 messages (not entire conversation)
@@ -179,37 +175,17 @@ impl App {
         let last_text = last.text().unwrap_or("");
         let last_lower = last_text.to_lowercase();
 
-        // Error happened recently → suggest fix
+        // Error happened recently -> suggest fix
         if had_error {
             return Some("Fix the error".to_string());
         }
 
-        // Wrote/edited files → suggest testing or running
+        // Wrote/edited files -> suggest testing (no language-specific commands)
         if had_write && !had_bash {
-            // Detect language from file extensions in tool calls
-            for m in msgs.iter().rev().take(5) {
-                if let MessageContent::AssistantWithToolCalls { tool_calls, .. } = &m.content {
-                    for tc in tool_calls {
-                        if let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
-                            if let Some(fp) = args.get("file_path").and_then(|v| v.as_str()) {
-                                if fp.ends_with(".rs") {
-                                    return Some("Run cargo build to check for errors".to_string());
-                                } else if fp.ends_with(".py") {
-                                    return Some("Run the script to test it".to_string());
-                                } else if fp.ends_with(".js") || fp.ends_with(".ts") {
-                                    return Some("Run npm test".to_string());
-                                } else if fp.ends_with(".go") {
-                                    return Some("Run go build to check for errors".to_string());
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            return Some("Run the code to test it".to_string());
+            return Some("Run the project to test changes".to_string());
         }
 
-        // Ran a command → suggest follow-up
+        // Ran a command -> suggest follow-up
         if had_bash && !had_write {
             if last_lower.contains("error") || last_lower.contains("failed") {
                 return Some("Fix the issue".to_string());
@@ -219,7 +195,7 @@ impl App {
             }
         }
 
-        // Wrote files + ran commands successfully → suggest commit
+        // Wrote files + ran commands successfully -> suggest commit
         if had_write && had_bash && !had_error {
             if last_lower.contains("success") || last_lower.contains("pass") || last_lower.contains("done") {
                 return Some("Commit the changes with a descriptive message".to_string());
@@ -231,17 +207,6 @@ impl App {
             return Some("Continue".to_string());
         }
 
-        None
-    }
-
-    /// Get the last tool call from conversation (the one that produced the current result).
-    fn get_last_tool_call(&self) -> Option<ToolCall> {
-        use atomcode_core::conversation::message::MessageContent;
-        for msg in self.conversation.messages.iter().rev() {
-            if let MessageContent::AssistantWithToolCalls { tool_calls, .. } = &msg.content {
-                return tool_calls.last().cloned();
-            }
-        }
         None
     }
 
@@ -454,30 +419,8 @@ impl App {
                     let system_prompt = self.system_prompt();
                     let messages = self.conversation.to_provider_messages_windowed(&system_prompt, 20);
                     let tool_defs = self.tool_registry.get_definitions();
-                    let stream_result_fn = self.provider.chat_stream(&messages, Some(&tool_defs));
-
-                    tokio::spawn(async move {
-                        tokio::time::sleep(std::time::Duration::from_secs(wait_secs)).await;
-                        match stream_result_fn {
-                            Ok(mut stream) => {
-                                use futures::StreamExt;
-                                while let Some(event) = stream.next().await {
-                                    let app_event = match event {
-                                        Ok(StreamEvent::Delta(text)) => AppEvent::StreamDelta(text),
-                                        Ok(StreamEvent::ToolCallStart { id, name }) => AppEvent::StreamToolCallStart { id, name },
-                                        Ok(StreamEvent::ToolCallDelta(args)) => AppEvent::StreamToolCallDelta(args),
-                                        Ok(StreamEvent::ToolCallDone(call)) => AppEvent::StreamToolCallDone(call),
-                                        Ok(StreamEvent::Usage(usage)) => AppEvent::StreamUsage(usage),
-                                        Ok(StreamEvent::Done) => { let _ = tx.send(AppEvent::StreamDone); break; }
-                                        Ok(StreamEvent::Error(e)) => { let _ = tx.send(AppEvent::StreamError(e)); break; }
-                                        Err(e) => { let _ = tx.send(AppEvent::StreamError(e.to_string())); break; }
-                                    };
-                                    if tx.send(app_event).is_err() { break; }
-                                }
-                            }
-                            Err(e) => { let _ = tx.send(AppEvent::StreamError(e.to_string())); }
-                        }
-                    });
+                    let stream_result = self.provider.chat_stream(&messages, Some(&tool_defs));
+                    spawn_stream_handler_delayed(stream_result, tx, wait_secs);
                 }
             }
             AppEvent::StreamToolCallStart { id, name } => {
@@ -1166,47 +1109,7 @@ impl App {
 
         let tx = event_tx.clone();
         let stream_result = self.provider.chat_stream(&messages, Some(&tool_defs));
-
-        tokio::spawn(async move {
-            match stream_result {
-                Ok(mut stream) => {
-                    while let Some(event) = stream.next().await {
-                        match event {
-                            Ok(StreamEvent::Delta(text)) => {
-                                let _ = tx.send(AppEvent::StreamDelta(text));
-                            }
-                            Ok(StreamEvent::ToolCallStart { id, name }) => {
-                                let _ = tx.send(AppEvent::StreamToolCallStart { id, name });
-                            }
-                            Ok(StreamEvent::ToolCallDelta(args)) => {
-                                let _ = tx.send(AppEvent::StreamToolCallDelta(args));
-                            }
-                            Ok(StreamEvent::ToolCallDone(call)) => {
-                                let _ = tx.send(AppEvent::StreamToolCallDone(call));
-                            }
-                            Ok(StreamEvent::Usage(usage)) => {
-                                let _ = tx.send(AppEvent::StreamUsage(usage));
-                            }
-                            Ok(StreamEvent::Done) => {
-                                let _ = tx.send(AppEvent::StreamDone);
-                                break;
-                            }
-                            Ok(StreamEvent::Error(e)) => {
-                                let _ = tx.send(AppEvent::StreamError(e));
-                                break;
-                            }
-                            Err(e) => {
-                                let _ = tx.send(AppEvent::StreamError(e.to_string()));
-                                break;
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    let _ = tx.send(AppEvent::StreamError(e.to_string()));
-                }
-            }
-        });
+        spawn_stream_handler(stream_result, tx);
     }
 
     fn handle_tool_call(&mut self, call: ToolCall, event_tx: &mpsc::UnboundedSender<AppEvent>) {
@@ -1236,21 +1139,31 @@ impl App {
         self.tool_start = Some(Instant::now());
         // Cache tool info for display (avoid per-frame JSON parsing)
         self.executing_tool_info = format_tool_info(&call);
-        let tool_name = call.name.clone();
         let call_id = call.id.clone();
         let args = self.resolve_tool_args(&call);
-        let working_dir = self.working_dir.clone();
         let tx = event_tx.clone();
 
+        // BashTool is stateful (needs current working_dir), so create a fresh instance.
+        // All other tools are stateless and dispatched through the registry.
+        let tool: std::sync::Arc<dyn Tool> = if call.name == "bash" {
+            std::sync::Arc::new(atomcode_core::tool::bash::BashTool::new(self.working_dir.clone()))
+        } else {
+            match self.tool_registry.get_arc(&call.name) {
+                Some(t) => t,
+                None => {
+                    let tool_name = call.name.clone();
+                    let _ = tx.send(AppEvent::ToolFinished(ToolResult {
+                        call_id,
+                        output: format!("Unknown tool: {}", tool_name),
+                        success: false,
+                    }));
+                    return;
+                }
+            }
+        };
+
         tokio::spawn(async move {
-            let result = match tool_name.as_str() {
-                "read_file" => atomcode_core::tool::read::ReadFileTool.execute(&args).await,
-                "write_file" => atomcode_core::tool::write::WriteFileTool.execute(&args).await,
-                "edit_file" => atomcode_core::tool::edit::EditFileTool.execute(&args).await,
-                "bash" => atomcode_core::tool::bash::BashTool::new(working_dir).execute(&args).await,
-                "change_dir" => atomcode_core::tool::cd::CdTool.execute(&args).await,
-                _ => Err(anyhow::anyhow!("Unknown tool: {}", tool_name)),
-            };
+            let result = tool.execute(&args).await;
             let tool_result = match result {
                 Ok(mut r) => { r.call_id = call_id; r }
                 Err(e) => ToolResult {
@@ -1321,58 +1234,66 @@ impl App {
 
         let tx = event_tx.clone();
         let stream_result = self.provider.chat_stream(&messages, Some(&tool_defs));
-
-        tokio::spawn(async move {
-            match stream_result {
-                Ok(mut stream) => {
-                    while let Some(event) = stream.next().await {
-                        match event {
-                            Ok(StreamEvent::Delta(text)) => {
-                                let _ = tx.send(AppEvent::StreamDelta(text));
-                            }
-                            Ok(StreamEvent::ToolCallStart { id, name }) => {
-                                let _ = tx.send(AppEvent::StreamToolCallStart { id, name });
-                            }
-                            Ok(StreamEvent::ToolCallDelta(args)) => {
-                                let _ = tx.send(AppEvent::StreamToolCallDelta(args));
-                            }
-                            Ok(StreamEvent::ToolCallDone(call)) => {
-                                let _ = tx.send(AppEvent::StreamToolCallDone(call));
-                            }
-                            Ok(StreamEvent::Usage(usage)) => {
-                                let _ = tx.send(AppEvent::StreamUsage(usage));
-                            }
-                            Ok(StreamEvent::Done) => {
-                                let _ = tx.send(AppEvent::StreamDone);
-                                break;
-                            }
-                            Ok(StreamEvent::Error(e)) => {
-                                let _ = tx.send(AppEvent::StreamError(e));
-                                break;
-                            }
-                            Err(e) => {
-                                let _ = tx.send(AppEvent::StreamError(e.to_string()));
-                                break;
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    let _ = tx.send(AppEvent::StreamError(e.to_string()));
-                }
-            }
-        });
+        spawn_stream_handler(stream_result, tx);
     }
 }
 
-/// Copy text to system clipboard (macOS: pbcopy, Linux: xclip/xsel).
-/// Snap a byte position to the nearest valid char boundary at or before `pos`.
-fn format_file_size(bytes: u64) -> String {
-    if bytes < 1024 { format!("{} B", bytes) }
-    else if bytes < 1024 * 1024 { format!("{:.1} KB", bytes as f64 / 1024.0) }
-    else { format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0)) }
+/// Spawn a tokio task that drains a provider stream and forwards events to the app channel.
+/// This is the single place where StreamEvent -> AppEvent mapping happens (DRY).
+fn spawn_stream_handler(
+    stream_result: anyhow::Result<std::pin::Pin<Box<dyn futures::Stream<Item = anyhow::Result<StreamEvent>> + Send>>>,
+    tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    tokio::spawn(async move {
+        match stream_result {
+            Ok(mut stream) => {
+                while let Some(event) = stream.next().await {
+                    let app_event = match event {
+                        Ok(StreamEvent::Delta(text)) => AppEvent::StreamDelta(text),
+                        Ok(StreamEvent::ToolCallStart { id, name }) => AppEvent::StreamToolCallStart { id, name },
+                        Ok(StreamEvent::ToolCallDelta(args)) => AppEvent::StreamToolCallDelta(args),
+                        Ok(StreamEvent::ToolCallDone(call)) => AppEvent::StreamToolCallDone(call),
+                        Ok(StreamEvent::Usage(usage)) => AppEvent::StreamUsage(usage),
+                        Ok(StreamEvent::Done) => { let _ = tx.send(AppEvent::StreamDone); break; }
+                        Ok(StreamEvent::Error(e)) => { let _ = tx.send(AppEvent::StreamError(e)); break; }
+                        Err(e) => { let _ = tx.send(AppEvent::StreamError(e.to_string())); break; }
+                    };
+                    if tx.send(app_event).is_err() { break; }
+                }
+            }
+            Err(e) => { let _ = tx.send(AppEvent::StreamError(e.to_string())); }
+        }
+    });
 }
 
+/// Like `spawn_stream_handler`, but waits `delay_secs` before draining the stream.
+fn spawn_stream_handler_delayed(
+    stream_result: anyhow::Result<std::pin::Pin<Box<dyn futures::Stream<Item = anyhow::Result<StreamEvent>> + Send>>>,
+    tx: mpsc::UnboundedSender<AppEvent>,
+    delay_secs: u64,
+) {
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+        match stream_result {
+            Ok(mut stream) => {
+                while let Some(event) = stream.next().await {
+                    let app_event = match event {
+                        Ok(StreamEvent::Delta(text)) => AppEvent::StreamDelta(text),
+                        Ok(StreamEvent::ToolCallStart { id, name }) => AppEvent::StreamToolCallStart { id, name },
+                        Ok(StreamEvent::ToolCallDelta(args)) => AppEvent::StreamToolCallDelta(args),
+                        Ok(StreamEvent::ToolCallDone(call)) => AppEvent::StreamToolCallDone(call),
+                        Ok(StreamEvent::Usage(usage)) => AppEvent::StreamUsage(usage),
+                        Ok(StreamEvent::Done) => { let _ = tx.send(AppEvent::StreamDone); break; }
+                        Ok(StreamEvent::Error(e)) => { let _ = tx.send(AppEvent::StreamError(e)); break; }
+                        Err(e) => { let _ = tx.send(AppEvent::StreamError(e.to_string())); break; }
+                    };
+                    if tx.send(app_event).is_err() { break; }
+                }
+            }
+            Err(e) => { let _ = tx.send(AppEvent::StreamError(e.to_string())); }
+        }
+    });
+}
 
 /// Format tool info for display (called once, cached in App).
 fn format_tool_info(call: &ToolCall) -> String {

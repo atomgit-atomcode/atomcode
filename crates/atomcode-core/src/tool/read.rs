@@ -38,7 +38,20 @@ impl Tool for ReadFileTool {
 
     async fn execute(&self, args: &str) -> Result<ToolResult> {
         let parsed: ReadFileArgs = serde_json::from_str(args)?;
-        let content = tokio::fs::read_to_string(&parsed.file_path).await?;
+        let bytes = tokio::fs::read(&parsed.file_path).await?;
+
+        // Check if the file is valid UTF-8; if not, report it as binary.
+        let content = match String::from_utf8(bytes.clone()) {
+            Ok(s) => s,
+            Err(_) => {
+                let output = format!(
+                    "Binary file ({} bytes), cannot display as text.",
+                    bytes.len()
+                );
+                return Ok(ToolResult { call_id: String::new(), output, success: true });
+            }
+        };
+
         let lines: Vec<&str> = content.lines().collect();
         let offset = parsed.offset.unwrap_or(1).max(1) - 1;
         let limit = parsed.limit.unwrap_or(2000);
