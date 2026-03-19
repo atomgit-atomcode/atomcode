@@ -258,7 +258,7 @@ impl MarkdownRenderer {
         lines
     }
 
-    /// Syntax-highlighted code with background color, no borders.
+    /// Syntax-highlighted code with line numbers and background color.
     fn highlight(&self, code: &str, lang: &str) -> Vec<Line<'static>> {
         let syntax = if lang.is_empty() {
             self.syntax_set.find_syntax_plain_text()
@@ -268,17 +268,28 @@ impl MarkdownRenderer {
         };
 
         let mut hl = HighlightLines::new(syntax, &self.theme);
+        let line_count = code.lines().count();
+        let gutter_width = if line_count < 10 { 1 } else if line_count < 100 { 2 } else if line_count < 1000 { 3 } else { 4 };
+        let line_num_style = Style::default().fg(Color::Rgb(60, 65, 75)).bg(CODE_BG);
+        let gutter_sep = Style::default().fg(Color::Rgb(45, 48, 58)).bg(CODE_BG);
 
-        code.lines().map(|line| {
+        code.lines().enumerate().map(|(i, line)| {
             let regions = hl.highlight_line(line, &self.syntax_set).unwrap_or_default();
-            let mut s: Vec<Span<'static>> = vec![
-                Span::styled("  ", Style::default().bg(CODE_BG)), // left margin
-            ];
+            let mut s: Vec<Span<'static>> = Vec::new();
+
+            // Line number gutter
+            s.push(Span::styled(
+                format!(" {:>width$}", i + 1, width = gutter_width),
+                line_num_style,
+            ));
+            s.push(Span::styled(" \u{2502} ", gutter_sep)); // │ separator
+
+            // Highlighted code
             for (style, text) in regions {
                 let fg = Color::Rgb(style.foreground.r, style.foreground.g, style.foreground.b);
                 s.push(Span::styled(text.to_string(), Style::default().fg(fg).bg(CODE_BG)));
             }
-            // Pad right side with bg
+
             s.push(Span::styled("  ", Style::default().bg(CODE_BG)));
             Line::from(s)
         }).collect()
