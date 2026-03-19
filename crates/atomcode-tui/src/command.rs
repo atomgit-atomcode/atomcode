@@ -16,10 +16,6 @@ pub const COMMANDS: &[SlashCommand] = &[
         description: "Manage providers",
     },
     SlashCommand {
-        name: "/file",
-        description: "Attach file (/file <path>)",
-    },
-    SlashCommand {
         name: "/cd",
         description: "Change working directory",
     },

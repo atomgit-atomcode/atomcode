@@ -894,37 +894,6 @@ impl App {
                 self.conversation.messages.pop(); // Remove the /model user message
                 self.mode = AppMode::ModelSelector;
             }
-            _ if cmd.starts_with("/file ") => {
-                let path_str = cmd.strip_prefix("/file ").unwrap().trim();
-                if path_str.is_empty() {
-                    self.conversation.push_delta("Usage: /file <path>");
-                    self.conversation.finalize_stream();
-                } else {
-                    let path = std::path::Path::new(path_str);
-                    match crate::file_attach::extract_file(path, &self.working_dir) {
-                        Ok(fc) => {
-                            // Add file content as a user message with context
-                            let msg = format!(
-                                "[Attached file: {} ({}, {} bytes)]\n\n{}",
-                                fc.filename, fc.file_type, fc.size_bytes, fc.content
-                            );
-                            // Remove the /file command message, replace with file content
-                            self.conversation.messages.pop();
-                            self.conversation.add_user_message(&msg);
-                            self.conversation.push_delta(&format!(
-                                "Attached **{}** ({}, {} bytes)",
-                                fc.filename, fc.file_type,
-                                format_file_size(fc.size_bytes)
-                            ));
-                            self.conversation.finalize_stream();
-                        }
-                        Err(e) => {
-                            self.conversation.push_delta(&e);
-                            self.conversation.finalize_stream();
-                        }
-                    }
-                }
-            }
             "/copy" => {
                 // Find the last assistant text and copy to clipboard
                 let last_text = self.conversation.messages.iter().rev()
