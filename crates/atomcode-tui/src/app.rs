@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use futures::StreamExt;
@@ -48,6 +49,12 @@ pub struct App {
     pub tool_registry: ToolRegistry,
     pub tool_call_count: usize,
     pub tick_count: usize,
+    /// When the current turn (user message → agent loop) started.
+    pub turn_start: Option<Instant>,
+    /// When the last tool execution started (for per-step timing).
+    pub tool_start: Option<Instant>,
+    /// Duration of the last completed turn.
+    pub last_turn_duration: Option<Duration>,
     pub working_dir: PathBuf,
     /// Suggested next prompt shown as ghost text in the input box.
     pub suggestion: Option<String>,
@@ -73,6 +80,9 @@ impl App {
             tool_registry,
             tool_call_count: 0,
             tick_count: 0,
+            turn_start: None,
+            tool_start: None,
+            last_turn_duration: None,
             working_dir,
             suggestion: None,
             render_cache: Vec::new(),
@@ -187,12 +197,16 @@ impl App {
                 self.conversation.finalize_stream();
                 self.mode = AppMode::Normal;
                 self.at_bottom = true;
+                self.last_turn_duration = self.turn_start.map(|t| t.elapsed());
+                self.turn_start = None;
                 self.suggestion = self.generate_suggestion();
             }
             AppEvent::StreamError(err) => {
                 self.conversation.push_delta(&format!("\n\n[Error: {}]", err));
                 self.conversation.finalize_stream();
                 self.mode = AppMode::Normal;
+                self.last_turn_duration = self.turn_start.map(|t| t.elapsed());
+                self.turn_start = None;
                 self.at_bottom = true;
             }
             AppEvent::StreamToolCallStart { id, name } => {
@@ -209,16 +223,32 @@ impl App {
                 self.conversation.tool_call_buffer = None;
                 self.handle_tool_call(call, event_tx);
             }
-            AppEvent::ToolFinished(result) => {
+            AppEvent::ToolFinished(mut result) => {
+                // Append step duration to output
+                if let Some(start) = self.tool_start.take() {
+                    let dur = start.elapsed();
+                    let dur_str = if dur.as_millis() < 1000 {
+                        format!(" ({}ms)", dur.as_millis())
+                    } else {
+                        format!(" ({:.1}s)", dur.as_secs_f64())
+                    };
+                    result.output.push_str(&dur_str);
+                }
                 self.handle_tool_result(result, event_tx);
             }
             AppEvent::ScrollUp(n) => {
-                self.scroll_offset = self.scroll_offset.saturating_sub(n as usize);
-                self.at_bottom = false;
+                if self.at_bottom {
+                    // Transition from at_bottom to manual scroll: estimate current position
+                    let total = crate::ui::chat_panel::total_lines(&self.conversation);
+                    self.scroll_offset = total.saturating_sub(n as usize);
+                    self.at_bottom = false;
+                } else {
+                    self.scroll_offset = self.scroll_offset.saturating_sub(n as usize);
+                }
             }
             AppEvent::ScrollDown(n) => {
                 self.scroll_offset += n as usize;
-                self.at_bottom = true; // will clamp in render
+                // Don't set at_bottom here; render will auto-clamp
             }
             AppEvent::Resize(_, _) => {}
             AppEvent::Tick => {
@@ -386,8 +416,13 @@ impl App {
                 }
             }
             (KeyModifiers::CONTROL, KeyCode::Up) => {
-                self.scroll_offset = self.scroll_offset.saturating_sub(3);
-                self.at_bottom = false;
+                if self.at_bottom {
+                    let total = crate::ui::chat_panel::total_lines(&self.conversation);
+                    self.scroll_offset = total.saturating_sub(3);
+                    self.at_bottom = false;
+                } else {
+                    self.scroll_offset = self.scroll_offset.saturating_sub(3);
+                }
             }
             (KeyModifiers::CONTROL, KeyCode::Down) => {
                 self.scroll_offset += 3;
@@ -560,6 +595,8 @@ impl App {
         self.mode = AppMode::Streaming;
         self.at_bottom = true;
         self.tool_call_count = 0;
+        self.turn_start = Some(Instant::now());
+        self.last_turn_duration = None;
 
         let system_prompt = self.system_prompt();
         let messages = self.conversation.to_provider_messages(&system_prompt);
@@ -631,6 +668,7 @@ impl App {
     }
 
     fn execute_tool(&mut self, call: ToolCall, event_tx: &mpsc::UnboundedSender<AppEvent>) {
+        self.tool_start = Some(Instant::now());
         let tool_name = call.name.clone();
         let call_id = call.id.clone();
         let args = self.resolve_tool_args(&call);

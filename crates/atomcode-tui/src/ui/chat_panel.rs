@@ -99,8 +99,8 @@ pub fn render(
     let has_text = conversation.stream_buffer.as_ref().map_or(false, |b| !b.is_empty());
     match mode {
         AppMode::Streaming if !has_text => {
-            // Only show thinking label when LLM hasn't produced any text yet
-            let label = THINKING_LABELS[(tick / 8) % THINKING_LABELS.len()];
+            // Pick one label per turn (stable, based on message count)
+            let label = THINKING_LABELS[conversation.messages.len() % THINKING_LABELS.len()];
             logical_lines.push(Line::from(Span::styled(
                 format!("    {} {}", spinner, label),
                 Style::default().fg(ACCENT),

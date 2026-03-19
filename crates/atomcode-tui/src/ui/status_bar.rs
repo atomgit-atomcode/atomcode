@@ -55,6 +55,24 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         Style::default().fg(FG),
     ));
 
+    // Elapsed time (shown when working or just finished)
+    let time_str = if let Some(start) = app.turn_start {
+        let elapsed = start.elapsed();
+        format!(" {}s ", elapsed.as_secs())
+    } else if let Some(dur) = app.last_turn_duration {
+        format!(" {}s ", dur.as_secs())
+    } else {
+        String::new()
+    };
+
+    if !time_str.is_empty() {
+        spans.push(Span::styled(SEP, Style::default().fg(DIM)));
+        spans.push(Span::styled(
+            time_str,
+            Style::default().fg(DIM),
+        ));
+    }
+
     // Right side: model name (right-aligned)
     let right = format!(" {} ", model);
     let left_len: usize = spans.iter().map(|s| s.content.len()).sum();
