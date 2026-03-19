@@ -316,8 +316,11 @@ impl App {
 
         if actions.is_empty() { return; }
 
-        let status = if had_error { "[DONE with errors]" } else { "[DONE]" };
-        let summary = format!("{} {} actions completed.", status, actions.len());
+        let status = if had_error { "Completed with errors" } else { "Done" };
+        let mut summary = format!("{}. {} steps:\n", status, actions.len());
+        for (i, action) in actions.iter().enumerate() {
+            summary.push_str(&format!("  {}. {}\n", i + 1, action));
+        }
         self.conversation.push_delta(&summary);
         self.conversation.finalize_stream();
     }
@@ -373,16 +376,6 @@ impl App {
             }
             AppEvent::StreamDone => {
                 self.conversation.finalize_stream();
-
-                // If planning phase just finished, auto-trigger execution phase
-                if self.is_planning_phase {
-                    self.is_planning_phase = false;
-                    self.mode = AppMode::Streaming;
-                    self.at_bottom = true;
-                    // Now call LLM WITH tools to execute the plan
-                    self.continue_agent_loop(event_tx);
-                    return;
-                }
 
                 // Auto-generate summary if the turn had tool calls but AI ended without text
                 self.maybe_add_auto_summary();
@@ -1101,30 +1094,19 @@ impl App {
 
         self.conversation.add_user_message(&full_content);
         self.input.clear();
+        self.mode = AppMode::Streaming;
         self.at_bottom = true;
         self.tool_call_count = 0;
         self.retry_count = 0;
         self.turn_start = Some(Instant::now());
         self.last_turn_duration = None;
 
-        // Phase 1: Plan — call LLM WITHOUT tools to get a text plan first
-        self.mode = AppMode::Streaming;
-        self.is_planning_phase = true;
-
-        let plan_prompt = format!(
-            "{}\n\nWorking directory: {}\n\n{}\n\nRespond with a brief plan (1-3 lines) describing what you will do. Do NOT use any tools yet.",
-            self.config.providers
-                .get(&self.config.default_provider)
-                .and_then(|p| p.system_prompt.as_deref())
-                .unwrap_or(DEFAULT_SYSTEM_PROMPT),
-            self.working_dir.display(),
-            crate::project_context::build_project_context(&self.working_dir),
-        );
-        let messages = self.conversation.to_provider_messages_windowed(&plan_prompt, 10);
+        let system_prompt = self.system_prompt();
+        let messages = self.conversation.to_provider_messages_windowed(&system_prompt, 30);
+        let tool_defs = self.tool_registry.get_definitions();
 
         let tx = event_tx.clone();
-        // No tools — forces text-only response
-        let stream_result = self.provider.chat_stream(&messages, None);
+        let stream_result = self.provider.chat_stream(&messages, Some(&tool_defs));
 
         tokio::spawn(async move {
             match stream_result {

@@ -67,8 +67,21 @@ pub fn render(
                     _ => {}
                 },
                 MessageContent::AssistantWithToolCalls { text, tool_calls } => {
+                    // Show text before tool calls as a "plan" with visual marker
                     if let Some(t) = text {
-                        render_assistant(render_cache, t);
+                        if !t.trim().is_empty() {
+                            render_cache.push(Line::from(Span::styled(
+                                "  \u{2502} Plan",
+                                Style::default().fg(ACCENT).add_modifier(ratatui::style::Modifier::BOLD),
+                            )));
+                            let md = render_markdown(t);
+                            for line in md {
+                                let mut spans = vec![Span::raw("    ".to_string())];
+                                spans.extend(line.spans);
+                                render_cache.push(Line::from(spans));
+                            }
+                            render_cache.push(Line::default());
+                        }
                     }
                     for call in tool_calls {
                         render_tool_call(render_cache, call);

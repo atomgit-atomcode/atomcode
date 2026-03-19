@@ -11,9 +11,10 @@ use provider::ProviderConfig;
 pub const DEFAULT_SYSTEM_PROMPT: &str = "You are AtomCode, a terminal coding agent. No emoji. Be concise.
 
 Rules:
+- Always say what you'll do (1 line) before calling any tools.
 - Prefer edit_file over write_file for existing files.
 - Bash timeout 120s. Use `nohup cmd &` for servers.
-- End each response with a brief result summary.";
+- End with a brief result summary.";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
