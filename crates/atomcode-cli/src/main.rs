@@ -16,7 +16,7 @@ use atomcode_core::tool::bash::BashTool;
 use atomcode_core::tool::cd::CdTool;
 
 #[derive(Parser)]
-#[command(name = "atomcode", version = "0.1.0", about = "AI coding assistant in your terminal")]
+#[command(name = "atomcode", version = "0.2.0", about = "AI coding assistant in your terminal")]
 struct Cli {
     /// Provider to use (overrides config default)
     #[arg(long)]
@@ -36,19 +36,62 @@ struct Cli {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() {
+    // Set panic hook to show errors cleanly
+    std::panic::set_hook(Box::new(|info| {
+        // Restore terminal before printing panic
+        let _ = crossterm::terminal::disable_raw_mode();
+        let _ = crossterm::execute!(
+            std::io::stdout(),
+            crossterm::event::DisableMouseCapture,
+            crossterm::terminal::LeaveAlternateScreen,
+        );
+        eprintln!("\nAtomCode crashed: {}", info);
+        if let Some(location) = info.location() {
+            eprintln!("  at {}:{}:{}", location.file(), location.line(), location.column());
+        }
+        eprintln!("\nPlease report this at: https://github.com/atomcode/atomcode/issues");
+    }));
+
+    if let Err(e) = run().await {
+        // Restore terminal before printing error
+        let _ = crossterm::terminal::disable_raw_mode();
+        let _ = crossterm::execute!(
+            std::io::stdout(),
+            crossterm::event::DisableMouseCapture,
+            crossterm::terminal::LeaveAlternateScreen,
+        );
+        eprintln!("\nAtomCode error: {:#}", e);
+        std::process::exit(1);
+    }
+}
+
+async fn run() -> Result<()> {
     let cli = Cli::parse();
 
     let config_path = cli.config.unwrap_or_else(Config::default_path);
 
     let mut config = if config_path.exists() {
-        Config::load(&config_path)?
+        Config::load(&config_path).unwrap_or_else(|e| {
+            eprintln!("Warning: failed to load config ({}), using defaults", e);
+            Config {
+                default_provider: "openai".to_string(),
+                default_workdir: None,
+                providers: HashMap::new(),
+            }
+        })
     } else {
         let config = first_run_wizard()?;
         config.save(&config_path)?;
         println!("\nConfig saved to {}\n", config_path.display());
         config
     };
+
+    if config.providers.is_empty() {
+        let config = first_run_wizard()?;
+        let _ = config.save(&config_path);
+        return Ok(());
+    }
 
     if let Some(ref model) = cli.model {
         let provider_name = cli.provider.as_deref().unwrap_or(&config.default_provider);
@@ -62,7 +105,6 @@ async fn main() -> Result<()> {
         .clone();
     let provider = create_provider(&provider_config)?;
 
-    // Resolve working directory: CLI flag > config default > cwd
     let working_dir = if let Some(d) = cli.dir {
         std::fs::canonicalize(d).unwrap_or_else(|_| std::env::current_dir().unwrap())
     } else if let Some(ref d) = config.default_workdir {
@@ -96,7 +138,6 @@ fn first_run_wizard() -> Result<Config> {
     io::stdin().read_line(&mut choice)?;
     let choice = choice.trim();
 
-    // For OpenAI-compatible providers, collect base_url and model interactively
     if choice == "3" {
         return setup_openai_compatible();
     }
@@ -168,7 +209,6 @@ fn setup_openai_compatible() -> Result<Config> {
     io::stdin().read_line(&mut model)?;
     let model = model.trim().to_string();
 
-    // Derive a short name from the base_url host
     let name = url::Url::parse(&base_url)
         .ok()
         .and_then(|u| u.host_str().map(|h| {
@@ -180,7 +220,7 @@ fn setup_openai_compatible() -> Result<Config> {
     providers.insert(
         name.clone(),
         ProviderConfig {
-            provider_type: "openai".to_string(), // Use OpenAI-compatible protocol
+            provider_type: "openai".to_string(),
             api_key: Some(api_key),
             model,
             base_url: Some(base_url),

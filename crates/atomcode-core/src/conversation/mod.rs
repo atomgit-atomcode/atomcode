@@ -27,20 +27,31 @@ impl Conversation {
         Self::default()
     }
 
-    /// Load conversation history from disk.
+    /// Load conversation history from disk. Never fails — returns empty on any error.
     pub fn load(path: &std::path::Path) -> Self {
-        if let Ok(data) = std::fs::read_to_string(path) {
-            if let Ok(messages) = serde_json::from_str::<Vec<Message>>(&data) {
-                let len = messages.len();
-                let start = if len > MAX_MESSAGES { len - MAX_MESSAGES } else { 0 };
-                return Self {
-                    messages: messages[start..].to_vec(),
-                    stream_buffer: None,
-                    tool_call_buffer: None,
-                };
+        let data = match std::fs::read_to_string(path) {
+            Ok(d) => d,
+            Err(_) => return Self::default(),
+        };
+
+        // Try parsing, if corrupted just start fresh
+        let messages = match serde_json::from_str::<Vec<Message>>(&data) {
+            Ok(msgs) => msgs,
+            Err(_) => {
+                // Corrupted history — backup and start fresh
+                let backup = path.with_extension("json.bak");
+                let _ = std::fs::rename(path, &backup);
+                return Self::default();
             }
+        };
+
+        let len = messages.len();
+        let start = if len > MAX_MESSAGES { len - MAX_MESSAGES } else { 0 };
+        Self {
+            messages: messages[start..].to_vec(),
+            stream_buffer: None,
+            tool_call_buffer: None,
         }
-        Self::default()
     }
 
     /// Save conversation history to disk.
