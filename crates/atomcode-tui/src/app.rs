@@ -1216,25 +1216,7 @@ impl App {
             result.success = ok;
         }
 
-        // Detect bash `cd` commands: check the last tool call to see if it was bash with cd
-        if result.success {
-            if let Some(last_call) = self.get_last_tool_call() {
-                if last_call.name == "bash" {
-                    if let Ok(args) = serde_json::from_str::<serde_json::Value>(&last_call.arguments) {
-                        if let Some(cmd) = args.get("command").and_then(|v| v.as_str()) {
-                            // Extract cd target from commands like "cd /path" or "cd /path && ..."
-                            let trimmed = cmd.trim();
-                            if trimmed.starts_with("cd ") {
-                                let cd_arg = trimmed[3..].split(&['&', ';', '|'][..]).next().unwrap_or("").trim();
-                                if !cd_arg.is_empty() {
-                                    let _ = self.try_change_dir(cd_arg);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
+
 
         // Truncate large tool outputs to reduce API payload size
         // (LLM doesn't need 2000 lines of file content in the next request)
