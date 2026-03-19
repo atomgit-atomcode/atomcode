@@ -14,6 +14,9 @@ use atomcode_core::tool::write::WriteFileTool;
 use atomcode_core::tool::edit::EditFileTool;
 use atomcode_core::tool::bash::BashTool;
 use atomcode_core::tool::cd::CdTool;
+use atomcode_core::tool::grep::GrepTool;
+use atomcode_core::tool::glob::GlobTool;
+use atomcode_core::tool::list_dir::ListDirTool;
 
 #[derive(Parser)]
 #[command(name = "atomcode", version = "0.2.0", about = "AI coding assistant in your terminal")]
@@ -120,6 +123,9 @@ async fn run() -> Result<()> {
     tool_registry.register(Box::new(EditFileTool));
     tool_registry.register(Box::new(BashTool::new(working_dir.clone())));
     tool_registry.register(Box::new(CdTool));
+    tool_registry.register(Box::new(GrepTool));
+    tool_registry.register(Box::new(GlobTool));
+    tool_registry.register(Box::new(ListDirTool));
 
     atomcode_tui::run(config, provider, tool_registry, working_dir).await
 }

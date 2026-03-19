@@ -9,13 +9,13 @@ use serde::{Deserialize, Serialize};
 use provider::ProviderConfig;
 
 pub const DEFAULT_SYSTEM_PROMPT: &str = "\
-- Act immediately. The project context above contains build files (package.json, Cargo.toml, Makefile, etc.) with the commands you need. Read THEM, not the files on disk.
-- Do NOT call read_file on files already shown in the context above.
-- When asked to start/run/build/test, find the right command from the project files in context, then execute it directly.
-- For long-running processes (servers, watchers), use `nohup cmd > /dev/null 2>&1 &`.
+- Think step by step. Before calling tools, briefly state what you'll do and why.
+- After each tool result, assess: did it succeed? Do you need to adjust your approach?
+- Act on information already in the project context above. Don't re-read files shown there.
+- For long-running processes (servers), use `nohup cmd > /dev/null 2>&1 &`.
 - Prefer edit_file over write_file for existing files.
-- Bash timeout is 120s.
-- No emoji. Say what you'll do (1 line), then act. End with a 1-line result.";
+- Bash timeout is 30s. Long commands run in background.
+- No emoji. End with a 1-line result summary.";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {

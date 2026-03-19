@@ -1219,14 +1219,23 @@ impl App {
 
 
 
-        // Truncate large tool outputs to reduce API payload size
-        // (LLM doesn't need 2000 lines of file content in the next request)
-        const MAX_OUTPUT_CHARS: usize = 8000;
-        if result.output.len() > MAX_OUTPUT_CHARS {
-            let truncated: String = result.output.chars().take(MAX_OUTPUT_CHARS).collect();
-            let total_lines = result.output.lines().count();
-            result.output = format!("{}...\n\n[truncated, showing first ~{} chars of {} lines total]",
-                truncated, MAX_OUTPUT_CHARS, total_lines);
+        // Smart output truncation: keep head + tail (errors are usually at the end)
+        const MAX_LINES: usize = 200;
+        const HEAD_LINES: usize = 30;
+        const TAIL_LINES: usize = 50;
+        let lines: Vec<&str> = result.output.lines().collect();
+        if lines.len() > MAX_LINES {
+            let head: String = lines[..HEAD_LINES].join("\n");
+            let tail: String = lines[lines.len()-TAIL_LINES..].join("\n");
+            result.output = format!(
+                "{}\n\n[... {} lines omitted ...]\n\n{}",
+                head, lines.len() - HEAD_LINES - TAIL_LINES, tail
+            );
+        }
+        // Also cap total chars
+        if result.output.len() > 10000 {
+            result.output = result.output.chars().take(10000).collect::<String>()
+                + "\n[output truncated at 10000 chars]";
         }
 
         self.conversation.add_tool_result(result);
