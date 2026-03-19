@@ -204,6 +204,9 @@ impl App {
         match std::fs::canonicalize(&new_path) {
             Ok(resolved) if resolved.is_dir() => {
                 self.working_dir = resolved.clone();
+                // Persist to config
+                self.config.default_workdir = Some(resolved.to_string_lossy().to_string());
+                let _ = self.config.save(&Config::default_path());
                 (true, format!("Changed working directory to {}", resolved.display()))
             }
             Ok(_) => (false, format!("Not a directory: {}", new_path.display())),

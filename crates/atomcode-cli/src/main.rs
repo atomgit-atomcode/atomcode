@@ -62,10 +62,15 @@ async fn main() -> Result<()> {
         .clone();
     let provider = create_provider(&provider_config)?;
 
-    // Resolve working directory
-    let working_dir = cli.dir
-        .map(|d| std::fs::canonicalize(d).unwrap_or_else(|_| std::env::current_dir().unwrap()))
-        .unwrap_or_else(|| std::env::current_dir().unwrap());
+    // Resolve working directory: CLI flag > config default > cwd
+    let working_dir = if let Some(d) = cli.dir {
+        std::fs::canonicalize(d).unwrap_or_else(|_| std::env::current_dir().unwrap())
+    } else if let Some(ref d) = config.default_workdir {
+        let p = PathBuf::from(d);
+        if p.is_dir() { p } else { std::env::current_dir().unwrap() }
+    } else {
+        std::env::current_dir().unwrap()
+    };
 
     let mut tool_registry = ToolRegistry::new();
     tool_registry.register(Box::new(ReadFileTool));
@@ -127,6 +132,7 @@ fn first_run_wizard() -> Result<Config> {
 
     Ok(Config {
         default_provider: name.to_string(),
+        default_workdir: None,
         providers,
     })
 }
@@ -184,6 +190,7 @@ fn setup_openai_compatible() -> Result<Config> {
 
     Ok(Config {
         default_provider: name,
+        default_workdir: None,
         providers,
     })
 }

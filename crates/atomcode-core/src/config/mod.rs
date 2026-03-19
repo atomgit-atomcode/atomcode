@@ -21,6 +21,8 @@ IMPORTANT:
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub default_provider: String,
+    /// Default working directory. Saved on /cd, restored on startup.
+    pub default_workdir: Option<String>,
     pub providers: HashMap<String, ProviderConfig>,
 }
 
