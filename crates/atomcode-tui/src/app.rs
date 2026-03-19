@@ -506,6 +506,26 @@ impl App {
             }
             (KeyModifiers::CONTROL, KeyCode::Down) => {
                 self.scroll_offset += 3;
+                let total = self.render_cache.len();
+                if self.scroll_offset >= total {
+                    self.at_bottom = true;
+                }
+            }
+            (_, KeyCode::PageUp) => {
+                if self.at_bottom {
+                    let total = self.render_cache.len();
+                    self.scroll_offset = total.saturating_sub(20);
+                    self.at_bottom = false;
+                } else {
+                    self.scroll_offset = self.scroll_offset.saturating_sub(20);
+                }
+            }
+            (_, KeyCode::PageDown) => {
+                self.scroll_offset += 20;
+                let total = self.render_cache.len();
+                if self.scroll_offset >= total {
+                    self.at_bottom = true;
+                }
             }
             (_, KeyCode::Backspace) => {
                 self.input.backspace();

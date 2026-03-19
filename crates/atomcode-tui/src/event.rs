@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use crossterm::event::{Event, EventStream, KeyEvent, MouseEvent, MouseEventKind};
+use crossterm::event::{Event, EventStream, KeyEvent};
 use futures::StreamExt;
 use tokio::sync::mpsc;
 
@@ -35,15 +35,12 @@ impl EventLoop {
         Self { rx, tx }
     }
 
-    /// Returns a sender that LLM streaming tasks can use to push events.
     pub fn sender(&self) -> mpsc::UnboundedSender<AppEvent> {
         self.tx.clone()
     }
 
-    /// Start polling crossterm events and tick timer in background tasks.
     pub fn start(&self) {
         let tx = self.tx.clone();
-        // Async crossterm event reader — no blocking of the tokio runtime
         tokio::spawn(async move {
             let mut reader = EventStream::new();
             loop {
@@ -51,14 +48,8 @@ impl EventLoop {
                     Some(Ok(evt)) => {
                         let app_event = match evt {
                             Event::Key(key) => AppEvent::Key(key),
-                            Event::Mouse(MouseEvent { kind: MouseEventKind::ScrollUp, .. }) => {
-                                AppEvent::ScrollUp(3)
-                            }
-                            Event::Mouse(MouseEvent { kind: MouseEventKind::ScrollDown, .. }) => {
-                                AppEvent::ScrollDown(3)
-                            }
                             Event::Resize(w, h) => AppEvent::Resize(w, h),
-                            _ => continue,
+                            _ => continue, // Mouse events go to terminal for native selection
                         };
                         if tx.send(app_event).is_err() {
                             break;
@@ -71,7 +62,6 @@ impl EventLoop {
         });
 
         let tx = self.tx.clone();
-        // Tick timer (250ms)
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_millis(250));
             loop {
@@ -83,13 +73,10 @@ impl EventLoop {
         });
     }
 
-    /// Receive the next event (blocking).
     pub async fn next(&mut self) -> Option<AppEvent> {
         self.rx.recv().await
     }
 
-    /// Try to receive a pending event without blocking.
-    /// Returns None if no events are queued.
     pub fn try_next(&mut self) -> Option<AppEvent> {
         self.rx.try_recv().ok()
     }
