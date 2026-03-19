@@ -442,7 +442,21 @@ impl App {
 
         match &self.mode {
             AppMode::Normal => self.handle_key_normal(key, event_tx),
-            AppMode::Streaming | AppMode::ToolExecuting => self.handle_key_streaming(key),
+            AppMode::Streaming | AppMode::ToolExecuting => {
+                // Esc cancels the operation
+                if key.code == KeyCode::Esc {
+                    self.conversation.stream_buffer = None;
+                    self.conversation.tool_call_buffer = None;
+                    self.conversation.finalize_stream();
+                    self.mode = AppMode::Normal;
+                    self.at_bottom = true;
+                    self.last_turn_duration = self.turn_start.map(|t| t.elapsed());
+                    self.turn_start = None;
+                } else {
+                    // All other keys go to input — user can type while AI is working
+                    self.handle_key_input(key);
+                }
+            }
             AppMode::WaitingApproval(_) => self.handle_key_approval(key, event_tx),
             AppMode::ProviderManager => self.handle_key_provider_manager(key),
             AppMode::Exiting => {}
@@ -725,17 +739,33 @@ impl App {
         self.slash_menu.update(&self.input.content());
     }
 
-    fn handle_key_streaming(&mut self, key: KeyEvent) {
+    /// Handle typing in the input box — works in any mode (Normal, Streaming, etc.)
+    fn handle_key_input(&mut self, key: KeyEvent) {
         match (key.modifiers, key.code) {
-            (_, KeyCode::Esc) => {
-                // Esc also cancels streaming
-                self.conversation.stream_buffer = None;
-                self.conversation.tool_call_buffer = None;
-                self.conversation.finalize_stream();
-                self.mode = AppMode::Normal;
-                self.at_bottom = true;
-                self.last_turn_duration = self.turn_start.map(|t| t.elapsed());
-                self.turn_start = None;
+            (KeyModifiers::SHIFT, KeyCode::Enter) => {
+                self.input.insert_newline();
+            }
+            (_, KeyCode::Backspace) => {
+                self.input.backspace();
+            }
+            (_, KeyCode::Left) => {
+                if self.input.cursor_col > 0 {
+                    let line = &self.input.lines[self.input.cursor_row];
+                    self.input.cursor_col = line[..self.input.cursor_col]
+                        .char_indices().last().map(|(i, _)| i).unwrap_or(0);
+                }
+            }
+            (_, KeyCode::Right) => {
+                let line = &self.input.lines[self.input.cursor_row];
+                if self.input.cursor_col < line.len() {
+                    self.input.cursor_col = line[self.input.cursor_col..]
+                        .char_indices().nth(1)
+                        .map(|(i, _)| self.input.cursor_col + i)
+                        .unwrap_or(line.len());
+                }
+            }
+            (_, KeyCode::Char(c)) => {
+                self.input.insert_char(c);
             }
             _ => {}
         }
