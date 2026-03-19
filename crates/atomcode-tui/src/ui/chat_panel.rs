@@ -122,9 +122,11 @@ pub fn render(
             ]));
         }
         AppMode::ToolExecuting => {
+            // Show what tool is running + its key argument
+            let tool_info = get_executing_tool_info(conversation);
             dynamic.push(Line::from(vec![
                 Span::styled(
-                    format!("    {} Executing...", spinner),
+                    format!("    {} Running {}", spinner, tool_info),
                     Style::default().fg(WARN),
                 ),
                 Span::styled(stats.clone(), Style::default().fg(DIM)),
@@ -356,6 +358,37 @@ fn build_turn_stats(elapsed_secs: Option<u64>, tokens: usize) -> String {
     } else {
         format!("  {}", parts.join(" | "))
     }
+}
+
+/// Get info about the currently executing tool from the last tool call in conversation.
+fn get_executing_tool_info(conversation: &Conversation) -> String {
+    use atomcode_core::conversation::message::MessageContent;
+    for msg in conversation.messages.iter().rev() {
+        if let MessageContent::AssistantWithToolCalls { tool_calls, .. } = &msg.content {
+            if let Some(tc) = tool_calls.last() {
+                let name = capitalize(&tc.name);
+                // Extract the key argument to show
+                if let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
+                    if let Some(cmd) = args.get("command").and_then(|v| v.as_str()) {
+                        let short: String = cmd.chars().take(50).collect();
+                        return format!("{}: {}", name, short);
+                    }
+                    if let Some(fp) = args.get("file_path").and_then(|v| v.as_str()) {
+                        let fname = std::path::Path::new(fp)
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_else(|| fp.to_string());
+                        return format!("{}: {}", name, fname);
+                    }
+                    if let Some(path) = args.get("path").and_then(|v| v.as_str()) {
+                        return format!("{}: {}", name, path);
+                    }
+                }
+                return name;
+            }
+        }
+    }
+    "...".to_string()
 }
 
 fn format_compact_tokens(n: usize) -> String {
