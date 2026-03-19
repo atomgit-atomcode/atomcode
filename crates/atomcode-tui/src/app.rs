@@ -259,6 +259,16 @@ impl App {
         self.conversation.finalize_stream();
     }
 
+    /// Rebuild the LLM provider from current config (after provider/model change).
+    fn rebuild_provider(&mut self) {
+        use atomcode_core::provider::create_provider;
+        if let Ok(provider_config) = self.config.active_provider(None) {
+            if let Ok(new_provider) = create_provider(&provider_config.clone()) {
+                self.provider = new_provider;
+            }
+        }
+    }
+
     /// Build system prompt with working directory context.
     fn system_prompt(&self) -> String {
         let base = self.config.providers
@@ -495,9 +505,10 @@ impl App {
         if let Some(action) = action {
             match action {
                 ManagerAction::Close => {
-                    // Save config before closing
                     let config_path = Config::default_path();
                     let _ = self.config.save(&config_path);
+                    // Rebuild provider from current config
+                    self.rebuild_provider();
                     self.provider_mgr = None;
                     self.mode = AppMode::Normal;
                 }
@@ -505,6 +516,7 @@ impl App {
                     self.config.default_provider = name;
                     let config_path = Config::default_path();
                     let _ = self.config.save(&config_path);
+                    self.rebuild_provider();
                 }
                 ManagerAction::Delete(name) => {
                     self.config.providers.remove(&name);
@@ -525,16 +537,20 @@ impl App {
                 ManagerAction::UpdateField(name, field, value) => {
                     if let Some(p) = self.config.providers.get_mut(&name) {
                         match field.as_str() {
-                            "type" => p.provider_type = value,
+                            "type" => p.provider_type = value.clone(),
                             "api_key" => {
-                                p.api_key = if value.is_empty() { None } else { Some(value) }
+                                p.api_key = if value.is_empty() { None } else { Some(value.clone()) }
                             }
                             "base_url" => {
-                                p.base_url = if value.is_empty() { None } else { Some(value) }
+                                p.base_url = if value.is_empty() { None } else { Some(value.clone()) }
                             }
-                            "model" => p.model = value,
+                            "model" => p.model = value.clone(),
                             _ => {}
                         }
+                    }
+                    // Rebuild provider if the active provider was modified
+                    if name == self.config.default_provider {
+                        self.rebuild_provider();
                     }
                     let config_path = Config::default_path();
                     let _ = self.config.save(&config_path);
