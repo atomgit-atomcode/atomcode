@@ -49,6 +49,8 @@ pub struct App {
     pub tool_registry: ToolRegistry,
     pub tool_call_count: usize,
     pub tick_count: usize,
+    /// Retry count for stream errors (auto-retry up to 3 times).
+    pub retry_count: usize,
     /// When the current turn (user message → agent loop) started.
     pub turn_start: Option<Instant>,
     /// When the last tool execution started (for per-step timing).
@@ -79,6 +81,7 @@ impl App {
             provider_mgr: None,
             tool_registry,
             tool_call_count: 0,
+            retry_count: 0,
             tick_count: 0,
             turn_start: None,
             tool_start: None,
@@ -242,17 +245,33 @@ impl App {
                 self.conversation.finalize_stream();
                 self.mode = AppMode::Normal;
                 self.at_bottom = true;
+                self.retry_count = 0;
                 self.last_turn_duration = self.turn_start.map(|t| t.elapsed());
                 self.turn_start = None;
                 self.suggestion = self.generate_suggestion();
             }
             AppEvent::StreamError(err) => {
-                self.conversation.push_delta(&format!("\n\n[Error: {}]", err));
-                self.conversation.finalize_stream();
-                self.mode = AppMode::Normal;
-                self.last_turn_duration = self.turn_start.map(|t| t.elapsed());
-                self.turn_start = None;
-                self.at_bottom = true;
+                if self.retry_count < 3 {
+                    // Auto-retry: discard partial stream, try again
+                    self.retry_count += 1;
+                    self.conversation.stream_buffer = None;
+                    self.conversation.push_delta(&format!(
+                        "\n[Retrying... ({}/3)]", self.retry_count
+                    ));
+                    self.conversation.finalize_stream();
+                    self.mode = AppMode::Streaming;
+                    self.at_bottom = true;
+                    self.continue_agent_loop(event_tx);
+                } else {
+                    // Give up after 3 retries
+                    self.conversation.push_delta(&format!("\n\n[Error: {}]", err));
+                    self.conversation.finalize_stream();
+                    self.mode = AppMode::Normal;
+                    self.last_turn_duration = self.turn_start.map(|t| t.elapsed());
+                    self.turn_start = None;
+                    self.at_bottom = true;
+                    self.retry_count = 0;
+                }
             }
             AppEvent::StreamToolCallStart { id, name } => {
                 self.conversation.tool_call_buffer = Some(ToolCallBuffer {
@@ -653,6 +672,7 @@ impl App {
         self.mode = AppMode::Streaming;
         self.at_bottom = true;
         self.tool_call_count = 0;
+        self.retry_count = 0;
         self.turn_start = Some(Instant::now());
         self.last_turn_duration = None;
 
@@ -801,12 +821,9 @@ impl App {
         self.conversation.add_tool_result(result);
         self.tool_call_count += 1;
 
+        // Auto-continue: reset counter every 25 calls but keep going
         if self.tool_call_count >= 25 {
-            self.conversation.push_delta("\n\n[Tool call limit reached (25). Send another message to continue.]");
-            self.conversation.finalize_stream();
-            self.mode = AppMode::Normal;
             self.tool_call_count = 0;
-            return;
         }
 
         self.mode = AppMode::Streaming;
