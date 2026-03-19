@@ -385,7 +385,9 @@ impl App {
         match event {
             AgentEvent::TextDelta(text) => {
                 self.conversation.push_delta(&text);
-                self.at_bottom = true;
+                // Don't force at_bottom here — respect user's scroll position.
+                // at_bottom is already true when a new turn starts; if the user
+                // scrolled away during streaming, we shouldn't snap them back.
             }
             AgentEvent::ToolCallStarted { name, arguments } => {
                 self.current_step_count += 1;
@@ -679,12 +681,18 @@ impl App {
                     self.at_bottom = true;
                     self.last_turn_duration = self.turn_start.map(|t| t.elapsed());
                     self.turn_start = None;
+                } else if self.handle_scroll_keys(key) {
+                    // Scroll keys handled — don't pass to input
                 } else {
                     // All other keys go to input — user can type while AI is working
                     self.handle_key_input(key);
                 }
             }
-            AppMode::WaitingApproval(_) => self.handle_key_approval(key, event_tx),
+            AppMode::WaitingApproval(_) => {
+                if !self.handle_scroll_keys(key) {
+                    self.handle_key_approval(key, event_tx);
+                }
+            }
             AppMode::ModelSelector => self.handle_key_model_selector(key),
             AppMode::ProviderManager => self.handle_key_provider_manager(key),
             AppMode::Exiting => {}
@@ -863,39 +871,8 @@ impl App {
                     self.slash_menu.close();
                 }
             }
-            (KeyModifiers::CONTROL, KeyCode::Up) => {
-                if self.at_bottom {
-                    // Use cached line count instead of recomputing render_markdown for all messages
-                    let total = self.render_cache.len();
-                    self.scroll_offset = total.saturating_sub(3);
-                    self.at_bottom = false;
-                } else {
-                    self.scroll_offset = self.scroll_offset.saturating_sub(3);
-                }
-            }
-            (KeyModifiers::CONTROL, KeyCode::Down) => {
-                self.scroll_offset += 3;
-                let total = self.render_cache.len();
-                if self.scroll_offset >= total {
-                    self.at_bottom = true;
-                }
-            }
-            (_, KeyCode::PageUp) => {
-                if self.at_bottom {
-                    let total = self.render_cache.len();
-                    self.scroll_offset = total.saturating_sub(20);
-                    self.at_bottom = false;
-                } else {
-                    self.scroll_offset = self.scroll_offset.saturating_sub(20);
-                }
-            }
-            (_, KeyCode::PageDown) => {
-                self.scroll_offset += 20;
-                let total = self.render_cache.len();
-                if self.scroll_offset >= total {
-                    self.at_bottom = true;
-                }
-            }
+            // Scroll keys: Ctrl+Up/Down (3 lines), PageUp/PageDown (20 lines)
+            _ if self.handle_scroll_keys(key) => {}
             (_, KeyCode::Backspace) => {
                 self.input.backspace();
             }
@@ -1008,6 +985,49 @@ impl App {
                 self.attached_files.push(file);
                 self.input.clear(); // Clear the path from input
             }
+        }
+    }
+
+    /// Handle scroll keys (Ctrl+Up/Down, PageUp/PageDown). Returns true if the key was a scroll key.
+    fn handle_scroll_keys(&mut self, key: KeyEvent) -> bool {
+        match (key.modifiers, key.code) {
+            (KeyModifiers::CONTROL, KeyCode::Up) => {
+                if self.at_bottom {
+                    let total = self.render_cache.len();
+                    self.scroll_offset = total.saturating_sub(3);
+                    self.at_bottom = false;
+                } else {
+                    self.scroll_offset = self.scroll_offset.saturating_sub(3);
+                }
+                true
+            }
+            (KeyModifiers::CONTROL, KeyCode::Down) => {
+                self.scroll_offset += 3;
+                let total = self.render_cache.len();
+                if self.scroll_offset >= total {
+                    self.at_bottom = true;
+                }
+                true
+            }
+            (_, KeyCode::PageUp) => {
+                if self.at_bottom {
+                    let total = self.render_cache.len();
+                    self.scroll_offset = total.saturating_sub(20);
+                    self.at_bottom = false;
+                } else {
+                    self.scroll_offset = self.scroll_offset.saturating_sub(20);
+                }
+                true
+            }
+            (_, KeyCode::PageDown) => {
+                self.scroll_offset += 20;
+                let total = self.render_cache.len();
+                if self.scroll_offset >= total {
+                    self.at_bottom = true;
+                }
+                true
+            }
+            _ => false,
         }
     }
 
