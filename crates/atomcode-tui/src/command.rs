@@ -28,6 +28,10 @@ pub const COMMANDS: &[SlashCommand] = &[
         description: "Show available commands and shortcuts",
     },
     SlashCommand {
+        name: "/cd",
+        description: "Change working directory",
+    },
+    SlashCommand {
         name: "/quit",
         description: "Exit AtomCode",
     },

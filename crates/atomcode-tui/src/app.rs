@@ -176,6 +176,48 @@ impl App {
         None
     }
 
+    /// Change the working directory. Updates bash tool, system prompt context.
+    pub fn change_working_dir(&mut self, path: &str) {
+        let new_path = if path.starts_with('/') || path.starts_with('~') {
+            let expanded = if path.starts_with('~') {
+                dirs::home_dir()
+                    .map(|h| h.join(&path[2..]))
+                    .unwrap_or_else(|| PathBuf::from(path))
+            } else {
+                PathBuf::from(path)
+            };
+            expanded
+        } else {
+            self.working_dir.join(path)
+        };
+
+        match std::fs::canonicalize(&new_path) {
+            Ok(resolved) => {
+                if resolved.is_dir() {
+                    self.working_dir = resolved.clone();
+                    self.conversation.push_delta(&format!(
+                        "Changed working directory to `{}`",
+                        resolved.display()
+                    ));
+                    self.conversation.finalize_stream();
+                } else {
+                    self.conversation.push_delta(&format!(
+                        "Not a directory: `{}`",
+                        new_path.display()
+                    ));
+                    self.conversation.finalize_stream();
+                }
+            }
+            Err(e) => {
+                self.conversation.push_delta(&format!(
+                    "Cannot access `{}`: {}",
+                    new_path.display(), e
+                ));
+                self.conversation.finalize_stream();
+            }
+        }
+    }
+
     /// Build system prompt with working directory context.
     fn system_prompt(&self) -> String {
         let base = self.config.providers
@@ -541,6 +583,19 @@ impl App {
                 ));
                 self.conversation.finalize_stream();
             }
+            _ if cmd.starts_with("/cd ") || cmd == "/cd" => {
+                let arg = cmd.strip_prefix("/cd").unwrap().trim();
+                if arg.is_empty() {
+                    // Show current directory
+                    self.conversation.push_delta(&format!(
+                        "Working directory: `{}`",
+                        self.working_dir.display()
+                    ));
+                    self.conversation.finalize_stream();
+                } else {
+                    self.change_working_dir(arg);
+                }
+            }
             "/clear" => {
                 self.conversation = Conversation::new();
                 self.scroll_offset = 0;
@@ -681,6 +736,7 @@ impl App {
                 "write_file" => atomcode_core::tool::write::WriteFileTool.execute(&args).await,
                 "edit_file" => atomcode_core::tool::edit::EditFileTool.execute(&args).await,
                 "bash" => atomcode_core::tool::bash::BashTool::new(working_dir).execute(&args).await,
+                "change_dir" => atomcode_core::tool::cd::CdTool.execute(&args).await,
                 _ => Err(anyhow::anyhow!("Unknown tool: {}", tool_name)),
             };
             let tool_result = match result {
@@ -710,7 +766,15 @@ impl App {
         call.arguments.clone()
     }
 
-    fn handle_tool_result(&mut self, result: ToolResult, event_tx: &mpsc::UnboundedSender<AppEvent>) {
+    fn handle_tool_result(&mut self, mut result: ToolResult, event_tx: &mpsc::UnboundedSender<AppEvent>) {
+        // Intercept change_dir requests
+        if result.output.starts_with("CD_REQUEST:") {
+            let path = result.output.strip_prefix("CD_REQUEST:").unwrap().to_string();
+            self.change_working_dir(&path);
+            // Replace output with actual result for the LLM
+            result.output = format!("Changed working directory to {}", self.working_dir.display());
+        }
+
         self.conversation.add_tool_result(result);
         self.tool_call_count += 1;
 
