@@ -9,6 +9,7 @@ pub mod ui;
 use anyhow::Result;
 use crossterm::{
     execute,
+    event::{EnableMouseCapture, DisableMouseCapture},
     terminal::{
         disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
         SetTitle, Clear, ClearType,
@@ -36,11 +37,12 @@ pub async fn run(
     execute!(
         stdout,
         EnterAlternateScreen,
+        EnableMouseCapture,
         SetTitle("AtomCode"),
         Clear(ClearType::All),
     )?;
-    // No mouse capture at all — let terminal handle selection/copy natively.
-    // Scrolling is keyboard-only (Ctrl+Up/Down, PageUp/Down).
+    // Mouse capture enabled to prevent terminal scrollback bleed-through.
+    // For copy: use /copy command or Option+drag (iTerm2) / Fn+drag (Terminal.app).
 
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
@@ -56,7 +58,7 @@ pub async fn run(
 
         if let Some(file_path) = app.pending_editor.take() {
             disable_raw_mode()?;
-            execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+            execute!(terminal.backend_mut(), DisableMouseCapture, LeaveAlternateScreen)?;
             terminal.show_cursor()?;
 
             let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vim".to_string());
@@ -68,6 +70,7 @@ pub async fn run(
             execute!(
                 terminal.backend_mut(),
                 EnterAlternateScreen,
+                EnableMouseCapture,
                 Clear(ClearType::All),
             )?;
             terminal.clear()?;
@@ -120,6 +123,7 @@ pub async fn run(
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
+        DisableMouseCapture,
         LeaveAlternateScreen,
     )?;
     terminal.show_cursor()?;
