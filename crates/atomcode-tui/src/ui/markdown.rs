@@ -5,51 +5,39 @@ use syntect::easy::HighlightLines;
 use syntect::highlighting::{Theme, ThemeSet};
 use syntect::parsing::SyntaxSet;
 
-// Clean, readable palette — bright enough to read, muted enough to not strain
-const TEXT: Color = Color::Rgb(210, 210, 215);
-const BOLD_TEXT: Color = Color::Rgb(245, 245, 250);
-const H1_COLOR: Color = Color::Rgb(120, 180, 255);
-const H2_COLOR: Color = Color::Rgb(170, 150, 255);
-const H3_COLOR: Color = Color::Rgb(140, 200, 170);
-const LINK_COLOR: Color = Color::Rgb(100, 150, 255);
-const INLINE_CODE_FG: Color = Color::Rgb(220, 185, 140);
-const INLINE_CODE_BG: Color = Color::Rgb(38, 38, 46);
-const CODE_BG: Color = Color::Rgb(22, 22, 30);
-const CODE_BORDER: Color = Color::Rgb(48, 48, 56);
-const BULLET_COLOR: Color = Color::Rgb(120, 130, 150);
-const QUOTE_BAR: Color = Color::Rgb(70, 70, 85);
-const QUOTE_TEXT: Color = Color::Rgb(160, 160, 175);
-const DIM: Color = Color::Rgb(100, 100, 110);
-const RULE_COLOR: Color = Color::Rgb(50, 50, 60);
+// Claude Code-inspired palette: clean, bright, minimal
+const TEXT: Color = Color::Rgb(220, 220, 225);
+const BOLD_TEXT: Color = Color::White;
+const H1: Color = Color::Rgb(130, 190, 255);
+const H2: Color = Color::Rgb(180, 160, 255);
+const H3: Color = Color::Rgb(150, 210, 180);
+const LINK: Color = Color::Rgb(110, 160, 255);
+const DIM: Color = Color::Rgb(110, 110, 120);
+const INLINE_CODE_FG: Color = Color::Rgb(230, 195, 150);
+const INLINE_CODE_BG: Color = Color::Rgb(35, 35, 42);
+const CODE_BG: Color = Color::Rgb(20, 20, 28);
+const CODE_LABEL: Color = Color::Rgb(90, 90, 100);
+const BULLET: Color = Color::Rgb(100, 120, 145);
+const QUOTE_BAR: Color = Color::Rgb(60, 60, 75);
+const QUOTE_TEXT: Color = Color::Rgb(170, 170, 180);
+const RULE: Color = Color::Rgb(45, 45, 55);
 
 pub fn render_markdown(input: &str) -> Vec<Line<'static>> {
     static RENDERER: std::sync::OnceLock<MarkdownRenderer> = std::sync::OnceLock::new();
     let renderer = RENDERER.get_or_init(MarkdownRenderer::new);
-    // Strip emoji characters before rendering
     let cleaned = strip_emoji(input);
     renderer.render(&cleaned)
 }
 
-/// Remove emoji and other decorative unicode from text.
 fn strip_emoji(s: &str) -> String {
     s.chars().filter(|c| {
         let cp = *c as u32;
-        // Keep basic ASCII, CJK, and standard unicode
-        // Filter out emoji ranges
-        !(
-            (0x1F600..=0x1F64F).contains(&cp) || // Emoticons
-            (0x1F300..=0x1F5FF).contains(&cp) || // Misc Symbols
-            (0x1F680..=0x1F6FF).contains(&cp) || // Transport
-            (0x1F1E0..=0x1F1FF).contains(&cp) || // Flags
-            (0x2600..=0x26FF).contains(&cp) ||   // Misc symbols
-            (0x2700..=0x27BF).contains(&cp) ||   // Dingbats
-            (0xFE00..=0xFE0F).contains(&cp) ||   // Variation selectors
-            (0x1F900..=0x1F9FF).contains(&cp) || // Supplemental
-            (0x1FA00..=0x1FA6F).contains(&cp) || // Chess symbols etc
-            (0x1FA70..=0x1FAFF).contains(&cp) || // Symbols extended
-            (0x200D == cp) ||                     // Zero-width joiner
-            (0xE0020..=0xE007F).contains(&cp)    // Tags
-        )
+        !((0x1F600..=0x1F64F).contains(&cp) || (0x1F300..=0x1F5FF).contains(&cp) ||
+          (0x1F680..=0x1F6FF).contains(&cp) || (0x1F1E0..=0x1F1FF).contains(&cp) ||
+          (0x2600..=0x26FF).contains(&cp) || (0x2700..=0x27BF).contains(&cp) ||
+          (0xFE00..=0xFE0F).contains(&cp) || (0x1F900..=0x1F9FF).contains(&cp) ||
+          (0x1FA00..=0x1FA6F).contains(&cp) || (0x1FA70..=0x1FAFF).contains(&cp) ||
+          cp == 0x200D || (0xE0020..=0xE007F).contains(&cp))
     }).collect()
 }
 
@@ -71,383 +59,271 @@ impl MarkdownRenderer {
         let parser = Parser::new_ext(input, options);
 
         let mut lines: Vec<Line<'static>> = Vec::new();
-        let mut current_spans: Vec<Span<'static>> = Vec::new();
-        let mut style_stack: Vec<Style> = vec![Style::default().fg(TEXT)];
-        let mut in_code_block = false;
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        let mut styles: Vec<Style> = vec![Style::default().fg(TEXT)];
+        let mut in_code = false;
         let mut code_lang = String::new();
-        let mut code_content = String::new();
+        let mut code_buf = String::new();
         let mut link_url: Option<String> = None;
-        let mut _in_table = false;
-        let mut table_row: Vec<String> = Vec::new();
+        let mut list_depth: usize = 0;
+        let mut ordered_idx: Option<u64> = None;
+        let mut in_quote = false;
         let mut table_header: Vec<String> = Vec::new();
         let mut table_rows: Vec<Vec<String>> = Vec::new();
+        let mut table_row: Vec<String> = Vec::new();
         let mut collecting_header = false;
-        let mut list_depth: usize = 0;
-        let mut ordered_index: Option<u64> = None;
-        let mut in_blockquote = false;
 
         for event in parser {
             match event {
+                // Headings
                 Event::Start(Tag::Heading { level, .. }) => {
-                    // Blank line before heading for breathing room
-                    if !lines.is_empty() {
-                        lines.push(Line::default());
-                    }
+                    if !lines.is_empty() { lines.push(Line::default()); }
                     let color = match level {
-                        HeadingLevel::H1 => H1_COLOR,
-                        HeadingLevel::H2 => H2_COLOR,
-                        _ => H3_COLOR,
+                        HeadingLevel::H1 => H1,
+                        HeadingLevel::H2 => H2,
+                        _ => H3,
                     };
-                    let style = Style::default()
-                        .fg(color)
-                        .add_modifier(Modifier::BOLD);
-                    style_stack.push(style);
+                    styles.push(Style::default().fg(color).add_modifier(Modifier::BOLD));
                 }
                 Event::End(TagEnd::Heading(level)) => {
-                    style_stack.pop();
-                    if !current_spans.is_empty() {
-                        lines.push(Line::from(std::mem::take(&mut current_spans)));
-                    }
-                    // Underline for H1
+                    styles.pop();
+                    flush(&mut lines, &mut spans);
                     if level == HeadingLevel::H1 {
                         lines.push(Line::from(Span::styled(
-                            "\u{2500}".repeat(40),
-                            Style::default().fg(RULE_COLOR),
+                            "\u{2500}".repeat(40), Style::default().fg(RULE),
                         )));
                     }
                 }
+
+                // Inline styles
                 Event::Start(Tag::Strong) => {
-                    let mut style = *style_stack.last().unwrap_or(&Style::default());
-                    style = style.fg(BOLD_TEXT).add_modifier(Modifier::BOLD);
-                    style_stack.push(style);
+                    let s = cur_style(&styles).fg(BOLD_TEXT).add_modifier(Modifier::BOLD);
+                    styles.push(s);
                 }
-                Event::End(TagEnd::Strong) => {
-                    style_stack.pop();
-                }
+                Event::End(TagEnd::Strong) => { styles.pop(); }
                 Event::Start(Tag::Emphasis) => {
-                    let mut style = *style_stack.last().unwrap_or(&Style::default());
-                    style = style.add_modifier(Modifier::ITALIC);
-                    style_stack.push(style);
+                    let s = cur_style(&styles).add_modifier(Modifier::ITALIC);
+                    styles.push(s);
                 }
-                Event::End(TagEnd::Emphasis) => {
-                    style_stack.pop();
-                }
+                Event::End(TagEnd::Emphasis) => { styles.pop(); }
+
+                // Links
                 Event::Start(Tag::Link { dest_url, .. }) => {
-                    let style = Style::default()
-                        .fg(LINK_COLOR)
-                        .add_modifier(Modifier::UNDERLINED);
-                    style_stack.push(style);
+                    styles.push(Style::default().fg(LINK).add_modifier(Modifier::UNDERLINED));
                     link_url = Some(dest_url.to_string());
                 }
                 Event::End(TagEnd::Link) => {
-                    style_stack.pop();
-                    // Show URL after link text if different from text
+                    styles.pop();
                     if let Some(url) = link_url.take() {
-                        let last_text: String = current_spans.last()
-                            .map(|s| s.content.to_string())
-                            .unwrap_or_default();
-                        if !last_text.is_empty() && last_text != url && !url.is_empty() {
-                            current_spans.push(Span::styled(
-                                format!(" ({})", url),
-                                Style::default().fg(DIM),
-                            ));
+                        let last = spans.last().map(|s| s.content.to_string()).unwrap_or_default();
+                        if !last.is_empty() && last != url && !url.is_empty() {
+                            spans.push(Span::styled(format!(" ({})", url), Style::default().fg(DIM)));
                         }
                     }
                 }
+
+                // Code blocks — clean, no border decorations
                 Event::Start(Tag::CodeBlock(kind)) => {
-                    in_code_block = true;
-                    code_content.clear();
+                    in_code = true;
+                    code_buf.clear();
                     code_lang = match kind {
-                        CodeBlockKind::Fenced(lang) => lang.to_string(),
+                        CodeBlockKind::Fenced(l) => l.to_string(),
                         CodeBlockKind::Indented => String::new(),
                     };
                 }
                 Event::End(TagEnd::CodeBlock) => {
-                    in_code_block = false;
-                    let highlighted = self.render_code_block(&code_content, &code_lang);
+                    in_code = false;
+                    // Language label
+                    if !code_lang.is_empty() {
+                        lines.push(Line::from(Span::styled(
+                            format!("  {}", code_lang), Style::default().fg(CODE_LABEL),
+                        )));
+                    }
+                    // Code lines with syntax highlight + background
+                    let highlighted = self.highlight(&code_buf, &code_lang);
                     lines.extend(highlighted);
-                    code_content.clear();
+                    lines.push(Line::default());
+                    code_buf.clear();
                 }
+
+                // Paragraphs
                 Event::Start(Tag::Paragraph) => {}
                 Event::End(TagEnd::Paragraph) => {
-                    if !current_spans.is_empty() {
-                        lines.push(Line::from(std::mem::take(&mut current_spans)));
-                    }
-                    // Single blank line between paragraphs
+                    flush(&mut lines, &mut spans);
                     lines.push(Line::default());
                 }
-                Event::Start(Tag::List(start)) => {
-                    list_depth += 1;
-                    ordered_index = start;
-                }
+
+                // Lists
+                Event::Start(Tag::List(start)) => { list_depth += 1; ordered_idx = start; }
                 Event::End(TagEnd::List(_)) => {
                     list_depth = list_depth.saturating_sub(1);
-                    ordered_index = None;
+                    ordered_idx = None;
                 }
                 Event::Start(Tag::Item) => {
                     let indent = "  ".repeat(list_depth);
-                    if let Some(idx) = &mut ordered_index {
-                        current_spans.push(Span::styled(
-                            format!("{}{:>2}. ", indent, idx),
-                            Style::default().fg(BULLET_COLOR),
-                        ));
+                    if let Some(idx) = &mut ordered_idx {
+                        spans.push(Span::styled(format!("{}{:>2}. ", indent, idx), Style::default().fg(BULLET)));
                         *idx += 1;
                     } else {
-                        current_spans.push(Span::styled(
-                            format!("{}  - ", indent),
-                            Style::default().fg(BULLET_COLOR),
-                        ));
+                        spans.push(Span::styled(format!("{}  - ", indent), Style::default().fg(BULLET)));
                     }
                 }
-                Event::End(TagEnd::Item) => {
-                    if !current_spans.is_empty() {
-                        lines.push(Line::from(std::mem::take(&mut current_spans)));
-                    }
-                }
+                Event::End(TagEnd::Item) => { flush(&mut lines, &mut spans); }
+
+                // Block quotes
                 Event::Start(Tag::BlockQuote(_)) => {
-                    in_blockquote = true;
-                    let style = Style::default().fg(QUOTE_TEXT);
-                    style_stack.push(style);
+                    in_quote = true;
+                    styles.push(Style::default().fg(QUOTE_TEXT));
                 }
                 Event::End(TagEnd::BlockQuote(_)) => {
-                    in_blockquote = false;
-                    style_stack.pop();
-                    if !current_spans.is_empty() {
-                        // Prepend quote bar
-                        let mut with_bar = vec![Span::styled(
-                            "  \u{2502} ".to_string(),
-                            Style::default().fg(QUOTE_BAR),
-                        )];
-                        with_bar.extend(std::mem::take(&mut current_spans));
-                        lines.push(Line::from(with_bar));
+                    in_quote = false;
+                    styles.pop();
+                    if !spans.is_empty() {
+                        let mut row = vec![Span::styled("  \u{2502} ", Style::default().fg(QUOTE_BAR))];
+                        row.extend(std::mem::take(&mut spans));
+                        lines.push(Line::from(row));
                     }
                 }
-                Event::Text(text) => {
-                    if in_code_block {
-                        code_content.push_str(&text);
-                    } else {
-                        let style = *style_stack.last().unwrap_or(&Style::default());
-                        if in_blockquote {
-                            // Add quote bar prefix for each line in blockquote
-                            for (i, tline) in text.lines().enumerate() {
-                                if i > 0 || !current_spans.is_empty() {
-                                    if !current_spans.is_empty() {
-                                        let mut with_bar = vec![Span::styled(
-                                            "  \u{2502} ".to_string(),
-                                            Style::default().fg(QUOTE_BAR),
-                                        )];
-                                        with_bar.extend(std::mem::take(&mut current_spans));
-                                        lines.push(Line::from(with_bar));
-                                    }
-                                }
-                                current_spans.push(Span::styled(tline.to_string(), style));
-                            }
-                        } else {
-                            current_spans.push(Span::styled(text.to_string(), style));
-                        }
-                    }
-                }
-                Event::Code(code) => {
-                    current_spans.push(Span::styled(
-                        format!(" {} ", code),
-                        Style::default().fg(INLINE_CODE_FG).bg(INLINE_CODE_BG),
-                    ));
-                }
-                Event::SoftBreak | Event::HardBreak => {
-                    if !current_spans.is_empty() {
-                        lines.push(Line::from(std::mem::take(&mut current_spans)));
-                    }
-                }
-                Event::Rule => {
-                    lines.push(Line::from(Span::styled(
-                        "  \u{2500}".repeat(20),
-                        Style::default().fg(RULE_COLOR),
-                    )));
-                    lines.push(Line::default());
-                }
-                // Table: collect all rows first, then render with aligned columns
-                Event::Start(Tag::Table(_)) => {
-                    _in_table = true;
-                    table_header.clear();
-                    table_rows.clear();
-                }
+
+                // Tables
+                Event::Start(Tag::Table(_)) => { table_header.clear(); table_rows.clear(); }
                 Event::End(TagEnd::Table) => {
-                    _in_table = false;
-                    // Render the complete table with aligned columns
                     render_table(&mut lines, &table_header, &table_rows);
-                    table_header.clear();
-                    table_rows.clear();
+                    table_header.clear(); table_rows.clear();
                 }
-                Event::Start(Tag::TableHead) => {
-                    collecting_header = true;
-                    table_row.clear();
-                }
+                Event::Start(Tag::TableHead) => { collecting_header = true; table_row.clear(); }
                 Event::End(TagEnd::TableHead) => {
                     collecting_header = false;
                     table_header = table_row.clone();
                     table_row.clear();
                 }
-                Event::Start(Tag::TableRow) => {
-                    table_row.clear();
-                }
+                Event::Start(Tag::TableRow) => { table_row.clear(); }
                 Event::End(TagEnd::TableRow) => {
-                    if !collecting_header {
-                        table_rows.push(table_row.clone());
-                    }
+                    if !collecting_header { table_rows.push(table_row.clone()); }
                     table_row.clear();
                 }
                 Event::Start(Tag::TableCell) => {}
                 Event::End(TagEnd::TableCell) => {
-                    let cell_text: String = current_spans.iter()
-                        .map(|s| s.content.to_string())
-                        .collect();
-                    table_row.push(cell_text.trim().to_string());
-                    current_spans.clear();
+                    let cell: String = spans.iter().map(|s| s.content.to_string()).collect();
+                    table_row.push(cell.trim().to_string());
+                    spans.clear();
+                }
+
+                // Text
+                Event::Text(text) => {
+                    if in_code {
+                        code_buf.push_str(&text);
+                    } else if in_quote {
+                        for (i, tl) in text.lines().enumerate() {
+                            if i > 0 || !spans.is_empty() {
+                                if !spans.is_empty() {
+                                    let mut row = vec![Span::styled("  \u{2502} ", Style::default().fg(QUOTE_BAR))];
+                                    row.extend(std::mem::take(&mut spans));
+                                    lines.push(Line::from(row));
+                                }
+                            }
+                            spans.push(Span::styled(tl.to_string(), cur_style(&styles)));
+                        }
+                    } else {
+                        spans.push(Span::styled(text.to_string(), cur_style(&styles)));
+                    }
+                }
+                Event::Code(code) => {
+                    spans.push(Span::styled(
+                        format!(" {} ", code),
+                        Style::default().fg(INLINE_CODE_FG).bg(INLINE_CODE_BG),
+                    ));
+                }
+                Event::SoftBreak | Event::HardBreak => { flush(&mut lines, &mut spans); }
+                Event::Rule => {
+                    lines.push(Line::from(Span::styled("\u{2500}".repeat(40), Style::default().fg(RULE))));
+                    lines.push(Line::default());
                 }
                 _ => {}
             }
         }
 
-        if !current_spans.is_empty() {
-            lines.push(Line::from(current_spans));
-        }
-
+        if !spans.is_empty() { lines.push(Line::from(spans)); }
         lines
     }
 
-    fn render_code_block(&self, code: &str, lang: &str) -> Vec<Line<'static>> {
-        let mut lines: Vec<Line<'static>> = Vec::new();
-        let border = Style::default().fg(CODE_BORDER);
-
-        // Top border
-        let label = if !lang.is_empty() {
-            format!(" {} ", lang)
-        } else {
-            String::new()
-        };
-        lines.push(Line::from(vec![
-            Span::styled("\u{256d}\u{2500}", border),
-            Span::styled(
-                label,
-                Style::default().fg(Color::Rgb(120, 120, 130)).add_modifier(Modifier::ITALIC),
-            ),
-            Span::styled(
-                "\u{2500}".repeat(38),
-                border,
-            ),
-        ]));
-
-        // Code
+    /// Syntax-highlighted code with background color, no borders.
+    fn highlight(&self, code: &str, lang: &str) -> Vec<Line<'static>> {
         let syntax = if lang.is_empty() {
             self.syntax_set.find_syntax_plain_text()
         } else {
-            self.syntax_set
-                .find_syntax_by_token(lang)
+            self.syntax_set.find_syntax_by_token(lang)
                 .unwrap_or_else(|| self.syntax_set.find_syntax_plain_text())
         };
 
-        let mut highlighter = HighlightLines::new(syntax, &self.theme);
+        let mut hl = HighlightLines::new(syntax, &self.theme);
 
-        for code_line in code.lines() {
-            let mut spans: Vec<Span<'static>> = vec![
-                Span::styled("\u{2502} ", border),
+        code.lines().map(|line| {
+            let regions = hl.highlight_line(line, &self.syntax_set).unwrap_or_default();
+            let mut s: Vec<Span<'static>> = vec![
+                Span::styled("  ", Style::default().bg(CODE_BG)), // left margin
             ];
-
-            let regions = highlighter
-                .highlight_line(code_line, &self.syntax_set)
-                .unwrap_or_default();
-
             for (style, text) in regions {
                 let fg = Color::Rgb(style.foreground.r, style.foreground.g, style.foreground.b);
-                spans.push(Span::styled(
-                    text.to_string(),
-                    Style::default().fg(fg).bg(CODE_BG),
-                ));
+                s.push(Span::styled(text.to_string(), Style::default().fg(fg).bg(CODE_BG)));
             }
-
-            lines.push(Line::from(spans));
-        }
-
-        // Bottom border
-        lines.push(Line::from(Span::styled(
-            format!("\u{2570}{}", "\u{2500}".repeat(40)),
-            border,
-        )));
-
-        lines
+            // Pad right side with bg
+            s.push(Span::styled("  ", Style::default().bg(CODE_BG)));
+            Line::from(s)
+        }).collect()
     }
 }
 
-/// Render a table with properly aligned columns, clean separators.
-fn render_table(lines: &mut Vec<Line<'static>>, header: &[String], rows: &[Vec<String>]) {
-    if header.is_empty() {
-        return;
+fn cur_style(stack: &[Style]) -> Style {
+    *stack.last().unwrap_or(&Style::default().fg(TEXT))
+}
+
+fn flush(lines: &mut Vec<Line<'static>>, spans: &mut Vec<Span<'static>>) {
+    if !spans.is_empty() {
+        lines.push(Line::from(std::mem::take(spans)));
     }
+}
 
-    let col_count = header.len();
-
-    // Calculate column widths
+fn render_table(lines: &mut Vec<Line<'static>>, header: &[String], rows: &[Vec<String>]) {
+    if header.is_empty() { return; }
+    let cols = header.len();
     let mut widths: Vec<usize> = header.iter().map(|h| h.chars().count()).collect();
     for row in rows {
         for (i, cell) in row.iter().enumerate() {
-            if i < widths.len() {
-                widths[i] = widths[i].max(cell.chars().count());
-            }
+            if i < widths.len() { widths[i] = widths[i].max(cell.chars().count()); }
         }
     }
-
-    // Pad each width by 2 for breathing room
     let widths: Vec<usize> = widths.iter().map(|w| w + 2).collect();
-
-    let sep_color = Style::default().fg(RULE_COLOR);
-    let header_style = Style::default().fg(BOLD_TEXT).add_modifier(Modifier::BOLD);
-    let cell_style = Style::default().fg(TEXT);
-    let dim_style = Style::default().fg(DIM);
 
     lines.push(Line::default());
 
-    // Header row
-    let mut hspans: Vec<Span<'static>> = Vec::new();
-    for (i, h) in header.iter().enumerate() {
-        let w = widths.get(i).copied().unwrap_or(10);
-        hspans.push(Span::styled(format!(" {:<width$}", h, width = w), header_style));
-        if i + 1 < col_count {
-            hspans.push(Span::styled(" ", dim_style));
-        }
+    // Header
+    let mut h: Vec<Span<'static>> = Vec::new();
+    for (i, hdr) in header.iter().enumerate() {
+        let w = widths.get(i).copied().unwrap_or(8);
+        h.push(Span::styled(format!(" {:<width$}", hdr, width = w),
+            Style::default().fg(BOLD_TEXT).add_modifier(Modifier::BOLD)));
     }
-    lines.push(Line::from(hspans));
+    lines.push(Line::from(h));
 
     // Separator
-    let mut sep_spans: Vec<Span<'static>> = Vec::new();
+    let mut sep: Vec<Span<'static>> = Vec::new();
     for (i, w) in widths.iter().enumerate() {
-        sep_spans.push(Span::styled(" ".to_string() + &"\u{2500}".repeat(*w), sep_color));
-        if i + 1 < col_count {
-            sep_spans.push(Span::styled("\u{2500}", sep_color));
-        }
+        sep.push(Span::styled(format!(" {}", "\u{2500}".repeat(*w)), Style::default().fg(RULE)));
+        if i + 1 < cols { sep.push(Span::styled("\u{2500}", Style::default().fg(RULE))); }
     }
-    lines.push(Line::from(sep_spans));
+    lines.push(Line::from(sep));
 
-    // Data rows
+    // Rows
     for row in rows {
-        let mut rspans: Vec<Span<'static>> = Vec::new();
-        for (i, cell) in row.iter().enumerate() {
-            let w = widths.get(i).copied().unwrap_or(10);
-            rspans.push(Span::styled(format!(" {:<width$}", cell, width = w), cell_style));
-            if i + 1 < col_count {
-                rspans.push(Span::styled(" ", dim_style));
-            }
+        let mut r: Vec<Span<'static>> = Vec::new();
+        for i in 0..cols {
+            let cell = row.get(i).map(|s| s.as_str()).unwrap_or("");
+            let w = widths.get(i).copied().unwrap_or(8);
+            r.push(Span::styled(format!(" {:<width$}", cell, width = w), Style::default().fg(TEXT)));
         }
-        // Fill missing columns
-        for i in row.len()..col_count {
-            let w = widths.get(i).copied().unwrap_or(10);
-            rspans.push(Span::styled(format!(" {:<width$}", "", width = w), cell_style));
-            if i + 1 < col_count {
-                rspans.push(Span::styled(" ", dim_style));
-            }
-        }
-        lines.push(Line::from(rspans));
+        lines.push(Line::from(r));
     }
-
     lines.push(Line::default());
 }
 
@@ -467,11 +343,8 @@ mod tests {
     fn test_bold_text() {
         let lines = render_markdown("Hello **bold** world");
         assert!(!lines.is_empty());
-        let has_bold = lines.iter().any(|line| {
-            line.spans
-                .iter()
-                .any(|s| s.style.add_modifier.contains(Modifier::BOLD))
-        });
+        let has_bold = lines.iter().any(|l| l.spans.iter().any(|s|
+            s.style.add_modifier.contains(Modifier::BOLD)));
         assert!(has_bold);
     }
 
@@ -479,11 +352,8 @@ mod tests {
     fn test_heading() {
         let lines = render_markdown("# Title");
         assert!(!lines.is_empty());
-        let has_bold = lines.iter().any(|line| {
-            line.spans
-                .iter()
-                .any(|s| s.style.add_modifier.contains(Modifier::BOLD))
-        });
+        let has_bold = lines.iter().any(|l| l.spans.iter().any(|s|
+            s.style.add_modifier.contains(Modifier::BOLD)));
         assert!(has_bold);
     }
 
@@ -491,10 +361,8 @@ mod tests {
     fn test_code_block() {
         let md = "```rust\nfn main() {}\n```";
         let lines = render_markdown(md);
-        assert!(lines.len() >= 3);
-        let has_lang = lines.iter().any(|line| {
-            line.spans.iter().any(|s| s.content.contains("rust"))
-        });
+        assert!(lines.len() >= 2);
+        let has_lang = lines.iter().any(|l| l.spans.iter().any(|s| s.content.contains("rust")));
         assert!(has_lang);
     }
 
