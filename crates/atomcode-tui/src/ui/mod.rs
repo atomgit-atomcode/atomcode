@@ -53,10 +53,12 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     if show_welcome && app.mode.is_normal() {
         welcome::render(frame, chunks[1], app);
     } else {
+        let turn_elapsed = app.turn_start.map(|t| t.elapsed().as_secs());
+        let turn_seed = app.conversation.messages.len();
         chat_panel::render(
             frame, chunks[1], &app.conversation,
             app.scroll_offset, app.at_bottom, &app.mode, app.tick_count,
-            app.turn_tokens,
+            app.turn_tokens, turn_elapsed, turn_seed,
             &mut app.render_cache, &mut app.render_cache_msg_count,
         );
     }

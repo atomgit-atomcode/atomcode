@@ -45,6 +45,8 @@ pub fn render(
     mode: &AppMode,
     tick: usize,
     turn_tokens: usize,
+    turn_elapsed_secs: Option<u64>,
+    turn_label_seed: usize,
     render_cache: &mut Vec<Line<'static>>,
     render_cache_msg_count: &mut usize,
 ) {
@@ -101,28 +103,22 @@ pub fn render(
         }
     }
 
-    // Active state indicator with label + token count
+    // Active state indicator: spinner + label (fixed per turn) + stats
     let spinner = SPINNER[tick % SPINNER.len()];
-    let token_info = if turn_tokens > 0 {
-        format!("  {}t", format_compact_tokens(turn_tokens))
-    } else {
-        String::new()
-    };
+
+    // Build stats string: elapsed | tokens | speed
+    let stats = build_turn_stats(turn_elapsed_secs, turn_tokens);
 
     match mode {
         AppMode::Streaming => {
-            // Pick a stable label per turn (changes every ~8 ticks = 2 seconds)
-            let label_idx = (conversation.messages.len() + tick / 8) % THINKING_LABELS.len();
-            let label = THINKING_LABELS[label_idx];
+            // One label per turn — stable, based on seed (message count at turn start)
+            let label = THINKING_LABELS[turn_label_seed % THINKING_LABELS.len()];
             dynamic.push(Line::from(vec![
                 Span::styled(
                     format!("    {} {}", spinner, label),
                     Style::default().fg(ACCENT),
                 ),
-                Span::styled(
-                    token_info.clone(),
-                    Style::default().fg(DIM),
-                ),
+                Span::styled(stats.clone(), Style::default().fg(DIM)),
             ]));
         }
         AppMode::ToolExecuting => {
@@ -131,10 +127,7 @@ pub fn render(
                     format!("    {} Executing...", spinner),
                     Style::default().fg(WARN),
                 ),
-                Span::styled(
-                    token_info.clone(),
-                    Style::default().fg(DIM),
-                ),
+                Span::styled(stats.clone(), Style::default().fg(DIM)),
             ]));
         }
         AppMode::WaitingApproval(call) => {
@@ -331,6 +324,38 @@ fn capitalize(name: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// Build stats string: "  12s | 1.2k tokens | 98 t/s"
+fn build_turn_stats(elapsed_secs: Option<u64>, tokens: usize) -> String {
+    let mut parts: Vec<String> = Vec::new();
+
+    if let Some(secs) = elapsed_secs {
+        if secs >= 60 {
+            parts.push(format!("{}m{}s", secs / 60, secs % 60));
+        } else {
+            parts.push(format!("{}s", secs));
+        }
+    }
+
+    if tokens > 0 {
+        parts.push(format!("{} tokens", format_compact_tokens(tokens)));
+        // Token speed
+        if let Some(secs) = elapsed_secs {
+            if secs > 0 {
+                let speed = tokens as f64 / secs as f64;
+                if speed >= 1.0 {
+                    parts.push(format!("{:.0} t/s", speed));
+                }
+            }
+        }
+    }
+
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!("  {}", parts.join(" | "))
+    }
 }
 
 fn format_compact_tokens(n: usize) -> String {
