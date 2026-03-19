@@ -85,6 +85,11 @@ pub fn render(
     // Streaming buffer
     if let Some(ref buffer) = conversation.stream_buffer {
         if !buffer.is_empty() {
+            // AI marker at start of streaming response
+            logical_lines.push(Line::from(Span::styled(
+                "  \u{2759} ",
+                Style::default().fg(ACCENT),
+            )));
             let md = render_markdown(buffer);
             for line in md {
                 let mut spans = vec![Span::raw("    ".to_string())];
@@ -168,6 +173,11 @@ fn render_user(lines: &mut Vec<Line<'static>>, content: &str) {
 }
 
 fn render_assistant(lines: &mut Vec<Line<'static>>, content: &str) {
+    // AI marker on first line
+    lines.push(Line::from(Span::styled(
+        "  \u{2759} ",  // ❙ thin bar marker
+        Style::default().fg(ACCENT),
+    )));
     let md = render_markdown(content);
     for line in md {
         let mut spans = vec![Span::raw("    ".to_string())];

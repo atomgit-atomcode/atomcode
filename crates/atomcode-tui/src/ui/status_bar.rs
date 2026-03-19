@@ -55,21 +55,21 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         Style::default().fg(FG),
     ));
 
-    // Elapsed time (shown when working or just finished)
-    let time_str = if let Some(start) = app.turn_start {
-        let elapsed = start.elapsed();
-        format!(" {}s ", elapsed.as_secs())
+    // Elapsed time (cumulative for current turn)
+    let (time_str, time_color) = if let Some(start) = app.turn_start {
+        let secs = start.elapsed().as_secs();
+        (format_duration(secs), Color::Rgb(240, 180, 40)) // yellow while active
     } else if let Some(dur) = app.last_turn_duration {
-        format!(" {}s ", dur.as_secs())
+        (format_duration(dur.as_secs()), Color::Rgb(80, 180, 100)) // green when done
     } else {
-        String::new()
+        (String::new(), DIM)
     };
 
     if !time_str.is_empty() {
         spans.push(Span::styled(SEP, Style::default().fg(DIM)));
         spans.push(Span::styled(
             time_str,
-            Style::default().fg(DIM),
+            Style::default().fg(time_color),
         ));
     }
 
@@ -107,5 +107,14 @@ fn shorten_path(path: &str) -> String {
         }
     } else {
         shortened
+    }
+}
+
+/// Format seconds into human-readable duration.
+fn format_duration(secs: u64) -> String {
+    if secs < 60 {
+        format!(" {}s ", secs)
+    } else {
+        format!(" {}m{}s ", secs / 60, secs % 60)
     }
 }
