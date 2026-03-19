@@ -4,6 +4,7 @@ use crossterm::event::{Event, EventStream, KeyEvent, MouseEvent, MouseEventKind}
 use futures::StreamExt;
 use tokio::sync::mpsc;
 
+use atomcode_core::stream::TokenUsage;
 use atomcode_core::tool::{ToolCall, ToolResult};
 
 #[derive(Debug)]
@@ -13,6 +14,7 @@ pub enum AppEvent {
     StreamToolCallStart { id: String, name: String },
     StreamToolCallDelta(String),
     StreamToolCallDone(ToolCall),
+    StreamUsage(TokenUsage),
     StreamDone,
     StreamError(String),
     ToolFinished(ToolResult),

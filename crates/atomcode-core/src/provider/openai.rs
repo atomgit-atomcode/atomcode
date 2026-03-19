@@ -86,6 +86,13 @@ impl OpenAiProvider {
 #[derive(Deserialize)]
 struct ChatChunk {
     choices: Vec<ChunkChoice>,
+    usage: Option<ChunkUsage>,
+}
+
+#[derive(Deserialize)]
+struct ChunkUsage {
+    prompt_tokens: Option<usize>,
+    completion_tokens: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -126,6 +133,7 @@ impl LlmProvider for OpenAiProvider {
             "model": self.model,
             "messages": Self::format_messages(messages),
             "stream": true,
+            "stream_options": { "include_usage": true },
         });
 
         if let Some(tool_defs) = tools {
@@ -200,6 +208,15 @@ impl LlmProvider for OpenAiProvider {
                             return;
                         }
                         if let Ok(chunk) = serde_json::from_str::<ChatChunk>(data) {
+                            // Extract token usage if present (sent in final chunk)
+                            if let Some(usage) = &chunk.usage {
+                                let _ = tx.send(Ok(StreamEvent::Usage(
+                                    crate::stream::TokenUsage {
+                                        prompt_tokens: usage.prompt_tokens.unwrap_or(0),
+                                        completion_tokens: usage.completion_tokens.unwrap_or(0),
+                                    }
+                                )));
+                            }
                             for choice in chunk.choices {
                                 if let Some(content) = choice.delta.content {
                                     if !content.is_empty() {

@@ -243,11 +243,12 @@ impl App {
         match event {
             AppEvent::Key(key) => self.handle_key(key, event_tx),
             AppEvent::StreamDelta(text) => {
-                // Estimate tokens (~4 chars per token)
-                let est = (text.len() + 3) / 4;
-                self.turn_tokens += est;
-                self.total_tokens += est;
                 self.conversation.push_delta(&text);
+            }
+            AppEvent::StreamUsage(usage) => {
+                let total = usage.prompt_tokens + usage.completion_tokens;
+                self.turn_tokens += total;
+                self.total_tokens += total;
             }
             AppEvent::StreamDone => {
                 self.conversation.finalize_stream();
@@ -685,11 +686,7 @@ impl App {
             return;
         }
 
-        // Estimate input tokens
-        let input_tokens = (content.len() + 3) / 4;
-        self.turn_tokens = input_tokens;
-        self.total_tokens += input_tokens;
-
+        self.turn_tokens = 0;
         self.conversation.add_user_message(&content);
         self.input.clear();
         self.mode = AppMode::Streaming;
@@ -722,6 +719,9 @@ impl App {
                             }
                             Ok(StreamEvent::ToolCallDone(call)) => {
                                 let _ = tx.send(AppEvent::StreamToolCallDone(call));
+                            }
+                            Ok(StreamEvent::Usage(usage)) => {
+                                let _ = tx.send(AppEvent::StreamUsage(usage));
                             }
                             Ok(StreamEvent::Done) => {
                                 let _ = tx.send(AppEvent::StreamDone);
@@ -878,6 +878,9 @@ impl App {
                             }
                             Ok(StreamEvent::ToolCallDone(call)) => {
                                 let _ = tx.send(AppEvent::StreamToolCallDone(call));
+                            }
+                            Ok(StreamEvent::Usage(usage)) => {
+                                let _ = tx.send(AppEvent::StreamUsage(usage));
                             }
                             Ok(StreamEvent::Done) => {
                                 let _ = tx.send(AppEvent::StreamDone);

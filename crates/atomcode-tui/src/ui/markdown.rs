@@ -5,21 +5,21 @@ use syntect::easy::HighlightLines;
 use syntect::highlighting::{Theme, ThemeSet};
 use syntect::parsing::SyntaxSet;
 
-// Muted, professional palette
-const TEXT: Color = Color::Rgb(190, 190, 195);
-const BOLD_TEXT: Color = Color::Rgb(230, 230, 235);
-const H1_COLOR: Color = Color::Rgb(140, 200, 255);
-const H2_COLOR: Color = Color::Rgb(180, 160, 255);
-const H3_COLOR: Color = Color::Rgb(160, 210, 180);
-const LINK_COLOR: Color = Color::Rgb(120, 160, 255);
-const INLINE_CODE_FG: Color = Color::Rgb(200, 170, 130);
-const INLINE_CODE_BG: Color = Color::Rgb(40, 40, 48);
-const CODE_BG: Color = Color::Rgb(25, 25, 32);
-const CODE_BORDER: Color = Color::Rgb(50, 50, 58);
-const BULLET_COLOR: Color = Color::Rgb(100, 100, 110);
-const QUOTE_BAR: Color = Color::Rgb(60, 60, 70);
-const QUOTE_TEXT: Color = Color::Rgb(140, 140, 150);
-const RULE_COLOR: Color = Color::Rgb(45, 45, 52);
+// Clean, readable palette — bright enough to read, muted enough to not strain
+const TEXT: Color = Color::Rgb(210, 210, 215);
+const BOLD_TEXT: Color = Color::Rgb(245, 245, 250);
+const H1_COLOR: Color = Color::Rgb(120, 180, 255);
+const H2_COLOR: Color = Color::Rgb(170, 150, 255);
+const H3_COLOR: Color = Color::Rgb(140, 200, 170);
+const LINK_COLOR: Color = Color::Rgb(100, 150, 255);
+const INLINE_CODE_FG: Color = Color::Rgb(220, 185, 140);
+const INLINE_CODE_BG: Color = Color::Rgb(38, 38, 46);
+const CODE_BG: Color = Color::Rgb(22, 22, 30);
+const CODE_BORDER: Color = Color::Rgb(48, 48, 56);
+const BULLET_COLOR: Color = Color::Rgb(120, 130, 150);
+const QUOTE_BAR: Color = Color::Rgb(70, 70, 85);
+const QUOTE_TEXT: Color = Color::Rgb(160, 160, 175);
+const RULE_COLOR: Color = Color::Rgb(50, 50, 60);
 
 pub fn render_markdown(input: &str) -> Vec<Line<'static>> {
     static RENDERER: std::sync::OnceLock<MarkdownRenderer> = std::sync::OnceLock::new();

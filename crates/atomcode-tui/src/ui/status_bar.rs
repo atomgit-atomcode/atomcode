@@ -73,33 +73,41 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         ));
     }
 
-    // Token counter
-    let token_str = if app.total_tokens > 0 {
+    // Right side: tokens + model (right-aligned, like Claude Code)
+    let token_badge = if app.total_tokens > 0 {
         if app.turn_tokens > 0 && app.turn_start.is_some() {
-            format!("~{}t (+{})", format_tokens(app.total_tokens), format_tokens(app.turn_tokens))
+            format!("{} (+{}) tokens", format_tokens(app.total_tokens), format_tokens(app.turn_tokens))
         } else {
-            format!("~{}t", format_tokens(app.total_tokens))
+            format!("{} tokens", format_tokens(app.total_tokens))
         }
     } else {
         String::new()
     };
 
-    if !token_str.is_empty() {
-        spans.push(Span::styled(SEP, Style::default().fg(DIM)));
-        spans.push(Span::styled(
-            token_str,
-            Style::default().fg(DIM),
-        ));
-    }
+    let right_parts: Vec<String> = vec![token_badge, model.to_string()]
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect();
+    let right = format!(" {} ", right_parts.join("  "));
 
-    // Right side: model name (right-aligned)
-    let right = format!(" {} ", model);
     let left_len: usize = spans.iter().map(|s| s.content.len()).sum();
     let pad = width.saturating_sub(left_len + right.len());
 
     spans.push(Span::styled(" ".repeat(pad), Style::default()));
+
+    // Token count
+    if app.total_tokens > 0 {
+        let badge = if app.turn_tokens > 0 && app.turn_start.is_some() {
+            format!(" {} (+{}) tokens ", format_tokens(app.total_tokens), format_tokens(app.turn_tokens))
+        } else {
+            format!(" {} tokens ", format_tokens(app.total_tokens))
+        };
+        spans.push(Span::styled(badge, Style::default().fg(DIM)));
+        spans.push(Span::styled(SEP, Style::default().fg(DIM)));
+    }
+
     spans.push(Span::styled(
-        right,
+        format!(" {} ", model),
         Style::default().fg(DIM),
     ));
 
