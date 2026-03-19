@@ -248,16 +248,23 @@ impl App {
             self.working_dir.join(path)
         };
 
-        match std::fs::canonicalize(&new_path) {
-            Ok(resolved) if resolved.is_dir() => {
-                self.working_dir = resolved.clone();
-                // Persist to config
-                self.config.default_workdir = Some(resolved.to_string_lossy().to_string());
-                let _ = self.config.save(&Config::default_path());
-                (true, format!("Changed working directory to {}", resolved.display()))
-            }
-            Ok(_) => (false, format!("Not a directory: {}", new_path.display())),
-            Err(e) => (false, format!("Cannot access {}: {}", new_path.display(), e)),
+        // Try canonicalize first, fall back to direct path check
+        let resolved = std::fs::canonicalize(&new_path)
+            .unwrap_or_else(|_| new_path.clone());
+
+        if resolved.is_dir() {
+            self.working_dir = resolved.clone();
+            self.config.default_workdir = Some(resolved.to_string_lossy().to_string());
+            let _ = self.config.save(&Config::default_path());
+            (true, format!("Changed working directory to {}", resolved.display()))
+        } else if new_path.is_dir() {
+            // canonicalize failed but path exists as dir
+            self.working_dir = new_path.clone();
+            self.config.default_workdir = Some(new_path.to_string_lossy().to_string());
+            let _ = self.config.save(&Config::default_path());
+            (true, format!("Changed working directory to {}", new_path.display()))
+        } else {
+            (false, format!("Not a directory: {}", new_path.display()))
         }
     }
 
@@ -265,6 +272,50 @@ impl App {
     pub fn change_working_dir(&mut self, path: &str) {
         let (_, msg) = self.try_change_dir(path);
         self.conversation.push_delta(&msg);
+        self.conversation.finalize_stream();
+    }
+
+    /// If the AI ended the turn without giving a summary (just tool calls, no final text),
+    /// auto-generate a brief summary from the tool results.
+    fn maybe_add_auto_summary(&mut self) {
+        use atomcode_core::conversation::message::{MessageContent, Role};
+
+        let msgs = &self.conversation.messages;
+        if msgs.is_empty() { return; }
+
+        // Check if the turn had tool calls
+        let had_tools = msgs.iter().rev().take(20).any(|m|
+            matches!(&m.content, MessageContent::AssistantWithToolCalls { .. } | MessageContent::ToolResult(_))
+        );
+        if !had_tools { return; }
+
+        // Check if the last message is a text assistant response (= AI gave summary)
+        let last = &msgs[msgs.len() - 1];
+        if matches!(&last.content, MessageContent::Text(s) if matches!(last.role, Role::Assistant) && s.len() > 10) {
+            return; // AI already gave a summary
+        }
+
+        // Build auto-summary from recent tool results
+        let mut actions: Vec<String> = Vec::new();
+        let mut had_error = false;
+        for msg in msgs.iter().rev().take(20) {
+            match &msg.content {
+                MessageContent::ToolResult(r) => {
+                    if !r.success { had_error = true; }
+                    let summary: String = r.output.lines().next().unwrap_or("").chars().take(60).collect();
+                    actions.push(summary);
+                }
+                MessageContent::Text(_) if matches!(msg.role, Role::User) => break, // stop at user message
+                _ => {}
+            }
+        }
+        actions.reverse();
+
+        if actions.is_empty() { return; }
+
+        let status = if had_error { "[DONE with errors]" } else { "[DONE]" };
+        let summary = format!("{} {} actions completed.", status, actions.len());
+        self.conversation.push_delta(&summary);
         self.conversation.finalize_stream();
     }
 
@@ -315,6 +366,10 @@ impl App {
             }
             AppEvent::StreamDone => {
                 self.conversation.finalize_stream();
+
+                // Auto-generate summary if the turn had tool calls but AI ended without text
+                self.maybe_add_auto_summary();
+
                 self.mode = AppMode::Normal;
                 self.at_bottom = true;
                 self.retry_count = 0;
