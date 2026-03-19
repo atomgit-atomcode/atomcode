@@ -11,6 +11,7 @@ use serde_json::json;
 use crate::config::provider::ProviderConfig;
 use crate::conversation::message::{Message, MessageContent, Role};
 use crate::stream::StreamEvent;
+use crate::tool::ToolDef;
 
 use super::LlmProvider;
 
@@ -42,19 +43,41 @@ impl OpenAiProvider {
         messages
             .iter()
             .map(|m| {
-                json!({
-                    "role": match m.role {
-                        Role::System => "system",
-                        Role::User => "user",
-                        Role::Assistant => "assistant",
-                        Role::Tool => "tool",
-                    },
-                    "content": match &m.content {
-                        MessageContent::Text(s) => s.as_str(),
-                        MessageContent::AssistantWithToolCalls { text, .. } => text.as_deref().unwrap_or(""),
-                        MessageContent::ToolResult(r) => &r.output,
-                    },
-                })
+                match &m.content {
+                    MessageContent::Text(s) => {
+                        let role = match m.role {
+                            Role::System => "system",
+                            Role::User => "user",
+                            Role::Assistant => "assistant",
+                            Role::Tool => "tool",
+                        };
+                        json!({"role": role, "content": s})
+                    }
+                    MessageContent::AssistantWithToolCalls { text, tool_calls } => {
+                        let mut msg = json!({
+                            "role": "assistant",
+                        });
+                        if let Some(t) = text {
+                            msg["content"] = json!(t);
+                        }
+                        msg["tool_calls"] = json!(tool_calls.iter().map(|tc| json!({
+                            "id": tc.id,
+                            "type": "function",
+                            "function": {
+                                "name": tc.name,
+                                "arguments": tc.arguments,
+                            }
+                        })).collect::<Vec<_>>());
+                        msg
+                    }
+                    MessageContent::ToolResult(r) => {
+                        json!({
+                            "role": "tool",
+                            "tool_call_id": r.call_id,
+                            "content": r.output,
+                        })
+                    }
+                }
             })
             .collect()
     }
@@ -74,6 +97,21 @@ struct ChunkChoice {
 #[derive(Deserialize)]
 struct ChunkDelta {
     content: Option<String>,
+    tool_calls: Option<Vec<DeltaToolCall>>,
+}
+
+#[derive(Deserialize)]
+struct DeltaToolCall {
+    #[allow(dead_code)]
+    index: Option<usize>,
+    id: Option<String>,
+    function: Option<DeltaFunction>,
+}
+
+#[derive(Deserialize)]
+struct DeltaFunction {
+    name: Option<String>,
+    arguments: Option<String>,
 }
 
 #[async_trait]
@@ -81,13 +119,28 @@ impl LlmProvider for OpenAiProvider {
     fn chat_stream(
         &self,
         messages: &[Message],
+        tools: Option<&[ToolDef]>,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
         let url = normalize_base_url(&self.base_url);
-        let body = json!({
+        let mut body = json!({
             "model": self.model,
             "messages": Self::format_messages(messages),
             "stream": true,
         });
+
+        if let Some(tool_defs) = tools {
+            if !tool_defs.is_empty() {
+                body["tools"] = json!(tool_defs.iter().map(|td| json!({
+                    "type": "function",
+                    "function": {
+                        "name": td.name,
+                        "description": td.description,
+                        "parameters": td.parameters,
+                    }
+                })).collect::<Vec<_>>());
+                body["parallel_tool_calls"] = json!(false);
+            }
+        }
 
         let request = self
             .client
@@ -121,6 +174,9 @@ impl LlmProvider for OpenAiProvider {
 
             let mut buffer = String::new();
             let mut byte_stream = response.bytes_stream();
+            let mut tc_id = String::new();
+            let mut tc_name = String::new();
+            let mut tc_args = String::new();
 
             while let Some(chunk) = byte_stream.next().await {
                 let text = match chunk {
@@ -150,9 +206,43 @@ impl LlmProvider for OpenAiProvider {
                                         let _ = tx.send(Ok(StreamEvent::Delta(content)));
                                     }
                                 }
-                                if choice.finish_reason.is_some() {
-                                    let _ = tx.send(Ok(StreamEvent::Done));
-                                    return;
+                                if let Some(tool_calls) = &choice.delta.tool_calls {
+                                    for tc in tool_calls {
+                                        if let Some(id) = &tc.id {
+                                            tc_id = id.clone();
+                                            if let Some(func) = &tc.function {
+                                                tc_name = func.name.clone().unwrap_or_default();
+                                            }
+                                            let _ = tx.send(Ok(StreamEvent::ToolCallStart {
+                                                id: tc_id.clone(),
+                                                name: tc_name.clone(),
+                                            }));
+                                        }
+                                        if let Some(func) = &tc.function {
+                                            if let Some(args) = &func.arguments {
+                                                tc_args.push_str(args);
+                                                let _ = tx.send(Ok(StreamEvent::ToolCallDelta(args.clone())));
+                                            }
+                                        }
+                                    }
+                                }
+                                if let Some(ref reason) = choice.finish_reason {
+                                    match reason.as_str() {
+                                        "tool_calls" => {
+                                            let _ = tx.send(Ok(StreamEvent::ToolCallDone(
+                                                crate::tool::ToolCall {
+                                                    id: tc_id.clone(),
+                                                    name: tc_name.clone(),
+                                                    arguments: tc_args.clone(),
+                                                }
+                                            )));
+                                            return;
+                                        }
+                                        "stop" | _ => {
+                                            let _ = tx.send(Ok(StreamEvent::Done));
+                                            return;
+                                        }
+                                    }
                                 }
                             }
                         }

@@ -11,6 +11,7 @@ use serde_json::json;
 use crate::config::provider::ProviderConfig;
 use crate::conversation::message::{Message, MessageContent, Role};
 use crate::stream::StreamEvent;
+use crate::tool::ToolDef;
 
 use super::LlmProvider;
 
@@ -70,6 +71,7 @@ impl LlmProvider for OllamaProvider {
     fn chat_stream(
         &self,
         messages: &[Message],
+        _tools: Option<&[ToolDef]>,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
         let url = format!("{}/api/chat", self.base_url);
         let body = json!({

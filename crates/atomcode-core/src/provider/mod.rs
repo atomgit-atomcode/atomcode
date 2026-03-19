@@ -11,12 +11,14 @@ use futures::Stream;
 use crate::config::provider::ProviderConfig;
 use crate::conversation::message::Message;
 use crate::stream::StreamEvent;
+use crate::tool::ToolDef;
 
 #[async_trait]
 pub trait LlmProvider: Send + Sync {
     fn chat_stream(
         &self,
         messages: &[Message],
+        tools: Option<&[ToolDef]>,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>>;
 
     fn model_name(&self) -> &str;

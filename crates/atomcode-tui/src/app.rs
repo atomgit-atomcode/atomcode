@@ -391,7 +391,7 @@ impl App {
         let messages = self.conversation.to_provider_messages(&system_prompt);
 
         let tx = event_tx.clone();
-        let stream_result = self.provider.chat_stream(&messages);
+        let stream_result = self.provider.chat_stream(&messages, None);
 
         tokio::spawn(async move {
             match stream_result {
