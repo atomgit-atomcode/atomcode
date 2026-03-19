@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use crossterm::event::{Event, EventStream, KeyEvent, MouseEvent, MouseEventKind};
+use crossterm::event::{Event, EventStream, KeyEvent};
 use futures::StreamExt;
 use tokio::sync::mpsc;
 
@@ -18,8 +18,6 @@ pub enum AppEvent {
     StreamDone,
     StreamError(String),
     ToolFinished(ToolResult),
-    ScrollUp(u16),
-    ScrollDown(u16),
     Resize(u16, u16),
     Tick,
 }
@@ -48,14 +46,8 @@ impl EventLoop {
                     Some(Ok(evt)) => {
                         let app_event = match evt {
                             Event::Key(key) => AppEvent::Key(key),
-                            Event::Mouse(MouseEvent { kind: MouseEventKind::ScrollUp, .. }) => {
-                                AppEvent::ScrollUp(3)
-                            }
-                            Event::Mouse(MouseEvent { kind: MouseEventKind::ScrollDown, .. }) => {
-                                AppEvent::ScrollDown(3)
-                            }
                             Event::Resize(w, h) => AppEvent::Resize(w, h),
-                            _ => continue, // Other mouse events (click/drag) ignored — terminal handles selection
+                            _ => continue, // No mouse tracking — terminal handles everything natively
                         };
                         if tx.send(app_event).is_err() {
                             break;

@@ -48,7 +48,6 @@ async fn main() {
         let _ = crossterm::terminal::disable_raw_mode();
         let _ = crossterm::execute!(
             std::io::stdout(),
-            crossterm::event::DisableMouseCapture,
             crossterm::terminal::LeaveAlternateScreen,
         );
         eprintln!("\nAtomCode crashed: {}", info);
@@ -63,7 +62,6 @@ async fn main() {
         let _ = crossterm::terminal::disable_raw_mode();
         let _ = crossterm::execute!(
             std::io::stdout(),
-            crossterm::event::DisableMouseCapture,
             crossterm::terminal::LeaveAlternateScreen,
         );
         eprintln!("\nAtomCode error: {:#}", e);

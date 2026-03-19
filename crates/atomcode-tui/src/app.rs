@@ -600,24 +600,6 @@ impl App {
                 }
                 self.handle_tool_result(result, event_tx);
             }
-            AppEvent::ScrollUp(n) => {
-                if self.at_bottom {
-                    // Use cached line count instead of recomputing render_markdown for all messages
-                    let total = self.render_cache.len();
-                    self.scroll_offset = total.saturating_sub(n as usize);
-                    self.at_bottom = false;
-                } else {
-                    self.scroll_offset = self.scroll_offset.saturating_sub(n as usize);
-                }
-            }
-            AppEvent::ScrollDown(n) => {
-                self.scroll_offset += n as usize;
-                // Re-engage at_bottom when scrolled past the end
-                let total = self.render_cache.len();
-                if self.scroll_offset >= total {
-                    self.at_bottom = true;
-                }
-            }
             AppEvent::Resize(_, _) => {}
             AppEvent::Tick => {
                 self.tick_count = self.tick_count.wrapping_add(1);
@@ -1190,8 +1172,7 @@ impl App {
                 help.push_str("  `/quit` — Exit\n");
                 help.push_str("\n**Copy text:**\n\n");
                 help.push_str("  `/copy` — Copy last AI response to clipboard\n");
-                help.push_str("  `Option+drag` — Native text selection (iTerm2/Alacritty)\n");
-                help.push_str("  `Fn+drag` — Native text selection (macOS Terminal)\n");
+                help.push_str("  `Drag+Cmd+C` — Native text selection & copy (all terminals)\n");
                 self.conversation.push_delta(&help);
                 self.conversation.finalize_stream();
             }
