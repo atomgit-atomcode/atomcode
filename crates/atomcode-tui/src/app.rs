@@ -530,6 +530,7 @@ impl App {
             let result = match tool_name.as_str() {
                 "read_file" => atomcode_core::tool::read::ReadFileTool.execute(&args).await,
                 "write_file" => atomcode_core::tool::write::WriteFileTool.execute(&args).await,
+                "edit_file" => atomcode_core::tool::edit::EditFileTool.execute(&args).await,
                 "bash" => atomcode_core::tool::bash::BashTool::new(working_dir).execute(&args).await,
                 _ => Err(anyhow::anyhow!("Unknown tool: {}", tool_name)),
             };

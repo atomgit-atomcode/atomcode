@@ -11,6 +11,7 @@ use atomcode_core::provider::create_provider;
 use atomcode_core::tool::ToolRegistry;
 use atomcode_core::tool::read::ReadFileTool;
 use atomcode_core::tool::write::WriteFileTool;
+use atomcode_core::tool::edit::EditFileTool;
 use atomcode_core::tool::bash::BashTool;
 
 #[derive(Parser)]
@@ -68,6 +69,7 @@ async fn main() -> Result<()> {
     let mut tool_registry = ToolRegistry::new();
     tool_registry.register(Box::new(ReadFileTool));
     tool_registry.register(Box::new(WriteFileTool));
+    tool_registry.register(Box::new(EditFileTool));
     tool_registry.register(Box::new(BashTool::new(working_dir.clone())));
 
     atomcode_tui::run(config, provider, tool_registry, working_dir).await

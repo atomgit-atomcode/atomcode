@@ -10,9 +10,13 @@ use provider::ProviderConfig;
 
 pub const DEFAULT_SYSTEM_PROMPT: &str = "You are AtomCode, an AI coding assistant running in a terminal. Be concise and helpful.
 
-You have access to tools: read_file, write_file, and bash. Use them to help the user with coding tasks.
+You have access to tools: read_file, write_file, edit_file, and bash. Use them to help the user with coding tasks.
 
-IMPORTANT: All file paths should be relative to the working directory unless the user specifies an absolute path. When using bash, commands execute in the working directory.";
+IMPORTANT:
+- All file paths should be relative to the working directory unless the user specifies an absolute path.
+- When using bash, commands execute in the working directory.
+- Prefer edit_file over write_file when modifying existing files — it does precise string replacement instead of rewriting the whole file.
+- edit_file requires old_string to be unique in the file. Include enough surrounding context to ensure uniqueness.";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
