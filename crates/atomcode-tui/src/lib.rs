@@ -2,6 +2,7 @@ pub mod app;
 pub mod command;
 pub mod event;
 pub mod file_attach;
+pub mod project_context;
 pub mod provider_manager;
 pub mod ui;
 
