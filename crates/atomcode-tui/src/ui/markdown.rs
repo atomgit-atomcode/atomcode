@@ -1,19 +1,26 @@
-use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd, HeadingLevel};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{Theme, ThemeSet};
 use syntect::parsing::SyntaxSet;
 
-const CODE_BG: Color = Color::Rgb(30, 30, 30);
-const CODE_BORDER: Color = Color::Rgb(60, 60, 60);
-const INLINE_CODE_BG: Color = Color::Rgb(45, 45, 45);
-const HEADING_COLOR: Color = Color::Rgb(100, 200, 255);
-const LINK_COLOR: Color = Color::Rgb(100, 150, 255);
-const LIST_BULLET_COLOR: Color = Color::Rgb(120, 120, 120);
+// Muted, professional palette
+const TEXT: Color = Color::Rgb(190, 190, 195);
+const BOLD_TEXT: Color = Color::Rgb(230, 230, 235);
+const H1_COLOR: Color = Color::Rgb(140, 200, 255);
+const H2_COLOR: Color = Color::Rgb(180, 160, 255);
+const H3_COLOR: Color = Color::Rgb(160, 210, 180);
+const LINK_COLOR: Color = Color::Rgb(120, 160, 255);
+const INLINE_CODE_FG: Color = Color::Rgb(200, 170, 130);
+const INLINE_CODE_BG: Color = Color::Rgb(40, 40, 48);
+const CODE_BG: Color = Color::Rgb(25, 25, 32);
+const CODE_BORDER: Color = Color::Rgb(50, 50, 58);
+const BULLET_COLOR: Color = Color::Rgb(100, 100, 110);
+const QUOTE_BAR: Color = Color::Rgb(60, 60, 70);
+const QUOTE_TEXT: Color = Color::Rgb(140, 140, 150);
+const RULE_COLOR: Color = Color::Rgb(45, 45, 52);
 
-/// Render a markdown string into a Vec of ratatui Lines.
-/// Uses a cached singleton renderer to avoid reloading syntect on every call.
 pub fn render_markdown(input: &str) -> Vec<Line<'static>> {
     static RENDERER: std::sync::OnceLock<MarkdownRenderer> = std::sync::OnceLock::new();
     let renderer = RENDERER.get_or_init(MarkdownRenderer::new);
@@ -39,32 +46,47 @@ impl MarkdownRenderer {
 
         let mut lines: Vec<Line<'static>> = Vec::new();
         let mut current_spans: Vec<Span<'static>> = Vec::new();
-        let mut style_stack: Vec<Style> = vec![Style::default().fg(Color::Rgb(200, 200, 200))];
+        let mut style_stack: Vec<Style> = vec![Style::default().fg(TEXT)];
         let mut in_code_block = false;
         let mut code_lang = String::new();
         let mut code_content = String::new();
         let mut list_depth: usize = 0;
         let mut ordered_index: Option<u64> = None;
+        let mut in_blockquote = false;
 
         for event in parser {
             match event {
-                Event::Start(Tag::Heading { level: _, .. }) => {
+                Event::Start(Tag::Heading { level, .. }) => {
+                    // Blank line before heading for breathing room
+                    if !lines.is_empty() {
+                        lines.push(Line::default());
+                    }
+                    let color = match level {
+                        HeadingLevel::H1 => H1_COLOR,
+                        HeadingLevel::H2 => H2_COLOR,
+                        _ => H3_COLOR,
+                    };
                     let style = Style::default()
-                        .fg(HEADING_COLOR)
+                        .fg(color)
                         .add_modifier(Modifier::BOLD);
                     style_stack.push(style);
-                    // Don't show # prefix — just style the text
                 }
-                Event::End(TagEnd::Heading(_)) => {
+                Event::End(TagEnd::Heading(level)) => {
                     style_stack.pop();
                     if !current_spans.is_empty() {
                         lines.push(Line::from(std::mem::take(&mut current_spans)));
                     }
-                    lines.push(Line::default());
+                    // Underline for H1
+                    if level == HeadingLevel::H1 {
+                        lines.push(Line::from(Span::styled(
+                            "\u{2500}".repeat(40),
+                            Style::default().fg(RULE_COLOR),
+                        )));
+                    }
                 }
                 Event::Start(Tag::Strong) => {
                     let mut style = *style_stack.last().unwrap_or(&Style::default());
-                    style = style.add_modifier(Modifier::BOLD);
+                    style = style.fg(BOLD_TEXT).add_modifier(Modifier::BOLD);
                     style_stack.push(style);
                 }
                 Event::End(TagEnd::Strong) => {
@@ -107,6 +129,7 @@ impl MarkdownRenderer {
                     if !current_spans.is_empty() {
                         lines.push(Line::from(std::mem::take(&mut current_spans)));
                     }
+                    // Single blank line between paragraphs
                     lines.push(Line::default());
                 }
                 Event::Start(Tag::List(start)) => {
@@ -115,22 +138,20 @@ impl MarkdownRenderer {
                 }
                 Event::End(TagEnd::List(_)) => {
                     list_depth = list_depth.saturating_sub(1);
-                    if list_depth == 0 {
-                        lines.push(Line::default());
-                    }
+                    ordered_index = None;
                 }
                 Event::Start(Tag::Item) => {
                     let indent = "  ".repeat(list_depth);
                     if let Some(idx) = &mut ordered_index {
                         current_spans.push(Span::styled(
-                            format!("{}{}. ", indent, idx),
-                            Style::default().fg(LIST_BULLET_COLOR),
+                            format!("{}{:>2}. ", indent, idx),
+                            Style::default().fg(BULLET_COLOR),
                         ));
                         *idx += 1;
                     } else {
                         current_spans.push(Span::styled(
-                            format!("{}\u{2022} ", indent),
-                            Style::default().fg(LIST_BULLET_COLOR),
+                            format!("{}  - ", indent),
+                            Style::default().fg(BULLET_COLOR),
                         ));
                     }
                 }
@@ -140,33 +161,53 @@ impl MarkdownRenderer {
                     }
                 }
                 Event::Start(Tag::BlockQuote(_)) => {
-                    let style = Style::default().fg(Color::Rgb(140, 140, 140));
+                    in_blockquote = true;
+                    let style = Style::default().fg(QUOTE_TEXT);
                     style_stack.push(style);
-                    current_spans.push(Span::styled(
-                        "\u{2502} ".to_string(),
-                        Style::default().fg(Color::Rgb(80, 80, 80)),
-                    ));
                 }
                 Event::End(TagEnd::BlockQuote(_)) => {
+                    in_blockquote = false;
                     style_stack.pop();
                     if !current_spans.is_empty() {
-                        lines.push(Line::from(std::mem::take(&mut current_spans)));
+                        // Prepend quote bar
+                        let mut with_bar = vec![Span::styled(
+                            "  \u{2502} ".to_string(),
+                            Style::default().fg(QUOTE_BAR),
+                        )];
+                        with_bar.extend(std::mem::take(&mut current_spans));
+                        lines.push(Line::from(with_bar));
                     }
-                    lines.push(Line::default());
                 }
                 Event::Text(text) => {
                     if in_code_block {
                         code_content.push_str(&text);
                     } else {
                         let style = *style_stack.last().unwrap_or(&Style::default());
-                        current_spans.push(Span::styled(text.to_string(), style));
+                        if in_blockquote {
+                            // Add quote bar prefix for each line in blockquote
+                            for (i, tline) in text.lines().enumerate() {
+                                if i > 0 || !current_spans.is_empty() {
+                                    if !current_spans.is_empty() {
+                                        let mut with_bar = vec![Span::styled(
+                                            "  \u{2502} ".to_string(),
+                                            Style::default().fg(QUOTE_BAR),
+                                        )];
+                                        with_bar.extend(std::mem::take(&mut current_spans));
+                                        lines.push(Line::from(with_bar));
+                                    }
+                                }
+                                current_spans.push(Span::styled(tline.to_string(), style));
+                            }
+                        } else {
+                            current_spans.push(Span::styled(text.to_string(), style));
+                        }
                     }
                 }
                 Event::Code(code) => {
-                    let style = Style::default()
-                        .fg(Color::Rgb(220, 180, 120))
-                        .bg(INLINE_CODE_BG);
-                    current_spans.push(Span::styled(format!(" {} ", code), style));
+                    current_spans.push(Span::styled(
+                        format!(" {} ", code),
+                        Style::default().fg(INLINE_CODE_FG).bg(INLINE_CODE_BG),
+                    ));
                 }
                 Event::SoftBreak | Event::HardBreak => {
                     if !current_spans.is_empty() {
@@ -175,8 +216,8 @@ impl MarkdownRenderer {
                 }
                 Event::Rule => {
                     lines.push(Line::from(Span::styled(
-                        "\u{2500}".repeat(50),
-                        Style::default().fg(Color::Rgb(60, 60, 60)),
+                        "  \u{2500}".repeat(20),
+                        Style::default().fg(RULE_COLOR),
                     )));
                     lines.push(Line::default());
                 }
@@ -191,34 +232,29 @@ impl MarkdownRenderer {
         lines
     }
 
-    /// Render a code block with language label, border, and syntax highlighting.
     fn render_code_block(&self, code: &str, lang: &str) -> Vec<Line<'static>> {
         let mut lines: Vec<Line<'static>> = Vec::new();
-        let border_style = Style::default().fg(CODE_BORDER);
+        let border = Style::default().fg(CODE_BORDER);
 
-        // Top border with language label
-        if !lang.is_empty() {
-            lines.push(Line::from(vec![
-                Span::styled("\u{256d}\u{2500} ", border_style),
-                Span::styled(
-                    lang.to_string(),
-                    Style::default()
-                        .fg(Color::Rgb(150, 150, 150))
-                        .add_modifier(Modifier::ITALIC),
-                ),
-                Span::styled(
-                    format!(" {}", "\u{2500}".repeat(40)),
-                    border_style,
-                ),
-            ]));
+        // Top border
+        let label = if !lang.is_empty() {
+            format!(" {} ", lang)
         } else {
-            lines.push(Line::from(Span::styled(
-                format!("\u{256d}{}", "\u{2500}".repeat(44)),
-                border_style,
-            )));
-        }
+            String::new()
+        };
+        lines.push(Line::from(vec![
+            Span::styled("\u{256d}\u{2500}", border),
+            Span::styled(
+                label,
+                Style::default().fg(Color::Rgb(120, 120, 130)).add_modifier(Modifier::ITALIC),
+            ),
+            Span::styled(
+                "\u{2500}".repeat(38),
+                border,
+            ),
+        ]));
 
-        // Code lines with syntax highlighting
+        // Code
         let syntax = if lang.is_empty() {
             self.syntax_set.find_syntax_plain_text()
         } else {
@@ -230,8 +266,9 @@ impl MarkdownRenderer {
         let mut highlighter = HighlightLines::new(syntax, &self.theme);
 
         for code_line in code.lines() {
-            let mut spans: Vec<Span<'static>> = Vec::new();
-            spans.push(Span::styled("\u{2502} ", border_style));
+            let mut spans: Vec<Span<'static>> = vec![
+                Span::styled("\u{2502} ", border),
+            ];
 
             let regions = highlighter
                 .highlight_line(code_line, &self.syntax_set)
@@ -250,10 +287,9 @@ impl MarkdownRenderer {
 
         // Bottom border
         lines.push(Line::from(Span::styled(
-            format!("\u{2570}{}", "\u{2500}".repeat(44)),
-            border_style,
+            format!("\u{2570}{}", "\u{2500}".repeat(40)),
+            border,
         )));
-        lines.push(Line::default());
 
         lines
     }
@@ -278,7 +314,7 @@ mod tests {
         let has_bold = lines.iter().any(|line| {
             line.spans
                 .iter()
-                .any(|s| s.style.add_modifier.contains(ratatui::style::Modifier::BOLD))
+                .any(|s| s.style.add_modifier.contains(Modifier::BOLD))
         });
         assert!(has_bold);
     }
@@ -290,7 +326,7 @@ mod tests {
         let has_bold = lines.iter().any(|line| {
             line.spans
                 .iter()
-                .any(|s| s.style.add_modifier.contains(ratatui::style::Modifier::BOLD))
+                .any(|s| s.style.add_modifier.contains(Modifier::BOLD))
         });
         assert!(has_bold);
     }
@@ -299,8 +335,7 @@ mod tests {
     fn test_code_block() {
         let md = "```rust\nfn main() {}\n```";
         let lines = render_markdown(md);
-        assert!(lines.len() >= 3); // top border + code + bottom border
-        // Should have language label
+        assert!(lines.len() >= 3);
         let has_lang = lines.iter().any(|line| {
             line.spans.iter().any(|s| s.content.contains("rust"))
         });

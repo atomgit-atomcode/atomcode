@@ -88,7 +88,7 @@ pub fn render(
     if let Some(ref buffer) = conversation.stream_buffer {
         if !buffer.is_empty() {
             dynamic.push(Line::from(Span::styled(
-                "  \u{2759} ",
+                "  \u{2502} ",
                 Style::default().fg(ACCENT),
             )));
             let md = render_markdown(buffer);
@@ -184,7 +184,7 @@ fn render_user(lines: &mut Vec<Line<'static>>, content: &str) {
     let style = Style::default().fg(Color::White).bg(USER_BG);
     for text_line in content.lines() {
         lines.push(Line::from(vec![
-            Span::styled("  \u{276f} ", Style::default().fg(ACCENT).bg(USER_BG)),
+            Span::styled("  > ", Style::default().fg(ACCENT).bg(USER_BG)),
             Span::styled(text_line.to_string(), style),
         ]));
     }
@@ -193,7 +193,7 @@ fn render_user(lines: &mut Vec<Line<'static>>, content: &str) {
 
 fn render_assistant(lines: &mut Vec<Line<'static>>, content: &str) {
     lines.push(Line::from(Span::styled(
-        "  \u{2759} ",
+        "  \u{2502} ",
         Style::default().fg(ACCENT),
     )));
     let md = render_markdown(content);
@@ -210,7 +210,7 @@ fn render_tool_call(lines: &mut Vec<Line<'static>>, call: &ToolCall) {
     lines.push(Line::from(vec![
         Span::styled("    \u{2502} ", border),
         Span::styled(
-            format!("\u{25b8} {}", name),
+            format!("> {}", name),
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
         ),
         Span::styled(
@@ -222,9 +222,9 @@ fn render_tool_call(lines: &mut Vec<Line<'static>>, call: &ToolCall) {
 
 fn render_tool_result(lines: &mut Vec<Line<'static>>, result: &ToolResult) {
     let (icon, color) = if result.success {
-        ("\u{2713}", SUCCESS)
+        ("+", SUCCESS)
     } else {
-        ("\u{2717}", ERROR)
+        ("x", ERROR)
     };
     let summary: String = result.output.lines().next().unwrap_or("").to_string();
     let summary: String = if summary.chars().count() > 70 {
@@ -246,7 +246,7 @@ fn render_approval(lines: &mut Vec<Line<'static>>, call: &ToolCall) {
     lines.push(Line::from(vec![
         Span::styled("    \u{256d}\u{2500} ", border),
         Span::styled(
-            format!("\u{26a0} {} ", name),
+            format!("! {} ", name),
             Style::default().fg(WARN).add_modifier(Modifier::BOLD),
         ),
         Span::styled("\u{2500}".repeat(30), border),
