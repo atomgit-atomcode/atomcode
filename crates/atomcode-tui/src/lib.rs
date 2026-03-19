@@ -7,6 +7,7 @@ pub mod ui;
 use anyhow::Result;
 use crossterm::{
     execute,
+    event::{EnableMouseCapture, DisableMouseCapture},
     terminal::{
         disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
         SetTitle, Clear, ClearType,
@@ -28,7 +29,7 @@ pub async fn run(config: Config, provider: Box<dyn LlmProvider>, tool_registry: 
     execute!(
         stdout,
         EnterAlternateScreen,
-        // No EnableMouseCapture — let terminal handle native mouse selection/copy
+        EnableMouseCapture, // Prevents terminal scrolling past alternate screen
         SetTitle("AtomCode"),
         Clear(ClearType::All),
     )?;
@@ -46,7 +47,7 @@ pub async fn run(config: Config, provider: Box<dyn LlmProvider>, tool_registry: 
 
         if let Some(file_path) = app.pending_editor.take() {
             disable_raw_mode()?;
-            execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+            execute!(terminal.backend_mut(), DisableMouseCapture, LeaveAlternateScreen)?;
             terminal.show_cursor()?;
 
             let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vim".to_string());
@@ -58,6 +59,7 @@ pub async fn run(config: Config, provider: Box<dyn LlmProvider>, tool_registry: 
             execute!(
                 terminal.backend_mut(),
                 EnterAlternateScreen,
+                EnableMouseCapture,
                 Clear(ClearType::All),
             )?;
             terminal.clear()?;
@@ -82,6 +84,7 @@ pub async fn run(config: Config, provider: Box<dyn LlmProvider>, tool_registry: 
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
+        DisableMouseCapture,
         LeaveAlternateScreen,
     )?;
     terminal.show_cursor()?;

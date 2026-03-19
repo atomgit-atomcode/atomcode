@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use crossterm::event::{Event, EventStream, KeyEvent};
+use crossterm::event::{Event, EventStream, KeyEvent, MouseEvent, MouseEventKind};
 use futures::StreamExt;
 use tokio::sync::mpsc;
 
@@ -48,8 +48,14 @@ impl EventLoop {
                     Some(Ok(evt)) => {
                         let app_event = match evt {
                             Event::Key(key) => AppEvent::Key(key),
+                            Event::Mouse(MouseEvent { kind: MouseEventKind::ScrollUp, .. }) => {
+                                AppEvent::ScrollUp(3)
+                            }
+                            Event::Mouse(MouseEvent { kind: MouseEventKind::ScrollDown, .. }) => {
+                                AppEvent::ScrollDown(3)
+                            }
                             Event::Resize(w, h) => AppEvent::Resize(w, h),
-                            _ => continue, // Mouse events go to terminal for native selection
+                            _ => continue, // Other mouse events (click/drag) ignored — terminal handles selection
                         };
                         if tx.send(app_event).is_err() {
                             break;
