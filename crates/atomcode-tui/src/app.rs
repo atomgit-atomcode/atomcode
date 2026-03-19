@@ -621,6 +621,33 @@ impl App {
                 ));
                 self.conversation.finalize_stream();
             }
+            "/copy" => {
+                // Find the last assistant text and copy to clipboard
+                let last_text = self.conversation.messages.iter().rev()
+                    .find_map(|m| {
+                        use atomcode_core::conversation::message::{MessageContent, Role};
+                        match &m.content {
+                            MessageContent::Text(s) if matches!(m.role, Role::Assistant) => Some(s.clone()),
+                            MessageContent::AssistantWithToolCalls { text: Some(t), .. } => Some(t.clone()),
+                            _ => None,
+                        }
+                    });
+                if let Some(text) = last_text {
+                    match copy_to_clipboard(&text) {
+                        Ok(_) => {
+                            self.conversation.push_delta("Copied to clipboard");
+                            self.conversation.finalize_stream();
+                        }
+                        Err(e) => {
+                            self.conversation.push_delta(&format!("Failed to copy: {}", e));
+                            self.conversation.finalize_stream();
+                        }
+                    }
+                } else {
+                    self.conversation.push_delta("No AI response to copy");
+                    self.conversation.finalize_stream();
+                }
+            }
             _ if cmd.starts_with("/cd ") || cmd == "/cd" => {
                 let arg = cmd.strip_prefix("/cd").unwrap().trim();
                 if arg.is_empty() {
@@ -651,10 +678,15 @@ impl App {
                     help.push_str(&format!("  `{}` — {}\n", cmd.name, cmd.description));
                 }
                 help.push_str("\n**Shortcuts:**\n\n");
-                help.push_str("  `ctrl+j` — Send message\n");
-                help.push_str("  `ctrl+c` — Quit\n");
-                help.push_str("  `Esc` — Quit (with confirmation)\n");
-                help.push_str("  `ctrl+Up/Down` — Scroll chat\n");
+                help.push_str("  `Enter` — Send message\n");
+                help.push_str("  `Esc` — Clear input\n");
+                help.push_str("  `Ctrl+Up/Down` — Scroll chat\n");
+                help.push_str("  `Tab` — Accept suggestion\n");
+                help.push_str("  `/quit` — Exit\n");
+                help.push_str("\n**Copy text:**\n\n");
+                help.push_str("  `/copy` — Copy last AI response to clipboard\n");
+                help.push_str("  `Option+drag` — Native text selection (iTerm2/Alacritty)\n");
+                help.push_str("  `Fn+drag` — Native text selection (macOS Terminal)\n");
                 self.conversation.push_delta(&help);
                 self.conversation.finalize_stream();
             }
@@ -903,6 +935,28 @@ impl App {
             }
         });
     }
+}
+
+/// Copy text to system clipboard (macOS: pbcopy, Linux: xclip/xsel).
+fn copy_to_clipboard(text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let cmd = if cfg!(target_os = "macos") {
+        "pbcopy"
+    } else {
+        "xclip"
+    };
+
+    let mut child = Command::new(cmd)
+        .stdin(Stdio::piped())
+        .spawn()?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(text.as_bytes())?;
+    }
+    child.wait()?;
+    Ok(())
 }
 
 #[derive(Debug, Clone)]

@@ -28,6 +28,10 @@ pub const COMMANDS: &[SlashCommand] = &[
         description: "Show available commands and shortcuts",
     },
     SlashCommand {
+        name: "/copy",
+        description: "Copy last AI response to clipboard",
+    },
+    SlashCommand {
         name: "/cd",
         description: "Change working directory",
     },
