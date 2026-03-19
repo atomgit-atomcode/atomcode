@@ -176,6 +176,17 @@ impl App {
         None
     }
 
+    /// Get the last tool call from conversation (the one that produced the current result).
+    fn get_last_tool_call(&self) -> Option<ToolCall> {
+        use atomcode_core::conversation::message::MessageContent;
+        for msg in self.conversation.messages.iter().rev() {
+            if let MessageContent::AssistantWithToolCalls { tool_calls, .. } = &msg.content {
+                return tool_calls.last().cloned();
+            }
+        }
+        None
+    }
+
     /// Try to change working directory. Returns (success, message).
     fn try_change_dir(&mut self, path: &str) -> (bool, String) {
         let new_path = if path.starts_with('/') || path.starts_with('~') {
@@ -756,12 +767,32 @@ impl App {
     }
 
     fn handle_tool_result(&mut self, mut result: ToolResult, event_tx: &mpsc::UnboundedSender<AppEvent>) {
-        // Intercept change_dir requests
+        // Intercept change_dir tool requests
         if result.output.starts_with("CD_REQUEST:") {
             let path = result.output.strip_prefix("CD_REQUEST:").unwrap().to_string();
             let (ok, msg) = self.try_change_dir(&path);
             result.output = msg;
             result.success = ok;
+        }
+
+        // Detect bash `cd` commands: check the last tool call to see if it was bash with cd
+        if result.success {
+            if let Some(last_call) = self.get_last_tool_call() {
+                if last_call.name == "bash" {
+                    if let Ok(args) = serde_json::from_str::<serde_json::Value>(&last_call.arguments) {
+                        if let Some(cmd) = args.get("command").and_then(|v| v.as_str()) {
+                            // Extract cd target from commands like "cd /path" or "cd /path && ..."
+                            let trimmed = cmd.trim();
+                            if trimmed.starts_with("cd ") {
+                                let cd_arg = trimmed[3..].split(&['&', ';', '|'][..]).next().unwrap_or("").trim();
+                                if !cd_arg.is_empty() {
+                                    let _ = self.try_change_dir(cd_arg);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         self.conversation.add_tool_result(result);
