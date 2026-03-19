@@ -91,6 +91,8 @@ pub struct App {
     pub render_cache_msg_count: usize,
     pub provider: Box<dyn LlmProvider>,
     pub config: Config,
+    /// CancellationToken for the current streaming/tool task.
+    pub cancel_token: tokio_util::sync::CancellationToken,
 }
 
 impl App {
@@ -144,6 +146,7 @@ impl App {
             render_cache_msg_count: 0,
             provider,
             config,
+            cancel_token: tokio_util::sync::CancellationToken::new(),
         }
     }
 
@@ -433,7 +436,7 @@ impl App {
                     let messages = self.conversation.to_provider_messages_windowed(&system_prompt, 20);
                     let tool_defs = self.tool_registry.get_definitions();
                     let stream_result = self.provider.chat_stream(&messages, Some(&tool_defs));
-                    spawn_stream_handler_delayed(stream_result, tx, wait_secs);
+                    spawn_stream_handler_delayed(stream_result, tx, wait_secs, self.cancel_token.clone());
                 }
             }
             AppEvent::StreamToolCallStart { id, name } => {
@@ -508,6 +511,7 @@ impl App {
             // Single Ctrl+C: cancel current operation
             match &self.mode {
                 AppMode::Streaming | AppMode::ToolExecuting => {
+                    self.cancel_token.cancel(); // Actually stop background tasks
                     self.conversation.stream_buffer = None;
                     self.conversation.tool_call_buffer = None;
                     self.conversation.finalize_stream();
@@ -1120,13 +1124,17 @@ impl App {
         self.turn_start = Some(Instant::now());
         self.last_turn_duration = None;
 
+        // Cancel any previous background tasks, then create a fresh token for this turn.
+        self.cancel_token.cancel();
+        self.cancel_token = tokio_util::sync::CancellationToken::new();
+
         let system_prompt = self.system_prompt();
         let messages = self.conversation.to_provider_messages_windowed(&system_prompt, 30);
         let tool_defs = self.tool_registry.get_definitions();
 
         let tx = event_tx.clone();
         let stream_result = self.provider.chat_stream(&messages, Some(&tool_defs));
-        spawn_stream_handler(stream_result, tx);
+        spawn_stream_handler(stream_result, tx, self.cancel_token.clone());
     }
 
     fn handle_tool_call(&mut self, call: ToolCall, event_tx: &mpsc::UnboundedSender<AppEvent>) {
@@ -1174,17 +1182,24 @@ impl App {
             }
         };
 
+        let cancel = self.cancel_token.clone();
         tokio::spawn(async move {
-            let result = tool.execute(&args, &ctx).await;
-            let tool_result = match result {
-                Ok(mut r) => { r.call_id = call_id; r }
-                Err(e) => ToolResult {
-                    call_id,
-                    output: format!("Error: {}", e),
-                    success: false,
-                },
-            };
-            let _ = tx.send(AppEvent::ToolFinished(tool_result));
+            tokio::select! {
+                _ = cancel.cancelled() => {
+                    // Tool was cancelled — don't send result
+                }
+                result = tool.execute(&args, &ctx) => {
+                    let tool_result = match result {
+                        Ok(mut r) => { r.call_id = call_id; r }
+                        Err(e) => ToolResult {
+                            call_id,
+                            output: format!("Error: {}", e),
+                            success: false,
+                        },
+                    };
+                    let _ = tx.send(AppEvent::ToolFinished(tool_result));
+                }
+            }
         });
     }
 
@@ -1258,7 +1273,7 @@ impl App {
 
         let tx = event_tx.clone();
         let stream_result = self.provider.chat_stream(&messages, Some(&tool_defs));
-        spawn_stream_handler(stream_result, tx);
+        spawn_stream_handler(stream_result, tx, self.cancel_token.clone());
     }
 }
 
@@ -1267,22 +1282,33 @@ impl App {
 fn spawn_stream_handler(
     stream_result: anyhow::Result<std::pin::Pin<Box<dyn futures::Stream<Item = anyhow::Result<StreamEvent>> + Send>>>,
     tx: mpsc::UnboundedSender<AppEvent>,
+    cancel: tokio_util::sync::CancellationToken,
 ) {
     tokio::spawn(async move {
         match stream_result {
             Ok(mut stream) => {
-                while let Some(event) = stream.next().await {
-                    let app_event = match event {
-                        Ok(StreamEvent::Delta(text)) => AppEvent::StreamDelta(text),
-                        Ok(StreamEvent::ToolCallStart { id, name }) => AppEvent::StreamToolCallStart { id, name },
-                        Ok(StreamEvent::ToolCallDelta(args)) => AppEvent::StreamToolCallDelta(args),
-                        Ok(StreamEvent::ToolCallDone(call)) => AppEvent::StreamToolCallDone(call),
-                        Ok(StreamEvent::Usage(usage)) => AppEvent::StreamUsage(usage),
-                        Ok(StreamEvent::Done) => { let _ = tx.send(AppEvent::StreamDone); break; }
-                        Ok(StreamEvent::Error(e)) => { let _ = tx.send(AppEvent::StreamError(e)); break; }
-                        Err(e) => { let _ = tx.send(AppEvent::StreamError(e.to_string())); break; }
-                    };
-                    if tx.send(app_event).is_err() { break; }
+                loop {
+                    tokio::select! {
+                        _ = cancel.cancelled() => { break; }
+                        event = stream.next() => {
+                            match event {
+                                None => break,
+                                Some(e) => {
+                                    let app_event = match e {
+                                        Ok(StreamEvent::Delta(text)) => AppEvent::StreamDelta(text),
+                                        Ok(StreamEvent::ToolCallStart { id, name }) => AppEvent::StreamToolCallStart { id, name },
+                                        Ok(StreamEvent::ToolCallDelta(args)) => AppEvent::StreamToolCallDelta(args),
+                                        Ok(StreamEvent::ToolCallDone(call)) => AppEvent::StreamToolCallDone(call),
+                                        Ok(StreamEvent::Usage(usage)) => AppEvent::StreamUsage(usage),
+                                        Ok(StreamEvent::Done) => { let _ = tx.send(AppEvent::StreamDone); break; }
+                                        Ok(StreamEvent::Error(e)) => { let _ = tx.send(AppEvent::StreamError(e)); break; }
+                                        Err(e) => { let _ = tx.send(AppEvent::StreamError(e.to_string())); break; }
+                                    };
+                                    if tx.send(app_event).is_err() { break; }
+                                }
+                            }
+                        }
+                    }
                 }
             }
             Err(e) => { let _ = tx.send(AppEvent::StreamError(e.to_string())); }
@@ -1295,23 +1321,37 @@ fn spawn_stream_handler_delayed(
     stream_result: anyhow::Result<std::pin::Pin<Box<dyn futures::Stream<Item = anyhow::Result<StreamEvent>> + Send>>>,
     tx: mpsc::UnboundedSender<AppEvent>,
     delay_secs: u64,
+    cancel: tokio_util::sync::CancellationToken,
 ) {
     tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+        tokio::select! {
+            _ = cancel.cancelled() => { return; }
+            _ = tokio::time::sleep(std::time::Duration::from_secs(delay_secs)) => {}
+        }
         match stream_result {
             Ok(mut stream) => {
-                while let Some(event) = stream.next().await {
-                    let app_event = match event {
-                        Ok(StreamEvent::Delta(text)) => AppEvent::StreamDelta(text),
-                        Ok(StreamEvent::ToolCallStart { id, name }) => AppEvent::StreamToolCallStart { id, name },
-                        Ok(StreamEvent::ToolCallDelta(args)) => AppEvent::StreamToolCallDelta(args),
-                        Ok(StreamEvent::ToolCallDone(call)) => AppEvent::StreamToolCallDone(call),
-                        Ok(StreamEvent::Usage(usage)) => AppEvent::StreamUsage(usage),
-                        Ok(StreamEvent::Done) => { let _ = tx.send(AppEvent::StreamDone); break; }
-                        Ok(StreamEvent::Error(e)) => { let _ = tx.send(AppEvent::StreamError(e)); break; }
-                        Err(e) => { let _ = tx.send(AppEvent::StreamError(e.to_string())); break; }
-                    };
-                    if tx.send(app_event).is_err() { break; }
+                loop {
+                    tokio::select! {
+                        _ = cancel.cancelled() => { break; }
+                        event = stream.next() => {
+                            match event {
+                                None => break,
+                                Some(e) => {
+                                    let app_event = match e {
+                                        Ok(StreamEvent::Delta(text)) => AppEvent::StreamDelta(text),
+                                        Ok(StreamEvent::ToolCallStart { id, name }) => AppEvent::StreamToolCallStart { id, name },
+                                        Ok(StreamEvent::ToolCallDelta(args)) => AppEvent::StreamToolCallDelta(args),
+                                        Ok(StreamEvent::ToolCallDone(call)) => AppEvent::StreamToolCallDone(call),
+                                        Ok(StreamEvent::Usage(usage)) => AppEvent::StreamUsage(usage),
+                                        Ok(StreamEvent::Done) => { let _ = tx.send(AppEvent::StreamDone); break; }
+                                        Ok(StreamEvent::Error(e)) => { let _ = tx.send(AppEvent::StreamError(e)); break; }
+                                        Err(e) => { let _ = tx.send(AppEvent::StreamError(e.to_string())); break; }
+                                    };
+                                    if tx.send(app_event).is_err() { break; }
+                                }
+                            }
+                        }
+                    }
                 }
             }
             Err(e) => { let _ = tx.send(AppEvent::StreamError(e.to_string())); }
