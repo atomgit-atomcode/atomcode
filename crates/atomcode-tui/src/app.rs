@@ -63,6 +63,12 @@ pub struct App {
     /// Duration of the last completed turn.
     pub last_turn_duration: Option<Duration>,
     pub working_dir: PathBuf,
+    /// Input history — past user prompts for Up/Down navigation.
+    pub input_history: Vec<String>,
+    /// Current position in input history (-1 = not browsing).
+    pub history_index: Option<usize>,
+    /// Stashed input text when entering history browse mode.
+    pub history_stash: Option<String>,
     /// Estimated token counts for the current session.
     pub total_tokens: usize,
     /// Tokens used in the current turn.
@@ -78,9 +84,22 @@ pub struct App {
 
 impl App {
     pub fn new(provider: Box<dyn LlmProvider>, config: Config, tool_registry: ToolRegistry, working_dir: PathBuf) -> Self {
+        let conversation = Conversation::load(&Conversation::history_path());
+        // Build input history from past user messages
+        let input_history: Vec<String> = conversation.messages.iter()
+            .filter_map(|m| {
+                use atomcode_core::conversation::message::{MessageContent, Role};
+                if matches!(m.role, Role::User) {
+                    if let MessageContent::Text(s) = &m.content {
+                        if !s.starts_with('/') { return Some(s.clone()); }
+                    }
+                }
+                None
+            })
+            .collect();
         Self {
             mode: AppMode::Normal,
-            conversation: Conversation::load(&Conversation::history_path()),
+            conversation,
             input: InputState::new(),
             scroll_offset: 0,
             at_bottom: true,
@@ -98,6 +117,9 @@ impl App {
             tool_start: None,
             last_turn_duration: None,
             working_dir,
+            input_history,
+            history_index: None,
+            history_stash: None,
             total_tokens: 0,
             turn_tokens: 0,
             suggestion: None,
@@ -605,21 +627,55 @@ impl App {
                 self.input.backspace();
             }
             (_, KeyCode::Up) => {
+                // Multi-line: move cursor up within input
                 if self.input.cursor_row > 0 {
                     self.input.cursor_row -= 1;
                     self.input.cursor_col = snap_to_char_boundary(
                         &self.input.lines[self.input.cursor_row],
                         self.input.cursor_col,
                     );
+                } else if !self.input_history.is_empty() {
+                    // Single line, at top: browse history
+                    if self.history_index.is_none() {
+                        // Stash current input
+                        self.history_stash = Some(self.input.content());
+                        self.history_index = Some(self.input_history.len().saturating_sub(1));
+                    } else if let Some(idx) = self.history_index {
+                        if idx > 0 {
+                            self.history_index = Some(idx - 1);
+                        }
+                    }
+                    if let Some(idx) = self.history_index {
+                        if let Some(hist) = self.input_history.get(idx) {
+                            self.input.clear();
+                            for c in hist.chars() { self.input.insert_char(c); }
+                        }
+                    }
                 }
             }
             (_, KeyCode::Down) => {
+                // Multi-line: move cursor down within input
                 if self.input.cursor_row + 1 < self.input.lines.len() {
                     self.input.cursor_row += 1;
                     self.input.cursor_col = snap_to_char_boundary(
                         &self.input.lines[self.input.cursor_row],
                         self.input.cursor_col,
                     );
+                } else if let Some(idx) = self.history_index {
+                    // Browsing history: go forward
+                    if idx + 1 < self.input_history.len() {
+                        self.history_index = Some(idx + 1);
+                        let hist = self.input_history[idx + 1].clone();
+                        self.input.clear();
+                        for c in hist.chars() { self.input.insert_char(c); }
+                    } else {
+                        // Past the end: restore stashed input
+                        self.history_index = None;
+                        self.input.clear();
+                        if let Some(stash) = self.history_stash.take() {
+                            for c in stash.chars() { self.input.insert_char(c); }
+                        }
+                    }
                 }
             }
             (_, KeyCode::Left) => {
@@ -835,6 +891,11 @@ impl App {
         if self.handle_slash_command() {
             return;
         }
+
+        // Add to input history
+        self.input_history.push(content.clone());
+        self.history_index = None;
+        self.history_stash = None;
 
         self.turn_tokens = 0;
         self.conversation.add_user_message(&content);
