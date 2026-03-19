@@ -9,7 +9,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::config::provider::ProviderConfig;
-use crate::conversation::message::{Message, Role};
+use crate::conversation::message::{Message, MessageContent, Role};
 use crate::stream::StreamEvent;
 
 use super::LlmProvider;
@@ -38,15 +38,23 @@ impl ClaudeProvider {
         let mut msgs = Vec::new();
 
         for m in messages {
+            let content_str = match &m.content {
+                MessageContent::Text(s) => s.as_str(),
+                MessageContent::AssistantWithToolCalls { text, .. } => text.as_deref().unwrap_or(""),
+                MessageContent::ToolResult(r) => &r.output,
+            };
             match m.role {
                 Role::System => {
-                    system = Some(m.content.clone());
+                    system = Some(content_str.to_string());
                 }
                 Role::User => {
-                    msgs.push(json!({"role": "user", "content": m.content}));
+                    msgs.push(json!({"role": "user", "content": content_str}));
                 }
                 Role::Assistant => {
-                    msgs.push(json!({"role": "assistant", "content": m.content}));
+                    msgs.push(json!({"role": "assistant", "content": content_str}));
+                }
+                Role::Tool => {
+                    msgs.push(json!({"role": "user", "content": content_str}));
                 }
             }
         }

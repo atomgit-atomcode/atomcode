@@ -5,7 +5,7 @@ use ratatui::widgets::{Paragraph, Wrap};
 use ratatui::Frame;
 
 use atomcode_core::conversation::Conversation;
-use atomcode_core::conversation::message::Role;
+use atomcode_core::conversation::message::{MessageContent, Role};
 
 use super::markdown::render_markdown;
 
@@ -25,14 +25,22 @@ pub fn render(
     let mut all_lines: Vec<Line<'static>> = Vec::new();
 
     for msg in &conversation.messages {
-        match msg.role {
-            Role::User => {
-                render_user_message(&mut all_lines, &msg.content);
+        match &msg.content {
+            MessageContent::Text(text) => {
+                match msg.role {
+                    Role::User => render_user_message(&mut all_lines, text),
+                    Role::Assistant => render_assistant_message(&mut all_lines, text),
+                    _ => {}
+                }
             }
-            Role::Assistant => {
-                render_assistant_message(&mut all_lines, &msg.content);
+            MessageContent::AssistantWithToolCalls { text, .. } => {
+                if let Some(t) = text {
+                    render_assistant_message(&mut all_lines, t);
+                }
             }
-            Role::System => {}
+            MessageContent::ToolResult(_result) => {
+                // Full rendering comes in Task 6
+            }
         }
     }
 
@@ -136,16 +144,28 @@ fn render_assistant_message(lines: &mut Vec<Line<'static>>, content: &str) {
 pub fn total_lines(conversation: &Conversation) -> usize {
     let mut count = 0;
     for msg in &conversation.messages {
-        match msg.role {
-            Role::User => {
-                // label(1) + blank(1) + content lines + blank(1) + separator(1) + blank(1) + top blank(1)
-                count += 6 + msg.content.lines().count();
+        match &msg.content {
+            MessageContent::Text(text) => {
+                match msg.role {
+                    Role::User => {
+                        // label(1) + blank(1) + content lines + blank(1) + separator(1) + blank(1) + top blank(1)
+                        count += 6 + text.lines().count();
+                    }
+                    Role::Assistant => {
+                        // label(1) + blank(1) + md lines + blank(1)
+                        count += 3 + render_markdown(text).len();
+                    }
+                    _ => {}
+                }
             }
-            Role::Assistant => {
-                // label(1) + blank(1) + md lines + blank(1)
-                count += 3 + render_markdown(&msg.content).len();
+            MessageContent::AssistantWithToolCalls { text, .. } => {
+                if let Some(t) = text {
+                    count += 3 + render_markdown(t).len();
+                }
             }
-            Role::System => {}
+            MessageContent::ToolResult(_) => {
+                // Will be rendered in Task 6
+            }
         }
     }
     if let Some(ref buffer) = conversation.stream_buffer {

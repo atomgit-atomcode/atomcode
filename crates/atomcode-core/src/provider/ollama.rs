@@ -9,7 +9,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::config::provider::ProviderConfig;
-use crate::conversation::message::{Message, Role};
+use crate::conversation::message::{Message, MessageContent, Role};
 use crate::stream::StreamEvent;
 
 use super::LlmProvider;
@@ -41,8 +41,13 @@ impl OllamaProvider {
                         Role::System => "system",
                         Role::User => "user",
                         Role::Assistant => "assistant",
+                        Role::Tool => "tool",
                     },
-                    "content": m.content,
+                    "content": match &m.content {
+                        MessageContent::Text(s) => s.as_str(),
+                        MessageContent::AssistantWithToolCalls { text, .. } => text.as_deref().unwrap_or(""),
+                        MessageContent::ToolResult(r) => &r.output,
+                    },
                 })
             })
             .collect()
