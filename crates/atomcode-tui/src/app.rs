@@ -45,6 +45,7 @@ pub struct App {
     pub provider_mgr: Option<ProviderManager>,
     pub tool_registry: ToolRegistry,
     pub tool_call_count: usize,
+    pub tick_count: usize,
     pub provider: Box<dyn LlmProvider>,
     pub config: Config,
 }
@@ -63,6 +64,7 @@ impl App {
             provider_mgr: None,
             tool_registry,
             tool_call_count: 0,
+            tick_count: 0,
             provider,
             config,
         }
@@ -105,7 +107,9 @@ impl App {
                 self.handle_tool_result(result, event_tx);
             }
             AppEvent::Resize(_, _) => {}
-            AppEvent::Tick => {}
+            AppEvent::Tick => {
+                self.tick_count = self.tick_count.wrapping_add(1);
+            }
         }
     }
 

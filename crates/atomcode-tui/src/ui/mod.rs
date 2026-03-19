@@ -12,8 +12,6 @@ use ratatui::Frame;
 use crate::app::App;
 
 pub fn render(frame: &mut Frame, app: &App) {
-    use crate::app::AppMode;
-
     // Provider manager takes over the full screen (except status bar)
     if app.mode.is_provider_manager() {
         let chunks = Layout::default()
@@ -48,14 +46,13 @@ pub fn render(frame: &mut Frame, app: &App) {
 
     status_bar::render(frame, chunks[0], app);
 
-    if show_welcome {
+    if show_welcome && app.mode.is_normal() {
         welcome::render(frame, chunks[1], app);
     } else {
-        let waiting_approval = match &app.mode {
-            AppMode::WaitingApproval(call) => Some(call),
-            _ => None,
-        };
-        chat_panel::render(frame, chunks[1], &app.conversation, app.scroll_offset, app.at_bottom, waiting_approval);
+        chat_panel::render(
+            frame, chunks[1], &app.conversation,
+            app.scroll_offset, app.at_bottom, &app.mode, app.tick_count,
+        );
     }
 
     input_box::render(frame, chunks[2], &app.input, app.mode.is_streaming_or_executing());
