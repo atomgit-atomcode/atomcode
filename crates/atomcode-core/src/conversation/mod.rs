@@ -123,6 +123,12 @@ impl Conversation {
         self.add_assistant_tool_calls(text.as_deref(), vec![tool_call]);
     }
 
+    /// Finalize the current stream buffer with multiple tool calls at once (multi-tool support).
+    pub fn finalize_stream_with_tool_calls(&mut self, tool_calls: &[ToolCall]) {
+        let text = self.stream_buffer.take();
+        self.add_assistant_tool_calls(text.as_deref(), tool_calls.to_vec());
+    }
+
     pub fn to_provider_messages(&self, system_prompt: &str) -> Vec<Message> {
         let mut msgs = Vec::with_capacity(self.messages.len() + 1);
         msgs.push(Message::new(Role::System, system_prompt));

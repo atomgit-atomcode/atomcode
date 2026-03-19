@@ -162,7 +162,7 @@ impl LlmProvider for OpenAiProvider {
                         "parameters": td.parameters,
                     }
                 })).collect::<Vec<_>>());
-                body["parallel_tool_calls"] = json!(false);
+                // Allow the model to decide whether to call multiple tools in parallel
             }
         }
 
@@ -198,9 +198,8 @@ impl LlmProvider for OpenAiProvider {
 
             let mut buffer = String::new();
             let mut byte_stream = response.bytes_stream();
-            let mut tc_id = String::new();
-            let mut tc_name = String::new();
-            let mut tc_args = String::new();
+            // Track multiple tool calls by index: Vec<(id, name, args)>
+            let mut tool_calls: Vec<(String, String, String)> = Vec::new();
 
             while let Some(chunk) = byte_stream.next().await {
                 let text = match chunk {
@@ -239,21 +238,27 @@ impl LlmProvider for OpenAiProvider {
                                         let _ = tx.send(Ok(StreamEvent::Delta(content)));
                                     }
                                 }
-                                if let Some(tool_calls) = &choice.delta.tool_calls {
-                                    for tc in tool_calls {
+                                if let Some(delta_tcs) = &choice.delta.tool_calls {
+                                    for tc in delta_tcs {
+                                        let idx = tc.index.unwrap_or(0);
+                                        // Grow the vec if this is a new tool call index
+                                        while tool_calls.len() <= idx {
+                                            tool_calls.push((String::new(), String::new(), String::new()));
+                                        }
+                                        let entry = &mut tool_calls[idx];
                                         if let Some(id) = &tc.id {
-                                            tc_id = id.clone();
+                                            entry.0 = id.clone();
                                             if let Some(func) = &tc.function {
-                                                tc_name = func.name.clone().unwrap_or_default();
+                                                entry.1 = func.name.clone().unwrap_or_default();
                                             }
                                             let _ = tx.send(Ok(StreamEvent::ToolCallStart {
-                                                id: tc_id.clone(),
-                                                name: tc_name.clone(),
+                                                id: entry.0.clone(),
+                                                name: entry.1.clone(),
                                             }));
                                         }
                                         if let Some(func) = &tc.function {
                                             if let Some(args) = &func.arguments {
-                                                tc_args.push_str(args);
+                                                entry.2.push_str(args);
                                                 let _ = tx.send(Ok(StreamEvent::ToolCallDelta(args.clone())));
                                             }
                                         }
@@ -262,13 +267,19 @@ impl LlmProvider for OpenAiProvider {
                                 if let Some(ref reason) = choice.finish_reason {
                                     match reason.as_str() {
                                         "tool_calls" => {
-                                            let _ = tx.send(Ok(StreamEvent::ToolCallDone(
-                                                crate::tool::ToolCall {
-                                                    id: tc_id.clone(),
-                                                    name: tc_name.clone(),
-                                                    arguments: tc_args.clone(),
-                                                }
-                                            )));
+                                            // Emit a ToolCallDone for every accumulated tool call
+                                            for (id, name, args) in &tool_calls {
+                                                let _ = tx.send(Ok(StreamEvent::ToolCallDone(
+                                                    crate::tool::ToolCall {
+                                                        id: id.clone(),
+                                                        name: name.clone(),
+                                                        arguments: args.clone(),
+                                                    }
+                                                )));
+                                            }
+                                            tool_calls.clear();
+                                            // Signal the end of this response turn
+                                            let _ = tx.send(Ok(StreamEvent::Done));
                                             return;
                                         }
                                         "stop" | _ => {

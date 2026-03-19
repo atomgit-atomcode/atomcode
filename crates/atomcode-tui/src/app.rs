@@ -94,6 +94,8 @@ pub struct App {
     pub config: Config,
     /// CancellationToken for the current streaming/tool task.
     pub cancel_token: tokio_util::sync::CancellationToken,
+    /// Buffered tool calls received during a single response turn (multi-tool support).
+    pub pending_tool_calls: Vec<ToolCall>,
 }
 
 impl App {
@@ -149,6 +151,7 @@ impl App {
             provider,
             config,
             cancel_token: tokio_util::sync::CancellationToken::new(),
+            pending_tool_calls: Vec::new(),
         }
     }
 
@@ -373,6 +376,22 @@ impl App {
                 self.total_tokens += usage.completion_tokens;
             }
             AppEvent::StreamDone => {
+                // If there are buffered tool calls (multi-tool response), process the first one.
+                // Each tool call's completion will trigger continue_agent_loop, which will
+                // process subsequent pending tool calls sequentially.
+                if !self.pending_tool_calls.is_empty() {
+                    let calls = std::mem::take(&mut self.pending_tool_calls);
+                    // Finalize the assistant message with ALL tool calls at once
+                    self.conversation.finalize_stream_with_tool_calls(&calls);
+                    // Execute the first tool; the rest are queued back as pending
+                    let mut remaining = calls.into_iter();
+                    if let Some(first_call) = remaining.next() {
+                        self.pending_tool_calls = remaining.collect();
+                        self.dispatch_tool_call(first_call, event_tx);
+                    }
+                    return;
+                }
+
                 self.conversation.finalize_stream();
 
                 // Auto-generate summary if the turn had tool calls but AI ended without text
@@ -453,7 +472,8 @@ impl App {
             }
             AppEvent::StreamToolCallDone(call) => {
                 self.conversation.tool_call_buffer = None;
-                self.handle_tool_call(call, event_tx);
+                // Buffer tool calls; they will all be processed when StreamDone arrives
+                self.pending_tool_calls.push(call);
             }
             AppEvent::ToolFinished(mut result) => {
                 // Append step duration to output
@@ -1145,8 +1165,8 @@ impl App {
         spawn_stream_handler(stream_result, tx, self.cancel_token.clone());
     }
 
-    fn handle_tool_call(&mut self, call: ToolCall, event_tx: &mpsc::UnboundedSender<AppEvent>) {
-        self.conversation.finalize_stream_with_tool_call(call.clone());
+    /// Execute a tool call that has already been recorded in conversation history.
+    fn dispatch_tool_call(&mut self, call: ToolCall, event_tx: &mpsc::UnboundedSender<AppEvent>) {
 
         if let Some(tool) = self.tool_registry.get(&call.name) {
             let approval = tool.approval(&call.arguments);
@@ -1277,8 +1297,17 @@ impl App {
             self.tool_call_count = 0;
         }
 
-        self.mode = AppMode::Streaming;
         self.at_bottom = true;
+
+        // If there are more pending tool calls from the same multi-tool response,
+        // execute the next one before continuing the agent loop.
+        if !self.pending_tool_calls.is_empty() {
+            let next_call = self.pending_tool_calls.remove(0);
+            self.dispatch_tool_call(next_call, event_tx);
+            return;
+        }
+
+        self.mode = AppMode::Streaming;
         self.continue_agent_loop(event_tx);
     }
 
