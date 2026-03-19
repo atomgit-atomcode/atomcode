@@ -5,10 +5,12 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::Parser;
 
+use atomcode_core::agent::AgentLoop;
 use atomcode_core::config::provider::ProviderConfig;
 use atomcode_core::config::Config;
+use atomcode_core::conversation::Conversation;
 use atomcode_core::provider::create_provider;
-use atomcode_core::tool::ToolRegistry;
+use atomcode_core::tool::{ToolContext, ToolRegistry};
 use atomcode_core::tool::read::ReadFileTool;
 use atomcode_core::tool::write::WriteFileTool;
 use atomcode_core::tool::edit::EditFileTool;
@@ -127,7 +129,22 @@ async fn run() -> Result<()> {
     tool_registry.register(Box::new(GlobTool));
     tool_registry.register(Box::new(ListDirTool));
 
-    atomcode_tui::run(config, provider, tool_registry, working_dir).await
+    // Derive model name for display in the status bar before giving provider to AgentLoop.
+    let model_name = provider_config.model.clone();
+
+    let tool_context = ToolContext::new(working_dir.clone());
+    let conversation = Conversation::load(&Conversation::history_path());
+
+    let (agent_loop, agent_handle) = AgentLoop::new(
+        config.clone(),
+        provider,
+        tool_registry,
+        tool_context.clone(),
+        conversation,
+    );
+    tokio::spawn(agent_loop.run());
+
+    atomcode_tui::run(config, model_name, agent_handle, tool_context, working_dir).await
 }
 
 fn first_run_wizard() -> Result<Config> {

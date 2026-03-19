@@ -17,14 +17,20 @@ use crossterm::{
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
+use atomcode_core::agent::AgentHandle;
 use atomcode_core::config::Config;
-use atomcode_core::provider::LlmProvider;
-use atomcode_core::tool::ToolRegistry;
+use atomcode_core::tool::ToolContext;
 
 use app::App;
-use event::EventLoop;
+use event::{AppEvent, EventLoop};
 
-pub async fn run(config: Config, provider: Box<dyn LlmProvider>, tool_registry: ToolRegistry, working_dir: std::path::PathBuf) -> Result<()> {
+pub async fn run(
+    config: Config,
+    model_name: String,
+    agent_handle: AgentHandle,
+    tool_context: ToolContext,
+    working_dir: std::path::PathBuf,
+) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
     execute!(
@@ -40,7 +46,7 @@ pub async fn run(config: Config, provider: Box<dyn LlmProvider>, tool_registry: 
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
 
-    let mut app = App::new(provider, config, tool_registry, working_dir);
+    let mut app = App::new(model_name, config, agent_handle, tool_context, working_dir);
     let mut event_loop = EventLoop::new();
     let event_tx = event_loop.sender();
     event_loop.start();
@@ -68,12 +74,40 @@ pub async fn run(config: Config, provider: Box<dyn LlmProvider>, tool_registry: 
             continue;
         }
 
-        if let Some(event) = event_loop.next().await {
-            app.handle_event(event, &event_tx);
-            loop {
-                match event_loop.try_next() {
-                    Some(event) => app.handle_event(event, &event_tx),
-                    None => break,
+        // Poll both TUI keyboard/tick events and AgentLoop events concurrently.
+        // We use two separate futures so neither blocks the other.
+        enum Wake {
+            Tui(AppEvent),
+            Agent(atomcode_core::agent::AgentEvent),
+        }
+
+        let tui_fut = event_loop.next();
+        let agent_fut = app.agent_handle.event_rx.recv();
+
+        let wake = tokio::select! {
+            Some(e) = tui_fut => Wake::Tui(e),
+            Some(e) = agent_fut => Wake::Agent(e),
+        };
+
+        match wake {
+            Wake::Tui(event) => {
+                app.handle_event(event, &event_tx);
+                // Drain any remaining buffered TUI events without blocking.
+                loop {
+                    match event_loop.try_next() {
+                        Some(e) => app.handle_event(e, &event_tx),
+                        None => break,
+                    }
+                }
+            }
+            Wake::Agent(agent_event) => {
+                app.handle_agent_event(agent_event);
+                // Drain any additional agent events that are already queued.
+                loop {
+                    match app.agent_handle.event_rx.try_recv() {
+                        Ok(e) => app.handle_agent_event(e),
+                        Err(_) => break,
+                    }
                 }
             }
         }

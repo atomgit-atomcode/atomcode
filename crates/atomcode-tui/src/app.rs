@@ -5,6 +5,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use futures::StreamExt;
 use tokio::sync::mpsc;
 
+use atomcode_core::agent::{AgentCommand, AgentEvent, AgentHandle};
 use atomcode_core::config::Config;
 use atomcode_core::config::DEFAULT_SYSTEM_PROMPT;
 use atomcode_core::conversation::Conversation;
@@ -96,10 +97,20 @@ pub struct App {
     pub cancel_token: tokio_util::sync::CancellationToken,
     /// Buffered tool calls received during a single response turn (multi-tool support).
     pub pending_tool_calls: Vec<ToolCall>,
+    /// Channel pair for communicating with the AgentLoop.
+    pub agent_handle: AgentHandle,
+    /// Display name of the active model (cached so we don't need the provider ref).
+    pub model_name: String,
 }
 
 impl App {
-    pub fn new(provider: Box<dyn LlmProvider>, config: Config, tool_registry: ToolRegistry, working_dir: PathBuf) -> Self {
+    pub fn new(
+        model_name: String,
+        config: Config,
+        agent_handle: AgentHandle,
+        tool_context: ToolContext,
+        working_dir: PathBuf,
+    ) -> Self {
         let conversation = Conversation::load(&Conversation::history_path());
         // Build input history from past user messages
         let input_history: Vec<String> = conversation.messages.iter()
@@ -126,7 +137,7 @@ impl App {
             provider_mgr: None,
             model_list: Vec::new(),
             model_selected: 0,
-            tool_registry,
+            tool_registry: ToolRegistry::new(),
             permission_store: PermissionStore::new(),
             tool_call_count: 0,
             retry_count: 0,
@@ -138,7 +149,7 @@ impl App {
             turn_start: None,
             tool_start: None,
             last_turn_duration: None,
-            tool_context: ToolContext::new(working_dir.clone()),
+            tool_context,
             working_dir,
             input_history,
             history_index: None,
@@ -148,10 +159,28 @@ impl App {
             suggestion: None,
             render_cache: Vec::new(),
             render_cache_msg_count: 0,
-            provider,
+            // Keep a dummy provider for rebuild_provider path (legacy). The real LLM
+            // work is now handled by AgentLoop. This avoids removing all provider refs at once.
+            provider: {
+                use atomcode_core::provider::create_provider;
+                use atomcode_core::config::provider::ProviderConfig;
+                // Create a no-op placeholder; rebuild_provider will set the real one on /provider changes.
+                create_provider(&ProviderConfig {
+                    provider_type: "openai".to_string(),
+                    api_key: Some("placeholder".to_string()),
+                    model: model_name.clone(),
+                    base_url: Some("http://localhost:1".to_string()),
+                    system_prompt: None,
+                }).unwrap_or_else(|_| {
+                    // Fallback: should never reach production path since AgentLoop handles LLM
+                    panic!("Failed to create placeholder provider")
+                })
+            },
             config,
             cancel_token: tokio_util::sync::CancellationToken::new(),
             pending_tool_calls: Vec::new(),
+            agent_handle,
+            model_name,
         }
     }
 
@@ -318,9 +347,11 @@ impl App {
     }
 
     /// Rebuild the LLM provider from current config (after provider/model change).
+    /// Also updates model_name for status bar display.
     fn rebuild_provider(&mut self) {
         use atomcode_core::provider::create_provider;
         if let Ok(provider_config) = self.config.active_provider(None) {
+            self.model_name = provider_config.model.clone();
             if let Ok(new_provider) = create_provider(&provider_config.clone()) {
                 self.provider = new_provider;
             }
@@ -348,6 +379,82 @@ impl App {
         )
     }
 
+
+    /// Process an event coming from the AgentLoop. Updates local conversation mirror and UI state.
+    pub fn handle_agent_event(&mut self, event: AgentEvent) {
+        match event {
+            AgentEvent::TextDelta(text) => {
+                self.conversation.push_delta(&text);
+                self.at_bottom = true;
+            }
+            AgentEvent::ToolCallStarted { name, arguments } => {
+                self.current_step_count += 1;
+                // Build a synthetic ToolCall so format_tool_info works.
+                let fake_call = ToolCall {
+                    id: String::new(),
+                    name: name.clone(),
+                    arguments: arguments.clone(),
+                };
+                self.executing_tool_info = format_tool_info(&fake_call);
+                self.mode = AppMode::ToolExecuting;
+                self.tool_start = Some(Instant::now());
+                self.at_bottom = true;
+            }
+            AgentEvent::ToolCallResult { name: _, output: _, success: _, duration: _ } => {
+                // The AgentLoop already added the result to its authoritative Conversation.
+                // We just invalidate the render cache so the UI re-renders on the next frame.
+                // The actual conversation mirror update happens on TurnComplete (we reload history).
+                self.render_cache_msg_count = 0;
+            }
+            AgentEvent::ApprovalNeeded { tool_name: _, reason: _, call } => {
+                self.mode = AppMode::WaitingApproval(call);
+            }
+            AgentEvent::PhaseChange(phase) => {
+                use atomcode_core::agent::AgentPhase;
+                match phase {
+                    AgentPhase::Idle => {
+                        // TurnComplete handles mode reset; ignore standalone Idle transitions.
+                    }
+                    AgentPhase::Thinking => {
+                        self.mode = AppMode::Streaming;
+                    }
+                    AgentPhase::CallingTool(_name) => {
+                        self.mode = AppMode::ToolExecuting;
+                    }
+                    AgentPhase::WaitingApproval => {
+                        // Handled by ApprovalNeeded event which carries the ToolCall.
+                    }
+                }
+            }
+            AgentEvent::TurnComplete { duration, total_tokens: _ } => {
+                self.mode = AppMode::Normal;
+                self.last_turn_duration = Some(duration);
+                self.turn_start = None;
+                // Reload conversation from history file so our local mirror matches AgentLoop's.
+                self.conversation = Conversation::load(&Conversation::history_path());
+                self.render_cache.clear();
+                self.render_cache_msg_count = 0;
+                self.suggestion = self.generate_suggestion();
+                self.at_bottom = true;
+            }
+            AgentEvent::Error(e) => {
+                self.conversation.push_delta(&format!("\n\n[Error: {}]", e));
+                self.conversation.finalize_stream();
+                self.mode = AppMode::Normal;
+                self.last_turn_duration = self.turn_start.map(|t| t.elapsed());
+                self.turn_start = None;
+                self.at_bottom = true;
+            }
+            AgentEvent::TokenUsage(usage) => {
+                self.turn_tokens += usage.completion_tokens;
+                self.total_tokens += usage.completion_tokens;
+            }
+            AgentEvent::WorkingDirChanged(new_dir) => {
+                self.working_dir = new_dir;
+                self.project_context_cache = None;
+            }
+        }
+    }
 
     pub fn handle_event(&mut self, event: AppEvent, event_tx: &mpsc::UnboundedSender<AppEvent>) {
         // Drop stale stream/tool events after cancellation
@@ -533,7 +640,10 @@ impl App {
             // Single Ctrl+C: cancel current operation
             match &self.mode {
                 AppMode::Streaming | AppMode::ToolExecuting => {
-                    self.cancel_token.cancel(); // Actually stop background tasks
+                    // Signal the AgentLoop to cancel.
+                    let _ = self.agent_handle.cmd_tx.send(AgentCommand::Cancel);
+                    // Also cancel any legacy local tasks still using the old token.
+                    self.cancel_token.cancel();
                     self.conversation.stream_buffer = None;
                     self.conversation.tool_call_buffer = None;
                     self.conversation.finalize_stream();
@@ -543,6 +653,9 @@ impl App {
                     self.turn_start = None;
                 }
                 AppMode::WaitingApproval(_) => {
+                    // Deny the pending tool and cancel the agent turn.
+                    let _ = self.agent_handle.cmd_tx.send(AgentCommand::DenyTool);
+                    let _ = self.agent_handle.cmd_tx.send(AgentCommand::Cancel);
                     self.mode = AppMode::Normal;
                     self.at_bottom = true;
                 }
@@ -570,6 +683,8 @@ impl App {
             AppMode::Streaming | AppMode::ToolExecuting => {
                 // Esc cancels the operation
                 if key.code == KeyCode::Esc {
+                    let _ = self.agent_handle.cmd_tx.send(AgentCommand::Cancel);
+                    self.cancel_token.cancel();
                     self.conversation.stream_buffer = None;
                     self.conversation.tool_call_buffer = None;
                     self.conversation.finalize_stream();
@@ -617,29 +732,20 @@ impl App {
         }
     }
 
-    fn handle_key_approval(&mut self, key: KeyEvent, event_tx: &mpsc::UnboundedSender<AppEvent>) {
-        let call = match &self.mode {
-            AppMode::WaitingApproval(c) => c.clone(),
-            _ => return,
-        };
+    fn handle_key_approval(&mut self, key: KeyEvent, _event_tx: &mpsc::UnboundedSender<AppEvent>) {
         match key.code {
             KeyCode::Char('y') | KeyCode::Enter => {
+                let _ = self.agent_handle.cmd_tx.send(AgentCommand::ApproveTool);
                 self.mode = AppMode::ToolExecuting;
-                self.execute_tool(call, event_tx);
             }
             KeyCode::Char('a') => {
                 // Grant session-level permission so this tool is auto-approved for the rest of the session.
-                self.permission_store.grant_session(&call.name);
+                let _ = self.agent_handle.cmd_tx.send(AgentCommand::ApproveToolAlways);
                 self.mode = AppMode::ToolExecuting;
-                self.execute_tool(call, event_tx);
             }
             KeyCode::Char('n') | KeyCode::Esc => {
-                let result = ToolResult {
-                    call_id: call.id.clone(),
-                    output: "Denied by user".to_string(),
-                    success: false,
-                };
-                self.handle_tool_result(result, event_tx);
+                let _ = self.agent_handle.cmd_tx.send(AgentCommand::DenyTool);
+                self.mode = AppMode::Normal;
             }
             _ => {}
         }
@@ -1043,7 +1149,10 @@ impl App {
                     ));
                     self.conversation.finalize_stream();
                 } else {
+                    // Update local state for immediate UI feedback.
                     self.change_working_dir(arg);
+                    // Also inform the AgentLoop so it uses the new working directory.
+                    let _ = self.agent_handle.cmd_tx.send(AgentCommand::ChangeDir(arg.to_string()));
                 }
             }
             "/clear" => {
@@ -1098,7 +1207,7 @@ impl App {
         true
     }
 
-    fn send_message(&mut self, event_tx: &mpsc::UnboundedSender<AppEvent>) {
+    fn send_message(&mut self, _event_tx: &mpsc::UnboundedSender<AppEvent>) {
         let content = self.input.content();
         if content.trim().is_empty() {
             return;
@@ -1142,6 +1251,7 @@ impl App {
             parts.join("\n")
         };
 
+        // Add user message to our local mirror for immediate display.
         self.conversation.add_user_message(&full_content);
         self.input.clear();
         self.mode = AppMode::Streaming;
@@ -1152,17 +1262,8 @@ impl App {
         self.turn_start = Some(Instant::now());
         self.last_turn_duration = None;
 
-        // Cancel any previous background tasks, then create a fresh token for this turn.
-        self.cancel_token.cancel();
-        self.cancel_token = tokio_util::sync::CancellationToken::new();
-
-        let system_prompt = self.system_prompt();
-        let messages = self.conversation.to_provider_messages_windowed(&system_prompt, 30);
-        let tool_defs = self.tool_registry.get_definitions();
-
-        let tx = event_tx.clone();
-        let stream_result = self.provider.chat_stream(&messages, Some(&tool_defs));
-        spawn_stream_handler(stream_result, tx, self.cancel_token.clone());
+        // Delegate to the AgentLoop via channel.
+        let _ = self.agent_handle.cmd_tx.send(AgentCommand::SendMessage(full_content));
     }
 
     /// Execute a tool call that has already been recorded in conversation history.

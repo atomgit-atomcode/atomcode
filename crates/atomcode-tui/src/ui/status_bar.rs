@@ -15,7 +15,7 @@ const SEP: &str = " \u{2502} "; // │
 pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     let width = area.width as usize;
     let dir = shorten_path(&app.working_dir.to_string_lossy());
-    let model = app.provider.model_name();
+    let model = app.model_name.as_str();
 
     let (mode_icon, mode_text, mode_fg) = match &app.mode {
         AppMode::Normal => ("", "", Color::Rgb(80, 180, 100)),

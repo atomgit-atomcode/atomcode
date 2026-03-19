@@ -49,7 +49,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(Color::DarkGray),
         ),
         Span::styled(
-            format!("  ·  model: {}", app.provider.model_name()),
+            format!("  ·  model: {}", app.model_name),
             Style::default().fg(Color::Cyan),
         ),
     ]));
