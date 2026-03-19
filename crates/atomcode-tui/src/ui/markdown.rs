@@ -154,18 +154,29 @@ impl MarkdownRenderer {
                 }
 
                 // Lists
-                Event::Start(Tag::List(start)) => { list_depth += 1; ordered_idx = start; }
+                Event::Start(Tag::List(start)) => {
+                    list_depth += 1;
+                    ordered_idx = start;
+                    if list_depth == 1 { lines.push(Line::default()); }
+                }
                 Event::End(TagEnd::List(_)) => {
                     list_depth = list_depth.saturating_sub(1);
                     ordered_idx = None;
+                    if list_depth == 0 { lines.push(Line::default()); }
                 }
                 Event::Start(Tag::Item) => {
-                    let indent = "  ".repeat(list_depth);
+                    let indent = "   ".repeat(list_depth);
                     if let Some(idx) = &mut ordered_idx {
-                        spans.push(Span::styled(format!("{}{:>2}. ", indent, idx), Style::default().fg(BULLET)));
+                        spans.push(Span::styled(
+                            format!("{}{:>2}. ", indent, idx),
+                            Style::default().fg(BULLET),
+                        ));
                         *idx += 1;
                     } else {
-                        spans.push(Span::styled(format!("{}  - ", indent), Style::default().fg(BULLET)));
+                        spans.push(Span::styled(
+                            format!("{}  - ", indent),
+                            Style::default().fg(BULLET),
+                        ));
                     }
                 }
                 Event::End(TagEnd::Item) => { flush(&mut lines, &mut spans); }
@@ -287,43 +298,50 @@ fn flush(lines: &mut Vec<Line<'static>>, spans: &mut Vec<Span<'static>>) {
 fn render_table(lines: &mut Vec<Line<'static>>, header: &[String], rows: &[Vec<String>]) {
     if header.is_empty() { return; }
     let cols = header.len();
+
+    // Calculate column widths: content + 4 chars padding (generous spacing)
     let mut widths: Vec<usize> = header.iter().map(|h| h.chars().count()).collect();
     for row in rows {
         for (i, cell) in row.iter().enumerate() {
             if i < widths.len() { widths[i] = widths[i].max(cell.chars().count()); }
         }
     }
-    let widths: Vec<usize> = widths.iter().map(|w| w + 2).collect();
+    let widths: Vec<usize> = widths.iter().map(|w| w + 4).collect();
 
     lines.push(Line::default());
 
-    // Header
+    // Header row
     let mut h: Vec<Span<'static>> = Vec::new();
     for (i, hdr) in header.iter().enumerate() {
-        let w = widths.get(i).copied().unwrap_or(8);
-        h.push(Span::styled(format!(" {:<width$}", hdr, width = w),
-            Style::default().fg(BOLD_TEXT).add_modifier(Modifier::BOLD)));
+        let w = widths.get(i).copied().unwrap_or(10);
+        h.push(Span::styled(
+            format!("  {:<width$}", hdr, width = w),
+            Style::default().fg(BOLD_TEXT).add_modifier(Modifier::BOLD),
+        ));
     }
     lines.push(Line::from(h));
 
-    // Separator
-    let mut sep: Vec<Span<'static>> = Vec::new();
-    for (i, w) in widths.iter().enumerate() {
-        sep.push(Span::styled(format!(" {}", "\u{2500}".repeat(*w)), Style::default().fg(RULE)));
-        if i + 1 < cols { sep.push(Span::styled("\u{2500}", Style::default().fg(RULE))); }
-    }
-    lines.push(Line::from(sep));
+    // Separator — one continuous line
+    let total_width: usize = widths.iter().sum::<usize>() + 2 * cols;
+    lines.push(Line::from(Span::styled(
+        format!("  {}", "\u{2500}".repeat(total_width)),
+        Style::default().fg(RULE),
+    )));
 
-    // Rows
+    // Data rows
     for row in rows {
         let mut r: Vec<Span<'static>> = Vec::new();
         for i in 0..cols {
             let cell = row.get(i).map(|s| s.as_str()).unwrap_or("");
-            let w = widths.get(i).copied().unwrap_or(8);
-            r.push(Span::styled(format!(" {:<width$}", cell, width = w), Style::default().fg(TEXT)));
+            let w = widths.get(i).copied().unwrap_or(10);
+            r.push(Span::styled(
+                format!("  {:<width$}", cell, width = w),
+                Style::default().fg(TEXT),
+            ));
         }
         lines.push(Line::from(r));
     }
+
     lines.push(Line::default());
 }
 
