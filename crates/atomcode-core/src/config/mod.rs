@@ -8,7 +8,11 @@ use serde::{Deserialize, Serialize};
 
 use provider::ProviderConfig;
 
-pub const DEFAULT_SYSTEM_PROMPT: &str = "You are AtomCode, an AI coding assistant running in a terminal. Be concise and helpful.";
+pub const DEFAULT_SYSTEM_PROMPT: &str = "You are AtomCode, an AI coding assistant running in a terminal. Be concise and helpful.
+
+You have access to tools: read_file, write_file, and bash. Use them to help the user with coding tasks.
+
+IMPORTANT: All file paths should be relative to the working directory unless the user specifies an absolute path. When using bash, commands execute in the working directory.";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {

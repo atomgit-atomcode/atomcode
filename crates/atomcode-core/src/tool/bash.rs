@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -6,7 +8,15 @@ use tokio::process::Command;
 
 use super::{ApprovalRequirement, Tool, ToolDef, ToolResult};
 
-pub struct BashTool;
+pub struct BashTool {
+    working_dir: PathBuf,
+}
+
+impl BashTool {
+    pub fn new(working_dir: PathBuf) -> Self {
+        Self { working_dir }
+    }
+}
 
 #[derive(Deserialize)]
 struct BashArgs {
@@ -19,7 +29,7 @@ impl Tool for BashTool {
     fn definition(&self) -> ToolDef {
         ToolDef {
             name: "bash",
-            description: "Execute a bash command and return its stdout and stderr.",
+            description: "Execute a bash command and return its stdout and stderr. Commands run in the project working directory.",
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -45,7 +55,11 @@ impl Tool for BashTool {
         let timeout_secs = parsed.timeout.unwrap_or(120);
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(timeout_secs),
-            Command::new("bash").arg("-c").arg(&parsed.command).output(),
+            Command::new("bash")
+                .arg("-c")
+                .arg(&parsed.command)
+                .current_dir(&self.working_dir)
+                .output(),
         ).await;
         match result {
             Ok(Ok(output)) => {

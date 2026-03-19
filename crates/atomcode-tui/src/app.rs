@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use futures::StreamExt;
 use tokio::sync::mpsc;
@@ -46,12 +48,13 @@ pub struct App {
     pub tool_registry: ToolRegistry,
     pub tool_call_count: usize,
     pub tick_count: usize,
+    pub working_dir: PathBuf,
     pub provider: Box<dyn LlmProvider>,
     pub config: Config,
 }
 
 impl App {
-    pub fn new(provider: Box<dyn LlmProvider>, config: Config, tool_registry: ToolRegistry) -> Self {
+    pub fn new(provider: Box<dyn LlmProvider>, config: Config, tool_registry: ToolRegistry, working_dir: PathBuf) -> Self {
         Self {
             mode: AppMode::Normal,
             conversation: Conversation::new(),
@@ -65,9 +68,19 @@ impl App {
             tool_registry,
             tool_call_count: 0,
             tick_count: 0,
+            working_dir,
             provider,
             config,
         }
+    }
+
+    /// Build system prompt with working directory context.
+    fn system_prompt(&self) -> String {
+        let base = self.config.providers
+            .get(&self.config.default_provider)
+            .and_then(|p| p.system_prompt.as_deref())
+            .unwrap_or(DEFAULT_SYSTEM_PROMPT);
+        format!("{}\n\nWorking directory: {}", base, self.working_dir.display())
     }
 
     pub fn handle_event(&mut self, event: AppEvent, event_tx: &mpsc::UnboundedSender<AppEvent>) {
@@ -431,13 +444,7 @@ impl App {
         self.at_bottom = true;
         self.tool_call_count = 0;
 
-        let provider_name = &self.config.default_provider;
-        let system_prompt = self.config.providers
-            .get(provider_name)
-            .and_then(|p| p.system_prompt.as_deref())
-            .unwrap_or(DEFAULT_SYSTEM_PROMPT)
-            .to_string();
-
+        let system_prompt = self.system_prompt();
         let messages = self.conversation.to_provider_messages(&system_prompt);
         let tool_defs = self.tool_registry.get_definitions();
 
@@ -509,14 +516,15 @@ impl App {
     fn execute_tool(&mut self, call: ToolCall, event_tx: &mpsc::UnboundedSender<AppEvent>) {
         let tool_name = call.name.clone();
         let call_id = call.id.clone();
-        let args = call.arguments.clone();
+        let args = self.resolve_tool_args(&call);
+        let working_dir = self.working_dir.clone();
         let tx = event_tx.clone();
 
         tokio::spawn(async move {
             let result = match tool_name.as_str() {
                 "read_file" => atomcode_core::tool::read::ReadFileTool.execute(&args).await,
                 "write_file" => atomcode_core::tool::write::WriteFileTool.execute(&args).await,
-                "bash" => atomcode_core::tool::bash::BashTool.execute(&args).await,
+                "bash" => atomcode_core::tool::bash::BashTool::new(working_dir).execute(&args).await,
                 _ => Err(anyhow::anyhow!("Unknown tool: {}", tool_name)),
             };
             let tool_result = match result {
@@ -529,6 +537,21 @@ impl App {
             };
             let _ = tx.send(AppEvent::ToolFinished(tool_result));
         });
+    }
+
+    /// Resolve relative file_path in tool arguments to absolute paths based on working_dir.
+    fn resolve_tool_args(&self, call: &ToolCall) -> String {
+        if let Ok(mut args) = serde_json::from_str::<serde_json::Value>(&call.arguments) {
+            if let Some(fp) = args.get("file_path").and_then(|v| v.as_str()) {
+                let path = std::path::Path::new(fp);
+                if !path.is_absolute() {
+                    let resolved = self.working_dir.join(path);
+                    args["file_path"] = serde_json::json!(resolved.to_string_lossy().to_string());
+                }
+                return serde_json::to_string(&args).unwrap_or(call.arguments.clone());
+            }
+        }
+        call.arguments.clone()
     }
 
     fn handle_tool_result(&mut self, result: ToolResult, event_tx: &mpsc::UnboundedSender<AppEvent>) {
@@ -549,13 +572,7 @@ impl App {
     }
 
     fn continue_agent_loop(&mut self, event_tx: &mpsc::UnboundedSender<AppEvent>) {
-        let provider_name = &self.config.default_provider;
-        let system_prompt = self.config.providers
-            .get(provider_name)
-            .and_then(|p| p.system_prompt.as_deref())
-            .unwrap_or(DEFAULT_SYSTEM_PROMPT)
-            .to_string();
-
+        let system_prompt = self.system_prompt();
         let messages = self.conversation.to_provider_messages(&system_prompt);
         let tool_defs = self.tool_registry.get_definitions();
 

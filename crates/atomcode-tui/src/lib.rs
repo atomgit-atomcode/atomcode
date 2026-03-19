@@ -19,14 +19,14 @@ use atomcode_core::tool::ToolRegistry;
 use app::App;
 use event::EventLoop;
 
-pub async fn run(config: Config, provider: Box<dyn LlmProvider>, tool_registry: ToolRegistry) -> Result<()> {
+pub async fn run(config: Config, provider: Box<dyn LlmProvider>, tool_registry: ToolRegistry, working_dir: std::path::PathBuf) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::new(provider, config, tool_registry);
+    let mut app = App::new(provider, config, tool_registry, working_dir);
     let mut event_loop = EventLoop::new();
     let event_tx = event_loop.sender();
     event_loop.start();

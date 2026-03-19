@@ -42,7 +42,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
 
     lines.push(Line::default());
 
-    // Version + model info
+    // Version + model + working dir
     lines.push(Line::from(vec![
         Span::styled(
             "  v0.1.0",
@@ -51,6 +51,12 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         Span::styled(
             format!("  ·  model: {}", app.provider.model_name()),
             Style::default().fg(Color::Cyan),
+        ),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!("  cwd: {}", app.working_dir.display()),
+            Style::default().fg(Color::Rgb(80, 80, 80)),
         ),
     ]));
 

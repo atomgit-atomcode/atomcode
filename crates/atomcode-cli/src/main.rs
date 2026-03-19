@@ -27,6 +27,10 @@ struct Cli {
     /// Path to config file
     #[arg(long)]
     config: Option<PathBuf>,
+
+    /// Working directory (defaults to current directory)
+    #[arg(long, short = 'C')]
+    dir: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -56,12 +60,17 @@ async fn main() -> Result<()> {
         .clone();
     let provider = create_provider(&provider_config)?;
 
+    // Resolve working directory
+    let working_dir = cli.dir
+        .map(|d| std::fs::canonicalize(d).unwrap_or_else(|_| std::env::current_dir().unwrap()))
+        .unwrap_or_else(|| std::env::current_dir().unwrap());
+
     let mut tool_registry = ToolRegistry::new();
     tool_registry.register(Box::new(ReadFileTool));
     tool_registry.register(Box::new(WriteFileTool));
-    tool_registry.register(Box::new(BashTool));
+    tool_registry.register(Box::new(BashTool::new(working_dir.clone())));
 
-    atomcode_tui::run(config, provider, tool_registry).await
+    atomcode_tui::run(config, provider, tool_registry, working_dir).await
 }
 
 fn first_run_wizard() -> Result<Config> {
