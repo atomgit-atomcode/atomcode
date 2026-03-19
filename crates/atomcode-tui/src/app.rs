@@ -335,9 +335,9 @@ impl App {
         }
     }
 
-    /// Build system prompt with working directory context + project understanding.
+    /// Build system prompt: identity → context → rules (recency effect).
     fn system_prompt(&self) -> String {
-        let base = self.config.providers
+        let rules = self.config.providers
             .get(&self.config.default_provider)
             .and_then(|p| p.system_prompt.as_deref())
             .unwrap_or(DEFAULT_SYSTEM_PROMPT);
@@ -345,7 +345,80 @@ impl App {
         let dir = self.working_dir.display();
         let project_ctx = crate::project_context::build_project_context(&self.working_dir);
 
-        format!("{}\n\nWorking directory: {}\n\n{}", base, dir, project_ctx)
+        // Identity first, context middle, RULES LAST (strongest position for weaker models)
+        format!(
+            "You are AtomCode, a terminal coding agent.\n\nWorking directory: {}\n\n{}\n\n---\nRULES (follow strictly):\n{}",
+            dir, project_ctx, rules
+        )
+    }
+
+    /// Pre-process user input: detect common intents and inject directives.
+    fn resolve_intent(&self, user_input: &str) -> String {
+        let input_lower = user_input.trim().to_lowercase();
+        let dir = &self.working_dir;
+
+        // "start" / "启动" / "run" patterns
+        let start_patterns = ["启动", "start", "run", "开始", "运行", "启动程序", "启动项目",
+                              "启动应用", "启动服务", "启动起来", "跑起来", "运行起来"];
+        if start_patterns.iter().any(|p| input_lower == *p || input_lower.starts_with(p)) {
+            if dir.join("start.sh").exists() {
+                return format!(
+                    "{}\n\n[DIRECTIVE: Run `nohup bash start.sh > /dev/null 2>&1 &` then verify with curl. Do NOT read files first.]",
+                    user_input
+                );
+            }
+            if dir.join("docker-compose.yml").exists() || dir.join("docker-compose.yaml").exists() {
+                return format!(
+                    "{}\n\n[DIRECTIVE: Run `docker-compose up -d`. Do NOT read files first.]",
+                    user_input
+                );
+            }
+            if dir.join("package.json").exists() {
+                return format!(
+                    "{}\n\n[DIRECTIVE: Run `nohup npm start > /dev/null 2>&1 &` or check scripts in package.json. Do NOT explore first.]",
+                    user_input
+                );
+            }
+            if dir.join("Cargo.toml").exists() {
+                return format!(
+                    "{}\n\n[DIRECTIVE: Run `cargo run`. Do NOT read files first.]",
+                    user_input
+                );
+            }
+        }
+
+        // "stop" / "停止" patterns
+        let stop_patterns = ["停止", "stop", "kill", "停", "关闭", "关掉"];
+        if stop_patterns.iter().any(|p| input_lower.starts_with(p)) {
+            return format!(
+                "{}\n\n[DIRECTIVE: Find processes with `lsof -i :<port>` or `ps aux | grep`, then `kill <pid>`. Be direct.]",
+                user_input
+            );
+        }
+
+        // "build" / "编译" patterns
+        let build_patterns = ["编译", "build", "构建"];
+        if build_patterns.iter().any(|p| input_lower.starts_with(p)) {
+            if dir.join("Cargo.toml").exists() {
+                return format!("{}\n\n[DIRECTIVE: Run `cargo build`. Do NOT read files first.]", user_input);
+            }
+            if dir.join("package.json").exists() {
+                return format!("{}\n\n[DIRECTIVE: Run `npm run build`. Do NOT read files first.]", user_input);
+            }
+        }
+
+        // "test" / "测试" patterns
+        let test_patterns = ["测试", "test"];
+        if test_patterns.iter().any(|p| input_lower.starts_with(p)) {
+            if dir.join("Cargo.toml").exists() {
+                return format!("{}\n\n[DIRECTIVE: Run `cargo test`. Do NOT read files first.]", user_input);
+            }
+            if dir.join("package.json").exists() {
+                return format!("{}\n\n[DIRECTIVE: Run `npm test`. Do NOT read files first.]", user_input);
+            }
+        }
+
+        user_input.to_string()
     }
 
     pub fn handle_event(&mut self, event: AppEvent, event_tx: &mpsc::UnboundedSender<AppEvent>) {
@@ -1092,7 +1165,9 @@ impl App {
             parts.join("\n")
         };
 
-        self.conversation.add_user_message(&full_content);
+        // Intent pre-processing: inject directives for common actions
+        let resolved_content = self.resolve_intent(&full_content);
+        self.conversation.add_user_message(&resolved_content);
         self.input.clear();
         self.mode = AppMode::Streaming;
         self.at_bottom = true;

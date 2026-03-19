@@ -45,10 +45,10 @@ pub fn build_project_context(dir: &Path) -> String {
         }
     }
 
-    // 3. Detect project type and suggest how to run
+    // 3. Detect project type — actionable rules
     let hints = detect_project_hints(dir);
     if !hints.is_empty() {
-        ctx.push_str(&format!("\nProject hints: {}\n", hints));
+        ctx.push_str(&format!("\nProject rules: {}\n", hints));
     }
 
     // Keep total context under 4000 chars
@@ -82,7 +82,7 @@ fn detect_project_hints(dir: &Path) -> String {
         hints.push("Makefile available".into());
     }
     if dir.join("start.sh").exists() {
-        hints.push("start.sh — use `nohup bash start.sh &` for servers".into());
+        hints.push("Has start.sh: when user says 'start', run `nohup bash start.sh &` immediately".into());
     }
 
     for sub in ["frontend", "backend", "server", "client", "web", "api"] {

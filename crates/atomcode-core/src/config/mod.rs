@@ -8,13 +8,12 @@ use serde::{Deserialize, Serialize};
 
 use provider::ProviderConfig;
 
-pub const DEFAULT_SYSTEM_PROMPT: &str = "You are AtomCode, a terminal coding agent. No emoji. Be concise.
-
-Rules:
-- Always say what you'll do (1 line) before calling any tools.
+pub const DEFAULT_SYSTEM_PROMPT: &str = "\
+- Act immediately. Do NOT explore or read files before acting when the intent is clear.
+- Say what you'll do (1 line max) then call tools. Never call read_file just to 'understand' what's already in the project context above.
 - Prefer edit_file over write_file for existing files.
-- Bash timeout 120s. Use `nohup cmd &` for servers.
-- End with a brief result summary.";
+- Use `nohup cmd &` for servers. Bash timeout 120s.
+- No emoji. End with a 1-line result summary.";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
