@@ -54,13 +54,16 @@ impl Conversation {
         }
     }
 
-    /// Save conversation history to disk.
+    /// Save conversation history to disk atomically (write to temp, then rename).
     pub fn save(&self, path: &std::path::Path) {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
         if let Ok(data) = serde_json::to_string(&self.messages) {
-            let _ = std::fs::write(path, data);
+            let temp_path = path.with_extension("json.tmp");
+            if std::fs::write(&temp_path, &data).is_ok() {
+                let _ = std::fs::rename(&temp_path, path);
+            }
         }
     }
 

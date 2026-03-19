@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -36,13 +38,38 @@ impl Tool for CdTool {
     }
 
     async fn execute(&self, args: &str) -> Result<ToolResult> {
-        // The actual directory change happens in App.
-        // This tool just validates the path exists and is a directory.
         let parsed: CdArgs = serde_json::from_str(args)?;
-        Ok(ToolResult {
-            call_id: String::new(),
-            output: format!("CD_REQUEST:{}", parsed.path),
-            success: true,
-        })
+        let path = parsed.path.as_str();
+
+        // Resolve the path (expand ~ if needed)
+        let target = if path.starts_with('~') {
+            dirs::home_dir()
+                .map(|h| h.join(path.strip_prefix("~/").unwrap_or(&path[1..])))
+                .unwrap_or_else(|| PathBuf::from(path))
+        } else {
+            PathBuf::from(path)
+        };
+
+        // Validate the target is a directory
+        if target.is_dir() {
+            let resolved = std::fs::canonicalize(&target).unwrap_or(target);
+            Ok(ToolResult {
+                call_id: String::new(),
+                output: format!("Changed working directory to {}", resolved.display()),
+                success: true,
+            })
+        } else if target.exists() {
+            Ok(ToolResult {
+                call_id: String::new(),
+                output: format!("Not a directory: {}", target.display()),
+                success: false,
+            })
+        } else {
+            Ok(ToolResult {
+                call_id: String::new(),
+                output: format!("Path does not exist: {}", target.display()),
+                success: false,
+            })
+        }
     }
 }

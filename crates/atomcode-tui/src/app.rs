@@ -78,6 +78,8 @@ pub struct App {
     pub current_step_count: usize,
     /// Cached tool info string for ToolExecuting mode (avoid per-frame JSON parse).
     pub executing_tool_info: String,
+    /// Name and arguments of the last dispatched tool call (for post-execution handling).
+    pub last_tool_call: Option<(String, String)>,
     /// Estimated token counts for the current session.
     pub total_tokens: usize,
     /// Tokens used in the current turn.
@@ -127,6 +129,7 @@ impl App {
             project_context_cache: None,
             current_step_count: 0,
             executing_tool_info: String::new(),
+            last_tool_call: None,
             turn_start: None,
             tool_start: None,
             last_turn_duration: None,
@@ -369,7 +372,7 @@ impl App {
                 self.last_turn_duration = self.turn_start.map(|t| t.elapsed());
                 self.turn_start = None;
                 self.suggestion = self.generate_suggestion();
-                // Persist history (async, non-blocking)
+                // Persist history atomically (async, non-blocking)
                 let msgs = self.conversation.messages.clone();
                 tokio::spawn(async move {
                     let path = Conversation::history_path();
@@ -377,7 +380,10 @@ impl App {
                         let _ = tokio::fs::create_dir_all(parent).await;
                     }
                     if let Ok(data) = serde_json::to_string(&msgs) {
-                        let _ = tokio::fs::write(path, data).await;
+                        let temp_path = path.with_extension("json.tmp");
+                        if tokio::fs::write(&temp_path, &data).await.is_ok() {
+                            let _ = tokio::fs::rename(&temp_path, &path).await;
+                        }
                     }
                 });
             }
@@ -1004,7 +1010,11 @@ impl App {
             "/clear" => {
                 self.conversation = Conversation::new();
                 tokio::spawn(async move {
-                    let _ = tokio::fs::write(Conversation::history_path(), "[]").await;
+                    let path = Conversation::history_path();
+                    let temp_path = path.with_extension("json.tmp");
+                    if tokio::fs::write(&temp_path, "[]").await.is_ok() {
+                        let _ = tokio::fs::rename(&temp_path, &path).await;
+                    }
                 });
                 self.scroll_offset = 0;
                 self.at_bottom = true;
@@ -1139,6 +1149,7 @@ impl App {
         self.tool_start = Some(Instant::now());
         // Cache tool info for display (avoid per-frame JSON parsing)
         self.executing_tool_info = format_tool_info(&call);
+        self.last_tool_call = Some((call.name.clone(), call.arguments.clone()));
         let call_id = call.id.clone();
         let args = self.resolve_tool_args(&call);
         let tx = event_tx.clone();
@@ -1192,13 +1203,19 @@ impl App {
     }
 
     fn handle_tool_result(&mut self, mut result: ToolResult, event_tx: &mpsc::UnboundedSender<AppEvent>) {
-        // Intercept change_dir tool requests
-        if result.output.starts_with("CD_REQUEST:") {
-            let path = result.output.strip_prefix("CD_REQUEST:").unwrap().to_string();
-            let (ok, msg) = self.try_change_dir(&path);
-            result.output = msg;
-            result.success = ok;
+        // Intercept change_dir tool: if it succeeded, update our working directory
+        if let Some((ref name, ref args)) = self.last_tool_call {
+            if name == "change_dir" && result.success {
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(args) {
+                    if let Some(path) = parsed.get("path").and_then(|v| v.as_str()) {
+                        let (ok, msg) = self.try_change_dir(path);
+                        result.output = msg;
+                        result.success = ok;
+                    }
+                }
+            }
         }
+        self.last_tool_call = None;
 
 
 

@@ -7,6 +7,44 @@ use super::{ApprovalRequirement, Tool, ToolDef, ToolResult};
 
 pub struct WriteFileTool;
 
+/// Check if a file path is a sensitive system location that should require user approval.
+fn is_sensitive_path(path: &str) -> bool {
+    let expanded = if path.starts_with("~/") {
+        if let Some(home) = dirs::home_dir() {
+            home.join(&path[2..]).to_string_lossy().to_string()
+        } else {
+            path.to_string()
+        }
+    } else {
+        path.to_string()
+    };
+
+    let sensitive_prefixes = ["/etc/", "/usr/", "/var/", "/System/"];
+    for prefix in &sensitive_prefixes {
+        if expanded.starts_with(prefix) {
+            return true;
+        }
+    }
+
+    // Check ~/.ssh (expanded)
+    if let Some(home) = dirs::home_dir() {
+        let ssh_dir = home.join(".ssh");
+        let bashrc = home.join(".bashrc");
+        let bash_profile = home.join(".bash_profile");
+        let zshrc = home.join(".zshrc");
+        let p = std::path::Path::new(&expanded);
+        if p.starts_with(&ssh_dir)
+            || p == bashrc
+            || p == bash_profile
+            || p == zshrc
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
 #[derive(Deserialize)]
 struct WriteFileArgs {
     file_path: String,
@@ -30,7 +68,14 @@ impl Tool for WriteFileTool {
         }
     }
 
-    fn approval(&self, _args: &str) -> ApprovalRequirement {
+    fn approval(&self, args: &str) -> ApprovalRequirement {
+        if let Ok(parsed) = serde_json::from_str::<WriteFileArgs>(args) {
+            if is_sensitive_path(&parsed.file_path) {
+                return ApprovalRequirement::RequireApproval(
+                    format!("Writing to sensitive system path: {}", parsed.file_path),
+                );
+            }
+        }
         ApprovalRequirement::AutoApprove
     }
 

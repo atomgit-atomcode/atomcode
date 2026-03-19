@@ -48,7 +48,12 @@ impl Tool for BashTool {
         }
     }
 
-    fn approval(&self, _args: &str) -> ApprovalRequirement {
+    fn approval(&self, args: &str) -> ApprovalRequirement {
+        if let Ok(parsed) = serde_json::from_str::<BashArgs>(args) {
+            if let Some(reason) = check_destructive_command(&parsed.command) {
+                return ApprovalRequirement::RequireApproval(reason);
+            }
+        }
         ApprovalRequirement::AutoApprove
     }
 
@@ -141,6 +146,40 @@ impl Tool for BashTool {
             }
         }
     }
+}
+
+/// Check if a shell command contains destructive patterns that require user approval.
+fn check_destructive_command(command: &str) -> Option<String> {
+    let cmd = command.to_lowercase();
+
+    let patterns: &[(&str, &str)] = &[
+        ("rm -rf", "Recursive force delete"),
+        ("rm -r ", "Recursive delete"),
+        ("rm -fr", "Recursive force delete"),
+        ("rmdir", "Directory removal"),
+        (" drop ", "SQL DROP statement"),
+        ("drop table", "SQL DROP TABLE"),
+        ("drop database", "SQL DROP DATABASE"),
+        ("format ", "Disk format"),
+        ("mkfs", "Filesystem creation"),
+        ("dd if=", "Raw disk write"),
+        ("> /dev/", "Device write"),
+        ("chmod 777", "World-writable permission"),
+        ("chmod -r ", "Recursive permission change"),
+        ("kill -9", "Force kill process"),
+        ("killall", "Kill all matching processes"),
+        ("git push --force", "Force push"),
+        ("git push -f", "Force push"),
+        ("git reset --hard", "Hard reset (destroys uncommitted changes)"),
+        ("git clean -f", "Force clean untracked files"),
+    ];
+
+    for (pattern, reason) in patterns {
+        if cmd.contains(pattern) {
+            return Some(format!("Destructive command detected: {}. Command: {}", reason, command));
+        }
+    }
+    None
 }
 
 fn format_output(stdout: &str, stderr: &str) -> String {

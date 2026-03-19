@@ -89,6 +89,7 @@ dependencies = [
  "atomcode-core",
  "atomcode-tui",
  "clap",
+ "crossterm",
  "tokio",
  "url",
 ]
