@@ -6,63 +6,68 @@ use ratatui::Frame;
 
 use crate::app::{App, AppMode};
 
-const BAR_BG: Color = Color::Rgb(20, 20, 25);
-const DIM: Color = Color::Rgb(70, 70, 70);
-const ACCENT: Color = Color::Rgb(130, 100, 255);
+/// VS Code style bottom-bar aesthetic: dark bg, subtle separators, clean typography
+const BG: Color = Color::Rgb(30, 30, 35);
+const FG: Color = Color::Rgb(160, 160, 170);
+const DIM: Color = Color::Rgb(80, 80, 90);
+const SEP: &str = " \u{2502} "; // │ thin separator
 
 pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     let width = area.width as usize;
-
-    // Left side: logo + working dir
     let dir = shorten_path(&app.working_dir.to_string_lossy());
+    let model = app.provider.model_name();
 
-    // Right side: model + mode
-    let model_name = app.provider.model_name();
-    let mode_str = match &app.mode {
-        AppMode::Normal => "",
-        AppMode::Streaming => " \u{25cf} streaming",        // ●
-        AppMode::WaitingApproval(_) => " \u{25cf} approval",
-        AppMode::ToolExecuting => " \u{25cf} executing",
-        AppMode::ProviderManager => " \u{25cf} providers",
-        AppMode::Exiting => " \u{25cf} exiting",
-    };
-    let mode_color = match &app.mode {
-        AppMode::Normal => DIM,
-        AppMode::Streaming => Color::Rgb(240, 200, 60),
-        AppMode::WaitingApproval(_) => Color::Rgb(240, 200, 60),
-        AppMode::ToolExecuting => Color::Rgb(80, 200, 255),
-        AppMode::ProviderManager => Color::Rgb(180, 140, 255),
-        AppMode::Exiting => Color::Rgb(240, 80, 80),
+    // Mode: icon + text
+    let (mode_icon, mode_text, mode_fg) = match &app.mode {
+        AppMode::Normal => ("\u{2713}", "", Color::Rgb(80, 180, 100)),  // ✓
+        AppMode::Streaming => ("\u{25b6}", "streaming", Color::Rgb(240, 180, 40)),  // ▶
+        AppMode::WaitingApproval(_) => ("\u{25cf}", "approval", Color::Rgb(240, 180, 40)),  // ●
+        AppMode::ToolExecuting => ("\u{25b6}", "running", Color::Rgb(80, 180, 240)),  // ▶
+        AppMode::ProviderManager => ("\u{2699}", "config", Color::Rgb(180, 140, 255)),  // ⚙
+        AppMode::Exiting => ("\u{00d7}", "exit", Color::Rgb(240, 80, 80)),  // ×
     };
 
-    let right_text = format!("{}{}", model_name, mode_str);
-    let left_text = format!(" \u{2666} {} ", dir); // ♦ ~/project/foo
+    // Build left segments
+    let mut spans: Vec<Span> = Vec::new();
 
-    // Calculate padding
-    let pad = width.saturating_sub(left_text.len() + right_text.len() + 1);
+    // App name
+    spans.push(Span::styled(
+        " atomcode ",
+        Style::default().fg(Color::White).bg(Color::Rgb(90, 60, 180)).add_modifier(Modifier::BOLD),
+    ));
 
-    let line = Line::from(vec![
-        Span::styled(
-            " \u{2666} ",
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!("{} ", dir),
-            Style::default().fg(Color::Rgb(140, 140, 140)),
-        ),
-        Span::styled(" ".repeat(pad), Style::default()),
-        Span::styled(
-            model_name.to_string(),
-            Style::default().fg(DIM),
-        ),
-        Span::styled(
-            mode_str.to_string(),
-            Style::default().fg(mode_color),
-        ),
-        Span::raw(" "),
-    ]);
+    // Mode indicator
+    spans.push(Span::styled(
+        format!(" {} ", mode_icon),
+        Style::default().fg(mode_fg),
+    ));
+    if !mode_text.is_empty() {
+        spans.push(Span::styled(
+            mode_text.to_string(),
+            Style::default().fg(mode_fg),
+        ));
+    }
 
-    let bar = Paragraph::new(line).style(Style::default().bg(BAR_BG));
+    // Separator + directory
+    spans.push(Span::styled(SEP, Style::default().fg(DIM)));
+    spans.push(Span::styled(
+        dir,
+        Style::default().fg(FG),
+    ));
+
+    // Right side: model name (right-aligned)
+    let right = format!(" {} ", model);
+    let left_len: usize = spans.iter().map(|s| s.content.len()).sum();
+    let pad = width.saturating_sub(left_len + right.len());
+
+    spans.push(Span::styled(" ".repeat(pad), Style::default()));
+    spans.push(Span::styled(
+        right,
+        Style::default().fg(DIM),
+    ));
+
+    let bar = Paragraph::new(Line::from(spans))
+        .style(Style::default().bg(BG));
     frame.render_widget(bar, area);
 }
 
