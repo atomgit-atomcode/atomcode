@@ -29,12 +29,12 @@ impl Tool for BashTool {
     fn definition(&self) -> ToolDef {
         ToolDef {
             name: "bash",
-            description: "Execute a bash command and return its stdout and stderr. Commands run in the project working directory.",
+            description: "Run a bash command (120s timeout, runs in working directory). For long-running processes (servers, watchers), append & to background them. Returns stdout+stderr.",
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "command": { "type": "string", "description": "The bash command to execute" },
-                    "timeout": { "type": "integer", "description": "Timeout in seconds. Default: 120" }
+                    "command": { "type": "string", "description": "The command. Use & for background processes. Timeout: 120s." },
+                    "timeout": { "type": "integer", "description": "Timeout in seconds (default 120)" }
                 },
                 "required": ["command"]
             }),
