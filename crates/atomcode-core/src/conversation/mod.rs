@@ -128,10 +128,40 @@ impl Conversation {
     }
 
     /// Like to_provider_messages but only sends the last `window` messages.
-    /// Keeps the conversation payload small for faster API calls during agent loops.
+    /// Ensures the window starts at a valid boundary — never in the middle
+    /// of a tool_call/tool_result pair (which causes API "messages illegal" errors).
     pub fn to_provider_messages_windowed(&self, system_prompt: &str, window: usize) -> Vec<Message> {
-        let start = self.messages.len().saturating_sub(window);
-        let mut msgs = Vec::with_capacity(window + 1);
+        let mut start = self.messages.len().saturating_sub(window);
+
+        // Scan forward to find a valid start position:
+        // - Skip ToolResult messages at the start (they need a preceding AssistantWithToolCalls)
+        // - Skip AssistantWithToolCalls without their following ToolResults
+        while start < self.messages.len() {
+            match &self.messages[start].content {
+                MessageContent::ToolResult(_) => {
+                    // Orphan tool result — skip it
+                    start += 1;
+                }
+                _ => break,
+            }
+        }
+
+        // Also ensure we start on a User or System message if possible
+        // (safest boundary for the API)
+        let original_start = start;
+        while start < self.messages.len() {
+            if matches!(self.messages[start].role, Role::User | Role::System) {
+                break;
+            }
+            start += 1;
+            // Don't go too far — if we can't find a user message within 5, use original
+            if start > original_start + 5 {
+                start = original_start;
+                break;
+            }
+        }
+
+        let mut msgs = Vec::with_capacity(self.messages.len() - start + 1);
         msgs.push(Message::new(Role::System, system_prompt));
         msgs.extend(self.messages[start..].iter().cloned());
         msgs
