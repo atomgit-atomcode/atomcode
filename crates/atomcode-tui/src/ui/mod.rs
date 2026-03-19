@@ -1,6 +1,7 @@
 pub mod chat_panel;
 pub mod input_box;
 pub mod markdown;
+pub mod model_selector;
 pub mod provider_panel;
 pub mod slash_menu;
 pub mod status_bar;
@@ -64,5 +65,10 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     // Render slash menu as overlay above input box
     if app.slash_menu.visible {
         slash_menu::render(frame, chunks[2], &app.slash_menu);
+    }
+
+    // Model selector popup (overlay)
+    if matches!(app.mode, crate::app::AppMode::ModelSelector) {
+        model_selector::render(frame, frame.area(), app);
     }
 }

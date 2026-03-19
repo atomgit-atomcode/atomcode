@@ -23,6 +23,7 @@ pub enum AppMode {
     WaitingApproval(ToolCall),
     ToolExecuting,
     ProviderManager,
+    ModelSelector,
     Exiting,
 }
 
@@ -46,6 +47,9 @@ pub struct App {
     pub pending_editor: Option<String>,
     pub slash_menu: SlashMenu,
     pub provider_mgr: Option<ProviderManager>,
+    /// Model selector: list of (provider_name, model_name), selected index
+    pub model_list: Vec<(String, String)>,
+    pub model_selected: usize,
     pub tool_registry: ToolRegistry,
     pub tool_call_count: usize,
     pub tick_count: usize,
@@ -107,6 +111,8 @@ impl App {
             pending_editor: None,
             slash_menu: SlashMenu::new(),
             provider_mgr: None,
+            model_list: Vec::new(),
+            model_selected: 0,
             tool_registry,
             tool_call_count: 0,
             retry_count: 0,
@@ -468,8 +474,37 @@ impl App {
                 }
             }
             AppMode::WaitingApproval(_) => self.handle_key_approval(key, event_tx),
+            AppMode::ModelSelector => self.handle_key_model_selector(key),
             AppMode::ProviderManager => self.handle_key_provider_manager(key),
             AppMode::Exiting => {}
+        }
+    }
+
+    fn handle_key_model_selector(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Up => {
+                if self.model_selected > 0 {
+                    self.model_selected -= 1;
+                }
+            }
+            KeyCode::Down => {
+                if self.model_selected + 1 < self.model_list.len() {
+                    self.model_selected += 1;
+                }
+            }
+            KeyCode::Enter => {
+                // Switch to selected provider
+                if let Some((name, _)) = self.model_list.get(self.model_selected) {
+                    self.config.default_provider = name.clone();
+                    let _ = self.config.save(&Config::default_path());
+                    self.rebuild_provider();
+                }
+                self.mode = AppMode::Normal;
+            }
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.mode = AppMode::Normal;
+            }
+            _ => {}
         }
     }
 
@@ -830,60 +865,18 @@ impl App {
                     self.pending_editor = Some(config_path.to_string_lossy().to_string());
                 }
             }
-            _ if cmd == "/model" || cmd.starts_with("/model ") => {
-                let arg = cmd.strip_prefix("/model").unwrap().trim();
-                if arg.is_empty() {
-                    // Show current model + available providers
-                    let current = self.provider.model_name();
-                    let default = &self.config.default_provider;
-                    let mut info = format!("Current: {} ({})\n\nAvailable:\n", current, default);
-                    for (name, p) in &self.config.providers {
-                        let marker = if name == default { " *" } else { "  " };
-                        info.push_str(&format!("{}  {} - {}\n", marker, name, p.model));
-                    }
-                    info.push_str("\nSwitch: /model <provider_name> or /model <provider> <model>");
-                    self.conversation.push_delta(&info);
-                    self.conversation.finalize_stream();
-                } else {
-                    // Switch model: "/model <provider>" or "/model <provider> <model>"
-                    let parts: Vec<&str> = arg.splitn(2, ' ').collect();
-                    let provider_name = parts[0];
-                    let new_model = parts.get(1).map(|s| s.trim());
-
-                    if self.config.providers.contains_key(provider_name) {
-                        // Update default provider
-                        self.config.default_provider = provider_name.to_string();
-
-                        // Optionally update model
-                        if let Some(model) = new_model {
-                            if let Some(p) = self.config.providers.get_mut(provider_name) {
-                                p.model = model.to_string();
-                            }
-                        }
-
-                        let _ = self.config.save(&Config::default_path());
-                        self.rebuild_provider();
-
-                        let model = self.provider.model_name().to_string();
-                        self.conversation.push_delta(&format!(
-                            "Switched to {} ({})", model, provider_name
-                        ));
-                        self.conversation.finalize_stream();
-                    } else {
-                        // Treat as model name change for current provider
-                        let current = self.config.default_provider.clone();
-                        if let Some(p) = self.config.providers.get_mut(&current) {
-                            p.model = arg.to_string();
-                        }
-                        let _ = self.config.save(&Config::default_path());
-                        self.rebuild_provider();
-
-                        self.conversation.push_delta(&format!(
-                            "Model changed to {} ({})", arg, current
-                        ));
-                        self.conversation.finalize_stream();
-                    }
-                }
+            "/model" => {
+                // Enter model selector mode
+                self.model_list = self.config.providers.iter()
+                    .map(|(name, p)| (name.clone(), p.model.clone()))
+                    .collect();
+                self.model_list.sort_by(|a, b| a.0.cmp(&b.0));
+                // Pre-select current provider
+                self.model_selected = self.model_list.iter()
+                    .position(|(name, _)| name == &self.config.default_provider)
+                    .unwrap_or(0);
+                self.conversation.messages.pop(); // Remove the /model user message
+                self.mode = AppMode::ModelSelector;
             }
             "/copy" => {
                 // Find the last assistant text and copy to clipboard

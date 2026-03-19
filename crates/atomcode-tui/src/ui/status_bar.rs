@@ -22,6 +22,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         AppMode::Streaming => (">", "streaming", Color::Rgb(240, 180, 40)),
         AppMode::WaitingApproval(_) => ("?", "approval", Color::Rgb(240, 180, 40)),
         AppMode::ToolExecuting => (">", "running", Color::Rgb(80, 180, 240)),
+        AppMode::ModelSelector => ("*", "model", Color::Rgb(180, 140, 255)),
         AppMode::ProviderManager => ("*", "config", Color::Rgb(180, 140, 255)),
         AppMode::Exiting => ("x", "exit", Color::Rgb(240, 80, 80)),
     };
