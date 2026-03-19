@@ -11,7 +11,7 @@ use serde_json::json;
 use crate::config::provider::ProviderConfig;
 use crate::conversation::message::{Message, MessageContent, Role};
 use crate::stream::StreamEvent;
-use crate::tool::ToolDef;
+use crate::tool::{ToolCall, ToolDef};
 
 use super::LlmProvider;
 
@@ -39,23 +39,64 @@ impl ClaudeProvider {
         let mut msgs = Vec::new();
 
         for m in messages {
-            let content_str = match &m.content {
-                MessageContent::Text(s) => s.as_str(),
-                MessageContent::AssistantWithToolCalls { text, .. } => text.as_deref().unwrap_or(""),
-                MessageContent::ToolResult(r) => &r.output,
-            };
             match m.role {
                 Role::System => {
-                    system = Some(content_str.to_string());
+                    let text = match &m.content {
+                        MessageContent::Text(s) => s.clone(),
+                        _ => String::new(),
+                    };
+                    system = Some(text);
                 }
                 Role::User => {
-                    msgs.push(json!({"role": "user", "content": content_str}));
+                    let content = match &m.content {
+                        MessageContent::Text(s) => json!(s),
+                        _ => json!(""),
+                    };
+                    msgs.push(json!({"role": "user", "content": content}));
                 }
                 Role::Assistant => {
-                    msgs.push(json!({"role": "assistant", "content": content_str}));
+                    match &m.content {
+                        MessageContent::Text(s) => {
+                            msgs.push(json!({
+                                "role": "assistant",
+                                "content": [{"type": "text", "text": s}]
+                            }));
+                        }
+                        MessageContent::AssistantWithToolCalls { text, tool_calls } => {
+                            let mut parts: Vec<serde_json::Value> = Vec::new();
+                            if let Some(t) = text {
+                                if !t.is_empty() {
+                                    parts.push(json!({"type": "text", "text": t}));
+                                }
+                            }
+                            for tc in tool_calls {
+                                let input: serde_json::Value =
+                                    serde_json::from_str(&tc.arguments).unwrap_or(json!({}));
+                                parts.push(json!({
+                                    "type": "tool_use",
+                                    "id": tc.id,
+                                    "name": tc.name,
+                                    "input": input,
+                                }));
+                            }
+                            msgs.push(json!({"role": "assistant", "content": parts}));
+                        }
+                        MessageContent::ToolResult(_) => {
+                            // Should not appear on assistant role; skip.
+                        }
+                    }
                 }
                 Role::Tool => {
-                    msgs.push(json!({"role": "user", "content": content_str}));
+                    if let MessageContent::ToolResult(r) = &m.content {
+                        msgs.push(json!({
+                            "role": "user",
+                            "content": [{
+                                "type": "tool_result",
+                                "tool_use_id": r.call_id,
+                                "content": r.output,
+                            }]
+                        }));
+                    }
                 }
             }
         }
@@ -64,24 +105,44 @@ impl ClaudeProvider {
     }
 }
 
+// ── SSE deserialization structs ──────────────────────────────────────────────
+
 #[derive(Deserialize)]
-struct ClaudeEvent {
+struct ClaudeSSE {
     #[serde(rename = "type")]
     event_type: String,
+    #[allow(dead_code)]
+    index: Option<usize>,
+    content_block: Option<ContentBlock>,
     delta: Option<ClaudeDelta>,
 }
 
 #[derive(Deserialize)]
-struct ClaudeDelta {
+struct ContentBlock {
+    #[serde(rename = "type")]
+    block_type: String,
+    id: Option<String>,
+    name: Option<String>,
+    #[allow(dead_code)]
     text: Option<String>,
 }
+
+#[derive(Deserialize)]
+struct ClaudeDelta {
+    #[serde(rename = "type")]
+    delta_type: String,
+    text: Option<String>,
+    partial_json: Option<String>,
+}
+
+// ── LlmProvider impl ─────────────────────────────────────────────────────────
 
 #[async_trait]
 impl LlmProvider for ClaudeProvider {
     fn chat_stream(
         &self,
         messages: &[Message],
-        _tools: Option<&[ToolDef]>,
+        tools: Option<&[ToolDef]>,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
         let (system, msgs) = Self::format_messages(messages);
 
@@ -94,6 +155,22 @@ impl LlmProvider for ClaudeProvider {
 
         if let Some(sys) = system {
             body["system"] = json!(sys);
+        }
+
+        if let Some(tool_defs) = tools {
+            if !tool_defs.is_empty() {
+                let tools_json: Vec<serde_json::Value> = tool_defs
+                    .iter()
+                    .map(|td| {
+                        json!({
+                            "name": td.name,
+                            "description": td.description,
+                            "input_schema": td.parameters,
+                        })
+                    })
+                    .collect();
+                body["tools"] = json!(tools_json);
+            }
         }
 
         let request = self
@@ -120,14 +197,20 @@ impl LlmProvider for ClaudeProvider {
             if !response.status().is_success() {
                 let status = response.status();
                 let body = response.text().await.unwrap_or_default();
-                let _ = tx.send(Ok(StreamEvent::Error(
-                    format!("Claude API error ({}): {}", status, body),
-                )));
+                let _ = tx.send(Ok(StreamEvent::Error(format!(
+                    "Claude API error ({}): {}",
+                    status, body
+                ))));
                 return;
             }
 
             let mut buffer = String::new();
             let mut byte_stream = response.bytes_stream();
+
+            // Per-message state for the current tool_use content block.
+            let mut tc_id = String::new();
+            let mut tc_name = String::new();
+            let mut tc_json = String::new();
 
             while let Some(chunk) = byte_stream.next().await {
                 let text = match chunk {
@@ -144,24 +227,67 @@ impl LlmProvider for ClaudeProvider {
                     let line = buffer[..pos].trim().to_string();
                     buffer = buffer[pos + 1..].to_string();
 
-                    if line.starts_with("data: ") {
-                        let data = &line[6..];
-                        if let Ok(evt) = serde_json::from_str::<ClaudeEvent>(data) {
-                            match evt.event_type.as_str() {
-                                "content_block_delta" => {
-                                    if let Some(delta) = evt.delta {
-                                        if let Some(text) = delta.text {
-                                            let _ = tx.send(Ok(StreamEvent::Delta(text)));
-                                        }
-                                    }
+                    if !line.starts_with("data: ") {
+                        continue;
+                    }
+
+                    let data = &line[6..];
+                    let evt = match serde_json::from_str::<ClaudeSSE>(data) {
+                        Ok(e) => e,
+                        Err(_) => continue,
+                    };
+
+                    match evt.event_type.as_str() {
+                        "content_block_start" => {
+                            if let Some(block) = &evt.content_block {
+                                if block.block_type == "tool_use" {
+                                    tc_id = block.id.clone().unwrap_or_default();
+                                    tc_name = block.name.clone().unwrap_or_default();
+                                    tc_json.clear();
+                                    let _ = tx.send(Ok(StreamEvent::ToolCallStart {
+                                        id: tc_id.clone(),
+                                        name: tc_name.clone(),
+                                    }));
                                 }
-                                "message_stop" => {
-                                    let _ = tx.send(Ok(StreamEvent::Done));
-                                    return;
-                                }
-                                _ => {}
                             }
                         }
+                        "content_block_delta" => {
+                            if let Some(delta) = &evt.delta {
+                                match delta.delta_type.as_str() {
+                                    "text_delta" => {
+                                        if let Some(text) = &delta.text {
+                                            let _ = tx.send(Ok(StreamEvent::Delta(text.clone())));
+                                        }
+                                    }
+                                    "input_json_delta" => {
+                                        if let Some(json_chunk) = &delta.partial_json {
+                                            tc_json.push_str(json_chunk);
+                                            let _ = tx.send(Ok(StreamEvent::ToolCallDelta(
+                                                json_chunk.clone(),
+                                            )));
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        "content_block_stop" => {
+                            if !tc_id.is_empty() {
+                                let _ = tx.send(Ok(StreamEvent::ToolCallDone(ToolCall {
+                                    id: tc_id.clone(),
+                                    name: tc_name.clone(),
+                                    arguments: tc_json.clone(),
+                                })));
+                                tc_id.clear();
+                                tc_name.clear();
+                                tc_json.clear();
+                            }
+                        }
+                        "message_stop" => {
+                            let _ = tx.send(Ok(StreamEvent::Done));
+                            return;
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -169,7 +295,9 @@ impl LlmProvider for ClaudeProvider {
             let _ = tx.send(Ok(StreamEvent::Done));
         });
 
-        Ok(Box::pin(tokio_stream::wrappers::UnboundedReceiverStream::new(rx)))
+        Ok(Box::pin(
+            tokio_stream::wrappers::UnboundedReceiverStream::new(rx),
+        ))
     }
 
     fn model_name(&self) -> &str {
