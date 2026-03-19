@@ -938,7 +938,7 @@ impl App {
         self.last_turn_duration = None;
 
         let system_prompt = self.system_prompt();
-        let messages = self.conversation.to_provider_messages_windowed(&system_prompt, 50);
+        let messages = self.conversation.to_provider_messages_windowed(&system_prompt, 30);
         let tool_defs = self.tool_registry.get_definitions();
 
         let tx = event_tx.clone();
@@ -1082,6 +1082,16 @@ impl App {
             }
         }
 
+        // Truncate large tool outputs to reduce API payload size
+        // (LLM doesn't need 2000 lines of file content in the next request)
+        const MAX_OUTPUT_CHARS: usize = 8000;
+        if result.output.len() > MAX_OUTPUT_CHARS {
+            let truncated: String = result.output.chars().take(MAX_OUTPUT_CHARS).collect();
+            let total_lines = result.output.lines().count();
+            result.output = format!("{}...\n\n[truncated, showing first ~{} chars of {} lines total]",
+                truncated, MAX_OUTPUT_CHARS, total_lines);
+        }
+
         self.conversation.add_tool_result(result);
         self.tool_call_count += 1;
 
@@ -1096,10 +1106,9 @@ impl App {
     }
 
     fn continue_agent_loop(&mut self, event_tx: &mpsc::UnboundedSender<AppEvent>) {
-        // Reuse cached system prompt from the turn start
         let system_prompt = self.system_prompt();
-        // Only send the last N messages to reduce payload size and API latency
-        let messages = self.conversation.to_provider_messages_windowed(&system_prompt, 50);
+        // Smaller window for tool continuations — recent context is enough
+        let messages = self.conversation.to_provider_messages_windowed(&system_prompt, 20);
         let tool_defs = self.tool_registry.get_definitions();
 
         let tx = event_tx.clone();
