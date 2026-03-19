@@ -334,19 +334,23 @@ impl App {
                 });
             }
             AppEvent::StreamError(err) => {
-                if self.retry_count < 3 {
-                    // Auto-retry: discard partial stream, try again
+                // Only retry on network/timeout errors, NOT on API errors (400, 401, etc.)
+                let is_api_error = err.contains("API error")
+                    || err.contains("400")
+                    || err.contains("401")
+                    || err.contains("403")
+                    || err.contains("404")
+                    || err.contains("422")
+                    || err.contains("429")
+                    || err.contains("illegal");
+
+                if !is_api_error && self.retry_count < 2 {
                     self.retry_count += 1;
                     self.conversation.stream_buffer = None;
-                    self.conversation.push_delta(&format!(
-                        "\n[Retrying... ({}/3)]", self.retry_count
-                    ));
-                    self.conversation.finalize_stream();
                     self.mode = AppMode::Streaming;
                     self.at_bottom = true;
                     self.continue_agent_loop(event_tx);
                 } else {
-                    // Give up after 3 retries
                     self.conversation.push_delta(&format!("\n\n[Error: {}]", err));
                     self.conversation.finalize_stream();
                     self.mode = AppMode::Normal;

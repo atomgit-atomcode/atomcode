@@ -42,21 +42,33 @@ impl OpenAiProvider {
     fn format_messages(messages: &[Message]) -> Vec<serde_json::Value> {
         messages
             .iter()
-            .map(|m| {
+            .filter_map(|m| {
                 match &m.content {
                     MessageContent::Text(s) => {
+                        // Skip Tool role with plain Text (invalid for OpenAI API)
+                        if matches!(m.role, Role::Tool) {
+                            return None;
+                        }
                         let role = match m.role {
                             Role::System => "system",
                             Role::User => "user",
                             Role::Assistant => "assistant",
-                            Role::Tool => "tool",
+                            Role::Tool => return None,
                         };
-                        json!({"role": role, "content": s})
+                        // Skip empty messages
+                        if s.trim().is_empty() {
+                            return None;
+                        }
+                        Some(json!({"role": role, "content": s}))
                     }
                     MessageContent::AssistantWithToolCalls { text, tool_calls } => {
-                        let mut msg = json!({
-                            "role": "assistant",
-                        });
+                        if tool_calls.is_empty() {
+                            // No tool calls — send as plain assistant text
+                            let t = text.as_deref().unwrap_or("");
+                            if t.is_empty() { return None; }
+                            return Some(json!({"role": "assistant", "content": t}));
+                        }
+                        let mut msg = json!({"role": "assistant"});
                         if let Some(t) = text {
                             msg["content"] = json!(t);
                         }
@@ -68,14 +80,18 @@ impl OpenAiProvider {
                                 "arguments": tc.arguments,
                             }
                         })).collect::<Vec<_>>());
-                        msg
+                        Some(msg)
                     }
                     MessageContent::ToolResult(r) => {
-                        json!({
+                        // Must have a call_id to be valid
+                        if r.call_id.is_empty() {
+                            return None;
+                        }
+                        Some(json!({
                             "role": "tool",
                             "tool_call_id": r.call_id,
                             "content": r.output,
-                        })
+                        }))
                     }
                 }
             })
