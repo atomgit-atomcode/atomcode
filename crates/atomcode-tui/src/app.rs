@@ -176,46 +176,35 @@ impl App {
         None
     }
 
-    /// Change the working directory. Updates bash tool, system prompt context.
-    pub fn change_working_dir(&mut self, path: &str) {
+    /// Try to change working directory. Returns (success, message).
+    fn try_change_dir(&mut self, path: &str) -> (bool, String) {
         let new_path = if path.starts_with('/') || path.starts_with('~') {
-            let expanded = if path.starts_with('~') {
+            if path.starts_with('~') {
                 dirs::home_dir()
-                    .map(|h| h.join(&path[2..]))
+                    .map(|h| h.join(path.strip_prefix("~/").unwrap_or(&path[1..])))
                     .unwrap_or_else(|| PathBuf::from(path))
             } else {
                 PathBuf::from(path)
-            };
-            expanded
+            }
         } else {
             self.working_dir.join(path)
         };
 
         match std::fs::canonicalize(&new_path) {
-            Ok(resolved) => {
-                if resolved.is_dir() {
-                    self.working_dir = resolved.clone();
-                    self.conversation.push_delta(&format!(
-                        "Changed working directory to `{}`",
-                        resolved.display()
-                    ));
-                    self.conversation.finalize_stream();
-                } else {
-                    self.conversation.push_delta(&format!(
-                        "Not a directory: `{}`",
-                        new_path.display()
-                    ));
-                    self.conversation.finalize_stream();
-                }
+            Ok(resolved) if resolved.is_dir() => {
+                self.working_dir = resolved.clone();
+                (true, format!("Changed working directory to {}", resolved.display()))
             }
-            Err(e) => {
-                self.conversation.push_delta(&format!(
-                    "Cannot access `{}`: {}",
-                    new_path.display(), e
-                ));
-                self.conversation.finalize_stream();
-            }
+            Ok(_) => (false, format!("Not a directory: {}", new_path.display())),
+            Err(e) => (false, format!("Cannot access {}: {}", new_path.display(), e)),
         }
+    }
+
+    /// Change working directory from /cd command (adds conversation message).
+    pub fn change_working_dir(&mut self, path: &str) {
+        let (_, msg) = self.try_change_dir(path);
+        self.conversation.push_delta(&msg);
+        self.conversation.finalize_stream();
     }
 
     /// Build system prompt with working directory context.
@@ -770,9 +759,9 @@ impl App {
         // Intercept change_dir requests
         if result.output.starts_with("CD_REQUEST:") {
             let path = result.output.strip_prefix("CD_REQUEST:").unwrap().to_string();
-            self.change_working_dir(&path);
-            // Replace output with actual result for the LLM
-            result.output = format!("Changed working directory to {}", self.working_dir.display());
+            let (ok, msg) = self.try_change_dir(&path);
+            result.output = msg;
+            result.success = ok;
         }
 
         self.conversation.add_tool_result(result);
