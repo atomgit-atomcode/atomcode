@@ -51,6 +51,8 @@ pub struct App {
     pub tick_count: usize,
     /// Retry count for stream errors (auto-retry up to 3 times).
     pub retry_count: usize,
+    /// Last Ctrl+C timestamp for double-press detection.
+    pub last_ctrl_c: Option<Instant>,
     /// When the current turn (user message → agent loop) started.
     pub turn_start: Option<Instant>,
     /// When the last tool execution started (for per-step timing).
@@ -86,6 +88,7 @@ impl App {
             tool_registry,
             tool_call_count: 0,
             retry_count: 0,
+            last_ctrl_c: None,
             tick_count: 0,
             turn_start: None,
             tool_start: None,
@@ -346,6 +349,56 @@ impl App {
     }
 
     fn handle_key(&mut self, key: KeyEvent, event_tx: &mpsc::UnboundedSender<AppEvent>) {
+        // Global Ctrl+C handling — like Claude Code:
+        // 1st press: cancel current operation
+        // 2nd press (within 1s): exit program
+        if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('c') {
+            let now = Instant::now();
+            let double_press = self.last_ctrl_c
+                .map(|t| now.duration_since(t).as_millis() < 1000)
+                .unwrap_or(false);
+            self.last_ctrl_c = Some(now);
+
+            if double_press {
+                // Double Ctrl+C: exit
+                self.mode = AppMode::Exiting;
+                return;
+            }
+
+            // Single Ctrl+C: cancel current operation
+            match &self.mode {
+                AppMode::Streaming | AppMode::ToolExecuting => {
+                    self.conversation.stream_buffer = None;
+                    self.conversation.tool_call_buffer = None;
+                    self.conversation.finalize_stream();
+                    self.mode = AppMode::Normal;
+                    self.at_bottom = true;
+                    self.last_turn_duration = self.turn_start.map(|t| t.elapsed());
+                    self.turn_start = None;
+                }
+                AppMode::WaitingApproval(_) => {
+                    self.mode = AppMode::Normal;
+                    self.at_bottom = true;
+                }
+                AppMode::Normal => {
+                    if !self.input.is_empty() {
+                        self.input.clear();
+                        self.slash_menu.close();
+                    }
+                    // Show hint about double-press to exit
+                }
+                AppMode::ProviderManager => {
+                    self.provider_mgr = None;
+                    self.mode = AppMode::Normal;
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        // Reset double-press timer on any other key
+        self.last_ctrl_c = None;
+
         match &self.mode {
             AppMode::Normal => self.handle_key_normal(key, event_tx),
             AppMode::Streaming | AppMode::ToolExecuting => self.handle_key_streaming(key),
@@ -481,13 +534,6 @@ impl App {
         }
 
         match (key.modifiers, key.code) {
-            (KeyModifiers::CONTROL, KeyCode::Char('c')) => {
-                // Same as Esc: clear input, don't exit program
-                if !self.input.is_empty() {
-                    self.input.clear();
-                    self.slash_menu.close();
-                }
-            }
             (KeyModifiers::SHIFT, KeyCode::Enter) => {
                 self.input.insert_newline();
             }
@@ -606,9 +652,15 @@ impl App {
 
     fn handle_key_streaming(&mut self, key: KeyEvent) {
         match (key.modifiers, key.code) {
-            (KeyModifiers::CONTROL, KeyCode::Char('c')) | (_, KeyCode::Esc) => {
+            (_, KeyCode::Esc) => {
+                // Esc also cancels streaming
+                self.conversation.stream_buffer = None;
+                self.conversation.tool_call_buffer = None;
                 self.conversation.finalize_stream();
                 self.mode = AppMode::Normal;
+                self.at_bottom = true;
+                self.last_turn_duration = self.turn_start.map(|t| t.elapsed());
+                self.turn_start = None;
             }
             _ => {}
         }
