@@ -78,7 +78,20 @@ pub fn render(frame: &mut Frame, area: Rect, input: &InputState, is_streaming: b
     // cursor_col is a byte index; we need the display width (columns) of the text before it.
     if !is_streaming {
         let current_line = &input.lines[input.cursor_row];
-        let text_before_cursor = &current_line[..input.cursor_col];
+        // Safely clamp cursor_col to a valid char boundary
+        let safe_col = if input.cursor_col >= current_line.len() {
+            current_line.len()
+        } else if current_line.is_char_boundary(input.cursor_col) {
+            input.cursor_col
+        } else {
+            // Find the nearest char boundary at or before cursor_col
+            current_line[..input.cursor_col]
+                .char_indices()
+                .last()
+                .map(|(i, c)| i + c.len_utf8())
+                .unwrap_or(0)
+        };
+        let text_before_cursor = &current_line[..safe_col];
         let display_col = unicode_display_width(text_before_cursor);
         let cursor_x = area.x + 1 + H_PADDING + display_col as u16;
         let cursor_y = area.y + 1 + input.cursor_row as u16;

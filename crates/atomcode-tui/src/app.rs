@@ -533,25 +533,41 @@ impl App {
             (_, KeyCode::Up) => {
                 if self.input.cursor_row > 0 {
                     self.input.cursor_row -= 1;
-                    self.input.cursor_col = self.input.cursor_col
-                        .min(self.input.lines[self.input.cursor_row].len());
+                    self.input.cursor_col = snap_to_char_boundary(
+                        &self.input.lines[self.input.cursor_row],
+                        self.input.cursor_col,
+                    );
                 }
             }
             (_, KeyCode::Down) => {
                 if self.input.cursor_row + 1 < self.input.lines.len() {
                     self.input.cursor_row += 1;
-                    self.input.cursor_col = self.input.cursor_col
-                        .min(self.input.lines[self.input.cursor_row].len());
+                    self.input.cursor_col = snap_to_char_boundary(
+                        &self.input.lines[self.input.cursor_row],
+                        self.input.cursor_col,
+                    );
                 }
             }
             (_, KeyCode::Left) => {
                 if self.input.cursor_col > 0 {
-                    self.input.cursor_col -= 1;
+                    // Move to previous char boundary
+                    let line = &self.input.lines[self.input.cursor_row];
+                    self.input.cursor_col = line[..self.input.cursor_col]
+                        .char_indices()
+                        .last()
+                        .map(|(i, _)| i)
+                        .unwrap_or(0);
                 }
             }
             (_, KeyCode::Right) => {
-                if self.input.cursor_col < self.input.lines[self.input.cursor_row].len() {
-                    self.input.cursor_col += 1;
+                let line = &self.input.lines[self.input.cursor_row];
+                if self.input.cursor_col < line.len() {
+                    // Move to next char boundary
+                    self.input.cursor_col = line[self.input.cursor_col..]
+                        .char_indices()
+                        .nth(1)
+                        .map(|(i, _)| self.input.cursor_col + i)
+                        .unwrap_or(line.len());
                 }
             }
             (_, KeyCode::Tab) => {
@@ -958,6 +974,20 @@ impl App {
 }
 
 /// Copy text to system clipboard (macOS: pbcopy, Linux: xclip/xsel).
+/// Snap a byte position to the nearest valid char boundary at or before `pos`.
+fn snap_to_char_boundary(s: &str, pos: usize) -> usize {
+    let pos = pos.min(s.len());
+    if s.is_char_boundary(pos) {
+        pos
+    } else {
+        s[..pos]
+            .char_indices()
+            .last()
+            .map(|(i, c)| i + c.len_utf8())
+            .unwrap_or(0)
+    }
+}
+
 fn copy_to_clipboard(text: &str) -> std::io::Result<()> {
     use std::io::Write;
     use std::process::{Command, Stdio};
