@@ -12,7 +12,6 @@ use crate::app::AppMode;
 
 use super::markdown::render_markdown;
 
-/// Colors
 const USER_BG: Color = Color::Rgb(35, 38, 52);
 const DIM: Color = Color::Rgb(90, 90, 90);
 const ACCENT: Color = Color::Rgb(130, 100, 255);
@@ -23,7 +22,6 @@ const WARN: Color = Color::Rgb(240, 200, 60);
 
 const SPINNER: &[&str] = &["\u{25dc}", "\u{25dd}", "\u{25de}", "\u{25df}"];
 
-/// Fun thinking labels, rotated each time
 const THINKING_LABELS: &[&str] = &[
     "Thinking...",
     "Pondering...",
@@ -35,6 +33,9 @@ const THINKING_LABELS: &[&str] = &[
     "Deliberating...",
 ];
 
+/// Full render — builds all lines, scrolls, draws.
+/// Uses render_cache for completed messages (only rebuilt when msg count changes).
+/// Dynamic parts (streaming, mode indicators) are appended fresh each frame.
 pub fn render(
     frame: &mut Frame,
     area: Rect,
@@ -46,9 +47,8 @@ pub fn render(
     render_cache: &mut Vec<Line<'static>>,
     render_cache_msg_count: &mut usize,
 ) {
-    let width = area.width as usize;
     let vh = area.height as usize;
-    if vh == 0 || width == 0 {
+    if vh == 0 {
         return;
     }
 
@@ -79,15 +79,15 @@ pub fn render(
         *render_cache_msg_count = msg_count;
     }
 
-    // Start with cached lines
-    let mut logical_lines: Vec<Line<'static>> = Vec::with_capacity(render_cache.len() + 20);
-    logical_lines.extend_from_slice(render_cache);
+    // Count total lines = cached + dynamic
+    let cached_len = render_cache.len();
 
-    // Streaming buffer
+    // Build dynamic lines (streaming + mode indicator) — small, cheap
+    let mut dynamic: Vec<Line<'static>> = Vec::new();
+
     if let Some(ref buffer) = conversation.stream_buffer {
         if !buffer.is_empty() {
-            // AI marker at start of streaming response
-            logical_lines.push(Line::from(Span::styled(
+            dynamic.push(Line::from(Span::styled(
                 "  \u{2759} ",
                 Style::default().fg(ACCENT),
             )));
@@ -95,55 +95,87 @@ pub fn render(
             for line in md {
                 let mut spans = vec![Span::raw("    ".to_string())];
                 spans.extend(line.spans);
-                logical_lines.push(Line::from(spans));
+                dynamic.push(Line::from(spans));
             }
         }
     }
 
-    // State indicators — only show when there's nothing else visible
-    let spinner = SPINNER[tick % SPINNER.len()];
     let has_text = conversation.stream_buffer.as_ref().map_or(false, |b| !b.is_empty());
+    let spinner = SPINNER[tick % SPINNER.len()];
     match mode {
         AppMode::Streaming if !has_text => {
-            // Pick one label per turn (stable, based on message count)
             let label = THINKING_LABELS[conversation.messages.len() % THINKING_LABELS.len()];
-            logical_lines.push(Line::from(Span::styled(
+            dynamic.push(Line::from(Span::styled(
                 format!("    {} {}", spinner, label),
                 Style::default().fg(ACCENT),
             )));
         }
+        AppMode::Streaming => {
+            dynamic.push(Line::from(Span::styled(
+                format!("    {}", spinner),
+                Style::default().fg(ACCENT),
+            )));
+        }
         AppMode::ToolExecuting => {
-            logical_lines.push(Line::from(Span::styled(
+            dynamic.push(Line::from(Span::styled(
                 format!("    {} Executing...", spinner),
                 Style::default().fg(WARN),
             )));
         }
         AppMode::WaitingApproval(call) => {
-            render_approval(&mut logical_lines, call);
+            render_approval(&mut dynamic, call);
         }
         _ => {}
     }
 
-    // Use logical line count for scroll (simple, fast)
-    let total = logical_lines.len();
+    let total = cached_len + dynamic.len();
+
+    // Scroll calculation
     let scroll = if at_bottom {
         total.saturating_sub(vh) as u16
     } else {
         (scroll_offset.min(total.saturating_sub(vh))) as u16
     };
 
-    // Padding so last content can be at top of viewport
-    for _ in 0..vh {
-        logical_lines.push(Line::default());
+    let scroll_usize = scroll as usize;
+
+    // Build only the visible slice + some padding
+    // Instead of cloning ALL cached lines, only take what's visible
+    let mut visible: Vec<Line<'static>> = Vec::with_capacity(vh + 10);
+
+    if scroll_usize < cached_len {
+        // Visible range starts in cached lines
+        let cache_start = scroll_usize;
+        let cache_end = (scroll_usize + vh + 5).min(cached_len);
+        visible.extend_from_slice(&render_cache[cache_start..cache_end]);
+
+        // If we need dynamic lines too
+        let remaining = (vh + 5).saturating_sub(cache_end - cache_start);
+        if remaining > 0 {
+            let dyn_end = remaining.min(dynamic.len());
+            visible.extend(dynamic[..dyn_end].iter().cloned());
+        }
+    } else {
+        // Scroll is past cached lines, only show dynamic
+        let dyn_start = scroll_usize.saturating_sub(cached_len);
+        let dyn_end = (dyn_start + vh + 5).min(dynamic.len());
+        if dyn_start < dynamic.len() {
+            visible.extend(dynamic[dyn_start..dyn_end].iter().cloned());
+        }
     }
 
-    // Clear the area first to prevent previous terminal content from showing through
-    frame.render_widget(Clear, area);
+    // Pad to fill viewport
+    while visible.len() < vh {
+        visible.push(Line::default());
+    }
 
+    // Clear + render
+    frame.render_widget(Clear, area);
     let bg = Block::default().style(Style::default().bg(Color::Reset));
     frame.render_widget(bg, area);
 
-    let paragraph = Paragraph::new(logical_lines).scroll((scroll, 0));
+    // No scroll on Paragraph since we already sliced
+    let paragraph = Paragraph::new(visible);
     frame.render_widget(paragraph, area);
 }
 
@@ -160,9 +192,8 @@ fn render_user(lines: &mut Vec<Line<'static>>, content: &str) {
 }
 
 fn render_assistant(lines: &mut Vec<Line<'static>>, content: &str) {
-    // AI marker on first line
     lines.push(Line::from(Span::styled(
-        "  \u{2759} ",  // ❙ thin bar marker
+        "  \u{2759} ",
         Style::default().fg(ACCENT),
     )));
     let md = render_markdown(content);
@@ -176,7 +207,6 @@ fn render_assistant(lines: &mut Vec<Line<'static>>, content: &str) {
 fn render_tool_call(lines: &mut Vec<Line<'static>>, call: &ToolCall) {
     let border = Style::default().fg(TOOL_BORDER);
     let name = capitalize(&call.name);
-
     lines.push(Line::from(vec![
         Span::styled("    \u{2502} ", border),
         Span::styled(
@@ -196,14 +226,12 @@ fn render_tool_result(lines: &mut Vec<Line<'static>>, result: &ToolResult) {
     } else {
         ("\u{2717}", ERROR)
     };
-
     let summary: String = result.output.lines().next().unwrap_or("").to_string();
     let summary: String = if summary.chars().count() > 70 {
         summary.chars().take(67).collect::<String>() + "..."
     } else {
         summary
     };
-
     lines.push(Line::from(vec![
         Span::styled("    \u{2502} ", Style::default().fg(TOOL_BORDER)),
         Span::styled(format!("{} ", icon), Style::default().fg(color)),
@@ -255,10 +283,7 @@ fn render_approval(lines: &mut Vec<Line<'static>>, call: &ToolCall) {
                     } else {
                         lines.push(Line::from(vec![
                             Span::styled("    \u{2502}   ", border),
-                            Span::styled(
-                                vline.to_string(),
-                                Style::default().fg(Color::Rgb(150, 150, 150)),
-                            ),
+                            Span::styled(vline.to_string(), Style::default().fg(Color::Rgb(150, 150, 150))),
                         ]));
                     }
                 }
@@ -273,19 +298,9 @@ fn render_approval(lines: &mut Vec<Line<'static>>, call: &ToolCall) {
 
     lines.push(Line::from(vec![
         Span::raw("    ".to_string()),
-        Span::styled(
-            "[Y]",
-            Style::default()
-                .fg(SUCCESS)
-                .add_modifier(Modifier::BOLD),
-        ),
+        Span::styled("[Y]", Style::default().fg(SUCCESS).add_modifier(Modifier::BOLD)),
         Span::styled(" Allow  ", Style::default().fg(Color::Gray)),
-        Span::styled(
-            "[N]",
-            Style::default()
-                .fg(ERROR)
-                .add_modifier(Modifier::BOLD),
-        ),
+        Span::styled("[N]", Style::default().fg(ERROR).add_modifier(Modifier::BOLD)),
         Span::styled(" Deny", Style::default().fg(Color::Gray)),
     ]));
 }
@@ -319,11 +334,7 @@ fn format_args_oneline(args_json: &str) -> String {
                         }
                         other => {
                             let s = other.to_string();
-                            if s.len() > 30 {
-                                s[..27].to_string() + "..."
-                            } else {
-                                s
-                            }
+                            if s.len() > 30 { s[..27].to_string() + "..." } else { s }
                         }
                     };
                     format!("{}={}", k, val)
@@ -341,12 +352,12 @@ pub fn total_lines(conversation: &Conversation) -> usize {
         match &msg.content {
             MessageContent::Text(text) => match msg.role {
                 Role::User => count += 2 + text.lines().count(),
-                Role::Assistant => count += render_markdown(text).len(),
+                Role::Assistant => count += 1 + render_markdown(text).len(),
                 _ => {}
             },
             MessageContent::AssistantWithToolCalls { text, tool_calls } => {
                 if let Some(t) = text {
-                    count += render_markdown(t).len();
+                    count += 1 + render_markdown(t).len();
                 }
                 count += tool_calls.len();
             }
@@ -354,7 +365,7 @@ pub fn total_lines(conversation: &Conversation) -> usize {
         }
     }
     if let Some(ref buffer) = conversation.stream_buffer {
-        count += render_markdown(buffer).len() + 1;
+        count += 1 + render_markdown(buffer).len() + 1;
     }
     count
 }

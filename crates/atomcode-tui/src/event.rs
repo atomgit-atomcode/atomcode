@@ -43,7 +43,7 @@ impl EventLoop {
         // Crossterm event reader
         tokio::spawn(async move {
             loop {
-                if event::poll(Duration::from_millis(50)).unwrap_or(false) {
+                if event::poll(Duration::from_millis(10)).unwrap_or(false) {
                     if let Ok(evt) = event::read() {
                         let app_event = match evt {
                             Event::Key(key) => AppEvent::Key(key),
