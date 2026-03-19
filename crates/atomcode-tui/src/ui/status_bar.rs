@@ -73,6 +73,25 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         ));
     }
 
+    // Token counter
+    let token_str = if app.total_tokens > 0 {
+        if app.turn_tokens > 0 && app.turn_start.is_some() {
+            format!("~{}t (+{})", format_tokens(app.total_tokens), format_tokens(app.turn_tokens))
+        } else {
+            format!("~{}t", format_tokens(app.total_tokens))
+        }
+    } else {
+        String::new()
+    };
+
+    if !token_str.is_empty() {
+        spans.push(Span::styled(SEP, Style::default().fg(DIM)));
+        spans.push(Span::styled(
+            token_str,
+            Style::default().fg(DIM),
+        ));
+    }
+
     // Right side: model name (right-aligned)
     let right = format!(" {} ", model);
     let left_len: usize = spans.iter().map(|s| s.content.len()).sum();
@@ -110,11 +129,20 @@ fn shorten_path(path: &str) -> String {
     }
 }
 
-/// Format seconds into human-readable duration.
 fn format_duration(secs: u64) -> String {
     if secs < 60 {
         format!(" {}s ", secs)
     } else {
         format!(" {}m{}s ", secs / 60, secs % 60)
+    }
+}
+
+fn format_tokens(n: usize) -> String {
+    if n < 1000 {
+        format!("{}", n)
+    } else if n < 1_000_000 {
+        format!("{:.1}k", n as f64 / 1000.0)
+    } else {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
     }
 }

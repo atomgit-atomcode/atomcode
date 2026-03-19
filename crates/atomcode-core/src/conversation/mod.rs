@@ -27,6 +27,37 @@ impl Conversation {
         Self::default()
     }
 
+    /// Load conversation history from disk.
+    pub fn load(path: &std::path::Path) -> Self {
+        if let Ok(data) = std::fs::read_to_string(path) {
+            if let Ok(messages) = serde_json::from_str::<Vec<Message>>(&data) {
+                let len = messages.len();
+                let start = if len > MAX_MESSAGES { len - MAX_MESSAGES } else { 0 };
+                return Self {
+                    messages: messages[start..].to_vec(),
+                    stream_buffer: None,
+                    tool_call_buffer: None,
+                };
+            }
+        }
+        Self::default()
+    }
+
+    /// Save conversation history to disk.
+    pub fn save(&self, path: &std::path::Path) {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(data) = serde_json::to_string(&self.messages) {
+            let _ = std::fs::write(path, data);
+        }
+    }
+
+    /// Path to history file.
+    pub fn history_path() -> std::path::PathBuf {
+        crate::config::Config::config_dir().join("history.json")
+    }
+
     /// Trim old messages to keep within MAX_MESSAGES limit.
     fn trim(&mut self) {
         if self.messages.len() > MAX_MESSAGES {

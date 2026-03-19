@@ -58,6 +58,10 @@ pub struct App {
     /// Duration of the last completed turn.
     pub last_turn_duration: Option<Duration>,
     pub working_dir: PathBuf,
+    /// Estimated token counts for the current session.
+    pub total_tokens: usize,
+    /// Tokens used in the current turn.
+    pub turn_tokens: usize,
     /// Suggested next prompt shown as ghost text in the input box.
     pub suggestion: Option<String>,
     /// Cache of rendered lines for completed messages. Invalidated on message count change.
@@ -71,7 +75,7 @@ impl App {
     pub fn new(provider: Box<dyn LlmProvider>, config: Config, tool_registry: ToolRegistry, working_dir: PathBuf) -> Self {
         Self {
             mode: AppMode::Normal,
-            conversation: Conversation::new(),
+            conversation: Conversation::load(&Conversation::history_path()),
             input: InputState::new(),
             scroll_offset: 0,
             at_bottom: true,
@@ -87,6 +91,8 @@ impl App {
             tool_start: None,
             last_turn_duration: None,
             working_dir,
+            total_tokens: 0,
+            turn_tokens: 0,
             suggestion: None,
             render_cache: Vec::new(),
             render_cache_msg_count: 0,
@@ -237,9 +243,11 @@ impl App {
         match event {
             AppEvent::Key(key) => self.handle_key(key, event_tx),
             AppEvent::StreamDelta(text) => {
+                // Estimate tokens (~4 chars per token)
+                let est = (text.len() + 3) / 4;
+                self.turn_tokens += est;
+                self.total_tokens += est;
                 self.conversation.push_delta(&text);
-                // Keep at_bottom true during streaming for auto-scroll
-                // (unless user manually scrolled up)
             }
             AppEvent::StreamDone => {
                 self.conversation.finalize_stream();
@@ -249,6 +257,8 @@ impl App {
                 self.last_turn_duration = self.turn_start.map(|t| t.elapsed());
                 self.turn_start = None;
                 self.suggestion = self.generate_suggestion();
+                // Persist history
+                self.conversation.save(&Conversation::history_path());
             }
             AppEvent::StreamError(err) => {
                 if self.retry_count < 3 {
@@ -620,10 +630,13 @@ impl App {
             }
             "/clear" => {
                 self.conversation = Conversation::new();
+                self.conversation.save(&Conversation::history_path());
                 self.scroll_offset = 0;
                 self.at_bottom = true;
                 self.render_cache.clear();
                 self.render_cache_msg_count = 0;
+                self.total_tokens = 0;
+                self.turn_tokens = 0;
                 return true;
             }
             "/help" => {
@@ -666,6 +679,11 @@ impl App {
         if self.handle_slash_command() {
             return;
         }
+
+        // Estimate input tokens
+        let input_tokens = (content.len() + 3) / 4;
+        self.turn_tokens = input_tokens;
+        self.total_tokens += input_tokens;
 
         self.conversation.add_user_message(&content);
         self.input.clear();

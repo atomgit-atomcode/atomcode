@@ -1,6 +1,6 @@
 use crate::tool::{ToolCall, ToolResult};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum Role {
     System,
     User,
@@ -8,7 +8,7 @@ pub enum Role {
     Tool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum MessageContent {
     Text(String),
     AssistantWithToolCalls {
@@ -18,7 +18,7 @@ pub enum MessageContent {
     ToolResult(ToolResult),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Message {
     pub role: Role,
     pub content: MessageContent,
