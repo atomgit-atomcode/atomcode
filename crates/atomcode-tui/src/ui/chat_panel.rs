@@ -44,6 +44,7 @@ pub fn render(
     at_bottom: bool,
     mode: &AppMode,
     tick: usize,
+    turn_tokens: usize,
     render_cache: &mut Vec<Line<'static>>,
     render_cache_msg_count: &mut usize,
 ) {
@@ -100,27 +101,41 @@ pub fn render(
         }
     }
 
-    let has_text = conversation.stream_buffer.as_ref().map_or(false, |b| !b.is_empty());
+    // Active state indicator with label + token count
     let spinner = SPINNER[tick % SPINNER.len()];
+    let token_info = if turn_tokens > 0 {
+        format!("  {}t", format_compact_tokens(turn_tokens))
+    } else {
+        String::new()
+    };
+
     match mode {
-        AppMode::Streaming if !has_text => {
-            let label = THINKING_LABELS[conversation.messages.len() % THINKING_LABELS.len()];
-            dynamic.push(Line::from(Span::styled(
-                format!("    {} {}", spinner, label),
-                Style::default().fg(ACCENT),
-            )));
-        }
         AppMode::Streaming => {
-            dynamic.push(Line::from(Span::styled(
-                format!("    {}", spinner),
-                Style::default().fg(ACCENT),
-            )));
+            // Pick a stable label per turn (changes every ~8 ticks = 2 seconds)
+            let label_idx = (conversation.messages.len() + tick / 8) % THINKING_LABELS.len();
+            let label = THINKING_LABELS[label_idx];
+            dynamic.push(Line::from(vec![
+                Span::styled(
+                    format!("    {} {}", spinner, label),
+                    Style::default().fg(ACCENT),
+                ),
+                Span::styled(
+                    token_info.clone(),
+                    Style::default().fg(DIM),
+                ),
+            ]));
         }
         AppMode::ToolExecuting => {
-            dynamic.push(Line::from(Span::styled(
-                format!("    {} Executing...", spinner),
-                Style::default().fg(WARN),
-            )));
+            dynamic.push(Line::from(vec![
+                Span::styled(
+                    format!("    {} Executing...", spinner),
+                    Style::default().fg(WARN),
+                ),
+                Span::styled(
+                    token_info.clone(),
+                    Style::default().fg(DIM),
+                ),
+            ]));
         }
         AppMode::WaitingApproval(call) => {
             render_approval(&mut dynamic, call);
@@ -316,6 +331,12 @@ fn capitalize(name: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn format_compact_tokens(n: usize) -> String {
+    if n < 1000 { format!("{}", n) }
+    else if n < 1_000_000 { format!("{:.1}k", n as f64 / 1000.0) }
+    else { format!("{:.1}M", n as f64 / 1_000_000.0) }
 }
 
 fn format_args_oneline(args_json: &str) -> String {

@@ -56,6 +56,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         chat_panel::render(
             frame, chunks[1], &app.conversation,
             app.scroll_offset, app.at_bottom, &app.mode, app.tick_count,
+            app.turn_tokens,
             &mut app.render_cache, &mut app.render_cache_msg_count,
         );
     }
