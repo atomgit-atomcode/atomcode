@@ -329,13 +329,17 @@ impl App {
         }
     }
 
-    /// Build system prompt with working directory context.
+    /// Build system prompt with working directory context + project structure.
     fn system_prompt(&self) -> String {
         let base = self.config.providers
             .get(&self.config.default_provider)
             .and_then(|p| p.system_prompt.as_deref())
             .unwrap_or(DEFAULT_SYSTEM_PROMPT);
-        format!("{}\n\nWorking directory: {}", base, self.working_dir.display())
+
+        let dir = self.working_dir.display();
+        let tree = scan_project_tree(&self.working_dir, 2); // 2 levels deep
+
+        format!("{}\n\nWorking directory: {}\n\nProject structure:\n{}", base, dir, tree)
     }
 
     pub fn handle_event(&mut self, event: AppEvent, event_tx: &mpsc::UnboundedSender<AppEvent>) {
@@ -1299,6 +1303,54 @@ fn format_file_size(bytes: u64) -> String {
     if bytes < 1024 { format!("{} B", bytes) }
     else if bytes < 1024 * 1024 { format!("{:.1} KB", bytes as f64 / 1024.0) }
     else { format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0)) }
+}
+
+/// Scan the project directory tree (limited depth + skip common noise).
+fn scan_project_tree(dir: &std::path::Path, max_depth: usize) -> String {
+    let mut lines = Vec::new();
+    scan_dir(&mut lines, dir, 0, max_depth);
+    if lines.len() > 50 {
+        lines.truncate(50);
+        lines.push("  ... (truncated)".to_string());
+    }
+    lines.join("\n")
+}
+
+fn scan_dir(lines: &mut Vec<String>, dir: &std::path::Path, depth: usize, max_depth: usize) {
+    if depth > max_depth { return; }
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+
+    let skip = [
+        "node_modules", ".git", "target", "__pycache__", ".next",
+        "dist", "build", ".cache", "vendor", ".venv", "venv",
+        ".idea", ".vscode", ".DS_Store",
+    ];
+
+    let mut items: Vec<_> = entries
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            !skip.contains(&name.as_str())
+        })
+        .collect();
+
+    items.sort_by_key(|e| e.file_name());
+
+    for entry in &items {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let indent = "  ".repeat(depth);
+        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+
+        if is_dir {
+            lines.push(format!("{}{}/", indent, name));
+            scan_dir(lines, &entry.path(), depth + 1, max_depth);
+        } else {
+            lines.push(format!("{}{}", indent, name));
+        }
+    }
 }
 
 fn snap_to_char_boundary(s: &str, pos: usize) -> usize {

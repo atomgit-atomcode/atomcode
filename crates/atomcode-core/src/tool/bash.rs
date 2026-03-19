@@ -66,7 +66,17 @@ impl Tool for BashTool {
                 Ok(ToolResult { call_id: String::new(), output: combined, success: output.status.success() })
             }
             Ok(Err(e)) => Ok(ToolResult { call_id: String::new(), output: format!("Failed to execute: {}", e), success: false }),
-            Err(_) => Ok(ToolResult { call_id: String::new(), output: format!("Timed out after {}s", timeout_secs), success: false }),
+            Err(_) => Ok(ToolResult {
+                call_id: String::new(),
+                output: format!(
+                    "Timed out after {}s. This command did not exit within the timeout. \
+                    If this is a server or long-running process, run it in background: \
+                    nohup <command> > /dev/null 2>&1 & \
+                    Then check if it's running with: lsof -i :<port> or curl localhost:<port>",
+                    timeout_secs
+                ),
+                success: false,
+            }),
         }
     }
 }
