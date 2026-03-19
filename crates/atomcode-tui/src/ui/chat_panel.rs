@@ -329,6 +329,8 @@ fn render_approval(lines: &mut Vec<Line<'static>>, call: &ToolCall) {
         Span::raw("    ".to_string()),
         Span::styled("[Y]", Style::default().fg(SUCCESS).add_modifier(Modifier::BOLD)),
         Span::styled(" Allow  ", Style::default().fg(Color::Gray)),
+        Span::styled("[A]", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::styled(" Always  ", Style::default().fg(Color::Gray)),
         Span::styled("[N]", Style::default().fg(ERROR).add_modifier(Modifier::BOLD)),
         Span::styled(" Deny", Style::default().fg(Color::Gray)),
     ]));

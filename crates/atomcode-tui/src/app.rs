@@ -10,7 +10,7 @@ use atomcode_core::config::DEFAULT_SYSTEM_PROMPT;
 use atomcode_core::conversation::Conversation;
 use atomcode_core::provider::LlmProvider;
 use atomcode_core::stream::StreamEvent;
-use atomcode_core::tool::{Tool, ToolCall, ToolCallBuffer, ToolContext, ToolRegistry, ToolResult, ApprovalRequirement};
+use atomcode_core::tool::{Tool, ToolCall, ToolCallBuffer, ToolContext, ToolRegistry, ToolResult, PermissionStore, PermissionDecision};
 
 use crate::command::SlashMenu;
 use crate::event::AppEvent;
@@ -53,6 +53,7 @@ pub struct App {
     pub model_list: Vec<(String, String)>,
     pub model_selected: usize,
     pub tool_registry: ToolRegistry,
+    pub permission_store: PermissionStore,
     pub tool_call_count: usize,
     pub tick_count: usize,
     /// Retry count for stream errors (auto-retry up to 3 times).
@@ -124,6 +125,7 @@ impl App {
             model_list: Vec::new(),
             model_selected: 0,
             tool_registry,
+            permission_store: PermissionStore::new(),
             tool_call_count: 0,
             retry_count: 0,
             last_ctrl_c: None,
@@ -602,6 +604,12 @@ impl App {
         };
         match key.code {
             KeyCode::Char('y') | KeyCode::Enter => {
+                self.mode = AppMode::ToolExecuting;
+                self.execute_tool(call, event_tx);
+            }
+            KeyCode::Char('a') => {
+                // Grant session-level permission so this tool is auto-approved for the rest of the session.
+                self.permission_store.grant_session(&call.name);
                 self.mode = AppMode::ToolExecuting;
                 self.execute_tool(call, event_tx);
             }
@@ -1141,13 +1149,22 @@ impl App {
         self.conversation.finalize_stream_with_tool_call(call.clone());
 
         if let Some(tool) = self.tool_registry.get(&call.name) {
-            match tool.approval(&call.arguments) {
-                ApprovalRequirement::AutoApprove => {
+            let approval = tool.approval(&call.arguments);
+            match self.permission_store.check(&call.name, &approval) {
+                PermissionDecision::Allow => {
                     self.mode = AppMode::ToolExecuting;
                     self.execute_tool(call, event_tx);
                 }
-                ApprovalRequirement::RequireApproval(_) => {
+                PermissionDecision::Ask(_reason) => {
                     self.mode = AppMode::WaitingApproval(call);
+                }
+                PermissionDecision::Deny => {
+                    let result = ToolResult {
+                        call_id: call.id.clone(),
+                        output: "Permission denied by user configuration.".to_string(),
+                        success: false,
+                    };
+                    self.handle_tool_result(result, event_tx);
                 }
             }
         } else {
