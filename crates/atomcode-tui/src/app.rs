@@ -401,23 +401,18 @@ impl App {
                 });
             }
             AppEvent::StreamError(err) => {
-                // Only retry on network/timeout errors, NOT on API errors (400, 401, etc.)
                 let is_api_error = err.contains("API error")
-                    || err.contains("400")
-                    || err.contains("401")
-                    || err.contains("403")
-                    || err.contains("404")
-                    || err.contains("422")
-                    || err.contains("429")
+                    || err.contains("400 ")
+                    || err.contains("401 ")
+                    || err.contains("403 ")
+                    || err.contains("404 ")
+                    || err.contains("422 ")
                     || err.contains("illegal");
 
-                if !is_api_error && self.retry_count < 2 {
-                    self.retry_count += 1;
-                    self.conversation.stream_buffer = None;
-                    self.mode = AppMode::Streaming;
-                    self.at_bottom = true;
-                    self.continue_agent_loop(event_tx);
-                } else {
+                let is_rate_limit = err.contains("429") || err.contains("rate");
+
+                if is_api_error {
+                    // API errors (bad request, auth, etc.) — don't retry
                     self.conversation.push_delta(&format!("\n\n[Error: {}]", err));
                     self.conversation.finalize_stream();
                     self.mode = AppMode::Normal;
@@ -425,6 +420,48 @@ impl App {
                     self.turn_start = None;
                     self.at_bottom = true;
                     self.retry_count = 0;
+                } else {
+                    // Network errors / rate limits — keep retrying with backoff (no limit)
+                    self.retry_count += 1;
+                    let wait_secs = if is_rate_limit {
+                        (self.retry_count as u64 * 5).min(30)
+                    } else {
+                        (self.retry_count as u64 * 2).min(15)
+                    };
+
+                    self.conversation.stream_buffer = None;
+                    self.mode = AppMode::Streaming;
+                    self.at_bottom = true;
+
+                    // Wait then retry
+                    let tx = event_tx.clone();
+                    let system_prompt = self.system_prompt();
+                    let messages = self.conversation.to_provider_messages_windowed(&system_prompt, 20);
+                    let tool_defs = self.tool_registry.get_definitions();
+                    let stream_result_fn = self.provider.chat_stream(&messages, Some(&tool_defs));
+
+                    tokio::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_secs(wait_secs)).await;
+                        match stream_result_fn {
+                            Ok(mut stream) => {
+                                use futures::StreamExt;
+                                while let Some(event) = stream.next().await {
+                                    let app_event = match event {
+                                        Ok(StreamEvent::Delta(text)) => AppEvent::StreamDelta(text),
+                                        Ok(StreamEvent::ToolCallStart { id, name }) => AppEvent::StreamToolCallStart { id, name },
+                                        Ok(StreamEvent::ToolCallDelta(args)) => AppEvent::StreamToolCallDelta(args),
+                                        Ok(StreamEvent::ToolCallDone(call)) => AppEvent::StreamToolCallDone(call),
+                                        Ok(StreamEvent::Usage(usage)) => AppEvent::StreamUsage(usage),
+                                        Ok(StreamEvent::Done) => { let _ = tx.send(AppEvent::StreamDone); break; }
+                                        Ok(StreamEvent::Error(e)) => { let _ = tx.send(AppEvent::StreamError(e)); break; }
+                                        Err(e) => { let _ = tx.send(AppEvent::StreamError(e.to_string())); break; }
+                                    };
+                                    if tx.send(app_event).is_err() { break; }
+                                }
+                            }
+                            Err(e) => { let _ = tx.send(AppEvent::StreamError(e.to_string())); }
+                        }
+                    });
                 }
             }
             AppEvent::StreamToolCallStart { id, name } => {
