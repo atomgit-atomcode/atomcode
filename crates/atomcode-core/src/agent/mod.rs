@@ -2,6 +2,7 @@
 //! calls LLM providers, executes tools, and communicates with the UI
 //! via channels. Decoupled from any TUI concerns.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::future::Future;
@@ -113,6 +114,24 @@ pub struct AgentLoop {
     // Cancellation token for the current turn
     cancel_token: CancellationToken,
 
+    // Cached project context (invalidated on working dir change)
+    project_context_cache: Option<(PathBuf, String)>,
+    /// Absolute paths of descriptor files included in the project context.
+    /// Used to intercept redundant read_file calls.
+    context_included_files: HashSet<PathBuf>,
+    /// Files read this turn (for tracking read-but-not-edit waste)
+    files_read_this_turn: Vec<String>,
+    /// Files edited/written this turn
+    files_edited_this_turn: Vec<String>,
+    /// Consecutive read-type calls without an edit (for read budget enforcement)
+    consecutive_reads: usize,
+    /// Last N tool call signatures for loop detection. (name, args_hash)
+    recent_calls: Vec<(String, u64)>,
+    /// The user's original task message for this turn (re-injected as reminders).
+    current_task: String,
+    /// Pre-read file contents injected as system context (not synthetic tool calls).
+    preread_context: String,
+
     // Channels
     cmd_rx: mpsc::UnboundedReceiver<AgentCommand>,
     event_tx: mpsc::UnboundedSender<AgentEvent>,
@@ -152,6 +171,14 @@ impl AgentLoop {
             pending_tool_calls: Vec::new(),
             pending_approval: None,
             cancel_token: CancellationToken::new(),
+            project_context_cache: None,
+            context_included_files: HashSet::new(),
+            files_read_this_turn: Vec::new(),
+            files_edited_this_turn: Vec::new(),
+            consecutive_reads: 0,
+            recent_calls: Vec::new(),
+            current_task: String::new(),
+            preread_context: String::new(),
             cmd_rx,
             event_tx,
         };
@@ -211,10 +238,19 @@ impl AgentLoop {
     // -------------------------------------------------------------------------
 
     async fn handle_send_message(&mut self, content: String) {
+        self.current_task = content.clone();
+        // Pre-read: analyze user's message, find relevant files, and store
+        // their contents. They'll be injected as system context (not synthetic tool calls)
+        // so the model doesn't learn to "read first, edit later".
+        self.preread_context = self.build_preread_context(&content).await;
         self.conversation.add_user_message(&content);
         self.turn_tokens = 0;
         self.tool_call_count = 0;
         self.retry_count = 0;
+        self.recent_calls.clear();
+        self.files_read_this_turn.clear();
+        self.files_edited_this_turn.clear();
+        self.consecutive_reads = 0;
         self.turn_start = Some(Instant::now());
         self.cancel_token = CancellationToken::new();
 
@@ -226,15 +262,167 @@ impl AgentLoop {
         self.call_llm().await;
     }
 
+    /// Analyze the user's message, find relevant files, pre-read them,
+    /// and return their contents as a context string to inject into the system prompt.
+    /// NOT injected as synthetic tool calls (which teaches the model to read more).
+    async fn build_preread_context(&self, content: &str) -> String {
+        let wd = self.tool_context.working_dir
+            .try_read()
+            .map(|g| g.clone())
+            .unwrap_or_default();
+
+        let files = collect_project_files(&wd, 0, 3);
+        let task_lower = content.to_lowercase();
+
+        let mut scored: Vec<(i32, std::path::PathBuf)> = Vec::new();
+        for file_path in &files {
+            let filename = file_path.file_name()
+                .map(|f| f.to_string_lossy().to_string())
+                .unwrap_or_default()
+                .to_lowercase();
+
+            if filename.starts_with('.') || filename.ends_with(".log") || filename.ends_with(".lock") {
+                continue;
+            }
+
+            let mut score = 0i32;
+            let name_no_ext = filename.split('.').next().unwrap_or(&filename);
+
+            if name_no_ext.len() > 2 && task_lower.contains(name_no_ext) {
+                score += 10;
+            }
+
+            let keyword_map: &[(&[&str], &[&str])] = &[
+                (&["样式", "style", "css", "圆角", "rounded", "美化", "丑", "布局", "ui", "界面", "美观", "tailwind"],
+                 &["css", "style", "app", "layout", "tailwind"]),
+                (&["接口", "api", "搜索", "search", "请求"],
+                 &["api", "route", "main", "server", "search", "index"]),
+                (&["页面", "page", "组件", "component", "视图", "view"],
+                 &["vue", "jsx", "tsx", "component"]),
+                (&["修复", "fix", "bug", "error", "错误", "报错", "改乱"],
+                 &["app", "main", "index", "config"]),
+                (&["启动", "start", "运行", "run", "报错", "crash", "崩溃"],
+                 &["start", "package", "vite", "config", "main", "app"]),
+            ];
+
+            for (task_kws, file_kws) in keyword_map {
+                let task_match = task_kws.iter().any(|kw| task_lower.contains(kw));
+                let file_match = file_kws.iter().any(|kw| filename.contains(kw));
+                if task_match && file_match {
+                    score += 8;
+                }
+            }
+
+            // Boost primary files
+            if filename == "app.vue" || filename == "main.css" {
+                score += 3;
+            }
+
+            if score > 0 {
+                scored.push((score, file_path.clone()));
+            }
+        }
+
+        scored.sort_by(|a, b| b.0.cmp(&a.0));
+
+        if scored.is_empty() {
+            return String::new();
+        }
+
+        // CRITICAL: When a file matches, expand to include ALL sibling files
+        // in the same directory with the same extension. This is why Claude Code
+        // fixes all views in one turn — it sees ALL of them, not just the matched one.
+        let mut expanded: Vec<std::path::PathBuf> = Vec::new();
+        let mut seen_dirs: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        for (_, path) in &scored {
+            expanded.push(path.clone());
+
+            // Expand: include all siblings with same extension
+            if let (Some(dir), Some(ext)) = (path.parent(), path.extension()) {
+                let dir_key = format!("{}:{}", dir.display(), ext.to_string_lossy());
+                if !seen_dirs.contains(&dir_key) {
+                    seen_dirs.insert(dir_key);
+                    if let Ok(entries) = std::fs::read_dir(dir) {
+                        for entry in entries.flatten() {
+                            let ep = entry.path();
+                            if ep.extension() == Some(ext) && ep != *path && ep.is_file() {
+                                if !expanded.contains(&ep) {
+                                    expanded.push(ep);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Include files in directories named "api", "lib", "utils", "services" —
+        // these typically contain shared interfaces the model needs when rewriting other files.
+        // Tech-stack agnostic: detects by directory name, not file extension.
+        let interface_dirs = ["api", "lib", "utils", "services", "helpers", "hooks", "stores"];
+        for file_path in &files {
+            let rel = file_path.strip_prefix(&wd)
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let in_interface_dir = rel.split('/').any(|part| interface_dirs.contains(&part));
+            if in_interface_dir && !expanded.contains(file_path) {
+                expanded.push(file_path.clone());
+            }
+        }
+
+        // Build context string with file contents
+        let mut ctx = String::from("=== FILES ALREADY LOADED (do NOT re-read these) ===\n");
+        let mut total_lines = 0usize;
+        const MAX_LINES: usize = 1500; // Generous budget — input tokens are cheap, round-trips are expensive
+
+        for path in &expanded {
+            if total_lines >= MAX_LINES { break; }
+
+            let file_content = match tokio::fs::read_to_string(path).await {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+
+            let lines: Vec<&str> = file_content.lines().collect();
+            let take = lines.len().min(MAX_LINES - total_lines);
+            let rel_path = path.strip_prefix(&wd)
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|_| path.to_string_lossy().to_string());
+
+            ctx.push_str(&format!("\n[{}] ({} lines{})\n",
+                rel_path, lines.len(),
+                if take >= lines.len() { " - COMPLETE" } else { "" }
+            ));
+            for (i, line) in lines.iter().take(take).enumerate() {
+                ctx.push_str(&format!("{:>4}| {}\n", i + 1, line));
+            }
+            if take < lines.len() {
+                ctx.push_str(&format!("[... {} more lines, use grep to find specific sections]\n", lines.len() - take));
+            }
+
+            total_lines += take;
+        }
+
+        ctx.push_str("\nYou have these files. Proceed directly to edit_file or write_file. Do NOT call read_file for files shown above.\n");
+        ctx
+    }
+
     /// Core agent turn: calls the LLM, processes the stream, and handles tool
     /// calls or finishes the turn. Boxed to allow mutual recursion with
     /// execute_tool / handle_tool_result / process_next_tool_call.
     fn call_llm(&mut self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         Box::pin(async move {
             let system_prompt = self.build_system_prompt();
+            let context_window = self
+                .config
+                .providers
+                .get(&self.config.default_provider)
+                .map(|p| p.context_window)
+                .unwrap_or(16000);
             let messages = self
                 .conversation
-                .to_provider_messages_windowed(&system_prompt, 30);
+                .to_provider_messages_budgeted(&system_prompt, context_window);
             let tool_defs = self.tool_registry.get_definitions();
 
             let stream_result = self.provider.chat_stream(&messages, Some(&tool_defs));
@@ -277,8 +465,12 @@ impl AgentLoop {
                                     buf.arguments.push_str(&args);
                                 }
                             }
-                            Some(Ok(StreamEvent::ToolCallDone(call))) => {
+                            Some(Ok(StreamEvent::ToolCallDone(mut call))) => {
                                 self.conversation.tool_call_buffer = None;
+                                // Repair malformed JSON arguments from weak models
+                                if serde_json::from_str::<serde_json::Value>(&call.arguments).is_err() {
+                                    call.arguments = repair_json(&call.arguments);
+                                }
                                 tool_calls_buf.push(call);
                             }
                             Some(Ok(StreamEvent::Usage(usage))) => {
@@ -295,7 +487,15 @@ impl AgentLoop {
                                     self.pending_tool_calls = tool_calls_buf;
                                     self.process_next_tool_call().await;
                                 } else {
-                                    self.finish_turn();
+                                    // Verification loop: if edits were made but no build/verify
+                                    // was run, inject a verification prompt and call LLM once more.
+                                    if self.should_verify() {
+                                        self.inject_verify_prompt();
+                                        self.call_llm().await;
+                                    } else {
+                                        self.maybe_emit_auto_summary();
+                                        self.finish_turn();
+                                    }
                                 }
                                 return;
                             }
@@ -391,6 +591,75 @@ impl AgentLoop {
             let name = call.name.clone();
             let args = self.resolve_args(&call);
 
+            // Track files read/edited and consecutive read count
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&args) {
+                let file = parsed.get("file_path").and_then(|v| v.as_str())
+                    .map(|s| short_path(s));
+                match name.as_str() {
+                    "read_file" | "list_directory" | "glob" | "grep" => {
+                        self.consecutive_reads += 1;
+                        if let Some(f) = file {
+                            if !self.files_read_this_turn.contains(&f) {
+                                self.files_read_this_turn.push(f);
+                            }
+                        }
+                    }
+                    "edit_file" | "write_file" | "bash" => {
+                        self.consecutive_reads = 0; // Reset on action
+                        if let Some(f) = file {
+                            if !self.files_edited_this_turn.contains(&f) {
+                                self.files_edited_this_turn.push(f);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            // --- Intercept redundant tool calls ---
+            if let Some(intercepted) = self.intercept_redundant_call(&name, &args) {
+                // Count how many consecutive blocks we've had
+                let block_count = self.recent_calls.iter()
+                    .rev()
+                    .take_while(|s| s.0 == name)
+                    .count();
+
+                let _ = self.event_tx.send(AgentEvent::ToolCallStarted {
+                    name: name.clone(),
+                    arguments: args.clone(),
+                });
+
+                if block_count >= 4 {
+                    // FORCE END TURN — model is stuck in an unbreakable loop
+                    let _ = self.event_tx.send(AgentEvent::ToolCallResult {
+                        name: name.clone(),
+                        output: "[FORCE STOPPED: Loop detected. Turn terminated.]".to_string(),
+                        success: false,
+                        duration: start.elapsed(),
+                    });
+                    let _ = self.event_tx.send(AgentEvent::Error(
+                        "Agent stuck in a loop. Turn force-terminated. Please try a more specific request.".to_string()
+                    ));
+                    self.maybe_emit_auto_summary();
+                    self.finish_turn();
+                    return;
+                }
+
+                let result = ToolResult {
+                    call_id: call.id,
+                    output: intercepted,
+                    success: false, // Mark as failure so model treats it seriously
+                };
+                let _ = self.event_tx.send(AgentEvent::ToolCallResult {
+                    name,
+                    output: result.output.clone(),
+                    success: false,
+                    duration: start.elapsed(),
+                });
+                self.handle_tool_result(result).await;
+                return;
+            }
+
             let _ = self.event_tx.send(AgentEvent::ToolCallStarted {
                 name: name.clone(),
                 arguments: args.clone(),
@@ -426,10 +695,33 @@ impl AgentLoop {
                     r.call_id = call.id;
                     r
                 }
-                Err(e) => ToolResult {
-                    call_id: call.id,
-                    output: format!("Error: {}", e),
-                    success: false,
+                Err(e) => {
+                    let err_str = e.to_string();
+                    // If it's a JSON parse error, give the model the correct format
+                    let output = if err_str.contains("expected") || err_str.contains("missing field") || err_str.contains("invalid type") {
+                        let example = match name.as_str() {
+                            "list_directory" => r#"{"path": "src", "depth": 2}"#,
+                            "read_file" => r#"{"file_path": "/absolute/path/to/file"}"#,
+                            "edit_file" => r#"{"file_path": "/path", "old_string": "old", "new_string": "new"}"#,
+                            "write_file" => r#"{"file_path": "/path", "content": "file content"}"#,
+                            "grep" => r#"{"pattern": "search_term", "path": "src"}"#,
+                            "bash" => r#"{"command": "ls -la"}"#,
+                            "glob" => r#"{"pattern": "**/*.vue"}"#,
+                            _ => "{}",
+                        };
+                        format!(
+                            "Error: Invalid JSON arguments. {}\n\
+                             Correct format for {}: {}",
+                            err_str, name, example
+                        )
+                    } else {
+                        format!("Error: {}", err_str)
+                    };
+                    ToolResult {
+                        call_id: call.id,
+                        output,
+                        success: false,
+                    }
                 },
             };
 
@@ -440,6 +732,93 @@ impl AgentLoop {
                 format!(" ({:.1}s)", duration.as_secs_f64())
             };
             tool_result.output.push_str(&dur_str);
+
+            // Detect and warn about bash misuse patterns.
+            if name == "bash" {
+                let cmd = serde_json::from_str::<serde_json::Value>(&args)
+                    .ok()
+                    .and_then(|v| v.get("command").and_then(|c| c.as_str()).map(String::from))
+                    .unwrap_or_default();
+                let cmd_start = cmd.split_whitespace().next().unwrap_or("");
+
+                // Pattern 1: Using bash to read files
+                let is_file_read_cmd = matches!(cmd_start, "grep" | "sed" | "cat" | "head" | "tail" | "awk");
+                if is_file_read_cmd {
+                    tool_result.output.push_str(
+                        "\n\n[SYSTEM: Do NOT use bash to read file contents. Use read_file or grep tool instead.]"
+                    );
+                }
+
+                // Pattern 2: Scouting commands — but ONLY warn if user didn't ask about runtime issues
+                let is_scouting = matches!(cmd_start, "ps" | "lsof" | "netstat" | "curl" | "wget")
+                    || (cmd_start == "tail" && cmd.contains("log"))
+                    || (cmd_start == "kill");
+                let task_is_runtime = {
+                    let t = self.current_task.to_lowercase();
+                    t.contains("启动") || t.contains("运行") || t.contains("访问")
+                        || t.contains("start") || t.contains("run") || t.contains("deploy")
+                        || t.contains("报错") || t.contains("crash") || t.contains("拒绝")
+                };
+                if is_scouting && self.tool_call_count <= 3 && !task_is_runtime {
+                    tool_result.output.push_str(
+                        "\n\n[SYSTEM: You are scouting (checking processes/ports/APIs) instead of fixing the code. \
+                         STOP scouting. Read the relevant source file and edit it directly.]"
+                    );
+                }
+            }
+
+            // Read budget enforcement: after 3 consecutive reads without an edit, hard redirect.
+            if self.consecutive_reads >= 3 && tool_result.success {
+                tool_result.output.push_str(
+                    "\n\n[SYSTEM: READ BUDGET EXCEEDED. You have read 3+ files without making any edits. \
+                     Your next action MUST be edit_file or write_file. \
+                     Do NOT call read_file, grep, glob, or list_directory. \
+                     If you don't know what to edit, STOP and ask the user.]"
+                );
+            }
+            // Post-read nudge: after every successful read, remind to edit
+            else if self.consecutive_reads >= 1 && tool_result.success
+                && matches!(name.as_str(), "read_file" | "grep" | "glob")
+            {
+                tool_result.output.push_str(
+                    "\n\n[If you have enough context, call edit_file or write_file NOW. Do not read more files unless necessary.]"
+                );
+            }
+
+            // Immediate sibling hint: after edit_file succeeds, find similar files
+            // that might have the same bug. Don't wait for 4-step system-reminder.
+            if (name == "edit_file" || name == "write_file") && tool_result.success {
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&args) {
+                    if let Some(fp) = parsed.get("file_path").and_then(|v| v.as_str()) {
+                        let edited_path = std::path::Path::new(fp);
+                        if let (Some(dir), Some(ext)) = (edited_path.parent(), edited_path.extension()) {
+                            let mut siblings: Vec<String> = Vec::new();
+                            if let Ok(entries) = std::fs::read_dir(dir) {
+                                for entry in entries.flatten() {
+                                    let ep = entry.path();
+                                    if ep.extension() == Some(ext)
+                                        && ep != edited_path
+                                        && ep.is_file()
+                                    {
+                                        let name_str = entry.file_name().to_string_lossy().to_string();
+                                        siblings.push(name_str);
+                                    }
+                                }
+                            }
+                            if !siblings.is_empty() {
+                                siblings.truncate(5);
+                                tool_result.output.push_str(&format!(
+                                    "\n\n[IMPORTANT: You just fixed a bug in {}. \
+                                     These files in the same directory may have the SAME bug: {}. \
+                                     Check and fix them NOW before finishing.]",
+                                    edited_path.file_name().unwrap_or_default().to_string_lossy(),
+                                    siblings.join(", ")
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
 
             let _ = self.event_tx.send(AgentEvent::ToolCallResult {
                 name,
@@ -465,8 +844,92 @@ impl AgentLoop {
             // Smart truncation: keep head + tail so errors (usually at the end) survive.
             self.truncate_output(&mut result);
 
-            self.conversation.add_tool_result(result);
             self.tool_call_count += 1;
+
+            // System reminders: re-inject rules + task every 4 steps.
+            // This is the #1 technique Claude Code uses to keep weak models on track.
+            if self.tool_call_count > 0 && self.tool_call_count % 4 == 0 {
+                let task_hint = if self.current_task.chars().count() > 100 {
+                    format!("{}...", self.current_task.chars().take(97).collect::<String>())
+                } else {
+                    self.current_task.clone()
+                };
+
+                // Check if we already have successful edits — if so, maybe we're done
+                let has_edits = self.conversation.messages.iter().rev()
+                    .take(self.tool_call_count * 2 + 2)
+                    .any(|m| {
+                        if let crate::conversation::message::MessageContent::ToolResult(r) = &m.content {
+                            r.success && (r.output.contains("Edited ") || r.output.contains("Wrote "))
+                        } else {
+                            false
+                        }
+                    });
+
+                // Build file tracking status
+                let read_list = if self.files_read_this_turn.is_empty() {
+                    "none".to_string()
+                } else {
+                    self.files_read_this_turn.join(", ")
+                };
+                let edit_list = if self.files_edited_this_turn.is_empty() {
+                    "none yet — you should be editing!".to_string()
+                } else {
+                    self.files_edited_this_turn.join(", ")
+                };
+
+                let unedited: Vec<&String> = self.files_read_this_turn.iter()
+                    .filter(|f| !self.files_edited_this_turn.contains(f))
+                    .collect();
+
+                let urgency = if self.tool_call_count >= 15 {
+                    "URGENT: You MUST finish NOW."
+                } else if self.files_edited_this_turn.is_empty() && self.tool_call_count >= 6 {
+                    "You have made ZERO edits after 6+ steps. Stop reading and start editing NOW."
+                } else {
+                    "Only read files you plan to edit."
+                };
+
+                // Find sibling files that might have the same bug pattern
+                let sibling_hint = if !self.files_edited_this_turn.is_empty() {
+                    self.find_sibling_files_hint()
+                } else {
+                    String::new()
+                };
+
+                result.output.push_str(&format!(
+                    "\n\n<system-reminder>\n\
+                     TASK: \"{}\"\n\
+                     STEP: {}/{}\n\
+                     FILES READ: {}\n\
+                     FILES EDITED: {}\n\
+                     {}\n\
+                     {}\
+                     </system-reminder>",
+                    task_hint, self.tool_call_count,
+                    25 + self.files_edited_this_turn.len() * 5,
+                    read_list, edit_list, urgency, sibling_hint
+                ));
+            }
+
+            // Dynamic step limit: base 25, +5 for each unique file edited.
+            // A task that edits 5 files gets 50 steps. A task that reads 25 files
+            // without editing anything gets stopped at 25.
+            let dynamic_limit = 25 + (self.files_edited_this_turn.len() * 5);
+            let hard_limit = dynamic_limit.min(50); // absolute max 50
+
+            if self.tool_call_count >= hard_limit {
+                result.output.push_str(&format!(
+                    "\n\n[SYSTEM: Step limit ({}) reached. Turn terminated.]",
+                    hard_limit
+                ));
+                self.conversation.add_tool_result(result);
+                self.maybe_emit_auto_summary();
+                self.finish_turn();
+                return;
+            }
+
+            self.conversation.add_tool_result(result);
 
             // Process remaining pending tool calls, or continue the agent loop.
             if !self.pending_tool_calls.is_empty() {
@@ -485,6 +948,231 @@ impl AgentLoop {
     // Helper methods
     // -------------------------------------------------------------------------
 
+    /// If the turn ended without the model producing a text summary (common with DeepSeek),
+    /// auto-generate a brief summary from the tool calls in this turn and emit it as text.
+    fn maybe_emit_auto_summary(&mut self) {
+        // Check if the model already produced text at the end
+        if let Some(last) = self.conversation.messages.last() {
+            match &last.content {
+                crate::conversation::message::MessageContent::Text(t) if !t.trim().is_empty() => {
+                    return; // Model already provided a summary
+                }
+                _ => {}
+            }
+        }
+
+        // Only generate summary if we actually executed tools this turn
+        if self.tool_call_count == 0 {
+            return;
+        }
+
+        // Collect tool operations from this turn only.
+        // Limit scan to tool_call_count * 2 + 2 messages from the end (each tool = AssistantWithToolCalls + ToolResult).
+        let scan_limit = self.tool_call_count * 2 + 2;
+        let mut edits: Vec<String> = Vec::new();
+        let mut other_ops: Vec<String> = Vec::new();
+        let mut scanned = 0;
+
+        for msg in self.conversation.messages.iter().rev() {
+            scanned += 1;
+            if scanned > scan_limit { break; }
+
+            match &msg.content {
+                crate::conversation::message::MessageContent::AssistantWithToolCalls { tool_calls, .. } => {
+                    for tc in tool_calls {
+                        let file = extract_file_from_args(&tc.arguments);
+                        match tc.name.as_str() {
+                            "edit_file" => {
+                                if let Some(f) = file {
+                                    let short = short_path(&f);
+                                    if !edits.contains(&short) {
+                                        edits.push(short);
+                                    }
+                                }
+                            }
+                            "write_file" => {
+                                if let Some(f) = file {
+                                    let short = short_path(&f);
+                                    if !edits.contains(&short) {
+                                        edits.push(short);
+                                    }
+                                }
+                            }
+                            "bash" => {
+                                if let Some(cmd) = extract_cmd_from_args(&tc.arguments) {
+                                    let short = if cmd.len() > 40 {
+                                        format!("{}...", cmd.chars().take(37).collect::<String>())
+                                    } else {
+                                        cmd
+                                    };
+                                    other_ops.push(format!("ran `{}`", short));
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                crate::conversation::message::MessageContent::Text(_) => {
+                    // Hit a User message = turn boundary, stop scanning
+                    if matches!(msg.role, crate::conversation::message::Role::User) {
+                        break;
+                    }
+                    // Hit an Assistant text after collecting edits = end of this turn's work
+                    if !edits.is_empty() || !other_ops.is_empty() {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if edits.is_empty() && other_ops.is_empty() {
+            return;
+        }
+
+        let mut summary = String::from("Done. ");
+        if !edits.is_empty() {
+            summary.push_str(&format!("Modified: {}", edits.join(", ")));
+        }
+        if !other_ops.is_empty() {
+            if !edits.is_empty() {
+                summary.push_str("; ");
+            }
+            summary.push_str(&other_ops.join("; "));
+        }
+        summary.push('.');
+
+        // Emit as text delta so it shows up in the chat
+        let _ = self.event_tx.send(AgentEvent::TextDelta(summary.clone()));
+        // Add to conversation so it persists
+        self.conversation.messages.push(
+            crate::conversation::message::Message::new(
+                crate::conversation::message::Role::Assistant,
+                summary,
+            )
+        );
+    }
+
+    /// Find sibling files (same directory, same extension) of edited files
+    /// and suggest the model check them for the same bug pattern.
+    fn find_sibling_files_hint(&self) -> String {
+        let wd = self.tool_context.working_dir
+            .try_read()
+            .map(|g| g.clone())
+            .unwrap_or_default();
+
+        let mut siblings: Vec<String> = Vec::new();
+        let mut seen_dirs: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        for edited in &self.files_edited_this_turn {
+            // Reconstruct full path from short path
+            // edited is like ".../views/SearchView.vue"
+            // We need to find the directory and list siblings
+            for msg in self.conversation.messages.iter().rev() {
+                if let crate::conversation::message::MessageContent::AssistantWithToolCalls { tool_calls, .. } = &msg.content {
+                    for tc in tool_calls {
+                        if tc.name == "edit_file" || tc.name == "write_file" {
+                            if let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
+                                if let Some(fp) = args.get("file_path").and_then(|v| v.as_str()) {
+                                    let path = std::path::Path::new(fp);
+                                    if let (Some(dir), Some(ext)) = (path.parent(), path.extension()) {
+                                        let dir_key = dir.to_string_lossy().to_string();
+                                        if seen_dirs.contains(&dir_key) { continue; }
+                                        seen_dirs.insert(dir_key);
+
+                                        // List sibling files with same extension
+                                        if let Ok(entries) = std::fs::read_dir(dir) {
+                                            for entry in entries.flatten() {
+                                                let name = entry.file_name().to_string_lossy().to_string();
+                                                let entry_path = entry.path();
+                                                if entry_path.extension() == Some(ext)
+                                                    && entry_path != path
+                                                    && !self.files_edited_this_turn.iter().any(|e| name.contains(e) || e.contains(&name))
+                                                {
+                                                    let rel = entry_path.strip_prefix(&wd)
+                                                        .map(|p| p.to_string_lossy().to_string())
+                                                        .unwrap_or_else(|_| name.clone());
+                                                    siblings.push(rel);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if siblings.is_empty() {
+            return String::new();
+        }
+
+        siblings.truncate(5);
+        format!(
+            "IMPORTANT: You fixed a bug in {}. These sibling files may have the SAME bug: {}. Check them before finishing.\n",
+            self.files_edited_this_turn.join(", "),
+            siblings.join(", ")
+        )
+    }
+
+    /// Check if the model should verify its changes before finishing.
+    /// Returns true if: edits were made AND no bash/build command was run AFTER the last edit.
+    fn should_verify(&self) -> bool {
+        if self.files_edited_this_turn.is_empty() {
+            return false; // No edits, nothing to verify
+        }
+        if self.tool_call_count >= 20 {
+            return false; // Near step limit, don't waste steps on verify
+        }
+
+        // Check if any bash command was run AFTER the last edit (a verification attempt)
+        let mut found_edit = false;
+        let mut found_bash_after_edit = false;
+        for msg in self.conversation.messages.iter().rev() {
+            match &msg.content {
+                crate::conversation::message::MessageContent::AssistantWithToolCalls { tool_calls, .. } => {
+                    for tc in tool_calls {
+                        if tc.name == "bash" && found_edit {
+                            found_bash_after_edit = true;
+                            break;
+                        }
+                        if tc.name == "edit_file" || tc.name == "write_file" {
+                            found_edit = true;
+                        }
+                    }
+                    if found_bash_after_edit { break; }
+                }
+                crate::conversation::message::MessageContent::Text(_) => {
+                    if matches!(msg.role, crate::conversation::message::Role::User) {
+                        break; // Reached turn boundary
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Verify if: edits were made but no bash run after them
+        found_edit && !found_bash_after_edit
+    }
+
+    /// Inject a verification prompt into the conversation as a user message,
+    /// forcing the model to check its work before declaring success.
+    fn inject_verify_prompt(&mut self) {
+        let files = self.files_edited_this_turn.join(", ");
+        let verify_msg = format!(
+            "[SYSTEM: You edited {}. Before finishing, verify your changes work. \
+             Run a quick check: look for syntax errors, check if the dev server shows errors, \
+             or re-read a key edited file to confirm it's correct. \
+             If you find errors, fix them now.]",
+            files
+        );
+        // Inject as assistant thought + will trigger another LLM call
+        self.conversation.push_delta(&verify_msg);
+        self.conversation.finalize_stream();
+    }
+
     fn finish_turn(&mut self) {
         let duration = self.turn_start.map(|t| t.elapsed()).unwrap_or_default();
         self.turn_start = None;
@@ -500,7 +1188,7 @@ impl AgentLoop {
         self.conversation.save(&Conversation::history_path());
     }
 
-    fn build_system_prompt(&self) -> String {
+    fn build_system_prompt(&mut self) -> String {
         let rules = self
             .config
             .providers
@@ -513,16 +1201,178 @@ impl AgentLoop {
             .tool_context
             .working_dir
             .try_read()
-            .map(|g| g.display().to_string())
-            .unwrap_or_else(|_| "unknown".to_string());
+            .map(|g| g.clone())
+            .unwrap_or_default();
 
-        let project_ctx =
-            crate::project_context::build_project_context(&std::path::PathBuf::from(&wd));
+        // Use cached project context if working dir hasn't changed
+        let project_ctx = match &self.project_context_cache {
+            Some((cached_wd, cached_ctx)) if cached_wd == &wd => cached_ctx.clone(),
+            _ => {
+                let pc = crate::project_context::build_project_context(&wd);
+                self.project_context_cache = Some((wd.clone(), pc.text.clone()));
+                self.context_included_files = pc.included_files;
+                pc.text
+            }
+        };
 
-        format!(
-            "You are AtomCode, a terminal coding agent.\n\nWorking directory: {}\n\n{}\n\n---\nRULES (follow strictly):\n{}",
-            wd, project_ctx, rules
-        )
+        // Analyze user's current task to suggest relevant files
+        let file_hints = if !self.current_task.is_empty() {
+            self.suggest_files_for_task(&self.current_task.clone(), &wd)
+        } else {
+            String::new()
+        };
+
+        // Load project-level instructions (.atomcode.md or ATOMCODE.md)
+        let project_instructions = [".atomcode.md", "ATOMCODE.md"]
+            .iter()
+            .find_map(|name| {
+                let path = wd.join(name);
+                std::fs::read_to_string(&path).ok()
+            })
+            .unwrap_or_default();
+
+        // Inject environment metadata
+        let env_info = format!(
+            "Platform: {} | Shell: {} | Date: {}",
+            std::env::consts::OS,
+            std::env::var("SHELL").unwrap_or_else(|_| "unknown".into()),
+            {
+                std::process::Command::new("date").arg("+%Y-%m-%d").output()
+                    .ok().and_then(|o| String::from_utf8(o.stdout).ok())
+                    .map(|s| s.trim().to_string())
+                    .unwrap_or_else(|| "unknown".into())
+            }
+        );
+
+        // Git context (branch + status summary)
+        let git_info = std::process::Command::new("git")
+            .args(&["status", "--short", "--branch"])
+            .current_dir(&wd)
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| {
+                let lines: Vec<&str> = s.lines().take(10).collect();
+                lines.join("\n")
+            })
+            .unwrap_or_default();
+
+        // Assemble prompt: rules → project instructions → env → project context
+        let mut prompt = format!(
+            "Working directory: {wd}\n{env_info}\n",
+            wd = wd.display(), env_info = env_info,
+        );
+
+        if !git_info.is_empty() {
+            prompt.push_str(&format!("Git: {}\n", git_info));
+        }
+
+        prompt.push_str(&format!("\n{rules}\n"));
+
+        if !project_instructions.is_empty() {
+            prompt.push_str(&format!(
+                "\n=== PROJECT INSTRUCTIONS (.atomcode.md) ===\n{}\n",
+                project_instructions
+            ));
+        }
+
+        prompt.push_str(&format!(
+            "\n=== PROJECT CONTEXT (already loaded — do NOT re-read these files) ===\n{project_ctx}"
+        ));
+
+        // Inject pre-read file contents (replaces file suggestions with actual content)
+        if !self.preread_context.is_empty() {
+            prompt.push_str(&format!("\n\n{}", self.preread_context));
+        } else if !file_hints.is_empty() {
+            prompt.push_str(&format!("\n\n=== SUGGESTED FILES (start here) ===\n{}", file_hints));
+        }
+
+        prompt
+    }
+
+    /// Analyze the user's task message and the project file tree to suggest
+    /// which files are most likely relevant. This reduces the number of exploratory
+    /// reads the model needs to do.
+    fn suggest_files_for_task(&self, task: &str, working_dir: &std::path::Path) -> String {
+        let mut suggestions = Vec::new();
+
+        // Walk the file tree (2 levels) and find files whose names match keywords in the task
+        let task_lower = task.to_lowercase();
+
+        // Collect all files in the project (up to 2 levels deep)
+        let files = collect_project_files(working_dir, 0, 3);
+
+        for file_path in &files {
+            let filename = file_path.file_name()
+                .map(|f| f.to_string_lossy().to_string())
+                .unwrap_or_default()
+                .to_lowercase();
+
+            let rel_path = file_path.strip_prefix(working_dir)
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|_| file_path.to_string_lossy().to_string());
+
+            // Skip noise
+            if filename.starts_with('.') || filename.ends_with(".log")
+                || filename.ends_with(".lock") || filename == "node_modules"
+            {
+                continue;
+            }
+
+            let mut score = 0;
+
+            // Check if filename appears in the task
+            let name_no_ext = filename.split('.').next().unwrap_or(&filename);
+            if task_lower.contains(name_no_ext) && name_no_ext.len() > 2 {
+                score += 10;
+            }
+
+            // Check path components
+            for component in rel_path.split('/') {
+                let comp_lower = component.to_lowercase();
+                if comp_lower.len() > 2 && task_lower.contains(&comp_lower) {
+                    score += 5;
+                }
+            }
+
+            // Keyword heuristics (tech-stack agnostic)
+            let keyword_map: &[(&[&str], &[&str])] = &[
+                (&["接口", "api", "endpoint", "请求", "request", "搜索", "search"],
+                 &["api", "route", "handler", "controller", "main", "app", "server", "search"]),
+                (&["样式", "style", "css", "布局", "layout", "ui", "界面", "design"],
+                 &["css", "style", "layout", "theme", "tailwind"]),
+                (&["配置", "config", "设置", "setting"],
+                 &["config", "setting", "env"]),
+                (&["路由", "router", "route", "导航", "nav"],
+                 &["router", "route", "nav"]),
+                (&["数据库", "database", "db", "model", "schema"],
+                 &["model", "schema", "migration", "db", "database"]),
+            ];
+
+            for (task_keywords, file_keywords) in keyword_map {
+                let task_match = task_keywords.iter().any(|kw| task_lower.contains(kw));
+                let file_match = file_keywords.iter().any(|kw| filename.contains(kw));
+                if task_match && file_match {
+                    score += 8;
+                }
+            }
+
+            if score > 0 {
+                suggestions.push((score, rel_path));
+            }
+        }
+
+        suggestions.sort_by(|a, b| b.0.cmp(&a.0));
+        suggestions.truncate(5);
+
+        if suggestions.is_empty() {
+            return String::new();
+        }
+
+        suggestions.iter()
+            .map(|(_, path)| format!("- {}", path))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     fn resolve_args(&self, call: &ToolCall) -> String {
@@ -533,18 +1383,127 @@ impl AgentLoop {
             .map(|g| g.clone())
             .unwrap_or_default();
 
-        if let Ok(mut args) = serde_json::from_str::<serde_json::Value>(&call.arguments) {
-            if let Some(fp) = args.get("file_path").and_then(|v| v.as_str()) {
-                let path = std::path::Path::new(fp);
-                if !path.is_absolute() {
-                    let resolved = wd.join(path);
-                    args["file_path"] =
-                        serde_json::json!(resolved.to_string_lossy().to_string());
+        // Try parsing JSON directly, then with repair, then with brute-force extraction
+        let args_str = &call.arguments;
+        let parsed = serde_json::from_str::<serde_json::Value>(args_str)
+            .or_else(|_| serde_json::from_str::<serde_json::Value>(&repair_json(args_str)))
+            .or_else(|_| Ok::<serde_json::Value, serde_json::Error>(
+                extract_json_fields(args_str)
+            ));
+
+        if let Ok(mut args) = parsed {
+            // Resolve relative paths for ALL path-like fields
+            for field in &["file_path", "path"] {
+                if let Some(fp) = args.get(*field).and_then(|v| v.as_str()) {
+                    let p = std::path::Path::new(fp);
+                    if !fp.is_empty() && !p.is_absolute() && fp != "." {
+                        let resolved = wd.join(p);
+                        args[*field] = serde_json::json!(resolved.to_string_lossy().to_string());
+                    }
                 }
-                return serde_json::to_string(&args).unwrap_or(call.arguments.clone());
             }
+
+            // For glob: if pattern contains a relative path prefix, resolve it
+            if call.name == "glob" {
+                if let Some(pattern) = args.get("pattern").and_then(|v| v.as_str()) {
+                    // If pattern starts with a relative directory (e.g., "frontend/src/**/*.vue"),
+                    // resolve the directory part against working dir
+                    if !pattern.starts_with('/') && pattern.contains('/') {
+                        let resolved = wd.join(pattern);
+                        args["pattern"] = serde_json::json!(resolved.to_string_lossy().to_string());
+                    }
+                }
+            }
+
+            return serde_json::to_string(&args).unwrap_or(call.arguments.clone());
         }
         call.arguments.clone()
+    }
+
+    /// Intercept tool calls that are provably redundant — returns a short message
+    /// instead of executing the tool. Only intercepts cases where the data is
+    /// already available in the system prompt (descriptor files, working dir tree).
+    /// Does NOT intercept duplicate reads (the model may re-read with different params).
+    fn intercept_redundant_call(&mut self, tool_name: &str, args: &str) -> Option<String> {
+        // Post-edit guard: if edits have been made and we're past step 8,
+        // block new read_file calls for files we haven't read yet.
+        // This prevents the "read more files after finishing" pattern.
+        if tool_name == "read_file"
+            && !self.files_edited_this_turn.is_empty()
+            && self.tool_call_count >= 8
+        {
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(args) {
+                if let Some(fp) = parsed.get("file_path").and_then(|v| v.as_str()) {
+                    let short = short_path(fp);
+                    if !self.files_read_this_turn.contains(&short) {
+                        return Some(format!(
+                            "[BLOCKED: You have already made edits. Do not read new files ({}). \
+                             If the task is complete, stop and summarize. \
+                             If you need to edit this file, explain why first.]",
+                            short
+                        ));
+                    }
+                }
+            }
+        }
+
+        // Loop detection: if the same (tool, args) appears 3+ times in recent calls, block it.
+        let args_hash = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            args.hash(&mut h);
+            h.finish()
+        };
+        let sig = (tool_name.to_string(), args_hash);
+        self.recent_calls.push(sig.clone());
+        if self.recent_calls.len() > 10 {
+            self.recent_calls.remove(0);
+        }
+        let repeat_count = self.recent_calls.iter().filter(|s| **s == sig).count();
+        if repeat_count >= 3 {
+            return Some(format!(
+                "[BLOCKED: You have called {} with the same arguments {} times. \
+                 This is a loop. STOP repeating this call and move on to the next step \
+                 or tell the user you are stuck.]",
+                tool_name, repeat_count
+            ));
+        }
+
+        match tool_name {
+            "read_file" => {
+                // Only intercept reads of descriptor files already in project context.
+                let parsed: serde_json::Value = serde_json::from_str(args).ok()?;
+                let file_path = parsed.get("file_path")?.as_str()?;
+                let path = std::path::Path::new(file_path);
+                let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+                if self.context_included_files.contains(&canonical) {
+                    let filename = path.file_name()
+                        .map(|f| f.to_string_lossy().to_string())
+                        .unwrap_or_else(|| file_path.to_string());
+                    return Some(format!(
+                        "[SKIPPED: {} content is already in your system prompt. \
+                         Use that information. Read the file you need to EDIT instead.]",
+                        filename
+                    ));
+                }
+                None
+            }
+            "list_directory" => {
+                // Intercept listing the working directory — tree is already in context.
+                let parsed: serde_json::Value = serde_json::from_str(args).ok()?;
+                let list_path = parsed.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+                let wd = self.tool_context.working_dir.try_read().ok()?;
+                let wd_str = wd.to_string_lossy();
+                if list_path == "." || list_path == wd_str.as_ref() {
+                    return Some(
+                        "[SKIPPED: Working directory file tree is already in your system prompt. \
+                         Read the file you need to EDIT instead.]".to_string()
+                    );
+                }
+                None
+            }
+            _ => None,
+        }
     }
 
     fn truncate_output(&self, result: &mut ToolResult) {
@@ -591,9 +1550,276 @@ impl AgentLoop {
             if let Ok(mut wd) = self.tool_context.working_dir.try_write() {
                 *wd = resolved.clone();
             }
+            self.project_context_cache = None; // invalidate on dir change
             let _ = self
                 .event_tx
                 .send(AgentEvent::WorkingDirChanged(resolved));
         }
     }
+}
+
+/// Extract file_path from tool call arguments JSON.
+fn extract_file_from_args(args: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(args)
+        .ok()?
+        .get("file_path")?
+        .as_str()
+        .map(|s| s.to_string())
+}
+
+/// Extract command from bash tool call arguments.
+fn extract_cmd_from_args(args: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(args)
+        .ok()?
+        .get("command")?
+        .as_str()
+        .map(|s| s.to_string())
+}
+
+/// Shorten a file path for display: keep last 2 components.
+fn short_path(path: &str) -> String {
+    let parts: Vec<&str> = path.rsplitn(3, '/').collect();
+    match parts.len() {
+        0 | 1 => path.to_string(),
+        2 => format!("{}/{}", parts[1], parts[0]),
+        _ => format!(".../{}/{}", parts[1], parts[0]),
+    }
+}
+
+/// Last-resort: extract ALL key-value pairs from malformed JSON by string matching.
+/// Tool-agnostic — no hardcoded field lists. Finds any `"key": "value"` or `key: value` pattern.
+fn extract_json_fields(s: &str) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    let chars: Vec<char> = s.chars().collect();
+    let len = chars.len();
+    let mut i = 0;
+
+    while i < len {
+        // Find a key: either "key" or bare_key followed by :
+        let key = if chars[i] == '"' {
+            // Quoted key
+            let start = i + 1;
+            i = start;
+            while i < len && chars[i] != '"' { i += 1; }
+            if i >= len { break; }
+            let k: String = chars[start..i].iter().collect();
+            i += 1; // skip closing "
+            k
+        } else if chars[i].is_alphabetic() || chars[i] == '_' {
+            // Bare key
+            let start = i;
+            while i < len && (chars[i].is_alphanumeric() || chars[i] == '_') { i += 1; }
+            chars[start..i].iter().collect()
+        } else {
+            i += 1;
+            continue;
+        };
+
+        // Skip whitespace, expect :
+        while i < len && chars[i].is_whitespace() { i += 1; }
+        if i >= len || chars[i] != ':' { continue; }
+        i += 1; // skip :
+        while i < len && chars[i].is_whitespace() { i += 1; }
+        if i >= len { break; }
+
+        // Read value
+        if chars[i] == '"' {
+            // String value
+            let start = i + 1;
+            i = start;
+            while i < len && chars[i] != '"' {
+                if chars[i] == '\\' { i += 1; }
+                i += 1;
+            }
+            let val: String = chars[start..i.min(len)].iter().collect();
+            map.insert(key, serde_json::json!(val));
+            if i < len { i += 1; }
+        } else if chars[i] == 't' || chars[i] == 'f' {
+            // Boolean
+            let start = i;
+            while i < len && chars[i].is_alphabetic() { i += 1; }
+            let word: String = chars[start..i].iter().collect();
+            match word.as_str() {
+                "true" => { map.insert(key, serde_json::json!(true)); }
+                "false" => { map.insert(key, serde_json::json!(false)); }
+                _ => { map.insert(key, serde_json::json!(word)); }
+            }
+        } else if chars[i].is_ascii_digit() || chars[i] == '-' {
+            // Number
+            let start = i;
+            while i < len && (chars[i].is_ascii_digit() || chars[i] == '.' || chars[i] == '-') { i += 1; }
+            let num_str: String = chars[start..i].iter().collect();
+            if let Ok(n) = num_str.parse::<i64>() {
+                map.insert(key, serde_json::json!(n));
+            } else if let Ok(f) = num_str.parse::<f64>() {
+                map.insert(key, serde_json::json!(f));
+            }
+        } else {
+            // Unquoted string value — read until , } ]
+            let start = i;
+            while i < len && !matches!(chars[i], ',' | '}' | ']' | '\n') { i += 1; }
+            let val: String = chars[start..i].iter().collect::<String>().trim().to_string();
+            if !val.is_empty() {
+                map.insert(key, serde_json::json!(val));
+            }
+        }
+    }
+
+    serde_json::Value::Object(map)
+}
+
+use crate::tool::SKIP_DIRS;
+
+/// Collect all file paths in a directory tree up to max_depth.
+fn collect_project_files(
+    dir: &std::path::Path,
+    depth: usize,
+    max_depth: usize,
+) -> Vec<std::path::PathBuf> {
+    let mut result = Vec::new();
+    if depth > max_depth { return result; }
+
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return result,
+    };
+
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if SKIP_DIRS.contains(&name.as_str()) { continue; }
+
+        let path = entry.path();
+        if path.is_dir() {
+            result.extend(collect_project_files(&path, depth + 1, max_depth));
+        } else {
+            result.push(path);
+        }
+    }
+    result
+}
+
+/// Attempt to repair common JSON issues from LLM output:
+/// - Trailing commas before } or ]
+/// - Single quotes instead of double quotes (outside of string values)
+/// - Missing closing braces
+/// - Unescaped newlines in strings
+fn repair_json(s: &str) -> String {
+    let mut result = s.to_string();
+
+    // Remove leading/trailing whitespace and any markdown code fences
+    result = result.trim().to_string();
+    if result.starts_with("```json") {
+        result = result.strip_prefix("```json").unwrap_or(&result).to_string();
+    }
+    if result.starts_with("```") {
+        result = result.strip_prefix("```").unwrap_or(&result).to_string();
+    }
+    if result.ends_with("```") {
+        result = result.strip_suffix("```").unwrap_or(&result).to_string();
+    }
+    result = result.trim().to_string();
+
+    // Replace single quotes with double quotes for keys/values
+    // Be careful not to break strings containing apostrophes
+    // Simple heuristic: replace ' at JSON structural positions
+    if !result.contains('"') && result.contains('\'') {
+        result = result.replace('\'', "\"");
+    }
+
+    // Fix missing commas between key-value pairs: }" " → }", "
+    // Pattern: value followed by whitespace then another key
+    // e.g., {"path": "src" "depth": 2} → {"path": "src", "depth": 2}
+    let mut chars: Vec<char> = result.chars().collect();
+    let mut insertions = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        // Look for pattern: " <whitespace> " where the second " starts a key
+        if chars[i] == '"' {
+            let j = i + 1;
+            // Skip whitespace
+            let mut k = j;
+            while k < chars.len() && chars[k].is_whitespace() { k += 1; }
+            // If next non-whitespace is " and it looks like a key (followed by :), insert comma
+            if k < chars.len() && chars[k] == '"' && k > j {
+                // Check if this looks like key: find the closing " then :
+                let mut q = k + 1;
+                while q < chars.len() && chars[q] != '"' { q += 1; }
+                if q + 1 < chars.len() {
+                    let mut r = q + 1;
+                    while r < chars.len() && chars[r].is_whitespace() { r += 1; }
+                    if r < chars.len() && chars[r] == ':' {
+                        // This is a missing comma: insert after position i
+                        insertions.push(j);
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    // Insert commas in reverse order to preserve indices
+    for pos in insertions.into_iter().rev() {
+        chars.insert(pos, ',');
+    }
+    result = chars.into_iter().collect();
+
+    // Fix unquoted keys: {path: "src"} → {"path": "src"}
+    // Simple approach: find patterns like {key: or ,key: and add quotes
+    let mut fixed = String::with_capacity(result.len() + 20);
+    let rchars: Vec<char> = result.chars().collect();
+    let mut ri = 0;
+    while ri < rchars.len() {
+        if (rchars[ri] == '{' || rchars[ri] == ',') {
+            fixed.push(rchars[ri]);
+            ri += 1;
+            // Skip whitespace
+            while ri < rchars.len() && rchars[ri].is_whitespace() {
+                fixed.push(rchars[ri]);
+                ri += 1;
+            }
+            // Check if next is an unquoted key (alphanumeric/underscore followed by :)
+            if ri < rchars.len() && rchars[ri].is_alphanumeric() {
+                let key_start = ri;
+                while ri < rchars.len() && (rchars[ri].is_alphanumeric() || rchars[ri] == '_') {
+                    ri += 1;
+                }
+                // Skip whitespace after key
+                let mut ki = ri;
+                while ki < rchars.len() && rchars[ki].is_whitespace() { ki += 1; }
+                if ki < rchars.len() && rchars[ki] == ':' {
+                    // Unquoted key — add quotes
+                    fixed.push('"');
+                    for c in &rchars[key_start..ri] { fixed.push(*c); }
+                    fixed.push('"');
+                } else {
+                    // Not a key, just copy
+                    for c in &rchars[key_start..ri] { fixed.push(*c); }
+                }
+            }
+        } else {
+            fixed.push(rchars[ri]);
+            ri += 1;
+        }
+    }
+    result = fixed;
+
+    // Remove trailing commas before } or ]
+    loop {
+        let before = result.clone();
+        result = result.replace(",}", "}").replace(",]", "]");
+        if result == before { break; }
+    }
+
+    // If it doesn't start with { or [, wrap it
+    if !result.starts_with('{') && !result.starts_with('[') {
+        result = format!("{{{}}}", result);
+    }
+
+    // Count braces and add missing closing ones
+    let open_braces = result.chars().filter(|c| *c == '{').count();
+    let close_braces = result.chars().filter(|c| *c == '}').count();
+    for _ in 0..(open_braces.saturating_sub(close_braces)) {
+        result.push('}');
+    }
+
+    result
 }

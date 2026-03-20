@@ -16,11 +16,7 @@ struct ListDirArgs {
 
 fn default_depth() -> usize { 2 }
 
-const SKIP_DIRS: &[&str] = &[
-    "node_modules", ".git", "target", "__pycache__", ".next",
-    "dist", "build", ".cache", "vendor", ".venv", "venv",
-    ".idea", ".vscode",
-];
+use super::SKIP_DIRS;
 
 #[async_trait]
 impl Tool for ListDirTool {

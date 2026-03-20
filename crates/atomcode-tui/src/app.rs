@@ -146,6 +146,8 @@ pub struct App {
     pub agent_handle: AgentHandle,
     /// Display name of the active model (cached so we don't need the provider ref).
     pub model_name: String,
+    /// Per-turn logger: writes each turn to datalog/ as a markdown file.
+    pub turn_log: crate::turn_log::TurnLog,
 }
 
 impl App {
@@ -156,9 +158,10 @@ impl App {
         tool_context: ToolContext,
         working_dir: PathBuf,
     ) -> Self {
-        let conversation = Conversation::load(&Conversation::history_path());
-        // Build input history from past user messages
-        let input_history: Vec<String> = conversation.messages.iter()
+        // Load history ONLY for input history (up/down arrow), NOT for conversation context.
+        // Each session starts fresh — prevents corrupted messages from causing API errors.
+        let old_history = Conversation::load(&Conversation::history_path());
+        let input_history: Vec<String> = old_history.messages.iter()
             .filter_map(|m| {
                 use atomcode_core::conversation::message::{MessageContent, Role};
                 if matches!(m.role, Role::User) {
@@ -169,6 +172,8 @@ impl App {
                 None
             })
             .collect();
+        // Start with a fresh conversation (like Claude Code)
+        let conversation = Conversation::new();
         Self {
             mode: AppMode::Normal,
             conversation,
@@ -194,6 +199,7 @@ impl App {
             turn_start: None,
             tool_start: None,
             last_turn_duration: None,
+            turn_log: crate::turn_log::TurnLog::new(&working_dir),
             tool_context,
             working_dir,
             input_history,
@@ -219,6 +225,7 @@ impl App {
                     model: model_name.clone(),
                     base_url: Some("http://localhost:1".to_string()),
                     system_prompt: None,
+                    context_window: 16000,
                 }).unwrap_or_else(|_| {
                     // Fallback: should never reach production path since AgentLoop handles LLM
                     panic!("Failed to create placeholder provider")
@@ -418,7 +425,7 @@ impl App {
 
         // Cache project context — only rebuild on first call or after /cd
         let project_ctx = self.project_context_cache
-            .get_or_insert_with(|| crate::project_context::build_project_context(&self.working_dir))
+            .get_or_insert_with(|| crate::project_context::build_project_context(&self.working_dir).text)
             .clone();
 
         format!(
@@ -439,6 +446,7 @@ impl App {
             }
             AgentEvent::ToolCallStarted { name, arguments } => {
                 self.current_step_count += 1;
+                self.turn_log.log_tool_call(&name, &arguments);
                 let call = ToolCall {
                     id: format!("call_{}", self.current_step_count),
                     name: name.clone(),
@@ -453,6 +461,7 @@ impl App {
                 self.at_bottom = true;
             }
             AgentEvent::ToolCallResult { name: _, output, success, duration: _ } => {
+                self.turn_log.log_tool_result(&output, success);
                 // Add result to conversation mirror so it renders in the UI
                 self.conversation.add_tool_result(ToolResult {
                     call_id: format!("call_{}", self.current_step_count),
@@ -483,16 +492,27 @@ impl App {
                 }
             }
             AgentEvent::TurnComplete { duration, total_tokens: _ } => {
+                // Finalize stream FIRST so auto-summary TextDelta becomes a message
+                self.conversation.finalize_stream();
+                // Then log the final assistant text
+                if let Some(last) = self.conversation.messages.last() {
+                    if matches!(last.role, atomcode_core::conversation::message::Role::Assistant) {
+                        if let Some(text) = last.text() {
+                            self.turn_log.log_text(text);
+                        }
+                    }
+                }
+                self.turn_log.end_turn(self.turn_tokens);
                 self.mode = AppMode::Normal;
                 self.last_turn_duration = Some(duration);
                 self.turn_start = None;
-                // Finalize any remaining stream text
-                self.conversation.finalize_stream();
                 self.render_cache_msg_count = 0; // Invalidate cache
                 self.suggestion = self.generate_suggestion();
                 self.at_bottom = true;
             }
             AgentEvent::Error(e) => {
+                self.turn_log.log_error(&e);
+                self.turn_log.end_turn(self.turn_tokens);
                 self.conversation.push_delta(&format!("\n\n[Error: {}]", e));
                 self.conversation.finalize_stream();
                 self.mode = AppMode::Normal;
@@ -505,6 +525,7 @@ impl App {
                 self.total_tokens += usage.completion_tokens;
             }
             AgentEvent::WorkingDirChanged(new_dir) => {
+                self.turn_log.set_working_dir(&new_dir);
                 self.working_dir = new_dir;
                 self.project_context_cache = None;
             }
@@ -1446,6 +1467,9 @@ impl App {
             self.attached_files.clear();
             parts.join("\n")
         };
+
+        // Log this turn
+        self.turn_log.begin_turn(&full_content);
 
         // Add user message to our local mirror for immediate display.
         self.conversation.add_user_message(&full_content);

@@ -34,11 +34,43 @@ pub fn render(frame: &mut Frame, area: Rect, input: &InputState, is_busy: bool, 
             ))]
         }
     } else {
-        input
-            .lines
-            .iter()
-            .map(|l| Line::from(Span::raw(l.clone())))
-            .collect()
+        // If more than 5 lines, show a scrolled view centered on the cursor row
+        let max_visible = 5;
+        if input.lines.len() > max_visible {
+            let half = max_visible / 2;
+            let start = if input.cursor_row <= half {
+                0
+            } else if input.cursor_row + half >= input.lines.len() {
+                input.lines.len().saturating_sub(max_visible)
+            } else {
+                input.cursor_row - half
+            };
+            let end = (start + max_visible).min(input.lines.len());
+
+            let mut lines_vec: Vec<Line> = Vec::new();
+            if start > 0 {
+                lines_vec.push(Line::from(Span::styled(
+                    format!("  ↑ {} more lines", start),
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+            for i in start..end {
+                lines_vec.push(Line::from(Span::raw(input.lines[i].clone())));
+            }
+            if end < input.lines.len() {
+                lines_vec.push(Line::from(Span::styled(
+                    format!("  ↓ {} more lines", input.lines.len() - end),
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+            lines_vec
+        } else {
+            input
+                .lines
+                .iter()
+                .map(|l| Line::from(Span::raw(l.clone())))
+                .collect()
+        }
     };
 
     // Subtle border color change when busy
@@ -96,7 +128,7 @@ pub fn render(frame: &mut Frame, area: Rect, input: &InputState, is_busy: bool, 
 
     frame.render_widget(input_widget, input_area);
 
-    // Always show cursor (offset for tags and input area)
+    // Always show cursor (offset for tags and input area + scroll)
     let current_line = &input.lines[input.cursor_row];
     let safe_col = if input.cursor_col >= current_line.len() {
         current_line.len()
@@ -111,8 +143,27 @@ pub fn render(frame: &mut Frame, area: Rect, input: &InputState, is_busy: bool, 
     };
     let text_before_cursor = &current_line[..safe_col];
     let display_col = unicode_display_width(text_before_cursor);
+
+    // Calculate visible row offset when scrolling
+    let max_visible = 5;
+    let visible_row = if input.lines.len() > max_visible {
+        let half = max_visible / 2;
+        let start = if input.cursor_row <= half {
+            0
+        } else if input.cursor_row + half >= input.lines.len() {
+            input.lines.len().saturating_sub(max_visible)
+        } else {
+            input.cursor_row - half
+        };
+        let offset_in_view = input.cursor_row - start;
+        // Account for the "↑ N more lines" indicator taking 1 line
+        if start > 0 { offset_in_view + 1 } else { offset_in_view }
+    } else {
+        input.cursor_row
+    };
+
     let cursor_x = input_area.x + 1 + H_PADDING + display_col as u16;
-    let cursor_y = input_area.y + 1 + input.cursor_row as u16;
+    let cursor_y = input_area.y + 1 + visible_row as u16;
     frame.set_cursor_position((cursor_x, cursor_y));
 }
 
@@ -140,8 +191,11 @@ fn is_wide_char(c: char) -> bool {
 
 pub fn height(input: &InputState, terminal_height: u16, has_attachments: bool) -> u16 {
     let content_lines = input.lines.len() as u16;
-    let max_height = terminal_height / 2;
     let tag_height = if has_attachments { 1 } else { 0 };
     let min_height = 3 + tag_height;
+    // Cap input box at 5 lines of content (like Claude Code) — prevents the input
+    // from taking over the screen. Users can still type more, it just scrolls.
+    let max_content = 5;
+    let max_height = (max_content + 2 + tag_height).min(terminal_height / 2);
     (content_lines + 2 + tag_height).clamp(min_height, max_height)
 }

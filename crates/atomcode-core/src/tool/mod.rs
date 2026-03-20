@@ -8,6 +8,14 @@ pub mod read;
 pub mod write;
 
 use std::collections::{HashMap, HashSet};
+
+/// Directories to skip when scanning file trees (build artifacts, caches, VCS).
+/// Used by glob, list_dir, project_context, and collect_project_files.
+pub const SKIP_DIRS: &[&str] = &[
+    "node_modules", ".git", "target", "__pycache__", ".next",
+    "dist", "build", ".cache", "vendor", ".venv", "venv",
+    ".idea", ".vscode", ".DS_Store", ".env",
+];
 use std::path::PathBuf;
 use std::sync::Arc;
 

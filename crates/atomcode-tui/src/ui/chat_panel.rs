@@ -134,7 +134,14 @@ pub fn render(
 
     match mode {
         AppMode::Streaming => {
-            let label = THINKING_LABELS[turn_label_seed % THINKING_LABELS.len()];
+            // Show a meaningful label based on context
+            let label = if step_count > 0 && conversation.stream_buffer.as_ref().map_or(true, |b| b.is_empty()) {
+                "Planning next step..."
+            } else if step_count == 0 {
+                THINKING_LABELS[turn_label_seed % THINKING_LABELS.len()]
+            } else {
+                "Generating..."
+            };
             dynamic.push(Line::from(vec![
                 Span::styled(
                     format!("    {} {}{}", spinner, step_prefix, label),
@@ -214,10 +221,40 @@ pub fn render(
 fn render_user(lines: &mut Vec<Line<'static>>, content: &str) {
     lines.push(Line::default());
     let style = Style::default().fg(Color::White).bg(USER_BG);
-    for text_line in content.lines() {
+    let text_lines: Vec<&str> = content.lines().collect();
+    let total_chars: usize = content.len();
+
+    if text_lines.len() <= 3 && total_chars <= 200 {
+        // Short message — show in full
+        for text_line in &text_lines {
+            lines.push(Line::from(vec![
+                Span::styled("  > ", Style::default().fg(ACCENT).bg(USER_BG)),
+                Span::styled(text_line.to_string(), style),
+            ]));
+        }
+    } else {
+        // Long message / pasted content — compact block (like Claude Code)
+        // Show first meaningful line as summary
+        let first = text_lines.iter()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or(&text_lines[0]);
+        let summary = if first.chars().count() > 60 {
+            format!("{}...", first.chars().take(57).collect::<String>())
+        } else {
+            first.to_string()
+        };
+
         lines.push(Line::from(vec![
             Span::styled("  > ", Style::default().fg(ACCENT).bg(USER_BG)),
-            Span::styled(text_line.to_string(), style),
+            Span::styled(summary, style),
+        ]));
+        // Compact indicator: lines + chars, styled as a muted tag
+        lines.push(Line::from(vec![
+            Span::styled("    ", Style::default().bg(USER_BG)),
+            Span::styled(
+                format!("\u{2500}\u{2500} {} lines, {} chars \u{2500}\u{2500}", text_lines.len(), total_chars),
+                Style::default().fg(Color::Rgb(60, 60, 70)).bg(USER_BG),
+            ),
         ]));
     }
     lines.push(Line::default());
@@ -239,6 +276,7 @@ fn render_assistant(lines: &mut Vec<Line<'static>>, content: &str) {
 fn render_tool_call(lines: &mut Vec<Line<'static>>, call: &ToolCall) {
     let border = Style::default().fg(TOOL_BORDER);
     let name = capitalize(&call.name);
+    let detail = format_tool_detail(&call.name, &call.arguments);
     lines.push(Line::from(vec![
         Span::styled("    \u{2502} ", border),
         Span::styled(
@@ -246,7 +284,7 @@ fn render_tool_call(lines: &mut Vec<Line<'static>>, call: &ToolCall) {
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            format!("  {}", format_args_oneline(&call.arguments)),
+            format!("  {}", detail),
             Style::default().fg(DIM),
         ),
     ]));
@@ -258,11 +296,14 @@ fn render_tool_result(lines: &mut Vec<Line<'static>>, result: &ToolResult) {
     } else {
         ("x", ERROR)
     };
-    let summary: String = result.output.lines().next().unwrap_or("").to_string();
-    let summary: String = if summary.chars().count() > 70 {
-        summary.chars().take(67).collect::<String>() + "..."
+    let first_line: String = result.output.lines().next().unwrap_or("").to_string();
+    let total_lines = result.output.lines().count();
+    let summary = if first_line.chars().count() > 80 {
+        first_line.chars().take(77).collect::<String>() + "..."
+    } else if total_lines > 1 {
+        format!("{} ({} lines)", first_line, total_lines)
     } else {
-        summary
+        first_line
     };
     lines.push(Line::from(vec![
         Span::styled("    \u{2502} ", Style::default().fg(TOOL_BORDER)),
@@ -388,6 +429,69 @@ fn format_compact_tokens(n: usize) -> String {
     if n < 1000 { format!("{}", n) }
     else if n < 1_000_000 { format!("{:.1}k", n as f64 / 1000.0) }
     else { format!("{:.1}M", n as f64 / 1_000_000.0) }
+}
+
+/// Format a human-readable one-line detail for a tool call, tailored per tool type.
+/// Shows the most important info: file paths shortened, command previews, etc.
+fn format_tool_detail(tool_name: &str, args_json: &str) -> String {
+    let args: serde_json::Value = match serde_json::from_str(args_json) {
+        Ok(v) => v,
+        Err(_) => return String::new(),
+    };
+
+    match tool_name {
+        "read_file" => {
+            let path = shorten_path(args.get("file_path").and_then(|v| v.as_str()).unwrap_or(""));
+            let mut detail = path;
+            if let Some(offset) = args.get("offset").and_then(|v| v.as_u64()) {
+                detail.push_str(&format!(" L{}", offset));
+                if let Some(limit) = args.get("limit").and_then(|v| v.as_u64()) {
+                    detail.push_str(&format!("-{}", offset + limit));
+                }
+            }
+            detail
+        }
+        "write_file" => {
+            let path = shorten_path(args.get("file_path").and_then(|v| v.as_str()).unwrap_or(""));
+            let size = args.get("content").and_then(|v| v.as_str()).map(|s| s.len()).unwrap_or(0);
+            format!("{} ({} bytes)", path, size)
+        }
+        "edit_file" => {
+            let path = shorten_path(args.get("file_path").and_then(|v| v.as_str()).unwrap_or(""));
+            let old_lines = args.get("old_string").and_then(|v| v.as_str()).map(|s| s.lines().count()).unwrap_or(0);
+            let new_lines = args.get("new_string").and_then(|v| v.as_str()).map(|s| s.lines().count()).unwrap_or(0);
+            format!("{} (-{} +{} lines)", path, old_lines, new_lines)
+        }
+        "bash" => {
+            let cmd = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
+            if cmd.chars().count() > 60 {
+                cmd.chars().take(57).collect::<String>() + "..."
+            } else {
+                cmd.to_string()
+            }
+        }
+        "list_directory" => {
+            let path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+            let depth = args.get("depth").and_then(|v| v.as_u64()).unwrap_or(2);
+            format!("{} (depth={})", shorten_path(path), depth)
+        }
+        "grep" | "glob" => {
+            let pattern = args.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
+            let path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+            format!("\"{}\" in {}", pattern, shorten_path(path))
+        }
+        _ => format_args_oneline(args_json),
+    }
+}
+
+/// Shorten a file path for display: keep filename + parent dir, trim the rest.
+fn shorten_path(path: &str) -> String {
+    let parts: Vec<&str> = path.rsplitn(3, '/').collect();
+    match parts.len() {
+        0 | 1 => path.to_string(),
+        2 => format!("{}/{}", parts[1], parts[0]),
+        _ => format!(".../{}/{}", parts[1], parts[0]),
+    }
 }
 
 fn format_args_oneline(args_json: &str) -> String {

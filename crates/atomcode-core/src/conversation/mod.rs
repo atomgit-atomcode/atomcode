@@ -175,6 +175,177 @@ impl Conversation {
         msgs.extend(self.messages[start..].iter().cloned());
         msgs
     }
+
+    /// Token-budget-aware windowing. Fits messages within `token_budget` by:
+    /// 1. Always including system prompt and the first user message of this turn
+    /// 2. Including recent messages at full fidelity
+    /// 3. Condensing older tool results to 1-line summaries to save tokens
+    /// 4. Dropping oldest messages if still over budget
+    pub fn to_provider_messages_budgeted(
+        &self,
+        system_prompt: &str,
+        token_budget: usize,
+    ) -> Vec<Message> {
+        if self.messages.is_empty() {
+            return vec![Message::new(Role::System, system_prompt)];
+        }
+
+        let system_msg = Message::new(Role::System, system_prompt);
+        let system_tokens = system_msg.estimate_tokens();
+        let remaining_budget = token_budget.saturating_sub(system_tokens);
+
+        // Find the most recent user message index (the current task).
+        // We always want to include this.
+        let last_user_idx = self.messages.iter().rposition(|m| matches!(m.role, Role::User));
+
+        // Phase 1: Walk backwards from the end, adding messages at full fidelity
+        // until we've used about 60% of the budget. These are the "hot" messages.
+        let hot_budget = remaining_budget * 60 / 100;
+        let mut hot_tokens = 0usize;
+        let mut hot_start = self.messages.len();
+
+        for i in (0..self.messages.len()).rev() {
+            let msg_tokens = self.messages[i].estimate_tokens();
+            if hot_tokens + msg_tokens > hot_budget {
+                break;
+            }
+            hot_tokens += msg_tokens;
+            hot_start = i;
+        }
+
+        // Ensure hot_start is at a valid boundary (User message preferred)
+        hot_start = self.snap_to_valid_boundary(hot_start);
+
+        // If the last user message is before hot_start, we must include it
+        let include_first_user = match last_user_idx {
+            Some(idx) if idx < hot_start => Some(idx),
+            _ => None,
+        };
+
+        // Phase 2: For messages between first_user and hot_start, condense tool results
+        let cold_budget = remaining_budget.saturating_sub(hot_tokens);
+        let mut cold_messages: Vec<Message> = Vec::new();
+        let mut cold_tokens = 0usize;
+
+        if let Some(first_idx) = include_first_user {
+            // Always include the user message that started the current task
+            let user_msg = self.messages[first_idx].clone();
+            cold_tokens += user_msg.estimate_tokens();
+            cold_messages.push(user_msg);
+
+            // Include condensed versions of messages between first_user and hot_start
+            for i in (first_idx + 1)..hot_start {
+                let condensed = self.messages[i].condensed();
+                let tokens = condensed.estimate_tokens();
+                if cold_tokens + tokens > cold_budget {
+                    break;
+                }
+                cold_tokens += tokens;
+                cold_messages.push(condensed);
+            }
+        }
+
+        // Phase 3: Assemble final messages
+        let mut result = Vec::with_capacity(cold_messages.len() + (self.messages.len() - hot_start) + 2);
+        result.push(system_msg);
+
+        // Cold zone (condensed older context)
+        if !cold_messages.is_empty() {
+            result.extend(cold_messages);
+        }
+
+        // Hot zone (recent messages at full fidelity)
+        result.extend(self.messages[hot_start..].iter().cloned());
+
+        // Phase 4: Sanitize — remove broken tool_call/tool_result pairs.
+        // This prevents "messages illegal" API errors from boundary splits.
+        Self::sanitize_messages(&mut result);
+
+        result
+    }
+
+    /// Remove messages that would cause "messages illegal" API errors.
+    /// Uses a simple state-machine approach: walk forward, track expected sequence.
+    /// Valid sequences: System → (User → Assistant/AssistantWithToolCalls → [ToolResult]* → ...)*
+    fn sanitize_messages(msgs: &mut Vec<Message>) {
+        let mut to_remove: Vec<usize> = Vec::new();
+        let mut expecting_tool_results = 0usize; // how many ToolResults we expect next
+
+        for i in 0..msgs.len() {
+            match &msgs[i].content {
+                MessageContent::ToolResult(_) => {
+                    if expecting_tool_results > 0 {
+                        expecting_tool_results -= 1;
+                    } else {
+                        // Orphan ToolResult — no AssistantWithToolCalls expecting it
+                        to_remove.push(i);
+                    }
+                }
+                MessageContent::AssistantWithToolCalls { tool_calls, .. } => {
+                    // If we were still expecting tool results from a previous call, that's broken
+                    // (the previous AssistantWithToolCalls didn't get all its results)
+                    // Don't remove it — just reset and accept the new one.
+                    expecting_tool_results = tool_calls.len();
+                }
+                MessageContent::Text(_) => {
+                    // A text message breaks any pending tool result expectation.
+                    // If we were expecting tool results, the preceding AssistantWithToolCalls
+                    // is broken — but removing it would be complex. Just reset.
+                    expecting_tool_results = 0;
+                }
+            }
+        }
+
+        // If the last message is AssistantWithToolCalls and we're still expecting results, remove it.
+        if expecting_tool_results > 0 {
+            // Find the last AssistantWithToolCalls and remove it + any trailing ToolResults
+            for i in (0..msgs.len()).rev() {
+                match &msgs[i].content {
+                    MessageContent::AssistantWithToolCalls { .. } => {
+                        to_remove.push(i);
+                        break;
+                    }
+                    MessageContent::ToolResult(_) => {
+                        to_remove.push(i);
+                    }
+                    _ => break,
+                }
+            }
+        }
+
+        // Remove in reverse order to preserve indices
+        to_remove.sort_unstable();
+        to_remove.dedup();
+        for &idx in to_remove.iter().rev() {
+            msgs.remove(idx);
+        }
+    }
+
+    /// Snap an index to a valid message boundary for the API.
+    fn snap_to_valid_boundary(&self, idx: usize) -> usize {
+        let mut start = idx.min(self.messages.len());
+
+        // Skip orphan ToolResult messages
+        while start < self.messages.len() {
+            match &self.messages[start].content {
+                MessageContent::ToolResult(_) => start += 1,
+                _ => break,
+            }
+        }
+
+        // Prefer starting at a User message
+        let original = start;
+        while start < self.messages.len() {
+            if matches!(self.messages[start].role, Role::User | Role::System) {
+                break;
+            }
+            start += 1;
+            if start > original + 5 {
+                return original;
+            }
+        }
+        start
+    }
 }
 
 #[cfg(test)]
@@ -291,5 +462,134 @@ mod tests {
             }
             _ => panic!("Expected AssistantWithToolCalls"),
         }
+    }
+
+    #[test]
+    fn test_budgeted_empty_conversation() {
+        let conv = Conversation::new();
+        let msgs = conv.to_provider_messages_budgeted("system prompt", 8000);
+        assert_eq!(msgs.len(), 1);
+        assert!(matches!(msgs[0].role, Role::System));
+    }
+
+    #[test]
+    fn test_budgeted_includes_recent_messages() {
+        let mut conv = Conversation::new();
+        conv.add_user_message("hello");
+        conv.messages.push(Message::new(Role::Assistant, "hi there"));
+        conv.add_user_message("do something");
+
+        let msgs = conv.to_provider_messages_budgeted("sys", 8000);
+        assert_eq!(msgs.len(), 4); // system + 3 messages
+        assert!(matches!(msgs[0].role, Role::System));
+    }
+
+    #[test]
+    fn test_budgeted_condenses_old_tool_results() {
+        use crate::tool::{ToolCall, ToolResult};
+        let mut conv = Conversation::new();
+        conv.add_user_message("fix the bug");
+
+        for i in 0..20 {
+            let call = ToolCall {
+                id: format!("call_{}", i),
+                name: "read_file".to_string(),
+                arguments: format!(r#"{{"file_path":"/tmp/file_{}.rs"}}"#, i),
+            };
+            conv.add_assistant_tool_calls(None, vec![call]);
+            conv.add_tool_result(ToolResult {
+                call_id: format!("call_{}", i),
+                output: "x".repeat(500),
+                success: true,
+            });
+        }
+        conv.add_user_message("now what?");
+
+        let msgs = conv.to_provider_messages_budgeted("sys", 4000);
+        let total_chars: usize = msgs.iter().map(|m| m.text().map_or(0, |t| t.len())).sum();
+        assert!(total_chars < 8000, "Expected condensation, got {} chars", total_chars);
+        assert!(matches!(msgs[0].role, Role::System));
+        assert_eq!(msgs.last().unwrap().text(), Some("now what?"));
+    }
+
+    #[test]
+    fn test_budgeted_preserves_first_user_message() {
+        use crate::tool::{ToolCall, ToolResult};
+        let mut conv = Conversation::new();
+        conv.add_user_message("original task: redesign the page");
+
+        for i in 0..10 {
+            let call = ToolCall {
+                id: format!("c{}", i),
+                name: "bash".to_string(),
+                arguments: "{}".to_string(),
+            };
+            conv.add_assistant_tool_calls(Some("working..."), vec![call]);
+            conv.add_tool_result(ToolResult {
+                call_id: format!("c{}", i),
+                output: "y".repeat(200),
+                success: true,
+            });
+        }
+
+        let msgs = conv.to_provider_messages_budgeted("sys", 3000);
+        let has_original = msgs.iter().any(|m| {
+            m.text() == Some("original task: redesign the page")
+        });
+        assert!(has_original, "Original user message should be preserved");
+    }
+
+    #[test]
+    fn test_sanitize_removes_orphan_tool_results() {
+        use crate::tool::ToolResult;
+        let mut msgs = vec![
+            Message::new(Role::System, "sys"),
+            // Orphan tool result (no matching AssistantWithToolCalls)
+            Message {
+                role: Role::Tool,
+                content: MessageContent::ToolResult(ToolResult {
+                    call_id: "orphan_1".to_string(),
+                    output: "some output".to_string(),
+                    success: true,
+                }),
+            },
+            Message::new(Role::User, "hello"),
+        ];
+        Conversation::sanitize_messages(&mut msgs);
+        // Orphan should be removed, leaving System + User
+        assert_eq!(msgs.len(), 2);
+        assert!(matches!(msgs[0].role, Role::System));
+        assert!(matches!(msgs[1].role, Role::User));
+    }
+
+    #[test]
+    fn test_sanitize_preserves_valid_pairs() {
+        use crate::tool::{ToolCall, ToolResult};
+        let mut msgs = vec![
+            Message::new(Role::System, "sys"),
+            Message::new(Role::User, "do it"),
+            Message {
+                role: Role::Assistant,
+                content: MessageContent::AssistantWithToolCalls {
+                    text: None,
+                    tool_calls: vec![ToolCall {
+                        id: "c1".to_string(),
+                        name: "bash".to_string(),
+                        arguments: "{}".to_string(),
+                    }],
+                },
+            },
+            Message {
+                role: Role::Tool,
+                content: MessageContent::ToolResult(ToolResult {
+                    call_id: "c1".to_string(),
+                    output: "ok".to_string(),
+                    success: true,
+                }),
+            },
+        ];
+        Conversation::sanitize_messages(&mut msgs);
+        // All 4 messages should be preserved (valid pair)
+        assert_eq!(msgs.len(), 4);
     }
 }

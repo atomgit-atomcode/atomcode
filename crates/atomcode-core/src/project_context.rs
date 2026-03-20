@@ -1,4 +1,5 @@
-use std::path::Path;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
 /// Descriptor files to include (filename, max_lines).
 /// The model reads these directly — no interpretation by us.
@@ -18,22 +19,27 @@ const DESCRIPTORS: &[(&str, usize)] = &[
     (".env.example", 10),
 ];
 
-const SKIP_DIRS: &[&str] = &[
-    "node_modules", ".git", "target", "__pycache__", ".next",
-    "dist", "build", ".cache", "vendor", ".venv", "venv",
-    ".idea", ".vscode", ".DS_Store", ".env",
-];
+use crate::tool::SKIP_DIRS;
+
+/// Result of building project context: the context string and the set of included file paths.
+pub struct ProjectContext {
+    pub text: String,
+    /// Absolute paths of descriptor files whose content is already in the context.
+    pub included_files: HashSet<PathBuf>,
+}
 
 /// Build project context by scanning the tree and including raw descriptor file contents.
 /// No hardcoded project-type detection — the model reads the files and figures it out.
-pub fn build_project_context(dir: &Path) -> String {
+pub fn build_project_context(dir: &Path) -> ProjectContext {
     let mut ctx = String::new();
+    let mut included_files = HashSet::new();
 
     // 1. File tree (2 levels)
     ctx.push_str("Project files:\n");
     ctx.push_str(&scan_tree(dir, 0, 2));
 
     // 2. Include raw content of descriptor files the model can read
+    let mut included_names = Vec::new();
     for &(filename, max_lines) in DESCRIPTORS {
         let path = dir.join(filename);
         if path.exists() {
@@ -49,8 +55,22 @@ pub fn build_project_context(dir: &Path) -> String {
                     summary
                 };
                 ctx.push_str(&format!("\n[{}]\n{}\n", filename, summary));
+                // Store the canonical absolute path for matching
+                if let Ok(abs) = std::fs::canonicalize(&path) {
+                    included_files.insert(abs);
+                } else {
+                    included_files.insert(path);
+                }
+                included_names.push(filename.to_string());
             }
         }
+    }
+
+    if !included_names.is_empty() {
+        ctx.push_str(&format!(
+            "\n(These files are already shown above — do NOT re-read them: {})\n",
+            included_names.join(", ")
+        ));
     }
 
     // 3. List executable/script files at root
@@ -65,7 +85,10 @@ pub fn build_project_context(dir: &Path) -> String {
         ctx.push_str("\n...(truncated)");
     }
 
-    ctx
+    ProjectContext {
+        text: ctx,
+        included_files,
+    }
 }
 
 /// Find executable files and known script files at root level.

@@ -4,6 +4,7 @@ pub mod event;
 pub mod file_attach;
 pub mod project_context;
 pub mod provider_manager;
+pub mod turn_log;
 pub mod ui;
 
 use std::io::Write;

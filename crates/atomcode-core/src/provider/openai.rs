@@ -29,7 +29,11 @@ impl OpenAiProvider {
             .clone()
             .context("OpenAI provider requires an api_key")?;
         Ok(Self {
-            client: Client::new(),
+            client: Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(30))
+                .timeout(std::time::Duration::from_secs(300)) // 5 min max per request
+                .build()
+                .unwrap_or_else(|_| Client::new()),
             api_key,
             model: config.model.clone(),
             base_url: config
@@ -72,14 +76,28 @@ impl OpenAiProvider {
                         if let Some(t) = text {
                             msg["content"] = json!(t);
                         }
-                        msg["tool_calls"] = json!(tool_calls.iter().map(|tc| json!({
-                            "id": tc.id,
-                            "type": "function",
-                            "function": {
-                                "name": tc.name,
-                                "arguments": tc.arguments,
-                            }
-                        })).collect::<Vec<_>>());
+                        msg["tool_calls"] = json!(tool_calls.iter().map(|tc| {
+                            // Ensure arguments is valid JSON — some APIs reject invalid JSON strings.
+                            let args = if serde_json::from_str::<serde_json::Value>(&tc.arguments).is_ok() {
+                                tc.arguments.clone()
+                            } else {
+                                // Try repair; if still invalid, wrap as a simple object
+                                let repaired = repair_tool_args(&tc.arguments);
+                                if serde_json::from_str::<serde_json::Value>(&repaired).is_ok() {
+                                    repaired
+                                } else {
+                                    json!({"input": tc.arguments}).to_string()
+                                }
+                            };
+                            json!({
+                                "id": tc.id,
+                                "type": "function",
+                                "function": {
+                                    "name": tc.name,
+                                    "arguments": args,
+                                }
+                            })
+                        }).collect::<Vec<_>>());
                         Some(msg)
                     }
                     MessageContent::ToolResult(r) => {
@@ -200,8 +218,26 @@ impl LlmProvider for OpenAiProvider {
             let mut byte_stream = response.bytes_stream();
             // Track multiple tool calls by index: Vec<(id, name, args)>
             let mut tool_calls: Vec<(String, String, String)> = Vec::new();
+            // Track the last usage report — some providers (DeepSeek) send cumulative
+            // usage in every chunk, so we only emit the final value.
+            let mut last_usage: Option<crate::stream::TokenUsage> = None;
 
-            while let Some(chunk) = byte_stream.next().await {
+            loop {
+                // 120s idle timeout: if no data arrives for 2 minutes, treat as dead connection.
+                let chunk = match tokio::time::timeout(
+                    std::time::Duration::from_secs(120),
+                    byte_stream.next(),
+                ).await {
+                    Ok(Some(chunk)) => chunk,
+                    Ok(None) => break, // stream ended
+                    Err(_) => {
+                        let _ = tx.send(Ok(StreamEvent::Error(
+                            "Stream timeout: no data received for 120 seconds".to_string()
+                        )));
+                        return;
+                    }
+                };
+
                 let text = match chunk {
                     Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
                     Err(e) => {
@@ -219,18 +255,20 @@ impl LlmProvider for OpenAiProvider {
                     if line.starts_with("data: ") {
                         let data = &line[6..];
                         if data == "[DONE]" {
+                            if let Some(usage) = last_usage.take() {
+                                let _ = tx.send(Ok(StreamEvent::Usage(usage)));
+                            }
                             let _ = tx.send(Ok(StreamEvent::Done));
                             return;
                         }
                         if let Ok(chunk) = serde_json::from_str::<ChatChunk>(data) {
-                            // Extract token usage if present (sent in final chunk)
+                            // Store usage — don't emit yet. Some providers send cumulative
+                            // usage in multiple chunks; we only want the final value.
                             if let Some(usage) = &chunk.usage {
-                                let _ = tx.send(Ok(StreamEvent::Usage(
-                                    crate::stream::TokenUsage {
-                                        prompt_tokens: usage.prompt_tokens.unwrap_or(0),
-                                        completion_tokens: usage.completion_tokens.unwrap_or(0),
-                                    }
-                                )));
+                                last_usage = Some(crate::stream::TokenUsage {
+                                    prompt_tokens: usage.prompt_tokens.unwrap_or(0),
+                                    completion_tokens: usage.completion_tokens.unwrap_or(0),
+                                });
                             }
                             for choice in chunk.choices {
                                 if let Some(content) = choice.delta.content {
@@ -265,6 +303,10 @@ impl LlmProvider for OpenAiProvider {
                                     }
                                 }
                                 if let Some(ref reason) = choice.finish_reason {
+                                    // Emit final usage before Done (only the last value, not cumulative sum)
+                                    if let Some(usage) = last_usage.take() {
+                                        let _ = tx.send(Ok(StreamEvent::Usage(usage)));
+                                    }
                                     match reason.as_str() {
                                         "tool_calls" => {
                                             // Emit a ToolCallDone for every accumulated tool call
@@ -303,6 +345,40 @@ impl LlmProvider for OpenAiProvider {
     fn model_name(&self) -> &str {
         &self.model
     }
+}
+
+/// Repair common JSON issues in tool call arguments from weak models.
+fn repair_tool_args(s: &str) -> String {
+    let mut r = s.trim().to_string();
+
+    // Remove markdown code fences
+    if r.starts_with("```") {
+        r = r.lines().skip(1).collect::<Vec<_>>().join("\n");
+    }
+    if r.ends_with("```") {
+        r = r.strip_suffix("```").unwrap_or(&r).trim().to_string();
+    }
+
+    // Remove trailing commas before } or ]
+    loop {
+        let before = r.clone();
+        r = r.replace(",}", "}").replace(",]", "]");
+        if r == before { break; }
+    }
+
+    // Ensure wrapped in braces
+    if !r.starts_with('{') && !r.starts_with('[') {
+        r = format!("{{{}}}", r);
+    }
+
+    // Balance braces
+    let open = r.chars().filter(|c| *c == '{').count();
+    let close = r.chars().filter(|c| *c == '}').count();
+    for _ in 0..open.saturating_sub(close) {
+        r.push('}');
+    }
+
+    r
 }
 
 /// Normalize a user-provided base_url to always end with `/chat/completions`.

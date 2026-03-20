@@ -28,7 +28,11 @@ impl ClaudeProvider {
             .clone()
             .context("Claude provider requires an api_key")?;
         Ok(Self {
-            client: Client::new(),
+            client: Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(30))
+                .timeout(std::time::Duration::from_secs(300))
+                .build()
+                .unwrap_or_else(|_| Client::new()),
             api_key,
             model: config.model.clone(),
         })
@@ -212,7 +216,21 @@ impl LlmProvider for ClaudeProvider {
             let mut tc_name = String::new();
             let mut tc_json = String::new();
 
-            while let Some(chunk) = byte_stream.next().await {
+            loop {
+                let chunk = match tokio::time::timeout(
+                    std::time::Duration::from_secs(120),
+                    byte_stream.next(),
+                ).await {
+                    Ok(Some(chunk)) => chunk,
+                    Ok(None) => break,
+                    Err(_) => {
+                        let _ = tx.send(Ok(StreamEvent::Error(
+                            "Stream timeout: no data received for 120 seconds".to_string()
+                        )));
+                        return;
+                    }
+                };
+
                 let text = match chunk {
                     Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
                     Err(e) => {

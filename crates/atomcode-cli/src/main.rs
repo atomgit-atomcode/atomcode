@@ -131,7 +131,10 @@ async fn run() -> Result<()> {
     let model_name = provider_config.model.clone();
 
     let tool_context = ToolContext::new(working_dir.clone());
-    let conversation = Conversation::load(&Conversation::history_path());
+    // Start with a fresh conversation every session (like Claude Code).
+    // History is saved for reference but NOT loaded — prevents corrupted messages
+    // from causing API errors, and gives 100% of context window to the current task.
+    let conversation = Conversation::new();
 
     let (agent_loop, agent_handle) = AgentLoop::new(
         config.clone(),
@@ -189,6 +192,7 @@ fn first_run_wizard() -> Result<Config> {
             model: default_model.to_string(),
             base_url: default_base_url.map(String::from),
             system_prompt: None,
+            context_window: 16000,
         },
     );
 
@@ -246,6 +250,7 @@ fn setup_openai_compatible() -> Result<Config> {
             model,
             base_url: Some(base_url),
             system_prompt: None,
+            context_window: 16000,
         },
     );
 

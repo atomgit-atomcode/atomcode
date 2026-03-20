@@ -25,9 +25,11 @@ impl Tool for BashTool {
     fn definition(&self) -> ToolDef {
         ToolDef {
             name: "bash",
-            description: "Run a bash command in the working directory. Returns stdout+stderr. \
-                For long-running processes, the tool returns early with partial output if the process \
-                is still running after 10s. Use & for explicit background.",
+            description: "Run a bash command. ONLY use for: running programs, installing packages, \
+                starting servers, git commands, build/test commands. \
+                Do NOT use bash to read files — use read_file instead. \
+                Do NOT use grep/cat/head/tail/sed/awk through bash — use the grep or read_file tools. \
+                For long-running processes, returns early after 10s with partial output.",
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -68,40 +70,41 @@ impl Tool for BashTool {
         let mut stdout_buf = Vec::new();
         let mut stderr_buf = Vec::new();
 
-        // Try to wait for process to finish within timeout
+        // Wait for process to finish or timeout. Read stdout/stderr concurrently.
+        // Use INITIAL_WAIT_SECS as the early-return timeout for long-running processes.
+        // After that, capture whatever output was produced so far.
+        let wait_secs = parsed.timeout.unwrap_or(INITIAL_WAIT_SECS);
         let result = tokio::time::timeout(
-            Duration::from_secs(timeout_secs),
+            Duration::from_secs(wait_secs),
             async {
-                // Read stdout and stderr concurrently
+                // Read stdout and stderr concurrently until process exits
                 let (_, _) = tokio::join!(
                     async {
                         let mut buf = vec![0u8; 65536];
                         loop {
-                            match tokio::time::timeout(Duration::from_secs(INITIAL_WAIT_SECS), stdout.read(&mut buf)).await {
-                                Ok(Ok(0)) => break, // EOF
-                                Ok(Ok(n)) => stdout_buf.extend_from_slice(&buf[..n]),
-                                Ok(Err(_)) => break,
-                                Err(_) => break, // Read timeout — process still producing or hung
+                            match stdout.read(&mut buf).await {
+                                Ok(0) => break,
+                                Ok(n) => stdout_buf.extend_from_slice(&buf[..n]),
+                                Err(_) => break,
                             }
                         }
                     },
                     async {
                         let mut buf = vec![0u8; 65536];
                         loop {
-                            match tokio::time::timeout(Duration::from_secs(INITIAL_WAIT_SECS), stderr.read(&mut buf)).await {
-                                Ok(Ok(0)) => break,
-                                Ok(Ok(n)) => stderr_buf.extend_from_slice(&buf[..n]),
-                                Ok(Err(_)) => break,
+                            match stderr.read(&mut buf).await {
+                                Ok(0) => break,
+                                Ok(n) => stderr_buf.extend_from_slice(&buf[..n]),
                                 Err(_) => break,
                             }
                         }
                     }
                 );
 
-                // Check if process has exited
+                // Process exited (stdout/stderr closed = process done)
                 match child.try_wait() {
                     Ok(Some(status)) => Some(status.success()),
-                    _ => None, // Still running
+                    _ => None,
                 }
             }
         ).await;
@@ -172,6 +175,20 @@ fn check_destructive_command(command: &str) -> Option<String> {
             return Some(format!("Destructive command detected: {}. Command: {}", reason, command));
         }
     }
+
+    // Detect `rm` on files in the working directory (prevents rm+write_file bypass).
+    // Tech-stack agnostic: any `rm` that isn't cleaning temp/build artifacts needs approval.
+    if cmd.starts_with("rm ") && !cmd.contains("-r") {
+        let ignore_dirs = ["node_modules", "dist", "build", ".cache", "target", "__pycache__", ".tmp"];
+        let is_artifact = ignore_dirs.iter().any(|d| cmd.contains(d));
+        if !is_artifact {
+            return Some(format!(
+                "Deleting file: {}. Use edit_file to modify files instead of deleting and recreating.",
+                command
+            ));
+        }
+    }
+
     None
 }
 

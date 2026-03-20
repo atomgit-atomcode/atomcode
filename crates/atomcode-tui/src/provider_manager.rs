@@ -332,6 +332,7 @@ impl ProviderManager {
                                 Some(self.new_base_url.clone())
                             },
                             system_prompt: None,
+                            context_window: 16000,
                         };
                         return Some(ManagerAction::Add(self.new_name.clone(), provider));
                     }
