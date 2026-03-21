@@ -112,11 +112,13 @@ pub fn render(frame: &mut Frame, area: Rect, input: &InputState, is_busy: bool, 
 
     let input_widget = Paragraph::new(lines)
         .block(block)
+        .wrap(ratatui::widgets::Wrap { trim: false })
         .style(Style::default().fg(Color::White));
 
     frame.render_widget(input_widget, input_area);
 
-    // Cursor
+    // Cursor — account for line wrapping
+    let inner_width = input_area.width.saturating_sub(2 + H_PADDING * 2) as usize;
     let current_line = &input.lines[input.cursor_row];
     let safe_col = if input.cursor_col >= current_line.len() {
         current_line.len()
@@ -132,9 +134,43 @@ pub fn render(frame: &mut Frame, area: Rect, input: &InputState, is_busy: bool, 
     let text_before_cursor = &current_line[..safe_col];
     let display_col = unicode_display_width(text_before_cursor);
 
-    let cursor_x = input_area.x + 1 + H_PADDING + display_col as u16;
-    let cursor_y = input_area.y + 1 + visible_row as u16;
-    frame.set_cursor_position((cursor_x, cursor_y));
+    // Account for visual line wrapping: a long line wraps into multiple visual rows.
+    // cursor_x = display_col % inner_width (position within the wrapped line)
+    // extra_rows = display_col / inner_width (how many wrapped rows above)
+    let (cursor_col_in_wrap, wrap_extra_rows) = if inner_width > 0 {
+        (display_col % inner_width, display_col / inner_width)
+    } else {
+        (display_col, 0)
+    };
+
+    // Also count wrapped rows from PREVIOUS lines (lines before cursor_row)
+    let mut prev_wrap_rows = 0usize;
+    if !is_empty {
+        let start_line = if input.lines.len() > (area.height as usize).saturating_sub(2) {
+            // In scroll mode — count from scroll start
+            let max_vis = (area.height as usize).saturating_sub(2);
+            let half = max_vis / 2;
+            if input.cursor_row <= half { 0 }
+            else if input.cursor_row + half >= input.lines.len() {
+                input.lines.len().saturating_sub(max_vis)
+            } else { input.cursor_row - half }
+        } else { 0 };
+
+        for i in start_line..input.cursor_row.min(input.lines.len()) {
+            let line_width = unicode_display_width(&input.lines[i]);
+            if inner_width > 0 && line_width > inner_width {
+                prev_wrap_rows += line_width / inner_width;
+            }
+        }
+    }
+
+    let cursor_x = input_area.x + 1 + H_PADDING + cursor_col_in_wrap as u16;
+    let total_row = visible_row + wrap_extra_rows + prev_wrap_rows;
+    let cursor_y = input_area.y + 1 + total_row as u16;
+
+    // Clamp to input area bounds
+    let max_y = input_area.y + input_area.height.saturating_sub(2);
+    frame.set_cursor_position((cursor_x, cursor_y.min(max_y)));
 }
 
 fn unicode_display_width(s: &str) -> usize {
