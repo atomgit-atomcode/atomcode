@@ -11,43 +11,16 @@ const H_PADDING: u16 = 3;
 
 use crate::file_attach::AttachedFile;
 
-pub fn render(frame: &mut Frame, area: Rect, input: &InputState, is_busy: bool, suggestion: Option<&str>, attached: &[AttachedFile], pasted: Option<&str>) {
-    let is_empty = input.is_empty() && pasted.is_none();
-    // Available width for text inside the box (minus borders + padding)
-    let inner_width = area.width.saturating_sub(2 + H_PADDING * 2) as usize;
+/// Render the input box. Grows dynamically with content, up to half the terminal height.
+/// Scrolls to keep the cursor visible when content exceeds the visible area.
+pub fn render(frame: &mut Frame, area: Rect, input: &InputState, is_busy: bool, suggestion: Option<&str>, attached: &[AttachedFile]) {
+    let is_empty = input.is_empty();
 
-    let lines: Vec<Line> = if let Some(pasted_text) = pasted {
-        // Claude Code-style: single compact line with icon
-        let line_count = pasted_text.lines().count();
-        let char_count = pasted_text.len();
-        let first_line = pasted_text.lines().next().unwrap_or("");
-        let max_preview = inner_width.saturating_sub(25); // leave room for badge
-        let preview = if first_line.chars().count() > max_preview {
-            format!("{}...", first_line.chars().take(max_preview.saturating_sub(3)).collect::<String>())
-        } else {
-            first_line.to_string()
-        };
+    // Build visible lines with scroll tracking
+    let max_visible = (area.height as usize).saturating_sub(2); // minus borders
 
-        let mut v = Vec::new();
-        if !input.is_empty() {
-            for l in &input.lines {
-                v.push(Line::from(Span::raw(l.clone())));
-            }
-        }
-        v.push(Line::from(vec![
-            Span::styled(" \u{2630} ", Style::default().fg(Color::Rgb(100, 140, 200)).bg(Color::Rgb(30, 35, 45))),
-            Span::styled(
-                format!(" {} ", preview),
-                Style::default().fg(Color::Rgb(170, 175, 185)).bg(Color::Rgb(30, 35, 45)),
-            ),
-            Span::styled(
-                format!(" {}L {}C ", line_count, char_count),
-                Style::default().fg(Color::Rgb(90, 95, 105)).bg(Color::Rgb(25, 28, 38)),
-            ),
-        ]));
-        v
-    } else if is_empty {
-        if let Some(sug) = suggestion {
+    let (lines, visible_row) = if is_empty {
+        let placeholder = if let Some(sug) = suggestion {
             vec![Line::from(vec![
                 Span::styled(sug.to_string(), Style::default().fg(Color::Rgb(70, 70, 70))),
                 Span::styled("  Tab", Style::default().fg(Color::Rgb(50, 50, 50))),
@@ -57,43 +30,46 @@ pub fn render(frame: &mut Frame, area: Rect, input: &InputState, is_busy: bool, 
                 "Ask anything... (Enter to send, / for commands)",
                 Style::default().fg(Color::DarkGray),
             ))]
-        }
+        };
+        (placeholder, 0usize)
+    } else if input.lines.len() <= max_visible {
+        // All lines fit — show everything
+        let lines: Vec<Line> = input.lines.iter()
+            .map(|l| Line::from(Span::raw(l.clone())))
+            .collect();
+        (lines, input.cursor_row)
     } else {
-        // Multi-line input: show scrolled view centered on cursor.
-        // Calculate how many visual lines each input line takes (accounting for wrap).
-        let max_visible = 5;
-
-        if input.lines.len() > max_visible {
-            let half = max_visible / 2;
-            let start = if input.cursor_row <= half {
-                0
-            } else if input.cursor_row + half >= input.lines.len() {
-                input.lines.len().saturating_sub(max_visible)
-            } else {
-                input.cursor_row - half
-            };
-            let end = (start + max_visible).min(input.lines.len());
-
-            let mut lines_vec: Vec<Line> = Vec::new();
-            if start > 0 {
-                lines_vec.push(Line::from(Span::styled(
-                    format!("  \u{2191} {} more lines", start),
-                    Style::default().fg(Color::Rgb(60, 65, 75)),
-                )));
-            }
-            for i in start..end {
-                lines_vec.push(Line::from(Span::raw(input.lines[i].clone())));
-            }
-            if end < input.lines.len() {
-                lines_vec.push(Line::from(Span::styled(
-                    format!("  \u{2193} {} more lines", input.lines.len() - end),
-                    Style::default().fg(Color::Rgb(60, 65, 75)),
-                )));
-            }
-            lines_vec
+        // Scroll: center on cursor row
+        let half = max_visible / 2;
+        let start = if input.cursor_row <= half {
+            0
+        } else if input.cursor_row + half >= input.lines.len() {
+            input.lines.len().saturating_sub(max_visible)
         } else {
-            input.lines.iter().map(|l| Line::from(Span::raw(l.clone()))).collect()
+            input.cursor_row - half
+        };
+        let end = (start + max_visible).min(input.lines.len());
+
+        let mut lines_vec: Vec<Line> = Vec::new();
+        if start > 0 {
+            lines_vec.push(Line::from(Span::styled(
+                format!("  \u{2191} {} more", start),
+                Style::default().fg(Color::Rgb(60, 65, 75)),
+            )));
         }
+        for i in start..end {
+            lines_vec.push(Line::from(Span::raw(input.lines[i].clone())));
+        }
+        if end < input.lines.len() {
+            lines_vec.push(Line::from(Span::styled(
+                format!("  \u{2193} {} more", input.lines.len() - end),
+                Style::default().fg(Color::Rgb(60, 65, 75)),
+            )));
+        }
+
+        let offset_in_view = input.cursor_row - start;
+        let vis_row = if start > 0 { offset_in_view + 1 } else { offset_in_view };
+        (lines_vec, vis_row)
     };
 
     let border_color = if is_busy { Color::Rgb(80, 80, 60) } else { Color::Rgb(100, 100, 100) };
@@ -134,56 +110,31 @@ pub fn render(frame: &mut Frame, area: Rect, input: &InputState, is_busy: bool, 
         (area, 0u16)
     };
 
-    // Render without wrap — we handle scrolling ourselves.
-    // Wrap caused cursor position miscalculation for long lines.
     let input_widget = Paragraph::new(lines)
         .block(block)
         .style(Style::default().fg(Color::White));
 
     frame.render_widget(input_widget, input_area);
 
-    // Cursor positioning
-    if pasted.is_some() && input.is_empty() {
-        // Cursor at the end of the paste indicator line
-        let cursor_x = input_area.x + 1 + H_PADDING;
-        let cursor_y = input_area.y + 1;
-        frame.set_cursor_position((cursor_x, cursor_y));
+    // Cursor
+    let current_line = &input.lines[input.cursor_row];
+    let safe_col = if input.cursor_col >= current_line.len() {
+        current_line.len()
+    } else if current_line.is_char_boundary(input.cursor_col) {
+        input.cursor_col
     } else {
-        let current_line = &input.lines[input.cursor_row];
-        let safe_col = if input.cursor_col >= current_line.len() {
-            current_line.len()
-        } else if current_line.is_char_boundary(input.cursor_col) {
-            input.cursor_col
-        } else {
-            current_line[..input.cursor_col]
-                .char_indices()
-                .last()
-                .map(|(i, c)| i + c.len_utf8())
-                .unwrap_or(0)
-        };
-        let text_before_cursor = &current_line[..safe_col];
-        let display_col = unicode_display_width(text_before_cursor);
+        current_line[..input.cursor_col]
+            .char_indices()
+            .last()
+            .map(|(i, c)| i + c.len_utf8())
+            .unwrap_or(0)
+    };
+    let text_before_cursor = &current_line[..safe_col];
+    let display_col = unicode_display_width(text_before_cursor);
 
-        let max_visible = 5;
-        let visible_row = if input.lines.len() > max_visible {
-            let half = max_visible / 2;
-            let start = if input.cursor_row <= half {
-                0
-            } else if input.cursor_row + half >= input.lines.len() {
-                input.lines.len().saturating_sub(max_visible)
-            } else {
-                input.cursor_row - half
-            };
-            let offset_in_view = input.cursor_row - start;
-            if start > 0 { offset_in_view + 1 } else { offset_in_view }
-        } else {
-            input.cursor_row
-        };
-
-        let cursor_x = input_area.x + 1 + H_PADDING + display_col as u16;
-        let cursor_y = input_area.y + 1 + visible_row as u16;
-        frame.set_cursor_position((cursor_x, cursor_y));
-    }
+    let cursor_x = input_area.x + 1 + H_PADDING + display_col as u16;
+    let cursor_y = input_area.y + 1 + visible_row as u16;
+    frame.set_cursor_position((cursor_x, cursor_y));
 }
 
 fn unicode_display_width(s: &str) -> usize {
@@ -206,11 +157,13 @@ fn is_wide_char(c: char) -> bool {
         || (0x3300..=0x33FF).contains(&cp)
 }
 
+/// Input box height: grows with content, max half terminal height.
 pub fn height(input: &InputState, terminal_height: u16, has_attachments: bool) -> u16 {
     let content_lines = input.lines.len() as u16;
     let tag_height = if has_attachments { 1 } else { 0 };
     let min_height = 3 + tag_height;
-    let max_content = 5;
+    // Allow up to 10 content lines or half terminal — like Claude Code
+    let max_content: u16 = 10;
     let max_height = (max_content + 2 + tag_height).min(terminal_height / 2);
     (content_lines + 2 + tag_height).clamp(min_height, max_height)
 }

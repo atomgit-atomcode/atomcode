@@ -87,8 +87,6 @@ pub struct App {
     pub pending_editor: Option<String>,
     /// Files attached to the next message (detected from pasted paths).
     pub attached_files: Vec<crate::file_attach::AttachedFile>,
-    /// Pasted text block (stored separately, shown as collapsed indicator in input).
-    pub pasted_text: Option<String>,
     pub slash_menu: SlashMenu,
     pub provider_mgr: Option<ProviderManager>,
     /// Model selector: list of (provider_name, model_name), selected index
@@ -185,7 +183,6 @@ impl App {
             confirm_quit: false,
             pending_editor: None,
             attached_files: Vec::new(),
-            pasted_text: None,
             slash_menu: SlashMenu::new(),
             provider_mgr: None,
             model_list: Vec::new(),
@@ -558,19 +555,13 @@ impl App {
                 self.handle_key(key, event_tx);
             }
             AppEvent::Paste(text) => {
+                // Always insert pasted text directly into input (like Claude Code).
+                // User can see and edit it before sending. Collapsing happens
+                // in chat_panel AFTER sending, not in the input box.
                 if matches!(self.mode, AppMode::Normal) {
-                    let line_count = text.lines().count();
-                    let char_count = text.len();
-                    if line_count > 3 || char_count > 200 {
-                        // Long paste: store as attached block, show indicator in input
-                        self.pasted_text = Some(text);
-                        self.suggestion = None;
-                    } else {
-                        // Short paste: insert inline
-                        self.input.insert_text(&text);
-                        self.suggestion = None;
-                        self.slash_menu.update(&self.input.content());
-                    }
+                    self.input.insert_text(&text);
+                    self.suggestion = None;
+                    self.slash_menu.update(&self.input.content());
                 }
             }
             AppEvent::ScrollUp(n) => {
@@ -1036,9 +1027,7 @@ impl App {
                 self.send_message(event_tx);
             }
             (_, KeyCode::Esc) => {
-                if self.pasted_text.is_some() {
-                    self.pasted_text = None; // Clear pasted block
-                } else if !self.input.is_empty() {
+                if !self.input.is_empty() {
                     self.input.clear();
                     self.slash_menu.close();
                 }
@@ -1511,17 +1500,7 @@ impl App {
     }
 
     fn send_message(&mut self, _event_tx: &mpsc::UnboundedSender<AppEvent>) {
-        let typed_content = self.input.content();
-        // Combine typed text + pasted block
-        let content = if let Some(pasted) = self.pasted_text.take() {
-            if typed_content.trim().is_empty() {
-                pasted
-            } else {
-                format!("{}\n\n{}", typed_content, pasted)
-            }
-        } else {
-            typed_content
-        };
+        let content = self.input.content();
         if content.trim().is_empty() {
             return;
         }
