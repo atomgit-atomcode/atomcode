@@ -106,7 +106,32 @@ impl Tool for EditFileTool {
             });
         }
 
+        // Safety check: warn about large deletions
+        let old_lines = parsed.old_string.lines().count();
+        let new_lines = parsed.new_string.lines().count();
+        let net_deleted = old_lines.saturating_sub(new_lines);
+        let deletion_warning = if net_deleted > 10 {
+            format!(
+                "\nWARNING: You removed {} more lines than you added. If you only meant to ADD a skeleton/loading section, \
+                 use v-if/v-else to show it ALONGSIDE the existing content, not INSTEAD of it.",
+                net_deleted
+            )
+        } else {
+            String::new()
+        };
+
         if parsed.replace_all {
+            // Safety check: warn about high replacement count
+            let replace_warning = if count > 10 {
+                format!(
+                    "\nWARNING: Replaced {} occurrences. This many replacements may have changed structural \
+                     elements (tags, brackets) that should not be bulk-replaced. Verify the file structure.",
+                    count
+                )
+            } else {
+                String::new()
+            };
+
             let new_content = content.replace(&parsed.old_string, &parsed.new_string);
             atomic_write(&parsed.file_path, &new_content).await?;
             let diff = build_compact_diff(&parsed.old_string, &parsed.new_string);
@@ -114,8 +139,9 @@ impl Tool for EditFileTool {
             Ok(ToolResult {
                 call_id: String::new(),
                 output: format!(
-                    "Edited {} (replaced {} occurrence{}).\n{}\n{}",
-                    parsed.file_path, count, if count > 1 { "s" } else { "" }, diff, context
+                    "Edited {} (replaced {} occurrence{}).{}{}\n{}\n{}",
+                    parsed.file_path, count, if count > 1 { "s" } else { "" },
+                    replace_warning, deletion_warning, diff, context
                 ),
                 success: true,
             })
@@ -141,8 +167,8 @@ impl Tool for EditFileTool {
             Ok(ToolResult {
                 call_id: String::new(),
                 output: format!(
-                    "Edited {} (-{} +{} lines).\n{}\n{}",
-                    parsed.file_path, removed, added, diff, context
+                    "Edited {} (-{} +{} lines).{}\n{}\n{}",
+                    parsed.file_path, removed, added, deletion_warning, diff, context
                 ),
                 success: true,
             })
@@ -166,6 +192,12 @@ fn try_fuzzy_replace(
     let content_lines: Vec<&str> = content.lines().collect();
     let has_trailing_newline = content.ends_with('\n');
     let mut matches: Vec<(usize, usize)> = Vec::new();
+
+    // Only attempt fuzzy match if old_string has substantial content (not just short fragments)
+    let total_non_ws: usize = old_normalized.iter().map(|l| l.len()).sum();
+    if total_non_ws < 10 {
+        return None; // Too short for reliable fuzzy matching
+    }
 
     // Slide window — skip overlapping matches
     let mut i = 0;
