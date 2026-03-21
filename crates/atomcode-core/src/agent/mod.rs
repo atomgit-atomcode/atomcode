@@ -379,13 +379,21 @@ impl AgentLoop {
             }
         }
 
-        // Build context string with file contents
+        // Build context string with file contents.
+        // Use ~40% of context_window for pre-read (rest for system prompt, conversation, tools).
+        let context_window = self.config
+            .providers
+            .get(&self.config.default_provider)
+            .map(|p| p.context_window)
+            .unwrap_or(64000);
+        let preread_token_budget = context_window * 40 / 100; // 40% of context for pre-read
+        let max_chars = preread_token_budget * 4; // ~4 chars per token
+
         let mut ctx = String::from("=== FILES ALREADY LOADED (do NOT re-read these) ===\n");
-        let mut total_lines = 0usize;
-        const MAX_LINES: usize = 3000; // Match model's context capacity — input tokens cheap, round-trips expensive
+        let mut total_chars = 0usize;
 
         for (idx, path) in expanded.iter().enumerate() {
-            if total_lines >= MAX_LINES { break; }
+            if total_chars >= max_chars { break; }
 
             let file_content = match tokio::fs::read_to_string(path).await {
                 Ok(c) => c,
@@ -393,10 +401,16 @@ impl AgentLoop {
             };
 
             let lines: Vec<&str> = file_content.lines().collect();
-            // First 2 files (highest scored) get full content up to 500 lines each.
-            // Remaining files share what's left of the budget.
-            let per_file_max = if idx < 2 { 500 } else { 200 };
-            let take = lines.len().min(per_file_max).min(MAX_LINES - total_lines);
+            // Calculate how many lines fit in remaining budget
+            let file_chars: usize = file_content.len();
+            let remaining = max_chars.saturating_sub(total_chars);
+            let take = if file_chars <= remaining {
+                lines.len() // Entire file fits
+            } else {
+                // Estimate lines that fit
+                let avg_line_len = file_chars / lines.len().max(1);
+                remaining / avg_line_len.max(1)
+            };
             let rel_path = path.strip_prefix(&wd)
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_else(|_| path.to_string_lossy().to_string());
@@ -412,7 +426,9 @@ impl AgentLoop {
                 ctx.push_str(&format!("[... {} more lines, use grep to find specific sections]\n", lines.len() - take));
             }
 
-            total_lines += take;
+            // Track chars consumed
+            let consumed: usize = lines.iter().take(take).map(|l| l.len() + 6).sum(); // +6 for "  NNN| "
+            total_chars += consumed;
         }
 
         ctx.push_str("\nYou have these files. Proceed directly to edit_file or write_file. Do NOT call read_file for files shown above.\n");
