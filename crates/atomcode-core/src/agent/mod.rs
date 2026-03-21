@@ -384,7 +384,7 @@ impl AgentLoop {
             total_chars += consumed;
         }
 
-        ctx.push_str("\nYou have these files. Proceed directly to edit_file or write_file. Do NOT call read_file for files shown above.\n");
+        ctx.push_str("\nYou have COMPLETE content of all files above. Go straight to edit_file. Do NOT call read_file — you already have everything.\n");
         ctx
     }
 
@@ -1505,9 +1505,26 @@ impl AgentLoop {
     /// already available in the system prompt (descriptor files, working dir tree).
     /// Does NOT intercept duplicate reads (the model may re-read with different params).
     fn intercept_redundant_call(&mut self, tool_name: &str, args: &str) -> Option<String> {
+        // Pre-read interception: if a file was already pre-read into the system prompt,
+        // tell the model it already has the content instead of reading from disk again.
+        if tool_name == "read_file" {
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(args) {
+                if let Some(fp) = parsed.get("file_path").and_then(|v| v.as_str()) {
+                    let short = short_path(fp);
+                    if self.files_read_this_turn.contains(&short) {
+                        return Some(format!(
+                            "[SKIPPED: {} is already in your context (pre-loaded at the start). \
+                             Scroll up in the system prompt to see its content. \
+                             Go straight to edit_file.]",
+                            short
+                        ));
+                    }
+                }
+            }
+        }
+
         // Post-edit guard: if edits have been made and we're past step 8,
         // block new read_file calls for files we haven't read yet.
-        // This prevents the "read more files after finishing" pattern.
         if tool_name == "read_file"
             && !self.files_edited_this_turn.is_empty()
             && self.tool_call_count >= 8
