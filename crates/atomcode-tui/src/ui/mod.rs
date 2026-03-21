@@ -7,7 +7,7 @@ pub mod slash_menu;
 pub mod status_bar;
 pub mod welcome;
 
-use ratatui::layout::{Constraint, Direction, Layout, Position};
+use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::Color;
 use ratatui::Frame;
 
@@ -79,25 +79,31 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         model_selector::render(frame, frame.area(), app);
     }
 
-    // Render text selection highlight (inverted colors overlay)
+    // Render text selection highlight — clipped to chat area only
     if app.selection.has_selection || app.selection.dragging {
-        render_selection_highlight(frame, &app.selection);
+        render_selection_highlight(frame, &app.selection, chunks[1]);
     }
 }
 
-/// Render selection highlight with a fixed blue overlay (like Claude Code).
-/// Uses a consistent blue background + white foreground regardless of underlying colors.
-fn render_selection_highlight(frame: &mut Frame, sel: &TextSelection) {
+/// Render selection highlight clipped to the chat area.
+fn render_selection_highlight(frame: &mut Frame, sel: &TextSelection, chat_area: Rect) {
     let ((start_col, start_row), (end_col, end_row)) = sel.normalized();
     let buf = frame.buffer_mut();
-    let width = buf.area.width;
 
-    let sel_bg = Color::Rgb(40, 80, 160); // Muted blue selection background
-    let sel_fg = Color::Rgb(240, 240, 245); // White text on selection
+    // Clip to chat area boundaries
+    let area_top = chat_area.y;
+    let area_bottom = chat_area.y + chat_area.height;
+    let area_width = chat_area.width;
+
+    let sel_bg = Color::Rgb(40, 80, 160);
+    let sel_fg = Color::Rgb(240, 240, 245);
 
     for row in start_row..=end_row {
+        // Skip rows outside chat area
+        if row < area_top || row >= area_bottom { continue; }
+
         let col_start = if row == start_row { start_col } else { 0 };
-        let col_end = if row == end_row { end_col } else { width };
+        let col_end = if row == end_row { end_col } else { area_width };
 
         for col in col_start..col_end {
             if let Some(cell) = buf.cell_mut(Position::new(col, row)) {
