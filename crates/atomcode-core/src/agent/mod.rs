@@ -844,17 +844,32 @@ impl AgentLoop {
                     .filter(|f| !self.files_edited_this_turn.contains(f))
                     .collect();
 
-                let urgency = if self.tool_call_count >= 15 {
+                // Detect "backend works but model keeps restarting" pattern
+                let api_confirmed_ok = self.conversation.messages.iter().rev()
+                    .take(self.tool_call_count * 2 + 2)
+                    .any(|m| {
+                        if let crate::conversation::message::MessageContent::ToolResult(r) = &m.content {
+                            r.success && (r.output.contains("200 OK") || r.output.contains("\"success\":true") || r.output.contains("success: True"))
+                        } else { false }
+                    });
+                let many_bash_restarts = self.conversation.messages.iter().rev()
+                    .take(self.tool_call_count * 2 + 2)
+                    .filter(|m| {
+                        if let crate::conversation::message::MessageContent::AssistantWithToolCalls { tool_calls, .. } = &m.content {
+                            tool_calls.iter().any(|tc| tc.name == "bash" && (tc.arguments.contains("kill") || tc.arguments.contains("pkill") || tc.arguments.contains("restart")))
+                        } else { false }
+                    })
+                    .count() >= 2;
+
+                let urgency = if api_confirmed_ok && many_bash_restarts && self.tool_call_count >= 6 {
+                    "STOP: The backend API is working (returned 200 OK). The problem is likely in the FRONTEND code. \
+                     Read the frontend file and check: imports, API call methods, response handling."
+                } else if self.tool_call_count >= 15 {
                     "URGENT: You MUST take action NOW. Either edit code, restart a service, or explain the issue to the user."
                 } else if self.files_edited_this_turn.is_empty() && self.tool_call_count >= 10 {
-                    "You have made ZERO edits or fixes after 10+ steps of diagnostics. STOP diagnosing. \
-                     Take action NOW: edit code with edit_file, OR restart a service if code was changed but service uses old code, \
-                     OR tell the user what you found."
+                    "STOP diagnosing. Take action NOW: edit code, restart service, or explain to user."
                 } else if self.files_edited_this_turn.is_empty() && self.tool_call_count >= 6 {
-                    "You have read many files but made no changes. Decide NOW: \
-                     Is this a code bug? → edit_file. \
-                     Is the service running old code? → restart it. \
-                     Can't figure it out? → tell the user what you found."
+                    "Decide NOW: code bug → edit_file. Service old code → restart. Can't tell → ask user."
                 } else {
                     "Only read files you plan to edit."
                 };
