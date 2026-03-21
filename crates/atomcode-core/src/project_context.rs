@@ -34,9 +34,9 @@ pub fn build_project_context(dir: &Path) -> ProjectContext {
     let mut ctx = String::new();
     let mut included_files = HashSet::new();
 
-    // 1. File tree (2 levels)
+    // 1. File tree (4 levels — deep enough for most projects)
     ctx.push_str("Project files:\n");
-    ctx.push_str(&scan_tree(dir, 0, 2));
+    ctx.push_str(&scan_tree(dir, 0, 4));
 
     // 2. Include raw content of descriptor files the model can read
     let mut included_names = Vec::new();
@@ -79,9 +79,9 @@ pub fn build_project_context(dir: &Path) -> ProjectContext {
         ctx.push_str(&format!("\nExecutable files: {}\n", executables.join(", ")));
     }
 
-    // Cap total size
-    if ctx.len() > 6000 {
-        ctx.truncate(6000);
+    // Cap total size — generous limit for large projects
+    if ctx.len() > 15000 {
+        ctx.truncate(15000);
         ctx.push_str("\n...(truncated)");
     }
 
