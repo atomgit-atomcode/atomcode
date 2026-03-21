@@ -270,117 +270,70 @@ impl AgentLoop {
         self.call_llm().await;
     }
 
-    /// Analyze the user's message, find relevant files, pre-read them,
-    /// and return their contents as a context string to inject into the system prompt.
-    /// NOT injected as synthetic tool calls (which teaches the model to read more).
-    async fn build_preread_context(&self, content: &str) -> String {
+    /// Pre-read ALL source files that fit in the token budget.
+    /// No keyword matching — Claude Code doesn't guess which files are relevant,
+    /// it gives the model everything and lets it decide.
+    async fn build_preread_context(&self, _content: &str) -> String {
         let wd = self.tool_context.working_dir
             .try_read()
             .map(|g| g.clone())
             .unwrap_or_default();
 
         let files = collect_project_files(&wd, 0, 3);
-        let task_lower = content.to_lowercase();
 
-        let mut scored: Vec<(i32, std::path::PathBuf)> = Vec::new();
+        // Collect all source files, sorted by relevance heuristic:
+        // - Files in api/lib/utils/services dirs go first (interface files)
+        // - Then by file size (smaller files first — more likely to fit)
+        let mut source_files: Vec<std::path::PathBuf> = Vec::new();
         for file_path in &files {
             let filename = file_path.file_name()
                 .map(|f| f.to_string_lossy().to_string())
-                .unwrap_or_default()
-                .to_lowercase();
+                .unwrap_or_default();
 
-            if filename.starts_with('.') || filename.ends_with(".log") || filename.ends_with(".lock") {
+            // Skip non-source files
+            if filename.starts_with('.')
+                || filename.ends_with(".log")
+                || filename.ends_with(".lock")
+                || filename.ends_with(".md")
+                || filename.ends_with(".json")  // package.json is in project_context already
+                || filename.ends_with(".toml")
+                || filename.ends_with(".yaml")
+                || filename.ends_with(".yml")
+                || filename.ends_with(".png")
+                || filename.ends_with(".jpg")
+                || filename.ends_with(".svg")
+                || filename.ends_with(".ico")
+                || filename.ends_with(".woff")
+                || filename.ends_with(".woff2")
+            {
                 continue;
             }
 
-            let mut score = 0i32;
-            let name_no_ext = filename.split('.').next().unwrap_or(&filename);
-
-            if name_no_ext.len() > 2 && task_lower.contains(name_no_ext) {
-                score += 10;
-            }
-
-            let keyword_map: &[(&[&str], &[&str])] = &[
-                (&["样式", "style", "css", "圆角", "rounded", "美化", "丑", "布局", "ui", "界面", "美观", "tailwind"],
-                 &["css", "style", "app", "layout", "tailwind"]),
-                (&["接口", "api", "搜索", "search", "请求"],
-                 &["api", "route", "main", "server", "search", "index"]),
-                (&["页面", "page", "组件", "component", "视图", "view"],
-                 &["vue", "jsx", "tsx", "component"]),
-                (&["修复", "fix", "bug", "error", "错误", "报错", "改乱"],
-                 &["app", "main", "index", "config"]),
-                (&["启动", "start", "运行", "run", "报错", "crash", "崩溃"],
-                 &["start", "package", "vite", "config", "main", "app"]),
-            ];
-
-            for (task_kws, file_kws) in keyword_map {
-                let task_match = task_kws.iter().any(|kw| task_lower.contains(kw));
-                let file_match = file_kws.iter().any(|kw| filename.contains(kw));
-                if task_match && file_match {
-                    score += 8;
-                }
-            }
-
-            // Boost primary files
-            if filename == "app.vue" || filename == "main.css" {
-                score += 3;
-            }
-
-            if score > 0 {
-                scored.push((score, file_path.clone()));
-            }
+            source_files.push(file_path.clone());
         }
 
-        scored.sort_by(|a, b| b.0.cmp(&a.0));
+        // Sort: interface dirs first, then by file size (ascending)
+        let interface_dirs = ["api", "lib", "utils", "services", "helpers", "hooks", "stores"];
+        source_files.sort_by(|a, b| {
+            let a_rel = a.strip_prefix(&wd).map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
+            let b_rel = b.strip_prefix(&wd).map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
+            let a_interface = a_rel.split('/').any(|p| interface_dirs.contains(&p));
+            let b_interface = b_rel.split('/').any(|p| interface_dirs.contains(&p));
+            // Interface files first
+            if a_interface != b_interface {
+                return if a_interface { std::cmp::Ordering::Less } else { std::cmp::Ordering::Greater };
+            }
+            // Then by size (smaller first — fit more files)
+            let a_size = std::fs::metadata(a).map(|m| m.len()).unwrap_or(u64::MAX);
+            let b_size = std::fs::metadata(b).map(|m| m.len()).unwrap_or(u64::MAX);
+            a_size.cmp(&b_size)
+        });
 
-        if scored.is_empty() {
+        if source_files.is_empty() {
             return String::new();
         }
 
-        // CRITICAL: When a file matches, expand to include ALL sibling files
-        // in the same directory with the same extension. This is why Claude Code
-        // fixes all views in one turn — it sees ALL of them, not just the matched one.
-        let mut expanded: Vec<std::path::PathBuf> = Vec::new();
-        let mut seen_dirs: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-        for (_, path) in &scored {
-            expanded.push(path.clone());
-
-            // Expand: include all siblings with same extension
-            if let (Some(dir), Some(ext)) = (path.parent(), path.extension()) {
-                let dir_key = format!("{}:{}", dir.display(), ext.to_string_lossy());
-                if !seen_dirs.contains(&dir_key) {
-                    seen_dirs.insert(dir_key);
-                    if let Ok(entries) = std::fs::read_dir(dir) {
-                        for entry in entries.flatten() {
-                            let ep = entry.path();
-                            if ep.extension() == Some(ext) && ep != *path && ep.is_file() {
-                                if !expanded.contains(&ep) {
-                                    expanded.push(ep);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Include files in directories named "api", "lib", "utils", "services" —
-        // these typically contain shared interfaces the model needs when rewriting other files.
-        // Tech-stack agnostic: detects by directory name, not file extension.
-        let interface_dirs = ["api", "lib", "utils", "services", "helpers", "hooks", "stores"];
-        for file_path in &files {
-            let rel = file_path.strip_prefix(&wd)
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_default();
-            let in_interface_dir = rel.split('/').any(|part| interface_dirs.contains(&part));
-            if in_interface_dir && !expanded.contains(file_path) {
-                expanded.push(file_path.clone());
-            }
-        }
-
-        // Build context string with file contents.
-        // Use ~40% of context_window for pre-read (rest for system prompt, conversation, tools).
+        // Use ~40% of context_window for pre-read.
         let context_window = self.config
             .providers
             .get(&self.config.default_provider)
@@ -392,7 +345,7 @@ impl AgentLoop {
         let mut ctx = String::from("=== FILES ALREADY LOADED (do NOT re-read these) ===\n");
         let mut total_chars = 0usize;
 
-        for (idx, path) in expanded.iter().enumerate() {
+        for path in &source_files {
             if total_chars >= max_chars { break; }
 
             let file_content = match tokio::fs::read_to_string(path).await {
