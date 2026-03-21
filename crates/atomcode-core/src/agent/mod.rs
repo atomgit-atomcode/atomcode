@@ -339,8 +339,12 @@ impl AgentLoop {
             .get(&self.config.default_provider)
             .map(|p| p.context_window)
             .unwrap_or(64000);
-        let preread_token_budget = context_window * 40 / 100; // 40% of context for pre-read
-        let max_chars = preread_token_budget * 4; // ~4 chars per token
+        // Use 20% of context for pre-read. NOT 40% — too much pre-read dilutes
+        // model attention. Better to have a compact system prompt the model can
+        // actually use than a huge one it ignores.
+        // 160K × 20% = 32K tokens ≈ 128K chars — still enough for most projects.
+        let preread_token_budget = context_window * 20 / 100;
+        let max_chars = preread_token_budget * 4;
 
         let mut ctx = String::from("=== FILES ALREADY LOADED (do NOT re-read these) ===\n");
         let mut total_chars = 0usize;
@@ -1331,7 +1335,10 @@ impl AgentLoop {
             })
             .unwrap_or_default();
 
-        // Assemble prompt: rules → project instructions → env → project context
+        // Assemble prompt: env + project context + pre-read files (bulk) → rules LAST.
+        // Models attend most to the START and END of context (primacy + recency).
+        // Pre-read files go in the middle (bulk reference material).
+        // Rules go LAST so the model remembers them when generating tool calls.
         let mut prompt = format!(
             "Working directory: {wd}\n{env_info}\n",
             wd = wd.display(), env_info = env_info,
@@ -1341,8 +1348,18 @@ impl AgentLoop {
             prompt.push_str(&format!("Git: {}\n", git_info));
         }
 
-        prompt.push_str(&format!("\n{rules}\n"));
+        prompt.push_str(&format!(
+            "\n=== PROJECT STRUCTURE ===\n{project_ctx}\n"
+        ));
 
+        // Pre-read files (bulk content — middle of prompt)
+        if !self.preread_context.is_empty() {
+            prompt.push_str(&format!("\n\n{}", self.preread_context));
+        } else if !file_hints.is_empty() {
+            prompt.push_str(&format!("\n\n=== SUGGESTED FILES (start here) ===\n{}", file_hints));
+        }
+
+        // Project instructions (if any)
         if !project_instructions.is_empty() {
             prompt.push_str(&format!(
                 "\n=== PROJECT INSTRUCTIONS (.atomcode.md) ===\n{}\n",
@@ -1350,16 +1367,9 @@ impl AgentLoop {
             ));
         }
 
-        prompt.push_str(&format!(
-            "\n=== PROJECT CONTEXT (already loaded — do NOT re-read these files) ===\n{project_ctx}"
-        ));
-
-        // Inject pre-read file contents (replaces file suggestions with actual content)
-        if !self.preread_context.is_empty() {
-            prompt.push_str(&format!("\n\n{}", self.preread_context));
-        } else if !file_hints.is_empty() {
-            prompt.push_str(&format!("\n\n=== SUGGESTED FILES (start here) ===\n{}", file_hints));
-        }
+        // RULES GO LAST — recency effect ensures the model remembers these
+        // when it starts generating tool calls.
+        prompt.push_str(&format!("\n=== RULES (follow these strictly) ===\n{rules}\n"));
 
         prompt
     }
