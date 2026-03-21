@@ -382,7 +382,7 @@ impl AgentLoop {
         // Build context string with file contents
         let mut ctx = String::from("=== FILES ALREADY LOADED (do NOT re-read these) ===\n");
         let mut total_lines = 0usize;
-        const MAX_LINES: usize = 1500; // Generous budget — input tokens are cheap, round-trips are expensive
+        const MAX_LINES: usize = 3000; // Match model's context capacity — input tokens cheap, round-trips expensive
 
         for (idx, path) in expanded.iter().enumerate() {
             if total_lines >= MAX_LINES { break; }

@@ -16,5 +16,5 @@ pub struct ProviderConfig {
 }
 
 fn default_context_window() -> usize {
-    32000
+    64000
 }
