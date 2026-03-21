@@ -188,12 +188,29 @@ fn is_wide_char(c: char) -> bool {
 }
 
 /// Input box height: grows with content, max half terminal height.
-pub fn height(input: &InputState, terminal_height: u16, has_attachments: bool) -> u16 {
-    let content_lines = input.lines.len() as u16;
+pub fn height(input: &InputState, terminal_height: u16, terminal_width: u16, has_attachments: bool) -> u16 {
     let tag_height = if has_attachments { 1 } else { 0 };
     let min_height = 3 + tag_height;
-    // Allow up to 10 content lines or half terminal — like Claude Code
     let max_content: u16 = 10;
     let max_height = (max_content + 2 + tag_height).min(terminal_height / 2);
-    (content_lines + 2 + tag_height).clamp(min_height, max_height)
+
+    // Inner width: terminal width - 2 borders - 2*H_PADDING
+    let inner_width = terminal_width.saturating_sub(2 + H_PADDING * 2) as usize;
+    let inner_width = inner_width.max(1);
+
+    // Count VISUAL lines (including word wrap)
+    let visual_lines: u16 = input.lines.iter().map(|line| {
+        let w = unicode_display_width_line(line);
+        if w > inner_width {
+            ((w + inner_width - 1) / inner_width) as u16
+        } else {
+            1
+        }
+    }).sum();
+
+    (visual_lines + 2 + tag_height).clamp(min_height, max_height)
+}
+
+fn unicode_display_width_line(s: &str) -> usize {
+    s.chars().map(|c| if is_wide_char(c) { 2 } else { 1 }).sum()
 }

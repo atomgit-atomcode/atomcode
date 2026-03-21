@@ -35,7 +35,8 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     }
 
     let terminal_height = frame.area().height;
-    let input_height = input_box::height(&app.input, terminal_height, !app.attached_files.is_empty());
+    let terminal_width = frame.area().width;
+    let input_height = input_box::height(&app.input, terminal_height, terminal_width, !app.attached_files.is_empty());
 
     let show_welcome = app.conversation.messages.is_empty()
         && app.conversation.stream_buffer.is_none();
