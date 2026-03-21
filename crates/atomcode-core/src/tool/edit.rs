@@ -83,19 +83,9 @@ impl Tool for EditFileTool {
         let count = content.matches(&parsed.old_string).count();
 
         if count == 0 {
-            // Try fuzzy match: trim whitespace on each line and compare
-            let fuzzy_result = try_fuzzy_replace(&content, &parsed.old_string, &parsed.new_string, parsed.replace_all);
-            if let Some((new_content, fuzzy_count)) = fuzzy_result {
-                atomic_write(&parsed.file_path, &new_content).await?;
-                return Ok(ToolResult {
-                    call_id: String::new(),
-                    output: format!(
-                        "Edited {} (fuzzy matched {} occurrence{}, whitespace differences ignored). Do NOT re-read.",
-                        parsed.file_path, fuzzy_count, if fuzzy_count > 1 { "s" } else { "" }
-                    ),
-                    success: true,
-                });
-            }
+            // NO fuzzy matching — Claude Code doesn't have it and works better without it.
+            // Fuzzy matching was silently matching wrong content and causing destructive edits.
+            // Failing explicitly forces the model to re-read and provide the correct old_string.
 
             // No match at all — show closest match
             let hint = find_closest_match(&content, &parsed.old_string);
