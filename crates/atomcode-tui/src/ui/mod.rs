@@ -67,7 +67,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         app.last_viewport_height = chunks[1].height;
     }
 
-    input_box::render(frame, chunks[2], &app.input, app.mode.is_streaming_or_executing(), app.suggestion.as_deref(), &app.attached_files);
+    input_box::render(frame, chunks[2], &app.input, app.mode.is_streaming_or_executing(), app.suggestion.as_deref(), &app.attached_files, app.pasted_text.as_deref());
 
     // Render slash menu as overlay above input box
     if app.slash_menu.visible {

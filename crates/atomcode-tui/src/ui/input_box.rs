@@ -11,11 +11,43 @@ const H_PADDING: u16 = 3;
 
 use crate::file_attach::AttachedFile;
 
-pub fn render(frame: &mut Frame, area: Rect, input: &InputState, is_busy: bool, suggestion: Option<&str>, attached: &[AttachedFile]) {
-    let is_empty = input.is_empty();
+pub fn render(frame: &mut Frame, area: Rect, input: &InputState, is_busy: bool, suggestion: Option<&str>, attached: &[AttachedFile], pasted: Option<&str>) {
+    let is_empty = input.is_empty() && pasted.is_none();
 
     // Always show user's input — even during streaming
-    let lines: Vec<Line> = if is_empty {
+    let lines: Vec<Line> = if let Some(pasted_text) = pasted {
+        // Show pasted text indicator (like Claude Code)
+        let line_count = pasted_text.lines().count();
+        let char_count = pasted_text.len();
+        let first_line = pasted_text.lines().next().unwrap_or("");
+        let preview = if first_line.chars().count() > 50 {
+            format!("{}...", first_line.chars().take(47).collect::<String>())
+        } else {
+            first_line.to_string()
+        };
+
+        let mut v = Vec::new();
+        // Show typed text above the paste indicator
+        if !input.is_empty() {
+            for l in &input.lines {
+                v.push(Line::from(Span::raw(l.clone())));
+            }
+        }
+        // Pasted block indicator
+        v.push(Line::from(vec![
+            Span::styled(
+                format!(" {} ", preview),
+                Style::default().fg(Color::Rgb(180, 190, 200)).bg(Color::Rgb(35, 40, 50)),
+            ),
+        ]));
+        v.push(Line::from(vec![
+            Span::styled(
+                format!(" {} lines, {} chars — pasted ", line_count, char_count),
+                Style::default().fg(Color::Rgb(100, 110, 120)).bg(Color::Rgb(30, 33, 40)),
+            ),
+        ]));
+        v
+    } else if is_empty {
         if let Some(sug) = suggestion {
             vec![Line::from(vec![
                 Span::styled(
