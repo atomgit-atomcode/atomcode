@@ -576,6 +576,7 @@ impl AgentLoop {
                             self.execute_tool(call).await;
                         }
                         PermissionDecision::Ask(reason) => {
+                            self.pending_tool_calls.remove(0); // Remove BEFORE storing as pending
                             self.pending_approval = Some(call);
                             self.phase = AgentPhase::WaitingApproval;
                             let _ = self.event_tx.send(AgentEvent::ApprovalNeeded {
