@@ -270,129 +270,17 @@ impl AgentLoop {
         self.call_llm().await;
     }
 
-    /// Pre-read ALL source files that fit in the token budget.
-    /// No keyword matching — Claude Code doesn't guess which files are relevant,
-    /// it gives the model everything and lets it decide.
+    /// DO NOT pre-read source files. Claude Code doesn't do this either.
+    /// Pre-reading stuffs the system prompt with 50K+ tokens of irrelevant code,
+    /// diluting model attention and making it WORSE at following rules.
+    ///
+    /// Instead: give the model a good file tree (project_context) and let it
+    /// read_file what it needs. Each read is 1 step — trivial cost.
+    /// A compact system prompt → model follows rules → fewer mistakes → fewer steps.
     async fn build_preread_context(&self, _content: &str) -> String {
-        let wd = self.tool_context.working_dir
-            .try_read()
-            .map(|g| g.clone())
-            .unwrap_or_default();
-
-        let files = collect_project_files(&wd, 0, 3);
-
-        // Collect all source files, sorted by relevance heuristic:
-        // - Files in api/lib/utils/services dirs go first (interface files)
-        // - Then by file size (smaller files first — more likely to fit)
-        let mut source_files: Vec<std::path::PathBuf> = Vec::new();
-        for file_path in &files {
-            let filename = file_path.file_name()
-                .map(|f| f.to_string_lossy().to_string())
-                .unwrap_or_default();
-
-            // Skip non-source files
-            if filename.starts_with('.')
-                || filename.ends_with(".log")
-                || filename.ends_with(".lock")
-                || filename.ends_with(".md")
-                || filename.ends_with(".json")  // package.json is in project_context already
-                || filename.ends_with(".toml")
-                || filename.ends_with(".yaml")
-                || filename.ends_with(".yml")
-                || filename.ends_with(".png")
-                || filename.ends_with(".jpg")
-                || filename.ends_with(".svg")
-                || filename.ends_with(".ico")
-                || filename.ends_with(".woff")
-                || filename.ends_with(".woff2")
-            {
-                continue;
-            }
-
-            source_files.push(file_path.clone());
-        }
-
-        // Sort: interface dirs first, then by file size (ascending)
-        let interface_dirs = ["api", "lib", "utils", "services", "helpers", "hooks", "stores"];
-        source_files.sort_by(|a, b| {
-            let a_rel = a.strip_prefix(&wd).map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
-            let b_rel = b.strip_prefix(&wd).map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
-            let a_interface = a_rel.split('/').any(|p| interface_dirs.contains(&p));
-            let b_interface = b_rel.split('/').any(|p| interface_dirs.contains(&p));
-            // Interface files first
-            if a_interface != b_interface {
-                return if a_interface { std::cmp::Ordering::Less } else { std::cmp::Ordering::Greater };
-            }
-            // Then by size (smaller first — fit more files)
-            let a_size = std::fs::metadata(a).map(|m| m.len()).unwrap_or(u64::MAX);
-            let b_size = std::fs::metadata(b).map(|m| m.len()).unwrap_or(u64::MAX);
-            a_size.cmp(&b_size)
-        });
-
-        if source_files.is_empty() {
-            return String::new();
-        }
-
-        // Use ~40% of context_window for pre-read.
-        let context_window = self.config
-            .providers
-            .get(&self.config.default_provider)
-            .map(|p| p.context_window)
-            .unwrap_or(64000);
-        // Dynamic pre-read ratio based on context window size:
-        // - Small context (≤32K): 15% — save room for conversation
-        // - Medium context (32K-100K): 20% — balanced
-        // - Large context (>100K): 30% — can afford more pre-read
-        let preread_pct = if context_window <= 32000 { 15 }
-            else if context_window <= 100000 { 20 }
-            else { 30 };
-        let preread_token_budget = context_window * preread_pct / 100;
-        let max_chars = preread_token_budget * 4;
-
-        let mut ctx = String::from("=== FILES ALREADY LOADED (do NOT re-read these) ===\n");
-        let mut total_chars = 0usize;
-
-        for path in &source_files {
-            if total_chars >= max_chars { break; }
-
-            let file_content = match tokio::fs::read_to_string(path).await {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-
-            let lines: Vec<&str> = file_content.lines().collect();
-            // Calculate how many lines fit in remaining budget
-            let file_chars: usize = file_content.len();
-            let remaining = max_chars.saturating_sub(total_chars);
-            let take = if file_chars <= remaining {
-                lines.len() // Entire file fits
-            } else {
-                // Estimate lines that fit
-                let avg_line_len = file_chars / lines.len().max(1);
-                remaining / avg_line_len.max(1)
-            };
-            let rel_path = path.strip_prefix(&wd)
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_else(|_| path.to_string_lossy().to_string());
-
-            ctx.push_str(&format!("\n[{}] ({} lines{})\n",
-                rel_path, lines.len(),
-                if take >= lines.len() { " - COMPLETE" } else { "" }
-            ));
-            for (i, line) in lines.iter().take(take).enumerate() {
-                ctx.push_str(&format!("{:>4}| {}\n", i + 1, line));
-            }
-            if take < lines.len() {
-                ctx.push_str(&format!("[... {} more lines, use grep to find specific sections]\n", lines.len() - take));
-            }
-
-            // Track chars consumed
-            let consumed: usize = lines.iter().take(take).map(|l| l.len() + 6).sum(); // +6 for "  NNN| "
-            total_chars += consumed;
-        }
-
-        ctx.push_str("\nYou have COMPLETE content of all files above. Go straight to edit_file. Do NOT call read_file — you already have everything.\n");
-        ctx
+        // Return empty — no pre-read. The file tree in project_context tells the
+        // model what files exist. The model reads what it needs via read_file.
+        String::new()
     }
 
     /// Core agent turn: calls the LLM, processes the stream, and handles tool
