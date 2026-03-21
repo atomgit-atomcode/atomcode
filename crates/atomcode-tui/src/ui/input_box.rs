@@ -75,17 +75,11 @@ pub fn render(frame: &mut Frame, area: Rect, input: &InputState, is_busy: bool, 
     let border_color = if is_busy { Color::Rgb(80, 80, 60) } else { Color::Rgb(100, 100, 100) };
 
     let prompt = Span::styled(" > ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
-    let hint = Span::styled(
-        " Enter send \u{00b7} Shift+Enter newline \u{00b7} / commands \u{00b7} Ctrl+L clear ",
-        Style::default().fg(Color::Rgb(50, 52, 58)),
-    );
-
     let block = Block::default()
         .borders(Borders::ALL)
         .border_set(border::ROUNDED)
         .border_style(Style::default().fg(border_color))
         .title(prompt)
-        .title_bottom(hint)
         .padding(Padding::horizontal(H_PADDING));
 
     // Render attached file tags
