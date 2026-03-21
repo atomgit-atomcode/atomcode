@@ -80,19 +80,10 @@ impl Tool for ReadFileTool {
         let total_lines = lines.len();
         let offset = parsed.offset.unwrap_or(1).max(1) - 1;
 
-        // Smart limit selection:
-        // - Small files (≤300 lines): auto-expand small requests to return the whole file
-        // - Large files (>300 lines) with no offset/limit: return first 200 lines + hint to use grep
-        // - Explicit limit: respect it (but auto-expand if file is small)
+        // Always return the full file (up to 2000 lines) — like Claude Code.
+        // The old 300-line truncation caused models to read the same file 3+ times.
+        // Context overflow is handled by to_provider_messages_budgeted, not here.
         let (limit, large_file_truncated) = match (parsed.offset, parsed.limit) {
-            (None, None) if total_lines > 300 => {
-                // Large file, no targeting — return head + suggest grep
-                (200, true)
-            }
-            (_, Some(l)) if l < 200 && total_lines <= 300 => {
-                // Small file + small limit — auto-expand to whole file
-                (total_lines, false)
-            }
             (_, Some(l)) => (l, false),
             (_, None) => (2000, false),
         };
@@ -110,15 +101,8 @@ impl Tool for ReadFileTool {
             .collect::<Vec<_>>()
             .join("\n");
 
-        // Tell the model what it got and what to do next
-        if large_file_truncated {
-            output.push_str(&format!(
-                "\n\n[LARGE FILE: {} lines total. Showing first {} lines. \
-                 Use the grep tool to find specific functions/variables, then read_file with offset to see that section. \
-                 Do NOT re-read from line 1.]",
-                total_lines, end
-            ));
-        } else if returned_all {
+        // Tell the model what it got
+        if returned_all {
             output.push_str(&format!(
                 "\n\n[COMPLETE FILE: {} lines. You have everything. Do NOT re-read sections of this file.]",
                 total_lines
