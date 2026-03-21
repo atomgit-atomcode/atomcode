@@ -130,6 +130,7 @@ pub fn render(frame: &mut Frame, area: Rect, input: &InputState, is_busy: bool, 
 
     let input_widget = Paragraph::new(lines)
         .block(block)
+        .wrap(ratatui::widgets::Wrap { trim: false })
         .style(Style::default().fg(Color::White));
 
     frame.render_widget(input_widget, input_area);

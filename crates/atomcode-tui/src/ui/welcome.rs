@@ -42,7 +42,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
 
     // Version + model
     lines.push(Line::from(vec![
-        Span::styled("  v0.8.0", Style::default().fg(Color::DarkGray)),
+        Span::styled("  v0.9.0", Style::default().fg(Color::DarkGray)),
         Span::styled(
             format!("  ·  model: {}", app.model_name),
             Style::default().fg(Color::Cyan),
