@@ -1197,16 +1197,33 @@ impl AgentLoop {
             return false; // Near step limit, don't waste steps
         }
 
-        // Simple check: find the LAST tool call in this turn.
-        // If it's bash → already verified (ran build/test). No need for another verify.
+        // Check the LAST tool call and its result.
+        // If it's a SUCCESSFUL bash → already verified. No need for another.
+        // If it's a FAILED bash (build error) → need to verify/fix.
         // If it's edit/write/read → hasn't verified yet.
+        let mut last_tool_name = String::new();
+        let mut last_result_success = true;
         for msg in self.conversation.messages.iter().rev() {
-            if let crate::conversation::message::MessageContent::AssistantWithToolCalls { tool_calls, .. } = &msg.content {
-                if let Some(last_tc) = tool_calls.last() {
-                    return last_tc.name != "bash";
+            if let crate::conversation::message::MessageContent::ToolResult(r) = &msg.content {
+                if last_tool_name.is_empty() {
+                    last_result_success = r.success;
+                    // Also check output for build failure keywords
+                    let out = r.output.to_lowercase();
+                    if out.contains("build failed") || out.contains("error") || out.contains("failed") {
+                        last_result_success = false;
+                    }
                 }
             }
-            // Stop at user message (turn boundary)
+            if let crate::conversation::message::MessageContent::AssistantWithToolCalls { tool_calls, .. } = &msg.content {
+                if let Some(last_tc) = tool_calls.last() {
+                    if last_tool_name.is_empty() {
+                        last_tool_name = last_tc.name.clone();
+                    }
+                    // If last tool was bash AND it succeeded → no verify needed
+                    // If last tool was bash AND it failed → verify/fix needed
+                    return last_tool_name != "bash" || !last_result_success;
+                }
+            }
             if matches!(msg.role, crate::conversation::message::Role::User) {
                 break;
             }
