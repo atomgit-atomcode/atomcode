@@ -339,11 +339,14 @@ impl AgentLoop {
             .get(&self.config.default_provider)
             .map(|p| p.context_window)
             .unwrap_or(64000);
-        // Use 20% of context for pre-read. NOT 40% — too much pre-read dilutes
-        // model attention. Better to have a compact system prompt the model can
-        // actually use than a huge one it ignores.
-        // 160K × 20% = 32K tokens ≈ 128K chars — still enough for most projects.
-        let preread_token_budget = context_window * 20 / 100;
+        // Dynamic pre-read ratio based on context window size:
+        // - Small context (≤32K): 15% — save room for conversation
+        // - Medium context (32K-100K): 20% — balanced
+        // - Large context (>100K): 30% — can afford more pre-read
+        let preread_pct = if context_window <= 32000 { 15 }
+            else if context_window <= 100000 { 20 }
+            else { 30 };
+        let preread_token_budget = context_window * preread_pct / 100;
         let max_chars = preread_token_budget * 4;
 
         let mut ctx = String::from("=== FILES ALREADY LOADED (do NOT re-read these) ===\n");
