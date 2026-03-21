@@ -110,11 +110,12 @@ impl Tool for EditFileTool {
             let new_content = content.replace(&parsed.old_string, &parsed.new_string);
             atomic_write(&parsed.file_path, &new_content).await?;
             let diff = build_compact_diff(&parsed.old_string, &parsed.new_string);
+            let context = surrounding_context(&new_content, &parsed.new_string);
             Ok(ToolResult {
                 call_id: String::new(),
                 output: format!(
-                    "Edited {} (replaced {} occurrence{}).\n{}",
-                    parsed.file_path, count, if count > 1 { "s" } else { "" }, diff
+                    "Edited {} (replaced {} occurrence{}).\n{}\n{}",
+                    parsed.file_path, count, if count > 1 { "s" } else { "" }, diff, context
                 ),
                 success: true,
             })
@@ -134,13 +135,14 @@ impl Tool for EditFileTool {
             atomic_write(&parsed.file_path, &new_content).await?;
 
             let diff = build_compact_diff(&parsed.old_string, &parsed.new_string);
+            let context = surrounding_context(&new_content, &parsed.new_string);
             let removed = parsed.old_string.lines().count();
             let added = parsed.new_string.lines().count();
             Ok(ToolResult {
                 call_id: String::new(),
                 output: format!(
-                    "Edited {} (-{} +{} lines).\n{}",
-                    parsed.file_path, removed, added, diff
+                    "Edited {} (-{} +{} lines).\n{}\n{}",
+                    parsed.file_path, removed, added, diff, context
                 ),
                 success: true,
             })
@@ -230,6 +232,31 @@ fn try_fuzzy_replace(
 
     let count = if replace_all { matches.len() } else { 1 };
     Some((result, count))
+}
+
+/// Show the surrounding context after an edit so the model doesn't need to re-read.
+/// Returns ~10 lines around the replacement location with line numbers.
+fn surrounding_context(new_content: &str, new_string: &str) -> String {
+    let lines: Vec<&str> = new_content.lines().collect();
+    let new_first = new_string.lines().next().unwrap_or("").trim();
+
+    if new_first.is_empty() || lines.len() <= 15 {
+        return String::new(); // Small file or empty replacement — not needed
+    }
+
+    // Find where the replacement is
+    let center = lines.iter().position(|l| l.trim() == new_first).unwrap_or(0);
+    let start = center.saturating_sub(5);
+    let end = (center + 10).min(lines.len());
+
+    let mut ctx = String::from("[Context around edit — do NOT re-read this file:]\n");
+    for i in start..end {
+        ctx.push_str(&format!("{:>4}| {}\n", i + 1, lines[i]));
+    }
+    if end < lines.len() {
+        ctx.push_str(&format!("     ... ({} more lines)\n", lines.len() - end));
+    }
+    ctx
 }
 
 /// Build a compact diff showing removed/added lines (max 8 lines total).
