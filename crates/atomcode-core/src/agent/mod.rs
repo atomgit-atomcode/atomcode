@@ -632,13 +632,19 @@ impl AgentLoop {
                             }
                         }
                     }
-                    "edit_file" | "write_file" | "bash" => {
-                        self.consecutive_reads = 0; // Reset on action
+                    "edit_file" | "write_file" => {
+                        self.consecutive_reads = 0; // Reset on edit action
                         if let Some(f) = file {
                             if !self.files_edited_this_turn.contains(&f) {
                                 self.files_edited_this_turn.push(f);
                             }
                         }
+                    }
+                    "bash" => {
+                        // Don't reset consecutive_reads here — let the bash handler decide
+                        // based on whether the command is file-reading or an action.
+                        // The bash handler increments for grep/sed/cat and the
+                        // read budget check handles the rest.
                     }
                     _ => {}
                 }
@@ -778,11 +784,57 @@ impl AgentLoop {
                 let cmd_start = cmd.split_whitespace().next().unwrap_or("");
 
                 // Pattern 1: Using bash to read files
-                let is_file_read_cmd = matches!(cmd_start, "grep" | "sed" | "cat" | "head" | "tail" | "awk");
+                let is_file_read_cmd = matches!(cmd_start, "grep" | "sed" | "cat" | "head" | "tail" | "awk" | "wc");
                 if is_file_read_cmd {
-                    tool_result.output.push_str(
-                        "\n\n[SYSTEM: Do NOT use bash to read file contents. Use read_file or grep tool instead.]"
-                    );
+                    self.consecutive_reads += 1;
+                    if self.consecutive_reads >= 3 && !self.files_edited_this_turn.is_empty() {
+                        // Model is lost — auto-attach the last edited file's content
+                        let last_edited = self.files_edited_this_turn.last().cloned();
+                        if let Some(ref short_name) = last_edited {
+                            // Find the full path from recent tool calls
+                            let full_path = self.conversation.messages.iter().rev()
+                                .filter_map(|m| {
+                                    if let crate::conversation::message::MessageContent::AssistantWithToolCalls { tool_calls, .. } = &m.content {
+                                        for tc in tool_calls {
+                                            if (tc.name == "edit_file" || tc.name == "write_file") {
+                                                if let Ok(a) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
+                                                    if let Some(fp) = a.get("file_path").and_then(|v| v.as_str()) {
+                                                        return Some(fp.to_string());
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    None
+                                })
+                                .next();
+
+                            if let Some(fp) = full_path {
+                                if let Ok(content) = std::fs::read_to_string(&fp) {
+                                    let lines: Vec<&str> = content.lines().collect();
+                                    let show = lines.len().min(200);
+                                    let preview: String = lines[..show].iter().enumerate()
+                                        .map(|(i, l)| format!("{:>4}| {}", i + 1, l))
+                                        .collect::<Vec<_>>()
+                                        .join("\n");
+                                    tool_result.output.push_str(&format!(
+                                        "\n\n[SYSTEM: You keep using bash to navigate {}. Here is the current file content. \
+                                         Use this to make your next edit_file call directly:]\n{}",
+                                        short_name, preview
+                                    ));
+                                }
+                            }
+                        }
+                    } else {
+                        tool_result.output.push_str(
+                            "\n\n[SYSTEM: Use read_file or grep tool instead of bash for reading files.]"
+                        );
+                    }
+                }
+
+                // Non-read bash commands (build, install, restart) reset the read counter
+                if !is_file_read_cmd {
+                    self.consecutive_reads = 0;
                 }
 
                 // Pattern 2: Scouting commands — but ONLY warn if user didn't ask about runtime issues
