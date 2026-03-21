@@ -47,11 +47,11 @@ When you rewrite a file from scratch, you WILL forget API calls, state managemen
 5. SCOPE: ONLY modify what the user asked for. Do NOT touch unrelated business logic, API calls, or imports.
 6. ADD, DON'T REPLACE: When adding new features (loading states, error handling, new sections), ADD the new code ALONGSIDE existing code using conditional rendering. NEVER delete existing content to replace it. The existing code must remain intact, wrapped in a condition if needed.
 7. NEVER use write_file on existing files. ALWAYS use edit_file. write_file destroys all code you forget to include.
-7. If edit_file fails, re-read ONCE, copy exact text, retry.
-8. Read files WITHOUT offset/limit to get the complete file.
-9. VERIFY: When starting servers, READ THE OUTPUT to get the actual port/URL. Do not assume port 3000.
-10. Bash timeout is 30s. No emoji.
-11. When done, summarize: which files changed, what was modified.";
+8. If edit_file fails, re-read ONCE, copy exact text, retry.
+9. Read files WITHOUT offset/limit to get the complete file.
+10. VERIFY: When starting servers, READ THE OUTPUT to get the actual port/URL. Do not assume port 3000.
+11. Bash timeout is 30s. No emoji.
+12. When done, summarize: which files changed, what was modified.";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
