@@ -85,11 +85,15 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     }
 }
 
-/// Render the text selection highlight by inverting cell colors in the selected range.
+/// Render selection highlight with a fixed blue overlay (like Claude Code).
+/// Uses a consistent blue background + white foreground regardless of underlying colors.
 fn render_selection_highlight(frame: &mut Frame, sel: &TextSelection) {
     let ((start_col, start_row), (end_col, end_row)) = sel.normalized();
     let buf = frame.buffer_mut();
     let width = buf.area.width;
+
+    let sel_bg = Color::Rgb(40, 80, 160); // Muted blue selection background
+    let sel_fg = Color::Rgb(240, 240, 245); // White text on selection
 
     for row in start_row..=end_row {
         let col_start = if row == start_row { start_col } else { 0 };
@@ -97,13 +101,8 @@ fn render_selection_highlight(frame: &mut Frame, sel: &TextSelection) {
 
         for col in col_start..col_end {
             if let Some(cell) = buf.cell_mut(Position::new(col, row)) {
-                let fg = cell.fg;
-                let bg = cell.bg;
-                // Invert: swap fg/bg, using sensible defaults for Reset
-                let new_bg = if fg == Color::Reset { Color::White } else { fg };
-                let new_fg = if bg == Color::Reset { Color::Black } else { bg };
-                cell.set_fg(new_fg);
-                cell.set_bg(new_bg);
+                cell.set_fg(sel_fg);
+                cell.set_bg(sel_bg);
             }
         }
     }

@@ -277,6 +277,7 @@ fn render_tool_call(lines: &mut Vec<Line<'static>>, call: &ToolCall) {
     let border = Style::default().fg(TOOL_BORDER);
     let name = capitalize(&call.name);
     let detail = format_tool_detail(&call.name, &call.arguments);
+
     lines.push(Line::from(vec![
         Span::styled("    \u{2502} ", border),
         Span::styled(
@@ -288,6 +289,53 @@ fn render_tool_call(lines: &mut Vec<Line<'static>>, call: &ToolCall) {
             Style::default().fg(DIM),
         ),
     ]));
+
+    // For edit_file: show old_string preview on a second line
+    if call.name == "edit_file" {
+        if let Ok(args) = serde_json::from_str::<serde_json::Value>(&call.arguments) {
+            if let Some(old) = args.get("old_string").and_then(|v| v.as_str()) {
+                let preview = old.lines().next().unwrap_or("");
+                let display = if preview.chars().count() > 60 {
+                    format!("{}...", preview.chars().take(57).collect::<String>())
+                } else {
+                    preview.to_string()
+                };
+                if !display.trim().is_empty() {
+                    lines.push(Line::from(vec![
+                        Span::styled("    \u{2502}   ", border),
+                        Span::styled(
+                            format!("find: {}", display.trim()),
+                            Style::default().fg(Color::Rgb(70, 70, 80)),
+                        ),
+                    ]));
+                }
+            }
+        }
+    }
+    // For bash: show command on second line if it was truncated
+    else if call.name == "bash" {
+        if let Ok(args) = serde_json::from_str::<serde_json::Value>(&call.arguments) {
+            if let Some(cmd) = args.get("command").and_then(|v| v.as_str()) {
+                if cmd.chars().count() > 60 {
+                    // Show second line of multi-line commands
+                    if let Some(second) = cmd.lines().nth(1) {
+                        let display = if second.chars().count() > 60 {
+                            format!("{}...", second.chars().take(57).collect::<String>())
+                        } else {
+                            second.to_string()
+                        };
+                        lines.push(Line::from(vec![
+                            Span::styled("    \u{2502}   ", border),
+                            Span::styled(
+                                display.trim().to_string(),
+                                Style::default().fg(Color::Rgb(70, 70, 80)),
+                            ),
+                        ]));
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn render_tool_result(lines: &mut Vec<Line<'static>>, result: &ToolResult) {
@@ -296,20 +344,75 @@ fn render_tool_result(lines: &mut Vec<Line<'static>>, result: &ToolResult) {
     } else {
         ("x", ERROR)
     };
-    let first_line: String = result.output.lines().next().unwrap_or("").to_string();
-    let total_lines = result.output.lines().count();
-    let summary = if first_line.chars().count() > 80 {
-        first_line.chars().take(77).collect::<String>() + "..."
-    } else if total_lines > 1 {
-        format!("{} ({} lines)", first_line, total_lines)
+
+    let output_lines: Vec<&str> = result.output.lines().collect();
+
+    if output_lines.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("    \u{2502} ", Style::default().fg(TOOL_BORDER)),
+            Span::styled(format!("{} ", icon), Style::default().fg(color)),
+            Span::styled("(no output)", Style::default().fg(DIM)),
+        ]));
+        return;
+    }
+
+    // First line: status icon + summary
+    let first = output_lines[0];
+    let first_display = if first.chars().count() > 80 {
+        first.chars().take(77).collect::<String>() + "..."
     } else {
-        first_line
+        first.to_string()
     };
     lines.push(Line::from(vec![
         Span::styled("    \u{2502} ", Style::default().fg(TOOL_BORDER)),
         Span::styled(format!("{} ", icon), Style::default().fg(color)),
-        Span::styled(summary, Style::default().fg(DIM)),
+        Span::styled(first_display, Style::default().fg(DIM)),
     ]));
+
+    // Show diff lines and additional detail (up to 8 more lines)
+    let max_detail = 8;
+    let mut shown = 0;
+    for line in output_lines.iter().skip(1) {
+        if shown >= max_detail { break; }
+        let trimmed = line.trim();
+        if trimmed.is_empty() { continue; }
+
+        let (prefix_style, text_style) = if trimmed.starts_with("- ") {
+            // Removed line — red
+            (Style::default().fg(ERROR), Style::default().fg(Color::Rgb(200, 100, 100)))
+        } else if trimmed.starts_with("+ ") {
+            // Added line — green
+            (Style::default().fg(SUCCESS), Style::default().fg(Color::Rgb(100, 200, 120)))
+        } else if trimmed.starts_with("WARNING") || trimmed.starts_with("[IMPORTANT") {
+            (Style::default().fg(WARN), Style::default().fg(WARN))
+        } else {
+            (Style::default().fg(DIM), Style::default().fg(DIM))
+        };
+
+        let display = if trimmed.chars().count() > 76 {
+            trimmed.chars().take(73).collect::<String>() + "..."
+        } else {
+            trimmed.to_string()
+        };
+
+        lines.push(Line::from(vec![
+            Span::styled("    \u{2502}   ", Style::default().fg(TOOL_BORDER)),
+            Span::styled(display, text_style),
+        ]));
+        shown += 1;
+    }
+
+    // If more lines not shown
+    let remaining = output_lines.len().saturating_sub(1 + max_detail);
+    if remaining > 0 {
+        lines.push(Line::from(vec![
+            Span::styled("    \u{2502}   ", Style::default().fg(TOOL_BORDER)),
+            Span::styled(
+                format!("... {} more lines", remaining),
+                Style::default().fg(Color::Rgb(60, 60, 70)),
+            ),
+        ]));
+    }
 }
 
 fn render_approval(lines: &mut Vec<Line<'static>>, call: &ToolCall) {

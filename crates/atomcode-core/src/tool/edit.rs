@@ -107,19 +107,18 @@ impl Tool for EditFileTool {
         }
 
         if parsed.replace_all {
-            // Replace ALL occurrences
             let new_content = content.replace(&parsed.old_string, &parsed.new_string);
-            tokio::fs::write(&parsed.file_path, &new_content).await?;
+            atomic_write(&parsed.file_path, &new_content).await?;
+            let diff = build_compact_diff(&parsed.old_string, &parsed.new_string);
             Ok(ToolResult {
                 call_id: String::new(),
                 output: format!(
-                    "Edited {} (replaced {} occurrence{}). Do NOT re-read this file.",
-                    parsed.file_path, count, if count > 1 { "s" } else { "" }
+                    "Edited {} (replaced {} occurrence{}).\n{}",
+                    parsed.file_path, count, if count > 1 { "s" } else { "" }, diff
                 ),
                 success: true,
             })
         } else {
-            // Single replacement — must be unique
             if count > 1 {
                 return Ok(ToolResult {
                     call_id: String::new(),
@@ -132,15 +131,16 @@ impl Tool for EditFileTool {
             }
 
             let new_content = content.replacen(&parsed.old_string, &parsed.new_string, 1);
-            tokio::fs::write(&parsed.file_path, &new_content).await?;
+            atomic_write(&parsed.file_path, &new_content).await?;
 
+            let diff = build_compact_diff(&parsed.old_string, &parsed.new_string);
             let removed = parsed.old_string.lines().count();
             let added = parsed.new_string.lines().count();
             Ok(ToolResult {
                 call_id: String::new(),
                 output: format!(
-                    "Edited {} (-{} +{} lines). Do NOT re-read this file.",
-                    parsed.file_path, removed, added
+                    "Edited {} (-{} +{} lines).\n{}",
+                    parsed.file_path, removed, added, diff
                 ),
                 success: true,
             })
@@ -230,6 +230,33 @@ fn try_fuzzy_replace(
 
     let count = if replace_all { matches.len() } else { 1 };
     Some((result, count))
+}
+
+/// Build a compact diff showing removed/added lines (max 8 lines total).
+fn build_compact_diff(old: &str, new: &str) -> String {
+    let mut diff = String::new();
+    let old_lines: Vec<&str> = old.lines().collect();
+    let new_lines: Vec<&str> = new.lines().collect();
+
+    let max_show = 4; // max lines per side
+
+    // Show removed lines (prefixed with -)
+    for (i, line) in old_lines.iter().take(max_show).enumerate() {
+        diff.push_str(&format!("- {}\n", line));
+        if i == max_show - 1 && old_lines.len() > max_show {
+            diff.push_str(&format!("  ... ({} more removed)\n", old_lines.len() - max_show));
+        }
+    }
+
+    // Show added lines (prefixed with +)
+    for (i, line) in new_lines.iter().take(max_show).enumerate() {
+        diff.push_str(&format!("+ {}\n", line));
+        if i == max_show - 1 && new_lines.len() > max_show {
+            diff.push_str(&format!("  ... ({} more added)\n", new_lines.len() - max_show));
+        }
+    }
+
+    diff.trim_end().to_string()
 }
 
 /// Find the closest matching line in the file to help the model fix old_string.

@@ -13,8 +13,8 @@ const H2: Color = Color::Rgb(180, 160, 255);
 const H3: Color = Color::Rgb(150, 210, 180);
 const LINK: Color = Color::Rgb(110, 160, 255);
 const DIM: Color = Color::Rgb(110, 110, 120);
-const INLINE_CODE_FG: Color = Color::Rgb(230, 195, 150);
-const INLINE_CODE_BG: Color = Color::Rgb(35, 35, 42);
+const INLINE_CODE_FG: Color = Color::Rgb(240, 200, 140);
+const INLINE_CODE_BG: Color = Color::Rgb(40, 38, 48);
 const CODE_BG: Color = Color::Rgb(20, 20, 28);
 const CODE_LABEL: Color = Color::Rgb(90, 90, 100);
 const BULLET: Color = Color::Rgb(100, 120, 145);
@@ -133,15 +133,27 @@ impl MarkdownRenderer {
                 }
                 Event::End(TagEnd::CodeBlock) => {
                     in_code = false;
-                    // Language label
-                    if !code_lang.is_empty() {
-                        lines.push(Line::from(Span::styled(
-                            format!("  {}", code_lang), Style::default().fg(CODE_LABEL),
-                        )));
-                    }
-                    // Code lines with syntax highlight + background
+                    // Top border with language label (Claude Code style)
+                    let lang_display = if code_lang.is_empty() { "text" } else { &code_lang };
+                    lines.push(Line::from(vec![
+                        Span::styled("  \u{256d}\u{2500} ", Style::default().fg(Color::Rgb(50, 55, 65))),
+                        Span::styled(
+                            format!("{} ", lang_display),
+                            Style::default().fg(Color::Rgb(120, 130, 150)).bg(Color::Rgb(30, 32, 40)),
+                        ),
+                        Span::styled(
+                            "\u{2500}".repeat(30),
+                            Style::default().fg(Color::Rgb(40, 43, 52)),
+                        ),
+                    ]));
+                    // Code lines with syntax highlight
                     let highlighted = self.highlight(&code_buf, &code_lang);
                     lines.extend(highlighted);
+                    // Bottom border
+                    lines.push(Line::from(Span::styled(
+                        format!("  \u{2570}{}", "\u{2500}".repeat(34)),
+                        Style::default().fg(Color::Rgb(40, 43, 52)),
+                    )));
                     lines.push(Line::default());
                     code_buf.clear();
                 }
@@ -258,7 +270,7 @@ impl MarkdownRenderer {
         lines
     }
 
-    /// Syntax-highlighted code with line numbers and background color.
+    /// Syntax-highlighted code with line numbers, left border, and background.
     fn highlight(&self, code: &str, lang: &str) -> Vec<Line<'static>> {
         let syntax = if lang.is_empty() {
             self.syntax_set.find_syntax_plain_text()
@@ -270,19 +282,23 @@ impl MarkdownRenderer {
         let mut hl = HighlightLines::new(syntax, &self.theme);
         let line_count = code.lines().count();
         let gutter_width = if line_count < 10 { 1 } else if line_count < 100 { 2 } else if line_count < 1000 { 3 } else { 4 };
-        let line_num_style = Style::default().fg(Color::Rgb(60, 65, 75)).bg(CODE_BG);
-        let gutter_sep = Style::default().fg(Color::Rgb(45, 48, 58)).bg(CODE_BG);
+        let border_style = Style::default().fg(Color::Rgb(50, 55, 65));
+        let line_num_style = Style::default().fg(Color::Rgb(75, 80, 95)).bg(CODE_BG);
+        let gutter_sep = Style::default().fg(Color::Rgb(50, 53, 63)).bg(CODE_BG);
 
         code.lines().enumerate().map(|(i, line)| {
             let regions = hl.highlight_line(line, &self.syntax_set).unwrap_or_default();
             let mut s: Vec<Span<'static>> = Vec::new();
+
+            // Left border
+            s.push(Span::styled("  \u{2502}", border_style));
 
             // Line number gutter
             s.push(Span::styled(
                 format!(" {:>width$}", i + 1, width = gutter_width),
                 line_num_style,
             ));
-            s.push(Span::styled(" \u{2502} ", gutter_sep)); // │ separator
+            s.push(Span::styled(" \u{2502} ", gutter_sep));
 
             // Highlighted code
             for (style, text) in regions {
@@ -290,6 +306,7 @@ impl MarkdownRenderer {
                 s.push(Span::styled(text.to_string(), Style::default().fg(fg).bg(CODE_BG)));
             }
 
+            // Pad right side with background
             s.push(Span::styled("  ", Style::default().bg(CODE_BG)));
             Line::from(s)
         }).collect()

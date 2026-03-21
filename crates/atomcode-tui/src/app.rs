@@ -554,10 +554,16 @@ impl App {
                 self.selection.has_selection = false;
                 self.handle_key(key, event_tx);
             }
+            AppEvent::Paste(text) => {
+                // Bracketed paste — insert text block into input
+                if matches!(self.mode, AppMode::Normal) {
+                    self.input.insert_text(&text);
+                    self.suggestion = None;
+                    self.slash_menu.update(&self.input.content());
+                }
+            }
             AppEvent::ScrollUp(n) => {
-                // Clear selection on scroll
-                self.selection.has_selection = false;
-                self.selection.dragging = false;
+                // Keep selection alive during scroll (like Claude Code)
                 if self.at_bottom {
                     let total = self.render_cache.len();
                     self.scroll_offset = total.saturating_sub(n as usize);
@@ -567,9 +573,6 @@ impl App {
                 }
             }
             AppEvent::ScrollDown(n) => {
-                // Clear selection on scroll
-                self.selection.has_selection = false;
-                self.selection.dragging = false;
                 self.scroll_offset += n as usize;
                 let total = self.render_cache.len();
                 if self.scroll_offset >= total {
@@ -587,9 +590,33 @@ impl App {
             AppEvent::MouseDrag(col, row) => {
                 if self.selection.dragging {
                     self.selection.end = (col, row);
-                    // Mark as having a selection if start != end
                     self.selection.has_selection =
                         self.selection.start != self.selection.end;
+
+                    // Auto-scroll when dragging near top/bottom edge (like Claude Code)
+                    let chat_top: u16 = 1;
+                    let chat_bottom = self.last_viewport_height;
+                    if row <= chat_top + 2 {
+                        // Near top — scroll up (faster when closer to edge)
+                        let speed = if row <= chat_top { 3 } else { 1 };
+                        if !self.at_bottom || self.scroll_offset > 0 {
+                            if self.at_bottom {
+                                let total = self.render_cache.len();
+                                self.scroll_offset = total.saturating_sub(speed);
+                                self.at_bottom = false;
+                            } else {
+                                self.scroll_offset = self.scroll_offset.saturating_sub(speed);
+                            }
+                        }
+                    } else if row + 2 >= chat_bottom {
+                        // Near bottom — scroll down
+                        let speed = if row >= chat_bottom { 3 } else { 1 };
+                        self.scroll_offset += speed;
+                        let total = self.render_cache.len();
+                        if self.scroll_offset >= total {
+                            self.at_bottom = true;
+                        }
+                    }
                 }
             }
             AppEvent::MouseUp(col, row) => {
@@ -733,6 +760,16 @@ impl App {
     }
 
     fn handle_key(&mut self, key: KeyEvent, event_tx: &mpsc::UnboundedSender<AppEvent>) {
+        // Ctrl+Shift+C: copy selection to clipboard (like Ctrl+C in Claude Code with selection)
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.modifiers.contains(KeyModifiers::SHIFT)
+            && key.code == KeyCode::Char('C')
+        {
+            if self.selection.has_selection {
+                self.copy_selection_to_clipboard();
+            }
+            return;
+        }
+
         // Global Ctrl+C handling — like Claude Code:
         // 1st press: cancel current operation
         // 2nd press (within 1s): exit program
@@ -804,11 +841,13 @@ impl App {
                     self.at_bottom = true;
                     self.last_turn_duration = self.turn_start.map(|t| t.elapsed());
                     self.turn_start = None;
-                } else if self.handle_scroll_keys(key) {
-                    // Scroll keys handled — don't pass to input
+                } else if (key.code == KeyCode::Enter && !key.modifiers.contains(KeyModifiers::SHIFT))
+                    || (key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('j')) {
+                    // Block sending messages during streaming — Enter/Ctrl+J does nothing
                 } else {
-                    // All other keys go to input — user can type while AI is working
-                    self.handle_key_input(key);
+                    // All other keys work normally: scroll, type, /, Ctrl+A/E, etc.
+                    // User can prepare next message and use slash commands while AI is working.
+                    self.handle_key_normal(key, event_tx);
                 }
             }
             AppMode::WaitingApproval(_) => {
@@ -852,16 +891,15 @@ impl App {
 
     fn handle_key_approval(&mut self, key: KeyEvent, _event_tx: &mpsc::UnboundedSender<AppEvent>) {
         match key.code {
-            KeyCode::Char('y') | KeyCode::Enter => {
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
                 let _ = self.agent_handle.cmd_tx.send(AgentCommand::ApproveTool);
                 self.mode = AppMode::ToolExecuting;
             }
-            KeyCode::Char('a') => {
-                // Grant session-level permission so this tool is auto-approved for the rest of the session.
+            KeyCode::Char('a') | KeyCode::Char('A') => {
                 let _ = self.agent_handle.cmd_tx.send(AgentCommand::ApproveToolAlways);
                 self.mode = AppMode::ToolExecuting;
             }
-            KeyCode::Char('n') | KeyCode::Esc => {
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                 let _ = self.agent_handle.cmd_tx.send(AgentCommand::DenyTool);
                 self.mode = AppMode::Normal;
             }
@@ -987,12 +1025,47 @@ impl App {
                 self.send_message(event_tx);
             }
             (_, KeyCode::Esc) => {
-                // Esc: clear input if not empty, otherwise do nothing
-                // (use /quit to exit the program)
                 if !self.input.is_empty() {
                     self.input.clear();
                     self.slash_menu.close();
                 }
+            }
+            // Ctrl+L: clear conversation (like Claude Code)
+            (KeyModifiers::CONTROL, KeyCode::Char('l')) => {
+                self.conversation = atomcode_core::conversation::Conversation::new();
+                self.render_cache.clear();
+                self.render_cache_msg_count = 0;
+                self.scroll_offset = 0;
+                self.at_bottom = true;
+                self.current_step_count = 0;
+                self.turn_tokens = 0;
+                self.total_tokens = 0;
+                self.suggestion = None;
+            }
+            // Emacs-style line editing (like Claude Code)
+            (KeyModifiers::CONTROL, KeyCode::Char('a')) => {
+                self.input.move_home();
+            }
+            (KeyModifiers::CONTROL, KeyCode::Char('e')) => {
+                self.input.move_end();
+            }
+            (KeyModifiers::CONTROL, KeyCode::Char('u')) => {
+                self.input.clear_line();
+            }
+            (KeyModifiers::CONTROL, KeyCode::Char('k')) => {
+                self.input.kill_to_end();
+            }
+            (KeyModifiers::CONTROL, KeyCode::Char('w')) => {
+                self.input.delete_word_backward();
+            }
+            (_, KeyCode::Home) => {
+                self.input.move_home();
+            }
+            (_, KeyCode::End) => {
+                self.input.move_end();
+            }
+            (_, KeyCode::Delete) => {
+                self.input.delete_forward();
             }
             // Scroll keys: Ctrl+Up/Down (3 lines), PageUp/PageDown (20 lines)
             _ if self.handle_scroll_keys(key) => {}
@@ -1838,6 +1911,72 @@ impl InputState {
             self.cursor_row -= 1;
             self.cursor_col = self.lines[self.cursor_row].len();
             self.lines[self.cursor_row].push_str(&current);
+        }
+    }
+
+    /// Forward delete (Delete key)
+    pub fn delete_forward(&mut self) {
+        let line = &self.lines[self.cursor_row];
+        if self.cursor_col < line.len() {
+            let next = line[self.cursor_col..]
+                .char_indices()
+                .nth(1)
+                .map(|(i, _)| self.cursor_col + i)
+                .unwrap_or(line.len());
+            self.lines[self.cursor_row].drain(self.cursor_col..next);
+        } else if self.cursor_row + 1 < self.lines.len() {
+            // Join with next line
+            let next_line = self.lines.remove(self.cursor_row + 1);
+            self.lines[self.cursor_row].push_str(&next_line);
+        }
+    }
+
+    /// Delete word backward (Ctrl+W)
+    pub fn delete_word_backward(&mut self) {
+        if self.cursor_col == 0 { return; }
+        let line = &self.lines[self.cursor_row];
+        let before = &line[..self.cursor_col];
+        // Skip trailing whitespace, then skip word chars
+        let trimmed = before.trim_end();
+        let word_start = trimmed.rfind(|c: char| c.is_whitespace() || c == '/' || c == '.')
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        self.lines[self.cursor_row].drain(word_start..self.cursor_col);
+        self.cursor_col = word_start;
+    }
+
+    /// Clear from cursor to end of line (Ctrl+K)
+    pub fn kill_to_end(&mut self) {
+        self.lines[self.cursor_row].truncate(self.cursor_col);
+    }
+
+    /// Clear entire line (Ctrl+U)
+    pub fn clear_line(&mut self) {
+        self.lines[self.cursor_row].clear();
+        self.cursor_col = 0;
+    }
+
+    /// Move cursor to start of line (Home / Ctrl+A)
+    pub fn move_home(&mut self) {
+        self.cursor_col = 0;
+    }
+
+    /// Move cursor to end of line (End / Ctrl+E)
+    pub fn move_end(&mut self) {
+        self.cursor_col = self.lines[self.cursor_row].len();
+    }
+
+    /// Insert a block of text (paste). Handles multi-line correctly.
+    pub fn insert_text(&mut self, text: &str) {
+        for (i, chunk) in text.split('\n').enumerate() {
+            if i > 0 {
+                self.insert_newline();
+            }
+            for c in chunk.chars() {
+                if c != '\r' { // Skip \r from Windows line endings
+                    self.insert_char(c);
+                }
+            }
         }
     }
 

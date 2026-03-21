@@ -10,6 +10,7 @@ use atomcode_core::tool::{ToolCall, ToolResult};
 #[derive(Debug)]
 pub enum AppEvent {
     Key(KeyEvent),
+    Paste(String),          // Bracketed paste content
     ScrollUp(u16),
     ScrollDown(u16),
     MouseDown(u16, u16),   // (column, row) in terminal coordinates
@@ -51,6 +52,7 @@ impl EventLoop {
                     Some(Ok(evt)) => {
                         let app_event = match evt {
                             Event::Key(key) => AppEvent::Key(key),
+                            Event::Paste(text) => AppEvent::Paste(text),
                             Event::Resize(w, h) => AppEvent::Resize(w, h),
                             Event::Mouse(MouseEvent { kind, column, row, .. }) => {
                                 match kind {

@@ -87,11 +87,17 @@ pub fn render(frame: &mut Frame, area: Rect, input: &InputState, is_busy: bool, 
             .add_modifier(Modifier::BOLD),
     );
 
+    let hint = Span::styled(
+        " Enter send · Shift+Enter newline · / commands · Ctrl+L clear ",
+        Style::default().fg(Color::Rgb(55, 55, 60)),
+    );
+
     let block = Block::default()
         .borders(Borders::ALL)
         .border_set(border::ROUNDED)
         .border_style(Style::default().fg(border_color))
         .title(prompt)
+        .title_bottom(hint)
         .padding(Padding::horizontal(H_PADDING));
 
     // Render attached file tags above the input box

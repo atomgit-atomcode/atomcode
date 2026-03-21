@@ -112,11 +112,17 @@ impl Tool for BashTool {
         let stdout_str = String::from_utf8_lossy(&stdout_buf).to_string();
         let stderr_str = String::from_utf8_lossy(&stderr_buf).to_string();
 
+        // Commands with & (backgrounded processes) may return non-zero even on success.
+        // pkill returns 1 when no process matched. These shouldn't be marked as failures.
+        let has_background = parsed.command.contains(" &");
+        let has_pkill = parsed.command.contains("pkill");
+
         match result {
             Ok(Some(success)) => {
-                // Process exited within timeout
                 let combined = format_output(&stdout_str, &stderr_str);
-                Ok(ToolResult { call_id: String::new(), output: combined, success })
+                // For background/pkill commands: non-empty output = success
+                let effective_success = success || has_background || (has_pkill && !combined.is_empty());
+                Ok(ToolResult { call_id: String::new(), output: combined, success: effective_success })
             }
             Ok(None) => {
                 // Process still running — return what we have + PID
@@ -172,6 +178,10 @@ fn check_destructive_command(command: &str) -> Option<String> {
 
     for (pattern, reason) in patterns {
         if cmd.contains(pattern) {
+            // Don't flag pkill/pgrep — they're standard process management commands
+            if pattern.contains("kill") && (cmd.contains("pkill") || cmd.contains("pgrep")) {
+                continue;
+            }
             return Some(format!("Destructive command detected: {}. Command: {}", reason, command));
         }
     }

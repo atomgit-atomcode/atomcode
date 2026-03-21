@@ -125,6 +125,10 @@ pub struct AgentLoop {
     files_edited_this_turn: Vec<String>,
     /// Consecutive read-type calls without an edit (for read budget enforcement)
     consecutive_reads: usize,
+    /// Whether verify prompt was already injected this turn (fire at most once)
+    verify_injected: bool,
+    /// Whether the model produced any text output this turn (if so, skip auto-summary)
+    model_produced_text: bool,
     /// Last N tool call signatures for loop detection. (name, args_hash)
     recent_calls: Vec<(String, u64)>,
     /// The user's original task message for this turn (re-injected as reminders).
@@ -176,6 +180,8 @@ impl AgentLoop {
             files_read_this_turn: Vec::new(),
             files_edited_this_turn: Vec::new(),
             consecutive_reads: 0,
+            verify_injected: false,
+            model_produced_text: false,
             recent_calls: Vec::new(),
             current_task: String::new(),
             preread_context: String::new(),
@@ -251,6 +257,8 @@ impl AgentLoop {
         self.files_read_this_turn.clear();
         self.files_edited_this_turn.clear();
         self.consecutive_reads = 0;
+        self.verify_injected = false;
+        self.model_produced_text = false;
         self.turn_start = Some(Instant::now());
         self.cancel_token = CancellationToken::new();
 
@@ -449,10 +457,14 @@ impl AgentLoop {
                     event = stream.next() => {
                         match event {
                             Some(Ok(StreamEvent::Delta(text))) => {
+                                self.model_produced_text = true;
                                 self.conversation.push_delta(&text);
                                 let _ = self.event_tx.send(AgentEvent::TextDelta(text));
                             }
                             Some(Ok(StreamEvent::ToolCallStart { id, name })) => {
+                                // Reset: if the model generated text before tool calls (plan text),
+                                // it doesn't count as a final summary. Only text AFTER all tools = summary.
+                                self.model_produced_text = false;
                                 self.conversation.tool_call_buffer = Some(ToolCallBuffer {
                                     id,
                                     name: name.clone(),
@@ -487,9 +499,9 @@ impl AgentLoop {
                                     self.pending_tool_calls = tool_calls_buf;
                                     self.process_next_tool_call().await;
                                 } else {
-                                    // Verification loop: if edits were made but no build/verify
-                                    // was run, inject a verification prompt and call LLM once more.
-                                    if self.should_verify() {
+                                    // Verification: inject ONCE if edits were made but not verified.
+                                    if !self.verify_injected && self.should_verify() {
+                                        self.verify_injected = true;
                                         self.inject_verify_prompt();
                                         self.call_llm().await;
                                     } else {
@@ -500,19 +512,35 @@ impl AgentLoop {
                                 return;
                             }
                             Some(Ok(StreamEvent::Error(e))) => {
-                                // Retry on transient network errors; fail fast on API errors.
-                                let is_api_error = e.contains("API error")
-                                    || e.contains("400 ")
-                                    || e.contains("401 ")
-                                    || e.contains("403 ")
-                                    || e.contains("illegal");
+                                let is_messages_illegal = e.contains("illegal") || e.contains("messages");
+                                let is_auth_error = e.contains("401 ") || e.contains("403 ");
+                                let is_api_error = e.contains("API error") || e.contains("400 ") || is_auth_error;
 
-                                if !is_api_error {
+                                if is_messages_illegal && self.retry_count == 0 {
+                                    // "messages illegal" — auto-recover by trimming conversation
+                                    // and removing potentially corrupted tool call pairs.
                                     self.retry_count += 1;
-                                    let wait = (self.retry_count as u64 * 2).min(15);
-                                    tokio::time::sleep(Duration::from_secs(wait)).await;
-                                    // Recursive retry — safe because retry_count is bounded.
+                                    let len = self.conversation.messages.len();
+                                    if len > 4 {
+                                        // Remove the last 4 messages (2 tool call/result pairs)
+                                        // which likely contain the problematic content
+                                        self.conversation.messages.truncate(len - 4);
+                                    }
+                                    let _ = self.event_tx.send(AgentEvent::TextDelta(
+                                        "\n[Recovering from API error — retrying with reduced context...]\n".to_string()
+                                    ));
                                     self.call_llm().await;
+                                    return;
+                                } else if !is_api_error {
+                                    self.retry_count += 1;
+                                    if self.retry_count <= 3 {
+                                        let wait = (self.retry_count as u64 * 2).min(15);
+                                        tokio::time::sleep(Duration::from_secs(wait)).await;
+                                        self.call_llm().await;
+                                        return;
+                                    }
+                                    let _ = self.event_tx.send(AgentEvent::Error(e));
+                                    self.finish_turn();
                                     return;
                                 } else {
                                     let _ = self.event_tx.send(AgentEvent::Error(e));
@@ -630,16 +658,24 @@ impl AgentLoop {
                 });
 
                 if block_count >= 4 {
-                    // FORCE END TURN — model is stuck in an unbreakable loop
+                    // FORCE END TURN — model is stuck in an unbreakable loop.
+                    // Use a friendly message if work was actually completed.
+                    let has_work = !self.files_edited_this_turn.is_empty();
+                    let msg = if has_work {
+                        "Loop in cleanup step stopped. Your changes were applied successfully."
+                    } else {
+                        "Agent stuck in a loop. Turn force-terminated. Please try a more specific request."
+                    };
+
                     let _ = self.event_tx.send(AgentEvent::ToolCallResult {
                         name: name.clone(),
-                        output: "[FORCE STOPPED: Loop detected. Turn terminated.]".to_string(),
-                        success: false,
+                        output: format!("[{}]", msg),
+                        success: has_work,
                         duration: start.elapsed(),
                     });
-                    let _ = self.event_tx.send(AgentEvent::Error(
-                        "Agent stuck in a loop. Turn force-terminated. Please try a more specific request.".to_string()
-                    ));
+                    if !has_work {
+                        let _ = self.event_tx.send(AgentEvent::Error(msg.to_string()));
+                    }
                     self.maybe_emit_auto_summary();
                     self.finish_turn();
                     return;
@@ -808,11 +844,17 @@ impl AgentLoop {
                             if !siblings.is_empty() {
                                 siblings.truncate(5);
                                 tool_result.output.push_str(&format!(
-                                    "\n\n[IMPORTANT: You just fixed a bug in {}. \
-                                     These files in the same directory may have the SAME bug: {}. \
-                                     Check and fix them NOW before finishing.]",
+                                    "\n\n[IMPORTANT: You edited {}. \
+                                     (1) Run a syntax check NOW before doing anything else. \
+                                     (2) These sibling files may need the same change: {}.]",
                                     edited_path.file_name().unwrap_or_default().to_string_lossy(),
                                     siblings.join(", ")
+                                ));
+                            } else {
+                                // No siblings, but still remind to verify
+                                tool_result.output.push_str(&format!(
+                                    "\n\n[Run a syntax check on {} NOW to catch errors early.]",
+                                    edited_path.file_name().unwrap_or_default().to_string_lossy(),
                                 ));
                             }
                         }
@@ -883,9 +925,16 @@ impl AgentLoop {
                     .collect();
 
                 let urgency = if self.tool_call_count >= 15 {
-                    "URGENT: You MUST finish NOW."
+                    "URGENT: You MUST take action NOW. Either edit code, restart a service, or explain the issue to the user."
+                } else if self.files_edited_this_turn.is_empty() && self.tool_call_count >= 10 {
+                    "You have made ZERO edits or fixes after 10+ steps of diagnostics. STOP diagnosing. \
+                     Take action NOW: edit code with edit_file, OR restart a service if code was changed but service uses old code, \
+                     OR tell the user what you found."
                 } else if self.files_edited_this_turn.is_empty() && self.tool_call_count >= 6 {
-                    "You have made ZERO edits after 6+ steps. Stop reading and start editing NOW."
+                    "You have read many files but made no changes. Decide NOW: \
+                     Is this a code bug? → edit_file. \
+                     Is the service running old code? → restart it. \
+                     Can't figure it out? → tell the user what you found."
                 } else {
                     "Only read files you plan to edit."
                 };
@@ -951,14 +1000,10 @@ impl AgentLoop {
     /// If the turn ended without the model producing a text summary (common with DeepSeek),
     /// auto-generate a brief summary from the tool calls in this turn and emit it as text.
     fn maybe_emit_auto_summary(&mut self) {
-        // Check if the model already produced text at the end
-        if let Some(last) = self.conversation.messages.last() {
-            match &last.content {
-                crate::conversation::message::MessageContent::Text(t) if !t.trim().is_empty() => {
-                    return; // Model already provided a summary
-                }
-                _ => {}
-            }
+        // If the model produced any text output this turn, don't auto-summarize.
+        // This is the definitive check — avoids duplicate "done" messages.
+        if self.model_produced_text {
+            return;
         }
 
         // Only generate summary if we actually executed tools this turn
@@ -1124,37 +1169,24 @@ impl AgentLoop {
             return false; // No edits, nothing to verify
         }
         if self.tool_call_count >= 20 {
-            return false; // Near step limit, don't waste steps on verify
+            return false; // Near step limit, don't waste steps
         }
 
-        // Check if any bash command was run AFTER the last edit (a verification attempt)
-        let mut found_edit = false;
-        let mut found_bash_after_edit = false;
+        // Simple check: find the LAST tool call in this turn.
+        // If it's bash → already verified (ran build/test). No need for another verify.
+        // If it's edit/write/read → hasn't verified yet.
         for msg in self.conversation.messages.iter().rev() {
-            match &msg.content {
-                crate::conversation::message::MessageContent::AssistantWithToolCalls { tool_calls, .. } => {
-                    for tc in tool_calls {
-                        if tc.name == "bash" && found_edit {
-                            found_bash_after_edit = true;
-                            break;
-                        }
-                        if tc.name == "edit_file" || tc.name == "write_file" {
-                            found_edit = true;
-                        }
-                    }
-                    if found_bash_after_edit { break; }
+            if let crate::conversation::message::MessageContent::AssistantWithToolCalls { tool_calls, .. } = &msg.content {
+                if let Some(last_tc) = tool_calls.last() {
+                    return last_tc.name != "bash";
                 }
-                crate::conversation::message::MessageContent::Text(_) => {
-                    if matches!(msg.role, crate::conversation::message::Role::User) {
-                        break; // Reached turn boundary
-                    }
-                }
-                _ => {}
+            }
+            // Stop at user message (turn boundary)
+            if matches!(msg.role, crate::conversation::message::Role::User) {
+                break;
             }
         }
-
-        // Verify if: edits were made but no bash run after them
-        found_edit && !found_bash_after_edit
+        false
     }
 
     /// Inject a verification prompt into the conversation as a user message,
@@ -1383,13 +1415,19 @@ impl AgentLoop {
             .map(|g| g.clone())
             .unwrap_or_default();
 
-        // Try parsing JSON directly, then with repair, then with brute-force extraction
+        // Try parsing JSON directly, then repair, then specialized extractors
         let args_str = &call.arguments;
         let parsed = serde_json::from_str::<serde_json::Value>(args_str)
             .or_else(|_| serde_json::from_str::<serde_json::Value>(&repair_json(args_str)))
-            .or_else(|_| Ok::<serde_json::Value, serde_json::Error>(
-                extract_json_fields(args_str)
-            ));
+            .or_else(|_| {
+                // For edit_file: specialized parser that handles unescaped source code
+                if call.name == "edit_file" {
+                    if let Some(v) = extract_edit_file_args(args_str) {
+                        return Ok(v);
+                    }
+                }
+                Ok::<serde_json::Value, serde_json::Error>(extract_json_fields(args_str))
+            });
 
         if let Ok(mut args) = parsed {
             // Resolve relative paths for ALL path-like fields
@@ -1624,14 +1662,19 @@ fn extract_json_fields(s: &str) -> serde_json::Value {
 
         // Read value
         if chars[i] == '"' {
-            // String value
+            // String value — extract and unescape JSON escape sequences
             let start = i + 1;
             i = start;
             while i < len && chars[i] != '"' {
                 if chars[i] == '\\' { i += 1; }
                 i += 1;
             }
-            let val: String = chars[start..i.min(len)].iter().collect();
+            let raw: String = chars[start..i.min(len)].iter().collect();
+            // Unescape JSON sequences: \n → newline, \t → tab, \" → quote, \\ → backslash
+            let val = raw.replace("\\n", "\n")
+                         .replace("\\t", "\t")
+                         .replace("\\\"", "\"")
+                         .replace("\\\\", "\\");
             map.insert(key, serde_json::json!(val));
             if i < len { i += 1; }
         } else if chars[i] == 't' || chars[i] == 'f' {
@@ -1666,6 +1709,68 @@ fn extract_json_fields(s: &str) -> serde_json::Value {
     }
 
     serde_json::Value::Object(map)
+}
+
+/// Specialized parser for edit_file arguments when JSON parsing fails.
+/// Models often generate old_string/new_string with unescaped quotes/newlines.
+/// This parser uses the known field order to extract content by position.
+fn extract_edit_file_args(raw: &str) -> Option<serde_json::Value> {
+    let fp_marker = raw.find("\"file_path\"")?;
+    let old_marker = raw.find("\"old_string\"")?;
+    let new_marker = raw.find("\"new_string\"")?;
+    if old_marker <= fp_marker || new_marker <= old_marker { return None; }
+
+    // Extract file_path (simple quoted string before old_string)
+    let fp_region = &raw[fp_marker + 11..old_marker];
+    let fp_colon = fp_region.find(':')?;
+    let fp_val = fp_region[fp_colon + 1..].trim().trim_matches(|c| c == '"' || c == ',').trim();
+    if fp_val.is_empty() { return None; }
+    let file_path = fp_val.to_string();
+
+    // Extract old_string: everything between "old_string": " and ", "new_string"
+    let old_colon = raw[old_marker..].find(':')?;
+    let old_start = old_marker + old_colon + 1;
+    let old_raw = &raw[old_start..new_marker];
+    let old_string = unescape_field_value(old_raw);
+
+    // Extract new_string: everything after "new_string": " to the end
+    let new_colon = raw[new_marker..].find(':')?;
+    let new_start = new_marker + new_colon + 1;
+    let new_raw = &raw[new_start..];
+    let new_string = unescape_field_value_end(new_raw);
+
+    if old_string.is_empty() && new_string.is_empty() { return None; }
+
+    let replace_all = raw.contains("\"replace_all\"")
+        && raw.rfind("true").map_or(false, |t| {
+            raw.rfind("\"replace_all\"").map_or(false, |r| t > r)
+        });
+
+    Some(serde_json::json!({
+        "file_path": file_path,
+        "old_string": old_string,
+        "new_string": new_string,
+        "replace_all": replace_all,
+    }))
+}
+
+fn unescape_field_value(raw: &str) -> String {
+    let t = raw.trim().trim_end_matches(',').trim();
+    let inner = if t.starts_with('"') { &t[1..] } else { t };
+    let inner = inner.trim_end_matches('"');
+    inner.replace("\\n", "\n").replace("\\t", "\t").replace("\\\"", "\"").replace("\\\\", "\\")
+}
+
+fn unescape_field_value_end(raw: &str) -> String {
+    let t = raw.trim();
+    let inner = if t.starts_with('"') { &t[1..] } else { t };
+    // Remove trailing "} or ", "replace_all": ... }
+    let end = inner.rfind("\", \"replace_all\"")
+        .or_else(|| inner.rfind("\"}"))
+        .or_else(|| inner.rfind("\"\n}"))
+        .unwrap_or(inner.len());
+    let content = &inner[..end];
+    content.replace("\\n", "\n").replace("\\t", "\t").replace("\\\"", "\"").replace("\\\\", "\\")
 }
 
 use crate::tool::SKIP_DIRS;

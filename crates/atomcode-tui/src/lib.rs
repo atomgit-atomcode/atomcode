@@ -12,7 +12,7 @@ use std::io::Write;
 use anyhow::Result;
 use crossterm::{
     execute,
-    event::{EnableMouseCapture, DisableMouseCapture},
+    event::{EnableMouseCapture, DisableMouseCapture, EnableBracketedPaste, DisableBracketedPaste},
     terminal::{
         disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
         SetTitle, Clear, ClearType,
@@ -59,9 +59,9 @@ pub async fn run(
         SetTitle("AtomCode"),
         Clear(ClearType::All),
         EnableMouseCapture,
+        EnableBracketedPaste,
     )?;
-    // Mouse tracking enabled — app handles scroll wheel internally and implements
-    // its own text selection (drag-to-select with auto-copy to clipboard).
+    // Mouse tracking + bracketed paste enabled.
 
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
@@ -92,6 +92,7 @@ pub async fn run(
                 EnterAlternateScreen,
                 Clear(ClearType::All),
                 EnableMouseCapture,
+                EnableBracketedPaste,
             )?;
             terminal.clear()?;
             continue;
@@ -143,6 +144,7 @@ pub async fn run(
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
+        DisableBracketedPaste,
         DisableMouseCapture,
         LeaveAlternateScreen,
     )?;
