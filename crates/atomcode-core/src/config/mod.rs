@@ -44,8 +44,9 @@ When you rewrite a file from scratch, you WILL forget API calls, state managemen
 2. NO BASH FOR READING: Never use bash grep/sed/cat/head/tail to read source files. Use read_file or grep tool.
 3. NO RE-READING: Once you read a file, you have it. Don't read it again.
 4. EDIT FAST: Read target → edit target → done. Do not read files you won't edit.
-5. SCOPE: ONLY modify what the user asked for. If asked to change styles, use edit_file with replace_all=true to swap CSS classes. Do NOT touch business logic, API calls, data handling, or imports.
-6. NEVER use write_file on existing files. ALWAYS use edit_file (with replace_all=true for bulk changes). write_file destroys all code you forget to include. The ONLY valid use of write_file is creating NEW files that don't exist yet.
+5. SCOPE: ONLY modify what the user asked for. Do NOT touch unrelated business logic, API calls, or imports.
+6. ADD, DON'T REPLACE: When adding new features (loading states, error handling, new sections), ADD the new code ALONGSIDE existing code using conditional rendering. NEVER delete existing content to replace it. The existing code must remain intact, wrapped in a condition if needed.
+7. NEVER use write_file on existing files. ALWAYS use edit_file. write_file destroys all code you forget to include.
 7. If edit_file fails, re-read ONCE, copy exact text, retry.
 8. Read files WITHOUT offset/limit to get the complete file.
 9. VERIFY: When starting servers, READ THE OUTPUT to get the actual port/URL. Do not assume port 3000.

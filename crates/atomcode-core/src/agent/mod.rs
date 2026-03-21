@@ -384,7 +384,7 @@ impl AgentLoop {
         let mut total_lines = 0usize;
         const MAX_LINES: usize = 1500; // Generous budget — input tokens are cheap, round-trips are expensive
 
-        for path in &expanded {
+        for (idx, path) in expanded.iter().enumerate() {
             if total_lines >= MAX_LINES { break; }
 
             let file_content = match tokio::fs::read_to_string(path).await {
@@ -393,7 +393,10 @@ impl AgentLoop {
             };
 
             let lines: Vec<&str> = file_content.lines().collect();
-            let take = lines.len().min(MAX_LINES - total_lines);
+            // First 2 files (highest scored) get full content up to 500 lines each.
+            // Remaining files share what's left of the budget.
+            let per_file_max = if idx < 2 { 500 } else { 200 };
+            let take = lines.len().min(per_file_max).min(MAX_LINES - total_lines);
             let rel_path = path.strip_prefix(&wd)
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_else(|_| path.to_string_lossy().to_string());
