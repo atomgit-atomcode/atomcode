@@ -85,6 +85,8 @@ pub struct App {
     pub at_bottom: bool,
     pub confirm_quit: bool,
     pub pending_editor: Option<String>,
+    /// Last key event timestamp — for paste detection when bracketed paste isn't available.
+    pub last_key_time: Instant,
     /// Files attached to the next message (detected from pasted paths).
     pub attached_files: Vec<crate::file_attach::AttachedFile>,
     pub slash_menu: SlashMenu,
@@ -181,6 +183,7 @@ impl App {
             scroll_offset: 0,
             at_bottom: true,
             confirm_quit: false,
+            last_key_time: Instant::now(),
             pending_editor: None,
             attached_files: Vec::new(),
             slash_menu: SlashMenu::new(),
@@ -762,6 +765,8 @@ impl App {
     }
 
     fn handle_key(&mut self, key: KeyEvent, event_tx: &mpsc::UnboundedSender<AppEvent>) {
+        // nothing here — key timing handled in handle_key_normal
+
         // Ctrl+Shift+C: copy selection to clipboard (like Ctrl+C in Claude Code with selection)
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.modifiers.contains(KeyModifiers::SHIFT)
             && key.code == KeyCode::Char('C')
@@ -843,9 +848,9 @@ impl App {
                     self.at_bottom = true;
                     self.last_turn_duration = self.turn_start.map(|t| t.elapsed());
                     self.turn_start = None;
-                } else if (key.code == KeyCode::Enter && !key.modifiers.contains(KeyModifiers::SHIFT))
+                } else if (key.code == KeyCode::Enter && key.modifiers == KeyModifiers::NONE)
                     || (key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('j')) {
-                    // Block sending messages during streaming — Enter/Ctrl+J does nothing
+                    // Block sending during streaming — only plain Enter/Ctrl+J blocked
                 } else {
                     // All other keys work normally: scroll, type, /, Ctrl+A/E, etc.
                     // User can prepare next message and use slash commands while AI is working.
@@ -1019,10 +1024,20 @@ impl App {
         }
 
         match (key.modifiers, key.code) {
-            (KeyModifiers::SHIFT, KeyCode::Enter) => {
+            // Enter handling:
+            // - Plain Enter (no modifiers) = send message
+            // - Any modifier + Enter (Shift/Ctrl/Alt) = newline
+            // - Rapid Enter (<50ms since last key) = newline (paste fallback)
+            (KeyModifiers::NONE, KeyCode::Enter) => {
+                self.slash_menu.close();
+                self.send_message(event_tx);
+            }
+            (_, KeyCode::Enter) => {
+                // Any modifier + Enter = newline
                 self.input.insert_newline();
             }
-            (KeyModifiers::CONTROL, KeyCode::Char('j')) | (_, KeyCode::Enter) => {
+            (KeyModifiers::CONTROL, KeyCode::Char('j')) => {
+                // Ctrl+J also sends (alternative send shortcut)
                 self.slash_menu.close();
                 self.send_message(event_tx);
             }
