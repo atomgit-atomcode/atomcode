@@ -36,23 +36,15 @@ pub fn render(frame: &mut Frame, area: Rect, input: &InputState, is_busy: bool, 
         let mut cursor_vrow = 0usize;
         let mut cursor_vcol = 0usize;
 
-        // If there's pasted text, show it as compact indicator first
+        // Pasted text: compact tag (like Claude Code file attachment style)
         if let Some(pt) = pasted {
             let line_count = pt.lines().count();
             let char_count = pt.len();
-            let first = pt.lines().next().unwrap_or("");
-            let preview_max = inner_width.saturating_sub(15);
-            let preview = if first.chars().count() > preview_max {
-                format!("{}...", first.chars().take(preview_max.saturating_sub(3)).collect::<String>())
-            } else {
-                first.to_string()
-            };
             vis_lines.push(Line::from(vec![
-                Span::styled("\u{2630} ", Style::default().fg(Color::Rgb(100, 140, 200))),
-                Span::styled(preview, Style::default().fg(Color::Rgb(160, 165, 175))),
                 Span::styled(
-                    format!("  {}L {}C", line_count, char_count),
-                    Style::default().fg(Color::Rgb(80, 85, 95)),
+                    format!(" \u{1f4cb} Pasted text \u{2502} {} lines \u{00b7} {} chars \u{2502} Esc to remove ",
+                        line_count, char_count),
+                    Style::default().fg(Color::Rgb(180, 195, 220)).bg(Color::Rgb(35, 45, 60)),
                 ),
             ]));
         }
