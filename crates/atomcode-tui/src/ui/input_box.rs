@@ -42,9 +42,8 @@ pub fn render(frame: &mut Frame, area: Rect, input: &InputState, is_busy: bool, 
             let char_count = pt.len();
             vis_lines.push(Line::from(vec![
                 Span::styled(
-                    format!(" \u{1f4cb} Pasted text \u{2502} {} lines \u{00b7} {} chars \u{2502} Esc to remove ",
-                        line_count, char_count),
-                    Style::default().fg(Color::Rgb(180, 195, 220)).bg(Color::Rgb(35, 45, 60)),
+                    format!("[Pasted text ({} lines, {} chars)]", line_count, char_count),
+                    Style::default().fg(Color::Rgb(130, 160, 210)),
                 ),
             ]));
         }
