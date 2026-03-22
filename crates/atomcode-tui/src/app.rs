@@ -1139,14 +1139,14 @@ impl App {
                     }
                     if let Some(idx) = self.history_index {
                         if let Some(hist) = self.input_history.get(idx) {
-                            self.input.clear();
-                            for c in hist.chars() { self.input.insert_char(c); }
+                            self.suggestion = None;
+                            self.pasted_text = None;
+                            self.load_history_entry(hist);
                         }
                     }
                 }
             }
             (_, KeyCode::Down) => {
-                // Multi-line: move cursor down within input
                 if self.input.cursor_row + 1 < self.input.lines.len() {
                     self.input.cursor_row += 1;
                     self.input.cursor_col = snap_to_char_boundary(
@@ -1154,15 +1154,15 @@ impl App {
                         self.input.cursor_col,
                     );
                 } else if let Some(idx) = self.history_index {
-                    // Browsing history: go forward
                     if idx + 1 < self.input_history.len() {
                         self.history_index = Some(idx + 1);
                         let hist = self.input_history[idx + 1].clone();
-                        self.input.clear();
-                        for c in hist.chars() { self.input.insert_char(c); }
+                        self.suggestion = None;
+                        self.pasted_text = None;
+                        self.load_history_entry(&hist);
                     } else {
-                        // Past the end: restore stashed input
                         self.history_index = None;
+                        self.pasted_text = None;
                         self.input.clear();
                         if let Some(stash) = self.history_stash.take() {
                             for c in stash.chars() { self.input.insert_char(c); }
@@ -1543,6 +1543,19 @@ impl App {
         true
     }
 
+    /// Load a history entry into input. Long entries shown as pasted_text reference.
+    fn load_history_entry(&mut self, entry: &str) {
+        self.input.clear();
+        let line_count = entry.lines().count();
+        if line_count > 3 || entry.len() > 200 {
+            // Long entry — show as pasted reference
+            self.pasted_text = Some(entry.to_string());
+        } else {
+            // Short entry — load inline
+            for c in entry.chars() { self.input.insert_char(c); }
+        }
+    }
+
     fn send_message(&mut self, _event_tx: &mpsc::UnboundedSender<AppEvent>) {
         let typed = self.input.content();
         let content = if let Some(pasted) = self.pasted_text.take() {
@@ -1560,11 +1573,8 @@ impl App {
             return;
         }
 
-        // Add to input history — only the typed portion (not pasted text)
-        let history_entry = self.input.content();
-        if !history_entry.trim().is_empty() {
-            self.input_history.push(history_entry);
-        }
+        // Add full content to history (typed + pasted)
+        self.input_history.push(content.clone());
         if self.input_history.len() > 100 {
             self.input_history.drain(..self.input_history.len() - 100);
         }
