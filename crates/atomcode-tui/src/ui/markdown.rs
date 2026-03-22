@@ -75,9 +75,11 @@ impl MarkdownRenderer {
 
         for event in parser {
             match event {
-                // Headings
+                // Headings — only add blank line before H1/H2, not H3+
                 Event::Start(Tag::Heading { level, .. }) => {
-                    if !lines.is_empty() { lines.push(Line::default()); }
+                    if !lines.is_empty() && matches!(level, HeadingLevel::H1 | HeadingLevel::H2) {
+                        lines.push(Line::default());
+                    }
                     let color = match level {
                         HeadingLevel::H1 => H1,
                         HeadingLevel::H2 => H2,
@@ -85,14 +87,9 @@ impl MarkdownRenderer {
                     };
                     styles.push(Style::default().fg(color).add_modifier(Modifier::BOLD));
                 }
-                Event::End(TagEnd::Heading(level)) => {
+                Event::End(TagEnd::Heading(_level)) => {
                     styles.pop();
                     flush(&mut lines, &mut spans);
-                    if level == HeadingLevel::H1 {
-                        lines.push(Line::from(Span::styled(
-                            "\u{2500}".repeat(40), Style::default().fg(RULE),
-                        )));
-                    }
                 }
 
                 // Inline styles
@@ -154,27 +151,23 @@ impl MarkdownRenderer {
                         format!("  \u{2570}{}", "\u{2500}".repeat(34)),
                         Style::default().fg(Color::Rgb(40, 43, 52)),
                     )));
-                    lines.push(Line::default());
                     code_buf.clear();
                 }
 
-                // Paragraphs
+                // Paragraphs — no extra blank line after, just flush
                 Event::Start(Tag::Paragraph) => {}
                 Event::End(TagEnd::Paragraph) => {
                     flush(&mut lines, &mut spans);
-                    lines.push(Line::default());
                 }
 
                 // Lists
                 Event::Start(Tag::List(start)) => {
                     list_depth += 1;
                     ordered_idx = start;
-                    if list_depth == 1 { lines.push(Line::default()); }
                 }
                 Event::End(TagEnd::List(_)) => {
                     list_depth = list_depth.saturating_sub(1);
                     ordered_idx = None;
-                    if list_depth == 0 { lines.push(Line::default()); }
                 }
                 Event::Start(Tag::Item) => {
                     let indent = "   ".repeat(list_depth);
@@ -260,7 +253,6 @@ impl MarkdownRenderer {
                 Event::SoftBreak | Event::HardBreak => { flush(&mut lines, &mut spans); }
                 Event::Rule => {
                     lines.push(Line::from(Span::styled("\u{2500}".repeat(40), Style::default().fg(RULE))));
-                    lines.push(Line::default());
                 }
                 _ => {}
             }
