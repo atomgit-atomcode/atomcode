@@ -233,13 +233,12 @@ fn render_user(lines: &mut Vec<Line<'static>>, content: &str) {
             ]));
         }
     } else {
-        // Long message / pasted content — compact block (like Claude Code)
-        // Show first meaningful line as summary
+        // Long message — show first line + bracket-style indicator
         let first = text_lines.iter()
             .find(|l| !l.trim().is_empty())
             .unwrap_or(&text_lines[0]);
-        let summary = if first.chars().count() > 60 {
-            format!("{}...", first.chars().take(57).collect::<String>())
+        let summary = if first.chars().count() > 70 {
+            format!("{}...", first.chars().take(67).collect::<String>())
         } else {
             first.to_string()
         };
@@ -247,13 +246,9 @@ fn render_user(lines: &mut Vec<Line<'static>>, content: &str) {
         lines.push(Line::from(vec![
             Span::styled("  > ", Style::default().fg(ACCENT).bg(USER_BG)),
             Span::styled(summary, style),
-        ]));
-        // Compact indicator: lines + chars, styled as a muted tag
-        lines.push(Line::from(vec![
-            Span::styled("    ", Style::default().bg(USER_BG)),
             Span::styled(
-                format!("\u{2500}\u{2500} {} lines, {} chars \u{2500}\u{2500}", text_lines.len(), total_chars),
-                Style::default().fg(Color::Rgb(60, 60, 70)).bg(USER_BG),
+                format!("  [{} lines]", text_lines.len()),
+                Style::default().fg(Color::Rgb(90, 100, 120)).bg(USER_BG),
             ),
         ]));
     }
