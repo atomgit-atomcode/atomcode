@@ -1560,8 +1560,11 @@ impl App {
             return;
         }
 
-        // Add to input history
-        self.input_history.push(content.clone());
+        // Add to input history — only the typed portion (not pasted text)
+        let history_entry = self.input.content();
+        if !history_entry.trim().is_empty() {
+            self.input_history.push(history_entry);
+        }
         if self.input_history.len() > 100 {
             self.input_history.drain(..self.input_history.len() - 100);
         }
