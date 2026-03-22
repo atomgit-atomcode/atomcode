@@ -89,6 +89,7 @@ pub struct App {
     pub last_key_time: Instant,
     /// Files attached to the next message (detected from pasted paths).
     pub attached_files: Vec<crate::file_attach::AttachedFile>,
+    pub pasted_text: Option<String>,
     pub slash_menu: SlashMenu,
     pub provider_mgr: Option<ProviderManager>,
     /// Model selector: list of (provider_name, model_name), selected index
@@ -186,6 +187,7 @@ impl App {
             last_key_time: Instant::now(),
             pending_editor: None,
             attached_files: Vec::new(),
+            pasted_text: None,
             slash_menu: SlashMenu::new(),
             provider_mgr: None,
             model_list: Vec::new(),
@@ -581,11 +583,15 @@ impl App {
                 self.handle_key(key, event_tx);
             }
             AppEvent::Paste(text) => {
-                // Bracketed paste — direct insert (preferred path)
                 if matches!(self.mode, AppMode::Normal) {
-                    self.input.insert_text(&text);
+                    if text.lines().count() > 3 || text.len() > 200 {
+                        // Long paste → compact reference
+                        self.pasted_text = Some(text);
+                    } else {
+                        // Short paste → inline
+                        self.input.insert_text(&text);
+                    }
                     self.suggestion = None;
-                    self.slash_menu.update(&self.input.content());
                 }
             }
             AppEvent::ScrollUp(n) => {
@@ -1063,7 +1069,9 @@ impl App {
                 self.send_message(event_tx);
             }
             (_, KeyCode::Esc) => {
-                if !self.input.is_empty() {
+                if self.pasted_text.is_some() {
+                    self.pasted_text = None;
+                } else if !self.input.is_empty() {
                     self.input.clear();
                     self.slash_menu.close();
                 }
@@ -1536,7 +1544,13 @@ impl App {
     }
 
     fn send_message(&mut self, _event_tx: &mpsc::UnboundedSender<AppEvent>) {
-        let content = self.input.content();
+        let typed = self.input.content();
+        let content = if let Some(pasted) = self.pasted_text.take() {
+            if typed.trim().is_empty() { pasted }
+            else { format!("{}\n\n{}", typed, pasted) }
+        } else {
+            typed
+        };
         if content.trim().is_empty() {
             return;
         }

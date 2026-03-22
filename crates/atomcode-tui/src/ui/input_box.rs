@@ -11,15 +11,14 @@ const H_PADDING: u16 = 3;
 
 use crate::file_attach::AttachedFile;
 
-/// Render the input box. Grows dynamically with content, up to half the terminal height.
-/// Scrolls to keep the cursor visible when content exceeds the visible area.
-pub fn render(frame: &mut Frame, area: Rect, input: &InputState, is_busy: bool, suggestion: Option<&str>, attached: &[AttachedFile]) {
-    let is_empty = input.is_empty();
+pub fn render(frame: &mut Frame, area: Rect, input: &InputState, is_busy: bool, suggestion: Option<&str>, attached: &[AttachedFile], pasted: Option<&str>) {
+    let is_empty = input.is_empty() && pasted.is_none();
+    let inner_width = area.width.saturating_sub(2 + H_PADDING * 2) as usize;
+    let inner_width = inner_width.max(1);
 
-    // Build visible lines with scroll tracking
-    let max_visible = (area.height as usize).saturating_sub(2); // minus borders
-
-    let (lines, visible_row) = if is_empty {
+    // Build visual lines by manually wrapping each logical line.
+    // This gives us exact control over cursor position (no ratatui Wrap needed).
+    let (visual_lines, cursor_visual_row, cursor_visual_col) = if is_empty {
         let placeholder = if let Some(sug) = suggestion {
             vec![Line::from(vec![
                 Span::styled(sug.to_string(), Style::default().fg(Color::Rgb(70, 70, 70))),
@@ -31,49 +30,112 @@ pub fn render(frame: &mut Frame, area: Rect, input: &InputState, is_busy: bool, 
                 Style::default().fg(Color::DarkGray),
             ))]
         };
-        (placeholder, 0usize)
-    } else if input.lines.len() <= max_visible {
-        // All lines fit — show everything
-        let lines: Vec<Line> = input.lines.iter()
-            .map(|l| Line::from(Span::raw(l.clone())))
-            .collect();
-        (lines, input.cursor_row)
+        (placeholder, 0usize, 0usize)
     } else {
-        // Scroll: center on cursor row
+        let mut vis_lines: Vec<Line<'static>> = Vec::new();
+        let mut cursor_vrow = 0usize;
+        let mut cursor_vcol = 0usize;
+
+        // If there's pasted text, show it as compact indicator first
+        if let Some(pt) = pasted {
+            let line_count = pt.lines().count();
+            let char_count = pt.len();
+            let first = pt.lines().next().unwrap_or("");
+            let preview_max = inner_width.saturating_sub(15);
+            let preview = if first.chars().count() > preview_max {
+                format!("{}...", first.chars().take(preview_max.saturating_sub(3)).collect::<String>())
+            } else {
+                first.to_string()
+            };
+            vis_lines.push(Line::from(vec![
+                Span::styled("\u{2630} ", Style::default().fg(Color::Rgb(100, 140, 200))),
+                Span::styled(preview, Style::default().fg(Color::Rgb(160, 165, 175))),
+                Span::styled(
+                    format!("  {}L {}C", line_count, char_count),
+                    Style::default().fg(Color::Rgb(80, 85, 95)),
+                ),
+            ]));
+        }
+
+        for (logical_row, line) in input.lines.iter().enumerate() {
+            let chars: Vec<char> = line.chars().collect();
+            let display_widths: Vec<usize> = chars.iter().map(|c| if is_wide_char(*c) { 2 } else { 1 }).collect();
+
+            if chars.is_empty() {
+                // Empty line
+                let vrow = vis_lines.len();
+                vis_lines.push(Line::from(Span::raw(String::new())));
+                if logical_row == input.cursor_row {
+                    cursor_vrow = vrow;
+                    cursor_vcol = 0;
+                }
+                continue;
+            }
+
+            // Split this logical line into visual lines based on inner_width
+            let mut col = 0usize;
+            let mut visual_col = 0usize;
+            let mut segment_start = 0usize;
+
+            while col < chars.len() {
+                let char_w = display_widths[col];
+                if visual_col + char_w > inner_width && segment_start < col {
+                    // Wrap: emit current segment as a visual line
+                    let vrow = vis_lines.len();
+                    let segment: String = chars[segment_start..col].iter().collect();
+                    vis_lines.push(Line::from(Span::raw(segment)));
+
+                    // Check if cursor is in this segment
+                    if logical_row == input.cursor_row {
+                        let cursor_char_idx = char_index_at_byte(line, input.cursor_col);
+                        if cursor_char_idx >= segment_start && cursor_char_idx < col {
+                            cursor_vrow = vrow;
+                            cursor_vcol = display_width_range(&display_widths, segment_start, cursor_char_idx);
+                        }
+                    }
+
+                    segment_start = col;
+                    visual_col = 0;
+                }
+                visual_col += char_w;
+                col += 1;
+            }
+
+            // Last segment (or entire line if no wrap)
+            let vrow = vis_lines.len();
+            let segment: String = chars[segment_start..].iter().collect();
+            vis_lines.push(Line::from(Span::raw(segment)));
+
+            if logical_row == input.cursor_row {
+                let cursor_char_idx = char_index_at_byte(line, input.cursor_col);
+                if cursor_char_idx >= segment_start {
+                    cursor_vrow = vrow;
+                    cursor_vcol = display_width_range(&display_widths, segment_start, cursor_char_idx);
+                }
+            }
+        }
+
+        (vis_lines, cursor_vrow, cursor_vcol)
+    };
+
+    // Scroll if too many visual lines
+    let max_visible = area.height.saturating_sub(2) as usize;
+    let (display_lines, scroll_offset) = if visual_lines.len() <= max_visible {
+        (visual_lines.clone(), 0usize)
+    } else {
         let half = max_visible / 2;
-        let start = if input.cursor_row <= half {
+        let start = if cursor_visual_row <= half {
             0
-        } else if input.cursor_row + half >= input.lines.len() {
-            input.lines.len().saturating_sub(max_visible)
+        } else if cursor_visual_row + half >= visual_lines.len() {
+            visual_lines.len().saturating_sub(max_visible)
         } else {
-            input.cursor_row - half
+            cursor_visual_row - half
         };
-        let end = (start + max_visible).min(input.lines.len());
-
-        let mut lines_vec: Vec<Line> = Vec::new();
-        if start > 0 {
-            lines_vec.push(Line::from(Span::styled(
-                format!("  \u{2191} {} more", start),
-                Style::default().fg(Color::Rgb(60, 65, 75)),
-            )));
-        }
-        for i in start..end {
-            lines_vec.push(Line::from(Span::raw(input.lines[i].clone())));
-        }
-        if end < input.lines.len() {
-            lines_vec.push(Line::from(Span::styled(
-                format!("  \u{2193} {} more", input.lines.len() - end),
-                Style::default().fg(Color::Rgb(60, 65, 75)),
-            )));
-        }
-
-        let offset_in_view = input.cursor_row - start;
-        let vis_row = if start > 0 { offset_in_view + 1 } else { offset_in_view };
-        (lines_vec, vis_row)
+        let end = (start + max_visible).min(visual_lines.len());
+        (visual_lines[start..end].to_vec(), start)
     };
 
     let border_color = if is_busy { Color::Rgb(80, 80, 60) } else { Color::Rgb(100, 100, 100) };
-
     let prompt = Span::styled(" > ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
     let block = Block::default()
         .borders(Borders::ALL)
@@ -82,135 +144,70 @@ pub fn render(frame: &mut Frame, area: Rect, input: &InputState, is_busy: bool, 
         .title(prompt)
         .padding(Padding::horizontal(H_PADDING));
 
-    // Render attached file tags
-    let (input_area, _tag_offset) = if !attached.is_empty() {
+    // Attached file tags
+    let (input_area, _) = if !attached.is_empty() {
         let tag_area = Rect::new(area.x, area.y, area.width, 1);
         let mut tag_spans: Vec<Span> = vec![Span::raw(" ".to_string())];
         for file in attached {
-            tag_spans.push(Span::styled(
-                format!(" {} ", file.file_type),
-                Style::default().fg(Color::White).bg(Color::Rgb(60, 55, 80)),
-            ));
-            tag_spans.push(Span::styled(
-                format!(" {} ", file.filename),
-                Style::default().fg(Color::Rgb(150, 150, 160)),
-            ));
+            tag_spans.push(Span::styled(format!(" {} ", file.file_type), Style::default().fg(Color::White).bg(Color::Rgb(60, 55, 80))));
+            tag_spans.push(Span::styled(format!(" {} ", file.filename), Style::default().fg(Color::Rgb(150, 150, 160))));
             tag_spans.push(Span::raw("  ".to_string()));
         }
         frame.render_widget(Paragraph::new(Line::from(tag_spans)), tag_area);
-        let remaining = Rect::new(area.x, area.y + 1, area.width, area.height.saturating_sub(1));
-        (remaining, 1u16)
+        (Rect::new(area.x, area.y + 1, area.width, area.height.saturating_sub(1)), 1u16)
     } else {
         (area, 0u16)
     };
 
-    let input_widget = Paragraph::new(lines)
-        .block(block)
-        .wrap(ratatui::widgets::Wrap { trim: false })
-        .style(Style::default().fg(Color::White));
+    // No Wrap — we already split lines manually
+    let widget = Paragraph::new(display_lines).block(block).style(Style::default().fg(Color::White));
+    frame.render_widget(widget, input_area);
 
-    frame.render_widget(input_widget, input_area);
-
-    // Cursor — account for line wrapping
-    let inner_width = input_area.width.saturating_sub(2 + H_PADDING * 2) as usize;
-    let current_line = &input.lines[input.cursor_row];
-    let safe_col = if input.cursor_col >= current_line.len() {
-        current_line.len()
-    } else if current_line.is_char_boundary(input.cursor_col) {
-        input.cursor_col
-    } else {
-        current_line[..input.cursor_col]
-            .char_indices()
-            .last()
-            .map(|(i, c)| i + c.len_utf8())
-            .unwrap_or(0)
-    };
-    let text_before_cursor = &current_line[..safe_col];
-    let display_col = unicode_display_width(text_before_cursor);
-
-    // Account for visual line wrapping: a long line wraps into multiple visual rows.
-    // cursor_x = display_col % inner_width (position within the wrapped line)
-    // extra_rows = display_col / inner_width (how many wrapped rows above)
-    let (cursor_col_in_wrap, wrap_extra_rows) = if inner_width > 0 {
-        (display_col % inner_width, display_col / inner_width)
-    } else {
-        (display_col, 0)
-    };
-
-    // Also count wrapped rows from PREVIOUS lines (lines before cursor_row)
-    let mut prev_wrap_rows = 0usize;
-    if !is_empty {
-        let start_line = if input.lines.len() > (area.height as usize).saturating_sub(2) {
-            // In scroll mode — count from scroll start
-            let max_vis = (area.height as usize).saturating_sub(2);
-            let half = max_vis / 2;
-            if input.cursor_row <= half { 0 }
-            else if input.cursor_row + half >= input.lines.len() {
-                input.lines.len().saturating_sub(max_vis)
-            } else { input.cursor_row - half }
-        } else { 0 };
-
-        for i in start_line..input.cursor_row.min(input.lines.len()) {
-            let line_width = unicode_display_width(&input.lines[i]);
-            if inner_width > 0 && line_width > inner_width {
-                prev_wrap_rows += line_width / inner_width;
-            }
-        }
-    }
-
-    let cursor_x = input_area.x + 1 + H_PADDING + cursor_col_in_wrap as u16;
-    let total_row = visible_row + wrap_extra_rows + prev_wrap_rows;
-    let cursor_y = input_area.y + 1 + total_row as u16;
-
-    // Clamp to input area bounds
+    // Cursor position — exact because we track visual rows ourselves
+    let cursor_row_in_view = cursor_visual_row.saturating_sub(scroll_offset);
+    let cursor_x = input_area.x + 1 + H_PADDING + cursor_visual_col as u16;
+    let cursor_y = input_area.y + 1 + cursor_row_in_view as u16;
     let max_y = input_area.y + input_area.height.saturating_sub(2);
     frame.set_cursor_position((cursor_x, cursor_y.min(max_y)));
 }
 
-fn unicode_display_width(s: &str) -> usize {
-    s.chars().map(|c| if is_wide_char(c) { 2 } else { 1 }).sum()
+/// Convert byte offset to char index
+fn char_index_at_byte(s: &str, byte_pos: usize) -> usize {
+    s.char_indices()
+        .position(|(i, _)| i >= byte_pos)
+        .unwrap_or_else(|| s.chars().count())
+}
+
+/// Sum display widths for chars[start..end]
+fn display_width_range(widths: &[usize], start: usize, end: usize) -> usize {
+    widths[start..end.min(widths.len())].iter().sum()
 }
 
 fn is_wide_char(c: char) -> bool {
     let cp = c as u32;
-    (0x4E00..=0x9FFF).contains(&cp)
-        || (0x3400..=0x4DBF).contains(&cp)
-        || (0x20000..=0x2A6DF).contains(&cp)
-        || (0xF900..=0xFAFF).contains(&cp)
-        || (0xFF01..=0xFF60).contains(&cp)
-        || (0xFFE0..=0xFFE6).contains(&cp)
-        || (0xAC00..=0xD7AF).contains(&cp)
-        || (0x3000..=0x303F).contains(&cp)
-        || (0x3040..=0x309F).contains(&cp)
-        || (0x30A0..=0x30FF).contains(&cp)
-        || (0x3200..=0x32FF).contains(&cp)
-        || (0x3300..=0x33FF).contains(&cp)
+    (0x4E00..=0x9FFF).contains(&cp) || (0x3400..=0x4DBF).contains(&cp)
+        || (0x20000..=0x2A6DF).contains(&cp) || (0xF900..=0xFAFF).contains(&cp)
+        || (0xFF01..=0xFF60).contains(&cp) || (0xFFE0..=0xFFE6).contains(&cp)
+        || (0xAC00..=0xD7AF).contains(&cp) || (0x3000..=0x303F).contains(&cp)
+        || (0x3040..=0x309F).contains(&cp) || (0x30A0..=0x30FF).contains(&cp)
+        || (0x3200..=0x32FF).contains(&cp) || (0x3300..=0x33FF).contains(&cp)
 }
 
-/// Input box height: grows with content, max half terminal height.
-pub fn height(input: &InputState, terminal_height: u16, terminal_width: u16, has_attachments: bool) -> u16 {
+/// Input box height: counts visual lines (including manual wrapping).
+pub fn height(input: &InputState, terminal_height: u16, terminal_width: u16, has_attachments: bool, has_paste: bool) -> u16 {
     let tag_height = if has_attachments { 1 } else { 0 };
+    let paste_height: u16 = if has_paste { 1 } else { 0 };
     let min_height = 3 + tag_height;
-    let max_content: u16 = 10;
+    let max_content: u16 = 8;
     let max_height = (max_content + 2 + tag_height).min(terminal_height / 2);
 
-    // Inner width: terminal width - 2 borders - 2*H_PADDING
     let inner_width = terminal_width.saturating_sub(2 + H_PADDING * 2) as usize;
     let inner_width = inner_width.max(1);
 
-    // Count VISUAL lines (including word wrap)
     let visual_lines: u16 = input.lines.iter().map(|line| {
-        let w = unicode_display_width_line(line);
-        if w > inner_width {
-            ((w + inner_width - 1) / inner_width) as u16
-        } else {
-            1
-        }
+        let w: usize = line.chars().map(|c| if is_wide_char(c) { 2 } else { 1 }).sum();
+        if w > inner_width { ((w + inner_width - 1) / inner_width) as u16 } else { 1 }
     }).sum();
 
-    (visual_lines + 2 + tag_height).clamp(min_height, max_height)
-}
-
-fn unicode_display_width_line(s: &str) -> usize {
-    s.chars().map(|c| if is_wide_char(c) { 2 } else { 1 }).sum()
+    (visual_lines + paste_height + 2 + tag_height).clamp(min_height, max_height)
 }
