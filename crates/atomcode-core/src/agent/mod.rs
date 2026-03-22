@@ -1775,6 +1775,37 @@ fn collect_project_files(
 fn repair_json(s: &str) -> String {
     let mut result = s.to_string();
 
+    // Fix invalid JSON backslash escapes: \. \( \) \| \w \d \s \+ \* etc.
+    // JSON only allows: \\ \" \/ \n \r \t \b \f \uXXXX
+    // Models often write regex like @app\.(get|post) which has \. — invalid in JSON.
+    // Fix by doubling the backslash: \. → \\. so JSON parses it as literal backslash + dot.
+    let valid_escapes = ['\\', '"', '/', 'n', 'r', 't', 'b', 'f', 'u'];
+    let chars: Vec<char> = result.chars().collect();
+    let mut fixed = String::with_capacity(result.len() + 20);
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '\\' && i + 1 < chars.len() {
+            let next = chars[i + 1];
+            if valid_escapes.contains(&next) {
+                // Valid JSON escape — keep as-is
+                fixed.push('\\');
+                fixed.push(next);
+                i += 2;
+            } else {
+                // Invalid JSON escape (like \. \( \| \w \d \s \+ \*)
+                // Double the backslash so JSON parser sees \\ followed by the char
+                fixed.push('\\');
+                fixed.push('\\');
+                fixed.push(next);
+                i += 2;
+            }
+        } else {
+            fixed.push(chars[i]);
+            i += 1;
+        }
+    }
+    result = fixed;
+
     // Remove leading/trailing whitespace and any markdown code fences
     result = result.trim().to_string();
     if result.starts_with("```json") {
