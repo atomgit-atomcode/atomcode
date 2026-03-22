@@ -154,10 +154,11 @@ impl MarkdownRenderer {
                     code_buf.clear();
                 }
 
-                // Paragraphs — no extra blank line after, just flush
+                // Paragraphs — blank line after for breathing room
                 Event::Start(Tag::Paragraph) => {}
                 Event::End(TagEnd::Paragraph) => {
                     flush(&mut lines, &mut spans);
+                    lines.push(Line::default());
                 }
 
                 // Lists
