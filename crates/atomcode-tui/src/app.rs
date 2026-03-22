@@ -553,14 +553,35 @@ impl App {
 
         match event {
             AppEvent::Key(key) => {
-                // Any keypress clears the current selection
                 self.selection.has_selection = false;
+
+                // Paste detection for terminals without bracketed paste:
+                // If a printable char or Enter arrives very fast (<10ms since last key),
+                // it's probably pasted text. Collect it into a buffer and flush later.
+                let now = Instant::now();
+                let interval_ms = now.duration_since(self.last_key_time).as_millis();
+                self.last_key_time = now;
+
+                if interval_ms < 10 && matches!(self.mode, AppMode::Normal) {
+                    // Rapid input — likely paste. Handle Enter as newline, chars as insert.
+                    match key.code {
+                        KeyCode::Enter => {
+                            self.input.insert_newline();
+                            return;
+                        }
+                        KeyCode::Char(c) => {
+                            self.input.insert_char(c);
+                            self.suggestion = None;
+                            return;
+                        }
+                        _ => {} // Other keys processed normally
+                    }
+                }
+
                 self.handle_key(key, event_tx);
             }
             AppEvent::Paste(text) => {
-                // Always insert pasted text directly into input (like Claude Code).
-                // User can see and edit it before sending. Collapsing happens
-                // in chat_panel AFTER sending, not in the input box.
+                // Bracketed paste — direct insert (preferred path)
                 if matches!(self.mode, AppMode::Normal) {
                     self.input.insert_text(&text);
                     self.suggestion = None;
