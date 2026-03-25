@@ -23,7 +23,7 @@ use atomcode_core::tool::web_search::WebSearchTool;
 use atomcode_core::tool::web_fetch::WebFetchTool;
 
 #[derive(Parser)]
-#[command(name = "atomcode", version = "0.2.0", about = "AI coding assistant in your terminal")]
+#[command(name = "atomcode", version = env!("CARGO_PKG_VERSION"), about = "AI coding assistant in your terminal")]
 struct Cli {
     /// Provider to use (overrides config default)
     #[arg(long)]

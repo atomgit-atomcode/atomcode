@@ -16,16 +16,21 @@
   <a href="#installation">Install</a> ·
   <a href="#quick-start">Quick Start</a> ·
   <a href="#features">Features</a> ·
-  <a href="#supported-providers">Providers</a> ·
-  <a href="#architecture">Architecture</a>
+  <a href="#architecture">Architecture</a> ·
+  <a href="#development">Development</a> ·
+  <a href="#contributing">Contributing</a>
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.2.0--alpha-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-2.1.0-blue" alt="version">
   <img src="https://img.shields.io/badge/rust-1.75%2B-orange" alt="rust">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="license">
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey" alt="platform">
 </p>
+
+---
+
+> **This project is 100% AI-generated.** Every line of code, every architectural decision's implementation, and every commit was written by AI. The human developer serves solely as the decision-maker and product manager — defining what to build, not how to build it.
 
 ---
 
@@ -284,35 +289,146 @@ AtomCode reads this file automatically and includes it in the system prompt.
 - [ ] Persistent memory across sessions
 - [ ] Web UI mode (optional browser interface)
 
-## Contributing
+## Development
 
-Contributions are welcome! AtomCode is in active development (alpha stage).
+### Prerequisites
+
+- **Rust 1.75+** — install via [rustup](https://rustup.rs/)
+- **Git**
+- A supported LLM provider API key (for runtime testing)
+
+### Build from Source
 
 ```bash
-# Clone and build
 git clone https://github.com/YubangXu/atomcode.git
 cd atomcode
+
+# Debug build (fast compilation, slower runtime)
 cargo build
 
-# Run in development
+# Release build (slower compilation, optimized binary)
+cargo build --release
+```
+
+### Run in Development
+
+```bash
+# Run directly with cargo (debug mode)
 cargo run
 
-# Run tests
+# Run with arguments
+cargo run -- -C /path/to/project
+cargo run -- --model gpt-4o
+
+# Run release build
+cargo run --release
+```
+
+### Testing
+
+```bash
+# Run all tests
 cargo test
+
+# Run tests for a specific crate
+cargo test -p atomcode-core
+cargo test -p atomcode-tui
+
+# Run a specific test
+cargo test -p atomcode-core test_name
 ```
 
 ### Project Structure
 
-- `crates/atomcode-core/` — Add new tools, providers, or agent capabilities here
-- `crates/atomcode-tui/` — UI changes, rendering, keybindings
-- `crates/atomcode-cli/` — CLI arguments, startup flow
+```
+atomcode/
+  Cargo.toml                 # Workspace root — version defined here
+  crates/
+    atomcode-core/           # Headless library (no TUI dependency)
+      src/
+        agent/               # AgentLoop: autonomous tool-use loop
+        config/              # Config loading, provider configs
+        conversation/        # Message types, windowed context
+        provider/            # LlmProvider trait + OpenAI/Claude/Ollama
+        tool/                # Tool trait + built-in tool implementations
+        stream/              # StreamEvent protocol
+    atomcode-tui/            # Terminal UI (ratatui + crossterm)
+      src/
+        app.rs               # App state machine
+        ui/                  # Render: chat, input, status bar, markdown
+    atomcode-cli/            # Binary entry point
+      src/
+        main.rs              # CLI args, first-run wizard, launch
+```
+
+### Useful Commands
+
+```bash
+# Check compilation without building
+cargo check
+
+# Format code
+cargo fmt
+
+# Run linter
+cargo clippy
+
+# Build and install to ~/.cargo/bin
+cargo install --path crates/atomcode-cli
+```
+
+## Contributing
+
+Contributions are welcome! AtomCode is in active development.
+
+### How to Contribute
+
+1. **Fork** the repository on GitHub
+2. **Clone** your fork locally:
+   ```bash
+   git clone https://github.com/<your-username>/atomcode.git
+   cd atomcode
+   ```
+3. **Create a branch** for your change:
+   ```bash
+   git checkout -b feat/your-feature
+   # or
+   git checkout -b fix/your-bugfix
+   ```
+4. **Make your changes**, ensure the project builds and tests pass:
+   ```bash
+   cargo build && cargo test && cargo clippy
+   ```
+5. **Commit** with a clear message:
+   ```bash
+   git commit -m "feat: add xxx support"
+   ```
+6. **Push** and open a **Pull Request** against `main`
+
+### Branch Naming
+
+| Prefix | Purpose |
+|--------|---------|
+| `feat/` | New feature |
+| `fix/` | Bug fix |
+| `refactor/` | Code refactoring (no behavior change) |
+| `docs/` | Documentation only |
+| `chore/` | Build, CI, tooling changes |
 
 ### Guidelines
 
-- Follow the principles in `CLAUDE.md` — especially tech-stack neutrality
-- All tool failures must be graceful (return error as observation, never panic)
+- Follow the principles in `CLAUDE.md` — especially **tech-stack neutrality**
+- All tool failures must be graceful — return error as observation to the LLM, never panic
 - Destructive operations must require user approval
-- Keep the system prompt compact (currently ~1.5K tokens)
+- Keep the system prompt compact (~1.5K tokens)
+- Run `cargo fmt` and `cargo clippy` before submitting
+
+### Where to Start
+
+- **Add a new tool** — implement the `Tool` trait in `crates/atomcode-core/src/tool/`
+- **Add a new provider** — implement `LlmProvider` in `crates/atomcode-core/src/provider/`
+- **Improve the UI** — rendering lives in `crates/atomcode-tui/src/ui/`
+- **Fix bugs** — check [Issues](https://github.com/YubangXu/atomcode/issues) for open bugs
 
 ## License
 

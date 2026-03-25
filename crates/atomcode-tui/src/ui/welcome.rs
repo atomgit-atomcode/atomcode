@@ -42,7 +42,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
 
     // Version + model
     lines.push(Line::from(vec![
-        Span::styled("  v1.2.0", Style::default().fg(Color::Rgb(65, 68, 80))),
+        Span::styled(format!("  v{}", env!("CARGO_PKG_VERSION")), Style::default().fg(Color::Rgb(65, 68, 80))),
         Span::styled(
             format!("  \u{00b7}  {}", app.model_name),
             Style::default().fg(Color::Rgb(100, 170, 235)),
