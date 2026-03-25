@@ -306,6 +306,54 @@ fn surrounding_context(new_content: &str, new_string: &str) -> String {
     ctx
 }
 
+/// Post-edit context: give the model the file's current state so it doesn't re-read.
+///
+/// - Files <= 500 lines: return the FULL file with line numbers.
+///   This eliminates re-reads entirely — the model has everything in the latest message.
+/// - Files > 500 lines: return outline + 40 lines of surrounding context around the edit.
+fn post_edit_context(new_content: &str, new_string: &str) -> String {
+    let lines: Vec<&str> = new_content.lines().collect();
+
+    if lines.len() <= 500 {
+        // Full file — model has zero reason to re-read.
+        let mut out = format!(
+            "\n[Full file after edit ({} lines) — do NOT re-read this file:]\n",
+            lines.len()
+        );
+        for (i, line) in lines.iter().enumerate() {
+            out.push_str(&format!("{:>4}| {}\n", i + 1, line));
+        }
+        return out;
+    }
+
+    // Large file: outline + surrounding context around the edit location.
+    let outline = file_outline(new_content);
+
+    // Find where the new content was inserted.
+    let new_first = new_string.lines().next().unwrap_or("").trim();
+    let center = if !new_first.is_empty() {
+        lines.iter().position(|l| l.trim().contains(new_first)).unwrap_or(0)
+    } else {
+        0
+    };
+
+    let start = center.saturating_sub(20);
+    let end = (center + 20).min(lines.len());
+
+    let mut ctx = format!(
+        "\n[File after edit ({} lines). Context around edit (lines {}-{}):]:\n",
+        lines.len(), start + 1, end
+    );
+    for i in start..end {
+        ctx.push_str(&format!("{:>4}| {}\n", i + 1, lines[i]));
+    }
+    if end < lines.len() {
+        ctx.push_str(&format!("     ... ({} more lines)\n", lines.len() - end));
+    }
+
+    format!("{}\n{}", outline, ctx)
+}
+
 /// Build a structural outline of the file after edit.
 /// Shows top-level lines (indent 0-1) with line numbers so the model
 /// knows the file's structure and can plan its next edit without re-reading.

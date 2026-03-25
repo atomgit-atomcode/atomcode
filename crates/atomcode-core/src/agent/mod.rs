@@ -161,6 +161,12 @@ pub struct AgentLoop {
 
     /// Pending user input appended during streaming. Injected before next LLM call.
     pending_input: Option<String>,
+    /// Recently edited file contents — injected at the END of messages in call_llm
+    /// so the model has the latest file content in its highest-attention zone.
+    /// Key: short file name, Value: (full_path, content).
+    recent_file_cache: std::collections::HashMap<String, (String, String)>,
+    /// Whether planning phase is active (first LLM call without tools to force a plan).
+    planning_phase: bool,
 
     /// Discovered service URLs extracted from tool outputs (e.g., "http://localhost:3002").
     /// Persisted across turns so the model knows which ports are active.
@@ -230,6 +236,8 @@ impl AgentLoop {
             consecutive_verify_count: 0,
             executed_cmds: std::collections::HashMap::new(),
             pending_input: None,
+            planning_phase: false,
+            recent_file_cache: std::collections::HashMap::new(),
             active_services: std::collections::HashMap::new(),
             result_store: ToolResultStore::new(ToolResultStore::default_dir()),
             cmd_rx,
@@ -327,8 +335,14 @@ impl AgentLoop {
         self.sleep_count = 0;
         self.consecutive_verify_count = 0;
         self.executed_cmds.clear();
+        self.recent_file_cache.clear();
         self.turn_start = Some(Instant::now());
         self.cancel_token = CancellationToken::new();
+
+        // Detect if this task needs a planning phase.
+        // Feature tasks (create/implement/refactor) benefit from planning first.
+        // Simple tasks (fix bug, change style, start server) should act directly.
+        self.planning_phase = Self::needs_planning(&content);
 
         self.phase = AgentPhase::Thinking;
         let _ = self
@@ -336,6 +350,32 @@ impl AgentLoop {
             .send(AgentEvent::PhaseChange(AgentPhase::Thinking));
 
         self.call_llm().await;
+    }
+
+    /// Detect if a task is complex enough to benefit from a planning phase.
+    /// Returns true for feature implementation, refactoring, multi-file tasks.
+    fn needs_planning(content: &str) -> bool {
+        let s = content.to_lowercase();
+        let len = content.chars().count();
+
+        // Short messages are follow-ups or simple tasks — no plan needed.
+        if len < 15 {
+            return false;
+        }
+
+        // Follow-up messages — no plan needed.
+        let follow_up_patterns = ["继续", "没有变化", "还是不行", "不行", "报错",
+            "失败", "改对了", "好的", "ok", "对", "错", "不对",
+            "启动", "start", "install", "安装", "部署"];
+        if follow_up_patterns.iter().any(|p| s.contains(p)) {
+            return false;
+        }
+
+        // Feature/creation patterns — plan needed.
+        let feature_patterns = ["实现", "功能", "创建", "新增", "添加",
+            "重构", "refactor", "implement", "feature", "build",
+            "设计", "开发", "做一个", "做个", "帮我做"];
+        feature_patterns.iter().any(|p| s.contains(p))
     }
 
     /// DO NOT pre-read source files. Claude Code doesn't do this either.
@@ -375,7 +415,44 @@ impl AgentLoop {
             // older ones keep their summary (already compact from budgeted windowing).
             self.inflate_recent_refs(&mut messages);
 
+            // Inject recently edited file contents at the END of messages (highest attention zone).
+            // This prevents the model from re-reading files it just edited.
+            // Only the most recent 2 files, and only if they fit in budget.
+            if !self.recent_file_cache.is_empty() {
+                let mut cached: Vec<_> = self.recent_file_cache.iter().collect();
+                cached.truncate(2); // Max 2 files to avoid context bloat
+                let mut file_context = String::from(
+                    "[Recently edited files — their current content is below. Do NOT re-read these files.]\n\n"
+                );
+                for (short, (full_path, content)) in &cached {
+                    let lines: Vec<&str> = content.lines().collect();
+                    file_context.push_str(&format!("=== {} ({} lines) ===\n", short, lines.len()));
+                    for (i, line) in lines.iter().enumerate() {
+                        file_context.push_str(&format!("{:>4}| {}\n", i + 1, line));
+                    }
+                    file_context.push('\n');
+                }
+                messages.push(crate::conversation::message::Message::new(
+                    crate::conversation::message::Role::System,
+                    file_context,
+                ));
+            }
+
             let tool_defs = self.tool_registry.get_definitions();
+
+            // Planning phase: inject a planning instruction before the first LLM call.
+            // Tools are still available so the model uses proper function calling format.
+            // The model may output plan text + tool calls together — that's fine.
+            if self.planning_phase {
+                self.planning_phase = false;
+                messages.push(crate::conversation::message::Message::new(
+                    crate::conversation::message::Role::System,
+                    "This is a complex task. FIRST output a brief implementation plan (under 15 lines):\n\
+                     - List files to create/modify and what changes each needs\n\
+                     - Note the order (dependencies)\n\
+                     Then start executing the plan."
+                ));
+            }
 
             // Log the complete request to disk for debugging/analysis.
             Self::log_llm_request(
@@ -1396,6 +1473,15 @@ impl AgentLoop {
                     if let Some(fp) = parsed.get("file_path").and_then(|v| v.as_str()) {
                         let short = short_path(fp);
                         self.file_read_counts.remove(&short);
+                        // Cache file content for injection into next LLM call.
+                        // This puts the latest file in the model's highest-attention zone.
+                        if let Ok(content) = std::fs::read_to_string(fp) {
+                            let lines = content.lines().count();
+                            if lines <= 600 {
+                                // Only cache manageable files (≤600 lines ≈ 2400 tokens)
+                                self.recent_file_cache.insert(short, (fp.to_string(), content));
+                            }
+                        }
                     }
                 }
             }
@@ -1871,15 +1957,18 @@ impl AgentLoop {
             prompt.push_str(&format!("Git: {}\n", git_info));
         }
 
-        // Active services discovered from tool outputs.
+        // Active services detected via lsof + extracted from tool outputs.
         if !self.active_services.is_empty() {
-            prompt.push_str("Active services:\n");
+            prompt.push_str("Running services (live):\n");
+            let mut has_node = false;
             for (label, url) in &self.active_services {
-                prompt.push_str(&format!("  {}: {}\n", label, url));
+                prompt.push_str(&format!("  {} — {}\n", url, label));
+                if label.contains("node") {
+                    has_node = true;
+                }
             }
-            // If a dev server is running, it auto-reloads on file changes.
-            if self.active_services.contains_key("frontend") {
-                prompt.push_str("(Frontend dev server auto-reloads on save — no build command needed after editing.)\n");
+            if has_node {
+                prompt.push_str("(Node dev server detected — auto-reloads on save, no build needed.)\n");
             }
         }
 
@@ -2544,26 +2633,45 @@ impl AgentLoop {
 
     /// Detect already-running dev servers by probing common ports.
     /// Runs once at startup to populate active_services.
+    /// Detect running services via `lsof` — shows actual listening ports with process names.
+    /// No hardcoded ports. The process name (java/node/python) is the label.
     async fn detect_running_services(&mut self) {
-        let ports = [3000, 3001, 3002, 3003, 3004, 3005, 5173, 5174, 8080, 8081, 4200, 8000];
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_millis(200))
-            .build()
-            .unwrap_or_default();
+        let output = tokio::process::Command::new("lsof")
+            .args(&["-i", "-P", "-n", "-sTCP:LISTEN"])
+            .output()
+            .await;
 
-        for port in ports {
-            let url = format!("http://localhost:{}", port);
-            if let Ok(resp) = client.get(&url).send().await {
-                if resp.status().is_success() || resp.status().is_redirection() {
-                    // Guess label from port range
-                    let label = if port >= 3000 && port <= 5999 {
-                        "frontend"
-                    } else if port >= 8000 && port <= 8999 {
-                        "backend"
-                    } else {
-                        "service"
-                    };
-                    self.active_services.insert(label.to_string(), url);
+        let stdout = match output {
+            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
+            _ => return, // lsof not available or failed — skip silently
+        };
+
+        // Parse lsof output. Each line looks like:
+        // node    80162 yubangxu   23u  IPv4 0x... TCP 127.0.0.1:3004 (LISTEN)
+        // java    79842 yubangxu   45u  IPv6 0x... TCP *:8080 (LISTEN)
+        for line in stdout.lines().skip(1) { // skip header
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() < 9 {
+                continue;
+            }
+            let process = parts[0].to_lowercase();
+            // Find the TCP address:port part
+            // Match any TCP address:port — localhost, 127.0.0.1, [::1], *:
+            let addr_part = parts.iter()
+                .find(|p| p.contains(':') && (
+                    p.contains("localhost") || p.contains("127.0.0.1")
+                    || p.contains("[::1]") || p.starts_with("*:")
+                ))
+                .copied()
+                .unwrap_or("");
+
+            if let Some(colon) = addr_part.rfind(':') {
+                if let Ok(port) = addr_part[colon + 1..].parse::<u16>() {
+                    if port >= 1024 {
+                        let url = format!("http://localhost:{}", port);
+                        let label = format!("{} ({})", process, port);
+                        self.active_services.insert(label, url);
+                    }
                 }
             }
         }
