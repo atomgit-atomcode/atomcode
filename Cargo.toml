@@ -10,5 +10,5 @@ members = [
 version = "2.1.0"
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/YubangXu/atomcode"
+repository = "https://gitcode.com/bangxu/atomcode"
 description = "Open-source terminal AI coding agent"

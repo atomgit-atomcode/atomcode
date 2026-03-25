@@ -97,7 +97,7 @@ AtomCode is specifically engineered to work well with weaker/cheaper models (Dee
 ### From Source (recommended)
 
 ```bash
-git clone https://github.com/YubangXu/atomcode.git
+git clone https://gitcode.com/bangxu/atomcode.git
 cd atomcode
 cargo build --release
 ```
@@ -300,7 +300,7 @@ AtomCode reads this file automatically and includes it in the system prompt.
 ### Build from Source
 
 ```bash
-git clone https://github.com/YubangXu/atomcode.git
+git clone https://gitcode.com/bangxu/atomcode.git
 cd atomcode
 
 # Debug build (fast compilation, slower runtime)
@@ -386,7 +386,7 @@ Contributions are welcome! AtomCode is in active development.
 1. **Fork** the repository on GitHub
 2. **Clone** your fork locally:
    ```bash
-   git clone https://github.com/<your-username>/atomcode.git
+   git clone https://gitcode.com/<your-username>/atomcode.git
    cd atomcode
    ```
 3. **Create a branch** for your change:
@@ -428,7 +428,7 @@ Contributions are welcome! AtomCode is in active development.
 - **Add a new tool** — implement the `Tool` trait in `crates/atomcode-core/src/tool/`
 - **Add a new provider** — implement `LlmProvider` in `crates/atomcode-core/src/provider/`
 - **Improve the UI** — rendering lives in `crates/atomcode-tui/src/ui/`
-- **Fix bugs** — check [Issues](https://github.com/YubangXu/atomcode/issues) for open bugs
+- **Fix bugs** — check [Issues](https://gitcode.com/bangxu/atomcode/issues) for open bugs
 
 ## License
 
