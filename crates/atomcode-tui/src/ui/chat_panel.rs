@@ -352,7 +352,8 @@ fn render_tool_call(lines: &mut Vec<Line<'static>>, call: &ToolCall) {
 }
 
 // ── Tool Result ──
-// Accent bar continues, success/failure indicator
+// Claude Code style: compact one-line summary with duration.
+// Diff lines shown for edit_file only. No raw output preview.
 fn render_tool_result(lines: &mut Vec<Line<'static>>, result: &ToolResult) {
     let bar = Span::styled(format!("{}\u{2502} ", INDENT), Style::default().fg(Color::Rgb(60, 50, 110)));
     let (icon, color) = if result.success {
@@ -361,65 +362,116 @@ fn render_tool_result(lines: &mut Vec<Line<'static>>, result: &ToolResult) {
         ("\u{2717}", ERROR)
     };
 
-    let output_lines: Vec<&str> = result.output.lines().collect();
+    let output = &result.output;
 
-    if output_lines.is_empty() {
-        lines.push(Line::from(vec![
-            bar.clone(),
-            Span::styled(format!("  {} ", icon), Style::default().fg(color)),
-            Span::styled("(no output)", Style::default().fg(DIM)),
-        ]));
-        return;
-    }
+    // Extract duration if present (e.g., "(12ms)" or "(2.1s)" at the end)
+    let duration = extract_duration(output);
 
-    // First line: icon + summary
-    let first = output_lines[0];
-    let first_display = if first.chars().count() > 72 {
-        first.chars().take(69).collect::<String>() + "..."
-    } else { first.to_string() };
+    // Build a one-line summary based on output content.
+    let summary = if output.is_empty() || output.trim().is_empty() {
+        "(no output)".to_string()
+    } else if output.starts_with("Edited ") {
+        // Edit result: "Edited file (-3 +4 lines)." → keep as-is (already concise)
+        output.lines().next().unwrap_or("").to_string()
+    } else if output.starts_with("Created new file") {
+        output.lines().next().unwrap_or("").to_string()
+    } else if output.starts_with("Overwrote") {
+        output.lines().next().unwrap_or("").to_string()
+    } else if output.starts_with("Error:") || output.starts_with("error:") {
+        // Error: show first line
+        let first = output.lines().next().unwrap_or("Error");
+        if first.chars().count() > 70 {
+            format!("{}...", first.chars().take(67).collect::<String>())
+        } else {
+            first.to_string()
+        }
+    } else if output.starts_with("[BLOCKED") || output.starts_with("[Loop") || output.starts_with("[SKIPPED") {
+        output.lines().next().unwrap_or("").to_string()
+    } else {
+        // Generic: count lines, show brief
+        let line_count = output.lines().count();
+        let first = output.lines().next().unwrap_or("");
+        let first_short = if first.chars().count() > 50 {
+            format!("{}...", first.chars().take(47).collect::<String>())
+        } else {
+            first.to_string()
+        };
+        if line_count > 1 {
+            format!("{} ({} lines)", first_short, line_count)
+        } else {
+            first_short
+        }
+    };
 
-    lines.push(Line::from(vec![
+    // Main result line: icon + summary + duration
+    let mut spans = vec![
         bar.clone(),
         Span::styled(format!("  {} ", icon), Style::default().fg(color)),
-        Span::styled(first_display, Style::default().fg(DIM)),
-    ]));
+        Span::styled(summary, Style::default().fg(DIM)),
+    ];
+    if !duration.is_empty() {
+        spans.push(Span::styled(format!(" {}", duration), Style::default().fg(Color::Rgb(75, 78, 95))));
+    }
+    lines.push(Line::from(spans));
 
-    // Detail lines (up to 6)
-    let max_detail = 6;
-    let mut shown = 0;
-    for line in output_lines.iter().skip(1) {
-        if shown >= max_detail { break; }
-        let trimmed = line.trim();
-        if trimmed.is_empty() { continue; }
-
-        let text_style = if trimmed.starts_with("- ") {
-            Style::default().fg(Color::Rgb(200, 95, 95))
-        } else if trimmed.starts_with("+ ") {
-            Style::default().fg(Color::Rgb(95, 190, 115))
-        } else if trimmed.starts_with("WARNING") || trimmed.starts_with("[IMPORTANT") {
-            Style::default().fg(WARN)
-        } else {
-            Style::default().fg(Color::Rgb(95, 98, 115))
-        };
-
-        let display = if trimmed.chars().count() > 70 {
-            trimmed.chars().take(67).collect::<String>() + "..."
-        } else { trimmed.to_string() };
-
-        lines.push(Line::from(vec![
-            bar.clone(),
-            Span::styled(format!("    {}", display), text_style),
-        ]));
-        shown += 1;
+    // For edit results: show diff lines (- red, + green) — max 4 each
+    if result.success && output.contains("\n- ") || output.contains("\n+ ") {
+        let mut diff_shown = 0;
+        for line in output.lines() {
+            if diff_shown >= 6 { break; }
+            let trimmed = line.trim();
+            if trimmed.starts_with("- ") {
+                let display = if trimmed.chars().count() > 65 {
+                    format!("{}...", trimmed.chars().take(62).collect::<String>())
+                } else { trimmed.to_string() };
+                lines.push(Line::from(vec![
+                    bar.clone(),
+                    Span::styled(format!("    {}", display), Style::default().fg(Color::Rgb(200, 95, 95))),
+                ]));
+                diff_shown += 1;
+            } else if trimmed.starts_with("+ ") {
+                let display = if trimmed.chars().count() > 65 {
+                    format!("{}...", trimmed.chars().take(62).collect::<String>())
+                } else { trimmed.to_string() };
+                lines.push(Line::from(vec![
+                    bar.clone(),
+                    Span::styled(format!("    {}", display), Style::default().fg(Color::Rgb(95, 190, 115))),
+                ]));
+                diff_shown += 1;
+            }
+        }
     }
 
-    let remaining = output_lines.len().saturating_sub(1 + max_detail);
-    if remaining > 0 {
-        lines.push(Line::from(vec![
-            bar.clone(),
-            Span::styled(format!("    \u{2026} {} more lines", remaining), Style::default().fg(Color::Rgb(85, 88, 105))),
-        ]));
+    // For errors: show a few detail lines
+    if !result.success && output.lines().count() > 1 {
+        let mut shown = 0;
+        for line in output.lines().skip(1) {
+            if shown >= 3 { break; }
+            let trimmed = line.trim();
+            if trimmed.is_empty() { continue; }
+            let display = if trimmed.chars().count() > 65 {
+                format!("{}...", trimmed.chars().take(62).collect::<String>())
+            } else { trimmed.to_string() };
+            lines.push(Line::from(vec![
+                bar.clone(),
+                Span::styled(format!("    {}", display), Style::default().fg(Color::Rgb(180, 80, 80))),
+            ]));
+            shown += 1;
+        }
     }
+}
+
+/// Extract duration string from tool output (e.g., "(12ms)", "(2.1s)").
+fn extract_duration(output: &str) -> String {
+    // Look for (Nms) or (N.Ns) pattern near the end
+    let last_line = output.lines().last().unwrap_or("");
+    if let Some(start) = last_line.rfind('(') {
+        let candidate = &last_line[start..];
+        if candidate.contains("ms)") || candidate.contains("s)") {
+            return candidate.trim_end().to_string();
+        }
+    }
+    String::new()
 }
 
 // ── Approval ──
