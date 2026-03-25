@@ -13,9 +13,7 @@ use crate::app::AppMode;
 use super::markdown::{render_markdown, wrap_lines};
 
 // ── Palette ──
-const TEXT: Color = Color::Rgb(210, 212, 220);
 const DIM: Color = Color::Rgb(110, 113, 128);
-const ACCENT: Color = Color::Rgb(140, 110, 255);
 const USER_FG: Color = Color::Rgb(220, 222, 230);
 const USER_LABEL: Color = Color::Rgb(90, 170, 255);
 const TOOL_ICON: Color = Color::Rgb(80, 165, 230);
@@ -23,7 +21,6 @@ const TOOL_DIM: Color = Color::Rgb(100, 103, 118);
 const SUCCESS: Color = Color::Rgb(75, 195, 115);
 const ERROR: Color = Color::Rgb(235, 80, 80);
 const WARN: Color = Color::Rgb(240, 190, 55);
-const SEPARATOR: Color = Color::Rgb(35, 38, 48);
 
 // Braille spinner
 const SPINNER: &[&str] = &["\u{280b}", "\u{2819}", "\u{2839}", "\u{2838}", "\u{283c}", "\u{2834}", "\u{2826}", "\u{2827}", "\u{2807}", "\u{280f}"];
@@ -43,8 +40,8 @@ pub fn render(
     at_bottom: bool,
     mode: &AppMode,
     tick: usize,
-    turn_tokens: usize,
-    turn_elapsed_secs: Option<u64>,
+    _turn_tokens: usize,
+    _turn_elapsed_secs: Option<u64>,
     turn_label_seed: usize,
     step_count: usize,
     tool_info: &str,
@@ -554,6 +551,7 @@ fn capitalize(name: &str) -> String {
     }).collect::<Vec<_>>().join(" ")
 }
 
+#[allow(dead_code)]
 fn build_turn_stats(elapsed_secs: Option<u64>, tokens: usize) -> String {
     let mut parts: Vec<String> = Vec::new();
     if let Some(secs) = elapsed_secs {
@@ -573,6 +571,7 @@ fn build_turn_stats(elapsed_secs: Option<u64>, tokens: usize) -> String {
     else { format!("  {}", parts.join(" \u{00b7} ")) }
 }
 
+#[allow(dead_code)]
 fn format_compact_tokens(n: usize) -> String {
     if n < 1000 { format!("{}", n) }
     else if n < 1_000_000 { format!("{:.1}k", n as f64 / 1000.0) }

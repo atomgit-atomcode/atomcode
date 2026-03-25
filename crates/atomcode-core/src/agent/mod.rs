@@ -424,7 +424,7 @@ impl AgentLoop {
                 let mut file_context = String::from(
                     "[Recently edited files — their current content is below. Do NOT re-read these files.]\n\n"
                 );
-                for (short, (full_path, content)) in &cached {
+                for (short, (_full_path, content)) in &cached {
                     let lines: Vec<&str> = content.lines().collect();
                     file_context.push_str(&format!("=== {} ({} lines) ===\n", short, lines.len()));
                     for (i, line) in lines.iter().enumerate() {
@@ -775,7 +775,7 @@ impl AgentLoop {
                 r = futures::future::join_all(handles) => r,
             };
 
-            let total_duration = start.elapsed();
+            let _total_duration = start.elapsed();
 
             // Phase 3: Convert raw results into ToolResults and queue them.
             // They'll be processed one-by-one through handle_tool_result which
@@ -1280,7 +1280,7 @@ impl AgentLoop {
                                 .filter_map(|m| {
                                     if let crate::conversation::message::MessageContent::AssistantWithToolCalls { tool_calls, .. } = &m.content {
                                         for tc in tool_calls {
-                                            if (tc.name == "edit_file" || tc.name == "write_file") {
+                                            if tc.name == "edit_file" || tc.name == "write_file" {
                                                 if let Ok(a) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
                                                     if let Some(fp) = a.get("file_path").and_then(|v| v.as_str()) {
                                                         return Some(fp.to_string());
@@ -1519,7 +1519,7 @@ impl AgentLoop {
 
             // System reminders: re-inject rules + task every 4 steps.
             // This is the #1 technique Claude Code uses to keep weak models on track.
-            if self.tool_call_count > 0 && self.tool_call_count % 4 == 0 {
+            if self.tool_call_count > 0 && self.tool_call_count.is_multiple_of(4) {
                 let task_hint = if self.current_task.chars().count() > 100 {
                     format!("{}...", self.current_task.chars().take(97).collect::<String>())
                 } else {
@@ -1527,7 +1527,7 @@ impl AgentLoop {
                 };
 
                 // Check if we already have successful edits — if so, maybe we're done
-                let has_edits = self.conversation.messages.iter().rev()
+                let _has_edits = self.conversation.messages.iter().rev()
                     .take(self.tool_call_count * 2 + 2)
                     .any(|m| {
                         if let (Some(true), Some(out)) = (m.tool_result_success(), m.tool_result_output()) {
@@ -1549,7 +1549,7 @@ impl AgentLoop {
                     self.files_edited_this_turn.join(", ")
                 };
 
-                let unedited: Vec<&String> = self.files_read_this_turn.iter()
+                let _unedited: Vec<&String> = self.files_read_this_turn.iter()
                     .filter(|f| !self.files_edited_this_turn.contains(f))
                     .collect();
 
@@ -1736,7 +1736,7 @@ impl AgentLoop {
         let mut siblings: Vec<String> = Vec::new();
         let mut seen_dirs: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-        for edited in &self.files_edited_this_turn {
+        for _edited in &self.files_edited_this_turn {
             // Reconstruct full path from short path
             // edited is like ".../views/SearchView.vue"
             // We need to find the directory and list siblings
@@ -2093,6 +2093,7 @@ impl AgentLoop {
     /// Analyze the user's task message and the project file tree to suggest
     /// which files are most likely relevant. This reduces the number of exploratory
     /// reads the model needs to do.
+    #[allow(dead_code)]
     fn suggest_files_for_task(&self, task: &str, working_dir: &std::path::Path) -> String {
         let mut suggestions = Vec::new();
 
@@ -2221,10 +2222,10 @@ impl AgentLoop {
                     let read_count = self.file_read_counts.get(&short).copied().unwrap_or(0);
                     if read_count == 0 && (args.get("offset").is_some() || args.get("limit").is_some()) {
                         // First read — remove offset/limit to get the full file.
-                        args.as_object_mut().map(|o| {
-                            o.remove("offset");
-                            o.remove("limit");
-                        });
+                        if let Some(obj) = args.as_object_mut() {
+                            obj.remove("offset");
+                            obj.remove("limit");
+                        }
                     }
                 }
             }
@@ -2686,7 +2687,7 @@ impl AgentLoop {
     ) {
         // Find all http://localhost:NNNN patterns in the output.
         let mut i = 0;
-        let bytes = output.as_bytes();
+        let _bytes = output.as_bytes();
         while i < output.len() {
             if let Some(pos) = output[i..].find("http://localhost:") {
                 let start = i + pos;
@@ -2799,6 +2800,7 @@ impl AgentLoop {
 }
 
 /// Extract file_path from tool call arguments JSON.
+#[allow(dead_code)]
 fn extract_file_from_args(args: &str) -> Option<String> {
     serde_json::from_str::<serde_json::Value>(args)
         .ok()?
@@ -2808,6 +2810,7 @@ fn extract_file_from_args(args: &str) -> Option<String> {
 }
 
 /// Extract command from bash tool call arguments.
+#[allow(dead_code)]
 fn extract_cmd_from_args(args: &str) -> Option<String> {
     serde_json::from_str::<serde_json::Value>(args)
         .ok()?
@@ -2994,6 +2997,7 @@ fn unescape_field_value_end(raw: &str) -> String {
 use crate::tool::SKIP_DIRS;
 
 /// Collect all file paths in a directory tree up to max_depth.
+#[allow(dead_code)]
 fn collect_project_files(
     dir: &std::path::Path,
     depth: usize,
@@ -3122,7 +3126,7 @@ fn repair_json(s: &str) -> String {
     let rchars: Vec<char> = result.chars().collect();
     let mut ri = 0;
     while ri < rchars.len() {
-        if (rchars[ri] == '{' || rchars[ri] == ',') {
+        if rchars[ri] == '{' || rchars[ri] == ',' {
             fixed.push(rchars[ri]);
             ri += 1;
             // Skip whitespace

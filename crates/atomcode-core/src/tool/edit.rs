@@ -126,7 +126,7 @@ impl Tool for EditFileTool {
         let old_lines = parsed.old_string.lines().count();
         let new_lines = parsed.new_string.lines().count();
         let net_deleted = old_lines.saturating_sub(new_lines);
-        let deletion_warning = if net_deleted > 10 {
+        let _deletion_warning = if net_deleted > 10 {
             format!(
                 "\nWARNING: You removed {} more lines than you added. If you only meant to ADD a skeleton/loading section, \
                  use v-if/v-else to show it ALONGSIDE the existing content, not INSTEAD of it.",
@@ -138,7 +138,7 @@ impl Tool for EditFileTool {
 
         if parsed.replace_all {
             // Safety check: warn about high replacement count
-            let replace_warning = if count > 10 {
+            let _replace_warning = if count > 10 {
                 format!(
                     "\nWARNING: Replaced {} occurrences. This many replacements may have changed structural \
                      elements (tags, brackets) that should not be bulk-replaced. Verify the file structure.",
@@ -193,6 +193,7 @@ impl Tool for EditFileTool {
 
 /// Try fuzzy matching: normalize whitespace (trim each line) and try to match.
 /// `replace_all` controls whether all matches or just a unique one should be replaced.
+#[allow(dead_code)]
 fn try_fuzzy_replace(
     content: &str,
     old_string: &str,
@@ -283,6 +284,7 @@ fn try_fuzzy_replace(
 
 /// Show the surrounding context after an edit so the model doesn't need to re-read.
 /// Returns ~10 lines around the replacement location with line numbers.
+#[allow(dead_code)]
 fn surrounding_context(new_content: &str, new_string: &str) -> String {
     let lines: Vec<&str> = new_content.lines().collect();
     let new_first = new_string.lines().next().unwrap_or("").trim();
@@ -311,6 +313,7 @@ fn surrounding_context(new_content: &str, new_string: &str) -> String {
 /// - Files <= 500 lines: return the FULL file with line numbers.
 ///   This eliminates re-reads entirely — the model has everything in the latest message.
 /// - Files > 500 lines: return outline + 40 lines of surrounding context around the edit.
+#[allow(dead_code)]
 fn post_edit_context(new_content: &str, new_string: &str) -> String {
     let lines: Vec<&str> = new_content.lines().collect();
 

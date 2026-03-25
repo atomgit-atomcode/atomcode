@@ -1580,6 +1580,7 @@ impl App {
     }
 
     /// Handle typing in the input box — works in any mode (Normal, Streaming, etc.)
+    #[allow(dead_code)]
     fn handle_key_input(&mut self, key: KeyEvent) {
         match (key.modifiers, key.code) {
             (KeyModifiers::SHIFT, KeyCode::Enter) => {

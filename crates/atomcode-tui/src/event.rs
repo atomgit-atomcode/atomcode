@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use crossterm::event::{Event, EventStream, KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{Event, EventStream, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use futures::StreamExt;
 use tokio::sync::mpsc;
 

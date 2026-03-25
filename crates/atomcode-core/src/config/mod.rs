@@ -82,16 +82,17 @@ When you rewrite a file from scratch, you WILL forget API calls, state managemen
 
 /// Windows-specific rules appended to the system prompt.
 /// Only injected on Windows builds — macOS/Linux never see these.
-pub const WINDOWS_RULES: &str = "\
+#[allow(clippy::needless_raw_string_hashes)]
+pub const WINDOWS_RULES: &str = r##"\
 
 ## WINDOWS PLATFORM RULES:
 
 - Bash runs via cmd.exe, NOT WSL. Use Windows syntax: dir (not ls), where (not which), type (not cat).
-- Path separators: use \\\\ in commands. Example: cd src\\\\components
+- Path separators: use \\ in commands. Example: cd src\\components
 - Install tools: use winget, choco, or direct download. NOT apt/brew.
 - Check tools: where <tool_name> (not which).
-- PowerShell: for complex scripts, use powershell -Command \"...\"
-- Virtual environments: check for Scripts\\\\ subdirectory (not bin/)";
+- PowerShell: for complex scripts, use powershell -Command "..."
+- Virtual environments: check for Scripts\\ subdirectory (not bin/)"##;
 
 /// macOS-specific rules (minimal — macOS is the primary dev platform).
 pub const MACOS_RULES: &str = "";
