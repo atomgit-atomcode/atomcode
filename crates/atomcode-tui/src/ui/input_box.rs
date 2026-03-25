@@ -21,13 +21,13 @@ pub fn render(frame: &mut Frame, area: Rect, input: &InputState, is_busy: bool, 
     let (visual_lines, cursor_visual_row, cursor_visual_col) = if is_empty {
         let placeholder = if let Some(sug) = suggestion {
             vec![Line::from(vec![
-                Span::styled(sug.to_string(), Style::default().fg(Color::Rgb(70, 70, 70))),
-                Span::styled("  Tab", Style::default().fg(Color::Rgb(50, 50, 50))),
+                Span::styled(sug.to_string(), Style::default().fg(Color::Rgb(60, 62, 72))),
+                Span::styled("  Tab", Style::default().fg(Color::Rgb(45, 47, 55))),
             ])]
         } else {
             vec![Line::from(Span::styled(
-                "Ask anything... (Enter to send, / for commands)",
-                Style::default().fg(Color::DarkGray),
+                "Ask anything\u{2026}",
+                Style::default().fg(Color::Rgb(55, 58, 70)),
             ))]
         };
         (placeholder, 0usize, 0usize)
@@ -42,8 +42,12 @@ pub fn render(frame: &mut Frame, area: Rect, input: &InputState, is_busy: bool, 
             let char_count = pt.len();
             vis_lines.push(Line::from(vec![
                 Span::styled(
-                    format!("[Pasted text ({} lines, {} chars)]", line_count, char_count),
-                    Style::default().fg(Color::Rgb(130, 160, 210)),
+                    "\u{25a0} Pasted text ".to_string(),
+                    Style::default().fg(Color::Rgb(100, 130, 185)),
+                ),
+                Span::styled(
+                    format!("({} lines, {} chars)", line_count, char_count),
+                    Style::default().fg(Color::Rgb(70, 75, 90)),
                 ),
             ]));
         }
@@ -126,8 +130,8 @@ pub fn render(frame: &mut Frame, area: Rect, input: &InputState, is_busy: bool, 
         (visual_lines[start..end].to_vec(), start)
     };
 
-    let border_color = if is_busy { Color::Rgb(80, 80, 60) } else { Color::Rgb(100, 100, 100) };
-    let prompt = Span::styled(" > ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
+    let border_color = if is_busy { Color::Rgb(65, 62, 48) } else { Color::Rgb(60, 62, 75) };
+    let prompt = Span::styled(" \u{276f} ", Style::default().fg(Color::Rgb(100, 180, 255)).add_modifier(Modifier::BOLD));
     let block = Block::default()
         .borders(Borders::ALL)
         .border_set(border::ROUNDED)

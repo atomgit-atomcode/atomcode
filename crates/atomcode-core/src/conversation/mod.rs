@@ -1,13 +1,17 @@
 pub mod message;
+pub mod turn;
 
 use crate::tool::{ToolCall, ToolCallBuffer, ToolResult};
+use crate::tool::result_store::ToolResultRef;
 use message::{Message, MessageContent, Role};
+use turn::TurnTracker;
 
 #[derive(Debug)]
 pub struct Conversation {
     pub messages: Vec<Message>,
     pub stream_buffer: Option<String>,
     pub tool_call_buffer: Option<ToolCallBuffer>,
+    pub turn_tracker: TurnTracker,
 }
 
 impl Default for Conversation {
@@ -16,6 +20,7 @@ impl Default for Conversation {
             messages: Vec::new(),
             stream_buffer: None,
             tool_call_buffer: None,
+            turn_tracker: TurnTracker::new(),
         }
     }
 }
@@ -47,10 +52,13 @@ impl Conversation {
 
         let len = messages.len();
         let start = if len > MAX_MESSAGES { len - MAX_MESSAGES } else { 0 };
+        let msgs = messages[start..].to_vec();
+        let turn_tracker = TurnTracker::rebuild(&msgs);
         Self {
-            messages: messages[start..].to_vec(),
+            messages: msgs,
             stream_buffer: None,
             tool_call_buffer: None,
+            turn_tracker,
         }
     }
 
@@ -73,15 +81,20 @@ impl Conversation {
     }
 
     /// Trim old messages to keep within MAX_MESSAGES limit.
+    /// Rebuilds turn tracker indices when messages are drained.
     fn trim(&mut self) {
         if self.messages.len() > MAX_MESSAGES {
             let excess = self.messages.len() - MAX_MESSAGES;
             self.messages.drain(..excess);
+            // Indices shifted — rebuild turn tracker from scratch.
+            self.turn_tracker = TurnTracker::rebuild(&self.messages);
         }
     }
 
     pub fn add_user_message(&mut self, content: &str) {
+        let idx = self.messages.len();
         self.messages.push(Message::new(Role::User, content));
+        self.turn_tracker.on_user_message(idx);
         self.trim();
     }
 
@@ -94,12 +107,15 @@ impl Conversation {
 
     pub fn finalize_stream(&mut self) {
         if let Some(content) = self.stream_buffer.take() {
+            let idx = self.messages.len();
             self.messages.push(Message::new(Role::Assistant, content));
+            self.turn_tracker.on_message_added(idx);
             self.trim();
         }
     }
 
     pub fn add_assistant_tool_calls(&mut self, text: Option<&str>, tool_calls: Vec<ToolCall>) {
+        let idx = self.messages.len();
         self.messages.push(Message {
             role: Role::Assistant,
             content: MessageContent::AssistantWithToolCalls {
@@ -107,14 +123,27 @@ impl Conversation {
                 tool_calls,
             },
         });
+        self.turn_tracker.on_message_added(idx);
         self.trim();
     }
 
     pub fn add_tool_result(&mut self, result: ToolResult) {
+        let idx = self.messages.len();
         self.messages.push(Message {
             role: Role::Tool,
             content: MessageContent::ToolResult(result),
         });
+        self.turn_tracker.on_message_added(idx);
+        self.trim();
+    }
+
+    pub fn add_tool_result_ref(&mut self, result_ref: ToolResultRef) {
+        let idx = self.messages.len();
+        self.messages.push(Message {
+            role: Role::Tool,
+            content: MessageContent::ToolResultRef(result_ref),
+        });
+        self.turn_tracker.on_message_added(idx);
         self.trim();
     }
 
@@ -147,7 +176,7 @@ impl Conversation {
         // - Skip AssistantWithToolCalls without their following ToolResults
         while start < self.messages.len() {
             match &self.messages[start].content {
-                MessageContent::ToolResult(_) => {
+                MessageContent::ToolResult(_) | MessageContent::ToolResultRef(_) => {
                     // Orphan tool result — skip it
                     start += 1;
                 }
@@ -176,11 +205,17 @@ impl Conversation {
         msgs
     }
 
-    /// Token-budget-aware windowing. Fits messages within `token_budget` by:
-    /// 1. Always including system prompt and the first user message of this turn
-    /// 2. Including recent messages at full fidelity
-    /// 3. Condensing older tool results to 1-line summaries to save tokens
-    /// 4. Dropping oldest messages if still over budget
+    /// Turn-aware token-budget windowing. Fits messages within `token_budget` by:
+    ///
+    /// 1. **Hot turns** (most recent): all messages at full fidelity.
+    /// 2. **Cold turns** (older completed): only user message + assistant's final
+    ///    text response. Intermediate tool calls/results are dropped — the model
+    ///    sees *what was asked* and *what the outcome was*, not every step.
+    /// 3. **Summarized turns**: a single summary message (Phase 3).
+    /// 4. Oldest turns dropped if still over budget.
+    ///
+    /// This preserves semantic context across long conversations far better than
+    /// the per-message condensation it replaces.
     pub fn to_provider_messages_budgeted(
         &self,
         system_prompt: &str,
@@ -194,12 +229,195 @@ impl Conversation {
         let system_tokens = system_msg.estimate_tokens();
         let remaining_budget = token_budget.saturating_sub(system_tokens);
 
-        // Find the most recent user message index (the current task).
-        // We always want to include this.
-        let last_user_idx = self.messages.iter().rposition(|m| matches!(m.role, Role::User));
+        let turns = &self.turn_tracker.turns;
 
-        // Phase 1: Walk backwards from the end, adding messages at full fidelity
-        // until we've used about 60% of the budget. These are the "hot" messages.
+        // If no turns tracked (edge case), fall back to simple tail windowing.
+        if turns.is_empty() {
+            return self.to_provider_messages_budgeted_fallback(system_msg, remaining_budget);
+        }
+
+        // Phase 1: Walk backwards through turns, adding full messages from
+        // recent turns until we've used ~60% of the budget (hot zone).
+        let hot_budget = remaining_budget * 60 / 100;
+        let mut hot_tokens = 0usize;
+        let mut hot_turn_start = turns.len(); // index into turns vec
+
+        for ti in (0..turns.len()).rev() {
+            let turn = &turns[ti];
+            let turn_tokens: usize = self.messages[turn.start_idx..turn.end_idx()]
+                .iter()
+                .map(|m| m.estimate_tokens())
+                .sum();
+            if hot_tokens + turn_tokens > hot_budget && hot_turn_start < turns.len() {
+                break;
+            }
+            hot_tokens += turn_tokens;
+            hot_turn_start = ti;
+        }
+
+        // Phase 2: For older turns (before hot_turn_start), build condensed
+        // representations: user message + assistant final text only.
+        let cold_budget = remaining_budget.saturating_sub(hot_tokens);
+        let mut cold_messages: Vec<Message> = Vec::new();
+        let mut cold_tokens = 0usize;
+
+        // Walk from most recent cold turn backward (newest cold = most relevant).
+        for ti in (0..hot_turn_start).rev() {
+            let turn = &turns[ti];
+
+            // Summarized turns: inject the summary as a single message.
+            if let Some(ref summary) = turn.summary {
+                let summary_msg = Message::new(Role::User, format!("[Previous task summary] {}", summary));
+                let tokens = summary_msg.estimate_tokens();
+                if cold_tokens + tokens > cold_budget {
+                    break; // No more budget for older turns
+                }
+                cold_tokens += tokens;
+                cold_messages.push(summary_msg);
+                continue;
+            }
+
+            // Completed turns without summary: keep user message + last assistant text.
+            let turn_msgs = &self.messages[turn.start_idx..turn.end_idx()];
+            let mut turn_condensed: Vec<Message> = Vec::new();
+            let mut turn_cost = 0usize;
+
+            // Always include the user message (first in turn).
+            if let Some(user_msg) = turn_msgs.first() {
+                if matches!(user_msg.role, Role::User) {
+                    turn_cost += user_msg.estimate_tokens();
+                    turn_condensed.push(user_msg.clone());
+                }
+            }
+
+            // Find the last assistant text message in this turn (the "outcome").
+            // Priority: pure text response > tool call with text > synthetic from tool results.
+            let mut found_outcome = false;
+            for msg in turn_msgs.iter().rev() {
+                match &msg.content {
+                    MessageContent::Text(s) if matches!(msg.role, Role::Assistant) => {
+                        turn_cost += msg.estimate_tokens();
+                        turn_condensed.push(Message::new(Role::Assistant, s.clone()));
+                        found_outcome = true;
+                        break;
+                    }
+                    MessageContent::AssistantWithToolCalls { text: Some(t), .. } if !t.is_empty() => {
+                        let text_msg = Message::new(Role::Assistant, t.clone());
+                        turn_cost += text_msg.estimate_tokens();
+                        turn_condensed.push(text_msg);
+                        found_outcome = true;
+                        break;
+                    }
+                    _ => continue,
+                }
+            }
+
+            // Fallback: no assistant text found (model only did tool calls, or
+            // turn was terminated by step limit). Synthesize a brief outcome
+            // from the last tool result so the model knows what happened.
+            if !found_outcome {
+                let synthetic = self.synthesize_turn_outcome(turn_msgs);
+                if !synthetic.is_empty() {
+                    let outcome_msg = Message::new(Role::Assistant, synthetic);
+                    turn_cost += outcome_msg.estimate_tokens();
+                    turn_condensed.push(outcome_msg);
+                }
+            }
+
+            if cold_tokens + turn_cost > cold_budget {
+                break; // Can't fit this turn, stop adding cold turns
+            }
+            cold_tokens += turn_cost;
+            cold_messages.extend(turn_condensed);
+        }
+
+        // Cold messages were added newest-first, reverse to chronological order.
+        cold_messages.reverse();
+
+        // Phase 3: Assemble — system + cold turns + hot turns.
+        let hot_msg_start = turns[hot_turn_start].start_idx;
+        let mut result = Vec::with_capacity(
+            1 + cold_messages.len() + (self.messages.len() - hot_msg_start),
+        );
+        result.push(system_msg);
+        result.extend(cold_messages);
+        result.extend(self.messages[hot_msg_start..].iter().cloned());
+
+        // Phase 4: Sanitize broken tool_call/tool_result pairs.
+        Self::sanitize_messages(&mut result);
+
+        result
+    }
+
+    /// Synthesize a brief outcome description for a turn that has no assistant
+    /// text (e.g., model only made tool calls, or turn was terminated by step limit).
+    /// Scans tool results for success/failure signals and tool call names.
+    pub fn synthesize_turn_outcome(&self, turn_msgs: &[Message]) -> String {
+        let mut tool_names: Vec<&str> = Vec::new();
+        let mut last_success = true;
+        let mut last_output = "";
+        let mut edits: Vec<String> = Vec::new();
+
+        for msg in turn_msgs {
+            match &msg.content {
+                MessageContent::AssistantWithToolCalls { tool_calls, .. } => {
+                    for tc in tool_calls {
+                        tool_names.push(&tc.name);
+                    }
+                }
+                MessageContent::ToolResult(r) => {
+                    last_success = r.success;
+                    last_output = &r.output;
+                    if r.success && (r.output.contains("Edited ") || r.output.contains("Wrote ")) {
+                        // Extract the first line as an edit summary
+                        if let Some(line) = r.output.lines().next() {
+                            edits.push(line.to_string());
+                        }
+                    }
+                }
+                MessageContent::ToolResultRef(r) => {
+                    last_success = r.success;
+                    last_output = &r.summary;
+                    if r.success && (r.summary.contains("Edited ") || r.summary.contains("Wrote ")) {
+                        edits.push(r.summary.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if tool_names.is_empty() {
+            return String::new();
+        }
+
+        let unique_tools: Vec<&str> = {
+            let mut seen = std::collections::HashSet::new();
+            tool_names.into_iter().filter(|n| seen.insert(*n)).collect()
+        };
+
+        let mut outcome = format!("[Used: {}]", unique_tools.join(", "));
+        if !edits.is_empty() {
+            outcome.push_str(&format!(" Files changed: {}", edits.join("; ")));
+        }
+        if !last_success {
+            let err_line = last_output.lines().next().unwrap_or("error");
+            let err_short = if err_line.chars().count() > 80 {
+                format!("{}...", err_line.chars().take(77).collect::<String>())
+            } else {
+                err_line.to_string()
+            };
+            outcome.push_str(&format!(" Last action failed: {}", err_short));
+        }
+        outcome
+    }
+
+    /// Fallback windowing when no turns are tracked. Uses the original
+    /// per-message approach: recent messages at full fidelity, older ones condensed.
+    fn to_provider_messages_budgeted_fallback(
+        &self,
+        system_msg: Message,
+        remaining_budget: usize,
+    ) -> Vec<Message> {
         let hot_budget = remaining_budget * 60 / 100;
         let mut hot_tokens = 0usize;
         let mut hot_start = self.messages.len();
@@ -212,55 +430,12 @@ impl Conversation {
             hot_tokens += msg_tokens;
             hot_start = i;
         }
-
-        // Ensure hot_start is at a valid boundary (User message preferred)
         hot_start = self.snap_to_valid_boundary(hot_start);
 
-        // If the last user message is before hot_start, we must include it
-        let include_first_user = match last_user_idx {
-            Some(idx) if idx < hot_start => Some(idx),
-            _ => None,
-        };
-
-        // Phase 2: For messages between first_user and hot_start, condense tool results
-        let cold_budget = remaining_budget.saturating_sub(hot_tokens);
-        let mut cold_messages: Vec<Message> = Vec::new();
-        let mut cold_tokens = 0usize;
-
-        if let Some(first_idx) = include_first_user {
-            // Always include the user message that started the current task
-            let user_msg = self.messages[first_idx].clone();
-            cold_tokens += user_msg.estimate_tokens();
-            cold_messages.push(user_msg);
-
-            // Include condensed versions of messages between first_user and hot_start
-            for i in (first_idx + 1)..hot_start {
-                let condensed = self.messages[i].condensed();
-                let tokens = condensed.estimate_tokens();
-                if cold_tokens + tokens > cold_budget {
-                    break;
-                }
-                cold_tokens += tokens;
-                cold_messages.push(condensed);
-            }
-        }
-
-        // Phase 3: Assemble final messages
-        let mut result = Vec::with_capacity(cold_messages.len() + (self.messages.len() - hot_start) + 2);
+        let mut result = Vec::with_capacity(self.messages.len() - hot_start + 1);
         result.push(system_msg);
-
-        // Cold zone (condensed older context)
-        if !cold_messages.is_empty() {
-            result.extend(cold_messages);
-        }
-
-        // Hot zone (recent messages at full fidelity)
         result.extend(self.messages[hot_start..].iter().cloned());
-
-        // Phase 4: Sanitize — remove broken tool_call/tool_result pairs.
-        // This prevents "messages illegal" API errors from boundary splits.
         Self::sanitize_messages(&mut result);
-
         result
     }
 
@@ -273,7 +448,7 @@ impl Conversation {
 
         for i in 0..msgs.len() {
             match &msgs[i].content {
-                MessageContent::ToolResult(_) => {
+                MessageContent::ToolResult(_) | MessageContent::ToolResultRef(_) => {
                     if expecting_tool_results > 0 {
                         expecting_tool_results -= 1;
                     } else {
@@ -305,7 +480,7 @@ impl Conversation {
                         to_remove.push(i);
                         break;
                     }
-                    MessageContent::ToolResult(_) => {
+                    MessageContent::ToolResult(_) | MessageContent::ToolResultRef(_) => {
                         to_remove.push(i);
                     }
                     _ => break,
@@ -325,10 +500,10 @@ impl Conversation {
     fn snap_to_valid_boundary(&self, idx: usize) -> usize {
         let mut start = idx.min(self.messages.len());
 
-        // Skip orphan ToolResult messages
+        // Skip orphan ToolResult/ToolResultRef messages
         while start < self.messages.len() {
             match &self.messages[start].content {
-                MessageContent::ToolResult(_) => start += 1,
+                MessageContent::ToolResult(_) | MessageContent::ToolResultRef(_) => start += 1,
                 _ => break,
             }
         }

@@ -1,5 +1,26 @@
+# Build
 /target
+
+# OS
 .DS_Store
+Thumbs.db
+
+# Python (dev scripts)
 __pycache__/
 *.pyc
+/venv/
+
+# Web (separate frontend, not part of core)
 /web/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Config with secrets
+config.toml
+
+# Logs
+/datalog/

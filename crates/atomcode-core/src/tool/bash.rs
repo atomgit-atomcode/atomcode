@@ -7,6 +7,7 @@ use serde_json::json;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
+
 use super::{ApprovalRequirement, Tool, ToolContext, ToolDef, ToolResult};
 
 pub struct BashTool;
@@ -25,11 +26,23 @@ impl Tool for BashTool {
     fn definition(&self) -> ToolDef {
         ToolDef {
             name: "bash",
-            description: "Run a bash command. ONLY use for: running programs, installing packages, \
-                starting servers, git commands, build/test commands. \
-                Do NOT use bash to read files — use read_file instead. \
-                Do NOT use grep/cat/head/tail/sed/awk through bash — use the grep or read_file tools. \
-                For long-running processes, returns early after 10s with partial output.",
+            description: "Execute a shell command and return its output (stdout + stderr).\n\
+                When to use:\n\
+                - Build/compile: npm run build, cargo build, make, etc.\n\
+                - Run tests: npm test, pytest, cargo test, etc.\n\
+                - Git commands: git status, git diff, git log, git add, git commit, etc.\n\
+                - Install packages: npm install, pip install, cargo add, etc.\n\
+                - Start/restart servers: npm run dev, python manage.py runserver, etc.\n\
+                - System commands: ls, mkdir, which, curl (for API testing), etc.\n\
+                When NOT to use (use dedicated tools instead):\n\
+                - Reading files: use read_file, NOT cat/head/tail\n\
+                - Searching content: use grep tool, NOT bash grep/rg/awk\n\
+                - Finding files: use glob tool, NOT bash find\n\
+                - Editing files: use edit_file, NOT sed/awk\n\
+                Behavior:\n\
+                - Default timeout: 30 seconds. Use 'timeout' parameter for longer commands.\n\
+                - Long-running server processes: returns after 10s with partial output (server keeps running).\n\
+                - Destructive commands (rm -rf, drop, etc.) require user confirmation.",
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -51,18 +64,64 @@ impl Tool for BashTool {
     }
 
     async fn execute(&self, args: &str, ctx: &ToolContext) -> Result<ToolResult> {
-        let parsed: BashArgs = serde_json::from_str(args)?;
+        let mut parsed: BashArgs = serde_json::from_str(args)?;
         let timeout_secs = parsed.timeout.unwrap_or(30);
 
         let wd = ctx.working_dir.read().await.clone();
 
-        let mut child = Command::new("bash")
-            .arg("-c")
-            .arg(&parsed.command)
+        // For commands that background a server process, wrap with nohup and
+        // redirect stdout/stderr to prevent SIGPIPE when the bash tool exits.
+        // Without this, the server dies as soon as our stdout reader drops the pipe.
+        #[cfg(not(target_os = "windows"))]
+        {
+            let cmd_trimmed = parsed.command.trim();
+            // Detect pattern: "some_command &" or "some_command & other_command"
+            // where the backgrounded part is a server/dev command
+            if is_background_command(cmd_trimmed)
+                && !cmd_trimmed.contains("nohup")
+                && !cmd_trimmed.contains(">/dev/null")
+                && !cmd_trimmed.contains("&>/dev/null")
+            {
+                // Find the backgrounded command and add nohup + redirect
+                if let Some(amp_pos) = cmd_trimmed.find(" &") {
+                    let bg_cmd = cmd_trimmed[..amp_pos].trim();
+                    let rest = cmd_trimmed[amp_pos + 2..].trim();
+                    if rest.is_empty() {
+                        parsed.command = format!("nohup {} >/dev/null 2>&1 &", bg_cmd);
+                    } else {
+                        parsed.command = format!("nohup {} >/dev/null 2>&1 & {}", bg_cmd, rest);
+                    }
+                }
+            }
+        }
+
+        // Platform-aware shell: cmd.exe on Windows, bash on Unix
+        #[cfg(target_os = "windows")]
+        let mut child = Command::new("cmd.exe")
+            .args(&["/C", &parsed.command])
             .current_dir(&wd)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()?;
+
+        // Detect long-running / background commands — these get their own process group
+        // so they survive atomcode exit and won't be killed on timeout.
+        let is_background = is_background_command(&parsed.command);
+
+        #[cfg(not(target_os = "windows"))]
+        let mut child = {
+            let mut cmd = Command::new("bash");
+            cmd.arg("-c")
+                .arg(&parsed.command)
+                .current_dir(&wd)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+            if is_background {
+                // Own process group so the server survives atomcode exit
+                cmd.process_group(0);
+            }
+            cmd.spawn()?
+        };
 
         let mut stdout = child.stdout.take().unwrap();
         let mut stderr = child.stderr.take().unwrap();
@@ -71,37 +130,57 @@ impl Tool for BashTool {
         let mut stderr_buf = Vec::new();
 
         // Wait for process to finish or timeout. Read stdout/stderr concurrently.
-        // Use INITIAL_WAIT_SECS as the early-return timeout for long-running processes.
-        // After that, capture whatever output was produced so far.
+        // Tech-stack-agnostic idle detection: if the process is still running but
+        // output has stopped for 3s, it's likely a long-running process (dev server)
+        // that started successfully. Return early without killing it.
         let wait_secs = parsed.timeout.unwrap_or(INITIAL_WAIT_SECS);
+        let idle_timeout = Duration::from_secs(3);
+        let has_any_output = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let has_out_1 = has_any_output.clone();
+        let has_out_2 = has_any_output.clone();
         let result = tokio::time::timeout(
             Duration::from_secs(wait_secs),
             async {
-                // Read stdout and stderr concurrently until process exits
                 let (_, _) = tokio::join!(
                     async {
                         let mut buf = vec![0u8; 65536];
                         loop {
-                            match stdout.read(&mut buf).await {
-                                Ok(0) => break,
-                                Ok(n) => stdout_buf.extend_from_slice(&buf[..n]),
-                                Err(_) => break,
+                            match tokio::time::timeout(idle_timeout, stdout.read(&mut buf)).await {
+                                Ok(Ok(0)) => break,
+                                Ok(Ok(n)) => {
+                                    stdout_buf.extend_from_slice(&buf[..n]);
+                                    has_out_1.store(true, std::sync::atomic::Ordering::Relaxed);
+                                }
+                                Ok(Err(_)) => break,
+                                Err(_) => {
+                                    // No new stdout for 3s — if we have ANY output, break
+                                    if has_out_1.load(std::sync::atomic::Ordering::Relaxed) {
+                                        break;
+                                    }
+                                }
                             }
                         }
                     },
                     async {
                         let mut buf = vec![0u8; 65536];
                         loop {
-                            match stderr.read(&mut buf).await {
-                                Ok(0) => break,
-                                Ok(n) => stderr_buf.extend_from_slice(&buf[..n]),
-                                Err(_) => break,
+                            match tokio::time::timeout(idle_timeout, stderr.read(&mut buf)).await {
+                                Ok(Ok(0)) => break,
+                                Ok(Ok(n)) => {
+                                    stderr_buf.extend_from_slice(&buf[..n]);
+                                    has_out_2.store(true, std::sync::atomic::Ordering::Relaxed);
+                                }
+                                Ok(Err(_)) => break,
+                                Err(_) => {
+                                    if has_out_2.load(std::sync::atomic::Ordering::Relaxed) {
+                                        break;
+                                    }
+                                }
                             }
                         }
                     }
                 );
 
-                // Process exited (stdout/stderr closed = process done)
                 match child.try_wait() {
                     Ok(Some(status)) => Some(status.success()),
                     _ => None,
@@ -119,32 +198,48 @@ impl Tool for BashTool {
 
         match result {
             Ok(Some(success)) => {
-                let combined = format_output(&stdout_str, &stderr_str);
+                let mut combined = format_output(&stdout_str, &stderr_str);
                 // For background/pkill commands: non-empty output = success
                 let effective_success = success || has_background || (has_pkill && !combined.is_empty());
+                if !effective_success && !combined.is_empty() {
+                    combined.push_str("\n\n[IMPORTANT: Command failed. Read the error above and fix the root cause. Do NOT retry the same command.]");
+                }
                 Ok(ToolResult { call_id: String::new(), output: combined, success: effective_success })
             }
             Ok(None) => {
-                // Process still running — return what we have + PID
+                // Process still running but output stopped (idle timeout).
+                // This is the typical pattern for dev servers: they print startup info then go quiet.
                 let pid = child.id().map(|p| p.to_string()).unwrap_or_else(|| "?".into());
                 let combined = format_output(&stdout_str, &stderr_str);
                 let output = if combined.is_empty() {
                     format!("Process still running (PID: {}). No output captured yet.", pid)
                 } else {
-                    format!("{}\n\n[Process still running, PID: {}]", combined, pid)
+                    format!("{}\n\n[Process running in background, PID: {}. Output stopped — likely started successfully. Do NOT wait for it to exit.]", combined, pid)
                 };
                 Ok(ToolResult { call_id: String::new(), output, success: true })
             }
             Err(_) => {
-                // Hard timeout
-                let _ = child.kill().await;
-                let combined = format_output(&stdout_str, &stderr_str);
-                let output = if combined.is_empty() {
-                    format!("Timed out after {}s with no output.", timeout_secs)
+                if is_background {
+                    // Background/server command — don't kill, let it run
+                    let pid = child.id().map(|p| p.to_string()).unwrap_or_else(|| "?".into());
+                    let combined = format_output(&stdout_str, &stderr_str);
+                    let output = if combined.is_empty() {
+                        format!("Process running in background (PID: {}). Output may be redirected.", pid)
+                    } else {
+                        format!("{}\n\n[Process running in background, PID: {}]", combined, pid)
+                    };
+                    Ok(ToolResult { call_id: String::new(), output, success: true })
                 } else {
-                    format!("{}\n\n[Timed out after {}s, process killed]", combined, timeout_secs)
-                };
-                Ok(ToolResult { call_id: String::new(), output, success: false })
+                    // Non-background command — hard timeout, kill it
+                    let _ = child.kill().await;
+                    let combined = format_output(&stdout_str, &stderr_str);
+                    let output = if combined.is_empty() {
+                        format!("Timed out after {}s with no output.", timeout_secs)
+                    } else {
+                        format!("{}\n\n[Timed out after {}s, process killed]", combined, timeout_secs)
+                    };
+                    Ok(ToolResult { call_id: String::new(), output, success: false })
+                }
             }
         }
     }
@@ -200,6 +295,23 @@ fn check_destructive_command(command: &str) -> Option<String> {
     }
 
     None
+}
+
+/// Detect commands intended to run in the background / as long-lived servers.
+/// These should not be killed on timeout and should get their own process group.
+fn is_background_command(cmd: &str) -> bool {
+    let trimmed = cmd.trim();
+    // Explicit background: trailing &, nohup, setsid
+    if trimmed.ends_with('&') || trimmed.contains("nohup ") || trimmed.contains("setsid ") {
+        return true;
+    }
+    // Common dev server commands
+    let server_patterns = [
+        "npm run dev", "npm start", "npx ", "yarn dev", "pnpm dev",
+        "python -m http", "python manage.py runserver", "uvicorn ", "gunicorn ",
+        "cargo run", "go run", "node server", "flask run", "rails s",
+    ];
+    server_patterns.iter().any(|p| trimmed.contains(p))
 }
 
 fn format_output(stdout: &str, stderr: &str) -> String {

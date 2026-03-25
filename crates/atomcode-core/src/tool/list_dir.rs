@@ -23,7 +23,10 @@ impl Tool for ListDirTool {
     fn definition(&self) -> ToolDef {
         ToolDef {
             name: "list_directory",
-            description: "List files and directories in a path. Returns a tree structure. Skips common noise directories (node_modules, .git, target, etc.).",
+            description: "List files and directories as a tree structure. Skips noise directories (node_modules, .git, target, __pycache__, etc.).\n\
+                Use this to understand project structure or explore unfamiliar directories.\n\
+                For finding specific files by name/extension, prefer glob instead.\n\
+                The depth parameter controls how deep to recurse (default 2, max 5).",
             parameters: json!({
                 "type": "object",
                 "properties": {

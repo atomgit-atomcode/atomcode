@@ -105,11 +105,23 @@ pub struct App {
     pub last_ctrl_c: Option<Instant>,
     /// When the current turn (user message -> agent loop) started.
     pub turn_start: Option<Instant>,
+    /// Time to first token (TTFT) — set when first TextDelta or ToolCallStarted arrives per LLM call.
+    pub first_token_ms: Option<u64>,
+    /// When the current LLM call started (reset on each Thinking phase).
+    pub llm_call_start: Option<Instant>,
+    /// Name of the last completed tool (for display: "after read_file, thinking...").
+    pub last_completed_tool: String,
     /// When the last tool execution started (for per-step timing).
     pub tool_start: Option<Instant>,
     /// Duration of the last completed turn.
     pub last_turn_duration: Option<Duration>,
     pub working_dir: PathBuf,
+    /// Previous working directory for `/cd -` support.
+    pub previous_working_dir: Option<PathBuf>,
+    /// Recent project directories (most recent first, max 5).
+    pub recent_dirs: Vec<PathBuf>,
+    /// Directory selector state: Some(selected_index) when picker is open.
+    pub dir_selector: Option<usize>,
     /// Shared tool execution context (holds working_dir for cross-thread access).
     pub tool_context: ToolContext,
     /// Input history — past user prompts for Up/Down navigation.
@@ -202,10 +214,24 @@ impl App {
             current_step_count: 0,
             executing_tool_info: String::new(),
             turn_start: None,
+            first_token_ms: None,
+            llm_call_start: None,
+            last_completed_tool: String::new(),
             tool_start: None,
             last_turn_duration: None,
             turn_log: crate::turn_log::TurnLog::new(&working_dir),
             tool_context,
+            previous_working_dir: None,
+            recent_dirs: {
+                let mut dirs = load_recent_dirs();
+                // Add current dir to recent list on startup
+                dirs.retain(|d| d != &working_dir);
+                dirs.insert(0, working_dir.clone());
+                dirs.truncate(5);
+                save_recent_dirs(&dirs);
+                dirs
+            },
+            dir_selector: None,
             working_dir,
             input_history,
             history_index: None,
@@ -230,7 +256,7 @@ impl App {
                     model: model_name.clone(),
                     base_url: Some("http://localhost:1".to_string()),
                     system_prompt: None,
-                    context_window: 16000,
+                    context_window: atomcode_core::config::provider::default_context_window_for("openai"),
                 }).unwrap_or_else(|_| {
                     // Fallback: should never reach production path since AgentLoop handles LLM
                     panic!("Failed to create placeholder provider")
@@ -352,11 +378,95 @@ impl App {
         }
     }
 
-    /// Change working directory from /cd command (adds conversation message).
+    /// Change working directory from /cd command.
+    /// Clears conversation and rebuilds context — like starting fresh in a new project.
     pub fn change_working_dir(&mut self, path: &str) {
-        let (_, msg) = self.try_change_dir(path);
-        self.conversation.push_delta(&msg);
-        self.conversation.finalize_stream();
+        let old_dir = self.working_dir.display().to_string();
+        let (ok, _) = self.try_change_dir(path);
+        if ok {
+            // Save previous dir for `/cd -`
+            self.previous_working_dir = Some(PathBuf::from(&old_dir));
+            // Track in recent dirs (max 5, deduplicated)
+            let new_dir = self.working_dir.clone();
+            self.recent_dirs.retain(|d| d != &new_dir);
+            self.recent_dirs.insert(0, new_dir);
+            self.recent_dirs.truncate(5);
+            save_recent_dirs(&self.recent_dirs);
+            // Clear conversation — new project, fresh context
+            self.conversation = atomcode_core::conversation::Conversation::new();
+            self.render_cache.clear();
+            self.render_cache_msg_count = 0;
+            self.scroll_offset = 0;
+            self.at_bottom = true;
+            // Show new project info
+            let new_dir = self.working_dir.display().to_string();
+            let tree = crate::project_context::build_project_context(&self.working_dir);
+            self.project_context_cache = Some(tree.text.clone());
+            let summary = format!(
+                "Switched to `{}`\n\n```\n{}\n```",
+                new_dir,
+                tree.text.lines().take(20).collect::<Vec<_>>().join("\n"),
+            );
+            self.conversation.push_delta(&summary);
+            self.conversation.finalize_stream();
+        } else {
+            // Directory doesn't exist — create it, git init, and add CLAUDE.md
+            let new_path = if path.starts_with('/') || path.starts_with('~') {
+                if path.starts_with('~') {
+                    dirs::home_dir()
+                        .map(|h| h.join(path.strip_prefix("~/").unwrap_or(&path[1..])))
+                        .unwrap_or_else(|| PathBuf::from(path))
+                } else {
+                    PathBuf::from(path)
+                }
+            } else {
+                self.working_dir.join(path)
+            };
+
+            if let Err(e) = std::fs::create_dir_all(&new_path) {
+                self.conversation.push_delta(&format!("Failed to create directory: {}", e));
+                self.conversation.finalize_stream();
+                return;
+            }
+
+            // git init
+            let _ = std::process::Command::new("git")
+                .args(&["init"])
+                .current_dir(&new_path)
+                .output();
+
+            // Create CLAUDE.md with project name
+            let project_name = new_path.file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "project".to_string());
+            let claude_md = format!("# {}\n\nNew project.\n", project_name);
+            let _ = std::fs::write(new_path.join("CLAUDE.md"), &claude_md);
+
+            // Now cd into it
+            let created_path = new_path.to_string_lossy().to_string();
+            let (ok, _) = self.try_change_dir(&created_path);
+            if ok {
+                self.previous_working_dir = Some(PathBuf::from(&old_dir));
+                // Track in recent dirs (same as existing-dir branch)
+                let new_dir = self.working_dir.clone();
+                self.recent_dirs.retain(|d| d != &new_dir);
+                self.recent_dirs.insert(0, new_dir);
+                self.recent_dirs.truncate(5);
+                save_recent_dirs(&self.recent_dirs);
+                self.conversation = atomcode_core::conversation::Conversation::new();
+                self.render_cache.clear();
+                self.render_cache_msg_count = 0;
+                self.scroll_offset = 0;
+                self.at_bottom = true;
+                let summary = format!(
+                    "Created and switched to `{}`\n\nInitialized git repo and CLAUDE.md.",
+                    self.working_dir.display()
+                );
+                self.conversation.push_delta(&summary);
+                self.conversation.finalize_stream();
+                self.project_context_cache = None;
+            }
+        }
     }
 
     /// If the AI ended the turn without giving a summary (just tool calls, no final text),
@@ -444,12 +554,21 @@ impl App {
     pub fn handle_agent_event(&mut self, event: AgentEvent) {
         match event {
             AgentEvent::TextDelta(text) => {
+                // Track TTFT — first text delta in this LLM call
+                if self.first_token_ms.is_none() {
+                    if let Some(start) = self.llm_call_start {
+                        self.first_token_ms = Some(start.elapsed().as_millis() as u64);
+                    }
+                }
                 self.conversation.push_delta(&text);
-                // Don't force at_bottom here — respect user's scroll position.
-                // at_bottom is already true when a new turn starts; if the user
-                // scrolled away during streaming, we shouldn't snap them back.
             }
             AgentEvent::ToolCallStarted { name, arguments } => {
+                // Track TTFT — tool call is also a "first token" from the LLM
+                if self.first_token_ms.is_none() {
+                    if let Some(start) = self.llm_call_start {
+                        self.first_token_ms = Some(start.elapsed().as_millis() as u64);
+                    }
+                }
                 self.current_step_count += 1;
                 self.turn_log.log_tool_call(&name, &arguments);
                 let call = ToolCall {
@@ -458,14 +577,14 @@ impl App {
                     arguments: arguments.clone(),
                 };
                 self.executing_tool_info = format_tool_info(&call);
-                // Add tool call to conversation mirror so it renders in the UI
                 self.conversation.finalize_stream_with_tool_call(call);
-                self.render_cache_msg_count = 0; // Invalidate render cache
+                self.render_cache_msg_count = 0;
                 self.mode = AppMode::ToolExecuting;
                 self.tool_start = Some(Instant::now());
                 self.at_bottom = true;
             }
-            AgentEvent::ToolCallResult { name: _, output, success, duration: _ } => {
+            AgentEvent::ToolCallResult { name, output, success, duration: _ } => {
+                self.last_completed_tool = name;
                 self.turn_log.log_tool_result(&output, success);
                 // Add result to conversation mirror so it renders in the UI
                 self.conversation.add_tool_result(ToolResult {
@@ -487,9 +606,24 @@ impl App {
                     }
                     AgentPhase::Thinking => {
                         self.mode = AppMode::Streaming;
+                        // Reset TTFT for each LLM call (not just the first in a turn)
+                        self.first_token_ms = None;
+                        self.llm_call_start = Some(Instant::now());
                     }
-                    AgentPhase::CallingTool(_name) => {
-                        self.mode = AppMode::ToolExecuting;
+                    AgentPhase::CallingTool(name) => {
+                        self.mode = AppMode::Streaming;
+                        // Show which tool the LLM is preparing (streaming args)
+                        let display_name = name.split('_')
+                            .map(|w| {
+                                let mut c = w.chars();
+                                match c.next() {
+                                    None => String::new(),
+                                    Some(ch) => ch.to_uppercase().to_string() + c.as_str(),
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        self.executing_tool_info = format!("Preparing {}...", display_name);
                     }
                     AgentPhase::WaitingApproval => {
                         // Handled by ApprovalNeeded event which carries the ToolCall.
@@ -531,8 +665,16 @@ impl App {
             }
             AgentEvent::WorkingDirChanged(new_dir) => {
                 self.turn_log.set_working_dir(&new_dir);
-                self.working_dir = new_dir;
+                self.previous_working_dir = Some(self.working_dir.clone());
+                self.working_dir = new_dir.clone();
                 self.project_context_cache = None;
+                // Sync recent dirs + config so /cd list and next startup remember this dir
+                self.recent_dirs.retain(|d| d != &new_dir);
+                self.recent_dirs.insert(0, new_dir.clone());
+                self.recent_dirs.truncate(5);
+                save_recent_dirs(&self.recent_dirs);
+                self.config.default_workdir = Some(new_dir.to_string_lossy().to_string());
+                let _ = self.config.save(&Config::default_path());
             }
         }
     }
@@ -557,15 +699,21 @@ impl App {
             AppEvent::Key(key) => {
                 self.selection.has_selection = false;
 
-                // Paste detection for terminals without bracketed paste:
-                // If a printable char or Enter arrives very fast (<10ms since last key),
-                // it's probably pasted text. Collect it into a buffer and flush later.
+                // Paste detection for terminals without bracketed paste (macOS/Linux only).
+                // Windows terminals don't support bracketed paste reliably, and the
+                // rapid-key detection causes input lag and IME issues. On Windows,
+                // paste is handled via Ctrl+V → clipboard read instead.
                 let now = Instant::now();
                 let interval_ms = now.duration_since(self.last_key_time).as_millis();
                 self.last_key_time = now;
 
-                if interval_ms < 10 && matches!(self.mode, AppMode::Normal) {
-                    // Rapid input — likely paste. Handle Enter as newline, chars as insert.
+                // Provider manager / model selector have their own input —
+                // skip fast-paste detection and Ctrl+V so keys reach their handler.
+                let is_overlay_mode = matches!(self.mode, AppMode::ProviderManager | AppMode::ModelSelector);
+
+                if !is_overlay_mode && !cfg!(target_os = "windows") && interval_ms < 10
+                    && !matches!(self.mode, AppMode::WaitingApproval(_) | AppMode::Exiting)
+                {
                     match key.code {
                         KeyCode::Enter => {
                             self.input.insert_newline();
@@ -576,19 +724,40 @@ impl App {
                             self.suggestion = None;
                             return;
                         }
-                        _ => {} // Other keys processed normally
+                        _ => {}
                     }
+                }
+
+                // Ctrl+V: clipboard paste
+                if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('v') {
+                    if let Some(text) = read_clipboard() {
+                        if is_overlay_mode {
+                            // Forward paste to provider manager's input buffer
+                            if let Some(ref mut mgr) = self.provider_mgr {
+                                mgr.input_buf.push_str(&text);
+                            }
+                        } else if text.lines().count() > 3 || text.len() > 200 {
+                            self.pasted_text = Some(text);
+                        } else {
+                            self.input.insert_text(&text);
+                        }
+                        self.suggestion = None;
+                    }
+                    return;
                 }
 
                 self.handle_key(key, event_tx);
             }
             AppEvent::Paste(text) => {
-                if matches!(self.mode, AppMode::Normal) {
+                if matches!(self.mode, AppMode::ProviderManager) {
+                    // Forward paste to provider manager's input buffer
+                    if let Some(ref mut mgr) = self.provider_mgr {
+                        mgr.input_buf.push_str(&text);
+                    }
+                } else if matches!(self.mode, AppMode::Normal | AppMode::Streaming | AppMode::ToolExecuting) {
                     if text.lines().count() > 3 || text.len() > 200 {
-                        // Long paste → compact reference
                         self.pasted_text = Some(text);
                     } else {
-                        // Short paste → inline
                         self.input.insert_text(&text);
                     }
                     self.suggestion = None;
@@ -861,27 +1030,76 @@ impl App {
         // Reset double-press timer on any other key
         self.last_ctrl_c = None;
 
+        // Directory selector (overlay, works in Normal mode)
+        if let Some(selected) = self.dir_selector {
+            match key.code {
+                KeyCode::Up => {
+                    if selected > 0 {
+                        self.dir_selector = Some(selected - 1);
+                    }
+                }
+                KeyCode::Down => {
+                    if selected + 1 < self.recent_dirs.len() {
+                        self.dir_selector = Some(selected + 1);
+                    }
+                }
+                KeyCode::Enter => {
+                    if let Some(dir) = self.recent_dirs.get(selected).cloned() {
+                        let dir_str = dir.to_string_lossy().to_string();
+                        self.dir_selector = None;
+                        self.change_working_dir(&dir_str);
+                        let _ = self.agent_handle.cmd_tx.send(AgentCommand::ChangeDir(dir_str));
+                    }
+                }
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    self.dir_selector = None;
+                }
+                _ => {}
+            }
+            return;
+        }
+
         match &self.mode {
             AppMode::Normal => self.handle_key_normal(key, event_tx),
             AppMode::Streaming | AppMode::ToolExecuting => {
-                // Esc cancels the operation
                 if key.code == KeyCode::Esc {
-                    let _ = self.agent_handle.cmd_tx.send(AgentCommand::Cancel);
-                    self.cancel_token.cancel();
-                    self.conversation.stream_buffer = None;
-                    self.conversation.tool_call_buffer = None;
-                    self.conversation.finalize_stream();
-                    self.mode = AppMode::Normal;
-                    self.at_bottom = true;
-                    self.last_turn_duration = self.turn_start.map(|t| t.elapsed());
-                    self.turn_start = None;
+                    if self.slash_menu.visible {
+                        // Slash menu is open — close it instead of cancelling the agent
+                        self.slash_menu.close();
+                    } else if !self.input.is_empty() {
+                        // Clear input instead of cancelling
+                        self.input.clear();
+                    } else {
+                        // Esc cancels the operation
+                        let _ = self.agent_handle.cmd_tx.send(AgentCommand::Cancel);
+                        self.cancel_token.cancel();
+                        self.conversation.stream_buffer = None;
+                        self.conversation.tool_call_buffer = None;
+                        self.conversation.finalize_stream();
+                        self.mode = AppMode::Normal;
+                        self.at_bottom = true;
+                        self.last_turn_duration = self.turn_start.map(|t| t.elapsed());
+                        self.turn_start = None;
+                    }
                 } else if (key.code == KeyCode::Enter && key.modifiers == KeyModifiers::NONE)
                     || (key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('j')) {
-                    // Block sending during streaming — only plain Enter/Ctrl+J blocked
+                    // During streaming: if input has content, append it as additional context.
+                    let content = self.input.content();
+                    if !content.trim().is_empty() {
+                        // Show the appended input in the chat
+                        self.conversation.push_delta(&format!("\n\n[User added: {}]\n", content.trim()));
+                        // Send to agent loop
+                        let _ = self.agent_handle.cmd_tx.send(
+                            atomcode_core::agent::AgentCommand::AppendInput(content)
+                        );
+                        self.input.clear();
+                    }
                 } else {
-                    // All other keys work normally: scroll, type, /, Ctrl+A/E, etc.
-                    // User can prepare next message and use slash commands while AI is working.
+                    // All other keys work normally: scroll, type, Ctrl+A/E, etc.
                     self.handle_key_normal(key, event_tx);
+                    // Don't show slash menu during streaming — it overlays the output
+                    // and Esc would need to close menu vs cancel agent (confusing UX)
+                    self.slash_menu.close();
                 }
             }
             AppMode::WaitingApproval(_) => {
@@ -1138,10 +1356,10 @@ impl App {
                         }
                     }
                     if let Some(idx) = self.history_index {
-                        if let Some(hist) = self.input_history.get(idx) {
+                        if let Some(hist) = self.input_history.get(idx).cloned() {
                             self.suggestion = None;
                             self.pasted_text = None;
-                            self.load_history_entry(hist);
+                            self.load_history_entry(&hist);
                         }
                     }
                 }
@@ -1479,16 +1697,28 @@ impl App {
             _ if cmd.starts_with("/cd ") || cmd == "/cd" => {
                 let arg = cmd.strip_prefix("/cd").unwrap().trim();
                 if arg.is_empty() {
-                    // Show current directory
-                    self.conversation.push_delta(&format!(
-                        "Working directory: `{}`",
-                        self.working_dir.display()
-                    ));
-                    self.conversation.finalize_stream();
+                    if self.recent_dirs.is_empty() {
+                        self.conversation.push_delta(&format!(
+                            "Working directory: `{}`\n\nNo recent projects. Use `/cd <path>` to switch.",
+                            self.working_dir.display()
+                        ));
+                        self.conversation.finalize_stream();
+                    } else {
+                        // Open directory picker
+                        self.dir_selector = Some(0);
+                    }
+                } else if arg == "-" {
+                    // /cd - : go back to previous directory
+                    if let Some(prev) = self.previous_working_dir.clone() {
+                        let prev_str = prev.to_string_lossy().to_string();
+                        self.change_working_dir(&prev_str);
+                        let _ = self.agent_handle.cmd_tx.send(AgentCommand::ChangeDir(prev_str));
+                    } else {
+                        self.conversation.push_delta("No previous directory");
+                        self.conversation.finalize_stream();
+                    }
                 } else {
-                    // Update local state for immediate UI feedback.
                     self.change_working_dir(arg);
-                    // Also inform the AgentLoop so it uses the new working directory.
                     let _ = self.agent_handle.cmd_tx.send(AgentCommand::ChangeDir(arg.to_string()));
                 }
             }
@@ -1618,6 +1848,9 @@ impl App {
         self.current_step_count = 0;
         self.retry_count = 0;
         self.turn_start = Some(Instant::now());
+        self.first_token_ms = None;
+        self.llm_call_start = Some(Instant::now());
+        self.last_completed_tool = String::new();
         self.last_turn_duration = None;
 
         // Delegate to the AgentLoop via channel.
@@ -1913,21 +2146,75 @@ fn copy_to_clipboard(text: &str) -> std::io::Result<()> {
     use std::io::Write;
     use std::process::{Command, Stdio};
 
-    let cmd = if cfg!(target_os = "macos") {
-        "pbcopy"
+    if cfg!(target_os = "windows") {
+        // Windows: use clip.exe
+        let mut child = Command::new("clip.exe")
+            .stdin(Stdio::piped())
+            .spawn()?;
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(text.as_bytes())?;
+        }
+        child.wait()?;
     } else {
-        "xclip"
+        let cmd = if cfg!(target_os = "macos") { "pbcopy" } else { "xclip" };
+        let mut child = Command::new(cmd)
+            .stdin(Stdio::piped())
+            .spawn()?;
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(text.as_bytes())?;
+        }
+        child.wait()?;
+    }
+    Ok(())
+}
+
+/// Read text from system clipboard.
+fn read_clipboard() -> Option<String> {
+    use std::process::Command;
+
+    let output = if cfg!(target_os = "macos") {
+        Command::new("pbpaste").output().ok()
+    } else if cfg!(target_os = "windows") {
+        Command::new("powershell")
+            .args(&["-Command", "Get-Clipboard"])
+            .output().ok()
+    } else {
+        Command::new("xclip")
+            .args(&["-selection", "clipboard", "-o"])
+            .output().ok()
+            .or_else(|| Command::new("xsel").args(&["--clipboard", "--output"]).output().ok())
     };
 
-    let mut child = Command::new(cmd)
-        .stdin(Stdio::piped())
-        .spawn()?;
+    output
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .filter(|s| !s.is_empty())
+}
 
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(text.as_bytes())?;
-    }
-    child.wait()?;
-    Ok(())
+/// Load recent project directories from ~/.atomcode/recent_dirs.txt
+fn load_recent_dirs() -> Vec<PathBuf> {
+    let path = atomcode_core::config::Config::config_dir().join("recent_dirs.txt");
+    std::fs::read_to_string(&path)
+        .ok()
+        .map(|s| {
+            s.lines()
+                .filter(|l| !l.trim().is_empty())
+                .map(PathBuf::from)
+                .filter(|p| p.is_dir())
+                .take(5)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Save recent project directories to ~/.atomcode/recent_dirs.txt
+fn save_recent_dirs(dirs: &[PathBuf]) {
+    let path = atomcode_core::config::Config::config_dir().join("recent_dirs.txt");
+    let content: String = dirs.iter()
+        .map(|d| d.to_string_lossy().to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let _ = std::fs::write(&path, content);
 }
 
 #[derive(Debug, Clone)]

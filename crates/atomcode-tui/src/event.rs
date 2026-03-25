@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use crossterm::event::{Event, EventStream, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{Event, EventStream, KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind};
 use futures::StreamExt;
 use tokio::sync::mpsc;
 
@@ -51,7 +51,17 @@ impl EventLoop {
                 match reader.next().await {
                     Some(Ok(evt)) => {
                         let app_event = match evt {
-                            Event::Key(key) => AppEvent::Key(key),
+                            Event::Key(key) => {
+                                // Windows sends Press + Release for each keystroke.
+                                // Skip Release to prevent double input. macOS/Linux
+                                // only sends Press, so this check is harmless there
+                                // but we gate it to avoid any edge cases with IME.
+                                #[cfg(target_os = "windows")]
+                                if key.kind == KeyEventKind::Release {
+                                    continue;
+                                }
+                                AppEvent::Key(key)
+                            }
                             Event::Paste(text) => AppEvent::Paste(text),
                             Event::Resize(w, h) => AppEvent::Resize(w, h),
                             Event::Mouse(MouseEvent { kind, column, row, .. }) => {

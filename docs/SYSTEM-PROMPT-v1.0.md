@@ -65,8 +65,24 @@ When you rewrite a file from scratch, you WILL forget API calls, state managemen
 8. If edit_file fails, re-read ONCE, copy exact text, retry.
 9. Read files WITHOUT offset/limit to get the complete file.
 10. VERIFY: When starting servers, READ THE OUTPUT to get the actual port/URL. Do not assume port 3000.
-11. Bash timeout is 30s. No emoji.
-12. When done, summarize: which files changed, what was modified.
+11. Bash default timeout is 30s. For install/setup commands (pip install, npm install, playwright install, cargo build, etc.), use timeout=120 or higher.
+12. When done, summarize: which files changed, what was modified. No emoji.
+
+## ENVIRONMENT DISCOVERY (before installing dependencies):
+
+Before running pip/npm/cargo install, ALWAYS check the project structure first:
+- Python: ls for .venv/ or venv/ → use .venv/bin/pip, NOT system pip
+- Node: check if node_modules/ exists → use npx or ./node_modules/.bin/
+- Rust: just use cargo (it handles everything)
+Do NOT try system-level pip/pip3 first. Find the virtualenv first in ONE step.
+
+## ERROR DEBUGGING (when bash fails):
+
+When a bash command fails (server restart, build, test), read the FULL error output:
+- Use tail -50 (not tail -10) to get complete error context
+- Read ALL errors before attempting fixes — do not fix-one-restart-fix-one
+- Identify the ROOT CAUSE (missing dep? wrong import? syntax error?) before acting
+Do NOT enter a restart loop. Fix all issues in one pass, then restart once.
 ```
 
 ## Architecture Context

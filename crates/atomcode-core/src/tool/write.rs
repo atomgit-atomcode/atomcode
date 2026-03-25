@@ -56,10 +56,18 @@ impl Tool for WriteFileTool {
     fn definition(&self) -> ToolDef {
         ToolDef {
             name: "write_file",
-            description: "Write content to a file (creates or overwrites). DANGER: This REPLACES the entire file. \
-                Any existing code you don't include will be permanently lost. \
-                Use edit_file instead for modifying existing files — it only changes what you specify. \
-                Only use write_file for: creating NEW files, or complete rewrites explicitly requested by the user.",
+            description: "Write content to a file (creates or overwrites).\n\
+                DANGER: This REPLACES the entire file. Any existing code not included will be permanently lost.\n\
+                When to use:\n\
+                - Creating a NEW file that doesn't exist yet.\n\
+                - Complete rewrites ONLY when the user explicitly requests it.\n\
+                When NOT to use:\n\
+                - Modifying existing files — use edit_file instead. It only changes matched text, preserving everything else.\n\
+                - NEVER read a file, then write_file with small changes. Use edit_file for targeted modifications.\n\
+                Behavior:\n\
+                - Overwriting an existing non-empty file requires user approval.\n\
+                - Parent directories are NOT auto-created — ensure the directory exists first.\n\
+                - Uses atomic write (temp file + rename) to prevent corruption.",
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -76,6 +84,14 @@ impl Tool for WriteFileTool {
             if is_sensitive_path(&parsed.file_path) {
                 return ApprovalRequirement::RequireApproval(
                     format!("Writing to sensitive system path: {}", parsed.file_path),
+                );
+            }
+            // Overwriting an existing non-empty file is dangerous — it destroys
+            // all code not included in the new content. Require approval.
+            let path = std::path::Path::new(&parsed.file_path);
+            if path.exists() && std::fs::metadata(path).map(|m| m.len() > 0).unwrap_or(false) {
+                return ApprovalRequirement::RequireApproval(
+                    format!("Overwriting existing file: {}. Use edit_file instead for targeted changes.", parsed.file_path),
                 );
             }
         }

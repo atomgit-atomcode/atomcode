@@ -5,39 +5,74 @@ use syntect::easy::HighlightLines;
 use syntect::highlighting::{Theme, ThemeSet};
 use syntect::parsing::SyntaxSet;
 
-// Claude Code-inspired palette: clean, bright, minimal
-const TEXT: Color = Color::Rgb(220, 220, 225);
-const BOLD_TEXT: Color = Color::White;
-const H1: Color = Color::Rgb(130, 190, 255);
-const H2: Color = Color::Rgb(180, 160, 255);
-const H3: Color = Color::Rgb(150, 210, 180);
-const LINK: Color = Color::Rgb(110, 160, 255);
-const DIM: Color = Color::Rgb(110, 110, 120);
-const INLINE_CODE_FG: Color = Color::Rgb(240, 200, 140);
-const INLINE_CODE_BG: Color = Color::Rgb(40, 38, 48);
-const CODE_BG: Color = Color::Rgb(20, 20, 28);
-const CODE_LABEL: Color = Color::Rgb(90, 90, 100);
-const BULLET: Color = Color::Rgb(100, 120, 145);
-const QUOTE_BAR: Color = Color::Rgb(60, 60, 75);
-const QUOTE_TEXT: Color = Color::Rgb(170, 170, 180);
-const RULE: Color = Color::Rgb(45, 45, 55);
+// Claude Code-aligned palette — warm, readable, not harsh
+const TEXT: Color = Color::Rgb(186, 188, 200);
+const BOLD_TEXT: Color = Color::Rgb(220, 222, 230);
+const H1: Color = Color::Rgb(115, 170, 240);
+const H2: Color = Color::Rgb(160, 140, 225);
+const H3: Color = Color::Rgb(130, 190, 160);
+const LINK: Color = Color::Rgb(100, 150, 230);
+const DIM: Color = Color::Rgb(95, 97, 110);
+const INLINE_CODE_FG: Color = Color::Rgb(220, 180, 120);
+const INLINE_CODE_BG: Color = Color::Rgb(40, 38, 50);
+const CODE_BG: Color = Color::Rgb(22, 22, 32);
+const CODE_BORDER: Color = Color::Rgb(50, 54, 68);
+const CODE_LANG: Color = Color::Rgb(110, 120, 150);
+const CODE_LINENUM: Color = Color::Rgb(70, 75, 95);
+const BULLET: Color = Color::Rgb(85, 105, 140);
+const QUOTE_BAR: Color = Color::Rgb(55, 55, 70);
+const QUOTE_TEXT: Color = Color::Rgb(155, 157, 170);
+const RULE: Color = Color::Rgb(42, 44, 55);
 
 pub fn render_markdown(input: &str) -> Vec<Line<'static>> {
     static RENDERER: std::sync::OnceLock<MarkdownRenderer> = std::sync::OnceLock::new();
     let renderer = RENDERER.get_or_init(MarkdownRenderer::new);
     let cleaned = strip_emoji(input);
-    renderer.render(&cleaned)
+    let spaced = pangu_spacing(&cleaned);
+    renderer.render(&spaced)
 }
+
+/// Pangu spacing: add a space between CJK and ASCII characters.
+/// "已完成WritingView.vue的修改" → "已完成 WritingView.vue 的修改"
+fn pangu_spacing(s: &str) -> String {
+    let mut result = String::with_capacity(s.len() + s.len() / 4);
+    let chars: Vec<char> = s.chars().collect();
+
+    for i in 0..chars.len() {
+        result.push(chars[i]);
+
+        if i + 1 < chars.len() {
+            let cur_cjk = is_cjk_ideograph(chars[i]);
+            let next_cjk = is_cjk_ideograph(chars[i + 1]);
+            let cur_ascii = chars[i].is_ascii_alphanumeric();
+            let next_ascii = chars[i + 1].is_ascii_alphanumeric();
+
+            if (cur_cjk && next_ascii) || (cur_ascii && next_cjk) {
+                result.push(' ');
+            }
+        }
+    }
+    result
+}
+
+fn is_cjk_ideograph(c: char) -> bool {
+    let cp = c as u32;
+    (0x4E00..=0x9FFF).contains(&cp) || (0x3400..=0x4DBF).contains(&cp)
+}
+
 
 fn strip_emoji(s: &str) -> String {
     s.chars().filter(|c| {
         let cp = *c as u32;
-        !((0x1F600..=0x1F64F).contains(&cp) || (0x1F300..=0x1F5FF).contains(&cp) ||
-          (0x1F680..=0x1F6FF).contains(&cp) || (0x1F1E0..=0x1F1FF).contains(&cp) ||
-          (0x2600..=0x26FF).contains(&cp) || (0x2700..=0x27BF).contains(&cp) ||
-          (0xFE00..=0xFE0F).contains(&cp) || (0x1F900..=0x1F9FF).contains(&cp) ||
-          (0x1FA00..=0x1FA6F).contains(&cp) || (0x1FA70..=0x1FAFF).contains(&cp) ||
-          cp == 0x200D || (0xE0020..=0xE007F).contains(&cp))
+        !((0x1F600..=0x1F64F).contains(&cp) ||   // Emoticons
+          (0x1F300..=0x1F5FF).contains(&cp) ||    // Misc Symbols & Pictographs
+          (0x1F680..=0x1F6FF).contains(&cp) ||    // Transport & Map
+          (0x1F1E0..=0x1F1FF).contains(&cp) ||    // Flags
+          (0x1F900..=0x1F9FF).contains(&cp) ||    // Supplemental Symbols
+          (0x1FA00..=0x1FA6F).contains(&cp) ||    // Chess Symbols
+          (0x1FA70..=0x1FAFF).contains(&cp) ||    // Symbols Extended-A
+          (0x2700..=0x27BF).contains(&cp) ||       // Dingbats (✅❌⚡ etc.)
+          (0x2600..=0x26FF).contains(&cp))         // Misc Symbols (⚠️☁️ etc.)
     }).collect()
 }
 
@@ -130,35 +165,45 @@ impl MarkdownRenderer {
                 }
                 Event::End(TagEnd::CodeBlock) => {
                     in_code = false;
-                    // Top border with language label (Claude Code style)
-                    let lang_display = if code_lang.is_empty() { "text" } else { &code_lang };
-                    lines.push(Line::from(vec![
-                        Span::styled("  \u{256d}\u{2500} ", Style::default().fg(Color::Rgb(50, 55, 65))),
-                        Span::styled(
-                            format!("{} ", lang_display),
-                            Style::default().fg(Color::Rgb(120, 130, 150)).bg(Color::Rgb(30, 32, 40)),
-                        ),
-                        Span::styled(
-                            "\u{2500}".repeat(30),
-                            Style::default().fg(Color::Rgb(40, 43, 52)),
-                        ),
-                    ]));
-                    // Code lines with syntax highlight
+                    // Top border: ╭─ language ────────
+                    let lang_display = if code_lang.is_empty() { "" } else { &code_lang };
+                    if !lang_display.is_empty() {
+                        lines.push(Line::from(vec![
+                            Span::styled("  \u{256d}\u{2500} ", Style::default().fg(CODE_BORDER)),
+                            Span::styled(
+                                lang_display.to_string(),
+                                Style::default().fg(CODE_LANG).add_modifier(Modifier::BOLD),
+                            ),
+                            Span::styled(
+                                format!(" {}", "\u{2500}".repeat(30)),
+                                Style::default().fg(CODE_BORDER),
+                            ),
+                        ]));
+                    } else {
+                        lines.push(Line::from(Span::styled(
+                            format!("  \u{256d}{}", "\u{2500}".repeat(36)),
+                            Style::default().fg(CODE_BORDER),
+                        )));
+                    }
                     let highlighted = self.highlight(&code_buf, &code_lang);
                     lines.extend(highlighted);
-                    // Bottom border
+                    // Bottom border: ╰──────────
                     lines.push(Line::from(Span::styled(
-                        format!("  \u{2570}{}", "\u{2500}".repeat(34)),
-                        Style::default().fg(Color::Rgb(40, 43, 52)),
+                        format!("  \u{2570}{}", "\u{2500}".repeat(36)),
+                        Style::default().fg(CODE_BORDER),
                     )));
                     code_buf.clear();
                 }
 
-                // Paragraphs — blank line after for breathing room
-                Event::Start(Tag::Paragraph) => {}
+                // Paragraphs — tight spacing: no trailing blank line,
+                // add one blank line before if previous content exists (avoids double blanks)
+                Event::Start(Tag::Paragraph) => {
+                    if !lines.is_empty() && lines.last().map_or(false, |l| !l.spans.is_empty()) {
+                        lines.push(Line::default());
+                    }
+                }
                 Event::End(TagEnd::Paragraph) => {
                     flush(&mut lines, &mut spans);
-                    lines.push(Line::default());
                 }
 
                 // Lists
@@ -171,16 +216,16 @@ impl MarkdownRenderer {
                     ordered_idx = None;
                 }
                 Event::Start(Tag::Item) => {
-                    let indent = "   ".repeat(list_depth);
+                    let indent = "  ".repeat(list_depth);
                     if let Some(idx) = &mut ordered_idx {
                         spans.push(Span::styled(
-                            format!("{}{:>2}. ", indent, idx),
+                            format!("{}{}. ", indent, idx),
                             Style::default().fg(BULLET),
                         ));
                         *idx += 1;
                     } else {
                         spans.push(Span::styled(
-                            format!("{}  - ", indent),
+                            format!("{}- ", indent),
                             Style::default().fg(BULLET),
                         ));
                     }
@@ -260,7 +305,21 @@ impl MarkdownRenderer {
         }
 
         if !spans.is_empty() { lines.push(Line::from(spans)); }
-        lines
+
+        // Collapse consecutive blank lines and trim trailing blanks
+        let mut deduped: Vec<Line<'static>> = Vec::with_capacity(lines.len());
+        let mut prev_blank = false;
+        for line in lines {
+            let is_blank = line.spans.is_empty();
+            if is_blank && prev_blank { continue; }
+            prev_blank = is_blank;
+            deduped.push(line);
+        }
+        // Remove trailing blank line
+        if deduped.last().map_or(false, |l| l.spans.is_empty()) {
+            deduped.pop();
+        }
+        deduped
     }
 
     /// Syntax-highlighted code with line numbers, left border, and background.
@@ -275,23 +334,22 @@ impl MarkdownRenderer {
         let mut hl = HighlightLines::new(syntax, &self.theme);
         let line_count = code.lines().count();
         let gutter_width = if line_count < 10 { 1 } else if line_count < 100 { 2 } else if line_count < 1000 { 3 } else { 4 };
-        let border_style = Style::default().fg(Color::Rgb(50, 55, 65));
-        let line_num_style = Style::default().fg(Color::Rgb(75, 80, 95)).bg(CODE_BG);
-        let gutter_sep = Style::default().fg(Color::Rgb(50, 53, 63)).bg(CODE_BG);
+        let gutter_bg = Color::Rgb(18, 18, 28);
 
         code.lines().enumerate().map(|(i, line)| {
             let regions = hl.highlight_line(line, &self.syntax_set).unwrap_or_default();
             let mut s: Vec<Span<'static>> = Vec::new();
 
             // Left border
-            s.push(Span::styled("  \u{2502}", border_style));
+            s.push(Span::styled("  \u{2502}", Style::default().fg(CODE_BORDER)));
 
-            // Line number gutter
+            // Line number gutter — dim, with subtle background
             s.push(Span::styled(
-                format!(" {:>width$}", i + 1, width = gutter_width),
-                line_num_style,
+                format!(" {:>width$} ", i + 1, width = gutter_width),
+                Style::default().fg(CODE_LINENUM).bg(gutter_bg),
             ));
-            s.push(Span::styled(" \u{2502} ", gutter_sep));
+            // Gutter separator
+            s.push(Span::styled("\u{2502} ", Style::default().fg(CODE_BORDER).bg(CODE_BG)));
 
             // Highlighted code
             for (style, text) in regions {
@@ -364,6 +422,64 @@ fn render_table(lines: &mut Vec<Line<'static>>, header: &[String], rows: &[Vec<S
     }
 
     lines.push(Line::default());
+}
+
+/// Wrap lines that exceed `max_width` columns.
+/// Splits spans at character boundaries, preserving styles.
+/// CJK characters count as 2 columns.
+pub fn wrap_lines(lines: Vec<Line<'static>>, max_width: usize) -> Vec<Line<'static>> {
+    if max_width == 0 { return lines; }
+    let mut result = Vec::with_capacity(lines.len());
+    for line in lines {
+        let total_w: usize = line.spans.iter().map(|s| span_width(s)).sum();
+        if total_w <= max_width {
+            result.push(line);
+            continue;
+        }
+        // Need to wrap — split spans across multiple lines
+        let mut cur_spans: Vec<Span<'static>> = Vec::new();
+        let mut cur_w: usize = 0;
+        for span in line.spans {
+            let style = span.style;
+            let text: &str = &span.content;
+            let mut chars = text.chars().peekable();
+            let mut buf = String::new();
+            while let Some(c) = chars.next() {
+                let cw = char_width(c);
+                if cur_w + cw > max_width && cur_w > 0 {
+                    // Emit current buffer as a span, start new line
+                    if !buf.is_empty() {
+                        cur_spans.push(Span::styled(std::mem::take(&mut buf), style));
+                    }
+                    result.push(Line::from(std::mem::take(&mut cur_spans)));
+                    cur_w = 0;
+                }
+                buf.push(c);
+                cur_w += cw;
+            }
+            if !buf.is_empty() {
+                cur_spans.push(Span::styled(buf, style));
+            }
+        }
+        if !cur_spans.is_empty() {
+            result.push(Line::from(cur_spans));
+        }
+    }
+    result
+}
+
+fn span_width(span: &Span) -> usize {
+    span.content.chars().map(char_width).sum()
+}
+
+fn char_width(c: char) -> usize {
+    let cp = c as u32;
+    if (0x4E00..=0x9FFF).contains(&cp) || (0x3400..=0x4DBF).contains(&cp)
+        || (0x20000..=0x2A6DF).contains(&cp) || (0xF900..=0xFAFF).contains(&cp)
+        || (0xFF01..=0xFF60).contains(&cp) || (0xFFE0..=0xFFE6).contains(&cp)
+        || (0xAC00..=0xD7AF).contains(&cp) || (0x3000..=0x303F).contains(&cp)
+        || (0x3040..=0x309F).contains(&cp) || (0x30A0..=0x30FF).contains(&cp)
+    { 2 } else { 1 }
 }
 
 #[cfg(test)]

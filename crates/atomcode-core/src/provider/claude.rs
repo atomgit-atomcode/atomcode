@@ -85,22 +85,27 @@ impl ClaudeProvider {
                             }
                             msgs.push(json!({"role": "assistant", "content": parts}));
                         }
-                        MessageContent::ToolResult(_) => {
+                        MessageContent::ToolResult(_) | MessageContent::ToolResultRef(_) => {
                             // Should not appear on assistant role; skip.
                         }
                     }
                 }
                 Role::Tool => {
-                    if let MessageContent::ToolResult(r) = &m.content {
-                        msgs.push(json!({
-                            "role": "user",
-                            "content": [{
-                                "type": "tool_result",
-                                "tool_use_id": r.call_id,
-                                "content": r.output,
-                            }]
-                        }));
-                    }
+                    // Both inline ToolResult and externalized ToolResultRef are
+                    // serialized the same way — ToolResultRef uses its summary.
+                    let (call_id, output) = match &m.content {
+                        MessageContent::ToolResult(r) => (r.call_id.as_str(), r.output.as_str()),
+                        MessageContent::ToolResultRef(r) => (r.call_id.as_str(), r.summary.as_str()),
+                        _ => continue,
+                    };
+                    msgs.push(json!({
+                        "role": "user",
+                        "content": [{
+                            "type": "tool_result",
+                            "tool_use_id": call_id,
+                            "content": output,
+                        }]
+                    }));
                 }
             }
         }

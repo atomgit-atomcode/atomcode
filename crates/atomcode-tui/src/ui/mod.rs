@@ -7,8 +7,11 @@ pub mod slash_menu;
 pub mod status_bar;
 pub mod welcome;
 
+use std::path::PathBuf;
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
-use ratatui::style::Color;
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
 use crate::app::{App, TextSelection};
@@ -57,11 +60,14 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     } else {
         let turn_elapsed = app.turn_start.map(|t| t.elapsed().as_secs());
         let turn_seed = app.conversation.messages.len();
+        let llm_wait_ms = app.llm_call_start.map(|s| s.elapsed().as_millis() as u64);
         let rendered_scroll = chat_panel::render(
             frame, chunks[1], &app.conversation,
             app.scroll_offset, app.at_bottom, &app.mode, app.tick_count,
             app.turn_tokens, turn_elapsed, turn_seed,
             app.current_step_count, &app.executing_tool_info,
+            app.first_token_ms, llm_wait_ms, &app.last_completed_tool,
+            app.last_turn_duration, app.current_step_count,
             &mut app.render_cache, &mut app.render_cache_msg_count,
         );
         app.last_rendered_scroll = rendered_scroll;
@@ -80,31 +86,38 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         model_selector::render(frame, frame.area(), app);
     }
 
+    // Directory selector popup (overlay)
+    if let Some(selected) = app.dir_selector {
+        render_dir_selector(frame, frame.area(), &app.recent_dirs, selected, &app.working_dir);
+    }
+
     // Render text selection highlight — clipped to chat area only
     if app.selection.has_selection || app.selection.dragging {
         render_selection_highlight(frame, &app.selection, chunks[1]);
     }
 }
 
-/// Render selection highlight clipped to the chat area.
+/// Render selection highlight strictly clipped to the chat area.
 fn render_selection_highlight(frame: &mut Frame, sel: &TextSelection, chat_area: Rect) {
     let ((start_col, start_row), (end_col, end_row)) = sel.normalized();
     let buf = frame.buffer_mut();
 
-    // Clip to chat area boundaries
+    // Strict boundaries — nothing outside the chat rect
+    let area_left = chat_area.x;
+    let area_right = chat_area.x + chat_area.width;
     let area_top = chat_area.y;
     let area_bottom = chat_area.y + chat_area.height;
-    let area_width = chat_area.width;
 
     let sel_bg = Color::Rgb(40, 80, 160);
     let sel_fg = Color::Rgb(240, 240, 245);
 
-    for row in start_row..=end_row {
-        // Skip rows outside chat area
-        if row < area_top || row >= area_bottom { continue; }
+    // Clamp row range to chat area — leave 1-row gap before input box
+    let row_start = start_row.max(area_top);
+    let row_end = end_row.min(area_bottom.saturating_sub(2));
 
-        let col_start = if row == start_row { start_col } else { 0 };
-        let col_end = if row == end_row { end_col } else { area_width };
+    for row in row_start..=row_end {
+        let col_start = if row == start_row { start_col.max(area_left) } else { area_left };
+        let col_end = if row == end_row { end_col.min(area_right) } else { area_right };
 
         for col in col_start..col_end {
             if let Some(cell) = buf.cell_mut(Position::new(col, row)) {
@@ -112,5 +125,74 @@ fn render_selection_highlight(frame: &mut Frame, sel: &TextSelection, chat_area:
                 cell.set_bg(sel_bg);
             }
         }
+    }
+}
+
+/// Render a floating directory picker popup.
+fn render_dir_selector(frame: &mut Frame, area: Rect, dirs: &[PathBuf], selected: usize, current: &PathBuf) {
+    let height = (dirs.len() as u16 + 4).min(area.height.saturating_sub(4));
+    let width = 60u16.min(area.width.saturating_sub(8));
+    let x = (area.width.saturating_sub(width)) / 2;
+    let y = (area.height.saturating_sub(height)) / 2;
+    let popup = Rect::new(x, y, width, height);
+
+    frame.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Rgb(80, 70, 140)))
+        .title(Span::styled(" Recent Projects ", Style::default().fg(Color::Rgb(170, 150, 240)).add_modifier(Modifier::BOLD)))
+        .style(Style::default().bg(Color::Rgb(18, 18, 26)));
+
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let mut lines: Vec<Line> = Vec::new();
+    // Current dir
+    let cur_short = shorten_dir(&current.to_string_lossy());
+    lines.push(Line::from(vec![
+        Span::styled("  current: ", Style::default().fg(Color::Rgb(80, 82, 95))),
+        Span::styled(cur_short, Style::default().fg(Color::Rgb(100, 170, 235))),
+    ]));
+    lines.push(Line::default());
+
+    for (i, dir) in dirs.iter().enumerate() {
+        let display = shorten_dir(&dir.to_string_lossy());
+        let is_selected = i == selected;
+        let is_current = dir == current;
+
+        let (prefix, style) = if is_selected {
+            (" \u{25b8} ", Style::default().fg(Color::Rgb(240, 240, 245)).bg(Color::Rgb(55, 45, 110)))
+        } else {
+            ("   ", Style::default().fg(Color::Rgb(170, 172, 185)))
+        };
+
+        let mut spans = vec![Span::styled(prefix, style)];
+        spans.push(Span::styled(display, style));
+        if is_current {
+            spans.push(Span::styled("  (current)", Style::default().fg(Color::Rgb(70, 160, 95))));
+        }
+        lines.push(Line::from(spans));
+    }
+
+    let paragraph = Paragraph::new(lines);
+    frame.render_widget(paragraph, inner);
+}
+
+fn shorten_dir(path: &str) -> String {
+    let home = dirs::home_dir()
+        .map(|h| h.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let shortened = if !home.is_empty() && path.starts_with(&home) {
+        format!("~{}", &path[home.len()..])
+    } else {
+        path.to_string()
+    };
+    if shortened.len() > 45 {
+        let parts: Vec<&str> = shortened.rsplitn(3, '/').collect();
+        if parts.len() >= 3 { format!(".../{}/{}", parts[1], parts[0]) }
+        else { shortened }
+    } else {
+        shortened
     }
 }

@@ -5,6 +5,9 @@ pub mod glob;
 pub mod grep;
 pub mod list_dir;
 pub mod read;
+pub mod result_store;
+pub mod web_fetch;
+pub mod web_search;
 pub mod write;
 
 use std::collections::{HashMap, HashSet};

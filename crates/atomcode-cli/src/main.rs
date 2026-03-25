@@ -6,7 +6,7 @@ use anyhow::Result;
 use clap::Parser;
 
 use atomcode_core::agent::AgentLoop;
-use atomcode_core::config::provider::ProviderConfig;
+use atomcode_core::config::provider::{ProviderConfig, default_context_window_for};
 use atomcode_core::config::Config;
 use atomcode_core::conversation::Conversation;
 use atomcode_core::provider::create_provider;
@@ -19,6 +19,8 @@ use atomcode_core::tool::cd::CdTool;
 use atomcode_core::tool::grep::GrepTool;
 use atomcode_core::tool::glob::GlobTool;
 use atomcode_core::tool::list_dir::ListDirTool;
+use atomcode_core::tool::web_search::WebSearchTool;
+use atomcode_core::tool::web_fetch::WebFetchTool;
 
 #[derive(Parser)]
 #[command(name = "atomcode", version = "0.2.0", about = "AI coding assistant in your terminal")]
@@ -126,15 +128,18 @@ async fn run() -> Result<()> {
     tool_registry.register(Box::new(GrepTool));
     tool_registry.register(Box::new(GlobTool));
     tool_registry.register(Box::new(ListDirTool));
+    tool_registry.register(Box::new(WebSearchTool));
+    tool_registry.register(Box::new(WebFetchTool));
 
     // Derive model name for display in the status bar before giving provider to AgentLoop.
     let model_name = provider_config.model.clone();
 
     let tool_context = ToolContext::new(working_dir.clone());
-    // Start with a fresh conversation every session (like Claude Code).
-    // History is saved for reference but NOT loaded — prevents corrupted messages
-    // from causing API errors, and gives 100% of context window to the current task.
-    let conversation = Conversation::new();
+    // Load previous session's conversation history for cross-session context.
+    // The turn tracker will be rebuilt from the loaded messages, enabling
+    // "PREVIOUS SESSION" context injection in the system prompt.
+    // Corrupted messages are handled gracefully (Conversation::load backs up + starts fresh).
+    let conversation = Conversation::load(&Conversation::history_path());
 
     let (agent_loop, agent_handle) = AgentLoop::new(
         config.clone(),
@@ -192,7 +197,7 @@ fn first_run_wizard() -> Result<Config> {
             model: default_model.to_string(),
             base_url: default_base_url.map(String::from),
             system_prompt: None,
-            context_window: 16000,
+            context_window: default_context_window_for(provider_type),
         },
     );
 
@@ -250,7 +255,7 @@ fn setup_openai_compatible() -> Result<Config> {
             model,
             base_url: Some(base_url),
             system_prompt: None,
-            context_window: 16000,
+            context_window: default_context_window_for("openai"),
         },
     );
 

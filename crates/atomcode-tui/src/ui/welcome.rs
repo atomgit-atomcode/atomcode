@@ -30,7 +30,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         lines.push(Line::default());
     }
 
-    let logo_color = Color::Rgb(130, 100, 255);
+    let logo_color = Color::Rgb(120, 95, 235);
     for logo_line in LOGO.lines().skip(1) {
         lines.push(Line::from(Span::styled(
             logo_line.to_string(),
@@ -42,22 +42,22 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
 
     // Version + model
     lines.push(Line::from(vec![
-        Span::styled("  v0.9.0", Style::default().fg(Color::DarkGray)),
+        Span::styled("  v1.2.0", Style::default().fg(Color::Rgb(65, 68, 80))),
         Span::styled(
-            format!("  ·  model: {}", app.model_name),
-            Style::default().fg(Color::Cyan),
+            format!("  \u{00b7}  {}", app.model_name),
+            Style::default().fg(Color::Rgb(100, 170, 235)),
         ),
     ]));
     lines.push(Line::from(Span::styled(
-        format!("  cwd: {}", app.working_dir.display()),
-        Style::default().fg(Color::Rgb(80, 80, 80)),
+        format!("  {}", app.working_dir.display()),
+        Style::default().fg(Color::Rgb(60, 62, 72)),
     )));
 
     lines.push(Line::default());
 
-    let h = Style::default().fg(Color::Rgb(140, 140, 150)).add_modifier(Modifier::BOLD);
-    let k = Style::default().fg(Color::Rgb(120, 160, 220));
-    let d = Style::default().fg(Color::Rgb(100, 100, 110));
+    let h = Style::default().fg(Color::Rgb(130, 132, 145)).add_modifier(Modifier::BOLD);
+    let k = Style::default().fg(Color::Rgb(105, 150, 210));
+    let d = Style::default().fg(Color::Rgb(85, 88, 100));
 
     // Input
     lines.push(Line::from(Span::styled("  Input", h)));

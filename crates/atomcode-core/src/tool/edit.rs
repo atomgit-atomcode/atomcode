@@ -4,13 +4,29 @@ use serde::Deserialize;
 use serde_json::json;
 
 /// Atomic write: write to temp file then rename. Prevents corruption on crash.
+/// Retries rename once after a short delay — dev servers (Vite, webpack) may
+/// briefly lock files during hot-reload, causing transient rename failures.
 async fn atomic_write(path: &str, content: &str) -> Result<()> {
     let temp = format!("{}.atomcode.tmp", path);
     tokio::fs::write(&temp, content).await
         .with_context(|| format!("Failed to write temp file {}", temp))?;
-    tokio::fs::rename(&temp, path).await
-        .with_context(|| format!("Failed to rename {} to {}", temp, path))?;
-    Ok(())
+    match tokio::fs::rename(&temp, path).await {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            // Retry once after 150ms — likely a transient file lock from dev server.
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            match tokio::fs::rename(&temp, path).await {
+                Ok(()) => Ok(()),
+                Err(_) => {
+                    // Final fallback: direct write (not atomic, but better than failing).
+                    let _ = tokio::fs::remove_file(&temp).await;
+                    tokio::fs::write(path, content).await
+                        .with_context(|| format!("Failed to write {}", path))?;
+                    Ok(())
+                }
+            }
+        }
+    }
 }
 
 use super::{ApprovalRequirement, Tool, ToolContext, ToolDef, ToolResult};
@@ -35,15 +51,20 @@ impl Tool for EditFileTool {
         ToolDef {
             name: "edit_file",
             description: "Replace text in a file. ALWAYS prefer this over write_file for existing files.\n\
+                Usage:\n\
+                - You MUST read the file with read_file before editing it. The edit will fail if you haven't read it.\n\
+                - old_string and new_string must be different.\n\
+                - When copying text from read_file output, preserve exact indentation (tabs/spaces) as shown AFTER the line number prefix.\n\
                 Modes:\n\
-                - replace_all=false (default): old_string must be unique. Replaces one occurrence.\n\
+                - replace_all=false (default): old_string must be unique in the file. Replaces one occurrence.\n\
+                  If old_string matches multiple times, provide more surrounding context lines to make it unique.\n\
                 - replace_all=true: Replaces ALL occurrences. Use for: renaming variables, changing CSS classes, \
-                  updating colors, bulk find-replace. Example: {\"old_string\": \"bg-green-500\", \"new_string\": \"bg-blue-500\", \"replace_all\": true}\n\n\
-                IMPORTANT:\n\
-                - When editing text from read_file output, preserve the exact indentation (tabs/spaces).\n\
-                - If old_string is not found, the tool will suggest the closest match.\n\
-                - If old_string matches multiple times and replace_all=false, provide more surrounding context to make it unique.\n\
-                - This is SAFE — it only changes matched text, preserving all surrounding code, imports, and logic.",
+                  updating colors, bulk find-replace.\n\
+                  Example: {\"old_string\": \"bg-green-500\", \"new_string\": \"bg-blue-500\", \"replace_all\": true}\n\
+                Behavior:\n\
+                - If old_string is not found, the tool will show the closest match to help you correct it.\n\
+                - This is SAFE — it only changes matched text, preserving all surrounding code, imports, and logic.\n\
+                - NEVER use write_file to modify existing files. edit_file prevents accidental deletion of code you forgot to include.",
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -83,15 +104,20 @@ impl Tool for EditFileTool {
         let count = content.matches(&parsed.old_string).count();
 
         if count == 0 {
-            // NO fuzzy matching — Claude Code doesn't have it and works better without it.
-            // Fuzzy matching was silently matching wrong content and causing destructive edits.
-            // Failing explicitly forces the model to re-read and provide the correct old_string.
-
-            // No match at all — show closest match
-            let hint = find_closest_match(&content, &parsed.old_string);
+            // No match — show closest match with a ready-to-use suggested old_string.
+            // This lets the model retry immediately without re-reading the file.
+            let (hint, suggested_old) = find_closest_match_with_suggestion(&content, &parsed.old_string);
+            let suggestion = if let Some(ref s) = suggested_old {
+                format!(
+                    "\n\n[SUGGESTED FIX: Use this exact text as old_string (copy it precisely):]\n```\n{}\n```",
+                    s
+                )
+            } else {
+                String::new()
+            };
             return Ok(ToolResult {
                 call_id: String::new(),
-                output: format!("Error: old_string not found in {}.\n{}", parsed.file_path, hint),
+                output: format!("Error: old_string not found in {}.\n{}{}", parsed.file_path, hint, suggestion),
                 success: false,
             });
         }
@@ -125,13 +151,12 @@ impl Tool for EditFileTool {
             let new_content = content.replace(&parsed.old_string, &parsed.new_string);
             atomic_write(&parsed.file_path, &new_content).await?;
             let diff = build_compact_diff(&parsed.old_string, &parsed.new_string);
-            let context = surrounding_context(&new_content, &parsed.new_string);
+            let outline = file_outline(&new_content);
             Ok(ToolResult {
                 call_id: String::new(),
                 output: format!(
-                    "Edited {} (replaced {} occurrence{}).{}{}\n{}\n{}",
-                    parsed.file_path, count, if count > 1 { "s" } else { "" },
-                    replace_warning, deletion_warning, diff, context
+                    "Edited {} (replaced {} occurrence{}).\n{}\n{}",
+                    parsed.file_path, count, if count > 1 { "s" } else { "" }, diff, outline,
                 ),
                 success: true,
             })
@@ -150,15 +175,15 @@ impl Tool for EditFileTool {
             let new_content = content.replacen(&parsed.old_string, &parsed.new_string, 1);
             atomic_write(&parsed.file_path, &new_content).await?;
 
-            let diff = build_compact_diff(&parsed.old_string, &parsed.new_string);
-            let context = surrounding_context(&new_content, &parsed.new_string);
             let removed = parsed.old_string.lines().count();
             let added = parsed.new_string.lines().count();
+            let diff = build_compact_diff(&parsed.old_string, &parsed.new_string);
+            let outline = file_outline(&new_content);
             Ok(ToolResult {
                 call_id: String::new(),
                 output: format!(
-                    "Edited {} (-{} +{} lines).{}\n{}\n{}",
-                    parsed.file_path, removed, added, deletion_warning, diff, context
+                    "Edited {} (-{} +{} lines).\n{}\n{}",
+                    parsed.file_path, removed, added, diff, outline,
                 ),
                 success: true,
             })
@@ -281,6 +306,49 @@ fn surrounding_context(new_content: &str, new_string: &str) -> String {
     ctx
 }
 
+/// Build a structural outline of the file after edit.
+/// Shows top-level lines (indent 0-1) with line numbers so the model
+/// knows the file's structure and can plan its next edit without re-reading.
+/// Only generated for files > 100 lines (small files don't need it).
+fn file_outline(content: &str) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+    if lines.len() <= 100 {
+        return String::new(); // Small file — diff is enough context.
+    }
+
+    let mut outline = format!("[File outline ({} lines) — do NOT re-read this file:]\n", lines.len());
+    let mut count = 0;
+    let max_outline_lines = 30;
+
+    for (i, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let indent = line.len() - line.trim_start().len();
+        // Indent 0-1 = top-level declaration. Also include <template>, <script>, <style> tags.
+        if indent <= 1 || trimmed.starts_with('<') && (
+            trimmed.starts_with("<template") || trimmed.starts_with("</template")
+            || trimmed.starts_with("<script") || trimmed.starts_with("</script")
+            || trimmed.starts_with("<style") || trimmed.starts_with("</style")
+        ) {
+            // Truncate long lines for the outline
+            let display = if trimmed.chars().count() > 60 {
+                format!("{}...", trimmed.chars().take(57).collect::<String>())
+            } else {
+                trimmed.to_string()
+            };
+            outline.push_str(&format!("{:>4}| {}\n", i + 1, display));
+            count += 1;
+            if count >= max_outline_lines {
+                outline.push_str(&format!("     ... ({} more lines)\n", lines.len() - i - 1));
+                break;
+            }
+        }
+    }
+    outline
+}
+
 /// Build a compact diff showing removed/added lines (max 8 lines total).
 fn build_compact_diff(old: &str, new: &str) -> String {
     let mut diff = String::new();
@@ -308,38 +376,209 @@ fn build_compact_diff(old: &str, new: &str) -> String {
     diff.trim_end().to_string()
 }
 
-/// Find the closest matching line in the file to help the model fix old_string.
+/// Find the closest match and return (hint_message, suggested_old_string).
+/// The suggested_old_string is the exact text from the file that the model
+/// should use — it can copy-paste this into old_string to retry immediately
+/// without re-reading the file.
+fn find_closest_match_with_suggestion(content: &str, old_string: &str) -> (String, Option<String>) {
+    let old_lines: Vec<&str> = old_string.lines().collect();
+    let content_lines: Vec<&str> = content.lines().collect();
+
+    if old_lines.is_empty() {
+        return ("old_string is empty. Use read_file to re-read the file.".to_string(), None);
+    }
+
+    let old_first_trimmed = old_lines[0].trim();
+    if old_first_trimmed.is_empty() && old_lines.len() > 1 {
+        let hint = find_closest_match(content, old_string);
+        return (hint, None);
+    }
+
+    // Try to find where the first line matches (trimmed) in the file
+    for (i, line) in content_lines.iter().enumerate() {
+        if line.trim() == old_first_trimmed {
+            // Found potential match start. Extract the same number of lines from file.
+            let end = (i + old_lines.len()).min(content_lines.len());
+            let actual_lines = &content_lines[i..end];
+
+            // Check if it's a plausible match (at least 30% of lines match trimmed)
+            let matching = actual_lines.iter().zip(old_lines.iter())
+                .filter(|(a, b)| a.trim() == b.trim())
+                .count();
+
+            if matching >= old_lines.len() / 3 || matching >= 2 {
+                let suggested = actual_lines.join("\n");
+                let hint = find_closest_match(content, old_string);
+                return (hint, Some(suggested));
+            }
+        }
+    }
+
+    let hint = find_closest_match(content, old_string);
+    (hint, None)
+}
+
+/// Find the closest matching region in the file to help the model fix old_string.
+/// Three strategies: (1) whitespace-normalized multi-line match, (2) first-line match, (3) keyword search.
 fn find_closest_match(content: &str, old_string: &str) -> String {
-    let old_first_line = old_string.lines().next().unwrap_or("").trim();
-    if old_first_line.is_empty() {
-        return "No similar text found. Use read_file to re-read the file.".to_string();
+    let old_lines: Vec<&str> = old_string.lines().collect();
+    let content_lines: Vec<&str> = content.lines().collect();
+
+    if old_lines.is_empty() {
+        return "old_string is empty. Use read_file to re-read the file.".to_string();
     }
 
-    let best = content.lines().enumerate()
-        .filter(|(_, line)| {
-            let trimmed = line.trim();
-            trimmed.contains(old_first_line) ||
-            old_first_line.contains(trimmed) ||
-            (trimmed.len() > 10 && old_first_line.len() > 10 &&
-             trimmed.chars().take(20).collect::<String>() == old_first_line.chars().take(20).collect::<String>())
-        })
-        .next()
-        .map(|(i, _)| {
-            let start = i.saturating_sub(1);
-            let end = (i + 5).min(content.lines().count());
-            let lines: Vec<&str> = content.lines().collect();
-            lines[start..end].iter()
-                .enumerate()
-                .map(|(j, l)| format!("{:>4}| {}", start + j + 1, l))
-                .collect::<Vec<_>>()
-                .join("\n")
-        });
-
-    match best {
-        Some(snippet) => format!(
-            "Closest match found near:\n{}\nCopy the EXACT text from above for old_string.",
-            snippet
-        ),
-        None => "No similar text found. Use read_file to re-read the file.".to_string(),
+    let old_first_trimmed = old_lines[0].trim();
+    if old_first_trimmed.is_empty() && old_lines.len() > 1 {
+        // First line is empty — try second line
+        return find_closest_match_inner(content, &content_lines, old_lines[1].trim(), &old_lines);
     }
+
+    find_closest_match_inner(content, &content_lines, old_first_trimmed, &old_lines)
+}
+
+fn find_closest_match_inner(
+    _content: &str,
+    content_lines: &[&str],
+    first_line_trimmed: &str,
+    old_lines: &[&str],
+) -> String {
+    if first_line_trimmed.is_empty() {
+        return "old_string appears empty after trimming. Use read_file to re-read the file.".to_string();
+    }
+
+    // Strategy 1: Find where the first line matches (trimmed) and show divergence point
+    let mut candidates: Vec<(usize, usize)> = Vec::new(); // (line_idx, match_score)
+
+    for (i, line) in content_lines.iter().enumerate() {
+        let trimmed = line.trim();
+        // Exact trimmed match of first line
+        if trimmed == first_line_trimmed {
+            // Check how many subsequent lines also match (trimmed)
+            let mut match_count = 1;
+            for j in 1..old_lines.len() {
+                if i + j >= content_lines.len() { break; }
+                if content_lines[i + j].trim() == old_lines[j].trim() {
+                    match_count += 1;
+                } else {
+                    break;
+                }
+            }
+            candidates.push((i, match_count));
+        }
+        // Substring match of first line
+        else if trimmed.contains(first_line_trimmed) || first_line_trimmed.contains(trimmed) {
+            candidates.push((i, 0));
+        }
+        // Prefix match (first 25 chars)
+        else if trimmed.len() > 15 && first_line_trimmed.len() > 15
+            && trimmed.chars().take(25).collect::<String>()
+                == first_line_trimmed.chars().take(25).collect::<String>()
+        {
+            candidates.push((i, 0));
+        }
+    }
+
+    // Sort by match_count (highest first)
+    candidates.sort_by(|a, b| b.1.cmp(&a.1));
+
+    if let Some(&(best_idx, match_count)) = candidates.first() {
+        let start = best_idx.saturating_sub(1);
+        // Cap snippet to 20 lines max — large snippets waste context without helping
+        let end = (best_idx + old_lines.len().min(18) + 2).min(content_lines.len());
+
+        let mut snippet = String::new();
+        for i in start..end {
+            snippet.push_str(&format!("{:>4}| {}\n", i + 1, content_lines[i]));
+        }
+        if best_idx + old_lines.len() + 2 > end {
+            snippet.push_str(&format!("     ... ({} more lines in file)\n", content_lines.len() - end));
+        }
+
+        // If some lines matched but not all, show exactly where the divergence is
+        if match_count > 0 && match_count < old_lines.len() && best_idx + match_count < content_lines.len() {
+            let diverge_idx = match_count;
+            let file_line = content_lines[best_idx + diverge_idx].trim();
+            let old_line = old_lines[diverge_idx].trim();
+
+            // Detect indentation mismatch
+            let file_indent = content_lines[best_idx].len() - content_lines[best_idx].trim_start().len();
+            let old_indent = old_lines[0].len() - old_lines[0].trim_start().len();
+
+            let mut hint = format!(
+                "First {} line(s) match (trimmed) but line {} diverges:\n\
+                 YOUR old_string line {}: \"{}\"\n\
+                 ACTUAL file line {}:     \"{}\"\n",
+                match_count, diverge_idx + 1,
+                diverge_idx + 1, old_line,
+                best_idx + diverge_idx + 1, file_line,
+            );
+
+            if file_indent != old_indent {
+                hint.push_str(&format!(
+                    "INDENTATION MISMATCH: file uses {} spaces, your old_string uses {} spaces.\n",
+                    file_indent, old_indent,
+                ));
+            }
+
+            return format!(
+                "Partial match at lines {}-{} ({}/{} lines match).\n{}\n{}\n\
+                 Copy the EXACT text from above (including indentation) for old_string.",
+                best_idx + 1, end, match_count, old_lines.len(), snippet, hint
+            );
+        }
+
+        // Indentation-only mismatch detection
+        if match_count == 0 {
+            let file_indent = content_lines[best_idx].len() - content_lines[best_idx].trim_start().len();
+            let old_indent = old_lines[0].len() - old_lines[0].trim_start().len();
+            if file_indent != old_indent
+                && content_lines[best_idx].trim() == old_lines[0].trim()
+            {
+                return format!(
+                    "INDENTATION MISMATCH at line {}. File uses {} spaces, your old_string uses {} spaces.\n\
+                     Actual file content:\n{}\n\
+                     Copy the EXACT text (with correct indentation) for old_string.",
+                    best_idx + 1, file_indent, old_indent, snippet
+                );
+            }
+        }
+
+        return format!(
+            "Closest match found near line {}:\n{}\n\
+             Copy the EXACT text from above for old_string (preserve indentation).",
+            best_idx + 1, snippet
+        );
+    }
+
+    // Strategy 2: keyword-based search — find lines containing distinctive words from old_string
+    let keywords: Vec<&str> = first_line_trimmed.split_whitespace()
+        .filter(|w| w.len() > 3 && !matches!(*w, "const" | "let" | "var" | "this" | "self" | "return" | "from" | "import" | "function"))
+        .take(3)
+        .collect();
+
+    if !keywords.is_empty() {
+        for (i, line) in content_lines.iter().enumerate() {
+            let lower = line.to_lowercase();
+            if keywords.iter().all(|kw| lower.contains(&kw.to_lowercase())) {
+                let start = i.saturating_sub(2);
+                let end = (i + 5).min(content_lines.len());
+                let mut snippet = String::new();
+                for j in start..end {
+                    snippet.push_str(&format!("{:>4}| {}\n", j + 1, content_lines[j]));
+                }
+                return format!(
+                    "No exact match, but keywords [{}] found near line {}:\n{}\n\
+                     Use read_file with offset={} limit=20 to see the exact content.",
+                    keywords.join(", "), i + 1, snippet, start + 1
+                );
+            }
+        }
+    }
+
+    format!(
+        "No similar text found in the file ({} lines total). \
+         The content may have changed. Use read_file to re-read the file.",
+        content_lines.len()
+    )
 }

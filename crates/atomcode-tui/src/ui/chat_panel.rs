@@ -1,7 +1,7 @@
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Clear, Paragraph};
+use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 
 use atomcode_core::conversation::Conversation;
@@ -10,33 +10,31 @@ use atomcode_core::tool::{ToolCall, ToolResult};
 
 use crate::app::AppMode;
 
-use super::markdown::render_markdown;
+use super::markdown::{render_markdown, wrap_lines};
 
-const USER_BG: Color = Color::Rgb(35, 38, 52);
-const DIM: Color = Color::Rgb(90, 90, 90);
-const ACCENT: Color = Color::Rgb(130, 100, 255);
-const TOOL_BORDER: Color = Color::Rgb(55, 55, 65);
-const SUCCESS: Color = Color::Rgb(80, 200, 120);
-const ERROR: Color = Color::Rgb(240, 80, 80);
-const WARN: Color = Color::Rgb(240, 200, 60);
+// ── Palette ──
+const TEXT: Color = Color::Rgb(210, 212, 220);
+const DIM: Color = Color::Rgb(110, 113, 128);
+const ACCENT: Color = Color::Rgb(140, 110, 255);
+const USER_FG: Color = Color::Rgb(220, 222, 230);
+const USER_LABEL: Color = Color::Rgb(90, 170, 255);
+const TOOL_ICON: Color = Color::Rgb(80, 165, 230);
+const TOOL_DIM: Color = Color::Rgb(100, 103, 118);
+const SUCCESS: Color = Color::Rgb(75, 195, 115);
+const ERROR: Color = Color::Rgb(235, 80, 80);
+const WARN: Color = Color::Rgb(240, 190, 55);
+const SEPARATOR: Color = Color::Rgb(35, 38, 48);
 
-const SPINNER: &[&str] = &["\u{25dc}", "\u{25dd}", "\u{25de}", "\u{25df}"];
+// Braille spinner
+const SPINNER: &[&str] = &["\u{280b}", "\u{2819}", "\u{2839}", "\u{2838}", "\u{283c}", "\u{2834}", "\u{2826}", "\u{2827}", "\u{2807}", "\u{280f}"];
 
-const THINKING_LABELS: &[&str] = &[
-    "Thinking...",
-    "Pondering...",
-    "Reasoning...",
-    "Contemplating...",
-    "Analyzing...",
-    "Processing...",
-    "Cogitating...",
-    "Deliberating...",
-];
+const THINKING_LABELS: &[&str] = &["Thinking", "Pondering", "Reasoning", "Contemplating", "Analyzing", "Processing"];
 
-/// Full render — builds all lines, scrolls, draws.
-/// Uses render_cache for completed messages (only rebuilt when msg count changes).
-/// Dynamic parts (streaming, mode indicators) are appended fresh each frame.
-/// Returns the actual scroll offset used (for text selection coordinate mapping).
+// Left indent for content
+const INDENT: &str = " ";
+// Tool indent inside accent bar
+const TOOL_INDENT: &str = "   ";
+
 pub fn render(
     frame: &mut Frame,
     area: Rect,
@@ -48,41 +46,38 @@ pub fn render(
     turn_tokens: usize,
     turn_elapsed_secs: Option<u64>,
     turn_label_seed: usize,
-    step_count: usize,    // Pre-computed, not scanned per frame
-    tool_info: &str,       // Pre-computed, not parsed per frame
+    step_count: usize,
+    tool_info: &str,
+    first_token_ms: Option<u64>,
+    llm_wait_ms: Option<u64>,
+    last_completed_tool: &str,
+    last_turn_duration: Option<std::time::Duration>,
+    finished_step_count: usize,
     render_cache: &mut Vec<Line<'static>>,
     render_cache_msg_count: &mut usize,
 ) -> usize {
-    let vh = area.height as usize;
-    if vh == 0 {
-        return 0;
-    }
+    let vh = (area.height as usize).saturating_sub(1);
+    if vh == 0 { return 0; }
 
-    // Rebuild cache only when message count changes
+    let term_width = area.width as usize;
+
+    // Encode msg_count + width into cache key so width changes invalidate cache.
+    // Use upper 16 bits for width, lower bits for count.
     let msg_count = conversation.messages.len();
-    if msg_count != *render_cache_msg_count {
+    let cache_key = msg_count | ((term_width & 0xFFFF) << 48);
+    if cache_key != *render_cache_msg_count {
         render_cache.clear();
         for msg in &conversation.messages {
             match &msg.content {
                 MessageContent::Text(text) => match msg.role {
                     Role::User => render_user(render_cache, text),
-                    Role::Assistant => render_assistant(render_cache, text),
+                    Role::Assistant => render_assistant(render_cache, text, term_width),
                     _ => {}
                 },
                 MessageContent::AssistantWithToolCalls { text, tool_calls } => {
-                    // Show text before tool calls as a "plan" with visual marker
                     if let Some(t) = text {
                         if !t.trim().is_empty() {
-                            render_cache.push(Line::from(Span::styled(
-                                "  \u{2502} Plan",
-                                Style::default().fg(ACCENT).add_modifier(ratatui::style::Modifier::BOLD),
-                            )));
-                            let md = render_markdown(t);
-                            for line in md {
-                                let mut spans = vec![Span::raw("    ".to_string())];
-                                spans.extend(line.spans);
-                                render_cache.push(Line::from(spans));
-                            }
+                            render_assistant(render_cache, t, term_width);
                             render_cache.push(Line::default());
                         }
                     }
@@ -92,108 +87,155 @@ pub fn render(
                 }
                 MessageContent::ToolResult(result) => {
                     render_tool_result(render_cache, result);
+                    render_cache.push(Line::default());
+                }
+                MessageContent::ToolResultRef(r) => {
+                    // Render ref as a synthetic ToolResult using its summary.
+                    let synthetic = atomcode_core::tool::ToolResult {
+                        call_id: r.call_id.clone(),
+                        output: r.summary.clone(),
+                        success: r.success,
+                    };
+                    render_tool_result(render_cache, &synthetic);
+                    render_cache.push(Line::default());
                 }
             }
         }
-        *render_cache_msg_count = msg_count;
+        *render_cache_msg_count = cache_key;
     }
 
-    // Count total lines = cached + dynamic
     let cached_len = render_cache.len();
-
-    // Build dynamic lines (streaming + mode indicator) — small, cheap
     let mut dynamic: Vec<Line<'static>> = Vec::new();
 
+    // Streaming content — accent bar + indented markdown (same as completed assistant text)
+    let bar_style = Style::default().fg(Color::Rgb(60, 50, 110));
     if let Some(ref buffer) = conversation.stream_buffer {
         if !buffer.is_empty() {
-            dynamic.push(Line::from(Span::styled(
-                "  \u{2502} ",
-                Style::default().fg(ACCENT),
-            )));
-            let md = render_markdown(buffer);
+            let content_w = term_width.saturating_sub(3);
+            // Trim trailing incomplete markdown tokens before rendering.
+            // During streaming, the buffer may end with partial backtick fences
+            // (`, ``, ```) that cause the parser to misinterpret subsequent text.
+            let safe_buf = trim_incomplete_markdown(buffer);
+            let md = wrap_lines(render_markdown(&safe_buf), content_w);
             for line in md {
-                let mut spans = vec![Span::raw("    ".to_string())];
+                let mut spans = vec![Span::styled(format!("{}\u{2502} ", INDENT), bar_style)];
                 spans.extend(line.spans);
                 dynamic.push(Line::from(spans));
             }
         }
     }
 
-    // Active state indicator: spinner + label (fixed per turn) + stats
+    // Active state indicator — always visible during streaming/executing
     let spinner = SPINNER[tick % SPINNER.len()];
+    let step_prefix = if step_count > 0 { format!("[step {}] ", step_count + 1) } else { String::new() };
 
-    // Build stats string: elapsed | tokens | speed
-    let stats = build_turn_stats(turn_elapsed_secs, turn_tokens);
-
-    // Step indicator from pre-computed count (no per-frame scan)
-    let step_prefix = if step_count > 0 {
-        format!("[step {}] ", step_count + 1)
+    // Per-call TTFT display: show live wait time while waiting, then fixed TTFT once arrived.
+    let ttft_display = if let Some(ms) = first_token_ms {
+        // First token arrived — show fixed TTFT
+        if ms >= 1000 {
+            format!("  TTFT {:.1}s", ms as f64 / 1000.0)
+        } else {
+            format!("  TTFT {}ms", ms)
+        }
+    } else if let Some(wait) = llm_wait_ms {
+        // Still waiting — show live elapsed
+        if wait >= 1000 {
+            format!("  waiting {:.1}s", wait as f64 / 1000.0)
+        } else {
+            format!("  waiting {}ms", wait)
+        }
     } else {
         String::new()
     };
 
     match mode {
         AppMode::Streaming => {
-            // Show a meaningful label based on context
-            let label = if step_count > 0 && conversation.stream_buffer.as_ref().map_or(true, |b| b.is_empty()) {
-                "Planning next step..."
-            } else if step_count == 0 {
-                THINKING_LABELS[turn_label_seed % THINKING_LABELS.len()]
+            let has_tokens = conversation.stream_buffer.as_ref().map_or(false, |b| !b.is_empty());
+            let waiting_first_token = !has_tokens && first_token_ms.is_none();
+
+            let label = if waiting_first_token {
+                if step_count > 0 && !last_completed_tool.is_empty() {
+                    // Show what just happened: "after read_file, thinking..."
+                    format!("After {}, thinking", last_completed_tool)
+                } else if step_count > 0 {
+                    "Thinking...".to_string()
+                } else {
+                    THINKING_LABELS[turn_label_seed % THINKING_LABELS.len()].to_string()
+                }
+            } else if !tool_info.is_empty() {
+                tool_info.to_string()
+            } else if step_count > 0 && !has_tokens {
+                if !last_completed_tool.is_empty() {
+                    format!("After {}, thinking", last_completed_tool)
+                } else {
+                    "Thinking...".to_string()
+                }
             } else {
-                "Generating..."
+                "Generating...".to_string()
             };
+
             dynamic.push(Line::from(vec![
-                Span::styled(
-                    format!("    {} {}{}", spinner, step_prefix, label),
-                    Style::default().fg(ACCENT),
-                ),
-                Span::styled(stats.clone(), Style::default().fg(DIM)),
+                Span::styled(format!("{}\u{2502} ", INDENT), bar_style),
+                Span::styled(format!("{} ", spinner), Style::default().fg(Color::Rgb(170, 145, 255))),
+                Span::styled(step_prefix.clone(), Style::default().fg(Color::Rgb(130, 133, 150))),
+                Span::styled(label, Style::default().fg(Color::Rgb(170, 145, 255))),
+                Span::styled(ttft_display.clone(), Style::default().fg(Color::Rgb(100, 110, 130))),
             ]));
         }
         AppMode::ToolExecuting => {
             dynamic.push(Line::from(vec![
-                Span::styled(
-                    format!("    {} {}Running {}", spinner, step_prefix, tool_info),
-                    Style::default().fg(WARN),
-                ),
-                Span::styled(stats.clone(), Style::default().fg(DIM)),
+                Span::styled(format!("{}\u{2502} ", INDENT), bar_style),
+                Span::styled(format!("{} ", spinner), Style::default().fg(WARN)),
+                Span::styled(step_prefix.clone(), Style::default().fg(Color::Rgb(130, 133, 150))),
+                Span::styled(tool_info.to_string(), Style::default().fg(Color::Rgb(210, 195, 130))),
             ]));
         }
         AppMode::WaitingApproval(call) => {
             render_approval(&mut dynamic, call);
         }
-        _ => {}
+        _ => {
+            // Turn finished — show summary line if a turn just completed.
+            if let Some(dur) = last_turn_duration {
+                let secs = dur.as_secs();
+                let time_str = if secs >= 60 {
+                    format!("{}m {}s", secs / 60, secs % 60)
+                } else {
+                    format!("{}s", secs)
+                };
+                let steps_str = if finished_step_count > 0 {
+                    format!("{} steps, ", finished_step_count)
+                } else {
+                    String::new()
+                };
+                let summary = format!("\u{273b} Completed in {}{}", steps_str, time_str);
+                dynamic.push(Line::default());
+                dynamic.push(Line::from(Span::styled(
+                    summary,
+                    Style::default().fg(Color::Rgb(100, 110, 130)),
+                )));
+            }
+        }
     }
 
     let total = cached_len + dynamic.len();
-
-    // Scroll calculation
     let scroll = if at_bottom {
         total.saturating_sub(vh) as u16
     } else {
         (scroll_offset.min(total.saturating_sub(vh))) as u16
     };
-
     let scroll_usize = scroll as usize;
 
-    // Build only the visible slice + some padding
-    // Instead of cloning ALL cached lines, only take what's visible
     let mut visible: Vec<Line<'static>> = Vec::with_capacity(vh + 10);
-
     if scroll_usize < cached_len {
-        // Visible range starts in cached lines
         let cache_start = scroll_usize;
         let cache_end = (scroll_usize + vh + 5).min(cached_len);
         visible.extend_from_slice(&render_cache[cache_start..cache_end]);
-
-        // If we need dynamic lines too
         let remaining = (vh + 5).saturating_sub(cache_end - cache_start);
         if remaining > 0 {
             let dyn_end = remaining.min(dynamic.len());
             visible.extend(dynamic[..dyn_end].iter().cloned());
         }
     } else {
-        // Scroll is past cached lines, only show dynamic
         let dyn_start = scroll_usize.saturating_sub(cached_len);
         let dyn_end = (dyn_start + vh + 5).min(dynamic.len());
         if dyn_start < dynamic.len() {
@@ -201,228 +243,200 @@ pub fn render(
         }
     }
 
-    // Pad to fill viewport
     while visible.len() < vh {
         visible.push(Line::default());
     }
 
-    // Clear + render
     frame.render_widget(Clear, area);
     let bg = Block::default().style(Style::default().bg(Color::Reset));
     frame.render_widget(bg, area);
-
-    // No scroll on Paragraph since we already sliced
-    let paragraph = Paragraph::new(visible);
+    let paragraph = Paragraph::new(visible).wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
 
     scroll_usize
 }
 
+// ── User Message ──
+// Clean chevron prefix, bright text, separator after
 fn render_user(lines: &mut Vec<Line<'static>>, content: &str) {
     lines.push(Line::default());
-    let style = Style::default().fg(Color::White).bg(USER_BG);
     let text_lines: Vec<&str> = content.lines().collect();
-    let total_chars: usize = content.len();
 
-    if text_lines.len() <= 3 && total_chars <= 200 {
-        // Short message — show in full
-        for text_line in &text_lines {
-            lines.push(Line::from(vec![
-                Span::styled("  > ", Style::default().fg(ACCENT).bg(USER_BG)),
-                Span::styled(text_line.to_string(), style),
-            ]));
+    if text_lines.len() <= 3 && content.len() <= 200 {
+        for (i, text_line) in text_lines.iter().enumerate() {
+            if i == 0 {
+                lines.push(Line::from(vec![
+                    Span::styled(format!("{}\u{276f} ", INDENT), Style::default().fg(USER_LABEL).add_modifier(Modifier::BOLD)),
+                    Span::styled(text_line.to_string(), Style::default().fg(USER_FG)),
+                ]));
+            } else {
+                lines.push(Line::from(vec![
+                    Span::styled(format!("{}  ", INDENT), Style::default()),
+                    Span::styled(text_line.to_string(), Style::default().fg(USER_FG)),
+                ]));
+            }
         }
     } else {
-        // Long message — show first line + bracket-style indicator
-        let first = text_lines.iter()
-            .find(|l| !l.trim().is_empty())
-            .unwrap_or(&text_lines[0]);
-        let summary = if first.chars().count() > 70 {
-            format!("{}...", first.chars().take(67).collect::<String>())
+        let first = text_lines.iter().find(|l| !l.trim().is_empty()).unwrap_or(&text_lines[0]);
+        let summary = if first.chars().count() > 60 {
+            format!("{}...", first.chars().take(57).collect::<String>())
         } else {
             first.to_string()
         };
-
         lines.push(Line::from(vec![
-            Span::styled("  > ", Style::default().fg(ACCENT).bg(USER_BG)),
-            Span::styled(summary, style),
-            Span::styled(
-                format!("  [{} lines]", text_lines.len()),
-                Style::default().fg(Color::Rgb(90, 100, 120)).bg(USER_BG),
-            ),
+            Span::styled(format!("{}\u{276f} ", INDENT), Style::default().fg(USER_LABEL).add_modifier(Modifier::BOLD)),
+            Span::styled(summary, Style::default().fg(USER_FG)),
+            Span::styled(format!("  [{} lines]", text_lines.len()), Style::default().fg(DIM)),
         ]));
     }
     lines.push(Line::default());
 }
 
-fn render_assistant(lines: &mut Vec<Line<'static>>, content: &str) {
-    lines.push(Line::from(Span::styled(
-        "  \u{2502} ",
-        Style::default().fg(ACCENT),
-    )));
-    let md = render_markdown(content);
+// ── Assistant Message ──
+// Thin accent bar on the left — visual anchor that groups the response.
+// Claude Code uses this exact pattern: subtle colored bar + indented content.
+fn render_assistant(lines: &mut Vec<Line<'static>>, content: &str, max_width: usize) {
+    let bar = Span::styled(format!("{}\u{2502} ", INDENT), Style::default().fg(Color::Rgb(60, 50, 110)));
+    // Content width = terminal width minus the bar prefix (3 columns: " │ ")
+    let content_w = max_width.saturating_sub(3);
+    let md = wrap_lines(render_markdown(content), content_w);
     for line in md {
-        let mut spans = vec![Span::raw("    ".to_string())];
+        let mut spans = vec![bar.clone()];
         spans.extend(line.spans);
         lines.push(Line::from(spans));
     }
 }
 
+// ── Tool Call ──
+// Accent bar continues through tool calls for visual grouping within a turn.
 fn render_tool_call(lines: &mut Vec<Line<'static>>, call: &ToolCall) {
-    let border = Style::default().fg(TOOL_BORDER);
+    let bar = Span::styled(format!("{}\u{2502} ", INDENT), Style::default().fg(Color::Rgb(60, 50, 110)));
     let name = capitalize(&call.name);
     let detail = format_tool_detail(&call.name, &call.arguments);
 
+    // Per-tool icon + color
+    let (icon, icon_color) = match call.name.as_str() {
+        "read_file" => ("\u{25b8}", TOOL_ICON),           // ▸
+        "edit_file" => ("\u{25b8}", Color::Rgb(100, 200, 150)),  // ▸ green
+        "write_file" => ("\u{25b8}", Color::Rgb(100, 200, 150)),
+        "bash" => ("\u{25b8}", Color::Rgb(200, 180, 100)),       // ▸ gold
+        "grep" | "glob" | "web_search" => ("\u{25b8}", Color::Rgb(170, 140, 230)),
+        "web_fetch" => ("\u{25b8}", Color::Rgb(170, 140, 230)),
+        _ => ("\u{25b8}", TOOL_ICON),
+    };
+
     lines.push(Line::from(vec![
-        Span::styled("    \u{2502} ", border),
-        Span::styled(
-            format!("> {}", name),
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!("  {}", detail),
-            Style::default().fg(DIM),
-        ),
+        bar.clone(),
+        Span::styled(format!("  {} ", icon), Style::default().fg(icon_color)),
+        Span::styled(name, Style::default().fg(TOOL_ICON).add_modifier(Modifier::BOLD)),
+        Span::styled(format!("  {}", detail), Style::default().fg(TOOL_DIM)),
     ]));
 
-    // For edit_file: show old_string preview on a second line
+    // edit_file: show old_string preview
     if call.name == "edit_file" {
         if let Ok(args) = serde_json::from_str::<serde_json::Value>(&call.arguments) {
             if let Some(old) = args.get("old_string").and_then(|v| v.as_str()) {
                 let preview = old.lines().next().unwrap_or("");
-                let display = if preview.chars().count() > 60 {
-                    format!("{}...", preview.chars().take(57).collect::<String>())
-                } else {
-                    preview.to_string()
-                };
+                let display = if preview.chars().count() > 55 {
+                    format!("{}...", preview.chars().take(52).collect::<String>())
+                } else { preview.to_string() };
                 if !display.trim().is_empty() {
                     lines.push(Line::from(vec![
-                        Span::styled("    \u{2502}   ", border),
-                        Span::styled(
-                            format!("find: {}", display.trim()),
-                            Style::default().fg(Color::Rgb(70, 70, 80)),
-                        ),
+                        bar.clone(),
+                        Span::styled(format!("    \u{2192} {}", display.trim()), Style::default().fg(Color::Rgb(95, 98, 115))),
                     ]));
-                }
-            }
-        }
-    }
-    // For bash: show command on second line if it was truncated
-    else if call.name == "bash" {
-        if let Ok(args) = serde_json::from_str::<serde_json::Value>(&call.arguments) {
-            if let Some(cmd) = args.get("command").and_then(|v| v.as_str()) {
-                if cmd.chars().count() > 60 {
-                    // Show second line of multi-line commands
-                    if let Some(second) = cmd.lines().nth(1) {
-                        let display = if second.chars().count() > 60 {
-                            format!("{}...", second.chars().take(57).collect::<String>())
-                        } else {
-                            second.to_string()
-                        };
-                        lines.push(Line::from(vec![
-                            Span::styled("    \u{2502}   ", border),
-                            Span::styled(
-                                display.trim().to_string(),
-                                Style::default().fg(Color::Rgb(70, 70, 80)),
-                            ),
-                        ]));
-                    }
                 }
             }
         }
     }
 }
 
+// ── Tool Result ──
+// Accent bar continues, success/failure indicator
 fn render_tool_result(lines: &mut Vec<Line<'static>>, result: &ToolResult) {
+    let bar = Span::styled(format!("{}\u{2502} ", INDENT), Style::default().fg(Color::Rgb(60, 50, 110)));
     let (icon, color) = if result.success {
-        ("+", SUCCESS)
+        ("\u{2713}", SUCCESS)
     } else {
-        ("x", ERROR)
+        ("\u{2717}", ERROR)
     };
 
     let output_lines: Vec<&str> = result.output.lines().collect();
 
     if output_lines.is_empty() {
         lines.push(Line::from(vec![
-            Span::styled("    \u{2502} ", Style::default().fg(TOOL_BORDER)),
-            Span::styled(format!("{} ", icon), Style::default().fg(color)),
+            bar.clone(),
+            Span::styled(format!("  {} ", icon), Style::default().fg(color)),
             Span::styled("(no output)", Style::default().fg(DIM)),
         ]));
         return;
     }
 
-    // First line: status icon + summary
+    // First line: icon + summary
     let first = output_lines[0];
-    let first_display = if first.chars().count() > 80 {
-        first.chars().take(77).collect::<String>() + "..."
-    } else {
-        first.to_string()
-    };
+    let first_display = if first.chars().count() > 72 {
+        first.chars().take(69).collect::<String>() + "..."
+    } else { first.to_string() };
+
     lines.push(Line::from(vec![
-        Span::styled("    \u{2502} ", Style::default().fg(TOOL_BORDER)),
-        Span::styled(format!("{} ", icon), Style::default().fg(color)),
+        bar.clone(),
+        Span::styled(format!("  {} ", icon), Style::default().fg(color)),
         Span::styled(first_display, Style::default().fg(DIM)),
     ]));
 
-    // Show diff lines and additional detail (up to 8 more lines)
-    let max_detail = 8;
+    // Detail lines (up to 6)
+    let max_detail = 6;
     let mut shown = 0;
     for line in output_lines.iter().skip(1) {
         if shown >= max_detail { break; }
         let trimmed = line.trim();
         if trimmed.is_empty() { continue; }
 
-        let (prefix_style, text_style) = if trimmed.starts_with("- ") {
-            // Removed line — red
-            (Style::default().fg(ERROR), Style::default().fg(Color::Rgb(200, 100, 100)))
+        let text_style = if trimmed.starts_with("- ") {
+            Style::default().fg(Color::Rgb(200, 95, 95))
         } else if trimmed.starts_with("+ ") {
-            // Added line — green
-            (Style::default().fg(SUCCESS), Style::default().fg(Color::Rgb(100, 200, 120)))
+            Style::default().fg(Color::Rgb(95, 190, 115))
         } else if trimmed.starts_with("WARNING") || trimmed.starts_with("[IMPORTANT") {
-            (Style::default().fg(WARN), Style::default().fg(WARN))
+            Style::default().fg(WARN)
         } else {
-            (Style::default().fg(DIM), Style::default().fg(DIM))
+            Style::default().fg(Color::Rgb(95, 98, 115))
         };
 
-        let display = if trimmed.chars().count() > 76 {
-            trimmed.chars().take(73).collect::<String>() + "..."
-        } else {
-            trimmed.to_string()
-        };
+        let display = if trimmed.chars().count() > 70 {
+            trimmed.chars().take(67).collect::<String>() + "..."
+        } else { trimmed.to_string() };
 
         lines.push(Line::from(vec![
-            Span::styled("    \u{2502}   ", Style::default().fg(TOOL_BORDER)),
-            Span::styled(display, text_style),
+            bar.clone(),
+            Span::styled(format!("    {}", display), text_style),
         ]));
         shown += 1;
     }
 
-    // If more lines not shown
     let remaining = output_lines.len().saturating_sub(1 + max_detail);
     if remaining > 0 {
         lines.push(Line::from(vec![
-            Span::styled("    \u{2502}   ", Style::default().fg(TOOL_BORDER)),
-            Span::styled(
-                format!("... {} more lines", remaining),
-                Style::default().fg(Color::Rgb(60, 60, 70)),
-            ),
+            bar.clone(),
+            Span::styled(format!("    \u{2026} {} more lines", remaining), Style::default().fg(Color::Rgb(85, 88, 105))),
         ]));
     }
 }
 
+// ── Approval ──
 fn render_approval(lines: &mut Vec<Line<'static>>, call: &ToolCall) {
     let name = capitalize(&call.name);
-    let border = Style::default().fg(WARN);
+    let border = Style::default().fg(Color::Rgb(160, 135, 45));
+    let key_label = Style::default().fg(Color::Rgb(115, 118, 130));
 
+    lines.push(Line::default());
+    // Top border
     lines.push(Line::from(vec![
-        Span::styled("    \u{256d}\u{2500} ", border),
-        Span::styled(
-            format!("! {} ", name),
-            Style::default().fg(WARN).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("\u{2500}".repeat(30), border),
+        Span::styled(format!("{}\u{256d}\u{2500}\u{2500} ", TOOL_INDENT), border),
+        Span::styled(format!("\u{26a1} {} ", name), Style::default().fg(WARN).add_modifier(Modifier::BOLD)),
+        Span::styled("\u{2500}".repeat(24), Style::default().fg(Color::Rgb(55, 50, 38))),
     ]));
 
+    // Args
     if let Ok(args) = serde_json::from_str::<serde_json::Value>(&call.arguments) {
         if let Some(obj) = args.as_object() {
             for (k, v) in obj {
@@ -430,31 +444,26 @@ fn render_approval(lines: &mut Vec<Line<'static>>, call: &ToolCall) {
                     serde_json::Value::String(s) => {
                         if k == "content" {
                             let lc = s.lines().count();
-                            let preview: String = s.lines().take(5).collect::<Vec<_>>().join("\n");
-                            if lc > 5 {
-                                format!("{}\n    \u{2502}   ... ({} lines)", preview, lc)
-                            } else {
-                                preview
-                            }
-                        } else if s.chars().count() > 50 {
-                            s.chars().take(47).collect::<String>() + "..."
-                        } else {
-                            s.clone()
-                        }
+                            let preview: String = s.lines().take(4).collect::<Vec<_>>().join("\n");
+                            if lc > 4 { format!("{}\n{}\u{2502}   \u{2026} ({} lines)", preview, TOOL_INDENT, lc) }
+                            else { preview }
+                        } else if s.chars().count() > 45 {
+                            s.chars().take(42).collect::<String>() + "..."
+                        } else { s.clone() }
                     }
                     other => other.to_string(),
                 };
                 for (i, vline) in val.lines().enumerate() {
                     if i == 0 {
                         lines.push(Line::from(vec![
-                            Span::styled("    \u{2502} ", border),
-                            Span::styled(format!("{}: ", k), Style::default().fg(Color::Gray)),
-                            Span::styled(vline.to_string(), Style::default().fg(Color::White)),
+                            Span::styled(format!("{}\u{2502} ", TOOL_INDENT), border),
+                            Span::styled(format!("{}: ", k), Style::default().fg(Color::Rgb(130, 132, 145))),
+                            Span::styled(vline.to_string(), Style::default().fg(Color::Rgb(215, 215, 220))),
                         ]));
                     } else {
                         lines.push(Line::from(vec![
-                            Span::styled("    \u{2502}   ", border),
-                            Span::styled(vline.to_string(), Style::default().fg(Color::Rgb(150, 150, 150))),
+                            Span::styled(format!("{}\u{2502}   ", TOOL_INDENT), border),
+                            Span::styled(vline.to_string(), Style::default().fg(Color::Rgb(155, 155, 165))),
                         ]));
                     }
                 }
@@ -462,65 +471,54 @@ fn render_approval(lines: &mut Vec<Line<'static>>, call: &ToolCall) {
         }
     }
 
+    // Bottom border
     lines.push(Line::from(Span::styled(
-        format!("    \u{2570}{}", "\u{2500}".repeat(40)),
-        border,
+        format!("{}\u{2570}{}", TOOL_INDENT, "\u{2500}".repeat(32)),
+        Style::default().fg(Color::Rgb(55, 50, 38)),
     )));
 
+    // Action buttons
     lines.push(Line::from(vec![
-        Span::raw("    ".to_string()),
-        Span::styled("[Y]", Style::default().fg(SUCCESS).add_modifier(Modifier::BOLD)),
-        Span::styled(" Allow  ", Style::default().fg(Color::Gray)),
-        Span::styled("[A]", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-        Span::styled(" Always  ", Style::default().fg(Color::Gray)),
-        Span::styled("[N]", Style::default().fg(ERROR).add_modifier(Modifier::BOLD)),
-        Span::styled(" Deny", Style::default().fg(Color::Gray)),
+        Span::raw(format!("{}", TOOL_INDENT)),
+        Span::styled(" Y ", Style::default().fg(Color::Rgb(15, 15, 15)).bg(SUCCESS).add_modifier(Modifier::BOLD)),
+        Span::styled(" Allow  ", key_label),
+        Span::styled(" A ", Style::default().fg(Color::Rgb(15, 15, 15)).bg(Color::Rgb(75, 155, 215)).add_modifier(Modifier::BOLD)),
+        Span::styled(" Always  ", key_label),
+        Span::styled(" N ", Style::default().fg(Color::Rgb(15, 15, 15)).bg(ERROR).add_modifier(Modifier::BOLD)),
+        Span::styled(" Deny", key_label),
     ]));
+    lines.push(Line::default());
 }
+
+// ── Helpers ──
 
 fn capitalize(name: &str) -> String {
-    name.split('_')
-        .map(|word| {
-            let mut chars = word.chars();
-            match chars.next() {
-                None => String::new(),
-                Some(c) => c.to_uppercase().to_string() + chars.as_str(),
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
+    name.split('_').map(|w| {
+        let mut c = w.chars();
+        match c.next() {
+            None => String::new(),
+            Some(ch) => ch.to_uppercase().to_string() + c.as_str(),
+        }
+    }).collect::<Vec<_>>().join(" ")
 }
 
-/// Build stats string: "  12s | 1.2k tokens | 98 t/s"
 fn build_turn_stats(elapsed_secs: Option<u64>, tokens: usize) -> String {
     let mut parts: Vec<String> = Vec::new();
-
     if let Some(secs) = elapsed_secs {
-        if secs >= 60 {
-            parts.push(format!("{}m{}s", secs / 60, secs % 60));
-        } else {
-            parts.push(format!("{}s", secs));
-        }
+        if secs >= 60 { parts.push(format!("{}m{}s", secs / 60, secs % 60)); }
+        else { parts.push(format!("{}s", secs)); }
     }
-
     if tokens > 0 {
         parts.push(format!("{} tokens", format_compact_tokens(tokens)));
-        // Token speed
         if let Some(secs) = elapsed_secs {
             if secs > 0 {
                 let speed = tokens as f64 / secs as f64;
-                if speed >= 1.0 {
-                    parts.push(format!("{:.0} t/s", speed));
-                }
+                if speed >= 1.0 { parts.push(format!("{:.0} t/s", speed)); }
             }
         }
     }
-
-    if parts.is_empty() {
-        String::new()
-    } else {
-        format!("  {}", parts.join(" | "))
-    }
+    if parts.is_empty() { String::new() }
+    else { format!("  {}", parts.join(" \u{00b7} ")) }
 }
 
 fn format_compact_tokens(n: usize) -> String {
@@ -529,25 +527,22 @@ fn format_compact_tokens(n: usize) -> String {
     else { format!("{:.1}M", n as f64 / 1_000_000.0) }
 }
 
-/// Format a human-readable one-line detail for a tool call, tailored per tool type.
-/// Shows the most important info: file paths shortened, command previews, etc.
 fn format_tool_detail(tool_name: &str, args_json: &str) -> String {
     let args: serde_json::Value = match serde_json::from_str(args_json) {
         Ok(v) => v,
         Err(_) => return String::new(),
     };
-
     match tool_name {
         "read_file" => {
             let path = shorten_path(args.get("file_path").and_then(|v| v.as_str()).unwrap_or(""));
-            let mut detail = path;
+            let mut d = path;
             if let Some(offset) = args.get("offset").and_then(|v| v.as_u64()) {
-                detail.push_str(&format!(" L{}", offset));
+                d.push_str(&format!(" L{}", offset));
                 if let Some(limit) = args.get("limit").and_then(|v| v.as_u64()) {
-                    detail.push_str(&format!("-{}", offset + limit));
+                    d.push_str(&format!("-{}", offset + limit));
                 }
             }
-            detail
+            d
         }
         "write_file" => {
             let path = shorten_path(args.get("file_path").and_then(|v| v.as_str()).unwrap_or(""));
@@ -558,66 +553,106 @@ fn format_tool_detail(tool_name: &str, args_json: &str) -> String {
             let path = shorten_path(args.get("file_path").and_then(|v| v.as_str()).unwrap_or(""));
             let old_lines = args.get("old_string").and_then(|v| v.as_str()).map(|s| s.lines().count()).unwrap_or(0);
             let new_lines = args.get("new_string").and_then(|v| v.as_str()).map(|s| s.lines().count()).unwrap_or(0);
-            format!("{} (-{} +{} lines)", path, old_lines, new_lines)
+            format!("{} (-{} +{})", path, old_lines, new_lines)
         }
         "bash" => {
             let cmd = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
-            if cmd.chars().count() > 60 {
-                cmd.chars().take(57).collect::<String>() + "..."
-            } else {
-                cmd.to_string()
-            }
+            let first = cmd.lines().next().unwrap_or(cmd);
+            if first.chars().count() > 55 { first.chars().take(52).collect::<String>() + "..." }
+            else { first.to_string() }
         }
         "list_directory" => {
             let path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
-            let depth = args.get("depth").and_then(|v| v.as_u64()).unwrap_or(2);
-            format!("{} (depth={})", shorten_path(path), depth)
+            shorten_path(path)
         }
         "grep" | "glob" => {
             let pattern = args.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
             let path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
             format!("\"{}\" in {}", pattern, shorten_path(path))
         }
+        "web_search" => {
+            args.get("query").and_then(|v| v.as_str()).unwrap_or("").to_string()
+        }
+        "web_fetch" => {
+            args.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string()
+        }
         _ => format_args_oneline(args_json),
     }
 }
 
-/// Shorten a file path for display: keep filename + parent dir, trim the rest.
 fn shorten_path(path: &str) -> String {
-    let parts: Vec<&str> = path.rsplitn(3, '/').collect();
+    let sep = if path.contains('\\') { '\\' } else { '/' };
+    let parts: Vec<&str> = path.rsplitn(3, sep).collect();
     match parts.len() {
         0 | 1 => path.to_string(),
-        2 => format!("{}/{}", parts[1], parts[0]),
-        _ => format!(".../{}/{}", parts[1], parts[0]),
+        2 => format!("{}{}{}", parts[1], sep, parts[0]),
+        _ => format!("...{}{}{}{}", sep, parts[1], sep, parts[0]),
     }
 }
 
 fn format_args_oneline(args_json: &str) -> String {
     if let Ok(args) = serde_json::from_str::<serde_json::Value>(args_json) {
         if let Some(obj) = args.as_object() {
-            let parts: Vec<String> = obj
-                .iter()
-                .map(|(k, v)| {
-                    let val = match v {
-                        serde_json::Value::String(s) => {
-                            if s.chars().count() > 30 {
-                                s.chars().take(27).collect::<String>() + "..."
-                            } else {
-                                s.clone()
-                            }
-                        }
-                        other => {
-                            let s = other.to_string();
-                            if s.len() > 30 { s[..27].to_string() + "..." } else { s }
-                        }
-                    };
-                    format!("{}={}", k, val)
-                })
-                .collect();
+            let parts: Vec<String> = obj.iter().map(|(k, v)| {
+                let val = match v {
+                    serde_json::Value::String(s) => {
+                        if s.chars().count() > 25 { s.chars().take(22).collect::<String>() + "..." }
+                        else { s.clone() }
+                    }
+                    other => {
+                        let s = other.to_string();
+                        if s.chars().count() > 25 { s.chars().take(22).collect::<String>() + "..." } else { s }
+                    }
+                };
+                format!("{}={}", k, val)
+            }).collect();
             return parts.join(" ");
         }
     }
     String::new()
+}
+
+/// Trim trailing incomplete markdown tokens from a streaming buffer.
+/// Handles: incomplete code fences (`, ``, ```), unclosed bold/italic (* or **),
+/// and trailing backslash escapes.
+fn trim_incomplete_markdown(buf: &str) -> String {
+    let mut s = buf.to_string();
+
+    // 1. Trailing backtick fence: if the buffer ends with 1-3 backticks on the
+    //    last line (possibly after a newline), it's likely an incomplete code fence.
+    //    Trim them so the parser doesn't misinterpret.
+    let last_line = s.rsplit('\n').next().unwrap_or(&s);
+    let trimmed = last_line.trim_end();
+    if trimmed.ends_with("```") || trimmed.ends_with("``") {
+        // Could be a complete closing fence or an incomplete opening.
+        // If the number of ``` fences in the full text is odd, it's incomplete.
+        let fence_count = s.matches("```").count();
+        if fence_count % 2 != 0 {
+            // Odd number — the last fence is unclosed. Remove it.
+            if let Some(pos) = s.rfind("```") {
+                s.truncate(pos);
+            }
+        }
+    } else if trimmed.ends_with('`') && !trimmed.ends_with("``") {
+        // Single trailing backtick — might be start of inline code.
+        // Count all backticks; if odd, the last one is unclosed.
+        let tick_count = s.chars().filter(|c| *c == '`').count();
+        if tick_count % 2 != 0 {
+            // Remove trailing backtick.
+            s.truncate(s.trim_end_matches('`').len());
+        }
+    }
+
+    // 2. Trailing unclosed bold/italic markers.
+    let end = s.trim_end();
+    if end.ends_with("**") || end.ends_with('*') {
+        let star_count = s.chars().filter(|c| *c == '*').count();
+        if star_count % 2 != 0 {
+            s.truncate(s.trim_end_matches('*').len());
+        }
+    }
+
+    s
 }
 
 pub fn total_lines(conversation: &Conversation) -> usize {
@@ -626,20 +661,19 @@ pub fn total_lines(conversation: &Conversation) -> usize {
         match &msg.content {
             MessageContent::Text(text) => match msg.role {
                 Role::User => count += 2 + text.lines().count(),
-                Role::Assistant => count += 1 + render_markdown(text).len(),
+                Role::Assistant => count += render_markdown(text).len(),
                 _ => {}
             },
             MessageContent::AssistantWithToolCalls { text, tool_calls } => {
-                if let Some(t) = text {
-                    count += 1 + render_markdown(t).len();
-                }
+                if let Some(t) = text { count += render_markdown(t).len(); }
                 count += tool_calls.len();
             }
             MessageContent::ToolResult(_) => count += 1,
+            MessageContent::ToolResultRef(_) => count += 1,
         }
     }
     if let Some(ref buffer) = conversation.stream_buffer {
-        count += 1 + render_markdown(buffer).len() + 1;
+        count += render_markdown(buffer).len() + 1;
     }
     count
 }

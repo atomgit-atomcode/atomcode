@@ -5,3 +5,10 @@ members = [
     "crates/atomcode-tui",
     "crates/atomcode-cli",
 ]
+
+[workspace.package]
+version = "1.2.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/YubangXu/atomcode"
+description = "Open-source terminal AI coding agent"

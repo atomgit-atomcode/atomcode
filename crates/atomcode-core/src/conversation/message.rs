@@ -1,4 +1,5 @@
 use crate::tool::{ToolCall, ToolResult};
+use crate::tool::result_store::ToolResultRef;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum Role {
@@ -16,6 +17,9 @@ pub enum MessageContent {
         tool_calls: Vec<ToolCall>,
     },
     ToolResult(ToolResult),
+    /// Lightweight reference to a tool result whose full output is cached on disk.
+    /// Used for new tool results; old `ToolResult` variant kept for backward compat.
+    ToolResultRef(ToolResultRef),
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -37,6 +41,7 @@ impl Message {
             MessageContent::Text(s) => Some(s),
             MessageContent::AssistantWithToolCalls { text, .. } => text.as_deref(),
             MessageContent::ToolResult(r) => Some(&r.output),
+            MessageContent::ToolResultRef(r) => Some(&r.summary),
         }
     }
 
@@ -53,6 +58,8 @@ impl Message {
                 text_len + calls_len
             }
             MessageContent::ToolResult(r) => r.output.len() + 10,
+            // ToolResultRef: estimate from summary only (full output is on disk).
+            MessageContent::ToolResultRef(r) => r.summary.len() + 10,
         };
         // ~4 chars per token for English, add 4 tokens overhead per message
         (char_count / 4).max(1) + 4
@@ -88,7 +95,41 @@ impl Message {
                     }),
                 }
             }
+            // ToolResultRef is already condensed (only holds a summary).
+            MessageContent::ToolResultRef(_) => self.clone(),
             _ => self.clone(),
+        }
+    }
+
+    /// Returns true if this message is a tool result (either inline or ref).
+    pub fn is_tool_result(&self) -> bool {
+        matches!(self.content, MessageContent::ToolResult(_) | MessageContent::ToolResultRef(_))
+    }
+
+    /// Extract call_id from tool result variants.
+    pub fn tool_result_call_id(&self) -> Option<&str> {
+        match &self.content {
+            MessageContent::ToolResult(r) => Some(&r.call_id),
+            MessageContent::ToolResultRef(r) => Some(&r.call_id),
+            _ => None,
+        }
+    }
+
+    /// Extract success status from tool result variants.
+    pub fn tool_result_success(&self) -> Option<bool> {
+        match &self.content {
+            MessageContent::ToolResult(r) => Some(r.success),
+            MessageContent::ToolResultRef(r) => Some(r.success),
+            _ => None,
+        }
+    }
+
+    /// Extract the output text from tool result variants (summary for refs).
+    pub fn tool_result_output(&self) -> Option<&str> {
+        match &self.content {
+            MessageContent::ToolResult(r) => Some(&r.output),
+            MessageContent::ToolResultRef(r) => Some(&r.summary),
+            _ => None,
         }
     }
 }

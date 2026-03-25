@@ -19,13 +19,21 @@ impl Tool for ReadFileTool {
     fn definition(&self) -> ToolDef {
         ToolDef {
             name: "read_file",
-            description: "Read the contents of a file. Returns the file text with line numbers. ALWAYS read the entire file (omit offset/limit) unless the file is known to be very large (1000+ lines). Do NOT read files in small chunks.",
+            description: "Read the contents of a file. Returns file text with line numbers (cat -n format).\n\
+                Usage:\n\
+                - file_path must be an absolute path, not a relative path.\n\
+                - By default reads the full file. For large files (500+ lines), use offset and limit to read specific sections.\n\
+                - When you already know which part of the file you need (e.g. a specific function), only read that part.\n\
+                - If the path is a directory, returns a listing of its contents instead of an error.\n\
+                - Binary files are detected and reported (not dumped as garbage text).\n\
+                - You can call read_file multiple times in parallel to read several files at once.\n\
+                - NEVER use bash (cat/head/tail/sed) to read files — always use this tool.",
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "file_path": { "type": "string", "description": "Absolute path to the file to read" },
-                    "offset": { "type": "integer", "description": "Line number to start reading from (1-based). Only use for files over 1000 lines." },
-                    "limit": { "type": "integer", "description": "Max lines to read. Defaults to 2000. Only set for files over 1000 lines." }
+                    "offset": { "type": "integer", "description": "Start line (1-based). Omit to read from beginning." },
+                    "limit": { "type": "integer", "description": "Max lines to read. Defaults to full file." }
                 },
                 "required": ["file_path"]
             }),
@@ -78,14 +86,24 @@ impl Tool for ReadFileTool {
 
         let lines: Vec<&str> = content.lines().collect();
         let total_lines = lines.len();
-        let offset = parsed.offset.unwrap_or(1).max(1) - 1;
 
-        // Always return the full file (up to 2000 lines) — like Claude Code.
-        // The old 300-line truncation caused models to read the same file 3+ times.
-        // Context overflow is handled by to_provider_messages_budgeted, not here.
-        let (limit, large_file_truncated) = match (parsed.offset, parsed.limit) {
-            (_, Some(l)) => (l, false),
-            (_, None) => (2000, false),
+        // No force_full — respect the model's offset/limit choices.
+        // Weak models work better with small, focused reads than full files.
+        let force_full = false;
+
+        let offset = if force_full {
+            0
+        } else {
+            parsed.offset.unwrap_or(1).max(1) - 1
+        };
+
+        let limit = if force_full {
+            total_lines
+        } else {
+            match parsed.limit {
+                Some(l) => l,
+                None => 2000,
+            }
         };
 
         // If offset > 0 but auto-expand would give the whole file, reset offset to 0
@@ -101,13 +119,7 @@ impl Tool for ReadFileTool {
             .collect::<Vec<_>>()
             .join("\n");
 
-        // Tell the model what it got
-        if returned_all {
-            output.push_str(&format!(
-                "\n\n[COMPLETE FILE: {} lines. You have everything. Do NOT re-read sections of this file.]",
-                total_lines
-            ));
-        } else {
+        if !returned_all {
             output.push_str(&format!(
                 "\n\n[Showing lines {}-{} of {} total.]",
                 offset + 1, end, total_lines

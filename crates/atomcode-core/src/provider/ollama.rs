@@ -48,6 +48,7 @@ impl OllamaProvider {
                         MessageContent::Text(s) => s.as_str(),
                         MessageContent::AssistantWithToolCalls { text, .. } => text.as_deref().unwrap_or(""),
                         MessageContent::ToolResult(r) => &r.output,
+                        MessageContent::ToolResultRef(r) => &r.summary,
                     },
                 })
             })

@@ -12,6 +12,12 @@ const DESCRIPTORS: &[(&str, usize)] = &[
     ("pyproject.toml", 30),
     ("go.mod", 5),
     ("Gemfile", 15),
+    ("pom.xml", 40),
+    ("build.gradle", 30),
+    ("build.gradle.kts", 30),
+    ("requirements.txt", 20),
+    ("composer.json", 20),
+    ("CMakeLists.txt", 30),
     ("docker-compose.yml", 30),
     ("docker-compose.yaml", 30),
     ("justfile", 50),
@@ -81,7 +87,11 @@ pub fn build_project_context(dir: &Path) -> ProjectContext {
 
     // Cap total size — generous limit for large projects
     if ctx.len() > 15000 {
-        ctx.truncate(15000);
+        let mut end = 15000;
+        while end > 0 && !ctx.is_char_boundary(end) {
+            end -= 1;
+        }
+        ctx.truncate(end);
         ctx.push_str("\n...(truncated)");
     }
 

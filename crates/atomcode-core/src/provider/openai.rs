@@ -101,7 +101,6 @@ impl OpenAiProvider {
                         Some(msg)
                     }
                     MessageContent::ToolResult(r) => {
-                        // Must have a call_id to be valid
                         if r.call_id.is_empty() {
                             return None;
                         }
@@ -109,6 +108,16 @@ impl OpenAiProvider {
                             "role": "tool",
                             "tool_call_id": r.call_id,
                             "content": r.output,
+                        }))
+                    }
+                    MessageContent::ToolResultRef(r) => {
+                        if r.call_id.is_empty() {
+                            return None;
+                        }
+                        Some(json!({
+                            "role": "tool",
+                            "tool_call_id": r.call_id,
+                            "content": r.summary,
                         }))
                     }
                 }

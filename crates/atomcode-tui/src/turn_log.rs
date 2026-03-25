@@ -186,7 +186,7 @@ fn format_tool_args(tool_name: &str, args_json: &str) -> String {
         }
         "bash" => {
             let cmd = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
-            if cmd.len() > 80 { format!("`{}...`", &cmd[..77]) } else { format!("`{}`", cmd) }
+            if cmd.chars().count() > 80 { format!("`{}...`", cmd.chars().take(77).collect::<String>()) } else { format!("`{}`", cmd) }
         }
         "list_directory" => {
             let path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
@@ -206,7 +206,7 @@ fn format_tool_args(tool_name: &str, args_json: &str) -> String {
                 obj.iter()
                     .map(|(k, v)| {
                         let val = match v {
-                            serde_json::Value::String(s) if s.len() > 30 => format!("{}...", &s[..27]),
+                            serde_json::Value::String(s) if s.chars().count() > 30 => format!("{}...", s.chars().take(27).collect::<String>()),
                             serde_json::Value::String(s) => s.clone(),
                             other => other.to_string(),
                         };

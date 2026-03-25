@@ -19,7 +19,17 @@ impl Tool for GlobTool {
     fn definition(&self) -> ToolDef {
         ToolDef {
             name: "glob",
-            description: "Find files matching a glob pattern (e.g. '**/*.rs', 'src/**/*.ts'). Returns file paths.",
+            description: "Find files by name pattern. Returns matching file paths.\n\
+                Use this when you need to find files by name or extension, NOT by content (use grep for content search).\n\
+                Pattern examples:\n\
+                - All Rust files: \"**/*.rs\"\n\
+                - Vue files in views: \"src/views/**/*.vue\"\n\
+                - Specific filename anywhere: \"**/config.ts\"\n\
+                - All files in a folder: \"src/components/*\"\n\
+                Common use cases:\n\
+                - Find all view/page files before deciding which to edit.\n\
+                - Find config or entry files in an unfamiliar project.\n\
+                - Check what files exist in a directory.",
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -38,37 +48,77 @@ impl Tool for GlobTool {
     async fn execute(&self, args: &str, ctx: &ToolContext) -> Result<ToolResult> {
         let parsed: GlobArgs = serde_json::from_str(args)?;
         let wd = ctx.working_dir.read().await.clone();
-        let path = parsed.path.as_deref().unwrap_or(".");
-        let resolved = if std::path::Path::new(path).is_absolute() {
-            path.to_string()
-        } else {
-            wd.join(path).to_string_lossy().to_string()
+        let base_dir = match &parsed.path {
+            Some(p) if std::path::Path::new(p).is_absolute() => p.clone(),
+            Some(p) => wd.join(p).to_string_lossy().to_string(),
+            None => wd.to_string_lossy().to_string(),
         };
 
-        // Parse pattern: extract directory prefix and filename glob.
-        // e.g., "src/views/**/*.vue" → search_dir="src/views", name_pattern="*.vue"
-        // e.g., "**/*.rs" → search_dir=resolved, name_pattern="*.rs"
-        // e.g., "*.vue" → search_dir=resolved, name_pattern="*.vue"
+        // Parse pattern: split into (search_dir, name_pattern).
+        // Handles all forms:
+        //   "**/*.java"                          → (base_dir, "*.java")
+        //   "src/views/**/*.vue"                 → (base_dir/src/views, "*.vue")
+        //   "/absolute/path/**/*.java"           → (/absolute/path, "*.java")
+        //   "/absolute/path/**/*Auth*.java"      → (/absolute/path, "*Auth*.java")
+        //   "*.vue"                              → (base_dir, "*.vue")
+        //   "**/config.ts"                       → (base_dir, "config.ts")
         let (search_dir, name_pattern) = {
             let p = &parsed.pattern;
-            // Remove leading ** or **/
-            let cleaned = p.trim_start_matches("**/").trim_start_matches("**");
-            if let Some(last_slash) = cleaned.rfind('/') {
-                // Has directory prefix: "views/*.vue" → ("views", "*.vue")
-                let dir_part = &cleaned[..last_slash];
-                let name_part = &cleaned[last_slash + 1..];
-                let full_dir = if std::path::Path::new(dir_part).is_absolute() {
+
+            // Split at the FIRST occurrence of "**/" — everything before is directory,
+            // everything after (minus further path segments) is the name pattern.
+            if let Some(star_pos) = p.find("**/") {
+                let dir_part = &p[..star_pos];
+                let after_stars = &p[star_pos + 3..]; // skip "**/"
+
+                // after_stars might be "*.java" or "sub/*.java" — take the last segment as name
+                let name_part = after_stars.rsplit('/').next().unwrap_or(after_stars);
+
+                // Build search directory: dir_part might be absolute, relative, or empty
+                let dir = if dir_part.is_empty() {
+                    base_dir.clone()
+                } else {
+                    let trimmed = dir_part.trim_end_matches('/');
+                    if std::path::Path::new(trimmed).is_absolute() {
+                        trimmed.to_string()
+                    } else {
+                        std::path::Path::new(&base_dir)
+                            .join(trimmed)
+                            .to_string_lossy()
+                            .to_string()
+                    }
+                };
+                (dir, name_part.to_string())
+            } else if let Some(last_slash) = p.rfind('/') {
+                // No "**/" but has directory: "src/components/*.vue"
+                let dir_part = &p[..last_slash];
+                let name_part = &p[last_slash + 1..];
+                let dir = if std::path::Path::new(dir_part).is_absolute() {
                     dir_part.to_string()
                 } else {
-                    let base = std::path::Path::new(&resolved);
-                    base.join(dir_part).to_string_lossy().to_string()
+                    std::path::Path::new(&base_dir)
+                        .join(dir_part)
+                        .to_string_lossy()
+                        .to_string()
                 };
-                (full_dir, name_part.to_string())
+                (dir, name_part.to_string())
             } else {
-                // Just a filename pattern: "*.vue"
-                (resolved.clone(), cleaned.to_string())
+                // Bare pattern: "*.vue" or "config.ts"
+                (base_dir.clone(), p.clone())
             }
         };
+
+        // Verify search directory exists.
+        if !std::path::Path::new(&search_dir).is_dir() {
+            return Ok(ToolResult {
+                call_id: String::new(),
+                output: format!(
+                    "No files matching '{}' (directory '{}' does not exist)",
+                    parsed.pattern, search_dir
+                ),
+                success: true,
+            });
+        }
 
         let mut find_args = vec![search_dir.clone(), "-name".to_string(), name_pattern];
         for skip in super::SKIP_DIRS {
@@ -83,7 +133,7 @@ impl Tool for GlobTool {
             .await?;
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let mut files: Vec<&str> = stdout.lines().collect();
+        let mut files: Vec<&str> = stdout.lines().filter(|l| !l.is_empty()).collect();
         files.sort();
 
         let result = if files.is_empty() {
