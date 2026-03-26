@@ -5,7 +5,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
-use crate::command::{SlashMenu, COMMANDS};
+use crate::command::{CommandKind, SlashMenu};
 
 /// Render the slash command autocomplete menu as a floating popup above the input box.
 pub fn render(frame: &mut Frame, input_area: Rect, menu: &SlashMenu) {
@@ -15,7 +15,7 @@ pub fn render(frame: &mut Frame, input_area: Rect, menu: &SlashMenu) {
 
     let item_count = menu.filtered.len();
     let menu_height = (item_count as u16 + 2).min(14); // +2 for border, max 14
-    let menu_width = 50u16.min(input_area.width.saturating_sub(2));
+    let menu_width = 64u16.min(input_area.width.saturating_sub(2));
 
     // Position: above the input box, aligned to left
     let menu_y = input_area.y.saturating_sub(menu_height);
@@ -28,34 +28,52 @@ pub fn render(frame: &mut Frame, input_area: Rect, menu: &SlashMenu) {
         .filtered
         .iter()
         .enumerate()
-        .map(|(i, &cmd_idx)| {
-            let cmd = &COMMANDS[cmd_idx];
+        .map(|(i, entry)| {
             let is_selected = i == menu.selected;
+            // Built-ins: cyan; skills: green
+            let name_color = match entry.kind {
+                CommandKind::BuiltIn => Color::Cyan,
+                CommandKind::Skill => Color::Green,
+            };
+
+            let hint_str = entry
+                .argument_hint
+                .as_deref()
+                .map(|h| format!(" {}", h))
+                .unwrap_or_default();
 
             if is_selected {
                 Line::from(vec![
                     Span::styled(
-                        format!(" {} ", cmd.name),
+                        format!(" {}", entry.name),
                         Style::default()
                             .fg(Color::Black)
-                            .bg(Color::Cyan)
+                            .bg(name_color)
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(
-                        format!(" {}", cmd.description),
+                        hint_str.clone(),
                         Style::default()
                             .fg(Color::Black)
-                            .bg(Color::Cyan),
+                            .bg(name_color),
+                    ),
+                    Span::styled(
+                        format!("  {} ", entry.description),
+                        Style::default().fg(Color::Black).bg(name_color),
                     ),
                 ])
             } else {
                 Line::from(vec![
                     Span::styled(
-                        format!(" {} ", cmd.name),
-                        Style::default().fg(Color::Cyan),
+                        format!(" {}", entry.name),
+                        Style::default().fg(name_color),
                     ),
                     Span::styled(
-                        format!(" {}", cmd.description),
+                        hint_str,
+                        Style::default().fg(Color::Yellow),
+                    ),
+                    Span::styled(
+                        format!("  {}", entry.description),
                         Style::default().fg(Color::DarkGray),
                     ),
                 ])

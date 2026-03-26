@@ -10,6 +10,7 @@ pub mod read;
 pub mod read_symbol;
 pub mod result_store;
 pub mod search_replace;
+pub mod use_skill;
 pub mod web_fetch;
 pub mod web_search;
 pub mod write;

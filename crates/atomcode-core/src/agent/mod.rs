@@ -15,12 +15,14 @@ use tokio_util::sync::CancellationToken;
 use crate::config::Config;
 use crate::conversation::Conversation;
 use crate::provider::LlmProvider;
+use crate::skill::SkillRegistry;
 use crate::stream::StreamEvent;
 use crate::tool::{
     PermissionDecision, PermissionStore, ToolCall, ToolCallBuffer, ToolContext, ToolRegistry,
     ToolResult,
 };
 use crate::tool::result_store::ToolResultStore;
+use crate::tool::use_skill::UseSkillTool;
 
 /// Commands sent FROM the UI TO the agent loop.
 #[derive(Debug)]
@@ -178,6 +180,9 @@ pub struct AgentLoop {
     // Tool result cache (content-addressed disk store)
     result_store: ToolResultStore,
 
+    // Skill registry — provides descriptions for system prompt and powers use_skill tool
+    skill_registry: std::sync::Arc<std::sync::RwLock<SkillRegistry>>,
+
     // Channels
     cmd_rx: mpsc::UnboundedReceiver<AgentCommand>,
     event_tx: mpsc::UnboundedSender<AgentEvent>,
@@ -194,12 +199,21 @@ impl AgentLoop {
     pub fn new(
         config: Config,
         provider: Box<dyn LlmProvider>,
-        tool_registry: ToolRegistry,
+        mut tool_registry: ToolRegistry,
         tool_context: ToolContext,
         conversation: Conversation,
     ) -> (Self, AgentHandle) {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let (event_tx, event_rx) = mpsc::unbounded_channel();
+
+        // Load skills from disk and register the use_skill tool.
+        let working_dir = tool_context.working_dir.try_read()
+            .map(|g| g.clone())
+            .unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let mut registry = SkillRegistry::new();
+        registry.reload(&working_dir);
+        let skill_registry = std::sync::Arc::new(std::sync::RwLock::new(registry));
+        tool_registry.register(Box::new(UseSkillTool { registry: skill_registry.clone() }));
 
         let agent = Self {
             conversation,
@@ -242,6 +256,7 @@ impl AgentLoop {
             recent_file_cache: std::collections::HashMap::new(),
             active_services: std::collections::HashMap::new(),
             result_store: ToolResultStore::new(ToolResultStore::default_dir()),
+            skill_registry,
             cmd_rx,
             event_tx,
         };
@@ -2003,6 +2018,20 @@ impl AgentLoop {
             ));
         }
 
+        // Available skills (descriptions only — full content loaded lazily via use_skill tool)
+        if let Ok(reg) = self.skill_registry.read() {
+            let mut skill_lines: Vec<String> = reg.invocable_by_llm()
+                .map(|s| format!("  - {}: {}", s.name, s.description))
+                .collect();
+            if !skill_lines.is_empty() {
+                skill_lines.sort();
+                prompt.push_str("\n=== AVAILABLE SKILLS ===\n");
+                prompt.push_str("Use the `use_skill` tool to load a skill's full instructions when the task matches.\n");
+                prompt.push_str(&skill_lines.join("\n"));
+                prompt.push('\n');
+            }
+        }
+
         // RULES GO LAST — recency effect ensures the model remembers these
         // when it starts generating tool calls.
         prompt.push_str(&format!("\n=== RULES (follow these strictly) ===\n{rules}\n"));
@@ -2796,6 +2825,10 @@ impl AgentLoop {
                 *wd = resolved.clone();
             }
             self.project_context_cache = None; // invalidate on dir change
+            // Reload skills for the new working directory (project-level skills may differ)
+            if let Ok(mut reg) = self.skill_registry.write() {
+                reg.reload(&resolved);
+            }
             let _ = self
                 .event_tx
                 .send(AgentEvent::WorkingDirChanged(resolved));

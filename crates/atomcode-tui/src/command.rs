@@ -1,61 +1,78 @@
-/// Slash command definition.
-#[derive(Debug, Clone)]
-pub struct SlashCommand {
-    pub name: &'static str,
-    pub description: &'static str,
+/// Whether a command entry is a built-in or a user-defined skill.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CommandKind {
+    BuiltIn,
+    Skill,
 }
 
-/// All available slash commands.
-pub const COMMANDS: &[SlashCommand] = &[
-    SlashCommand {
-        name: "/model",
-        description: "Switch model/provider",
-    },
-    SlashCommand {
-        name: "/provider",
-        description: "Manage providers",
-    },
-    SlashCommand {
-        name: "/cd",
-        description: "Change working directory",
-    },
-    SlashCommand {
-        name: "/copy",
-        description: "Copy last AI response",
-    },
-    SlashCommand {
-        name: "/clear",
-        description: "Clear conversation",
-    },
-    SlashCommand {
-        name: "/config",
-        description: "Edit config file",
-    },
-    SlashCommand {
-        name: "/login",
-        description: "Login with GitCode OAuth",
-    },
-    SlashCommand {
-        name: "/logout",
-        description: "Logout from GitCode",
-    },
-    SlashCommand {
-        name: "/help",
-        description: "Show commands & shortcuts",
-    },
-    SlashCommand {
-        name: "/quit",
-        description: "Exit (or Ctrl+C x2)",
-    },
+/// A single entry in the slash-command menu — either a built-in command or a loaded skill.
+#[derive(Debug, Clone)]
+pub struct CommandEntry {
+    /// Full name with leading slash, e.g. "/commit"
+    pub name: String,
+    /// Short description shown in the menu.
+    pub description: String,
+    /// Optional argument hint shown in autocomplete, e.g. "[issue-number]".
+    pub argument_hint: Option<String>,
+    pub kind: CommandKind,
+}
+
+/// Static built-in slash commands.
+pub const BUILTIN_COMMANDS: &[(&str, &str)] = &[
+    ("/model",    "Switch model/provider"),
+    ("/provider", "Manage providers"),
+    ("/cd",       "Change working directory"),
+    ("/copy",     "Copy last AI response"),
+    ("/clear",    "Clear conversation"),
+    ("/config",   "Edit config file"),
+    ("/login",    "Login with GitCode OAuth"),
+    ("/logout",   "Logout from GitCode"),
+    ("/help",     "Show commands & shortcuts"),
+    ("/quit",     "Exit (or Ctrl+C x2)"),
 ];
+
+/// Build the combined list of built-in commands + loaded skills.
+///
+/// Built-ins appear first in their original order.
+/// Skills are appended in alphabetical order.
+/// If a skill name collides with a built-in, the built-in wins (skill is silently omitted).
+pub fn build_command_list(registry: &atomcode_core::skill::SkillRegistry) -> Vec<CommandEntry> {
+    let mut entries: Vec<CommandEntry> = BUILTIN_COMMANDS
+        .iter()
+        .map(|(name, desc)| CommandEntry {
+            name: name.to_string(),
+            description: desc.to_string(),
+            argument_hint: None,
+            kind: CommandKind::BuiltIn,
+        })
+        .collect();
+
+    let builtin_names: std::collections::HashSet<&str> =
+        BUILTIN_COMMANDS.iter().map(|(name, _)| *name).collect();
+
+    let mut skill_entries: Vec<CommandEntry> = registry
+        .user_invocable()
+        .filter(|s| !builtin_names.contains(format!("/{}", s.name).as_str()))
+        .map(|s| CommandEntry {
+            name: format!("/{}", s.name),
+            description: s.description.clone(),
+            argument_hint: s.argument_hint.clone(),
+            kind: CommandKind::Skill,
+        })
+        .collect();
+    skill_entries.sort_by(|a, b| a.name.cmp(&b.name));
+
+    entries.extend(skill_entries);
+    entries
+}
 
 /// State of the slash command autocomplete menu.
 #[derive(Debug, Clone)]
 pub struct SlashMenu {
     /// Whether the menu is currently visible.
     pub visible: bool,
-    /// Indices into COMMANDS that match the current input.
-    pub filtered: Vec<usize>,
+    /// Entries that match the current filter query.
+    pub filtered: Vec<CommandEntry>,
     /// Currently highlighted index within `filtered`.
     pub selected: usize,
 }
@@ -69,12 +86,11 @@ impl SlashMenu {
         }
     }
 
-    /// Update filtered list based on current input text.
-    /// Returns true if menu should be visible.
-    pub fn update(&mut self, input: &str) {
+    /// Rebuild the filtered list from `all_commands` based on the current input text.
+    pub fn update(&mut self, input: &str, all_commands: &[CommandEntry]) {
         let trimmed = input.trim();
 
-        // Only activate on first line starting with /
+        // Only activate on a single line starting with /
         if !trimmed.starts_with('/') || trimmed.contains('\n') {
             self.visible = false;
             self.filtered.clear();
@@ -83,16 +99,14 @@ impl SlashMenu {
         }
 
         let query = trimmed.to_lowercase();
-        self.filtered = COMMANDS
+        self.filtered = all_commands
             .iter()
-            .enumerate()
-            .filter(|(_, cmd)| cmd.name.starts_with(&query))
-            .map(|(i, _)| i)
+            .filter(|cmd| cmd.name.to_lowercase().starts_with(&query))
+            .cloned()
             .collect();
 
         self.visible = !self.filtered.is_empty();
 
-        // Clamp selection
         if self.selected >= self.filtered.len() {
             self.selected = 0;
         }
@@ -116,11 +130,9 @@ impl SlashMenu {
         }
     }
 
-    /// Get the currently selected command, if any.
-    pub fn selected_command(&self) -> Option<&'static SlashCommand> {
-        self.filtered
-            .get(self.selected)
-            .map(|&i| &COMMANDS[i])
+    /// Get the currently selected entry, if any.
+    pub fn selected_command(&self) -> Option<&CommandEntry> {
+        self.filtered.get(self.selected)
     }
 
     /// Close the menu.

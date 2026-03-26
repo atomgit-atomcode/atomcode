@@ -12,7 +12,7 @@ use atomcode_core::tool::{ToolCall, ToolContext, ToolResult};
 
 use base64::Engine as _;
 
-use crate::command::SlashMenu;
+use crate::command::{build_command_list, SlashMenu};
 use crate::event::AppEvent;
 use crate::provider_manager::{ManagerAction, ProviderManager};
 
@@ -94,6 +94,10 @@ pub struct App {
     /// Model selector: list of (provider_name, model_name), selected index
     pub model_list: Vec<(String, String)>,
     pub model_selected: usize,
+    /// Skill registry — drives the slash menu and manual `/skill-name` invocations.
+    pub skill_registry: atomcode_core::skill::SkillRegistry,
+    /// Pre-built command list (built-ins + skills). Rebuilt only on skill reload.
+    pub command_list: Vec<crate::command::CommandEntry>,
     pub tick_count: usize,
     /// Last Ctrl+C timestamp for double-press detection.
     pub last_ctrl_c: Option<Instant>,
@@ -181,6 +185,10 @@ impl App {
             .collect();
         // Start with a fresh conversation (like Claude Code)
         let conversation = Conversation::new();
+        // Load skills for slash menu and manual invocation
+        let mut skill_registry = atomcode_core::skill::SkillRegistry::new();
+        skill_registry.reload(&working_dir);
+        let command_list = build_command_list(&skill_registry);
         Self {
             mode: AppMode::Normal,
             conversation,
@@ -197,6 +205,8 @@ impl App {
             provider_mgr: None,
             model_list: Vec::new(),
             model_selected: 0,
+            skill_registry,
+            command_list,
             last_ctrl_c: None,
             tick_count: 0,
             project_context_cache: None,
@@ -380,6 +390,9 @@ impl App {
             self.recent_dirs.insert(0, new_dir);
             self.recent_dirs.truncate(5);
             save_recent_dirs(&self.recent_dirs);
+            // Reload skills for the new project directory
+            self.skill_registry.reload(&self.working_dir);
+            self.command_list = build_command_list(&self.skill_registry);
             // Clear conversation — new project, fresh context
             self.conversation = atomcode_core::conversation::Conversation::new();
             self.render_cache.clear();
@@ -1223,8 +1236,8 @@ impl App {
             self.suggestion = None;
         }
 
-        // After any input change, update the slash menu
-        self.slash_menu.update(&self.input.content());
+        // After any input change, update the slash menu (uses pre-built list, no alloc)
+        self.slash_menu.update(&self.input.content(), &self.command_list);
 
         // Detect file path — auto-attach if input is a valid file path
         let content = self.input.content();
@@ -1563,8 +1576,18 @@ impl App {
             }
             "/help" => {
                 let mut help = String::from("**Available commands:**\n\n");
-                for cmd in crate::command::COMMANDS {
-                    help.push_str(&format!("  `{}` — {}\n", cmd.name, cmd.description));
+                for (name, desc) in crate::command::BUILTIN_COMMANDS {
+                    help.push_str(&format!("  `{}` — {}\n", name, desc));
+                }
+                // List loaded skills
+                let mut skills: Vec<_> = self.skill_registry.all().collect();
+                if !skills.is_empty() {
+                    skills.sort_by(|a, b| a.name.cmp(&b.name));
+                    help.push_str("\n**Skills** (from `~/.claude/skills/`, `.claude/skills/`, `commands/` dirs):\n\n");
+                    for s in skills {
+                        let desc = if s.description.is_empty() { "skill".to_string() } else { s.description.clone() };
+                        help.push_str(&format!("  `/{0}` — {1}\n", s.name, desc));
+                    }
                 }
                 help.push_str("\n**Shortcuts:**\n\n");
                 help.push_str("  `Enter` — Send message\n");
@@ -1579,16 +1602,47 @@ impl App {
                 self.conversation.finalize_stream();
             }
             _ => {
-                let available: Vec<String> = crate::command::COMMANDS
-                    .iter()
-                    .map(|c| format!("  `{}` — {}", c.name, c.description))
-                    .collect();
-                self.conversation.push_delta(&format!(
-                    "Unknown command: `{}`\n\nAvailable commands:\n{}",
-                    cmd,
-                    available.join("\n")
-                ));
-                self.conversation.finalize_stream();
+                // Check if it's a skill invocation: /skill-name [args]
+                let without_slash = cmd.strip_prefix('/').unwrap_or(&cmd);
+                let (skill_name, skill_args) = without_slash
+                    .split_once(' ')
+                    .map(|(n, a)| (n, a))
+                    .unwrap_or((without_slash, ""));
+
+                if let Some(skill) = self.skill_registry.get(skill_name) {
+                    let expanded = skill.expand(skill_args, "");
+                    if expanded.trim().is_empty() {
+                        self.conversation.push_delta(&format!(
+                            "Skill `{}` has an empty template.",
+                            skill_name
+                        ));
+                        self.conversation.finalize_stream();
+                    } else {
+                        // Replace the raw /skill-name message with the expanded prompt
+                        self.conversation.messages.pop();
+                        self.conversation.add_user_message(&expanded);
+                        self.mode = AppMode::Streaming;
+                        self.at_bottom = true;
+                        self.current_step_count = 0;
+                        self.turn_start = Some(Instant::now());
+                        self.first_token_ms = None;
+                        self.llm_call_start = Some(Instant::now());
+                        self.last_completed_tool = String::new();
+                        self.last_turn_duration = None;
+                        let _ = self.agent_handle.cmd_tx.send(AgentCommand::SendMessage(expanded));
+                    }
+                } else {
+                    let available: Vec<String> = crate::command::BUILTIN_COMMANDS
+                        .iter()
+                        .map(|(name, desc)| format!("  `{}` — {}", name, desc))
+                        .collect();
+                    self.conversation.push_delta(&format!(
+                        "Unknown command: `{}`\n\nAvailable commands:\n{}",
+                        cmd,
+                        available.join("\n")
+                    ));
+                    self.conversation.finalize_stream();
+                }
             }
         }
 
