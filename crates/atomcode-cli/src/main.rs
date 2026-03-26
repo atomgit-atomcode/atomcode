@@ -57,7 +57,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Login to AtomCode using GitCode OAuth
+    /// Login to AtomCode using AtomGit OAuth
     Login,
     /// Logout from AtomCode
     Logout,

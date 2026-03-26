@@ -315,24 +315,13 @@ impl AgentLoop {
                         self.config = new_config;
                     }
                     
-                    // Debug: show available providers and exact match attempt
-                    let available: Vec<_> = self.config.providers.keys().collect();
-                    let _ = self.event_tx.send(AgentEvent::TextDelta(
-                        format!("\n[DEBUG] SwitchProvider: '{}' | Available: {:?}\n", provider_name, available)
-                    ));
-                    
                     // Try exact match first, then case-insensitive match
                     let provider_config = self.config.providers.get(&provider_name)
                         .or_else(|| {
                             // Try case-insensitive match
                             self.config.providers.iter()
                                 .find(|(k, _)| k.to_lowercase() == provider_name.to_lowercase())
-                                .map(|(k, v)| {
-                                    let _ = self.event_tx.send(AgentEvent::TextDelta(
-                                        format!("[DEBUG] Case-insensitive match: '{}' -> '{}'\n", provider_name, k)
-                                    ));
-                                    v
-                                })
+                                .map(|(_, v)| v)
                         });
                     
                     if let Some(provider_config) = provider_config {
@@ -352,8 +341,9 @@ impl AgentLoop {
                             }
                         }
                     } else {
+                        let available: Vec<_> = self.config.providers.keys().collect();
                         let _ = self.event_tx.send(AgentEvent::TextDelta(
-                            format!("**Provider '{}' not found**\n\n", provider_name)
+                            format!("**Provider '{}' not found. Available: {:?}**\n\n", provider_name, available)
                         ));
                     }
                 }

@@ -25,8 +25,8 @@ pub const BUILTIN_COMMANDS: &[(&str, &str)] = &[
     ("/copy",     "Copy last AI response"),
     ("/clear",    "Clear conversation"),
     ("/config",   "Edit config file"),
-    ("/login",    "Login with GitCode OAuth"),
-    ("/logout",   "Logout from GitCode"),
+    ("/login",    "Login with AtomGit OAuth"),
+    ("/logout",   "Logout from AtomGit"),
     ("/help",     "Show commands & shortcuts"),
     ("/quit",     "Exit (or Ctrl+C x2)"),
 ];
