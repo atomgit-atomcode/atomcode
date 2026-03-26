@@ -37,7 +37,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
 
     // 2. Mode badge — colored bg pill per state, hidden when idle
     match &app.mode {
-        AppMode::Normal => {
+        AppMode::Welcome | AppMode::Normal => {
             left.push(Span::styled(" ", Style::default()));
         }
         AppMode::Streaming => {

@@ -53,8 +53,24 @@ impl TextSelection {
     }
 }
 
+/// State for the first-run welcome/setup screen.
+#[derive(Debug, Clone)]
+pub struct WelcomeState {
+    /// Selected option: 0 = Login with AtomGit, 1 = Configure manually, 2 = Skip
+    pub selected: usize,
+    /// Error message from a failed OAuth attempt.
+    pub error: Option<String>,
+}
+
+impl WelcomeState {
+    pub fn new() -> Self {
+        Self { selected: 0, error: None }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum AppMode {
+    Welcome,
     Normal,
     Streaming,
     WaitingApproval(ToolCall),
@@ -65,6 +81,7 @@ pub enum AppMode {
 }
 
 impl AppMode {
+    pub fn is_welcome(&self) -> bool { matches!(self, AppMode::Welcome) }
     pub fn is_normal(&self) -> bool { matches!(self, AppMode::Normal) }
     pub fn is_streaming(&self) -> bool { matches!(self, AppMode::Streaming) }
     pub fn is_exiting(&self) -> bool { matches!(self, AppMode::Exiting) }
@@ -91,6 +108,9 @@ pub struct App {
     pub pasted_text: Option<String>,
     pub slash_menu: SlashMenu,
     pub provider_mgr: Option<ProviderManager>,
+    pub welcome_state: WelcomeState,
+    /// Name to use when OAuth login is triggered from ProviderManager.
+    pub pending_oauth_name: Option<String>,
     /// Model selector: list of (provider_name, model_name), selected index
     pub model_list: Vec<(String, String)>,
     pub model_selected: usize,
@@ -190,7 +210,7 @@ impl App {
         skill_registry.reload(&working_dir);
         let command_list = build_command_list(&skill_registry);
         Self {
-            mode: AppMode::Normal,
+            mode: if config.providers.is_empty() { AppMode::Welcome } else { AppMode::Normal },
             conversation,
             input: InputState::new(),
             scroll_offset: 0,
@@ -203,6 +223,8 @@ impl App {
             pasted_text: None,
             slash_menu: SlashMenu::new(),
             provider_mgr: None,
+            welcome_state: WelcomeState::new(),
+            pending_oauth_name: None,
             model_list: Vec::new(),
             model_selected: 0,
             skill_registry,
@@ -865,6 +887,7 @@ impl App {
         }
 
         match &self.mode {
+            AppMode::Welcome => self.handle_key_welcome(key),
             AppMode::Normal => self.handle_key_normal(key, event_tx),
             AppMode::Streaming | AppMode::ToolExecuting => {
                 if key.code == KeyCode::Esc {
@@ -1024,6 +1047,56 @@ impl App {
                     let config_path = Config::default_path();
                     let _ = self.config.save(&config_path);
                 }
+            }
+        }
+    }
+
+    fn handle_key_welcome(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Up => {
+                if self.welcome_state.selected > 0 {
+                    self.welcome_state.selected -= 1;
+                }
+            }
+            KeyCode::Down => {
+                if self.welcome_state.selected < 2 {
+                    self.welcome_state.selected += 1;
+                }
+            }
+            KeyCode::Char('1') => {
+                self.welcome_state.selected = 0;
+                self.trigger_welcome_action();
+            }
+            KeyCode::Char('2') => {
+                self.welcome_state.selected = 1;
+                self.trigger_welcome_action();
+            }
+            KeyCode::Char('3') | KeyCode::Esc => {
+                self.welcome_state.selected = 2;
+                self.trigger_welcome_action();
+            }
+            KeyCode::Enter => {
+                self.trigger_welcome_action();
+            }
+            _ => {}
+        }
+    }
+
+    fn trigger_welcome_action(&mut self) {
+        match self.welcome_state.selected {
+            0 => {
+                // Login with AtomGit
+                self.pending_login = true;
+                self.mode = AppMode::Normal;
+            }
+            1 => {
+                // Configure manually → open ProviderManager
+                self.provider_mgr = Some(ProviderManager::new(&self.config));
+                self.mode = AppMode::ProviderManager;
+            }
+            _ => {
+                // Skip
+                self.mode = AppMode::Normal;
             }
         }
     }
