@@ -18,11 +18,12 @@ pub enum ManagerState {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum AddStep {
-    Name = 0,
-    Type = 1,
-    ApiKey = 2,
-    BaseUrl = 3,
-    Model = 4,
+    Name,
+    Type,
+    ApiKey,
+    BaseUrl,
+    Model,
+    OAuthPending,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -35,6 +36,7 @@ pub enum EditField {
 
 /// Type selector for add/edit.
 pub const PROVIDER_TYPES: &[(&str, &str)] = &[
+    ("atomgit_login", "AtomGit (Login)"),
     ("claude", "Claude (Anthropic)"),
     ("openai", "OpenAI / Compatible"),
     ("ollama", "Ollama (local)"),
@@ -241,7 +243,14 @@ impl ProviderManager {
                         }
                     }
                     KeyCode::Enter => {
-                        self.new_type = PROVIDER_TYPES[self.type_selected].0.to_string();
+                        let selected_type = PROVIDER_TYPES[self.type_selected].0;
+                        if selected_type == "atomgit_login" {
+                            // Skip manual fields — trigger OAuth instead
+                            self.state = ManagerState::Adding(AddStep::OAuthPending);
+                            self.message = Some("Opening browser...".to_string());
+                            return Some(ManagerAction::StartAtomGitOAuth(self.new_name.clone()));
+                        }
+                        self.new_type = selected_type.to_string();
                         self.input_buf.clear();
                         self.state = ManagerState::Adding(AddStep::ApiKey);
                         self.message = None;
@@ -343,6 +352,15 @@ impl ProviderManager {
                         self.input_buf.push(c);
                     }
                     _ => {}
+                }
+                None
+            }
+            AddStep::OAuthPending => {
+                // Waiting for OAuth callback — only Esc is handled here.
+                // The actual OAuth runs in lib.rs via pending_login.
+                if let KeyCode::Esc = key.code {
+                    self.state = ManagerState::Adding(AddStep::Type);
+                    self.message = None;
                 }
                 None
             }
@@ -471,4 +489,6 @@ pub enum ManagerAction {
     Delete(String),
     Add(String, ProviderConfig),
     UpdateField(String, String, String),
+    /// Trigger AtomGit OAuth login; saves provider with the given name on success.
+    StartAtomGitOAuth(String),
 }
