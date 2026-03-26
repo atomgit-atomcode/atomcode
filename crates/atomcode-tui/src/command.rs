@@ -32,6 +32,14 @@ pub const COMMANDS: &[SlashCommand] = &[
         description: "Edit config file",
     },
     SlashCommand {
+        name: "/login",
+        description: "Login with GitCode OAuth",
+    },
+    SlashCommand {
+        name: "/logout",
+        description: "Logout from GitCode",
+    },
+    SlashCommand {
         name: "/help",
         description: "Show commands & shortcuts",
     },

@@ -3,7 +3,7 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 
 use anyhow::Result;
-use clap::Parser;
+use clap::{Parser, Subcommand};
 
 use atomcode_core::agent::AgentLoop;
 use atomcode_core::config::provider::{ProviderConfig, default_context_window_for};
@@ -22,9 +22,14 @@ use atomcode_core::tool::list_dir::ListDirTool;
 use atomcode_core::tool::web_search::WebSearchTool;
 use atomcode_core::tool::web_fetch::WebFetchTool;
 
+mod auth;
+
 #[derive(Parser)]
 #[command(name = "atomcode", version = env!("CARGO_PKG_VERSION"), about = "AI coding assistant in your terminal")]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<Commands>,
+
     /// Provider to use (overrides config default)
     #[arg(long)]
     provider: Option<String>,
@@ -40,6 +45,16 @@ struct Cli {
     /// Working directory (defaults to current directory)
     #[arg(long, short = 'C')]
     dir: Option<PathBuf>,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Login to AtomCode using GitCode OAuth
+    Login,
+    /// Logout from AtomCode
+    Logout,
+    /// Show current login status
+    Status,
 }
 
 #[tokio::main]
@@ -73,6 +88,13 @@ async fn main() {
 
 async fn run() -> Result<()> {
     let cli = Cli::parse();
+
+    // Handle subcommands
+    if let Some(cmd) = cli.command {
+        return handle_command(cmd).await;
+    }
+
+    // Default: start TUI
 
     let config_path = cli.config.unwrap_or_else(Config::default_path);
 
@@ -264,4 +286,37 @@ fn setup_openai_compatible() -> Result<Config> {
         default_workdir: None,
         providers,
     })
+}
+
+/// Handle subcommands (login, logout, status)
+async fn handle_command(cmd: Commands) -> Result<()> {
+    match cmd {
+        Commands::Login => {
+            let auth = auth::login()?;
+            auth::save_auth(&auth)?;
+            println!("  Login successful! You can now use AtomCode.");
+            Ok(())
+        }
+        Commands::Logout => {
+            auth::logout()?;
+            println!("  You have been logged out.");
+            Ok(())
+        }
+        Commands::Status => {
+            if let Some(auth) = auth::get_stored_auth() {
+                println!("\n  Logged in as: {} ({})", auth.user.username, auth.user.id);
+                if let Some(name) = auth.user.name {
+                    println!("  Name: {}", name);
+                }
+                if let Some(email) = auth.user.email {
+                    println!("  Email: {}", email);
+                }
+                println!("  Auth file: {}\n", auth::auth_file_path().display());
+            } else {
+                println!("\n  Not logged in.");
+                println!("  Run 'atomcode login' to authenticate.\n");
+            }
+            Ok(())
+        }
+    }
 }

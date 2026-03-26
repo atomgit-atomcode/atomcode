@@ -85,6 +85,8 @@ pub struct App {
     pub at_bottom: bool,
     pub confirm_quit: bool,
     pub pending_editor: Option<String>,
+    /// Flag to trigger OAuth login flow.
+    pub pending_login: bool,
     /// Last key event timestamp — for paste detection when bracketed paste isn't available.
     pub last_key_time: Instant,
     /// Files attached to the next message (detected from pasted paths).
@@ -198,6 +200,7 @@ impl App {
             confirm_quit: false,
             last_key_time: Instant::now(),
             pending_editor: None,
+            pending_login: false,
             attached_files: Vec::new(),
             pasted_text: None,
             slash_menu: SlashMenu::new(),
@@ -1739,6 +1742,34 @@ impl App {
                 self.total_tokens = 0;
                 self.turn_tokens = 0;
                 return true;
+            }
+            "/login" => {
+                self.pending_login = true;
+                self.conversation.push_delta("Opening browser for AtomGit login...");
+                self.conversation.finalize_stream();
+            }
+            "/logout" => {
+                // Use atomcode-cli auth module for logout
+                let auth_path = dirs::config_dir()
+                    .unwrap_or_else(|| std::path::PathBuf::from("."))
+                    .join("atomcode")
+                    .join("auth.toml");
+                if auth_path.exists() {
+                    match std::fs::remove_file(&auth_path) {
+                        Ok(_) => {
+                            self.conversation.push_delta(&format!(
+                                "Logged out successfully.\n\nAuth file removed: `{}`",
+                                auth_path.display()
+                            ));
+                        }
+                        Err(e) => {
+                            self.conversation.push_delta(&format!("Failed to logout: {}", e));
+                        }
+                    }
+                } else {
+                    self.conversation.push_delta("Not logged in.");
+                }
+                self.conversation.finalize_stream();
             }
             "/help" => {
                 let mut help = String::from("**Available commands:**\n\n");
