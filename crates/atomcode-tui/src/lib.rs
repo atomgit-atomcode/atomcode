@@ -425,11 +425,15 @@ pub async fn run(
                     }
                     let config_path = Config::default_path();
                     if let Ok(new_config) = Config::load(&config_path) {
-                        app.config = new_config;
+                        app.config = new_config.clone();
                         let default_name = app.config.default_provider.clone();
                         if let Ok(provider) = app.config.active_provider(None) {
                             app.model_name = format!("{} / {}", default_name, provider.model);
                         }
+                        // Reload AgentLoop's config so it uses the new provider
+                        let _ = app.agent_handle.cmd_tx.send(
+                            atomcode_core::agent::AgentCommand::ReloadConfig(new_config)
+                        );
                     }
                     app.conversation.add_user_message("/login");
                     app.conversation.push_delta(&format!(

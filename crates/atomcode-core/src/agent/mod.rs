@@ -39,6 +39,8 @@ pub enum AgentCommand {
     DenyTool,
     /// Switch to a different provider.
     SwitchProvider(String),
+    /// Reload config (e.g. after OAuth login) and switch to the new default provider.
+    ReloadConfig(crate::config::Config),
     /// Change working directory.
     ChangeDir(String),
     /// Append input during streaming — queued and injected before next LLM call.
@@ -332,6 +334,22 @@ impl AgentLoop {
                         let _ = self.event_tx.send(AgentEvent::TextDelta(
                             format!("**Provider '{}' not found**\n\n", provider_name)
                         ));
+                    }
+                }
+                AgentCommand::ReloadConfig(new_config) => {
+                    self.config = new_config;
+                    let default_name = self.config.default_provider.clone();
+                    if let Some(provider_config) = self.config.providers.get(&default_name) {
+                        match crate::provider::create_provider(provider_config) {
+                            Ok(new_provider) => {
+                                self.provider = new_provider;
+                            }
+                            Err(e) => {
+                                let _ = self.event_tx.send(AgentEvent::TextDelta(
+                                    format!("**Warning: failed to reload provider: {}**\n\n", e)
+                                ));
+                            }
+                        }
                     }
                 }
                 AgentCommand::ChangeDir(path) => {
