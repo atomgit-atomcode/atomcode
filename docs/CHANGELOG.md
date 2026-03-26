@@ -4,6 +4,39 @@ All notable changes to AtomCode are documented in this file.
 
 ---
 
+## v2.2.0 — Headless Mode
+
+### New Features
+- **Headless mode**: run AtomCode without TUI, output to stdout/stderr
+- `--headless` flag to enable headless mode
+- `-p/--prompt` argument for headless prompt input
+- Interactive approval in headless mode (Y/A/N prompts)
+- Auto-shutdown after task completion in headless mode
+
+### Usage
+```bash
+atomcode --headless -p "fix the bug in main.rs"
+atomcode --headless -p "analyze the project" --provider claude
+```
+
+---
+
+## v2.1.0 — Stability Improvements
+
+### Fixes
+- Fixed headless mode not exiting after TurnComplete
+- Improved process lifecycle management
+
+---
+
+## v2.0.0 — Architecture Refinement
+
+### Changes
+- Consolidated agent loop architecture
+- Improved tool result handling
+
+---
+
 ## v1.0.0 — Production-Ready Agent (Claude Code-Aligned Architecture)
 
 **Major architecture overhaul aligning with Claude Code's design principles.**
