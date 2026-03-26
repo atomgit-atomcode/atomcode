@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::Parser;
 
-use atomcode_core::agent::AgentLoop;
+use atomcode_core::agent::{AgentCommand, AgentEvent, AgentLoop};
 use atomcode_core::config::provider::{ProviderConfig, default_context_window_for};
 use atomcode_core::config::Config;
 use atomcode_core::conversation::Conversation;
@@ -40,6 +40,14 @@ struct Cli {
     /// Working directory (defaults to current directory)
     #[arg(long, short = 'C')]
     dir: Option<PathBuf>,
+
+    /// Run in headless mode (no TUI, just execute the prompt)
+    #[arg(long)]
+    headless: bool,
+
+    /// Prompt to send in headless mode (required if --headless)
+    #[arg(short = 'p', long)]
+    prompt: Option<String>,
 }
 
 #[tokio::main]
@@ -148,9 +156,117 @@ async fn run() -> Result<()> {
         tool_context.clone(),
         conversation,
     );
+
+    // Headless mode: run without TUI
+    if cli.headless {
+        let prompt = cli.prompt.clone().ok_or_else(|| {
+            anyhow::anyhow!("--prompt is required in headless mode")
+        })?;
+        return run_headless(agent_loop, agent_handle, prompt, cli.provider.as_deref()).await;
+    }
+
+    tokio::spawn(agent_loop.run());
+    atomcode_tui::run(config, model_name, agent_handle, tool_context, working_dir).await
+}
+
+/// Run agent in headless mode (no TUI, output to stdout).
+async fn run_headless(
+    agent_loop: AgentLoop,
+    agent_handle: atomcode_core::agent::AgentHandle,
+    prompt: String,
+    _provider_name: Option<&str>,
+) -> Result<()> {
+    let (cmd_tx, mut event_rx) = {
+        let handle = agent_handle;
+        (handle.cmd_tx, handle.event_rx)
+    };
+
+    // Spawn agent loop
     tokio::spawn(agent_loop.run());
 
-    atomcode_tui::run(config, model_name, agent_handle, tool_context, working_dir).await
+    // Send the prompt
+    cmd_tx.send(AgentCommand::SendMessage(prompt))?;
+
+    // Process events until completion
+    while let Some(event) = event_rx.recv().await {
+        match event {
+            AgentEvent::TextDelta(text) => {
+                print!("{}", text);
+                io::stdout().flush()?;
+            }
+            AgentEvent::ToolCallStarted { name, arguments } => {
+                println!("\n[Tool: {}]", name);
+                if arguments.len() > 200 {
+                    println!("  {}...", &arguments[..200]);
+                } else {
+                    println!("  {}", arguments);
+                }
+            }
+            AgentEvent::ToolCallResult { name, output, success, duration } => {
+                let status = if success { "OK" } else { "FAILED" };
+                let dur_ms = duration.as_millis();
+                if output.is_empty() {
+                    println!("[{}: {} {}ms]", name, status, dur_ms);
+                } else if output.len() > 500 {
+                    println!("[{}: {} {}ms]\n  {}...\n", name, status, dur_ms, &output[..500]);
+                } else {
+                    println!("[{}: {} {}ms]\n  {}\n", name, status, dur_ms, output);
+                }
+            }
+            AgentEvent::ApprovalNeeded { tool_name, reason, .. } => {
+                println!("\n[Approval Required] {}", tool_name);
+                println!("  Reason: {}", reason);
+                println!("  [Y] Approve  [A] Always allow  [N] Deny");
+                print!("> ");
+                io::stdout().flush()?;
+
+                let mut input = String::new();
+                io::stdin().read_line(&mut input)?;
+                match input.trim().to_lowercase().as_str() {
+                    "y" | "yes" => {
+                        cmd_tx.send(AgentCommand::ApproveTool)?;
+                    }
+                    "a" | "always" => {
+                        cmd_tx.send(AgentCommand::ApproveToolAlways)?;
+                    }
+                    _ => {
+                        cmd_tx.send(AgentCommand::DenyTool)?;
+                    }
+                }
+            }
+            AgentEvent::TokenUsage(usage) => {
+                // Silent in headless mode, or optionally show
+                eprintln!("[Tokens: {} prompt + {} completion]", usage.prompt_tokens, usage.completion_tokens);
+            }
+            AgentEvent::PhaseChange(phase) => {
+                // Optional: show phase changes
+                match phase {
+                    atomcode_core::agent::AgentPhase::Idle => {}
+                    atomcode_core::agent::AgentPhase::Thinking => {
+                        eprintln!("[Thinking...]");
+                    }
+                    atomcode_core::agent::AgentPhase::CallingTool(name) => {
+                        eprintln!("[Executing: {}]", name);
+                    }
+                    atomcode_core::agent::AgentPhase::WaitingApproval => {}
+                }
+            }
+            AgentEvent::TurnComplete { duration, total_tokens } => {
+                println!("\n[Done: {:.1}s, {} tokens]", duration.as_secs_f64(), total_tokens);
+                // In headless mode, exit after turn completes
+                let _ = cmd_tx.send(AgentCommand::Shutdown);
+                break;
+            }
+            AgentEvent::Error(e) => {
+                eprintln!("\n[Error: {}]", e);
+            }
+            AgentEvent::WorkingDirChanged(new_dir) => {
+                eprintln!("[Working directory: {}]", new_dir.display());
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn first_run_wizard() -> Result<Config> {
