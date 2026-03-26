@@ -208,8 +208,9 @@ fn parse_frontmatter(content: &str) -> (Frontmatter, String) {
                 fm.argument_hint = Some(v.to_string());
             }
         } else if let Some(val) = line.strip_prefix("allowed-tools:") {
+            // AgentSkills spec: space-delimited. Also accept comma for Claude Code compat.
             fm.allowed_tools = val
-                .split(',')
+                .split(|c| c == ' ' || c == ',')
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .collect();
@@ -303,11 +304,20 @@ fn parse_skill_dir(skill_dir: &Path, skill_md: &Path, namespace: Option<&str>) -
 }
 
 fn validate_skill_name(name: &str) -> anyhow::Result<()> {
-    if name.contains(|c: char| c.is_whitespace() || c == '/') {
+    if name.is_empty() || name.len() > 64 {
+        anyhow::bail!("skill name '{}' must be 1-64 characters", name);
+    }
+    if !name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-') {
         anyhow::bail!(
-            "skill name '{}' contains invalid characters (no spaces or slashes)",
+            "skill name '{}' must contain only lowercase letters, digits, and hyphens",
             name
         );
+    }
+    if name.starts_with('-') || name.ends_with('-') {
+        anyhow::bail!("skill name '{}' must not start or end with a hyphen", name);
+    }
+    if name.contains("--") {
+        anyhow::bail!("skill name '{}' must not contain consecutive hyphens", name);
     }
     Ok(())
 }
@@ -552,7 +562,7 @@ mod tests {
 
     #[test]
     fn test_frontmatter_full() {
-        let content = "---\nname: my-skill\ndescription: \"My skill\"\ndisable-model-invocation: true\nuser-invocable: false\nargument-hint: \"[file]\"\nallowed-tools: Read, Grep\n---\nBody.\n";
+        let content = "---\nname: my-skill\ndescription: \"My skill\"\ndisable-model-invocation: true\nuser-invocable: false\nargument-hint: \"[file]\"\nallowed-tools: Read Grep\n---\nBody.\n";
         let (fm, tmpl) = parse_frontmatter(content);
         assert_eq!(fm.name.as_deref(), Some("my-skill"));
         assert_eq!(fm.description, "My skill");
