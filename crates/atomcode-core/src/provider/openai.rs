@@ -29,11 +29,7 @@ impl OpenAiProvider {
             .clone()
             .context("OpenAI provider requires an api_key")?;
         Ok(Self {
-            client: Client::builder()
-                .connect_timeout(std::time::Duration::from_secs(30))
-                .timeout(std::time::Duration::from_secs(300)) // 5 min max per request
-                .build()
-                .unwrap_or_else(|_| Client::new()),
+            client: super::build_http_client(config.user_agent.as_deref()),
             api_key,
             model: config.model.clone(),
             base_url: config

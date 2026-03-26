@@ -341,6 +341,7 @@ impl ProviderManager {
                                 Some(self.new_base_url.clone())
                             },
                             system_prompt: None,
+                            user_agent: None,
                             context_window: atomcode_core::config::provider::default_context_window_for(&self.new_type),
                         };
                         return Some(ManagerAction::Add(self.new_name.clone(), provider));

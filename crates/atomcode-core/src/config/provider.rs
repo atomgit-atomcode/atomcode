@@ -8,6 +8,10 @@ pub struct ProviderConfig {
     pub model: String,
     pub base_url: Option<String>,
     pub system_prompt: Option<String>,
+    /// Override User-Agent for this provider (useful when the upstream blocks generic UAs).
+    /// Defaults to `atomcode/<version>` if not set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_agent: Option<String>,
     /// Maximum tokens to use for context (system prompt + messages).
     /// The windowing algorithm fits messages within this budget,
     /// condensing old tool results to save space.

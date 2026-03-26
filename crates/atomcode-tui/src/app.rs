@@ -277,6 +277,7 @@ impl App {
                     model: model_name.clone(),
                     base_url: Some("http://localhost:1".to_string()),
                     system_prompt: None,
+                    user_agent: None,
                     context_window: atomcode_core::config::provider::default_context_window_for("openai"),
                 }).unwrap_or_else(|_| {
                     // Fallback: should never reach production path since AgentLoop handles LLM

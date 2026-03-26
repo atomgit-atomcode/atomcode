@@ -133,6 +133,7 @@ async fn run() -> Result<()> {
             model: String::new(),
             base_url: Some("http://localhost:1".to_string()),
             system_prompt: None,
+            user_agent: None,
             context_window: default_context_window_for("openai"),
         };
         (dummy, String::new())

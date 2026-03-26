@@ -138,6 +138,7 @@ fn add_atomgit_provider(access_token: &str, provider_name: &str) -> anyhow::Resu
         model: "Qwen/Qwen3.5-35B-A3B".to_string(),
         base_url: Some("https://api-ai.gitcode.com/v1".to_string()),
         system_prompt: None,
+        user_agent: None,
         context_window: 32000,
     };
     

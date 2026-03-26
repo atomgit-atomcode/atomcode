@@ -28,11 +28,7 @@ impl ClaudeProvider {
             .clone()
             .context("Claude provider requires an api_key")?;
         Ok(Self {
-            client: Client::builder()
-                .connect_timeout(std::time::Duration::from_secs(30))
-                .timeout(std::time::Duration::from_secs(300))
-                .build()
-                .unwrap_or_else(|_| Client::new()),
+            client: super::build_http_client(config.user_agent.as_deref()),
             api_key,
             model: config.model.clone(),
         })
