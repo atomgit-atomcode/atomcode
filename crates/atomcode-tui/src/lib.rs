@@ -34,6 +34,28 @@ fn clear_scrollback(w: &mut impl Write) -> std::io::Result<()> {
     w.flush()
 }
 
+/// Flush the terminal input buffer (discard any pending input)
+/// This is critical when switching between TUI and external editor
+#[cfg(unix)]
+fn flush_stdin() {
+    unsafe {
+        // TCIFLUSH = 0, flush input queue
+        libc::tcflush(libc::STDIN_FILENO, libc::TCIFLUSH);
+    }
+}
+
+#[cfg(not(unix))]
+fn flush_stdin() {
+    // On non-Unix systems, we can't flush stdin directly
+    // Just drain any available input
+    use std::io::Read;
+    let mut stdin = std::io::stdin();
+    let mut buf = [0u8; 64];
+    while let Ok(n) = stdin.read(&mut buf) {
+        if n == 0 { break; }
+    }
+}
+
 use atomcode_core::agent::AgentHandle;
 use atomcode_core::config::Config;
 use atomcode_core::tool::ToolContext;
@@ -76,25 +98,73 @@ pub async fn run(
         terminal.draw(|frame| ui::render(frame, &mut app))?;
 
         if let Some(file_path) = app.pending_editor.take() {
+            // First disable raw mode to release terminal control completely
+            // This must happen BEFORE stopping the event loop
             disable_raw_mode()?;
-            execute!(terminal.backend_mut(), DisableMouseCapture, LeaveAlternateScreen)?;
+            execute!(
+                terminal.backend_mut(),
+                DisableBracketedPaste,
+                DisableMouseCapture,
+                LeaveAlternateScreen
+            )?;
             terminal.show_cursor()?;
+            
+            // Now stop the event loop (after raw mode is disabled)
+            event_loop.stop();
+            
+            // Flush any pending output and DISCARD any buffered input
+            let _ = std::io::stdout().flush();
+            flush_stdin();
 
             let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vim".to_string());
-            let _ = std::process::Command::new(&editor)
+            let status = std::process::Command::new(&editor)
                 .arg(&file_path)
+                .stdin(std::process::Stdio::inherit())
+                .stdout(std::process::Stdio::inherit())
+                .stderr(std::process::Stdio::inherit())
                 .status();
 
+            // Show result message
+            if let Ok(exit_status) = status {
+                if exit_status.success() {
+                    // Reload config if the edited file was the config file
+                    let config_path = Config::default_path();
+                    if std::path::Path::new(&file_path) == config_path {
+                        match Config::load(&config_path) {
+                            Ok(new_config) => {
+                                app.config = new_config;
+                                // Update default provider in app
+                                let default_name = app.config.default_provider.clone();
+                                if let Ok(provider) = app.config.active_provider(None) {
+                                    app.model_name = format!("{} / {}", default_name, provider.model);
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("Failed to reload config: {}", e);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Flush stdin again before restoring TUI
+            flush_stdin();
+
+            // Restore TUI
             enable_raw_mode()?;
             clear_scrollback(terminal.backend_mut())?;
             execute!(
                 terminal.backend_mut(),
                 EnterAlternateScreen,
+                SetTitle("AtomCode"),
                 Clear(ClearType::All),
                 EnableMouseCapture,
                 EnableBracketedPaste,
             )?;
             terminal.clear()?;
+
+            // Restart the event loop
+            event_loop.start();
             continue;
         }
 

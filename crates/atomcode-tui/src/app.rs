@@ -1437,8 +1437,9 @@ impl App {
         // Detect file path — auto-attach if input is a valid file path
         let content = self.input.content();
         let trimmed = content.trim();
-        if !trimmed.is_empty() && !trimmed.starts_with('/') || trimmed.starts_with("/file") {
-            // Skip — not a path or it's a slash command
+        // Skip slash commands (except /file which is explicitly for file attachment)
+        if trimmed.is_empty() || trimmed.starts_with('/') && !trimmed.starts_with("/file") {
+            // Not a file path
         } else if let Some(file) = crate::file_attach::detect_file_path(trimmed, &self.working_dir) {
             // Only attach if not already attached
             if !self.attached_files.iter().any(|f| f.path == file.path) {

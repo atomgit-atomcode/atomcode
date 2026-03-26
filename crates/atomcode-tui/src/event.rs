@@ -1,7 +1,8 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
-use crossterm::event::{Event, EventStream, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
-use futures::StreamExt;
+use crossterm::event::{Event, KeyEvent, MouseButton, MouseEvent, MouseEventKind, poll};
 use tokio::sync::mpsc;
 
 use atomcode_core::stream::TokenUsage;
@@ -31,71 +32,119 @@ pub enum AppEvent {
 pub struct EventLoop {
     rx: mpsc::UnboundedReceiver<AppEvent>,
     tx: mpsc::UnboundedSender<AppEvent>,
+    /// Flag to signal the input thread to stop
+    stop_flag: Arc<AtomicBool>,
+    /// Handle to the keyboard/mouse reader thread
+    input_thread: Option<std::thread::JoinHandle<()>>,
+    /// Handle to the tick task
+    tick_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl EventLoop {
     pub fn new() -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
-        Self { rx, tx }
+        Self {
+            rx,
+            tx,
+            stop_flag: Arc::new(AtomicBool::new(false)),
+            input_thread: None,
+            tick_task: None,
+        }
     }
 
     pub fn sender(&self) -> mpsc::UnboundedSender<AppEvent> {
         self.tx.clone()
     }
 
-    pub fn start(&self) {
+    pub fn start(&mut self) {
+        // Reset stop flag
+        self.stop_flag.store(false, Ordering::SeqCst);
+
+        // Start keyboard/mouse reader in a dedicated thread (not tokio task)
+        // This gives us more control over the input stream
         let tx = self.tx.clone();
-        tokio::spawn(async move {
-            let mut reader = EventStream::new();
-            loop {
-                match reader.next().await {
-                    Some(Ok(evt)) => {
-                        let app_event = match evt {
-                            Event::Key(key) => {
-                                // Windows sends Press + Release for each keystroke.
-                                // Skip Release to prevent double input. macOS/Linux
-                                // only sends Press, so this check is harmless there
-                                // but we gate it to avoid any edge cases with IME.
-                                #[cfg(target_os = "windows")]
-                                if key.kind == KeyEventKind::Release {
-                                    continue;
-                                }
-                                AppEvent::Key(key)
-                            }
-                            Event::Paste(text) => AppEvent::Paste(text),
-                            Event::Resize(w, h) => AppEvent::Resize(w, h),
-                            Event::Mouse(MouseEvent { kind, column, row, .. }) => {
-                                match kind {
-                                    MouseEventKind::ScrollUp => AppEvent::ScrollUp(3),
-                                    MouseEventKind::ScrollDown => AppEvent::ScrollDown(3),
-                                    MouseEventKind::Down(MouseButton::Left) => AppEvent::MouseDown(column, row),
-                                    MouseEventKind::Drag(MouseButton::Left) => AppEvent::MouseDrag(column, row),
-                                    MouseEventKind::Up(MouseButton::Left) => AppEvent::MouseUp(column, row),
+        let stop_flag = self.stop_flag.clone();
+        let handle = std::thread::spawn(move || {
+            while !stop_flag.load(Ordering::SeqCst) {
+                // Use poll with timeout to allow checking stop flag periodically
+                match poll(Duration::from_millis(50)) {
+                    Ok(true) => {
+                        // Event available, read it
+                        match crossterm::event::read() {
+                            Ok(evt) => {
+                                let app_event = match evt {
+                                    Event::Key(key) => {
+                                        #[cfg(target_os = "windows")]
+                                        if key.kind == crossterm::event::KeyEventKind::Release {
+                                            continue;
+                                        }
+                                        AppEvent::Key(key)
+                                    }
+                                    Event::Paste(text) => AppEvent::Paste(text),
+                                    Event::Resize(w, h) => AppEvent::Resize(w, h),
+                                    Event::Mouse(MouseEvent { kind, column, row, .. }) => {
+                                        match kind {
+                                            MouseEventKind::ScrollUp => AppEvent::ScrollUp(3),
+                                            MouseEventKind::ScrollDown => AppEvent::ScrollDown(3),
+                                            MouseEventKind::Down(MouseButton::Left) => AppEvent::MouseDown(column, row),
+                                            MouseEventKind::Drag(MouseButton::Left) => AppEvent::MouseDrag(column, row),
+                                            MouseEventKind::Up(MouseButton::Left) => AppEvent::MouseUp(column, row),
+                                            _ => continue,
+                                        }
+                                    }
                                     _ => continue,
+                                };
+                                if tx.send(app_event).is_err() {
+                                    break;
                                 }
                             }
-                            _ => continue,
-                        };
-                        if tx.send(app_event).is_err() {
-                            break;
+                            Err(_) => break,
                         }
                     }
-                    Some(Err(_)) => break,
-                    None => break,
+                    Ok(false) => {
+                        // Timeout, continue to check stop flag
+                    }
+                    Err(_) => break,
                 }
             }
         });
+        self.input_thread = Some(handle);
 
+        // Start tick generator (keep as tokio task)
         let tx = self.tx.clone();
-        tokio::spawn(async move {
+        let stop_flag = self.stop_flag.clone();
+        let tick_handle = tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_millis(250));
             loop {
                 interval.tick().await;
+                if stop_flag.load(Ordering::SeqCst) {
+                    break;
+                }
                 if tx.send(AppEvent::Tick).is_err() {
                     break;
                 }
             }
         });
+        self.tick_task = Some(tick_handle);
+    }
+
+    /// Stop the event loop tasks (before opening external editor)
+    pub fn stop(&mut self) {
+        // Signal threads to stop
+        self.stop_flag.store(true, Ordering::SeqCst);
+
+        // Wait for input thread to finish (it should exit quickly due to timeout)
+        if let Some(handle) = self.input_thread.take() {
+            let _ = handle.join();
+        }
+
+        // Abort tick task
+        if let Some(handle) = self.tick_task.take() {
+            handle.abort();
+        }
+
+        // Drain any remaining events from the queue
+        while self.rx.try_recv().is_ok() {}
     }
 
     pub async fn next(&mut self) -> Option<AppEvent> {
