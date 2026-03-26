@@ -4,7 +4,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
-use crate::app::App;
+use crate::app::{App, WelcomeState};
 
 const LOGO: &str = r#"
      _   _                  ____          _
@@ -93,6 +93,79 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     lines.push(line_kv("    /model", "Switch model", k, d));
     lines.push(line_kv("    /provider", "Manage providers", k, d));
     lines.push(line_kv("    Ctrl+C", "Cancel / double to exit", k, d));
+
+    let paragraph = Paragraph::new(lines);
+    frame.render_widget(paragraph, area);
+}
+
+/// Full-screen first-run setup screen shown when no providers are configured.
+pub fn render_setup(frame: &mut Frame, area: Rect, state: &WelcomeState) {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    let logo_height = 7;
+    let content_height = logo_height + 14;
+    let top_pad = if area.height as usize > content_height {
+        (area.height as usize - content_height) / 3
+    } else {
+        1
+    };
+
+    for _ in 0..top_pad {
+        lines.push(Line::default());
+    }
+
+    // Logo
+    let logo_color = Color::Rgb(120, 95, 235);
+    for logo_line in LOGO.lines().skip(1) {
+        lines.push(Line::from(Span::styled(
+            logo_line.to_string(),
+            Style::default().fg(logo_color).add_modifier(Modifier::BOLD),
+        )));
+    }
+
+    lines.push(Line::default());
+    lines.push(Line::from(Span::styled(
+        "  Welcome! Choose how to get started:",
+        Style::default().fg(Color::Rgb(180, 182, 195)),
+    )));
+    lines.push(Line::default());
+
+    let options = [
+        "Login with AtomGit",
+        "Configure manually",
+        "Skip for now",
+    ];
+    for (i, opt) in options.iter().enumerate() {
+        let is_sel = i == state.selected;
+        let prefix = if is_sel { "  \u{25b6} " } else { "     " };
+        let (fg, bg) = if is_sel {
+            (Color::Rgb(240, 240, 245), Color::Rgb(50, 40, 100))
+        } else {
+            (Color::Rgb(140, 142, 155), Color::Reset)
+        };
+        let number = format!("[{}] ", i + 1);
+        lines.push(Line::from(vec![
+            Span::styled(prefix, Style::default().fg(fg).bg(bg)),
+            Span::styled(number, Style::default().fg(Color::Rgb(105, 150, 210)).bg(bg)),
+            Span::styled(opt.to_string(), Style::default().fg(fg).bg(bg)),
+        ]));
+    }
+
+    lines.push(Line::default());
+
+    // Error message if any
+    if let Some(ref err) = state.error {
+        lines.push(Line::from(Span::styled(
+            format!("  Error: {}", err),
+            Style::default().fg(Color::Red),
+        )));
+        lines.push(Line::default());
+    }
+
+    lines.push(Line::from(Span::styled(
+        "  \u{2191}\u{2193} / 1-3 to select   Enter to confirm",
+        Style::default().fg(Color::Rgb(65, 68, 80)),
+    )));
 
     let paragraph = Paragraph::new(lines);
     frame.render_widget(paragraph, area);
