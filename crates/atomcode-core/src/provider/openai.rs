@@ -257,8 +257,8 @@ impl LlmProvider for OpenAiProvider {
                     let line = buffer[..pos].trim().to_string();
                     buffer = buffer[pos + 1..].to_string();
 
-                    if line.starts_with("data: ") {
-                        let data = &line[6..];
+                    if line.starts_with("data:") {
+                        let data = line.strip_prefix("data:").unwrap().trim();
                         if data == "[DONE]" {
                             if let Some(usage) = last_usage.take() {
                                 let _ = tx.send(Ok(StreamEvent::Usage(usage)));

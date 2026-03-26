@@ -309,19 +309,40 @@ impl AgentLoop {
                     }
                 }
                 AgentCommand::SwitchProvider(provider_name) => {
-                    // Debug: show available providers
+                    // Reload config from file first (in case new providers were added via /login or /provider)
+                    let config_path = Config::default_path();
+                    if let Ok(new_config) = Config::load(&config_path) {
+                        self.config = new_config;
+                    }
+                    
+                    // Debug: show available providers and exact match attempt
                     let available: Vec<_> = self.config.providers.keys().collect();
                     let _ = self.event_tx.send(AgentEvent::TextDelta(
                         format!("\n[DEBUG] SwitchProvider: '{}' | Available: {:?}\n", provider_name, available)
                     ));
                     
-                    if let Some(provider_config) = self.config.providers.get(&provider_name) {
+                    // Try exact match first, then case-insensitive match
+                    let provider_config = self.config.providers.get(&provider_name)
+                        .or_else(|| {
+                            // Try case-insensitive match
+                            self.config.providers.iter()
+                                .find(|(k, _)| k.to_lowercase() == provider_name.to_lowercase())
+                                .map(|(k, v)| {
+                                    let _ = self.event_tx.send(AgentEvent::TextDelta(
+                                        format!("[DEBUG] Case-insensitive match: '{}' -> '{}'\n", provider_name, k)
+                                    ));
+                                    v
+                                })
+                        });
+                    
+                    if let Some(provider_config) = provider_config {
                         self.config.default_provider = provider_name.clone();
                         match crate::provider::create_provider(provider_config) {
                             Ok(new_provider) => {
+                                let model_name = new_provider.model_name().to_string();
                                 self.provider = new_provider;
                                 let _ = self.event_tx.send(AgentEvent::TextDelta(
-                                    format!("**Switched to: {} / {}**\n\n", provider_name, provider_config.model)
+                                    format!("**Switched to: {} / {}**\n\n", provider_name, model_name)
                                 ));
                             }
                             Err(e) => {

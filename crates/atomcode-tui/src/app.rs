@@ -956,10 +956,12 @@ impl App {
             }
             KeyCode::Enter => {
                 // Switch to selected provider
-                if let Some((name, _)) = self.model_list.get(self.model_selected) {
+                if let Some((name, _)) = self.model_list.get(self.model_selected).cloned() {
                     self.config.default_provider = name.clone();
                     let _ = self.config.save(&Config::default_path());
                     self.rebuild_provider();
+                    // Tell AgentLoop to switch to the new provider
+                    let _ = self.agent_handle.cmd_tx.send(AgentCommand::SwitchProvider(name));
                 }
                 self.mode = AppMode::Normal;
             }
