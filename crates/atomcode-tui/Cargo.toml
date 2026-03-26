@@ -19,3 +19,4 @@ base64 = "0.22"
 url = "2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }
 serde = { version = "1", features = ["derive"] }
+libc = "0.2"

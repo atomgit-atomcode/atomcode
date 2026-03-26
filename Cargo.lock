@@ -126,6 +126,7 @@ dependencies = [
  "crossterm",
  "dirs",
  "futures",
+ "libc",
  "pulldown-cmark",
  "ratatui",
  "reqwest",
