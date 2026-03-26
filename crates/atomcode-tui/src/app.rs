@@ -1026,6 +1026,14 @@ impl App {
                     let config_path = Config::default_path();
                     let _ = self.config.save(&config_path);
                 }
+                ManagerAction::StartAtomGitOAuth(name) => {
+                    // Store the desired provider name, then trigger the existing OAuth flow.
+                    self.pending_oauth_name = Some(name);
+                    self.pending_login = true;
+                    // Close provider manager — OAuth runs in lib.rs main loop
+                    self.provider_mgr = None;
+                    self.mode = AppMode::Normal;
+                }
                 ManagerAction::UpdateField(name, field, value) => {
                     if let Some(p) = self.config.providers.get_mut(&name) {
                         match field.as_str() {

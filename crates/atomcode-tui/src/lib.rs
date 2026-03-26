@@ -113,7 +113,7 @@ struct UserResponse {
 }
 
 /// Add AtomGit provider to config and set as default
-fn add_atomgit_provider(access_token: &str) -> anyhow::Result<()> {
+fn add_atomgit_provider(access_token: &str, provider_name: &str) -> anyhow::Result<()> {
     let config_path = Config::default_path();
     
     // Load existing config or create new one
@@ -141,13 +141,13 @@ fn add_atomgit_provider(access_token: &str) -> anyhow::Result<()> {
         context_window: 32000,
     };
     
-    config.providers.insert("AtomGit".to_string(), atomgit_provider);
-    config.default_provider = "AtomGit".to_string();
-    
+    config.providers.insert(provider_name.to_string(), atomgit_provider);
+    config.default_provider = provider_name.to_string();
+
     // Save config
     config.save(&config_path)?;
-    
-    println!("  AtomGit provider added to config: {}\n", config_path.display());
+
+    println!("  {} provider added to config: {}\n", provider_name, config_path.display());
     
     Ok(())
 }
@@ -419,8 +419,9 @@ pub async fn run(
             match run_oauth_login() {
                 Ok(auth) => {
                     println!("\n  Login successful! Logged in as: {}", auth.user.username);
-                    if let Err(e) = add_atomgit_provider(&auth.access_token) {
-                        println!("  Warning: Failed to add AtomGit provider: {}", e);
+                    let oauth_name = app.pending_oauth_name.take().unwrap_or_else(|| "AtomGit".to_string());
+                    if let Err(e) = add_atomgit_provider(&auth.access_token, &oauth_name) {
+                        println!("  Warning: Failed to add provider: {}", e);
                     }
                     let config_path = Config::default_path();
                     if let Ok(new_config) = Config::load(&config_path) {
@@ -432,8 +433,8 @@ pub async fn run(
                     }
                     app.conversation.add_user_message("/login");
                     app.conversation.push_delta(&format!(
-                        "Login successful! Logged in as: **{}** (ID: {})\n\nAtomGit provider added and set as default.\nModel: `Qwen/Qwen3.5-35B-A3B`",
-                        auth.user.username, auth.user.id
+                        "Login successful! Logged in as: **{}** (ID: {})\n\nProvider `{}` added and set as default.\nModel: `Qwen/Qwen3.5-35B-A3B`",
+                        auth.user.username, auth.user.id, oauth_name
                     ));
                     app.conversation.finalize_stream();
                 }
