@@ -35,6 +35,8 @@ pub enum AgentCommand {
     ApproveToolAlways,
     /// Deny a pending tool call.
     DenyTool,
+    /// Switch to a different provider.
+    SwitchProvider(String),
     /// Change working directory.
     ChangeDir(String),
     /// Append input during streaming — queued and injected before next LLM call.
@@ -287,6 +289,34 @@ impl AgentLoop {
                             success: false,
                         };
                         self.handle_tool_result(result).await;
+                    }
+                }
+                AgentCommand::SwitchProvider(provider_name) => {
+                    // Debug: show available providers
+                    let available: Vec<_> = self.config.providers.keys().collect();
+                    let _ = self.event_tx.send(AgentEvent::TextDelta(
+                        format!("\n[DEBUG] SwitchProvider: '{}' | Available: {:?}\n", provider_name, available)
+                    ));
+                    
+                    if let Some(provider_config) = self.config.providers.get(&provider_name) {
+                        self.config.default_provider = provider_name.clone();
+                        match crate::provider::create_provider(provider_config) {
+                            Ok(new_provider) => {
+                                self.provider = new_provider;
+                                let _ = self.event_tx.send(AgentEvent::TextDelta(
+                                    format!("**Switched to: {} / {}**\n\n", provider_name, provider_config.model)
+                                ));
+                            }
+                            Err(e) => {
+                                let _ = self.event_tx.send(AgentEvent::TextDelta(
+                                    format!("**Failed to create provider: {}**\n\n", e)
+                                ));
+                            }
+                        }
+                    } else {
+                        let _ = self.event_tx.send(AgentEvent::TextDelta(
+                            format!("**Provider '{}' not found**\n\n", provider_name)
+                        ));
                     }
                 }
                 AgentCommand::ChangeDir(path) => {
