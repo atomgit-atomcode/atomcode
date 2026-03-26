@@ -497,7 +497,7 @@ impl App {
     /// auto-generate a brief summary from the tool results.
     /// Rebuild the LLM provider from current config (after provider/model change).
     /// Also updates model_name for status bar display.
-    fn rebuild_provider(&mut self) {
+    pub fn rebuild_provider(&mut self) {
         use atomcode_core::provider::create_provider;
         if let Ok(provider_config) = self.config.active_provider(None) {
             self.model_name = provider_config.model.clone();
@@ -1636,26 +1636,125 @@ impl App {
                 self.conversation.finalize_stream();
             }
             "/logout" => {
-                // Use atomcode-cli auth module for logout
+                let mut logged_out = false;
+                let mut messages = Vec::new();
+                
+                // 1. Remove auth.toml (access_token and user info)
                 let auth_path = dirs::config_dir()
                     .unwrap_or_else(|| std::path::PathBuf::from("."))
                     .join("atomcode")
                     .join("auth.toml");
+                    
                 if auth_path.exists() {
                     match std::fs::remove_file(&auth_path) {
                         Ok(_) => {
-                            self.conversation.push_delta(&format!(
-                                "Logged out successfully.\n\nAuth file removed: `{}`",
-                                auth_path.display()
-                            ));
+                            messages.push(format!("Auth file removed: `{}`", auth_path.display()));
+                            logged_out = true;
                         }
                         Err(e) => {
-                            self.conversation.push_delta(&format!("Failed to logout: {}", e));
+                            messages.push(format!("Failed to remove auth file: {}", e));
                         }
                     }
-                } else {
-                    self.conversation.push_delta("Not logged in.");
                 }
+                
+                // 2. Remove AtomGit provider from config.toml
+                let config_path = Config::default_path();
+                if config_path.exists() {
+                    if let Ok(mut config) = Config::load(&config_path) {
+                        // Case-insensitive search for AtomGit provider
+                        let atomgit_key = config.providers.keys()
+                            .find(|k| k.to_lowercase() == "atomgit")
+                            .cloned();
+                            
+                        if let Some(key) = atomgit_key {
+                            config.providers.remove(&key);
+                            messages.push("AtomGit provider removed from config.".to_string());
+                            
+                            // If default provider was AtomGit, switch to another
+                            if config.default_provider.to_lowercase() == "atomgit" {
+                                if let Some(new_default) = config.providers.keys().next().cloned() {
+                                    config.default_provider = new_default.clone();
+                                    messages.push(format!("Switched default provider to: {}", new_default));
+                                }
+                            }
+                            
+                            let _ = config.save(&config_path);
+                            
+                            // Update app config and rebuild provider
+                            self.config = config;
+                            self.rebuild_provider();
+                            logged_out = true;
+                        }
+                    }
+                }
+                
+                // 3. Show result message
+                if logged_out {
+                    self.conversation.push_delta(&format!(
+                        "**Logged out from AtomGit.**\n\n{}",
+                        messages.join("\n\n")
+                    ));
+                } else {
+                    self.conversation.push_delta("Not logged in with AtomGit.");
+                }
+                self.conversation.finalize_stream();
+            }
+            "/status" => {
+                let mut status = String::new();
+                
+                // Check login status
+                let auth_path = dirs::config_dir()
+                    .unwrap_or_else(|| std::path::PathBuf::from("."))
+                    .join("atomcode")
+                    .join("auth.toml");
+                    
+                if auth_path.exists() {
+                    if let Ok(content) = std::fs::read_to_string(&auth_path) {
+                        // Parse user info from auth.toml
+                        let mut username: Option<String> = None;
+                        let mut user_id: Option<String> = None;
+                        
+                        for line in content.lines() {
+                            if line.starts_with("username") {
+                                username = line.split('=').nth(1)
+                                    .map(|s| s.trim().trim_matches('"').to_string());
+                            }
+                            if line.starts_with("id") {
+                                user_id = line.split('=').nth(1)
+                                    .map(|s| s.trim().trim_matches('"').to_string());
+                            }
+                        }
+                        
+                        status.push_str("**Login Status**\n\n");
+                        status.push_str("- Status: **Logged in**\n");
+                        if let Some(u) = username {
+                            status.push_str(&format!("- Username: `{}`\n", u));
+                        }
+                        if let Some(id) = user_id {
+                            status.push_str(&format!("- User ID: `{}`\n", id));
+                        }
+                        status.push_str("\n");
+                    }
+                } else {
+                    status.push_str("**Login Status**\n\n");
+                    status.push_str("- Status: Not logged in\n\n");
+                }
+                
+                // Show model info
+                let provider_name = &self.config.default_provider;
+                let model_name = self.provider.model_name().to_string();
+                    
+                status.push_str("**Model Info**\n\n");
+                status.push_str(&format!("- Provider: `{}`\n", provider_name));
+                status.push_str(&format!("- Model: `{}`\n", model_name));
+                
+                if let Some(provider_config) = self.config.providers.get(provider_name) {
+                    if let Some(base_url) = &provider_config.base_url {
+                        status.push_str(&format!("- Base URL: `{}`\n", base_url));
+                    }
+                }
+                
+                self.conversation.push_delta(&status);
                 self.conversation.finalize_stream();
             }
             "/help" => {

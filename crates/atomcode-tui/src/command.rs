@@ -18,14 +18,21 @@ pub struct CommandEntry {
 }
 
 /// Static built-in slash commands.
+/// Ordered by importance: core features first, utilities second, help/config last.
 pub const BUILTIN_COMMANDS: &[(&str, &str)] = &[
-    ("/model",    "Switch model/provider"),
+    // === Core features ===
     ("/provider", "Manage providers"),
+    ("/model",    "Switch model/provider"),
+    ("/login",    "Login with AtomGit OAuth"),
     ("/cd",       "Change working directory"),
+    
+    // === Utilities ===
     ("/copy",     "Copy last AI response"),
     ("/clear",    "Clear conversation"),
+    
+    // === Config & Help ===
     ("/config",   "Edit config file"),
-    ("/login",    "Login with AtomGit OAuth"),
+    ("/status",   "Show login status and model info"),
     ("/logout",   "Logout from AtomGit"),
     ("/help",     "Show commands & shortcuts"),
     ("/quit",     "Exit (or Ctrl+C x2)"),
