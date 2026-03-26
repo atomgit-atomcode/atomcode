@@ -24,3 +24,6 @@ config.toml
 
 # Logs
 /datalog/
+
+# Local docs (not pushed to remote)
+/doc/
