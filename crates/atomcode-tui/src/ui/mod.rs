@@ -20,6 +20,12 @@ use crate::app::{App, TextSelection};
 // render is the only place that reads the cache, called from the main loop.
 
 pub fn render(frame: &mut Frame, app: &mut App) {
+    // Welcome screen takes over the full display (no status bar, no input)
+    if app.mode.is_welcome() {
+        welcome::render_setup(frame, frame.area(), &app.welcome_state);
+        return;
+    }
+
     // Provider manager takes over the full screen (except status bar)
     if app.mode.is_provider_manager() {
         let chunks = Layout::default()
