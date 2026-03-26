@@ -104,40 +104,49 @@ async fn run() -> Result<()> {
 
     // Default: start TUI
 
-    let config_path = cli.config.unwrap_or_else(Config::default_path);
+    let config_path = cli.config.clone().unwrap_or_else(Config::default_path);
 
     let mut config = if config_path.exists() {
         Config::load(&config_path).unwrap_or_else(|e| {
             eprintln!("Warning: failed to load config ({}), using defaults", e);
             Config {
-                default_provider: "openai".to_string(),
+                default_provider: String::new(),
                 default_workdir: None,
                 providers: HashMap::new(),
             }
         })
     } else {
-        let config = first_run_wizard()?;
-        config.save(&config_path)?;
-        println!("\nConfig saved to {}\n", config_path.display());
-        config
+        // No config yet — TUI Welcome screen will guide first-run setup
+        Config {
+            default_provider: String::new(),
+            default_workdir: None,
+            providers: HashMap::new(),
+        }
     };
 
-    if config.providers.is_empty() {
-        let config = first_run_wizard()?;
-        let _ = config.save(&config_path);
-        return Ok(());
-    }
-
-    if let Some(ref model) = cli.model {
-        let provider_name = cli.provider.as_deref().unwrap_or(&config.default_provider);
-        if let Some(p) = config.providers.get_mut(provider_name) {
-            p.model = model.clone();
+    let (provider_config, model_name) = if config.providers.is_empty() {
+        // No providers configured yet — Welcome screen handles setup.
+        // Use a dummy provider; AgentLoop won't be called until user configures one.
+        let dummy = ProviderConfig {
+            provider_type: "openai".to_string(),
+            api_key: Some("not-configured".to_string()),
+            model: String::new(),
+            base_url: Some("http://localhost:1".to_string()),
+            system_prompt: None,
+            context_window: default_context_window_for("openai"),
+        };
+        (dummy, String::new())
+    } else {
+        if let Some(ref model) = cli.model {
+            let provider_name = cli.provider.as_deref().unwrap_or(&config.default_provider);
+            if let Some(p) = config.providers.get_mut(provider_name) {
+                p.model = model.clone();
+            }
         }
-    }
-
-    let provider_config = config
-        .active_provider(cli.provider.as_deref())?
-        .clone();
+        let pc = config.active_provider(cli.provider.as_deref())?.clone();
+        let name = pc.model.clone();
+        (pc, name)
+    };
     let provider = create_provider(&provider_config)?;
 
     let working_dir = if let Some(d) = cli.dir {
@@ -160,9 +169,6 @@ async fn run() -> Result<()> {
     tool_registry.register(Box::new(WebSearchTool));
     tool_registry.register(Box::new(WebFetchTool));
     tool_registry.register(Box::new(SearchReplaceTool));
-
-    // Derive model name for display in the status bar before giving provider to AgentLoop.
-    let model_name = provider_config.model.clone();
 
     let tool_context = ToolContext::new(working_dir.clone());
     // Load previous session's conversation history for cross-session context.
@@ -289,119 +295,6 @@ async fn run_headless(
     }
 
     Ok(())
-}
-
-fn first_run_wizard() -> Result<Config> {
-    println!("Welcome to AtomCode! Let's set up your first provider.\n");
-    println!("Select provider:");
-    println!("  [1] Claude (Anthropic)");
-    println!("  [2] OpenAI");
-    println!("  [3] OpenAI Compatible (Deepseek, Qwen, Zhipu, Moonshot...)");
-    println!("  [4] Ollama (local)");
-    print!("\n> ");
-    io::stdout().flush()?;
-
-    let mut choice = String::new();
-    io::stdin().read_line(&mut choice)?;
-    let choice = choice.trim();
-
-    if choice == "3" {
-        return setup_openai_compatible();
-    }
-
-    let (name, provider_type, default_model, needs_key, default_base_url) = match choice {
-        "1" => ("claude", "claude", "claude-sonnet-4-6", true, None),
-        "2" => ("openai", "openai", "gpt-4o", true, Some("https://api.openai.com/v1")),
-        "4" => ("ollama", "ollama", "llama3", false, Some("http://localhost:11434")),
-        _ => anyhow::bail!("Invalid choice: {}", choice),
-    };
-
-    let api_key = if needs_key {
-        print!("\nEnter API Key: ");
-        io::stdout().flush()?;
-        let mut key = String::new();
-        io::stdin().read_line(&mut key)?;
-        Some(key.trim().to_string())
-    } else {
-        None
-    };
-
-    let mut providers = HashMap::new();
-    providers.insert(
-        name.to_string(),
-        ProviderConfig {
-            provider_type: provider_type.to_string(),
-            api_key,
-            model: default_model.to_string(),
-            base_url: default_base_url.map(String::from),
-            system_prompt: None,
-            context_window: default_context_window_for(provider_type),
-        },
-    );
-
-    Ok(Config {
-        default_provider: name.to_string(),
-        default_workdir: None,
-        providers,
-    })
-}
-
-fn setup_openai_compatible() -> Result<Config> {
-    println!("\nCommon API base URLs:");
-    println!("  Deepseek:  https://api.deepseek.com/v1");
-    println!("  Qwen:      https://dashscope.aliyuncs.com/compatible-mode/v1");
-    println!("  Zhipu:     https://open.bigmodel.cn/api/paas/v4");
-    println!("  Moonshot:  https://api.moonshot.cn/v1");
-    println!("  SiliconFlow: https://api.siliconflow.cn/v1");
-
-    print!("\nEnter API Base URL: ");
-    io::stdout().flush()?;
-    let mut base_url = String::new();
-    io::stdin().read_line(&mut base_url)?;
-    let base_url = base_url
-        .trim()
-        .trim_end_matches('/')
-        .trim_end_matches("/chat/completions")
-        .trim_end_matches('/')
-        .to_string();
-
-    print!("Enter API Key: ");
-    io::stdout().flush()?;
-    let mut api_key = String::new();
-    io::stdin().read_line(&mut api_key)?;
-    let api_key = api_key.trim().to_string();
-
-    print!("Enter Model name (e.g. deepseek-chat, qwen-plus, glm-4): ");
-    io::stdout().flush()?;
-    let mut model = String::new();
-    io::stdin().read_line(&mut model)?;
-    let model = model.trim().to_string();
-
-    let name = url::Url::parse(&base_url)
-        .ok()
-        .and_then(|u| u.host_str().map(|h| {
-            h.split('.').next().unwrap_or("custom").to_string()
-        }))
-        .unwrap_or_else(|| "custom".to_string());
-
-    let mut providers = HashMap::new();
-    providers.insert(
-        name.clone(),
-        ProviderConfig {
-            provider_type: "openai".to_string(),
-            api_key: Some(api_key),
-            model,
-            base_url: Some(base_url),
-            system_prompt: None,
-            context_window: default_context_window_for("openai"),
-        },
-    );
-
-    Ok(Config {
-        default_provider: name,
-        default_workdir: None,
-        providers,
-    })
 }
 
 /// Handle subcommands (login, logout, status)
