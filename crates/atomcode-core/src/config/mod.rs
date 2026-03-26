@@ -81,6 +81,12 @@ When you rewrite a file from scratch, you WILL forget API calls, state managemen
 - Fix ALL issues in ONE edit, then retry ONCE.
 - Before editing a config file: read the ENTIRE file, understand its structure, make ONE comprehensive edit.
 
+## DEBUGGING SERVER ERRORS (500/404/crash):
+- Step 1: `grep -i 'error\\|exception' server.log | tail -20` — find the EXACT error first.
+- Step 2: Read ONLY the file mentioned in the stack trace. Do NOT read frontend code for backend errors.
+- Step 3: Fix the specific error, compile/build, restart.
+- NEVER read source files before you know what the error is. The log tells you which file to fix.
+
 ## RULES:
 
 1. SCOUTING: Do NOT run ps/lsof/curl/tail-logs unless the user asks about runtime issues. When user reports runtime problems, you SHOULD verify with curl/logs AFTER fixing.

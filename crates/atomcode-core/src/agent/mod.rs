@@ -375,11 +375,12 @@ impl AgentLoop {
 
     async fn handle_send_message(&mut self, content: String) {
         self.current_task = content.clone();
-        // Pre-read: analyze user's message, find relevant files, and store
-        // their contents. They'll be injected as system context (not synthetic tool calls)
-        // so the model doesn't learn to "read first, edit later".
         self.preread_context = self.build_preread_context(&content).await;
-        self.conversation.add_user_message(&content);
+
+        // Auto-diagnose: if user mentions error keywords, scan logs and attach findings.
+        // This gives the model the real error from Turn 1, instead of spending 3-5 turns grepping.
+        let enriched = self.auto_diagnose_errors(&content).await;
+        self.conversation.add_user_message(&enriched);
         self.turn_tokens = 0;
         self.tool_call_count = 0;
         self.retry_count = 0;
@@ -449,9 +450,146 @@ impl AgentLoop {
     /// read_file what it needs. Each read is 1 step — trivial cost.
     /// A compact system prompt → model follows rules → fewer mistakes → fewer steps.
     async fn build_preread_context(&self, _content: &str) -> String {
-        // Return empty — no pre-read. The file tree in project_context tells the
-        // model what files exist. The model reads what it needs via read_file.
         String::new()
+    }
+
+    /// Auto-diagnose: when user mentions error keywords, scan log files for recent errors
+    /// and append them to the user message. The model starts Turn 1 with the real error.
+    async fn auto_diagnose_errors(&self, content: &str) -> String {
+        let lower = content.to_lowercase();
+        let has_error_keyword = ["错误", "报错", "失败", "error", "500", "404", "crash",
+            "异常", "exception", "内部错误", "not work", "不行", "不好使", "bug"]
+            .iter().any(|k| lower.contains(k));
+
+        if !has_error_keyword {
+            return content.to_string();
+        }
+
+        let wd = self.tool_context.working_dir.try_read()
+            .map(|g| g.clone())
+            .unwrap_or_default();
+
+        // Find log files: *.log in project root and common subdirs
+        let log_candidates = ["backend.log", "server.log", "app.log",
+            "backend/backend.log", "logs/app.log", "log/development.log"];
+
+        let mut diagnostics = Vec::new();
+
+        for log_name in &log_candidates {
+            let log_path = wd.join(log_name);
+            if !log_path.exists() { continue; }
+
+            // grep for recent errors/exceptions
+            if let Ok(output) = tokio::process::Command::new("grep")
+                .args(&["-i", "-E", "error|exception|fail|caused by",
+                    &log_path.to_string_lossy()])
+                .output()
+                .await
+            {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                if !stdout.trim().is_empty() {
+                    // Take last 15 lines of errors
+                    let lines: Vec<&str> = stdout.lines().collect();
+                    let start = lines.len().saturating_sub(15);
+                    let recent = lines[start..].join("\n");
+                    diagnostics.push(format!("[Auto-detected from {}:]\n{}", log_name, recent));
+                }
+            }
+        }
+
+        // Also check if any service on common ports is responding with errors
+        if diagnostics.is_empty() {
+            // Try npm/vite dev server log
+            for log_name in &["frontend/.vite/log", "nohup.out"] {
+                let log_path = wd.join(log_name);
+                if log_path.exists() {
+                    if let Ok(content_str) = tokio::fs::read_to_string(&log_path).await {
+                        let lines: Vec<&str> = content_str.lines().collect();
+                        let start = lines.len().saturating_sub(10);
+                        let tail = lines[start..].join("\n");
+                        if tail.to_lowercase().contains("error") {
+                            diagnostics.push(format!("[Auto-detected from {}:]\n{}", log_name, tail));
+                        }
+                    }
+                }
+            }
+        }
+
+        if diagnostics.is_empty() {
+            return content.to_string();
+        }
+
+        // Phase 2: Parse stack traces for file:line references, extract function code via tree-sitter.
+        // This gives the model the actual broken code so it can edit directly in Turn 1.
+        let diag_text = diagnostics.join("\n");
+        let mut extracted_code = Vec::new();
+        let mut searcher = self.tool_context.semantic.lock().await;
+
+        // Match patterns like "FileName.java:45" or "file.py:123" or "file.rs:45"
+        let file_line_re = regex::Regex::new(r"(\w+\.\w+):(\d+)").unwrap_or_else(|_| regex::Regex::new(".^").unwrap());
+        let mut seen_files = std::collections::HashSet::new();
+
+        for cap in file_line_re.captures_iter(&diag_text) {
+            let filename = &cap[1];
+            let line_no: usize = cap[2].parse().unwrap_or(0);
+            if line_no == 0 || seen_files.contains(filename) { continue; }
+
+            // Find the actual file path in the project
+            let file_path = Self::find_file_in_project(&wd, filename);
+            if let Some(ref fp) = file_path {
+                seen_files.insert(filename.to_string());
+                // Use tree-sitter to find the enclosing function at this line
+                if let Some(symbols) = searcher.list_symbols(fp) {
+                    if let Some(sym) = symbols.iter().find(|s| line_no >= s.start_line && line_no <= s.end_line) {
+                        // Extract the function code
+                        if let Some(slice) = searcher.extract_symbol(fp, &sym.name) {
+                            let mut code = format!(
+                                "[Source: {} → {}() lines {}-{}]\n",
+                                filename, sym.name, slice.start_line, slice.end_line
+                            );
+                            for (i, line) in slice.text.lines().enumerate() {
+                                code.push_str(&format!("{:4}| {}\n", slice.start_line + i, line));
+                            }
+                            extracted_code.push(code);
+                            if extracted_code.len() >= 2 { break; } // Max 2 functions
+                        }
+                    }
+                }
+            }
+        }
+        drop(searcher);
+
+        let mut result = format!("{}\n\n{}", content, diagnostics.join("\n\n"));
+        if !extracted_code.is_empty() {
+            result.push_str("\n\n[Relevant source code from stack trace — you can edit directly:]\n");
+            result.push_str(&extracted_code.join("\n"));
+        }
+        result
+    }
+
+    /// Find a file by name in the project directory (searches up to 4 levels deep).
+    fn find_file_in_project(wd: &std::path::Path, filename: &str) -> Option<std::path::PathBuf> {
+        use crate::tool::SKIP_DIRS;
+        fn walk(dir: &std::path::Path, target: &str, depth: usize) -> Option<std::path::PathBuf> {
+            if depth > 4 { return None; }
+            let entries = std::fs::read_dir(dir).ok()?;
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                if name_str == target && entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                    return Some(entry.path());
+                }
+                if entry.file_type().map(|t| t.is_dir()).unwrap_or(false)
+                    && !SKIP_DIRS.contains(&name_str.as_ref())
+                {
+                    if let Some(found) = walk(&entry.path(), target, depth + 1) {
+                        return Some(found);
+                    }
+                }
+            }
+            None
+        }
+        walk(wd, filename, 0)
     }
 
     /// Core agent turn: calls the LLM, processes the stream, and handles tool
@@ -478,28 +616,10 @@ impl AgentLoop {
             // older ones keep their summary (already compact from budgeted windowing).
             self.inflate_recent_refs(&mut messages);
 
-            // Inject recently edited file contents at the END of messages (highest attention zone).
-            // This prevents the model from re-reading files it just edited.
-            // Only the most recent 2 files, and only if they fit in budget.
-            if !self.recent_file_cache.is_empty() {
-                let mut cached: Vec<_> = self.recent_file_cache.iter().collect();
-                cached.truncate(2); // Max 2 files to avoid context bloat
-                let mut file_context = String::from(
-                    "[Recently edited files — their current content is below. Do NOT re-read these files.]\n\n"
-                );
-                for (short, (_full_path, content)) in &cached {
-                    let lines: Vec<&str> = content.lines().collect();
-                    file_context.push_str(&format!("=== {} ({} lines) ===\n", short, lines.len()));
-                    for (i, line) in lines.iter().enumerate() {
-                        file_context.push_str(&format!("{:>4}| {}\n", i + 1, line));
-                    }
-                    file_context.push('\n');
-                }
-                messages.push(crate::conversation::message::Message::new(
-                    crate::conversation::message::Role::System,
-                    file_context,
-                ));
-            }
+            // NOTE: recently edited file cache was removed (v2.3.0).
+            // It injected full file contents (~8K tokens) OUTSIDE the context budget,
+            // causing 40K+ actual input on a 32K budget. The model ignored the cache
+            // and re-read files anyway. Net effect was purely negative (slower, no benefit).
 
             let tool_defs = self.tool_registry.get_definitions();
 
@@ -1373,6 +1493,15 @@ impl AgentLoop {
 
                 if is_file_read_cmd {
                     self.consecutive_reads += 1;
+                    // Diagnosis timeout: if 3+ consecutive read/grep/bash-read without ANY edit,
+                    // inject a prompt forcing the model to act instead of spinning.
+                    if self.consecutive_reads >= 3 && self.files_edited_this_turn.is_empty() {
+                        tool_result.output.push_str(
+                            "\n\n[SYSTEM: You have spent 3+ turns reading/searching without making any edit. \
+                             STOP investigating and make your best fix NOW based on what you already know. \
+                             If you're unsure, fix the most likely cause. You can always iterate after.]"
+                        );
+                    }
                     if self.consecutive_reads >= 3 && !self.files_edited_this_turn.is_empty() {
                         // Model is lost — auto-attach the last edited file's content
                         let last_edited = self.files_edited_this_turn.last().cloned();

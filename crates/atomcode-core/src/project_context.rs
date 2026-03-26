@@ -3,26 +3,17 @@ use std::path::{Path, PathBuf};
 
 /// Descriptor files to include (filename, max_lines).
 /// The model reads these directly — no interpretation by us.
+/// Descriptor files: only build/dependency configs. No README (wastes tokens on prose).
 const DESCRIPTORS: &[(&str, usize)] = &[
-    ("README.md", 40),
-    ("README", 40),
-    ("Makefile", 50),
-    ("package.json", 30),
-    ("Cargo.toml", 20),
-    ("pyproject.toml", 30),
+    ("package.json", 10),
+    ("Cargo.toml", 10),
+    ("pyproject.toml", 10),
     ("go.mod", 5),
-    ("Gemfile", 15),
-    ("pom.xml", 40),
-    ("build.gradle", 30),
-    ("build.gradle.kts", 30),
-    ("requirements.txt", 20),
-    ("composer.json", 20),
-    ("CMakeLists.txt", 30),
-    ("docker-compose.yml", 30),
-    ("docker-compose.yaml", 30),
-    ("justfile", 50),
-    ("Taskfile.yml", 40),
-    (".env.example", 10),
+    ("pom.xml", 10),
+    ("build.gradle", 10),
+    ("requirements.txt", 10),
+    ("docker-compose.yml", 10),
+    ("Makefile", 10),
 ];
 
 use crate::tool::SKIP_DIRS;
@@ -40,9 +31,9 @@ pub fn build_project_context(dir: &Path) -> ProjectContext {
     let mut ctx = String::new();
     let mut included_files = HashSet::new();
 
-    // 1. File tree (4 levels — deep enough for most projects)
+    // 1. File tree (3 levels — enough to show structure, deeper files found via glob)
     ctx.push_str("Project files:\n");
-    ctx.push_str(&scan_tree(dir, 0, 4));
+    ctx.push_str(&scan_tree(dir, 0, 3));
 
     // 2. Include raw content of descriptor files the model can read
     let mut included_names = Vec::new();
@@ -85,9 +76,9 @@ pub fn build_project_context(dir: &Path) -> ProjectContext {
         ctx.push_str(&format!("\nExecutable files: {}\n", executables.join(", ")));
     }
 
-    // Cap total size — generous limit for large projects
-    if ctx.len() > 15000 {
-        let mut end = 15000;
+    // Cap total size — keep lean for faster inference
+    if ctx.len() > 6000 {
+        let mut end = 6000;
         while end > 0 && !ctx.is_char_boundary(end) {
             end -= 1;
         }

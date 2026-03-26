@@ -310,6 +310,8 @@ fn is_background_command(cmd: &str) -> bool {
         "npm run dev", "npm start", "npx ", "yarn dev", "pnpm dev",
         "python -m http", "python manage.py runserver", "uvicorn ", "gunicorn ",
         "cargo run", "go run", "node server", "flask run", "rails s",
+        "mvn spring-boot:run", "mvn spring-boot:", "gradle bootRun",
+        "java -jar", "java -cp",
     ];
     server_patterns.iter().any(|p| trimmed.contains(p))
 }
