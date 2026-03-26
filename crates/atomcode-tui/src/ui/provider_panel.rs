@@ -139,6 +139,43 @@ fn render_list(frame: &mut Frame, area: Rect, mgr: &ProviderManager, config: &Co
 }
 
 fn render_add_form(frame: &mut Frame, area: Rect, mgr: &ProviderManager, step: &AddStep) {
+    // OAuthPending has its own full render — skip the normal field-by-field form.
+    if *step == AddStep::OAuthPending {
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled(
+            "  AtomGit Login",
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled(
+            "  Opening browser for AtomGit authorization...",
+            Style::default().fg(Color::Rgb(120, 200, 120)),
+        )));
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled(
+            "  Waiting for callback on port 8765",
+            Style::default().fg(Color::Rgb(120, 140, 200)),
+        )));
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled(
+            "  Press Esc to cancel",
+            Style::default().fg(Color::Rgb(90, 92, 105)),
+        )));
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_set(border::ROUNDED)
+            .border_style(Style::default().fg(Color::Cyan))
+            .title(Span::styled(
+                " Add Provider ",
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ));
+        let paragraph = Paragraph::new(lines).block(block);
+        frame.render_widget(paragraph, area);
+        return;
+    }
+
     let mut lines: Vec<Line<'static>> = Vec::new();
 
     let dim = Style::default().fg(Color::DarkGray);
