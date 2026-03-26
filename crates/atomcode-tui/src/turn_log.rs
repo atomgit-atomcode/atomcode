@@ -37,10 +37,6 @@ impl TurnLog {
         }
     }
 
-    pub fn set_working_dir(&mut self, dir: &Path) {
-        self.base_dir = dir.to_path_buf();
-    }
-
     /// Flush current buffer to disk immediately.
     fn flush(&self) {
         if let Some(ref path) = self.file_path {
@@ -73,13 +69,20 @@ impl TurnLog {
         self.flush();
     }
 
-    /// Log a tool call start.
-    pub fn log_tool_call(&mut self, name: &str, args: &str) {
+    /// Log start of a new LLM round-trip (increments the turn counter).
+    pub fn log_llm_call(&mut self) {
         if !self.active { return; }
         self.step += 1;
+        let _ = writeln!(&mut self.buf, "### Turn {}", self.step);
+        self.flush();
+    }
+
+    /// Log a tool call start (within the current LLM turn).
+    pub fn log_tool_call(&mut self, name: &str, args: &str) {
+        if !self.active { return; }
 
         let detail = format_tool_args(name, args);
-        let _ = writeln!(&mut self.buf, "**Step {}** > {} {}", self.step, capitalize(name), detail);
+        let _ = writeln!(&mut self.buf, "- {} {}", capitalize(name), detail);
         // Log raw args when JSON is invalid (for debugging model output)
         if serde_json::from_str::<serde_json::Value>(args).is_err() {
             let _ = writeln!(&mut self.buf, "  [RAW ARGS: {}]", args.chars().take(200).collect::<String>());
@@ -135,7 +138,7 @@ impl TurnLog {
         let _ = writeln!(&mut self.buf, "---");
         let _ = writeln!(
             &mut self.buf,
-            "**Stats:** {} steps, {:.1}s, {} tokens",
+            "**Stats:** {} turns, {:.1}s, {} tokens",
             self.step,
             duration.as_secs_f64(),
             total_tokens,

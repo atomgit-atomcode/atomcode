@@ -107,6 +107,9 @@ impl Conversation {
 
     pub fn finalize_stream(&mut self) {
         if let Some(content) = self.stream_buffer.take() {
+            // Strip trailing duplicate: weak models sometimes repeat their summary.
+            // If the second half of the text is a near-duplicate of the first half, truncate.
+            let content = dedup_trailing_repeat(&content);
             let idx = self.messages.len();
             self.messages.push(Message::new(Role::Assistant, content));
             self.turn_tracker.on_message_added(idx);
@@ -237,8 +240,10 @@ impl Conversation {
         }
 
         // Phase 1: Walk backwards through turns, adding full messages from
-        // recent turns until we've used ~60% of the budget (hot zone).
-        let hot_budget = remaining_budget * 60 / 100;
+        // recent turns until we've used ~40% of the budget (hot zone).
+        // Keep it lean: 40% full content + 60% condensed summaries.
+        // This prevents large read_file results from bloating the input.
+        let hot_budget = remaining_budget * 40 / 100;
         let mut hot_tokens = 0usize;
         let mut hot_turn_start = turns.len(); // index into turns vec
 
@@ -335,13 +340,64 @@ impl Conversation {
         cold_messages.reverse();
 
         // Phase 3: Assemble — system + cold turns + hot turns.
+        // Within the hot zone, only the LATEST turn keeps full tool results.
+        // Older hot turns get condensed tool results (first line only) to save tokens.
+        // This prevents old read_file/write_file content from bloating the context.
         let hot_msg_start = turns[hot_turn_start].start_idx;
+        let latest_turn_start = if turns.len() > 0 {
+            turns[turns.len() - 1].start_idx
+        } else {
+            self.messages.len()
+        };
+
         let mut result = Vec::with_capacity(
             1 + cold_messages.len() + (self.messages.len() - hot_msg_start),
         );
         result.push(system_msg);
         result.extend(cold_messages);
-        result.extend(self.messages[hot_msg_start..].iter().cloned());
+
+        for (i, msg) in self.messages[hot_msg_start..].iter().enumerate() {
+            let abs_idx = hot_msg_start + i;
+            if abs_idx < latest_turn_start {
+                // Older hot turn — condense large tool results & strip write_file content
+                match &msg.content {
+                    MessageContent::ToolResult(r) if r.output.len() > 500 => {
+                        result.push(msg.condensed());
+                    }
+                    MessageContent::AssistantWithToolCalls { text, tool_calls } => {
+                        // Strip write_file content from tool call arguments
+                        let compressed_calls: Vec<ToolCall> = tool_calls.iter().map(|tc| {
+                            if tc.name == "write_file" {
+                                let mut tc = tc.clone();
+                                // Replace content with size summary
+                                if let Ok(mut args) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
+                                    if let Some(content) = args.get("content").and_then(|v| v.as_str()) {
+                                        let lines = content.lines().count();
+                                        let bytes = content.len();
+                                        args["content"] = serde_json::json!(format!("[{} lines, {} bytes]", lines, bytes));
+                                        tc.arguments = serde_json::to_string(&args).unwrap_or(tc.arguments);
+                                    }
+                                }
+                                tc
+                            } else {
+                                tc.clone()
+                            }
+                        }).collect();
+                        result.push(Message {
+                            role: msg.role.clone(),
+                            content: MessageContent::AssistantWithToolCalls {
+                                text: text.clone(),
+                                tool_calls: compressed_calls,
+                            },
+                        });
+                    }
+                    _ => result.push(msg.clone()),
+                }
+            } else {
+                // Latest turn — keep everything at full fidelity
+                result.push(msg.clone());
+            }
+        }
 
         // Phase 4: Sanitize broken tool_call/tool_result pairs.
         Self::sanitize_messages(&mut result);
@@ -521,6 +577,48 @@ impl Conversation {
         }
         start
     }
+}
+
+/// Strip trailing duplicate content from model output.
+/// Weak models sometimes repeat their summary verbatim at the end.
+/// Strategy: find a repeated heading/marker line and truncate at the second occurrence.
+fn dedup_trailing_repeat(text: &str) -> String {
+    let text = text.trim_end();
+    if text.len() < 100 { return text.to_string(); }
+
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.len() < 6 { return text.to_string(); }
+
+    // Look for repeated marker lines: headings (**, ##) or key phrases.
+    // If a distinctive line appears twice, the second occurrence starts the duplicate.
+    // Only check lines in the first half as potential repeat starts.
+    let half = lines.len() / 2;
+    for i in 0..half {
+        let line = lines[i].trim();
+        // Must be a "distinctive" line (heading, bold marker, numbered item header)
+        if line.len() < 8 { continue; }
+        let is_marker = line.starts_with("**") || line.starts_with("##")
+            || line.starts_with("1.") || line.starts_with("1、");
+        if !is_marker { continue; }
+
+        // Look for this same line in the second half
+        for j in half..lines.len() {
+            let other = lines[j].trim();
+            if other == line {
+                // Found repeat marker. Verify: at least 3 lines after j should ~match lines after i.
+                let match_count = lines[i..].iter().zip(lines[j..].iter())
+                    .filter(|(a, b)| a.trim() == b.trim())
+                    .count();
+                let remaining = lines.len() - j;
+                // If >60% of remaining lines match, it's a duplicate
+                if remaining >= 3 && match_count * 100 / remaining >= 60 {
+                    return lines[..j].join("\n");
+                }
+            }
+        }
+    }
+
+    text.to_string()
 }
 
 #[cfg(test)]

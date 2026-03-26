@@ -174,12 +174,40 @@ impl Tool for GrepTool {
 
             msg
         } else {
-            let lines: Vec<&str> = final_stdout.lines().take(max).collect();
+            let raw_lines: Vec<&str> = final_stdout.lines().take(max).collect();
             let total = final_stdout.lines().count();
+
+            // Annotate matching lines with the enclosing function/symbol name
+            let mut searcher = ctx.semantic.lock().await;
+            let mut annotated: Vec<String> = Vec::new();
+            // Cache symbols per file to avoid re-parsing
+            let mut sym_cache: std::collections::HashMap<String, Vec<crate::semantic::Symbol>> = std::collections::HashMap::new();
+
+            for line in &raw_lines {
+                // Parse rg output: file:line:content or separator --
+                let parts: Vec<&str> = line.splitn(3, ':').collect();
+                if parts.len() >= 3 {
+                    if let Ok(line_no) = parts[1].parse::<usize>() {
+                        let file = parts[0];
+                        // Look up enclosing symbol
+                        let symbols = sym_cache.entry(file.to_string()).or_insert_with(|| {
+                            let p = std::path::Path::new(file);
+                            searcher.list_symbols(p).unwrap_or_default()
+                        });
+                        let enclosing = symbols.iter().find(|s| line_no >= s.start_line && line_no <= s.end_line);
+                        if let Some(sym) = enclosing {
+                            annotated.push(format!("{}  ← in {}()", line, sym.name));
+                            continue;
+                        }
+                    }
+                }
+                annotated.push(line.to_string());
+            }
+
             let mut out = if was_literal_fallback {
-                format!("[Regex failed, used literal match]\n{}", lines.join("\n"))
+                format!("[Regex failed, used literal match]\n{}", annotated.join("\n"))
             } else {
-                lines.join("\n")
+                annotated.join("\n")
             };
             if total > max {
                 out.push_str(&format!("\n\n[{} more matches not shown]", total - max));

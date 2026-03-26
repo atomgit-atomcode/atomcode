@@ -1,11 +1,15 @@
 pub mod bash;
 pub mod cd;
 pub mod edit;
+pub mod find_references;
 pub mod glob;
 pub mod grep;
 pub mod list_dir;
+pub mod list_symbols;
 pub mod read;
+pub mod read_symbol;
 pub mod result_store;
+pub mod search_replace;
 pub mod web_fetch;
 pub mod web_search;
 pub mod write;
@@ -24,7 +28,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 #[derive(Debug, Clone)]
 pub struct ToolDef {
@@ -138,12 +142,14 @@ impl PermissionStore {
 #[derive(Clone)]
 pub struct ToolContext {
     pub working_dir: Arc<RwLock<PathBuf>>,
+    pub semantic: Arc<Mutex<crate::semantic::SemanticSearcher>>,
 }
 
 impl ToolContext {
     pub fn new(working_dir: PathBuf) -> Self {
         Self {
             working_dir: Arc::new(RwLock::new(working_dir)),
+            semantic: Arc::new(Mutex::new(crate::semantic::SemanticSearcher::new())),
         }
     }
 }

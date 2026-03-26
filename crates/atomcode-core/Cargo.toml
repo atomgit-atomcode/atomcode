@@ -16,5 +16,18 @@ tokio-util = "0.7"
 toml = "0.8"
 dirs = "6"
 
+# Semantic analysis
+tree-sitter = "0.26"
+tree-sitter-rust = "0.24"
+tree-sitter-python = "0.25"
+tree-sitter-javascript = "0.25"
+tree-sitter-typescript = "0.23"
+tree-sitter-go = "0.25"
+tree-sitter-java = "0.23"
+tree-sitter-c = "0.24"
+tree-sitter-cpp = "0.23"
+ignore = "0.4"
+regex = "1"
+
 [dev-dependencies]
 tempfile = "3"

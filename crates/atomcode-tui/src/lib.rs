@@ -348,7 +348,6 @@ pub async fn run(
 
         if let Some(file_path) = app.pending_editor.take() {
             // First disable raw mode to release terminal control completely
-            // This must happen BEFORE stopping the event loop
             disable_raw_mode()?;
             execute!(
                 terminal.backend_mut(),
@@ -357,11 +356,8 @@ pub async fn run(
                 LeaveAlternateScreen
             )?;
             terminal.show_cursor()?;
-            
-            // Now stop the event loop (after raw mode is disabled)
+
             event_loop.stop();
-            
-            // Flush any pending output and DISCARD any buffered input
             let _ = std::io::stdout().flush();
             flush_stdin();
 
@@ -373,33 +369,22 @@ pub async fn run(
                 .stderr(std::process::Stdio::inherit())
                 .status();
 
-            // Show result message
             if let Ok(exit_status) = status {
                 if exit_status.success() {
-                    // Reload config if the edited file was the config file
                     let config_path = Config::default_path();
                     if std::path::Path::new(&file_path) == config_path {
-                        match Config::load(&config_path) {
-                            Ok(new_config) => {
-                                app.config = new_config;
-                                // Update default provider in app
-                                let default_name = app.config.default_provider.clone();
-                                if let Ok(provider) = app.config.active_provider(None) {
-                                    app.model_name = format!("{} / {}", default_name, provider.model);
-                                }
-                            }
-                            Err(e) => {
-                                eprintln!("Failed to reload config: {}", e);
+                        if let Ok(new_config) = Config::load(&config_path) {
+                            app.config = new_config;
+                            let default_name = app.config.default_provider.clone();
+                            if let Ok(provider) = app.config.active_provider(None) {
+                                app.model_name = format!("{} / {}", default_name, provider.model);
                             }
                         }
                     }
                 }
             }
 
-            // Flush stdin again before restoring TUI
             flush_stdin();
-
-            // Restore TUI
             enable_raw_mode()?;
             clear_scrollback(terminal.backend_mut())?;
             execute!(
@@ -411,8 +396,6 @@ pub async fn run(
                 EnableBracketedPaste,
             )?;
             terminal.clear()?;
-
-            // Restart the event loop
             event_loop.start();
             continue;
         }
@@ -420,8 +403,7 @@ pub async fn run(
         // Handle pending OAuth login
         if app.pending_login {
             app.pending_login = false;
-            
-            // Disable raw mode and restore terminal for OAuth flow
+
             disable_raw_mode()?;
             execute!(
                 terminal.backend_mut(),
@@ -431,20 +413,15 @@ pub async fn run(
             )?;
             terminal.show_cursor()?;
 
-            // Run OAuth login (this blocks until complete)
             println!("\n  AtomCode AtomGit Login");
             println!("  =========================\n");
-            
+
             match run_oauth_login() {
                 Ok(auth) => {
                     println!("\n  Login successful! Logged in as: {}", auth.user.username);
-                    
-                    // Add AtomGit provider to config
                     if let Err(e) = add_atomgit_provider(&auth.access_token) {
                         println!("  Warning: Failed to add AtomGit provider: {}", e);
                     }
-                    
-                    // Reload config to get the new provider
                     let config_path = Config::default_path();
                     if let Ok(new_config) = Config::load(&config_path) {
                         app.config = new_config;
@@ -453,7 +430,6 @@ pub async fn run(
                             app.model_name = format!("{} / {}", default_name, provider.model);
                         }
                     }
-                    
                     app.conversation.add_user_message("/login");
                     app.conversation.push_delta(&format!(
                         "Login successful! Logged in as: **{}** (ID: {})\n\nAtomGit provider added and set as default.\nModel: `Qwen/Qwen3.5-35B-A3B`",
@@ -469,7 +445,6 @@ pub async fn run(
                 }
             }
 
-            // Restore TUI
             enable_raw_mode()?;
             clear_scrollback(terminal.backend_mut())?;
             execute!(

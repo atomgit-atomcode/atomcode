@@ -15,12 +15,12 @@ use atomcode_core::tool::read::ReadFileTool;
 use atomcode_core::tool::write::WriteFileTool;
 use atomcode_core::tool::edit::EditFileTool;
 use atomcode_core::tool::bash::BashTool;
-use atomcode_core::tool::cd::CdTool;
 use atomcode_core::tool::grep::GrepTool;
 use atomcode_core::tool::glob::GlobTool;
 use atomcode_core::tool::list_dir::ListDirTool;
 use atomcode_core::tool::web_search::WebSearchTool;
 use atomcode_core::tool::web_fetch::WebFetchTool;
+use atomcode_core::tool::search_replace::SearchReplaceTool;
 
 mod auth;
 
@@ -154,12 +154,12 @@ async fn run() -> Result<()> {
     tool_registry.register(Box::new(WriteFileTool));
     tool_registry.register(Box::new(EditFileTool));
     tool_registry.register(Box::new(BashTool));
-    tool_registry.register(Box::new(CdTool));
     tool_registry.register(Box::new(GrepTool));
     tool_registry.register(Box::new(GlobTool));
     tool_registry.register(Box::new(ListDirTool));
     tool_registry.register(Box::new(WebSearchTool));
     tool_registry.register(Box::new(WebFetchTool));
+    tool_registry.register(Box::new(SearchReplaceTool));
 
     // Derive model name for display in the status bar before giving provider to AgentLoop.
     let model_name = provider_config.model.clone();

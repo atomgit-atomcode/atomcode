@@ -36,13 +36,21 @@ pub struct EditFileTool;
 #[derive(Deserialize)]
 struct EditFileArgs {
     file_path: String,
-    old_string: String,
+    /// Text to find and replace. Required unless using line-number mode (start_line/end_line).
+    #[serde(default)]
+    old_string: Option<String>,
     new_string: String,
-    /// If true, replace ALL occurrences (not just the first unique one).
-    /// This is the key feature for bulk style changes — change all "rounded-lg"
-    /// to "rounded-xl" in one call without touching business logic.
     #[serde(default)]
     replace_all: bool,
+    /// Scope edit to a specific function/class by name (tree-sitter).
+    #[serde(default)]
+    symbol: Option<String>,
+    /// Line-number mode: replace lines start_line..end_line with new_string.
+    /// Use line numbers from read_file output. No need to copy text precisely.
+    #[serde(default)]
+    start_line: Option<usize>,
+    #[serde(default)]
+    end_line: Option<usize>,
 }
 
 #[async_trait]
@@ -51,20 +59,18 @@ impl Tool for EditFileTool {
         ToolDef {
             name: "edit_file",
             description: "Replace text in a file. ALWAYS prefer this over write_file for existing files.\n\
-                Usage:\n\
-                - You MUST read the file with read_file before editing it. The edit will fail if you haven't read it.\n\
-                - old_string and new_string must be different.\n\
-                - When copying text from read_file output, preserve exact indentation (tabs/spaces) as shown AFTER the line number prefix.\n\
-                Modes:\n\
-                - replace_all=false (default): old_string must be unique in the file. Replaces one occurrence.\n\
-                  If old_string matches multiple times, provide more surrounding context lines to make it unique.\n\
-                - replace_all=true: Replaces ALL occurrences. Use for: renaming variables, changing CSS classes, \
-                  updating colors, bulk find-replace.\n\
-                  Example: {\"old_string\": \"bg-green-500\", \"new_string\": \"bg-blue-500\", \"replace_all\": true}\n\
+                Two modes:\n\
+                1. LINE-NUMBER MODE (recommended): specify start_line and end_line from read_file output.\n\
+                   No need to copy text — just use line numbers. Replaces lines start_line through end_line with new_string.\n\
+                   Example: {\"file_path\": \"app.vue\", \"start_line\": 150, \"end_line\": 165, \"new_string\": \"<new content>\"}\n\
+                2. TEXT MATCH MODE: specify old_string to find and replace.\n\
+                   old_string must be unique in the file (or use replace_all=true for bulk changes).\n\
+                   Example: {\"file_path\": \"app.vue\", \"old_string\": \"bg-blue-500\", \"new_string\": \"bg-red-500\", \"replace_all\": true}\n\
+                Additional options:\n\
+                - symbol: scope the edit to a specific function/class (tree-sitter). Reduces ambiguity.\n\
                 Behavior:\n\
-                - If old_string is not found, the tool will show the closest match to help you correct it.\n\
-                - This is SAFE — it only changes matched text, preserving all surrounding code, imports, and logic.\n\
-                - NEVER use write_file to modify existing files. edit_file prevents accidental deletion of code you forgot to include.",
+                - If old_string is not found, auto-tries fuzzy matching (whitespace-normalized).\n\
+                - NEVER use write_file to modify existing files. edit_file prevents accidental code deletion.",
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -74,18 +80,30 @@ impl Tool for EditFileTool {
                     },
                     "old_string": {
                         "type": "string",
-                        "description": "Text to find. For replace_all=false, must be unique in the file."
+                        "description": "Text to find (text-match mode). Not needed if using start_line/end_line."
                     },
                     "new_string": {
                         "type": "string",
                         "description": "Replacement text"
                     },
+                    "start_line": {
+                        "type": "integer",
+                        "description": "Start line number (from read_file output). Replaces lines start_line..end_line with new_string."
+                    },
+                    "end_line": {
+                        "type": "integer",
+                        "description": "End line number (inclusive). Used with start_line for line-number mode."
+                    },
                     "replace_all": {
                         "type": "boolean",
-                        "description": "Replace ALL occurrences (true) or just one unique match (false, default). Use true for bulk CSS/style changes."
+                        "description": "Replace ALL occurrences of old_string (text-match mode only)."
+                    },
+                    "symbol": {
+                        "type": "string",
+                        "description": "Scope edit to a specific function/class name (tree-sitter)."
                     }
                 },
-                "required": ["file_path", "old_string", "new_string"]
+                "required": ["file_path", "new_string"]
             }),
         }
     }
@@ -94,19 +112,178 @@ impl Tool for EditFileTool {
         ApprovalRequirement::AutoApprove
     }
 
-    async fn execute(&self, args: &str, _ctx: &ToolContext) -> Result<ToolResult> {
+    async fn execute(&self, args: &str, ctx: &ToolContext) -> Result<ToolResult> {
         let parsed: EditFileArgs = serde_json::from_str(args)?;
 
         let content = tokio::fs::read_to_string(&parsed.file_path)
             .await
             .with_context(|| format!("Failed to read {}", parsed.file_path))?;
 
-        let count = content.matches(&parsed.old_string).count();
+        // ── LINE-NUMBER MODE ──
+        // Replace lines start_line..=end_line with new_string. No text matching needed.
+        if let (Some(start), Some(end)) = (parsed.start_line, parsed.end_line) {
+            let lines: Vec<&str> = content.lines().collect();
+            let total = lines.len();
+
+            if start == 0 || start > total || end < start {
+                return Ok(ToolResult {
+                    call_id: String::new(),
+                    output: format!("Invalid line range: {}-{} (file has {} lines)", start, end, total),
+                    success: false,
+                });
+            }
+            let end = end.min(total);
+
+            // Show what's being replaced
+            let old_text: String = lines[start - 1..end].join("\n");
+            let removed = end - start + 1;
+            let added = parsed.new_string.lines().count();
+
+            // Reconstruct file
+            let mut new_lines: Vec<&str> = Vec::with_capacity(total);
+            new_lines.extend_from_slice(&lines[..start - 1]);
+            // new_string lines go in the middle
+            let new_content_lines: Vec<&str> = parsed.new_string.lines().collect();
+            new_lines.extend_from_slice(&new_content_lines);
+            if end < total {
+                new_lines.extend_from_slice(&lines[end..]);
+            }
+            let new_content = if content.ends_with('\n') {
+                format!("{}\n", new_lines.join("\n"))
+            } else {
+                new_lines.join("\n")
+            };
+
+            atomic_write(&parsed.file_path, &new_content).await?;
+            let diff = build_compact_diff(&old_text, &parsed.new_string);
+            let outline = file_outline(&new_content);
+            return Ok(ToolResult {
+                call_id: String::new(),
+                output: format!(
+                    "Edited {} lines {}-{} (-{} +{} lines).\n{}\n{}",
+                    parsed.file_path, start, end, removed, added, diff, outline
+                ),
+                success: true,
+            });
+        }
+
+        // ── old_string is required for text-match and symbol modes ──
+        let old_string = match parsed.old_string {
+            Some(ref s) if !s.is_empty() => s.clone(),
+            _ => {
+                return Ok(ToolResult {
+                    call_id: String::new(),
+                    output: "Error: either old_string or start_line/end_line is required.".to_string(),
+                    success: false,
+                });
+            }
+        };
+
+        // If symbol is provided, scope the edit to that symbol's body using tree-sitter.
+        // This resolves ambiguity: old_string only needs to be unique within the symbol, not the whole file.
+        if let Some(ref symbol_name) = parsed.symbol {
+            let path = std::path::Path::new(&parsed.file_path);
+            let mut searcher = ctx.semantic.lock().await;
+            if let Some(slice) = searcher.extract_symbol(path, symbol_name) {
+                let sym_text = &content[slice.start_byte..slice.end_byte];
+                let sym_count = sym_text.matches(&old_string).count();
+
+                if sym_count == 0 {
+                    let (hint, _) = find_closest_match_with_suggestion(sym_text, &old_string);
+                    return Ok(ToolResult {
+                        call_id: String::new(),
+                        output: format!(
+                            "Error: old_string not found in symbol '{}' (lines {}-{}).\n{}",
+                            symbol_name, slice.start_line, slice.end_line, hint
+                        ),
+                        success: false,
+                    });
+                }
+
+                if !parsed.replace_all && sym_count > 1 {
+                    return Ok(ToolResult {
+                        call_id: String::new(),
+                        output: format!(
+                            "Error: old_string found {} times in symbol '{}'. Use replace_all=true or provide more context.",
+                            sym_count, symbol_name
+                        ),
+                        success: false,
+                    });
+                }
+
+                // Replace within the symbol, reconstruct the full file
+                let new_sym_text = if parsed.replace_all {
+                    sym_text.replace(&old_string, &parsed.new_string)
+                } else {
+                    sym_text.replacen(&old_string, &parsed.new_string, 1)
+                };
+                let new_content = format!(
+                    "{}{}{}",
+                    &content[..slice.start_byte],
+                    new_sym_text,
+                    &content[slice.end_byte..]
+                );
+
+                atomic_write(&parsed.file_path, &new_content).await?;
+                // Invalidate AST cache for this file
+                drop(searcher); // release lock before re-acquiring
+                let mut searcher = ctx.semantic.lock().await;
+                searcher.invalidate(path);
+
+                let diff = build_compact_diff(&old_string, &parsed.new_string);
+                let label = if parsed.replace_all {
+                    format!("replaced {} occurrences in {}", sym_count, symbol_name)
+                } else {
+                    format!("in {} (lines {}-{})", symbol_name, slice.start_line, slice.end_line)
+                };
+                let outline = file_outline(&new_content);
+                return Ok(ToolResult {
+                    call_id: String::new(),
+                    output: format!("Edited {} {}.\n{}\n{}", parsed.file_path, label, diff, outline),
+                    success: true,
+                });
+            } else {
+                // Symbol not found — list available symbols as hint
+                let hint = match searcher.list_symbols(path) {
+                    Some(syms) => {
+                        let names: Vec<&str> = syms.iter().map(|s| s.name.as_str()).collect();
+                        format!("Symbol '{}' not found. Available: {}", symbol_name, names.join(", "))
+                    }
+                    None => format!("Symbol '{}' not found in {}", symbol_name, parsed.file_path),
+                };
+                return Ok(ToolResult {
+                    call_id: String::new(),
+                    output: hint,
+                    success: false,
+                });
+            }
+        }
+
+        // Standard path: no symbol scoping
+        let count = content.matches(&old_string).count();
 
         if count == 0 {
-            // No match — show closest match with a ready-to-use suggested old_string.
-            // This lets the model retry immediately without re-reading the file.
-            let (hint, suggested_old) = find_closest_match_with_suggestion(&content, &parsed.old_string);
+            // Auto-fuzzy: try whitespace-normalized matching before failing.
+            // This handles the common case where the model gets indentation slightly wrong.
+            if let Some((fuzzy_result, fuzzy_count)) = try_fuzzy_replace(
+                &content, &old_string, &parsed.new_string, parsed.replace_all
+            ) {
+                atomic_write(&parsed.file_path, &fuzzy_result).await?;
+                let diff = build_compact_diff(&old_string, &parsed.new_string);
+                let outline = file_outline(&fuzzy_result);
+                return Ok(ToolResult {
+                    call_id: String::new(),
+                    output: format!(
+                        "Edited {} (fuzzy match, {} occurrence{}).\n{}\n{}",
+                        parsed.file_path, fuzzy_count,
+                        if fuzzy_count > 1 { "s" } else { "" },
+                        diff, outline
+                    ),
+                    success: true,
+                });
+            }
+
+            let (hint, suggested_old) = find_closest_match_with_suggestion(&content, &old_string);
             let suggestion = if let Some(ref s) = suggested_old {
                 format!(
                     "\n\n[SUGGESTED FIX: Use this exact text as old_string (copy it precisely):]\n```\n{}\n```",
@@ -123,7 +300,7 @@ impl Tool for EditFileTool {
         }
 
         // Safety check: warn about large deletions
-        let old_lines = parsed.old_string.lines().count();
+        let old_lines = old_string.lines().count();
         let new_lines = parsed.new_string.lines().count();
         let net_deleted = old_lines.saturating_sub(new_lines);
         let _deletion_warning = if net_deleted > 10 {
@@ -148,9 +325,9 @@ impl Tool for EditFileTool {
                 String::new()
             };
 
-            let new_content = content.replace(&parsed.old_string, &parsed.new_string);
+            let new_content = content.replace(&old_string, &parsed.new_string);
             atomic_write(&parsed.file_path, &new_content).await?;
-            let diff = build_compact_diff(&parsed.old_string, &parsed.new_string);
+            let diff = build_compact_diff(&old_string, &parsed.new_string);
             let outline = file_outline(&new_content);
             Ok(ToolResult {
                 call_id: String::new(),
@@ -172,12 +349,12 @@ impl Tool for EditFileTool {
                 });
             }
 
-            let new_content = content.replacen(&parsed.old_string, &parsed.new_string, 1);
+            let new_content = content.replacen(&old_string, &parsed.new_string, 1);
             atomic_write(&parsed.file_path, &new_content).await?;
 
-            let removed = parsed.old_string.lines().count();
+            let removed = old_string.lines().count();
             let added = parsed.new_string.lines().count();
-            let diff = build_compact_diff(&parsed.old_string, &parsed.new_string);
+            let diff = build_compact_diff(&old_string, &parsed.new_string);
             let outline = file_outline(&new_content);
             Ok(ToolResult {
                 call_id: String::new(),

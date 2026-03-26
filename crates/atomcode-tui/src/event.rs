@@ -5,9 +5,6 @@ use std::time::Duration;
 use crossterm::event::{Event, KeyEvent, MouseButton, MouseEvent, MouseEventKind, poll};
 use tokio::sync::mpsc;
 
-use atomcode_core::stream::TokenUsage;
-use atomcode_core::tool::{ToolCall, ToolResult};
-
 #[derive(Debug)]
 pub enum AppEvent {
     Key(KeyEvent),
@@ -17,14 +14,6 @@ pub enum AppEvent {
     MouseDown(u16, u16),   // (column, row) in terminal coordinates
     MouseDrag(u16, u16),   // (column, row)
     MouseUp(u16, u16),     // (column, row)
-    StreamDelta(String),
-    StreamToolCallStart { id: String, name: String },
-    StreamToolCallDelta(String),
-    StreamToolCallDone(ToolCall),
-    StreamUsage(TokenUsage),
-    StreamDone,
-    StreamError(String),
-    ToolFinished(ToolResult),
     Resize(u16, u16),
     Tick,
 }

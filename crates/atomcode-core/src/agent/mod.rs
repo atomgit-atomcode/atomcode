@@ -540,6 +540,22 @@ impl AgentLoop {
                                 self.model_produced_text = true;
                                 self.conversation.push_delta(&text);
                                 let _ = self.event_tx.send(AgentEvent::TextDelta(text));
+                                // Real-time repeat detection: if the buffer is repeating
+                                // earlier content, truncate and terminate the stream immediately.
+                                // All subsequent tokens would be waste — stop the model now.
+                                if let Some(ref buf) = self.conversation.stream_buffer {
+                                    if buf.len() > 200 {
+                                        if let Some(cut) = detect_streaming_repeat(buf) {
+                                            let truncated = buf[..cut].trim_end().to_string();
+                                            self.conversation.stream_buffer = Some(truncated);
+                                            // Kill the stream — drop it by breaking out of the loop.
+                                            // Then finalize as if Done was received.
+                                            self.conversation.finalize_stream();
+                                            self.finish_turn();
+                                            return;
+                                        }
+                                    }
+                                }
                             }
                             Some(Ok(StreamEvent::ToolCallStart { id, name })) => {
                                 // Reset: if the model generated text before tool calls (plan text),
@@ -558,22 +574,21 @@ impl AgentLoop {
                             Some(Ok(StreamEvent::ToolCallDelta(args))) => {
                                 if let Some(ref mut buf) = self.conversation.tool_call_buffer {
                                     buf.arguments.push_str(&args);
-                                    // Extract file_path or command from partial args for live display.
-                                    // Once we see the key info, update the UI with a more descriptive label.
                                     let partial = &buf.arguments;
-                                    let label = if let Some(fp_start) = partial.find("\"file_path\"") {
-                                        // Extract file_path value
+                                    let arg_size = partial.len();
+
+                                    // Extract file_path or command for display
+                                    let target = if let Some(fp_start) = partial.find("\"file_path\"") {
                                         if let Some(val_start) = partial[fp_start..].find(":\"").or_else(|| partial[fp_start..].find(": \"")) {
                                             let s = fp_start + val_start;
                                             let after_colon = partial[s..].find('"').map(|p| s + p + 1);
                                             if let Some(start) = after_colon {
                                                 if let Some(end) = partial[start..].find('"') {
                                                     let fp = &partial[start..start + end];
-                                                    let short = std::path::Path::new(fp)
+                                                    Some(std::path::Path::new(fp)
                                                         .file_name()
                                                         .map(|n| n.to_string_lossy().to_string())
-                                                        .unwrap_or_else(|| fp.to_string());
-                                                    Some(format!("{}: {}", buf.name, short))
+                                                        .unwrap_or_else(|| fp.to_string()))
                                                 } else { None }
                                             } else { None }
                                         } else { None }
@@ -583,17 +598,29 @@ impl AgentLoop {
                                             let after_colon = partial[s..].find('"').map(|p| s + p + 1);
                                             if let Some(start) = after_colon {
                                                 let end = partial[start..].find('"').unwrap_or(partial.len() - start).min(50);
-                                                let cmd = &partial[start..start + end];
-                                                Some(format!("{}: {}", buf.name, cmd))
+                                                Some(partial[start..start + end].to_string())
                                             } else { None }
                                         } else { None }
                                     } else { None };
 
-                                    if let Some(label) = label {
-                                        let _ = self.event_tx.send(AgentEvent::PhaseChange(
-                                            AgentPhase::CallingTool(label),
-                                        ));
-                                    }
+                                    // Always update label with size — shows live progress during large writes
+                                    let size_str = if arg_size > 1024 {
+                                        format!(" ({:.1}KB)", arg_size as f64 / 1024.0)
+                                    } else if arg_size > 100 {
+                                        format!(" ({}B)", arg_size)
+                                    } else {
+                                        String::new()
+                                    };
+                                    let label = if let Some(ref t) = target {
+                                        format!("{}: {}{}", buf.name, t, size_str)
+                                    } else if !size_str.is_empty() {
+                                        format!("{}{}", buf.name, size_str)
+                                    } else {
+                                        buf.name.clone()
+                                    };
+                                    let _ = self.event_tx.send(AgentEvent::PhaseChange(
+                                        AgentPhase::CallingTool(label),
+                                    ));
                                 }
                             }
                             Some(Ok(StreamEvent::ToolCallDone(mut call))) => {
@@ -622,8 +649,6 @@ impl AgentLoop {
                                     if !self.verify_injected && self.should_verify() {
                                         self.verify_injected = true;
                                         self.inject_verify_prompt();
-                                        self.call_llm().await;
-                                    } else if self.maybe_inject_summary_prompt() {
                                         self.call_llm().await;
                                     } else {
                                         self.finish_turn();
@@ -1009,10 +1034,17 @@ impl AgentLoop {
 
             // --- Intercept redundant tool calls ---
             if let Some(intercepted) = self.intercept_redundant_call(&name, &args) {
-                // Count how many consecutive blocks we've had
+                // Count how many consecutive INTERCEPTED calls (same tool + same args hash).
+                // Different edits on the same file are NOT a loop — don't count them.
+                let args_hash = {
+                    use std::hash::{Hash, Hasher};
+                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    args.hash(&mut h);
+                    h.finish()
+                };
                 let block_count = self.recent_calls.iter()
                     .rev()
-                    .take_while(|s| s.0 == name)
+                    .take_while(|s| s.0 == name && s.1 == args_hash)
                     .count();
 
                 let _ = self.event_tx.send(AgentEvent::ToolCallStarted {
@@ -1048,8 +1080,10 @@ impl AgentLoop {
                             format!("Task stopped due to a verification error. Files modified: {}. \
                                      The final verification step failed — please check manually.", files)
                         };
+                        self.conversation.push_delta(&summary);
                         let _ = self.event_tx.send(AgentEvent::TextDelta(summary));
                     }
+                    self.conversation.finalize_stream();
                     self.finish_turn();
                     return;
                 }
@@ -1167,24 +1201,29 @@ impl AgentLoop {
             tool_result.output.push_str(&dur_str);
 
             // ── Re-read reminder for read_file ──
-            // If the model re-reads a file it already has, remind it (don't block).
-            // This prevents GLM-5's pattern of reading the same file 4 times.
+            // Block excessive FULL re-reads of the same file.
+            // Offset/limit reads are allowed (model is narrowing focus for precise edits).
+            // Only block full re-reads (no offset) on 3rd+ attempt.
             if name == "read_file" {
                 if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&args) {
                     if let Some(fp) = parsed.get("file_path").and_then(|v| v.as_str()) {
-                        let short = short_path(fp);
-                        let count = self.file_read_counts.get(&short).copied().unwrap_or(0);
-                        if count >= 2 {
-                            tool_result.output.push_str(
-                                "\n\n[SYSTEM: You have read this file multiple times. \
-                                 Its content is already in your conversation. \
-                                 DO NOT read it again — use the content you have to make your edit NOW.]"
-                            );
-                        } else if count == 1 {
-                            tool_result.output.push_str(
-                                "\n\n[SYSTEM: You already read this file. If you need to edit it, \
-                                 do it now using the content in your conversation.]"
-                            );
+                        let has_offset = parsed.get("offset").is_some() || parsed.get("limit").is_some();
+                        if !has_offset {
+                            let short = short_path(fp);
+                            let count = self.file_read_counts.get(&short).copied().unwrap_or(0);
+                            if count >= 2 {
+                                tool_result.output = format!(
+                                    "[BLOCKED: You already read {} {} times. The content is in your conversation. \
+                                     Make your edit NOW. If you need a specific section, use offset/limit.]",
+                                    short, count
+                                );
+                                tool_result.success = false;
+                            } else if count == 1 {
+                                tool_result.output.push_str(
+                                    "\n\n[WARNING: You already read this file. Next full read will be blocked. \
+                                     Use offset/limit if you need a specific section, or make your edit NOW.]"
+                                );
+                            }
                         }
                     }
                 }
@@ -1536,11 +1575,6 @@ impl AgentLoop {
         mut result: ToolResult,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         Box::pin(async move {
-            // Sync working_dir changes propagated by CdTool.
-            if let Ok(wd) = self.tool_context.working_dir.try_read() {
-                let _ = self.event_tx.send(AgentEvent::WorkingDirChanged(wd.clone()));
-            }
-
             // Smart per-tool truncation.
             let tool_name = self.current_tool_name.clone();
             self.truncate_output(&mut result, &tool_name);
@@ -1653,37 +1687,25 @@ impl AgentLoop {
                 let has_edits = !self.files_edited_this_turn.is_empty();
 
                 if last_failed && has_edits {
-                    // Edits were made but verification/restart failed — warn the user
                     let warning = format!(
                         "Stopped at step limit ({}). Files modified: {}. \
                          However, the last action failed — the changes may not be fully working. \
                          Please check manually.",
                         hard_limit, self.files_edited_this_turn.join(", ")
                     );
-                    let _ = self.event_tx.send(AgentEvent::TextDelta(warning.clone()));
-                    self.conversation.messages.push(
-                        crate::conversation::message::Message::new(
-                            crate::conversation::message::Role::Assistant,
-                            warning,
-                        )
-                    );
+                    // Only emit TextDelta — TurnComplete handler will add to conversation via finalize_stream
+                    self.conversation.push_delta(&warning);
+                    let _ = self.event_tx.send(AgentEvent::TextDelta(warning));
                 } else if !has_edits {
                     let warning = format!(
                         "Stopped at step limit ({}) without completing any edits. \
                          Please try a more specific request.",
                         hard_limit
                     );
-                    let _ = self.event_tx.send(AgentEvent::TextDelta(warning.clone()));
-                    self.conversation.messages.push(
-                        crate::conversation::message::Message::new(
-                            crate::conversation::message::Role::Assistant,
-                            warning,
-                        )
-                    );
-                } else {
-                    // Step limit reached but last action succeeded — use fallback summary
-                    self.maybe_inject_summary_prompt();
+                    self.conversation.push_delta(&warning);
+                    let _ = self.event_tx.send(AgentEvent::TextDelta(warning));
                 }
+                self.conversation.finalize_stream();
                 self.finish_turn();
                 return;
             }
@@ -1706,54 +1728,6 @@ impl AgentLoop {
     // -------------------------------------------------------------------------
     // Helper methods
     // -------------------------------------------------------------------------
-
-    /// If the turn ended without the model producing a text summary (common with DeepSeek),
-    /// auto-generate a brief summary from the tool calls in this turn and emit it as text.
-    /// If the model didn't produce a final text summary, inject a prompt
-    /// asking it to summarize what it did. This forces a proper LLM-generated
-    /// summary instead of a code-generated "Done. Modified: ..." string.
-    /// Returns true if a summary prompt was injected (caller should call_llm again).
-    fn maybe_inject_summary_prompt(&mut self) -> bool {
-        // If the model already produced text, no need to force a summary
-        if self.model_produced_text {
-            return false;
-        }
-        // No tools executed — nothing to summarize
-        if self.tool_call_count == 0 {
-            return false;
-        }
-        // Near step limit — don't waste another LLM call
-        let dynamic_limit = 35 + (self.files_edited_this_turn.len() * 5);
-        if self.tool_call_count + 2 >= dynamic_limit.min(50) {
-            // Fallback: quick code-generated summary
-            let files = self.files_edited_this_turn.join(", ");
-            let summary = if files.is_empty() {
-                "Done.".to_string()
-            } else {
-                format!("Done. Modified: {}.", files)
-            };
-            let _ = self.event_tx.send(AgentEvent::TextDelta(summary.clone()));
-            self.conversation.messages.push(
-                crate::conversation::message::Message::new(
-                    crate::conversation::message::Role::Assistant,
-                    summary,
-                )
-            );
-            return false;
-        }
-
-        // Inject summary request as a system-style message
-        let files = self.files_edited_this_turn.join(", ");
-        let prompt = format!(
-            "[SYSTEM: You completed the task but didn't summarize. \
-             Briefly tell the user what you changed and why. \
-             Files modified: {}. Be concise — 2-3 sentences max.]",
-            if files.is_empty() { "none".to_string() } else { files }
-        );
-        self.conversation.add_user_message(&prompt);
-        self.model_produced_text = false; // Reset so the summary text is captured
-        true // Caller should call_llm() again
-    }
 
     /// Find sibling files (same directory, same extension) of edited files
     /// and suggest the model check them for the same bug pattern.
@@ -3210,4 +3184,37 @@ fn repair_json(s: &str) -> String {
     }
 
     result
+}
+
+/// Detect if a streaming text buffer is repeating earlier content.
+/// Returns Some(byte_position) where the repeat starts, None if no repeat detected.
+fn detect_streaming_repeat(buf: &str) -> Option<usize> {
+    let lines: Vec<&str> = buf.lines().collect();
+    if lines.len() < 6 { return None; }
+
+    let half = lines.len() / 2;
+
+    // Check ANY distinctive line (>= 15 chars) that appears in both halves.
+    // Previous version only checked markdown headings — too narrow.
+    for i in 0..half {
+        let line = lines[i].trim();
+        if line.len() < 15 { continue; }
+
+        for j in half..lines.len() {
+            if lines[j].trim() == line {
+                // Verify: at least 2 of the next 4 lines also match
+                let match_count = lines[i..].iter().zip(lines[j..].iter())
+                    .take(4)
+                    .filter(|(a, b)| a.trim() == b.trim())
+                    .count();
+                if match_count >= 2 {
+                    let byte_pos: usize = lines[..j].iter()
+                        .map(|l| l.len() + 1)
+                        .sum();
+                    return Some(byte_pos.min(buf.len()));
+                }
+            }
+        }
+    }
+    None
 }

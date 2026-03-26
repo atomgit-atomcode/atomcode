@@ -124,26 +124,55 @@ pub fn render(
 
     // Active state indicator — always visible during streaming/executing
     let spinner = SPINNER[tick % SPINNER.len()];
-    let step_prefix = if step_count > 0 { format!("[step {}] ", step_count + 1) } else { String::new() };
+    let step_prefix = if step_count > 0 { format!("[turn {}] ", step_count) } else { String::new() };
 
-    // Per-call TTFT display: show live wait time while waiting, then fixed TTFT once arrived.
-    let ttft_display = if let Some(ms) = first_token_ms {
-        // First token arrived — show fixed TTFT
-        if ms >= 1000 {
-            format!("  TTFT {:.1}s", ms as f64 / 1000.0)
+    // Time-based color: green (<10s) → yellow (10-60s) → orange (60-120s) → red (>120s)
+    let wait_ms = llm_wait_ms.unwrap_or(0);
+    let wait_color = if first_token_ms.is_some() {
+        Color::Rgb(170, 145, 255) // purple — streaming normally
+    } else if wait_ms < 10_000 {
+        Color::Rgb(75, 195, 115)  // green — fast
+    } else if wait_ms < 60_000 {
+        Color::Rgb(215, 170, 45)  // yellow — normal
+    } else if wait_ms < 120_000 {
+        Color::Rgb(230, 140, 50)  // orange — slow
+    } else {
+        Color::Rgb(235, 80, 80)   // red — very slow
+    };
+
+    // Time display with animated dots for waiting state
+    let time_display = if let Some(ms) = first_token_ms {
+        if ms >= 1000 { format!("  TTFT {:.1}s", ms as f64 / 1000.0) }
+        else { format!("  TTFT {}ms", ms) }
+    } else if wait_ms > 0 {
+        let dots = ".".repeat((tick % 4) + 1);
+        let pad = " ".repeat(3 - (tick % 4));
+        if wait_ms >= 60_000 {
+            format!("  {:.0}m {:.0}s{}{}", wait_ms / 60_000, (wait_ms % 60_000) / 1000, dots, pad)
+        } else if wait_ms >= 1000 {
+            format!("  {:.1}s{}{}", wait_ms as f64 / 1000.0, dots, pad)
         } else {
-            format!("  TTFT {}ms", ms)
-        }
-    } else if let Some(wait) = llm_wait_ms {
-        // Still waiting — show live elapsed
-        if wait >= 1000 {
-            format!("  waiting {:.1}s", wait as f64 / 1000.0)
-        } else {
-            format!("  waiting {}ms", wait)
+            format!("  {}ms{}{}", wait_ms, dots, pad)
         }
     } else {
         String::new()
     };
+
+    // Token speed indicator during streaming
+    let stream_len = conversation.stream_buffer.as_ref().map_or(0, |b| b.len());
+    let speed_display = if stream_len > 100 && first_token_ms.is_some() {
+        if let Some(start_ms) = llm_wait_ms {
+            let elapsed = start_ms.saturating_sub(first_token_ms.unwrap_or(0));
+            if elapsed > 500 {
+                let chars_per_sec = stream_len as f64 / (elapsed as f64 / 1000.0);
+                if chars_per_sec >= 200.0 {
+                    format!("  {:.0} c/s", chars_per_sec)
+                } else {
+                    format!("  {:.0} c/s (slow)", chars_per_sec)
+                }
+            } else { String::new() }
+        } else { String::new() }
+    } else { String::new() };
 
     match mode {
         AppMode::Streaming => {
@@ -152,7 +181,6 @@ pub fn render(
 
             let label = if waiting_first_token {
                 if step_count > 0 && !last_completed_tool.is_empty() {
-                    // Show what just happened: "after read_file, thinking..."
                     format!("After {}, thinking", last_completed_tool)
                 } else if step_count > 0 {
                     "Thinking...".to_string()
@@ -173,10 +201,11 @@ pub fn render(
 
             dynamic.push(Line::from(vec![
                 Span::styled(format!("{}\u{2502} ", INDENT), bar_style),
-                Span::styled(format!("{} ", spinner), Style::default().fg(Color::Rgb(170, 145, 255))),
+                Span::styled(format!("{} ", spinner), Style::default().fg(wait_color)),
                 Span::styled(step_prefix.clone(), Style::default().fg(Color::Rgb(130, 133, 150))),
-                Span::styled(label, Style::default().fg(Color::Rgb(170, 145, 255))),
-                Span::styled(ttft_display.clone(), Style::default().fg(Color::Rgb(100, 110, 130))),
+                Span::styled(label, Style::default().fg(wait_color)),
+                Span::styled(time_display.clone(), Style::default().fg(wait_color)),
+                Span::styled(speed_display.clone(), Style::default().fg(Color::Rgb(100, 110, 130))),
             ]));
         }
         AppMode::ToolExecuting => {

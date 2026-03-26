@@ -2,16 +2,13 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use futures::StreamExt;
 use tokio::sync::mpsc;
 
 use atomcode_core::agent::{AgentCommand, AgentEvent, AgentHandle};
 use atomcode_core::config::Config;
-use atomcode_core::config::DEFAULT_SYSTEM_PROMPT;
 use atomcode_core::conversation::Conversation;
 use atomcode_core::provider::LlmProvider;
-use atomcode_core::stream::StreamEvent;
-use atomcode_core::tool::{Tool, ToolCall, ToolCallBuffer, ToolContext, ToolRegistry, ToolResult, PermissionStore, PermissionDecision};
+use atomcode_core::tool::{ToolCall, ToolContext, ToolResult};
 
 use base64::Engine as _;
 
@@ -97,12 +94,7 @@ pub struct App {
     /// Model selector: list of (provider_name, model_name), selected index
     pub model_list: Vec<(String, String)>,
     pub model_selected: usize,
-    pub tool_registry: ToolRegistry,
-    pub permission_store: PermissionStore,
-    pub tool_call_count: usize,
     pub tick_count: usize,
-    /// Retry count for stream errors (auto-retry up to 3 times).
-    pub retry_count: usize,
     /// Last Ctrl+C timestamp for double-press detection.
     pub last_ctrl_c: Option<Instant>,
     /// When the current turn (user message -> agent loop) started.
@@ -157,8 +149,6 @@ pub struct App {
     pub config: Config,
     /// CancellationToken for the current streaming/tool task.
     pub cancel_token: tokio_util::sync::CancellationToken,
-    /// Buffered tool calls received during a single response turn (multi-tool support).
-    pub pending_tool_calls: Vec<ToolCall>,
     /// Channel pair for communicating with the AgentLoop.
     pub agent_handle: AgentHandle,
     /// Display name of the active model (cached so we don't need the provider ref).
@@ -207,10 +197,6 @@ impl App {
             provider_mgr: None,
             model_list: Vec::new(),
             model_selected: 0,
-            tool_registry: ToolRegistry::new(),
-            permission_store: PermissionStore::new(),
-            tool_call_count: 0,
-            retry_count: 0,
             last_ctrl_c: None,
             tick_count: 0,
             project_context_cache: None,
@@ -267,7 +253,6 @@ impl App {
             },
             config,
             cancel_token: tokio_util::sync::CancellationToken::new(),
-            pending_tool_calls: Vec::new(),
             agent_handle,
             model_name,
         }
@@ -474,51 +459,6 @@ impl App {
 
     /// If the AI ended the turn without giving a summary (just tool calls, no final text),
     /// auto-generate a brief summary from the tool results.
-    fn maybe_add_auto_summary(&mut self) {
-        use atomcode_core::conversation::message::{MessageContent, Role};
-
-        let msgs = &self.conversation.messages;
-        if msgs.is_empty() { return; }
-
-        // Check if the turn had tool calls
-        let had_tools = msgs.iter().rev().take(20).any(|m|
-            matches!(&m.content, MessageContent::AssistantWithToolCalls { .. } | MessageContent::ToolResult(_))
-        );
-        if !had_tools { return; }
-
-        // Check if the last message is a text assistant response (= AI gave summary)
-        let last = &msgs[msgs.len() - 1];
-        if matches!(&last.content, MessageContent::Text(s) if matches!(last.role, Role::Assistant) && s.len() > 10) {
-            return; // AI already gave a summary
-        }
-
-        // Build auto-summary from recent tool results
-        let mut actions: Vec<String> = Vec::new();
-        let mut had_error = false;
-        for msg in msgs.iter().rev().take(20) {
-            match &msg.content {
-                MessageContent::ToolResult(r) => {
-                    if !r.success { had_error = true; }
-                    let summary: String = r.output.lines().next().unwrap_or("").chars().take(60).collect();
-                    actions.push(summary);
-                }
-                MessageContent::Text(_) if matches!(msg.role, Role::User) => break, // stop at user message
-                _ => {}
-            }
-        }
-        actions.reverse();
-
-        if actions.is_empty() { return; }
-
-        let status = if had_error { "Completed with errors" } else { "Done" };
-        let mut summary = format!("{}. {} steps:\n", status, actions.len());
-        for (i, action) in actions.iter().enumerate() {
-            summary.push_str(&format!("  {}. {}\n", i + 1, action));
-        }
-        self.conversation.push_delta(&summary);
-        self.conversation.finalize_stream();
-    }
-
     /// Rebuild the LLM provider from current config (after provider/model change).
     /// Also updates model_name for status bar display.
     fn rebuild_provider(&mut self) {
@@ -530,28 +470,6 @@ impl App {
             }
         }
     }
-
-    /// Build system prompt: identity → context → rules (recency effect).
-    fn system_prompt(&mut self) -> String {
-        let rules = self.config.providers
-            .get(&self.config.default_provider)
-            .and_then(|p| p.system_prompt.as_deref())
-            .unwrap_or(DEFAULT_SYSTEM_PROMPT)
-            .to_string();
-
-        let dir = self.working_dir.display().to_string();
-
-        // Cache project context — only rebuild on first call or after /cd
-        let project_ctx = self.project_context_cache
-            .get_or_insert_with(|| crate::project_context::build_project_context(&self.working_dir).text)
-            .clone();
-
-        format!(
-            "You are AtomCode, a terminal coding agent.\n\nWorking directory: {}\n\n{}\n\n---\nRULES (follow strictly):\n{}",
-            dir, project_ctx, rules
-        )
-    }
-
 
     /// Process an event coming from the AgentLoop. Updates local conversation mirror and UI state.
     pub fn handle_agent_event(&mut self, event: AgentEvent) {
@@ -572,7 +490,11 @@ impl App {
                         self.first_token_ms = Some(start.elapsed().as_millis() as u64);
                     }
                 }
-                self.current_step_count += 1;
+                // If model produced text before tool calls (looks like a premature summary),
+                // append a visual separator so the user knows more work is coming.
+                if self.conversation.stream_buffer.as_ref().map_or(false, |b| b.len() > 50) {
+                    self.conversation.push_delta("\n\n---\n*[continuing...]*\n");
+                }
                 self.turn_log.log_tool_call(&name, &arguments);
                 let call = ToolCall {
                     id: format!("call_{}", self.current_step_count),
@@ -609,6 +531,9 @@ impl App {
                     }
                     AgentPhase::Thinking => {
                         self.mode = AppMode::Streaming;
+                        // Count LLM round-trips (not individual tool calls) — matches Claude Code's step counting.
+                        self.current_step_count += 1;
+                        self.turn_log.log_llm_call();
                         // Reset TTFT for each LLM call (not just the first in a turn)
                         self.first_token_ms = None;
                         self.llm_call_start = Some(Instant::now());
@@ -667,7 +592,7 @@ impl App {
                 self.total_tokens += usage.completion_tokens;
             }
             AgentEvent::WorkingDirChanged(new_dir) => {
-                self.turn_log.set_working_dir(&new_dir);
+                // Only /cd (user command) triggers this — LLM tools cannot change working dir.
                 self.previous_working_dir = Some(self.working_dir.clone());
                 self.working_dir = new_dir.clone();
                 self.project_context_cache = None;
@@ -683,21 +608,6 @@ impl App {
     }
 
     pub fn handle_event(&mut self, event: AppEvent, event_tx: &mpsc::UnboundedSender<AppEvent>) {
-        // Drop stale stream/tool events after cancellation
-        if self.mode.is_normal() {
-            match &event {
-                AppEvent::StreamDelta(_)
-                | AppEvent::StreamToolCallStart { .. }
-                | AppEvent::StreamToolCallDelta(_)
-                | AppEvent::StreamToolCallDone(_)
-                | AppEvent::StreamUsage(_)
-                | AppEvent::StreamDone
-                | AppEvent::StreamError(_)
-                | AppEvent::ToolFinished(_) => return, // Stale event from cancelled task
-                _ => {}
-            }
-        }
-
         match event {
             AppEvent::Key(key) => {
                 self.selection.has_selection = false;
@@ -834,127 +744,6 @@ impl App {
                         self.selection.has_selection = false;
                     }
                 }
-            }
-            AppEvent::StreamDelta(text) => {
-                self.conversation.push_delta(&text);
-            }
-            AppEvent::StreamUsage(usage) => {
-                // Only count completion tokens (prompt is repeated context, not new work)
-                self.turn_tokens += usage.completion_tokens;
-                self.total_tokens += usage.completion_tokens;
-            }
-            AppEvent::StreamDone => {
-                // If there are buffered tool calls (multi-tool response), process the first one.
-                // Each tool call's completion will trigger continue_agent_loop, which will
-                // process subsequent pending tool calls sequentially.
-                if !self.pending_tool_calls.is_empty() {
-                    let calls = std::mem::take(&mut self.pending_tool_calls);
-                    // Finalize the assistant message with ALL tool calls at once
-                    self.conversation.finalize_stream_with_tool_calls(&calls);
-                    // Execute the first tool; the rest are queued back as pending
-                    let mut remaining = calls.into_iter();
-                    if let Some(first_call) = remaining.next() {
-                        self.pending_tool_calls = remaining.collect();
-                        self.dispatch_tool_call(first_call, event_tx);
-                    }
-                    return;
-                }
-
-                self.conversation.finalize_stream();
-
-                // Auto-generate summary if the turn had tool calls but AI ended without text
-                self.maybe_add_auto_summary();
-
-                self.mode = AppMode::Normal;
-                self.at_bottom = true;
-                self.retry_count = 0;
-                self.last_turn_duration = self.turn_start.map(|t| t.elapsed());
-                self.turn_start = None;
-                self.suggestion = self.generate_suggestion();
-                // Persist history atomically (async, non-blocking)
-                let msgs = self.conversation.messages.clone();
-                tokio::spawn(async move {
-                    let path = Conversation::history_path();
-                    if let Some(parent) = path.parent() {
-                        let _ = tokio::fs::create_dir_all(parent).await;
-                    }
-                    if let Ok(data) = serde_json::to_string(&msgs) {
-                        let temp_path = path.with_extension("json.tmp");
-                        if tokio::fs::write(&temp_path, &data).await.is_ok() {
-                            let _ = tokio::fs::rename(&temp_path, &path).await;
-                        }
-                    }
-                });
-            }
-            AppEvent::StreamError(err) => {
-                let is_api_error = err.contains("API error")
-                    || err.contains("400 ")
-                    || err.contains("401 ")
-                    || err.contains("403 ")
-                    || err.contains("404 ")
-                    || err.contains("422 ")
-                    || err.contains("illegal");
-
-                let is_rate_limit = err.contains("429") || err.contains("rate");
-
-                if is_api_error {
-                    // API errors (bad request, auth, etc.) — don't retry
-                    self.conversation.push_delta(&format!("\n\n[Error: {}]", err));
-                    self.conversation.finalize_stream();
-                    self.mode = AppMode::Normal;
-                    self.last_turn_duration = self.turn_start.map(|t| t.elapsed());
-                    self.turn_start = None;
-                    self.at_bottom = true;
-                    self.retry_count = 0;
-                } else {
-                    // Network errors / rate limits — keep retrying with backoff (no limit)
-                    self.retry_count += 1;
-                    let wait_secs = if is_rate_limit {
-                        (self.retry_count as u64 * 5).min(30)
-                    } else {
-                        (self.retry_count as u64 * 2).min(15)
-                    };
-
-                    self.conversation.stream_buffer = None;
-                    self.mode = AppMode::Streaming;
-                    self.at_bottom = true;
-
-                    // Wait then retry
-                    let tx = event_tx.clone();
-                    let system_prompt = self.system_prompt();
-                    let messages = self.conversation.to_provider_messages_windowed(&system_prompt, 20);
-                    let tool_defs = self.tool_registry.get_definitions();
-                    let stream_result = self.provider.chat_stream(&messages, Some(&tool_defs));
-                    spawn_stream_handler_delayed(stream_result, tx, wait_secs, self.cancel_token.clone());
-                }
-            }
-            AppEvent::StreamToolCallStart { id, name } => {
-                self.conversation.tool_call_buffer = Some(ToolCallBuffer {
-                    id, name, arguments: String::new(),
-                });
-            }
-            AppEvent::StreamToolCallDelta(args) => {
-                if let Some(ref mut buf) = self.conversation.tool_call_buffer {
-                    buf.arguments.push_str(&args);
-                }
-            }
-            AppEvent::StreamToolCallDone(call) => {
-                self.conversation.tool_call_buffer = None;
-                // Buffer tool calls; they will all be processed when StreamDone arrives
-                self.pending_tool_calls.push(call);
-            }
-            AppEvent::ToolFinished(mut result) => {
-                // Append step duration to output
-                if let Some(start) = self.tool_start.take() {
-                    let dur = start.elapsed();
-                    let dur_str = if dur.as_millis() < 1000 {
-                        format!(" ({}ms)", dur.as_millis())
-                    } else {
-                        format!(" ({:.1}s)", dur.as_secs_f64())
-                    };
-                    result.output.push_str(&dur_str);
-                }
-                self.handle_tool_result(result, event_tx);
             }
             AppEvent::Resize(_, _) => {}
             AppEvent::Tick => {
@@ -1877,9 +1666,7 @@ impl App {
         self.input.clear();
         self.mode = AppMode::Streaming;
         self.at_bottom = true;
-        self.tool_call_count = 0;
         self.current_step_count = 0;
-        self.retry_count = 0;
         self.turn_start = Some(Instant::now());
         self.first_token_ms = None;
         self.llm_call_start = Some(Instant::now());
@@ -1890,244 +1677,6 @@ impl App {
         let _ = self.agent_handle.cmd_tx.send(AgentCommand::SendMessage(full_content));
     }
 
-    /// Execute a tool call that has already been recorded in conversation history.
-    fn dispatch_tool_call(&mut self, call: ToolCall, event_tx: &mpsc::UnboundedSender<AppEvent>) {
-
-        if let Some(tool) = self.tool_registry.get(&call.name) {
-            let approval = tool.approval(&call.arguments);
-            match self.permission_store.check(&call.name, &approval) {
-                PermissionDecision::Allow => {
-                    self.mode = AppMode::ToolExecuting;
-                    self.execute_tool(call, event_tx);
-                }
-                PermissionDecision::Ask(_reason) => {
-                    self.mode = AppMode::WaitingApproval(call);
-                }
-                PermissionDecision::Deny => {
-                    let result = ToolResult {
-                        call_id: call.id.clone(),
-                        output: "Permission denied by user configuration.".to_string(),
-                        success: false,
-                    };
-                    self.handle_tool_result(result, event_tx);
-                }
-            }
-        } else {
-            let result = ToolResult {
-                call_id: call.id.clone(),
-                output: format!("Unknown tool: {}", call.name),
-                success: false,
-            };
-            self.handle_tool_result(result, event_tx);
-        }
-    }
-
-    fn execute_tool(&mut self, call: ToolCall, event_tx: &mpsc::UnboundedSender<AppEvent>) {
-        self.tool_start = Some(Instant::now());
-        // Cache tool info for display (avoid per-frame JSON parsing)
-        self.executing_tool_info = format_tool_info(&call);
-        let call_id = call.id.clone();
-        let args = self.resolve_tool_args(&call);
-        let tx = event_tx.clone();
-        let ctx = self.tool_context.clone();
-
-        let tool: std::sync::Arc<dyn Tool> = match self.tool_registry.get_arc(&call.name) {
-            Some(t) => t,
-            None => {
-                let tool_name = call.name.clone();
-                let _ = tx.send(AppEvent::ToolFinished(ToolResult {
-                    call_id,
-                    output: format!("Unknown tool: {}", tool_name),
-                    success: false,
-                }));
-                return;
-            }
-        };
-
-        let cancel = self.cancel_token.clone();
-        tokio::spawn(async move {
-            tokio::select! {
-                _ = cancel.cancelled() => {
-                    // Tool was cancelled — don't send result
-                }
-                result = tool.execute(&args, &ctx) => {
-                    let tool_result = match result {
-                        Ok(mut r) => { r.call_id = call_id; r }
-                        Err(e) => ToolResult {
-                            call_id,
-                            output: format!("Error: {}", e),
-                            success: false,
-                        },
-                    };
-                    let _ = tx.send(AppEvent::ToolFinished(tool_result));
-                }
-            }
-        });
-    }
-
-    /// Resolve relative file_path in tool arguments to absolute paths based on working_dir.
-    fn resolve_tool_args(&self, call: &ToolCall) -> String {
-        let wd = self.tool_context.working_dir.try_read()
-            .map(|g| g.clone())
-            .unwrap_or_else(|_| self.working_dir.clone());
-        if let Ok(mut args) = serde_json::from_str::<serde_json::Value>(&call.arguments) {
-            if let Some(fp) = args.get("file_path").and_then(|v| v.as_str()) {
-                let path = std::path::Path::new(fp);
-                if !path.is_absolute() {
-                    let resolved = wd.join(path);
-                    args["file_path"] = serde_json::json!(resolved.to_string_lossy().to_string());
-                }
-                return serde_json::to_string(&args).unwrap_or(call.arguments.clone());
-            }
-        }
-        call.arguments.clone()
-    }
-
-    fn handle_tool_result(&mut self, mut result: ToolResult, event_tx: &mpsc::UnboundedSender<AppEvent>) {
-        // Sync working_dir from tool_context (CdTool may have updated it)
-        if let Ok(wd) = self.tool_context.working_dir.try_read() {
-            if *wd != self.working_dir {
-                self.working_dir = wd.clone();
-                self.project_context_cache = None;
-            }
-        }
-
-
-
-        // Smart output truncation: keep head + tail (errors are usually at the end)
-        const MAX_LINES: usize = 200;
-        const HEAD_LINES: usize = 30;
-        const TAIL_LINES: usize = 50;
-        let lines: Vec<&str> = result.output.lines().collect();
-        if lines.len() > MAX_LINES {
-            let head: String = lines[..HEAD_LINES].join("\n");
-            let tail: String = lines[lines.len()-TAIL_LINES..].join("\n");
-            result.output = format!(
-                "{}\n\n[... {} lines omitted ...]\n\n{}",
-                head, lines.len() - HEAD_LINES - TAIL_LINES, tail
-            );
-        }
-        // Also cap total chars
-        if result.output.len() > 10000 {
-            result.output = result.output.chars().take(10000).collect::<String>()
-                + "\n[output truncated at 10000 chars]";
-        }
-
-        self.conversation.add_tool_result(result);
-        self.tool_call_count += 1;
-        self.current_step_count += 1;
-
-        // Auto-continue: reset counter every 25 calls but keep going
-        if self.tool_call_count >= 25 {
-            self.tool_call_count = 0;
-        }
-
-        self.at_bottom = true;
-
-        // If there are more pending tool calls from the same multi-tool response,
-        // execute the next one before continuing the agent loop.
-        if !self.pending_tool_calls.is_empty() {
-            let next_call = self.pending_tool_calls.remove(0);
-            self.dispatch_tool_call(next_call, event_tx);
-            return;
-        }
-
-        self.mode = AppMode::Streaming;
-        self.continue_agent_loop(event_tx);
-    }
-
-    fn continue_agent_loop(&mut self, event_tx: &mpsc::UnboundedSender<AppEvent>) {
-        let system_prompt = self.system_prompt();
-        // Smaller window for tool continuations — recent context is enough
-        let messages = self.conversation.to_provider_messages_windowed(&system_prompt, 20);
-        let tool_defs = self.tool_registry.get_definitions();
-
-        let tx = event_tx.clone();
-        let stream_result = self.provider.chat_stream(&messages, Some(&tool_defs));
-        spawn_stream_handler(stream_result, tx, self.cancel_token.clone());
-    }
-}
-
-/// Spawn a tokio task that drains a provider stream and forwards events to the app channel.
-/// This is the single place where StreamEvent -> AppEvent mapping happens (DRY).
-fn spawn_stream_handler(
-    stream_result: anyhow::Result<std::pin::Pin<Box<dyn futures::Stream<Item = anyhow::Result<StreamEvent>> + Send>>>,
-    tx: mpsc::UnboundedSender<AppEvent>,
-    cancel: tokio_util::sync::CancellationToken,
-) {
-    tokio::spawn(async move {
-        match stream_result {
-            Ok(mut stream) => {
-                loop {
-                    tokio::select! {
-                        _ = cancel.cancelled() => { break; }
-                        event = stream.next() => {
-                            match event {
-                                None => break,
-                                Some(e) => {
-                                    let app_event = match e {
-                                        Ok(StreamEvent::Delta(text)) => AppEvent::StreamDelta(text),
-                                        Ok(StreamEvent::ToolCallStart { id, name }) => AppEvent::StreamToolCallStart { id, name },
-                                        Ok(StreamEvent::ToolCallDelta(args)) => AppEvent::StreamToolCallDelta(args),
-                                        Ok(StreamEvent::ToolCallDone(call)) => AppEvent::StreamToolCallDone(call),
-                                        Ok(StreamEvent::Usage(usage)) => AppEvent::StreamUsage(usage),
-                                        Ok(StreamEvent::Done) => { let _ = tx.send(AppEvent::StreamDone); break; }
-                                        Ok(StreamEvent::Error(e)) => { let _ = tx.send(AppEvent::StreamError(e)); break; }
-                                        Err(e) => { let _ = tx.send(AppEvent::StreamError(e.to_string())); break; }
-                                    };
-                                    if tx.send(app_event).is_err() { break; }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            Err(e) => { let _ = tx.send(AppEvent::StreamError(e.to_string())); }
-        }
-    });
-}
-
-/// Like `spawn_stream_handler`, but waits `delay_secs` before draining the stream.
-fn spawn_stream_handler_delayed(
-    stream_result: anyhow::Result<std::pin::Pin<Box<dyn futures::Stream<Item = anyhow::Result<StreamEvent>> + Send>>>,
-    tx: mpsc::UnboundedSender<AppEvent>,
-    delay_secs: u64,
-    cancel: tokio_util::sync::CancellationToken,
-) {
-    tokio::spawn(async move {
-        tokio::select! {
-            _ = cancel.cancelled() => { return; }
-            _ = tokio::time::sleep(std::time::Duration::from_secs(delay_secs)) => {}
-        }
-        match stream_result {
-            Ok(mut stream) => {
-                loop {
-                    tokio::select! {
-                        _ = cancel.cancelled() => { break; }
-                        event = stream.next() => {
-                            match event {
-                                None => break,
-                                Some(e) => {
-                                    let app_event = match e {
-                                        Ok(StreamEvent::Delta(text)) => AppEvent::StreamDelta(text),
-                                        Ok(StreamEvent::ToolCallStart { id, name }) => AppEvent::StreamToolCallStart { id, name },
-                                        Ok(StreamEvent::ToolCallDelta(args)) => AppEvent::StreamToolCallDelta(args),
-                                        Ok(StreamEvent::ToolCallDone(call)) => AppEvent::StreamToolCallDone(call),
-                                        Ok(StreamEvent::Usage(usage)) => AppEvent::StreamUsage(usage),
-                                        Ok(StreamEvent::Done) => { let _ = tx.send(AppEvent::StreamDone); break; }
-                                        Ok(StreamEvent::Error(e)) => { let _ = tx.send(AppEvent::StreamError(e)); break; }
-                                        Err(e) => { let _ = tx.send(AppEvent::StreamError(e.to_string())); break; }
-                                    };
-                                    if tx.send(app_event).is_err() { break; }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            Err(e) => { let _ = tx.send(AppEvent::StreamError(e.to_string())); }
-        }
-    });
 }
 
 /// Format tool info for display (called once, cached in App).

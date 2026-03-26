@@ -3,5 +3,6 @@ pub mod config;
 pub mod conversation;
 pub mod project_context;
 pub mod provider;
+pub mod semantic;
 pub mod stream;
 pub mod tool;
