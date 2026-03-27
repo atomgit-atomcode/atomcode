@@ -116,8 +116,10 @@ impl Conversation {
 
     pub fn finalize_stream(&mut self) {
         if let Some(content) = self.stream_buffer.take() {
-            // Strip trailing duplicate: weak models sometimes repeat their summary.
-            // If the second half of the text is a near-duplicate of the first half, truncate.
+            // Clean up model artifacts
+            let content = content
+                .replace("<think>", "").replace("</think>", "")
+                .replace("<|im_start|>", "").replace("<|im_end|>", "");
             let content = dedup_trailing_repeat(&content);
             let idx = self.messages.len();
             self.messages.push(Message::new(Role::Assistant, content));

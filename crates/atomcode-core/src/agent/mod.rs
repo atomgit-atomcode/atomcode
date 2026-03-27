@@ -835,6 +835,10 @@ impl AgentLoop {
                     event = stream.next() => {
                         match event {
                             Some(Ok(StreamEvent::Delta(text))) => {
+                                // Strip model-internal tags (DeepSeek <think>, QwQ reasoning, etc.)
+                                let text = strip_model_tags(&text);
+                                if text.is_empty() { continue; }
+
                                 self.model_produced_text = true;
                                 self.conversation.push_delta(&text);
                                 let _ = self.event_tx.send(AgentEvent::TextDelta(text));
@@ -3594,4 +3598,27 @@ fn detect_streaming_repeat(buf: &str) -> Option<usize> {
         }
     }
     None
+}
+
+/// Strip model-internal reasoning tags from streaming output.
+/// DeepSeek uses `<think>...</think>`, QwQ uses similar patterns.
+/// These should not be shown to the user or stored in conversation.
+fn strip_model_tags(text: &str) -> String {
+    let mut result = text.to_string();
+    // Remove <think> and </think> tags and everything between them
+    while let Some(start) = result.find("<think>") {
+        if let Some(end) = result.find("</think>") {
+            let end = end + "</think>".len();
+            result = format!("{}{}", &result[..start], &result[end..]);
+        } else {
+            // Unclosed <think> — remove from <think> to end (more content coming)
+            result = result[..start].to_string();
+            break;
+        }
+    }
+    // Also strip standalone </think> (opening tag was in a previous delta)
+    result = result.replace("</think>", "");
+    // Strip other common model internal tags
+    result = result.replace("<|im_start|>", "").replace("<|im_end|>", "");
+    result
 }
