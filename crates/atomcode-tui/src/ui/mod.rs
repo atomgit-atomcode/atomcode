@@ -5,6 +5,7 @@ pub mod model_selector;
 pub mod provider_panel;
 pub mod slash_menu;
 pub mod status_bar;
+pub mod theme;
 pub mod welcome;
 
 use std::path::PathBuf;

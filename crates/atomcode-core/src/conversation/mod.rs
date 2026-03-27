@@ -240,10 +240,10 @@ impl Conversation {
         }
 
         // Phase 1: Walk backwards through turns, adding full messages from
-        // recent turns until we've used ~40% of the budget (hot zone).
-        // Keep it lean: 40% full content + 60% condensed summaries.
-        // This prevents large read_file results from bloating the input.
-        let hot_budget = remaining_budget * 40 / 100;
+        // recent turns until we've used ~30% of the budget (hot zone).
+        // Working set (injected in call_llm) provides file skeletons separately,
+        // so conversation hot zone only needs the most recent turn's content.
+        let hot_budget = remaining_budget * 30 / 100;
         let mut hot_tokens = 0usize;
         let mut hot_turn_start = turns.len(); // index into turns vec
 

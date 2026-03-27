@@ -156,7 +156,7 @@ impl Tool for EditFileTool {
 
             atomic_write(&parsed.file_path, &new_content).await?;
             let diff = build_compact_diff(&old_text, &parsed.new_string);
-            let outline = file_outline(&new_content);
+            let outline = post_edit_info(&new_content, &parsed.new_string);
             return Ok(ToolResult {
                 call_id: String::new(),
                 output: format!(
@@ -236,7 +236,7 @@ impl Tool for EditFileTool {
                 } else {
                     format!("in {} (lines {}-{})", symbol_name, slice.start_line, slice.end_line)
                 };
-                let outline = file_outline(&new_content);
+                let outline = post_edit_info(&new_content, &parsed.new_string);
                 return Ok(ToolResult {
                     call_id: String::new(),
                     output: format!("Edited {} {}.\n{}\n{}", parsed.file_path, label, diff, outline),
@@ -270,7 +270,7 @@ impl Tool for EditFileTool {
             ) {
                 atomic_write(&parsed.file_path, &fuzzy_result).await?;
                 let diff = build_compact_diff(&old_string, &parsed.new_string);
-                let outline = file_outline(&fuzzy_result);
+                let outline = post_edit_info(&fuzzy_result, &parsed.new_string);
                 return Ok(ToolResult {
                     call_id: String::new(),
                     output: format!(
@@ -328,7 +328,7 @@ impl Tool for EditFileTool {
             let new_content = content.replace(&old_string, &parsed.new_string);
             atomic_write(&parsed.file_path, &new_content).await?;
             let diff = build_compact_diff(&old_string, &parsed.new_string);
-            let outline = file_outline(&new_content);
+            let outline = post_edit_info(&new_content, &parsed.new_string);
             Ok(ToolResult {
                 call_id: String::new(),
                 output: format!(
@@ -339,6 +339,46 @@ impl Tool for EditFileTool {
             })
         } else {
             if count > 1 {
+                // Auto-disambiguate using tree-sitter: if only ONE symbol contains the match,
+                // scope to that symbol automatically. The model doesn't need to pass symbol=.
+                let path = std::path::Path::new(&parsed.file_path);
+                let mut searcher = ctx.semantic.lock().await;
+                if let Some(symbols) = searcher.list_symbols(path) {
+                    // Find which symbols contain the old_string
+                    let matching_syms: Vec<&crate::semantic::Symbol> = symbols.iter()
+                        .filter(|sym| {
+                            let sym_text = &content[sym.start_byte..sym.end_byte.min(content.len())];
+                            sym_text.contains(&*old_string)
+                        })
+                        .collect();
+
+                    if matching_syms.len() == 1 {
+                        // Only one symbol contains it — auto-scope and replace
+                        let sym = matching_syms[0];
+                        let sym_text = &content[sym.start_byte..sym.end_byte.min(content.len())];
+                        let new_sym = sym_text.replacen(&*old_string, &parsed.new_string, 1);
+                        let new_content = format!(
+                            "{}{}{}",
+                            &content[..sym.start_byte],
+                            new_sym,
+                            &content[sym.end_byte.min(content.len())..]
+                        );
+                        drop(searcher);
+                        atomic_write(&parsed.file_path, &new_content).await?;
+                        let diff = build_compact_diff(&old_string, &parsed.new_string);
+                        let outline = post_edit_info(&new_content, &parsed.new_string);
+                        return Ok(ToolResult {
+                            call_id: String::new(),
+                            output: format!(
+                                "Edited {} in {}() (auto-scoped, {} global matches).\n{}\n{}",
+                                parsed.file_path, sym.name, count, diff, outline
+                            ),
+                            success: true,
+                        });
+                    }
+                }
+                drop(searcher);
+
                 return Ok(ToolResult {
                     call_id: String::new(),
                     output: format!(
@@ -355,7 +395,7 @@ impl Tool for EditFileTool {
             let removed = old_string.lines().count();
             let added = parsed.new_string.lines().count();
             let diff = build_compact_diff(&old_string, &parsed.new_string);
-            let outline = file_outline(&new_content);
+            let outline = post_edit_info(&new_content, &parsed.new_string);
             Ok(ToolResult {
                 call_id: String::new(),
                 output: format!(
@@ -459,9 +499,20 @@ fn try_fuzzy_replace(
     Some((result, count))
 }
 
+/// Combined post-edit info: outline + surrounding context.
+/// Gives the model enough info to do the next edit without re-reading.
+fn post_edit_info(new_content: &str, new_string: &str) -> String {
+    let outline = file_outline(new_content);
+    let context = surrounding_context(new_content, new_string);
+    if context.is_empty() {
+        outline
+    } else {
+        format!("{}\n{}", outline, context)
+    }
+}
+
 /// Show the surrounding context after an edit so the model doesn't need to re-read.
 /// Returns ~10 lines around the replacement location with line numbers.
-#[allow(dead_code)]
 fn surrounding_context(new_content: &str, new_string: &str) -> String {
     let lines: Vec<&str> = new_content.lines().collect();
     let new_first = new_string.lines().next().unwrap_or("").trim();

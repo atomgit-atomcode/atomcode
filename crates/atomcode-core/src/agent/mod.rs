@@ -167,10 +167,10 @@ pub struct AgentLoop {
 
     /// Pending user input appended during streaming. Injected before next LLM call.
     pending_input: Option<String>,
-    /// Recently edited file contents — injected at the END of messages in call_llm
-    /// so the model has the latest file content in its highest-attention zone.
-    /// Key: short file name, Value: (full_path, content).
-    recent_file_cache: std::collections::HashMap<String, (String, String)>,
+    /// Session-level file tracker: all files read/edited across the entire session.
+    /// Used to build the "working set" — tree-sitter skeletons injected before each LLM call.
+    /// This replaces the old recent_file_cache with a smarter, budget-aware approach.
+    session_files: std::collections::HashMap<String, PathBuf>,
     /// Whether planning phase is active (first LLM call without tools to force a plan).
     planning_phase: bool,
 
@@ -255,7 +255,7 @@ impl AgentLoop {
             executed_cmds: std::collections::HashMap::new(),
             pending_input: None,
             planning_phase: false,
-            recent_file_cache: std::collections::HashMap::new(),
+            session_files: std::collections::HashMap::new(),
             active_services: std::collections::HashMap::new(),
             result_store: ToolResultStore::new(ToolResultStore::default_dir()),
             skill_registry,
@@ -410,7 +410,7 @@ impl AgentLoop {
         self.sleep_count = 0;
         self.consecutive_verify_count = 0;
         self.executed_cmds.clear();
-        self.recent_file_cache.clear();
+        // session_files NOT cleared — persists across turns for working set
         self.turn_start = Some(Instant::now());
         self.cancel_token = CancellationToken::new();
 
@@ -627,10 +627,77 @@ impl AgentLoop {
             // older ones keep their summary (already compact from budgeted windowing).
             self.inflate_recent_refs(&mut messages);
 
-            // NOTE: recently edited file cache was removed (v2.3.0).
-            // It injected full file contents (~8K tokens) OUTSIDE the context budget,
-            // causing 40K+ actual input on a 32K budget. The model ignored the cache
-            // and re-read files anyway. Net effect was purely negative (slower, no benefit).
+            // Working Set: inject tree-sitter skeletons of all files touched this session.
+            // This replaces stale conversation content with CURRENT file state from disk.
+            // Budget: max 6K tokens (~1500 chars per file × ~4 files).
+            if !self.session_files.is_empty() {
+                let mut working_set = String::from(
+                    "[FILES IN THIS SESSION — current structure from disk. Use start_line/end_line to edit.]\n\n"
+                );
+                let mut ws_budget = 6000usize; // chars budget
+                let mut searcher = self.tool_context.semantic.lock().await;
+
+                // Sort by most recently added (HashMap doesn't preserve order, but that's OK)
+                let files: Vec<(String, PathBuf)> = self.session_files.iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+
+                for (short, full_path) in &files {
+                    if ws_budget < 200 { break; }
+                    if !full_path.exists() { continue; }
+
+                    let line_count = std::fs::read_to_string(full_path)
+                        .map(|c| c.lines().count())
+                        .unwrap_or(0);
+
+                    if line_count == 0 { continue; }
+
+                    if line_count <= 80 {
+                        // Small file: include full content
+                        if let Ok(content) = std::fs::read_to_string(full_path) {
+                            let entry = format!("=== {} ({} lines, full) ===\n{}\n\n", short, line_count, content);
+                            if entry.len() <= ws_budget {
+                                ws_budget -= entry.len();
+                                working_set.push_str(&entry);
+                            }
+                        }
+                    } else {
+                        // Large file: tree-sitter skeleton
+                        if let Some(symbols) = searcher.list_symbols(full_path) {
+                            let source = std::fs::read_to_string(full_path).unwrap_or_default();
+                            let source_lines: Vec<&str> = source.lines().collect();
+                            let mut skel = format!("=== {} ({} lines) ===\n", short, line_count);
+                            for sym in &symbols {
+                                let sig = source_lines.get(sym.start_line.saturating_sub(1))
+                                    .map(|l| l.trim())
+                                    .unwrap_or(&sym.name);
+                                let sig_short = if sig.chars().count() > 60 {
+                                    format!("{}...", sig.chars().take(57).collect::<String>())
+                                } else {
+                                    sig.to_string()
+                                };
+                                skel.push_str(&format!("{:>4}| {}  (L{}-{})\n",
+                                    sym.start_line, sig_short, sym.start_line, sym.end_line));
+                            }
+                            skel.push('\n');
+                            if skel.len() <= ws_budget {
+                                ws_budget -= skel.len();
+                                working_set.push_str(&skel);
+                            }
+                        }
+                    }
+                }
+                drop(searcher);
+
+                if working_set.lines().count() > 3 {
+                    // Insert BEFORE the last message (high attention zone)
+                    let insert_pos = messages.len().saturating_sub(1);
+                    messages.insert(insert_pos, crate::conversation::message::Message::new(
+                        crate::conversation::message::Role::System,
+                        working_set,
+                    ));
+                }
+            }
 
             let tool_defs = self.tool_registry.get_definitions();
 
@@ -944,8 +1011,15 @@ impl AgentLoop {
 
                 // Track file access state
                 if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&args) {
-                    let file = parsed.get("file_path").and_then(|v| v.as_str())
-                        .map(|s| short_path(s));
+                    let file_path_str = parsed.get("file_path").and_then(|v| v.as_str());
+                    let file = file_path_str.map(|s| short_path(s));
+                    // Track in session-level working set
+                    if let Some(fp) = file_path_str {
+                        if matches!(name.as_str(), "read_file" | "edit_file" | "write_file") {
+                            let short = short_path(fp);
+                            self.session_files.insert(short, std::path::PathBuf::from(fp));
+                        }
+                    }
                     match name.as_str() {
                         "read_file" | "list_directory" | "glob" | "grep" => {
                             self.consecutive_reads += 1;
@@ -1716,14 +1790,8 @@ impl AgentLoop {
                         let short = short_path(fp);
                         self.file_read_counts.remove(&short);
                         // Cache file content for injection into next LLM call.
-                        // This puts the latest file in the model's highest-attention zone.
-                        if let Ok(content) = std::fs::read_to_string(fp) {
-                            let lines = content.lines().count();
-                            if lines <= 600 {
-                                // Only cache manageable files (≤600 lines ≈ 2400 tokens)
-                                self.recent_file_cache.insert(short, (fp.to_string(), content));
-                            }
-                        }
+                        // Track file for working set (session-level, read from disk each LLM call)
+                        self.session_files.insert(short, std::path::PathBuf::from(fp));
                     }
                 }
             }
@@ -2498,7 +2566,7 @@ impl AgentLoop {
                         self.consecutive_edits_file = Some(short.clone());
                         self.consecutive_edits_count = 1;
                     }
-                    if self.consecutive_edits_count >= 4 {
+                    if self.consecutive_edits_count >= 8 {
                         return Some(format!(
                             "[BLOCKED: You have edited {} {} times in a row. \
                              STOP and re-read the file first to see the current state, \

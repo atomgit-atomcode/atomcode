@@ -5,24 +5,7 @@ use syntect::easy::HighlightLines;
 use syntect::highlighting::{Theme, ThemeSet};
 use syntect::parsing::SyntaxSet;
 
-// Claude Code-aligned palette — warm, readable, not harsh
-const TEXT: Color = Color::Rgb(186, 188, 200);
-const BOLD_TEXT: Color = Color::Rgb(220, 222, 230);
-const H1: Color = Color::Rgb(115, 170, 240);
-const H2: Color = Color::Rgb(160, 140, 225);
-const H3: Color = Color::Rgb(130, 190, 160);
-const LINK: Color = Color::Rgb(100, 150, 230);
-const DIM: Color = Color::Rgb(95, 97, 110);
-const INLINE_CODE_FG: Color = Color::Rgb(220, 180, 120);
-const INLINE_CODE_BG: Color = Color::Rgb(40, 38, 50);
-const CODE_BG: Color = Color::Rgb(22, 22, 32);
-const CODE_BORDER: Color = Color::Rgb(50, 54, 68);
-const CODE_LANG: Color = Color::Rgb(110, 120, 150);
-const CODE_LINENUM: Color = Color::Rgb(70, 75, 95);
-const BULLET: Color = Color::Rgb(85, 105, 140);
-const QUOTE_BAR: Color = Color::Rgb(55, 55, 70);
-const QUOTE_TEXT: Color = Color::Rgb(155, 157, 170);
-const RULE: Color = Color::Rgb(42, 44, 55);
+use super::theme;
 
 pub fn render_markdown(input: &str) -> Vec<Line<'static>> {
     static RENDERER: std::sync::OnceLock<MarkdownRenderer> = std::sync::OnceLock::new();
@@ -95,7 +78,7 @@ impl MarkdownRenderer {
 
         let mut lines: Vec<Line<'static>> = Vec::new();
         let mut spans: Vec<Span<'static>> = Vec::new();
-        let mut styles: Vec<Style> = vec![Style::default().fg(TEXT)];
+        let mut styles: Vec<Style> = vec![Style::default().fg(theme::TEXT_SECONDARY)];
         let mut in_code = false;
         let mut code_lang = String::new();
         let mut code_buf = String::new();
@@ -116,9 +99,9 @@ impl MarkdownRenderer {
                         lines.push(Line::default());
                     }
                     let color = match level {
-                        HeadingLevel::H1 => H1,
-                        HeadingLevel::H2 => H2,
-                        _ => H3,
+                        HeadingLevel::H1 => theme::MD_H1,
+                        HeadingLevel::H2 => theme::MD_H2,
+                        _ => theme::MD_H3,
                     };
                     styles.push(Style::default().fg(color).add_modifier(Modifier::BOLD));
                 }
@@ -129,7 +112,7 @@ impl MarkdownRenderer {
 
                 // Inline styles
                 Event::Start(Tag::Strong) => {
-                    let s = cur_style(&styles).fg(BOLD_TEXT).add_modifier(Modifier::BOLD);
+                    let s = cur_style(&styles).fg(theme::TEXT_PRIMARY).add_modifier(Modifier::BOLD);
                     styles.push(s);
                 }
                 Event::End(TagEnd::Strong) => { styles.pop(); }
@@ -141,7 +124,7 @@ impl MarkdownRenderer {
 
                 // Links
                 Event::Start(Tag::Link { dest_url, .. }) => {
-                    styles.push(Style::default().fg(LINK).add_modifier(Modifier::UNDERLINED));
+                    styles.push(Style::default().fg(theme::MD_LINK).add_modifier(Modifier::UNDERLINED));
                     link_url = Some(dest_url.to_string());
                 }
                 Event::End(TagEnd::Link) => {
@@ -149,7 +132,7 @@ impl MarkdownRenderer {
                     if let Some(url) = link_url.take() {
                         let last = spans.last().map(|s| s.content.to_string()).unwrap_or_default();
                         if !last.is_empty() && last != url && !url.is_empty() {
-                            spans.push(Span::styled(format!(" ({})", url), Style::default().fg(DIM)));
+                            spans.push(Span::styled(format!(" ({})", url), Style::default().fg(theme::TEXT_MUTED)));
                         }
                     }
                 }
@@ -169,20 +152,20 @@ impl MarkdownRenderer {
                     let lang_display = if code_lang.is_empty() { "" } else { &code_lang };
                     if !lang_display.is_empty() {
                         lines.push(Line::from(vec![
-                            Span::styled("  \u{256d}\u{2500} ", Style::default().fg(CODE_BORDER)),
+                            Span::styled("  \u{256d}\u{2500} ", Style::default().fg(theme::MD_CODE_BORDER)),
                             Span::styled(
                                 lang_display.to_string(),
-                                Style::default().fg(CODE_LANG).add_modifier(Modifier::BOLD),
+                                Style::default().fg(theme::MD_CODE_LANG).add_modifier(Modifier::BOLD),
                             ),
                             Span::styled(
                                 format!(" {}", "\u{2500}".repeat(30)),
-                                Style::default().fg(CODE_BORDER),
+                                Style::default().fg(theme::MD_CODE_BORDER),
                             ),
                         ]));
                     } else {
                         lines.push(Line::from(Span::styled(
                             format!("  \u{256d}{}", "\u{2500}".repeat(36)),
-                            Style::default().fg(CODE_BORDER),
+                            Style::default().fg(theme::MD_CODE_BORDER),
                         )));
                     }
                     let highlighted = self.highlight(&code_buf, &code_lang);
@@ -190,7 +173,7 @@ impl MarkdownRenderer {
                     // Bottom border: ╰──────────
                     lines.push(Line::from(Span::styled(
                         format!("  \u{2570}{}", "\u{2500}".repeat(36)),
-                        Style::default().fg(CODE_BORDER),
+                        Style::default().fg(theme::MD_CODE_BORDER),
                     )));
                     code_buf.clear();
                 }
@@ -220,13 +203,13 @@ impl MarkdownRenderer {
                     if let Some(idx) = &mut ordered_idx {
                         spans.push(Span::styled(
                             format!("{}{}. ", indent, idx),
-                            Style::default().fg(BULLET),
+                            Style::default().fg(theme::MD_BULLET),
                         ));
                         *idx += 1;
                     } else {
                         spans.push(Span::styled(
                             format!("{}- ", indent),
-                            Style::default().fg(BULLET),
+                            Style::default().fg(theme::MD_BULLET),
                         ));
                     }
                 }
@@ -235,13 +218,13 @@ impl MarkdownRenderer {
                 // Block quotes
                 Event::Start(Tag::BlockQuote(_)) => {
                     in_quote = true;
-                    styles.push(Style::default().fg(QUOTE_TEXT));
+                    styles.push(Style::default().fg(theme::MD_QUOTE_TEXT));
                 }
                 Event::End(TagEnd::BlockQuote(_)) => {
                     in_quote = false;
                     styles.pop();
                     if !spans.is_empty() {
-                        let mut row = vec![Span::styled("  \u{2502} ", Style::default().fg(QUOTE_BAR))];
+                        let mut row = vec![Span::styled("  \u{2502} ", Style::default().fg(theme::MD_QUOTE_BAR))];
                         row.extend(std::mem::take(&mut spans));
                         lines.push(Line::from(row));
                     }
@@ -279,7 +262,7 @@ impl MarkdownRenderer {
                         for (i, tl) in text.lines().enumerate() {
                             if i > 0 || !spans.is_empty() {
                                 if !spans.is_empty() {
-                                    let mut row = vec![Span::styled("  \u{2502} ", Style::default().fg(QUOTE_BAR))];
+                                    let mut row = vec![Span::styled("  \u{2502} ", Style::default().fg(theme::MD_QUOTE_BAR))];
                                     row.extend(std::mem::take(&mut spans));
                                     lines.push(Line::from(row));
                                 }
@@ -293,12 +276,12 @@ impl MarkdownRenderer {
                 Event::Code(code) => {
                     spans.push(Span::styled(
                         format!(" {} ", code),
-                        Style::default().fg(INLINE_CODE_FG).bg(INLINE_CODE_BG),
+                        Style::default().fg(theme::MD_INLINE_CODE).bg(theme::BG_INLINE_CODE),
                     ));
                 }
                 Event::SoftBreak | Event::HardBreak => { flush(&mut lines, &mut spans); }
                 Event::Rule => {
-                    lines.push(Line::from(Span::styled("\u{2500}".repeat(40), Style::default().fg(RULE))));
+                    lines.push(Line::from(Span::styled("\u{2500}".repeat(40), Style::default().fg(theme::BORDER))));
                 }
                 _ => {}
             }
@@ -334,38 +317,38 @@ impl MarkdownRenderer {
         let mut hl = HighlightLines::new(syntax, &self.theme);
         let line_count = code.lines().count();
         let gutter_width = if line_count < 10 { 1 } else if line_count < 100 { 2 } else if line_count < 1000 { 3 } else { 4 };
-        let gutter_bg = Color::Rgb(18, 18, 28);
+        let gutter_bg = theme::MD_CODE_GUTTER;
 
         code.lines().enumerate().map(|(i, line)| {
             let regions = hl.highlight_line(line, &self.syntax_set).unwrap_or_default();
             let mut s: Vec<Span<'static>> = Vec::new();
 
             // Left border
-            s.push(Span::styled("  \u{2502}", Style::default().fg(CODE_BORDER)));
+            s.push(Span::styled("  \u{2502}", Style::default().fg(theme::MD_CODE_BORDER)));
 
             // Line number gutter — dim, with subtle background
             s.push(Span::styled(
                 format!(" {:>width$} ", i + 1, width = gutter_width),
-                Style::default().fg(CODE_LINENUM).bg(gutter_bg),
+                Style::default().fg(theme::MD_CODE_LINENUM).bg(gutter_bg),
             ));
             // Gutter separator
-            s.push(Span::styled("\u{2502} ", Style::default().fg(CODE_BORDER).bg(CODE_BG)));
+            s.push(Span::styled("\u{2502} ", Style::default().fg(theme::MD_CODE_BORDER).bg(theme::BG_CODE)));
 
             // Highlighted code
             for (style, text) in regions {
                 let fg = Color::Rgb(style.foreground.r, style.foreground.g, style.foreground.b);
-                s.push(Span::styled(text.to_string(), Style::default().fg(fg).bg(CODE_BG)));
+                s.push(Span::styled(text.to_string(), Style::default().fg(fg).bg(theme::BG_CODE)));
             }
 
             // Pad right side with background
-            s.push(Span::styled("  ", Style::default().bg(CODE_BG)));
+            s.push(Span::styled("  ", Style::default().bg(theme::BG_CODE)));
             Line::from(s)
         }).collect()
     }
 }
 
 fn cur_style(stack: &[Style]) -> Style {
-    *stack.last().unwrap_or(&Style::default().fg(TEXT))
+    *stack.last().unwrap_or(&Style::default().fg(theme::TEXT_SECONDARY))
 }
 
 fn flush(lines: &mut Vec<Line<'static>>, spans: &mut Vec<Span<'static>>) {
@@ -377,51 +360,80 @@ fn flush(lines: &mut Vec<Line<'static>>, spans: &mut Vec<Span<'static>>) {
 fn render_table(lines: &mut Vec<Line<'static>>, header: &[String], rows: &[Vec<String>]) {
     if header.is_empty() { return; }
     let cols = header.len();
+    let border = Style::default().fg(theme::BORDER);
+    let hdr_style = Style::default().fg(theme::TEXT_PRIMARY).add_modifier(Modifier::BOLD);
+    let cell_style = Style::default().fg(theme::TEXT_SECONDARY);
 
-    // Calculate column widths: content + 4 chars padding (generous spacing)
-    let mut widths: Vec<usize> = header.iter().map(|h| h.chars().count()).collect();
+    // Column widths: content + 2 padding each side
+    let mut widths: Vec<usize> = header.iter().map(|h| display_width_str(h)).collect();
     for row in rows {
         for (i, cell) in row.iter().enumerate() {
-            if i < widths.len() { widths[i] = widths[i].max(cell.chars().count()); }
+            if i < widths.len() { widths[i] = widths[i].max(display_width_str(cell)); }
         }
     }
-    let widths: Vec<usize> = widths.iter().map(|w| w + 4).collect();
+    let widths: Vec<usize> = widths.iter().map(|w| w + 2).collect();
 
     lines.push(Line::default());
 
-    // Header row
-    let mut h: Vec<Span<'static>> = Vec::new();
+    // ┌───┬───┐
+    let mut top = String::from("  \u{250c}");
+    for (i, w) in widths.iter().enumerate() {
+        top.push_str(&"\u{2500}".repeat(*w));
+        top.push(if i < cols - 1 { '\u{252c}' } else { '\u{2510}' });
+    }
+    lines.push(Line::from(Span::styled(top, border)));
+
+    // │ Header │
+    let mut h: Vec<Span<'static>> = vec![Span::styled("  \u{2502}", border)];
     for (i, hdr) in header.iter().enumerate() {
-        let w = widths.get(i).copied().unwrap_or(10);
-        h.push(Span::styled(
-            format!("  {:<width$}", hdr, width = w),
-            Style::default().fg(BOLD_TEXT).add_modifier(Modifier::BOLD),
-        ));
+        let w = widths.get(i).copied().unwrap_or(4);
+        let pad = w.saturating_sub(display_width_str(hdr) + 1);
+        h.push(Span::styled(format!(" {}{}", hdr, " ".repeat(pad)), hdr_style));
+        h.push(Span::styled("\u{2502}", border));
     }
     lines.push(Line::from(h));
 
-    // Separator — one continuous line
-    let total_width: usize = widths.iter().sum::<usize>() + 2 * cols;
-    lines.push(Line::from(Span::styled(
-        format!("  {}", "\u{2500}".repeat(total_width)),
-        Style::default().fg(RULE),
-    )));
+    // ├───┼───┤
+    let mut mid = String::from("  \u{251c}");
+    for (i, w) in widths.iter().enumerate() {
+        mid.push_str(&"\u{2500}".repeat(*w));
+        mid.push(if i < cols - 1 { '\u{253c}' } else { '\u{2524}' });
+    }
+    lines.push(Line::from(Span::styled(mid, border)));
 
-    // Data rows
+    // │ Data │
     for row in rows {
-        let mut r: Vec<Span<'static>> = Vec::new();
+        let mut r: Vec<Span<'static>> = vec![Span::styled("  \u{2502}", border)];
         for i in 0..cols {
             let cell = row.get(i).map(|s| s.as_str()).unwrap_or("");
-            let w = widths.get(i).copied().unwrap_or(10);
-            r.push(Span::styled(
-                format!("  {:<width$}", cell, width = w),
-                Style::default().fg(TEXT),
-            ));
+            let w = widths.get(i).copied().unwrap_or(4);
+            let pad = w.saturating_sub(display_width_str(cell) + 1);
+            r.push(Span::styled(format!(" {}{}", cell, " ".repeat(pad)), cell_style));
+            r.push(Span::styled("\u{2502}", border));
         }
         lines.push(Line::from(r));
     }
 
+    // └───┴───┘
+    let mut bot = String::from("  \u{2514}");
+    for (i, w) in widths.iter().enumerate() {
+        bot.push_str(&"\u{2500}".repeat(*w));
+        bot.push(if i < cols - 1 { '\u{2534}' } else { '\u{2518}' });
+    }
+    lines.push(Line::from(Span::styled(bot, border)));
+
     lines.push(Line::default());
+}
+
+/// Display width of a string (CJK = 2 columns).
+fn display_width_str(s: &str) -> usize {
+    s.chars().map(|c| {
+        let cp = c as u32;
+        if (0x4E00..=0x9FFF).contains(&cp) || (0x3400..=0x4DBF).contains(&cp)
+            || (0xFF01..=0xFF60).contains(&cp) || (0x3000..=0x30FF).contains(&cp)
+            || (0xAC00..=0xD7AF).contains(&cp)
+        { 2 } else { 1 }
+    }).sum()
 }
 
 /// Wrap lines that exceed `max_width` columns.

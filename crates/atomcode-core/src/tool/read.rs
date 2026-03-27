@@ -44,7 +44,7 @@ impl Tool for ReadFileTool {
         ApprovalRequirement::AutoApprove
     }
 
-    async fn execute(&self, args: &str, _ctx: &ToolContext) -> Result<ToolResult> {
+    async fn execute(&self, args: &str, ctx: &ToolContext) -> Result<ToolResult> {
         let parsed: ReadFileArgs = serde_json::from_str(args)?;
         let path = std::path::Path::new(&parsed.file_path);
 
@@ -87,22 +87,19 @@ impl Tool for ReadFileTool {
         let lines: Vec<&str> = content.lines().collect();
         let total_lines = lines.len();
 
-        // No force_full — respect the model's offset/limit choices.
-        // Weak models work better with small, focused reads than full files.
-        let force_full = false;
+        let offset = parsed.offset.unwrap_or(1).max(1) - 1;
 
-        let offset = if force_full {
-            0
-        } else {
-            parsed.offset.unwrap_or(1).max(1) - 1
-        };
-
-        let limit = if force_full {
-            total_lines
-        } else {
-            match parsed.limit {
-                Some(l) => l,
-                None => 2000,
+        // Large files (>500 lines) without explicit offset/limit: cap at 300 lines.
+        // Prevents context overflow when the model reads multiple large files in one turn.
+        // Model can use offset/limit to read specific sections.
+        let limit = match parsed.limit {
+            Some(l) => l,
+            None => {
+                if total_lines > 500 && parsed.offset.is_none() {
+                    300
+                } else {
+                    2000
+                }
             }
         };
 
@@ -120,9 +117,43 @@ impl Tool for ReadFileTool {
             .join("\n");
 
         if !returned_all {
+            // Generate skeleton of the unseen portion using tree-sitter.
+            // This tells the model what functions/sections exist beyond the truncation point,
+            // so it can target-read with offset instead of re-reading the full file.
+            let remaining_skeleton = if end < total_lines && parsed.offset.is_none() {
+                let mut searcher = ctx.semantic.lock().await;
+                if let Some(symbols) = searcher.list_symbols(path) {
+                    let beyond: Vec<String> = symbols.iter()
+                        .filter(|s| s.start_line > end)
+                        .map(|s| {
+                            let sig = lines.get(s.start_line - 1)
+                                .map(|l| l.trim())
+                                .unwrap_or(&s.name);
+                            let sig_short = if sig.chars().count() > 60 {
+                                format!("{}...", sig.chars().take(57).collect::<String>())
+                            } else {
+                                sig.to_string()
+                            };
+                            format!("{:>4}| {}  (L{}-{})", s.start_line, sig_short, s.start_line, s.end_line)
+                        })
+                        .collect();
+                    if !beyond.is_empty() {
+                        format!("\n\n[Remaining structure (lines {}-{}):\n{}]",
+                            end + 1, total_lines, beyond.join("\n"))
+                    } else {
+                        String::new()
+                    }
+                } else {
+                    String::new()
+                }
+            } else {
+                String::new()
+            };
+
             output.push_str(&format!(
-                "\n\n[Showing lines {}-{} of {} total.]",
-                offset + 1, end, total_lines
+                "\n\n[Showing lines {}-{} of {} total. To read more: offset={} limit=200. \
+                 To edit: use start_line/end_line.]{}",
+                offset + 1, end, total_lines, end + 1, remaining_skeleton
             ));
         }
 
