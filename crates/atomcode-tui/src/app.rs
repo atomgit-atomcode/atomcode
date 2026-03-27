@@ -1815,16 +1815,10 @@ impl App {
                         let _ = self.agent_handle.cmd_tx.send(AgentCommand::SendMessage(expanded));
                     }
                 } else {
-                    let available: Vec<String> = crate::command::BUILTIN_COMMANDS
-                        .iter()
-                        .map(|(name, desc)| format!("  `{}` — {}", name, desc))
-                        .collect();
-                    self.conversation.push_delta(&format!(
-                        "Unknown command: `{}`\n\nAvailable commands:\n{}",
-                        cmd,
-                        available.join("\n")
-                    ));
-                    self.conversation.finalize_stream();
+                    // Not a known command or skill - treat as regular message
+                    // Remove the user message we added earlier and return false
+                    self.conversation.messages.pop();
+                    return false;
                 }
             }
         }
