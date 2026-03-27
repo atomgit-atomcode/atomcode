@@ -102,8 +102,9 @@ impl Tool for GrepTool {
                 }
                 #[cfg(not(target_os = "windows"))]
                 {
+                    // Use grep -E for extended regex (supports |, +, etc.)
                     std::process::Command::new("grep")
-                        .args(&["-rn", "--color=never",
+                        .args(&["-rn", "-E", "--color=never",
                                 &format!("-C{}", context_lines),
                                 &parsed.pattern, &resolved_path])
                         .output()
