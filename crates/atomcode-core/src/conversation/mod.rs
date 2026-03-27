@@ -866,7 +866,7 @@ mod tests {
     #[test]
     fn test_budgeted_empty_conversation() {
         let conv = Conversation::new();
-        let msgs = conv.to_provider_messages_budgeted("system prompt", 8000);
+        let (msgs, _stats) = conv.to_provider_messages_budgeted("system prompt", 8000);
         assert_eq!(msgs.len(), 1);
         assert!(matches!(msgs[0].role, Role::System));
     }
@@ -878,7 +878,7 @@ mod tests {
         conv.messages.push(Message::new(Role::Assistant, "hi there"));
         conv.add_user_message("do something");
 
-        let msgs = conv.to_provider_messages_budgeted("sys", 8000);
+        let (msgs, _stats) = conv.to_provider_messages_budgeted("sys", 8000);
         assert_eq!(msgs.len(), 4); // system + 3 messages
         assert!(matches!(msgs[0].role, Role::System));
     }
@@ -904,7 +904,7 @@ mod tests {
         }
         conv.add_user_message("now what?");
 
-        let msgs = conv.to_provider_messages_budgeted("sys", 4000);
+        let (msgs, _stats) = conv.to_provider_messages_budgeted("sys", 4000);
         let total_chars: usize = msgs.iter().map(|m| m.text().map_or(0, |t| t.len())).sum();
         assert!(total_chars < 8000, "Expected condensation, got {} chars", total_chars);
         assert!(matches!(msgs[0].role, Role::System));
@@ -931,7 +931,7 @@ mod tests {
             });
         }
 
-        let msgs = conv.to_provider_messages_budgeted("sys", 3000);
+        let (msgs, _stats) = conv.to_provider_messages_budgeted("sys", 3000);
         let has_original = msgs.iter().any(|m| {
             m.text() == Some("original task: redesign the page")
         });

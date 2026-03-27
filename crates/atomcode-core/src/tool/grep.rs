@@ -113,11 +113,27 @@ impl Tool for GrepTool {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
 
+        // Debug: write grep details to datalog dir when no results
+        if stdout.is_empty() {
+            let debug_msg = format!(
+                "[grep-debug] rg {} {:?} {:?} | wd={:?} | exit={:?} | stderr={}\n",
+                rg_args.join(" "), parsed.pattern, resolved_path,
+                wd, output.status.code(), stderr.trim()
+            );
+            let debug_path = wd.join("datalog").join("grep-debug.log");
+            let _ = std::fs::OpenOptions::new()
+                .create(true).append(true)
+                .open(&debug_path)
+                .and_then(|mut f| std::io::Write::write_all(&mut f, debug_msg.as_bytes()));
+        }
+
         // If regex search failed (bad pattern or no results), auto-retry with --fixed-strings
+        // Note: '|' is NOT a metachar here — it's valid regex OR used intentionally by models.
+        // Only include chars that likely mean the model typed a literal string with special chars.
         let has_metachar = parsed.pattern.contains('(') || parsed.pattern.contains('[')
             || parsed.pattern.contains('{') || parsed.pattern.contains('.')
             || parsed.pattern.contains('*') || parsed.pattern.contains('+')
-            || parsed.pattern.contains('?') || parsed.pattern.contains('|');
+            || parsed.pattern.contains('?');
 
         let (final_stdout, was_literal_fallback) = if stdout.is_empty() && has_metachar {
             // Retry with literal matching — the model likely meant a literal string
@@ -227,3 +243,4 @@ impl Tool for GrepTool {
         })
     }
 }
+// Tests in tests/grep_test.rs
