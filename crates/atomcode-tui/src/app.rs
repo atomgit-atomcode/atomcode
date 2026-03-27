@@ -1617,7 +1617,11 @@ impl App {
                 }
             }
             "/clear" => {
+                // Clear UI conversation
                 self.conversation = Conversation::new();
+                // Clear agent's conversation context
+                let _ = self.agent_handle.cmd_tx.send(AgentCommand::ClearConversation);
+                // Clear history file
                 tokio::spawn(async move {
                     let path = Conversation::history_path();
                     let temp_path = path.with_extension("json.tmp");

@@ -45,6 +45,8 @@ pub enum AgentCommand {
     ChangeDir(String),
     /// Append input during streaming — queued and injected before next LLM call.
     AppendInput(String),
+    /// Clear conversation history.
+    ClearConversation,
     /// Shutdown the agent.
     Shutdown,
 }
@@ -374,6 +376,10 @@ impl AgentLoop {
                     } else {
                         self.pending_input = Some(text);
                     }
+                }
+                AgentCommand::ClearConversation => {
+                    // Clear the conversation history in the agent loop.
+                    self.conversation = Conversation::new();
                 }
                 AgentCommand::Shutdown => break,
             }
