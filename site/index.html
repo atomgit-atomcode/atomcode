@@ -4,6 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>AtomCode — 开源终端 AI 编码助手</title>
+  <link rel="icon" type="image/png" href="https://cdn-static.gitcode.host/static/images/logo-favicon.png">
   <script src="https://cdn.tailwindcss.com"></script>
   <script>
     tailwind.config = {
@@ -83,6 +84,10 @@
     [data-theme="light"] .shadow-black\/50 { box-shadow: 0 25px 50px -12px rgba(0,0,0,0.15); }
     [data-theme="light"] .glass { background: rgba(255,255,255,0.8); border-color: rgba(0,0,0,0.08); }
     [data-theme="light"] #settingsDropdown { background: rgba(255,255,255,0.95); border-color: rgba(0,0,0,0.08); }
+    
+    /* Light theme hover fixes */
+    [data-theme="light"] .hover\:text-white:hover { color: #2563eb !important; }
+    [data-theme="light"] .hover\:bg-white\/5:hover { background: rgba(37,99,235,0.08); }
     
     /* Mobile table scroll */
     .table-container { overflow-x: auto; -webkit-overflow-scrolling: touch; }
