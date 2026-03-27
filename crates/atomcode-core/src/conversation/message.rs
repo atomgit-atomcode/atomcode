@@ -194,7 +194,7 @@ fn compress_file_to_skeleton(output: &str) -> String {
         let indent = content.len() - content.trim_start().len();
         let is_signature = indent <= 4 && sig_keywords.iter().any(|kw| trimmed.starts_with(kw));
         let is_decorator = trimmed.starts_with('@') || trimmed.starts_with("#[");
-        let is_close = trimmed == "}" || trimmed == "}" || trimmed.starts_with("})");
+        let _is_close = trimmed == "}" || trimmed == "}" || trimmed.starts_with("})");
 
         if is_signature || is_decorator {
             skeleton.push(*line);

@@ -1620,9 +1620,7 @@ impl App {
                 }
             }
             "/clear" => {
-                // Clear UI conversation
-                self.conversation = Conversation::new();
-                // Clear agent's conversation context
+                // Clear agent's conversation context (but keep UI messages)
                 let _ = self.agent_handle.cmd_tx.send(AgentCommand::ClearConversation);
                 // Clear history file
                 tokio::spawn(async move {
@@ -1632,12 +1630,9 @@ impl App {
                         let _ = tokio::fs::rename(&temp_path, &path).await;
                     }
                 });
-                self.scroll_offset = 0;
-                self.at_bottom = true;
-                self.render_cache.clear();
-                self.render_cache_msg_count = 0;
-                self.total_tokens = 0;
-                self.turn_tokens = 0;
+                // Add a placeholder message to indicate conversation was cleared
+                self.conversation.push_delta("(no content)");
+                self.conversation.finalize_stream();
                 return true;
             }
             "/login" => {
