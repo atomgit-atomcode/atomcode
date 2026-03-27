@@ -260,14 +260,42 @@ impl Conversation {
             hot_turn_start = ti;
         }
 
+        // Phase 1.5: Mid-session summarization.
+        // When cold zone has 10+ turns, merge the oldest ones into a single summary.
+        // This frees massive token space (10 turns × ~150 tok = 1500 tok → ~100 tok).
+        let cold_turn_count = hot_turn_start;
+        let summary_cutoff = if cold_turn_count > 10 {
+            // Summarize turns 0..cutoff into one message
+            cold_turn_count.saturating_sub(5) // keep the most recent 5 cold turns individual
+        } else {
+            0
+        };
+
         // Phase 2: For older turns (before hot_turn_start), build condensed
         // representations: user message + assistant final text only.
         let cold_budget = remaining_budget.saturating_sub(hot_tokens);
         let mut cold_messages: Vec<Message> = Vec::new();
         let mut cold_tokens = 0usize;
 
+        // Inject batch summary for oldest turns (if applicable)
+        if summary_cutoff > 0 {
+            let batch_summary = self.build_batch_summary(0, summary_cutoff);
+            if !batch_summary.is_empty() {
+                let summary_msg = Message::new(Role::System,
+                    format!("[Session history (turns 1-{})]\n{}", summary_cutoff, batch_summary)
+                );
+                let tokens = summary_msg.estimate_tokens();
+                if tokens < cold_budget / 2 {
+                    cold_tokens += tokens;
+                    cold_messages.push(summary_msg);
+                }
+            }
+        }
+
         // Walk from most recent cold turn backward (newest cold = most relevant).
-        for ti in (0..hot_turn_start).rev() {
+        // Skip turns already covered by batch summary.
+        let cold_start = if summary_cutoff > 0 { summary_cutoff } else { 0 };
+        for ti in (cold_start..hot_turn_start).rev() {
             let turn = &turns[ti];
 
             // Summarized turns: inject the summary as a single message.
@@ -465,6 +493,84 @@ impl Conversation {
             outcome.push_str(&format!(" Last action failed: {}", err_short));
         }
         outcome
+    }
+
+    /// Build a batch summary for turns[start..end].
+    /// Extracts: user requests, files read/edited, key outcomes.
+    /// Returns a compact paragraph (~100-200 tokens) replacing 1000+ tokens of individual turns.
+    fn build_batch_summary(&self, start: usize, end: usize) -> String {
+        let turns = &self.turn_tracker.turns;
+        if start >= end || end > turns.len() { return String::new(); }
+
+        let mut user_requests: Vec<String> = Vec::new();
+        let mut files_read: Vec<String> = Vec::new();
+        let mut files_edited: Vec<String> = Vec::new();
+        let mut tools_used: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut had_errors = false;
+
+        for ti in start..end {
+            let turn = &turns[ti];
+            let turn_msgs = &self.messages[turn.start_idx..turn.end_idx().min(self.messages.len())];
+
+            for msg in turn_msgs {
+                match &msg.content {
+                    MessageContent::Text(s) if matches!(msg.role, Role::User) => {
+                        let short = if s.chars().count() > 60 {
+                            format!("{}...", s.chars().take(57).collect::<String>())
+                        } else {
+                            s.clone()
+                        };
+                        if !short.starts_with("[") { // skip system-injected messages
+                            user_requests.push(short);
+                        }
+                    }
+                    MessageContent::AssistantWithToolCalls { tool_calls, .. } => {
+                        for tc in tool_calls {
+                            tools_used.insert(tc.name.clone());
+                            // Extract file paths
+                            if let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
+                                if let Some(fp) = args.get("file_path").and_then(|v| v.as_str()) {
+                                    let short = std::path::Path::new(fp)
+                                        .file_name()
+                                        .map(|n| n.to_string_lossy().to_string())
+                                        .unwrap_or_else(|| fp.to_string());
+                                    match tc.name.as_str() {
+                                        "read_file" => {
+                                            if !files_read.contains(&short) { files_read.push(short); }
+                                        }
+                                        "edit_file" | "write_file" => {
+                                            if !files_edited.contains(&short) { files_edited.push(short); }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    MessageContent::ToolResult(r) if !r.success => { had_errors = true; }
+                    _ => {}
+                }
+            }
+        }
+
+        let mut summary = String::new();
+
+        if !user_requests.is_empty() {
+            summary.push_str(&format!("Tasks: {}\n", user_requests.join(" → ")));
+        }
+        if !files_read.is_empty() {
+            files_read.truncate(8);
+            summary.push_str(&format!("Read: {}\n", files_read.join(", ")));
+        }
+        if !files_edited.is_empty() {
+            files_edited.truncate(8);
+            summary.push_str(&format!("Edited: {}\n", files_edited.join(", ")));
+        }
+        if had_errors {
+            summary.push_str("Had errors (resolved).\n");
+        }
+
+        summary
     }
 
     /// Fallback windowing when no turns are tracked. Uses the original

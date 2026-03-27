@@ -410,7 +410,10 @@ impl AgentLoop {
         self.sleep_count = 0;
         self.consecutive_verify_count = 0;
         self.executed_cmds.clear();
-        // session_files NOT cleared — persists across turns for working set
+        // Clear session_files on each new user message.
+        // Working Set only tracks files from the CURRENT task.
+        // Previous files are remembered via cold zone summaries.
+        self.session_files.clear();
         self.turn_start = Some(Instant::now());
         self.cancel_token = CancellationToken::new();
 
