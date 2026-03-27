@@ -2759,6 +2759,35 @@ impl AgentLoop {
     /// Errors are the highest-value signal — keep all lines containing "error",
     /// "Error", "FAILED", "STDERR", "panic", plus surrounding context.
     fn truncate_bash(&self, result: &mut ToolResult) {
+        // Smart build output compression: maven/gradle/npm build output is very verbose
+        // but only SUCCESS/FAILURE + error lines matter.
+        let is_build_output = result.output.contains("BUILD SUCCESS")
+            || result.output.contains("BUILD FAILURE")
+            || result.output.contains("Compiled successfully")
+            || result.output.contains("compiled successfully")
+            || result.output.contains("vite build")
+            || result.output.contains("vue-tsc");
+        if is_build_output {
+            let lines: Vec<&str> = result.output.lines().collect();
+            let mut key_lines: Vec<String> = Vec::new();
+            for line in &lines {
+                let trimmed = line.trim();
+                if trimmed.contains("ERROR") || trimmed.contains("error")
+                    || trimmed.contains("FAILURE") || trimmed.contains("SUCCESS")
+                    || trimmed.contains("BUILD") || trimmed.contains("warning:")
+                    || trimmed.contains("✓") || trimmed.contains("✗")
+                    || trimmed.starts_with("> ") // npm script output
+                    || trimmed.contains("gzip:")  // vite bundle size
+                {
+                    key_lines.push(line.to_string());
+                }
+            }
+            if !key_lines.is_empty() && key_lines.len() < lines.len() / 2 {
+                result.output = key_lines.join("\n");
+                return;
+            }
+        }
+
         let lines: Vec<&str> = result.output.lines().collect();
         if lines.len() <= 80 {
             return; // Short enough — keep everything.

@@ -72,8 +72,9 @@ When you rewrite a file from scratch, you WILL forget API calls, state managemen
 - Run each command ONCE. If it fails, read the error and fix the root cause.
 - NEVER re-run the same command with different flags hoping for a different result.
 - Install commands block until done — no need to sleep afterward.
-- NEVER use sleep-and-check polling loops. Background process? Sleep ONCE (10-15s), check ONCE.
+- NEVER use sleep-and-check polling loops. Server started in background? Port is auto-detected — just check the result.
 - If a command fails twice, stop and try a DIFFERENT approach.
+- ALWAYS compile/build BEFORE starting a server. Never start a server without verifying build passes first.
 
 ## ERROR HANDLING:
 - Command fails → READ the full error output BEFORE doing anything.

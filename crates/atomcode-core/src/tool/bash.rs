@@ -223,8 +223,30 @@ impl Tool for BashTool {
                     // Background/server command — don't kill, let it run
                     let pid = child.id().map(|p| p.to_string()).unwrap_or_else(|| "?".into());
                     let combined = format_output(&stdout_str, &stderr_str);
+
+                    // Auto-detect port from command and poll until ready
+                    let port = extract_port(&parsed.command);
+                    let port_status = if let Some(p) = port {
+                        // Poll port every 2s for up to 30s
+                        let mut ready = false;
+                        for _ in 0..15 {
+                            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                            if std::net::TcpStream::connect(format!("127.0.0.1:{}", p)).is_ok() {
+                                ready = true;
+                                break;
+                            }
+                        }
+                        if ready {
+                            format!(" Port {} is ready.", p)
+                        } else {
+                            format!(" Port {} not responding after 30s — check logs.", p)
+                        }
+                    } else {
+                        String::new()
+                    };
+
                     let output = if combined.is_empty() {
-                        format!("Process running in background (PID: {}). Output may be redirected.", pid)
+                        format!("Process running in background (PID: {}).{}", pid, port_status)
                     } else {
                         format!("{}\n\n[Process running in background, PID: {}]", combined, pid)
                     };
@@ -314,6 +336,39 @@ fn is_background_command(cmd: &str) -> bool {
         "java -jar", "java -cp",
     ];
     server_patterns.iter().any(|p| trimmed.contains(p))
+}
+
+/// Extract port number from a command string.
+/// Detects patterns like `:8080`, `--port 3000`, `-p 8080`, `PORT=3000`.
+fn extract_port(cmd: &str) -> Option<u16> {
+    // Common default ports by tool
+    let defaults: &[(&str, u16)] = &[
+        ("spring-boot:run", 8080),
+        ("npm run dev", 3000), ("npm start", 3000),
+        ("vite", 5173), ("next", 3000),
+        ("flask run", 5000), ("uvicorn", 8000),
+        ("rails s", 3000), ("cargo run", 8080),
+    ];
+
+    // Check for explicit port in command
+    let port_patterns = ["-p ", "--port ", "--port=", "-Dserver.port=", "PORT="];
+    for pat in &port_patterns {
+        if let Some(pos) = cmd.find(pat) {
+            let after = &cmd[pos + pat.len()..];
+            let port_str: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if let Ok(p) = port_str.parse::<u16>() {
+                return Some(p);
+            }
+        }
+    }
+
+    // Fall back to defaults
+    for (pattern, port) in defaults {
+        if cmd.contains(pattern) {
+            return Some(*port);
+        }
+    }
+    None
 }
 
 fn format_output(stdout: &str, stderr: &str) -> String {

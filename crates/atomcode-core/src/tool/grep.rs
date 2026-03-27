@@ -73,16 +73,21 @@ impl Tool for GrepTool {
         };
 
         // Try ripgrep first
+        let max_count_arg = format!("--max-count={}", max);
+        let context_arg = format!("--context={}", context_lines);
+        let rg_args = vec![
+            "--line-number", "--no-heading", "--color=never",
+            "--smart-case",
+            "--glob", "!**/datalog/**", "--glob", "!**/*.log",
+            "--glob", "!**/target/**", "--glob", "!**/dist/**",
+            "--glob", "!**/node_modules/**", "--glob", "!**/.git/**",
+            max_count_arg.as_str(), context_arg.as_str(),
+            &parsed.pattern, &resolved_path,
+        ];
+        // current_dir must point to the search target's git root so ripgrep
+        // finds .gitignore correctly. Without this, rg uses atomcode's cwd.
         let output = Command::new("rg")
-            .args(&[
-                "--line-number", "--no-heading", "--color=never",
-                "--smart-case",  // lowercase pattern = case-insensitive (like Claude Code)
-                "--glob=!datalog/", "--glob=!*.log", "--glob=!target/",
-                "--glob=!dist/", "--glob=!node_modules/", "--glob=!.git/",
-                &format!("--max-count={}", max),
-                &format!("--context={}", context_lines),
-                &parsed.pattern, &resolved_path,
-            ])
+            .args(&rg_args)
             .current_dir(&wd)
             .output()
             .await
@@ -93,7 +98,6 @@ impl Tool for GrepTool {
                     std::process::Command::new("findstr")
                         .args(&["/S", "/N", "/I",
                                 &parsed.pattern, &format!("{}\\*", resolved_path)])
-                        .current_dir(&wd)
                         .output()
                 }
                 #[cfg(not(target_os = "windows"))]
@@ -102,7 +106,6 @@ impl Tool for GrepTool {
                         .args(&["-rn", "--color=never",
                                 &format!("-C{}", context_lines),
                                 &parsed.pattern, &resolved_path])
-                        .current_dir(&wd)
                         .output()
                 }
             })?;
@@ -122,11 +125,11 @@ impl Tool for GrepTool {
                 .args(&[
                     "--line-number", "--no-heading", "--color=never",
                     "--fixed-strings",
+                    "--glob", "!**/target/**", "--glob", "!**/node_modules/**",
                     &format!("--max-count={}", max),
                     &format!("--context={}", context_lines),
                     &parsed.pattern, &resolved_path,
                 ])
-                .current_dir(&wd)
                 .output()
                 .await;
 
