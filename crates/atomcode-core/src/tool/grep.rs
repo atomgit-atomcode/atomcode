@@ -1,8 +1,9 @@
 use anyhow::Result;
 use async_trait::async_trait;
+use ignore::WalkBuilder;
+use regex::RegexBuilder;
 use serde::Deserialize;
 use serde_json::json;
-use tokio::process::Command;
 
 use super::{ApprovalRequirement, Tool, ToolContext, ToolDef, ToolResult};
 
@@ -14,13 +15,11 @@ struct GrepArgs {
     path: Option<String>,
     #[serde(default = "default_max_results")]
     max_results: usize,
-    /// Lines of context around each match (default 3)
     #[serde(default = "default_context")]
     context: usize,
 }
 
 fn default_context() -> usize { 3 }
-
 fn default_max_results() -> usize { 50 }
 
 #[async_trait]
@@ -28,11 +27,11 @@ impl Tool for GrepTool {
     fn definition(&self) -> ToolDef {
         ToolDef {
             name: "grep",
-            description: "Search file contents for a pattern using ripgrep. Returns matching lines with surrounding context.\n\
+            description: "Search file contents for a pattern. Returns matching lines with surrounding context.\n\
                 Usage:\n\
                 - Use this to find where a function, variable, string, or UI element is defined or used.\n\
                 - Use this BEFORE editing when the user's request is ambiguous — find ALL candidates first.\n\
-                - Pattern is regex by default (smart-case: case-insensitive unless uppercase is used).\n\
+                - Pattern is regex by default (case-insensitive unless uppercase is used).\n\
                 - Escape special regex chars: . → \\\\. , ( → \\\\( , [ → \\\\[\n\
                 - If regex fails, the tool automatically retries with literal string matching.\n\
                 - NEVER use bash grep/rg — always use this tool.\n\
@@ -66,182 +65,181 @@ impl Tool for GrepTool {
 
         // Resolve path against working directory
         let wd = ctx.working_dir.read().await.clone();
-        let resolved_path = if std::path::Path::new(path).is_absolute() {
-            path.to_string()
+        let resolved = if std::path::Path::new(path).is_absolute() {
+            std::path::PathBuf::from(path)
         } else {
-            wd.join(path).to_string_lossy().to_string()
+            wd.join(path)
         };
 
-        // Try ripgrep first
-        let max_count_arg = format!("--max-count={}", max);
-        let context_arg = format!("--context={}", context_lines);
-        let rg_args = vec![
-            "--line-number", "--no-heading", "--color=never",
-            "--smart-case",
-            "--glob", "!**/datalog/**", "--glob", "!**/*.log",
-            "--glob", "!**/target/**", "--glob", "!**/dist/**",
-            "--glob", "!**/node_modules/**", "--glob", "!**/.git/**",
-            max_count_arg.as_str(), context_arg.as_str(),
-            &parsed.pattern, &resolved_path,
-        ];
-        // current_dir must point to the search target's git root so ripgrep
-        // finds .gitignore correctly. Without this, rg uses atomcode's cwd.
-        let output = Command::new("rg")
-            .args(&rg_args)
-            .current_dir(&wd)
-            .output()
-            .await
-            .or_else(|_| {
-                // Fallback: grep on Unix, findstr on Windows
-                #[cfg(target_os = "windows")]
-                {
-                    std::process::Command::new("findstr")
-                        .args(&["/S", "/N", "/I",
-                                &parsed.pattern, &format!("{}\\*", resolved_path)])
-                        .output()
-                }
-                #[cfg(not(target_os = "windows"))]
-                {
-                    // Use grep -E for extended regex (supports |, +, etc.)
-                    std::process::Command::new("grep")
-                        .args(&["-rn", "-E", "--color=never",
-                                &format!("-C{}", context_lines),
-                                &parsed.pattern, &resolved_path])
-                        .output()
-                }
-            })?;
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-
-        // Debug: write grep details to datalog dir when no results
-        if stdout.is_empty() {
-            let debug_msg = format!(
-                "[grep-debug] rg {} {:?} {:?} | wd={:?} | exit={:?} | stderr={}\n",
-                rg_args.join(" "), parsed.pattern, resolved_path,
-                wd, output.status.code(), stderr.trim()
-            );
-            let debug_path = wd.join("datalog").join("grep-debug.log");
-            let _ = std::fs::OpenOptions::new()
-                .create(true).append(true)
-                .open(&debug_path)
-                .and_then(|mut f| std::io::Write::write_all(&mut f, debug_msg.as_bytes()));
+        if !resolved.exists() {
+            return Ok(ToolResult {
+                call_id: String::new(),
+                output: format!("Path not found: {}", resolved.display()),
+                success: false,
+            });
         }
 
-        // If regex search failed (bad pattern or no results), auto-retry with --fixed-strings
-        // Note: '|' is NOT a metachar here — it's valid regex OR used intentionally by models.
-        // Only include chars that likely mean the model typed a literal string with special chars.
-        let has_metachar = parsed.pattern.contains('(') || parsed.pattern.contains('[')
-            || parsed.pattern.contains('{') || parsed.pattern.contains('.')
-            || parsed.pattern.contains('*') || parsed.pattern.contains('+')
-            || parsed.pattern.contains('?');
-
-        let (final_stdout, was_literal_fallback) = if stdout.is_empty() && has_metachar {
-            // Retry with literal matching — the model likely meant a literal string
-            let literal_output = Command::new("rg")
-                .args(&[
-                    "--line-number", "--no-heading", "--color=never",
-                    "--fixed-strings",
-                    "--glob", "!**/target/**", "--glob", "!**/node_modules/**",
-                    &format!("--max-count={}", max),
-                    &format!("--context={}", context_lines),
-                    &parsed.pattern, &resolved_path,
-                ])
-                .output()
-                .await;
-
-            match literal_output {
-                Ok(lo) => {
-                    let ls = String::from_utf8_lossy(&lo.stdout).to_string();
-                    if !ls.is_empty() {
-                        (ls, true)
-                    } else {
-                        (String::new(), false)
+        // Build regex (smart-case: case-insensitive if pattern has no uppercase)
+        let has_uppercase = parsed.pattern.chars().any(|c| c.is_uppercase());
+        let re = match RegexBuilder::new(&parsed.pattern)
+            .case_insensitive(!has_uppercase)
+            .build()
+        {
+            Ok(r) => r,
+            Err(_) => {
+                // Regex failed — try as literal
+                match RegexBuilder::new(&regex::escape(&parsed.pattern))
+                    .case_insensitive(!has_uppercase)
+                    .build()
+                {
+                    Ok(r) => r,
+                    Err(e) => {
+                        return Ok(ToolResult {
+                            call_id: String::new(),
+                            output: format!("Invalid pattern '{}': {}", parsed.pattern, e),
+                            success: false,
+                        });
                     }
                 }
-                Err(_) => (String::new(), false),
             }
-        } else {
-            (stdout.to_string(), false)
         };
 
-        let result = if final_stdout.is_empty() {
-            // Build an informative "no match" message
-            let mut msg = format!("No matches found for '{}' in {}", parsed.pattern, path);
+        // Walk files using ignore crate (respects .gitignore, skips binary, multi-threaded)
+        let walker = WalkBuilder::new(&resolved)
+            .hidden(true)        // skip hidden files
+            .git_ignore(true)    // respect .gitignore
+            .git_global(true)
+            .git_exclude(true)
+            .build();
 
-            // Check if it's a regex error
-            if stderr.contains("regex") || stderr.contains("error") {
-                msg.push_str(&format!(
-                    "\nRegex error: {}. Escape special chars: . → \\\\. , ( → \\\\( , [ → \\\\[",
-                    stderr.lines().next().unwrap_or("invalid pattern")
-                ));
-            } else if has_metachar {
-                msg.push_str(
-                    "\nTip: Your pattern has regex metacharacters (. ( [ etc). \
-                     If you meant a literal search, escape them: console\\.log\\("
-                );
+        let mut matches: Vec<String> = Vec::new();
+        let mut files_searched = 0usize;
+        let mut match_count = 0usize;
+
+        for entry in walker {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+
+            if !entry.file_type().map_or(false, |ft| ft.is_file()) {
+                continue;
             }
 
-            // Count files searched to help diagnose "wrong directory" issues
-            if let Ok(file_count_out) = Command::new("rg")
-                .args(&["--files", &resolved_path])
-                .current_dir(&wd)
-                .output()
-                .await
+            let file_path = entry.path();
+
+            // Skip known noise directories/files not covered by .gitignore
+            let path_str = file_path.to_string_lossy();
+            if path_str.contains("/datalog/") || path_str.ends_with(".log")
+                || path_str.contains("/target/") || path_str.contains("/dist/")
+                || path_str.contains("/node_modules/")
             {
-                let file_count = String::from_utf8_lossy(&file_count_out.stdout)
-                    .lines().count();
-                msg.push_str(&format!(" ({} files searched)", file_count));
+                continue;
             }
 
-            msg
-        } else {
-            let raw_lines: Vec<&str> = final_stdout.lines().take(max).collect();
-            let total = final_stdout.lines().count();
+            // Read file (skip binary)
+            let content = match std::fs::read_to_string(file_path) {
+                Ok(c) => c,
+                Err(_) => continue, // binary or unreadable
+            };
 
-            // Annotate matching lines with the enclosing function/symbol name
-            let mut searcher = ctx.semantic.lock().await;
-            let mut annotated: Vec<String> = Vec::new();
-            // Cache symbols per file to avoid re-parsing
-            let mut sym_cache: std::collections::HashMap<String, Vec<crate::semantic::Symbol>> = std::collections::HashMap::new();
+            files_searched += 1;
+            let lines: Vec<&str> = content.lines().collect();
 
-            for line in &raw_lines {
-                // Parse rg output: file:line:content or separator --
-                let parts: Vec<&str> = line.splitn(3, ':').collect();
-                if parts.len() >= 3 {
-                    if let Ok(line_no) = parts[1].parse::<usize>() {
-                        let file = parts[0];
-                        // Look up enclosing symbol
-                        let symbols = sym_cache.entry(file.to_string()).or_insert_with(|| {
-                            let p = std::path::Path::new(file);
-                            searcher.list_symbols(p).unwrap_or_default()
-                        });
-                        let enclosing = symbols.iter().find(|s| line_no >= s.start_line && line_no <= s.end_line);
-                        if let Some(sym) = enclosing {
-                            annotated.push(format!("{}  ← in {}()", line, sym.name));
-                            continue;
-                        }
+            // Find matching lines
+            let mut file_matches: Vec<usize> = Vec::new();
+            for (i, line) in lines.iter().enumerate() {
+                if re.is_match(line) {
+                    file_matches.push(i);
+                    if match_count + file_matches.len() >= max {
+                        break;
                     }
                 }
-                annotated.push(line.to_string());
             }
 
-            let mut out = if was_literal_fallback {
-                format!("[Regex failed, used literal match]\n{}", annotated.join("\n"))
-            } else {
-                annotated.join("\n")
-            };
-            if total > max {
-                out.push_str(&format!("\n\n[{} more matches not shown]", total - max));
+            if file_matches.is_empty() {
+                continue;
+            }
+
+            // Format matches with context
+            let rel_path = file_path.strip_prefix(&wd)
+                .unwrap_or(file_path)
+                .to_string_lossy();
+
+            let mut shown: std::collections::HashSet<usize> = std::collections::HashSet::new();
+            for &match_line in &file_matches {
+                let start = match_line.saturating_sub(context_lines);
+                let end = (match_line + context_lines + 1).min(lines.len());
+
+                // Separator between non-contiguous chunks
+                if !shown.is_empty() && start > 0 && !shown.contains(&(start - 1)) {
+                    matches.push("--".to_string());
+                }
+
+                for i in start..end {
+                    if shown.contains(&i) { continue; }
+                    shown.insert(i);
+
+                    let prefix = if i == match_line {
+                        format!("{}:{}:", rel_path, i + 1)
+                    } else {
+                        format!("{}-{}-", rel_path, i + 1)
+                    };
+                    matches.push(format!("{}{}", prefix, lines[i]));
+                }
+            }
+
+            match_count += file_matches.len();
+            if match_count >= max {
+                break;
+            }
+        }
+
+        // Annotate matching lines with enclosing function name (tree-sitter)
+        let mut searcher = ctx.semantic.lock().await;
+        let mut annotated: Vec<String> = Vec::new();
+        let mut sym_cache: std::collections::HashMap<String, Vec<crate::semantic::Symbol>> = std::collections::HashMap::new();
+
+        for line in &matches {
+            let parts: Vec<&str> = line.splitn(3, ':').collect();
+            if parts.len() >= 3 {
+                if let Ok(line_no) = parts[1].parse::<usize>() {
+                    let file = parts[0];
+                    let abs_file = if std::path::Path::new(file).is_absolute() {
+                        std::path::PathBuf::from(file)
+                    } else {
+                        wd.join(file)
+                    };
+                    let symbols = sym_cache.entry(file.to_string()).or_insert_with(|| {
+                        searcher.list_symbols(&abs_file).unwrap_or_default()
+                    });
+                    if let Some(sym) = symbols.iter().find(|s| line_no >= s.start_line && line_no <= s.end_line) {
+                        annotated.push(format!("{}  ← in {}()", line, sym.name));
+                        continue;
+                    }
+                }
+            }
+            annotated.push(line.clone());
+        }
+        drop(searcher);
+
+        let output = if annotated.is_empty() {
+            let mut msg = format!("No matches found for '{}' in {}", parsed.pattern, path);
+            msg.push_str(&format!(" ({} files searched)", files_searched));
+            msg
+        } else {
+            let total = annotated.len();
+            let mut out = annotated.join("\n");
+            if total >= max {
+                out.push_str(&format!("\n\n[Results capped at {} matches]", max));
             }
             out
         };
 
         Ok(ToolResult {
             call_id: String::new(),
-            output: result,
-            success: !final_stdout.is_empty(),
+            output,
+            success: !matches.is_empty(),
         })
     }
 }
-// Tests in tests/grep_test.rs
