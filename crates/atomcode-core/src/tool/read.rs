@@ -89,14 +89,15 @@ impl Tool for ReadFileTool {
 
         let offset = parsed.offset.unwrap_or(1).max(1) - 1;
 
-        // Large files (>500 lines) without explicit offset/limit: cap at 300 lines.
-        // Prevents context overflow when the model reads multiple large files in one turn.
-        // Model can use offset/limit to read specific sections.
+        // Only truncate truly large files (>1000 lines).
+        // 95% of source files are under 1000 lines — truncating smaller files
+        // causes 3-5x re-reads that waste MORE tokens than truncation saves.
+        // Working Set + cold zone compression handle context budget.
         let limit = match parsed.limit {
             Some(l) => l,
             None => {
-                if total_lines > 500 && parsed.offset.is_none() {
-                    300
+                if total_lines > 1000 && parsed.offset.is_none() {
+                    500
                 } else {
                     2000
                 }

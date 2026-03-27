@@ -6,6 +6,15 @@ use crate::tool::result_store::ToolResultRef;
 use message::{Message, MessageContent, Role};
 use turn::TurnTracker;
 
+/// Context budget statistics for logging/debugging.
+#[derive(Debug, Clone, Default)]
+pub struct ContextStats {
+    pub system_tokens: usize,
+    pub hot_tokens: usize,
+    pub cold_tokens: usize,
+    pub total_messages: usize,
+}
+
 #[derive(Debug)]
 pub struct Conversation {
     pub messages: Vec<Message>,
@@ -223,9 +232,9 @@ impl Conversation {
         &self,
         system_prompt: &str,
         token_budget: usize,
-    ) -> Vec<Message> {
+    ) -> (Vec<Message>, ContextStats) {
         if self.messages.is_empty() {
-            return vec![Message::new(Role::System, system_prompt)];
+            return (vec![Message::new(Role::System, system_prompt)], ContextStats::default());
         }
 
         let system_msg = Message::new(Role::System, system_prompt);
@@ -236,7 +245,7 @@ impl Conversation {
 
         // If no turns tracked (edge case), fall back to simple tail windowing.
         if turns.is_empty() {
-            return self.to_provider_messages_budgeted_fallback(system_msg, remaining_budget);
+            return (self.to_provider_messages_budgeted_fallback(system_msg, remaining_budget), ContextStats::default());
         }
 
         // Phase 1: Walk backwards through turns, adding full messages from
@@ -249,7 +258,9 @@ impl Conversation {
 
         for ti in (0..turns.len()).rev() {
             let turn = &turns[ti];
-            let turn_tokens: usize = self.messages[turn.start_idx..turn.end_idx()]
+            let end = turn.end_idx().min(self.messages.len());
+            if turn.start_idx >= self.messages.len() { continue; }
+            let turn_tokens: usize = self.messages[turn.start_idx..end]
                 .iter()
                 .map(|m| m.estimate_tokens())
                 .sum();
@@ -311,7 +322,9 @@ impl Conversation {
             }
 
             // Completed turns without summary: keep user message + last assistant text.
-            let turn_msgs = &self.messages[turn.start_idx..turn.end_idx()];
+            let end = turn.end_idx().min(self.messages.len());
+            if turn.start_idx >= self.messages.len() { continue; }
+            let turn_msgs = &self.messages[turn.start_idx..end];
             let mut turn_condensed: Vec<Message> = Vec::new();
             let mut turn_cost = 0usize;
 
@@ -430,7 +443,14 @@ impl Conversation {
         // Phase 4: Sanitize broken tool_call/tool_result pairs.
         Self::sanitize_messages(&mut result);
 
-        result
+        let stats = ContextStats {
+            system_tokens,
+            hot_tokens,
+            cold_tokens,
+            total_messages: result.len(),
+        };
+
+        (result, stats)
     }
 
     /// Synthesize a brief outcome description for a turn that has no assistant

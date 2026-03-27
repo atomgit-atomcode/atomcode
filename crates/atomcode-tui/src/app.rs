@@ -640,6 +640,9 @@ impl App {
                 self.config.default_workdir = Some(new_dir.to_string_lossy().to_string());
                 let _ = self.config.save(&Config::default_path());
             }
+            AgentEvent::ContextStats { system_tokens, hot_tokens, cold_tokens, working_set_tokens, total_messages } => {
+                self.turn_log.log_context_stats(system_tokens, hot_tokens, cold_tokens, working_set_tokens, total_messages);
+            }
         }
     }
 

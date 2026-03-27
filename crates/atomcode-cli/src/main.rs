@@ -172,11 +172,12 @@ async fn run() -> Result<()> {
     tool_registry.register(Box::new(SearchReplaceTool));
 
     let tool_context = ToolContext::new(working_dir.clone());
-    // Load previous session's conversation history for cross-session context.
-    // The turn tracker will be rebuilt from the loaded messages, enabling
-    // "PREVIOUS SESSION" context injection in the system prompt.
-    // Corrupted messages are handled gracefully (Conversation::load backs up + starts fresh).
-    let conversation = Conversation::load(&Conversation::history_path());
+    // Start with a fresh conversation each session.
+    // Previous session context is injected via build_previous_session_context()
+    // from the saved history file — no need to load raw messages.
+    // Loading raw messages caused: old model's tool_call format incompatibility,
+    // stale file paths from old working directories, and 100+ message context pollution.
+    let conversation = Conversation::new();
 
     let (agent_loop, agent_handle) = AgentLoop::new(
         config.clone(),
@@ -291,6 +292,9 @@ async fn run_headless(
             }
             AgentEvent::WorkingDirChanged(new_dir) => {
                 eprintln!("[Working directory: {}]", new_dir.display());
+            }
+            AgentEvent::ContextStats { .. } => {
+                // Silent in headless mode
             }
         }
     }

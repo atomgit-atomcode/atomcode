@@ -69,9 +69,9 @@ impl OpenAiProvider {
                             return Some(json!({"role": "assistant", "content": t}));
                         }
                         let mut msg = json!({"role": "assistant"});
-                        if let Some(t) = text {
-                            msg["content"] = json!(t);
-                        }
+                        // Always include content field — some APIs (DeepSeek/SiliconFlow)
+                        // reject messages without it even when tool_calls is present.
+                        msg["content"] = json!(text.as_deref().unwrap_or(""));
                         msg["tool_calls"] = json!(tool_calls.iter().map(|tc| {
                             // Ensure arguments is valid JSON — some APIs reject invalid JSON strings.
                             let args = if serde_json::from_str::<serde_json::Value>(&tc.arguments).is_ok() {
