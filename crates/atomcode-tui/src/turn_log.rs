@@ -17,9 +17,11 @@ pub struct TurnLog {
     buf: String,
     /// Whether we have an active turn
     active: bool,
-    /// Turn start time (for duration)
+    /// Turn start time (for total duration)
     start: Option<Instant>,
-    /// Step counter
+    /// Per-LLM-turn timer (reset on each log_llm_call)
+    llm_turn_start: Option<Instant>,
+    /// Step counter (LLM turn count)
     step: usize,
     /// File path for this turn
     file_path: Option<PathBuf>,
@@ -32,6 +34,7 @@ impl TurnLog {
             buf: String::new(),
             active: false,
             start: None,
+            llm_turn_start: None,
             step: 0,
             file_path: None,
         }
@@ -70,10 +73,33 @@ impl TurnLog {
     }
 
     /// Log start of a new LLM round-trip (increments the turn counter).
+    /// Records the duration of the previous LLM turn.
     pub fn log_llm_call(&mut self) {
         if !self.active { return; }
+        // Log previous turn's duration
+        if let Some(prev_start) = self.llm_turn_start {
+            let dur = prev_start.elapsed();
+            if dur.as_millis() >= 1000 {
+                let _ = writeln!(&mut self.buf, "  _({:.1}s)_\n", dur.as_secs_f64());
+            }
+        }
         self.step += 1;
         let _ = writeln!(&mut self.buf, "### Turn {}", self.step);
+        self.llm_turn_start = Some(Instant::now());
+        self.flush();
+    }
+
+    /// Log context statistics for debugging.
+    /// Called from AgentLoop before each LLM call.
+    pub fn log_context_stats(&mut self, system_tokens: usize, hot_tokens: usize,
+                              cold_tokens: usize, working_set_tokens: usize,
+                              total_messages: usize) {
+        if !self.active { return; }
+        let total = system_tokens + hot_tokens + cold_tokens + working_set_tokens;
+        let _ = writeln!(&mut self.buf,
+            "  _[ctx: {}tok = sys:{}+hot:{}+cold:{}+ws:{}, msgs:{}]_",
+            total, system_tokens, hot_tokens, cold_tokens, working_set_tokens, total_messages
+        );
         self.flush();
     }
 
@@ -132,6 +158,14 @@ impl TurnLog {
     pub fn end_turn(&mut self, total_tokens: usize) {
         if !self.active { return; }
         self.active = false;
+
+        // Log last LLM turn duration
+        if let Some(prev_start) = self.llm_turn_start.take() {
+            let dur = prev_start.elapsed();
+            if dur.as_millis() >= 1000 {
+                let _ = writeln!(&mut self.buf, "  _({:.1}s)_", dur.as_secs_f64());
+            }
+        }
 
         let duration = self.start.map(|s| s.elapsed()).unwrap_or_default();
         let _ = writeln!(&mut self.buf);

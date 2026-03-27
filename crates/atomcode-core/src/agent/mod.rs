@@ -87,6 +87,14 @@ pub enum AgentEvent {
     Error(String),
     /// Working directory changed.
     WorkingDirChanged(PathBuf),
+    /// Context budget stats for logging (not displayed, only written to datalog).
+    ContextStats {
+        system_tokens: usize,
+        hot_tokens: usize,
+        cold_tokens: usize,
+        working_set_tokens: usize,
+        total_messages: usize,
+    },
 }
 
 /// The current phase of the agent (for UI display).
@@ -169,10 +177,10 @@ pub struct AgentLoop {
 
     /// Pending user input appended during streaming. Injected before next LLM call.
     pending_input: Option<String>,
-    /// Recently edited file contents — injected at the END of messages in call_llm
-    /// so the model has the latest file content in its highest-attention zone.
-    /// Key: short file name, Value: (full_path, content).
-    recent_file_cache: std::collections::HashMap<String, (String, String)>,
+    /// Session-level file tracker: all files read/edited across the entire session.
+    /// Used to build the "working set" — tree-sitter skeletons injected before each LLM call.
+    /// This replaces the old recent_file_cache with a smarter, budget-aware approach.
+    session_files: std::collections::HashMap<String, PathBuf>,
     /// Whether planning phase is active (first LLM call without tools to force a plan).
     planning_phase: bool,
 
@@ -257,7 +265,7 @@ impl AgentLoop {
             executed_cmds: std::collections::HashMap::new(),
             pending_input: None,
             planning_phase: false,
-            recent_file_cache: std::collections::HashMap::new(),
+            session_files: std::collections::HashMap::new(),
             active_services: std::collections::HashMap::new(),
             result_store: ToolResultStore::new(ToolResultStore::default_dir()),
             skill_registry,
@@ -350,9 +358,18 @@ impl AgentLoop {
                     }
                 }
                 AgentCommand::ReloadConfig(new_config) => {
+                    let old_provider = self.config.default_provider.clone();
                     self.config = new_config;
-                    let default_name = self.config.default_provider.clone();
-                    if let Some(provider_config) = self.config.providers.get(&default_name) {
+                    let new_provider_name = self.config.default_provider.clone();
+
+                    // If provider/model changed, clear conversation to avoid context pollution
+                    if old_provider != new_provider_name {
+                        self.conversation.messages.clear();
+                        self.conversation.turn_tracker = crate::conversation::turn::TurnTracker::new();
+                        self.session_files.clear();
+                    }
+
+                    if let Some(provider_config) = self.config.providers.get(&new_provider_name) {
                         match crate::provider::create_provider(provider_config) {
                             Ok(new_provider) => {
                                 self.provider = new_provider;
@@ -416,7 +433,10 @@ impl AgentLoop {
         self.sleep_count = 0;
         self.consecutive_verify_count = 0;
         self.executed_cmds.clear();
-        self.recent_file_cache.clear();
+        // Clear session_files on each new user message.
+        // Working Set only tracks files from the CURRENT task.
+        // Previous files are remembered via cold zone summaries.
+        self.session_files.clear();
         self.turn_start = Some(Instant::now());
         self.cancel_token = CancellationToken::new();
 
@@ -625,7 +645,7 @@ impl AgentLoop {
                 .get(&self.config.default_provider)
                 .map(|p| p.context_window)
                 .unwrap_or(16000);
-            let mut messages = self
+            let (mut messages, ctx_stats) = self
                 .conversation
                 .to_provider_messages_budgeted(&system_prompt, context_window);
 
@@ -633,10 +653,118 @@ impl AgentLoop {
             // older ones keep their summary (already compact from budgeted windowing).
             self.inflate_recent_refs(&mut messages);
 
-            // NOTE: recently edited file cache was removed (v2.3.0).
-            // It injected full file contents (~8K tokens) OUTSIDE the context budget,
-            // causing 40K+ actual input on a 32K budget. The model ignored the cache
-            // and re-read files anyway. Net effect was purely negative (slower, no benefit).
+            // Working Set: inject tree-sitter skeletons of all files touched this session.
+            // This replaces stale conversation content with CURRENT file state from disk.
+            // Budget: max 6K tokens (~1500 chars per file × ~4 files).
+            if !self.session_files.is_empty() {
+                let mut working_set = String::from(
+                    "[FILES IN THIS SESSION — current structure from disk. Use start_line/end_line to edit.]\n\n"
+                );
+                let mut ws_budget = 6000usize; // chars budget
+                let mut searcher = self.tool_context.semantic.lock().await;
+
+                // Sort by most recently added (HashMap doesn't preserve order, but that's OK)
+                let files: Vec<(String, PathBuf)> = self.session_files.iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+
+                for (short, full_path) in &files {
+                    if ws_budget < 200 { break; }
+                    if !full_path.exists() { continue; }
+
+                    let source = match std::fs::read_to_string(full_path) {
+                        Ok(s) => s,
+                        Err(_) => continue,
+                    };
+                    let line_count = source.lines().count();
+                    if line_count == 0 { continue; }
+
+                    if line_count <= 80 {
+                        // Small file: include full content
+                        let entry = format!("=== {} ({} lines, full) ===\n{}\n\n", short, line_count, source);
+                        if entry.len() <= ws_budget {
+                            ws_budget -= entry.len();
+                            working_set.push_str(&entry);
+                        }
+                    } else {
+                        // Large file: tree-sitter skeleton, with fallback to line-based scan
+                        let source_lines: Vec<&str> = source.lines().collect();
+                        let symbols = searcher.list_symbols(full_path);
+                        let mut skel = format!("=== {} ({} lines) ===\n", short, line_count);
+
+                        if let Some(ref syms) = symbols {
+                            if !syms.is_empty() {
+                                for sym in syms {
+                                    let sig = source_lines.get(sym.start_line.saturating_sub(1))
+                                        .map(|l| l.trim())
+                                        .unwrap_or(&sym.name);
+                                    let sig_short = if sig.chars().count() > 60 {
+                                        format!("{}...", sig.chars().take(57).collect::<String>())
+                                    } else {
+                                        sig.to_string()
+                                    };
+                                    skel.push_str(&format!("{:>4}| {}  (L{}-{})\n",
+                                        sym.start_line, sig_short, sym.start_line, sym.end_line));
+                                }
+                            }
+                        }
+
+                        // Fallback: if tree-sitter produced nothing, use first+last 5 lines
+                        if skel.lines().count() <= 2 {
+                            for (i, line) in source_lines.iter().take(5).enumerate() {
+                                skel.push_str(&format!("{:>4}| {}\n", i + 1, line));
+                            }
+                            if line_count > 10 {
+                                skel.push_str(&format!("     ... ({} lines)\n", line_count - 10));
+                                for i in (line_count - 5)..line_count {
+                                    skel.push_str(&format!("{:>4}| {}\n", i + 1, source_lines[i]));
+                                }
+                            }
+                        }
+
+                        skel.push('\n');
+                        if skel.len() <= ws_budget {
+                            ws_budget -= skel.len();
+                            working_set.push_str(&skel);
+                        }
+                    }
+                }
+                drop(searcher);
+
+                // Always inject if we have any files
+                if self.session_files.len() > 0 {
+                    // Find safe insertion point: before the last user message,
+                    // NOT between tool_call and tool_result pairs.
+                    let mut insert_pos = messages.len();
+                    for i in (0..messages.len()).rev() {
+                        match &messages[i].content {
+                            crate::conversation::message::MessageContent::Text(_)
+                                if matches!(messages[i].role, crate::conversation::message::Role::User) => {
+                                insert_pos = i;
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                    messages.insert(insert_pos, crate::conversation::message::Message::new(
+                        crate::conversation::message::Role::System,
+                        working_set,
+                    ));
+                }
+            }
+
+            // Emit context stats for datalog (not displayed in UI)
+            let ws_tokens: usize = messages.iter()
+                .filter(|m| matches!(m.role, crate::conversation::message::Role::System) && m.text().map_or(false, |t| t.contains("FILES IN THIS SESSION")))
+                .map(|m| m.estimate_tokens())
+                .sum();
+            let _ = self.event_tx.send(AgentEvent::ContextStats {
+                system_tokens: ctx_stats.system_tokens,
+                hot_tokens: ctx_stats.hot_tokens,
+                cold_tokens: ctx_stats.cold_tokens,
+                working_set_tokens: ws_tokens,
+                total_messages: messages.len(),
+            });
 
             let tool_defs = self.tool_registry.get_definitions();
 
@@ -807,7 +935,23 @@ impl AgentLoop {
                                 let _ = self.event_tx.send(AgentEvent::TokenUsage(usage));
                             }
                             Some(Ok(StreamEvent::Done)) => {
+                                let had_output = !tool_calls_buf.is_empty()
+                                    || self.model_produced_text
+                                    || self.conversation.stream_buffer.as_ref().map_or(false, |b| !b.is_empty());
+
                                 self.conversation.finalize_stream();
+
+                                // Empty response detection: model returned Done with zero output.
+                                // Retry up to 2 times — likely a transient API/provider issue.
+                                if !had_output && self.retry_count < 2 {
+                                    self.retry_count += 1;
+                                    let _ = self.event_tx.send(AgentEvent::TextDelta(
+                                        format!("\n[Empty response — retrying ({}/2)...]\n", self.retry_count)
+                                    ));
+                                    tokio::time::sleep(Duration::from_secs(2)).await;
+                                    self.call_llm().await;
+                                    return;
+                                }
 
                                 if !tool_calls_buf.is_empty() {
                                     self.conversation
@@ -815,7 +959,6 @@ impl AgentLoop {
                                     self.pending_tool_calls = tool_calls_buf;
                                     self.dispatch_pending_tools().await;
                                 } else {
-                                    // Verification: inject ONCE if edits were made but not verified.
                                     if !self.verify_injected && self.should_verify() {
                                         self.verify_injected = true;
                                         self.inject_verify_prompt();
@@ -830,8 +973,6 @@ impl AgentLoop {
                                 let is_messages_illegal = e.contains("illegal") || e.contains("messages");
                                 let is_rate_limited = e.contains("429") || e.contains("rate") || e.contains("Too Many");
                                 let is_auth_error = e.contains("401 ") || e.contains("403 ");
-                                let is_fatal_api_error = (e.contains("400 ") || is_auth_error)
-                                    && !is_rate_limited; // 429 is NOT fatal
 
                                 if is_messages_illegal && self.retry_count == 0 {
                                     // "messages illegal" — auto-recover by trimming conversation
@@ -855,20 +996,25 @@ impl AgentLoop {
                                     tokio::time::sleep(Duration::from_secs(wait)).await;
                                     self.call_llm().await;
                                     return;
-                                } else if !is_fatal_api_error && !is_rate_limited {
-                                    // Transient error (network, timeout) — retry up to 3 times.
-                                    self.retry_count += 1;
-                                    if self.retry_count <= 3 {
-                                        let wait = (self.retry_count as u64 * 2).min(15);
-                                        tokio::time::sleep(Duration::from_secs(wait)).await;
-                                        self.call_llm().await;
-                                        return;
-                                    }
+                                } else if is_auth_error {
+                                    // 401/403 Auth error — truly fatal, no retry.
                                     let _ = self.event_tx.send(AgentEvent::Error(e));
                                     self.finish_turn();
                                     return;
+                                } else if self.retry_count < 3 {
+                                    // All other errors (400, network, timeout, provider errors)
+                                    // — retry up to 3 times with backoff.
+                                    // OpenRouter 400 is often upstream provider failure, not bad request.
+                                    self.retry_count += 1;
+                                    let wait = (self.retry_count as u64 * 3).min(15);
+                                    let _ = self.event_tx.send(AgentEvent::TextDelta(
+                                        format!("\n[API error — retrying in {}s ({}/3)...]\n", wait, self.retry_count)
+                                    ));
+                                    tokio::time::sleep(Duration::from_secs(wait)).await;
+                                    self.call_llm().await;
+                                    return;
                                 } else {
-                                    // Fatal: 400 Bad Request, 401/403 Auth error — no retry.
+                                    // Exhausted retries — give up.
                                     let _ = self.event_tx.send(AgentEvent::Error(e));
                                     self.finish_turn();
                                     return;
@@ -950,8 +1096,15 @@ impl AgentLoop {
 
                 // Track file access state
                 if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&args) {
-                    let file = parsed.get("file_path").and_then(|v| v.as_str())
-                        .map(|s| short_path(s));
+                    let file_path_str = parsed.get("file_path").and_then(|v| v.as_str());
+                    let file = file_path_str.map(|s| short_path(s));
+                    // Track in session-level working set
+                    if let Some(fp) = file_path_str {
+                        if matches!(name.as_str(), "read_file" | "edit_file" | "write_file") {
+                            let short = short_path(fp);
+                            self.session_files.insert(short, std::path::PathBuf::from(fp));
+                        }
+                    }
                     match name.as_str() {
                         "read_file" | "list_directory" | "glob" | "grep" => {
                             self.consecutive_reads += 1;
@@ -1722,14 +1875,8 @@ impl AgentLoop {
                         let short = short_path(fp);
                         self.file_read_counts.remove(&short);
                         // Cache file content for injection into next LLM call.
-                        // This puts the latest file in the model's highest-attention zone.
-                        if let Ok(content) = std::fs::read_to_string(fp) {
-                            let lines = content.lines().count();
-                            if lines <= 600 {
-                                // Only cache manageable files (≤600 lines ≈ 2400 tokens)
-                                self.recent_file_cache.insert(short, (fp.to_string(), content));
-                            }
-                        }
+                        // Track file for working set (session-level, read from disk each LLM call)
+                        self.session_files.insert(short, std::path::PathBuf::from(fp));
                     }
                 }
             }
@@ -2132,7 +2279,7 @@ impl AgentLoop {
         // Pre-read files go in the middle (bulk reference material).
         // Rules go LAST so the model remembers them when generating tool calls.
         let mut prompt = format!(
-            "Working directory: {wd}\n{env_info}\n",
+            "Working directory: {wd}\nALL file paths MUST start with {wd}. NEVER use paths from previous sessions.\n{env_info}\n",
             wd = wd.display(), env_info = env_info,
         );
 
@@ -2504,7 +2651,7 @@ impl AgentLoop {
                         self.consecutive_edits_file = Some(short.clone());
                         self.consecutive_edits_count = 1;
                     }
-                    if self.consecutive_edits_count >= 4 {
+                    if self.consecutive_edits_count >= 8 {
                         return Some(format!(
                             "[BLOCKED: You have edited {} {} times in a row. \
                              STOP and re-read the file first to see the current state, \
@@ -2989,6 +3136,10 @@ impl AgentLoop {
                 *wd = resolved.clone();
             }
             self.project_context_cache = None; // invalidate on dir change
+            // Clear conversation history — old paths from previous directory will confuse the model
+            self.conversation.messages.clear();
+            self.conversation.turn_tracker = crate::conversation::turn::TurnTracker::new();
+            self.session_files.clear();
             // Reload skills for the new working directory (project-level skills may differ)
             if let Ok(mut reg) = self.skill_registry.write() {
                 reg.reload(&resolved);

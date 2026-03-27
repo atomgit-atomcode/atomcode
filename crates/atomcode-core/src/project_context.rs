@@ -31,9 +31,11 @@ pub fn build_project_context(dir: &Path) -> ProjectContext {
     let mut ctx = String::new();
     let mut included_files = HashSet::new();
 
-    // 1. File tree (3 levels — enough to show structure, deeper files found via glob)
+    // 1. File tree (3 levels) with tree-sitter annotations
+    // Each source file gets top-level symbol names so the model can navigate without grepping
+    let mut searcher = crate::semantic::SemanticSearcher::new();
     ctx.push_str("Project files:\n");
-    ctx.push_str(&scan_tree(dir, 0, 3));
+    ctx.push_str(&scan_tree(dir, 0, 3, &mut searcher, dir));
 
     // 2. Include raw content of descriptor files the model can read
     let mut included_names = Vec::new();
@@ -127,7 +129,19 @@ fn find_executables(dir: &Path) -> Vec<String> {
     result
 }
 
-fn scan_tree(dir: &Path, depth: usize, max_depth: usize) -> String {
+/// Source file extensions that get tree-sitter annotations in the file tree.
+const ANNOTATE_EXTS: &[&str] = &[
+    "rs", "py", "js", "ts", "tsx", "jsx", "vue", "svelte",
+    "go", "java", "c", "cpp", "cc", "h", "hpp",
+];
+
+fn scan_tree(
+    dir: &Path,
+    depth: usize,
+    max_depth: usize,
+    searcher: &mut crate::semantic::SemanticSearcher,
+    _project_root: &Path,
+) -> String {
     if depth > max_depth { return String::new(); }
 
     let entries = match std::fs::read_dir(dir) {
@@ -147,9 +161,37 @@ fn scan_tree(dir: &Path, depth: usize, max_depth: usize) -> String {
         let indent = "  ".repeat(depth);
         if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
             out.push_str(&format!("{}{}/\n", indent, name));
-            out.push_str(&scan_tree(&entry.path(), depth + 1, max_depth));
+            out.push_str(&scan_tree(&entry.path(), depth + 1, max_depth, searcher, _project_root));
         } else {
-            out.push_str(&format!("{}{}\n", indent, name));
+            // Annotate source files with top-level symbol names (max 5)
+            let entry_path = entry.path();
+            let ext = entry_path.extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("");
+            if depth <= 2 && ANNOTATE_EXTS.contains(&ext) {
+                let line_count = std::fs::read_to_string(entry.path())
+                    .map(|c| c.lines().count())
+                    .unwrap_or(0);
+                if let Some(symbols) = searcher.list_symbols(&entry.path()) {
+                    let sym_names: Vec<&str> = symbols.iter()
+                        .filter(|s| !s.name.starts_with('<')) // skip <template>/<style> pseudo-symbols
+                        .map(|s| s.name.as_str())
+                        .take(5)
+                        .collect();
+                    if !sym_names.is_empty() {
+                        out.push_str(&format!("{}{} ({}L): {}\n",
+                            indent, name, line_count, sym_names.join(", ")));
+                        continue;
+                    }
+                }
+                if line_count > 0 {
+                    out.push_str(&format!("{}{} ({}L)\n", indent, name, line_count));
+                } else {
+                    out.push_str(&format!("{}{}\n", indent, name));
+                }
+            } else {
+                out.push_str(&format!("{}{}\n", indent, name));
+            }
         }
     }
     out

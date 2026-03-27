@@ -72,11 +72,19 @@ impl Message {
         match &self.content {
             MessageContent::ToolResult(r) => {
                 let summary = if r.success {
-                    let first_line = r.output.lines().next().unwrap_or("OK");
-                    if first_line.chars().count() > 100 {
-                        format!("{}...", first_line.chars().take(97).collect::<String>())
+                    // For read_file results (detected by line-number format "  N| ..."),
+                    // generate a skeleton instead of just the first line.
+                    // This preserves function signatures + line numbers so the model
+                    // can use line-number mode for edits without re-reading.
+                    if is_file_read_output(&r.output) && r.output.lines().count() > 50 {
+                        compress_file_to_skeleton(&r.output)
                     } else {
-                        first_line.to_string()
+                        let first_line = r.output.lines().next().unwrap_or("OK");
+                        if first_line.chars().count() > 100 {
+                            format!("{}...", first_line.chars().take(97).collect::<String>())
+                        } else {
+                            first_line.to_string()
+                        }
                     }
                 } else {
                     let first_line = r.output.lines().next().unwrap_or("Error");
@@ -132,4 +140,77 @@ impl Message {
             _ => None,
         }
     }
+}
+
+/// Detect if tool output looks like a read_file result (line-numbered content).
+fn is_file_read_output(output: &str) -> bool {
+    // read_file outputs lines like "   1| package com.devpress..."
+    let first_lines: Vec<&str> = output.lines().take(3).collect();
+    first_lines.len() >= 2 && first_lines.iter().any(|l| {
+        let trimmed = l.trim_start();
+        // Match pattern: digits followed by "| "
+        trimmed.chars().take_while(|c| c.is_ascii_digit()).count() > 0
+            && trimmed.contains("| ")
+    })
+}
+
+/// Compress a read_file result to a skeleton: keep import lines, function/class
+/// signatures, and section markers (template/script/style for Vue).
+/// Output is ~10% of the original but preserves structure + line numbers.
+fn compress_file_to_skeleton(output: &str) -> String {
+    let lines: Vec<&str> = output.lines().collect();
+    let total = lines.len();
+    let mut skeleton = Vec::new();
+
+    // Function/class/struct signature keywords
+    let sig_keywords = [
+        "fn ", "pub fn ", "async fn ", "pub async fn ",
+        "def ", "class ", "function ", "func ",
+        "export ", "import ", "const ", "let ",
+        "public ", "private ", "protected ",
+        "interface ", "type ", "struct ", "enum ", "impl ",
+        "<template", "</template", "<script", "</script", "<style", "</style",
+        "package ", "use ", "from ", "#include",
+    ];
+
+    for line in &lines {
+        // Extract the content after "N| " prefix
+        let content = if let Some(pos) = line.find("| ") {
+            &line[pos + 2..]
+        } else {
+            line
+        };
+        let trimmed = content.trim();
+
+        // Keep empty lines between sections (but not consecutive)
+        if trimmed.is_empty() {
+            if skeleton.last().map_or(true, |l: &&str| !l.trim().is_empty()) {
+                // Don't add empty lines to skeleton
+            }
+            continue;
+        }
+
+        // Keep lines at indent 0-1 that look like signatures
+        let indent = content.len() - content.trim_start().len();
+        let is_signature = indent <= 4 && sig_keywords.iter().any(|kw| trimmed.starts_with(kw));
+        let is_decorator = trimmed.starts_with('@') || trimmed.starts_with("#[");
+        let is_close = trimmed == "}" || trimmed == "}" || trimmed.starts_with("})");
+
+        if is_signature || is_decorator {
+            skeleton.push(*line);
+        }
+    }
+
+    if skeleton.is_empty() {
+        // Fallback: just first line + count
+        let first = lines.first().unwrap_or(&"");
+        return format!("{} ({} lines total)", first, total);
+    }
+
+    let mut result = format!("[File skeleton — {} lines total, use edit_file with start_line/end_line to edit:]\n", total);
+    for line in &skeleton {
+        result.push_str(line);
+        result.push('\n');
+    }
+    result
 }

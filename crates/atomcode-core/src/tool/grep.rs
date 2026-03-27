@@ -77,6 +77,8 @@ impl Tool for GrepTool {
             .args(&[
                 "--line-number", "--no-heading", "--color=never",
                 "--smart-case",  // lowercase pattern = case-insensitive (like Claude Code)
+                "--glob=!datalog/", "--glob=!*.log", "--glob=!target/",
+                "--glob=!dist/", "--glob=!node_modules/", "--glob=!.git/",
                 &format!("--max-count={}", max),
                 &format!("--context={}", context_lines),
                 &parsed.pattern, &resolved_path,

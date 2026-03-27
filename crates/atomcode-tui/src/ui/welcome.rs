@@ -5,6 +5,7 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use crate::app::{App, WelcomeState};
+use super::theme;
 
 const LOGO: &str = r#"
      _   _                  ____          _
@@ -30,7 +31,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         lines.push(Line::default());
     }
 
-    let logo_color = Color::Rgb(120, 95, 235);
+    let logo_color = theme::ACCENT;
     for logo_line in LOGO.lines().skip(1) {
         lines.push(Line::from(Span::styled(
             logo_line.to_string(),
@@ -42,22 +43,22 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
 
     // Version + model
     lines.push(Line::from(vec![
-        Span::styled(format!("  v{}", env!("CARGO_PKG_VERSION")), Style::default().fg(Color::Rgb(65, 68, 80))),
+        Span::styled(format!("  v{}", env!("CARGO_PKG_VERSION")), Style::default().fg(theme::TEXT_MUTED)),
         Span::styled(
             format!("  \u{00b7}  {}", app.model_name),
-            Style::default().fg(Color::Rgb(100, 170, 235)),
+            Style::default().fg(theme::INFO),
         ),
     ]));
     lines.push(Line::from(Span::styled(
         format!("  {}", app.working_dir.display()),
-        Style::default().fg(Color::Rgb(60, 62, 72)),
+        Style::default().fg(theme::TEXT_MUTED),
     )));
 
     lines.push(Line::default());
 
-    let h = Style::default().fg(Color::Rgb(130, 132, 145)).add_modifier(Modifier::BOLD);
-    let k = Style::default().fg(Color::Rgb(105, 150, 210));
-    let d = Style::default().fg(Color::Rgb(85, 88, 100));
+    let h = Style::default().fg(theme::TEXT_SECONDARY).add_modifier(Modifier::BOLD);
+    let k = Style::default().fg(theme::INFO);
+    let d = Style::default().fg(theme::TEXT_MUTED);
 
     // Input
     lines.push(Line::from(Span::styled("  Input", h)));
@@ -115,7 +116,7 @@ pub fn render_setup(frame: &mut Frame, area: Rect, state: &WelcomeState) {
     }
 
     // Logo
-    let logo_color = Color::Rgb(120, 95, 235);
+    let logo_color = theme::ACCENT;
     for logo_line in LOGO.lines().skip(1) {
         lines.push(Line::from(Span::styled(
             logo_line.to_string(),
@@ -126,7 +127,7 @@ pub fn render_setup(frame: &mut Frame, area: Rect, state: &WelcomeState) {
     lines.push(Line::default());
     lines.push(Line::from(Span::styled(
         "  Welcome! Choose how to get started:",
-        Style::default().fg(Color::Rgb(180, 182, 195)),
+        Style::default().fg(theme::TEXT_SECONDARY),
     )));
     lines.push(Line::default());
 
@@ -139,14 +140,14 @@ pub fn render_setup(frame: &mut Frame, area: Rect, state: &WelcomeState) {
         let is_sel = i == state.selected;
         let prefix = if is_sel { "  \u{25b6} " } else { "     " };
         let (fg, bg) = if is_sel {
-            (Color::Rgb(240, 240, 245), Color::Rgb(50, 40, 100))
+            (theme::TEXT_PRIMARY, theme::BG_ELEVATED)
         } else {
-            (Color::Rgb(140, 142, 155), Color::Reset)
+            (theme::TEXT_SECONDARY, Color::Reset)
         };
         let number = format!("[{}] ", i + 1);
         lines.push(Line::from(vec![
             Span::styled(prefix, Style::default().fg(fg).bg(bg)),
-            Span::styled(number, Style::default().fg(Color::Rgb(105, 150, 210)).bg(bg)),
+            Span::styled(number, Style::default().fg(theme::INFO).bg(bg)),
             Span::styled(opt.to_string(), Style::default().fg(fg).bg(bg)),
         ]));
     }
@@ -164,7 +165,7 @@ pub fn render_setup(frame: &mut Frame, area: Rect, state: &WelcomeState) {
 
     lines.push(Line::from(Span::styled(
         "  \u{2191}\u{2193} / 1-3 to select   Enter to confirm",
-        Style::default().fg(Color::Rgb(65, 68, 80)),
+        Style::default().fg(theme::TEXT_MUTED),
     )));
 
     let paragraph = Paragraph::new(lines);
