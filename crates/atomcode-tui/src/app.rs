@@ -701,13 +701,16 @@ impl App {
                 if matches!(self.mode, AppMode::ProviderManager) {
                     // Forward paste to provider manager's input buffer
                     if let Some(ref mut mgr) = self.provider_mgr {
-                        mgr.input_buf.push_str(&text);
+                        // Normalize line endings
+                        mgr.input_buf.push_str(&text.replace("\r\n", "\n").replace('\r', "\n"));
                     }
                 } else if matches!(self.mode, AppMode::Normal | AppMode::Streaming | AppMode::ToolExecuting) {
-                    if text.lines().count() > 3 || text.len() > 200 {
-                        self.pasted_text = Some(text);
+                    // Normalize line endings: \r\n -> \n, \r -> \n
+                    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+                    if normalized.lines().count() > 3 || normalized.len() > 200 {
+                        self.pasted_text = Some(normalized);
                     } else {
-                        self.input.insert_text(&text);
+                        self.input.insert_text(&normalized);
                     }
                     self.suggestion = None;
                 }
@@ -1834,8 +1837,8 @@ impl App {
             // Long entry — show as pasted reference
             self.pasted_text = Some(entry.to_string());
         } else {
-            // Short entry — load inline
-            for c in entry.chars() { self.input.insert_char(c); }
+            // Short entry — load inline using insert_text to preserve newlines
+            self.input.insert_text(entry);
         }
     }
 
@@ -2000,7 +2003,11 @@ fn read_clipboard() -> Option<String> {
 
     output
         .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .map(|o| {
+            let text = String::from_utf8_lossy(&o.stdout).to_string();
+            // Normalize line endings: \r\n -> \n, \r -> \n
+            text.replace("\r\n", "\n").replace('\r', "\n")
+        })
         .filter(|s| !s.is_empty())
 }
 

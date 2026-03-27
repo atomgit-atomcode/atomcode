@@ -284,36 +284,24 @@ pub fn render(
 
 // ── User Message ──
 // Clean chevron prefix, bright text, separator after
+// Always show full content (like Claude Code) so users can copy-paste
 fn render_user(lines: &mut Vec<Line<'static>>, content: &str) {
     lines.push(Line::default());
     let text_lines: Vec<&str> = content.lines().collect();
 
-    if text_lines.len() <= 3 && content.len() <= 200 {
-        for (i, text_line) in text_lines.iter().enumerate() {
-            if i == 0 {
-                lines.push(Line::from(vec![
-                    Span::styled(format!("{}\u{276f} ", INDENT), Style::default().fg(USER_LABEL).add_modifier(Modifier::BOLD)),
-                    Span::styled(text_line.to_string(), Style::default().fg(USER_FG)),
-                ]));
-            } else {
-                lines.push(Line::from(vec![
-                    Span::styled(format!("{}  ", INDENT), Style::default()),
-                    Span::styled(text_line.to_string(), Style::default().fg(USER_FG)),
-                ]));
-            }
-        }
-    } else {
-        let first = text_lines.iter().find(|l| !l.trim().is_empty()).unwrap_or(&text_lines[0]);
-        let summary = if first.chars().count() > 60 {
-            format!("{}...", first.chars().take(57).collect::<String>())
+    // Show all lines - no truncation
+    for (i, text_line) in text_lines.iter().enumerate() {
+        if i == 0 {
+            lines.push(Line::from(vec![
+                Span::styled(format!("{}\u{276f} ", INDENT), Style::default().fg(USER_LABEL).add_modifier(Modifier::BOLD)),
+                Span::styled(text_line.to_string(), Style::default().fg(USER_FG)),
+            ]));
         } else {
-            first.to_string()
-        };
-        lines.push(Line::from(vec![
-            Span::styled(format!("{}\u{276f} ", INDENT), Style::default().fg(USER_LABEL).add_modifier(Modifier::BOLD)),
-            Span::styled(summary, Style::default().fg(USER_FG)),
-            Span::styled(format!("  [{} lines]", text_lines.len()), Style::default().fg(DIM)),
-        ]));
+            lines.push(Line::from(vec![
+                Span::styled(format!("{}  ", INDENT), Style::default()),
+                Span::styled(text_line.to_string(), Style::default().fg(USER_FG)),
+            ]));
+        }
     }
     lines.push(Line::default());
 }
