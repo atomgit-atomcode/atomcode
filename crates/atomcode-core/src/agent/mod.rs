@@ -1783,9 +1783,6 @@ impl AgentLoop {
         }
     }
 
-    /// Smart truncation: applies per-tool strategies to keep the most useful
-    /// parts of tool output while staying within token budget.
-
     /// Log the complete LLM request (messages + tools + metadata) to
     /// `~/.atomcode/logs/YYYY-MM-DD_HH-MM-SS_NNN.json`.
     /// This is fire-and-forget — logging failures are silently ignored.

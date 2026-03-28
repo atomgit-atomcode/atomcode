@@ -198,7 +198,7 @@ fn truncate_read_file(result: &mut ToolResult) {
 }
 
 /// Generic truncation: head + tail, skipping middle.
-pub fn truncate_generic(result: &mut ToolResult, max_lines: usize, head: usize, tail: usize) {
+pub(crate) fn truncate_generic(result: &mut ToolResult, max_lines: usize, head: usize, tail: usize) {
     let lines: Vec<&str> = result.output.lines().collect();
     if lines.len() > max_lines {
         let head_part: String = lines[..head].join("\n");
