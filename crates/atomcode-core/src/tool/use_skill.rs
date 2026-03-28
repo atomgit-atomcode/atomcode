@@ -33,7 +33,7 @@ impl Tool for UseSkillTool {
                 Use this when a task matches a skill's purpose — the skill provides \
                 detailed, reusable instructions that guide how to complete the task. \
                 Available skills are listed in the system prompt under 'Available Skills'. \
-                Returns the expanded skill content for you to follow.",
+                Returns the expanded skill content for you to follow.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {

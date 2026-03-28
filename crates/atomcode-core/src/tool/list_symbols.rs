@@ -21,7 +21,7 @@ impl Tool for ListSymbolsTool {
                 Returns symbol names with line ranges. Use this to understand a file's structure before editing.\n\
                 This is faster and more precise than read_file for understanding file structure.\n\
                 Examples:\n\
-                - {\"file_path\": \"/path/to/main.rs\"} → lists all functions, structs, impls with line numbers",
+                - {\"file_path\": \"/path/to/main.rs\"} → lists all functions, structs, impls with line numbers".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {

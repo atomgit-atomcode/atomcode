@@ -27,7 +27,7 @@ impl Tool for ReadFileTool {
                 - If the path is a directory, returns a listing of its contents instead of an error.\n\
                 - Binary files are detected and reported (not dumped as garbage text).\n\
                 - You can call read_file multiple times in parallel to read several files at once.\n\
-                - NEVER use bash (cat/head/tail/sed) to read files — always use this tool.",
+                - NEVER use bash (cat/head/tail/sed) to read files — always use this tool.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {

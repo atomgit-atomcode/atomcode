@@ -27,7 +27,7 @@ impl Tool for WebFetchTool {
                 HTML is automatically converted to readable text.\n\
                 Examples:\n\
                 - {\"url\": \"https://github.com/user/repo\"}\n\
-                - {\"url\": \"https://docs.rs/reqwest/latest/reqwest/\"}",
+                - {\"url\": \"https://docs.rs/reqwest/latest/reqwest/\"}".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {

@@ -34,7 +34,7 @@ use tokio::sync::{Mutex, RwLock};
 #[derive(Debug, Clone)]
 pub struct ToolDef {
     pub name: &'static str,
-    pub description: &'static str,
+    pub description: String,
     pub parameters: serde_json::Value,
 }
 
@@ -153,6 +153,13 @@ impl ToolContext {
             semantic: Arc::new(Mutex::new(crate::semantic::SemanticSearcher::new())),
         }
     }
+
+    /// Create an isolated copy: same working directory value, independent Arc.
+    /// Used when passing context across Agent boundaries (subagents, tests).
+    pub async fn isolate(&self) -> Self {
+        let wd = self.working_dir.read().await.clone();
+        Self::new(wd)
+    }
 }
 
 #[async_trait]
@@ -190,6 +197,16 @@ impl ToolRegistry {
     pub fn get_arc(&self, name: &str) -> Option<Arc<dyn Tool>> {
         self.tools.get(name).cloned()
     }
+
+    /// Register a tool from an Arc (for building filtered registries from parent).
+    pub fn register_arc(&mut self, name: String, tool: Arc<dyn Tool>) {
+        self.tools.insert(name, tool);
+    }
+
+    /// Iterate over all registered tools.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &Arc<dyn Tool>)> {
+        self.tools.iter().map(|(k, v)| (k.as_str(), v))
+    }
 }
 
 #[cfg(test)]
@@ -203,7 +220,7 @@ mod tests {
         fn definition(&self) -> ToolDef {
             ToolDef {
                 name: "dummy",
-                description: "A dummy tool",
+                description: "A dummy tool".to_string(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {},
@@ -289,6 +306,36 @@ mod tests {
         store.set_override("bash", PermissionLevel::AlwaysAllow);
         let decision = store.check("bash", &ApprovalRequirement::RequireApproval("Destructive".into()));
         assert!(matches!(decision, PermissionDecision::Allow));
+    }
+
+    #[tokio::test]
+    async fn test_tool_context_isolate() {
+        let ctx = ToolContext::new(PathBuf::from("/original"));
+        let isolated = ctx.isolate().await;
+        // Mutating isolated should not affect original
+        *isolated.working_dir.write().await = PathBuf::from("/changed");
+        let original_wd = ctx.working_dir.read().await.clone();
+        assert_eq!(original_wd, PathBuf::from("/original"));
+    }
+
+    #[test]
+    fn test_registry_iter() {
+        let mut reg = ToolRegistry::new();
+        reg.register(Box::new(DummyTool));
+        let items: Vec<_> = reg.iter().collect();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].0, "dummy");
+    }
+
+    #[test]
+    fn test_registry_register_arc() {
+        let mut reg1 = ToolRegistry::new();
+        reg1.register(Box::new(DummyTool));
+        let mut reg2 = ToolRegistry::new();
+        for (name, arc) in reg1.iter() {
+            reg2.register_arc(name.to_string(), arc.clone());
+        }
+        assert!(reg2.get("dummy").is_some());
     }
 
     #[test]
