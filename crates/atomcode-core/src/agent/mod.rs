@@ -1489,91 +1489,6 @@ impl AgentLoop {
         ctx
     }
 
-    /// Analyze the user's task message and the project file tree to suggest
-    /// which files are most likely relevant. This reduces the number of exploratory
-    /// reads the model needs to do.
-    #[allow(dead_code)]
-    fn suggest_files_for_task(&self, task: &str, working_dir: &std::path::Path) -> String {
-        let mut suggestions = Vec::new();
-
-        // Walk the file tree (2 levels) and find files whose names match keywords in the task
-        let task_lower = task.to_lowercase();
-
-        // Collect all files in the project (up to 2 levels deep)
-        let files = collect_project_files(working_dir, 0, 3);
-
-        for file_path in &files {
-            let filename = file_path.file_name()
-                .map(|f| f.to_string_lossy().to_string())
-                .unwrap_or_default()
-                .to_lowercase();
-
-            let rel_path = file_path.strip_prefix(working_dir)
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_else(|_| file_path.to_string_lossy().to_string());
-
-            // Skip noise
-            if filename.starts_with('.') || filename.ends_with(".log")
-                || filename.ends_with(".lock") || filename == "node_modules"
-            {
-                continue;
-            }
-
-            let mut score = 0;
-
-            // Check if filename appears in the task
-            let name_no_ext = filename.split('.').next().unwrap_or(&filename);
-            if task_lower.contains(name_no_ext) && name_no_ext.len() > 2 {
-                score += 10;
-            }
-
-            // Check path components
-            for component in rel_path.split('/') {
-                let comp_lower = component.to_lowercase();
-                if comp_lower.len() > 2 && task_lower.contains(&comp_lower) {
-                    score += 5;
-                }
-            }
-
-            // Keyword heuristics (tech-stack agnostic)
-            let keyword_map: &[(&[&str], &[&str])] = &[
-                (&["接口", "api", "endpoint", "请求", "request", "搜索", "search"],
-                 &["api", "route", "handler", "controller", "main", "app", "server", "search"]),
-                (&["样式", "style", "css", "布局", "layout", "ui", "界面", "design"],
-                 &["css", "style", "layout", "theme", "tailwind"]),
-                (&["配置", "config", "设置", "setting"],
-                 &["config", "setting", "env"]),
-                (&["路由", "router", "route", "导航", "nav"],
-                 &["router", "route", "nav"]),
-                (&["数据库", "database", "db", "model", "schema"],
-                 &["model", "schema", "migration", "db", "database"]),
-            ];
-
-            for (task_keywords, file_keywords) in keyword_map {
-                let task_match = task_keywords.iter().any(|kw| task_lower.contains(kw));
-                let file_match = file_keywords.iter().any(|kw| filename.contains(kw));
-                if task_match && file_match {
-                    score += 8;
-                }
-            }
-
-            if score > 0 {
-                suggestions.push((score, rel_path));
-            }
-        }
-
-        suggestions.sort_by(|a, b| b.0.cmp(&a.0));
-        suggestions.truncate(5);
-
-        if suggestions.is_empty() {
-            return String::new();
-        }
-
-        suggestions.iter()
-            .map(|(_, path)| format!("- {}", path))
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
 
     #[allow(dead_code)]
     fn resolve_args(&self, call: &ToolCall) -> String {
@@ -1945,26 +1860,6 @@ impl AgentLoop {
     }
 }
 
-/// Extract file_path from tool call arguments JSON.
-#[allow(dead_code)]
-fn extract_file_from_args(args: &str) -> Option<String> {
-    serde_json::from_str::<serde_json::Value>(args)
-        .ok()?
-        .get("file_path")?
-        .as_str()
-        .map(|s| s.to_string())
-}
-
-/// Extract command from bash tool call arguments.
-#[allow(dead_code)]
-fn extract_cmd_from_args(args: &str) -> Option<String> {
-    serde_json::from_str::<serde_json::Value>(args)
-        .ok()?
-        .get("command")?
-        .as_str()
-        .map(|s| s.to_string())
-}
-
 fn short_path(path: &str) -> String {
     let parts: Vec<&str> = path.rsplitn(3, '/').collect();
     match parts.len() {
@@ -1972,71 +1867,6 @@ fn short_path(path: &str) -> String {
         2 => format!("{}/{}", parts[1], parts[0]),
         _ => format!(".../{}/{}", parts[1], parts[0]),
     }
-}
-
-use crate::tool::SKIP_DIRS;
-
-/// Collect all file paths in a directory tree up to max_depth.
-#[allow(dead_code)]
-fn collect_project_files(
-    dir: &std::path::Path,
-    depth: usize,
-    max_depth: usize,
-) -> Vec<std::path::PathBuf> {
-    let mut result = Vec::new();
-    if depth > max_depth { return result; }
-
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return result,
-    };
-
-    for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().to_string();
-        if SKIP_DIRS.contains(&name.as_str()) { continue; }
-
-        let path = entry.path();
-        if path.is_dir() {
-            result.extend(collect_project_files(&path, depth + 1, max_depth));
-        } else {
-            result.push(path);
-        }
-    }
-    result
-}
-
-/// Detect if a streaming text buffer is repeating earlier content.
-/// Returns Some(byte_position) where the repeat starts, None if no repeat detected.
-#[allow(dead_code)]
-fn detect_streaming_repeat(buf: &str) -> Option<usize> {
-    let lines: Vec<&str> = buf.lines().collect();
-    if lines.len() < 6 { return None; }
-
-    let half = lines.len() / 2;
-
-    // Check ANY distinctive line (>= 15 chars) that appears in both halves.
-    // Previous version only checked markdown headings — too narrow.
-    for i in 0..half {
-        let line = lines[i].trim();
-        if line.len() < 15 { continue; }
-
-        for j in half..lines.len() {
-            if lines[j].trim() == line {
-                // Verify: at least 2 of the next 4 lines also match
-                let match_count = lines[i..].iter().zip(lines[j..].iter())
-                    .take(4)
-                    .filter(|(a, b)| a.trim() == b.trim())
-                    .count();
-                if match_count >= 2 {
-                    let byte_pos: usize = lines[..j].iter()
-                        .map(|l| l.len() + 1)
-                        .sum();
-                    return Some(byte_pos.min(buf.len()));
-                }
-            }
-        }
-    }
-    None
 }
 
 
