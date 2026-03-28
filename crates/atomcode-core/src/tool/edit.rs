@@ -70,7 +70,7 @@ impl Tool for EditFileTool {
                 - symbol: scope the edit to a specific function/class (tree-sitter). Reduces ambiguity.\n\
                 Behavior:\n\
                 - If old_string is not found, auto-tries fuzzy matching (whitespace-normalized).\n\
-                - NEVER use write_file to modify existing files. edit_file prevents accidental code deletion.",
+                - NEVER use write_file to modify existing files. edit_file prevents accidental code deletion.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {

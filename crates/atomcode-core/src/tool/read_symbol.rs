@@ -23,7 +23,7 @@ impl Tool for ReadSymbolTool {
                 Use list_symbols first to discover available symbols, then read_symbol to get the code.\n\
                 Examples:\n\
                 - {\"file_path\": \"/path/to/main.rs\", \"symbol\": \"process_data\"}\n\
-                - {\"file_path\": \"/path/to/app.py\", \"symbol\": \"UserService\"}",
+                - {\"file_path\": \"/path/to/app.py\", \"symbol\": \"UserService\"}".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {

@@ -4,11 +4,8 @@
 
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::pin::Pin;
-use std::future::Future;
 use std::time::{Duration, Instant};
 
-use futures::StreamExt;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -16,13 +13,14 @@ use crate::config::Config;
 use crate::conversation::Conversation;
 use crate::provider::LlmProvider;
 use crate::skill::SkillRegistry;
-use crate::stream::StreamEvent;
 use crate::tool::{
-    PermissionDecision, PermissionStore, ToolCall, ToolCallBuffer, ToolContext, ToolRegistry,
+    PermissionDecision, PermissionStore, ToolCall, ToolContext, ToolRegistry,
     ToolResult,
 };
 use crate::tool::result_store::ToolResultStore;
 use crate::tool::use_skill::UseSkillTool;
+use crate::turn::event::{TurnEvent, TurnResult};
+use crate::turn::runner::TurnRunner;
 
 /// Commands sent FROM the UI TO the agent loop.
 #[derive(Debug)]
@@ -110,10 +108,10 @@ pub enum AgentPhase {
 pub struct AgentLoop {
     // Core components
     pub conversation: Conversation,
-    pub tool_registry: ToolRegistry,
-    pub provider: Box<dyn LlmProvider>,
-    pub tool_context: ToolContext,
-    pub permission_store: PermissionStore,
+    pub tool_registry: std::sync::Arc<ToolRegistry>,
+    /// TurnRunner owns the provider, tools, and context.
+    pub turn_runner: TurnRunner,
+    pub permission_store: std::sync::Arc<std::sync::RwLock<PermissionStore>>,
     pub config: Config,
 
     // Execution state
@@ -126,9 +124,13 @@ pub struct AgentLoop {
     tool_call_count: usize,
     retry_count: usize,
 
-    // Pending tool calls from multi-tool LLM responses
-    pending_tool_calls: Vec<ToolCall>,
-    pending_approval: Option<ToolCall>,
+    // Approval channel endpoints for InteractivePermissionDecider
+    /// Receives approval requests from InteractivePermissionDecider
+    approval_req_rx: mpsc::UnboundedReceiver<crate::turn::permission::ApprovalRequest>,
+    /// Sends approval decisions back to InteractivePermissionDecider
+    approval_resp_tx: mpsc::UnboundedSender<PermissionDecision>,
+    /// Last approval request (for ApproveToolAlways — need to know which tool)
+    last_approval_request: Option<crate::turn::permission::ApprovalRequest>,
 
     // Cancellation token for the current turn
     cancel_token: CancellationToken,
@@ -227,12 +229,34 @@ impl AgentLoop {
         let skill_registry = std::sync::Arc::new(std::sync::RwLock::new(registry));
         tool_registry.register(Box::new(UseSkillTool { registry: skill_registry.clone() }));
 
+        // Build approval channels for interactive permission flow
+        let (approval_req_tx, approval_req_rx) = mpsc::unbounded_channel();
+        let (approval_resp_tx, approval_resp_rx) = mpsc::unbounded_channel();
+
+        let permission_store = std::sync::Arc::new(std::sync::RwLock::new(PermissionStore::new()));
+
+        let interactive_permission = Box::new(
+            crate::turn::permission::InteractivePermissionDecider::new(
+                approval_req_tx, approval_resp_rx, permission_store.clone(),
+            )
+        );
+
+        // Share tool registry between AgentLoop and TurnRunner via Arc.
+        let shared_tools = std::sync::Arc::new(tool_registry);
+
+        let turn_runner = TurnRunner {
+            provider,
+            tools: shared_tools.clone(),
+            context: tool_context.clone(),
+            config: config.clone(),
+            permission: interactive_permission,
+        };
+
         let agent = Self {
             conversation,
-            tool_registry,
-            provider,
-            tool_context,
-            permission_store: PermissionStore::new(),
+            tool_registry: shared_tools,
+            turn_runner,
+            permission_store,
             config,
             phase: AgentPhase::Idle,
             turn_tokens: 0,
@@ -240,8 +264,9 @@ impl AgentLoop {
             turn_start: None,
             tool_call_count: 0,
             retry_count: 0,
-            pending_tool_calls: Vec::new(),
-            pending_approval: None,
+            approval_req_rx,
+            approval_resp_tx,
+            last_approval_request: None,
             cancel_token: CancellationToken::new(),
             project_context_cache: None,
             context_included_files: HashSet::new(),
@@ -293,30 +318,16 @@ impl AgentLoop {
                     self.cancel_token.cancel();
                     self.cancel_token = CancellationToken::new();
                     self.phase = AgentPhase::Idle;
-                    self.pending_tool_calls.clear();
-                    self.pending_approval = None;
                     let _ = self.event_tx.send(AgentEvent::PhaseChange(AgentPhase::Idle));
                 }
                 AgentCommand::ApproveTool => {
-                    if let Some(call) = self.pending_approval.take() {
-                        self.execute_tool(call).await;
-                    }
+                    // Approval handled inside run_turn_loop via channels
                 }
                 AgentCommand::ApproveToolAlways => {
-                    if let Some(call) = self.pending_approval.take() {
-                        self.permission_store.grant_session(&call.name);
-                        self.execute_tool(call).await;
-                    }
+                    // Approval handled inside run_turn_loop via channels
                 }
                 AgentCommand::DenyTool => {
-                    if let Some(call) = self.pending_approval.take() {
-                        let result = ToolResult {
-                            call_id: call.id.clone(),
-                            output: "Denied by user".to_string(),
-                            success: false,
-                        };
-                        self.handle_tool_result(result).await;
-                    }
+                    // Denial handled inside run_turn_loop via channels
                 }
                 AgentCommand::SwitchProvider(provider_name) => {
                     // Reload config from file first (in case new providers were added via /login or /provider)
@@ -339,7 +350,8 @@ impl AgentLoop {
                         match crate::provider::create_provider(provider_config) {
                             Ok(new_provider) => {
                                 let model_name = new_provider.model_name().to_string();
-                                self.provider = new_provider;
+                                self.turn_runner.provider = new_provider;
+                                self.turn_runner.config = self.config.clone();
                                 let _ = self.event_tx.send(AgentEvent::TextDelta(
                                     format!("**Switched to: {} / {}**\n\n", provider_name, model_name)
                                 ));
@@ -372,7 +384,8 @@ impl AgentLoop {
                     if let Some(provider_config) = self.config.providers.get(&new_provider_name) {
                         match crate::provider::create_provider(provider_config) {
                             Ok(new_provider) => {
-                                self.provider = new_provider;
+                                self.turn_runner.provider = new_provider;
+                                self.turn_runner.config = self.config.clone();
                             }
                             Err(e) => {
                                 let _ = self.event_tx.send(AgentEvent::TextDelta(
@@ -450,7 +463,7 @@ impl AgentLoop {
             .event_tx
             .send(AgentEvent::PhaseChange(AgentPhase::Thinking));
 
-        self.call_llm().await;
+        self.run_turn_loop().await;
     }
 
     /// Detect if a task is complex enough to benefit from a planning phase.
@@ -502,7 +515,7 @@ impl AgentLoop {
             return content.to_string();
         }
 
-        let wd = self.tool_context.working_dir.try_read()
+        let wd: PathBuf = self.turn_runner.context.working_dir.try_read()
             .map(|g| g.clone())
             .unwrap_or_default();
 
@@ -560,7 +573,7 @@ impl AgentLoop {
         // This gives the model the actual broken code so it can edit directly in Turn 1.
         let diag_text = diagnostics.join("\n");
         let mut extracted_code = Vec::new();
-        let mut searcher = self.tool_context.semantic.lock().await;
+        let mut searcher = self.turn_runner.context.semantic.lock().await;
 
         // Match patterns like "FileName.java:45" or "file.py:123" or "file.rs:45"
         let file_line_re = regex::Regex::new(r"(\w+\.\w+):(\d+)").unwrap_or_else(|_| regex::Regex::new(".^").unwrap());
@@ -629,1431 +642,498 @@ impl AgentLoop {
         walk(wd, filename, 0)
     }
 
-    /// Core agent turn: calls the LLM, processes the stream, and handles tool
-    /// calls or finishes the turn. Boxed to allow mutual recursion with
-    /// execute_tool / handle_tool_result / process_next_tool_call.
-    fn call_llm(&mut self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
-        Box::pin(async move {
+    /// Multi-turn execution loop using TurnRunner.
+    /// Each iteration calls TurnRunner.run() for one LLM turn, then applies
+    /// discipline (reminders, step limits) and decides whether to continue.
+    async fn run_turn_loop(&mut self) {
+        loop {
             // Inject any pending user input appended during streaming.
             if let Some(input) = self.pending_input.take() {
                 self.conversation.add_user_message(&format!("[Additional context from user]: {}", input));
             }
-            let system_prompt = self.build_system_prompt();
-            let context_window = self
-                .config
-                .providers
-                .get(&self.config.default_provider)
-                .map(|p| p.context_window)
-                .unwrap_or(16000);
-            let (mut messages, ctx_stats) = self
-                .conversation
-                .to_provider_messages_budgeted(&system_prompt, context_window);
 
-            // Inflate ToolResultRef messages: recent ones get full content from disk,
-            // older ones keep their summary (already compact from budgeted windowing).
-            self.inflate_recent_refs(&mut messages);
-
-            // Working Set: inject tree-sitter skeletons of all files touched this session.
-            // This replaces stale conversation content with CURRENT file state from disk.
-            // Budget: max 6K tokens (~1500 chars per file × ~4 files).
-            if !self.session_files.is_empty() {
-                let mut working_set = String::from(
-                    "[FILES IN THIS SESSION — current structure from disk. Use start_line/end_line to edit.]\n\n"
-                );
-                let mut ws_budget = 6000usize; // chars budget
-                let mut searcher = self.tool_context.semantic.lock().await;
-
-                // Sort by most recently added (HashMap doesn't preserve order, but that's OK)
-                let files: Vec<(String, PathBuf)> = self.session_files.iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect();
-
-                for (short, full_path) in &files {
-                    if ws_budget < 200 { break; }
-                    if !full_path.exists() { continue; }
-
-                    let source = match std::fs::read_to_string(full_path) {
-                        Ok(s) => s,
-                        Err(_) => continue,
-                    };
-                    let line_count = source.lines().count();
-                    if line_count == 0 { continue; }
-
-                    if line_count <= 80 {
-                        // Small file: include full content
-                        let entry = format!("=== {} ({} lines, full) ===\n{}\n\n", short, line_count, source);
-                        if entry.len() <= ws_budget {
-                            ws_budget -= entry.len();
-                            working_set.push_str(&entry);
-                        }
-                    } else {
-                        // Large file: tree-sitter skeleton, with fallback to line-based scan
-                        let source_lines: Vec<&str> = source.lines().collect();
-                        let symbols = searcher.list_symbols(full_path);
-                        let mut skel = format!("=== {} ({} lines) ===\n", short, line_count);
-
-                        if let Some(ref syms) = symbols {
-                            if !syms.is_empty() {
-                                for sym in syms {
-                                    let sig = source_lines.get(sym.start_line.saturating_sub(1))
-                                        .map(|l| l.trim())
-                                        .unwrap_or(&sym.name);
-                                    let sig_short = if sig.chars().count() > 60 {
-                                        format!("{}...", sig.chars().take(57).collect::<String>())
-                                    } else {
-                                        sig.to_string()
-                                    };
-                                    skel.push_str(&format!("{:>4}| {}  (L{}-{})\n",
-                                        sym.start_line, sig_short, sym.start_line, sym.end_line));
-                                }
-                            }
-                        }
-
-                        // Fallback: if tree-sitter produced nothing, use first+last 5 lines
-                        if skel.lines().count() <= 2 {
-                            for (i, line) in source_lines.iter().take(5).enumerate() {
-                                skel.push_str(&format!("{:>4}| {}\n", i + 1, line));
-                            }
-                            if line_count > 10 {
-                                skel.push_str(&format!("     ... ({} lines)\n", line_count - 10));
-                                for i in (line_count - 5)..line_count {
-                                    skel.push_str(&format!("{:>4}| {}\n", i + 1, source_lines[i]));
-                                }
-                            }
-                        }
-
-                        skel.push('\n');
-                        if skel.len() <= ws_budget {
-                            ws_budget -= skel.len();
-                            working_set.push_str(&skel);
-                        }
-                    }
-                }
-                drop(searcher);
-
-                // Always inject if we have any files
-                if self.session_files.len() > 0 {
-                    // Find safe insertion point: before the last user message,
-                    // NOT between tool_call and tool_result pairs.
-                    let mut insert_pos = messages.len();
-                    for i in (0..messages.len()).rev() {
-                        match &messages[i].content {
-                            crate::conversation::message::MessageContent::Text(_)
-                                if matches!(messages[i].role, crate::conversation::message::Role::User) => {
-                                insert_pos = i;
-                                break;
-                            }
-                            _ => {}
-                        }
-                    }
-                    messages.insert(insert_pos, crate::conversation::message::Message::new(
-                        crate::conversation::message::Role::System,
-                        working_set,
-                    ));
-                }
-            }
-
-            // Emit context stats for datalog (not displayed in UI)
-            let ws_tokens: usize = messages.iter()
-                .filter(|m| matches!(m.role, crate::conversation::message::Role::System) && m.text().map_or(false, |t| t.contains("FILES IN THIS SESSION")))
-                .map(|m| m.estimate_tokens())
-                .sum();
-            let _ = self.event_tx.send(AgentEvent::ContextStats {
-                system_tokens: ctx_stats.system_tokens,
-                hot_tokens: ctx_stats.hot_tokens,
-                cold_tokens: ctx_stats.cold_tokens,
-                working_set_tokens: ws_tokens,
-                total_messages: messages.len(),
-            });
-
-            let tool_defs = self.tool_registry.get_definitions();
-
-            // Planning phase: inject a planning instruction before the first LLM call.
-            // Tools are still available so the model uses proper function calling format.
-            // The model may output plan text + tool calls together — that's fine.
+            // Planning phase: inject instruction to plan before acting
             if self.planning_phase {
-                self.planning_phase = false;
-                messages.push(crate::conversation::message::Message::new(
-                    crate::conversation::message::Role::System,
-                    "This is a complex task. FIRST output a brief implementation plan (under 15 lines):\n\
-                     - List files to create/modify and what changes each needs\n\
-                     - Note the order (dependencies)\n\
-                     Then start executing the plan."
-                ));
+                self.conversation.add_user_message(
+                    "[System: This is a complex task. Before using any tools, first output a brief plan \
+                     (3-5 steps) of what you'll do. Then proceed to execute it.]"
+                );
+                self.planning_phase = false; // Only inject once
             }
 
-            // Log the complete request to disk for debugging/analysis.
-            Self::log_llm_request(
-                &messages,
-                &tool_defs,
-                self.provider.model_name(),
-                context_window,
-                self.tool_call_count,
-            );
+            let system_prompt = self.build_system_prompt();
+            let cancel = self.cancel_token.clone();
 
-            let stream_result = self.provider.chat_stream(&messages, Some(&tool_defs));
+            // Move conversation out to avoid borrow conflicts with self in select!
+            let mut conv = std::mem::take(&mut self.conversation);
 
-            let mut stream = match stream_result {
-                Ok(s) => s,
-                Err(e) => {
-                    let _ = self.event_tx.send(AgentEvent::Error(e.to_string()));
+            // Log LLM request to ~/.atomcode/logs/ (caller responsibility, not TurnRunner's)
+            {
+                let context_window = self.config
+                    .providers
+                    .get(&self.config.default_provider)
+                    .map(|p| p.context_window)
+                    .unwrap_or(16000);
+                let (msgs, _) = conv.to_provider_messages_budgeted(&system_prompt, context_window);
+                let tool_defs = self.turn_runner.tools.get_definitions();
+                Self::log_llm_request(
+                    &msgs,
+                    &tool_defs,
+                    self.turn_runner.provider.model_name(),
+                    context_window,
+                    self.tool_call_count,
+                );
+            }
+
+            // Run the turn in a scoped block so all borrows of self.turn_runner
+            // end before we use self.conversation again.
+            let (result, mut turn_rx) = {
+                let (turn_tx, mut turn_rx) = mpsc::unbounded_channel::<TurnEvent>();
+
+                // Destructure self to get split borrows — the borrow checker needs to see
+                // that turn_runner and the other fields are disjoint borrows.
+                let runner = &self.turn_runner;
+                let cmd_rx = &mut self.cmd_rx;
+                let approval_req_rx = &mut self.approval_req_rx;
+                let event_tx = &self.event_tx;
+                let approval_resp_tx = &self.approval_resp_tx;
+                let permission_store = &self.permission_store;
+                let cancel_token = &mut self.cancel_token;
+                let last_approval_request = &mut self.last_approval_request;
+                let pending_input = &mut self.pending_input;
+                let phase = &mut self.phase;
+                let model_produced_text = &mut self.model_produced_text;
+                let current_tool_name = &mut self.current_tool_name;
+                let files_edited_this_turn = &mut self.files_edited_this_turn;
+                let consecutive_reads = &mut self.consecutive_reads;
+                let session_files = &mut self.session_files;
+
+                // Run TurnRunner concurrently with command processing
+                let turn_fut = runner.run(&mut conv, &system_prompt, &turn_tx, cancel);
+                tokio::pin!(turn_fut);
+
+                let result = loop {
+                    tokio::select! {
+                        biased;
+
+                        result = &mut turn_fut => break result,
+
+                        Some(event) = turn_rx.recv() => {
+                            // Inline forward_turn_event to avoid borrowing self
+                            match event {
+                                TurnEvent::TextDelta(text) => {
+                                    *model_produced_text = true;
+                                    let _ = event_tx.send(AgentEvent::TextDelta(text));
+                                }
+                                TurnEvent::ToolCallStarted { ref name, ref arguments } => {
+                                    *current_tool_name = name.clone();
+                                    *phase = AgentPhase::CallingTool(name.clone());
+                                    let _ = event_tx.send(AgentEvent::PhaseChange(phase.clone()));
+
+                                    // Track files for Working Set
+                                    if matches!(name.as_str(), "read_file" | "edit_file" | "write_file" | "search_replace" | "glob" | "grep") {
+                                        if let Ok(args) = serde_json::from_str::<serde_json::Value>(arguments) {
+                                            // Try file_path first, then path (glob/grep use path)
+                                            let fp = args.get("file_path").and_then(|v| v.as_str())
+                                                .or_else(|| args.get("path").and_then(|v| v.as_str()));
+                                            if let Some(fp) = fp {
+                                                let short = std::path::Path::new(fp)
+                                                    .file_name()
+                                                    .map(|n| n.to_string_lossy().to_string())
+                                                    .unwrap_or_else(|| fp.to_string());
+                                                session_files.insert(short, std::path::PathBuf::from(fp));
+                                            }
+                                        }
+                                    }
+
+                                    let _ = event_tx.send(AgentEvent::ToolCallStarted { name: name.clone(), arguments: arguments.clone() });
+                                }
+                                TurnEvent::ToolCallResult { name, output, success, duration } => {
+                                    // Track files for discipline
+                                    if let Some(pos) = output.find("Edited ") {
+                                        let rest = &output[pos + 7..];
+                                        if let Some(end) = rest.find(|c: char| c == '\n' || c == '.') {
+                                            let file = short_path(&rest[..end]);
+                                            if !files_edited_this_turn.contains(&file) {
+                                                files_edited_this_turn.push(file);
+                                            }
+                                        }
+                                    }
+                                    if let Some(pos) = output.find("Wrote ") {
+                                        let rest = &output[pos + 6..];
+                                        if let Some(end) = rest.find(|c: char| c == '\n' || c == ' ') {
+                                            let file = short_path(&rest[..end]);
+                                            if !files_edited_this_turn.contains(&file) {
+                                                files_edited_this_turn.push(file);
+                                            }
+                                        }
+                                    }
+                                    if matches!(name.as_str(), "read_file" | "list_directory" | "glob" | "grep") {
+                                        *consecutive_reads += 1;
+                                    } else if matches!(name.as_str(), "edit_file" | "write_file") {
+                                        *consecutive_reads = 0;
+                                    }
+                                    let _ = event_tx.send(AgentEvent::ToolCallResult {
+                                        name, output, success, duration,
+                                    });
+                                }
+                                TurnEvent::TokenUsage { prompt_tokens, completion_tokens, total_tokens: _ } => {
+                                    let _ = event_tx.send(AgentEvent::TokenUsage(
+                                        crate::stream::TokenUsage {
+                                            prompt_tokens,
+                                            completion_tokens,
+                                        }
+                                    ));
+                                }
+                                TurnEvent::Error(e) => {
+                                    let _ = event_tx.send(AgentEvent::Error(e));
+                                }
+                            }
+                        }
+
+                        Some(req) = approval_req_rx.recv() => {
+                            // Forward approval request to TUI
+                            let _ = event_tx.send(AgentEvent::ApprovalNeeded {
+                                tool_name: req.call.name.clone(),
+                                reason: req.reason.clone(),
+                                call: req.call.clone(),
+                            });
+                            *phase = AgentPhase::WaitingApproval;
+                            let _ = event_tx.send(AgentEvent::PhaseChange(AgentPhase::WaitingApproval));
+                            *last_approval_request = Some(req);
+                        }
+
+                        Some(cmd) = cmd_rx.recv() => {
+                            match cmd {
+                                AgentCommand::Cancel => {
+                                    cancel_token.cancel();
+                                    *cancel_token = CancellationToken::new();
+                                }
+                                AgentCommand::ApproveTool => {
+                                    *phase = AgentPhase::Thinking;
+                                    let _ = event_tx.send(AgentEvent::PhaseChange(AgentPhase::Thinking));
+                                    let _ = approval_resp_tx.send(PermissionDecision::Allow);
+                                }
+                                AgentCommand::ApproveToolAlways => {
+                                    if let Some(ref req) = last_approval_request {
+                                        if let Ok(mut store) = permission_store.write() {
+                                            store.grant_session(&req.call.name);
+                                        }
+                                    }
+                                    *phase = AgentPhase::Thinking;
+                                    let _ = event_tx.send(AgentEvent::PhaseChange(AgentPhase::Thinking));
+                                    let _ = approval_resp_tx.send(PermissionDecision::Allow);
+                                }
+                                AgentCommand::DenyTool => {
+                                    *phase = AgentPhase::Thinking;
+                                    let _ = event_tx.send(AgentEvent::PhaseChange(AgentPhase::Thinking));
+                                    let _ = approval_resp_tx.send(PermissionDecision::Deny);
+                                }
+                                AgentCommand::Shutdown => {
+                                    cancel_token.cancel();
+                                }
+                                AgentCommand::AppendInput(text) => {
+                                    if let Some(ref mut existing) = pending_input {
+                                        existing.push('\n');
+                                        existing.push_str(&text);
+                                    } else {
+                                        *pending_input = Some(text);
+                                    }
+                                }
+                                _ => {} // Other commands ignored during turn
+                            }
+                        }
+                    }
+                };
+
+                // turn_tx drops here (owned by this block), turn_fut also drops
+                (result, turn_rx)
+            };
+            // All borrows of self.turn_runner are now released.
+
+            // Restore conversation
+            self.conversation = conv;
+
+            // Drain remaining events
+            while let Ok(event) = turn_rx.try_recv() {
+                self.forward_turn_event(event);
+            }
+
+            // Handle result
+            match result {
+                TurnResult::Responded { text: _, tokens } => {
+                    self.turn_tokens += tokens;
+                    self.total_tokens += tokens;
                     self.finish_turn();
                     return;
                 }
-            };
-
-            let cancel = self.cancel_token.clone();
-            let mut tool_calls_buf: Vec<ToolCall> = Vec::new();
-
-            loop {
-                tokio::select! {
-                    _ = cancel.cancelled() => {
-                        self.conversation.finalize_stream();
+                TurnResult::UsedTools { tool_count, tokens, .. } => {
+                    self.turn_tokens += tokens;
+                    self.total_tokens += tokens;
+                    self.tool_call_count += tool_count;
+                    // Post-process: truncate large outputs + externalize to disk
+                    self.post_process_tool_results(tool_count);
+                    // Apply discipline: inject reminders, check step limits
+                    self.apply_post_turn_discipline();
+                    if self.check_step_limit() {
                         self.finish_turn();
                         return;
                     }
-                    cmd = self.cmd_rx.recv() => {
-                        match cmd {
-                            Some(AgentCommand::Cancel) | None => {
-                                self.cancel_token.cancel();
-                                self.conversation.finalize_stream();
-                                self.finish_turn();
-                                return;
-                            }
-                            Some(AgentCommand::Shutdown) => {
-                                self.conversation.finalize_stream();
-                                return;
-                            }
-                            _ => {
-                                // Non-cancel commands (ApproveTool, DenyTool, etc.)
-                                // during streaming — skip this select iteration,
-                                // the command stays consumed but doesn't break the loop.
-                                // These shouldn't arrive here in normal flow.
-                            }
-                        }
-                    }
-                    event = stream.next() => {
-                        match event {
-                            Some(Ok(StreamEvent::Delta(text))) => {
-                                // Strip model-internal tags (DeepSeek <think>, QwQ reasoning, etc.)
-                                let text = strip_model_tags(&text);
-                                if text.is_empty() { continue; }
-
-                                self.model_produced_text = true;
-                                self.conversation.push_delta(&text);
-                                let _ = self.event_tx.send(AgentEvent::TextDelta(text));
-                                // Real-time repeat detection: if the buffer is repeating
-                                // earlier content, truncate and terminate the stream immediately.
-                                // All subsequent tokens would be waste — stop the model now.
-                                if let Some(ref buf) = self.conversation.stream_buffer {
-                                    if buf.len() > 200 {
-                                        if let Some(cut) = detect_streaming_repeat(buf) {
-                                            let truncated = buf[..cut].trim_end().to_string();
-                                            self.conversation.stream_buffer = Some(truncated);
-                                            // Kill the stream — drop it by breaking out of the loop.
-                                            // Then finalize as if Done was received.
-                                            self.conversation.finalize_stream();
-                                            self.finish_turn();
-                                            return;
-                                        }
-                                    }
-                                }
-                            }
-                            Some(Ok(StreamEvent::ToolCallStart { id, name })) => {
-                                // Reset: if the model generated text before tool calls (plan text),
-                                // it doesn't count as a final summary. Only text AFTER all tools = summary.
-                                self.model_produced_text = false;
-                                self.conversation.tool_call_buffer = Some(ToolCallBuffer {
-                                    id,
-                                    name: name.clone(),
-                                    arguments: String::new(),
-                                });
-                                self.phase = AgentPhase::CallingTool(name.clone());
-                                let _ = self.event_tx.send(AgentEvent::PhaseChange(
-                                    AgentPhase::CallingTool(name),
-                                ));
-                            }
-                            Some(Ok(StreamEvent::ToolCallDelta(args))) => {
-                                if let Some(ref mut buf) = self.conversation.tool_call_buffer {
-                                    buf.arguments.push_str(&args);
-                                    let partial = &buf.arguments;
-                                    let arg_size = partial.len();
-
-                                    // Extract file_path or command for display
-                                    let target = if let Some(fp_start) = partial.find("\"file_path\"") {
-                                        if let Some(val_start) = partial[fp_start..].find(":\"").or_else(|| partial[fp_start..].find(": \"")) {
-                                            let s = fp_start + val_start;
-                                            let after_colon = partial[s..].find('"').map(|p| s + p + 1);
-                                            if let Some(start) = after_colon {
-                                                if let Some(end) = partial[start..].find('"') {
-                                                    let fp = &partial[start..start + end];
-                                                    Some(std::path::Path::new(fp)
-                                                        .file_name()
-                                                        .map(|n| n.to_string_lossy().to_string())
-                                                        .unwrap_or_else(|| fp.to_string()))
-                                                } else { None }
-                                            } else { None }
-                                        } else { None }
-                                    } else if let Some(cmd_start) = partial.find("\"command\"") {
-                                        if let Some(val_start) = partial[cmd_start..].find(":\"").or_else(|| partial[cmd_start..].find(": \"")) {
-                                            let s = cmd_start + val_start;
-                                            let after_colon = partial[s..].find('"').map(|p| s + p + 1);
-                                            if let Some(start) = after_colon {
-                                                let end = partial[start..].find('"').unwrap_or(partial.len() - start).min(50);
-                                                Some(partial[start..start + end].to_string())
-                                            } else { None }
-                                        } else { None }
-                                    } else { None };
-
-                                    // Always update label with size — shows live progress during large writes
-                                    let size_str = if arg_size > 1024 {
-                                        format!(" ({:.1}KB)", arg_size as f64 / 1024.0)
-                                    } else if arg_size > 100 {
-                                        format!(" ({}B)", arg_size)
-                                    } else {
-                                        String::new()
-                                    };
-                                    let label = if let Some(ref t) = target {
-                                        format!("{}: {}{}", buf.name, t, size_str)
-                                    } else if !size_str.is_empty() {
-                                        format!("{}{}", buf.name, size_str)
-                                    } else {
-                                        buf.name.clone()
-                                    };
-                                    let _ = self.event_tx.send(AgentEvent::PhaseChange(
-                                        AgentPhase::CallingTool(label),
-                                    ));
-                                }
-                            }
-                            Some(Ok(StreamEvent::ToolCallDone(mut call))) => {
-                                self.conversation.tool_call_buffer = None;
-                                // Repair malformed JSON arguments from weak models
-                                if serde_json::from_str::<serde_json::Value>(&call.arguments).is_err() {
-                                    call.arguments = repair_json(&call.arguments);
-                                }
-                                tool_calls_buf.push(call);
-                            }
-                            Some(Ok(StreamEvent::Usage(usage))) => {
-                                self.turn_tokens += usage.completion_tokens;
-                                self.total_tokens += usage.completion_tokens;
-                                let _ = self.event_tx.send(AgentEvent::TokenUsage(usage));
-                            }
-                            Some(Ok(StreamEvent::Done)) => {
-                                let had_output = !tool_calls_buf.is_empty()
-                                    || self.model_produced_text
-                                    || self.conversation.stream_buffer.as_ref().map_or(false, |b| !b.is_empty());
-
-                                self.conversation.finalize_stream();
-
-                                // Empty response detection: model returned Done with zero output.
-                                // Retry up to 2 times — likely a transient API/provider issue.
-                                if !had_output && self.retry_count < 2 {
-                                    self.retry_count += 1;
-                                    let _ = self.event_tx.send(AgentEvent::TextDelta(
-                                        format!("\n[Empty response — retrying ({}/2)...]\n", self.retry_count)
-                                    ));
-                                    tokio::time::sleep(Duration::from_secs(2)).await;
-                                    self.call_llm().await;
-                                    return;
-                                }
-
-                                if !tool_calls_buf.is_empty() {
-                                    self.conversation
-                                        .finalize_stream_with_tool_calls(&tool_calls_buf);
-                                    self.pending_tool_calls = tool_calls_buf;
-                                    self.dispatch_pending_tools().await;
-                                } else {
-                                    if !self.verify_injected && self.should_verify() {
-                                        self.verify_injected = true;
-                                        self.inject_verify_prompt();
-                                        self.call_llm().await;
-                                    } else {
-                                        self.finish_turn();
-                                    }
-                                }
-                                return;
-                            }
-                            Some(Ok(StreamEvent::Error(e))) => {
-                                let is_messages_illegal = e.contains("illegal") || e.contains("messages");
-                                let is_rate_limited = e.contains("429") || e.contains("rate") || e.contains("Too Many");
-                                let is_auth_error = e.contains("401 ") || e.contains("403 ");
-
-                                if is_messages_illegal && self.retry_count == 0 {
-                                    // "messages illegal" — auto-recover by trimming conversation
-                                    self.retry_count += 1;
-                                    let len = self.conversation.messages.len();
-                                    if len > 4 {
-                                        self.conversation.messages.truncate(len - 4);
-                                    }
-                                    let _ = self.event_tx.send(AgentEvent::TextDelta(
-                                        "\n[Recovering from API error — retrying with reduced context...]\n".to_string()
-                                    ));
-                                    self.call_llm().await;
-                                    return;
-                                } else if is_rate_limited && self.retry_count < 5 {
-                                    // 429 rate limit — back off and retry (up to 5 times).
-                                    self.retry_count += 1;
-                                    let wait = (self.retry_count as u64 * 3).min(30);
-                                    let _ = self.event_tx.send(AgentEvent::TextDelta(
-                                        format!("\n[Rate limited — retrying in {}s...]\n", wait)
-                                    ));
-                                    tokio::time::sleep(Duration::from_secs(wait)).await;
-                                    self.call_llm().await;
-                                    return;
-                                } else if is_auth_error {
-                                    // 401/403 Auth error — truly fatal, no retry.
-                                    let _ = self.event_tx.send(AgentEvent::Error(e));
-                                    self.finish_turn();
-                                    return;
-                                } else if self.retry_count < 3 {
-                                    // All other errors (400, network, timeout, provider errors)
-                                    // — retry up to 3 times with backoff.
-                                    // OpenRouter 400 is often upstream provider failure, not bad request.
-                                    self.retry_count += 1;
-                                    let wait = (self.retry_count as u64 * 3).min(15);
-                                    let _ = self.event_tx.send(AgentEvent::TextDelta(
-                                        format!("\n[API error — retrying in {}s ({}/3)...]\n", wait, self.retry_count)
-                                    ));
-                                    tokio::time::sleep(Duration::from_secs(wait)).await;
-                                    self.call_llm().await;
-                                    return;
-                                } else {
-                                    // Exhausted retries — give up.
-                                    let _ = self.event_tx.send(AgentEvent::Error(e));
-                                    self.finish_turn();
-                                    return;
-                                }
-                            }
-                            Some(Err(e)) => {
-                                let _ = self.event_tx.send(AgentEvent::Error(e.to_string()));
-                                self.finish_turn();
-                                return;
-                            }
-                            None => {
-                                self.conversation.finalize_stream();
-                                self.finish_turn();
-                                return;
-                            }
-                        }
-                    }
+                    // Continue to next turn
+                    self.phase = AgentPhase::Thinking;
+                    let _ = self.event_tx.send(AgentEvent::PhaseChange(AgentPhase::Thinking));
+                    continue;
                 }
-            }
-        })
-    }
+                TurnResult::Failed(e) => {
+                    // Retry logic for transient errors
+                    let is_rate_limited = e.contains("429") || e.contains("rate") || e.contains("Too Many");
+                    let is_auth_error = e.contains("401 ") || e.contains("403 ");
+                    let is_messages_illegal = e.contains("illegal") || e.contains("messages");
 
-    /// Decide whether to execute pending tool calls in parallel or sequentially.
-    /// Parallel execution is used when there are 2+ calls AND all are auto-approved.
-    fn dispatch_pending_tools(&mut self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
-        Box::pin(async move {
-            if self.pending_tool_calls.len() <= 1 {
-                self.process_next_tool_call().await;
-                return;
-            }
-
-            // Check if ALL pending calls can be auto-approved
-            let all_auto = self.pending_tool_calls.iter().all(|call| {
-                self.tool_registry.get(&call.name)
-                    .map(|tool| {
-                        let approval = tool.approval(&call.arguments);
-                        matches!(self.permission_store.check(&call.name, &approval), PermissionDecision::Allow)
-                    })
-                    .unwrap_or(false)
-            });
-
-            if !all_auto {
-                // Some need approval — fall back to sequential
-                self.process_next_tool_call().await;
-                return;
-            }
-
-            self.execute_tools_parallel().await;
-        })
-    }
-
-    /// Execute all pending tool calls concurrently, then process results sequentially.
-    fn execute_tools_parallel(&mut self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
-        Box::pin(async move {
-            let calls = std::mem::take(&mut self.pending_tool_calls);
-            let start = Instant::now();
-
-            // Phase 1: Pre-process — resolve args, get tool refs, send start events
-            let mut prepared: Vec<(ToolCall, String, std::sync::Arc<dyn crate::tool::Tool>)> = Vec::new();
-            for call in &calls {
-                let name = call.name.clone();
-                let args = self.resolve_args(call);
-
-                let tool = match self.tool_registry.get_arc(&call.name) {
-                    Some(t) => t,
-                    None => {
-                        // Unknown tool — put everything back and go sequential
-                        self.pending_tool_calls = calls;
-                        self.process_next_tool_call().await;
+                    if is_messages_illegal && self.retry_count == 0 {
+                        self.retry_count += 1;
+                        let len = self.conversation.messages.len();
+                        if len > 4 {
+                            self.conversation.messages.truncate(len - 4);
+                        }
+                        let _ = self.event_tx.send(AgentEvent::TextDelta(
+                            "\n[Recovering from API error — retrying with reduced context...]\n".to_string()
+                        ));
+                        continue;
+                    } else if is_rate_limited && self.retry_count < 5 {
+                        self.retry_count += 1;
+                        let wait = (self.retry_count as u64 * 3).min(30);
+                        let _ = self.event_tx.send(AgentEvent::TextDelta(
+                            format!("\n[Rate limited — retrying in {}s...]\n", wait)
+                        ));
+                        tokio::time::sleep(Duration::from_secs(wait)).await;
+                        continue;
+                    } else if is_auth_error {
+                        let _ = self.event_tx.send(AgentEvent::Error(e));
+                        self.finish_turn();
+                        return;
+                    } else if self.retry_count < 3 {
+                        self.retry_count += 1;
+                        let wait = (self.retry_count as u64 * 3).min(15);
+                        let _ = self.event_tx.send(AgentEvent::TextDelta(
+                            format!("\n[API error — retrying in {}s ({}/3)...]\n", wait, self.retry_count)
+                        ));
+                        tokio::time::sleep(Duration::from_secs(wait)).await;
+                        continue;
+                    } else {
+                        let _ = self.event_tx.send(AgentEvent::Error(e));
+                        self.finish_turn();
                         return;
                     }
-                };
-
-                // Send start event for each tool
-                let _ = self.event_tx.send(AgentEvent::ToolCallStarted {
-                    name: name.clone(),
-                    arguments: args.clone(),
-                });
-
-                // Track file access state
-                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&args) {
-                    let file_path_str = parsed.get("file_path").and_then(|v| v.as_str());
-                    let file = file_path_str.map(|s| short_path(s));
-                    // Track in session-level working set
-                    if let Some(fp) = file_path_str {
-                        if matches!(name.as_str(), "read_file" | "edit_file" | "write_file") {
-                            let short = short_path(fp);
-                            self.session_files.insert(short, std::path::PathBuf::from(fp));
-                        }
-                    }
-                    match name.as_str() {
-                        "read_file" | "list_directory" | "glob" | "grep" => {
-                            self.consecutive_reads += 1;
-                            if let Some(f) = file {
-                                if !self.files_read_this_turn.contains(&f) {
-                                    self.files_read_this_turn.push(f);
-                                }
-                            }
-                        }
-                        "edit_file" | "write_file" => {
-                            self.consecutive_reads = 0;
-                            if let Some(f) = file {
-                                if !self.files_edited_this_turn.contains(&f) {
-                                    self.files_edited_this_turn.push(f);
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
                 }
-
-                prepared.push((call.clone(), args, tool));
-            }
-
-            // Phase 2: Execute all tools concurrently
-            let ctx = self.tool_context.clone();
-            let cancel = self.cancel_token.clone();
-
-            let handles: Vec<_> = prepared.iter().map(|(call, args, tool)| {
-                let args = args.clone();
-                let ctx = ctx.clone();
-                let tool = std::sync::Arc::clone(tool);
-                let call_id = call.id.clone();
-                tokio::spawn(async move {
-                    let t = Instant::now();
-                    let result = tool.execute(&args, &ctx).await;
-                    (call_id, result, t.elapsed())
-                })
-            }).collect();
-
-            let raw_results = tokio::select! {
-                _ = cancel.cancelled() => {
+                TurnResult::Cancelled => {
                     self.finish_turn();
                     return;
                 }
-                r = futures::future::join_all(handles) => r,
+            }
+        }
+    }
+
+    /// Forward a TurnEvent to the TUI as an AgentEvent.
+    fn forward_turn_event(&mut self, event: TurnEvent) {
+        match event {
+            TurnEvent::TextDelta(text) => {
+                self.model_produced_text = true;
+                let _ = self.event_tx.send(AgentEvent::TextDelta(text));
+            }
+            TurnEvent::ToolCallStarted { ref name, ref arguments } => {
+                self.current_tool_name = name.clone();
+                self.phase = AgentPhase::CallingTool(name.clone());
+                let _ = self.event_tx.send(AgentEvent::PhaseChange(self.phase.clone()));
+
+                // Track files for Working Set
+                if matches!(name.as_str(), "read_file" | "edit_file" | "write_file" | "search_replace" | "glob" | "grep") {
+                    if let Ok(args) = serde_json::from_str::<serde_json::Value>(arguments) {
+                        let fp = args.get("file_path").and_then(|v| v.as_str())
+                            .or_else(|| args.get("path").and_then(|v| v.as_str()));
+                        if let Some(fp) = fp {
+                            let short = std::path::Path::new(fp)
+                                .file_name()
+                                .map(|n| n.to_string_lossy().to_string())
+                                .unwrap_or_else(|| fp.to_string());
+                            self.session_files.insert(short, std::path::PathBuf::from(fp));
+                        }
+                    }
+                }
+
+                let _ = self.event_tx.send(AgentEvent::ToolCallStarted { name: name.clone(), arguments: arguments.clone() });
+            }
+            TurnEvent::ToolCallResult { name, output, success, duration } => {
+                // Track files for discipline
+                if let Some(pos) = output.find("Edited ") {
+                    // Extract short filename from edit confirmation
+                    let rest = &output[pos + 7..];
+                    if let Some(end) = rest.find(|c: char| c == '\n' || c == '.') {
+                        let file = short_path(&rest[..end]);
+                        if !self.files_edited_this_turn.contains(&file) {
+                            self.files_edited_this_turn.push(file);
+                        }
+                    }
+                }
+                if let Some(pos) = output.find("Wrote ") {
+                    let rest = &output[pos + 6..];
+                    if let Some(end) = rest.find(|c: char| c == '\n' || c == ' ') {
+                        let file = short_path(&rest[..end]);
+                        if !self.files_edited_this_turn.contains(&file) {
+                            self.files_edited_this_turn.push(file);
+                        }
+                    }
+                }
+                if matches!(name.as_str(), "read_file" | "list_directory" | "glob" | "grep") {
+                    self.consecutive_reads += 1;
+                } else if matches!(name.as_str(), "edit_file" | "write_file") {
+                    self.consecutive_reads = 0;
+                }
+                let _ = self.event_tx.send(AgentEvent::ToolCallResult {
+                    name, output, success, duration,
+                });
+            }
+            TurnEvent::TokenUsage { prompt_tokens, completion_tokens, total_tokens: _ } => {
+                let _ = self.event_tx.send(AgentEvent::TokenUsage(
+                    crate::stream::TokenUsage {
+                        prompt_tokens,
+                        completion_tokens,
+                    }
+                ));
+            }
+            TurnEvent::Error(e) => {
+                let _ = self.event_tx.send(AgentEvent::Error(e));
+            }
+        }
+    }
+
+    /// Post-process tool results added by TurnRunner: truncate large outputs
+    /// and externalize to disk store. TurnRunner adds raw results; we clean them up.
+    fn post_process_tool_results(&mut self, tool_count: usize) {
+        let len = self.conversation.messages.len();
+        let start = len.saturating_sub(tool_count);
+
+        // Collect indices of ToolResult messages to process
+        let mut to_process: Vec<usize> = Vec::new();
+        for i in start..len {
+            if matches!(self.conversation.messages[i].content,
+                crate::conversation::message::MessageContent::ToolResult(_)) {
+                to_process.push(i);
+            }
+        }
+
+        // Phase 1: Truncate outputs — extract, truncate, put back to satisfy borrow checker
+        for &i in &to_process {
+            if let crate::conversation::message::MessageContent::ToolResult(ref r) =
+                self.conversation.messages[i].content
+            {
+                let mut result = r.clone();
+                let tool_name = self.current_tool_name.clone();
+                self.truncate_output(&mut result, &tool_name);
+                self.conversation.messages[i].content =
+                    crate::conversation::message::MessageContent::ToolResult(result);
+            }
+        }
+
+        // Phase 2: Externalize large results to disk (replace ToolResult with ToolResultRef)
+        for &i in &to_process {
+            let should_externalize = if let crate::conversation::message::MessageContent::ToolResult(ref r) =
+                self.conversation.messages[i].content
+            {
+                r.output.len() >= 512
+            } else {
+                false
             };
 
-            let _total_duration = start.elapsed();
-
-            // Phase 3: Convert raw results into ToolResults and queue them.
-            // They'll be processed one-by-one through handle_tool_result which
-            // includes ALL post-processing: system reminders, step limits,
-            // bash misuse detection, file re-read warnings, etc.
-            let mut completed: Vec<(ToolResult, String)> = Vec::new();
-            for (i, join_result) in raw_results.into_iter().enumerate() {
-                let (call, _args, _) = &prepared[i];
-                let name = call.name.clone();
-
-                let (mut tool_result, duration) = match join_result {
-                    Ok((call_id, Ok(mut r), dur)) => {
-                        r.call_id = call_id;
-                        (r, dur)
-                    }
-                    Ok((call_id, Err(e), dur)) => {
-                        (ToolResult {
-                            call_id,
-                            output: format!("Error: {}", e),
-                            success: false,
-                        }, dur)
-                    }
-                    Err(e) => {
-                        (ToolResult {
-                            call_id: call.id.clone(),
-                            output: format!("Task panicked: {}", e),
-                            success: false,
-                        }, Duration::ZERO)
-                    }
-                };
-
-                // Append per-tool duration
-                let dur_str = if duration.as_millis() < 1000 {
-                    format!(" ({}ms)", duration.as_millis())
-                } else {
-                    format!(" ({:.1}s)", duration.as_secs_f64())
-                };
-                tool_result.output.push_str(&dur_str);
-
-                // Send result event
-                let _ = self.event_tx.send(AgentEvent::ToolCallResult {
-                    name: name.clone(),
-                    output: tool_result.output.clone(),
-                    success: tool_result.success,
-                    duration,
-                });
-
-                completed.push((tool_result, name));
+            if should_externalize {
+                if let crate::conversation::message::MessageContent::ToolResult(ref result) =
+                    self.conversation.messages[i].content
+                {
+                    let result_ref = self.result_store.store(result);
+                    self.conversation.messages[i].content =
+                        crate::conversation::message::MessageContent::ToolResultRef(result_ref);
+                }
             }
+        }
+    }
 
-            // Phase 4: Feed results through handle_tool_result sequentially.
-            // All but the last go directly into conversation; the last one triggers
-            // handle_tool_result which continues the agent loop (calls call_llm).
-            let last = completed.pop();
-            for (result, tool_name) in completed {
-                // Inline the essential bookkeeping (truncate + count + add).
-                // We skip handle_tool_result's continuation logic since there are
-                // more results to process. System reminders fire via handle_tool_result
-                // on the final result.
-                let mut r = result;
-                self.truncate_output(&mut r, &tool_name);
-                self.tool_call_count += 1;
-                self.store_tool_result(r);
-            }
-            if let Some((final_result, _final_name)) = last {
-                // The last result goes through full handle_tool_result which
-                // includes system reminders, step limits, and continuation.
-                self.handle_tool_result(final_result).await;
+    /// Apply discipline after a turn with tool calls.
+    /// Injects system reminders into conversation and tracks usage.
+    fn apply_post_turn_discipline(&mut self) {
+        // System reminders: re-inject rules + task every 4 steps.
+        if self.tool_call_count > 0 && self.tool_call_count % 4 == 0 {
+            let task_hint = if self.current_task.chars().count() > 100 {
+                format!("{}...", self.current_task.chars().take(97).collect::<String>())
             } else {
-                // No results (shouldn't happen) — continue the loop
-                self.phase = AgentPhase::Thinking;
-                let _ = self.event_tx.send(AgentEvent::PhaseChange(AgentPhase::Thinking));
-                self.call_llm().await;
-            }
-        })
-    }
+                self.current_task.clone()
+            };
 
-    fn process_next_tool_call(&mut self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
-        Box::pin(async move {
-            if let Some(call) = self.pending_tool_calls.first().cloned() {
-                if let Some(tool) = self.tool_registry.get(&call.name) {
-                    let approval = tool.approval(&call.arguments);
-                    match self.permission_store.check(&call.name, &approval) {
-                        PermissionDecision::Allow => {
-                            self.pending_tool_calls.remove(0);
-                            self.execute_tool(call).await;
-                        }
-                        PermissionDecision::Ask(reason) => {
-                            self.pending_tool_calls.remove(0); // Remove BEFORE storing as pending
-                            self.pending_approval = Some(call);
-                            self.phase = AgentPhase::WaitingApproval;
-                            let _ = self.event_tx.send(AgentEvent::ApprovalNeeded {
-                                tool_name: self
-                                    .pending_approval
-                                    .as_ref()
-                                    .unwrap()
-                                    .name
-                                    .clone(),
-                                reason,
-                                call: self.pending_approval.as_ref().unwrap().clone(),
-                            });
-                        }
-                        PermissionDecision::Deny => {
-                            self.pending_tool_calls.remove(0);
-                            let result = ToolResult {
-                                call_id: call.id,
-                                output: "Permission denied".to_string(),
-                                success: false,
-                            };
-                            self.handle_tool_result(result).await;
-                        }
-                    }
-                } else {
-                    // Unknown tool — return an error result and continue.
-                    self.pending_tool_calls.remove(0);
-                    let result = ToolResult {
-                        call_id: call.id.clone(),
-                        output: format!("Unknown tool: {}", call.name),
-                        success: false,
-                    };
-                    self.handle_tool_result(result).await;
-                }
-            }
-        })
-    }
+            // Build file tracking status
+            let read_list = if self.files_read_this_turn.is_empty() {
+                "none".to_string()
+            } else {
+                self.files_read_this_turn.join(", ")
+            };
+            let edit_list = if self.files_edited_this_turn.is_empty() {
+                "none yet — you should be editing!".to_string()
+            } else {
+                self.files_edited_this_turn.join(", ")
+            };
 
-    fn execute_tool(&mut self, call: ToolCall) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
-        Box::pin(async move {
-            let start = Instant::now();
-            let name = call.name.clone();
-            let mut args = self.resolve_args(&call);
+            let urgency = if self.tool_call_count >= 15 {
+                "URGENT: You MUST take action NOW. Either edit code, restart a service, or explain the issue to the user."
+            } else if self.files_edited_this_turn.is_empty() && self.tool_call_count >= 10 {
+                "STOP diagnosing. Take action NOW: edit code, restart service, or explain to user."
+            } else if self.files_edited_this_turn.is_empty() && self.tool_call_count >= 6 {
+                "Decide NOW: code bug → edit_file. Service old code → restart. Can't tell → ask user."
+            } else {
+                "Only read files you plan to edit."
+            };
 
-            // Auto-extend bash timeout for install/setup/build commands
-            if name == "bash" {
-                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&args) {
-                    if parsed.get("timeout").is_none() {
-                        if let Some(cmd) = parsed.get("command").and_then(|v| v.as_str()) {
-                            let cmd_lower = cmd.to_lowercase();
-                            // Tech-stack-agnostic: detect install/build BEHAVIOR, not specific tools.
-                            // Any command with "install" or "setup" keyword is likely slow.
-                            let is_install = cmd_lower.contains(" install")
-                                || cmd_lower.contains("-setup")
-                                || cmd_lower.contains("build --release");
-                            // Compound restart: kill+sleep+start pattern (any stack)
-                            let is_compound_restart = (cmd_lower.contains("pkill") || cmd_lower.contains("kill"))
-                                && (cmd_lower.contains("sleep") || cmd_lower.contains("curl"));
-                            if is_install {
-                                if let Ok(mut obj) = serde_json::from_str::<serde_json::Value>(&args) {
-                                    obj["timeout"] = serde_json::json!(180);
-                                    if let Ok(new_args) = serde_json::to_string(&obj) {
-                                        args = new_args;
-                                    }
-                                }
-                            } else if is_compound_restart {
-                                if let Ok(mut obj) = serde_json::from_str::<serde_json::Value>(&args) {
-                                    obj["timeout"] = serde_json::json!(60);
-                                    if let Ok(new_args) = serde_json::to_string(&obj) {
-                                        args = new_args;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            // Find sibling files that might have the same bug pattern
+            let sibling_hint = if !self.files_edited_this_turn.is_empty() {
+                self.find_sibling_files_hint()
+            } else {
+                String::new()
+            };
 
-            // Track files read/edited and consecutive read count
-            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&args) {
-                let file = parsed.get("file_path").and_then(|v| v.as_str())
-                    .map(|s| short_path(s));
-                match name.as_str() {
-                    "read_file" | "list_directory" | "glob" | "grep" => {
-                        self.consecutive_reads += 1;
-                        if let Some(ref f) = file {
-                            if !self.files_read_this_turn.contains(f) {
-                                self.files_read_this_turn.push(f.clone());
-                            }
-                            // Track per-file read count
-                            if name == "read_file" {
-                                *self.file_read_counts.entry(f.clone()).or_insert(0) += 1;
-                            }
-                        }
-                    }
-                    "edit_file" | "write_file" => {
-                        self.consecutive_reads = 0; // Reset on edit action
-                        if let Some(f) = file {
-                            if !self.files_edited_this_turn.contains(&f) {
-                                self.files_edited_this_turn.push(f);
-                            }
-                        }
-                    }
-                    "bash" => {
-                        // Don't reset consecutive_reads here — let the bash handler decide
-                        // based on whether the command is file-reading or an action.
-                        // The bash handler increments for grep/sed/cat and the
-                        // read budget check handles the rest.
+            let reminder = format!(
+                "\n\n<system-reminder>\n\
+                 TASK: \"{}\"\n\
+                 STEP: {}/{}\n\
+                 FILES READ: {}\n\
+                 FILES EDITED: {}\n\
+                 {}\n\
+                 {}\
+                 </system-reminder>",
+                task_hint, self.tool_call_count,
+                25 + self.files_edited_this_turn.len() * 5,
+                read_list, edit_list, urgency, sibling_hint
+            );
+
+            // Append reminder to the last tool result in conversation
+            if let Some(last_msg) = self.conversation.messages.last_mut() {
+                match &mut last_msg.content {
+                    crate::conversation::message::MessageContent::ToolResult(ref mut r) => {
+                        r.output.push_str(&reminder);
                     }
                     _ => {}
                 }
             }
-
-            // --- Intercept redundant tool calls ---
-            if let Some(intercepted) = self.intercept_redundant_call(&name, &args) {
-                // Count how many consecutive INTERCEPTED calls (same tool + same args hash).
-                // Different edits on the same file are NOT a loop — don't count them.
-                let args_hash = {
-                    use std::hash::{Hash, Hasher};
-                    let mut h = std::collections::hash_map::DefaultHasher::new();
-                    args.hash(&mut h);
-                    h.finish()
-                };
-                let block_count = self.recent_calls.iter()
-                    .rev()
-                    .take_while(|s| s.0 == name && s.1 == args_hash)
-                    .count();
-
-                let _ = self.event_tx.send(AgentEvent::ToolCallStarted {
-                    name: name.clone(),
-                    arguments: args.clone(),
-                });
-
-                if block_count >= 4 {
-                    // FORCE END TURN — model is stuck in an unbreakable loop.
-                    // Use a friendly message if work was actually completed.
-                    let has_work = !self.files_edited_this_turn.is_empty();
-                    let msg = if has_work {
-                        "Loop in cleanup step stopped. Your changes were applied successfully."
-                    } else {
-                        "Agent stuck in a loop. Turn force-terminated. Please try a more specific request."
-                    };
-
-                    let _ = self.event_tx.send(AgentEvent::ToolCallResult {
-                        name: name.clone(),
-                        output: format!("[{}]", msg),
-                        success: has_work,
-                        duration: start.elapsed(),
-                    });
-                    if !has_work {
-                        let _ = self.event_tx.send(AgentEvent::Error(msg.to_string()));
-                    }
-                    // Force-stop: generate a fallback summary since we can't call LLM again
-                    if !self.model_produced_text {
-                        let files = self.files_edited_this_turn.join(", ");
-                        let summary = if files.is_empty() {
-                            format!("Task stopped (repeated failed command). No files were modified.")
-                        } else {
-                            format!("Task stopped due to a verification error. Files modified: {}. \
-                                     The final verification step failed — please check manually.", files)
-                        };
-                        self.conversation.push_delta(&summary);
-                        let _ = self.event_tx.send(AgentEvent::TextDelta(summary));
-                    }
-                    self.conversation.finalize_stream();
-                    self.finish_turn();
-                    return;
-                }
-
-                let result = ToolResult {
-                    call_id: call.id,
-                    output: intercepted,
-                    success: false,
-                };
-                let _ = self.event_tx.send(AgentEvent::ToolCallResult {
-                    name: name.clone(),
-                    output: result.output.clone(),
-                    success: false,
-                    duration: start.elapsed(),
-                });
-                // Intercepted calls do NOT count toward step limit —
-                // they accomplished nothing and shouldn't eat the model's budget.
-                // Feed back directly without incrementing tool_call_count.
-                self.current_tool_name = name;
-                self.store_tool_result(result);
-                // Continue the agent loop without counting this as a step.
-                self.call_llm().await;
-                return;
-            }
-
-            let _ = self.event_tx.send(AgentEvent::ToolCallStarted {
-                name: name.clone(),
-                arguments: args.clone(),
-            });
-            let _ = self.event_tx.send(AgentEvent::PhaseChange(
-                AgentPhase::CallingTool(name.clone()),
-            ));
-
-            let ctx = self.tool_context.clone();
-            let cancel = self.cancel_token.clone();
-
-            let tool = match self.tool_registry.get_arc(&call.name) {
-                Some(t) => t,
-                None => {
-                    let result = ToolResult {
-                        call_id: call.id,
-                        output: format!("Unknown tool: {}", name),
-                        success: false,
-                    };
-                    self.handle_tool_result(result).await;
-                    return;
-                }
-            };
-
-            let result = tokio::select! {
-                _ = cancel.cancelled() => {
-                    self.finish_turn();
-                    return;
-                },
-                cmd = self.cmd_rx.recv() => {
-                    match cmd {
-                        Some(AgentCommand::Cancel) | None => {
-                            self.cancel_token.cancel();
-                            self.finish_turn();
-                            return;
-                        }
-                        Some(AgentCommand::Shutdown) => return,
-                        _ => {
-                            // Non-cancel command during tool execution — ignore.
-                            // Wait for the tool to finish normally.
-                            tool.execute(&args, &ctx).await
-                        }
-                    }
-                },
-                r = tool.execute(&args, &ctx) => r,
-            };
-
-            let duration = start.elapsed();
-            let mut tool_result = match result {
-                Ok(mut r) => {
-                    r.call_id = call.id;
-                    r
-                }
-                Err(e) => {
-                    let err_str = e.to_string();
-                    // If it's a JSON parse error, give the model the correct format
-                    let output = if err_str.contains("expected") || err_str.contains("missing field") || err_str.contains("invalid type") {
-                        let example = match name.as_str() {
-                            "list_directory" => r#"{"path": "src", "depth": 2}"#,
-                            "read_file" => r#"{"file_path": "/absolute/path/to/file"}"#,
-                            "edit_file" => r#"{"file_path": "/path", "old_string": "old", "new_string": "new"}"#,
-                            "write_file" => r#"{"file_path": "/path", "content": "file content"}"#,
-                            "grep" => r#"{"pattern": "search_term", "path": "src"}"#,
-                            "bash" => r#"{"command": "ls -la"}"#,
-                            "glob" => r#"{"pattern": "**/*.vue"}"#,
-                            _ => "{}",
-                        };
-                        format!(
-                            "Error: Invalid JSON arguments. {}\n\
-                             Correct format for {}: {}",
-                            err_str, name, example
-                        )
-                    } else {
-                        format!("Error: {}", err_str)
-                    };
-                    ToolResult {
-                        call_id: call.id,
-                        output,
-                        success: false,
-                    }
-                },
-            };
-
-            // Append execution duration to output.
-            let dur_str = if duration.as_millis() < 1000 {
-                format!(" ({}ms)", duration.as_millis())
-            } else {
-                format!(" ({:.1}s)", duration.as_secs_f64())
-            };
-            tool_result.output.push_str(&dur_str);
-
-            // ── Re-read reminder for read_file ──
-            // Block excessive FULL re-reads of the same file.
-            // Offset/limit reads are allowed (model is narrowing focus for precise edits).
-            // Only block full re-reads (no offset) on 3rd+ attempt.
-            if name == "read_file" {
-                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&args) {
-                    if let Some(fp) = parsed.get("file_path").and_then(|v| v.as_str()) {
-                        let has_offset = parsed.get("offset").is_some() || parsed.get("limit").is_some();
-                        if !has_offset {
-                            let short = short_path(fp);
-                            let count = self.file_read_counts.get(&short).copied().unwrap_or(0);
-                            if count >= 2 {
-                                tool_result.output = format!(
-                                    "[BLOCKED: You already read {} {} times. The content is in your conversation. \
-                                     Make your edit NOW. If you need a specific section, use offset/limit.]",
-                                    short, count
-                                );
-                                tool_result.success = false;
-                            } else if count == 1 {
-                                tool_result.output.push_str(
-                                    "\n\n[WARNING: You already read this file. Next full read will be blocked. \
-                                     Use offset/limit if you need a specific section, or make your edit NOW.]"
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Detect and warn about bash misuse patterns.
-            if name == "bash" {
-                let cmd = serde_json::from_str::<serde_json::Value>(&args)
-                    .ok()
-                    .and_then(|v| v.get("command").and_then(|c| c.as_str()).map(String::from))
-                    .unwrap_or_default();
-
-                // ── Service URL discovery ──
-                // Scan tool output for http://localhost:PORT patterns.
-                // Store them so the model always knows the actual running ports.
-                Self::extract_service_urls(&tool_result.output, &cmd, &mut self.active_services);
-                let cmd_lower = cmd.to_lowercase();
-                let cmd_start = cmd.split_whitespace().next().unwrap_or("");
-
-                // Pattern 1: Using bash to read files
-                let is_file_read_cmd = matches!(cmd_start, "grep" | "sed" | "cat" | "head" | "tail" | "awk" | "wc");
-
-                // Block bash-as-read: cat/head/tail/sed/awk should ALWAYS use
-                // dedicated tools (read_file, grep). Don't just warn — inject a
-                // hard redirect so the model learns to use the right tool.
-                // grep is allowed in bash since it sometimes needs piping/flags
-                // that the grep tool doesn't support.
-                if is_file_read_cmd && cmd_start != "grep" {
-                    tool_result.output.push_str(
-                        "\n\n[SYSTEM: Do NOT use bash for reading files. \
-                         Use read_file to read files, grep to search contents. \
-                         Bash is only for: builds, tests, git, server commands.]"
-                    );
-                }
-
-                // Also catch piped patterns: "cat X | grep Y" should be "grep Y X"
-                if cmd.contains("| grep") || cmd.contains("|grep") {
-                    tool_result.output.push_str(
-                        "\n\n[SYSTEM: Use the grep tool instead of piped bash commands. \
-                         grep tool supports pattern matching and is more efficient.]"
-                    );
-                }
-
-                // ── Sleep loop detection ──
-                // Detect "sleep N && check" polling patterns. After 2 occurrences,
-                // hard-block further sleeps.
-                if cmd_lower.starts_with("sleep ") || cmd_lower.contains("&& sleep ") || cmd_lower.contains("; sleep ") {
-                    self.sleep_count += 1;
-                    if self.sleep_count >= 3 {
-                        tool_result.output.push_str(
-                            "\n\n[SYSTEM: STOP. You have used sleep-and-check 3+ times this turn. \
-                             This is a polling anti-pattern. Instead: \
-                             1) For brew/npm install: run the command ONCE, it will complete when done. \
-                             2) For server startup: use nohup, then wait a reasonable time (one sleep 10-15), then curl to verify. \
-                             3) If a command hasn't finished, it may be downloading dependencies — that's normal. \
-                             Do NOT keep sleeping and checking. Take a different action or tell the user to wait.]"
-                        );
-                    } else if self.sleep_count >= 2 {
-                        tool_result.output.push_str(
-                            "\n\n[SYSTEM: Warning: you've used sleep-and-check twice. \
-                             Avoid polling loops. If the previous command is still running, wait once more then move on.]"
-                        );
-                    }
-                }
-
-                // ── Repeated command detection (tech-stack agnostic) ──
-                // Normalize the command (strip env vars, redirects, timestamps) and
-                // check if it was already executed this turn. Warns on 2nd, blocks on 3rd+.
-                let cmd_key = Self::normalize_bash_cmd(&cmd);
-                if !cmd_key.is_empty() {
-                    let count = self.executed_cmds.entry(cmd_key.clone()).or_insert(0);
-                    *count += 1;
-                    if *count >= 3 {
-                        tool_result.output.push_str(&format!(
-                            "\n\n[SYSTEM: STOP. You have run this same command {} times this turn: '{}'. \
-                             Repeating the same command will not produce a different result. \
-                             Read the error output, diagnose the root cause, and try a DIFFERENT approach.]",
-                            count, cmd_key
-                        ));
-                    } else if *count == 2 {
-                        tool_result.output.push_str(&format!(
-                            "\n\n[SYSTEM: Warning: you already ran '{}' earlier this turn. \
-                             If it failed before, re-running the same command is unlikely to help. \
-                             Analyze the previous error and try a different approach.]",
-                            cmd_key
-                        ));
-                    }
-                }
-
-                // ── Over-verification detection ──
-                // Detect consecutive "check-only" commands: --version, list, status,
-                // which, ls, ps. These don't change state — if the previous action
-                // succeeded, further verification is wasted.
-                let is_verify_cmd = cmd_lower.contains("--version")
-                    || cmd_lower.contains("version")
-                    || cmd_lower.contains(" list")
-                    || cmd_lower.contains(" status")
-                    || cmd_start == "which"
-                    || cmd_start == "ls"
-                    || cmd_start == "ps";
-                if is_verify_cmd && !is_file_read_cmd {
-                    self.consecutive_verify_count += 1;
-                    if self.consecutive_verify_count >= 3 {
-                        tool_result.output.push_str(
-                            "\n\n[SYSTEM: You have run 3+ consecutive verification commands \
-                             (version/list/status/which/ls). One verification is enough. \
-                             If the previous action succeeded, move on to the next step or \
-                             respond to the user with the result.]"
-                        );
-                    }
-                } else if !is_verify_cmd {
-                    self.consecutive_verify_count = 0;
-                }
-
-                if is_file_read_cmd {
-                    self.consecutive_reads += 1;
-                    // Diagnosis timeout: if 3+ consecutive read/grep/bash-read without ANY edit,
-                    // inject a prompt forcing the model to act instead of spinning.
-                    if self.consecutive_reads >= 3 && self.files_edited_this_turn.is_empty() {
-                        tool_result.output.push_str(
-                            "\n\n[SYSTEM: You have spent 3+ turns reading/searching without making any edit. \
-                             STOP investigating and make your best fix NOW based on what you already know. \
-                             If you're unsure, fix the most likely cause. You can always iterate after.]"
-                        );
-                    }
-                    if self.consecutive_reads >= 3 && !self.files_edited_this_turn.is_empty() {
-                        // Model is lost — auto-attach the last edited file's content
-                        let last_edited = self.files_edited_this_turn.last().cloned();
-                        if let Some(ref short_name) = last_edited {
-                            // Find the full path from recent tool calls
-                            let full_path = self.conversation.messages.iter().rev()
-                                .filter_map(|m| {
-                                    if let crate::conversation::message::MessageContent::AssistantWithToolCalls { tool_calls, .. } = &m.content {
-                                        for tc in tool_calls {
-                                            if tc.name == "edit_file" || tc.name == "write_file" {
-                                                if let Ok(a) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
-                                                    if let Some(fp) = a.get("file_path").and_then(|v| v.as_str()) {
-                                                        return Some(fp.to_string());
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                    None
-                                })
-                                .next();
-
-                            if let Some(fp) = full_path {
-                                if let Ok(content) = std::fs::read_to_string(&fp) {
-                                    let lines: Vec<&str> = content.lines().collect();
-                                    let show = lines.len().min(200);
-                                    let preview: String = lines[..show].iter().enumerate()
-                                        .map(|(i, l)| format!("{:>4}| {}", i + 1, l))
-                                        .collect::<Vec<_>>()
-                                        .join("\n");
-                                    tool_result.output.push_str(&format!(
-                                        "\n\n[SYSTEM: You keep using bash to navigate {}. Here is the current file content. \
-                                         Use this to make your next edit_file call directly:]\n{}",
-                                        short_name, preview
-                                    ));
-                                }
-                            }
-                        }
-                    } else {
-                        tool_result.output.push_str(
-                            "\n\n[SYSTEM: Use read_file or grep tool instead of bash for reading files.]"
-                        );
-                    }
-                }
-
-                // Non-read bash commands (build, install, restart) reset the read counter
-                if !is_file_read_cmd {
-                    self.consecutive_reads = 0;
-                }
-
-                // Pattern 2: Scouting commands
-                let is_scouting = matches!(cmd_start, "ps" | "lsof" | "netstat" | "curl" | "wget")
-                    || (cmd_start == "tail" && cmd.contains("log"))
-                    || cmd_start == "kill" || cmd_start == "pkill";
-                let task_is_runtime = {
-                    let t = self.current_task.to_lowercase();
-                    t.contains("启动") || t.contains("运行") || t.contains("访问")
-                        || t.contains("不能用") || t.contains("不工作") || t.contains("不好使")
-                        || t.contains("失败") || t.contains("报错") || t.contains("拒绝")
-                        || t.contains("加载") || t.contains("显示") || t.contains("骨架")
-                        || t.contains("loading") || t.contains("blank") || t.contains("empty")
-                        || t.contains("crash") || t.contains("broken") || t.contains("not work")
-                        || t.contains("start") || t.contains("run") || t.contains("deploy")
-                        || t.contains("搞定") || t.contains("修一下") || t.contains("fix")
-                };
-                if is_scouting {
-                    self.scouting_count += 1;
-                }
-                if is_scouting && self.tool_call_count <= 3 && !task_is_runtime {
-                    tool_result.output.push_str(
-                        "\n\n[SYSTEM: You are scouting (checking processes/ports/APIs) instead of fixing the code. \
-                         STOP scouting. Read the relevant source file and edit it directly.]"
-                    );
-                }
-                // Scouting budget: even for runtime tasks, cap scouting at 6 commands
-                if is_scouting && self.scouting_count >= 6 && self.files_edited_this_turn.is_empty() {
-                    tool_result.output.push_str(
-                        "\n\n[SYSTEM: SCOUTING BUDGET EXCEEDED. You have run 6+ diagnostic commands \
-                         without editing any code. STOP running curl/lsof/ps/kill. \
-                         Read the source code NOW and fix the issue. \
-                         If the backend API works (returned data), the problem is in the FRONTEND.]"
-                    );
-                }
-
-                // Pattern 2b: API/server confirmed working — detect curl returning 200 or valid data
-                if (cmd_start == "curl" || cmd_start == "wget") && tool_result.success {
-                    // Check for HTTP status code responses (e.g., curl -w "%{http_code}" → "200")
-                    let is_http_200 = {
-                        let out = &tool_result.output;
-                        let first_line = out.trim().split('\n').next().unwrap_or("").trim();
-                        first_line == "200" || first_line.starts_with("200 ") || out.contains("200 OK")
-                    };
-                    if is_http_200 {
-                        self.api_confirmed_working = true;
-                        tool_result.output.push_str(
-                            "\n\n[SYSTEM: Server returned HTTP 200 — it is running. \
-                             You can now respond to the user. No need for additional checks (tail, logs, etc).]"
-                        );
-                    }
-                    // Use actual JSON parsing to confirm valid API response.
-                    let trimmed = tool_result.output.trim().split("\n\n[").next().unwrap_or("").trim().to_string();
-                    let is_valid_json = serde_json::from_str::<serde_json::Value>(&trimmed).is_ok();
-                    let looks_like_error = tool_result.output.contains("Connection refused")
-                        || tool_result.output.contains("Could not resolve")
-                        || tool_result.output.contains("timed out");
-                    if is_valid_json && !looks_like_error {
-                        self.api_confirmed_working = true;
-                        // If user's task mentions UI/display/loading issues, redirect to frontend
-                        let task_l = self.current_task.to_lowercase();
-                        let task_is_frontend = task_l.contains("加载") || task_l.contains("骨架")
-                            || task_l.contains("显示") || task_l.contains("loading")
-                            || task_l.contains("blank") || task_l.contains("页面")
-                            || task_l.contains("前端") || task_l.contains("frontend");
-                        if task_is_frontend {
-                            tool_result.output.push_str(
-                                "\n\n[SYSTEM: The backend API returned valid data — it is WORKING. \
-                                 The user reported a FRONTEND display issue (loading/blank/skeleton). \
-                                 STOP diagnosing the backend. Read the FRONTEND source code \
-                                 (Vue/React components, API client, route handlers) and fix the display logic.]"
-                            );
-                        }
-                    }
-                }
-
-                // Pattern 3: Build/compile failure tracking — escalating intervention
-                let is_build = cmd_lower.contains("build") || cmd_lower.contains("compile")
-                    || cmd_lower.contains("check") || cmd_lower.contains("tsc")
-                    || (cmd_lower.contains("run") && (cmd_lower.contains("build") || cmd_lower.contains("check")));
-                let is_restart = cmd_lower.contains("kill") || cmd_lower.contains("restart")
-                    || cmd_lower.contains("run dev") || cmd_lower.contains("run serve");
-
-                if is_build {
-                    if !tool_result.success {
-                        self.build_fail_count += 1;
-                        if self.build_fail_count >= 2 {
-                            tool_result.output.push_str(
-                                "\n\n[SYSTEM: BUILD FAILED AGAIN. You have failed the build multiple times. \
-                                 DO NOT run build again until you have:\n\
-                                 1. Read the COMPLETE error output above\n\
-                                 2. Identified ALL errors (not just the first one)\n\
-                                 3. Fixed ALL of them in one pass\n\
-                                 The fix-one-build-fix-one-build pattern wastes steps. Fix everything, THEN build once.]"
-                            );
-                        }
-                    } else {
-                        self.build_fail_count = 0; // Reset on success
-                        // Build passed — but for loading/spinner issues, build passing
-                        // does NOT mean the problem is fixed. Remind to check runtime.
-                        let task_l = self.current_task.to_lowercase();
-                        let is_runtime_issue = task_l.contains("转") || task_l.contains("加载")
-                            || task_l.contains("空白") || task_l.contains("不显示")
-                            || task_l.contains("loading") || task_l.contains("spinner")
-                            || task_l.contains("blank") || task_l.contains("empty");
-                        if is_runtime_issue {
-                            tool_result.output.push_str(
-                                "\n\n[SYSTEM: Build passed, but the user reported a RUNTIME issue (loading/blank/spinner). \
-                                 Build passing only means no compile errors — the page may still not work. \
-                                 You MUST trace the data flow: \
-                                 1. Is the API call URL correct? Does the frontend call the right endpoint? \
-                                 2. Does the response format match what the frontend expects? (field names, nesting) \
-                                 3. Is there error handling that silently swallows failures? \
-                                 4. Use curl to see the actual API response, then compare with the frontend's type definition. \
-                                 Do NOT claim 'fixed' just because build passed.]"
-                            );
-                        }
-                    }
-                }
-
-                if !tool_result.success && !is_file_read_cmd && !is_scouting && (is_restart || is_build) {
-                    let recent_bash_fails = self.conversation.messages.iter().rev()
-                        .take(self.tool_call_count * 2 + 2)
-                        .filter(|m| {
-                            if let (Some(false), Some(out)) = (m.tool_result_success(), m.tool_result_output()) {
-                                out.contains("Error") || out.contains("error") || out.contains("failed")
-                            } else { false }
-                        })
-                        .count();
-
-                    if recent_bash_fails >= 2 {
-                        tool_result.output.push_str(
-                            "\n\n[SYSTEM: STOP the restart loop. You have had multiple failures. \
-                             Read the FULL error log (tail -50, not tail -10), identify ALL issues, \
-                             fix ALL of them in one pass, then restart ONCE. \
-                             Do not fix-one-restart-fix-one-restart.]"
-                        );
-                    }
-                }
-
-            }
-
-            // Clean tool results — no injected noise. Behavioral guidance
-            // lives in the system prompt only, matching Claude Code's architecture.
-
-            // After successful edit/write, reset read count for that file so the model
-            // can re-read the updated version. Without this, the BLOCK on re-reads
-            // prevents the model from seeing its own changes, causing cascading
-            // edit failures when old_string no longer matches.
-            if (name == "edit_file" || name == "write_file") && tool_result.success {
-                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&args) {
-                    if let Some(fp) = parsed.get("file_path").and_then(|v| v.as_str()) {
-                        let short = short_path(fp);
-                        self.file_read_counts.remove(&short);
-                        // Cache file content for injection into next LLM call.
-                        // Track file for working set (session-level, read from disk each LLM call)
-                        self.session_files.insert(short, std::path::PathBuf::from(fp));
-                    }
-                }
-            }
-
-            // No sibling hints or syntax check reminders injected here.
-            // System prompt handles verification guidance.
-
-            let _ = self.event_tx.send(AgentEvent::ToolCallResult {
-                name: name.clone(),
-                output: tool_result.output.clone(),
-                success: tool_result.success,
-                duration,
-            });
-
-            self.current_tool_name = name;
-            self.handle_tool_result(tool_result).await;
-        })
+        }
     }
 
-    fn handle_tool_result(
-        &mut self,
-        mut result: ToolResult,
-    ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
-        Box::pin(async move {
-            // Smart per-tool truncation.
-            let tool_name = self.current_tool_name.clone();
-            self.truncate_output(&mut result, &tool_name);
-
-            self.tool_call_count += 1;
-
-            // System reminders: re-inject rules + task every 4 steps.
-            // This is the #1 technique Claude Code uses to keep weak models on track.
-            if self.tool_call_count > 0 && self.tool_call_count.is_multiple_of(4) {
-                let task_hint = if self.current_task.chars().count() > 100 {
-                    format!("{}...", self.current_task.chars().take(97).collect::<String>())
-                } else {
-                    self.current_task.clone()
-                };
-
-                // Check if we already have successful edits — if so, maybe we're done
-                let _has_edits = self.conversation.messages.iter().rev()
-                    .take(self.tool_call_count * 2 + 2)
-                    .any(|m| {
-                        if let (Some(true), Some(out)) = (m.tool_result_success(), m.tool_result_output()) {
-                            out.contains("Edited ") || out.contains("Wrote ")
-                        } else {
-                            false
-                        }
-                    });
-
-                // Build file tracking status
-                let read_list = if self.files_read_this_turn.is_empty() {
-                    "none".to_string()
-                } else {
-                    self.files_read_this_turn.join(", ")
-                };
-                let edit_list = if self.files_edited_this_turn.is_empty() {
-                    "none yet — you should be editing!".to_string()
-                } else {
-                    self.files_edited_this_turn.join(", ")
-                };
-
-                let _unedited: Vec<&String> = self.files_read_this_turn.iter()
-                    .filter(|f| !self.files_edited_this_turn.contains(f))
-                    .collect();
-
-                // Detect "backend works but model keeps restarting" pattern
-                let api_confirmed_ok = self.conversation.messages.iter().rev()
-                    .take(self.tool_call_count * 2 + 2)
-                    .any(|m| {
-                        if let (Some(true), Some(out)) = (m.tool_result_success(), m.tool_result_output()) {
-                            out.contains("200 OK") || out.contains("\"success\":true") || out.contains("success: True")
-                        } else { false }
-                    });
-                let many_bash_restarts = self.conversation.messages.iter().rev()
-                    .take(self.tool_call_count * 2 + 2)
-                    .filter(|m| {
-                        if let crate::conversation::message::MessageContent::AssistantWithToolCalls { tool_calls, .. } = &m.content {
-                            tool_calls.iter().any(|tc| tc.name == "bash" && (tc.arguments.contains("kill") || tc.arguments.contains("pkill") || tc.arguments.contains("restart")))
-                        } else { false }
-                    })
-                    .count() >= 2;
-
-                let urgency = if api_confirmed_ok && many_bash_restarts && self.tool_call_count >= 6 {
-                    "STOP: The backend API is working (returned 200 OK). The problem is likely in the FRONTEND code. \
-                     Read the frontend file and check: imports, API call methods, response handling."
-                } else if self.tool_call_count >= 15 {
-                    "URGENT: You MUST take action NOW. Either edit code, restart a service, or explain the issue to the user."
-                } else if self.files_edited_this_turn.is_empty() && self.tool_call_count >= 10 {
-                    "STOP diagnosing. Take action NOW: edit code, restart service, or explain to user."
-                } else if self.files_edited_this_turn.is_empty() && self.tool_call_count >= 6 {
-                    "Decide NOW: code bug → edit_file. Service old code → restart. Can't tell → ask user."
-                } else {
-                    "Only read files you plan to edit."
-                };
-
-                // Find sibling files that might have the same bug pattern
-                let sibling_hint = if !self.files_edited_this_turn.is_empty() {
-                    self.find_sibling_files_hint()
-                } else {
-                    String::new()
-                };
-
-                result.output.push_str(&format!(
-                    "\n\n<system-reminder>\n\
-                     TASK: \"{}\"\n\
-                     STEP: {}/{}\n\
-                     FILES READ: {}\n\
-                     FILES EDITED: {}\n\
-                     {}\n\
-                     {}\
-                     </system-reminder>",
-                    task_hint, self.tool_call_count,
-                    25 + self.files_edited_this_turn.len() * 5,
-                    read_list, edit_list, urgency, sibling_hint
-                ));
-            }
-
-            // Dynamic step limit: base 25, +5 for each unique file edited.
-            // A task that edits 5 files gets 50 steps. A task that reads 25 files
-            // without editing anything gets stopped at 25.
-            let dynamic_limit = 35 + (self.files_edited_this_turn.len() * 5);
-            let hard_limit = dynamic_limit.min(60); // absolute max 50
-
-            if self.tool_call_count >= hard_limit {
-                result.output.push_str(&format!(
-                    "\n\n[SYSTEM: Step limit ({}) reached. Turn terminated.]",
-                    hard_limit
-                ));
-                self.store_tool_result(result.clone());
-
-                // Check if the last action failed — don't blindly say "Done"
-                let last_failed = !result.success;
-                let has_edits = !self.files_edited_this_turn.is_empty();
-
-                if last_failed && has_edits {
-                    let warning = format!(
-                        "Stopped at step limit ({}). Files modified: {}. \
-                         However, the last action failed — the changes may not be fully working. \
-                         Please check manually.",
-                        hard_limit, self.files_edited_this_turn.join(", ")
-                    );
-                    // Only emit TextDelta — TurnComplete handler will add to conversation via finalize_stream
-                    self.conversation.push_delta(&warning);
-                    let _ = self.event_tx.send(AgentEvent::TextDelta(warning));
-                } else if !has_edits {
-                    let warning = format!(
-                        "Stopped at step limit ({}) without completing any edits. \
-                         Please try a more specific request.",
-                        hard_limit
-                    );
-                    self.conversation.push_delta(&warning);
-                    let _ = self.event_tx.send(AgentEvent::TextDelta(warning));
-                }
-                self.conversation.finalize_stream();
-                self.finish_turn();
-                return;
-            }
-
-            self.store_tool_result(result);
-
-            // Process remaining pending tool calls, or continue the agent loop.
-            if !self.pending_tool_calls.is_empty() {
-                self.dispatch_pending_tools().await;
-            } else {
-                self.phase = AgentPhase::Thinking;
-                let _ = self
-                    .event_tx
-                    .send(AgentEvent::PhaseChange(AgentPhase::Thinking));
-                self.call_llm().await;
-            }
-        })
+    /// Check if step limit has been reached.
+    fn check_step_limit(&self) -> bool {
+        let dynamic_limit = 35 + (5 * self.files_edited_this_turn.len());
+        let hard_limit = dynamic_limit.min(60);
+        self.tool_call_count >= hard_limit
     }
+
+    // Legacy methods removed: call_llm, dispatch_pending_tools,
+    // execute_tools_parallel, process_next_tool_call, execute_tool, handle_tool_result.
+    // Their responsibilities are now split between TurnRunner and run_turn_loop.
+
 
     // -------------------------------------------------------------------------
     // Helper methods
@@ -2062,7 +1142,7 @@ impl AgentLoop {
     /// Find sibling files (same directory, same extension) of edited files
     /// and suggest the model check them for the same bug pattern.
     fn find_sibling_files_hint(&self) -> String {
-        let wd = self.tool_context.working_dir
+        let wd: PathBuf = self.turn_runner.context.working_dir
             .try_read()
             .map(|g| g.clone())
             .unwrap_or_default();
@@ -2125,6 +1205,7 @@ impl AgentLoop {
 
     /// Check if the model should verify its changes before finishing.
     /// Returns true if: edits were made AND no bash/build command was run AFTER the last edit.
+    #[allow(dead_code)]
     fn should_verify(&self) -> bool {
         if self.files_edited_this_turn.is_empty() {
             return false; // No edits, nothing to verify
@@ -2169,6 +1250,7 @@ impl AgentLoop {
 
     /// Inject a verification prompt into the conversation as a user message,
     /// forcing the model to check its work before declaring success.
+    #[allow(dead_code)]
     fn inject_verify_prompt(&mut self) {
         let files = self.files_edited_this_turn.join(", ");
         let verify_msg = format!(
@@ -2210,8 +1292,8 @@ impl AgentLoop {
             .unwrap_or(crate::config::DEFAULT_SYSTEM_PROMPT)
             .to_string();
 
-        let wd = self
-            .tool_context
+        let wd: PathBuf = self
+            .turn_runner.context
             .working_dir
             .try_read()
             .map(|g| g.clone())
@@ -2524,9 +1606,10 @@ impl AgentLoop {
             .join("\n")
     }
 
+    #[allow(dead_code)]
     fn resolve_args(&self, call: &ToolCall) -> String {
-        let wd = self
-            .tool_context
+        let wd: PathBuf = self
+            .turn_runner.context
             .working_dir
             .try_read()
             .map(|g| g.clone())
@@ -2587,6 +1670,7 @@ impl AgentLoop {
     /// instead of executing the tool. Only intercepts cases where the data is
     /// already available in the system prompt (descriptor files, working dir tree).
     /// Does NOT intercept duplicate reads (the model may re-read with different params).
+    #[allow(dead_code)]
     fn intercept_redundant_call(&mut self, tool_name: &str, args: &str) -> Option<String> {
         // Pre-read cache hit: if a file was already pre-read, return its content
         // directly from disk (zero overhead — the file is in OS cache).
@@ -2698,7 +1782,7 @@ impl AgentLoop {
                 // Intercept listing the working directory — tree is already in context.
                 let parsed: serde_json::Value = serde_json::from_str(args).ok()?;
                 let list_path = parsed.get("path").and_then(|v| v.as_str()).unwrap_or(".");
-                let wd = self.tool_context.working_dir.try_read().ok()?;
+                let wd = self.turn_runner.context.working_dir.try_read().ok()?;
                 let wd_str = wd.to_string_lossy();
                 if list_path == "." || list_path == wd_str.as_ref() {
                     return Some(
@@ -2715,6 +1799,7 @@ impl AgentLoop {
     /// Inflate ToolResultRef messages in the provider message list.
     /// Recent messages (last N) get their full content loaded from disk;
     /// older refs keep their summary (they're in the cold zone anyway).
+    #[allow(dead_code)]
     fn inflate_recent_refs(&self, messages: &mut Vec<crate::conversation::message::Message>) {
         // Inflate the last 20 tool-result messages (roughly the hot zone).
         let mut inflated = 0usize;
@@ -2733,6 +1818,9 @@ impl AgentLoop {
 
     /// Add a tool result to the conversation, externalizing large outputs to disk.
     /// Results smaller than the threshold are stored inline for simplicity.
+    /// Note: post_process_tool_results() now handles this for TurnRunner-added messages.
+    /// This method is retained for any future direct-add paths.
+    #[allow(dead_code)]
     fn store_tool_result(&mut self, result: ToolResult) {
         const EXTERNALIZE_THRESHOLD: usize = 512;
         if result.output.len() >= EXTERNALIZE_THRESHOLD {
@@ -2942,13 +2030,13 @@ impl AgentLoop {
     /// Log the complete LLM request (messages + tools + metadata) to
     /// `~/.atomcode/logs/YYYY-MM-DD_HH-MM-SS_NNN.json`.
     /// This is fire-and-forget — logging failures are silently ignored.
-    fn log_llm_request(
-        messages: &[crate::conversation::message::Message],
-        tool_defs: &[crate::tool::ToolDef],
-        model: &str,
-        context_window: usize,
-        step: usize,
-    ) {
+    pub(crate) fn log_llm_request(
+    messages: &[crate::conversation::message::Message],
+    tool_defs: &[crate::tool::ToolDef],
+    model: &str,
+    context_window: usize,
+    step: usize,
+) {
         use std::io::Write;
 
         let log_dir = crate::config::Config::config_dir().join("logs");
@@ -3057,6 +2145,7 @@ impl AgentLoop {
 
     /// Extract http://localhost:PORT URLs from tool output and store them.
     /// Uses the command to guess a label (frontend/backend/service).
+    #[allow(dead_code)]
     fn extract_service_urls(
         output: &str,
         cmd: &str,
@@ -3104,6 +2193,7 @@ impl AgentLoop {
     /// Strips: env var prefixes (FOO=bar), stderr redirects (2>&1, 2>/dev/null),
     /// sleep prefixes (sleep N &&), and leading/trailing whitespace.
     /// Returns a stable key so that semantically identical commands match.
+    #[allow(dead_code)]
     fn normalize_bash_cmd(cmd: &str) -> String {
         let mut s = cmd.trim().to_string();
 
@@ -3154,8 +2244,8 @@ impl AgentLoop {
                 .map(|h| h.join(path.strip_prefix("~/").unwrap_or(&path[1..])))
                 .unwrap_or_else(|| std::path::PathBuf::from(path))
         } else {
-            let wd = self
-                .tool_context
+            let wd: PathBuf = self
+                .turn_runner.context
                 .working_dir
                 .try_read()
                 .map(|g| g.clone())
@@ -3165,7 +2255,7 @@ impl AgentLoop {
 
         let resolved = std::fs::canonicalize(&new_path).unwrap_or(new_path);
         if resolved.is_dir() {
-            if let Ok(mut wd) = self.tool_context.working_dir.try_write() {
+            if let Ok(mut wd) = self.turn_runner.context.working_dir.try_write() {
                 *wd = resolved.clone();
             }
             self.project_context_cache = None; // invalidate on dir change
@@ -3569,6 +2659,7 @@ fn repair_json(s: &str) -> String {
 
 /// Detect if a streaming text buffer is repeating earlier content.
 /// Returns Some(byte_position) where the repeat starts, None if no repeat detected.
+#[allow(dead_code)]
 fn detect_streaming_repeat(buf: &str) -> Option<usize> {
     let lines: Vec<&str> = buf.lines().collect();
     if lines.len() < 6 { return None; }
@@ -3600,25 +2691,61 @@ fn detect_streaming_repeat(buf: &str) -> Option<usize> {
     None
 }
 
-/// Strip model-internal reasoning tags from streaming output.
-/// DeepSeek uses `<think>...</think>`, QwQ uses similar patterns.
-/// These should not be shown to the user or stored in conversation.
-fn strip_model_tags(text: &str) -> String {
-    let mut result = text.to_string();
-    // Remove <think> and </think> tags and everything between them
-    while let Some(start) = result.find("<think>") {
-        if let Some(end) = result.find("</think>") {
-            let end = end + "</think>".len();
-            result = format!("{}{}", &result[..start], &result[end..]);
-        } else {
-            // Unclosed <think> — remove from <think> to end (more content coming)
-            result = result[..start].to_string();
-            break;
-        }
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::conversation::message::{Message, Role};
+    use crate::tool::ToolDef;
+
+    #[test]
+    fn test_log_llm_request_creates_json_file() {
+        let messages = vec![
+            Message::new(Role::System, "You are helpful."),
+            Message::new(Role::User, "Hello"),
+        ];
+        let tool_defs = vec![ToolDef {
+            name: "bash",
+            description: "Run a command".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+        }];
+
+        // Record files before
+        let log_dir = crate::config::Config::config_dir().join("logs");
+        let before: std::collections::HashSet<_> = std::fs::read_dir(&log_dir)
+            .ok()
+            .map(|rd| rd.filter_map(|e| e.ok().map(|e| e.path())).collect())
+            .unwrap_or_default();
+
+        // Call
+        AgentLoop::log_llm_request(&messages, &tool_defs, "test-model", 16000, 3);
+
+        // Find new file
+        let after: std::collections::HashSet<_> = std::fs::read_dir(&log_dir)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .collect();
+        let new_files: Vec<_> = after.difference(&before).collect();
+        assert_eq!(new_files.len(), 1, "Expected exactly 1 new log file");
+
+        let log_path = new_files[0];
+        assert!(log_path.extension().unwrap() == "json");
+
+        // Verify JSON content
+        let content = std::fs::read_to_string(log_path).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&content).unwrap();
+
+        assert_eq!(json["model"], "test-model");
+        assert_eq!(json["context_window"], 16000);
+        assert_eq!(json["step"], 3);
+        assert_eq!(json["message_count"], 2);
+        assert_eq!(json["tool_count"], 1);
+        assert!(json["messages"].is_array());
+        assert!(json["tools"].is_array());
+        assert_eq!(json["tools"][0]["name"], "bash");
+
+        // Cleanup
+        let _ = std::fs::remove_file(log_path);
     }
-    // Also strip standalone </think> (opening tag was in a previous delta)
-    result = result.replace("</think>", "");
-    // Strip other common model internal tags
-    result = result.replace("<|im_start|>", "").replace("<|im_end|>", "");
-    result
 }

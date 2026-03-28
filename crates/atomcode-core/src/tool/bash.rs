@@ -42,7 +42,7 @@ impl Tool for BashTool {
                 Behavior:\n\
                 - Default timeout: 30 seconds. Use 'timeout' parameter for longer commands.\n\
                 - Long-running server processes: returns after 10s with partial output (server keeps running).\n\
-                - Destructive commands (rm -rf, drop, etc.) require user confirmation.",
+                - Destructive commands (rm -rf, drop, etc.) require user confirmation.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {

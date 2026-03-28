@@ -45,7 +45,7 @@ impl Tool for WebSearchTool {
                 Examples:\n\
                 - {\"query\": \"openclaw github\"}\n\
                 - {\"query\": \"tailwindcss v4 installation guide\"}\n\
-                - {\"query\": \"rust reqwest POST example\"}",
+                - {\"query\": \"rust reqwest POST example\"}".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {

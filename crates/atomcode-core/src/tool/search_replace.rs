@@ -42,7 +42,7 @@ impl Tool for SearchReplaceTool {
                 Examples:\n\
                 - Change color: {\"search\": \"bg-blue-600\", \"replace\": \"bg-violet-600\", \"glob\": \"*.vue\"}\n\
                 - Rename class: {\"search\": \"rounded-2xl\", \"replace\": \"rounded-lg\", \"glob\": \"*.vue\"}\n\
-                - Regex rename: {\"search\": \"bg-blue-(\\\\d+)\", \"replace\": \"bg-violet-$1\", \"glob\": \"*.vue\", \"regex\": true}",
+                - Regex rename: {\"search\": \"bg-blue-(\\\\d+)\", \"replace\": \"bg-violet-$1\", \"glob\": \"*.vue\", \"regex\": true}".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
