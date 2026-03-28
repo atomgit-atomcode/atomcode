@@ -31,6 +31,8 @@ pub struct TurnRunner {
     pub context: ToolContext,
     pub config: Config,
     pub permission: Box<dyn PermissionDecider>,
+    /// Tool result store — used to inflate ToolResultRef messages before sending to LLM.
+    pub result_store: crate::tool::result_store::ToolResultStore,
 }
 
 impl TurnRunner {
@@ -50,10 +52,25 @@ impl TurnRunner {
             .map(|p| p.context_window)
             .unwrap_or(16000);
 
-        let (messages, _ctx_stats) =
+        let (mut messages, _ctx_stats) =
             conversation.to_provider_messages_budgeted(system_prompt, context_window);
 
-        // 2. Get tool definitions for the LLM
+        // 2. Inflate ToolResultRef → ToolResult for recent messages.
+        // Conversation stores large results as compact refs on disk;
+        // inflate the last 20 so the LLM sees actual tool output.
+        {
+            let mut inflated = 0usize;
+            for msg in messages.iter_mut().rev() {
+                if inflated >= 20 { break; }
+                if let crate::conversation::message::MessageContent::ToolResultRef(ref r) = msg.content {
+                    let full = self.result_store.inflate(r);
+                    msg.content = crate::conversation::message::MessageContent::ToolResult(full);
+                    inflated += 1;
+                }
+            }
+        }
+
+        // 3. Get tool definitions for the LLM
         let tool_defs = self.tools.get_definitions();
 
         // 3. Start streaming

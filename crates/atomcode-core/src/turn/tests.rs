@@ -183,6 +183,9 @@ fn make_runner(provider: MockProvider, tools: ToolRegistry, permission: Box<dyn 
         context: test_context(),
         config: test_config(),
         permission,
+        result_store: crate::tool::result_store::ToolResultStore::new(
+            crate::tool::result_store::ToolResultStore::default_dir()
+        ),
     }
 }
 

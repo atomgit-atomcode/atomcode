@@ -250,6 +250,7 @@ impl AgentLoop {
             context: tool_context.clone(),
             config: config.clone(),
             permission: interactive_permission,
+            result_store: ToolResultStore::new(ToolResultStore::default_dir()),
         };
 
         let agent = Self {
@@ -1797,24 +1798,7 @@ impl AgentLoop {
     }
 
     /// Inflate ToolResultRef messages in the provider message list.
-    /// Recent messages (last N) get their full content loaded from disk;
-    /// older refs keep their summary (they're in the cold zone anyway).
-    #[allow(dead_code)]
-    fn inflate_recent_refs(&self, messages: &mut Vec<crate::conversation::message::Message>) {
-        // Inflate the last 20 tool-result messages (roughly the hot zone).
-        let mut inflated = 0usize;
-        const MAX_INFLATE: usize = 20;
-        for msg in messages.iter_mut().rev() {
-            if inflated >= MAX_INFLATE {
-                break;
-            }
-            if let crate::conversation::message::MessageContent::ToolResultRef(ref r) = msg.content {
-                let full = self.result_store.inflate(r);
-                msg.content = crate::conversation::message::MessageContent::ToolResult(full);
-                inflated += 1;
-            }
-        }
-    }
+    // inflate_recent_refs — moved to TurnRunner.run() where messages are built.
 
     /// Add a tool result to the conversation, externalizing large outputs to disk.
     /// Results smaller than the threshold are stored inline for simplicity.
