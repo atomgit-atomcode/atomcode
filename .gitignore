@@ -13,6 +13,13 @@ __pycache__/
 # Web (separate frontend, not part of core)
 /web/
 
+# Node
+node_modules/
+package-lock.json
+
+# Temp / WIP files
+site/index-new.html
+
 # IDE
 .idea/
 .vscode/

@@ -24,7 +24,7 @@ impl Tool for FindReferencesTool {
                 Returns the definition location + all call/usage sites with file:line context.\n\
                 Examples:\n\
                 - {\"symbol\": \"process_data\"} → finds definition + all calls across the project\n\
-                - {\"symbol\": \"UserService\", \"path\": \"src/\"} → search only in src/",
+                - {\"symbol\": \"UserService\", \"path\": \"src/\"} → search only in src/".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {

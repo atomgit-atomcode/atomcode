@@ -39,7 +39,7 @@ impl Tool for GrepTool {
                 - Find a function: {\"pattern\": \"def process_data\"}\n\
                 - Find a string with dots: {\"pattern\": \"console\\\\.log\"}\n\
                 - Find across alternatives: {\"pattern\": \"upload|上传\"}\n\
-                - Search specific directory: {\"pattern\": \"import\", \"path\": \"src/views\"}",
+                - Search specific directory: {\"pattern\": \"import\", \"path\": \"src/views\"}".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {

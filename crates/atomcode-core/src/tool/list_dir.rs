@@ -26,7 +26,7 @@ impl Tool for ListDirTool {
             description: "List files and directories as a tree structure. Skips noise directories (node_modules, .git, target, __pycache__, etc.).\n\
                 Use this to understand project structure or explore unfamiliar directories.\n\
                 For finding specific files by name/extension, prefer glob instead.\n\
-                The depth parameter controls how deep to recurse (default 2, max 5).",
+                The depth parameter controls how deep to recurse (default 2, max 5).".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {

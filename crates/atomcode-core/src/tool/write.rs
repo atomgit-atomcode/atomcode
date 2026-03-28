@@ -67,7 +67,7 @@ impl Tool for WriteFileTool {
                 Behavior:\n\
                 - Overwriting an existing non-empty file requires user approval.\n\
                 - Parent directories are NOT auto-created — ensure the directory exists first.\n\
-                - Uses atomic write (temp file + rename) to prevent corruption.",
+                - Uses atomic write (temp file + rename) to prevent corruption.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {

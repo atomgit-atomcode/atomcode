@@ -19,7 +19,7 @@ impl Tool for CdTool {
     fn definition(&self) -> ToolDef {
         ToolDef {
             name: "change_dir",
-            description: "Change the working directory. All subsequent file operations and bash commands will execute in the new directory.",
+            description: "Change the working directory. All subsequent file operations and bash commands will execute in the new directory.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {

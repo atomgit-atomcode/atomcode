@@ -29,7 +29,7 @@ impl Tool for GlobTool {
                 Common use cases:\n\
                 - Find all view/page files before deciding which to edit.\n\
                 - Find config or entry files in an unfamiliar project.\n\
-                - Check what files exist in a directory.",
+                - Check what files exist in a directory.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
