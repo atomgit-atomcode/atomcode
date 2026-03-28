@@ -675,7 +675,14 @@ impl AgentLoop {
                     .get(&self.config.default_provider)
                     .map(|p| p.context_window)
                     .unwrap_or(16000);
-                let (msgs, _) = conv.to_provider_messages_budgeted(&system_prompt, context_window);
+                let (mut msgs, _) = conv.to_provider_messages_budgeted(&system_prompt, context_window);
+                // Inflate ToolResultRef → ToolResult so logs contain actual content
+                for msg in msgs.iter_mut().rev().take(20) {
+                    if let crate::conversation::message::MessageContent::ToolResultRef(ref r) = msg.content {
+                        let full = self.turn_runner.result_store.inflate(r);
+                        msg.content = crate::conversation::message::MessageContent::ToolResult(full);
+                    }
+                }
                 let tool_defs = self.turn_runner.tools.get_definitions();
                 Self::log_llm_request(
                     &msgs,
