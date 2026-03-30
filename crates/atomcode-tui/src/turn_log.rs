@@ -40,6 +40,11 @@ impl TurnLog {
         }
     }
 
+    /// Update the base directory (e.g. after `/cd`).
+    pub fn set_working_dir(&mut self, dir: &Path) {
+        self.base_dir = dir.to_path_buf();
+    }
+
     /// Flush current buffer to disk immediately.
     fn flush(&self) {
         if let Some(ref path) = self.file_path {

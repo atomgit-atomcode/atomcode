@@ -377,6 +377,7 @@ impl App {
 
         if resolved.is_dir() {
             self.working_dir = resolved.clone();
+            self.turn_log.set_working_dir(&resolved);
             // Sync tool context (best-effort; won't block since we're in the main task)
             if let Ok(mut wd) = self.tool_context.working_dir.try_write() {
                 *wd = resolved.clone();
@@ -388,6 +389,7 @@ impl App {
         } else if new_path.is_dir() {
             // canonicalize failed but path exists as dir
             self.working_dir = new_path.clone();
+            self.turn_log.set_working_dir(&new_path);
             if let Ok(mut wd) = self.tool_context.working_dir.try_write() {
                 *wd = new_path.clone();
             }
@@ -631,6 +633,7 @@ impl App {
                 // Only /cd (user command) triggers this — LLM tools cannot change working dir.
                 self.previous_working_dir = Some(self.working_dir.clone());
                 self.working_dir = new_dir.clone();
+                self.turn_log.set_working_dir(&new_dir);
                 self.project_context_cache = None;
                 // Sync recent dirs + config so /cd list and next startup remember this dir
                 self.recent_dirs.retain(|d| d != &new_dir);

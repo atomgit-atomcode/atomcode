@@ -176,14 +176,40 @@ impl TurnRunner {
             };
         }
 
-        // 6. Execute tool calls
+        // 6. Execute tool calls (with dedup for identical calls in the same batch)
         let tool_count = tool_calls_buf.len();
-        for call in &tool_calls_buf {
+        let mut seen_calls: std::collections::HashMap<(String, String), usize> = std::collections::HashMap::new();
+        let mut is_dup: Vec<bool> = vec![false; tool_calls_buf.len()];
+        for (i, call) in tool_calls_buf.iter().enumerate() {
+            let key = (call.name.clone(), call.arguments.clone());
+            if seen_calls.contains_key(&key) {
+                is_dup[i] = true;
+            } else {
+                seen_calls.insert(key, i);
+            }
+        }
+        for (i, call) in tool_calls_buf.iter().enumerate() {
             if cancel.is_cancelled() {
                 return TurnResult::Cancelled;
             }
-            let result = self.execute_single_tool(call, event_tx).await;
-            conversation.add_tool_result(result);
+            if is_dup[i] {
+                let result = ToolResult {
+                    call_id: call.id.clone(),
+                    output: "[Duplicate call — same tool and arguments as an earlier call in this batch. \
+                             Result already returned above.]".to_string(),
+                    success: true,
+                };
+                let _ = event_tx.send(TurnEvent::ToolCallResult {
+                    name: call.name.clone(),
+                    output: result.output.clone(),
+                    success: true,
+                    duration: std::time::Duration::ZERO,
+                });
+                conversation.add_tool_result(result);
+            } else {
+                let result = self.execute_single_tool(call, event_tx).await;
+                conversation.add_tool_result(result);
+            }
         }
 
         TurnResult::UsedTools {
