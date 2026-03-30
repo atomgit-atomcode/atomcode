@@ -718,75 +718,6 @@ impl App {
                     self.suggestion = None;
                 }
             }
-            AppEvent::ScrollUp(n) => {
-                // Keep selection alive during scroll (like Claude Code)
-                if self.at_bottom {
-                    let total = self.render_cache.len();
-                    self.scroll_offset = total.saturating_sub(n as usize);
-                    self.at_bottom = false;
-                } else {
-                    self.scroll_offset = self.scroll_offset.saturating_sub(n as usize);
-                }
-            }
-            AppEvent::ScrollDown(n) => {
-                self.scroll_offset += n as usize;
-                let total = self.render_cache.len();
-                if self.scroll_offset >= total {
-                    self.at_bottom = true;
-                }
-            }
-            AppEvent::MouseDown(col, row) => {
-                self.selection = TextSelection {
-                    dragging: true,
-                    start: (col, row),
-                    end: (col, row),
-                    has_selection: false,
-                };
-            }
-            AppEvent::MouseDrag(col, row) => {
-                if self.selection.dragging {
-                    self.selection.end = (col, row);
-                    self.selection.has_selection =
-                        self.selection.start != self.selection.end;
-
-                    // Auto-scroll when dragging near top/bottom edge (like Claude Code)
-                    let chat_top: u16 = 1;
-                    let chat_bottom = self.last_viewport_height;
-                    if row <= chat_top + 2 {
-                        // Near top — scroll up (faster when closer to edge)
-                        let speed = if row <= chat_top { 3 } else { 1 };
-                        if !self.at_bottom || self.scroll_offset > 0 {
-                            if self.at_bottom {
-                                let total = self.render_cache.len();
-                                self.scroll_offset = total.saturating_sub(speed);
-                                self.at_bottom = false;
-                            } else {
-                                self.scroll_offset = self.scroll_offset.saturating_sub(speed);
-                            }
-                        }
-                    } else if row + 2 >= chat_bottom {
-                        // Near bottom — scroll down
-                        let speed = if row >= chat_bottom { 3 } else { 1 };
-                        self.scroll_offset += speed;
-                        let total = self.render_cache.len();
-                        if self.scroll_offset >= total {
-                            self.at_bottom = true;
-                        }
-                    }
-                }
-            }
-            AppEvent::MouseUp(col, row) => {
-                if self.selection.dragging {
-                    self.selection.end = (col, row);
-                    self.selection.dragging = false;
-                    if self.selection.start != self.selection.end {
-                        self.selection.has_selection = true;
-                        self.copy_selection_to_clipboard();
-                    } else {
-                        self.selection.has_selection = false;
-                    }
-                }
-            }
             AppEvent::Resize(_, _) => {}
             AppEvent::Tick => {
                 self.tick_count = self.tick_count.wrapping_add(1);
@@ -1227,6 +1158,25 @@ impl App {
                 self.input.delete_forward();
             }
             // Scroll keys: Ctrl+Up/Down (3 lines), PageUp/PageDown (20 lines)
+            // Also handle plain Up/Down for scroll when input is empty (for terminal alternate scroll mode)
+            (_, KeyCode::Up) if self.input.is_empty() => {
+                // Scroll up when input is empty (terminal scroll wheel sends Up/Down in alternate mode)
+                if self.at_bottom {
+                    let total = self.render_cache.len();
+                    self.scroll_offset = total.saturating_sub(3);
+                    self.at_bottom = false;
+                } else {
+                    self.scroll_offset = self.scroll_offset.saturating_sub(3);
+                }
+            }
+            (_, KeyCode::Down) if self.input.is_empty() => {
+                // Scroll down when input is empty (terminal scroll wheel sends Up/Down in alternate mode)
+                self.scroll_offset += 3;
+                let total = self.render_cache.len();
+                if self.scroll_offset >= total {
+                    self.at_bottom = true;
+                }
+            }
             _ if self.handle_scroll_keys(key) => {}
             (_, KeyCode::Backspace) => {
                 self.input.backspace();
@@ -1388,32 +1338,29 @@ impl App {
     }
 
     /// Extract text from the rendered content between the selection coordinates,
-    /// then copy it to the system clipboard via OSC 52 + pbcopy fallback.
+    /// then copy it to the system clipboard.
+    /// On macOS/Windows/Linux local: use native clipboard commands (no permission prompt).
+    /// On SSH: use OSC 52 escape sequence (requires terminal support).
     fn copy_selection_to_clipboard(&self) {
         let text = self.extract_selection_text();
         if text.is_empty() {
             return;
         }
 
-        // OSC 52 clipboard (works across SSH and on terminals that support it)
-        let encoded = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
-        let osc = format!("\x1b]52;c;{}\x07", encoded);
-        let _ = std::io::Write::write_all(&mut std::io::stdout(), osc.as_bytes());
-        let _ = std::io::Write::flush(&mut std::io::stdout());
+        // Check if we're in an SSH session
+        let is_ssh = std::env::var("SSH_CONNECTION").is_ok()
+            || std::env::var("SSH_TTY").is_ok()
+            || std::env::var("SSH_CLIENT").is_ok();
 
-        // Also try pbcopy as fallback (macOS)
-        if let Ok(mut child) = std::process::Command::new("pbcopy")
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-        {
-            if let Some(ref mut stdin) = child.stdin {
-                let _ = std::io::Write::write_all(stdin, text.as_bytes());
-            }
-            // Drop stdin to close pipe, then wait
-            child.stdin.take();
-            let _ = child.wait();
+        if is_ssh {
+            // OSC 52 clipboard (works across SSH and on terminals that support it)
+            let encoded = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
+            let osc = format!("\x1b]52;c;{}\x07", encoded);
+            let _ = std::io::Write::write_all(&mut std::io::stdout(), osc.as_bytes());
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+        } else {
+            // Local: use native clipboard commands (no permission prompt on iTerm2)
+            let _ = copy_to_clipboard(&text);
         }
     }
 
@@ -1449,7 +1396,7 @@ impl App {
                 // Single line selection
                 let s = start_col as usize;
                 let e = end_col as usize;
-                let slice: String = chars[s.min(chars.len())..e.min(chars.len())]
+                let slice: String = chars[s.min(chars.len())..=e.min(chars.len().saturating_sub(1))]
                     .iter()
                     .collect();
                 result.push_str(&slice);
@@ -1460,7 +1407,7 @@ impl App {
                 result.push('\n');
             } else if i == end_line {
                 let e = end_col as usize;
-                let slice: String = chars[..e.min(chars.len())].iter().collect();
+                let slice: String = chars[..=e.min(chars.len().saturating_sub(1))].iter().collect();
                 result.push_str(&slice);
             } else {
                 result.push_str(&line_text);
@@ -1785,7 +1732,8 @@ impl App {
                 help.push_str("  `/quit` — Exit\n");
                 help.push_str("\n**Copy text:**\n\n");
                 help.push_str("  `/copy` — Copy last AI response to clipboard\n");
-                help.push_str("  `Drag+Cmd+C` — Native text selection & copy (all terminals)\n");
+                help.push_str("  `Shift+Drag` — Native text selection (temporary disable mouse)\n");
+                help.push_str("  `Ctrl+Shift+C` — Copy current selection\n");
                 self.conversation.push_delta(&help);
                 self.conversation.finalize_stream();
             }

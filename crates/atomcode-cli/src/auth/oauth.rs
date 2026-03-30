@@ -351,9 +351,9 @@ pub fn save_auth(auth: &AuthInfo) -> Result<()> {
 
 /// Get path to auth file
 pub fn auth_file_path() -> std::path::PathBuf {
-    dirs::config_dir()
+    dirs::home_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join("atomcode")
+        .join(".atomcode")
         .join("auth.toml")
 }
 

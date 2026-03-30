@@ -124,9 +124,9 @@ fn render_selection_highlight(frame: &mut Frame, sel: &TextSelection, chat_area:
 
     for row in row_start..=row_end {
         let col_start = if row == start_row { start_col.max(area_left) } else { area_left };
-        let col_end = if row == end_row { end_col.min(area_right) } else { area_right };
+        let col_end = if row == end_row { end_col.min(area_right.saturating_sub(1)) } else { area_right.saturating_sub(1) };
 
-        for col in col_start..col_end {
+        for col in col_start..=col_end {
             if let Some(cell) = buf.cell_mut(Position::new(col, row)) {
                 cell.set_fg(sel_fg);
                 cell.set_bg(sel_bg);

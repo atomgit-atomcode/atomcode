@@ -12,7 +12,7 @@ use std::io::Write;
 use anyhow::Result;
 use crossterm::{
     execute,
-    event::{EnableMouseCapture, DisableMouseCapture, EnableBracketedPaste, DisableBracketedPaste},
+    event::{EnableBracketedPaste, DisableBracketedPaste},
     terminal::{
         disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
         SetTitle, Clear, ClearType,
@@ -330,10 +330,9 @@ pub async fn run(
         EnterAlternateScreen,
         SetTitle("AtomCode"),
         Clear(ClearType::All),
-        EnableMouseCapture,
         EnableBracketedPaste,
     )?;
-    // Mouse tracking + bracketed paste enabled.
+    // Bracketed paste enabled. Scroll events handled by terminal's alternate scroll mode.
 
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
@@ -353,7 +352,6 @@ pub async fn run(
             execute!(
                 terminal.backend_mut(),
                 DisableBracketedPaste,
-                DisableMouseCapture,
                 LeaveAlternateScreen
             )?;
             terminal.show_cursor()?;
@@ -393,7 +391,6 @@ pub async fn run(
                 EnterAlternateScreen,
                 SetTitle("AtomCode"),
                 Clear(ClearType::All),
-                EnableMouseCapture,
                 EnableBracketedPaste,
             )?;
             terminal.clear()?;
@@ -409,7 +406,6 @@ pub async fn run(
             execute!(
                 terminal.backend_mut(),
                 DisableBracketedPaste,
-                DisableMouseCapture,
                 LeaveAlternateScreen
             )?;
             terminal.show_cursor()?;
@@ -452,7 +448,6 @@ pub async fn run(
                 EnterAlternateScreen,
                 SetTitle("AtomCode"),
                 Clear(ClearType::All),
-                EnableMouseCapture,
                 EnableBracketedPaste,
             )?;
             terminal.clear()?;
@@ -506,7 +501,6 @@ pub async fn run(
     execute!(
         terminal.backend_mut(),
         DisableBracketedPaste,
-        DisableMouseCapture,
         LeaveAlternateScreen,
     )?;
     terminal.show_cursor()?;

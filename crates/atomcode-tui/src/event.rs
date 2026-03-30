@@ -2,18 +2,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crossterm::event::{Event, KeyEvent, MouseButton, MouseEvent, MouseEventKind, poll};
+use crossterm::event::{Event, KeyEvent, poll};
 use tokio::sync::mpsc;
 
 #[derive(Debug)]
 pub enum AppEvent {
     Key(KeyEvent),
     Paste(String),          // Bracketed paste content
-    ScrollUp(u16),
-    ScrollDown(u16),
-    MouseDown(u16, u16),   // (column, row) in terminal coordinates
-    MouseDrag(u16, u16),   // (column, row)
-    MouseUp(u16, u16),     // (column, row)
     Resize(u16, u16),
     Tick,
 }
@@ -71,16 +66,6 @@ impl EventLoop {
                                     }
                                     Event::Paste(text) => AppEvent::Paste(text),
                                     Event::Resize(w, h) => AppEvent::Resize(w, h),
-                                    Event::Mouse(MouseEvent { kind, column, row, .. }) => {
-                                        match kind {
-                                            MouseEventKind::ScrollUp => AppEvent::ScrollUp(3),
-                                            MouseEventKind::ScrollDown => AppEvent::ScrollDown(3),
-                                            MouseEventKind::Down(MouseButton::Left) => AppEvent::MouseDown(column, row),
-                                            MouseEventKind::Drag(MouseButton::Left) => AppEvent::MouseDrag(column, row),
-                                            MouseEventKind::Up(MouseButton::Left) => AppEvent::MouseUp(column, row),
-                                            _ => continue,
-                                        }
-                                    }
                                     _ => continue,
                                 };
                                 if tx.send(app_event).is_err() {
