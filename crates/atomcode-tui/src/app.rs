@@ -460,6 +460,11 @@ impl App {
             );
             self.conversation.push_delta(&summary);
             self.conversation.finalize_stream();
+            // Update session manager for new project directory
+            self.session_manager = SessionManager::new(&self.working_dir);
+            // Create a fresh default session for the new project
+            self.current_session = Session::default_session(self.working_dir.clone());
+            let _ = self.session_manager.save(&self.current_session);
         } else {
             // Directory doesn't exist — create it, git init, and add CLAUDE.md
             let new_path = if path.starts_with('/') || path.starts_with('~') {
@@ -516,6 +521,11 @@ impl App {
                 self.conversation.push_delta(&summary);
                 self.conversation.finalize_stream();
                 self.project_context_cache = None;
+                // Update session manager for new project directory
+                self.session_manager = SessionManager::new(&self.working_dir);
+                // Create a fresh default session for the new project
+                self.current_session = Session::default_session(self.working_dir.clone());
+                let _ = self.session_manager.save(&self.current_session);
             }
         }
     }
@@ -1700,25 +1710,35 @@ impl App {
                 }
             }
             "/clear" => {
-                // Clear agent's conversation context (but keep UI messages)
+                // Delete the old session file if it exists and is not the default session
+                if self.current_session.name != "default" {
+                    let old_id = self.current_session.id.clone();
+                    let _ = self.session_manager.delete(&old_id);
+                }
+                // Reset session to a fresh default session
+                self.current_session = Session::default_session(self.working_dir.clone());
+                let _ = self.session_manager.save(&self.current_session);
+                // Clear agent's conversation context
                 let _ = self.agent_handle.cmd_tx.send(AgentCommand::ClearConversation);
-                // Clear history file
-                tokio::spawn(async move {
-                    let path = Conversation::history_path();
-                    let temp_path = path.with_extension("json.tmp");
-                    if tokio::fs::write(&temp_path, "[]").await.is_ok() {
-                        let _ = tokio::fs::rename(&temp_path, &path).await;
-                    }
-                });
+                // Clear UI conversation
+                self.conversation.messages.clear();
+                self.render_cache.clear();
+                self.render_cache_msg_count = 0;
+                // Clear the turn log (deletes the current log file)
+                self.turn_log.clear();
                 // Add a placeholder message to indicate conversation was cleared
-                self.conversation.push_delta("(no content)");
+                self.conversation.push_delta("(conversation cleared)");
                 self.conversation.finalize_stream();
                 return true;
             }
             "/resume" => {
                 // Open session selector inline
                 match self.session_manager.list() {
-                    Ok(sessions) => {
+                    Ok(all_sessions) => {
+                        // Filter out sessions with no messages (cleared sessions)
+                        let sessions: Vec<_> = all_sessions.into_iter()
+                            .filter(|s| s.message_count > 0)
+                            .collect();
                         if sessions.is_empty() {
                             self.conversation.push_delta("No previous sessions found. Start a conversation first.");
                             self.conversation.finalize_stream();

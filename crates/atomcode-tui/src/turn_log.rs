@@ -45,6 +45,21 @@ impl TurnLog {
         self.base_dir = dir.to_path_buf();
     }
 
+    /// Clear the current turn log state and delete the log file if it exists.
+    /// Called when user runs /clear command.
+    pub fn clear(&mut self) {
+        // Delete the current log file if it exists
+        if let Some(ref path) = self.file_path {
+            let _ = std::fs::remove_file(path);
+        }
+        self.buf.clear();
+        self.active = false;
+        self.start = None;
+        self.llm_turn_start = None;
+        self.step = 0;
+        self.file_path = None;
+    }
+
     /// Flush current buffer to disk immediately.
     fn flush(&self) {
         if let Some(ref path) = self.file_path {
