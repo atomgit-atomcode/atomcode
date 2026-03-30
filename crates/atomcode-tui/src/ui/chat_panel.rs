@@ -44,6 +44,87 @@ pub fn render(
     render_cache: &mut Vec<Line<'static>>,
     render_cache_msg_count: &mut usize,
 ) -> usize {
+    // ── Spinner: rendered as a SEPARATE widget at the bottom of the chat area ──
+    // This guarantees it's always visible regardless of line wrapping in the
+    // main Paragraph. Previously the spinner was inside the Paragraph with
+    // Wrap { trim: false }, causing long tool result lines to push the spinner
+    // below the viewport.
+    let turn_active = last_turn_duration.is_none() && (
+        matches!(mode, AppMode::Streaming | AppMode::ToolExecuting)
+        || step_count > 0
+    );
+    let spinner_height: u16 = if turn_active || matches!(mode, AppMode::WaitingApproval(_)) { 1 } else { 0 };
+    let (chat_area, spinner_area) = if spinner_height > 0 && area.height > 2 {
+        let chat = Rect { height: area.height - spinner_height, ..area };
+        let spin = Rect { y: area.y + chat.height, height: spinner_height, ..area };
+        (chat, Some(spin))
+    } else {
+        (area, None)
+    };
+
+    // Render spinner in its dedicated area (immune to Paragraph wrapping)
+    if let Some(spin_rect) = spinner_area {
+        let spinner = SPINNER[tick % SPINNER.len()];
+        let bar_style = Style::default().fg(theme::ACCENT_DIM);
+        let wait_ms = llm_wait_ms.unwrap_or(0);
+        let wait_color = if first_token_ms.is_some() {
+            theme::ACCENT
+        } else if wait_ms < 10_000 {
+            theme::WAIT_FAST
+        } else if wait_ms < 60_000 {
+            theme::WAIT_NORMAL
+        } else if wait_ms < 120_000 {
+            theme::WAIT_SLOW
+        } else {
+            theme::WAIT_VERY_SLOW
+        };
+
+        let step_prefix = if step_count > 0 { format!("[turn {}] ", step_count) } else { String::new() };
+
+        let time_display = if wait_ms >= 60_000 {
+            format!("  {:.0}m{:.0}s", wait_ms / 60_000, (wait_ms % 60_000) / 1000)
+        } else if wait_ms >= 1000 {
+            format!("  {:.1}s", wait_ms as f64 / 1000.0)
+        } else if wait_ms > 0 {
+            format!("  {}ms", wait_ms)
+        } else {
+            String::new()
+        };
+
+        if let AppMode::WaitingApproval(call) = mode {
+            let mut approval_lines = Vec::new();
+            render_approval(&mut approval_lines, call);
+            if let Some(line) = approval_lines.into_iter().next() {
+                frame.render_widget(Paragraph::new(vec![line]), spin_rect);
+            }
+        } else {
+            let has_tokens = conversation.stream_buffer.as_ref().map_or(false, |b| !b.is_empty());
+            let label = if matches!(mode, AppMode::ToolExecuting) && !tool_info.is_empty() {
+                tool_info.to_string()
+            } else if has_tokens {
+                "Generating...".to_string()
+            } else if step_count > 0 && !last_completed_tool.is_empty() {
+                format!("After {}, thinking", last_completed_tool)
+            } else if step_count > 0 {
+                "Thinking...".to_string()
+            } else {
+                THINKING_LABELS[turn_label_seed % THINKING_LABELS.len()].to_string()
+            };
+
+            let spin_color = if matches!(mode, AppMode::ToolExecuting) { theme::WARNING } else { wait_color };
+
+            let spin_line = Line::from(vec![
+                Span::styled(format!("{}\u{2502} ", INDENT), bar_style),
+                Span::styled(format!("{} ", spinner), Style::default().fg(spin_color)),
+                Span::styled(step_prefix, Style::default().fg(theme::TEXT_SECONDARY)),
+                Span::styled(label, Style::default().fg(spin_color)),
+                Span::styled(time_display, Style::default().fg(wait_color)),
+            ]);
+            frame.render_widget(Paragraph::new(vec![spin_line]), spin_rect);
+        }
+    }
+
+    let area = chat_area;
     let vh = (area.height as usize).saturating_sub(1);
     if vh == 0 { return 0; }
 
@@ -113,131 +194,34 @@ pub fn render(
         }
     }
 
-    // Active state indicator — always visible during streaming/executing
-    let spinner = SPINNER[tick % SPINNER.len()];
-    let step_prefix = if step_count > 0 { format!("[turn {}] ", step_count) } else { String::new() };
+    // (Spinner variables moved to the dedicated spinner_area renderer at the top)
 
-    // Time-based color: green (<10s) → yellow (10-60s) → orange (60-120s) → red (>120s)
-    let wait_ms = llm_wait_ms.unwrap_or(0);
-    let wait_color = if first_token_ms.is_some() {
-        theme::ACCENT
-    } else if wait_ms < 10_000 {
-        theme::WAIT_FAST
-    } else if wait_ms < 60_000 {
-        theme::WAIT_NORMAL
-    } else if wait_ms < 120_000 {
-        theme::WAIT_SLOW
-    } else {
-        theme::WAIT_VERY_SLOW
-    };
-
-    // Time display with animated dots for waiting state
-    let time_display = if let Some(ms) = first_token_ms {
-        if ms >= 1000 { format!("  TTFT {:.1}s", ms as f64 / 1000.0) }
-        else { format!("  TTFT {}ms", ms) }
-    } else if wait_ms > 0 {
-        let dots = ".".repeat((tick % 4) + 1);
-        let pad = " ".repeat(3 - (tick % 4));
-        if wait_ms >= 60_000 {
-            format!("  {:.0}m {:.0}s{}{}", wait_ms / 60_000, (wait_ms % 60_000) / 1000, dots, pad)
-        } else if wait_ms >= 1000 {
-            format!("  {:.1}s{}{}", wait_ms as f64 / 1000.0, dots, pad)
+    // ── Turn finished separator ──
+    // (Spinner is rendered separately above the chat Paragraph — see spinner_area)
+    if let Some(dur) = last_turn_duration {
+        let secs = dur.as_secs();
+        let time_str = if secs >= 60 {
+            format!("{}m {}s", secs / 60, secs % 60)
         } else {
-            format!("  {}ms{}{}", wait_ms, dots, pad)
-        }
-    } else {
-        String::new()
-    };
-
-    // Token speed indicator during streaming
-    let stream_len = conversation.stream_buffer.as_ref().map_or(0, |b| b.len());
-    let speed_display = if stream_len > 100 && first_token_ms.is_some() {
-        if let Some(start_ms) = llm_wait_ms {
-            let elapsed = start_ms.saturating_sub(first_token_ms.unwrap_or(0));
-            if elapsed > 500 {
-                let chars_per_sec = stream_len as f64 / (elapsed as f64 / 1000.0);
-                if chars_per_sec >= 200.0 {
-                    format!("  {:.0} c/s", chars_per_sec)
-                } else {
-                    format!("  {:.0} c/s (slow)", chars_per_sec)
-                }
-            } else { String::new() }
-        } else { String::new() }
-    } else { String::new() };
-
-    match mode {
-        AppMode::Streaming => {
-            let has_tokens = conversation.stream_buffer.as_ref().map_or(false, |b| !b.is_empty());
-            let waiting_first_token = !has_tokens && first_token_ms.is_none();
-
-            let label = if waiting_first_token {
-                if step_count > 0 && !last_completed_tool.is_empty() {
-                    format!("After {}, thinking", last_completed_tool)
-                } else if step_count > 0 {
-                    "Thinking...".to_string()
-                } else {
-                    THINKING_LABELS[turn_label_seed % THINKING_LABELS.len()].to_string()
-                }
-            } else if !tool_info.is_empty() {
-                tool_info.to_string()
-            } else if step_count > 0 && !has_tokens {
-                if !last_completed_tool.is_empty() {
-                    format!("After {}, thinking", last_completed_tool)
-                } else {
-                    "Thinking...".to_string()
-                }
-            } else {
-                "Generating...".to_string()
-            };
-
-            dynamic.push(Line::from(vec![
-                Span::styled(format!("{}\u{2502} ", INDENT), bar_style),
-                Span::styled(format!("{} ", spinner), Style::default().fg(wait_color)),
-                Span::styled(step_prefix.clone(), Style::default().fg(theme::TEXT_SECONDARY)),
-                Span::styled(label, Style::default().fg(wait_color)),
-                Span::styled(time_display.clone(), Style::default().fg(wait_color)),
-                Span::styled(speed_display.clone(), Style::default().fg(theme::TEXT_MUTED)),
-            ]));
-        }
-        AppMode::ToolExecuting => {
-            dynamic.push(Line::from(vec![
-                Span::styled(format!("{}\u{2502} ", INDENT), bar_style),
-                Span::styled(format!("{} ", spinner), Style::default().fg(theme::WARNING)),
-                Span::styled(step_prefix.clone(), Style::default().fg(theme::TEXT_SECONDARY)),
-                Span::styled(tool_info.to_string(), Style::default().fg(theme::TOOL_BASH)),
-            ]));
-        }
-        AppMode::WaitingApproval(call) => {
-            render_approval(&mut dynamic, call);
-        }
-        _ => {
-            // Turn finished — Claude Code style separator: ─── N turns · Xs ───
-            if let Some(dur) = last_turn_duration {
-                let secs = dur.as_secs();
-                let time_str = if secs >= 60 {
-                    format!("{}m {}s", secs / 60, secs % 60)
-                } else {
-                    format!("{}s", secs)
-                };
-                let turns_str = if finished_step_count > 0 {
-                    format!("{} turns", finished_step_count)
-                } else {
-                    "done".to_string()
-                };
-                let label = format!(" {} \u{00b7} {} ", turns_str, time_str);
-                let line_char = "\u{2500}";
-                let side_len = 8;
-                let sep = format!(
-                    "  {}{}{}",
-                    line_char.repeat(side_len),
-                    label,
-                    line_char.repeat(side_len),
-                );
-                let sep_color = theme::SEPARATOR;
-                dynamic.push(Line::default());
-                dynamic.push(Line::from(Span::styled(sep, Style::default().fg(sep_color))));
-            }
-        }
+            format!("{}s", secs)
+        };
+        let turns_str = if finished_step_count > 0 {
+            format!("{} turns", finished_step_count)
+        } else {
+            "done".to_string()
+        };
+        let label = format!(" {} \u{00b7} {} ", turns_str, time_str);
+        let line_char = "\u{2500}";
+        let side_len = 8;
+        let sep = format!(
+            "  {}{}{}",
+            line_char.repeat(side_len),
+            label,
+            line_char.repeat(side_len),
+        );
+        let sep_color = theme::SEPARATOR;
+        dynamic.push(Line::default());
+        dynamic.push(Line::from(Span::styled(sep, Style::default().fg(sep_color))));
     }
 
     let total = cached_len + dynamic.len();
