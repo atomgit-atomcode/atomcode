@@ -1,5 +1,5 @@
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
@@ -7,105 +7,19 @@ use ratatui::Frame;
 use crate::app::{App, WelcomeState};
 use super::theme;
 
-const LOGO: &str = r#"
-     _   _                  ____          _
-    / \ | |_ ___  _ __ ___ / ___|___   __| | ___
-   / _ \| __/ _ \| '_ ` _ \ |   / _ \ / _` |/ _ \
-  / ___ \ || (_) | | | | | | |__| (_) | (_| |  __/
- /_/   \_\__\___/|_| |_| |_|\____\___/ \__,_|\___|
-"#;
+// ── Atom logo — 3-line orbital, compact & geeky ──
+const ATOM: [&str; 3] = [
+    r"   ╱·╲   ",
+    r"  ( ◉ )  ",
+    r"   ╲·╱   ",
+];
 
+/// Render the normal welcome screen (conversation empty, providers configured).
 pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     let mut lines: Vec<Line<'static>> = Vec::new();
 
-    let logo_height = 7;
-    let info_height = 18;
-    let total_content = logo_height + info_height;
-    let top_pad = if area.height as usize > total_content {
-        (area.height as usize - total_content) / 3
-    } else {
-        1
-    };
-
-    for _ in 0..top_pad {
-        lines.push(Line::default());
-    }
-
-    let logo_color = theme::ACCENT;
-    for logo_line in LOGO.lines().skip(1) {
-        lines.push(Line::from(Span::styled(
-            logo_line.to_string(),
-            Style::default().fg(logo_color).add_modifier(Modifier::BOLD),
-        )));
-    }
-
-    lines.push(Line::default());
-
-    // Version + model
-    lines.push(Line::from(vec![
-        Span::styled(format!("  v{}", env!("CARGO_PKG_VERSION")), Style::default().fg(theme::TEXT_MUTED)),
-        Span::styled(
-            format!("  \u{00b7}  {}", app.model_name),
-            Style::default().fg(theme::INFO),
-        ),
-    ]));
-    lines.push(Line::from(Span::styled(
-        format!("  {}", app.working_dir.display()),
-        Style::default().fg(theme::TEXT_MUTED),
-    )));
-
-    lines.push(Line::default());
-
-    let h = Style::default().fg(theme::TEXT_SECONDARY).add_modifier(Modifier::BOLD);
-    let k = Style::default().fg(theme::INFO);
-    let d = Style::default().fg(theme::TEXT_MUTED);
-
-    // Input
-    lines.push(Line::from(Span::styled("  Input", h)));
-    lines.push(line_kv("    Enter", "Send message", k, d));
-    lines.push(line_kv("    Shift+Enter", "New line", k, d));
-    lines.push(line_kv("    Esc", "Clear input", k, d));
-    lines.push(line_kv("    Up/Down", "Browse history", k, d));
-    lines.push(line_kv("    Tab", "Accept suggestion", k, d));
-
-    lines.push(Line::default());
-
-    // Navigation
-    lines.push(Line::from(Span::styled("  Navigation", h)));
-    lines.push(line_kv("    Ctrl+Up/Down", "Scroll (3 lines)", k, d));
-    lines.push(line_kv("    PageUp/Down", "Scroll (page)", k, d));
-    lines.push(line_kv("    Ctrl+L", "Clear conversation", k, d));
-
-    lines.push(Line::default());
-
-    // Editing
-    lines.push(Line::from(Span::styled("  Editing", h)));
-    lines.push(line_kv("    Ctrl+A / Home", "Line start", k, d));
-    lines.push(line_kv("    Ctrl+E / End", "Line end", k, d));
-    lines.push(line_kv("    Ctrl+U", "Clear line", k, d));
-    lines.push(line_kv("    Ctrl+K", "Delete to end", k, d));
-    lines.push(line_kv("    Ctrl+W", "Delete word", k, d));
-
-    lines.push(Line::default());
-
-    // Commands
-    lines.push(Line::from(Span::styled("  Commands", h)));
-    lines.push(line_kv("    /", "Show all commands", k, d));
-    lines.push(line_kv("    /model", "Switch model", k, d));
-    lines.push(line_kv("    /provider", "Manage providers", k, d));
-    lines.push(line_kv("    Ctrl+C", "Cancel / double to exit", k, d));
-
-    let paragraph = Paragraph::new(lines);
-    frame.render_widget(paragraph, area);
-}
-
-/// Full-screen first-run setup screen shown when no providers are configured.
-pub fn render_setup(frame: &mut Frame, area: Rect, state: &WelcomeState) {
-    let mut lines: Vec<Line<'static>> = Vec::new();
-
-    let logo_height = 7;
-    let content_height = logo_height + 14;
-    let top_pad = if area.height as usize > content_height {
+    let content_height = 18;
+    let top_pad = if area.height as usize > content_height + 4 {
         (area.height as usize - content_height) / 3
     } else {
         1
@@ -115,56 +29,83 @@ pub fn render_setup(frame: &mut Frame, area: Rect, state: &WelcomeState) {
         lines.push(Line::default());
     }
 
-    // Logo
-    let logo_color = theme::ACCENT;
-    for logo_line in LOGO.lines().skip(1) {
-        lines.push(Line::from(Span::styled(
-            logo_line.to_string(),
-            Style::default().fg(logo_color).add_modifier(Modifier::BOLD),
-        )));
+    // ── Atom art + info panel (neofetch style) ──
+    let git = git_info(&app.working_dir);
+
+    // Gradient: top orbit → core → bottom orbit
+    let c_orbit = theme::ACCENT_DIM;
+    let c_core = theme::ACCENT;
+
+    // Line 1: top orbit + "atomcode"
+    lines.push(Line::from(vec![
+        Span::styled(format!("  {}", ATOM[0]), Style::default().fg(c_orbit)),
+        Span::styled(
+            "  atomcode",
+            Style::default().fg(theme::TEXT_PRIMARY).add_modifier(Modifier::BOLD),
+        ),
+    ]));
+    // Line 2: core + version · model
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!("  {}", ATOM[1]),
+            Style::default().fg(c_core).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("  v{}", env!("CARGO_PKG_VERSION")),
+            Style::default().fg(theme::TEXT_MUTED),
+        ),
+        Span::styled(" · ", Style::default().fg(theme::BORDER)),
+        Span::styled(
+            app.model_name.clone(),
+            Style::default().fg(theme::TEXT_SECONDARY),
+        ),
+    ]));
+    // Line 3: bottom orbit + path (+ git)
+    let mut path_spans = vec![
+        Span::styled(format!("  {}", ATOM[2]), Style::default().fg(c_orbit)),
+        Span::styled(
+            format!("  {}", short_home(&app.working_dir)),
+            Style::default().fg(theme::TEXT_MUTED),
+        ),
+    ];
+    if let Some((branch, dirty)) = &git {
+        path_spans.push(Span::styled("  ", Style::default()));
+        path_spans.push(Span::styled(
+            format!(" {}", branch),
+            Style::default().fg(theme::INFO),
+        ));
+        if *dirty {
+            path_spans.push(Span::styled(
+                " ✱",
+                Style::default().fg(theme::WARNING),
+            ));
+        }
     }
+    lines.push(Line::from(path_spans));
 
     lines.push(Line::default());
+
+    // ── Separator ──
+    let sep_w = (area.width as usize).min(60);
     lines.push(Line::from(Span::styled(
-        "  Welcome! Choose how to get started:",
-        Style::default().fg(theme::TEXT_SECONDARY),
+        format!("  {}", "─".repeat(sep_w.saturating_sub(4))),
+        Style::default().fg(theme::BORDER),
     )));
     lines.push(Line::default());
 
-    let options = [
-        "Login with AtomGit",
-        "Configure manually",
-        "Skip for now",
-    ];
-    for (i, opt) in options.iter().enumerate() {
-        let is_sel = i == state.selected;
-        let prefix = if is_sel { "  \u{25b6} " } else { "     " };
-        let (fg, bg) = if is_sel {
-            (theme::TEXT_PRIMARY, theme::BG_ELEVATED)
-        } else {
-            (theme::TEXT_SECONDARY, Color::Reset)
-        };
-        let number = format!("[{}] ", i + 1);
-        lines.push(Line::from(vec![
-            Span::styled(prefix, Style::default().fg(fg).bg(bg)),
-            Span::styled(number, Style::default().fg(theme::INFO).bg(bg)),
-            Span::styled(opt.to_string(), Style::default().fg(fg).bg(bg)),
-        ]));
-    }
+    // ── Shortcuts — two-column ──
+    let k = Style::default().fg(theme::TEXT_SECONDARY);
+    let d = Style::default().fg(theme::TEXT_MUTED);
+
+    lines.push(two_col("Enter",       "Send",            "/",        "Commands", k, d));
+    lines.push(two_col("Shift+Enter", "Newline",         "/model",   "Switch model", k, d));
+    lines.push(two_col("Esc",         "Clear / cancel",  "/cd",      "Change dir", k, d));
+    lines.push(two_col("↑ ↓",         "History",         "/provider","Providers", k, d));
+    lines.push(two_col("Ctrl+C",      "Exit",            "Ctrl+L",   "Clear chat", k, d));
 
     lines.push(Line::default());
-
-    // Error message if any
-    if let Some(ref err) = state.error {
-        lines.push(Line::from(Span::styled(
-            format!("  Error: {}", err),
-            Style::default().fg(Color::Red),
-        )));
-        lines.push(Line::default());
-    }
-
     lines.push(Line::from(Span::styled(
-        "  \u{2191}\u{2193} / 1-3 to select   Enter to confirm",
+        "  Type a message to get started.",
         Style::default().fg(theme::TEXT_MUTED),
     )));
 
@@ -172,11 +113,155 @@ pub fn render_setup(frame: &mut Frame, area: Rect, state: &WelcomeState) {
     frame.render_widget(paragraph, area);
 }
 
-fn line_kv(key: &str, desc: &str, ks: Style, ds: Style) -> Line<'static> {
-    let pad = 20usize.saturating_sub(key.len());
+/// Full-screen first-run setup screen shown when no providers are configured.
+pub fn render_setup(frame: &mut Frame, area: Rect, state: &WelcomeState) {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    let content_height = 16;
+    let top_pad = if area.height as usize > content_height + 4 {
+        (area.height as usize - content_height) / 3
+    } else {
+        1
+    };
+
+    for _ in 0..top_pad {
+        lines.push(Line::default());
+    }
+
+    let c_orbit = theme::ACCENT_DIM;
+    let c_core = theme::ACCENT;
+
+    // ── Atom + brand ──
+    lines.push(Line::from(vec![
+        Span::styled(format!("  {}", ATOM[0]), Style::default().fg(c_orbit)),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!("  {}", ATOM[1]),
+            Style::default().fg(c_core).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "  atomcode",
+            Style::default().fg(theme::TEXT_PRIMARY).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("  v{}", env!("CARGO_PKG_VERSION")),
+            Style::default().fg(theme::TEXT_MUTED),
+        ),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled(format!("  {}", ATOM[2]), Style::default().fg(c_orbit)),
+    ]));
+
+    lines.push(Line::default());
+
+    let sep_w = (area.width as usize).min(48);
+    lines.push(Line::from(Span::styled(
+        format!("  {}", "─".repeat(sep_w.saturating_sub(4))),
+        Style::default().fg(theme::BORDER),
+    )));
+    lines.push(Line::default());
+
+    lines.push(Line::from(Span::styled(
+        "  Get started:",
+        Style::default().fg(theme::TEXT_SECONDARY),
+    )));
+    lines.push(Line::default());
+
+    let options = [
+        ("Login with AtomGit", "OAuth · recommended"),
+        ("Configure manually", "API key"),
+        ("Skip for now",       "explore first"),
+    ];
+    for (i, (label, hint)) in options.iter().enumerate() {
+        let is_sel = i == state.selected;
+        if is_sel {
+            lines.push(Line::from(vec![
+                Span::styled("  ▸ ", Style::default().fg(theme::ACCENT)),
+                Span::styled(
+                    label.to_string(),
+                    Style::default().fg(theme::TEXT_PRIMARY).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("  {}", hint),
+                    Style::default().fg(theme::TEXT_MUTED),
+                ),
+            ]));
+        } else {
+            lines.push(Line::from(vec![
+                Span::styled("    ", Style::default()),
+                Span::styled(label.to_string(), Style::default().fg(theme::TEXT_SECONDARY)),
+            ]));
+        }
+    }
+
+    lines.push(Line::default());
+
+    if let Some(ref err) = state.error {
+        lines.push(Line::from(Span::styled(
+            format!("  {}", err),
+            Style::default().fg(theme::ERROR),
+        )));
+        lines.push(Line::default());
+    }
+
+    lines.push(Line::from(Span::styled(
+        "  ↑↓ select · Enter confirm · Esc skip",
+        Style::default().fg(theme::TEXT_MUTED),
+    )));
+
+    let paragraph = Paragraph::new(lines);
+    frame.render_widget(paragraph, area);
+}
+
+// ─── Helpers ───────────────────────────────────────────────────────
+
+/// Two-column shortcut row.
+fn two_col(k1: &str, d1: &str, k2: &str, d2: &str, ks: Style, ds: Style) -> Line<'static> {
+    let kw: usize = 14;
+    let dw: usize = 16;
+    let gap: usize = 4;
+
     Line::from(vec![
-        Span::styled(key.to_string(), ks),
-        Span::styled(" ".repeat(pad), ds),
-        Span::styled(desc.to_string(), ds),
+        Span::styled("  ", ds),
+        Span::styled(k1.to_string(), ks),
+        Span::styled(" ".repeat(kw.saturating_sub(k1.len())), ds),
+        Span::styled(d1.to_string(), ds),
+        Span::styled(" ".repeat(dw.saturating_sub(d1.len()) + gap), ds),
+        Span::styled(k2.to_string(), ks),
+        Span::styled(" ".repeat(kw.saturating_sub(k2.len())), ds),
+        Span::styled(d2.to_string(), ds),
     ])
+}
+
+/// Get current git branch + dirty status. Returns None if not a git repo.
+fn git_info(wd: &std::path::Path) -> Option<(String, bool)> {
+    let branch = std::process::Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .current_dir(wd)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())?;
+
+    let dirty = std::process::Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(wd)
+        .output()
+        .ok()
+        .map(|o| !o.stdout.is_empty())
+        .unwrap_or(false);
+
+    Some((branch, dirty))
+}
+
+/// Replace home directory prefix with ~
+fn short_home(path: &std::path::Path) -> String {
+    if let Some(home) = dirs::home_dir() {
+        if let Ok(rel) = path.strip_prefix(&home) {
+            return format!("~/{}", rel.display());
+        }
+    }
+    path.display().to_string()
 }
