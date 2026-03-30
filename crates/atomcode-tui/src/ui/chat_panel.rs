@@ -44,87 +44,6 @@ pub fn render(
     render_cache: &mut Vec<Line<'static>>,
     render_cache_msg_count: &mut usize,
 ) -> usize {
-    // ── Spinner: rendered as a SEPARATE widget at the bottom of the chat area ──
-    // This guarantees it's always visible regardless of line wrapping in the
-    // main Paragraph. Previously the spinner was inside the Paragraph with
-    // Wrap { trim: false }, causing long tool result lines to push the spinner
-    // below the viewport.
-    let turn_active = last_turn_duration.is_none() && (
-        matches!(mode, AppMode::Streaming | AppMode::ToolExecuting)
-        || step_count > 0
-    );
-    let spinner_height: u16 = if turn_active || matches!(mode, AppMode::WaitingApproval(_)) { 1 } else { 0 };
-    let (chat_area, spinner_area) = if spinner_height > 0 && area.height > 2 {
-        let chat = Rect { height: area.height - spinner_height, ..area };
-        let spin = Rect { y: area.y + chat.height, height: spinner_height, ..area };
-        (chat, Some(spin))
-    } else {
-        (area, None)
-    };
-
-    // Render spinner in its dedicated area (immune to Paragraph wrapping)
-    if let Some(spin_rect) = spinner_area {
-        let spinner = SPINNER[tick % SPINNER.len()];
-        let bar_style = Style::default().fg(theme::ACCENT_DIM);
-        let wait_ms = llm_wait_ms.unwrap_or(0);
-        let wait_color = if first_token_ms.is_some() {
-            theme::ACCENT
-        } else if wait_ms < 10_000 {
-            theme::WAIT_FAST
-        } else if wait_ms < 60_000 {
-            theme::WAIT_NORMAL
-        } else if wait_ms < 120_000 {
-            theme::WAIT_SLOW
-        } else {
-            theme::WAIT_VERY_SLOW
-        };
-
-        let step_prefix = if step_count > 0 { format!("[turn {}] ", step_count) } else { String::new() };
-
-        let time_display = if wait_ms >= 60_000 {
-            format!("  {:.0}m{:.0}s", wait_ms / 60_000, (wait_ms % 60_000) / 1000)
-        } else if wait_ms >= 1000 {
-            format!("  {:.1}s", wait_ms as f64 / 1000.0)
-        } else if wait_ms > 0 {
-            format!("  {}ms", wait_ms)
-        } else {
-            String::new()
-        };
-
-        if let AppMode::WaitingApproval(call) = mode {
-            let mut approval_lines = Vec::new();
-            render_approval(&mut approval_lines, call);
-            if let Some(line) = approval_lines.into_iter().next() {
-                frame.render_widget(Paragraph::new(vec![line]), spin_rect);
-            }
-        } else {
-            let has_tokens = conversation.stream_buffer.as_ref().map_or(false, |b| !b.is_empty());
-            let label = if matches!(mode, AppMode::ToolExecuting) && !tool_info.is_empty() {
-                tool_info.to_string()
-            } else if has_tokens {
-                "Generating...".to_string()
-            } else if step_count > 0 && !last_completed_tool.is_empty() {
-                format!("After {}, thinking", last_completed_tool)
-            } else if step_count > 0 {
-                "Thinking...".to_string()
-            } else {
-                THINKING_LABELS[turn_label_seed % THINKING_LABELS.len()].to_string()
-            };
-
-            let spin_color = if matches!(mode, AppMode::ToolExecuting) { theme::WARNING } else { wait_color };
-
-            let spin_line = Line::from(vec![
-                Span::styled(format!("{}\u{2502} ", INDENT), bar_style),
-                Span::styled(format!("{} ", spinner), Style::default().fg(spin_color)),
-                Span::styled(step_prefix, Style::default().fg(theme::TEXT_SECONDARY)),
-                Span::styled(label, Style::default().fg(spin_color)),
-                Span::styled(time_display, Style::default().fg(wait_color)),
-            ]);
-            frame.render_widget(Paragraph::new(vec![spin_line]), spin_rect);
-        }
-    }
-
-    let area = chat_area;
     let vh = (area.height as usize).saturating_sub(1);
     if vh == 0 { return 0; }
 
@@ -259,6 +178,61 @@ pub fn render(
     frame.render_widget(bg, area);
     let paragraph = Paragraph::new(visible).wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
+
+    // ── Spinner overlay: rendered AFTER the Paragraph, at the last row of chat area ──
+    // This overwrites whatever the Paragraph put there. Immune to Wrap-induced
+    // scroll miscalculations because it doesn't depend on the Paragraph's content.
+    let turn_active = last_turn_duration.is_none() && (
+        matches!(mode, AppMode::Streaming | AppMode::ToolExecuting)
+        || step_count > 0
+    );
+    if turn_active && area.height >= 2 {
+        let spin_y = area.y + area.height - 1;
+        let spin_rect = Rect::new(area.x, spin_y, area.width, 1);
+        frame.render_widget(Clear, spin_rect);
+
+        let spinner = SPINNER[tick % SPINNER.len()];
+        let bar_style = Style::default().fg(theme::ACCENT_DIM);
+        let wait_ms = llm_wait_ms.unwrap_or(0);
+        let spin_color = if first_token_ms.is_some() {
+            theme::ACCENT
+        } else if wait_ms < 10_000 {
+            theme::WAIT_FAST
+        } else if wait_ms < 60_000 {
+            theme::WAIT_NORMAL
+        } else if wait_ms < 120_000 {
+            theme::WAIT_SLOW
+        } else {
+            theme::WAIT_VERY_SLOW
+        };
+        let step_prefix = if step_count > 0 { format!("[turn {}] ", step_count) } else { String::new() };
+        let has_tokens = conversation.stream_buffer.as_ref().map_or(false, |b| !b.is_empty());
+        let label = if matches!(mode, AppMode::ToolExecuting) && !tool_info.is_empty() {
+            tool_info.to_string()
+        } else if has_tokens {
+            "Generating...".to_string()
+        } else if step_count > 0 && !last_completed_tool.is_empty() {
+            format!("After {}, thinking", last_completed_tool)
+        } else {
+            "Thinking...".to_string()
+        };
+        let time_str = if wait_ms >= 60_000 {
+            format!("  {:.0}m{:.0}s", wait_ms / 60_000, (wait_ms % 60_000) / 1000)
+        } else if wait_ms >= 1000 {
+            format!("  {:.1}s", wait_ms as f64 / 1000.0)
+        } else {
+            String::new()
+        };
+
+        let spin_line = Line::from(vec![
+            Span::styled(format!("{}\u{2502} ", INDENT), bar_style),
+            Span::styled(format!("{} ", spinner), Style::default().fg(spin_color)),
+            Span::styled(step_prefix, Style::default().fg(theme::TEXT_SECONDARY)),
+            Span::styled(label, Style::default().fg(spin_color)),
+            Span::styled(time_str, Style::default().fg(spin_color)),
+        ]);
+        frame.render_widget(Paragraph::new(vec![spin_line]), spin_rect);
+    }
 
     scroll_usize
 }
