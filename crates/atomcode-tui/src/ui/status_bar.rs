@@ -7,13 +7,13 @@ use ratatui::Frame;
 use crate::app::App;
 use super::theme;
 
-/// Minimal status bar: brand │ path │ model │ turn N
-/// No mode badges, timers, or speed — those are in the chat spinner.
+const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
 pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     let width = area.width as usize;
     let dir = shorten_path(&app.working_dir.to_string_lossy());
     let model = app.model_name.as_str();
-    let sep = Span::styled(" \u{2502} ", Style::default().fg(theme::STATUS_SEP));
+    let sep = Span::styled(" │ ", Style::default().fg(theme::STATUS_SEP));
 
     let mut left: Vec<Span> = Vec::new();
     let mut right: Vec<Span> = Vec::new();
@@ -26,29 +26,66 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     left.push(Span::styled(" ", Style::default()));
     left.push(Span::styled(dir, Style::default().fg(theme::STATUS_PATH)));
 
-    // Right: turn count (if active) │ model
-    if app.current_step_count > 0 {
+    // Right side: turn state + model
+    let is_active = app.turn_start.is_some();
+
+    if is_active {
+        // ── Active turn: spinner + turn N + live timer ──
+        let spin = SPINNER[app.tick_count % SPINNER.len()];
+        let secs = app.turn_start.unwrap().elapsed().as_secs();
+        let dur = if secs >= 60 { format!("{}m{}s", secs / 60, secs % 60) } else { format!("{}s", secs) };
+
+        let time_color = if secs < 10 {
+            theme::WAIT_FAST
+        } else if secs < 60 {
+            theme::WAIT_NORMAL
+        } else if secs < 120 {
+            theme::WAIT_SLOW
+        } else {
+            theme::WAIT_VERY_SLOW
+        };
+
         right.push(Span::styled(
-            format!("turn {}", app.current_step_count),
-            Style::default().fg(theme::TEXT_SECONDARY),
+            format!("{} ", spin),
+            Style::default().fg(time_color),
+        ));
+        if app.current_step_count > 0 {
+            right.push(Span::styled(
+                format!("turn {}", app.current_step_count),
+                Style::default().fg(theme::TEXT_SECONDARY),
+            ));
+            right.push(sep.clone());
+        }
+        right.push(Span::styled(
+            dur,
+            Style::default().fg(time_color).add_modifier(Modifier::BOLD),
         ));
         right.push(sep.clone());
+    } else if app.last_turn_duration.is_some() || app.current_step_count > 0 {
+        // ── Completed turn: ✓ + turn N + duration (green) ──
+        right.push(Span::styled(
+            "✓ ",
+            Style::default().fg(theme::SUCCESS),
+        ));
+        if app.current_step_count > 0 {
+            right.push(Span::styled(
+                format!("turn {}", app.current_step_count),
+                Style::default().fg(theme::TEXT_SECONDARY),
+            ));
+            right.push(sep.clone());
+        }
+        if let Some(dur) = app.last_turn_duration {
+            let secs = dur.as_secs();
+            let dur_str = if secs >= 60 { format!("{}m{}s", secs / 60, secs % 60) } else { format!("{}s", secs) };
+            right.push(Span::styled(
+                dur_str,
+                Style::default().fg(theme::SUCCESS),
+            ));
+            right.push(sep.clone());
+        }
     }
 
-    // Duration (active or last)
-    if let Some(start) = app.turn_start {
-        let secs = start.elapsed().as_secs();
-        let dur = if secs >= 60 { format!("{}m{}s", secs / 60, secs % 60) } else { format!("{}s", secs) };
-        right.push(Span::styled(dur, Style::default().fg(theme::WARNING)));
-        right.push(sep.clone());
-    } else if let Some(dur) = app.last_turn_duration {
-        let secs = dur.as_secs();
-        let dur_str = if secs >= 60 { format!("{}m{}s", secs / 60, secs % 60) } else { format!("{}s", secs) };
-        right.push(Span::styled(dur_str, Style::default().fg(theme::SUCCESS)));
-        right.push(sep.clone());
-    }
-
-    // Model name
+    // Model name (always)
     right.push(Span::styled(
         format!("{} ", model),
         Style::default().fg(theme::STATUS_MODEL).add_modifier(Modifier::BOLD),
