@@ -662,6 +662,62 @@ impl AgentLoop {
                 self.planning_phase = false; // Only inject once
             }
 
+            // Fix 6: Bug-fix diagnostic guidance — inject on first turn when user
+            // message contains bug-related keywords.
+            if self.tool_call_count == 0 {
+                let last_user = self.conversation.messages.iter().rev()
+                    .find(|m| matches!(m.role, crate::conversation::message::Role::User))
+                    .and_then(|m| m.text())
+                    .unwrap_or("")
+                    .to_string();
+                let lower = last_user.to_lowercase();
+                let has_bug_keyword = ["bug", "fix", "broken", "error", "错误", "报错", "不行",
+                    "失败", "crash", "wrong", "issue", "problem", "doesn't work", "not working"]
+                    .iter().any(|k| lower.contains(k));
+                if has_bug_keyword {
+                    let has_frontend_keyword = ["页面", "前端", "样式", "css", "html", "vue",
+                        "react", "component", "button", "render", "display", "layout", "ui"]
+                        .iter().any(|k| lower.contains(k));
+                    let strategy = if has_frontend_keyword {
+                        "[DIAGNOSTIC STRATEGY: This looks like a frontend bug. \
+                         1) Read the relevant component file. \
+                         2) Check for CSS/template issues. \
+                         3) Make the fix. \
+                         Do NOT start a dev server or run build commands until you've read the code.]"
+                    } else {
+                        "[DIAGNOSTIC STRATEGY: This looks like a bug fix task. \
+                         1) Read the most likely source file (check error messages/stack traces for clues). \
+                         2) Identify the root cause. \
+                         3) Make the fix. \
+                         Stay focused — most bugs need only 3-4 steps to fix.]"
+                    };
+                    self.conversation.messages.push(
+                        crate::conversation::message::Message::new(
+                            crate::conversation::message::Role::System,
+                            strategy,
+                        )
+                    );
+                }
+            }
+
+            // Fix 5: Step budget warning — nudge the model to stop reading and start editing.
+            if self.tool_call_count >= 6 && self.files_edited_this_turn.is_empty() {
+                let warning = format!(
+                    "[STEP BUDGET WARNING: You have made {} tool calls with ZERO edits. \
+                     You are off track. Most bug fixes need 3-4 steps. \
+                     STOP reading more files. Based on what you already know, make your edit NOW. \
+                     Files you've read: {}]",
+                    self.tool_call_count,
+                    self.files_read_this_turn.join(", "),
+                );
+                self.conversation.messages.push(
+                    crate::conversation::message::Message::new(
+                        crate::conversation::message::Role::System,
+                        warning,
+                    )
+                );
+            }
+
             let system_prompt = self.build_system_prompt();
             let cancel = self.cancel_token.clone();
 
@@ -713,6 +769,8 @@ impl AgentLoop {
                 let model_produced_text = &mut self.model_produced_text;
                 let current_tool_name = &mut self.current_tool_name;
                 let files_edited_this_turn = &mut self.files_edited_this_turn;
+                let files_read_this_turn = &mut self.files_read_this_turn;
+                let file_read_counts = &mut self.file_read_counts;
                 let consecutive_reads = &mut self.consecutive_reads;
                 let session_files = &mut self.session_files;
 
@@ -738,7 +796,7 @@ impl AgentLoop {
                                     *phase = AgentPhase::CallingTool(name.clone());
                                     let _ = event_tx.send(AgentEvent::PhaseChange(phase.clone()));
 
-                                    // Track files for Working Set
+                                    // Track files for Working Set + read counts
                                     if matches!(name.as_str(), "read_file" | "edit_file" | "write_file" | "search_replace" | "glob" | "grep") {
                                         if let Ok(args) = serde_json::from_str::<serde_json::Value>(arguments) {
                                             // Try file_path first, then path (glob/grep use path)
@@ -749,7 +807,14 @@ impl AgentLoop {
                                                     .file_name()
                                                     .map(|n| n.to_string_lossy().to_string())
                                                     .unwrap_or_else(|| fp.to_string());
-                                                session_files.insert(short, std::path::PathBuf::from(fp));
+                                                session_files.insert(short.clone(), std::path::PathBuf::from(fp));
+                                                // Track per-file read count for re-read guard
+                                                if name == "read_file" {
+                                                    *file_read_counts.entry(short.clone()).or_insert(0) += 1;
+                                                    if !files_read_this_turn.contains(&short) {
+                                                        files_read_this_turn.push(short);
+                                                    }
+                                                }
                                             }
                                         }
                                     }
@@ -1018,11 +1083,17 @@ impl AgentLoop {
     /// Post-process tool results added by TurnRunner: truncate large outputs
     /// and externalize to disk store. TurnRunner adds raw results; we clean them up.
     fn post_process_tool_results(&mut self, tool_count: usize) {
+        let context_window = self.config
+            .providers
+            .get(&self.config.default_provider)
+            .map(|p| p.context_window)
+            .unwrap_or(16000);
         crate::turn::truncation::post_process_tool_results(
             &mut self.conversation.messages,
             tool_count,
             &self.current_tool_name,
             &self.result_store,
+            context_window,
         );
     }
 
@@ -1085,6 +1156,32 @@ impl AgentLoop {
                 match &mut last_msg.content {
                     crate::conversation::message::MessageContent::ToolResult(ref mut r) => {
                         r.output.push_str(&reminder);
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Re-read guard: inject warnings for files read too many times.
+        // count >= 3: hard block warning — the model is looping on the same file.
+        // count >= 2 without offset in last read: warn about full re-reads.
+        let mut reread_warnings: Vec<String> = Vec::new();
+        for (file, count) in &self.file_read_counts {
+            if *count >= 3 {
+                reread_warnings.push(format!(
+                    "[BLOCKED: You have read {} {} times this turn. \
+                     You already have the content. STOP re-reading and use what you have. \
+                     If you need to edit, use edit_file now.]",
+                    file, count
+                ));
+            }
+        }
+        if !reread_warnings.is_empty() {
+            let warning = reread_warnings.join("\n");
+            if let Some(last_msg) = self.conversation.messages.last_mut() {
+                match &mut last_msg.content {
+                    crate::conversation::message::MessageContent::ToolResult(ref mut r) => {
+                        r.output.push_str(&format!("\n{}", warning));
                     }
                     _ => {}
                 }

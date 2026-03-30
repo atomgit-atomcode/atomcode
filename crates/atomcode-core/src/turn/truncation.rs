@@ -3,17 +3,19 @@ use crate::tool::ToolResult;
 use crate::tool::result_store::ToolResultStore;
 
 /// Dispatch to per-tool truncation based on tool name, then apply a hard char limit.
-pub fn truncate_output(result: &mut ToolResult, tool_name: &str) {
+/// `context_window` drives the hard char limit — larger context windows allow more output.
+pub fn truncate_output(result: &mut ToolResult, tool_name: &str, context_window: usize) {
     match tool_name {
         "bash" => truncate_bash(result),
         "read_file" => truncate_read_file(result),
         "web_fetch" => truncate_generic(result, 150, 20, 40),
         _ => truncate_generic(result, 200, 30, 50),
     }
-    // Hard char limit as a safety net.
-    if result.output.len() > 12000 {
-        result.output = result.output.chars().take(12000).collect::<String>()
-            + "\n[output truncated at 12000 chars]";
+    // Hard char limit as a safety net — scales with context window.
+    let char_limit = (context_window).max(16000);
+    if result.output.len() > char_limit {
+        result.output = result.output.chars().take(char_limit).collect::<String>()
+            + &format!("\n[output truncated at {} chars]", char_limit);
     }
 }
 
@@ -219,6 +221,7 @@ pub fn post_process_tool_results(
     tool_count: usize,
     current_tool_name: &str,
     result_store: &ToolResultStore,
+    context_window: usize,
 ) {
     let len = messages.len();
     let start = len.saturating_sub(tool_count);
@@ -235,7 +238,7 @@ pub fn post_process_tool_results(
     for &i in &to_process {
         if let MessageContent::ToolResult(ref r) = messages[i].content {
             let mut result = r.clone();
-            truncate_output(&mut result, current_tool_name);
+            truncate_output(&mut result, current_tool_name, context_window);
             messages[i].content = MessageContent::ToolResult(result);
         }
     }
@@ -381,12 +384,12 @@ mod tests {
 
     #[test]
     fn truncate_output_hard_char_limit() {
-        // Create output that's way over 12000 chars
+        // Create output that's way over 16000 chars (minimum limit)
         let output = "x".repeat(20000);
         let mut result = make_result(&output);
-        truncate_output(&mut result, "unknown_tool");
-        assert!(result.output.len() <= 12000 + 100); // allow for truncation message
-        assert!(result.output.contains("[output truncated at 12000 chars]"));
+        truncate_output(&mut result, "unknown_tool", 16000);
+        assert!(result.output.len() <= 16000 + 100); // allow for truncation message
+        assert!(result.output.contains("[output truncated at 16000 chars]"));
     }
 
     // --- post_process_tool_results tests ---
@@ -396,7 +399,7 @@ mod tests {
         let (store, _dir) = temp_store();
         let large_output = "x".repeat(600); // over 512 threshold
         let mut messages = vec![make_tool_result_message(&large_output)];
-        post_process_tool_results(&mut messages, 1, "bash", &store);
+        post_process_tool_results(&mut messages, 1, "bash", &store, 16000);
         // Should have been externalized to ToolResultRef
         assert!(matches!(messages[0].content, MessageContent::ToolResultRef(_)));
     }
@@ -406,7 +409,7 @@ mod tests {
         let (store, _dir) = temp_store();
         let small_output = "short output";
         let mut messages = vec![make_tool_result_message(small_output)];
-        post_process_tool_results(&mut messages, 1, "bash", &store);
+        post_process_tool_results(&mut messages, 1, "bash", &store, 16000);
         // Should remain as ToolResult (small enough)
         assert!(matches!(messages[0].content, MessageContent::ToolResult(_)));
     }
