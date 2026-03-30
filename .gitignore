@@ -34,4 +34,3 @@ config.toml
 
 # Local docs (not pushed to remote)
 /doc/
-/docs/

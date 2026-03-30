@@ -31,7 +31,7 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
 
-    /// Continue the most recent conversation session
+    /// Continue the previous session instead of starting a new one
     #[arg(short = 'c', long = "continue")]
     continue_last: bool,
 
@@ -177,7 +177,7 @@ async fn run() -> Result<()> {
     tool_registry.register(Box::new(SearchReplaceTool));
     let tool_context = ToolContext::new(working_dir.clone());
 
-    // Handle --continue flag: load the most recent session
+    // Only continue the previous session when --continue is explicitly specified
     let session_to_continue = if cli.continue_last {
         let session_manager = SessionManager::new(&working_dir);
         match session_manager.latest() {
@@ -186,7 +186,7 @@ async fn run() -> Result<()> {
                 Some(session)
             }
             Ok(None) => {
-                eprintln!("No previous session found. Starting a new session.");
+                eprintln!("No previous session found. Starting fresh.");
                 None
             }
             Err(e) => {
