@@ -1161,8 +1161,9 @@ impl App {
                 self.input.delete_forward();
             }
             // Scroll keys: Ctrl+Up/Down (3 lines), PageUp/PageDown (20 lines)
-            // Also handle plain Up/Down for scroll when input is empty (for terminal alternate scroll mode)
-            (_, KeyCode::Up) if self.input.is_empty() => {
+            // Also handle plain Up/Down for scroll when input is empty AND no history available.
+            // If there's history, Up should enter history browse mode, not scroll.
+            (_, KeyCode::Up) if self.input.is_empty() && self.input_history.is_empty() => {
                 // Scroll up when input is empty (terminal scroll wheel sends Up/Down in alternate mode)
                 if self.at_bottom {
                     let total = self.render_cache.len();
@@ -1172,7 +1173,7 @@ impl App {
                     self.scroll_offset = self.scroll_offset.saturating_sub(3);
                 }
             }
-            (_, KeyCode::Down) if self.input.is_empty() => {
+            (_, KeyCode::Down) if self.input.is_empty() && self.input_history.is_empty() => {
                 // Scroll down when input is empty (terminal scroll wheel sends Up/Down in alternate mode)
                 self.scroll_offset += 3;
                 let total = self.render_cache.len();
