@@ -65,7 +65,9 @@ impl Tool for BashTool {
 
     async fn execute(&self, args: &str, ctx: &ToolContext) -> Result<ToolResult> {
         let mut parsed: BashArgs = serde_json::from_str(args)?;
-        let timeout_secs = parsed.timeout.unwrap_or(30);
+        // Cap timeout: model may request absurdly large values. Max 5 min for
+        // normal commands, 3 min for background/server commands.
+        let timeout_secs = parsed.timeout.unwrap_or(30).min(300);
 
         let wd = ctx.working_dir.read().await.clone();
 
@@ -133,7 +135,7 @@ impl Tool for BashTool {
         // Tech-stack-agnostic idle detection: if the process is still running but
         // output has stopped for 3s, it's likely a long-running process (dev server)
         // that started successfully. Return early without killing it.
-        let wait_secs = parsed.timeout.unwrap_or(INITIAL_WAIT_SECS);
+        let wait_secs = parsed.timeout.unwrap_or(INITIAL_WAIT_SECS).min(300);
         let idle_timeout = Duration::from_secs(3);
         let has_any_output = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let has_out_1 = has_any_output.clone();
