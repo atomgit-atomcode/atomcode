@@ -4,6 +4,7 @@ pub mod conversation;
 pub mod project_context;
 pub mod provider;
 pub mod semantic;
+pub mod session;
 pub mod skill;
 pub mod stream;
 pub mod tool;

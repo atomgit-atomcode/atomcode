@@ -10,6 +10,7 @@ use atomcode_core::config::provider::{ProviderConfig, default_context_window_for
 use atomcode_core::config::Config;
 use atomcode_core::conversation::Conversation;
 use atomcode_core::provider::create_provider;
+use atomcode_core::session::SessionManager;
 use atomcode_core::tool::{ToolContext, ToolRegistry};
 use atomcode_core::tool::read::ReadFileTool;
 use atomcode_core::tool::write::WriteFileTool;
@@ -29,6 +30,10 @@ mod auth;
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
+
+    /// Continue the most recent conversation session
+    #[arg(short = 'c', long = "continue")]
+    continue_last: bool,
 
     /// Provider to use (overrides config default)
     #[arg(long)]
@@ -170,8 +175,29 @@ async fn run() -> Result<()> {
     tool_registry.register(Box::new(WebSearchTool));
     tool_registry.register(Box::new(WebFetchTool));
     tool_registry.register(Box::new(SearchReplaceTool));
-
     let tool_context = ToolContext::new(working_dir.clone());
+
+    // Handle --continue flag: load the most recent session
+    let session_to_continue = if cli.continue_last {
+        let session_manager = SessionManager::new(&working_dir);
+        match session_manager.latest() {
+            Ok(Some(session)) => {
+                eprintln!("Continuing session: {}", session.name);
+                Some(session)
+            }
+            Ok(None) => {
+                eprintln!("No previous session found. Starting a new session.");
+                None
+            }
+            Err(e) => {
+                eprintln!("Warning: Failed to load last session ({}). Starting fresh.", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // Start with a fresh conversation each session.
     // Previous session context is injected via build_previous_session_context()
     // from the saved history file — no need to load raw messages.
@@ -196,7 +222,7 @@ async fn run() -> Result<()> {
     }
 
     tokio::spawn(agent_loop.run());
-    atomcode_tui::run(config, model_name, agent_handle, tool_context, working_dir).await
+    atomcode_tui::run(config, model_name, agent_handle, tool_context, working_dir, session_to_continue).await
 }
 
 /// Run agent in headless mode (no TUI, output to stdout).

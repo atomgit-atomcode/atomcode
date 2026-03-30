@@ -8,6 +8,7 @@ use atomcode_core::agent::{AgentCommand, AgentEvent, AgentHandle};
 use atomcode_core::config::Config;
 use atomcode_core::conversation::Conversation;
 use atomcode_core::provider::LlmProvider;
+use atomcode_core::session::{Session, SessionManager, SessionMeta};
 use atomcode_core::tool::{ToolCall, ToolContext, ToolResult};
 
 use base64::Engine as _;
@@ -77,6 +78,8 @@ pub enum AppMode {
     ToolExecuting,
     ProviderManager,
     ModelSelector,
+    /// Session selector mode - shows session list inline for /resume
+    SessionSelector,
     Exiting,
 }
 
@@ -179,117 +182,139 @@ pub struct App {
     pub model_name: String,
     /// Per-turn logger: writes each turn to datalog/ as a markdown file.
     pub turn_log: crate::turn_log::TurnLog,
+    /// Session manager for persistence.
+    pub session_manager: SessionManager,
+    /// Current session (wraps conversation for persistence).
+    pub current_session: Session,
+    /// Session selector state: list of session metas + selected index.
+    /// selected = 0 means search box is focused, 1+ means session item is selected.
+    pub session_selector: Option<(Vec<SessionMeta>, usize)>,
+    /// Search filter for session selector.
+    pub session_selector_query: String,
 }
 
 impl App {
-    pub fn new(
-        model_name: String,
-        config: Config,
-        agent_handle: AgentHandle,
-        tool_context: ToolContext,
-        working_dir: PathBuf,
-    ) -> Self {
-        // Load history ONLY for input history (up/down arrow), NOT for conversation context.
-        // Each session starts fresh — prevents corrupted messages from causing API errors.
-        let old_history = Conversation::load(&Conversation::history_path());
-        let input_history: Vec<String> = old_history.messages.iter()
-            .filter_map(|m| {
-                use atomcode_core::conversation::message::{MessageContent, Role};
-                if matches!(m.role, Role::User) {
-                    if let MessageContent::Text(s) = &m.content {
-                        if !s.starts_with('/') { return Some(s.clone()); }
-                    }
-                }
-                None
-            })
-            .collect();
-        // Start with a fresh conversation (like Claude Code)
-        let conversation = Conversation::new();
-        // Load skills for slash menu and manual invocation
-        let mut skill_registry = atomcode_core::skill::SkillRegistry::new();
-        skill_registry.reload(&working_dir);
-        let command_list = build_command_list(&skill_registry);
-        Self {
-            mode: if config.providers.is_empty() { AppMode::Welcome } else { AppMode::Normal },
-            conversation,
-            input: InputState::new(),
-            scroll_offset: 0,
-            at_bottom: true,
-            confirm_quit: false,
-            last_key_time: Instant::now(),
-            pending_editor: None,
-            pending_login: false,
-            attached_files: Vec::new(),
-            pasted_text: None,
-            slash_menu: SlashMenu::new(),
-            provider_mgr: None,
-            welcome_state: WelcomeState::new(),
-            pending_oauth_name: None,
-            model_list: Vec::new(),
-            model_selected: 0,
-            skill_registry,
-            command_list,
-            last_ctrl_c: None,
-            tick_count: 0,
-            project_context_cache: None,
-            current_step_count: 0,
-            executing_tool_info: String::new(),
-            turn_start: None,
-            first_token_ms: None,
-            llm_call_start: None,
-            last_completed_tool: String::new(),
-            tool_start: None,
-            last_turn_duration: None,
-            turn_log: crate::turn_log::TurnLog::new(&working_dir),
-            tool_context,
-            previous_working_dir: None,
-            recent_dirs: {
-                let mut dirs = load_recent_dirs();
-                // Add current dir to recent list on startup
-                dirs.retain(|d| d != &working_dir);
-                dirs.insert(0, working_dir.clone());
-                dirs.truncate(5);
-                save_recent_dirs(&dirs);
-                dirs
-            },
-            dir_selector: None,
-            working_dir,
-            input_history,
-            history_index: None,
-            history_stash: None,
-            total_tokens: 0,
-            turn_tokens: 0,
-            suggestion: None,
-            render_cache: Vec::new(),
-            render_cache_msg_count: 0,
-            selection: TextSelection::new(),
-            last_rendered_scroll: 0,
-            last_viewport_height: 0,
-            // Keep a dummy provider for rebuild_provider path (legacy). The real LLM
-            // work is now handled by AgentLoop. This avoids removing all provider refs at once.
-            provider: {
-                use atomcode_core::provider::create_provider;
-                use atomcode_core::config::provider::ProviderConfig;
-                // Create a no-op placeholder; rebuild_provider will set the real one on /provider changes.
-                create_provider(&ProviderConfig {
-                    provider_type: "openai".to_string(),
-                    api_key: Some("placeholder".to_string()),
-                    model: model_name.clone(),
-                    base_url: Some("http://localhost:1".to_string()),
-                    system_prompt: None,
-                    user_agent: None,
-                    context_window: atomcode_core::config::provider::default_context_window_for("openai"),
-                }).unwrap_or_else(|_| {
-                    // Fallback: should never reach production path since AgentLoop handles LLM
-                    panic!("Failed to create placeholder provider")
-                })
-            },
-            config,
-            cancel_token: tokio_util::sync::CancellationToken::new(),
-            agent_handle,
-            model_name,
-        }
-    }
+   pub fn new(
+       model_name: String,
+       config: Config,
+       agent_handle: AgentHandle,
+       tool_context: ToolContext,
+       working_dir: PathBuf,
+       session_to_continue: Option<Session>,
+   ) -> Self {
+       // Load history ONLY for input history (up/down arrow), NOT for conversation context.
+       // Each session starts fresh — prevents corrupted messages from causing API errors.
+       let old_history = Conversation::load(&Conversation::history_path());
+       let input_history: Vec<String> = old_history.messages.iter()
+           .filter_map(|m| {
+               use atomcode_core::conversation::message::{MessageContent, Role};
+               if matches!(m.role, Role::User) {
+                   if let MessageContent::Text(s) = &m.content {
+                       if !s.starts_with('/') { return Some(s.clone()); }
+                   }
+               }
+               None
+           })
+           .collect();
+
+       // Initialize session manager and load or create default session
+       let session_manager = SessionManager::new(&working_dir);
+       let current_session = session_to_continue
+           .unwrap_or_else(|| Session::default_session(working_dir.clone()));
+
+       // Create conversation from session messages
+       let mut conversation = Conversation::new();
+       conversation.messages = current_session.messages.clone();
+
+       // Load skills for slash menu and manual invocation
+       let mut skill_registry = atomcode_core::skill::SkillRegistry::new();
+       skill_registry.reload(&working_dir);
+       let command_list = build_command_list(&skill_registry);
+       Self {
+           mode: if config.providers.is_empty() { AppMode::Welcome } else { AppMode::Normal },
+           conversation,
+           input: InputState::new(),
+           scroll_offset: 0,
+           at_bottom: true,
+           confirm_quit: false,
+           last_key_time: Instant::now(),
+           pending_editor: None,
+           pending_login: false,
+           attached_files: Vec::new(),
+           pasted_text: None,
+           slash_menu: SlashMenu::new(),
+           provider_mgr: None,
+           welcome_state: WelcomeState::new(),
+           pending_oauth_name: None,
+           model_list: Vec::new(),
+           model_selected: 0,
+           skill_registry,
+           command_list,
+           last_ctrl_c: None,
+           tick_count: 0,
+           project_context_cache: None,
+           current_step_count: 0,
+           executing_tool_info: String::new(),
+           turn_start: None,
+           first_token_ms: None,
+           llm_call_start: None,
+           last_completed_tool: String::new(),
+           tool_start: None,
+           last_turn_duration: None,
+           turn_log: crate::turn_log::TurnLog::new(&working_dir),
+           tool_context,
+           previous_working_dir: None,
+           recent_dirs: {
+               let mut dirs = load_recent_dirs();
+               // Add current dir to recent list on startup
+               dirs.retain(|d| d != &working_dir);
+               dirs.insert(0, working_dir.clone());
+               dirs.truncate(5);
+               save_recent_dirs(&dirs);
+               dirs
+           },
+           dir_selector: None,
+           working_dir,
+           input_history,
+           history_index: None,
+           history_stash: None,
+           total_tokens: 0,
+           turn_tokens: 0,
+           suggestion: None,
+           render_cache: Vec::new(),
+           render_cache_msg_count: 0,
+           selection: TextSelection::new(),
+           last_rendered_scroll: 0,
+           last_viewport_height: 0,
+           // Keep a dummy provider for rebuild_provider path (legacy). The real LLM
+           // work is now handled by AgentLoop. This avoids removing all provider refs at once.
+           provider: {
+               use atomcode_core::provider::create_provider;
+               use atomcode_core::config::provider::ProviderConfig;
+               // Create a no-op placeholder; rebuild_provider will set the real one on /provider changes.
+               create_provider(&ProviderConfig {
+                   provider_type: "openai".to_string(),
+                   api_key: Some("placeholder".to_string()),
+                   model: model_name.clone(),
+                   base_url: Some("http://localhost:1".to_string()),
+                   system_prompt: None,
+                   user_agent: None,
+                   context_window: atomcode_core::config::provider::default_context_window_for("openai"),
+               }).unwrap_or_else(|_| {
+                   // Fallback: should never reach production path since AgentLoop handles LLM
+                   panic!("Failed to create placeholder provider")
+               })
+           },
+               config,
+               cancel_token: tokio_util::sync::CancellationToken::new(),
+               agent_handle,
+               model_name,
+               session_manager,
+               current_session,
+               session_selector: None,
+               session_selector_query: String::new(),
+           }
+   }
 
     /// Generate a follow-up suggestion based on conversation context.
     /// Language-agnostic: never references specific file extensions or build tools.
@@ -614,6 +639,30 @@ impl App {
                 self.render_cache_msg_count = 0; // Invalidate cache
                 self.suggestion = self.generate_suggestion();
                 self.at_bottom = true;
+                // Auto-save session after each turn
+                self.current_session.messages = self.conversation.messages.clone();
+                self.current_session.touch();
+                // Auto-name session from first user message if still default
+                if self.current_session.name == "default" || self.current_session.name.starts_with("session-") {
+                    if let Some(first_user_msg) = self.conversation.messages.iter().find(|m| {
+                        matches!(m.role, atomcode_core::conversation::message::Role::User)
+                    }) {
+                        if let Some(text) = first_user_msg.text() {
+                            // Generate name from first user message (truncate to 40 chars)
+                            let name: String = text
+                                .lines()
+                                .next()
+                                .unwrap_or("")
+                                .chars()
+                                .take(40)
+                                .collect();
+                            if !name.is_empty() {
+                                self.current_session.name = name;
+                            }
+                        }
+                    }
+                }
+                let _ = self.session_manager.save(&self.current_session);
             }
             AgentEvent::Error(e) => {
                 self.turn_log.log_error(&e);
@@ -830,6 +879,7 @@ impl App {
         match &self.mode {
             AppMode::Welcome => self.handle_key_welcome(key),
             AppMode::Normal => self.handle_key_normal(key, event_tx),
+            AppMode::SessionSelector => self.handle_key_session_selector(key),
             AppMode::Streaming | AppMode::ToolExecuting => {
                 if key.code == KeyCode::Esc {
                     if self.slash_menu.visible {
@@ -909,6 +959,85 @@ impl App {
                 self.mode = AppMode::Normal;
             }
             _ => {}
+        }
+    }
+    fn handle_key_session_selector(&mut self, key: KeyEvent) {
+        if let Some((ref sessions, ref mut selected)) = self.session_selector {
+            // Filter sessions by query for navigation
+            let filtered: Vec<usize> = sessions.iter().enumerate()
+                .filter(|(_, s)| self.session_selector_query.is_empty() 
+                    || s.name.to_lowercase().contains(&self.session_selector_query.to_lowercase()))
+                .map(|(i, _)| i)
+                .collect();
+            
+            // Total items = search row (index 0) + filtered sessions (index 1+)
+            let total_items = 1 + filtered.len();
+            
+            match key.code {
+                KeyCode::Up => {
+                    if *selected > 0 {
+                        *selected -= 1;
+                    } else {
+                        // Wrap to last item
+                        *selected = total_items.saturating_sub(1);
+                    }
+                }
+                KeyCode::Down => {
+                    if *selected + 1 < total_items {
+                        *selected += 1;
+                    } else {
+                        // Wrap to search row
+                        *selected = 0;
+                    }
+                }
+                KeyCode::Enter => {
+                    // Only load session if we're on a session item (selected >= 1)
+                    if *selected >= 1 {
+                        let filtered_idx = *selected - 1;
+                        if filtered_idx < filtered.len() {
+                            let session_idx = filtered[filtered_idx];
+                            let session_id = sessions[session_idx].id.clone();
+                            self.session_selector = None;
+                            self.session_selector_query.clear();
+                            if let Ok(session) = self.session_manager.load(&session_id) {
+                                self.current_session = session;
+                                self.conversation.messages = self.current_session.messages.clone();
+                                self.render_cache.clear();
+                                self.render_cache_msg_count = 0;
+                                self.scroll_offset = 0;
+                                self.at_bottom = true;
+                                let _ = self.agent_handle.cmd_tx.send(AgentCommand::SetMessages(self.current_session.messages.clone()));
+                            }
+                            self.mode = AppMode::Normal;
+                        }
+                    }
+                    // If on search row (selected == 0), Enter does nothing
+                }
+                KeyCode::Esc => {
+                    self.session_selector = None;
+                    self.session_selector_query.clear();
+                    self.mode = AppMode::Normal;
+                }
+                KeyCode::Backspace => {
+                    // Always allow backspace in search query, regardless of selection
+                    self.session_selector_query.pop();
+                    // Reset selection to first matching session (index 1)
+                    if !filtered.is_empty() {
+                        *selected = 1; // First session after search row
+                    }
+                }
+                KeyCode::Char(c) => {
+                    // Typing always goes to search query
+                    self.session_selector_query.push(c);
+                    // Auto-select first matching session (index 1 = first session)
+                    if !filtered.is_empty() {
+                        *selected = 1;
+                    } else {
+                        *selected = 0; // Stay on search row if no matches
+                    }
+                }
+                _ => {}
+            }
         }
     }
 
@@ -1585,6 +1714,43 @@ impl App {
                 self.conversation.push_delta("(no content)");
                 self.conversation.finalize_stream();
                 return true;
+            }
+            "/resume" => {
+                // Open session selector inline
+                match self.session_manager.list() {
+                    Ok(sessions) => {
+                        if sessions.is_empty() {
+                            self.conversation.push_delta("No previous sessions found. Start a conversation first.");
+                            self.conversation.finalize_stream();
+                        } else {
+                            // selected = 0 is search row, 1+ is session items
+                            // Default to first session (index 1) so user can press Enter immediately
+                            let default_selected = if sessions.is_empty() { 0 } else { 1 };
+                            self.session_selector = Some((sessions, default_selected));
+                            self.session_selector_query.clear();
+                            self.mode = AppMode::SessionSelector;
+                            self.conversation.messages.pop(); // Remove the /resume user message
+                        }
+                    }
+                    Err(e) => {
+                        self.conversation.push_delta(&format!("Failed to list sessions: {}", e));
+                        self.conversation.finalize_stream();
+                    }
+                }
+            }
+            "/session" => {
+                // Create a new session (fresh conversation)
+                self.current_session = Session::new(self.working_dir.clone());
+                self.conversation = Conversation::new();
+                self.render_cache.clear();
+                self.render_cache_msg_count = 0;
+                self.scroll_offset = 0;
+                self.at_bottom = true;
+                // Sync with agent (clear conversation)
+                let _ = self.agent_handle.cmd_tx.send(AgentCommand::ClearConversation);
+                // Don't save empty session - will be saved when first user message is sent
+                // Remove the /session user message
+                self.conversation.messages.pop();
             }
             "/login" => {
                 self.pending_login = true;

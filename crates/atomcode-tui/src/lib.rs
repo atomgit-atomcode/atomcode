@@ -316,6 +316,7 @@ pub async fn run(
     agent_handle: AgentHandle,
     tool_context: ToolContext,
     working_dir: std::path::PathBuf,
+    session_to_continue: Option<atomcode_core::session::Session>,
 ) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
@@ -334,8 +335,7 @@ pub async fn run(
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
-
-    let mut app = App::new(model_name, config, agent_handle, tool_context, working_dir);
+    let mut app = App::new(model_name, config, agent_handle, tool_context, working_dir, session_to_continue);
     let mut event_loop = EventLoop::new();
     let event_tx = event_loop.sender();
     event_loop.start();
@@ -490,6 +490,11 @@ pub async fn run(
         }
 
         if app.mode.is_exiting() {
+            // Clean up empty session - don't save sessions with no messages
+            if app.current_session.messages.is_empty() {
+                // Delete the session file if it exists
+                let _ = app.session_manager.delete(&app.current_session.id);
+            }
             break;
         }
     }

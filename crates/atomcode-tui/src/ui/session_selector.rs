@@ -1,0 +1,179 @@
+//! Session selector inline UI.
+//! Displays session list in the chat area for /resume command.
+
+use ratatui::layout::Rect;
+use ratatui::style::{Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::Paragraph;
+use ratatui::Frame;
+
+use atomcode_core::session::SessionMeta;
+use super::theme;
+
+/// Format file size in human-readable format (KB, MB, etc.)
+fn format_size(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    const GB: u64 = MB * 1024;
+    
+    if bytes >= GB {
+        format!("{:.1} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.1} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{} B", bytes)
+    }
+}
+
+/// Format timestamp as human-readable string
+fn format_timestamp(ts: u64) -> String {
+    use chrono::{TimeZone, Utc, Local};
+    let dt = Utc.timestamp_opt(ts as i64, 0).single().unwrap_or_else(|| Utc::now());
+    let local = dt.with_timezone(&Local);
+    let now = Local::now();
+    
+    let duration = now.signed_duration_since(local);
+    if duration.num_minutes() < 1 {
+        "just now".to_string()
+    } else if duration.num_hours() < 1 {
+        format!("{}m ago", duration.num_minutes())
+    } else if duration.num_hours() < 24 {
+        format!("{}h ago", duration.num_hours())
+    } else if duration.num_days() < 7 {
+        format!("{}d ago", duration.num_days())
+    } else {
+        local.format("%m-%d %H:%M").to_string()
+    }
+}
+/// Render the session selector inline in the chat area.
+/// Returns the number of lines rendered (for scroll calculation).
+/// selected = 0 means search box is focused, 1+ means session item is selected.
+pub fn render(frame: &mut Frame, area: Rect, sessions: &[SessionMeta], selected: usize, query: &str) -> usize {
+    // Filter sessions by query
+    let filtered: Vec<(usize, &SessionMeta)> = sessions.iter().enumerate()
+        .filter(|(_, s)| query.is_empty() 
+            || s.name.to_lowercase().contains(&query.to_lowercase()))
+        .collect();
+    
+    let mut lines: Vec<Line> = Vec::new();
+    
+    // Header
+    lines.push(Line::from(vec![
+        Span::styled(" Resume Session", Style::default().fg(theme::BRAND_FG).add_modifier(Modifier::BOLD)),
+    ]));
+    
+    lines.push(Line::default()); // blank line
+    
+    // Search row - first item (index 0)
+    let search_is_selected = selected == 0;
+    let search_bg = if search_is_selected { theme::BRAND_BG } else { theme::BG_SURFACE };
+    let search_fg = if search_is_selected { theme::TEXT_PRIMARY } else { theme::TEXT_SECONDARY };
+    
+    let search_prompt = if query.is_empty() {
+        " Type to search..."
+    } else {
+        query
+    };
+    
+    // Search row with box style
+    let search_indicator = if search_is_selected { " \u{25b8} " } else { "   " };
+    lines.push(Line::from(vec![
+        Span::styled(search_indicator, Style::default().fg(search_fg).bg(search_bg)),
+        Span::styled("Search: ", Style::default().fg(search_fg).bg(search_bg)),
+        Span::styled(
+            search_prompt,
+            Style::default().fg(if query.is_empty() { 
+                if search_is_selected { theme::TEXT_MUTED } else { theme::TEXT_MUTED } 
+            } else { 
+                search_fg 
+            }).bg(search_bg)
+        ),
+        Span::styled("\u{2588}", Style::default().fg(search_fg).bg(search_bg)), // cursor
+        Span::styled(" ", Style::default().bg(search_bg)), // padding
+    ]));
+    
+    // Cursor hint when search is selected
+    if search_is_selected {
+        lines.push(Line::from(vec![
+            Span::styled("      ", Style::default()),
+            Span::styled("Type to filter sessions", Style::default().fg(theme::TEXT_MUTED)),
+        ]));
+    }
+    
+    lines.push(Line::default()); // blank line
+    
+    if filtered.is_empty() {
+        if query.is_empty() {
+            lines.push(Line::from(vec![
+                Span::styled("  No sessions found. Start a conversation first.", Style::default().fg(theme::TEXT_MUTED)),
+            ]));
+        } else {
+            lines.push(Line::from(vec![
+                Span::styled("  No sessions matching '", Style::default().fg(theme::TEXT_MUTED)),
+                Span::styled(query, Style::default().fg(theme::TEXT_SECONDARY)),
+                Span::styled("'", Style::default().fg(theme::TEXT_MUTED)),
+            ]));
+        }
+    } else {
+        for (idx, (_, session)) in filtered.iter().enumerate() {
+            // Item index is 1 + idx (0 is search row)
+            let item_index = 1 + idx;
+            let is_selected = item_index == selected;
+            
+            // Line 1: Session name with indicator
+            let indicator = if is_selected { " \u{25b8} " } else { "   " };
+            let name_style = if is_selected {
+                Style::default().fg(theme::TEXT_PRIMARY).bg(theme::BRAND_BG).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme::TEXT_PRIMARY)
+            };
+            
+            lines.push(Line::from(vec![
+                Span::styled(indicator, name_style),
+                Span::styled(&session.name, name_style),
+            ]));
+            
+            // Line 2: Time and size (dimmed, indented)
+            let time_str = format_timestamp(session.updated_at);
+            let size_str = format_size(session.file_size);
+            let msg_str = format!("{} messages", session.message_count);
+            let meta_style = if is_selected {
+                Style::default().fg(theme::TEXT_SECONDARY)
+            } else {
+                Style::default().fg(theme::TEXT_MUTED)
+            };
+            
+            lines.push(Line::from(vec![
+                Span::styled("      ", Style::default()),
+                Span::styled(time_str, meta_style),
+                Span::styled("  \u{2022}  ", meta_style),
+                Span::styled(size_str, meta_style),
+                Span::styled("  \u{2022}  ", meta_style),
+                Span::styled(msg_str, meta_style),
+            ]));
+            
+            lines.push(Line::default()); // blank line between sessions
+        }
+    }
+    
+    // Help hint
+    lines.push(Line::from(vec![
+        Span::styled("  ", Style::default()),
+        Span::styled("\u{2191}\u{2193}", Style::default().fg(theme::TEXT_MUTED)),
+        Span::styled(" navigate  ", Style::default().fg(theme::TEXT_MUTED)),
+        Span::styled("type", Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD)),
+        Span::styled(" to search  ", Style::default().fg(theme::TEXT_MUTED)),
+        Span::styled("Enter", Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD)),
+        Span::styled(" resume  ", Style::default().fg(theme::TEXT_MUTED)),
+        Span::styled("Esc", Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD)),
+        Span::styled(" cancel", Style::default().fg(theme::TEXT_MUTED)),
+    ]));
+    
+    let paragraph = Paragraph::new(lines);
+    frame.render_widget(paragraph, area);
+    
+    // Return line count for scroll calculation
+    filtered.len() * 3 + 8 // each session = 3 lines (name + meta + blank), plus header + search row
+}

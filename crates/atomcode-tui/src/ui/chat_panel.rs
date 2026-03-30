@@ -16,13 +16,14 @@ use super::theme;
 // Braille spinner
 const SPINNER: &[&str] = &["\u{280b}", "\u{2819}", "\u{2839}", "\u{2838}", "\u{283c}", "\u{2834}", "\u{2826}", "\u{2827}", "\u{2807}", "\u{280f}"];
 
+#[allow(dead_code)]
 const THINKING_LABELS: &[&str] = &["Thinking", "Pondering", "Reasoning", "Contemplating", "Analyzing", "Processing"];
 
 // Left indent for content
 const INDENT: &str = " ";
 // Tool indent inside accent bar
+#[allow(dead_code)]
 const TOOL_INDENT: &str = "   ";
-
 pub fn render(
     frame: &mut Frame,
     area: Rect,
@@ -33,7 +34,7 @@ pub fn render(
     tick: usize,
     _turn_tokens: usize,
     _turn_elapsed_secs: Option<u64>,
-    turn_label_seed: usize,
+    _turn_label_seed: usize,
     step_count: usize,
     tool_info: &str,
     first_token_ms: Option<u64>,
@@ -442,8 +443,8 @@ fn extract_duration(output: &str) -> String {
     }
     String::new()
 }
-
 // ── Approval ──
+#[allow(dead_code)]
 fn render_approval(lines: &mut Vec<Line<'static>>, call: &ToolCall) {
     let name = capitalize(&call.name);
     let border = Style::default().fg(theme::WARNING);

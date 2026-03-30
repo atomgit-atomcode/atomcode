@@ -45,6 +45,8 @@ pub enum AgentCommand {
     AppendInput(String),
     /// Clear conversation history.
     ClearConversation,
+    /// Set messages from a resumed session.
+    SetMessages(Vec<crate::conversation::message::Message>),
     /// Shutdown the agent.
     Shutdown,
 }
@@ -411,6 +413,10 @@ impl AgentLoop {
                 AgentCommand::ClearConversation => {
                     // Clear the conversation history in the agent loop.
                     self.conversation = Conversation::new();
+                }
+                AgentCommand::SetMessages(messages) => {
+                    // Set messages from a resumed session.
+                    self.conversation.messages = messages;
                 }
                 AgentCommand::Shutdown => break,
             }

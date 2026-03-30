@@ -3,6 +3,7 @@ pub mod input_box;
 pub mod markdown;
 pub mod model_selector;
 pub mod provider_panel;
+pub mod session_selector;
 pub mod slash_menu;
 pub mod status_bar;
 pub mod theme;
@@ -61,6 +62,15 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         .split(frame.area());
 
     status_bar::render(frame, chunks[0], app);
+
+    // Session selector mode: render inline in chat area
+    if matches!(app.mode, crate::app::AppMode::SessionSelector) {
+        if let Some((ref sessions, selected)) = app.session_selector {
+            session_selector::render(frame, chunks[1], sessions, selected, &app.session_selector_query);
+        }
+        input_box::render(frame, chunks[2], &app.input, false, None, &app.attached_files, app.pasted_text.as_deref());
+        return;
+    }
 
     if show_welcome && app.mode.is_normal() {
         welcome::render(frame, chunks[1], app);

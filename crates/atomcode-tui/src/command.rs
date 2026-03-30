@@ -21,6 +21,8 @@ pub struct CommandEntry {
 /// Ordered by importance: core features first, utilities second, help/config last.
 pub const BUILTIN_COMMANDS: &[(&str, &str)] = &[
     // === Core features ===
+    ("/resume",   "Resume or switch session"),
+    ("/session",  "Create a new session"),
     ("/provider", "Manage providers"),
     ("/model",    "Switch model/provider"),
     ("/login",    "Login with AtomGit OAuth"),

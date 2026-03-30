@@ -18,17 +18,65 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     let mut left: Vec<Span> = Vec::new();
     let mut right: Vec<Span> = Vec::new();
 
-    // Left: brand + path
+    // Left: brand + path + session
     left.push(Span::styled(
         " atomcode ",
         Style::default().fg(theme::BRAND_FG).bg(theme::BRAND_BG).add_modifier(Modifier::BOLD),
     ));
     left.push(Span::styled(" ", Style::default()));
-    left.push(Span::styled(dir, Style::default().fg(theme::STATUS_PATH)));
+    left.push(Span::styled(&dir, Style::default().fg(theme::STATUS_PATH)));
+
+    // Calculate available space for session name
+    // Right side content (will be computed below)
+    let is_active = app.turn_start.is_some();
+    let mut right_preview: Vec<String> = Vec::new();
+    
+    if is_active {
+        let secs = app.turn_start.unwrap().elapsed().as_secs();
+        let dur = if secs >= 60 { format!("{}m{}s", secs / 60, secs % 60) } else { format!("{}s", secs) };
+        right_preview.push(format!("{} ", SPINNER[app.tick_count % SPINNER.len()]));
+        if app.current_step_count > 0 {
+            right_preview.push(format!("turn {}", app.current_step_count));
+            right_preview.push(" │ ".to_string());
+        }
+        right_preview.push(dur);
+        right_preview.push(" │ ".to_string());
+    } else if app.last_turn_duration.is_some() || app.current_step_count > 0 {
+        right_preview.push("✓ ".to_string());
+        if app.current_step_count > 0 {
+            right_preview.push(format!("turn {}", app.current_step_count));
+            right_preview.push(" │ ".to_string());
+        }
+        if let Some(dur) = app.last_turn_duration {
+            let secs = dur.as_secs();
+            let dur_str = if secs >= 60 { format!("{}m{}s", secs / 60, secs % 60) } else { format!("{}s", secs) };
+            right_preview.push(dur_str);
+            right_preview.push(" │ ".to_string());
+        }
+    }
+    right_preview.push(format!("{} ", model));
+    
+    // Calculate session name max length
+    let brand_w = 10; // " atomcode " + " "
+    let dir_w = display_width(&dir);
+    let session_brackets_w = 3; // " [" + "]"
+    let right_w: usize = right_preview.iter().map(|s| display_width(s)).sum();
+    let min_padding = 1; // at least one space between left and right
+    
+    let fixed_width = brand_w + dir_w + session_brackets_w + right_w + min_padding;
+    let max_session_len = width.saturating_sub(fixed_width);
+    // Allow up to 60 chars but at least 10
+    let max_session_len = max_session_len.min(60).max(10);
+    
+    // Session name
+    left.push(Span::styled(" [", Style::default().fg(theme::TEXT_MUTED)));
+    left.push(Span::styled(
+        truncate_session_name(&app.current_session.name, max_session_len),
+        Style::default().fg(theme::ACCENT),
+    ));
+    left.push(Span::styled("]", Style::default().fg(theme::TEXT_MUTED)));
 
     // Right side: turn state + model
-    let is_active = app.turn_start.is_some();
-
     if is_active {
         // ── Active turn: spinner + turn N + live timer ──
         let spin = SPINNER[app.tick_count % SPINNER.len()];
@@ -135,5 +183,15 @@ fn shorten_path(path: &str) -> String {
         }
     } else {
         shortened
+    }
+}
+
+fn truncate_session_name(name: &str, max_len: usize) -> String {
+    let char_count = name.chars().count();
+    if char_count <= max_len {
+        name.to_string()
+    } else {
+        let truncated: String = name.chars().take(max_len.saturating_sub(3)).collect();
+        format!("{}...", truncated)
     }
 }
