@@ -152,6 +152,8 @@ pub struct AgentLoop {
     verify_injected: bool,
     /// Whether the model produced any text output this turn (if so, skip auto-summary)
     model_produced_text: bool,
+    /// True when the user's message is negative feedback on the previous turn's work.
+    is_negative_feedback: bool,
     /// Last N tool call signatures for loop detection. (name, args_hash)
     recent_calls: Vec<(String, u64)>,
     /// The user's original task message for this turn (re-injected as reminders).
@@ -278,6 +280,7 @@ impl AgentLoop {
             consecutive_reads: 0,
             verify_injected: false,
             model_produced_text: false,
+            is_negative_feedback: false,
             recent_calls: Vec::new(),
             current_task: String::new(),
             current_tool_name: String::new(),
@@ -429,6 +432,18 @@ impl AgentLoop {
 
     async fn handle_send_message(&mut self, content: String) {
         self.current_task = content.clone();
+
+        // Detect negative feedback — user is unhappy with previous turn's work.
+        let lower = content.to_lowercase();
+        let negative_keywords = [
+            "改错", "不对", "错了", "还是不行", "没用", "不是这样", "搞错",
+            "又错", "白做", "越改越差", "恢复", "回滚", "撤销", "不行",
+            "wrong", "not right", "still broken", "doesn't work", "undo",
+            "revert", "go back", "that's worse", "stop", "broken",
+        ];
+        self.is_negative_feedback = content.chars().count() < 80
+            && negative_keywords.iter().any(|kw| lower.contains(kw));
+
         self.preread_context = self.build_preread_context(&content).await;
 
         // Auto-diagnose: if user mentions error keywords, scan logs and attach findings.
@@ -444,6 +459,7 @@ impl AgentLoop {
         self.consecutive_reads = 0;
         self.verify_injected = false;
         self.model_produced_text = false;
+        // Note: is_negative_feedback is set above, do not reset here.
         self.build_fail_count = 0;
         self.file_read_counts.clear();
         self.scouting_count = 0;
@@ -666,6 +682,30 @@ impl AgentLoop {
                      (3-5 steps) of what you'll do. Then proceed to execute it.]"
                 );
                 self.planning_phase = false; // Only inject once
+            }
+
+            // Negative feedback: force model to reflect before repeating mistakes.
+            if self.is_negative_feedback && self.tool_call_count == 0 {
+                let recent_files: Vec<String> = self.session_files.keys().take(5).cloned().collect();
+                let files_hint = if !recent_files.is_empty() {
+                    format!(" Recently touched: {}", recent_files.join(", "))
+                } else {
+                    String::new()
+                };
+                self.conversation.messages.push(
+                    crate::conversation::message::Message::new(
+                        crate::conversation::message::Role::System,
+                        format!(
+                            "[NEGATIVE FEEDBACK] The user is unhappy with your previous work. \
+                             BEFORE making any tool calls, you MUST:\n\
+                             1. State what you think went wrong\n\
+                             2. Explain your different approach\n\
+                             3. Only then use tools\n\
+                             Do NOT repeat the same fix.{}",
+                            files_hint,
+                        ),
+                    )
+                );
             }
 
             // Fix 6: Bug-fix diagnostic guidance — inject on first turn when user
