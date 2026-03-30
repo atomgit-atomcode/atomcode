@@ -291,10 +291,7 @@ fn run_oauth_login() -> anyhow::Result<AuthInfo> {
     };
 
     // Save to file
-    let auth_path = dirs::config_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join("atomcode")
-        .join("auth.toml");
+    let auth_path = atomcode_core::config::Config::config_dir().join("auth.toml");
 
     if let Some(parent) = auth_path.parent() {
         let _ = std::fs::create_dir_all(parent);

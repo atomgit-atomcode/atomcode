@@ -1592,10 +1592,7 @@ impl App {
                 let mut messages = Vec::new();
                 
                 // 1. Remove auth.toml (access_token and user info)
-                let auth_path = dirs::config_dir()
-                    .unwrap_or_else(|| std::path::PathBuf::from("."))
-                    .join("atomcode")
-                    .join("auth.toml");
+                let auth_path = atomcode_core::config::Config::config_dir().join("auth.toml");
                     
                 if auth_path.exists() {
                     match std::fs::remove_file(&auth_path) {
@@ -1655,10 +1652,7 @@ impl App {
                 let mut status = String::new();
                 
                 // Check login status
-                let auth_path = dirs::config_dir()
-                    .unwrap_or_else(|| std::path::PathBuf::from("."))
-                    .join("atomcode")
-                    .join("auth.toml");
+                let auth_path = atomcode_core::config::Config::config_dir().join("auth.toml");
                     
                 if auth_path.exists() {
                     if let Ok(content) = std::fs::read_to_string(&auth_path) {
