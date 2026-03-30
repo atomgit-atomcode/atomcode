@@ -84,8 +84,15 @@ impl TurnRunner {
         let mut tool_calls_buf: Vec<ToolCall> = Vec::new();
         let mut text_buf = String::new();
         let mut total_tokens: usize = 0;
+        let mut got_any_event = false;
+
+        // Timeout: 5 min for first token, 3 min for subsequent tokens.
+        // Prevents silent connection drops from hanging forever.
+        const FIRST_TOKEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+        const STREAM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
 
         loop {
+            let timeout = if got_any_event { STREAM_TIMEOUT } else { FIRST_TOKEN_TIMEOUT };
             tokio::select! {
                 biased;
 
@@ -94,9 +101,19 @@ impl TurnRunner {
                     return TurnResult::Cancelled;
                 }
 
+                _ = tokio::time::sleep(timeout) => {
+                    conversation.finalize_stream();
+                    let waited = if got_any_event { "3 min" } else { "5 min" };
+                    return TurnResult::Failed(format!(
+                        "LLM stream timeout: no response for {}. Connection may have dropped.",
+                        waited,
+                    ));
+                }
+
                 event = stream.next() => {
                     match event {
                         Some(Ok(StreamEvent::Delta(text))) => {
+                            got_any_event = true;
                             // Strip model-internal tags (DeepSeek <think>, QwQ, etc.)
                             let text = strip_model_tags(&text);
                             if !text.is_empty() {
@@ -107,6 +124,7 @@ impl TurnRunner {
                         }
 
                         Some(Ok(StreamEvent::ToolCallStart { id, name })) => {
+                            got_any_event = true;
                             conversation.tool_call_buffer = Some(ToolCallBuffer {
                                 id,
                                 name,
@@ -115,6 +133,7 @@ impl TurnRunner {
                         }
 
                         Some(Ok(StreamEvent::ToolCallDelta(args))) => {
+                            got_any_event = true;
                             if let Some(ref mut buf) = conversation.tool_call_buffer {
                                 buf.arguments.push_str(&args);
                             }
