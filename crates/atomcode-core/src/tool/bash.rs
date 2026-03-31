@@ -97,10 +97,16 @@ impl Tool for BashTool {
             }
         }
 
-        // NOTE: Pre-compile interception disabled — blocking the model's command
-        // confuses weak models into retrying with different flags instead of fixing
-        // the compile error. The system prompt rule "ALWAYS compile/build BEFORE
-        // starting a server" is sufficient guidance.
+        // Java full restart: when model runs spring-boot:run, we orchestrate the
+        // full kill→compile→start→poll cycle automatically. This saves 8-10 steps.
+        if devserver::java::detect(&parsed.command).is_some()
+            && !parsed.command.contains("mvn compile")
+            && !parsed.command.contains("mvn clean")
+        {
+            let port = devserver::extract_port_with_dir(&parsed.command, Some(&wd)).unwrap_or(8080);
+            let (success, output) = devserver::java::full_restart(&wd, port, &parsed.command).await;
+            return Ok(ToolResult { call_id: String::new(), output, success });
+        }
 
         // Platform-aware shell: cmd.exe on Windows, bash on Unix
         #[cfg(target_os = "windows")]
@@ -216,6 +222,10 @@ impl Tool for BashTool {
                 let mut combined = format_output(&stdout_str, &stderr_str);
                 // For background/pkill commands: non-empty output = success
                 let effective_success = success || has_background || (has_pkill && !combined.is_empty());
+                // Java compile error auto-diagnosis: extract file:line + source context
+                if !effective_success && devserver::java::is_compile_command(&parsed.command) {
+                    combined = devserver::java::enhance_compile_error(&combined, &wd);
+                }
                 if !effective_success && !combined.is_empty() {
                     combined.push_str("\n\n[IMPORTANT: Command failed. Read the error above and fix the root cause. Do NOT retry the same command.]");
                 }
