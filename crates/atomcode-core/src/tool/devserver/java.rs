@@ -294,5 +294,20 @@ pub async fn full_restart(
         return (false, output);
     }
 
+    // Quick smoke test: curl the health endpoint
+    let health_url = format!("http://localhost:{}/actuator/health", port);
+    let health = tokio::process::Command::new("bash")
+        .arg("-c")
+        .arg(format!("curl -s {} 2>/dev/null || echo 'no health endpoint'", health_url))
+        .current_dir(working_dir)
+        .output()
+        .await;
+    if let Ok(o) = health {
+        let body = String::from_utf8_lossy(&o.stdout);
+        let short = if body.len() > 100 { &body[..100] } else { &body };
+        output.push_str(&format!("[Health] {}\n", short.trim()));
+    }
+    output.push_str("Server restarted successfully. You can now test your changes.\n");
+
     (true, output)
 }
