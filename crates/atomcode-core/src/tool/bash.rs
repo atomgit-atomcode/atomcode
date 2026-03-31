@@ -7,7 +7,7 @@ use serde_json::json;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
-
+use super::devserver;
 use super::{ApprovalRequirement, Tool, ToolContext, ToolDef, ToolResult};
 
 pub struct BashTool;
@@ -79,7 +79,7 @@ impl Tool for BashTool {
             let cmd_trimmed = parsed.command.trim();
             // Detect pattern: "some_command &" or "some_command & other_command"
             // where the backgrounded part is a server/dev command
-            if is_background_command(cmd_trimmed)
+            if devserver::is_server_command(cmd_trimmed)
                 && !cmd_trimmed.contains("nohup")
                 && !cmd_trimmed.contains(">/dev/null")
                 && !cmd_trimmed.contains("&>/dev/null")
@@ -97,6 +97,20 @@ impl Tool for BashTool {
             }
         }
 
+        // Dev server pre-command: compile before starting to catch errors early.
+        // e.g., `mvn compile` before `mvn spring-boot:run`.
+        if let Some(result) = devserver::run_pre_command(&parsed.command, &wd).await {
+            if !result.success {
+                let hint = format!(
+                    "[Pre-compile failed — server NOT started]\n{}\n\n\
+                     Fix the compile errors above, then retry the server command.",
+                    result.output,
+                );
+                return Ok(ToolResult { call_id: String::new(), output: hint, success: false });
+            }
+            // Pre-command succeeded — continue to start the server
+        }
+
         // Platform-aware shell: cmd.exe on Windows, bash on Unix
         #[cfg(target_os = "windows")]
         let mut child = Command::new("cmd.exe")
@@ -108,7 +122,7 @@ impl Tool for BashTool {
 
         // Detect long-running / background commands — these get their own process group
         // so they survive atomcode exit and won't be killed on timeout.
-        let is_background = is_background_command(&parsed.command);
+        let is_background = devserver::is_server_command(&parsed.command);
 
         #[cfg(not(target_os = "windows"))]
         let mut child = {
@@ -227,7 +241,7 @@ impl Tool for BashTool {
                     let combined = format_output(&stdout_str, &stderr_str);
 
                     // Auto-detect port from command and poll until ready
-                    let port = extract_port(&parsed.command);
+                    let port = devserver::extract_port(&parsed.command);
                     let port_status = if let Some(p) = port {
                         // Poll port every 2s for up to 30s
                         let mut ready = false;
@@ -318,58 +332,6 @@ fn check_destructive_command(command: &str) -> Option<String> {
         }
     }
 
-    None
-}
-
-/// Detect commands intended to run in the background / as long-lived servers.
-/// These should not be killed on timeout and should get their own process group.
-fn is_background_command(cmd: &str) -> bool {
-    let trimmed = cmd.trim();
-    // Explicit background: trailing &, nohup, setsid
-    if trimmed.ends_with('&') || trimmed.contains("nohup ") || trimmed.contains("setsid ") {
-        return true;
-    }
-    // Common dev server commands
-    let server_patterns = [
-        "npm run dev", "npm start", "npx ", "yarn dev", "pnpm dev",
-        "python -m http", "python manage.py runserver", "uvicorn ", "gunicorn ",
-        "cargo run", "go run", "node server", "flask run", "rails s",
-        "mvn spring-boot:run", "mvn spring-boot:", "gradle bootRun",
-        "java -jar", "java -cp",
-    ];
-    server_patterns.iter().any(|p| trimmed.contains(p))
-}
-
-/// Extract port number from a command string.
-/// Detects patterns like `:8080`, `--port 3000`, `-p 8080`, `PORT=3000`.
-fn extract_port(cmd: &str) -> Option<u16> {
-    // Common default ports by tool
-    let defaults: &[(&str, u16)] = &[
-        ("spring-boot:run", 8080),
-        ("npm run dev", 3000), ("npm start", 3000),
-        ("vite", 5173), ("next", 3000),
-        ("flask run", 5000), ("uvicorn", 8000),
-        ("rails s", 3000), ("cargo run", 8080),
-    ];
-
-    // Check for explicit port in command
-    let port_patterns = ["-p ", "--port ", "--port=", "-Dserver.port=", "PORT="];
-    for pat in &port_patterns {
-        if let Some(pos) = cmd.find(pat) {
-            let after = &cmd[pos + pat.len()..];
-            let port_str: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
-            if let Ok(p) = port_str.parse::<u16>() {
-                return Some(p);
-            }
-        }
-    }
-
-    // Fall back to defaults
-    for (pattern, port) in defaults {
-        if cmd.contains(pattern) {
-            return Some(*port);
-        }
-    }
     None
 }
 

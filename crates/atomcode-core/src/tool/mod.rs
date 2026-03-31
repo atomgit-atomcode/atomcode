@@ -1,5 +1,6 @@
 pub mod bash;
 pub mod cd;
+pub mod devserver;
 pub mod edit;
 pub mod find_references;
 pub mod glob;
