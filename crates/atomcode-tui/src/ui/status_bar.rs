@@ -54,8 +54,12 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
             right_preview.push(" │ ".to_string());
         }
     }
+    if app.ctx_used_tokens > 0 && app.context_window > 0 {
+        right_preview.push(format!("ctx {}K/{}K", app.ctx_used_tokens / 1000, app.context_window / 1000));
+        right_preview.push(" │ ".to_string());
+    }
     right_preview.push(format!("{} ", model));
-    
+
     // Calculate session name max length
     let brand_w = 10; // " atomcode " + " "
     let dir_w = display_width(&dir);
@@ -131,6 +135,25 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
             ));
             right.push(sep.clone());
         }
+    }
+
+    // Context usage (show after first LLM call)
+    if app.ctx_used_tokens > 0 && app.context_window > 0 {
+        let used_k = app.ctx_used_tokens / 1000;
+        let total_k = app.context_window / 1000;
+        let ratio = app.ctx_used_tokens as f64 / app.context_window as f64;
+        let ctx_color = if ratio < 0.5 {
+            theme::SUCCESS
+        } else if ratio < 0.8 {
+            theme::WAIT_NORMAL
+        } else {
+            theme::WAIT_VERY_SLOW
+        };
+        right.push(Span::styled(
+            format!("ctx {}K/{}K", used_k, total_k),
+            Style::default().fg(ctx_color),
+        ));
+        right.push(sep.clone());
     }
 
     // Model name (always)

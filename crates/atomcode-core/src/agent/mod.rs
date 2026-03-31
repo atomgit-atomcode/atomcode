@@ -186,6 +186,10 @@ pub struct AgentLoop {
     /// Last git checkpoint ref (SHA) for /undo rollback.
     pub last_checkpoint: Option<String>,
 
+    /// Most recently edited file (absolute path). Injected as full content in system prompt
+    /// so the model doesn't need to re-read it next turn. Capped at ~6K tokens.
+    active_file: Option<PathBuf>,
+
     /// Pending user input appended during streaming. Injected before next LLM call.
     pending_input: Option<String>,
     /// Session-level file tracker: all files read/edited across the entire session.
@@ -300,6 +304,7 @@ impl AgentLoop {
             consecutive_verify_count: 0,
             executed_cmds: std::collections::HashMap::new(),
             last_checkpoint: None,
+            active_file: None,
             pending_input: None,
             planning_phase: false,
             session_files: std::collections::HashMap::new(),
@@ -827,6 +832,7 @@ impl AgentLoop {
                 let model_produced_text = &mut self.model_produced_text;
                 let current_tool_name = &mut self.current_tool_name;
                 let files_edited_this_turn = &mut self.files_edited_this_turn;
+                let active_file = &mut self.active_file;
                 let files_read_this_turn = &mut self.files_read_this_turn;
                 let file_read_counts = &mut self.file_read_counts;
                 let consecutive_reads = &mut self.consecutive_reads;
@@ -883,6 +889,11 @@ impl AgentLoop {
                                     // Track files for discipline
                                     if let Some(pos) = output.find("Edited ") {
                                         let rest = &output[pos + 7..];
+                                        let fp_end = rest.find(|c: char| c == ' ' || c == '\n' || c == '(').unwrap_or(rest.len());
+                                        let fp = rest[..fp_end].trim();
+                                        if !fp.is_empty() {
+                                            *active_file = Some(PathBuf::from(fp));
+                                        }
                                         if let Some(end) = rest.find(|c: char| c == '\n' || c == '.') {
                                             let file = short_path(&rest[..end]);
                                             if !files_edited_this_turn.contains(&file) {
@@ -892,6 +903,11 @@ impl AgentLoop {
                                     }
                                     if let Some(pos) = output.find("Wrote ") {
                                         let rest = &output[pos + 6..];
+                                        let fp_end = rest.find(|c: char| c == ' ' || c == '\n' || c == '(').unwrap_or(rest.len());
+                                        let fp = rest[..fp_end].trim();
+                                        if !fp.is_empty() {
+                                            *active_file = Some(PathBuf::from(fp));
+                                        }
                                         if let Some(end) = rest.find(|c: char| c == '\n' || c == ' ') {
                                             let file = short_path(&rest[..end]);
                                             if !files_edited_this_turn.contains(&file) {
@@ -1097,8 +1113,13 @@ impl AgentLoop {
             TurnEvent::ToolCallResult { name, output, success, duration } => {
                 // Track files for discipline
                 if let Some(pos) = output.find("Edited ") {
-                    // Extract short filename from edit confirmation
+                    // Extract full path from "Edited /path/to/file ..." or "Edited /path/to/file\n..."
                     let rest = &output[pos + 7..];
+                    let full_path_end = rest.find(|c: char| c == ' ' || c == '\n' || c == '(').unwrap_or(rest.len());
+                    let full_path_str = rest[..full_path_end].trim();
+                    if !full_path_str.is_empty() {
+                        self.active_file = Some(PathBuf::from(full_path_str));
+                    }
                     if let Some(end) = rest.find(|c: char| c == '\n' || c == '.') {
                         let file = short_path(&rest[..end]);
                         if !self.files_edited_this_turn.contains(&file) {
@@ -1108,6 +1129,11 @@ impl AgentLoop {
                 }
                 if let Some(pos) = output.find("Wrote ") {
                     let rest = &output[pos + 6..];
+                    let full_path_end = rest.find(|c: char| c == ' ' || c == '\n' || c == '(').unwrap_or(rest.len());
+                    let full_path_str = rest[..full_path_end].trim();
+                    if !full_path_str.is_empty() {
+                        self.active_file = Some(PathBuf::from(full_path_str));
+                    }
                     if let Some(end) = rest.find(|c: char| c == '\n' || c == ' ') {
                         let file = short_path(&rest[..end]);
                         if !self.files_edited_this_turn.contains(&file) {
@@ -1519,6 +1545,48 @@ impl AgentLoop {
         // Pre-read files (bulk content — middle of prompt)
         if !self.preread_context.is_empty() {
             prompt.push_str(&format!("\n\n{}", self.preread_context));
+        }
+
+        // Active file: inject full content of the most recently edited file.
+        // This prevents the model from needing to re-read it next turn.
+        // Budget: ~6000 tokens ≈ 24000 chars (conservative 4 chars/token).
+        const ACTIVE_FILE_CHAR_LIMIT: usize = 24000;
+        if let Some(ref path) = self.active_file {
+            if path.exists() {
+                if let Ok(content) = std::fs::read_to_string(path) {
+                    if !content.is_empty() {
+                        let display = path.display();
+                        if content.len() <= ACTIVE_FILE_CHAR_LIMIT {
+                            prompt.push_str(&format!(
+                                "\n=== ACTIVE FILE (full content, no need to re-read) ===\n\
+                                 File: {}\n```\n{}\n```\n",
+                                display, content,
+                            ));
+                        } else {
+                            // Too large: include head + tail with line numbers
+                            let lines: Vec<&str> = content.lines().collect();
+                            let total = lines.len();
+                            let head_n = 200.min(total);
+                            let tail_n = 100.min(total.saturating_sub(head_n));
+                            let head: String = lines[..head_n].iter().enumerate()
+                                .map(|(i, l)| format!("{}\t{}", i + 1, l))
+                                .collect::<Vec<_>>().join("\n");
+                            let tail: String = if tail_n > 0 {
+                                lines[total - tail_n..].iter().enumerate()
+                                    .map(|(i, l)| format!("{}\t{}", total - tail_n + i + 1, l))
+                                    .collect::<Vec<_>>().join("\n")
+                            } else {
+                                String::new()
+                            };
+                            prompt.push_str(&format!(
+                                "\n=== ACTIVE FILE (truncated, {} lines total) ===\n\
+                                 File: {}\n```\n{}\n\n[... {} lines omitted ...]\n\n{}\n```\n",
+                                total, display, head, total - head_n - tail_n, tail,
+                            ));
+                        }
+                    }
+                }
+            }
         }
 
         // Project instructions (if any)

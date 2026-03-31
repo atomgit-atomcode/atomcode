@@ -161,6 +161,10 @@ pub struct App {
     pub total_tokens: usize,
     /// Tokens used in the current turn.
     pub turn_tokens: usize,
+    /// Context budget: tokens used in the last LLM call.
+    pub ctx_used_tokens: usize,
+    /// Context budget: total context window size.
+    pub context_window: usize,
     /// Suggested next prompt shown as ghost text in the input box.
     pub suggestion: Option<String>,
     /// Cache of rendered lines for completed messages. Invalidated on message count change.
@@ -282,6 +286,9 @@ impl App {
            history_stash: None,
            total_tokens: 0,
            turn_tokens: 0,
+           ctx_used_tokens: 0,
+           context_window: config.providers.get(&config.default_provider)
+               .map(|p| p.context_window).unwrap_or(32000),
            suggestion: None,
            render_cache: Vec::new(),
            render_cache_msg_count: 0,
@@ -706,6 +713,7 @@ impl App {
                 let _ = self.config.save(&Config::default_path());
             }
             AgentEvent::ContextStats { system_tokens, hot_tokens, cold_tokens, working_set_tokens, total_messages } => {
+                self.ctx_used_tokens = system_tokens + hot_tokens + cold_tokens + working_set_tokens;
                 self.turn_log.log_context_stats(system_tokens, hot_tokens, cold_tokens, working_set_tokens, total_messages);
             }
         }
@@ -1724,6 +1732,40 @@ impl App {
                     self.conversation.push_delta("No checkpoint available. /undo works after the agent has made edits.");
                     self.conversation.finalize_stream();
                 }
+                return true;
+            }
+            "/diff" => {
+                let output = std::process::Command::new("git")
+                    .args(["diff"])
+                    .current_dir(&self.working_dir)
+                    .output();
+                match output {
+                    Ok(o) => {
+                        let diff = String::from_utf8_lossy(&o.stdout);
+                        if diff.trim().is_empty() {
+                            self.conversation.push_delta("No uncommitted changes.");
+                        } else {
+                            self.conversation.push_delta(&format!("```diff\n{}\n```", diff.trim()));
+                        }
+                    }
+                    Err(e) => {
+                        self.conversation.push_delta(&format!("git diff failed: {}", e));
+                    }
+                }
+                self.conversation.finalize_stream();
+                return true;
+            }
+            "/cost" => {
+                let ctx_str = if self.context_window > 0 && self.ctx_used_tokens > 0 {
+                    format!("Context: {}K / {}K", self.ctx_used_tokens / 1000, self.context_window / 1000)
+                } else {
+                    "Context: (not yet measured)".to_string()
+                };
+                self.conversation.push_delta(&format!(
+                    "**Session token usage**\n- Total output tokens: {}\n- Current turn tokens: {}\n- {}",
+                    self.total_tokens, self.turn_tokens, ctx_str,
+                ));
+                self.conversation.finalize_stream();
                 return true;
             }
             "/clear" => {
