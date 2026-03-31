@@ -154,6 +154,9 @@ pub struct AgentLoop {
     verify_injected: bool,
     /// Whether the model produced any text output this turn (if so, skip auto-summary)
     model_produced_text: bool,
+    /// Consecutive LLM rounds with tool calls but zero text output.
+    /// Reset to 0 whenever the model produces text. Used to inject progress prompts.
+    silent_tool_rounds: usize,
     /// True when the user's message is negative feedback on the previous turn's work.
     is_negative_feedback: bool,
     /// Last N tool call signatures for loop detection. (name, args_hash)
@@ -289,6 +292,7 @@ impl AgentLoop {
             consecutive_reads: 0,
             verify_injected: false,
             model_produced_text: false,
+            silent_tool_rounds: 0,
             is_negative_feedback: false,
             recent_calls: Vec::new(),
             current_task: String::new(),
@@ -476,6 +480,7 @@ impl AgentLoop {
         self.consecutive_reads = 0;
         self.verify_injected = false;
         self.model_produced_text = false;
+        self.silent_tool_rounds = 0;
         // Note: is_negative_feedback is set above, do not reset here.
         self.build_fail_count = 0;
         self.file_read_counts.clear();
@@ -1014,10 +1019,17 @@ impl AgentLoop {
                     self.finish_turn();
                     return;
                 }
-                TurnResult::UsedTools { tool_count, tokens, .. } => {
+                TurnResult::UsedTools { tool_count, tokens, text } => {
                     self.turn_tokens += tokens;
                     self.total_tokens += tokens;
                     self.tool_call_count += tool_count;
+                    // Track silent rounds: model used tools without explaining anything.
+                    let had_text = text.as_ref().map(|t| !t.trim().is_empty()).unwrap_or(false);
+                    if had_text {
+                        self.silent_tool_rounds = 0;
+                    } else {
+                        self.silent_tool_rounds += 1;
+                    }
                     // Post-process: truncate large outputs + externalize to disk
                     self.post_process_tool_results(tool_count);
                     // Apply discipline: inject reminders, check step limits
@@ -1270,6 +1282,24 @@ impl AgentLoop {
                     _ => {}
                 }
             }
+        }
+
+        // Progress prompt: force the model to explain after consecutive silent rounds.
+        // Threshold: 3 rounds of pure tool calls without any text output.
+        if self.silent_tool_rounds >= 3 {
+            let files_so_far = if self.files_read_this_turn.is_empty() {
+                String::new()
+            } else {
+                format!(" Files examined: {}", self.files_read_this_turn.join(", "))
+            };
+            self.conversation.add_user_message(&format!(
+                "[SYSTEM: You've made {} tool calls without explaining anything to the user. \
+                 Before your next tool call, briefly state: \
+                 (1) what you've found so far, (2) what you're going to do next. \
+                 Keep it to 1-2 sentences.{}]",
+                self.tool_call_count, files_so_far,
+            ));
+            self.silent_tool_rounds = 0; // Reset so it fires again after another 3 rounds
         }
     }
 
