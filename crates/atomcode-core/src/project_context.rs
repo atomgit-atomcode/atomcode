@@ -25,11 +25,111 @@ pub struct ProjectContext {
     pub included_files: HashSet<PathBuf>,
 }
 
+/// Detect project tech stack from marker files in the working directory.
+/// Scans root and common monorepo subdirectories for build configs and frameworks.
+fn detect_tech_stack(working_dir: &Path) -> String {
+    let mut stack: Vec<String> = Vec::new();
+
+    let markers: &[(&str, &str)] = &[
+        ("pom.xml", "Java/Maven"),
+        ("build.gradle", "Java/Gradle"),
+        ("build.gradle.kts", "Kotlin/Gradle"),
+        ("Cargo.toml", "Rust/Cargo"),
+        ("package.json", "Node.js"),
+        ("go.mod", "Go"),
+        ("requirements.txt", "Python"),
+        ("pyproject.toml", "Python"),
+        ("Gemfile", "Ruby"),
+        ("composer.json", "PHP"),
+        ("CMakeLists.txt", "C/C++/CMake"),
+        ("Makefile", "Make"),
+    ];
+
+    // Root-level markers
+    for &(file, label) in markers {
+        if working_dir.join(file).exists() {
+            stack.push(label.to_string());
+        }
+    }
+
+    // Monorepo subdirectories
+    for subdir in &["frontend", "backend", "server", "client", "web", "app"] {
+        let sub = working_dir.join(subdir);
+        if sub.is_dir() {
+            for &(file, label) in markers {
+                if sub.join(file).exists() {
+                    stack.push(format!("{}/{}", subdir, label));
+                    break;
+                }
+            }
+        }
+    }
+
+    // Detect JS/TS frameworks from package.json
+    let framework_markers: &[(&str, &str)] = &[
+        ("\"vue\"", "Vue"),
+        ("\"react\"", "React"),
+        ("\"next\"", "Next.js"),
+        ("\"nuxt\"", "Nuxt"),
+        ("\"vite\"", "Vite"),
+        ("\"tailwindcss\"", "Tailwind"),
+        ("\"svelte\"", "Svelte"),
+        ("\"angular\"", "Angular"),
+    ];
+
+    for pkg_path in &[
+        working_dir.join("package.json"),
+        working_dir.join("frontend").join("package.json"),
+        working_dir.join("web").join("package.json"),
+    ] {
+        if pkg_path.exists() {
+            if let Ok(content) = std::fs::read_to_string(pkg_path) {
+                for &(needle, label) in framework_markers {
+                    if content.contains(needle) {
+                        stack.push(label.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    // Detect Spring Boot from pom.xml (root or backend/)
+    for pom_path in &[
+        working_dir.join("pom.xml"),
+        working_dir.join("backend").join("pom.xml"),
+    ] {
+        if pom_path.exists() {
+            if let Ok(content) = std::fs::read_to_string(pom_path) {
+                if content.contains("spring-boot") {
+                    stack.push("Spring Boot".to_string());
+                }
+            }
+            break; // only check the first pom that exists
+        }
+    }
+
+    // Deduplicate while preserving order
+    let mut seen = HashSet::new();
+    stack.retain(|item| seen.insert(item.clone()));
+
+    if stack.is_empty() {
+        String::new()
+    } else {
+        format!("Tech stack: {}\n", stack.join(", "))
+    }
+}
+
 /// Build project context by scanning the tree and including raw descriptor file contents.
-/// No hardcoded project-type detection — the model reads the files and figures it out.
 pub fn build_project_context(dir: &Path) -> ProjectContext {
     let mut ctx = String::new();
     let mut included_files = HashSet::new();
+
+    // 0. Tech stack summary — model sees this first, no need to explore marker files
+    let tech_stack = detect_tech_stack(dir);
+    if !tech_stack.is_empty() {
+        ctx.push_str(&tech_stack);
+        ctx.push('\n');
+    }
 
     // 1. File tree (3 levels) with tree-sitter annotations
     // Each source file gets top-level symbol names so the model can navigate without grepping
