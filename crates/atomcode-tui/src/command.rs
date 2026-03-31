@@ -29,6 +29,7 @@ pub const BUILTIN_COMMANDS: &[(&str, &str)] = &[
     ("/cd",       "Change working directory"),
     
     // === Utilities ===
+    ("/undo",     "Undo last turn's edits"),
     ("/copy",     "Copy last AI response"),
     ("/clear",    "Clear conversation"),
     

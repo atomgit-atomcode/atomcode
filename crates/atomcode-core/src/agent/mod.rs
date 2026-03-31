@@ -2,6 +2,8 @@
 //! calls LLM providers, executes tools, and communicates with the UI
 //! via channels. Decoupled from any TUI concerns.
 
+pub mod git_checkpoint;
+
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -181,6 +183,9 @@ pub struct AgentLoop {
     /// Used to detect repeated execution of the same command.
     executed_cmds: std::collections::HashMap<String, usize>,
 
+    /// Last git checkpoint ref (SHA) for /undo rollback.
+    pub last_checkpoint: Option<String>,
+
     /// Pending user input appended during streaming. Injected before next LLM call.
     pending_input: Option<String>,
     /// Session-level file tracker: all files read/edited across the entire session.
@@ -294,6 +299,7 @@ impl AgentLoop {
             sleep_count: 0,
             consecutive_verify_count: 0,
             executed_cmds: std::collections::HashMap::new(),
+            last_checkpoint: None,
             pending_input: None,
             planning_phase: false,
             session_files: std::collections::HashMap::new(),
@@ -443,6 +449,12 @@ impl AgentLoop {
         ];
         self.is_negative_feedback = content.chars().count() < 80
             && negative_keywords.iter().any(|kw| lower.contains(kw));
+
+        // Git checkpoint: snapshot working tree before agent starts editing.
+        let wd = self.turn_runner.context.working_dir.try_read()
+            .map(|g| g.clone())
+            .unwrap_or_default();
+        self.last_checkpoint = git_checkpoint::create_checkpoint(&wd);
 
         self.preread_context = self.build_preread_context(&content).await;
 

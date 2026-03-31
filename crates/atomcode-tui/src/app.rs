@@ -182,6 +182,8 @@ pub struct App {
     pub model_name: String,
     /// Per-turn logger: writes each turn to datalog/ as a markdown file.
     pub turn_log: crate::turn_log::TurnLog,
+    /// Last git checkpoint SHA for /undo.
+    pub last_checkpoint: Option<String>,
     /// Session manager for persistence.
     pub session_manager: SessionManager,
     /// Current session (wraps conversation for persistence).
@@ -309,6 +311,7 @@ impl App {
                cancel_token: tokio_util::sync::CancellationToken::new(),
                agent_handle,
                model_name,
+               last_checkpoint: None,
                session_manager,
                current_session,
                session_selector: None,
@@ -1709,6 +1712,20 @@ impl App {
                     let _ = self.agent_handle.cmd_tx.send(AgentCommand::ChangeDir(arg.to_string()));
                 }
             }
+            "/undo" => {
+                if let Some(ref checkpoint) = self.last_checkpoint.clone() {
+                    let (ok, msg) = atomcode_core::agent::git_checkpoint::restore_checkpoint(
+                        &self.working_dir, checkpoint,
+                    );
+                    self.conversation.push_delta(&msg);
+                    self.conversation.finalize_stream();
+                    if ok { self.last_checkpoint = None; }
+                } else {
+                    self.conversation.push_delta("No checkpoint available. /undo works after the agent has made edits.");
+                    self.conversation.finalize_stream();
+                }
+                return true;
+            }
             "/clear" => {
                 // Delete the old session file if it exists and is not the default session
                 if self.current_session.name != "default" {
@@ -2040,6 +2057,9 @@ impl App {
         self.llm_call_start = Some(Instant::now());
         self.last_completed_tool = String::new();
         self.last_turn_duration = None;
+
+        // Git checkpoint before agent edits
+        self.last_checkpoint = atomcode_core::agent::git_checkpoint::create_checkpoint(&self.working_dir);
 
         // Delegate to the AgentLoop via channel.
         let _ = self.agent_handle.cmd_tx.send(AgentCommand::SendMessage(full_content));
