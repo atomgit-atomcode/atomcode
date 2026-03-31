@@ -4,6 +4,7 @@ members = [
     "crates/atomcode-core",
     "crates/atomcode-tui",
     "crates/atomcode-cli",
+    "crates/atomcode-api",
 ]
 
 [workspace.package]

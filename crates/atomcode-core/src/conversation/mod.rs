@@ -34,7 +34,6 @@ impl Default for Conversation {
     }
 }
 
-const MAX_MESSAGES: usize = 1000;
 
 impl Conversation {
     pub fn new() -> Self {
@@ -59,12 +58,9 @@ impl Conversation {
             }
         };
 
-        let len = messages.len();
-        let start = if len > MAX_MESSAGES { len - MAX_MESSAGES } else { 0 };
-        let msgs = messages[start..].to_vec();
-        let turn_tracker = TurnTracker::rebuild(&msgs);
+        let turn_tracker = TurnTracker::rebuild(&messages);
         Self {
-            messages: msgs,
+            messages,
             stream_buffer: None,
             tool_call_buffer: None,
             turn_tracker,
@@ -89,22 +85,10 @@ impl Conversation {
         crate::config::Config::config_dir().join("history.json")
     }
 
-    /// Trim old messages to keep within MAX_MESSAGES limit.
-    /// Rebuilds turn tracker indices when messages are drained.
-    fn trim(&mut self) {
-        if self.messages.len() > MAX_MESSAGES {
-            let excess = self.messages.len() - MAX_MESSAGES;
-            self.messages.drain(..excess);
-            // Indices shifted — rebuild turn tracker from scratch.
-            self.turn_tracker = TurnTracker::rebuild(&self.messages);
-        }
-    }
-
     pub fn add_user_message(&mut self, content: &str) {
         let idx = self.messages.len();
         self.messages.push(Message::new(Role::User, content));
         self.turn_tracker.on_user_message(idx);
-        self.trim();
     }
 
     pub fn push_delta(&mut self, delta: &str) {
@@ -124,7 +108,6 @@ impl Conversation {
             let idx = self.messages.len();
             self.messages.push(Message::new(Role::Assistant, content));
             self.turn_tracker.on_message_added(idx);
-            self.trim();
         }
     }
 
@@ -138,7 +121,6 @@ impl Conversation {
             },
         });
         self.turn_tracker.on_message_added(idx);
-        self.trim();
     }
 
     pub fn add_tool_result(&mut self, result: ToolResult) {
@@ -148,7 +130,6 @@ impl Conversation {
             content: MessageContent::ToolResult(result),
         });
         self.turn_tracker.on_message_added(idx);
-        self.trim();
     }
 
     pub fn add_tool_result_ref(&mut self, result_ref: ToolResultRef) {
@@ -158,7 +139,6 @@ impl Conversation {
             content: MessageContent::ToolResultRef(result_ref),
         });
         self.turn_tracker.on_message_added(idx);
-        self.trim();
     }
 
     pub fn finalize_stream_with_tool_call(&mut self, tool_call: ToolCall) {

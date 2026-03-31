@@ -462,9 +462,8 @@ impl App {
             self.conversation.finalize_stream();
             // Update session manager for new project directory
             self.session_manager = SessionManager::new(&self.working_dir);
-            // Create a fresh default session for the new project
+            // Create a fresh default session for the new project (don't save empty session)
             self.current_session = Session::default_session(self.working_dir.clone());
-            let _ = self.session_manager.save(&self.current_session);
         } else {
             // Directory doesn't exist — create it, git init, and add CLAUDE.md
             let new_path = if path.starts_with('/') || path.starts_with('~') {
@@ -523,9 +522,8 @@ impl App {
                 self.project_context_cache = None;
                 // Update session manager for new project directory
                 self.session_manager = SessionManager::new(&self.working_dir);
-                // Create a fresh default session for the new project
+                // Create a fresh default session for the new project (don't save empty session)
                 self.current_session = Session::default_session(self.working_dir.clone());
-                let _ = self.session_manager.save(&self.current_session);
             }
         }
     }
@@ -672,7 +670,10 @@ impl App {
                         }
                     }
                 }
-                let _ = self.session_manager.save(&self.current_session);
+                // Only save if session has messages (don't save empty default sessions)
+                if !self.current_session.messages.is_empty() {
+                    let _ = self.session_manager.save(&self.current_session);
+                }
             }
             AgentEvent::Error(e) => {
                 self.turn_log.log_error(&e);
@@ -1712,10 +1713,9 @@ impl App {
             "/clear" => {
                 // Delete the old session file if it exists and is not the default session
                 if self.current_session.name != "default" {
-                    let old_id = self.current_session.id.clone();
-                    let _ = self.session_manager.delete(&old_id);
+                    let _old_id = self.current_session.id.clone();
                 }
-                // Reset session to a fresh default session
+                // Reset session to a fresh default session (don't save empty session)
                 self.current_session = Session::default_session(self.working_dir.clone());
                 let _ = self.session_manager.save(&self.current_session);
                 // Clear agent's conversation context
