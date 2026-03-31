@@ -105,7 +105,10 @@ impl Tool for BashTool {
         {
             // Extract actual working dir from `cd /path/to/backend &&` in the command
             let effective_wd = extract_cd_dir(&parsed.command).unwrap_or_else(|| wd.clone());
-            let port = devserver::extract_port_with_dir(&parsed.command, Some(&effective_wd)).unwrap_or(8080);
+            // Port priority: explicit in command (lsof -ti:PORT) > config file > default
+            let port = extract_lsof_port(&parsed.command)
+                .or_else(|| devserver::extract_port_with_dir(&parsed.command, Some(&effective_wd)))
+                .unwrap_or(8080);
             let (success, output) = devserver::java::full_restart(&effective_wd, port, &parsed.command).await;
             return Ok(ToolResult { call_id: String::new(), output, success });
         }
@@ -374,6 +377,23 @@ fn check_destructive_command(command: &str) -> Option<String> {
         }
     }
 
+    None
+}
+
+/// Extract port from `lsof -ti:PORT` pattern in command.
+/// This is the strongest hint — the model explicitly knows which port to use.
+fn extract_lsof_port(cmd: &str) -> Option<u16> {
+    if let Some(pos) = cmd.find("lsof -ti:") {
+        let after = &cmd[pos + 9..];
+        let port_str: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+        return port_str.parse().ok();
+    }
+    // Also match `lsof -i :PORT`
+    if let Some(pos) = cmd.find("lsof -i :") {
+        let after = &cmd[pos + 9..];
+        let port_str: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+        return port_str.parse().ok();
+    }
     None
 }
 

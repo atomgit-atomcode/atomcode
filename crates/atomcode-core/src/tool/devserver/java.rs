@@ -219,11 +219,11 @@ pub async fn full_restart(
         }
     }
 
-    // Step 2: Compile
+    // Step 2: Compile (no tail — enhance_compile_error needs full output to find file:line)
     let compile_cmd = if original_cmd.contains("gradle") {
-        "gradle compileJava 2>&1 | tail -30"
+        "gradle compileJava 2>&1"
     } else {
-        "mvn compile 2>&1 | tail -30"
+        "mvn compile 2>&1"
     };
     let compile_result = tokio::process::Command::new("bash")
         .arg("-c")
@@ -238,7 +238,20 @@ pub async fn full_restart(
             let compile_err = String::from_utf8_lossy(&o.stderr);
             let combined = format!("{}{}", compile_out, compile_err);
             if !o.status.success() {
-                let enhanced = enhance_compile_error(&combined, working_dir);
+                // Extract only ERROR lines from verbose Maven output
+                let error_lines: String = combined.lines()
+                    .filter(|l| l.contains("[ERROR]") || l.contains("error:") || l.contains("error]"))
+                    .take(15)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let errors_to_enhance = if error_lines.is_empty() {
+                    // Fallback: last 20 lines
+                    combined.lines().rev().take(20).collect::<Vec<_>>().into_iter().rev()
+                        .collect::<Vec<_>>().join("\n")
+                } else {
+                    error_lines
+                };
+                let enhanced = enhance_compile_error(&errors_to_enhance, working_dir);
                 output.push_str(&format!("[Step 2/4] Compile FAILED:\n{}\n", enhanced));
                 return (false, output);
             }

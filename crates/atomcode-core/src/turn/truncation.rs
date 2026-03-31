@@ -331,7 +331,10 @@ pub fn post_process_tool_results(
     // Phase 2: Externalize large results to disk (replace ToolResult with ToolResultRef)
     for &i in &to_process {
         let should_externalize = if let MessageContent::ToolResult(ref r) = messages[i].content {
-            r.output.len() >= 512
+            // Don't externalize structured agent outputs (full_restart, auto-diagnosis)
+            // — they're already concise summaries, not raw command output.
+            r.output.len() >= 512 && !r.output.starts_with("[Step ")
+                && !r.output.starts_with("[AUTO-DIAGNOSIS")
         } else {
             false
         };
