@@ -185,6 +185,11 @@ pub struct AgentLoop {
     /// Normalized bash commands executed this turn → count.
     /// Used to detect repeated execution of the same command.
     executed_cmds: std::collections::HashMap<String, usize>,
+    /// Consecutive failures by command category (e.g., "curl", "mysql").
+    /// Reset on success. Used to detect "same approach keeps failing" patterns.
+    category_fail_streak: std::collections::HashMap<String, usize>,
+    /// Last bash command string (set on ToolCallStarted, used on ToolCallResult).
+    last_bash_cmd: String,
 
     /// Last git checkpoint ref (SHA) for /undo rollback.
     pub last_checkpoint: Option<String>,
@@ -307,6 +312,8 @@ impl AgentLoop {
             sleep_count: 0,
             consecutive_verify_count: 0,
             executed_cmds: std::collections::HashMap::new(),
+            category_fail_streak: std::collections::HashMap::new(),
+            last_bash_cmd: String::new(),
             last_checkpoint: None,
             active_file: None,
             pending_input: None,
@@ -491,6 +498,7 @@ impl AgentLoop {
         self.sleep_count = 0;
         self.consecutive_verify_count = 0;
         self.executed_cmds.clear();
+        self.category_fail_streak.clear();
         // Clear session_files on each new user message.
         // Working Set only tracks files from the CURRENT task.
         // Previous files are remembered via cold zone summaries.
@@ -1116,6 +1124,16 @@ impl AgentLoop {
                 self.phase = AgentPhase::CallingTool(name.clone());
                 let _ = self.event_tx.send(AgentEvent::PhaseChange(self.phase.clone()));
 
+                // Track bash command for failure categorization
+                if name == "bash" {
+                    if let Ok(args) = serde_json::from_str::<serde_json::Value>(arguments) {
+                        self.last_bash_cmd = args.get("command")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                    }
+                }
+
                 // Track files for Working Set
                 if matches!(name.as_str(), "read_file" | "edit_file" | "write_file" | "search_replace" | "glob" | "grep") {
                     if let Ok(args) = serde_json::from_str::<serde_json::Value>(arguments) {
@@ -1169,6 +1187,31 @@ impl AgentLoop {
                 } else if matches!(name.as_str(), "edit_file" | "write_file") {
                     self.consecutive_reads = 0;
                 }
+
+                // Track bash command category failures (curl, mysql, etc.)
+                if name == "bash" && !self.last_bash_cmd.is_empty() {
+                    let cat = categorize_bash_cmd(&self.last_bash_cmd);
+                    let is_empty_output = output.trim().is_empty()
+                        || output.trim() == "(no output)";
+                    if !success || is_empty_output {
+                        let count = self.category_fail_streak.entry(cat.clone()).or_insert(0);
+                        *count += 1;
+                        if *count >= 2 {
+                            // Inject warning into tool result
+                            let warning = format!(
+                                "\n\n[WARNING: `{}` has failed {} times in a row. \
+                                 This approach is not working. Try a DIFFERENT method: \
+                                 check logs, read config, or ask the user for help.]",
+                                cat, count,
+                            );
+                            // We can't mutate output here (it's moved), so we'll inject in discipline
+                            self.conversation.add_user_message(&warning);
+                        }
+                    } else {
+                        self.category_fail_streak.remove(&cat);
+                    }
+                }
+
                 let _ = self.event_tx.send(AgentEvent::ToolCallResult {
                     name, output, success, duration,
                 });
@@ -2131,6 +2174,27 @@ fn short_path(path: &str) -> String {
         2 => format!("{}/{}", parts[1], parts[0]),
         _ => format!(".../{}/{}", parts[1], parts[0]),
     }
+}
+
+/// Extract a category from a bash command for failure tracking.
+/// e.g., "curl -s http://..." → "curl", "mysql -u root ..." → "mysql"
+fn categorize_bash_cmd(cmd: &str) -> String {
+    let categories = [
+        "curl", "wget", "mysql", "psql", "sqlite3", "redis-cli",
+        "docker", "kubectl", "npm", "yarn", "pnpm", "pip",
+        "mvn", "gradle", "cargo",
+    ];
+    let lower = cmd.to_lowercase();
+    for cat in &categories {
+        if lower.contains(cat) {
+            return cat.to_string();
+        }
+    }
+    // Fallback: first word of the command
+    cmd.split_whitespace()
+        .next()
+        .unwrap_or("unknown")
+        .to_string()
 }
 
 

@@ -30,12 +30,54 @@ pub struct PreCommandResult {
 }
 
 /// Detect if a command is a dev server. Returns metadata if matched.
+/// Also handles compound commands (e.g., `kill PID; sleep 2; mvn spring-boot:run`)
+/// by splitting on `;`, `&&`, `||` and checking each segment.
 pub fn detect(cmd: &str) -> Option<DetectedServer> {
-    // Try each language module in order. First match wins.
+    detect_single(cmd).or_else(|| {
+        // Split compound commands and check each segment
+        split_compound(cmd).iter()
+            .filter_map(|seg| detect_single(seg))
+            .last() // last match = the actual server command
+    })
+}
+
+/// Detect a single (non-compound) command.
+fn detect_single(cmd: &str) -> Option<DetectedServer> {
     java::detect(cmd)
         .or_else(|| javascript::detect(cmd))
         .or_else(|| python::detect(cmd))
         .or_else(|| rust::detect(cmd))
+}
+
+/// Split a compound command by `;`, `&&`, `||` into segments.
+fn split_compound(cmd: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut rest = cmd;
+    while !rest.is_empty() {
+        // Find earliest delimiter
+        let delims = ["&&", "||", ";"];
+        let mut earliest: Option<(usize, usize)> = None; // (pos, delim_len)
+        for d in &delims {
+            if let Some(pos) = rest.find(d) {
+                if earliest.is_none() || pos < earliest.unwrap().0 {
+                    earliest = Some((pos, d.len()));
+                }
+            }
+        }
+        match earliest {
+            Some((pos, len)) => {
+                let seg = rest[..pos].trim();
+                if !seg.is_empty() { parts.push(seg); }
+                rest = rest[pos + len..].trim_start();
+            }
+            None => {
+                let seg = rest.trim();
+                if !seg.is_empty() { parts.push(seg); }
+                break;
+            }
+        }
+    }
+    parts
 }
 
 /// Check if a command is a background/server command (should not be killed on timeout).
