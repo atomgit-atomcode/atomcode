@@ -171,9 +171,30 @@ impl Tool for EditFileTool {
         let old_string = match parsed.old_string {
             Some(ref s) if !s.is_empty() => s.clone(),
             _ => {
+                // Weak model fallback: no old_string and no line range = append to end of file.
+                // This is a common mistake where the model only provides new_string.
+                if !parsed.new_string.is_empty() {
+                    let new_content = if content.ends_with('\n') {
+                        format!("{}{}\n", content, parsed.new_string)
+                    } else {
+                        format!("{}\n{}\n", content, parsed.new_string)
+                    };
+                    let added = parsed.new_string.lines().count();
+                    atomic_write(&parsed.file_path, &new_content).await?;
+                    let outline = post_edit_info(&new_content, &parsed.new_string);
+                    return Ok(ToolResult {
+                        call_id: String::new(),
+                        output: format!(
+                            "Edited {} (appended +{} lines to end of file — no old_string provided, auto-appended).\n{}",
+                            parsed.file_path, added, outline
+                        ),
+                        success: true,
+                    });
+                }
                 return Ok(ToolResult {
                     call_id: String::new(),
-                    output: "Error: either old_string or start_line/end_line is required.".to_string(),
+                    output: "Error: either old_string or start_line/end_line is required. \
+                             Provide old_string (text to replace) or start_line+end_line (line range).".to_string(),
                     success: false,
                 });
             }
@@ -190,11 +211,12 @@ impl Tool for EditFileTool {
 
                 if sym_count == 0 {
                     let (hint, _) = find_closest_match_with_suggestion(sym_text, &old_string);
+                    let reread = auto_reread_content(&content, &old_string);
                     return Ok(ToolResult {
                         call_id: String::new(),
                         output: format!(
-                            "Error: old_string not found in symbol '{}' (lines {}-{}).\n{}",
-                            symbol_name, slice.start_line, slice.end_line, hint
+                            "Error: old_string not found in symbol '{}' (lines {}-{}).\n{}\n{}",
+                            symbol_name, slice.start_line, slice.end_line, hint, reread
                         ),
                         success: false,
                     });
@@ -292,9 +314,10 @@ impl Tool for EditFileTool {
             } else {
                 String::new()
             };
+            let reread = auto_reread_content(&content, &old_string);
             return Ok(ToolResult {
                 call_id: String::new(),
-                output: format!("Error: old_string not found in {}.\n{}{}", parsed.file_path, hint, suggestion),
+                output: format!("Error: old_string not found in {}.\n{}{}\n{}", parsed.file_path, hint, suggestion, reread),
                 success: false,
             });
         }
@@ -653,6 +676,63 @@ fn build_compact_diff(old: &str, new: &str) -> String {
     }
 
     diff.trim_end().to_string()
+}
+
+/// Auto re-read: when old_string match fails, include current file content
+/// so the model can retry immediately without a separate read_file call.
+///
+/// - Files <= 200 lines: full content with line numbers.
+/// - Files > 200 lines: 50 lines around the approximate target area.
+fn auto_reread_content(content: &str, old_string: &str) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+    let total = lines.len();
+
+    if total == 0 {
+        return String::new();
+    }
+
+    let mut out = String::new();
+
+    if total <= 200 {
+        out.push_str(&format!(
+            "\n[Edit failed: old_string not found. Current file content ({} lines):]\n",
+            total
+        ));
+        for (i, line) in lines.iter().enumerate() {
+            out.push_str(&format!("{:>4}| {}\n", i + 1, line));
+        }
+    } else {
+        // Find approximate target area using the first non-empty line of old_string
+        let target_line = old_string
+            .lines()
+            .find(|l| !l.trim().is_empty())
+            .map(|first| first.trim());
+
+        let center = target_line
+            .and_then(|needle| {
+                lines.iter().position(|l| l.trim().contains(needle))
+            })
+            .unwrap_or(0);
+
+        let start = center.saturating_sub(25);
+        let end = (center + 25).min(total);
+
+        out.push_str(&format!(
+            "\n[Edit failed: old_string not found. Current file content (lines {}-{} of {}):]\n",
+            start + 1, end, total
+        ));
+        if start > 0 {
+            out.push_str(&format!("     ... ({} lines above)\n", start));
+        }
+        for i in start..end {
+            out.push_str(&format!("{:>4}| {}\n", i + 1, lines[i]));
+        }
+        if end < total {
+            out.push_str(&format!("     ... ({} lines below)\n", total - end));
+        }
+    }
+
+    out
 }
 
 /// Find the closest match and return (hint_message, suggested_old_string).

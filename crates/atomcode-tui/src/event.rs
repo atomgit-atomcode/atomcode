@@ -2,12 +2,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crossterm::event::{Event, KeyEvent, poll};
+use crossterm::event::{Event, KeyEvent, MouseEvent, poll};
 use tokio::sync::mpsc;
 
 #[derive(Debug)]
 pub enum AppEvent {
     Key(KeyEvent),
+    Mouse(MouseEvent),
     Paste(String),          // Bracketed paste content
     Resize(u16, u16),
     Tick,
@@ -64,6 +65,7 @@ impl EventLoop {
                                         }
                                         AppEvent::Key(key)
                                     }
+                                    Event::Mouse(mouse) => AppEvent::Mouse(mouse),
                                     Event::Paste(text) => AppEvent::Paste(text),
                                     Event::Resize(w, h) => AppEvent::Resize(w, h),
                                     _ => continue,

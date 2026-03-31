@@ -7,7 +7,7 @@ use serde_json::json;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
-
+use super::devserver;
 use super::{ApprovalRequirement, Tool, ToolContext, ToolDef, ToolResult};
 
 pub struct BashTool;
@@ -79,7 +79,7 @@ impl Tool for BashTool {
             let cmd_trimmed = parsed.command.trim();
             // Detect pattern: "some_command &" or "some_command & other_command"
             // where the backgrounded part is a server/dev command
-            if is_background_command(cmd_trimmed)
+            if devserver::is_server_command(cmd_trimmed)
                 && !cmd_trimmed.contains("nohup")
                 && !cmd_trimmed.contains(">/dev/null")
                 && !cmd_trimmed.contains("&>/dev/null")
@@ -97,6 +97,22 @@ impl Tool for BashTool {
             }
         }
 
+        // Java full restart: when model runs spring-boot:run, we orchestrate the
+        // full kill→compile→start→poll cycle automatically. This saves 8-10 steps.
+        if devserver::java::detect(&parsed.command).is_some()
+            && !parsed.command.contains("mvn compile")
+            && !parsed.command.contains("mvn clean")
+        {
+            // Extract actual working dir from `cd /path/to/backend &&` in the command
+            let effective_wd = extract_cd_dir(&parsed.command).unwrap_or_else(|| wd.clone());
+            // Port priority: explicit in command (lsof -ti:PORT) > config file > default
+            let port = extract_lsof_port(&parsed.command)
+                .or_else(|| devserver::extract_port_with_dir(&parsed.command, Some(&effective_wd)))
+                .unwrap_or(8080);
+            let (success, output) = devserver::java::full_restart(&effective_wd, port, &parsed.command).await;
+            return Ok(ToolResult { call_id: String::new(), output, success });
+        }
+
         // Platform-aware shell: cmd.exe on Windows, bash on Unix
         #[cfg(target_os = "windows")]
         let mut child = Command::new("cmd.exe")
@@ -108,7 +124,7 @@ impl Tool for BashTool {
 
         // Detect long-running / background commands — these get their own process group
         // so they survive atomcode exit and won't be killed on timeout.
-        let is_background = is_background_command(&parsed.command);
+        let is_background = devserver::is_server_command(&parsed.command);
 
         #[cfg(not(target_os = "windows"))]
         let mut child = {
@@ -132,11 +148,19 @@ impl Tool for BashTool {
         let mut stderr_buf = Vec::new();
 
         // Wait for process to finish or timeout. Read stdout/stderr concurrently.
-        // Tech-stack-agnostic idle detection: if the process is still running but
-        // output has stopped for 3s, it's likely a long-running process (dev server)
-        // that started successfully. Return early without killing it.
-        let wait_secs = parsed.timeout.unwrap_or(INITIAL_WAIT_SECS).min(300);
-        let idle_timeout = Duration::from_secs(3);
+        // Idle detection (3s no output → early return) ONLY for background/server commands.
+        // Non-background commands (curl, mvn, etc.) wait the full timeout.
+        let wait_secs = if is_background {
+            parsed.timeout.unwrap_or(INITIAL_WAIT_SECS).min(300)
+        } else {
+            parsed.timeout.unwrap_or(30).min(300)
+        };
+        // For background commands: 3s idle = server started. For others: no idle detection.
+        let idle_timeout = if is_background {
+            Duration::from_secs(3)
+        } else {
+            Duration::from_secs(wait_secs + 1) // effectively disabled
+        };
         let has_any_output = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let has_out_1 = has_any_output.clone();
         let has_out_2 = has_any_output.clone();
@@ -203,6 +227,10 @@ impl Tool for BashTool {
                 let mut combined = format_output(&stdout_str, &stderr_str);
                 // For background/pkill commands: non-empty output = success
                 let effective_success = success || has_background || (has_pkill && !combined.is_empty());
+                // Java compile error auto-diagnosis: extract file:line + source context
+                if !effective_success && devserver::java::is_compile_command(&parsed.command) {
+                    combined = devserver::java::enhance_compile_error(&combined, &wd);
+                }
                 if !effective_success && !combined.is_empty() {
                     combined.push_str("\n\n[IMPORTANT: Command failed. Read the error above and fix the root cause. Do NOT retry the same command.]");
                 }
@@ -210,15 +238,27 @@ impl Tool for BashTool {
             }
             Ok(None) => {
                 // Process still running but output stopped (idle timeout).
-                // This is the typical pattern for dev servers: they print startup info then go quiet.
-                let pid = child.id().map(|p| p.to_string()).unwrap_or_else(|| "?".into());
-                let combined = format_output(&stdout_str, &stderr_str);
-                let output = if combined.is_empty() {
-                    format!("Process still running (PID: {}). No output captured yet.", pid)
+                if is_background {
+                    // Dev server: idle = likely started successfully. Don't kill.
+                    let pid = child.id().map(|p| p.to_string()).unwrap_or_else(|| "?".into());
+                    let combined = format_output(&stdout_str, &stderr_str);
+                    let output = if combined.is_empty() {
+                        format!("Process still running (PID: {}). No output captured yet.", pid)
+                    } else {
+                        format!("{}\n\n[Process running in background, PID: {}. Output stopped — likely started successfully. Do NOT wait for it to exit.]", combined, pid)
+                    };
+                    Ok(ToolResult { call_id: String::new(), output, success: true })
                 } else {
-                    format!("{}\n\n[Process running in background, PID: {}. Output stopped — likely started successfully. Do NOT wait for it to exit.]", combined, pid)
-                };
-                Ok(ToolResult { call_id: String::new(), output, success: true })
+                    // Non-background command (curl, etc.): shouldn't reach here normally,
+                    // but if it does, wait for the process to finish.
+                    let _ = child.wait().await;
+                    let combined = format_output(&stdout_str, &stderr_str);
+                    if combined.is_empty() {
+                        Ok(ToolResult { call_id: String::new(), output: "(no output)".to_string(), success: true })
+                    } else {
+                        Ok(ToolResult { call_id: String::new(), output: combined, success: true })
+                    }
+                }
             }
             Err(_) => {
                 if is_background {
@@ -227,7 +267,7 @@ impl Tool for BashTool {
                     let combined = format_output(&stdout_str, &stderr_str);
 
                     // Auto-detect port from command and poll until ready
-                    let port = extract_port(&parsed.command);
+                    let port = devserver::extract_port_with_dir(&parsed.command, Some(&wd));
                     let port_status = if let Some(p) = port {
                         // Poll port every 2s for up to 30s
                         let mut ready = false;
@@ -288,7 +328,7 @@ fn check_destructive_command(command: &str) -> Option<String> {
         ("chmod 777", "World-writable permission"),
         ("chmod -r ", "Recursive permission change"),
         ("kill -9", "Force kill process"),
-        ("killall", "Kill all matching processes"),
+        ("killall ", "Kill all matching processes"),
         ("git push --force", "Force push"),
         ("git push -f", "Force push"),
         ("git reset --hard", "Hard reset (destroys uncommitted changes)"),
@@ -297,9 +337,28 @@ fn check_destructive_command(command: &str) -> Option<String> {
 
     for (pattern, reason) in patterns {
         if cmd.contains(pattern) {
-            // Don't flag pkill/pgrep — they're standard process management commands
+            // Don't flag pkill/pgrep — standard process management
             if pattern.contains("kill") && (cmd.contains("pkill") || cmd.contains("pgrep")) {
                 continue;
+            }
+            // Don't flag `kill -9 <PID>` or `kill <PID>` targeting a specific process.
+            // Also allow piped kill patterns like `lsof -ti:PORT | xargs kill -9`
+            // which are standard dev server restart operations.
+            if pattern.contains("kill") {
+                let is_targeted_kill = cmd.contains("| xargs kill")
+                    || cmd.contains("| kill")
+                    || {
+                        // `kill -9 12345` — numeric PID follows
+                        let after_kill = if let Some(pos) = cmd.find("kill -9") {
+                            cmd[pos + 7..].trim_start()
+                        } else if let Some(pos) = cmd.find("kill ") {
+                            cmd[pos + 5..].trim_start()
+                        } else { "" };
+                        after_kill.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false)
+                    };
+                if is_targeted_kill {
+                    continue;
+                }
             }
             return Some(format!("Destructive command detected: {}. Command: {}", reason, command));
         }
@@ -321,53 +380,39 @@ fn check_destructive_command(command: &str) -> Option<String> {
     None
 }
 
-/// Detect commands intended to run in the background / as long-lived servers.
-/// These should not be killed on timeout and should get their own process group.
-fn is_background_command(cmd: &str) -> bool {
-    let trimmed = cmd.trim();
-    // Explicit background: trailing &, nohup, setsid
-    if trimmed.ends_with('&') || trimmed.contains("nohup ") || trimmed.contains("setsid ") {
-        return true;
+/// Extract port from `lsof -ti:PORT` pattern in command.
+/// This is the strongest hint — the model explicitly knows which port to use.
+fn extract_lsof_port(cmd: &str) -> Option<u16> {
+    if let Some(pos) = cmd.find("lsof -ti:") {
+        let after = &cmd[pos + 9..];
+        let port_str: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+        return port_str.parse().ok();
     }
-    // Common dev server commands
-    let server_patterns = [
-        "npm run dev", "npm start", "npx ", "yarn dev", "pnpm dev",
-        "python -m http", "python manage.py runserver", "uvicorn ", "gunicorn ",
-        "cargo run", "go run", "node server", "flask run", "rails s",
-        "mvn spring-boot:run", "mvn spring-boot:", "gradle bootRun",
-        "java -jar", "java -cp",
-    ];
-    server_patterns.iter().any(|p| trimmed.contains(p))
+    // Also match `lsof -i :PORT`
+    if let Some(pos) = cmd.find("lsof -i :") {
+        let after = &cmd[pos + 9..];
+        let port_str: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+        return port_str.parse().ok();
+    }
+    None
 }
 
-/// Extract port number from a command string.
-/// Detects patterns like `:8080`, `--port 3000`, `-p 8080`, `PORT=3000`.
-fn extract_port(cmd: &str) -> Option<u16> {
-    // Common default ports by tool
-    let defaults: &[(&str, u16)] = &[
-        ("spring-boot:run", 8080),
-        ("npm run dev", 3000), ("npm start", 3000),
-        ("vite", 5173), ("next", 3000),
-        ("flask run", 5000), ("uvicorn", 8000),
-        ("rails s", 3000), ("cargo run", 8080),
-    ];
-
-    // Check for explicit port in command
-    let port_patterns = ["-p ", "--port ", "--port=", "-Dserver.port=", "PORT="];
-    for pat in &port_patterns {
-        if let Some(pos) = cmd.find(pat) {
-            let after = &cmd[pos + pat.len()..];
-            let port_str: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
-            if let Ok(p) = port_str.parse::<u16>() {
-                return Some(p);
+/// Extract the target directory from a `cd /path/to/dir && ...` command.
+/// Returns None if no cd found.
+fn extract_cd_dir(cmd: &str) -> Option<std::path::PathBuf> {
+    // Match patterns: "cd /path/to/dir &&", "cd /path/to/dir;", "cd /path/to/dir\n"
+    for prefix in ["cd ", "CD "] {
+        if let Some(pos) = cmd.find(prefix) {
+            let after = &cmd[pos + prefix.len()..];
+            let dir_end = after.find(|c: char| c == '&' || c == ';' || c == '\n' || c == '|')
+                .unwrap_or(after.len());
+            let dir = after[..dir_end].trim();
+            if !dir.is_empty() {
+                let path = std::path::PathBuf::from(dir);
+                if path.is_dir() {
+                    return Some(path);
+                }
             }
-        }
-    }
-
-    // Fall back to defaults
-    for (pattern, port) in defaults {
-        if cmd.contains(pattern) {
-            return Some(*port);
         }
     }
     None

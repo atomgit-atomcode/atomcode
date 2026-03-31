@@ -45,6 +45,13 @@ pub fn render(
     render_cache: &mut Vec<Line<'static>>,
     render_cache_msg_count: &mut usize,
 ) -> usize {
+    // Apply right margin (same as left indent) so text doesn't touch the edge.
+    let right_margin: u16 = 2;
+    let area = Rect {
+        width: area.width.saturating_sub(right_margin),
+        ..area
+    };
+
     let vh = (area.height as usize).saturating_sub(1);
     if vh == 0 { return 0; }
 
@@ -499,9 +506,11 @@ fn render_approval(lines: &mut Vec<Line<'static>>, call: &ToolCall) {
         Style::default().fg(theme::SEPARATOR),
     )));
 
-    // Action buttons
+    // Action buttons with prominent prompt
     lines.push(Line::from(vec![
         Span::raw(format!("{}", TOOL_INDENT)),
+        Span::styled(" \u{25b6} ", Style::default().fg(theme::WARNING).add_modifier(Modifier::BOLD)),
+        Span::styled("Waiting for approval: ", Style::default().fg(theme::WARNING)),
         Span::styled(" Y ", Style::default().fg(theme::TEXT_ON_ACCENT).bg(theme::SUCCESS).add_modifier(Modifier::BOLD)),
         Span::styled(" Allow  ", key_label),
         Span::styled(" A ", Style::default().fg(theme::TEXT_ON_ACCENT).bg(theme::INFO).add_modifier(Modifier::BOLD)),

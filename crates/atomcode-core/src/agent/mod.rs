@@ -2,6 +2,9 @@
 //! calls LLM providers, executes tools, and communicates with the UI
 //! via channels. Decoupled from any TUI concerns.
 
+pub mod git_checkpoint;
+pub mod knowledge;
+
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -152,6 +155,11 @@ pub struct AgentLoop {
     verify_injected: bool,
     /// Whether the model produced any text output this turn (if so, skip auto-summary)
     model_produced_text: bool,
+    /// Consecutive LLM rounds with tool calls but zero text output.
+    /// Reset to 0 whenever the model produces text. Used to inject progress prompts.
+    silent_tool_rounds: usize,
+    /// True when the user's message is negative feedback on the previous turn's work.
+    is_negative_feedback: bool,
     /// Last N tool call signatures for loop detection. (name, args_hash)
     recent_calls: Vec<(String, u64)>,
     /// The user's original task message for this turn (re-injected as reminders).
@@ -178,6 +186,18 @@ pub struct AgentLoop {
     /// Normalized bash commands executed this turn → count.
     /// Used to detect repeated execution of the same command.
     executed_cmds: std::collections::HashMap<String, usize>,
+    /// Consecutive failures by command category (e.g., "curl", "mysql").
+    /// Reset on success. Used to detect "same approach keeps failing" patterns.
+    category_fail_streak: std::collections::HashMap<String, usize>,
+    /// Last bash command string (set on ToolCallStarted, used on ToolCallResult).
+    last_bash_cmd: String,
+
+    /// Last git checkpoint ref (SHA) for /undo rollback.
+    pub last_checkpoint: Option<String>,
+
+    /// Most recently edited file (absolute path). Injected as full content in system prompt
+    /// so the model doesn't need to re-read it next turn. Capped at ~6K tokens.
+    active_file: Option<PathBuf>,
 
     /// Pending user input appended during streaming. Injected before next LLM call.
     pending_input: Option<String>,
@@ -278,6 +298,8 @@ impl AgentLoop {
             consecutive_reads: 0,
             verify_injected: false,
             model_produced_text: false,
+            silent_tool_rounds: 0,
+            is_negative_feedback: false,
             recent_calls: Vec::new(),
             current_task: String::new(),
             current_tool_name: String::new(),
@@ -291,6 +313,10 @@ impl AgentLoop {
             sleep_count: 0,
             consecutive_verify_count: 0,
             executed_cmds: std::collections::HashMap::new(),
+            category_fail_streak: std::collections::HashMap::new(),
+            last_bash_cmd: String::new(),
+            last_checkpoint: None,
+            active_file: None,
             pending_input: None,
             planning_phase: false,
             session_files: std::collections::HashMap::new(),
@@ -429,6 +455,24 @@ impl AgentLoop {
 
     async fn handle_send_message(&mut self, content: String) {
         self.current_task = content.clone();
+
+        // Detect negative feedback — user is unhappy with previous turn's work.
+        let lower = content.to_lowercase();
+        let negative_keywords = [
+            "改错", "不对", "错了", "还是不行", "没用", "不是这样", "搞错",
+            "又错", "白做", "越改越差", "恢复", "回滚", "撤销", "不行",
+            "wrong", "not right", "still broken", "doesn't work", "undo",
+            "revert", "go back", "that's worse", "stop", "broken",
+        ];
+        self.is_negative_feedback = content.chars().count() < 80
+            && negative_keywords.iter().any(|kw| lower.contains(kw));
+
+        // Git checkpoint: snapshot working tree before agent starts editing.
+        let wd = self.turn_runner.context.working_dir.try_read()
+            .map(|g| g.clone())
+            .unwrap_or_default();
+        self.last_checkpoint = git_checkpoint::create_checkpoint(&wd);
+
         self.preread_context = self.build_preread_context(&content).await;
 
         // Auto-diagnose: if user mentions error keywords, scan logs and attach findings.
@@ -444,6 +488,8 @@ impl AgentLoop {
         self.consecutive_reads = 0;
         self.verify_injected = false;
         self.model_produced_text = false;
+        self.silent_tool_rounds = 0;
+        // Note: is_negative_feedback is set above, do not reset here.
         self.build_fail_count = 0;
         self.file_read_counts.clear();
         self.scouting_count = 0;
@@ -453,6 +499,7 @@ impl AgentLoop {
         self.sleep_count = 0;
         self.consecutive_verify_count = 0;
         self.executed_cmds.clear();
+        self.category_fail_streak.clear();
         // Clear session_files on each new user message.
         // Working Set only tracks files from the CURRENT task.
         // Previous files are remembered via cold zone summaries.
@@ -668,6 +715,10 @@ impl AgentLoop {
                 self.planning_phase = false; // Only inject once
             }
 
+            // NOTE: Negative feedback injection disabled — adds a System message that
+            // confuses weak models and wastes context. The model sees the user's complaint
+            // directly; no extra injection needed.
+
             // Fix 6: Bug-fix diagnostic guidance — inject on first turn when user
             // message contains bug-related keywords.
             if self.tool_call_count == 0 {
@@ -775,6 +826,7 @@ impl AgentLoop {
                 let model_produced_text = &mut self.model_produced_text;
                 let current_tool_name = &mut self.current_tool_name;
                 let files_edited_this_turn = &mut self.files_edited_this_turn;
+                let active_file = &mut self.active_file;
                 let files_read_this_turn = &mut self.files_read_this_turn;
                 let file_read_counts = &mut self.file_read_counts;
                 let consecutive_reads = &mut self.consecutive_reads;
@@ -831,6 +883,11 @@ impl AgentLoop {
                                     // Track files for discipline
                                     if let Some(pos) = output.find("Edited ") {
                                         let rest = &output[pos + 7..];
+                                        let fp_end = rest.find(|c: char| c == ' ' || c == '\n' || c == '(').unwrap_or(rest.len());
+                                        let fp = rest[..fp_end].trim();
+                                        if !fp.is_empty() {
+                                            *active_file = Some(PathBuf::from(fp));
+                                        }
                                         if let Some(end) = rest.find(|c: char| c == '\n' || c == '.') {
                                             let file = short_path(&rest[..end]);
                                             if !files_edited_this_turn.contains(&file) {
@@ -840,6 +897,11 @@ impl AgentLoop {
                                     }
                                     if let Some(pos) = output.find("Wrote ") {
                                         let rest = &output[pos + 6..];
+                                        let fp_end = rest.find(|c: char| c == ' ' || c == '\n' || c == '(').unwrap_or(rest.len());
+                                        let fp = rest[..fp_end].trim();
+                                        if !fp.is_empty() {
+                                            *active_file = Some(PathBuf::from(fp));
+                                        }
                                         if let Some(end) = rest.find(|c: char| c == '\n' || c == ' ') {
                                             let file = short_path(&rest[..end]);
                                             if !files_edited_this_turn.contains(&file) {
@@ -863,6 +925,11 @@ impl AgentLoop {
                                             completion_tokens,
                                         }
                                     ));
+                                }
+                                TurnEvent::ContextStats { system_tokens, hot_tokens, cold_tokens, working_set_tokens, total_messages } => {
+                                    let _ = event_tx.send(AgentEvent::ContextStats {
+                                        system_tokens, hot_tokens, cold_tokens, working_set_tokens, total_messages,
+                                    });
                                 }
                                 TurnEvent::Error(e) => {
                                     let _ = event_tx.send(AgentEvent::Error(e));
@@ -940,16 +1007,38 @@ impl AgentLoop {
 
             // Handle result
             match result {
-                TurnResult::Responded { text: _, tokens } => {
+                TurnResult::Responded { ref text, tokens } => {
                     self.turn_tokens += tokens;
                     self.total_tokens += tokens;
+                    // Empty response from LLM (common with DeepSeek/SiliconFlow):
+                    // If we edited files, ask model to summarize before ending.
+                    let is_empty = text.trim().is_empty() && tokens == 0;
+                    if is_empty && self.retry_count < 2 && self.tool_call_count > 0 {
+                        self.retry_count += 1;
+                        if !self.files_edited_this_turn.is_empty() {
+                            // Nudge model to produce a summary
+                            let files = self.files_edited_this_turn.join(", ");
+                            self.conversation.add_user_message(&format!(
+                                "Summarize what you changed: {}", files,
+                            ));
+                        }
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        continue;
+                    }
                     self.finish_turn();
                     return;
                 }
-                TurnResult::UsedTools { tool_count, tokens, .. } => {
+                TurnResult::UsedTools { tool_count, tokens, text } => {
                     self.turn_tokens += tokens;
                     self.total_tokens += tokens;
                     self.tool_call_count += tool_count;
+                    // Track silent rounds: model used tools without explaining anything.
+                    let had_text = text.as_ref().map(|t| !t.trim().is_empty()).unwrap_or(false);
+                    if had_text {
+                        self.silent_tool_rounds = 0;
+                    } else {
+                        self.silent_tool_rounds += 1;
+                    }
                     // Post-process: truncate large outputs + externalize to disk
                     self.post_process_tool_results(tool_count);
                     // Apply discipline: inject reminders, check step limits
@@ -1025,6 +1114,16 @@ impl AgentLoop {
                 self.phase = AgentPhase::CallingTool(name.clone());
                 let _ = self.event_tx.send(AgentEvent::PhaseChange(self.phase.clone()));
 
+                // Track bash command for failure categorization
+                if name == "bash" {
+                    if let Ok(args) = serde_json::from_str::<serde_json::Value>(arguments) {
+                        self.last_bash_cmd = args.get("command")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                    }
+                }
+
                 // Track files for Working Set
                 if matches!(name.as_str(), "read_file" | "edit_file" | "write_file" | "search_replace" | "glob" | "grep") {
                     if let Ok(args) = serde_json::from_str::<serde_json::Value>(arguments) {
@@ -1045,8 +1144,13 @@ impl AgentLoop {
             TurnEvent::ToolCallResult { name, output, success, duration } => {
                 // Track files for discipline
                 if let Some(pos) = output.find("Edited ") {
-                    // Extract short filename from edit confirmation
+                    // Extract full path from "Edited /path/to/file ..." or "Edited /path/to/file\n..."
                     let rest = &output[pos + 7..];
+                    let full_path_end = rest.find(|c: char| c == ' ' || c == '\n' || c == '(').unwrap_or(rest.len());
+                    let full_path_str = rest[..full_path_end].trim();
+                    if !full_path_str.is_empty() {
+                        self.active_file = Some(PathBuf::from(full_path_str));
+                    }
                     if let Some(end) = rest.find(|c: char| c == '\n' || c == '.') {
                         let file = short_path(&rest[..end]);
                         if !self.files_edited_this_turn.contains(&file) {
@@ -1056,6 +1160,11 @@ impl AgentLoop {
                 }
                 if let Some(pos) = output.find("Wrote ") {
                     let rest = &output[pos + 6..];
+                    let full_path_end = rest.find(|c: char| c == ' ' || c == '\n' || c == '(').unwrap_or(rest.len());
+                    let full_path_str = rest[..full_path_end].trim();
+                    if !full_path_str.is_empty() {
+                        self.active_file = Some(PathBuf::from(full_path_str));
+                    }
                     if let Some(end) = rest.find(|c: char| c == '\n' || c == ' ') {
                         let file = short_path(&rest[..end]);
                         if !self.files_edited_this_turn.contains(&file) {
@@ -1068,6 +1177,15 @@ impl AgentLoop {
                 } else if matches!(name.as_str(), "edit_file" | "write_file") {
                     self.consecutive_reads = 0;
                 }
+
+                // Extract and persist cross-session knowledge (db credentials, ports, etc.)
+                let entries = knowledge::extract_knowledge(&output);
+                if !entries.is_empty() {
+                    let wd = self.turn_runner.context.working_dir.try_read()
+                        .map(|g| g.clone()).unwrap_or_default();
+                    knowledge::save_knowledge(&wd, &entries);
+                }
+
                 let _ = self.event_tx.send(AgentEvent::ToolCallResult {
                     name, output, success, duration,
                 });
@@ -1079,6 +1197,11 @@ impl AgentLoop {
                         completion_tokens,
                     }
                 ));
+            }
+            TurnEvent::ContextStats { system_tokens, hot_tokens, cold_tokens, working_set_tokens, total_messages } => {
+                let _ = self.event_tx.send(AgentEvent::ContextStats {
+                    system_tokens, hot_tokens, cold_tokens, working_set_tokens, total_messages,
+                });
             }
             TurnEvent::Error(e) => {
                 let _ = self.event_tx.send(AgentEvent::Error(e));
@@ -1193,6 +1316,9 @@ impl AgentLoop {
                 }
             }
         }
+
+        // NOTE: Silent-round progress prompt disabled — add_user_message injections
+        // confuse weak models and waste context. Let the model work silently.
     }
 
     /// Check if step limit has been reached.
@@ -1469,12 +1595,22 @@ impl AgentLoop {
             prompt.push_str(&format!("\n\n{}", self.preread_context));
         }
 
+        // NOTE: Active file full-content injection disabled — it consumes too much
+        // context window on weak models (32K), degrading decision quality.
+        // The working-set skeleton mechanism is sufficient.
+
         // Project instructions (if any)
         if !project_instructions.is_empty() {
             prompt.push_str(&format!(
                 "\n=== PROJECT INSTRUCTIONS (.atomcode.md) ===\n{}\n",
                 project_instructions
             ));
+        }
+
+        // Cross-session knowledge: db credentials, ports, startup commands, etc.
+        let project_knowledge = knowledge::load_knowledge(&wd);
+        if !project_knowledge.is_empty() {
+            prompt.push_str(&format!("\n{}\n", project_knowledge));
         }
 
         // Previous session context: inject the last few completed turns' outcomes
@@ -1971,6 +2107,7 @@ fn short_path(path: &str) -> String {
         _ => format!(".../{}/{}", parts[1], parts[0]),
     }
 }
+
 
 
 

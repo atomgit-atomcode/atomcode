@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind, MouseButton};
 use tokio::sync::mpsc;
 
 use atomcode_core::agent::{AgentCommand, AgentEvent, AgentHandle};
@@ -161,6 +161,10 @@ pub struct App {
     pub total_tokens: usize,
     /// Tokens used in the current turn.
     pub turn_tokens: usize,
+    /// Context budget: tokens used in the last LLM call.
+    pub ctx_used_tokens: usize,
+    /// Context budget: total context window size.
+    pub context_window: usize,
     /// Suggested next prompt shown as ghost text in the input box.
     pub suggestion: Option<String>,
     /// Cache of rendered lines for completed messages. Invalidated on message count change.
@@ -182,6 +186,8 @@ pub struct App {
     pub model_name: String,
     /// Per-turn logger: writes each turn to datalog/ as a markdown file.
     pub turn_log: crate::turn_log::TurnLog,
+    /// Last git checkpoint SHA for /undo.
+    pub last_checkpoint: Option<String>,
     /// Session manager for persistence.
     pub session_manager: SessionManager,
     /// Current session (wraps conversation for persistence).
@@ -280,6 +286,9 @@ impl App {
            history_stash: None,
            total_tokens: 0,
            turn_tokens: 0,
+           ctx_used_tokens: 0,
+           context_window: config.providers.get(&config.default_provider)
+               .map(|p| p.context_window).unwrap_or(32000),
            suggestion: None,
            render_cache: Vec::new(),
            render_cache_msg_count: 0,
@@ -309,6 +318,7 @@ impl App {
                cancel_token: tokio_util::sync::CancellationToken::new(),
                agent_handle,
                model_name,
+               last_checkpoint: None,
                session_manager,
                current_session,
                session_selector: None,
@@ -704,6 +714,7 @@ impl App {
                 let _ = self.config.save(&Config::default_path());
             }
             AgentEvent::ContextStats { system_tokens, hot_tokens, cold_tokens, working_set_tokens, total_messages } => {
+                self.ctx_used_tokens = system_tokens + hot_tokens + cold_tokens + working_set_tokens;
                 self.turn_log.log_context_stats(system_tokens, hot_tokens, cold_tokens, working_set_tokens, total_messages);
             }
         }
@@ -780,6 +791,9 @@ impl App {
                     }
                     self.suggestion = None;
                 }
+            }
+            AppEvent::Mouse(mouse) => {
+                self.handle_mouse(mouse);
             }
             AppEvent::Resize(_, _) => {}
             AppEvent::Tick => {
@@ -1481,6 +1495,59 @@ impl App {
         }
     }
 
+    /// Handle mouse events: scroll wheel, click, drag-to-select, release-to-copy.
+    fn handle_mouse(&mut self, mouse: MouseEvent) {
+        match mouse.kind {
+            // ── Scroll wheel ──
+            MouseEventKind::ScrollUp => {
+                if self.at_bottom {
+                    let total = self.render_cache.len();
+                    self.scroll_offset = total.saturating_sub(3);
+                    self.at_bottom = false;
+                } else {
+                    self.scroll_offset = self.scroll_offset.saturating_sub(3);
+                }
+            }
+            MouseEventKind::ScrollDown => {
+                self.scroll_offset += 3;
+                let total = self.render_cache.len();
+                if self.scroll_offset >= total {
+                    self.at_bottom = true;
+                }
+            }
+            // ── Drag to select ──
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.selection.dragging = true;
+                self.selection.has_selection = true;
+                self.selection.start = (mouse.column, mouse.row);
+                self.selection.end = (mouse.column, mouse.row);
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                self.selection.end = (mouse.column, mouse.row);
+                self.selection.has_selection = true;
+
+                // Auto-scroll when dragging near edges
+                let viewport = self.last_viewport_height;
+                if mouse.row <= 1 && !self.at_bottom {
+                    self.scroll_offset = self.scroll_offset.saturating_sub(1);
+                } else if viewport > 2 && mouse.row >= viewport - 2 {
+                    self.scroll_offset += 1;
+                    let total = self.render_cache.len();
+                    if self.scroll_offset >= total {
+                        self.at_bottom = true;
+                    }
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                self.selection.dragging = false;
+                if self.selection.has_selection && self.selection.start != self.selection.end {
+                    self.copy_selection_to_clipboard();
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Extract text from the rendered content between the selection coordinates,
     /// then copy it to the system clipboard.
     /// On macOS/Windows/Linux local: use native clipboard commands (no permission prompt).
@@ -1709,6 +1776,54 @@ impl App {
                     self.change_working_dir(arg);
                     let _ = self.agent_handle.cmd_tx.send(AgentCommand::ChangeDir(arg.to_string()));
                 }
+            }
+            "/undo" => {
+                if let Some(ref checkpoint) = self.last_checkpoint.clone() {
+                    let (ok, msg) = atomcode_core::agent::git_checkpoint::restore_checkpoint(
+                        &self.working_dir, checkpoint,
+                    );
+                    self.conversation.push_delta(&msg);
+                    self.conversation.finalize_stream();
+                    if ok { self.last_checkpoint = None; }
+                } else {
+                    self.conversation.push_delta("No checkpoint available. /undo works after the agent has made edits.");
+                    self.conversation.finalize_stream();
+                }
+                return true;
+            }
+            "/diff" => {
+                let output = std::process::Command::new("git")
+                    .args(["diff"])
+                    .current_dir(&self.working_dir)
+                    .output();
+                match output {
+                    Ok(o) => {
+                        let diff = String::from_utf8_lossy(&o.stdout);
+                        if diff.trim().is_empty() {
+                            self.conversation.push_delta("No uncommitted changes.");
+                        } else {
+                            self.conversation.push_delta(&format!("```diff\n{}\n```", diff.trim()));
+                        }
+                    }
+                    Err(e) => {
+                        self.conversation.push_delta(&format!("git diff failed: {}", e));
+                    }
+                }
+                self.conversation.finalize_stream();
+                return true;
+            }
+            "/cost" => {
+                let ctx_str = if self.context_window > 0 && self.ctx_used_tokens > 0 {
+                    format!("Context: {}K / {}K", self.ctx_used_tokens / 1000, self.context_window / 1000)
+                } else {
+                    "Context: (not yet measured)".to_string()
+                };
+                self.conversation.push_delta(&format!(
+                    "**Session token usage**\n- Total output tokens: {}\n- Current turn tokens: {}\n- {}",
+                    self.total_tokens, self.turn_tokens, ctx_str,
+                ));
+                self.conversation.finalize_stream();
+                return true;
             }
             "/clear" => {
                 // Delete the old session file if it exists and is not the default session
@@ -2040,6 +2155,9 @@ impl App {
         self.llm_call_start = Some(Instant::now());
         self.last_completed_tool = String::new();
         self.last_turn_duration = None;
+
+        // Git checkpoint before agent edits
+        self.last_checkpoint = atomcode_core::agent::git_checkpoint::create_checkpoint(&self.working_dir);
 
         // Delegate to the AgentLoop via channel.
         let _ = self.agent_handle.cmd_tx.send(AgentCommand::SendMessage(full_content));

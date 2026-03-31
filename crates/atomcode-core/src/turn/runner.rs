@@ -52,8 +52,17 @@ impl TurnRunner {
             .map(|p| p.context_window)
             .unwrap_or(16000);
 
-        let (mut messages, _ctx_stats) =
+        let (mut messages, ctx_stats) =
             conversation.to_provider_messages_budgeted(system_prompt, context_window);
+
+        // Emit context stats for logging/display
+        let _ = event_tx.send(TurnEvent::ContextStats {
+            system_tokens: ctx_stats.system_tokens,
+            hot_tokens: ctx_stats.hot_tokens,
+            cold_tokens: ctx_stats.cold_tokens,
+            working_set_tokens: 0, // working set injected separately
+            total_messages: ctx_stats.total_messages,
+        });
 
         // 2. Inflate ToolResultRef → ToolResult for recent messages.
         // Conversation stores large results as compact refs on disk;
@@ -86,9 +95,9 @@ impl TurnRunner {
         let mut total_tokens: usize = 0;
         let mut got_any_event = false;
 
-        // Timeout: 5 min for first token, 3 min for subsequent tokens.
-        // Prevents silent connection drops from hanging forever.
-        const FIRST_TOKEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+        // Timeout: 180s for first token, 180s for subsequent tokens.
+        // Domestic model providers (SiliconFlow, etc.) can be very slow under load.
+        const FIRST_TOKEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
         const STREAM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
 
         loop {

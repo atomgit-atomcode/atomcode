@@ -23,41 +23,23 @@ pub fn truncate_output(result: &mut ToolResult, tool_name: &str, context_window:
 /// Errors are the highest-value signal — keep all lines containing "error",
 /// "Error", "FAILED", "STDERR", "panic", plus surrounding context.
 fn truncate_bash(result: &mut ToolResult) {
-    // Smart build output compression: maven/gradle/npm build output is very verbose
-    // but only SUCCESS/FAILURE + error lines matter.
-    let is_build_output = result.output.contains("BUILD SUCCESS")
-        || result.output.contains("BUILD FAILURE")
-        || result.output.contains("Compiled successfully")
-        || result.output.contains("compiled successfully")
-        || result.output.contains("vite build")
-        || result.output.contains("vue-tsc");
-    if is_build_output {
-        let lines: Vec<&str> = result.output.lines().collect();
-        let mut key_lines: Vec<String> = Vec::new();
-        for line in &lines {
-            let trimmed = line.trim();
-            if trimmed.contains("ERROR") || trimmed.contains("error")
-                || trimmed.contains("FAILURE") || trimmed.contains("SUCCESS")
-                || trimmed.contains("BUILD") || trimmed.contains("warning:")
-                || trimmed.contains("✓") || trimmed.contains("✗")
-                || trimmed.starts_with("> ") // npm script output
-                || trimmed.contains("gzip:")  // vite bundle size
-            {
-                key_lines.push(line.to_string());
-            }
-        }
-        if !key_lines.is_empty() && key_lines.len() < lines.len() / 2 {
-            result.output = key_lines.join("\n");
-            return;
-        }
-    }
-
     let lines: Vec<&str> = result.output.lines().collect();
     if lines.len() <= 80 {
         return; // Short enough — keep everything.
     }
 
-    // Phase 1: Identify error/important lines.
+    // --- Phase 0: Compile error smart compression ---
+    // Detect build tool output and extract only error-bearing lines + context.
+    // This fires for Maven/Gradle, TypeScript/Node, Rust/Cargo, and generic builds.
+    let compressed = try_compress_compile_errors(&lines);
+    if let Some(compressed_output) = compressed {
+        if compressed_output.len() < result.output.len() {
+            result.output = compressed_output;
+            return;
+        }
+    }
+
+    // --- Phase 1: General error-line extraction (non-build output) ---
     // Generic error patterns — no language-specific strings.
     let error_patterns = ["error", "Error", "ERROR", "FAILED", "STDERR:",
         "panic", "Panic", "PANIC", "not found", "No such file",
@@ -86,7 +68,110 @@ fn truncate_bash(result: &mut ToolResult) {
     }
 
     // Phase 3: Assemble, collapsing unimportant runs into "[N lines skipped]".
-    let mut output = String::with_capacity(result.output.len() / 2);
+    let output = assemble_important_lines(&lines, &important);
+    result.output = output;
+}
+
+/// Attempt to compress compile/build error output by extracting only error lines
+/// with surrounding context, plus head/tail for build status summary.
+/// Returns `Some(compressed)` if the output looks like build output and was compressed,
+/// `None` if it doesn't look like build output.
+fn try_compress_compile_errors(lines: &[&str]) -> Option<String> {
+    let full_text = lines.join("\n");
+
+    // Detect build tool output.
+    let is_build = full_text.contains("BUILD SUCCESS")
+        || full_text.contains("BUILD FAILURE")
+        || full_text.contains("Compiled successfully")
+        || full_text.contains("compiled successfully")
+        || full_text.contains("Compiling")
+        || full_text.contains("vite build")
+        || full_text.contains("vue-tsc")
+        || full_text.contains("tsc --")
+        || full_text.contains("npm run build")
+        || full_text.contains("cargo build")
+        || full_text.contains("cargo check")
+        || full_text.contains("mvn compile")
+        || full_text.contains("mvn package")
+        || full_text.contains("gradle build");
+
+    if !is_build {
+        return None;
+    }
+
+    // Compile error patterns by ecosystem — match lines that carry diagnostic value.
+    // Java / Maven / Gradle
+    let java_patterns: &[&str] = &[
+        "[ERROR]", "error:", "cannot find symbol", "package does not exist",
+        "incompatible types", "unreported exception", "method does not override",
+    ];
+    // TypeScript / Node
+    let ts_patterns: &[&str] = &[
+        "error TS", "Error:", "SyntaxError", "TypeError", "ReferenceError",
+        "Module not found", "Cannot find module",
+    ];
+    // Rust / Cargo
+    let rust_patterns: &[&str] = &[
+        "error[E", "warning[", "cannot find", "error:", "error[",
+        "aborting due to", "could not compile",
+    ];
+    // Generic build status lines — always valuable.
+    let status_patterns: &[&str] = &[
+        "BUILD", "FAILURE", "SUCCESS", "FAILED", "PASSED",
+        "warning:", "warnings generated", "error generated",
+        "✓", "✗", "gzip:",
+    ];
+
+    let all_patterns: Vec<&str> = java_patterns.iter()
+        .chain(ts_patterns.iter())
+        .chain(rust_patterns.iter())
+        .chain(status_patterns.iter())
+        .copied()
+        .collect();
+
+    // Mark error/diagnostic lines + 2 lines of context around each.
+    let mut important: Vec<bool> = vec![false; lines.len()];
+
+    for (i, line) in lines.iter().enumerate() {
+        if all_patterns.iter().any(|p| line.contains(p)) {
+            let start = i.saturating_sub(2);
+            let end = (i + 3).min(lines.len());
+            for j in start..end {
+                important[j] = true;
+            }
+        }
+    }
+
+    // Always keep first 5 and last 5 lines (command invocation + build status summary).
+    const HEAD: usize = 5;
+    const TAIL: usize = 5;
+    for i in 0..HEAD.min(lines.len()) {
+        important[i] = true;
+    }
+    for i in lines.len().saturating_sub(TAIL)..lines.len() {
+        important[i] = true;
+    }
+
+    let important_count = important.iter().filter(|&&v| v).count();
+
+    // Only compress if we actually removed a meaningful amount of lines.
+    if important_count >= lines.len() * 3 / 4 {
+        return None; // Not enough savings — let the general path handle it.
+    }
+
+    let mut output = assemble_important_lines(lines, &important);
+    output.push_str(&format!(
+        "\n[{} lines of build output compressed to {} lines — showing errors only]",
+        lines.len(),
+        important_count,
+    ));
+    Some(output)
+}
+
+/// Assemble output from lines marked as important, collapsing unimportant runs
+/// into `[... N lines skipped ...]` markers.
+fn assemble_important_lines(lines: &[&str], important: &[bool]) -> String {
+    let mut output = String::with_capacity(lines.len() * 40);
     let mut skipping = false;
     let mut skip_count = 0usize;
 
@@ -110,7 +195,7 @@ fn truncate_bash(result: &mut ToolResult) {
         output.push_str(&format!("\n[... {} lines skipped ...]", skip_count));
     }
 
-    result.output = output;
+    output
 }
 
 /// read_file: if output is very long, extract an outline — keep top-level
@@ -246,7 +331,10 @@ pub fn post_process_tool_results(
     // Phase 2: Externalize large results to disk (replace ToolResult with ToolResultRef)
     for &i in &to_process {
         let should_externalize = if let MessageContent::ToolResult(ref r) = messages[i].content {
-            r.output.len() >= 512
+            // Don't externalize structured agent outputs (full_restart, auto-diagnosis)
+            // — they're already concise summaries, not raw command output.
+            r.output.len() >= 512 && !r.output.starts_with("[Step ")
+                && !r.output.starts_with("[AUTO-DIAGNOSIS")
         } else {
             false
         };
