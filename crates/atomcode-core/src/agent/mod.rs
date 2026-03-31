@@ -714,29 +714,9 @@ impl AgentLoop {
                 self.planning_phase = false; // Only inject once
             }
 
-            // Negative feedback: force model to reflect before repeating mistakes.
-            if self.is_negative_feedback && self.tool_call_count == 0 {
-                let recent_files: Vec<String> = self.session_files.keys().take(5).cloned().collect();
-                let files_hint = if !recent_files.is_empty() {
-                    format!(" Recently touched: {}", recent_files.join(", "))
-                } else {
-                    String::new()
-                };
-                self.conversation.messages.push(
-                    crate::conversation::message::Message::new(
-                        crate::conversation::message::Role::System,
-                        format!(
-                            "[NEGATIVE FEEDBACK] The user is unhappy with your previous work. \
-                             BEFORE making any tool calls, you MUST:\n\
-                             1. State what you think went wrong\n\
-                             2. Explain your different approach\n\
-                             3. Only then use tools\n\
-                             Do NOT repeat the same fix.{}",
-                            files_hint,
-                        ),
-                    )
-                );
-            }
+            // NOTE: Negative feedback injection disabled — adds a System message that
+            // confuses weak models and wastes context. The model sees the user's complaint
+            // directly; no extra injection needed.
 
             // Fix 6: Bug-fix diagnostic guidance — inject on first turn when user
             // message contains bug-related keywords.
@@ -1188,29 +1168,8 @@ impl AgentLoop {
                     self.consecutive_reads = 0;
                 }
 
-                // Track bash command category failures (curl, mysql, etc.)
-                if name == "bash" && !self.last_bash_cmd.is_empty() {
-                    let cat = categorize_bash_cmd(&self.last_bash_cmd);
-                    let is_empty_output = output.trim().is_empty()
-                        || output.trim() == "(no output)";
-                    if !success || is_empty_output {
-                        let count = self.category_fail_streak.entry(cat.clone()).or_insert(0);
-                        *count += 1;
-                        if *count >= 2 {
-                            // Inject warning into tool result
-                            let warning = format!(
-                                "\n\n[WARNING: `{}` has failed {} times in a row. \
-                                 This approach is not working. Try a DIFFERENT method: \
-                                 check logs, read config, or ask the user for help.]",
-                                cat, count,
-                            );
-                            // We can't mutate output here (it's moved), so we'll inject in discipline
-                            self.conversation.add_user_message(&warning);
-                        }
-                    } else {
-                        self.category_fail_streak.remove(&cat);
-                    }
-                }
+                // NOTE: category_fail_streak injection disabled — add_user_message
+                // confuses weak models. The system-reminder (every 4 steps) is enough.
 
                 let _ = self.event_tx.send(AgentEvent::ToolCallResult {
                     name, output, success, duration,
@@ -1338,23 +1297,8 @@ impl AgentLoop {
             }
         }
 
-        // Progress prompt: force the model to explain after consecutive silent rounds.
-        // Threshold: 3 rounds of pure tool calls without any text output.
-        if self.silent_tool_rounds >= 3 {
-            let files_so_far = if self.files_read_this_turn.is_empty() {
-                String::new()
-            } else {
-                format!(" Files examined: {}", self.files_read_this_turn.join(", "))
-            };
-            self.conversation.add_user_message(&format!(
-                "[SYSTEM: You've made {} tool calls without explaining anything to the user. \
-                 Before your next tool call, briefly state: \
-                 (1) what you've found so far, (2) what you're going to do next. \
-                 Keep it to 1-2 sentences.{}]",
-                self.tool_call_count, files_so_far,
-            ));
-            self.silent_tool_rounds = 0; // Reset so it fires again after another 3 rounds
-        }
+        // NOTE: Silent-round progress prompt disabled — add_user_message injections
+        // confuse weak models and waste context. Let the model work silently.
     }
 
     /// Check if step limit has been reached.
@@ -1631,47 +1575,9 @@ impl AgentLoop {
             prompt.push_str(&format!("\n\n{}", self.preread_context));
         }
 
-        // Active file: inject full content of the most recently edited file.
-        // This prevents the model from needing to re-read it next turn.
-        // Budget: ~6000 tokens ≈ 24000 chars (conservative 4 chars/token).
-        const ACTIVE_FILE_CHAR_LIMIT: usize = 24000;
-        if let Some(ref path) = self.active_file {
-            if path.exists() {
-                if let Ok(content) = std::fs::read_to_string(path) {
-                    if !content.is_empty() {
-                        let display = path.display();
-                        if content.len() <= ACTIVE_FILE_CHAR_LIMIT {
-                            prompt.push_str(&format!(
-                                "\n=== ACTIVE FILE (full content, no need to re-read) ===\n\
-                                 File: {}\n```\n{}\n```\n",
-                                display, content,
-                            ));
-                        } else {
-                            // Too large: include head + tail with line numbers
-                            let lines: Vec<&str> = content.lines().collect();
-                            let total = lines.len();
-                            let head_n = 200.min(total);
-                            let tail_n = 100.min(total.saturating_sub(head_n));
-                            let head: String = lines[..head_n].iter().enumerate()
-                                .map(|(i, l)| format!("{}\t{}", i + 1, l))
-                                .collect::<Vec<_>>().join("\n");
-                            let tail: String = if tail_n > 0 {
-                                lines[total - tail_n..].iter().enumerate()
-                                    .map(|(i, l)| format!("{}\t{}", total - tail_n + i + 1, l))
-                                    .collect::<Vec<_>>().join("\n")
-                            } else {
-                                String::new()
-                            };
-                            prompt.push_str(&format!(
-                                "\n=== ACTIVE FILE (truncated, {} lines total) ===\n\
-                                 File: {}\n```\n{}\n\n[... {} lines omitted ...]\n\n{}\n```\n",
-                                total, display, head, total - head_n - tail_n, tail,
-                            ));
-                        }
-                    }
-                }
-            }
-        }
+        // NOTE: Active file full-content injection disabled — it consumes too much
+        // context window on weak models (32K), degrading decision quality.
+        // The working-set skeleton mechanism is sufficient.
 
         // Project instructions (if any)
         if !project_instructions.is_empty() {
@@ -2176,26 +2082,6 @@ fn short_path(path: &str) -> String {
     }
 }
 
-/// Extract a category from a bash command for failure tracking.
-/// e.g., "curl -s http://..." → "curl", "mysql -u root ..." → "mysql"
-fn categorize_bash_cmd(cmd: &str) -> String {
-    let categories = [
-        "curl", "wget", "mysql", "psql", "sqlite3", "redis-cli",
-        "docker", "kubectl", "npm", "yarn", "pnpm", "pip",
-        "mvn", "gradle", "cargo",
-    ];
-    let lower = cmd.to_lowercase();
-    for cat in &categories {
-        if lower.contains(cat) {
-            return cat.to_string();
-        }
-    }
-    // Fallback: first word of the command
-    cmd.split_whitespace()
-        .next()
-        .unwrap_or("unknown")
-        .to_string()
-}
 
 
 

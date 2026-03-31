@@ -97,28 +97,10 @@ impl Tool for BashTool {
             }
         }
 
-        // Dev server pre-command: compile before starting to catch errors early.
-        // e.g., `mvn compile` before `mvn spring-boot:run`.
-        // Dev server pre-command: compile before starting to catch errors early.
-        // e.g., `mvn compile` before `mvn spring-boot:run`.
-        if let Some(result) = devserver::run_pre_command(&parsed.command, &wd).await {
-            if !result.success {
-                let server = devserver::detect(&parsed.command);
-                let pre_cmd = server.as_ref().and_then(|s| s.pre_command).unwrap_or("compile");
-                let hint = format!(
-                    "[ATOMCODE AUTO-COMPILE: `{}` failed — your command was NOT executed]\n\
-                     \n{}\n\
-                     \nNEXT STEPS:\n\
-                     1. Read the compile errors above\n\
-                     2. Fix the source code with edit_file\n\
-                     3. Then retry your original command: `{}`\n\
-                     \nDo NOT retry the same command with different flags — the compile error must be fixed first.",
-                    pre_cmd, result.output, parsed.command,
-                );
-                return Ok(ToolResult { call_id: String::new(), output: hint, success: false });
-            }
-            // Pre-command succeeded — continue to start the server
-        }
+        // NOTE: Pre-compile interception disabled — blocking the model's command
+        // confuses weak models into retrying with different flags instead of fixing
+        // the compile error. The system prompt rule "ALWAYS compile/build BEFORE
+        // starting a server" is sufficient guidance.
 
         // Platform-aware shell: cmd.exe on Windows, bash on Unix
         #[cfg(target_os = "windows")]
