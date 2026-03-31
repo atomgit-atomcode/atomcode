@@ -137,6 +137,14 @@ pub fn build_project_context(dir: &Path) -> ProjectContext {
     ctx.push_str("Project files:\n");
     ctx.push_str(&scan_tree(dir, 0, 3, &mut searcher, dir));
 
+    // 1.5. Deep scan for config files — these live in deep directories
+    // (e.g., backend/src/main/java/.../SecurityConfig.java) but are critical for diagnosis.
+    let config_summaries = scan_config_files(dir);
+    if !config_summaries.is_empty() {
+        ctx.push_str("\nKey config:\n");
+        ctx.push_str(&config_summaries);
+    }
+
     // 2. Include raw content of descriptor files the model can read
     let mut included_names = Vec::new();
     for &(filename, max_lines) in DESCRIPTORS {
@@ -235,6 +243,24 @@ const ANNOTATE_EXTS: &[&str] = &[
     "go", "java", "c", "cpp", "cc", "h", "hpp",
 ];
 
+/// Config file patterns that get key-line summaries in the file tree.
+/// (name_pattern, is_prefix_match)
+const CONFIG_PATTERNS: &[(&str, bool)] = &[
+    ("SecurityConfig", true),     // Java Spring Security
+    ("AuthConfig", true),         // Generic auth config
+    ("CorsConfig", true),         // CORS config
+    ("WebSecurityConfig", true),  // Spring Security variant
+    ("application.properties", false),
+    ("application.yml", false),
+    ("application.yaml", false),
+    (".env", false),
+    ("vite.config", true),
+    ("next.config", true),
+    ("webpack.config", true),
+    ("tsconfig", true),
+    ("nginx.conf", false),
+];
+
 fn scan_tree(
     dir: &Path,
     depth: usize,
@@ -263,8 +289,18 @@ fn scan_tree(
             out.push_str(&format!("{}{}/\n", indent, name));
             out.push_str(&scan_tree(&entry.path(), depth + 1, max_depth, searcher, _project_root));
         } else {
-            // Annotate source files with top-level symbol names (max 5)
             let entry_path = entry.path();
+
+            // Config files: extract key-line summaries
+            if let Some(summary) = extract_config_summary(&name, &entry_path) {
+                out.push_str(&format!("{}{}\n", indent, name));
+                for line in summary.lines() {
+                    out.push_str(&format!("{}  {}\n", indent, line));
+                }
+                continue;
+            }
+
+            // Annotate source files with top-level symbol names (max 5)
             let ext = entry_path.extension()
                 .and_then(|e| e.to_str())
                 .unwrap_or("");
@@ -295,4 +331,184 @@ fn scan_tree(
         }
     }
     out
+}
+
+/// Deep scan for config files across the entire project (respects SKIP_DIRS).
+/// Returns formatted summaries of all found config files.
+fn scan_config_files(dir: &Path) -> String {
+    let mut results = Vec::new();
+    scan_config_recursive(dir, dir, 0, 8, &mut results);
+    results.join("")
+}
+
+fn scan_config_recursive(
+    dir: &Path,
+    project_root: &Path,
+    depth: usize,
+    max_depth: usize,
+    results: &mut Vec<String>,
+) {
+    if depth > max_depth || results.len() >= 10 { return; }
+
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if SKIP_DIRS.contains(&name.as_str()) { continue; }
+
+        let path = entry.path();
+        if path.is_dir() {
+            scan_config_recursive(&path, project_root, depth + 1, max_depth, results);
+        } else if let Some(summary) = extract_config_summary(&name, &path) {
+            if !summary.trim().is_empty() {
+                let rel = path.strip_prefix(project_root).unwrap_or(&path);
+                results.push(format!("  [{}]\n", rel.display()));
+                for line in summary.lines() {
+                    results.push(format!("    {}\n", line));
+                }
+            }
+        }
+    }
+}
+
+/// Check if a file is a config file and extract key-line summary.
+fn extract_config_summary(name: &str, path: &Path) -> Option<String> {
+    let name_lower = name.to_lowercase();
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+
+    let is_config = CONFIG_PATTERNS.iter().any(|(pattern, is_prefix)| {
+        let pat_lower = pattern.to_lowercase();
+        if *is_prefix {
+            stem.to_lowercase().contains(&pat_lower)
+        } else {
+            name_lower == pat_lower
+        }
+    });
+
+    if !is_config {
+        return None;
+    }
+
+    let content = std::fs::read_to_string(path).ok()?;
+    if content.trim().is_empty() {
+        return None;
+    }
+
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+
+    let summary = match ext {
+        // Java Security/Auth config: extract permission rules
+        "java" => extract_java_security_summary(&content),
+        // Properties files: extract key=value pairs
+        "properties" => extract_properties_summary(&content),
+        // YAML files: extract top-level key: value pairs
+        "yml" | "yaml" => extract_yaml_summary(&content),
+        // .env files: extract KEY=value pairs
+        _ if name == ".env" || name.starts_with(".env") => extract_properties_summary(&content),
+        // JS/TS config: extract key lines (proxy, port, etc.)
+        "js" | "ts" | "mjs" => extract_js_config_summary(&content),
+        // Default: first 5 non-comment lines
+        _ => extract_generic_summary(&content),
+    };
+
+    if summary.trim().is_empty() {
+        None
+    } else {
+        Some(summary)
+    }
+}
+
+/// Extract permission rules from Java Security config.
+fn extract_java_security_summary(content: &str) -> String {
+    let mut rules = Vec::new();
+    for line in content.lines() {
+        let trimmed = line.trim();
+        // Match: .requestMatchers("/api/...").permitAll()
+        if trimmed.contains("requestMatchers") || trimmed.contains("antMatchers") {
+            // Clean up and collect
+            let clean = trimmed
+                .trim_start_matches('.')
+                .replace("  ", " ");
+            rules.push(format!("[auth] {}", clean));
+            if rules.len() >= 8 { break; }
+        }
+    }
+    rules.join("\n")
+}
+
+/// Extract key=value from .properties or .env files.
+fn extract_properties_summary(content: &str) -> String {
+    let important_keys = [
+        "server.port", "spring.datasource", "database", "port",
+        "DB_", "DATABASE_URL", "API_KEY", "SECRET", "HOST",
+        "VITE_", "NEXT_PUBLIC_",
+    ];
+    let mut lines = Vec::new();
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with("//") {
+            continue;
+        }
+        let is_important = important_keys.iter()
+            .any(|k| trimmed.to_uppercase().contains(&k.to_uppercase()));
+        if is_important {
+            // Mask sensitive values partially
+            lines.push(format!("[config] {}", trimmed));
+            if lines.len() >= 8 { break; }
+        }
+    }
+    lines.join("\n")
+}
+
+/// Extract top-level key: value from YAML.
+fn extract_yaml_summary(content: &str) -> String {
+    let mut lines = Vec::new();
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        // Top-level or important nested keys
+        let is_top_level = !line.starts_with(' ') && trimmed.contains(':');
+        let is_important = trimmed.contains("port") || trimmed.contains("datasource")
+            || trimmed.contains("url:") || trimmed.contains("password")
+            || trimmed.contains("username") || trimmed.contains("host");
+        if is_top_level || is_important {
+            lines.push(format!("[config] {}", trimmed));
+            if lines.len() >= 8 { break; }
+        }
+    }
+    lines.join("\n")
+}
+
+/// Extract key config lines from JS/TS config files.
+fn extract_js_config_summary(content: &str) -> String {
+    let mut lines = Vec::new();
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.contains("proxy") || trimmed.contains("port")
+            || trimmed.contains("target:") || trimmed.contains("rewrite")
+            || trimmed.contains("server:") || trimmed.contains("base:")
+        {
+            lines.push(format!("[config] {}", trimmed));
+            if lines.len() >= 6 { break; }
+        }
+    }
+    lines.join("\n")
+}
+
+/// Generic: first N non-comment, non-empty lines.
+fn extract_generic_summary(content: &str) -> String {
+    content.lines()
+        .filter(|l| {
+            let t = l.trim();
+            !t.is_empty() && !t.starts_with('#') && !t.starts_with("//")
+        })
+        .take(5)
+        .map(|l| format!("[config] {}", l.trim()))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
