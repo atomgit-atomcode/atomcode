@@ -155,11 +155,19 @@ impl Tool for BashTool {
         let mut stderr_buf = Vec::new();
 
         // Wait for process to finish or timeout. Read stdout/stderr concurrently.
-        // Tech-stack-agnostic idle detection: if the process is still running but
-        // output has stopped for 3s, it's likely a long-running process (dev server)
-        // that started successfully. Return early without killing it.
-        let wait_secs = parsed.timeout.unwrap_or(INITIAL_WAIT_SECS).min(300);
-        let idle_timeout = Duration::from_secs(3);
+        // Idle detection (3s no output → early return) ONLY for background/server commands.
+        // Non-background commands (curl, mvn, etc.) wait the full timeout.
+        let wait_secs = if is_background {
+            parsed.timeout.unwrap_or(INITIAL_WAIT_SECS).min(300)
+        } else {
+            parsed.timeout.unwrap_or(30).min(300)
+        };
+        // For background commands: 3s idle = server started. For others: no idle detection.
+        let idle_timeout = if is_background {
+            Duration::from_secs(3)
+        } else {
+            Duration::from_secs(wait_secs + 1) // effectively disabled
+        };
         let has_any_output = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let has_out_1 = has_any_output.clone();
         let has_out_2 = has_any_output.clone();
@@ -233,15 +241,27 @@ impl Tool for BashTool {
             }
             Ok(None) => {
                 // Process still running but output stopped (idle timeout).
-                // This is the typical pattern for dev servers: they print startup info then go quiet.
-                let pid = child.id().map(|p| p.to_string()).unwrap_or_else(|| "?".into());
-                let combined = format_output(&stdout_str, &stderr_str);
-                let output = if combined.is_empty() {
-                    format!("Process still running (PID: {}). No output captured yet.", pid)
+                if is_background {
+                    // Dev server: idle = likely started successfully. Don't kill.
+                    let pid = child.id().map(|p| p.to_string()).unwrap_or_else(|| "?".into());
+                    let combined = format_output(&stdout_str, &stderr_str);
+                    let output = if combined.is_empty() {
+                        format!("Process still running (PID: {}). No output captured yet.", pid)
+                    } else {
+                        format!("{}\n\n[Process running in background, PID: {}. Output stopped — likely started successfully. Do NOT wait for it to exit.]", combined, pid)
+                    };
+                    Ok(ToolResult { call_id: String::new(), output, success: true })
                 } else {
-                    format!("{}\n\n[Process running in background, PID: {}. Output stopped — likely started successfully. Do NOT wait for it to exit.]", combined, pid)
-                };
-                Ok(ToolResult { call_id: String::new(), output, success: true })
+                    // Non-background command (curl, etc.): shouldn't reach here normally,
+                    // but if it does, wait for the process to finish.
+                    let _ = child.wait().await;
+                    let combined = format_output(&stdout_str, &stderr_str);
+                    if combined.is_empty() {
+                        Ok(ToolResult { call_id: String::new(), output: "(no output)".to_string(), success: true })
+                    } else {
+                        Ok(ToolResult { call_id: String::new(), output: combined, success: true })
+                    }
+                }
             }
             Err(_) => {
                 if is_background {

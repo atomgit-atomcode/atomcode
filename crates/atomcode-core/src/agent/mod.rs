@@ -1013,9 +1013,20 @@ impl AgentLoop {
 
             // Handle result
             match result {
-                TurnResult::Responded { text: _, tokens } => {
+                TurnResult::Responded { ref text, tokens } => {
                     self.turn_tokens += tokens;
                     self.total_tokens += tokens;
+                    // Empty response from LLM (common with DeepSeek/SiliconFlow):
+                    // retry once instead of silently ending the turn.
+                    let is_empty = text.trim().is_empty() && tokens == 0;
+                    if is_empty && self.retry_count == 0 && self.tool_call_count > 0 {
+                        self.retry_count += 1;
+                        let _ = self.event_tx.send(AgentEvent::TextDelta(
+                            "\n[Empty response — retrying...]\n".to_string()
+                        ));
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        continue;
+                    }
                     self.finish_turn();
                     return;
                 }
