@@ -1005,13 +1005,17 @@ impl AgentLoop {
                     self.turn_tokens += tokens;
                     self.total_tokens += tokens;
                     // Empty response from LLM (common with DeepSeek/SiliconFlow):
-                    // retry once instead of silently ending the turn.
+                    // If we edited files, ask model to summarize before ending.
                     let is_empty = text.trim().is_empty() && tokens == 0;
-                    if is_empty && self.retry_count == 0 && self.tool_call_count > 0 {
+                    if is_empty && self.retry_count < 2 && self.tool_call_count > 0 {
                         self.retry_count += 1;
-                        let _ = self.event_tx.send(AgentEvent::TextDelta(
-                            "\n[Empty response — retrying...]\n".to_string()
-                        ));
+                        if !self.files_edited_this_turn.is_empty() {
+                            // Nudge model to produce a summary
+                            let files = self.files_edited_this_turn.join(", ");
+                            self.conversation.add_user_message(&format!(
+                                "Summarize what you changed: {}", files,
+                            ));
+                        }
                         tokio::time::sleep(Duration::from_secs(2)).await;
                         continue;
                     }
@@ -1444,17 +1448,6 @@ impl AgentLoop {
     }
 
     fn finish_turn(&mut self) {
-        // Auto-summary: if model edited files but never output a summary, generate one.
-        // This prevents "no summary" when LLM returns empty response at end of turn.
-        if !self.files_edited_this_turn.is_empty() && !self.model_produced_text {
-            let files = self.files_edited_this_turn.join(", ");
-            let summary = format!(
-                "Done. Edited {} file(s): {}. {} tool calls in this turn.",
-                self.files_edited_this_turn.len(), files, self.tool_call_count,
-            );
-            let _ = self.event_tx.send(AgentEvent::TextDelta(summary));
-        }
-
         // Mark the current turn as completed in the tracker.
         self.conversation.turn_tracker.complete_current();
 
