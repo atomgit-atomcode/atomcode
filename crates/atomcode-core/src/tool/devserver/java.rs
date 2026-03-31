@@ -10,11 +10,11 @@ pub fn detect(cmd: &str) -> Option<DetectedServer> {
 
     if trimmed.contains("spring-boot:run") {
         let pre = if trimmed.contains("mvn") || trimmed.contains("mvnw") {
-            Some("mvn compile -q")
+            Some("mvn compile 2>&1 | tail -30")
         } else if trimmed.contains("gradle") || trimmed.contains("gradlew") {
-            Some("gradle compileJava -q")
+            Some("gradle compileJava 2>&1 | tail -30")
         } else {
-            Some("mvn compile -q")
+            Some("mvn compile 2>&1 | tail -30")
         };
         return Some(DetectedServer {
             label: "Spring Boot",
@@ -27,7 +27,7 @@ pub fn detect(cmd: &str) -> Option<DetectedServer> {
         return Some(DetectedServer {
             label: "Spring Boot (Gradle)",
             default_port: 8080,
-            pre_command: Some("gradle compileJava -q"),
+            pre_command: Some("gradle compileJava 2>&1 | tail -30"),
         });
     }
 

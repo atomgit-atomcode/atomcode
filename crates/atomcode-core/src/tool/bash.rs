@@ -99,12 +99,21 @@ impl Tool for BashTool {
 
         // Dev server pre-command: compile before starting to catch errors early.
         // e.g., `mvn compile` before `mvn spring-boot:run`.
+        // Dev server pre-command: compile before starting to catch errors early.
+        // e.g., `mvn compile` before `mvn spring-boot:run`.
         if let Some(result) = devserver::run_pre_command(&parsed.command, &wd).await {
             if !result.success {
+                let server = devserver::detect(&parsed.command);
+                let pre_cmd = server.as_ref().and_then(|s| s.pre_command).unwrap_or("compile");
                 let hint = format!(
-                    "[Pre-compile failed — server NOT started]\n{}\n\n\
-                     Fix the compile errors above, then retry the server command.",
-                    result.output,
+                    "[ATOMCODE AUTO-COMPILE: `{}` failed — your command was NOT executed]\n\
+                     \n{}\n\
+                     \nNEXT STEPS:\n\
+                     1. Read the compile errors above\n\
+                     2. Fix the source code with edit_file\n\
+                     3. Then retry your original command: `{}`\n\
+                     \nDo NOT retry the same command with different flags — the compile error must be fixed first.",
+                    pre_cmd, result.output, parsed.command,
                 );
                 return Ok(ToolResult { call_id: String::new(), output: hint, success: false });
             }
