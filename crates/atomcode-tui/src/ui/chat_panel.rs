@@ -45,6 +45,13 @@ pub fn render(
     render_cache: &mut Vec<Line<'static>>,
     render_cache_msg_count: &mut usize,
 ) -> usize {
+    // Apply right margin (same as left indent) so text doesn't touch the edge.
+    let right_margin: u16 = 2;
+    let area = Rect {
+        width: area.width.saturating_sub(right_margin),
+        ..area
+    };
+
     let vh = (area.height as usize).saturating_sub(1);
     if vh == 0 { return 0; }
 
