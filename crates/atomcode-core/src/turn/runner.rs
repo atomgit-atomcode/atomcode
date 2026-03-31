@@ -86,9 +86,9 @@ impl TurnRunner {
         let mut total_tokens: usize = 0;
         let mut got_any_event = false;
 
-        // Timeout: 5 min for first token, 3 min for subsequent tokens.
-        // Prevents silent connection drops from hanging forever.
-        const FIRST_TOKEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+        // Timeout: 180s for first token, 180s for subsequent tokens.
+        // Domestic model providers (SiliconFlow, etc.) can be very slow under load.
+        const FIRST_TOKEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
         const STREAM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
 
         loop {
