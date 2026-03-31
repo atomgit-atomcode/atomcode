@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind, MouseButton};
 use tokio::sync::mpsc;
 
 use atomcode_core::agent::{AgentCommand, AgentEvent, AgentHandle};
@@ -791,6 +791,9 @@ impl App {
                     self.suggestion = None;
                 }
             }
+            AppEvent::Mouse(mouse) => {
+                self.handle_mouse(mouse);
+            }
             AppEvent::Resize(_, _) => {}
             AppEvent::Tick => {
                 self.tick_count = self.tick_count.wrapping_add(1);
@@ -1488,6 +1491,59 @@ impl App {
                 true
             }
             _ => false,
+        }
+    }
+
+    /// Handle mouse events: scroll wheel, click, drag-to-select, release-to-copy.
+    fn handle_mouse(&mut self, mouse: MouseEvent) {
+        match mouse.kind {
+            // ── Scroll wheel ──
+            MouseEventKind::ScrollUp => {
+                if self.at_bottom {
+                    let total = self.render_cache.len();
+                    self.scroll_offset = total.saturating_sub(3);
+                    self.at_bottom = false;
+                } else {
+                    self.scroll_offset = self.scroll_offset.saturating_sub(3);
+                }
+            }
+            MouseEventKind::ScrollDown => {
+                self.scroll_offset += 3;
+                let total = self.render_cache.len();
+                if self.scroll_offset >= total {
+                    self.at_bottom = true;
+                }
+            }
+            // ── Drag to select ──
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.selection.dragging = true;
+                self.selection.has_selection = true;
+                self.selection.start = (mouse.column, mouse.row);
+                self.selection.end = (mouse.column, mouse.row);
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                self.selection.end = (mouse.column, mouse.row);
+                self.selection.has_selection = true;
+
+                // Auto-scroll when dragging near edges
+                let viewport = self.last_viewport_height;
+                if mouse.row <= 1 && !self.at_bottom {
+                    self.scroll_offset = self.scroll_offset.saturating_sub(1);
+                } else if viewport > 2 && mouse.row >= viewport - 2 {
+                    self.scroll_offset += 1;
+                    let total = self.render_cache.len();
+                    if self.scroll_offset >= total {
+                        self.at_bottom = true;
+                    }
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                self.selection.dragging = false;
+                if self.selection.has_selection && self.selection.start != self.selection.end {
+                    self.copy_selection_to_clipboard();
+                }
+            }
+            _ => {}
         }
     }
 
