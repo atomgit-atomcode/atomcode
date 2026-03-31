@@ -3,6 +3,7 @@
 //! via channels. Decoupled from any TUI concerns.
 
 pub mod git_checkpoint;
+pub mod knowledge;
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -1172,8 +1173,13 @@ impl AgentLoop {
                     self.consecutive_reads = 0;
                 }
 
-                // NOTE: category_fail_streak injection disabled — add_user_message
-                // confuses weak models. The system-reminder (every 4 steps) is enough.
+                // Extract and persist cross-session knowledge (db credentials, ports, etc.)
+                let entries = knowledge::extract_knowledge(&output);
+                if !entries.is_empty() {
+                    let wd = self.turn_runner.context.working_dir.try_read()
+                        .map(|g| g.clone()).unwrap_or_default();
+                    knowledge::save_knowledge(&wd, &entries);
+                }
 
                 let _ = self.event_tx.send(AgentEvent::ToolCallResult {
                     name, output, success, duration,
@@ -1589,6 +1595,12 @@ impl AgentLoop {
                 "\n=== PROJECT INSTRUCTIONS (.atomcode.md) ===\n{}\n",
                 project_instructions
             ));
+        }
+
+        // Cross-session knowledge: db credentials, ports, startup commands, etc.
+        let project_knowledge = knowledge::load_knowledge(&wd);
+        if !project_knowledge.is_empty() {
+            prompt.push_str(&format!("\n{}\n", project_knowledge));
         }
 
         // Previous session context: inject the last few completed turns' outcomes

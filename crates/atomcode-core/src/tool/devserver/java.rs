@@ -267,7 +267,9 @@ pub async fn full_restart(
     // Extract just the server command (mvn spring-boot:run / gradle bootRun),
     // NOT the full original command which may include kill/sleep/cd.
     let server_cmd = extract_server_cmd(original_cmd);
-    let start_cmd = format!("nohup {} >/dev/null 2>&1 &", server_cmd);
+    // Redirect to backend.log instead of /dev/null so model can read logs later
+    let log_file = working_dir.join("backend.log");
+    let start_cmd = format!("nohup {} > {} 2>&1 &", server_cmd, log_file.display());
     let _ = tokio::process::Command::new("bash")
         .arg("-c")
         .arg(&start_cmd)
