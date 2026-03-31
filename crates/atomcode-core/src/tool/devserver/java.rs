@@ -128,6 +128,32 @@ pub fn enhance_compile_error(output: &str, working_dir: &Path) -> String {
     enhanced
 }
 
+/// Extract the actual server command from a compound command string.
+/// e.g., "kill PID; sleep 2; cd backend && mvn spring-boot:run -q" → "mvn spring-boot:run -q"
+fn extract_server_cmd(cmd: &str) -> String {
+    // Split by ;, &&, || and find the segment with the server command
+    let delimiters = [";", "&&", "||", "\n"];
+    let mut segments: Vec<&str> = vec![cmd];
+    for delim in &delimiters {
+        segments = segments.iter()
+            .flat_map(|s| s.split(delim))
+            .collect();
+    }
+
+    for seg in segments.iter().rev() {
+        let trimmed = seg.trim().trim_end_matches('&').trim();
+        if trimmed.contains("spring-boot:run")
+            || trimmed.contains("bootRun")
+            || trimmed.contains("java -jar")
+        {
+            return trimmed.to_string();
+        }
+    }
+
+    // Fallback: use mvn spring-boot:run
+    "mvn spring-boot:run".to_string()
+}
+
 /// Extract file path and line number from a compile error line.
 fn extract_error_location(line: &str) -> Option<(String, usize)> {
     // Maven: [ERROR] /path/File.java:[42,15] message
@@ -225,17 +251,17 @@ pub async fn full_restart(
     }
 
     // Step 3: Start server in background
-    let start_cmd = format!(
-        "nohup {} >/dev/null 2>&1 &",
-        original_cmd.trim().trim_end_matches('&').trim()
-    );
+    // Extract just the server command (mvn spring-boot:run / gradle bootRun),
+    // NOT the full original command which may include kill/sleep/cd.
+    let server_cmd = extract_server_cmd(original_cmd);
+    let start_cmd = format!("nohup {} >/dev/null 2>&1 &", server_cmd);
     let _ = tokio::process::Command::new("bash")
         .arg("-c")
         .arg(&start_cmd)
         .current_dir(working_dir)
         .output()
         .await;
-    output.push_str("[Step 3/4] Server starting...\n");
+    output.push_str(&format!("[Step 3/4] Starting: {}\n", server_cmd));
 
     // Step 4: Poll port until ready
     let mut ready = false;
