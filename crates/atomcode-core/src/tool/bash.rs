@@ -103,8 +103,10 @@ impl Tool for BashTool {
             && !parsed.command.contains("mvn compile")
             && !parsed.command.contains("mvn clean")
         {
-            let port = devserver::extract_port_with_dir(&parsed.command, Some(&wd)).unwrap_or(8080);
-            let (success, output) = devserver::java::full_restart(&wd, port, &parsed.command).await;
+            // Extract actual working dir from `cd /path/to/backend &&` in the command
+            let effective_wd = extract_cd_dir(&parsed.command).unwrap_or_else(|| wd.clone());
+            let port = devserver::extract_port_with_dir(&parsed.command, Some(&effective_wd)).unwrap_or(8080);
+            let (success, output) = devserver::java::full_restart(&effective_wd, port, &parsed.command).await;
             return Ok(ToolResult { call_id: String::new(), output, success });
         }
 
@@ -372,6 +374,27 @@ fn check_destructive_command(command: &str) -> Option<String> {
         }
     }
 
+    None
+}
+
+/// Extract the target directory from a `cd /path/to/dir && ...` command.
+/// Returns None if no cd found.
+fn extract_cd_dir(cmd: &str) -> Option<std::path::PathBuf> {
+    // Match patterns: "cd /path/to/dir &&", "cd /path/to/dir;", "cd /path/to/dir\n"
+    for prefix in ["cd ", "CD "] {
+        if let Some(pos) = cmd.find(prefix) {
+            let after = &cmd[pos + prefix.len()..];
+            let dir_end = after.find(|c: char| c == '&' || c == ';' || c == '\n' || c == '|')
+                .unwrap_or(after.len());
+            let dir = after[..dir_end].trim();
+            if !dir.is_empty() {
+                let path = std::path::PathBuf::from(dir);
+                if path.is_dir() {
+                    return Some(path);
+                }
+            }
+        }
+    }
     None
 }
 
