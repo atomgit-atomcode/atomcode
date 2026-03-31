@@ -270,7 +270,7 @@ impl Tool for BashTool {
                     let combined = format_output(&stdout_str, &stderr_str);
 
                     // Auto-detect port from command and poll until ready
-                    let port = devserver::extract_port(&parsed.command);
+                    let port = devserver::extract_port_with_dir(&parsed.command, Some(&wd));
                     let port_status = if let Some(p) = port {
                         // Poll port every 2s for up to 30s
                         let mut ready = false;

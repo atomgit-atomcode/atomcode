@@ -90,11 +90,15 @@ pub fn is_server_command(cmd: &str) -> bool {
     detect(trimmed).is_some()
 }
 
-/// Extract port number from a command string.
-/// Checks explicit flags first (--port, -p, -Dserver.port=), then falls back
-/// to the detected server's default port.
+/// Extract port number from a command string + project config files.
+/// Priority: explicit flags > project config > detected server default.
 pub fn extract_port(cmd: &str) -> Option<u16> {
-    // Explicit port flags (tech-stack agnostic)
+    extract_port_with_dir(cmd, None)
+}
+
+/// Extract port with optional working directory for config file lookup.
+pub fn extract_port_with_dir(cmd: &str, working_dir: Option<&Path>) -> Option<u16> {
+    // 1. Explicit port flags in command (highest priority)
     let port_patterns = ["-p ", "--port ", "--port=", "-Dserver.port=", "PORT="];
     for pat in &port_patterns {
         if let Some(pos) = cmd.find(pat) {
@@ -106,8 +110,60 @@ pub fn extract_port(cmd: &str) -> Option<u16> {
         }
     }
 
-    // Fall back to detected server's default port
+    // 2. Read from project config files (application.properties / .env / vite.config)
+    if let Some(wd) = working_dir {
+        if let Some(p) = read_port_from_config(wd) {
+            return Some(p);
+        }
+    }
+
+    // 3. Fall back to detected server's default port
     detect(cmd).map(|s| s.default_port)
+}
+
+/// Try to read server port from common config files.
+fn read_port_from_config(working_dir: &Path) -> Option<u16> {
+    // Spring Boot: application.properties / application.yml
+    let spring_configs = [
+        "src/main/resources/application.properties",
+        "src/main/resources/application.yml",
+        "src/main/resources/application.yaml",
+        "application.properties",
+    ];
+    for cfg in &spring_configs {
+        let path = working_dir.join(cfg);
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            // server.port=8081 or server.port: 8081
+            for line in content.lines() {
+                let trimmed = line.trim();
+                if trimmed.starts_with("server.port") {
+                    let port_str: String = trimmed.chars()
+                        .filter(|c| c.is_ascii_digit())
+                        .collect();
+                    if let Ok(p) = port_str.parse::<u16>() {
+                        return Some(p);
+                    }
+                }
+            }
+        }
+    }
+
+    // Node.js: .env (PORT=3001)
+    let env_path = working_dir.join(".env");
+    if let Ok(content) = std::fs::read_to_string(&env_path) {
+        for line in content.lines() {
+            if line.trim().starts_with("PORT=") {
+                let port_str: String = line.trim()[5..].chars()
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect();
+                if let Ok(p) = port_str.parse::<u16>() {
+                    return Some(p);
+                }
+            }
+        }
+    }
+
+    None
 }
 
 /// Run a pre-command (e.g. `mvn compile`) synchronously before starting the server.
