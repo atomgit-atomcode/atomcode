@@ -23,6 +23,14 @@ pub enum TurnEvent {
         completion_tokens: usize,
         total_tokens: usize,
     },
+    /// Context budget stats for logging
+    ContextStats {
+        system_tokens: usize,
+        hot_tokens: usize,
+        cold_tokens: usize,
+        working_set_tokens: usize,
+        total_messages: usize,
+    },
 }
 
 /// Result of a single turn execution

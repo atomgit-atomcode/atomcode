@@ -926,6 +926,11 @@ impl AgentLoop {
                                         }
                                     ));
                                 }
+                                TurnEvent::ContextStats { system_tokens, hot_tokens, cold_tokens, working_set_tokens, total_messages } => {
+                                    let _ = event_tx.send(AgentEvent::ContextStats {
+                                        system_tokens, hot_tokens, cold_tokens, working_set_tokens, total_messages,
+                                    });
+                                }
                                 TurnEvent::Error(e) => {
                                     let _ = event_tx.send(AgentEvent::Error(e));
                                 }
@@ -1192,6 +1197,11 @@ impl AgentLoop {
                         completion_tokens,
                     }
                 ));
+            }
+            TurnEvent::ContextStats { system_tokens, hot_tokens, cold_tokens, working_set_tokens, total_messages } => {
+                let _ = self.event_tx.send(AgentEvent::ContextStats {
+                    system_tokens, hot_tokens, cold_tokens, working_set_tokens, total_messages,
+                });
             }
             TurnEvent::Error(e) => {
                 let _ = self.event_tx.send(AgentEvent::Error(e));
