@@ -302,7 +302,7 @@ fn check_destructive_command(command: &str) -> Option<String> {
         ("chmod 777", "World-writable permission"),
         ("chmod -r ", "Recursive permission change"),
         ("kill -9", "Force kill process"),
-        ("killall", "Kill all matching processes"),
+        ("killall ", "Kill all matching processes"),
         ("git push --force", "Force push"),
         ("git push -f", "Force push"),
         ("git reset --hard", "Hard reset (destroys uncommitted changes)"),
@@ -311,9 +311,28 @@ fn check_destructive_command(command: &str) -> Option<String> {
 
     for (pattern, reason) in patterns {
         if cmd.contains(pattern) {
-            // Don't flag pkill/pgrep — they're standard process management commands
+            // Don't flag pkill/pgrep — standard process management
             if pattern.contains("kill") && (cmd.contains("pkill") || cmd.contains("pgrep")) {
                 continue;
+            }
+            // Don't flag `kill -9 <PID>` or `kill <PID>` targeting a specific process.
+            // Also allow piped kill patterns like `lsof -ti:PORT | xargs kill -9`
+            // which are standard dev server restart operations.
+            if pattern.contains("kill") {
+                let is_targeted_kill = cmd.contains("| xargs kill")
+                    || cmd.contains("| kill")
+                    || {
+                        // `kill -9 12345` — numeric PID follows
+                        let after_kill = if let Some(pos) = cmd.find("kill -9") {
+                            cmd[pos + 7..].trim_start()
+                        } else if let Some(pos) = cmd.find("kill ") {
+                            cmd[pos + 5..].trim_start()
+                        } else { "" };
+                        after_kill.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false)
+                    };
+                if is_targeted_kill {
+                    continue;
+                }
             }
             return Some(format!("Destructive command detected: {}. Command: {}", reason, command));
         }

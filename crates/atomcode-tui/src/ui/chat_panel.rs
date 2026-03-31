@@ -499,9 +499,11 @@ fn render_approval(lines: &mut Vec<Line<'static>>, call: &ToolCall) {
         Style::default().fg(theme::SEPARATOR),
     )));
 
-    // Action buttons
+    // Action buttons with prominent prompt
     lines.push(Line::from(vec![
         Span::raw(format!("{}", TOOL_INDENT)),
+        Span::styled(" \u{25b6} ", Style::default().fg(theme::WARNING).add_modifier(Modifier::BOLD)),
+        Span::styled("Waiting for approval: ", Style::default().fg(theme::WARNING)),
         Span::styled(" Y ", Style::default().fg(theme::TEXT_ON_ACCENT).bg(theme::SUCCESS).add_modifier(Modifier::BOLD)),
         Span::styled(" Allow  ", key_label),
         Span::styled(" A ", Style::default().fg(theme::TEXT_ON_ACCENT).bg(theme::INFO).add_modifier(Modifier::BOLD)),
