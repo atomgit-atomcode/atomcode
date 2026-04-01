@@ -812,8 +812,23 @@ impl AgentLoop {
                 let consecutive_reads = &mut self.consecutive_reads;
                 let session_files = &mut self.session_files;
 
-                // Run TurnRunner concurrently with command processing
-                let turn_fut = runner.run(&mut conv, &system_prompt, &turn_tx, cancel);
+                // Run TurnRunner concurrently with command processing.
+                // Phase 2: first turn of planning tasks → restrict to read-only tools.
+                // Model must output a plan before it can edit/write/bash.
+                let read_only_tools: &[&str] = &[
+                    "read_file", "grep", "glob", "list_directory",
+                    "find_references", "list_symbols", "read_symbol",
+                ];
+                let use_filter = self.planning_phase && self.tool_call_count == 0
+                    && self.current_task_type.restrict_first_turn();
+                let tool_filter: Option<&[&str]> = if use_filter {
+                    Some(read_only_tools)
+                } else {
+                    None
+                };
+                let turn_fut = runner.run_with_filter(
+                    &mut conv, &system_prompt, &turn_tx, cancel, tool_filter,
+                );
                 tokio::pin!(turn_fut);
 
                 let result = loop {
