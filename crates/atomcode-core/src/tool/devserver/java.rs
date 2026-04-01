@@ -202,14 +202,9 @@ pub async fn full_restart(
     _port_hint: u16,
     original_cmd: &str,
 ) -> (bool, String) {
-    // Step 1: Kill any existing server process
-    // Kill by common server process patterns, not by port (port might be wrong)
-    let _ = tokio::process::Command::new("bash")
-        .arg("-c")
-        .arg("pkill -f 'spring-boot:run' 2>/dev/null; pkill -f 'bootRun' 2>/dev/null; sleep 1")
-        .current_dir(working_dir)
-        .output()
-        .await;
+    // Step 1: No hardcoded kill. If port is in use, server will fail with
+    // "Address already in use" and we return the error for model to handle.
+    // This avoids killing wrong processes (frontend, other services).
 
     // Step 2: Compile
     let compile_cmd = if original_cmd.contains("gradle") {
@@ -272,9 +267,23 @@ pub async fn full_restart(
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         if let Ok(log_content) = std::fs::read_to_string(&log_file) {
             // Check for startup failure
-            if log_content.contains("APPLICATION FAILED TO START")
-                || log_content.contains("Application run failed")
-            {
+            // Detect startup failures from log
+            let is_port_conflict = log_content.contains("Address already in use")
+                || log_content.contains("Port already in use");
+            let is_app_failure = log_content.contains("APPLICATION FAILED TO START")
+                || log_content.contains("Application run failed");
+
+            if is_port_conflict {
+                // Extract the conflicting port from log
+                let port_line = log_content.lines()
+                    .find(|l| l.contains("Address already in use") || l.contains("Port already in use"))
+                    .unwrap_or("unknown port");
+                return (false, format!(
+                    "[Port conflict — kill the old process first, then retry.]\n{}",
+                    port_line,
+                ));
+            }
+            if is_app_failure {
                 let last_lines: String = log_content.lines().rev().take(10)
                     .collect::<Vec<_>>().into_iter().rev()
                     .collect::<Vec<_>>().join("\n");
