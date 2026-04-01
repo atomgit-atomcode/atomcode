@@ -1034,6 +1034,8 @@ impl App {
                                 self.render_cache_msg_count = 0;
                                 self.scroll_offset = 0;
                                 self.at_bottom = true;
+                                // Calculate total lines for scroll to work immediately
+                                self.last_total_lines = crate::ui::chat_panel::total_lines(&self.conversation);
                                 let _ = self.agent_handle.cmd_tx.send(AgentCommand::SetMessages(self.current_session.messages.clone()));
                             }
                             self.mode = AppMode::Normal;
