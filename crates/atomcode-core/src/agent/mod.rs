@@ -1554,25 +1554,11 @@ impl AgentLoop {
             prompt.push_str(&format!("Git: {}\n", git_info));
         }
 
-        // Recent activity: files changed in last 3 commits.
-        // Gives model context about what was recently worked on,
-        // so "构建任务停止了" maps to TagRebuildTask not Vite.
-        let recent_files = std::process::Command::new("git")
-            .args(&["diff", "--name-only", "HEAD~3..HEAD"])
-            .current_dir(&wd)
-            .output()
-            .ok()
-            .and_then(|o| String::from_utf8(o.stdout).ok())
-            .map(|s| {
-                let files: Vec<&str> = s.lines()
-                    .filter(|l| !l.trim().is_empty())
-                    .take(15)
-                    .collect();
-                files.join("\n")
-            })
-            .unwrap_or_default();
-        if !recent_files.is_empty() {
-            prompt.push_str(&format!("Recently changed files:\n{}\n", recent_files));
+        // Recent activity: extract edited file names from the most recent datalog.
+        // Only file names (not content/user messages) — safe, small, factual.
+        let recent_activity = extract_recent_activity_from_datalog(&wd);
+        if !recent_activity.is_empty() {
+            prompt.push_str(&format!("Recent activity: {}\n", recent_activity));
         }
 
         // Active services detected via lsof + extracted from tool outputs.
@@ -2110,6 +2096,63 @@ fn short_path(path: &str) -> String {
         2 => format!("{}/{}", parts[1], parts[0]),
         _ => format!(".../{}/{}", parts[1], parts[0]),
     }
+}
+
+/// Extract recently edited file names from the most recent datalog file.
+/// Returns a comma-separated list of unique file names (max 5).
+/// Only extracts from "Edit File" and "Write File" lines — safe, factual, small.
+fn extract_recent_activity_from_datalog(working_dir: &std::path::Path) -> String {
+    let log_dir = working_dir.join("datalog");
+    if !log_dir.is_dir() {
+        return String::new();
+    }
+
+    // Find the most recent .md file in datalog/
+    let mut files: Vec<_> = match std::fs::read_dir(&log_dir) {
+        Ok(entries) => entries
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().map(|x| x == "md").unwrap_or(false))
+            .collect(),
+        Err(_) => return String::new(),
+    };
+    files.sort_by_key(|e| std::cmp::Reverse(e.file_name()));
+    let latest = match files.first() {
+        Some(f) => f.path(),
+        None => return String::new(),
+    };
+
+    // Read and extract file names from "Edit File" / "Write File" lines
+    let content = match std::fs::read_to_string(&latest) {
+        Ok(c) => c,
+        Err(_) => return String::new(),
+    };
+
+    let mut edited_files = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        // Match: "- Edit File .../SomeFile.ext" or "- Write File .../SomeFile.ext"
+        if (trimmed.starts_with("- Edit File") || trimmed.starts_with("- Write File"))
+            && trimmed.contains("...")
+        {
+            // Extract the short file path after "..."
+            if let Some(pos) = trimmed.rfind('/') {
+                let file_name = &trimmed[pos + 1..];
+                // Clean up: remove trailing content like " (-3 +5 lines)"
+                let clean = file_name.split(|c: char| c == ' ' || c == '(')
+                    .next()
+                    .unwrap_or(file_name)
+                    .trim();
+                if !clean.is_empty() && seen.insert(clean.to_string()) {
+                    edited_files.push(clean.to_string());
+                    if edited_files.len() >= 5 { break; }
+                }
+            }
+        }
+    }
+
+    edited_files.join(", ")
 }
 
 
