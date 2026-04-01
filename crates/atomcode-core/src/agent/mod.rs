@@ -545,6 +545,33 @@ impl AgentLoop {
         self.turn_start = Some(Instant::now());
         self.cancel_token = CancellationToken::new();
 
+        // "记住这个" / "remember this" — save last assistant response as knowledge.
+        let lower_content = content.to_lowercase();
+        let is_remember = lower_content.contains("记住")
+            || lower_content.contains("remember")
+            || lower_content.contains("记录一下")
+            || lower_content.contains("记下来");
+        if is_remember {
+            let wd = self.turn_runner.context.working_dir.try_read()
+                .map(|g| g.clone()).unwrap_or_default();
+            // Find last assistant text
+            let last_assistant = self.conversation.messages.iter().rev()
+                .find(|m| matches!(m.role, crate::conversation::message::Role::Assistant))
+                .and_then(|m| m.text())
+                .unwrap_or("")
+                .to_string();
+            if !last_assistant.is_empty() {
+                // Use first 200 chars as value, timestamp as category
+                let summary = if last_assistant.chars().count() > 200 {
+                    format!("{}...", last_assistant.chars().take(197).collect::<String>())
+                } else {
+                    last_assistant.clone()
+                };
+                let category = format!("user_note_{}", chrono::Local::now().format("%Y%m%d_%H%M"));
+                knowledge::save_user_knowledge(&wd, &category, &summary);
+            }
+        }
+
         // Classify task to decide planning and read-only constraint.
         let has_previous = !self.conversation.messages.is_empty();
         let task_type = task_classifier::classify(&content, has_previous);

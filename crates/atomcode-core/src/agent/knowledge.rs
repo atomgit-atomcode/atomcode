@@ -92,6 +92,13 @@ pub fn save_knowledge(working_dir: &Path, entries: &[(String, String)]) {
     let _ = std::fs::write(&path, format!("# Project Knowledge (auto-generated)\n\n{}\n", content));
 }
 
+/// Save a user-triggered knowledge entry ("记住这个" / "remember this").
+/// Extracts the last assistant response as the knowledge content.
+pub fn save_user_knowledge(working_dir: &Path, category: &str, content: &str) {
+    let entry = vec![(category.to_string(), content.to_string())];
+    save_knowledge(working_dir, &entry);
+}
+
 /// Load knowledge from .atomcode/knowledge.md for injection into system prompt.
 pub fn load_knowledge(working_dir: &Path) -> String {
     let path = working_dir.join(".atomcode/knowledge.md");
