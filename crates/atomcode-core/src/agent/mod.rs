@@ -1554,6 +1554,27 @@ impl AgentLoop {
             prompt.push_str(&format!("Git: {}\n", git_info));
         }
 
+        // Recent activity: files changed in last 3 commits.
+        // Gives model context about what was recently worked on,
+        // so "构建任务停止了" maps to TagRebuildTask not Vite.
+        let recent_files = std::process::Command::new("git")
+            .args(&["diff", "--name-only", "HEAD~3..HEAD"])
+            .current_dir(&wd)
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| {
+                let files: Vec<&str> = s.lines()
+                    .filter(|l| !l.trim().is_empty())
+                    .take(15)
+                    .collect();
+                files.join("\n")
+            })
+            .unwrap_or_default();
+        if !recent_files.is_empty() {
+            prompt.push_str(&format!("Recently changed files:\n{}\n", recent_files));
+        }
+
         // Active services detected via lsof + extracted from tool outputs.
         if !self.active_services.is_empty() {
             prompt.push_str("Running services (live):\n");
