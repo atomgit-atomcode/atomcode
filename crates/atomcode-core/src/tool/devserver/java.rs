@@ -284,20 +284,30 @@ pub async fn full_restart(
     output.push_str(&format!("[Step 3/4] Starting: {}\n", server_cmd));
 
     // Step 4: Poll port until ready
-    let mut ready = false;
-    for i in 0..20 {
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        if std::net::TcpStream::connect(format!("127.0.0.1:{}", port)).is_ok() {
-            ready = true;
-            output.push_str(&format!("[Step 4/4] Port {} ready after {}s\n", port, (i + 1) * 2));
-            break;
+    // Poll: try the detected port + fallback ports (in case detection was wrong)
+    let mut ports_to_try = vec![port];
+    for fallback in &[8080u16, 8081, 3000, 8000, 8443] {
+        if *fallback != port && !ports_to_try.contains(fallback) {
+            ports_to_try.push(*fallback);
         }
     }
+    let mut ready = false;
+    let mut actual_port = port;
+    for _i in 0..20 {
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        for &p in &ports_to_try {
+            if std::net::TcpStream::connect(format!("127.0.0.1:{}", p)).is_ok() {
+                ready = true;
+                actual_port = p;
+                break;
+            }
+        }
+        if ready { break; }
+    }
+    // Use actual_port from here on (may differ from detected port)
+    let port = actual_port;
     if !ready {
-        output.push_str(&format!(
-            "[Step 4/4] Port {} not responding after 40s. Check: tail -30 backend.log\n",
-            port
-        ));
+        output.push_str("[Server not responding after 40s. Check logs.\n");
         return (false, output);
     }
 
