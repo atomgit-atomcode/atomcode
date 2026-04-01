@@ -265,12 +265,11 @@ impl Conversation {
         }
 
         // Phase 1.5: Mid-session summarization.
-        // When cold zone has 10+ turns, merge the oldest ones into a single summary.
-        // This frees massive token space (10 turns × ~150 tok = 1500 tok → ~100 tok).
+        // When cold zone has 5+ turns, merge the oldest ones into a single summary.
+        // Keeps context stable at ~14K regardless of session length.
         let cold_turn_count = hot_turn_start;
-        let summary_cutoff = if cold_turn_count > 10 {
-            // Summarize turns 0..cutoff into one message
-            cold_turn_count.saturating_sub(5) // keep the most recent 5 cold turns individual
+        let summary_cutoff = if cold_turn_count > 5 {
+            cold_turn_count.saturating_sub(3) // keep the most recent 3 cold turns individual
         } else {
             0
         };
