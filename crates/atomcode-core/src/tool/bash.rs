@@ -268,29 +268,10 @@ async fn bash_execute(args: &str, ctx: &ToolContext) -> Result<ToolResult> {
                     let pid = child.id().map(|p| p.to_string()).unwrap_or_else(|| "?".into());
                     let combined = format_output(&stdout_str, &stderr_str);
 
-                    // Auto-detect port from command and poll until ready
-                    let port = devserver::extract_port_with_dir(&parsed.command, Some(&wd));
-                    let port_status = if let Some(p) = port {
-                        // Poll port every 2s for up to 30s
-                        let mut ready = false;
-                        for _ in 0..15 {
-                            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                            if std::net::TcpStream::connect(format!("127.0.0.1:{}", p)).is_ok() {
-                                ready = true;
-                                break;
-                            }
-                        }
-                        if ready {
-                            format!(" Port {} is ready.", p)
-                        } else {
-                            format!(" Port {} not responding after 30s — check logs.", p)
-                        }
-                    } else {
-                        String::new()
-                    };
-
+                    // No port polling — let model verify with its own curl.
+                    // Log redirected to backend.log, model can tail it.
                     let output = if combined.is_empty() {
-                        format!("Process running in background (PID: {}).{}", pid, port_status)
+                        format!("Process running in background (PID: {}). Check backend.log for status.", pid)
                     } else {
                         format!("{}\n\n[Process running in background, PID: {}]", combined, pid)
                     };
