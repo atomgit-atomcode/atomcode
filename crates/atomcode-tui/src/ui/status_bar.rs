@@ -18,9 +18,9 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     let mut left: Vec<Span> = Vec::new();
     let mut right: Vec<Span> = Vec::new();
 
-    // Left: brand + path + session
+    // Left: brand (with build hash) + path + session
     left.push(Span::styled(
-        " atomcode ",
+        format!(" atomcode [{}] ", env!("ATOMCODE_BUILD_ID")),
         Style::default().fg(theme::BRAND_FG).bg(theme::BRAND_BG).add_modifier(Modifier::BOLD),
     ));
     left.push(Span::styled(" ", Style::default()));
