@@ -60,11 +60,16 @@ pub fn classify(message: &str, has_previous_turns: bool) -> TaskType {
     // because "还是不行" also contains bug keywords.
     if has_previous_turns {
         let followup_keywords = [
+            // Chinese: "still broken" patterns
             "还是不行", "依然不行", "没有成功", "还是不对", "还是报错",
-            "还是没有", "依然没有", "还是空", "依然不能",
-            "没用", "还是一样", "又错了", "又报错",
+            "还是没有", "依然没有", "还是空", "依然不能", "依然失败",
+            "没用", "还是一样", "又错了", "又报错", "又失败",
+            "还是很慢", "依然很慢", "还没解决", "依然没解决",
+            "还是那个", "感觉依然", "感觉还是",
+            // English: "still broken" patterns
             "still broken", "still not", "doesn't work", "not working",
-            "same error", "still failing",
+            "same error", "still failing", "still slow", "not fixed",
+            "still the same", "again", "keeps happening",
         ];
         if followup_keywords.iter().any(|kw| lower.contains(kw)) {
             return TaskType::FollowUp;
@@ -119,18 +124,40 @@ pub fn classify(message: &str, has_previous_turns: bool) -> TaskType {
     }
 
     // Rule 5: Bug fix — something is broken.
+    // Three detection layers: keywords, negation patterns, sentence structure.
     let bug_keywords = [
+        // Chinese: explicit error words
         "报错", "错误", "不行了", "失败", "空白", "不显示", "不工作",
         "找不到", "没有显示", "不能", "无法", "异常", "崩溃",
         "没有成功", "没成功", "空的", "不出来", "没有配置",
         "没有一次", "没有任何", "也没", "没有提示", "没有通知",
         "没反应", "不生效", "没生效", "没起作用",
-        "点击", "点了", "打开", // user actions that imply something failed
+        // Chinese: negation phenomena (user describes something not working)
+        "转不停", "转起来", "死循环", "乱跳", "闪烁", "白屏",
+        "没完了", "没完没了", "卡住", "卡死", "超时",
+        "乱码", "不对", "不正确", "不准", "不匹配",
+        // Chinese: questioning why something is wrong
+        "怎么是", "怎么会", "咋回事", "为啥会", "为什么会",
+        // English: explicit error words
         "error", "fail", "broken", "crash", "blank", "empty",
         "not showing", "doesn't", "can't", "unable", "missing",
         "no result", "nothing", "not working",
+        // English: negation phenomena
+        "spinning", "loop", "infinite", "stuck", "frozen", "timeout",
+        "flicker", "blink", "white screen", "garbled", "corrupted",
+        "keeps", "won't stop", "never ends",
+        // English: questioning broken state
+        "why is it", "why does it", "how come",
     ];
     if bug_keywords.iter().any(|kw| lower.contains(kw)) {
+        return TaskType::BugFix;
+    }
+
+    // Sentence-structure detection: "X 怎么 Y 了" / "X is Y-ing" patterns
+    // Catches cases like "首页笔记本怎么是空的" where no keyword matches
+    let has_interrogative_complaint = (lower.contains("怎么") || lower.contains("咋"))
+        && !lower.contains("怎么做") && !lower.contains("怎么实现"); // exclude "how to do X"
+    if has_interrogative_complaint {
         return TaskType::BugFix;
     }
 
@@ -192,5 +219,42 @@ mod tests {
     #[test]
     fn test_feature_dev() {
         assert_eq!(classify("给发现页面添加标签筛选功能", false), TaskType::FeatureDev);
+    }
+
+    // Tests for sentence-structure detection (no explicit keywords)
+    #[test]
+    fn test_bug_interrogative_pattern() {
+        // "怎么" + complaint = bug, not question
+        assert_eq!(classify("首页怎么是空的", false), TaskType::BugFix);
+        assert_eq!(classify("按钮怎么转不停", false), TaskType::BugFix);
+        assert_eq!(classify("Why is the page empty", false), TaskType::BugFix);
+        // "怎么做" = question, not bug
+        assert_eq!(classify("这个功能怎么做？", false), TaskType::Question);
+        assert_eq!(classify("How do I implement this?", false), TaskType::Question);
+    }
+
+    #[test]
+    fn test_bug_negation_phenomena() {
+        assert_eq!(classify("登录以后白屏", false), TaskType::BugFix);
+        assert_eq!(classify("页面一直在闪烁", false), TaskType::BugFix);
+        assert_eq!(classify("接口超时了", false), TaskType::BugFix);
+        assert_eq!(classify("The page keeps spinning", false), TaskType::BugFix);
+        assert_eq!(classify("Login is stuck in a loop", false), TaskType::BugFix);
+    }
+
+    #[test]
+    fn test_followup_expanded() {
+        assert_eq!(classify("还是很慢", true), TaskType::FollowUp);
+        assert_eq!(classify("感觉依然没有改善", true), TaskType::FollowUp);
+        assert_eq!(classify("still the same issue", true), TaskType::FollowUp);
+    }
+
+    #[test]
+    fn test_bug_vs_action() {
+        // Performance complaints → BugFix (diagnosis first)
+        assert_eq!(classify("页面加载很慢", false), TaskType::BugFix);
+        // Explicit action keywords → FeatureDev
+        assert_eq!(classify("优化查询性能", false), TaskType::FeatureDev);
+        assert_eq!(classify("Add a cache layer for the API", false), TaskType::FeatureDev);
     }
 }

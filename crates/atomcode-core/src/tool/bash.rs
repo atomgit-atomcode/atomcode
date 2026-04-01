@@ -111,31 +111,12 @@ async fn bash_execute(args: &str, ctx: &ToolContext) -> Result<ToolResult> {
             }
         }
 
-        // Intercept "kill + restart" patterns for Java projects: route through
-        // full_restart which does compile→start→poll→health atomically.
-        // Only triggers when BOTH kill and server start are in the same command,
-        // connected by ; or && (not newlines — newlines indicate separate steps).
-        #[cfg(not(target_os = "windows"))]
-        {
-            // Split by newlines first — only check single-line or ;/&& joined commands
-            let is_single_logical_command = !parsed.command.contains('\n')
-                || parsed.command.lines().count() <= 2;
-            if is_single_logical_command {
-                let cmd_lower = parsed.command.to_lowercase();
-                let has_kill = cmd_lower.contains("kill") || cmd_lower.contains("pkill");
-                let has_server_start = devserver::java::detect(&parsed.command).is_some();
-                if has_kill && has_server_start {
-                    let (success, output) = devserver::java::full_restart(
-                        &wd, 0, &parsed.command,
-                    ).await;
-                    return Ok(ToolResult {
-                        call_id: String::new(),
-                        output,
-                        success,
-                    });
-                }
-            }
-        }
+        // NOTE: full_restart interception removed after 5 add/remove cycles.
+        // Data shows net -11 turns today: 0 successful interceptions, 11 wasted turns
+        // when compile fails inside full_restart and model doesn't understand the output.
+        // The model manages kill→restart on its own in 5-7 turns.
+        // auto_compile_verify after edits catches compile errors before restart.
+        // full_restart() is kept in devserver/java.rs for potential future use.
 
         // Platform-aware shell: cmd.exe on Windows, bash on Unix
         #[cfg(target_os = "windows")]
@@ -172,18 +153,20 @@ async fn bash_execute(args: &str, ctx: &ToolContext) -> Result<ToolResult> {
         let mut stderr_buf = Vec::new();
 
         // Wait for process to finish or timeout. Read stdout/stderr concurrently.
-        // Idle detection (3s no output → early return) ONLY for background/server commands.
-        // Non-background commands (curl, mvn, etc.) wait the full timeout.
+        // Idle detection for ALL commands: if output stops for N seconds after
+        // having produced some output, the command is likely stuck. Kill it early
+        // instead of waiting for the full timeout (prevents 10+ min hangs).
         let wait_secs = if is_background {
             parsed.timeout.unwrap_or(INITIAL_WAIT_SECS).min(300)
         } else {
             parsed.timeout.unwrap_or(30).min(300)
         };
-        // For background commands: 3s idle = server started. For others: no idle detection.
+        // Background: 3s idle = server started.
+        // Normal: 30s idle after first output = stuck.
         let idle_timeout = if is_background {
             Duration::from_secs(3)
         } else {
-            Duration::from_secs(wait_secs + 1) // effectively disabled
+            Duration::from_secs(30)
         };
         let has_any_output = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let has_out_1 = has_any_output.clone();
@@ -273,14 +256,13 @@ async fn bash_execute(args: &str, ctx: &ToolContext) -> Result<ToolResult> {
                     };
                     Ok(ToolResult { call_id: String::new(), output, success: true })
                 } else {
-                    // Non-background command (curl, etc.): shouldn't reach here normally,
-                    // but if it does, wait for the process to finish.
-                    let _ = child.wait().await;
+                    // Non-background command: output stopped for 30s = stuck. Kill it.
+                    let _ = child.kill().await;
                     let combined = format_output(&stdout_str, &stderr_str);
                     if combined.is_empty() {
-                        Ok(ToolResult { call_id: String::new(), output: "(no output)".to_string(), success: true })
+                        Ok(ToolResult { call_id: String::new(), output: "Command produced no output and was killed after 30s idle. Try a different approach.".to_string(), success: false })
                     } else {
-                        Ok(ToolResult { call_id: String::new(), output: combined, success: true })
+                        Ok(ToolResult { call_id: String::new(), output: format!("{}\n\n[Command stalled — no output for 30s. Killed. Output above is partial.]", combined), success: false })
                     }
                 }
             }

@@ -220,6 +220,10 @@ pub struct AgentLoop {
     session_files: std::collections::HashMap<String, PathBuf>,
     /// Whether planning phase is active (first LLM call without tools to force a plan).
     planning_phase: bool,
+    /// Remaining read-only turns for diagnosis tasks. When > 0, only read_file/grep/glob/
+    /// list_directory/find_references/list_symbols/read_symbol are available.
+    /// Decremented each turn. Forces the model to read code before curl/edit.
+    diagnosis_read_only_turns: usize,
     /// Current task type — drives dynamic prompt selection and planning.
     /// ATLAS-style subtask driver: decomposes plan into per-file subtasks.
     subtask_driver: subtask_driver::SubtaskDriver,
@@ -337,6 +341,7 @@ impl AgentLoop {
             active_file: None,
             pending_input: None,
             planning_phase: false,
+            diagnosis_read_only_turns: 0,
             subtask_driver: subtask_driver::SubtaskDriver::new(),
             session_files: std::collections::HashMap::new(),
             active_services: std::collections::HashMap::new(),
@@ -540,12 +545,18 @@ impl AgentLoop {
         self.turn_start = Some(Instant::now());
         self.cancel_token = CancellationToken::new();
 
-        // Simple heuristic: short messages (questions/commands) skip planning.
-        // Everything else gets planning + tool restriction.
-        // No task classification — unified prompt handles all types.
-        let is_short = content.chars().count() < 20;
-        let is_question = content.ends_with('?') || content.ends_with('？');
-        self.planning_phase = !is_short && !is_question;
+        // Classify task to decide planning and read-only constraint.
+        let has_previous = !self.conversation.messages.is_empty();
+        let task_type = task_classifier::classify(&content, has_previous);
+        self.planning_phase = task_type.needs_planning();
+
+        // Diagnosis/follow-up tasks: restrict to read-only tools for first 3 turns.
+        // Forces the model to read code before curl/edit — prevents the "blind curl" pattern.
+        self.diagnosis_read_only_turns = match task_type {
+            task_classifier::TaskType::BugFix => 3,
+            task_classifier::TaskType::FollowUp => 2,
+            _ => 0,
+        };
 
         self.phase = AgentPhase::Thinking;
         let _ = self
@@ -796,6 +807,11 @@ impl AgentLoop {
         loop {
             self.turn_count += 1;
 
+            // Decrement diagnosis read-only counter each turn.
+            if self.diagnosis_read_only_turns > 0 {
+                self.diagnosis_read_only_turns -= 1;
+            }
+
             // Inject any pending user input appended during streaming.
             if let Some(input) = self.pending_input.take() {
                 self.conversation.add_user_message(&format!("[Additional context from user]: {}", input));
@@ -928,13 +944,14 @@ impl AgentLoop {
                 let session_files = &mut self.session_files;
 
                 // Run TurnRunner concurrently with command processing.
-                // Phase 2: first turn of planning tasks → restrict to read-only tools.
-                // Model must output a plan before it can edit/write/bash.
+                // Diagnosis tasks: restrict to read-only tools for N turns.
+                // This forces the model to read code before curl/edit.
                 let read_only_tools: &[&str] = &[
                     "read_file", "grep", "glob", "list_directory",
                     "find_references", "list_symbols", "read_symbol",
                 ];
-                let use_filter = self.planning_phase && self.tool_call_count == 0;
+                let use_filter = self.diagnosis_read_only_turns > 0
+                    || (self.planning_phase && self.tool_call_count == 0);
                 let tool_filter: Option<&[&str]> = if use_filter {
                     Some(read_only_tools)
                 } else {
