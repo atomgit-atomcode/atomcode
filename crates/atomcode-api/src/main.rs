@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use tower_http::cors::{Any, CorsLayer};
 
+use atomcode_core::config::Config;
 use atomcode_core::session::{Session, SessionManager, SessionMeta};
 
 /// Project metadata with working directory resolved
@@ -579,6 +580,43 @@ async fn rename_session(
     }
 }
 
+/// Model info for API response
+#[derive(Debug, Serialize)]
+pub struct ModelInfo {
+    /// Provider name
+    pub provider: String,
+    /// Model identifier
+    pub model: String,
+    /// Provider type (claude, openai, ollama)
+    pub provider_type: String,
+    /// Whether this is the default provider
+    pub is_default: bool,
+}
+
+/// GET /models - List all available models from configured providers
+async fn get_models() -> impl IntoResponse {
+    let config_path = Config::default_path();
+    let config = match Config::load(&config_path) {
+        Ok(c) => c,
+        Err(_e) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(Vec::<ModelInfo>::new())).into_response();
+        }
+    };
+    
+    let models: Vec<ModelInfo> = config
+        .providers
+        .iter()
+        .map(|(name, p)| ModelInfo {
+            provider: name.clone(),
+            model: p.model.clone(),
+            provider_type: p.provider_type.clone(),
+            is_default: name == &config.default_provider,
+        })
+        .collect();
+    
+    (StatusCode::OK, Json(models)).into_response()
+}
+
 #[tokio::main]
 async fn main() {
     use axum::routing::patch;
@@ -586,13 +624,14 @@ async fn main() {
     let app = Router::new()
         .route("/sessions", get(get_all_sessions))
         .route("/sessions/search", get(search_sessions))
+        .route("/models", get(get_models))
         .route("/projects", get(get_projects))
         .route("/projects/:hash/sessions", get(get_project_sessions))
         .route("/projects/:hash/sessions/:id", get(get_session_detail).delete(delete_session))
         .route("/projects/:hash/sessions/:id/rename", patch(rename_session))
         .layer(CorsLayer::new().allow_origin(Any).allow_methods(Any));
 
-    let addr = "0.0.0.0:3456";
+    let addr = "0.0.0.0:13456";
     println!("AtomCode API server listening on http://{}", addr);
     println!("\nAPI endpoints:");
     println!("  GET /sessions                       - List all sessions (cross-project)");
