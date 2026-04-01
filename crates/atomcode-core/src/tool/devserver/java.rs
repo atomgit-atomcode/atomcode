@@ -49,6 +49,8 @@ pub fn is_compile_command(cmd: &str) -> bool {
         || lower.contains("mvn install")
         || lower.contains("gradle compile")
         || lower.contains("gradle build")
+        || lower.contains("gradlew build")
+        || lower.contains("gradlew compile")
 }
 
 /// Enhance a failed compile output with source code context.
