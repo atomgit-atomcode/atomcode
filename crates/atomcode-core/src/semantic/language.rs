@@ -13,7 +13,8 @@ pub enum Lang {
     Java,
     C,
     Cpp,
-    /// Vue SFC — script section extracted and parsed as TypeScript.
+    Html,
+    /// Vue SFC — dual parser: <script> as TypeScript, <template> as HTML.
     Vue,
 }
 
@@ -30,12 +31,12 @@ impl Lang {
             Lang::Java => tree_sitter_java::LANGUAGE.into(),
             Lang::C => tree_sitter_c::LANGUAGE.into(),
             Lang::Cpp => tree_sitter_cpp::LANGUAGE.into(),
+            Lang::Html => tree_sitter_html::LANGUAGE.into(),
             Lang::Vue => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
         }
     }
 
     /// The tree-sitter query for extracting function/method definitions.
-    /// Returns (query_string, function_capture_name, name_capture_name).
     pub fn symbols_query(&self) -> &'static str {
         match self {
             Lang::Rust => include_str!("queries/rust.scm"),
@@ -46,8 +47,19 @@ impl Lang {
             Lang::Java => include_str!("queries/java.scm"),
             Lang::C => include_str!("queries/c.scm"),
             Lang::Cpp => include_str!("queries/cpp.scm"),
+            Lang::Html => include_str!("queries/html.scm"),
             Lang::Vue => include_str!("queries/typescript.scm"),
         }
+    }
+
+    /// Whether this language is a Vue SFC (needs dual parsing).
+    pub fn is_vue(&self) -> bool {
+        matches!(self, Lang::Vue)
+    }
+
+    /// Get the HTML grammar for parsing Vue <template> sections.
+    pub fn html_grammar() -> Language {
+        tree_sitter_html::LANGUAGE.into()
     }
 }
 
@@ -68,6 +80,7 @@ impl LanguageRegistry {
             "java" => Some(Lang::Java),
             "c" | "h" => Some(Lang::C),
             "cc" | "cpp" | "cxx" | "hh" | "hpp" | "hxx" => Some(Lang::Cpp),
+            "html" | "htm" => Some(Lang::Html),
             "vue" | "svelte" => Some(Lang::Vue),
             _ => None,
         }

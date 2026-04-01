@@ -63,6 +63,10 @@ run_test_suite "Phase 2 Tests" \
 run_test_suite "Full Restart Tests" \
     "cargo test -p atomcode-core --test full_restart_test 2>&1"
 
+# 3.5. Vue template tests
+run_test_suite "Vue Template Tests" \
+    "cargo test -p atomcode-core --test vue_template_test 2>&1"
+
 # 4. Grep integration tests
 run_test_suite "Grep Tests" \
     "cargo test -p atomcode-core --test grep_test 2>&1"
