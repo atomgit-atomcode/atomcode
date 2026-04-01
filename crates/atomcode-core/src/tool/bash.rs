@@ -94,8 +94,8 @@ async fn bash_execute(args: &str, ctx: &ToolContext) -> Result<ToolResult> {
                 && !cmd_trimmed.contains(">/dev/null")
                 && !cmd_trimmed.contains("&>/dev/null")
             {
-                // Find the backgrounded command and add nohup + redirect
                 if let Some(amp_pos) = cmd_trimmed.find(" &") {
+                    // Has &: wrap the backgrounded part with nohup
                     let bg_cmd = cmd_trimmed[..amp_pos].trim();
                     let rest = cmd_trimmed[amp_pos + 2..].trim();
                     if rest.is_empty() {
@@ -103,6 +103,10 @@ async fn bash_execute(args: &str, ctx: &ToolContext) -> Result<ToolResult> {
                     } else {
                         parsed.command = format!("nohup {} >/dev/null 2>&1 & {}", bg_cmd, rest);
                     }
+                } else {
+                    // No &: server command without background marker.
+                    // Auto-wrap entire command with nohup to prevent hang.
+                    parsed.command = format!("nohup sh -c '{}' >/dev/null 2>&1 &", cmd_trimmed.replace('\'', "'\\''"));
                 }
             }
         }
