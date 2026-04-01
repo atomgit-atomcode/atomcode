@@ -252,7 +252,12 @@ pub async fn full_restart(
                     error_lines
                 };
                 let enhanced = enhance_compile_error(&errors_to_enhance, working_dir);
-                output.push_str(&format!("[Step 2/4] Compile FAILED:\n{}\n", enhanced));
+                // Clear all step output — model only needs to see the error
+                output.clear();
+                output.push_str(&format!(
+                    "[COMPILE FAILED — server NOT started. Fix the code, then retry.]\n\n{}",
+                    enhanced,
+                ));
                 return (false, output);
             }
             output.push_str("[Step 2/4] Compile passed\n");
@@ -304,12 +309,16 @@ pub async fn full_restart(
         .current_dir(working_dir)
         .output()
         .await;
+    // Replace verbose step output with concise success message
+    output.clear();
+    output.push_str(&format!("[Server restarted on port {}. Compile passed, port ready.", port));
     if let Ok(o) = health {
         let body = String::from_utf8_lossy(&o.stdout);
-        let short = if body.len() > 100 { &body[..100] } else { &body };
-        output.push_str(&format!("[Health] {}\n", short.trim()));
+        let short = if body.len() > 80 { &body[..80] } else { &body };
+        output.push_str(&format!(" Health: {}]", short.trim()));
+    } else {
+        output.push(']');
     }
-    output.push_str("Server restarted successfully. You can now test your changes.\n");
 
     (true, output)
 }
