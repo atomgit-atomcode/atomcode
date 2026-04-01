@@ -44,6 +44,19 @@ impl TurnRunner {
         event_tx: &mpsc::UnboundedSender<TurnEvent>,
         cancel: CancellationToken,
     ) -> TurnResult {
+        self.run_with_filter(conversation, system_prompt, event_tx, cancel, None).await
+    }
+
+    /// Run with optional tool filter. If `allowed_tools` is Some, only those tools
+    /// are visible to the LLM. Used by Phase 2 to restrict first turn to read-only.
+    pub async fn run_with_filter(
+        &self,
+        conversation: &mut Conversation,
+        system_prompt: &str,
+        event_tx: &mpsc::UnboundedSender<TurnEvent>,
+        cancel: CancellationToken,
+        allowed_tools: Option<&[&str]>,
+    ) -> TurnResult {
         // 1. Build messages within token budget
         let context_window = self
             .config
@@ -80,7 +93,14 @@ impl TurnRunner {
         }
 
         // 3. Get tool definitions for the LLM
-        let tool_defs = self.tools.get_definitions();
+        let all_tool_defs = self.tools.get_definitions();
+        let tool_defs: Vec<_> = if let Some(filter) = allowed_tools {
+            all_tool_defs.into_iter()
+                .filter(|d| filter.contains(&d.name))
+                .collect()
+        } else {
+            all_tool_defs
+        };
 
         // 3. Start streaming
         let stream_result = self.provider.chat_stream(&messages, Some(&tool_defs));

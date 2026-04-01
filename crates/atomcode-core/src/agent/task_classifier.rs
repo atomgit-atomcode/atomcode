@@ -88,8 +88,12 @@ pub fn classify(message: &str, has_previous_turns: bool) -> TaskType {
         || lower.contains("失败") || lower.contains("空白") || lower.contains("空的")
         || lower.contains("不显示") || lower.contains("找不到") || lower.contains("不能")
         || lower.contains("没有显示") || lower.contains("不出来") || lower.contains("不准")
+        || lower.contains("没有一次") || lower.contains("没有任何") || lower.contains("也没")
+        || lower.contains("没有提示") || lower.contains("没有通知") || lower.contains("没反应")
+        || lower.contains("不生效") || lower.contains("没生效") || lower.contains("没起作用")
         || lower.contains("error") || lower.contains("fail") || lower.contains("empty")
-        || lower.contains("broken") || lower.contains("missing");
+        || lower.contains("broken") || lower.contains("missing")
+        || lower.contains("no result") || lower.contains("nothing");
     let is_question = (msg.ends_with('?') || msg.ends_with('？')
         || lower.contains("是什么") || lower.contains("为什么")
         || lower.contains("怎么来的") || lower.contains("如何")
@@ -119,9 +123,12 @@ pub fn classify(message: &str, has_previous_turns: bool) -> TaskType {
         "报错", "错误", "不行了", "失败", "空白", "不显示", "不工作",
         "找不到", "没有显示", "不能", "无法", "异常", "崩溃",
         "没有成功", "没成功", "空的", "不出来", "没有配置",
+        "没有一次", "没有任何", "也没", "没有提示", "没有通知",
+        "没反应", "不生效", "没生效", "没起作用",
         "点击", "点了", "打开", // user actions that imply something failed
         "error", "fail", "broken", "crash", "blank", "empty",
         "not showing", "doesn't", "can't", "unable", "missing",
+        "no result", "nothing", "not working",
     ];
     if bug_keywords.iter().any(|kw| lower.contains(kw)) {
         return TaskType::BugFix;

@@ -1,4 +1,8 @@
 fn main() {
+    // Always re-run: git HEAD changes on every commit.
+    println!("cargo:rerun-if-changed=../../.git/HEAD");
+    println!("cargo:rerun-if-changed=../../.git/refs/heads/");
+
     // Inject git short hash as ATOMCODE_BUILD_ID at compile time.
     let output = std::process::Command::new("git")
         .args(["rev-parse", "--short", "HEAD"])

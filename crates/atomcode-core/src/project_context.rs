@@ -290,8 +290,18 @@ fn scan_tree(
         .collect();
     items.sort_by_key(|e| e.file_name());
 
+    // Directories first (always show), then files capped at 20 per directory.
+    // Prevents large directories (e.g., 295 datalog files) from drowning the tree.
+    let (dirs, files): (Vec<_>, Vec<_>) = items.iter()
+        .partition(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false));
+    let mut visible: Vec<&std::fs::DirEntry> = dirs.clone();
+    let file_limit = 20;
+    let truncated = files.len().saturating_sub(file_limit);
+    visible.extend(files.iter().take(file_limit));
+    visible.sort_by_key(|e| e.file_name());
+
     let mut out = String::new();
-    for entry in &items {
+    for entry in &visible {
         let name = entry.file_name().to_string_lossy().to_string();
         let indent = "  ".repeat(depth);
         if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
@@ -338,6 +348,10 @@ fn scan_tree(
                 out.push_str(&format!("{}{}\n", indent, name));
             }
         }
+    }
+    if truncated > 0 {
+        let indent = "  ".repeat(depth);
+        out.push_str(&format!("{}(... {} more files)\n", indent, truncated));
     }
     out
 }

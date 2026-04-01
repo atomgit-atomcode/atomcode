@@ -4,6 +4,7 @@
 
 pub mod git_checkpoint;
 pub mod knowledge;
+pub mod subtask_driver;
 pub mod task_classifier;
 
 use std::collections::HashSet;
@@ -209,7 +210,8 @@ pub struct AgentLoop {
     /// Whether planning phase is active (first LLM call without tools to force a plan).
     planning_phase: bool,
     /// Current task type — drives dynamic prompt selection and planning.
-    current_task_type: task_classifier::TaskType,
+    /// ATLAS-style subtask driver: decomposes plan into per-file subtasks.
+    subtask_driver: subtask_driver::SubtaskDriver,
 
     /// Discovered service URLs extracted from tool outputs (e.g., "http://localhost:3002").
     /// Persisted across turns so the model knows which ports are active.
@@ -322,7 +324,7 @@ impl AgentLoop {
             active_file: None,
             pending_input: None,
             planning_phase: false,
-            current_task_type: task_classifier::TaskType::BugFix,
+            subtask_driver: subtask_driver::SubtaskDriver::new(),
             session_files: std::collections::HashMap::new(),
             active_services: std::collections::HashMap::new(),
             result_store: ToolResultStore::new(ToolResultStore::default_dir()),
@@ -511,10 +513,12 @@ impl AgentLoop {
         self.turn_start = Some(Instant::now());
         self.cancel_token = CancellationToken::new();
 
-        // Classify task type — drives dynamic prompt + planning decision.
-        let has_prev = !self.conversation.messages.is_empty();
-        self.current_task_type = task_classifier::classify(&content, has_prev);
-        self.planning_phase = self.current_task_type.needs_planning();
+        // Simple heuristic: short messages (questions/commands) skip planning.
+        // Everything else gets planning + tool restriction.
+        // No task classification — unified prompt handles all types.
+        let is_short = content.chars().count() < 20;
+        let is_question = content.ends_with('?') || content.ends_with('？');
+        self.planning_phase = !is_short && !is_question;
 
         self.phase = AgentPhase::Thinking;
         let _ = self
@@ -812,8 +816,22 @@ impl AgentLoop {
                 let consecutive_reads = &mut self.consecutive_reads;
                 let session_files = &mut self.session_files;
 
-                // Run TurnRunner concurrently with command processing
-                let turn_fut = runner.run(&mut conv, &system_prompt, &turn_tx, cancel);
+                // Run TurnRunner concurrently with command processing.
+                // Phase 2: first turn of planning tasks → restrict to read-only tools.
+                // Model must output a plan before it can edit/write/bash.
+                let read_only_tools: &[&str] = &[
+                    "read_file", "grep", "glob", "list_directory",
+                    "find_references", "list_symbols", "read_symbol",
+                ];
+                let use_filter = self.planning_phase && self.tool_call_count == 0;
+                let tool_filter: Option<&[&str]> = if use_filter {
+                    Some(read_only_tools)
+                } else {
+                    None
+                };
+                let turn_fut = runner.run_with_filter(
+                    &mut conv, &system_prompt, &turn_tx, cancel, tool_filter,
+                );
                 tokio::pin!(turn_fut);
 
                 let result = loop {
@@ -990,17 +1008,45 @@ impl AgentLoop {
                 TurnResult::Responded { ref text, tokens } => {
                     self.turn_tokens += tokens;
                     self.total_tokens += tokens;
+
+                    // ATLAS subtask extraction: if model just output a plan (FeatureDev,
+                    // first response with text, no tools used yet), extract subtasks
+                    // and drive execution file-by-file.
+                    if self.tool_call_count == 0
+                        && !text.trim().is_empty()
+                        && !self.subtask_driver.active
+                    {
+                        self.subtask_driver.extract_from_plan(text);
+                        if self.subtask_driver.active {
+                            // Inject first subtask instruction
+                            if let Some(instr) = self.subtask_driver.current_instruction() {
+                                self.conversation.add_user_message(&instr);
+                            }
+                            continue; // Don't finish — drive subtask execution
+                        }
+                    }
+
                     // Empty response from LLM (common with DeepSeek/SiliconFlow):
                     // If we edited files, ask model to summarize before ending.
                     let is_empty = text.trim().is_empty() && tokens == 0;
                     if is_empty && self.retry_count < 2 && self.tool_call_count > 0 {
                         self.retry_count += 1;
+                        // Ensure valid message alternation: empty LLM response didn't add
+                        // an Assistant message, so add one before injecting User message.
+                        // Without this: ToolResult → User (invalid) → LLM returns empty.
+                        self.conversation.messages.push(
+                            crate::conversation::message::Message::new(
+                                crate::conversation::message::Role::Assistant,
+                                "(continuing...)".to_string(),
+                            )
+                        );
                         if !self.files_edited_this_turn.is_empty() {
-                            // Nudge model to produce a summary
                             let files = self.files_edited_this_turn.join(", ");
                             self.conversation.add_user_message(&format!(
                                 "Summarize what you changed: {}", files,
                             ));
+                        } else {
+                            self.conversation.add_user_message("Continue.");
                         }
                         tokio::time::sleep(Duration::from_secs(2)).await;
                         continue;
@@ -1021,6 +1067,14 @@ impl AgentLoop {
                     }
                     // Post-process: truncate large outputs + externalize to disk
                     self.post_process_tool_results(tool_count);
+
+                    // ATLAS-style auto-verify: if files were edited, auto-compile
+                    // and inject result. Catches errors immediately instead of
+                    // letting model pile up 10 broken edits before compiling.
+                    if !self.files_edited_this_turn.is_empty() {
+                        self.auto_compile_verify().await;
+                    }
+
                     // Apply discipline: inject reminders, check step limits
                     self.apply_post_turn_discipline();
                     if self.check_step_limit() {
@@ -1443,6 +1497,113 @@ impl AgentLoop {
         self.conversation.finalize_stream();
     }
 
+    /// ATLAS-style auto-compile verification after edits.
+    /// Detects the project's compile command and runs it.
+    /// Injects result into conversation so model sees errors immediately.
+    /// Only runs once per "batch" of edits (tracked by last_compile_at_step).
+    async fn auto_compile_verify(&mut self) {
+        // Only auto-compile for compiled languages (Java/Rust/Go/TS).
+        // Skip if we already compiled at this step count.
+        static COMPILE_COMMANDS: &[(&str, &str)] = &[
+            ("pom.xml", "mvn compile -q 2>&1 | tail -20"),
+            ("build.gradle", "gradle compileJava -q 2>&1 | tail -20"),
+            ("Cargo.toml", "cargo check 2>&1 | tail -20"),
+            ("tsconfig.json", "npx tsc --noEmit 2>&1 | tail -20"),
+        ];
+
+        let wd = self.turn_runner.context.working_dir.try_read()
+            .map(|g| g.clone()).unwrap_or_default();
+
+        // Find compile command by checking for build files (project root or subdirs)
+        let mut compile_cmd: Option<String> = None;
+        let mut compile_dir = wd.clone();
+
+        for &(marker, cmd) in COMPILE_COMMANDS {
+            // Check project root
+            if wd.join(marker).exists() {
+                compile_cmd = Some(cmd.to_string());
+                compile_dir = wd.clone();
+                break;
+            }
+            // Check common subdirs (backend/, server/)
+            for subdir in &["backend", "server"] {
+                let sub = wd.join(subdir);
+                if sub.join(marker).exists() {
+                    compile_cmd = Some(format!("cd {} && {}", sub.display(), cmd));
+                    compile_dir = sub;
+                    break;
+                }
+            }
+            if compile_cmd.is_some() { break; }
+        }
+
+        let compile_cmd = match compile_cmd {
+            Some(c) => c,
+            None => return, // No compiled language detected
+        };
+
+        // Don't auto-compile every single edit — only when model has done 2+ edits
+        // since last compile, to avoid slowing down single-edit turns.
+        if self.files_edited_this_turn.len() < 2 && self.build_fail_count == 0 {
+            return;
+        }
+
+        // Run compile
+        let output = tokio::process::Command::new("bash")
+            .arg("-c")
+            .arg(&compile_cmd)
+            .current_dir(&compile_dir)
+            .output()
+            .await;
+
+        match output {
+            Ok(o) => {
+                let stdout = String::from_utf8_lossy(&o.stdout);
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                let combined = format!("{}{}", stdout, stderr);
+
+                if o.status.success() {
+                    // Compile passed — inject short confirmation
+                    self.build_fail_count = 0;
+                    // Advance subtask driver on compile pass
+                    if self.subtask_driver.active {
+                        self.subtask_driver.advance();
+                        if let Some(instr) = self.subtask_driver.current_instruction() {
+                            self.conversation.add_user_message(&format!(
+                                "[Auto-compile: PASSED]\n{}", instr
+                            ));
+                        } else {
+                            self.conversation.add_user_message(
+                                "[Auto-compile: PASSED. All subtasks done. Verify and summarize.]"
+                            );
+                        }
+                    } else {
+                        self.conversation.add_user_message("[Auto-compile: PASSED. Continue.]");
+                    }
+                } else {
+                    // Compile failed — inject error with source diagnosis
+                    self.build_fail_count += 1;
+                    let enhanced = crate::tool::devserver::java::enhance_compile_error(
+                        &combined, &compile_dir,
+                    );
+                    // Trim to keep context small
+                    let error_lines: String = enhanced.lines()
+                        .filter(|l| l.contains("[ERROR]") || l.contains(">>>") || l.contains("---") || l.contains("[AUTO"))
+                        .take(20)
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    let msg = if error_lines.is_empty() {
+                        format!("[Auto-compile: FAILED]\n{}", combined.lines().take(15).collect::<Vec<_>>().join("\n"))
+                    } else {
+                        format!("[Auto-compile: FAILED]\n{}", error_lines)
+                    };
+                    self.conversation.add_user_message(&msg);
+                }
+            }
+            Err(_) => {} // Compile command not available, skip
+        }
+    }
+
     fn finish_turn(&mut self) {
         // Mark the current turn as completed in the tracker.
         self.conversation.turn_tracker.complete_current();
@@ -1470,7 +1631,7 @@ impl AgentLoop {
         {
             custom.to_string()
         } else {
-            crate::config::prompt_sections::build_rules_for_task(&self.current_task_type)
+            crate::config::prompt_sections::build_rules().to_string()
         };
 
         let wd: PathBuf = self
@@ -1552,6 +1713,13 @@ impl AgentLoop {
 
         if !git_info.is_empty() {
             prompt.push_str(&format!("Git: {}\n", git_info));
+        }
+
+        // Recent activity: extract edited file names from the most recent datalog.
+        // Only file names (not content/user messages) — safe, small, factual.
+        let recent_activity = extract_recent_activity_from_datalog(&wd);
+        if !recent_activity.is_empty() {
+            prompt.push_str(&format!("Recent activity: {}\n", recent_activity));
         }
 
         // Active services detected via lsof + extracted from tool outputs.
@@ -2089,6 +2257,63 @@ fn short_path(path: &str) -> String {
         2 => format!("{}/{}", parts[1], parts[0]),
         _ => format!(".../{}/{}", parts[1], parts[0]),
     }
+}
+
+/// Extract recently edited file names from the most recent datalog file.
+/// Returns a comma-separated list of unique file names (max 5).
+/// Only extracts from "Edit File" and "Write File" lines — safe, factual, small.
+fn extract_recent_activity_from_datalog(working_dir: &std::path::Path) -> String {
+    let log_dir = working_dir.join("datalog");
+    if !log_dir.is_dir() {
+        return String::new();
+    }
+
+    // Find the most recent .md file in datalog/
+    let mut files: Vec<_> = match std::fs::read_dir(&log_dir) {
+        Ok(entries) => entries
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().map(|x| x == "md").unwrap_or(false))
+            .collect(),
+        Err(_) => return String::new(),
+    };
+    files.sort_by_key(|e| std::cmp::Reverse(e.file_name()));
+    let latest = match files.first() {
+        Some(f) => f.path(),
+        None => return String::new(),
+    };
+
+    // Read and extract file names from "Edit File" / "Write File" lines
+    let content = match std::fs::read_to_string(&latest) {
+        Ok(c) => c,
+        Err(_) => return String::new(),
+    };
+
+    let mut edited_files = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        // Match: "- Edit File .../SomeFile.ext" or "- Write File .../SomeFile.ext"
+        if (trimmed.starts_with("- Edit File") || trimmed.starts_with("- Write File"))
+            && trimmed.contains("...")
+        {
+            // Extract the short file path after "..."
+            if let Some(pos) = trimmed.rfind('/') {
+                let file_name = &trimmed[pos + 1..];
+                // Clean up: remove trailing content like " (-3 +5 lines)"
+                let clean = file_name.split(|c: char| c == ' ' || c == '(')
+                    .next()
+                    .unwrap_or(file_name)
+                    .trim();
+                if !clean.is_empty() && seen.insert(clean.to_string()) {
+                    edited_files.push(clean.to_string());
+                    if edited_files.len() >= 5 { break; }
+                }
+            }
+        }
+    }
+
+    edited_files.join(", ")
 }
 
 
