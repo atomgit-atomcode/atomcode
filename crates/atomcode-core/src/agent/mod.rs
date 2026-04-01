@@ -4,6 +4,7 @@
 
 pub mod git_checkpoint;
 pub mod knowledge;
+pub mod subtask_driver;
 pub mod task_classifier;
 
 use std::collections::HashSet;
@@ -210,6 +211,8 @@ pub struct AgentLoop {
     planning_phase: bool,
     /// Current task type — drives dynamic prompt selection and planning.
     current_task_type: task_classifier::TaskType,
+    /// ATLAS-style subtask driver: decomposes plan into per-file subtasks.
+    subtask_driver: subtask_driver::SubtaskDriver,
 
     /// Discovered service URLs extracted from tool outputs (e.g., "http://localhost:3002").
     /// Persisted across turns so the model knows which ports are active.
@@ -323,6 +326,7 @@ impl AgentLoop {
             pending_input: None,
             planning_phase: false,
             current_task_type: task_classifier::TaskType::BugFix,
+            subtask_driver: subtask_driver::SubtaskDriver::new(),
             session_files: std::collections::HashMap::new(),
             active_services: std::collections::HashMap::new(),
             result_store: ToolResultStore::new(ToolResultStore::default_dir()),
@@ -1005,13 +1009,31 @@ impl AgentLoop {
                 TurnResult::Responded { ref text, tokens } => {
                     self.turn_tokens += tokens;
                     self.total_tokens += tokens;
+
+                    // ATLAS subtask extraction: if model just output a plan (FeatureDev,
+                    // first response with text, no tools used yet), extract subtasks
+                    // and drive execution file-by-file.
+                    if self.current_task_type == task_classifier::TaskType::FeatureDev
+                        && self.tool_call_count == 0
+                        && !text.trim().is_empty()
+                        && !self.subtask_driver.active
+                    {
+                        self.subtask_driver.extract_from_plan(text);
+                        if self.subtask_driver.active {
+                            // Inject first subtask instruction
+                            if let Some(instr) = self.subtask_driver.current_instruction() {
+                                self.conversation.add_user_message(&instr);
+                            }
+                            continue; // Don't finish — drive subtask execution
+                        }
+                    }
+
                     // Empty response from LLM (common with DeepSeek/SiliconFlow):
                     // If we edited files, ask model to summarize before ending.
                     let is_empty = text.trim().is_empty() && tokens == 0;
                     if is_empty && self.retry_count < 2 && self.tool_call_count > 0 {
                         self.retry_count += 1;
                         if !self.files_edited_this_turn.is_empty() {
-                            // Nudge model to produce a summary
                             let files = self.files_edited_this_turn.join(", ");
                             self.conversation.add_user_message(&format!(
                                 "Summarize what you changed: {}", files,
@@ -1036,6 +1058,14 @@ impl AgentLoop {
                     }
                     // Post-process: truncate large outputs + externalize to disk
                     self.post_process_tool_results(tool_count);
+
+                    // ATLAS-style auto-verify: if files were edited, auto-compile
+                    // and inject result. Catches errors immediately instead of
+                    // letting model pile up 10 broken edits before compiling.
+                    if !self.files_edited_this_turn.is_empty() {
+                        self.auto_compile_verify().await;
+                    }
+
                     // Apply discipline: inject reminders, check step limits
                     self.apply_post_turn_discipline();
                     if self.check_step_limit() {
@@ -1456,6 +1486,113 @@ impl AgentLoop {
         // Inject as assistant thought + will trigger another LLM call
         self.conversation.push_delta(&verify_msg);
         self.conversation.finalize_stream();
+    }
+
+    /// ATLAS-style auto-compile verification after edits.
+    /// Detects the project's compile command and runs it.
+    /// Injects result into conversation so model sees errors immediately.
+    /// Only runs once per "batch" of edits (tracked by last_compile_at_step).
+    async fn auto_compile_verify(&mut self) {
+        // Only auto-compile for compiled languages (Java/Rust/Go/TS).
+        // Skip if we already compiled at this step count.
+        static COMPILE_COMMANDS: &[(&str, &str)] = &[
+            ("pom.xml", "mvn compile -q 2>&1 | tail -20"),
+            ("build.gradle", "gradle compileJava -q 2>&1 | tail -20"),
+            ("Cargo.toml", "cargo check 2>&1 | tail -20"),
+            ("tsconfig.json", "npx tsc --noEmit 2>&1 | tail -20"),
+        ];
+
+        let wd = self.turn_runner.context.working_dir.try_read()
+            .map(|g| g.clone()).unwrap_or_default();
+
+        // Find compile command by checking for build files (project root or subdirs)
+        let mut compile_cmd: Option<String> = None;
+        let mut compile_dir = wd.clone();
+
+        for &(marker, cmd) in COMPILE_COMMANDS {
+            // Check project root
+            if wd.join(marker).exists() {
+                compile_cmd = Some(cmd.to_string());
+                compile_dir = wd.clone();
+                break;
+            }
+            // Check common subdirs (backend/, server/)
+            for subdir in &["backend", "server"] {
+                let sub = wd.join(subdir);
+                if sub.join(marker).exists() {
+                    compile_cmd = Some(format!("cd {} && {}", sub.display(), cmd));
+                    compile_dir = sub;
+                    break;
+                }
+            }
+            if compile_cmd.is_some() { break; }
+        }
+
+        let compile_cmd = match compile_cmd {
+            Some(c) => c,
+            None => return, // No compiled language detected
+        };
+
+        // Don't auto-compile every single edit — only when model has done 2+ edits
+        // since last compile, to avoid slowing down single-edit turns.
+        if self.files_edited_this_turn.len() < 2 && self.build_fail_count == 0 {
+            return;
+        }
+
+        // Run compile
+        let output = tokio::process::Command::new("bash")
+            .arg("-c")
+            .arg(&compile_cmd)
+            .current_dir(&compile_dir)
+            .output()
+            .await;
+
+        match output {
+            Ok(o) => {
+                let stdout = String::from_utf8_lossy(&o.stdout);
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                let combined = format!("{}{}", stdout, stderr);
+
+                if o.status.success() {
+                    // Compile passed — inject short confirmation
+                    self.build_fail_count = 0;
+                    // Advance subtask driver on compile pass
+                    if self.subtask_driver.active {
+                        self.subtask_driver.advance();
+                        if let Some(instr) = self.subtask_driver.current_instruction() {
+                            self.conversation.add_user_message(&format!(
+                                "[Auto-compile: PASSED]\n{}", instr
+                            ));
+                        } else {
+                            self.conversation.add_user_message(
+                                "[Auto-compile: PASSED. All subtasks done. Verify and summarize.]"
+                            );
+                        }
+                    } else {
+                        self.conversation.add_user_message("[Auto-compile: PASSED. Continue.]");
+                    }
+                } else {
+                    // Compile failed — inject error with source diagnosis
+                    self.build_fail_count += 1;
+                    let enhanced = crate::tool::devserver::java::enhance_compile_error(
+                        &combined, &compile_dir,
+                    );
+                    // Trim to keep context small
+                    let error_lines: String = enhanced.lines()
+                        .filter(|l| l.contains("[ERROR]") || l.contains(">>>") || l.contains("---") || l.contains("[AUTO"))
+                        .take(20)
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    let msg = if error_lines.is_empty() {
+                        format!("[Auto-compile: FAILED]\n{}", combined.lines().take(15).collect::<Vec<_>>().join("\n"))
+                    } else {
+                        format!("[Auto-compile: FAILED]\n{}", error_lines)
+                    };
+                    self.conversation.add_user_message(&msg);
+                }
+            }
+            Err(_) => {} // Compile command not available, skip
+        }
     }
 
     fn finish_turn(&mut self) {
