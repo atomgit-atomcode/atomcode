@@ -210,7 +210,6 @@ pub struct AgentLoop {
     /// Whether planning phase is active (first LLM call without tools to force a plan).
     planning_phase: bool,
     /// Current task type — drives dynamic prompt selection and planning.
-    current_task_type: task_classifier::TaskType,
     /// ATLAS-style subtask driver: decomposes plan into per-file subtasks.
     subtask_driver: subtask_driver::SubtaskDriver,
 
@@ -325,7 +324,6 @@ impl AgentLoop {
             active_file: None,
             pending_input: None,
             planning_phase: false,
-            current_task_type: task_classifier::TaskType::BugFix,
             subtask_driver: subtask_driver::SubtaskDriver::new(),
             session_files: std::collections::HashMap::new(),
             active_services: std::collections::HashMap::new(),
@@ -515,10 +513,12 @@ impl AgentLoop {
         self.turn_start = Some(Instant::now());
         self.cancel_token = CancellationToken::new();
 
-        // Classify task type — drives dynamic prompt + planning decision.
-        let has_prev = !self.conversation.messages.is_empty();
-        self.current_task_type = task_classifier::classify(&content, has_prev);
-        self.planning_phase = self.current_task_type.needs_planning();
+        // Simple heuristic: short messages (questions/commands) skip planning.
+        // Everything else gets planning + tool restriction.
+        // No task classification — unified prompt handles all types.
+        let is_short = content.chars().count() < 20;
+        let is_question = content.ends_with('?') || content.ends_with('？');
+        self.planning_phase = !is_short && !is_question;
 
         self.phase = AgentPhase::Thinking;
         let _ = self
@@ -823,8 +823,7 @@ impl AgentLoop {
                     "read_file", "grep", "glob", "list_directory",
                     "find_references", "list_symbols", "read_symbol",
                 ];
-                let use_filter = self.planning_phase && self.tool_call_count == 0
-                    && self.current_task_type.restrict_first_turn();
+                let use_filter = self.planning_phase && self.tool_call_count == 0;
                 let tool_filter: Option<&[&str]> = if use_filter {
                     Some(read_only_tools)
                 } else {
@@ -1013,8 +1012,7 @@ impl AgentLoop {
                     // ATLAS subtask extraction: if model just output a plan (FeatureDev,
                     // first response with text, no tools used yet), extract subtasks
                     // and drive execution file-by-file.
-                    if self.current_task_type == task_classifier::TaskType::FeatureDev
-                        && self.tool_call_count == 0
+                    if self.tool_call_count == 0
                         && !text.trim().is_empty()
                         && !self.subtask_driver.active
                     {
@@ -1622,7 +1620,7 @@ impl AgentLoop {
         {
             custom.to_string()
         } else {
-            crate::config::prompt_sections::build_rules_for_task(&self.current_task_type)
+            crate::config::prompt_sections::build_rules().to_string()
         };
 
         let wd: PathBuf = self
