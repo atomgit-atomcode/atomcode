@@ -87,6 +87,10 @@ pub enum AgentEvent {
     TurnComplete {
         duration: Duration,
         total_tokens: usize,
+        /// LLM round-trips (Claude Code-compatible metric).
+        turn_count: usize,
+        /// Total individual tool calls.
+        tool_call_count: usize,
     },
     /// An error occurred.
     Error(String),
@@ -129,6 +133,10 @@ pub struct AgentLoop {
 
     // Per-turn counters
     tool_call_count: usize,
+    /// LLM round-trip count (Claude Code-compatible "turn" metric).
+    /// Each iteration of run_turn_loop = 1 turn, regardless of how many
+    /// tools were called in that iteration.
+    turn_count: usize,
     retry_count: usize,
 
     // Approval channel endpoints for InteractivePermissionDecider
@@ -193,6 +201,9 @@ pub struct AgentLoop {
     category_fail_streak: std::collections::HashMap<String, usize>,
     /// Last bash command string (set on ToolCallStarted, used on ToolCallResult).
     last_bash_cmd: String,
+    /// Exception signature from previous auto_diagnose (e.g. "TransactionRequiredException").
+    /// Used to detect when the same error recurs after a "fix" attempt.
+    last_diagnosed_error: String,
 
     /// Last git checkpoint ref (SHA) for /undo rollback.
     pub last_checkpoint: Option<String>,
@@ -291,6 +302,7 @@ impl AgentLoop {
             total_tokens: 0,
             turn_start: None,
             tool_call_count: 0,
+            turn_count: 0,
             retry_count: 0,
             approval_req_rx,
             approval_resp_tx,
@@ -320,6 +332,7 @@ impl AgentLoop {
             executed_cmds: std::collections::HashMap::new(),
             category_fail_streak: std::collections::HashMap::new(),
             last_bash_cmd: String::new(),
+            last_diagnosed_error: String::new(),
             last_checkpoint: None,
             active_file: None,
             pending_input: None,
@@ -484,9 +497,23 @@ impl AgentLoop {
         // Auto-diagnose: if user mentions error keywords, scan logs and attach findings.
         // This gives the model the real error from Turn 1, instead of spending 3-5 turns grepping.
         let enriched = self.auto_diagnose_errors(&content).await;
-        self.conversation.add_user_message(&enriched);
+        // Extract and store exception signature for recurrence detection across turns.
+        if let Some(pos) = enriched.find("<!-- diag_exception:") {
+            let rest = &enriched[pos + 20..];
+            if let Some(end) = rest.find(" -->") {
+                self.last_diagnosed_error = rest[..end].to_string();
+            }
+        }
+        // Strip the hidden marker before adding to conversation
+        let clean = if let Some(pos) = enriched.find("\n<!-- diag_exception:") {
+            enriched[..pos].to_string()
+        } else {
+            enriched
+        };
+        self.conversation.add_user_message(&clean);
         self.turn_tokens = 0;
         self.tool_call_count = 0;
+        self.turn_count = 0;
         self.retry_count = 0;
         self.recent_calls.clear();
         self.files_read_this_turn.clear();
@@ -558,8 +585,9 @@ impl AgentLoop {
             .unwrap_or_default();
 
         // Find log files: *.log in project root and common subdirs
-        let log_candidates = ["backend.log", "server.log", "app.log",
-            "backend/backend.log", "logs/app.log", "log/development.log"];
+        let log_candidates = ["backend.log", "server.log", "app.log", "nohup.out",
+            "backend/backend.log", "backend/nohup.out",
+            "logs/app.log", "log/development.log"];
 
         let mut diagnostics = Vec::new();
 
@@ -567,7 +595,14 @@ impl AgentLoop {
             let log_path = wd.join(log_name);
             if !log_path.exists() { continue; }
 
-            // grep for recent errors/exceptions
+            // Check if log is stale (mtime > 5 min ago).
+            // Stale logs contain only old startup output, not the runtime error
+            // the user is reporting. Still scan but tag as stale.
+            let is_stale = std::fs::metadata(&log_path).ok()
+                .and_then(|m| m.modified().ok())
+                .map(|mtime| mtime.elapsed().unwrap_or_default().as_secs() > 300)
+                .unwrap_or(false);
+
             if let Ok(output) = tokio::process::Command::new("grep")
                 .args(&["-i", "-E", "error|exception|fail|caused by",
                     &log_path.to_string_lossy()])
@@ -576,28 +611,46 @@ impl AgentLoop {
             {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 if !stdout.trim().is_empty() {
-                    // Take last 15 lines of errors
                     let lines: Vec<&str> = stdout.lines().collect();
                     let start = lines.len().saturating_sub(15);
                     let recent = lines[start..].join("\n");
-                    diagnostics.push(format!("[Auto-detected from {}:]\n{}", log_name, recent));
+                    if is_stale {
+                        diagnostics.push(format!(
+                            "[Auto-detected from {} (STALE — last modified >5min ago, errors may be old):]\n{}",
+                            log_name, recent
+                        ));
+                    } else {
+                        diagnostics.push(format!("[Auto-detected from {}:]\n{}", log_name, recent));
+                    }
                 }
             }
         }
 
-        // Also check if any service on common ports is responding with errors
-        if diagnostics.is_empty() {
-            // Try npm/vite dev server log
-            for log_name in &["frontend/.vite/log", "nohup.out"] {
-                let log_path = wd.join(log_name);
-                if log_path.exists() {
-                    if let Ok(content_str) = tokio::fs::read_to_string(&log_path).await {
-                        let lines: Vec<&str> = content_str.lines().collect();
-                        let start = lines.len().saturating_sub(10);
-                        let tail = lines[start..].join("\n");
-                        if tail.to_lowercase().contains("error") {
-                            diagnostics.push(format!("[Auto-detected from {}:]\n{}", log_name, tail));
-                        }
+        // Fallback: if all logs are stale or empty, try to capture live output
+        // from running Java/Node processes via their recent stderr.
+        let all_stale_or_empty = diagnostics.is_empty()
+            || diagnostics.iter().all(|d| d.contains("STALE"));
+        if all_stale_or_empty {
+            // Try Spring Boot default log location
+            let spring_log = wd.join("backend/logs/spring.log");
+            if spring_log.exists() {
+                if let Ok(output) = tokio::process::Command::new("tail")
+                    .args(&["-50", &spring_log.to_string_lossy()])
+                    .output().await
+                {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    let error_lines: Vec<&str> = stdout.lines()
+                        .filter(|l| {
+                            let low = l.to_lowercase();
+                            low.contains("error") || low.contains("exception") || low.contains("caused by")
+                        })
+                        .collect();
+                    if !error_lines.is_empty() {
+                        let start = error_lines.len().saturating_sub(15);
+                        diagnostics.push(format!(
+                            "[Auto-detected from logs/spring.log:]\n{}",
+                            error_lines[start..].join("\n")
+                        ));
                     }
                 }
             }
@@ -647,7 +700,32 @@ impl AgentLoop {
         }
         drop(searcher);
 
+        // Extract exception signature (e.g. "TransactionRequiredException") for recurrence detection.
+        let exception_re = regex::Regex::new(r"(\w+Exception|\w+Error)")
+            .unwrap_or_else(|_| regex::Regex::new(".^").unwrap());
+        let current_exception = exception_re.captures_iter(&diag_text)
+            .next()
+            .map(|c| c[1].to_string())
+            .unwrap_or_default();
+
         let mut result = format!("{}\n\n{}", content, diagnostics.join("\n\n"));
+
+        // If the same exception recurs after a previous fix attempt, tell the model
+        // its approach isn't working and it needs a different strategy.
+        if !current_exception.is_empty() && current_exception == self.last_diagnosed_error {
+            result.push_str(&format!(
+                "\n\n[RECURRING ERROR: {} appeared again after your previous fix. \
+                 Your last approach did not resolve it. Try a fundamentally different fix — \
+                 e.g. add @Transactional at the method level instead of wrapping individual calls.]",
+                current_exception
+            ));
+        }
+        // Store for next comparison (caller updates self.last_diagnosed_error)
+        // We embed it in the result with a hidden marker for the caller to extract.
+        if !current_exception.is_empty() {
+            result.push_str(&format!("\n<!-- diag_exception:{} -->", current_exception));
+        }
+
         if !extracted_code.is_empty() {
             result.push_str("\n\n[Relevant source code from stack trace — you can edit directly:]\n");
             result.push_str(&extracted_code.join("\n"));
@@ -685,6 +763,8 @@ impl AgentLoop {
     /// discipline (reminders, step limits) and decides whether to continue.
     async fn run_turn_loop(&mut self) {
         loop {
+            self.turn_count += 1;
+
             // Inject any pending user input appended during streaming.
             if let Some(input) = self.pending_input.take() {
                 self.conversation.add_user_message(&format!("[Additional context from user]: {}", input));
@@ -1212,6 +1292,17 @@ impl AgentLoop {
                     self.consecutive_reads = 0;
                 }
 
+                // Track scouting commands for datalog metrics (no injection).
+                if name == "bash" {
+                    let cmd = self.last_bash_cmd.to_lowercase();
+                    if cmd.contains("curl") || cmd.contains("lsof")
+                        || cmd.contains("ps aux") || cmd.contains("tail") {
+                        self.scouting_count += 1;
+                    }
+                } else if matches!(name.as_str(), "read_file" | "edit_file" | "write_file") {
+                    self.scouting_count = 0;
+                }
+
                 // Extract and persist cross-session knowledge (db credentials, ports, etc.)
                 let entries = knowledge::extract_knowledge(&output);
                 if !entries.is_empty() {
@@ -1611,6 +1702,8 @@ impl AgentLoop {
         let _ = self.event_tx.send(AgentEvent::TurnComplete {
             duration,
             total_tokens: self.turn_tokens,
+            turn_count: self.turn_count,
+            tool_call_count: self.tool_call_count,
         });
         let _ = self
             .event_tx

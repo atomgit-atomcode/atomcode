@@ -36,7 +36,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         let dur = if secs >= 60 { format!("{}m{}s", secs / 60, secs % 60) } else { format!("{}s", secs) };
         right_preview.push(format!("{} ", SPINNER[app.tick_count % SPINNER.len()]));
         if app.current_step_count > 0 {
-            right_preview.push(format!("turn {}", app.current_step_count));
+            right_preview.push(format!("T{}/C{}", app.current_step_count, app.current_tool_call_count));
             right_preview.push(" │ ".to_string());
         }
         right_preview.push(dur);
@@ -44,7 +44,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     } else if app.last_turn_duration.is_some() || app.current_step_count > 0 {
         right_preview.push("✓ ".to_string());
         if app.current_step_count > 0 {
-            right_preview.push(format!("turn {}", app.current_step_count));
+            right_preview.push(format!("T{}/C{}", app.current_step_count, app.current_tool_call_count));
             right_preview.push(" │ ".to_string());
         }
         if let Some(dur) = app.last_turn_duration {
@@ -103,7 +103,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         ));
         if app.current_step_count > 0 {
             right.push(Span::styled(
-                format!("turn {}", app.current_step_count),
+                format!("T{}/C{}", app.current_step_count, app.current_tool_call_count),
                 Style::default().fg(theme::TEXT_SECONDARY),
             ));
             right.push(sep.clone());
@@ -121,7 +121,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         ));
         if app.current_step_count > 0 {
             right.push(Span::styled(
-                format!("turn {}", app.current_step_count),
+                format!("T{}/C{}", app.current_step_count, app.current_tool_call_count),
                 Style::default().fg(theme::TEXT_SECONDARY),
             ));
             right.push(sep.clone());

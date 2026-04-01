@@ -111,9 +111,25 @@ async fn bash_execute(args: &str, ctx: &ToolContext) -> Result<ToolResult> {
             }
         }
 
-        // No interception: let model run its own commands and trust the results.
-        // Server commands get nohup wrapping + log redirect (below).
-        // auto_compile_verify catches compile errors after edits (in agent loop).
+        // Intercept "kill + restart" patterns for Java projects: route through
+        // full_restart which does compile→start→poll→health atomically.
+        // This eliminates the 5-10 turn "sleep+curl+tail log" waste.
+        #[cfg(not(target_os = "windows"))]
+        {
+            let cmd_lower = parsed.command.to_lowercase();
+            let has_kill = cmd_lower.contains("kill") || cmd_lower.contains("pkill");
+            let is_java_server = devserver::java::detect(&parsed.command).is_some();
+            if has_kill && is_java_server {
+                let (success, output) = devserver::java::full_restart(
+                    &wd, 0, &parsed.command,
+                ).await;
+                return Ok(ToolResult {
+                    call_id: String::new(),
+                    output,
+                    success,
+                });
+            }
+        }
 
         // Platform-aware shell: cmd.exe on Windows, bash on Unix
         #[cfg(target_os = "windows")]

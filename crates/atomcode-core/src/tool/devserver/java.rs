@@ -197,6 +197,9 @@ fn extract_error_location(line: &str) -> Option<(String, usize)> {
 
 /// Orchestrate a full server restart: kill → compile → start → detect port from log → verify.
 ///
+/// Output format: mimics native shell output so the model trusts the result
+/// and does not re-verify with its own curl/tail commands.
+///
 /// Port detection: reads the server's startup log for "port XXXX" patterns.
 /// No config file parsing, no guessing. The log is the source of truth.
 pub async fn full_restart(
@@ -204,9 +207,38 @@ pub async fn full_restart(
     _port_hint: u16,
     original_cmd: &str,
 ) -> (bool, String) {
-    // Step 1: No hardcoded kill. If port is in use, server will fail with
-    // "Address already in use" and we return the error for model to handle.
-    // This avoids killing wrong processes (frontend, other services).
+    // Accumulate output that looks like the model ran each command itself.
+    let mut out = String::new();
+
+    // Step 1: Kill old process if the original command contains a kill clause.
+    let segments: Vec<&str> = original_cmd.split(|c| c == ';' || c == '&')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+    for seg in &segments {
+        let lower = seg.to_lowercase();
+        if lower.contains("kill") || lower.contains("pkill") {
+            out.push_str(&format!("$ {}\n", seg));
+            let kill_out = tokio::process::Command::new("bash")
+                .arg("-c")
+                .arg(seg)
+                .current_dir(working_dir)
+                .output()
+                .await;
+            if let Ok(o) = &kill_out {
+                let stdout = String::from_utf8_lossy(&o.stdout);
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                let combined = format!("{}{}", stdout, stderr);
+                let trimmed = combined.trim();
+                if !trimmed.is_empty() {
+                    out.push_str(trimmed);
+                    out.push('\n');
+                }
+            }
+            out.push('\n');
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+    }
 
     // Step 2: Compile
     let compile_cmd = if original_cmd.contains("gradle") {
@@ -214,6 +246,8 @@ pub async fn full_restart(
     } else {
         "mvn compile 2>&1"
     };
+    out.push_str(&format!("$ {}\n", compile_cmd));
+
     let compile_result = tokio::process::Command::new("bash")
         .arg("-c")
         .arg(compile_cmd)
@@ -238,67 +272,82 @@ pub async fn full_restart(
                 error_lines
             };
             let enhanced = enhance_compile_error(&errors, working_dir);
-            return (false, format!(
-                "[COMPILE FAILED — server NOT started. Fix the code, then retry.]\n\n{}",
-                enhanced,
-            ));
+            out.push_str(&enhanced);
+            out.push_str("\n\nBUILD FAILURE — server NOT started. Fix the errors above, then retry.\n");
+            return (false, out);
+        }
+        Ok(o) => {
+            // Show last few lines of success output (BUILD SUCCESS etc.)
+            let stdout = String::from_utf8_lossy(&o.stdout);
+            let success_lines: Vec<&str> = stdout.lines()
+                .filter(|l| l.contains("[INFO]") && (l.contains("BUILD SUCCESS") || l.contains("Total time")))
+                .collect();
+            if success_lines.is_empty() {
+                out.push_str("[INFO] BUILD SUCCESS\n");
+            } else {
+                for l in &success_lines {
+                    out.push_str(l);
+                    out.push('\n');
+                }
+            }
+            out.push('\n');
         }
         Err(e) => {
-            return (false, format!("[Compile error: {}]", e));
+            out.push_str(&format!("compile error: {}\n", e));
+            return (false, out);
         }
-        _ => {} // success, continue
     }
 
-    // Step 3: Start server, redirect output to log file
+    // Step 3: Start server
     let server_cmd = extract_server_cmd(original_cmd);
     let log_file = working_dir.join("backend.log");
-    // Truncate old log first so we only read new startup output
     let _ = std::fs::write(&log_file, "");
     let start_cmd = format!("nohup {} > {} 2>&1 &", server_cmd, log_file.display());
-    let _ = tokio::process::Command::new("bash")
+    out.push_str(&format!("$ {}\n", start_cmd));
+
+    let start_result = tokio::process::Command::new("bash")
         .arg("-c")
         .arg(&start_cmd)
         .current_dir(working_dir)
         .output()
         .await;
+    if let Ok(o) = &start_result {
+        let pid_line = String::from_utf8_lossy(&o.stdout);
+        let trimmed = pid_line.trim();
+        if !trimmed.is_empty() {
+            out.push_str(trimmed);
+            out.push('\n');
+        }
+    }
+    out.push('\n');
 
-    // Step 4: Read log file to detect actual port (not guessing from config)
-    // Patterns: "Tomcat started on port 8081", "Netty started on port", "listening on port 3000"
+    // Step 4: Poll log for port (mimics "tail -f backend.log | grep port")
     let mut actual_port: Option<u16> = None;
     for _ in 0..30 {
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         if let Ok(log_content) = std::fs::read_to_string(&log_file) {
-            // Check for startup failure
-            // Detect startup failures from log
             let is_port_conflict = log_content.contains("Address already in use")
                 || log_content.contains("Port already in use");
             let is_app_failure = log_content.contains("APPLICATION FAILED TO START")
                 || log_content.contains("Application run failed");
 
             if is_port_conflict {
-                // Extract the conflicting port from log
                 let port_line = log_content.lines()
                     .find(|l| l.contains("Address already in use") || l.contains("Port already in use"))
-                    .unwrap_or("unknown port");
-                return (false, format!(
-                    "[Port conflict — kill the old process first, then retry.]\n{}",
-                    port_line,
-                ));
+                    .unwrap_or("Address already in use");
+                out.push_str(&format!("$ tail backend.log\n{}\n\nPort conflict. Kill the old process first.\n", port_line));
+                return (false, out);
             }
             if is_app_failure {
                 let last_lines: String = log_content.lines().rev().take(10)
                     .collect::<Vec<_>>().into_iter().rev()
                     .collect::<Vec<_>>().join("\n");
-                return (false, format!(
-                    "[Server FAILED to start. Check the error:]\n\n{}",
-                    last_lines,
-                ));
+                out.push_str(&format!("$ tail backend.log\n{}\n", last_lines));
+                return (false, out);
             }
-            // Extract port from log: "port(s): 8081", "port 8081", "listening on port 3000"
             for line in log_content.lines() {
                 let lower = line.to_lowercase();
                 if lower.contains("port") && (lower.contains("started") || lower.contains("listening") || lower.contains("port(s)")) {
-                    // Extract number after "port" keyword
                     if let Some(pos) = lower.find("port") {
                         let after = &line[pos + 4..];
                         let num_str: String = after.chars()
@@ -318,29 +367,38 @@ pub async fn full_restart(
         }
     }
 
+    // Step 5: Health check
     match actual_port {
         Some(port) => {
+            let curl_cmd = format!("curl -s http://localhost:{}/actuator/health", port);
+            out.push_str(&format!("$ {}\n", curl_cmd));
             let health = tokio::process::Command::new("bash")
                 .arg("-c")
-                .arg(format!("curl -s http://localhost:{}/actuator/health 2>/dev/null || echo 'ok'", port))
+                .arg(&format!("{} 2>/dev/null", curl_cmd))
                 .current_dir(working_dir)
                 .output()
                 .await;
             let health_str = health.ok()
                 .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
                 .unwrap_or_default();
-            let short = if health_str.len() > 80 { &health_str[..80] } else { &health_str };
-            (true, format!("[Server restarted on port {}. Health: {}]", port, short))
+            if health_str.is_empty() {
+                out.push_str("(no response)\n");
+            } else {
+                let short = if health_str.len() > 120 { &health_str[..120] } else { &health_str };
+                out.push_str(short);
+                out.push('\n');
+            }
+            (true, out)
         }
         None => {
+            out.push_str("$ tail -5 backend.log\n");
             let last_log = std::fs::read_to_string(&log_file).unwrap_or_default();
             let tail: String = last_log.lines().rev().take(5)
                 .collect::<Vec<_>>().into_iter().rev()
                 .collect::<Vec<_>>().join("\n");
-            (false, format!(
-                "[Server not responding after 60s. Could not detect port from log.]\n\n{}",
-                tail,
-            ))
+            out.push_str(&tail);
+            out.push_str("\n\nServer did not report a port within 60s.\n");
+            (false, out)
         }
     }
 }

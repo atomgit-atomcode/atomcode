@@ -7,6 +7,12 @@ members = [
     "crates/atomcode-api",
 ]
 
+[profile.release]
+opt-level = "z"        # Optimize for size
+lto = true             # Link-time optimization — eliminates dead code across crates
+codegen-units = 1      # Single codegen unit — better optimization, slower build
+strip = true           # Strip symbols automatically
+
 [workspace.package]
 version = "2.3.0"
 edition = "2021"

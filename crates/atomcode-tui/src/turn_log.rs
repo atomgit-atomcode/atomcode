@@ -164,8 +164,8 @@ impl TurnLog {
         let trimmed = text.trim();
         if trimmed.is_empty() { return; }
         // Cap at 500 chars to avoid bloating datalog
-        let display = if trimmed.len() > 500 {
-            format!("{}...", &trimmed[..497])
+        let display = if trimmed.chars().count() > 500 {
+            format!("{}...", trimmed.chars().take(497).collect::<String>())
         } else {
             trimmed.to_string()
         };
@@ -193,7 +193,7 @@ impl TurnLog {
     }
 
     /// End the turn: write duration and final flush.
-    pub fn end_turn(&mut self, total_tokens: usize) {
+    pub fn end_turn(&mut self, total_tokens: usize, tool_call_count: usize) {
         if !self.active { return; }
         self.active = false;
 
@@ -210,8 +210,9 @@ impl TurnLog {
         let _ = writeln!(&mut self.buf, "---");
         let _ = writeln!(
             &mut self.buf,
-            "**Stats:** {} turns, {:.1}s, {} tokens",
+            "**Stats:** {} turns, {} tool calls, {:.1}s, {} tokens",
             self.step,
+            tool_call_count,
             duration.as_secs_f64(),
             total_tokens,
         );
@@ -306,6 +307,90 @@ fn short_path(path: &str) -> String {
 }
 
 /// Format current local time as "YYYY-MM-DD HH:MM:SS".
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn make_log(dir: &Path) -> TurnLog {
+        let mut log = TurnLog::new(dir);
+        log.begin_turn("test", "test-model", 16000);
+        log.log_llm_call();
+        log
+    }
+
+    #[test]
+    fn test_log_model_text_chinese_truncation() {
+        let dir = std::env::temp_dir().join("atomcode_test_turnlog_cn");
+        let _ = std::fs::create_dir_all(&dir);
+        let mut log = make_log(&dir);
+
+        // 500+ Chinese characters — each is 3 bytes in UTF-8.
+        // Old code used byte slicing [..497] which would panic on char boundary.
+        let long_chinese = "这是一段很长的中文文本用于测试截断逻辑".repeat(30);
+        assert!(long_chinese.chars().count() > 500);
+
+        // This must not panic
+        log.log_model_text(&long_chinese);
+
+        // Verify it was truncated
+        let content = std::fs::read_to_string(log.file_path.as_ref().unwrap()).unwrap();
+        assert!(content.contains("..."));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_log_model_text_short_no_truncation() {
+        let dir = std::env::temp_dir().join("atomcode_test_turnlog_short");
+        let _ = std::fs::create_dir_all(&dir);
+        let mut log = make_log(&dir);
+
+        log.log_model_text("短文本");
+
+        let content = std::fs::read_to_string(log.file_path.as_ref().unwrap()).unwrap();
+        assert!(content.contains("短文本"));
+        assert!(!content.contains("..."));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_log_model_text_mixed_unicode() {
+        let dir = std::env::temp_dir().join("atomcode_test_turnlog_mixed");
+        let _ = std::fs::create_dir_all(&dir);
+        let mut log = make_log(&dir);
+
+        // Mix of ASCII, Chinese, emoji — all multi-byte
+        let mixed = format!("Hello 你好 {} end", "🎉测试".repeat(200));
+        assert!(mixed.chars().count() > 500);
+
+        // Must not panic
+        log.log_model_text(&mixed);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_end_turn_stats_format() {
+        let dir = std::env::temp_dir().join("atomcode_test_turnlog_stats");
+        let _ = std::fs::create_dir_all(&dir);
+        let mut log = make_log(&dir);
+
+        log.log_tool_call("bash", r#"{"command":"ls"}"#);
+        log.log_tool_result("file.txt", true);
+        log.end_turn(1000, 3);
+
+        let content = std::fs::read_to_string(log.file_path.as_ref().unwrap()).unwrap();
+        // Verify the new dual-metric stats format
+        assert!(content.contains("1 turns"));
+        assert!(content.contains("3 tool calls"));
+        assert!(content.contains("1000 tokens"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 fn format_timestamp() -> String {
     std::process::Command::new("date")
         .arg("+%Y-%m-%d %H:%M:%S")

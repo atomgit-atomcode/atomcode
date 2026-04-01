@@ -307,8 +307,9 @@ async fn run_headless(
                     atomcode_core::agent::AgentPhase::WaitingApproval => {}
                 }
             }
-            AgentEvent::TurnComplete { duration, total_tokens } => {
-                println!("\n[Done: {:.1}s, {} tokens]", duration.as_secs_f64(), total_tokens);
+            AgentEvent::TurnComplete { duration, total_tokens, turn_count, tool_call_count } => {
+                println!("\n[Done: {:.1}s, {} tokens, {} turns, {} tool calls]",
+                    duration.as_secs_f64(), total_tokens, turn_count, tool_call_count);
                 // In headless mode, exit after turn completes
                 let _ = cmd_tx.send(AgentCommand::Shutdown);
                 break;

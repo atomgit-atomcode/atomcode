@@ -153,8 +153,10 @@ pub struct App {
     pub history_stash: Option<String>,
     /// Cached project context (rebuilt on /cd, not every API call).
     pub project_context_cache: Option<String>,
-    /// Cached step count for current turn (avoid per-frame O(n) scan).
+    /// Cached step count for current turn (LLM round-trips, Claude Code-compatible).
     pub current_step_count: usize,
+    /// Total individual tool calls in the current turn.
+    pub current_tool_call_count: usize,
     /// Cached tool info string for ToolExecuting mode (avoid per-frame JSON parse).
     pub executing_tool_info: String,
     /// Estimated token counts for the current session.
@@ -262,6 +264,7 @@ impl App {
            tick_count: 0,
            project_context_cache: None,
            current_step_count: 0,
+           current_tool_call_count: 0,
            executing_tool_info: String::new(),
            turn_start: None,
            first_token_ms: None,
@@ -568,6 +571,7 @@ impl App {
                 self.conversation.push_delta(&text);
             }
             AgentEvent::ToolCallStarted { name, arguments } => {
+                self.current_tool_call_count += 1;
                 // Track TTFT — tool call is also a "first token" from the LLM
                 if self.first_token_ms.is_none() {
                     if let Some(start) = self.llm_call_start {
@@ -649,7 +653,7 @@ impl App {
                     }
                 }
             }
-            AgentEvent::TurnComplete { duration, total_tokens: _ } => {
+            AgentEvent::TurnComplete { duration, total_tokens: _, turn_count: _, tool_call_count } => {
                 // Finalize stream FIRST so auto-summary TextDelta becomes a message
                 self.conversation.finalize_stream();
                 // Then log the final assistant text
@@ -660,7 +664,7 @@ impl App {
                         }
                     }
                 }
-                self.turn_log.end_turn(self.turn_tokens);
+                self.turn_log.end_turn(self.turn_tokens, tool_call_count);
                 self.mode = AppMode::Normal;
                 self.last_turn_duration = Some(duration);
                 self.turn_start = None;
@@ -697,7 +701,7 @@ impl App {
             }
             AgentEvent::Error(e) => {
                 self.turn_log.log_error(&e);
-                self.turn_log.end_turn(self.turn_tokens);
+                self.turn_log.end_turn(self.turn_tokens, 0);
                 self.conversation.push_delta(&format!("\n\n[Error: {}]", e));
                 self.conversation.finalize_stream();
                 self.mode = AppMode::Normal;
@@ -1297,6 +1301,7 @@ impl App {
                 self.scroll_offset = 0;
                 self.at_bottom = true;
                 self.current_step_count = 0;
+                self.current_tool_call_count = 0;
                 self.turn_tokens = 0;
                 self.total_tokens = 0;
                 self.suggestion = None;
@@ -2043,6 +2048,7 @@ impl App {
                         self.mode = AppMode::Streaming;
                         self.at_bottom = true;
                         self.current_step_count = 0;
+                        self.current_tool_call_count = 0;
                         self.turn_start = Some(Instant::now());
                         self.first_token_ms = None;
                         self.llm_call_start = Some(Instant::now());
@@ -2134,6 +2140,7 @@ impl App {
         self.mode = AppMode::Streaming;
         self.at_bottom = true;
         self.current_step_count = 0;
+        self.current_tool_call_count = 0;
         self.turn_start = Some(Instant::now());
         self.first_token_ms = None;
         self.llm_call_start = Some(Instant::now());

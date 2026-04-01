@@ -106,7 +106,14 @@ impl PermissionStore {
 
     /// Check whether a tool call should be auto-approved, needs asking, or denied.
     pub fn check(&self, tool_name: &str, approval: &ApprovalRequirement) -> PermissionDecision {
-        // 1. Explicit per-tool override wins.
+        // Destructive commands (RequireApproval) ALWAYS prompt — no override or
+        // session grant can bypass this. Prevents a single [A]lways on "bash"
+        // from silently executing DROP TABLE, rm -rf, etc.
+        if let ApprovalRequirement::RequireApproval(reason) = approval {
+            return PermissionDecision::Ask(reason.clone());
+        }
+
+        // 1. Explicit per-tool override (only reached for AutoApprove tools).
         if let Some(level) = self.overrides.get(tool_name) {
             match level {
                 PermissionLevel::AlwaysAllow | PermissionLevel::SessionAllow => {
@@ -121,12 +128,7 @@ impl PermissionStore {
             return PermissionDecision::Allow;
         }
         // 3. Defer to the tool's own approval requirement.
-        match approval {
-            ApprovalRequirement::AutoApprove => PermissionDecision::Allow,
-            ApprovalRequirement::RequireApproval(reason) => {
-                PermissionDecision::Ask(reason.clone())
-            }
-        }
+        PermissionDecision::Allow
     }
 
     /// Grant session-level permission for a tool (user pressed [A]).
@@ -286,10 +288,21 @@ mod tests {
     }
 
     #[test]
-    fn test_permission_store_session_grant_overrides_require_approval() {
+    fn test_permission_store_session_grant_cannot_bypass_destructive() {
+        // Session grant on "bash" must NOT bypass RequireApproval.
+        // This prevents [A]lways on bash from silently executing DROP TABLE etc.
         let mut store = PermissionStore::new();
         store.grant_session("bash");
         let decision = store.check("bash", &ApprovalRequirement::RequireApproval("Destructive".into()));
+        assert!(matches!(decision, PermissionDecision::Ask(_)));
+    }
+
+    #[test]
+    fn test_permission_store_session_grant_allows_auto_approve() {
+        // Session grant still works for non-destructive (AutoApprove) tools.
+        let mut store = PermissionStore::new();
+        store.grant_session("bash");
+        let decision = store.check("bash", &ApprovalRequirement::AutoApprove);
         assert!(matches!(decision, PermissionDecision::Allow));
     }
 
@@ -303,11 +316,12 @@ mod tests {
     }
 
     #[test]
-    fn test_permission_store_always_allow_override() {
+    fn test_permission_store_always_allow_cannot_bypass_destructive() {
+        // Even AlwaysAllow override must NOT bypass RequireApproval.
         let mut store = PermissionStore::new();
         store.set_override("bash", PermissionLevel::AlwaysAllow);
         let decision = store.check("bash", &ApprovalRequirement::RequireApproval("Destructive".into()));
-        assert!(matches!(decision, PermissionDecision::Allow));
+        assert!(matches!(decision, PermissionDecision::Ask(_)));
     }
 
     #[tokio::test]
