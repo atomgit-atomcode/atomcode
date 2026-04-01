@@ -24,6 +24,7 @@ pub const SKIP_DIRS: &[&str] = &[
     "node_modules", ".git", "target", "__pycache__", ".next",
     "dist", "build", ".cache", "vendor", ".venv", "venv",
     ".idea", ".vscode", ".DS_Store", ".env",
+    "datalog", "logs", "log", ".atomcode",
 ];
 use std::path::PathBuf;
 use std::sync::Arc;
