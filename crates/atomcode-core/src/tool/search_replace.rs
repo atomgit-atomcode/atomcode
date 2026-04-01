@@ -151,6 +151,9 @@ impl Tool for SearchReplaceTool {
             let new_content = re.replace_all(&content, parsed.replace.as_str()).to_string();
 
             if new_content != content {
+                // Backup before write
+                ctx.file_history.lock().await
+                    .backup_before_write(&file_path.to_string_lossy()).await;
                 // Write back
                 if let Err(e) = std::fs::write(file_path, &new_content) {
                     return Ok(ToolResult {

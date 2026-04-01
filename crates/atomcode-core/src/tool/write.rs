@@ -98,9 +98,12 @@ impl Tool for WriteFileTool {
         ApprovalRequirement::AutoApprove
     }
 
-    async fn execute(&self, args: &str, _ctx: &ToolContext) -> Result<ToolResult> {
+    async fn execute(&self, args: &str, ctx: &ToolContext) -> Result<ToolResult> {
         let parsed: WriteFileArgs = serde_json::from_str(args)?;
         let path = std::path::Path::new(&parsed.file_path);
+
+        // Backup file before overwrite (file-level checkpointing).
+        ctx.file_history.lock().await.backup_before_write(&parsed.file_path).await;
 
         // Read old content for diff summary (tech-stack agnostic)
         let is_overwrite = path.exists() && std::fs::metadata(path).map(|m| m.len() > 0).unwrap_or(false);

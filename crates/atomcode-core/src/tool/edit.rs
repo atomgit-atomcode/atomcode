@@ -115,6 +115,9 @@ impl Tool for EditFileTool {
     async fn execute(&self, args: &str, ctx: &ToolContext) -> Result<ToolResult> {
         let parsed: EditFileArgs = serde_json::from_str(args)?;
 
+        // Backup file before any modification (file-level checkpointing).
+        ctx.file_history.lock().await.backup_before_write(&parsed.file_path).await;
+
         let content = tokio::fs::read_to_string(&parsed.file_path)
             .await
             .with_context(|| format!("Failed to read {}", parsed.file_path))?;

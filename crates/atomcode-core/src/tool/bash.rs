@@ -113,21 +113,27 @@ async fn bash_execute(args: &str, ctx: &ToolContext) -> Result<ToolResult> {
 
         // Intercept "kill + restart" patterns for Java projects: route through
         // full_restart which does compile→start→poll→health atomically.
-        // This eliminates the 5-10 turn "sleep+curl+tail log" waste.
+        // Only triggers when BOTH kill and server start are in the same command,
+        // connected by ; or && (not newlines — newlines indicate separate steps).
         #[cfg(not(target_os = "windows"))]
         {
-            let cmd_lower = parsed.command.to_lowercase();
-            let has_kill = cmd_lower.contains("kill") || cmd_lower.contains("pkill");
-            let is_java_server = devserver::java::detect(&parsed.command).is_some();
-            if has_kill && is_java_server {
-                let (success, output) = devserver::java::full_restart(
-                    &wd, 0, &parsed.command,
-                ).await;
-                return Ok(ToolResult {
-                    call_id: String::new(),
-                    output,
-                    success,
-                });
+            // Split by newlines first — only check single-line or ;/&& joined commands
+            let is_single_logical_command = !parsed.command.contains('\n')
+                || parsed.command.lines().count() <= 2;
+            if is_single_logical_command {
+                let cmd_lower = parsed.command.to_lowercase();
+                let has_kill = cmd_lower.contains("kill") || cmd_lower.contains("pkill");
+                let has_server_start = devserver::java::detect(&parsed.command).is_some();
+                if has_kill && has_server_start {
+                    let (success, output) = devserver::java::full_restart(
+                        &wd, 0, &parsed.command,
+                    ).await;
+                    return Ok(ToolResult {
+                        call_id: String::new(),
+                        output,
+                        success,
+                    });
+                }
             }
         }
 

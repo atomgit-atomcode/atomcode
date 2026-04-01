@@ -99,6 +99,89 @@ impl SemanticSearcher {
         self.cache.invalidate(path);
     }
 
+    /// Find all call sites in a file that match a pattern (e.g., "tagRepository")
+    /// and report their line numbers and enclosing function.
+    ///
+    /// Language-agnostic: works on any tree-sitter supported language by searching
+    /// for method_invocation / call_expression nodes whose text contains the pattern.
+    ///
+    /// Used by auto_diagnose to give the model a complete list of similar call sites
+    /// when a stack trace points to one — preventing the "fix one, miss nine" pattern.
+    pub fn find_similar_calls(&mut self, path: &Path, pattern: &str) -> Option<String> {
+        let source = std::fs::read_to_string(path).ok()?;
+        let lang = LanguageRegistry::detect(path)?;
+        let tree = self.cache.parse_source(&source, lang)?;
+
+        let pattern_lower = pattern.to_lowercase();
+        let mut results: Vec<(usize, String, String)> = Vec::new(); // (line, call_text, enclosing_fn)
+
+        Self::walk_matching_calls(tree.root_node(), &source, &pattern_lower, &mut results, "");
+
+        if results.is_empty() { return None; }
+
+        let short_name = path.file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.to_string_lossy().to_string());
+
+        let mut out = format!(
+            "{} calls matching '{}' in {}:\n",
+            results.len(), pattern, short_name
+        );
+        for (line, call_text, func) in &results {
+            if func.is_empty() {
+                out.push_str(&format!("  L{}: {}\n", line, call_text));
+            } else {
+                out.push_str(&format!("  L{}: {} (in {})\n", line, call_text, func));
+            }
+        }
+        Some(out)
+    }
+
+    /// Walk AST to find call expressions matching a pattern.
+    fn walk_matching_calls(
+        node: tree_sitter::Node,
+        source: &str,
+        pattern: &str,
+        results: &mut Vec<(usize, String, String)>,
+        enclosing_fn: &str,
+    ) {
+        // Track enclosing function name
+        let mut current_fn = enclosing_fn.to_string();
+        let kind = node.kind();
+        if kind.contains("function") || kind.contains("method") || kind == "constructor_declaration" {
+            if let Some(name_node) = node.child_by_field_name("name") {
+                current_fn = source[name_node.start_byte()..name_node.end_byte()].to_string();
+            }
+        }
+
+        // Match method_invocation (Java), call_expression (JS/TS/Python/Go/Rust)
+        if kind == "method_invocation" || kind == "call_expression" {
+            let call_text = &source[node.start_byte()..node.end_byte()];
+            // Truncate long call texts (keep first 80 chars)
+            let short = if call_text.len() > 80 {
+                format!("{}...", &call_text[..77])
+            } else {
+                call_text.to_string()
+            };
+            // Remove newlines for display
+            let oneline = short.replace('\n', " ").replace("  ", " ");
+
+            if call_text.to_lowercase().contains(pattern) {
+                let line = node.start_position().row + 1;
+                results.push((line, oneline, current_fn.clone()));
+            }
+        }
+
+        // Recurse
+        let mut cursor = node.walk();
+        if cursor.goto_first_child() {
+            loop {
+                Self::walk_matching_calls(cursor.node(), source, pattern, results, &current_fn);
+                if !cursor.goto_next_sibling() { break; }
+            }
+        }
+    }
+
     /// Extract symbols from Vue <template> section using tree-sitter-html.
     /// Returns key HTML elements as symbols so they appear in skeleton/file tree.
     fn list_vue_template_symbols(&mut self, source: &str) -> Option<Vec<Symbol>> {

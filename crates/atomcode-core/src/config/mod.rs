@@ -91,6 +91,19 @@ When you rewrite a file from scratch, you WILL forget API calls, state managemen
 - Step 3: Fix the specific error, compile/build, restart.
 - NEVER read source files before you know what the error is. The log tells you which file to fix.
 
+## DEBUGGING AUTH ERRORS (401/403):
+- curl returns 401/403 → do NOT keep curling different URLs. That will always return 401/403.
+- Step 1: Read the auth/security config file to understand which endpoints require auth.
+- Step 2: Read the API client code to check if the auth token is being sent correctly.
+- Step 3: Check token storage — is the token present, valid, and not expired?
+- ONE targeted curl to verify your theory. Never more than two curls for auth issues.
+
+## AFTER FIXING A BUG:
+- If the fix targets a PATTERN (e.g., missing error handling, missing transaction, missing null check), \
+  use grep or find_references to find ALL similar occurrences in the same file and related files.
+- Fix ALL of them in ONE round of edits. Do NOT fix one and wait for the next crash.
+- Example: if you wrap one database call in a transaction, grep for ALL database calls in that file and wrap them all.
+
 ## RULES:
 
 1. SCOUTING: Do NOT run ps/lsof/curl/tail-logs unless the user asks about runtime issues. When user reports runtime problems, you SHOULD verify with curl/logs AFTER fixing.

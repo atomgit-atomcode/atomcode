@@ -2,6 +2,7 @@ pub mod bash;
 pub mod cd;
 pub mod devserver;
 pub mod edit;
+pub mod file_history;
 pub mod find_references;
 pub mod glob;
 pub mod grep;
@@ -148,13 +149,19 @@ impl PermissionStore {
 pub struct ToolContext {
     pub working_dir: Arc<RwLock<PathBuf>>,
     pub semantic: Arc<Mutex<crate::semantic::SemanticSearcher>>,
+    pub file_history: Arc<Mutex<file_history::FileHistory>>,
 }
 
 impl ToolContext {
     pub fn new(working_dir: PathBuf) -> Self {
+        Self::with_session(working_dir, "default")
+    }
+
+    pub fn with_session(working_dir: PathBuf, session_id: &str) -> Self {
         Self {
             working_dir: Arc::new(RwLock::new(working_dir)),
             semantic: Arc::new(Mutex::new(crate::semantic::SemanticSearcher::new())),
+            file_history: Arc::new(Mutex::new(file_history::FileHistory::new(session_id))),
         }
     }
 
