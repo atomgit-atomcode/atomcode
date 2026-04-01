@@ -86,6 +86,17 @@ impl Conversation {
     }
 
     pub fn add_user_message(&mut self, content: &str) {
+        // Merge with last message if it's also User — prevents consecutive User messages
+        // which cause OpenAI-compatible APIs to return empty responses.
+        if let Some(last) = self.messages.last_mut() {
+            if matches!(last.role, Role::User) {
+                if let MessageContent::Text(ref mut text) = last.content {
+                    text.push('\n');
+                    text.push_str(content);
+                    return;
+                }
+            }
+        }
         let idx = self.messages.len();
         self.messages.push(Message::new(Role::User, content));
         self.turn_tracker.on_user_message(idx);
