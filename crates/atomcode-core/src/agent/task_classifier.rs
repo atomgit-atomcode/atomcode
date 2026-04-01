@@ -55,12 +55,14 @@ pub fn classify(message: &str, has_previous_turns: bool) -> TaskType {
     let lower = msg.to_lowercase();
     let char_count = msg.chars().count();
 
-    // Rule 1: Follow-up — short message indicating previous attempt failed.
-    // Must have previous turns in conversation.
-    if has_previous_turns && char_count < 50 {
+    // Rule 1: Follow-up — message indicating previous attempt failed.
+    // Must have previous turns in conversation. Check before other rules
+    // because "还是不行" also contains bug keywords.
+    if has_previous_turns {
         let followup_keywords = [
             "还是不行", "依然不行", "没有成功", "还是不对", "还是报错",
-            "没用", "不行", "还是一样", "还没", "又错了", "又报错",
+            "还是没有", "依然没有", "还是空", "依然不能",
+            "没用", "还是一样", "又错了", "又报错",
             "still broken", "still not", "doesn't work", "not working",
             "same error", "still failing",
         ];
@@ -81,13 +83,22 @@ pub fn classify(message: &str, has_previous_turns: bool) -> TaskType {
     }
 
     // Rule 3: Question — asking for information, not action.
-    let is_question = msg.ends_with('?') || msg.ends_with('？')
+    // Must not contain bug indicators (prioritize bug fix over question).
+    let has_bug_signal = lower.contains("不行") || lower.contains("报错")
+        || lower.contains("失败") || lower.contains("空白") || lower.contains("空的")
+        || lower.contains("不显示") || lower.contains("找不到") || lower.contains("不能")
+        || lower.contains("没有显示") || lower.contains("不出来") || lower.contains("不准")
+        || lower.contains("error") || lower.contains("fail") || lower.contains("empty")
+        || lower.contains("broken") || lower.contains("missing");
+    let is_question = (msg.ends_with('?') || msg.ends_with('？')
         || lower.contains("是什么") || lower.contains("为什么")
-        || lower.contains("怎么") || lower.contains("如何")
+        || lower.contains("怎么来的") || lower.contains("如何")
         || lower.contains("是否") || lower.contains("有没有")
+        || lower.contains("还是") // "A还是B" pattern = question
         || lower.contains("what ") || lower.contains("why ")
-        || lower.contains("how ") || lower.contains("is there");
-    if is_question && char_count < 80 {
+        || lower.contains("how ") || lower.contains("is there"))
+        && !has_bug_signal;
+    if is_question && char_count < 100 {
         return TaskType::Question;
     }
 
@@ -105,9 +116,10 @@ pub fn classify(message: &str, has_previous_turns: bool) -> TaskType {
 
     // Rule 5: Bug fix — something is broken.
     let bug_keywords = [
-        "报错", "错误", "不行", "失败", "空白", "不显示", "不工作",
+        "报错", "错误", "不行了", "失败", "空白", "不显示", "不工作",
         "找不到", "没有显示", "不能", "无法", "异常", "崩溃",
-        "点击", "点了", "打开", // user actions that failed
+        "没有成功", "没成功", "空的", "不出来", "没有配置",
+        "点击", "点了", "打开", // user actions that imply something failed
         "error", "fail", "broken", "crash", "blank", "empty",
         "not showing", "doesn't", "can't", "unable", "missing",
     ];
