@@ -1031,11 +1031,22 @@ impl AgentLoop {
                     let is_empty = text.trim().is_empty() && tokens == 0;
                     if is_empty && self.retry_count < 2 && self.tool_call_count > 0 {
                         self.retry_count += 1;
+                        // Ensure valid message alternation: empty LLM response didn't add
+                        // an Assistant message, so add one before injecting User message.
+                        // Without this: ToolResult → User (invalid) → LLM returns empty.
+                        self.conversation.messages.push(
+                            crate::conversation::message::Message::new(
+                                crate::conversation::message::Role::Assistant,
+                                "(continuing...)".to_string(),
+                            )
+                        );
                         if !self.files_edited_this_turn.is_empty() {
                             let files = self.files_edited_this_turn.join(", ");
                             self.conversation.add_user_message(&format!(
                                 "Summarize what you changed: {}", files,
                             ));
+                        } else {
+                            self.conversation.add_user_message("Continue.");
                         }
                         tokio::time::sleep(Duration::from_secs(2)).await;
                         continue;
