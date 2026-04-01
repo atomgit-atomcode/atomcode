@@ -99,6 +99,38 @@ impl SemanticSearcher {
         self.cache.invalidate(path);
     }
 
+    /// Count ERROR nodes in source code. Language-agnostic.
+    /// Returns (error_count, first few error line numbers).
+    pub fn count_syntax_errors(&mut self, source: &str, path: &Path) -> (usize, Vec<usize>) {
+        let lang = match language::LanguageRegistry::detect(path) {
+            Some(l) => l,
+            None => return (0, vec![]),
+        };
+        let tree = match self.cache.parse_source(source, lang) {
+            Some(t) => t,
+            None => return (0, vec![]),
+        };
+
+        let mut errors = Vec::new();
+        Self::collect_errors(tree.root_node(), &mut errors);
+        let count = errors.len();
+        errors.truncate(5); // Only report first 5
+        (count, errors)
+    }
+
+    fn collect_errors(node: tree_sitter::Node, errors: &mut Vec<usize>) {
+        if node.is_error() || node.is_missing() {
+            errors.push(node.start_position().row + 1);
+        }
+        let mut cursor = node.walk();
+        if cursor.goto_first_child() {
+            loop {
+                Self::collect_errors(cursor.node(), errors);
+                if !cursor.goto_next_sibling() { break; }
+            }
+        }
+    }
+
     /// Find all call sites in a file that match a pattern (e.g., "tagRepository")
     /// and report their line numbers and enclosing function.
     ///

@@ -558,6 +558,21 @@ impl AgentLoop {
             _ => 0,
         };
 
+        // Prepend "analyze first" to user message for complex tasks.
+        // Data shows this changes model behavior from "pattern match → quick fix (often wrong)"
+        // to "systematic diagnosis → correct fix". Placed in user message (not system prompt)
+        // because models comply with user instructions more reliably.
+        let content = match task_type {
+            task_classifier::TaskType::BugFix
+            | task_classifier::TaskType::FollowUp => {
+                format!("Analyze the root cause before making changes.\n\n{}", content)
+            }
+            task_classifier::TaskType::FeatureDev => {
+                format!("Read the relevant code first, then plan and implement.\n\n{}", content)
+            }
+            _ => content,
+        };
+
         self.phase = AgentPhase::Thinking;
         let _ = self
             .event_tx
@@ -1201,6 +1216,7 @@ impl AgentLoop {
                     // letting model pile up 10 broken edits before compiling.
                     if !self.files_edited_this_turn.is_empty() {
                         self.auto_compile_verify().await;
+                        self.syntax_check_edited_files().await;
                     }
 
                     // Apply discipline: inject reminders, check step limits
@@ -1664,13 +1680,17 @@ impl AgentLoop {
                 compile_dir = wd.clone();
                 break;
             }
-            // Check common subdirs (backend/, server/)
-            for subdir in &["backend", "server"] {
-                let sub = wd.join(subdir);
-                if sub.join(marker).exists() {
-                    compile_cmd = Some(format!("cd {} && {}", sub.display(), cmd));
-                    compile_dir = sub;
-                    break;
+            // Check all immediate subdirectories for marker files.
+            // No hardcoded directory names — any subdir with a build marker gets checked.
+            if let Ok(entries) = std::fs::read_dir(&wd) {
+                for entry in entries.flatten() {
+                    if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) { continue; }
+                    let sub = entry.path();
+                    if sub.join(marker).exists() {
+                        compile_cmd = Some(format!("cd {} && {}", sub.display(), cmd));
+                        compile_dir = sub;
+                        break;
+                    }
                 }
             }
             if compile_cmd.is_some() { break; }
@@ -1737,6 +1757,49 @@ impl AgentLoop {
                 }
             }
             Err(_) => {} // Compile command not available, skip
+        }
+    }
+
+    /// Tree-sitter syntax check on recently edited files.
+    /// Language-agnostic: works on any file tree-sitter can parse.
+    /// Catches bracket mismatches, missing closings, duplicate declarations
+    /// that build tools may miss (e.g., Vite doesn't catch Vue SFC syntax errors).
+    async fn syntax_check_edited_files(&mut self) {
+        let wd = self.turn_runner.context.working_dir.try_read()
+            .map(|g| g.clone()).unwrap_or_default();
+
+        let mut warnings: Vec<String> = Vec::new();
+        let mut searcher = self.turn_runner.context.semantic.lock().await;
+
+        for file in &self.files_edited_this_turn {
+            // Resolve to full path
+            let path = if std::path::Path::new(file).is_absolute() {
+                std::path::PathBuf::from(file)
+            } else {
+                wd.join(file)
+            };
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                let (errors, lines) = searcher.count_syntax_errors(&content, &path);
+                if errors > 0 {
+                    let lines_str = lines.iter()
+                        .map(|l| format!("L{}", l))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    warnings.push(format!(
+                        "{}: {} syntax error(s) at {}",
+                        file, errors, lines_str
+                    ));
+                }
+            }
+        }
+        drop(searcher);
+
+        if !warnings.is_empty() {
+            let msg = format!(
+                "[SYNTAX CHECK: {}. Fix these before continuing — the file structure may be broken.]",
+                warnings.join("; ")
+            );
+            self.conversation.add_user_message(&msg);
         }
     }
 
