@@ -64,6 +64,16 @@ impl Tool for BashTool {
     }
 
     async fn execute(&self, args: &str, ctx: &ToolContext) -> Result<ToolResult> {
+        let mut result = bash_execute(args, ctx).await?;
+        // Append cwd to every bash result so model always knows where it is.
+        // This prevents "forgot to cd" loops (e.g., 5x "no POM in this directory").
+        let wd = ctx.working_dir.read().await;
+        result.output.push_str(&format!("\n[cwd: {}]", wd.display()));
+        Ok(result)
+    }
+}
+
+async fn bash_execute(args: &str, ctx: &ToolContext) -> Result<ToolResult> {
         let mut parsed: BashArgs = serde_json::from_str(args)?;
         // Cap timeout: model may request absurdly large values. Max 5 min for
         // normal commands, 3 min for background/server commands.
@@ -307,7 +317,6 @@ impl Tool for BashTool {
             }
         }
     }
-}
 
 /// Check if a shell command contains destructive patterns that require user approval.
 fn check_destructive_command(command: &str) -> Option<String> {
