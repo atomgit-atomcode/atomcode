@@ -3,7 +3,7 @@
 //! Provides HTTP API for querying conversation history.
 
 use axum::{
-    extract::Path,
+    extract::{Path, Query},
     http::StatusCode,
     response::{IntoResponse, Json},
     routing::get,
@@ -28,6 +28,12 @@ pub struct ProjectInfo {
     pub last_updated: u64,
 }
 
+/// Search query parameters
+#[derive(Debug, Deserialize)]
+pub struct SearchQuery {
+    /// Search keyword for session name
+    pub q: String,
+}
 /// Session detail response
 #[derive(Debug, Serialize)]
 pub struct SessionDetail {
@@ -45,6 +51,8 @@ pub struct ToolCallInfo {
     pub id: String,
     pub name: String,
     pub arguments: String,
+    /// Formatted display string (CLI style)
+    pub display: String,
 }
 
 /// Message info for API response
@@ -54,6 +62,17 @@ pub struct MessageInfo {
     pub content: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCallInfo>>,
+    /// Tool result summary (for tool role messages)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_result: Option<ToolResultInfo>,
+}
+
+/// Tool result info for API response
+#[derive(Debug, Serialize)]
+pub struct ToolResultInfo {
+    pub success: bool,
+    pub summary: String,
+    pub line_count: usize,
 }
 
 impl From<&atomcode_core::conversation::message::Message> for MessageInfo {
@@ -65,9 +84,9 @@ impl From<&atomcode_core::conversation::message::Message> for MessageInfo {
             atomcode_core::conversation::message::Role::Tool => "tool",
         };
         
-        let (content, tool_calls) = match &msg.content {
+        let (content, tool_calls, tool_result) = match &msg.content {
             atomcode_core::conversation::message::MessageContent::Text(s) => {
-                (s.clone(), None)
+                (s.clone(), None, None)
             }
             atomcode_core::conversation::message::MessageContent::AssistantWithToolCalls { text, tool_calls } => {
                 let calls: Vec<ToolCallInfo> = tool_calls.iter()
@@ -75,19 +94,119 @@ impl From<&atomcode_core::conversation::message::Message> for MessageInfo {
                         id: tc.id.clone(),
                         name: tc.name.clone(),
                         arguments: tc.arguments.clone(),
+                        display: format_tool_args(&tc.name, &tc.arguments),
                     })
                     .collect();
-                (text.clone().unwrap_or_default(), Some(calls))
+                (text.clone().unwrap_or_default(), Some(calls), None)
             }
             atomcode_core::conversation::message::MessageContent::ToolResult(r) => {
-                (r.output.clone(), None)
+                let lines = r.output.lines().count();
+                let first_line = r.output.lines().next().unwrap_or("");
+                let summary = if first_line.len() > 100 {
+                    format!("{}...", first_line.chars().take(97).collect::<String>())
+                } else {
+                    first_line.to_string()
+                };
+                (r.output.clone(), None, Some(ToolResultInfo {
+                    success: r.success,
+                    summary,
+                    line_count: lines,
+                }))
             }
             atomcode_core::conversation::message::MessageContent::ToolResultRef(r) => {
-                (r.summary.clone(), None)
+                (r.summary.clone(), None, None)
             }
         };
         
-        Self { role: role.to_string(), content, tool_calls }
+        Self { role: role.to_string(), content, tool_calls, tool_result }
+    }
+}
+
+/// Format tool arguments for display (CLI style)
+fn format_tool_args(tool_name: &str, args_json: &str) -> String {
+    let args: serde_json::Value = match serde_json::from_str(args_json) {
+        Ok(v) => v,
+        Err(_) => return String::new(),
+    };
+
+    match tool_name {
+        "read_file" => {
+            let path = args.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
+            let short = short_path(path);
+            let mut s = short;
+            if let Some(offset) = args.get("offset").and_then(|v| v.as_u64()) {
+                if let Some(limit) = args.get("limit").and_then(|v| v.as_u64()) {
+                    s.push_str(&format!(" L{}-{}", offset, offset + limit));
+                }
+            }
+            s
+        }
+        "write_file" => {
+            let path = args.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
+            let size = args.get("content").and_then(|v| v.as_str()).map(|s| s.len()).unwrap_or(0);
+            format!("{} ({} bytes)", short_path(path), size)
+        }
+        "edit_file" => {
+            let path = args.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
+            short_path(path)
+        }
+        "bash" => {
+            let cmd = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
+            if cmd.chars().count() > 80 { 
+                format!("`{}...`", cmd.chars().take(77).collect::<String>()) 
+            } else { 
+                format!("`{}`", cmd) 
+            }
+        }
+        "list_directory" => {
+            let path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+            short_path(path)
+        }
+        "grep" => {
+            let pattern = args.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
+            let path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+            format!("\"{}\" in {}", pattern, short_path(path))
+        }
+        "glob" => {
+            let pattern = args.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
+            format!("\"{}\"", pattern)
+        }
+        "web_search" => {
+            let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
+            format!("\"{}\"", query)
+        }
+        "web_fetch" => {
+            let url = args.get("url").and_then(|v| v.as_str()).unwrap_or("");
+            url.to_string()
+        }
+        _ => {
+            if let Some(obj) = args.as_object() {
+                obj.iter()
+                    .map(|(k, v)| {
+                        let val = match v {
+                            serde_json::Value::String(s) if s.chars().count() > 30 => {
+                                format!("{}...", s.chars().take(27).collect::<String>())
+                            }
+                            serde_json::Value::String(s) => s.clone(),
+                            other => other.to_string(),
+                        };
+                        format!("{}={}", k, val)
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            } else {
+                String::new()
+            }
+        }
+    }
+}
+
+fn short_path(path: &str) -> String {
+    let parts: Vec<&str> = path.rsplitn(3, '/').collect();
+    match parts.len() {
+        0 | 1 => path.to_string(),
+        2 => format!("{}/{}", parts[1], parts[0]),
+        _ => format!(".../{}/{}", parts[1], parts[0]),
     }
 }
 
@@ -126,8 +245,8 @@ fn list_projects() -> std::io::Result<Vec<ProjectInfo>> {
                 if file_path.extension().map_or(false, |ext| ext == "json") {
                     if let Ok(json) = std::fs::read_to_string(&file_path) {
                         if let Ok(session) = serde_json::from_str::<Session>(&json) {
-                            // Skip empty sessions or default sessions
-                            if session.messages.is_empty() || session.name == "default" {
+                            // Skip empty sessions
+                            if session.messages.is_empty() {
                                 continue;
                             }
                             session_count += 1;
@@ -181,8 +300,8 @@ fn list_sessions(project_hash: &str) -> std::io::Result<Vec<SessionMeta>> {
             let file_size = entry.metadata().map(|m| m.len()).unwrap_or(0);
             if let Ok(json) = std::fs::read_to_string(&path) {
                 if let Ok(session) = serde_json::from_str::<Session>(&json) {
-                    // Skip empty sessions (no messages) or default sessions
-                    if session.messages.is_empty() || session.name == "default" {
+                    // Skip empty sessions (no messages)
+                    if session.messages.is_empty() {
                         continue;
                     }
                     let mut meta = SessionMeta::from(&session);
@@ -222,8 +341,8 @@ fn list_all_sessions() -> std::io::Result<Vec<SessionMetaWithProject>> {
                     let file_size = session_file.metadata().map(|m| m.len()).unwrap_or(0);
                     if let Ok(json) = std::fs::read_to_string(&file_path) {
                         if let Ok(session) = serde_json::from_str::<Session>(&json) {
-                            // Skip empty sessions (no messages) or default sessions
-                            if session.messages.is_empty() || session.name == "default" {
+                            // Skip empty sessions (no messages)
+                            if session.messages.is_empty() {
                                 continue;
                             }
                             let mut meta = SessionMeta::from(&session);
@@ -316,6 +435,71 @@ async fn get_all_sessions() -> impl IntoResponse {
     }
 }
 
+/// Search sessions by name across all projects
+fn search_sessions_by_name(keyword: &str) -> std::io::Result<Vec<SessionMetaWithProject>> {
+    let sessions_root = sessions_dir();
+    if !sessions_root.exists() {
+        return Ok(Vec::new());
+    }
+
+    let keyword_lower = keyword.to_lowercase();
+    let mut results = Vec::new();
+    
+    for entry in std::fs::read_dir(sessions_root)? {
+        let entry = entry?;
+        let path = entry.path();
+        
+        if path.is_dir() {
+            let project_hash = path.file_name().unwrap().to_string_lossy().to_string();
+            
+            for session_file in std::fs::read_dir(&path)? {
+                let session_file = session_file?;
+                let file_path = session_file.path();
+                
+                if file_path.extension().map_or(false, |ext| ext == "json") {
+                    let file_size = session_file.metadata().map(|m| m.len()).unwrap_or(0);
+                    if let Ok(json) = std::fs::read_to_string(&file_path) {
+                        if let Ok(session) = serde_json::from_str::<Session>(&json) {
+                            // Skip empty sessions
+                            if session.messages.is_empty() {
+                                continue;
+                            }
+                            // Match keyword in session name (case-insensitive)
+                            if session.name.to_lowercase().contains(&keyword_lower) {
+                                let mut meta = SessionMeta::from(&session);
+                                meta.file_size = file_size;
+                                results.push(SessionMetaWithProject {
+                                    project_hash: project_hash.clone(),
+                                    meta,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    // Sort by updated_at descending
+    results.sort_by(|a, b| b.meta.updated_at.cmp(&a.meta.updated_at));
+    Ok(results)
+}
+
+/// GET /sessions/search?q=keyword - Search sessions by name
+async fn search_sessions(Query(query): Query<SearchQuery>) -> impl IntoResponse {
+    if query.q.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, Json("Search keyword cannot be empty")).into_response();
+    }
+    
+    match search_sessions_by_name(&query.q) {
+        Ok(sessions) => Json(sessions).into_response(),
+        Err(e) => {
+            let msg = format!("Failed to search sessions: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(msg)).into_response()
+        }
+    }
+}
+
 /// Delete a session file
 fn delete_session_file(project_hash: &str, session_id: &str) -> std::io::Result<()> {
     let path = sessions_dir()
@@ -401,6 +585,7 @@ async fn main() {
     
     let app = Router::new()
         .route("/sessions", get(get_all_sessions))
+        .route("/sessions/search", get(search_sessions))
         .route("/projects", get(get_projects))
         .route("/projects/:hash/sessions", get(get_project_sessions))
         .route("/projects/:hash/sessions/:id", get(get_session_detail).delete(delete_session))
@@ -411,6 +596,7 @@ async fn main() {
     println!("AtomCode API server listening on http://{}", addr);
     println!("\nAPI endpoints:");
     println!("  GET /sessions                       - List all sessions (cross-project)");
+    println!("  GET /sessions/search?q=<keyword>    - Search sessions by name");
     println!("  GET /projects                       - List all projects");
     println!("  GET /projects/:hash/sessions        - List sessions in a project");
     println!("  GET /projects/:hash/sessions/:id    - Get session detail with messages");
