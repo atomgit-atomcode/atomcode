@@ -4,6 +4,7 @@
 
 pub mod git_checkpoint;
 pub mod knowledge;
+pub mod task_classifier;
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -207,6 +208,8 @@ pub struct AgentLoop {
     session_files: std::collections::HashMap<String, PathBuf>,
     /// Whether planning phase is active (first LLM call without tools to force a plan).
     planning_phase: bool,
+    /// Current task type — drives dynamic prompt selection and planning.
+    current_task_type: task_classifier::TaskType,
 
     /// Discovered service URLs extracted from tool outputs (e.g., "http://localhost:3002").
     /// Persisted across turns so the model knows which ports are active.
@@ -319,6 +322,7 @@ impl AgentLoop {
             active_file: None,
             pending_input: None,
             planning_phase: false,
+            current_task_type: task_classifier::TaskType::BugFix,
             session_files: std::collections::HashMap::new(),
             active_services: std::collections::HashMap::new(),
             result_store: ToolResultStore::new(ToolResultStore::default_dir()),
@@ -507,10 +511,10 @@ impl AgentLoop {
         self.turn_start = Some(Instant::now());
         self.cancel_token = CancellationToken::new();
 
-        // Detect if this task needs a planning phase.
-        // Feature tasks (create/implement/refactor) benefit from planning first.
-        // Simple tasks (fix bug, change style, start server) should act directly.
-        self.planning_phase = Self::needs_planning(&content);
+        // Classify task type — drives dynamic prompt + planning decision.
+        let has_prev = !self.conversation.messages.is_empty();
+        self.current_task_type = task_classifier::classify(&content, has_prev);
+        self.planning_phase = self.current_task_type.needs_planning();
 
         self.phase = AgentPhase::Thinking;
         let _ = self
@@ -520,31 +524,7 @@ impl AgentLoop {
         self.run_turn_loop().await;
     }
 
-    /// Detect if a task is complex enough to benefit from a planning phase.
-    /// Returns true for feature implementation, refactoring, multi-file tasks.
-    fn needs_planning(content: &str) -> bool {
-        let s = content.to_lowercase();
-        let len = content.chars().count();
-
-        // Short messages are follow-ups or simple tasks — no plan needed.
-        if len < 15 {
-            return false;
-        }
-
-        // Follow-up messages — no plan needed.
-        let follow_up_patterns = ["继续", "没有变化", "还是不行", "不行", "报错",
-            "失败", "改对了", "好的", "ok", "对", "错", "不对",
-            "启动", "start", "install", "安装", "部署"];
-        if follow_up_patterns.iter().any(|p| s.contains(p)) {
-            return false;
-        }
-
-        // Feature/creation patterns — plan needed.
-        let feature_patterns = ["实现", "功能", "创建", "新增", "添加",
-            "重构", "refactor", "implement", "feature", "build",
-            "设计", "开发", "做一个", "做个", "帮我做"];
-        feature_patterns.iter().any(|p| s.contains(p))
-    }
+    // needs_planning replaced by task_classifier::TaskType::needs_planning()
 
     /// DO NOT pre-read source files. Claude Code doesn't do this either.
     /// Pre-reading stuffs the system prompt with 50K+ tokens of irrelevant code,
@@ -1482,13 +1462,16 @@ impl AgentLoop {
     }
 
     fn build_system_prompt(&mut self) -> String {
-        let rules = self
-            .config
-            .providers
+        // Dynamic rules: select prompt sections based on task type.
+        // If user has a custom system_prompt in config, use that instead (override).
+        let rules = if let Some(custom) = self.config.providers
             .get(&self.config.default_provider)
             .and_then(|p| p.system_prompt.as_deref())
-            .unwrap_or(crate::config::DEFAULT_SYSTEM_PROMPT)
-            .to_string();
+        {
+            custom.to_string()
+        } else {
+            crate::config::prompt_sections::build_rules_for_task(&self.current_task_type)
+        };
 
         let wd: PathBuf = self
             .turn_runner.context

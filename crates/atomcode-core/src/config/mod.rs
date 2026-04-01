@@ -1,4 +1,5 @@
 pub mod provider;
+pub mod prompt_sections;
 
 use std::collections::HashMap;
 use std::path::Path;
