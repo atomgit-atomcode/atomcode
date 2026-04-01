@@ -67,8 +67,8 @@ impl TurnLog {
         }
     }
 
-    /// Start a new turn: create log file, write user message.
-    pub fn begin_turn(&mut self, user_message: &str) {
+    /// Start a new turn: create log file, write env info + user message.
+    pub fn begin_turn(&mut self, user_message: &str, model_name: &str, context_window: usize) {
         self.buf.clear();
         self.step = 0;
         self.active = true;
@@ -81,6 +81,9 @@ impl TurnLog {
         self.file_path = Some(log_dir.join(filename));
 
         let _ = writeln!(&mut self.buf, "# Turn {} [build:{}]", timestamp, env!("ATOMCODE_BUILD_ID"));
+        let _ = writeln!(&mut self.buf, "**env:** model={}, ctx_window={}, cwd={}",
+            model_name, context_window, self.base_dir.display());
+        let _ = writeln!(&mut self.buf);
         let _ = writeln!(&mut self.buf, "## User");
         let _ = writeln!(&mut self.buf, "```");
         let _ = writeln!(&mut self.buf, "{}", user_message);
@@ -155,7 +158,23 @@ impl TurnLog {
         self.flush();
     }
 
-    /// Log assistant text output.
+    /// Log model text output between tool calls (plan, thinking, explanation).
+    pub fn log_model_text(&mut self, text: &str) {
+        if !self.active { return; }
+        let trimmed = text.trim();
+        if trimmed.is_empty() { return; }
+        // Cap at 500 chars to avoid bloating datalog
+        let display = if trimmed.len() > 500 {
+            format!("{}...", &trimmed[..497])
+        } else {
+            trimmed.to_string()
+        };
+        let _ = writeln!(&mut self.buf, "  > {}", display.replace('\n', "\n  > "));
+        let _ = writeln!(&mut self.buf);
+        self.flush();
+    }
+
+    /// Log final assistant text output (response/summary).
     pub fn log_text(&mut self, text: &str) {
         if !self.active { return; }
         if text.trim().is_empty() { return; }
