@@ -176,6 +176,8 @@ pub struct App {
     pub last_rendered_scroll: usize,
     /// Chat panel viewport height from the last render.
     pub last_viewport_height: u16,
+    /// Total rendered lines from last render (for scroll handling).
+    pub last_total_lines: usize,
     pub provider: Box<dyn LlmProvider>,
     pub config: Config,
     /// CancellationToken for the current streaming/tool task.
@@ -295,6 +297,7 @@ impl App {
            selection: TextSelection::new(),
            last_rendered_scroll: 0,
            last_viewport_height: 0,
+           last_total_lines: 0,
            // Keep a dummy provider for rebuild_provider path (legacy). The real LLM
            // work is now handled by AgentLoop. This avoids removing all provider refs at once.
            provider: {
@@ -1320,7 +1323,7 @@ impl App {
             (_, KeyCode::Up) if self.input.is_empty() && self.input_history.is_empty() => {
                 // Scroll up when input is empty (terminal scroll wheel sends Up/Down in alternate mode)
                 if self.at_bottom {
-                    let total = self.render_cache.len();
+                    let total = self.last_total_lines;
                     self.scroll_offset = total.saturating_sub(3);
                     self.at_bottom = false;
                 } else {
@@ -1330,7 +1333,7 @@ impl App {
             (_, KeyCode::Down) if self.input.is_empty() && self.input_history.is_empty() => {
                 // Scroll down when input is empty (terminal scroll wheel sends Up/Down in alternate mode)
                 self.scroll_offset += 3;
-                let total = self.render_cache.len();
+                let total = self.last_total_lines;
                 if self.scroll_offset >= total {
                     self.at_bottom = true;
                 }
@@ -1457,7 +1460,7 @@ impl App {
         match (key.modifiers, key.code) {
             (KeyModifiers::CONTROL, KeyCode::Up) => {
                 if self.at_bottom {
-                    let total = self.render_cache.len();
+                    let total = self.last_total_lines;
                     self.scroll_offset = total.saturating_sub(3);
                     self.at_bottom = false;
                 } else {
@@ -1467,7 +1470,7 @@ impl App {
             }
             (KeyModifiers::CONTROL, KeyCode::Down) => {
                 self.scroll_offset += 3;
-                let total = self.render_cache.len();
+                let total = self.last_total_lines;
                 if self.scroll_offset >= total {
                     self.at_bottom = true;
                 }
@@ -1475,7 +1478,7 @@ impl App {
             }
             (_, KeyCode::PageUp) => {
                 if self.at_bottom {
-                    let total = self.render_cache.len();
+                    let total = self.last_total_lines;
                     self.scroll_offset = total.saturating_sub(20);
                     self.at_bottom = false;
                 } else {
@@ -1485,7 +1488,7 @@ impl App {
             }
             (_, KeyCode::PageDown) => {
                 self.scroll_offset += 20;
-                let total = self.render_cache.len();
+                let total = self.last_total_lines;
                 if self.scroll_offset >= total {
                     self.at_bottom = true;
                 }
@@ -1502,7 +1505,7 @@ impl App {
             // ── Scroll wheel ──
             MouseEventKind::ScrollUp => {
                 if self.at_bottom {
-                    let total = self.render_cache.len();
+                    let total = self.last_total_lines;
                     self.scroll_offset = total.saturating_sub(3);
                     self.at_bottom = false;
                 } else {
@@ -1511,7 +1514,7 @@ impl App {
             }
             MouseEventKind::ScrollDown => {
                 self.scroll_offset += 3;
-                let total = self.render_cache.len();
+                let total = self.last_total_lines;
                 if self.scroll_offset >= total {
                     self.at_bottom = true;
                 }

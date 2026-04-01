@@ -78,7 +78,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         let turn_elapsed = app.turn_start.map(|t| t.elapsed().as_secs());
         let turn_seed = app.conversation.messages.len();
         let llm_wait_ms = app.llm_call_start.map(|s| s.elapsed().as_millis() as u64);
-        let rendered_scroll = chat_panel::render(
+        let (total_lines, rendered_scroll) = chat_panel::render(
             frame, chunks[1], &app.conversation,
             app.scroll_offset, app.at_bottom, &app.mode, app.tick_count,
             app.turn_tokens, turn_elapsed, turn_seed,
@@ -89,6 +89,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         );
         app.last_rendered_scroll = rendered_scroll;
         app.last_viewport_height = chunks[1].height;
+        app.last_total_lines = total_lines;
     }
 
     input_box::render(frame, chunks[2], &app.input, app.mode.is_streaming_or_executing(), app.suggestion.as_deref(), &app.attached_files, app.pasted_text.as_deref());

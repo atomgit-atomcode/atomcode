@@ -44,8 +44,7 @@ pub fn render(
     finished_step_count: usize,
     render_cache: &mut Vec<Line<'static>>,
     render_cache_msg_count: &mut usize,
-) -> usize {
-    // Apply right margin (same as left indent) so text doesn't touch the edge.
+) -> (usize, usize) {
     let right_margin: u16 = 2;
     let area = Rect {
         width: area.width.saturating_sub(right_margin),
@@ -53,7 +52,7 @@ pub fn render(
     };
 
     let vh = (area.height as usize).saturating_sub(1);
-    if vh == 0 { return 0; }
+    if vh == 0 { return (0, 0); }
 
     let term_width = area.width as usize;
 
@@ -241,10 +240,9 @@ pub fn render(
         ]);
         frame.render_widget(Paragraph::new(vec![spin_line]), spin_rect);
     }
-
-    scroll_usize
+    // Return (total_lines, scroll_offset) for scroll handling
+    (total, scroll_usize)
 }
-
 // ── User Message ──
 // Clean chevron prefix, bright text, separator after
 // Always show full content (like Claude Code) so users can copy-paste
