@@ -80,8 +80,7 @@ impl TurnLog {
         let _ = std::fs::create_dir_all(&log_dir);
         self.file_path = Some(log_dir.join(filename));
 
-        let _ = writeln!(&mut self.buf, "# Turn {}", timestamp);
-        let _ = writeln!(&mut self.buf);
+        let _ = writeln!(&mut self.buf, "# Turn {} [build:{}]", timestamp, env!("ATOMCODE_BUILD_ID"));
         let _ = writeln!(&mut self.buf, "## User");
         let _ = writeln!(&mut self.buf, "```");
         let _ = writeln!(&mut self.buf, "{}", user_message);
