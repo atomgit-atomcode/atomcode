@@ -89,17 +89,15 @@ impl Tool for ReadFileTool {
 
         let offset = parsed.offset.unwrap_or(1).max(1) - 1;
 
-        // Only truncate truly large files (>800 lines).
-        // 750 lines ≈ 10K tokens — fits in 32K context while leaving room
-        // for system prompt + conversation.
-        // Truncating smaller files causes 3-5x re-reads that waste MORE
-        // tokens than truncation saves. Working Set + cold zone compression
-        // handle context budget.
+        // Only truncate very large files (>1500 lines).
+        // 1500 lines ≈ 20K tokens. Covers 95%+ of real files
+        // (Vue SFC, Java services, TS modules typically <1200 lines).
+        // Truncating smaller files causes 3x re-reads that waste more steps.
         let limit = match parsed.limit {
             Some(l) => l,
             None => {
-                if total_lines > 800 && parsed.offset.is_none() {
-                    750
+                if total_lines > 1500 && parsed.offset.is_none() {
+                    1500
                 } else {
                     2000
                 }
