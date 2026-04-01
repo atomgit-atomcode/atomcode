@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind, MouseButton};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use tokio::sync::mpsc;
 
 use atomcode_core::agent::{AgentCommand, AgentEvent, AgentHandle};
@@ -1495,7 +1495,8 @@ impl App {
         }
     }
 
-    /// Handle mouse events: scroll wheel, click, drag-to-select, release-to-copy.
+    /// Handle mouse events: scroll wheel only.
+    /// Mouse selection is now handled natively by the terminal (mouse capture is disabled during drag).
     fn handle_mouse(&mut self, mouse: MouseEvent) {
         match mouse.kind {
             // ── Scroll wheel ──
@@ -1513,35 +1514,6 @@ impl App {
                 let total = self.render_cache.len();
                 if self.scroll_offset >= total {
                     self.at_bottom = true;
-                }
-            }
-            // ── Drag to select ──
-            MouseEventKind::Down(MouseButton::Left) => {
-                self.selection.dragging = true;
-                self.selection.has_selection = true;
-                self.selection.start = (mouse.column, mouse.row);
-                self.selection.end = (mouse.column, mouse.row);
-            }
-            MouseEventKind::Drag(MouseButton::Left) => {
-                self.selection.end = (mouse.column, mouse.row);
-                self.selection.has_selection = true;
-
-                // Auto-scroll when dragging near edges
-                let viewport = self.last_viewport_height;
-                if mouse.row <= 1 && !self.at_bottom {
-                    self.scroll_offset = self.scroll_offset.saturating_sub(1);
-                } else if viewport > 2 && mouse.row >= viewport - 2 {
-                    self.scroll_offset += 1;
-                    let total = self.render_cache.len();
-                    if self.scroll_offset >= total {
-                        self.at_bottom = true;
-                    }
-                }
-            }
-            MouseEventKind::Up(MouseButton::Left) => {
-                self.selection.dragging = false;
-                if self.selection.has_selection && self.selection.start != self.selection.end {
-                    self.copy_selection_to_clipboard();
                 }
             }
             _ => {}
@@ -2031,7 +2003,7 @@ impl App {
                 help.push_str("  `/quit` — Exit\n");
                 help.push_str("\n**Copy text:**\n\n");
                 help.push_str("  `/copy` — Copy last AI response to clipboard\n");
-                help.push_str("  `Shift+Drag` — Native text selection (temporary disable mouse)\n");
+                help.push_str("  `Drag` — Native text selection and copy\n");
                 help.push_str("  `Ctrl+Shift+C` — Copy current selection\n");
                 self.conversation.push_delta(&help);
                 self.conversation.finalize_stream();

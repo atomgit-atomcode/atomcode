@@ -2,7 +2,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crossterm::event::{Event, KeyEvent, MouseEvent, poll};
+use crossterm::event::{Event, KeyEvent, MouseEvent, MouseEventKind, MouseButton, poll};
+use crossterm::execute;
+use crossterm::event::{EnableMouseCapture, DisableMouseCapture};
+use std::io::{self};
 use tokio::sync::mpsc;
 
 #[derive(Debug)]
@@ -23,6 +26,8 @@ pub struct EventLoop {
     input_thread: Option<std::thread::JoinHandle<()>>,
     /// Handle to the tick task
     tick_task: Option<tokio::task::JoinHandle<()>>,
+    /// Whether mouse capture is currently enabled
+    mouse_enabled: Arc<AtomicBool>,
 }
 
 impl EventLoop {
@@ -34,6 +39,7 @@ impl EventLoop {
             stop_flag: Arc::new(AtomicBool::new(false)),
             input_thread: None,
             tick_task: None,
+            mouse_enabled: Arc::new(AtomicBool::new(true)),
         }
     }
 
@@ -44,11 +50,13 @@ impl EventLoop {
     pub fn start(&mut self) {
         // Reset stop flag
         self.stop_flag.store(false, Ordering::SeqCst);
+        self.mouse_enabled.store(true, Ordering::SeqCst);
 
         // Start keyboard/mouse reader in a dedicated thread (not tokio task)
         // This gives us more control over the input stream
         let tx = self.tx.clone();
         let stop_flag = self.stop_flag.clone();
+        let mouse_enabled = self.mouse_enabled.clone();
         let handle = std::thread::spawn(move || {
             while !stop_flag.load(Ordering::SeqCst) {
                 // Use poll with timeout to allow checking stop flag periodically
@@ -65,7 +73,24 @@ impl EventLoop {
                                         }
                                         AppEvent::Key(key)
                                     }
-                                    Event::Mouse(mouse) => AppEvent::Mouse(mouse),
+                                    Event::Mouse(mouse) => {
+                                        // When left button is pressed, disable mouse capture
+                                        // to allow native terminal selection
+                                        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                                            if mouse_enabled.load(Ordering::SeqCst) {
+                                                let _ = execute!(io::stdout(), DisableMouseCapture);
+                                                mouse_enabled.store(false, Ordering::SeqCst);
+                                            }
+                                        }
+                                        // When left button is released, re-enable mouse capture
+                                        if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left)) {
+                                            if !mouse_enabled.load(Ordering::SeqCst) {
+                                                let _ = execute!(io::stdout(), EnableMouseCapture);
+                                                mouse_enabled.store(true, Ordering::SeqCst);
+                                            }
+                                        }
+                                        AppEvent::Mouse(mouse)
+                                    }
                                     Event::Paste(text) => AppEvent::Paste(text),
                                     Event::Resize(w, h) => AppEvent::Resize(w, h),
                                     _ => continue,
