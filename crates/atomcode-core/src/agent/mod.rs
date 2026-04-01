@@ -1542,11 +1542,8 @@ impl AgentLoop {
             None => return, // No compiled language detected
         };
 
-        // Don't auto-compile every single edit — only when model has done 2+ edits
-        // since last compile, to avoid slowing down single-edit turns.
-        if self.files_edited_this_turn.len() < 2 && self.build_fail_count == 0 {
-            return;
-        }
+        // Auto-compile after every edit. The 5-10s compile cost is worth it —
+        // catching errors immediately saves 5-10 steps of broken edit accumulation.
 
         // Run compile
         let output = tokio::process::Command::new("bash")

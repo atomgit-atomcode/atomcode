@@ -94,38 +94,26 @@ async fn bash_execute(args: &str, ctx: &ToolContext) -> Result<ToolResult> {
                 && !cmd_trimmed.contains(">/dev/null")
                 && !cmd_trimmed.contains("&>/dev/null")
             {
+                // Redirect to backend.log so model can `tail` later for debugging.
+                let log_path = wd.join("backend.log");
+                let log = log_path.display();
                 if let Some(amp_pos) = cmd_trimmed.find(" &") {
-                    // Has &: wrap the backgrounded part with nohup
                     let bg_cmd = cmd_trimmed[..amp_pos].trim();
                     let rest = cmd_trimmed[amp_pos + 2..].trim();
                     if rest.is_empty() {
-                        parsed.command = format!("nohup {} >/dev/null 2>&1 &", bg_cmd);
+                        parsed.command = format!("nohup {} > {} 2>&1 &", bg_cmd, log);
                     } else {
-                        parsed.command = format!("nohup {} >/dev/null 2>&1 & {}", bg_cmd, rest);
+                        parsed.command = format!("nohup {} > {} 2>&1 & {}", bg_cmd, log, rest);
                     }
                 } else {
-                    // No &: server command without background marker.
-                    // Auto-wrap entire command with nohup to prevent hang.
-                    parsed.command = format!("nohup sh -c '{}' >/dev/null 2>&1 &", cmd_trimmed.replace('\'', "'\\''"));
+                    parsed.command = format!("nohup sh -c '{}' > {} 2>&1 &", cmd_trimmed.replace('\'', "'\\''"), log);
                 }
             }
         }
 
-        // Java full restart: when model runs spring-boot:run, we orchestrate the
-        // full kill→compile→start→poll cycle automatically. This saves 8-10 steps.
-        if devserver::java::detect(&parsed.command).is_some()
-            && !parsed.command.contains("mvn compile")
-            && !parsed.command.contains("mvn clean")
-        {
-            // Extract actual working dir from `cd /path/to/backend &&` in the command
-            let effective_wd = extract_cd_dir(&parsed.command).unwrap_or_else(|| wd.clone());
-            // Port priority: explicit in command (lsof -ti:PORT) > config file > default
-            let port = extract_lsof_port(&parsed.command)
-                .or_else(|| devserver::extract_port_with_dir(&parsed.command, Some(&effective_wd)))
-                .unwrap_or(8080);
-            let (success, output) = devserver::java::full_restart(&effective_wd, port, &parsed.command).await;
-            return Ok(ToolResult { call_id: String::new(), output, success });
-        }
+        // No interception: let model run its own commands and trust the results.
+        // Server commands get nohup wrapping + log redirect (below).
+        // auto_compile_verify catches compile errors after edits (in agent loop).
 
         // Platform-aware shell: cmd.exe on Windows, bash on Unix
         #[cfg(target_os = "windows")]
@@ -280,29 +268,10 @@ async fn bash_execute(args: &str, ctx: &ToolContext) -> Result<ToolResult> {
                     let pid = child.id().map(|p| p.to_string()).unwrap_or_else(|| "?".into());
                     let combined = format_output(&stdout_str, &stderr_str);
 
-                    // Auto-detect port from command and poll until ready
-                    let port = devserver::extract_port_with_dir(&parsed.command, Some(&wd));
-                    let port_status = if let Some(p) = port {
-                        // Poll port every 2s for up to 30s
-                        let mut ready = false;
-                        for _ in 0..15 {
-                            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                            if std::net::TcpStream::connect(format!("127.0.0.1:{}", p)).is_ok() {
-                                ready = true;
-                                break;
-                            }
-                        }
-                        if ready {
-                            format!(" Port {} is ready.", p)
-                        } else {
-                            format!(" Port {} not responding after 30s — check logs.", p)
-                        }
-                    } else {
-                        String::new()
-                    };
-
+                    // No port polling — let model verify with its own curl.
+                    // Log redirected to backend.log, model can tail it.
                     let output = if combined.is_empty() {
-                        format!("Process running in background (PID: {}).{}", pid, port_status)
+                        format!("Process running in background (PID: {}). Check backend.log for status.", pid)
                     } else {
                         format!("{}\n\n[Process running in background, PID: {}]", combined, pid)
                     };
@@ -393,43 +362,6 @@ fn check_destructive_command(command: &str) -> Option<String> {
     None
 }
 
-/// Extract port from `lsof -ti:PORT` pattern in command.
-/// This is the strongest hint — the model explicitly knows which port to use.
-fn extract_lsof_port(cmd: &str) -> Option<u16> {
-    if let Some(pos) = cmd.find("lsof -ti:") {
-        let after = &cmd[pos + 9..];
-        let port_str: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
-        return port_str.parse().ok();
-    }
-    // Also match `lsof -i :PORT`
-    if let Some(pos) = cmd.find("lsof -i :") {
-        let after = &cmd[pos + 9..];
-        let port_str: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
-        return port_str.parse().ok();
-    }
-    None
-}
-
-/// Extract the target directory from a `cd /path/to/dir && ...` command.
-/// Returns None if no cd found.
-fn extract_cd_dir(cmd: &str) -> Option<std::path::PathBuf> {
-    // Match patterns: "cd /path/to/dir &&", "cd /path/to/dir;", "cd /path/to/dir\n"
-    for prefix in ["cd ", "CD "] {
-        if let Some(pos) = cmd.find(prefix) {
-            let after = &cmd[pos + prefix.len()..];
-            let dir_end = after.find(|c: char| c == '&' || c == ';' || c == '\n' || c == '|')
-                .unwrap_or(after.len());
-            let dir = after[..dir_end].trim();
-            if !dir.is_empty() {
-                let path = std::path::PathBuf::from(dir);
-                if path.is_dir() {
-                    return Some(path);
-                }
-            }
-        }
-    }
-    None
-}
 
 fn format_output(stdout: &str, stderr: &str) -> String {
     let stdout = stdout.trim();

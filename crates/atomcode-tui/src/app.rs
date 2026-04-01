@@ -574,6 +574,13 @@ impl App {
                         self.first_token_ms = Some(start.elapsed().as_millis() as u64);
                     }
                 }
+                // Log model text if it output text before tool calls (plan, explanation)
+                if let Some(ref buf) = self.conversation.stream_buffer {
+                    let text = buf.trim();
+                    if !text.is_empty() {
+                        self.turn_log.log_model_text(text);
+                    }
+                }
                 // If model produced text before tool calls (looks like a premature summary),
                 // append a visual separator so the user knows more work is coming.
                 if self.conversation.stream_buffer.as_ref().map_or(false, |b| b.len() > 50) {
@@ -2118,8 +2125,8 @@ impl App {
             parts.join("\n")
         };
 
-        // Log this turn
-        self.turn_log.begin_turn(&full_content);
+        // Log this turn with env info
+        self.turn_log.begin_turn(&full_content, &self.model_name, self.context_window);
 
         // Add user message to our local mirror for immediate display.
         self.conversation.add_user_message(&full_content);
