@@ -62,6 +62,25 @@ pub fn render(
     let cache_key = msg_count | ((term_width & 0xFFFF) << 48);
     if cache_key != *render_cache_msg_count {
         render_cache.clear();
+
+        // Count total tool results to determine which are "recent" (last 3
+        // in the current turn get expanded view by default).
+        let total_tool_results = conversation.messages.iter().filter(|m| {
+            matches!(&m.content, MessageContent::ToolResult(_) | MessageContent::ToolResultRef(_))
+        }).count();
+        let mut tool_result_idx: usize = 0;
+
+        // Find the index of the last user message to scope "recent" to current turn.
+        let last_user_idx = conversation.messages.iter().rposition(|m| {
+            matches!(m.role, Role::User) && matches!(&m.content, MessageContent::Text(..))
+        }).unwrap_or(0);
+        // Count tool results after the last user message
+        let results_in_current_turn = conversation.messages[last_user_idx..].iter().filter(|m| {
+            matches!(&m.content, MessageContent::ToolResult(_) | MessageContent::ToolResultRef(_))
+        }).count();
+        // The last 3 tool results in the current turn should be expanded
+        let expand_threshold = total_tool_results.saturating_sub(results_in_current_turn.min(3));
+
         for msg in &conversation.messages {
             match &msg.content {
                 MessageContent::Text(text) => match msg.role {
@@ -81,8 +100,10 @@ pub fn render(
                     }
                 }
                 MessageContent::ToolResult(result) => {
-                    render_tool_result(render_cache, result);
+                    let expanded = tool_result_idx >= expand_threshold;
+                    render_tool_result(render_cache, result, expanded);
                     render_cache.push(Line::default());
+                    tool_result_idx += 1;
                 }
                 MessageContent::ToolResultRef(r) => {
                     // Render ref as a synthetic ToolResult using its summary.
@@ -91,8 +112,10 @@ pub fn render(
                         output: r.summary.clone(),
                         success: r.success,
                     };
-                    render_tool_result(render_cache, &synthetic);
+                    let expanded = tool_result_idx >= expand_threshold;
+                    render_tool_result(render_cache, &synthetic, expanded);
                     render_cache.push(Line::default());
+                    tool_result_idx += 1;
                 }
             }
         }
@@ -328,8 +351,8 @@ fn render_tool_call(lines: &mut Vec<Line<'static>>, call: &ToolCall) {
 
 // ── Tool Result ──
 // Claude Code style: compact one-line summary with duration.
-// Diff lines shown for edit_file only. No raw output preview.
-fn render_tool_result(lines: &mut Vec<Line<'static>>, result: &ToolResult) {
+// Diff lines shown for edit_file only. `expanded` shows full output for recent calls.
+fn render_tool_result(lines: &mut Vec<Line<'static>>, result: &ToolResult, expanded: bool) {
     let bar = Span::styled(format!("{}\u{2502} ", INDENT), Style::default().fg(theme::ACCENT_DIM));
     let (icon, color) = if result.success {
         ("\u{2713}", theme::SUCCESS)
@@ -378,10 +401,14 @@ fn render_tool_result(lines: &mut Vec<Line<'static>>, result: &ToolResult) {
         }
     };
 
-    // Main result line: icon + summary + duration
+    // Expand/collapse indicator: ▾ for expanded, ▸ for collapsed
+    let expand_indicator = if expanded { "\u{25be}" } else { "\u{25b8}" };
+
+    // Main result line: indicator + icon + summary + duration
     let mut spans = vec![
         bar.clone(),
-        Span::styled(format!("  {} ", icon), Style::default().fg(color)),
+        Span::styled(format!(" {} ", expand_indicator), Style::default().fg(theme::TEXT_MUTED)),
+        Span::styled(format!("{} ", icon), Style::default().fg(color)),
         Span::styled(summary, Style::default().fg(theme::TEXT_MUTED)),
     ];
     if !duration.is_empty() {
@@ -389,31 +416,77 @@ fn render_tool_result(lines: &mut Vec<Line<'static>>, result: &ToolResult) {
     }
     lines.push(Line::from(spans));
 
-    // For edit results: show diff lines (- red, + green) — max 4 each
-    if result.success && output.contains("\n- ") || output.contains("\n+ ") {
-        let mut diff_shown = 0;
-        for line in output.lines() {
-            if diff_shown >= 6 { break; }
-            let trimmed = line.trim();
-            if trimmed.starts_with("- ") {
-                let display = if trimmed.chars().count() > 65 {
-                    format!("{}...", trimmed.chars().take(62).collect::<String>())
-                } else { trimmed.to_string() };
-                lines.push(Line::from(vec![
-                    bar.clone(),
-                    Span::styled(format!("    {}", display), Style::default().fg(theme::DIFF_REMOVE)),
-                ]));
-                diff_shown += 1;
-            } else if trimmed.starts_with("+ ") {
-                let display = if trimmed.chars().count() > 65 {
-                    format!("{}...", trimmed.chars().take(62).collect::<String>())
-                } else { trimmed.to_string() };
-                lines.push(Line::from(vec![
-                    bar.clone(),
-                    Span::styled(format!("    {}", display), Style::default().fg(theme::DIFF_ADD)),
-                ]));
-                diff_shown += 1;
-            }
+    // For edit results: show unified diff with line numbers, colored bg — max 15 lines
+    if result.success && (output.contains("\n- ") || output.contains("\n+ ")) {
+        // Collect diff lines with their original line numbers from the output.
+        // The output format from edit_file is:
+        //   "Edited file (-N +M lines).\n- old1\n- old2\n+ new1\n+ new2"
+        let diff_lines: Vec<&str> = output.lines()
+            .filter(|l| {
+                let t = l.trim();
+                t.starts_with("- ") || t.starts_with("+ ")
+            })
+            .collect();
+
+        let total_diff = diff_lines.len();
+        let max_diff_lines = 15;
+        let show_count = total_diff.min(max_diff_lines);
+
+        // Assign gutter line numbers: removed lines count from 1, added lines
+        // count from 1 separately (like unified diff old/new line numbers).
+        let mut old_lineno: usize = 1;
+        let mut new_lineno: usize = 1;
+
+        for (i, diff_line) in diff_lines.iter().enumerate() {
+            if i >= show_count { break; }
+            let trimmed = diff_line.trim();
+
+            let (prefix, gutter_num, fg_color, bg_color) = if trimmed.starts_with("- ") {
+                let n = old_lineno;
+                old_lineno += 1;
+                ("-", n, theme::DIFF_REMOVE, theme::DIFF_REMOVE_BG)
+            } else {
+                let n = new_lineno;
+                new_lineno += 1;
+                ("+", n, theme::DIFF_ADD, theme::DIFF_ADD_BG)
+            };
+
+            // Content after the "- " or "+ " prefix
+            let content = &trimmed[2..];
+            let display = if content.chars().count() > 60 {
+                format!("{}...", content.chars().take(57).collect::<String>())
+            } else {
+                content.to_string()
+            };
+
+            // Gutter: right-aligned 4-char line number
+            let gutter = format!("{:>4}", gutter_num);
+
+            lines.push(Line::from(vec![
+                bar.clone(),
+                Span::styled(
+                    format!("  {}", gutter),
+                    Style::default().fg(theme::DIFF_GUTTER),
+                ),
+                Span::styled(
+                    format!(" {} ", prefix),
+                    Style::default().fg(fg_color).bg(bg_color),
+                ),
+                Span::styled(
+                    format!("{} ", display),
+                    Style::default().fg(fg_color).bg(bg_color),
+                ),
+            ]));
+        }
+
+        if total_diff > max_diff_lines {
+            lines.push(Line::from(vec![
+                bar.clone(),
+                Span::styled(
+                    format!("        ... ({} more lines)", total_diff - max_diff_lines),
+                    Style::default().fg(theme::TEXT_MUTED),
+                ),
+            ]));
         }
     }
 
@@ -432,6 +505,44 @@ fn render_tool_result(lines: &mut Vec<Line<'static>>, result: &ToolResult) {
                 Span::styled(format!("    {}", display), Style::default().fg(theme::ERROR)),
             ]));
             shown += 1;
+        }
+    }
+
+    // Expanded view: show up to 30 lines of full tool output for recent calls.
+    // Skip if this is a diff result (already shown above) or error (shown above).
+    let is_diff_output = result.success && (output.contains("\n- ") || output.contains("\n+ "));
+    let is_error = !result.success;
+    if expanded && !is_diff_output && !is_error {
+        let output_lines: Vec<&str> = output.lines().collect();
+        // Skip the first line (already shown in summary)
+        if output_lines.len() > 1 {
+            let max_expanded = 30;
+            let show_lines = &output_lines[1..(output_lines.len()).min(1 + max_expanded)];
+            for ol in show_lines {
+                let trimmed = ol.trim_end();
+                if trimmed.is_empty() { continue; }
+                let display = if trimmed.chars().count() > 70 {
+                    format!("{}...", trimmed.chars().take(67).collect::<String>())
+                } else {
+                    trimmed.to_string()
+                };
+                lines.push(Line::from(vec![
+                    bar.clone(),
+                    Span::styled(
+                        format!("    {}", display),
+                        Style::default().fg(theme::TEXT_SECONDARY),
+                    ),
+                ]));
+            }
+            if output_lines.len() > 1 + max_expanded {
+                lines.push(Line::from(vec![
+                    bar.clone(),
+                    Span::styled(
+                        format!("    ... ({} more lines)", output_lines.len() - 1 - max_expanded),
+                        Style::default().fg(theme::TEXT_MUTED),
+                    ),
+                ]));
+            }
         }
     }
 }
