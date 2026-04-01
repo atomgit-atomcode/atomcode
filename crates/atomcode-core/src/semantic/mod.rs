@@ -45,7 +45,16 @@ impl SemanticSearcher {
         let lang = LanguageRegistry::detect(path);
 
         if let Some(lang) = lang {
-            self.list_symbols_treesitter(path, &source, lang)
+            let mut symbols = self.list_symbols_treesitter(path, &source, lang)?;
+
+            // Vue SFC: also parse <template> section with HTML parser
+            if lang.is_vue() {
+                if let Some(html_symbols) = self.list_vue_template_symbols(&source) {
+                    symbols.extend(html_symbols);
+                }
+            }
+
+            Some(symbols)
         } else {
             Some(self.list_symbols_indent(&source))
         }
@@ -88,6 +97,82 @@ impl SemanticSearcher {
     /// Invalidate cache for a file (call after edit_file).
     pub fn invalidate(&mut self, path: &Path) {
         self.cache.invalidate(path);
+    }
+
+    /// Extract symbols from Vue <template> section using tree-sitter-html.
+    /// Returns key HTML elements as symbols so they appear in skeleton/file tree.
+    fn list_vue_template_symbols(&mut self, source: &str) -> Option<Vec<Symbol>> {
+        // Find <template> section
+        let template_start = source.find("<template")?;
+        let template_end = source.rfind("</template>")?;
+        if template_start >= template_end { return None; }
+
+        // Byte offset of <template> in the original file
+        let template_content_start = source[template_start..].find('>')? + template_start + 1;
+        let template_content = &source[template_content_start..template_end];
+
+        // Line offset: count newlines before template start
+        let line_offset = source[..template_content_start].lines().count();
+
+        // Parse with HTML grammar
+        let html_grammar = Lang::html_grammar();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&html_grammar).ok()?;
+        let tree = parser.parse(template_content, None)?;
+
+        let query_str = Lang::Html.symbols_query();
+        let query = tree_sitter::Query::new(&html_grammar, query_str).ok()?;
+        let mut cursor = tree_sitter::QueryCursor::new();
+        let mut matches = cursor.matches(&query, tree.root_node(), template_content.as_bytes());
+
+        let name_idx = query.capture_index_for_name("name")?;
+        let def_idx = query.capture_index_for_name("definition")?;
+
+        let mut symbols = Vec::new();
+        let mut seen_lines = std::collections::HashSet::new();
+
+        while let Some(m) = matches.next() {
+            let name_cap = match m.captures.iter().find(|c| c.index == name_idx) {
+                Some(c) => c, None => continue,
+            };
+            let def_cap = match m.captures.iter().find(|c| c.index == def_idx) {
+                Some(c) => c, None => continue,
+            };
+            let name_node = name_cap.node;
+            let def_node = def_cap.node;
+
+            let tag_name = &template_content[name_node.start_byte()..name_node.end_byte()];
+            let start_line = def_node.start_position().row + line_offset;
+
+            // Skip common noise tags, keep structural/component elements
+            if matches!(tag_name, "div" | "span" | "p" | "a" | "li" | "ul" | "ol"
+                | "br" | "hr" | "img" | "i" | "b" | "strong" | "em" | "small"
+                | "label" | "input" | "option" | "thead" | "tbody" | "tr" | "td" | "th") {
+                // Only keep div/span if they have interesting attributes
+                let line = template_content.lines().nth(def_node.start_position().row).unwrap_or("");
+                let has_vue_attr = line.contains("v-if") || line.contains("v-for")
+                    || line.contains("v-show") || line.contains("@click")
+                    || line.contains("v-model");
+                if !has_vue_attr { continue; }
+            }
+
+            // Dedup by line
+            if !seen_lines.insert(start_line) { continue; }
+
+            let end_line = def_node.end_position().row + line_offset;
+            symbols.push(Symbol {
+                name: format!("<{}>", tag_name),
+                start_line,
+                end_line,
+                start_byte: def_node.start_byte() + template_content_start,
+                end_byte: def_node.end_byte() + template_content_start,
+                kind: "element".to_string(),
+            });
+
+            if symbols.len() >= 20 { break; } // Cap to avoid noise
+        }
+
+        if symbols.is_empty() { None } else { Some(symbols) }
     }
 
     // ── Tree-sitter implementation ──
