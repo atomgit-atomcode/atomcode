@@ -160,11 +160,13 @@ impl Tool for EditFileTool {
             atomic_write(&parsed.file_path, &new_content).await?;
             let diff = build_compact_diff(&old_text, &parsed.new_string);
             let outline = post_edit_info(&new_content, &parsed.new_string);
+            let new_end = start + added.saturating_sub(1);
+            let ctx = surrounding_context(&parsed.file_path, start, new_end);
             return Ok(ToolResult {
                 call_id: String::new(),
                 output: format!(
-                    "Edited {} lines {}-{} (-{} +{} lines).\n{}\n{}",
-                    parsed.file_path, start, end, removed, added, diff, outline
+                    "Edited {} lines {}-{} (-{} +{} lines).\n{}\n{}{}",
+                    parsed.file_path, start, end, removed, added, diff, outline, ctx
                 ),
                 success: true,
             });
@@ -244,9 +246,11 @@ impl Tool for EditFileTool {
                     format!("in {} (lines {}-{})", symbol_name, slice.start_line, slice.end_line)
                 };
                 let outline = post_edit_info(&new_content, &parsed.new_string);
+                let (sl, el) = find_edit_lines(&parsed.file_path, &parsed.new_string);
+                let ctx_str = surrounding_context(&parsed.file_path, sl, el);
                 return Ok(ToolResult {
                     call_id: String::new(),
-                    output: format!("Edited {} {}.\n{}\n{}", parsed.file_path, label, diff, outline),
+                    output: format!("Edited {} {}.\n{}\n{}{}", parsed.file_path, label, diff, outline, ctx_str),
                     success: true,
                 });
             } else {
@@ -278,13 +282,15 @@ impl Tool for EditFileTool {
                 atomic_write(&parsed.file_path, &fuzzy_result).await?;
                 let diff = build_compact_diff(&old_string, &parsed.new_string);
                 let outline = post_edit_info(&fuzzy_result, &parsed.new_string);
+                let (sl, el) = find_edit_lines(&parsed.file_path, &parsed.new_string);
+                let ctx_str = surrounding_context(&parsed.file_path, sl, el);
                 return Ok(ToolResult {
                     call_id: String::new(),
                     output: format!(
-                        "Edited {} (fuzzy match, {} occurrence{}).\n{}\n{}",
+                        "Edited {} (fuzzy match, {} occurrence{}).\n{}\n{}{}",
                         parsed.file_path, fuzzy_count,
                         if fuzzy_count > 1 { "s" } else { "" },
-                        diff, outline
+                        diff, outline, ctx_str
                     ),
                     success: true,
                 });
@@ -337,11 +343,13 @@ impl Tool for EditFileTool {
             atomic_write(&parsed.file_path, &new_content).await?;
             let diff = build_compact_diff(&old_string, &parsed.new_string);
             let outline = post_edit_info(&new_content, &parsed.new_string);
+            let (sl, el) = find_edit_lines(&parsed.file_path, &parsed.new_string);
+            let ctx_str = surrounding_context(&parsed.file_path, sl, el);
             Ok(ToolResult {
                 call_id: String::new(),
                 output: format!(
-                    "Edited {} (replaced {} occurrence{}).\n{}\n{}",
-                    parsed.file_path, count, if count > 1 { "s" } else { "" }, diff, outline,
+                    "Edited {} (replaced {} occurrence{}).\n{}\n{}{}",
+                    parsed.file_path, count, if count > 1 { "s" } else { "" }, diff, outline, ctx_str,
                 ),
                 success: true,
             })
@@ -375,11 +383,13 @@ impl Tool for EditFileTool {
                         atomic_write(&parsed.file_path, &new_content).await?;
                         let diff = build_compact_diff(&old_string, &parsed.new_string);
                         let outline = post_edit_info(&new_content, &parsed.new_string);
+                        let (sl, el) = find_edit_lines(&parsed.file_path, &parsed.new_string);
+                        let ctx_str = surrounding_context(&parsed.file_path, sl, el);
                         return Ok(ToolResult {
                             call_id: String::new(),
                             output: format!(
-                                "Edited {} in {}() (auto-scoped, {} global matches).\n{}\n{}",
-                                parsed.file_path, sym.name, count, diff, outline
+                                "Edited {} in {}() (auto-scoped, {} global matches).\n{}\n{}{}",
+                                parsed.file_path, sym.name, count, diff, outline, ctx_str
                             ),
                             success: true,
                         });
@@ -404,11 +414,13 @@ impl Tool for EditFileTool {
             let added = parsed.new_string.lines().count();
             let diff = build_compact_diff(&old_string, &parsed.new_string);
             let outline = post_edit_info(&new_content, &parsed.new_string);
+            let (sl, el) = find_edit_lines(&parsed.file_path, &parsed.new_string);
+            let ctx_str = surrounding_context(&parsed.file_path, sl, el);
             Ok(ToolResult {
                 call_id: String::new(),
                 output: format!(
-                    "Edited {} (-{} +{} lines).\n{}\n{}",
-                    parsed.file_path, removed, added, diff, outline,
+                    "Edited {} (-{} +{} lines).\n{}\n{}{}",
+                    parsed.file_path, removed, added, diff, outline, ctx_str,
                 ),
                 success: true,
             })
@@ -507,41 +519,10 @@ fn try_fuzzy_replace(
     Some((result, count))
 }
 
-/// Combined post-edit info: outline + surrounding context.
-/// Gives the model enough info to do the next edit without re-reading.
-fn post_edit_info(new_content: &str, new_string: &str) -> String {
-    let outline = file_outline(new_content);
-    let context = surrounding_context(new_content, new_string);
-    if context.is_empty() {
-        outline
-    } else {
-        format!("{}\n{}", outline, context)
-    }
-}
-
-/// Show the surrounding context after an edit so the model doesn't need to re-read.
-/// Returns ~10 lines around the replacement location with line numbers.
-fn surrounding_context(new_content: &str, new_string: &str) -> String {
-    let lines: Vec<&str> = new_content.lines().collect();
-    let new_first = new_string.lines().next().unwrap_or("").trim();
-
-    if new_first.is_empty() || lines.len() <= 15 {
-        return String::new(); // Small file or empty replacement — not needed
-    }
-
-    // Find where the replacement is
-    let center = lines.iter().position(|l| l.trim() == new_first).unwrap_or(0);
-    let start = center.saturating_sub(5);
-    let end = (center + 10).min(lines.len());
-
-    let mut ctx = String::from("[Context around edit — do NOT re-read this file:]\n");
-    for i in start..end {
-        ctx.push_str(&format!("{:>4}| {}\n", i + 1, lines[i]));
-    }
-    if end < lines.len() {
-        ctx.push_str(&format!("     ... ({} more lines)\n", lines.len() - end));
-    }
-    ctx
+/// Post-edit info: file outline for navigation.
+/// Surrounding context is now added separately via surrounding_context() at each return path.
+fn post_edit_info(new_content: &str, _new_string: &str) -> String {
+    file_outline(new_content)
 }
 
 /// Post-edit context: give the model the file's current state so it doesn't re-read.
@@ -925,4 +906,47 @@ fn find_closest_match_inner(
          The content may have changed. Use read_file to re-read the file.",
         content_lines.len()
     )
+}
+
+/// Find line range where new_string appears in the written file.
+fn find_edit_lines(file_path: &str, new_string: &str) -> (usize, usize) {
+    if let Ok(content) = std::fs::read_to_string(file_path) {
+        if let Some(byte_offset) = content.find(new_string) {
+            let start_line = content[..byte_offset].lines().count() + 1;
+            let end_line = start_line + new_string.lines().count().saturating_sub(1);
+            return (start_line, end_line);
+        }
+    }
+    (1, 1)
+}
+
+/// After a successful edit, show surrounding context so the model sees
+/// the current file state at the END of the prompt (recency bias).
+/// This helps catch boundary issues (duplicate declarations, missing brackets)
+/// that the model would miss when file content is buried in the middle of context.
+fn surrounding_context(file_path: &str, edit_start_line: usize, edit_end_line: usize) -> String {
+    let content = match std::fs::read_to_string(file_path) {
+        Ok(c) => c,
+        Err(_) => return String::new(),
+    };
+    let lines: Vec<&str> = content.lines().collect();
+    let total = lines.len();
+    if total == 0 { return String::new(); }
+
+    // Show 10 lines before edit start and 10 lines after edit end
+    let ctx_before = 10;
+    let ctx_after = 10;
+    let from = edit_start_line.saturating_sub(ctx_before).max(1);
+    let to = (edit_end_line + ctx_after).min(total);
+
+    let mut out = format!("\n[File state around edit (lines {}-{} of {}):]\n", from, to, total);
+    for i in (from - 1)..to {
+        let marker = if i + 1 >= edit_start_line && i + 1 <= edit_end_line {
+            ">"  // edited line
+        } else {
+            " "  // context line
+        };
+        out.push_str(&format!("{}{:4}| {}\n", marker, i + 1, lines[i]));
+    }
+    out
 }
