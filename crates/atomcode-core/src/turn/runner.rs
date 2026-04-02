@@ -68,15 +68,6 @@ impl TurnRunner {
         let (mut messages, ctx_stats) =
             conversation.to_provider_messages_budgeted(system_prompt, context_window);
 
-        // Emit context stats for logging/display
-        let _ = event_tx.send(TurnEvent::ContextStats {
-            system_tokens: ctx_stats.system_tokens,
-            hot_tokens: ctx_stats.hot_tokens,
-            cold_tokens: ctx_stats.cold_tokens,
-            working_set_tokens: 0, // working set injected separately
-            total_messages: ctx_stats.total_messages,
-        });
-
         // 2. Inflate ToolResultRef → ToolResult for recent messages.
         // Conversation stores large results as compact refs on disk;
         // inflate the last 20 so the LLM sees actual tool output.
@@ -91,6 +82,18 @@ impl TurnRunner {
                 }
             }
         }
+
+        // Emit context stats AFTER inflate so datalog reflects actual tokens sent to LLM.
+        // Pre-inflate stats were misleading (ToolResultRef counted as ~50 tokens,
+        // but inflate expands them to 5K-20K).
+        let actual_tokens: usize = messages.iter().map(|m| m.estimate_tokens()).sum();
+        let _ = event_tx.send(TurnEvent::ContextStats {
+            system_tokens: ctx_stats.system_tokens,
+            hot_tokens: actual_tokens.saturating_sub(ctx_stats.system_tokens),
+            cold_tokens: ctx_stats.cold_tokens,
+            working_set_tokens: 0,
+            total_messages: messages.len(),
+        });
 
         // 3. Get tool definitions for the LLM
         let all_tool_defs = self.tools.get_definitions();
