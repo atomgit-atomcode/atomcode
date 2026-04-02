@@ -34,6 +34,7 @@ pub const BUILTIN_COMMANDS: &[(&str, &str)] = &[
     ("/cost",     "Show token usage for this session"),
     ("/copy",     "Copy last AI response"),
     ("/clear",    "Clear conversation"),
+    ("/issue",    "Create issue on AtomGit"),
     
     // === Config & Help ===
     ("/config",   "Edit config file"),
@@ -43,13 +44,10 @@ pub const BUILTIN_COMMANDS: &[(&str, &str)] = &[
     ("/quit",     "Exit (or Ctrl+C x2)"),
 ];
 
-/// Build the combined list of built-in commands + loaded skills.
-///
-/// Built-ins appear first in their original order.
-/// Skills are appended in alphabetical order.
-/// If a skill name collides with a built-in, the built-in wins (skill is silently omitted).
-pub fn build_command_list(registry: &atomcode_core::skill::SkillRegistry) -> Vec<CommandEntry> {
-    let mut entries: Vec<CommandEntry> = BUILTIN_COMMANDS
+/// Build the command list with only built-in commands.
+/// Skills are not shown in the menu but can still be invoked by typing their name.
+pub fn build_command_list(_registry: &atomcode_core::skill::SkillRegistry) -> Vec<CommandEntry> {
+    BUILTIN_COMMANDS
         .iter()
         .map(|(name, desc)| CommandEntry {
             name: name.to_string(),
@@ -57,25 +55,7 @@ pub fn build_command_list(registry: &atomcode_core::skill::SkillRegistry) -> Vec
             argument_hint: None,
             kind: CommandKind::BuiltIn,
         })
-        .collect();
-
-    let builtin_names: std::collections::HashSet<&str> =
-        BUILTIN_COMMANDS.iter().map(|(name, _)| *name).collect();
-
-    let mut skill_entries: Vec<CommandEntry> = registry
-        .user_invocable()
-        .filter(|s| !builtin_names.contains(format!("/{}", s.name).as_str()))
-        .map(|s| CommandEntry {
-            name: format!("/{}", s.name),
-            description: s.description.clone(),
-            argument_hint: s.argument_hint.clone(),
-            kind: CommandKind::Skill,
-        })
-        .collect();
-    skill_entries.sort_by(|a, b| a.name.cmp(&b.name));
-
-    entries.extend(skill_entries);
-    entries
+        .collect()
 }
 
 /// State of the slash command autocomplete menu.
@@ -87,6 +67,8 @@ pub struct SlashMenu {
     pub filtered: Vec<CommandEntry>,
     /// Currently highlighted index within `filtered`.
     pub selected: usize,
+    /// Scroll offset for when items exceed visible area.
+    pub scroll_offset: usize,
 }
 
 impl SlashMenu {
@@ -95,6 +77,7 @@ impl SlashMenu {
             visible: false,
             filtered: Vec::new(),
             selected: 0,
+            scroll_offset: 0,
         }
     }
 
@@ -132,6 +115,7 @@ impl SlashMenu {
             } else {
                 self.selected -= 1;
             }
+            self.adjust_scroll();
         }
     }
 
@@ -139,6 +123,18 @@ impl SlashMenu {
     pub fn next(&mut self) {
         if !self.filtered.is_empty() {
             self.selected = (self.selected + 1) % self.filtered.len();
+            self.adjust_scroll();
+        }
+    }
+
+    /// Ensure selected item is visible by adjusting scroll_offset.
+    /// Max visible items = 12 (menu_height 14 - 2 for borders).
+    fn adjust_scroll(&mut self) {
+        const MAX_VISIBLE: usize = 12;
+        if self.selected < self.scroll_offset {
+            self.scroll_offset = self.selected;
+        } else if self.selected >= self.scroll_offset + MAX_VISIBLE {
+            self.scroll_offset = self.selected - MAX_VISIBLE + 1;
         }
     }
 
@@ -152,5 +148,6 @@ impl SlashMenu {
         self.visible = false;
         self.filtered.clear();
         self.selected = 0;
+        self.scroll_offset = 0;
     }
 }

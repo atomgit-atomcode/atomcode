@@ -1,5 +1,6 @@
 pub mod chat_panel;
 pub mod input_box;
+pub mod issue_input;
 pub mod markdown;
 pub mod model_selector;
 pub mod provider_panel;
@@ -68,6 +69,13 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         if let Some((ref sessions, selected)) = app.session_selector {
             session_selector::render(frame, chunks[1], sessions, selected, &app.session_selector_query);
         }
+        input_box::render(frame, chunks[2], &app.input, false, None, &app.attached_files, app.pasted_text.as_deref());
+        return;
+    }
+
+    // Issue input mode: render issue form in chat area
+    if let crate::app::AppMode::IssueInput(ref state) = app.mode {
+        issue_input::render(frame, chunks[1], state);
         input_box::render(frame, chunks[2], &app.input, false, None, &app.attached_files, app.pasted_text.as_deref());
         return;
     }

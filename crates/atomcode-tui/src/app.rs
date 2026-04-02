@@ -69,6 +69,38 @@ impl WelcomeState {
     }
 }
 
+/// State for issue creation input form.
+#[derive(Debug, Clone)]
+pub struct IssueInputState {
+    pub title: String,
+    pub description: String,
+    pub title_cursor: usize,
+    pub desc_cursor: usize,
+    pub cursor_field: IssueField,
+    pub submitting: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum IssueField {
+    Title,
+    Description,
+}
+
+impl IssueInputState {
+    pub fn new() -> Self {
+        Self {
+            title: String::new(),
+            description: String::new(),
+            title_cursor: 0,
+            desc_cursor: 0,
+            cursor_field: IssueField::Title,
+            submitting: false,
+            error: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum AppMode {
     Welcome,
@@ -80,6 +112,8 @@ pub enum AppMode {
     ModelSelector,
     /// Session selector mode - shows session list inline for /resume
     SessionSelector,
+    /// Issue input form - create issue on AtomGit
+    IssueInput(IssueInputState),
     Exiting,
 }
 
@@ -764,9 +798,10 @@ impl App {
                 let interval_ms = now.duration_since(self.last_key_time).as_millis();
                 self.last_key_time = now;
 
-                // Provider manager / model selector have their own input —
+                // Provider manager / model selector / issue input have their own input —
                 // skip fast-paste detection and Ctrl+V so keys reach their handler.
-                let is_overlay_mode = matches!(self.mode, AppMode::ProviderManager | AppMode::ModelSelector);
+                let is_overlay_mode = matches!(self.mode, AppMode::ProviderManager | AppMode::ModelSelector)
+                    || matches!(self.mode, AppMode::IssueInput(_));
 
                 if !is_overlay_mode && !cfg!(target_os = "windows") && interval_ms < 10
                     && !matches!(self.mode, AppMode::WaitingApproval(_) | AppMode::Exiting)
@@ -829,6 +864,23 @@ impl App {
             AppEvent::Resize(_, _) => {}
             AppEvent::Tick => {
                 self.tick_count = self.tick_count.wrapping_add(1);
+            }
+            AppEvent::IssueCreated { success, message } => {
+                if success {
+                    // Use ASCII checkmark since emoji gets stripped by markdown renderer
+                    self.conversation.push_delta(&format!(
+                        "**[OK] Issue created successfully!**\n\n[View Issue]({})",
+                        message
+                    ));
+                } else {
+                    self.conversation.push_delta(&format!(
+                        "**[ERROR] Failed to create issue**\n\nError: {}",
+                        message
+                    ));
+                }
+                self.conversation.finalize_stream();
+                // Ensure we switch to Normal mode after handling the event
+                self.mode = AppMode::Normal;
             }
         }
     }
@@ -936,6 +988,7 @@ impl App {
             AppMode::Welcome => self.handle_key_welcome(key),
             AppMode::Normal => self.handle_key_normal(key, event_tx),
             AppMode::SessionSelector => self.handle_key_session_selector(key),
+            AppMode::IssueInput(ref state) => self.handle_key_issue_input(key, state.clone(), event_tx),
             AppMode::Streaming | AppMode::ToolExecuting => {
                 if key.code == KeyCode::Esc {
                     if self.slash_menu.visible {
@@ -1096,6 +1149,225 @@ impl App {
                 }
                 _ => {}
             }
+        }
+    }
+
+    fn handle_key_issue_input(&mut self, key: KeyEvent, state: IssueInputState, event_tx: &mpsc::UnboundedSender<AppEvent>) {
+        match key.code {
+            KeyCode::Tab => {
+                // Toggle between title and description fields
+                let cursor_field = state.cursor_field;
+                let desc_len = state.description.chars().count();
+                let title_len = state.title.chars().count();
+                let mut new_state = state;
+                match cursor_field {
+                    IssueField::Title => {
+                        new_state.cursor_field = IssueField::Description;
+                        // Position cursor at end of description
+                        new_state.desc_cursor = desc_len;
+                    }
+                    IssueField::Description => {
+                        new_state.cursor_field = IssueField::Title;
+                        // Position cursor at end of title
+                        new_state.title_cursor = title_len;
+                    }
+                }
+                self.mode = AppMode::IssueInput(new_state);
+            }
+            KeyCode::Enter => {
+                // Submit if in description field, or move to description if in title
+                match state.cursor_field {
+                    IssueField::Title => {
+                        let desc_cursor = state.description.chars().count();
+                        let mut new_state = state;
+                        new_state.cursor_field = IssueField::Description;
+                        new_state.desc_cursor = desc_cursor;
+                        self.mode = AppMode::IssueInput(new_state);
+                    }
+                    IssueField::Description => {
+                        // Submit the issue
+                        if state.title.trim().is_empty() {
+                            let mut new_state = state;
+                            new_state.error = Some("Title is required".to_string());
+                            self.mode = AppMode::IssueInput(new_state);
+                        } else if state.description.trim().is_empty() {
+                            let mut new_state = state;
+                            new_state.error = Some("Description is required".to_string());
+                            self.mode = AppMode::IssueInput(new_state);
+                        } else if state.submitting {
+                            // Already submitting, ignore
+                        } else {
+                            let mut new_state = state.clone();
+                            new_state.submitting = true;
+                            new_state.error = None;
+                            self.mode = AppMode::IssueInput(new_state);
+                            
+                            // Get access token
+                            let auth_path = atomcode_core::config::Config::config_dir().join("auth.toml");
+                            if let Ok(content) = std::fs::read_to_string(&auth_path) {
+                                let access_token = content.lines()
+                                    .find(|line| line.starts_with("access_token"))
+                                    .and_then(|line| line.split('=').nth(1))
+                                    .map(|s| s.trim().trim_matches('"').to_string());
+                                
+                                if let Some(token) = access_token {
+                                    let title = state.title.clone();
+                                    let description = state.description.clone();
+                                    let tx = event_tx.clone();
+                                    
+                                    // Spawn async task to submit issue
+                                    let _ = std::thread::spawn(move || {
+                                        let rt = tokio::runtime::Runtime::new().unwrap();
+                                        let result = rt.block_on(async {
+                                            submit_issue_to_gitcode(&token, &title, &description).await
+                                        });
+                                        
+                                        // Send result back to main event loop
+                                        match result {
+                                            Ok(issue_url) => {
+                                                let _ = tx.send(AppEvent::IssueCreated {
+                                                    success: true,
+                                                    message: issue_url,
+                                                });
+                                            }
+                                            Err(err) => {
+                                                let _ = tx.send(AppEvent::IssueCreated {
+                                                    success: false,
+                                                    message: err,
+                                                });
+                                            }
+                                        }
+                                    });
+                                    // Keep IssueInput mode with submitting=true until event arrives
+                                    // Mode will switch to Normal in IssueCreated handler
+                                } else {
+                                    let mut new_state = state;
+                                    new_state.submitting = false;
+                                    new_state.error = Some("Failed to read access token".to_string());
+                                    self.mode = AppMode::IssueInput(new_state);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            KeyCode::Esc => {
+                self.mode = AppMode::Normal;
+            }
+            KeyCode::Up => {
+                // Move from Description to Title
+                if state.cursor_field == IssueField::Description {
+                    let title_len = state.title.chars().count();
+                    let mut new_state = state;
+                    new_state.cursor_field = IssueField::Title;
+                    // Position cursor at end of title
+                    new_state.title_cursor = title_len;
+                    self.mode = AppMode::IssueInput(new_state);
+                }
+            }
+            KeyCode::Down => {
+                // Move from Title to Description
+                if state.cursor_field == IssueField::Title {
+                    let desc_len = state.description.chars().count();
+                    let mut new_state = state;
+                    new_state.cursor_field = IssueField::Description;
+                    // Position cursor at end of description
+                    new_state.desc_cursor = desc_len;
+                    self.mode = AppMode::IssueInput(new_state);
+                }
+            }
+            KeyCode::Left => {
+                let field = state.cursor_field;
+                let title_cursor = state.title_cursor;
+                let desc_cursor = state.desc_cursor;
+                let mut new_state = state;
+                match field {
+                    IssueField::Title => {
+                        new_state.title_cursor = title_cursor.saturating_sub(1);
+                    }
+                    IssueField::Description => {
+                        new_state.desc_cursor = desc_cursor.saturating_sub(1);
+                    }
+                }
+                self.mode = AppMode::IssueInput(new_state);
+            }
+            KeyCode::Right => {
+                let field = state.cursor_field;
+                let title_cursor = state.title_cursor;
+                let desc_cursor = state.desc_cursor;
+                let title_len = state.title.chars().count();
+                let desc_len = state.description.chars().count();
+                let mut new_state = state;
+                match field {
+                    IssueField::Title => {
+                        let max = title_len;
+                        new_state.title_cursor = title_cursor.min(max);
+                        if new_state.title_cursor < max {
+                            new_state.title_cursor += 1;
+                        }
+                    }
+                    IssueField::Description => {
+                        let max = desc_len;
+                        new_state.desc_cursor = desc_cursor.min(max);
+                        if new_state.desc_cursor < max {
+                            new_state.desc_cursor += 1;
+                        }
+                    }
+                }
+                self.mode = AppMode::IssueInput(new_state);
+            }
+            KeyCode::Backspace => {
+                let field = state.cursor_field;
+                let title_cursor = state.title_cursor;
+                let desc_cursor = state.desc_cursor;
+                let title = state.title.clone();
+                let description = state.description.clone();
+                let mut new_state = state;
+                match field {
+                    IssueField::Title => {
+                        if title_cursor > 0 {
+                            // Delete char before cursor
+                            let pos = title_cursor;
+                            let chars: Vec<char> = title.chars().collect();
+                            new_state.title = chars[..pos-1].iter().chain(chars[pos..].iter()).collect();
+                            new_state.title_cursor = pos - 1;
+                        }
+                    }
+                    IssueField::Description => {
+                        if desc_cursor > 0 {
+                            let pos = desc_cursor;
+                            let chars: Vec<char> = description.chars().collect();
+                            new_state.description = chars[..pos-1].iter().chain(chars[pos..].iter()).collect();
+                            new_state.desc_cursor = pos - 1;
+                        }
+                    }
+                }
+                self.mode = AppMode::IssueInput(new_state);
+            }
+            KeyCode::Char(c) => {
+                let field = state.cursor_field;
+                let title_cursor = state.title_cursor;
+                let desc_cursor = state.desc_cursor;
+                let title = state.title.clone();
+                let description = state.description.clone();
+                let mut new_state = state;
+                match field {
+                    IssueField::Title => {
+                        let pos = title_cursor;
+                        let chars: Vec<char> = title.chars().collect();
+                        new_state.title = chars[..pos].iter().cloned().chain(std::iter::once(c)).chain(chars[pos..].iter().cloned()).collect();
+                        new_state.title_cursor = pos + 1;
+                    }
+                    IssueField::Description => {
+                        let pos = desc_cursor;
+                        let chars: Vec<char> = description.chars().collect();
+                        new_state.description = chars[..pos].iter().cloned().chain(std::iter::once(c)).chain(chars[pos..].iter().cloned()).collect();
+                        new_state.desc_cursor = pos + 1;
+                    }
+                }
+                self.mode = AppMode::IssueInput(new_state);
+            }
+            _ => {}
         }
     }
 
@@ -1384,15 +1656,18 @@ impl App {
                     );
                 } else if !self.input_history.is_empty() {
                     // Single line, at top: browse history
-                    if self.history_index.is_none() {
-                        // Stash current input
-                        self.history_stash = Some(self.input.content());
+                if self.history_index.is_none() {
+                    // Stash current input
+                    self.history_stash = Some(self.input.content());
+                    self.history_index = Some(self.input_history.len().saturating_sub(1));
+                } else if let Some(idx) = self.history_index {
+                    if idx > 0 {
+                        self.history_index = Some(idx - 1);
+                    } else {
+                        // Wrap around: oldest -> newest
                         self.history_index = Some(self.input_history.len().saturating_sub(1));
-                    } else if let Some(idx) = self.history_index {
-                        if idx > 0 {
-                            self.history_index = Some(idx - 1);
-                        }
                     }
+                }
                     if let Some(idx) = self.history_index {
                         if let Some(hist) = self.input_history.get(idx).cloned() {
                             self.suggestion = None;
@@ -1963,6 +2238,29 @@ impl App {
                 }
                 self.conversation.finalize_stream();
             }
+            "/issue" => {
+                // Check login status first
+                let auth_path = atomcode_core::config::Config::config_dir().join("auth.toml");
+                let mut logged_in = false;
+                
+                if auth_path.exists() {
+                    if let Ok(content) = std::fs::read_to_string(&auth_path) {
+                        // Check if access_token exists
+                        if content.lines().any(|line| line.starts_with("access_token")) {
+                            logged_in = true;
+                        }
+                    }
+                }
+                
+                if logged_in {
+                    // Switch to issue input mode
+                    self.mode = AppMode::IssueInput(IssueInputState::new());
+                    self.conversation.messages.pop(); // Remove the /issue user message
+                } else {
+                    self.conversation.push_delta("**Not logged in.**\n\nPlease use `/login` to authenticate with AtomGit first.");
+                    self.conversation.finalize_stream();
+                }
+            }
             "/status" => {
                 let mut status = String::new();
                 
@@ -2428,6 +2726,42 @@ impl InputState {
 
     pub fn is_empty(&self) -> bool {
         self.lines.len() == 1 && self.lines[0].is_empty()
+    }
+}
+
+/// Submit an issue to AtomGit API
+async fn submit_issue_to_gitcode(access_token: &str, title: &str, body: &str) -> Result<String, String> {
+    use reqwest::Client;
+    
+    let client = Client::new();
+
+    // AtomGit API endpoint for creating issues
+    // Format: https://api.atomgit.com/api/v5/repos/:owner/issues
+    let url = "https://api.atomgit.com/api/v5/repos/bangxu/issues";
+    
+    let response = client
+        .post(url)
+        .json(&serde_json::json!({
+            "access_token": access_token,
+            "repo": "atomcode",
+            "title": title,
+            "body": body,
+        }))
+        .send()
+        .await
+        .map_err(|e| format!("Request failed: {}", e))?;
+    
+    if response.status().is_success() {
+        let json: serde_json::Value = response.json().await
+            .map_err(|e| format!("Failed to parse response: {}", e))?;
+        let issue_url = json["html_url"].as_str()
+            .ok_or("No html_url in response")?
+            .to_string();
+        Ok(issue_url)
+    } else {
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        Err(format!("API error {}: {}", status, text))
     }
 }
 

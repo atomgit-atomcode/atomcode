@@ -15,6 +15,7 @@ pub enum AppEvent {
     Paste(String),          // Bracketed paste content
     Resize(u16, u16),
     Tick,
+    IssueCreated { success: bool, message: String },  // Issue creation result
 }
 
 pub struct EventLoop {

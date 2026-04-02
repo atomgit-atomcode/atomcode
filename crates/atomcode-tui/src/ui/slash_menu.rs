@@ -12,9 +12,10 @@ pub fn render(frame: &mut Frame, input_area: Rect, menu: &SlashMenu) {
     if !menu.visible || menu.filtered.is_empty() {
         return;
     }
-
     let item_count = menu.filtered.len();
-    let menu_height = (item_count as u16 + 2).min(14); // +2 for border, max 14
+    let max_visible = 12usize;
+    let visible_count = item_count.min(max_visible);
+    let menu_height = (visible_count as u16 + 2).min(14); // +2 for border, max 14
     let menu_width = 64u16.min(input_area.width.saturating_sub(2));
 
     // Position: above the input box, aligned to left
@@ -23,11 +24,14 @@ pub fn render(frame: &mut Frame, input_area: Rect, menu: &SlashMenu) {
 
     let area = Rect::new(menu_x, menu_y, menu_width, menu_height);
 
-    // Build menu items
+    // Build menu items - only visible range
+    let scroll_offset = menu.scroll_offset;
     let lines: Vec<Line> = menu
         .filtered
         .iter()
         .enumerate()
+        .skip(scroll_offset)
+        .take(visible_count)
         .map(|(i, entry)| {
             let is_selected = i == menu.selected;
             // Built-ins: cyan; skills: green
