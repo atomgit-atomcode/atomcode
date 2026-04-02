@@ -1,0 +1,204 @@
+//! Edit tool tests — surrounding context, file_history backup, line-number mode, text-match mode.
+
+use std::path::PathBuf;
+use atomcode_core::tool::{Tool, ToolContext, ToolResult};
+
+fn test_context() -> ToolContext {
+    ToolContext::new(PathBuf::from("/tmp"))
+}
+
+fn create_test_file(content: &str) -> String {
+    let dir = std::env::temp_dir().join("atomcode_edit_test");
+    let _ = std::fs::create_dir_all(&dir);
+    let id = format!("{}_{}", std::process::id(), std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos());
+    let path = dir.join(format!("test_{}.vue", id));
+    std::fs::write(&path, content).unwrap();
+    path.to_string_lossy().to_string()
+}
+
+fn cleanup(path: &str) {
+    let _ = std::fs::remove_file(path);
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 1. Surrounding context — edit result includes lines around edit point
+// ═══════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn edit_line_mode_includes_surrounding_context() {
+    let content = (1..=50).map(|i| format!("line {}", i)).collect::<Vec<_>>().join("\n");
+    let path = create_test_file(&content);
+    let ctx = test_context();
+
+    let tool = atomcode_core::tool::edit::EditFileTool;
+    let args = serde_json::json!({
+        "file_path": path,
+        "start_line": 20,
+        "end_line": 25,
+        "new_string": "replaced line 20\nreplaced line 21\nreplaced line 22"
+    });
+
+    let result = tool.execute(&args.to_string(), &ctx).await.unwrap();
+    assert!(result.success, "Edit should succeed: {}", result.output);
+
+    // Should contain surrounding context marker
+    assert!(result.output.contains("[File state around edit"),
+        "Should include surrounding context, got: {}", result.output);
+
+    // Should show lines BEFORE the edit (context)
+    assert!(result.output.contains("line 15") || result.output.contains("line 12"),
+        "Should show lines before edit point");
+
+    // Should show lines AFTER the edit (to catch boundary issues)
+    assert!(result.output.contains("line 26") || result.output.contains("line 30"),
+        "Should show lines after edit point");
+
+    cleanup(&path);
+}
+
+#[tokio::test]
+async fn edit_text_match_includes_surrounding_context() {
+    let content = "const a = 1;\nconst b = 2;\nconst target = 'old';\nconst c = 3;\nconst d = 4;\n";
+    let path = create_test_file(content);
+    let ctx = test_context();
+
+    let tool = atomcode_core::tool::edit::EditFileTool;
+    let args = serde_json::json!({
+        "file_path": path,
+        "old_string": "const target = 'old';",
+        "new_string": "const target = 'new';"
+    });
+
+    let result = tool.execute(&args.to_string(), &ctx).await.unwrap();
+    assert!(result.success, "Edit should succeed: {}", result.output);
+
+    // Should contain surrounding context
+    assert!(result.output.contains("[File state around edit"),
+        "Text-match edit should include surrounding context, got: {}", result.output);
+
+    cleanup(&path);
+}
+
+#[tokio::test]
+async fn edit_surrounding_context_shows_boundary_residual() {
+    // Simulate the exact bug: line-number edit leaves a duplicate declaration outside range
+    let content = "\
+function render() {
+  const isHtml = checkHtml();
+  // some logic
+  // more logic
+  // even more
+  let rendered = oldParse(content);
+  return rendered;
+}
+";
+    let path = create_test_file(content);
+    let ctx = test_context();
+
+    let tool = atomcode_core::tool::edit::EditFileTool;
+    // Replace lines 2-5 (isHtml check), but leave line 6 (let rendered) untouched
+    let args = serde_json::json!({
+        "file_path": path,
+        "start_line": 2,
+        "end_line": 5,
+        "new_string": "  const isHtml = newCheck();\n  let rendered = newParse(content);"
+    });
+
+    let result = tool.execute(&args.to_string(), &ctx).await.unwrap();
+    assert!(result.success);
+
+    // The surrounding context should show the RESIDUAL "let rendered = oldParse" at line 6+
+    // which is now right after the edit, making the duplicate visible
+    assert!(result.output.contains("oldParse"),
+        "Surrounding context should show residual code after edit boundary: {}", result.output);
+
+    cleanup(&path);
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 2. Small file — no surrounding context needed
+// ═══════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn edit_small_file_still_works() {
+    let content = "line 1\nline 2\nline 3\n";
+    let path = create_test_file(content);
+    let ctx = test_context();
+
+    let tool = atomcode_core::tool::edit::EditFileTool;
+    let args = serde_json::json!({
+        "file_path": path,
+        "old_string": "line 2",
+        "new_string": "modified line 2"
+    });
+
+    let result = tool.execute(&args.to_string(), &ctx).await.unwrap();
+    assert!(result.success);
+
+    let new_content = std::fs::read_to_string(&path).unwrap();
+    assert!(new_content.contains("modified line 2"));
+
+    cleanup(&path);
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 3. file_history backup — edit creates backup before write
+// ═══════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn edit_creates_file_history_backup() {
+    let content = "original content\nline 2\nline 3\n";
+    let path = create_test_file(content);
+    let ctx = test_context();
+
+    let tool = atomcode_core::tool::edit::EditFileTool;
+    let args = serde_json::json!({
+        "file_path": path,
+        "old_string": "original content",
+        "new_string": "modified content"
+    });
+
+    let result = tool.execute(&args.to_string(), &ctx).await.unwrap();
+    assert!(result.success);
+
+    // Verify file was modified
+    let new_content = std::fs::read_to_string(&path).unwrap();
+    assert!(new_content.contains("modified content"));
+    assert!(!new_content.contains("original content"));
+
+    // Verify backup exists (file_history should have created one)
+    let fh = ctx.file_history.lock().await;
+    let latest = fh.latest_version(&path);
+    assert!(latest.is_some(), "file_history should have a backup version");
+
+    cleanup(&path);
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 4. Empty old_string — should error, not append
+// ═══════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn edit_empty_old_string_returns_error() {
+    let content = "existing code\n";
+    let path = create_test_file(content);
+    let ctx = test_context();
+
+    let tool = atomcode_core::tool::edit::EditFileTool;
+    let args = serde_json::json!({
+        "file_path": path,
+        "new_string": "should not be appended"
+    });
+
+    let result = tool.execute(&args.to_string(), &ctx).await.unwrap();
+    assert!(!result.success, "Should fail when old_string is empty");
+    assert!(result.output.contains("old_string is required"),
+        "Should tell model old_string is required: {}", result.output);
+
+    // File should NOT be modified
+    let after = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(after, "existing code\n", "File should not be modified");
+
+    cleanup(&path);
+}
