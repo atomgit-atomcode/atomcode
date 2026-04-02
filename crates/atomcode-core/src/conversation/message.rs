@@ -58,8 +58,11 @@ impl Message {
                 text_len + calls_len
             }
             MessageContent::ToolResult(r) => r.output.len() + 10,
-            // ToolResultRef: estimate from summary only (full output is on disk).
-            MessageContent::ToolResultRef(r) => r.summary.len() + 10,
+            // ToolResultRef: estimate from INFLATED size, not summary.
+            // inflate() will expand this to full content before sending to LLM.
+            // Using summary.len() here would make budgeted() think refs are tiny,
+            // causing it to put everything in hot zone, then inflate blows up to 25K+.
+            MessageContent::ToolResultRef(r) => r.byte_size + 10,
         };
         // ~4 chars per token for English, add 4 tokens overhead per message
         (char_count / 4).max(1) + 4
