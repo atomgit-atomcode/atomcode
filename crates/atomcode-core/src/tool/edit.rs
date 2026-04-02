@@ -174,30 +174,12 @@ impl Tool for EditFileTool {
         let old_string = match parsed.old_string {
             Some(ref s) if !s.is_empty() => s.clone(),
             _ => {
-                // Weak model fallback: no old_string and no line range = append to end of file.
-                // This is a common mistake where the model only provides new_string.
-                if !parsed.new_string.is_empty() {
-                    let new_content = if content.ends_with('\n') {
-                        format!("{}{}\n", content, parsed.new_string)
-                    } else {
-                        format!("{}\n{}\n", content, parsed.new_string)
-                    };
-                    let added = parsed.new_string.lines().count();
-                    atomic_write(&parsed.file_path, &new_content).await?;
-                    let outline = post_edit_info(&new_content, &parsed.new_string);
-                    return Ok(ToolResult {
-                        call_id: String::new(),
-                        output: format!(
-                            "Edited {} (appended +{} lines to end of file — no old_string provided, auto-appended).\n{}",
-                            parsed.file_path, added, outline
-                        ),
-                        success: true,
-                    });
-                }
+                // old_string is required. Do NOT auto-append — it creates duplicate code
+                // when the model intends to replace but forgets old_string.
                 return Ok(ToolResult {
                     call_id: String::new(),
-                    output: "Error: either old_string or start_line/end_line is required. \
-                             Provide old_string (text to replace) or start_line+end_line (line range).".to_string(),
+                    output: "Error: old_string is required for editing existing files. \
+                             Provide the exact text you want to replace, or use start_line/end_line for line-based editing.".to_string(),
                     success: false,
                 });
             }
