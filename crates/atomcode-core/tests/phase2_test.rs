@@ -25,7 +25,8 @@ fn unified_prompt_has_key_guidance() {
     let prompt = build_rules();
     assert!(prompt.contains("HYPOTHESIS"), "Must ask for hypothesis");
     assert!(prompt.contains("Silent failure"), "Must cover silent failures");
-    assert!(prompt.contains("SecurityConfig"), "Must mention auth config");
+    // SecurityConfig removed — hardcoding Java class names violates tech-stack neutrality.
+    // Auth debugging is covered by generic "DEBUGGING AUTH ERRORS" section in system prompt.
     assert!(prompt.contains("ONE file at a time"), "Must guide per-file editing");
 }
 
