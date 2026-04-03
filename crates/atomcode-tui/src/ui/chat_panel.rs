@@ -146,7 +146,7 @@ pub fn render(
     // (Spinner variables moved to the dedicated spinner_area renderer at the top)
 
     // ── Turn finished separator ──
-    // (Spinner is rendered separately above the chat Paragraph — see spinner_area)
+    // Claude Code style: "✓ Done in 47s · 3 turns" with subtle separator line
     if let Some(dur) = last_turn_duration {
         let secs = dur.as_secs();
         let time_str = if secs >= 60 {
@@ -154,23 +154,26 @@ pub fn render(
         } else {
             format!("{}s", secs)
         };
-        let turns_str = if finished_step_count > 0 {
-            format!("{} turns", finished_step_count)
-        } else {
-            "done".to_string()
-        };
-        let label = format!(" {} \u{00b7} {} ", turns_str, time_str);
-        let line_char = "\u{2500}";
-        let side_len = 8;
-        let sep = format!(
-            "  {}{}{}",
-            line_char.repeat(side_len),
-            label,
-            line_char.repeat(side_len),
-        );
-        let sep_color = theme::SEPARATOR;
+
         dynamic.push(Line::default());
-        dynamic.push(Line::from(Span::styled(sep, Style::default().fg(sep_color))));
+
+        let mut parts: Vec<Span> = Vec::new();
+        parts.push(Span::styled(
+            format!("{}  \u{2713} ", INDENT),
+            Style::default().fg(theme::SUCCESS),
+        ));
+        parts.push(Span::styled(
+            time_str,
+            Style::default().fg(theme::TEXT_SECONDARY),
+        ));
+        if finished_step_count > 0 {
+            parts.push(Span::styled(
+                format!(" \u{00b7} {} turns", finished_step_count),
+                Style::default().fg(theme::TEXT_MUTED),
+            ));
+        }
+
+        dynamic.push(Line::from(parts));
     }
 
     // Approval prompt — render when waiting for user approval
