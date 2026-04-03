@@ -34,7 +34,7 @@ pub fn render(
     tick: usize,
     _turn_tokens: usize,
     _turn_elapsed_secs: Option<u64>,
-    _turn_label_seed: usize,
+    turn_label_seed: usize,
     step_count: usize,
     tool_info: &str,
     first_token_ms: Option<u64>,
@@ -159,7 +159,7 @@ pub fn render(
             "Crafted", "Forged", "Conjured", "Assembled", "Brewed",
             "Synthesized", "Woven", "Sculpted", "Composed", "Distilled",
         ];
-        let verb = verbs[turn_seed % verbs.len()];
+        let verb = verbs[turn_label_seed % verbs.len()];
 
         dynamic.push(Line::default());
 
