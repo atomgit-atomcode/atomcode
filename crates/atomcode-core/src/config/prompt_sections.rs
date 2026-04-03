@@ -55,6 +55,8 @@ Most tasks need 3-8 tool calls. 8+ calls without editing = off track.
 - NEVER re-run with different flags. Fails twice → DIFFERENT approach.
 - ALWAYS compile BEFORE starting a server.
 - No sleep-and-check loops. Port auto-detected.
+- Do NOT deploy/restart backend servers. If compile fails or server needs restart, tell the user.
+- Do NOT debug authentication/token errors via curl. Tell the user to check credentials.
 
 ## ERROR HANDLING:
 - Command fails → READ full error BEFORE acting.

@@ -391,6 +391,32 @@ impl TurnRunner {
             }
         };
 
+        // Intercept deployment/restart commands — these waste 5-8 turns and
+        // should be done by the user, not the agent.
+        if call.name == "bash" {
+            if let Ok(args) = serde_json::from_str::<serde_json::Value>(&call.arguments) {
+                if let Some(cmd) = args.get("command").and_then(|v| v.as_str()) {
+                    if let Some(reason) = detect_deployment_command(cmd) {
+                        let output = format!(
+                            "[STOPPED: {}. Tell the user to do this manually instead of attempting it yourself.]",
+                            reason
+                        );
+                        let _ = event_tx.send(TurnEvent::ToolCallResult {
+                            name: call.name.clone(),
+                            output: output.clone(),
+                            success: false,
+                            duration: std::time::Duration::ZERO,
+                        });
+                        return ToolResult {
+                            call_id: call.id.clone(),
+                            output,
+                            success: false,
+                        };
+                    }
+                }
+            }
+        }
+
         // Check permission via the injected PermissionDecider.
         // AutoApprove tools execute immediately; RequireApproval tools go through
         // the decider which handles interactive prompts or automatic policy.
@@ -458,6 +484,30 @@ fn strip_model_tags(text: &str) -> String {
     result = result.replace("</think>", "");
     result = result.replace("<|im_start|>", "").replace("<|im_end|>", "");
     result
+}
+
+/// Detect deployment/restart/auth-debug commands that waste agent turns.
+/// Returns Some(reason) if the command should be blocked.
+fn detect_deployment_command(cmd: &str) -> Option<String> {
+    let trimmed = cmd.trim();
+
+    // Backend server restart patterns
+    if (trimmed.contains("java -jar") || trimmed.contains("mvn spring-boot:run")
+        || trimmed.contains("mvn spring-boot:start") || trimmed.contains("gradle bootRun"))
+        && !trimmed.contains("mvn compile")
+    {
+        return Some("Backend server deployment should be done by the user".to_string());
+    }
+
+    // Auth/token debugging via curl (waste of turns — agent can't fix auth)
+    if trimmed.contains("curl") && (
+        trimmed.contains("Authorization") || trimmed.contains("Bearer")
+        || trimmed.contains("token") || trimmed.contains("login")
+    ) {
+        return Some("Authentication debugging via curl should be done by the user".to_string());
+    }
+
+    None
 }
 
 /// Generate a compact file skeleton showing structure + line numbers.
