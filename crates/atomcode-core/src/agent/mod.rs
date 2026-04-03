@@ -1278,6 +1278,24 @@ impl AgentLoop {
                         self.finish_turn();
                         return;
                     }
+                    // Read-loop breaker: if model has done 8+ consecutive reads without
+                    // any edit, it's stuck (likely context too full to generate edits).
+                    // Force it to act or explain.
+                    if self.consecutive_reads >= 8 && self.files_edited_this_turn.is_empty() {
+                        self.conversation.add_user_message(
+                            "You have read files 8+ times without making any edit. \
+                             You are stuck. Either use edit_file NOW to fix the issue, \
+                             or summarize the problem for the user."
+                        );
+                    } else if self.consecutive_reads >= 12 {
+                        // Absolute hard stop — 12 consecutive reads is a death spiral
+                        self.conversation.add_user_message(
+                            "STOPPED: 12 consecutive reads without editing. \
+                             Summarize what you found and what the user should do."
+                        );
+                        self.finish_turn();
+                        return;
+                    }
                     // Continue to next turn
                     self.phase = AgentPhase::Thinking;
                     let _ = self.event_tx.send(AgentEvent::PhaseChange(AgentPhase::Thinking));
@@ -2298,9 +2316,26 @@ impl AgentLoop {
         // content mid-conversation with limited context windows.
         // We still avoid counting this as a "real" read for budget purposes.
 
-        // No read blocking — trust the model to read what it needs,
-        // like Claude Code does. The "NO RE-READING" rule in the system
-        // prompt is a guideline, not a hard block.
+        // Hard block: 5+ reads of the same file → stop executing, force the model to act.
+        // Prevents infinite read loops when context is near-full and model can't generate edits.
+        if tool_name == "read_file" {
+            if let Ok(args_val) = serde_json::from_str::<serde_json::Value>(args) {
+                if let Some(fp) = args_val.get("file_path").and_then(|v| v.as_str()) {
+                    let short = std::path::Path::new(fp)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| fp.to_string());
+                    let count = self.file_read_counts.get(&short).copied().unwrap_or(0);
+                    if count >= 5 {
+                        return Some(format!(
+                            "BLOCKED: You have read {} {} times. You already have the content. \
+                             Use edit_file to make changes NOW, or explain to the user what's wrong.",
+                            short, count
+                        ));
+                    }
+                }
+            }
+        }
 
         // Loop detection: if the same (tool, args) appears 3+ times in recent calls, block it.
         // EXCEPTION: if there was an edit_file/write_file between repeats, the model is

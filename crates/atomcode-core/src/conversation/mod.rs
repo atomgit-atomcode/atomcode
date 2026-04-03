@@ -331,18 +331,16 @@ impl Conversation {
             // Find the last assistant text message in this turn (the "outcome").
             // Priority: pure text response > tool call with text > synthetic from tool results.
             let mut found_outcome = false;
+            let mut outcome_text = String::new();
             for msg in turn_msgs.iter().rev() {
                 match &msg.content {
                     MessageContent::Text(s) if matches!(msg.role, Role::Assistant) => {
-                        turn_cost += msg.estimate_tokens();
-                        turn_condensed.push(Message::new(Role::Assistant, s.clone()));
+                        outcome_text = s.clone();
                         found_outcome = true;
                         break;
                     }
                     MessageContent::AssistantWithToolCalls { text: Some(t), .. } if !t.is_empty() => {
-                        let text_msg = Message::new(Role::Assistant, t.clone());
-                        turn_cost += text_msg.estimate_tokens();
-                        turn_condensed.push(text_msg);
+                        outcome_text = t.clone();
                         found_outcome = true;
                         break;
                     }
@@ -354,12 +352,23 @@ impl Conversation {
             // turn was terminated by step limit). Synthesize a brief outcome
             // from the last tool result so the model knows what happened.
             if !found_outcome {
-                let synthetic = self.synthesize_turn_outcome(turn_msgs);
-                if !synthetic.is_empty() {
-                    let outcome_msg = Message::new(Role::Assistant, synthetic);
-                    turn_cost += outcome_msg.estimate_tokens();
-                    turn_condensed.push(outcome_msg);
+                outcome_text = self.synthesize_turn_outcome(turn_msgs);
+            }
+
+            // Always append edit/write tombstones so the model knows which files
+            // were changed in this turn, even after compression drops tool results.
+            let edit_tombstones = Self::extract_edit_tombstones(turn_msgs);
+            if !edit_tombstones.is_empty() {
+                if !outcome_text.is_empty() {
+                    outcome_text.push('\n');
                 }
+                outcome_text.push_str(&edit_tombstones);
+            }
+
+            if !outcome_text.is_empty() {
+                let outcome_msg = Message::new(Role::Assistant, outcome_text);
+                turn_cost += outcome_msg.estimate_tokens();
+                turn_condensed.push(outcome_msg);
             }
 
             if cold_tokens + turn_cost > cold_budget {
@@ -505,6 +514,30 @@ impl Conversation {
             outcome.push_str(&format!(" Last action failed: {}", err_short));
         }
         outcome
+    }
+
+    /// Extract edit/write tombstones from a turn's messages.
+    /// Returns lines like `[edited: NoteService.java L94-95]` so the model
+    /// remembers which files it changed even after cold-zone compression
+    /// drops the full tool results.
+    fn extract_edit_tombstones(turn_msgs: &[Message]) -> String {
+        let mut tombstones: Vec<String> = Vec::new();
+        for msg in turn_msgs {
+            let (success, output) = match &msg.content {
+                MessageContent::ToolResult(r) => (r.success, r.output.as_str()),
+                MessageContent::ToolResultRef(r) => (r.success, r.summary.as_str()),
+                _ => continue,
+            };
+            if !success { continue; }
+            for line in output.lines() {
+                if line.starts_with("Edited ") || line.starts_with("Wrote ")
+                    || line.starts_with("Multi-edit:")
+                {
+                    tombstones.push(format!("[{}]", line.trim()));
+                }
+            }
+        }
+        tombstones.join("\n")
     }
 
     /// Build a batch summary for turns[start..end].
