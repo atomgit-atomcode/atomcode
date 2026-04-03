@@ -44,7 +44,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(theme::TEXT_PRIMARY).add_modifier(Modifier::BOLD),
         ),
     ]));
-    // Line 2: core + version · model
+    // Line 2: core + version [build] · model
     lines.push(Line::from(vec![
         Span::styled(
             format!("  {}", ATOM[1]),
@@ -53,6 +53,10 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         Span::styled(
             format!("  v{}", env!("CARGO_PKG_VERSION")),
             Style::default().fg(theme::TEXT_MUTED),
+        ),
+        Span::styled(
+            format!(" [{}]", env!("ATOMCODE_BUILD_ID")),
+            Style::default().fg(theme::BORDER),
         ),
         Span::styled(" · ", Style::default().fg(theme::BORDER)),
         Span::styled(
