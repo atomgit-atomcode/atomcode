@@ -296,39 +296,44 @@ impl TurnRunner {
                         .chain(self.recently_edited_files.iter())
                         .any(|f| f == &short || fp.contains(f.as_str()));
                     if edited_recently {
-                        // Track post-edit read count: first read returns skeleton, second+ BLOCKED.
+                        // Track post-edit read count:
+                        //   1st: return skeleton (plan next edit)
+                        //   2nd: allow actual read (verify fix in bug-fix scenarios)
+                        //   3rd+: BLOCKED
                         let read_count = self.post_edit_read_counts.entry(short.clone()).or_insert(0);
                         *read_count += 1;
 
-                        let output = if *read_count == 1 {
-                            // First read after edit: return file skeleton (structure + line numbers)
-                            // so model can plan next edit without re-reading full content.
+                        let intercept_output = if *read_count == 1 {
                             let skeleton = match std::fs::read_to_string(fp) {
                                 Ok(content) => generate_file_skeleton(&content, &short),
                                 Err(_) => format!("[{} was just edited. Use edit_file to make further changes.]", short),
                             };
-                            skeleton
+                            Some(skeleton)
+                        } else if *read_count == 2 {
+                            None // allow normal execution — model may be verifying a bug fix
                         } else {
-                            format!(
-                                "[BLOCKED: {} was already read once after editing. You have the skeleton above. \
-                                 Use edit_file with start_line/end_line to make changes. Do NOT read again.]",
-                                short
-                            )
+                            Some(format!(
+                                "[BLOCKED: {} read {} times after editing. Use edit_file to make changes.]",
+                                short, read_count
+                            ))
                         };
 
-                        let result = ToolResult {
-                            call_id: call.id.clone(),
-                            output,
-                            success: true,
-                        };
-                        let _ = event_tx.send(TurnEvent::ToolCallResult {
-                            name: call.name.clone(),
-                            output: result.output.clone(),
-                            success: true,
-                            duration: std::time::Duration::ZERO,
-                        });
-                        conversation.add_tool_result(result);
-                        continue;
+                        if let Some(output) = intercept_output {
+                            let result = ToolResult {
+                                call_id: call.id.clone(),
+                                output,
+                                success: true,
+                            };
+                            let _ = event_tx.send(TurnEvent::ToolCallResult {
+                                name: call.name.clone(),
+                                output: result.output.clone(),
+                                success: true,
+                                duration: std::time::Duration::ZERO,
+                            });
+                            conversation.add_tool_result(result);
+                            continue;
+                        }
+                        // read_count == 2: fall through to normal execution
                     }
                 }
 
