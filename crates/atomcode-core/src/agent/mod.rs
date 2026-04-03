@@ -295,6 +295,7 @@ impl AgentLoop {
             config: config.clone(),
             permission: interactive_permission,
             result_store: ToolResultStore::new(ToolResultStore::default_dir()),
+            recently_edited_files: Vec::new(),
         };
 
         let agent = Self {
@@ -969,7 +970,7 @@ impl AgentLoop {
 
                 // Destructure self to get split borrows — the borrow checker needs to see
                 // that turn_runner and the other fields are disjoint borrows.
-                let runner = &self.turn_runner;
+                let runner = &mut self.turn_runner;
                 let cmd_rx = &mut self.cmd_rx;
                 let approval_req_rx = &mut self.approval_req_rx;
                 let event_tx = &self.event_tx;

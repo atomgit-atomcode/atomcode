@@ -33,12 +33,15 @@ pub struct TurnRunner {
     pub permission: Box<dyn PermissionDecider>,
     /// Tool result store — used to inflate ToolResultRef messages before sending to LLM.
     pub result_store: crate::tool::result_store::ToolResultStore,
+    /// Files edited during the current session — read_file on these is intercepted
+    /// to prevent wasteful "verification reads" after editing.
+    pub recently_edited_files: Vec<String>,
 }
 
 impl TurnRunner {
     /// Execute one LLM turn: stream response, execute any tool calls, return result.
     pub async fn run(
-        &self,
+        &mut self,
         conversation: &mut Conversation,
         system_prompt: &str,
         event_tx: &mpsc::UnboundedSender<TurnEvent>,
@@ -50,7 +53,7 @@ impl TurnRunner {
     /// Run with optional tool filter. If `allowed_tools` is Some, only those tools
     /// are visible to the LLM. Used by Phase 2 to restrict first turn to read-only.
     pub async fn run_with_filter(
-        &self,
+        &mut self,
         conversation: &mut Conversation,
         system_prompt: &str,
         event_tx: &mpsc::UnboundedSender<TurnEvent>,
@@ -239,6 +242,7 @@ impl TurnRunner {
                 seen_calls.insert(key, i);
             }
         }
+        let mut files_edited_this_batch: Vec<String> = Vec::new();
         for (i, call) in tool_calls_buf.iter().enumerate() {
             if cancel.is_cancelled() {
                 return TurnResult::Cancelled;
@@ -258,7 +262,62 @@ impl TurnRunner {
                 });
                 conversation.add_tool_result(result);
             } else {
+                // Intercept: block read_file on a file that was recently edited.
+                // Prevents the model from wasting turns "verifying" its own edits.
+                // Checks both this batch AND across turns (recently_edited_files).
+                if call.name == "read_file" {
+                    if let Ok(args) = serde_json::from_str::<serde_json::Value>(&call.arguments) {
+                        if let Some(fp) = args.get("file_path").and_then(|v| v.as_str()) {
+                            let short = std::path::Path::new(fp)
+                                .file_name()
+                                .map(|n| n.to_string_lossy().to_string())
+                                .unwrap_or_else(|| fp.to_string());
+                            let edited_recently = files_edited_this_batch.iter()
+                                .chain(self.recently_edited_files.iter())
+                                .any(|f| f == &short || fp.contains(f.as_str()));
+                            if edited_recently {
+                                let result = ToolResult {
+                                    call_id: call.id.clone(),
+                                    output: format!(
+                                        "[SKIPPED: {} was just edited. The edit result above shows the current state. \
+                                         Do NOT re-read files you just edited. Proceed to the next task or summarize.]",
+                                        short
+                                    ),
+                                    success: true,
+                                };
+                                let _ = event_tx.send(TurnEvent::ToolCallResult {
+                                    name: call.name.clone(),
+                                    output: result.output.clone(),
+                                    success: true,
+                                    duration: std::time::Duration::ZERO,
+                                });
+                                conversation.add_tool_result(result);
+                                continue;
+                            }
+                        }
+                    }
+                }
+
                 let result = self.execute_single_tool(call, event_tx).await;
+
+                // Track files edited for read interception (batch + cross-turn)
+                if matches!(call.name.as_str(), "edit_file" | "write_file") && result.success {
+                    if let Ok(args) = serde_json::from_str::<serde_json::Value>(&call.arguments) {
+                        if let Some(fp) = args.get("file_path").and_then(|v| v.as_str()) {
+                            let short = std::path::Path::new(fp)
+                                .file_name()
+                                .map(|n| n.to_string_lossy().to_string())
+                                .unwrap_or_else(|| fp.to_string());
+                            if !files_edited_this_batch.contains(&short) {
+                                files_edited_this_batch.push(short.clone());
+                            }
+                            if !self.recently_edited_files.contains(&short) {
+                                self.recently_edited_files.push(short);
+                            }
+                        }
+                    }
+                }
+
                 conversation.add_tool_result(result);
             }
         }

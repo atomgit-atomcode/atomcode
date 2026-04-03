@@ -186,6 +186,7 @@ fn make_runner(provider: MockProvider, tools: ToolRegistry, permission: Box<dyn 
         result_store: crate::tool::result_store::ToolResultStore::new(
             crate::tool::result_store::ToolResultStore::default_dir()
         ),
+        recently_edited_files: Vec::new(),
     }
 }
 
@@ -203,7 +204,7 @@ fn auto_deny() -> Box<dyn super::permission::PermissionDecider> {
 
 #[tokio::test]
 async fn test_turn_runner_text_only_response() {
-    let runner = make_runner(MockProvider::text_only("Hello, world!"), ToolRegistry::new(), auto_bypass());
+    let mut runner = make_runner(MockProvider::text_only("Hello, world!"), ToolRegistry::new(), auto_bypass());
     let mut conv = Conversation::new();
     conv.add_user_message("Hi");
     let (tx, _rx) = mpsc::unbounded_channel();
@@ -221,7 +222,7 @@ async fn test_turn_runner_text_only_response() {
 
 #[tokio::test]
 async fn test_turn_runner_emits_text_delta_events() {
-    let runner = make_runner(MockProvider::text_only("Hello"), ToolRegistry::new(), auto_bypass());
+    let mut runner = make_runner(MockProvider::text_only("Hello"), ToolRegistry::new(), auto_bypass());
     let mut conv = Conversation::new();
     conv.add_user_message("Hi");
     let (tx, mut rx) = mpsc::unbounded_channel();
@@ -245,7 +246,7 @@ async fn test_turn_runner_executes_tool_call() {
     tools.register(Box::new(EchoTool { name: "grep" }));
 
     let provider = MockProvider::with_tool_call("grep", r#"{"pattern":"foo"}"#);
-    let runner = make_runner(provider, tools, auto_bypass());
+    let mut runner = make_runner(provider, tools, auto_bypass());
     let mut conv = Conversation::new();
     conv.add_user_message("search for foo");
     let (tx, _rx) = mpsc::unbounded_channel();
@@ -273,7 +274,7 @@ async fn test_turn_runner_emits_tool_events() {
     tools.register(Box::new(EchoTool { name: "grep" }));
 
     let provider = MockProvider::with_tool_call("grep", r#"{"pattern":"foo"}"#);
-    let runner = make_runner(provider, tools, auto_bypass());
+    let mut runner = make_runner(provider, tools, auto_bypass());
     let mut conv = Conversation::new();
     conv.add_user_message("search");
     let (tx, mut rx) = mpsc::unbounded_channel();
@@ -301,7 +302,7 @@ async fn test_turn_runner_emits_tool_events() {
 async fn test_turn_runner_unknown_tool_returns_error_result() {
     // Provider asks to call a tool that isn't registered
     let provider = MockProvider::with_tool_call("nonexistent", "{}");
-    let runner = make_runner(provider, ToolRegistry::new(), auto_bypass());
+    let mut runner = make_runner(provider, ToolRegistry::new(), auto_bypass());
     let mut conv = Conversation::new();
     conv.add_user_message("do something");
     let (tx, _rx) = mpsc::unbounded_channel();
@@ -327,7 +328,7 @@ async fn test_turn_runner_unknown_tool_returns_error_result() {
 #[tokio::test]
 async fn test_turn_runner_handles_stream_error() {
     let provider = MockProvider::with_error("API rate limit exceeded");
-    let runner = make_runner(provider, ToolRegistry::new(), auto_bypass());
+    let mut runner = make_runner(provider, ToolRegistry::new(), auto_bypass());
     let mut conv = Conversation::new();
     conv.add_user_message("Hi");
     let (tx, _rx) = mpsc::unbounded_channel();
@@ -345,7 +346,7 @@ async fn test_turn_runner_handles_stream_error() {
 #[tokio::test]
 async fn test_turn_runner_cancellation() {
     let provider = MockProvider::text_only("This should be cancelled");
-    let runner = make_runner(provider, ToolRegistry::new(), auto_bypass());
+    let mut runner = make_runner(provider, ToolRegistry::new(), auto_bypass());
     let mut conv = Conversation::new();
     conv.add_user_message("Hi");
     let (tx, _rx) = mpsc::unbounded_channel();
@@ -368,7 +369,7 @@ async fn test_turn_runner_auto_deny_blocks_dangerous_tool() {
     tools.register(Box::new(DangerousTool));
 
     let provider = MockProvider::with_tool_call("dangerous", "{}");
-    let runner = make_runner(provider, tools, auto_deny());
+    let mut runner = make_runner(provider, tools, auto_deny());
     let mut conv = Conversation::new();
     conv.add_user_message("do dangerous thing");
     let (tx, _rx) = mpsc::unbounded_channel();
@@ -396,7 +397,7 @@ async fn test_turn_runner_auto_bypass_allows_dangerous_tool() {
     tools.register(Box::new(DangerousTool));
 
     let provider = MockProvider::with_tool_call("dangerous", "{}");
-    let runner = make_runner(provider, tools, auto_bypass());
+    let mut runner = make_runner(provider, tools, auto_bypass());
     let mut conv = Conversation::new();
     conv.add_user_message("do dangerous thing");
     let (tx, _rx) = mpsc::unbounded_channel();
@@ -428,7 +429,7 @@ async fn test_turn_runner_interactive_approval_allow() {
     let permission = Box::new(InteractivePermissionDecider::new(req_tx, resp_rx, store));
 
     let provider = MockProvider::with_tool_call("dangerous", "{}");
-    let runner = make_runner(provider, tools, permission);
+    let mut runner = make_runner(provider, tools, permission);
     let mut conv = Conversation::new();
     conv.add_user_message("do it");
     let (tx, _rx) = mpsc::unbounded_channel();
@@ -466,7 +467,7 @@ async fn test_turn_runner_interactive_approval_deny() {
     let permission = Box::new(InteractivePermissionDecider::new(req_tx, resp_rx, store));
 
     let provider = MockProvider::with_tool_call("dangerous", "{}");
-    let runner = make_runner(provider, tools, permission);
+    let mut runner = make_runner(provider, tools, permission);
     let mut conv = Conversation::new();
     conv.add_user_message("do it");
     let (tx, _rx) = mpsc::unbounded_channel();
@@ -554,7 +555,7 @@ fn should_inject_reminder(tool_call_count: usize) -> bool {
 
 #[tokio::test]
 async fn test_turn_runner_reports_token_usage() {
-    let runner = make_runner(MockProvider::text_only("Hello"), ToolRegistry::new(), auto_bypass());
+    let mut runner = make_runner(MockProvider::text_only("Hello"), ToolRegistry::new(), auto_bypass());
     let mut conv = Conversation::new();
     conv.add_user_message("Hi");
     let (tx, mut rx) = mpsc::unbounded_channel();
@@ -578,7 +579,7 @@ async fn test_turn_runner_reports_token_usage() {
 
 #[tokio::test]
 async fn test_turn_runner_adds_assistant_message_on_text_response() {
-    let runner = make_runner(MockProvider::text_only("Hello!"), ToolRegistry::new(), auto_bypass());
+    let mut runner = make_runner(MockProvider::text_only("Hello!"), ToolRegistry::new(), auto_bypass());
     let mut conv = Conversation::new();
     conv.add_user_message("Hi");
     let (tx, _rx) = mpsc::unbounded_channel();
@@ -599,7 +600,7 @@ async fn test_turn_runner_adds_tool_call_and_result_messages() {
     tools.register(Box::new(EchoTool { name: "grep" }));
 
     let provider = MockProvider::with_tool_call("grep", "{}");
-    let runner = make_runner(provider, tools, auto_bypass());
+    let mut runner = make_runner(provider, tools, auto_bypass());
     let mut conv = Conversation::new();
     conv.add_user_message("search");
     let (tx, _rx) = mpsc::unbounded_channel();
@@ -632,7 +633,7 @@ async fn test_tool_result_content_in_llm_context() {
     tools.register(Box::new(EchoTool { name: "grep" }));
 
     let provider = MockProvider::with_tool_call("grep", r#"{"pattern":"foo"}"#);
-    let runner = make_runner(provider, tools, auto_bypass());
+    let mut runner = make_runner(provider, tools, auto_bypass());
     let mut conv = Conversation::new();
     conv.add_user_message("search for foo");
     let (tx, _rx) = mpsc::unbounded_channel();
@@ -696,7 +697,7 @@ async fn test_multiple_tool_calls_results_in_context() {
         ],
     };
 
-    let runner = make_runner(provider, tools, auto_bypass());
+    let mut runner = make_runner(provider, tools, auto_bypass());
     let mut conv = Conversation::new();
     conv.add_user_message("search and read");
     let (tx, _rx) = mpsc::unbounded_channel();
@@ -749,7 +750,7 @@ async fn test_denied_tool_result_in_llm_context() {
     tools.register(Box::new(DangerousTool));
 
     let provider = MockProvider::with_tool_call("dangerous", "{}");
-    let runner = make_runner(provider, tools, auto_deny());
+    let mut runner = make_runner(provider, tools, auto_deny());
     let mut conv = Conversation::new();
     conv.add_user_message("do it");
     let (tx, _rx) = mpsc::unbounded_channel();
