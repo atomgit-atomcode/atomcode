@@ -970,19 +970,21 @@ async fn post_edit_validate(result: ToolResult, file_path: &str, new_content: &s
 /// common weak-model error in multi-edit of large files.
 fn check_brace_balance(content: &str, file_path: &str) -> String {
     let ext = file_path.rsplit('.').next().unwrap_or("");
-    // Only check brace-based languages
     if !matches!(ext, "js" | "ts" | "tsx" | "jsx" | "vue" | "svelte" | "java" | "rs" | "go" | "c" | "cpp" | "cs" | "json") {
         return String::new();
     }
 
     let mut braces = 0i64;
-    let mut brackets = 0i64;
-    let mut parens = 0i64;
     let mut in_string = false;
     let mut escape = false;
     let mut string_char = ' ';
+    // Track where the deepest unmatched `{` is — likely where `}` is missing.
+    let mut max_depth = 0i64;
+    let mut max_depth_line = 0usize;
+    let mut line_num = 1usize;
 
     for ch in content.chars() {
+        if ch == '\n' { line_num += 1; }
         if escape { escape = false; continue; }
         if ch == '\\' && in_string { escape = true; continue; }
         if in_string {
@@ -991,33 +993,30 @@ fn check_brace_balance(content: &str, file_path: &str) -> String {
         }
         match ch {
             '\'' | '"' | '`' => { in_string = true; string_char = ch; }
-            '{' => braces += 1,
-            '}' => braces -= 1,
-            '[' => brackets += 1,
-            ']' => brackets -= 1,
-            '(' => parens += 1,
-            ')' => parens -= 1,
+            '{' => {
+                braces += 1;
+                if braces > max_depth {
+                    max_depth = braces;
+                    max_depth_line = line_num;
+                }
+            }
+            '}' => { braces -= 1; }
             _ => {}
         }
     }
 
-    let mut warnings = Vec::new();
-    if braces != 0 {
-        warnings.push(format!("braces {{}} off by {}", braces.abs()));
-    }
-    if brackets != 0 {
-        warnings.push(format!("brackets [] off by {}", brackets.abs()));
-    }
-    if parens != 0 {
-        warnings.push(format!("parens () off by {}", parens.abs()));
-    }
-
-    if warnings.is_empty() {
+    if braces == 0 {
         String::new()
+    } else if braces > 0 {
+        format!(
+            "\n⚠ BRACE MISMATCH in {}: {} unclosed '{{'. \
+             Deepest nesting at line {}. Add {} closing '}}' near that function's end. Fix NOW.",
+            file_path, braces, max_depth_line, braces
+        )
     } else {
         format!(
-            "\n⚠ BRACE MISMATCH in {}: {}. You likely have a missing closing bracket. Fix NOW.",
-            file_path, warnings.join(", ")
+            "\n⚠ BRACE MISMATCH in {}: {} extra closing '}}'. Remove the extra. Fix NOW.",
+            file_path, braces.abs()
         )
     }
 }
