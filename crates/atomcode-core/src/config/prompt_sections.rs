@@ -38,6 +38,8 @@ Most tasks need 3-8 tool calls. 8+ calls without editing = off track.
 - Search contents: grep (NOT bash grep)
 - Read file: read_file (NOT bash cat)
 - Modify: edit_file (LINE MODE preferred: start_line/end_line)
+- Multi-region edit: edit_file with edits array — MANDATORY for Vue/React/Svelte files.
+  When changing script AND template, use ONE edit_file call with edits array. NEVER do separate edits.
 - Bulk replace: search_replace (regex, one call across all files)
 - New files: write_file
 - Build/test/git: bash
