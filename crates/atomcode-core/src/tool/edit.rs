@@ -982,7 +982,13 @@ async fn post_edit_validate(result: ToolResult, file_path: &str, new_content: &s
 
     let dup_warn = detect_duplicate_blocks(new_content, new_string);
     let syntax_warn = post_edit_syntax_check(file_path).await;
-    let brace_warn = check_brace_balance(new_content, file_path);
+
+    // Try auto-fix brace imbalance before warning the model.
+    let brace_warn = match auto_fix_braces(new_content, file_path).await {
+        BraceFixResult::Balanced => String::new(),
+        BraceFixResult::AutoFixed(msg) => msg,
+        BraceFixResult::CannotFix(msg) => msg,
+    };
 
     if dup_warn.is_empty() && syntax_warn.is_empty() && brace_warn.is_empty() {
         return result;
@@ -991,6 +997,120 @@ async fn post_edit_validate(result: ToolResult, file_path: &str, new_content: &s
     ToolResult {
         output: format!("{}{}{}{}", result.output, dup_warn, syntax_warn, brace_warn),
         ..result
+    }
+}
+
+enum BraceFixResult {
+    Balanced,
+    AutoFixed(String),
+    CannotFix(String),
+}
+
+/// Try to auto-fix brace imbalance. If there are N missing `}`, find the deepest
+/// nesting point and insert `}` after the last non-empty line at that depth.
+/// Only attempts fix for missing closing braces (braces > 0), not extra ones.
+async fn auto_fix_braces(content: &str, file_path: &str) -> BraceFixResult {
+    let ext = file_path.rsplit('.').next().unwrap_or("");
+    if !matches!(ext, "js" | "ts" | "tsx" | "jsx" | "vue" | "svelte" | "java" | "rs" | "go" | "c" | "cpp" | "cs") {
+        return BraceFixResult::Balanced;
+    }
+
+    // Count brace balance with string awareness
+    let lines: Vec<&str> = content.lines().collect();
+    let mut depth = 0i64;
+    let mut in_string = false;
+    let mut escape = false;
+    let mut string_char = ' ';
+
+    // Track depth at each line end to find insertion points
+    let mut line_depths: Vec<i64> = Vec::with_capacity(lines.len());
+    for line in &lines {
+        for ch in line.chars() {
+            if escape { escape = false; continue; }
+            if ch == '\\' && in_string { escape = true; continue; }
+            if in_string {
+                if ch == string_char { in_string = false; }
+                continue;
+            }
+            match ch {
+                '\'' | '"' | '`' => { in_string = true; string_char = ch; }
+                '{' => depth += 1,
+                '}' => depth -= 1,
+                _ => {}
+            }
+        }
+        line_depths.push(depth);
+    }
+
+    if depth == 0 {
+        return BraceFixResult::Balanced;
+    }
+    if depth < 0 {
+        // Extra closing braces — too risky to auto-fix
+        return BraceFixResult::CannotFix(format!(
+            "\n⚠ BRACE MISMATCH in {}: {} extra closing '}}'. Remove the extra. Fix NOW.",
+            file_path, depth.abs()
+        ));
+    }
+    if depth > 3 {
+        // Too many missing — likely a structural problem, don't guess
+        return BraceFixResult::CannotFix(format!(
+            "\n⚠ BRACE MISMATCH in {}: {} unclosed '{{'. Too many to auto-fix. Fix manually.",
+            file_path, depth
+        ));
+    }
+
+    // Find insertion points: for each missing `}`, find the last line where
+    // depth drops to the target level. Insert `}` after that line.
+    let mut fixed_lines: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+    let mut remaining = depth;
+
+    // Work backwards: find lines where depth is highest and insert `}` after them
+    for target_depth in (1..=depth).rev() {
+        // Find the last line where depth == target_depth (where the unclosed block ends)
+        let mut insert_after = None;
+        for i in (0..line_depths.len()).rev() {
+            if line_depths[i] >= target_depth && !lines[i].trim().is_empty() {
+                insert_after = Some(i);
+                break;
+            }
+        }
+        if let Some(idx) = insert_after {
+            // Determine indentation: match the line that opened this block
+            let indent = if idx > 0 {
+                let prev_line = &fixed_lines[idx];
+                let spaces = prev_line.len() - prev_line.trim_start().len();
+                if spaces >= 2 { spaces - 2 } else { 0 }
+            } else { 0 };
+            let closing = format!("{}}}", " ".repeat(indent));
+            fixed_lines.insert(idx + 1, closing);
+            remaining -= 1;
+        }
+    }
+
+    if remaining > 0 {
+        return BraceFixResult::CannotFix(format!(
+            "\n⚠ BRACE MISMATCH in {}: {} unclosed '{{'. Could not determine where to insert closing braces. Fix NOW.",
+            file_path, depth
+        ));
+    }
+
+    // Write the fixed content
+    let new_content = if content.ends_with('\n') {
+        format!("{}\n", fixed_lines.join("\n"))
+    } else {
+        fixed_lines.join("\n")
+    };
+
+    match atomic_write(file_path, &new_content).await {
+        Ok(()) => BraceFixResult::AutoFixed(format!(
+            "\n[AUTO-FIXED: inserted {} missing closing '}}' in {}. File is now balanced.]",
+            depth, file_path
+        )),
+        Err(_) => BraceFixResult::CannotFix(format!(
+            "\n⚠ BRACE MISMATCH in {}: {} unclosed '{{'. Auto-fix failed. Fix NOW.",
+            file_path, depth
+        )),
     }
 }
 
