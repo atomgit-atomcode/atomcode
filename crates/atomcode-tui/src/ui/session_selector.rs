@@ -125,7 +125,7 @@ pub fn render(frame: &mut Frame, area: Rect, sessions: &[SessionMeta], selected:
             // Line 1: Session name with indicator
             let indicator = if is_selected { " \u{25b8} " } else { "   " };
             let name_style = if is_selected {
-                Style::default().fg(theme::text_primary()).bg(theme::brand_bg()).add_modifier(Modifier::BOLD)
+                Style::default().fg(theme::text_on_accent()).bg(theme::brand_bg()).add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(theme::text_primary())
             };

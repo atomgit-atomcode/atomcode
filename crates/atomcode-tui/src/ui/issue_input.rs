@@ -1,5 +1,5 @@
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
@@ -53,7 +53,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &IssueInputState) {
 
     // Title input box
     let title_style = if state.cursor_field == IssueField::Title {
-        Style::default().fg(theme::text_primary()).bg(theme::brand_bg())
+        Style::default().fg(theme::text_on_accent()).bg(theme::brand_bg())
     } else {
         Style::default().fg(theme::text_primary())
     };
@@ -105,7 +105,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &IssueInputState) {
 
     // Description input box
     let desc_style = if state.cursor_field == IssueField::Description {
-        Style::default().fg(theme::text_primary()).bg(theme::brand_bg())
+        Style::default().fg(theme::text_on_accent()).bg(theme::brand_bg())
     } else {
         Style::default().fg(theme::text_primary())
     };
@@ -152,7 +152,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &IssueInputState) {
     let help_line = if let Some(ref err) = state.error {
         Line::from(Span::styled(
             format!(" Error: {} ", err),
-            Style::default().fg(Color::Red),
+            Style::default().fg(theme::error()),
         ))
     } else if state.submitting {
         Line::from(Span::styled(

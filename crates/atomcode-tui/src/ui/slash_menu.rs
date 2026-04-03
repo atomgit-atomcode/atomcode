@@ -1,10 +1,11 @@
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::symbols::border;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
+use super::theme;
 use crate::command::{CommandKind, SlashMenu};
 
 /// Render the slash command autocomplete menu as a floating popup above the input box.
@@ -34,10 +35,10 @@ pub fn render(frame: &mut Frame, input_area: Rect, menu: &SlashMenu) {
         .take(visible_count)
         .map(|(i, entry)| {
             let is_selected = i == menu.selected;
-            // Built-ins: cyan; skills: green
+            // Built-ins: accent color; skills: success color
             let name_color = match entry.kind {
-                CommandKind::BuiltIn => Color::Cyan,
-                CommandKind::Skill => Color::Green,
+                CommandKind::BuiltIn => theme::accent(),
+                CommandKind::Skill => theme::success(),
             };
 
             let hint_str = entry
@@ -51,19 +52,19 @@ pub fn render(frame: &mut Frame, input_area: Rect, menu: &SlashMenu) {
                     Span::styled(
                         format!(" {}", entry.name),
                         Style::default()
-                            .fg(Color::Black)
+                            .fg(theme::text_on_accent())
                             .bg(name_color)
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(
                         hint_str.clone(),
                         Style::default()
-                            .fg(Color::Black)
+                            .fg(theme::text_on_accent())
                             .bg(name_color),
                     ),
                     Span::styled(
                         format!("  {} ", entry.description),
-                        Style::default().fg(Color::Black).bg(name_color),
+                        Style::default().fg(theme::text_on_accent()).bg(name_color),
                     ),
                 ])
             } else {
@@ -74,11 +75,11 @@ pub fn render(frame: &mut Frame, input_area: Rect, menu: &SlashMenu) {
                     ),
                     Span::styled(
                         hint_str,
-                        Style::default().fg(Color::Yellow),
+                        Style::default().fg(theme::warning()),
                     ),
                     Span::styled(
                         format!("  {}", entry.description),
-                        Style::default().fg(Color::DarkGray),
+                        Style::default().fg(theme::text_muted()),
                     ),
                 ])
             }
@@ -88,10 +89,10 @@ pub fn render(frame: &mut Frame, input_area: Rect, menu: &SlashMenu) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_set(border::ROUNDED)
-        .border_style(Style::default().fg(Color::Rgb(80, 80, 80)))
+        .border_style(Style::default().fg(theme::border()))
         .title(Span::styled(
             " Commands ",
-            Style::default().fg(Color::Gray),
+            Style::default().fg(theme::text_muted()),
         ));
 
     // Clear the area first (so menu floats above content)
@@ -99,7 +100,7 @@ pub fn render(frame: &mut Frame, input_area: Rect, menu: &SlashMenu) {
 
     let paragraph = Paragraph::new(lines)
         .block(block)
-        .style(Style::default().bg(Color::Rgb(30, 30, 30)));
+        .style(Style::default().bg(theme::bg_elevated()));
 
     frame.render_widget(paragraph, area);
 }

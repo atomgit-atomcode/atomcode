@@ -1,5 +1,5 @@
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 use ratatui::Frame;
@@ -204,7 +204,7 @@ pub fn render(
     }
 
     frame.render_widget(Clear, area);
-    let bg = Block::default().style(Style::default().bg(Color::Reset));
+    let bg = Block::default().style(Style::default().bg(theme::bg_surface()));
     frame.render_widget(bg, area);
     let paragraph = Paragraph::new(visible).wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);

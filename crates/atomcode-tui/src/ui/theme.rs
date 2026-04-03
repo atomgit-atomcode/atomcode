@@ -210,7 +210,7 @@ pub fn brand_fg() -> Color {
 pub fn brand_bg() -> Color {
     match Theme::current() {
         Theme::Dark => Color::Rgb(55, 38, 120),
-        Theme::Light => Color::Rgb(100, 75, 180),
+        Theme::Light => Color::Rgb(70, 50, 150),  // 更深的紫色，确保白色文字可见
     }
 }
 
@@ -255,6 +255,14 @@ pub fn diff_remove() -> Color {
     match Theme::current() {
         Theme::Dark => Color::Rgb(200, 95, 95),
         Theme::Light => Color::Rgb(170, 55, 55),
+    }
+}
+
+// ── Selection ──
+pub fn selection_bg() -> Color {
+    match Theme::current() {
+        Theme::Dark => Color::Rgb(45, 40, 80),
+        Theme::Light => Color::Rgb(200, 195, 230),
     }
 }
 

@@ -188,7 +188,7 @@ fn render_dir_selector(frame: &mut Frame, area: Rect, dirs: &[PathBuf], selected
         let is_current = dir == current;
 
         let (prefix, style) = if is_selected {
-            (" \u{25b8} ", Style::default().fg(theme::text_primary()).bg(theme::brand_bg()))
+            (" \u{25b8} ", Style::default().fg(theme::text_on_accent()).bg(theme::brand_bg()))
         } else {
             ("   ", Style::default().fg(theme::text_secondary()))
         };

@@ -1,16 +1,12 @@
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::symbols::border;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
 use crate::app::App;
-
-const BG: Color = Color::Rgb(25, 25, 32);
-const SELECTED_BG: Color = Color::Rgb(45, 42, 65);
-const ACCENT: Color = Color::Rgb(130, 100, 255);
-const DIM: Color = Color::Rgb(90, 90, 100);
+use crate::ui::theme;
 
 pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     let item_count = app.model_list.len();
@@ -32,57 +28,63 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         let is_current = *name == app.config.default_provider;
 
         let marker = if is_current { "*" } else { " " };
-        let line_style = if is_selected {
-            Style::default().bg(SELECTED_BG)
-        } else {
-            Style::default()
-        };
 
-        let marker_style = if is_current {
-            Style::default().fg(Color::Rgb(80, 200, 120)).add_modifier(Modifier::BOLD)
+        if is_selected {
+            // Selected: accent background, white text
+            let marker_color = if is_current {
+                theme::text_on_accent()
+            } else {
+                theme::text_on_accent()
+            };
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("  {} ", marker),
+                    Style::default().fg(marker_color).bg(theme::accent()).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("{:<14}", name),
+                    Style::default().fg(theme::text_on_accent()).bg(theme::accent()).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(" {}", model),
+                    Style::default().fg(theme::text_on_accent()).bg(theme::accent()),
+                ),
+            ]));
         } else {
-            Style::default().fg(DIM)
-        };
-
-        let name_style = if is_selected {
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD).bg(SELECTED_BG)
-        } else {
-            Style::default().fg(Color::Rgb(180, 180, 190))
-        };
-
-        let model_style = if is_selected {
-            Style::default().fg(Color::Rgb(160, 160, 170)).bg(SELECTED_BG)
-        } else {
-            Style::default().fg(DIM)
-        };
-
-        lines.push(Line::from(vec![
-            Span::styled(format!("  {} ", marker), marker_style.patch(line_style)),
-            Span::styled(format!("{:<14}", name), name_style),
-            Span::styled(format!(" {}", model), model_style),
-        ]));
+            // Not selected: normal colors with explicit background
+            let marker_style = if is_current {
+                Style::default().fg(theme::success()).bg(theme::bg_elevated()).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme::text_muted()).bg(theme::bg_elevated())
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {} ", marker), marker_style),
+                Span::styled(format!("{:<14}", name), Style::default().fg(theme::text_primary()).bg(theme::bg_elevated())),
+                Span::styled(format!(" {}", model), Style::default().fg(theme::text_muted()).bg(theme::bg_elevated())),
+            ]));
+        }
     }
 
     lines.push(Line::default());
     lines.push(Line::from(vec![
-        Span::styled("  Enter", Style::default().fg(Color::Rgb(160, 160, 170))),
-        Span::styled(" select  ", Style::default().fg(DIM)),
-        Span::styled("Esc", Style::default().fg(Color::Rgb(160, 160, 170))),
-        Span::styled(" cancel", Style::default().fg(DIM)),
+        Span::styled("  Enter", Style::default().fg(theme::text_secondary())),
+        Span::styled(" select  ", Style::default().fg(theme::text_muted())),
+        Span::styled("Esc", Style::default().fg(theme::text_secondary())),
+        Span::styled(" cancel", Style::default().fg(theme::text_muted())),
     ]));
 
     let block = Block::default()
         .borders(Borders::ALL)
         .border_set(border::ROUNDED)
-        .border_style(Style::default().fg(Color::Rgb(60, 55, 80)))
+        .border_style(Style::default().fg(theme::border()))
         .title(Span::styled(
             " Switch Model ",
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            Style::default().fg(theme::accent()).add_modifier(Modifier::BOLD),
         ));
 
     let paragraph = Paragraph::new(lines)
         .block(block)
-        .style(Style::default().bg(BG));
+        .style(Style::default().bg(theme::bg_elevated()));
 
     frame.render_widget(paragraph, popup);
 }

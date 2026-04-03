@@ -1,5 +1,5 @@
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::symbols::border;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
@@ -10,6 +10,7 @@ use atomcode_core::config::Config;
 use crate::provider_manager::{
     AddStep, EditField, ManagerState, ProviderManager, PROVIDER_TYPES,
 };
+use crate::ui::theme;
 
 pub fn render(frame: &mut Frame, area: Rect, mgr: &ProviderManager, config: &Config) {
     // Clear the whole area
@@ -43,12 +44,12 @@ fn render_list(frame: &mut Frame, area: Rect, mgr: &ProviderManager, config: &Co
     if mgr.provider_names.is_empty() {
         lines.push(Line::from(Span::styled(
             "  No providers configured.",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme::text_muted()),
         )));
         lines.push(Line::default());
         lines.push(Line::from(Span::styled(
             "  Press [a] to add one.",
-            Style::default().fg(Color::Gray),
+            Style::default().fg(theme::text_secondary()),
         )));
     } else {
         for (i, name) in mgr.provider_names.iter().enumerate() {
@@ -60,36 +61,49 @@ fn render_list(frame: &mut Frame, area: Rect, mgr: &ProviderManager, config: &Co
             let ptype = provider.map(|p| p.provider_type.as_str()).unwrap_or("?");
             let model = provider.map(|p| p.model.as_str()).unwrap_or("?");
 
-            let line_style = if is_selected {
-                Style::default().bg(Color::Rgb(40, 40, 60))
+            if is_selected {
+                // Selected: accent background, white text
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("  {} ", marker),
+                        Style::default().fg(theme::text_on_accent()).bg(theme::accent()).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!("{:<14}", name),
+                        Style::default().fg(theme::text_on_accent()).bg(theme::accent()).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!("{:<10}", ptype),
+                        Style::default().fg(theme::text_on_accent()).bg(theme::accent()),
+                    ),
+                    Span::styled(
+                        model.to_string(),
+                        Style::default().fg(theme::text_on_accent()).bg(theme::accent()),
+                    ),
+                ]));
             } else {
-                Style::default()
-            };
-
-            let marker_style = if is_default {
-                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::DarkGray)
-            };
-
-            lines.push(Line::from(vec![
-                Span::styled(format!("  {} ", marker), marker_style.patch(line_style)),
-                Span::styled(
-                    format!("{:<14}", name),
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD)
-                        .patch(line_style),
-                ),
-                Span::styled(
-                    format!("{:<10}", ptype),
-                    Style::default().fg(Color::Gray).patch(line_style),
-                ),
-                Span::styled(
-                    model.to_string(),
-                    Style::default().fg(Color::DarkGray).patch(line_style),
-                ),
-            ]));
+                // Not selected: normal colors with explicit background
+                let marker_style = if is_default {
+                    Style::default().fg(theme::success()).bg(theme::bg_elevated()).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(theme::text_muted()).bg(theme::bg_elevated())
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(format!("  {} ", marker), marker_style),
+                    Span::styled(
+                        format!("{:<14}", name),
+                        Style::default().fg(theme::accent()).bg(theme::bg_elevated()).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!("{:<10}", ptype),
+                        Style::default().fg(theme::text_secondary()).bg(theme::bg_elevated()),
+                    ),
+                    Span::styled(
+                        model.to_string(),
+                        Style::default().fg(theme::text_muted()).bg(theme::bg_elevated()),
+                    ),
+                ]));
+            }
         }
     }
 
@@ -99,38 +113,38 @@ fn render_list(frame: &mut Frame, area: Rect, mgr: &ProviderManager, config: &Co
     if mgr.state == ManagerState::ConfirmDelete {
         if let Some(name) = mgr.selected_name() {
             lines.push(Line::from(vec![
-                Span::styled("  Delete '", Style::default().fg(Color::Red)),
+                Span::styled("  Delete '", Style::default().fg(theme::error())),
                 Span::styled(
                     name.to_string(),
-                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                    Style::default().fg(theme::error()).add_modifier(Modifier::BOLD),
                 ),
-                Span::styled("'? ", Style::default().fg(Color::Red)),
-                Span::styled("[y]es / [n]o", Style::default().fg(Color::Yellow)),
+                Span::styled("'? ", Style::default().fg(theme::error())),
+                Span::styled("[y]es / [n]o", Style::default().fg(theme::warning())),
             ]));
         }
     } else {
         lines.push(Line::from(vec![
-            Span::styled("  [a]", Style::default().fg(Color::Cyan)),
-            Span::styled("dd  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("[e]", Style::default().fg(Color::Cyan)),
-            Span::styled("dit  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("[d]", Style::default().fg(Color::Cyan)),
-            Span::styled("elete  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("[s]", Style::default().fg(Color::Cyan)),
-            Span::styled("et default  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("[q]", Style::default().fg(Color::Cyan)),
-            Span::styled("uit", Style::default().fg(Color::DarkGray)),
+            Span::styled("  [a]", Style::default().fg(theme::accent())),
+            Span::styled("dd  ", Style::default().fg(theme::text_muted())),
+            Span::styled("[e]", Style::default().fg(theme::accent())),
+            Span::styled("dit  ", Style::default().fg(theme::text_muted())),
+            Span::styled("[d]", Style::default().fg(theme::accent())),
+            Span::styled("elete  ", Style::default().fg(theme::text_muted())),
+            Span::styled("[s]", Style::default().fg(theme::accent())),
+            Span::styled("et default  ", Style::default().fg(theme::text_muted())),
+            Span::styled("[q]", Style::default().fg(theme::accent())),
+            Span::styled("uit", Style::default().fg(theme::text_muted())),
         ]));
     }
 
     let block = Block::default()
         .borders(Borders::ALL)
         .border_set(border::ROUNDED)
-        .border_style(Style::default().fg(Color::Rgb(80, 80, 80)))
+        .border_style(Style::default().fg(theme::border()))
         .title(Span::styled(
             " Provider Manager ",
             Style::default()
-                .fg(Color::White)
+                .fg(theme::text_primary())
                 .add_modifier(Modifier::BOLD),
         ));
 
@@ -145,49 +159,49 @@ fn render_add_form(frame: &mut Frame, area: Rect, mgr: &ProviderManager, step: &
         lines.push(Line::default());
         lines.push(Line::from(Span::styled(
             "  AtomGit Login",
-            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            Style::default().fg(theme::text_primary()).add_modifier(Modifier::BOLD),
         )));
-        lines.push(Line::default());
-        lines.push(Line::from(Span::styled(
-            "  Opening browser for AtomGit authorization...",
-            Style::default().fg(Color::Rgb(120, 200, 120)),
-        )));
-        lines.push(Line::default());
-        lines.push(Line::from(Span::styled(
-            "  Waiting for callback on port 8765",
-            Style::default().fg(Color::Rgb(120, 140, 200)),
-        )));
-        lines.push(Line::default());
-        lines.push(Line::from(Span::styled(
-            "  Press Esc to cancel",
-            Style::default().fg(Color::Rgb(90, 92, 105)),
-        )));
+    lines.push(Line::default());
+    lines.push(Line::from(Span::styled(
+        "  Opening browser for AtomGit authorization...",
+        Style::default().fg(theme::success()),
+    )));
+    lines.push(Line::default());
+    lines.push(Line::from(Span::styled(
+        "  Waiting for callback on port 8765",
+        Style::default().fg(theme::info()),
+    )));
+    lines.push(Line::default());
+    lines.push(Line::from(Span::styled(
+        "  Press Esc to cancel",
+        Style::default().fg(theme::text_muted()),
+    )));
 
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_set(border::ROUNDED)
-            .border_style(Style::default().fg(Color::Cyan))
-            .title(Span::styled(
-                " Add Provider ",
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-            ));
-        let paragraph = Paragraph::new(lines).block(block);
-        frame.render_widget(paragraph, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_set(border::ROUNDED)
+        .border_style(Style::default().fg(theme::accent()))
+        .title(Span::styled(
+            " Add Provider ",
+            Style::default().fg(theme::accent()).add_modifier(Modifier::BOLD),
+        ));
+    let paragraph = Paragraph::new(lines).block(block);
+    frame.render_widget(paragraph, area);
         return;
     }
 
     let mut lines: Vec<Line<'static>> = Vec::new();
 
-    let dim = Style::default().fg(Color::DarkGray);
-    let label = Style::default().fg(Color::Gray);
-    let value = Style::default().fg(Color::White);
-    let active_label = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+    let dim = Style::default().fg(theme::text_muted());
+    let label = Style::default().fg(theme::text_secondary());
+    let value = Style::default().fg(theme::text_primary());
+    let active_label = Style::default().fg(theme::accent()).add_modifier(Modifier::BOLD);
 
     lines.push(Line::default());
     lines.push(Line::from(Span::styled(
         "  Add New Provider",
         Style::default()
-            .fg(Color::White)
+            .fg(theme::text_primary())
             .add_modifier(Modifier::BOLD),
     )));
     lines.push(Line::default());
@@ -214,7 +228,7 @@ fn render_add_form(frame: &mut Frame, area: Rect, mgr: &ProviderManager, step: &
                 let is_sel = i == mgr.type_selected;
                 let prefix = if is_sel { " ▸ " } else { "   " };
                 let style = if is_sel {
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                    Style::default().fg(theme::accent()).add_modifier(Modifier::BOLD)
                 } else {
                     dim
                 };
@@ -284,11 +298,11 @@ fn render_add_form(frame: &mut Frame, area: Rect, mgr: &ProviderManager, step: &
     let block = Block::default()
         .borders(Borders::ALL)
         .border_set(border::ROUNDED)
-        .border_style(Style::default().fg(Color::Cyan))
+        .border_style(Style::default().fg(theme::accent()))
         .title(Span::styled(
             " Add Provider ",
             Style::default()
-                .fg(Color::Cyan)
+                .fg(theme::accent())
                 .add_modifier(Modifier::BOLD),
         ));
 
@@ -307,17 +321,17 @@ fn render_edit_form(
     let provider = config.providers.get(name);
 
     let mut lines: Vec<Line<'static>> = Vec::new();
-    let dim = Style::default().fg(Color::DarkGray);
-    let label = Style::default().fg(Color::Gray);
-    let value = Style::default().fg(Color::White);
+    let dim = Style::default().fg(theme::text_muted());
+    let label = Style::default().fg(theme::text_secondary());
+    let value = Style::default().fg(theme::text_primary());
 
     lines.push(Line::default());
     lines.push(Line::from(vec![
-        Span::styled("  Editing: ", Style::default().fg(Color::White)),
+        Span::styled("  Editing: ", Style::default().fg(theme::text_primary())),
         Span::styled(
             name.to_string(),
             Style::default()
-                .fg(Color::Cyan)
+                .fg(theme::accent())
                 .add_modifier(Modifier::BOLD),
         ),
     ]));
@@ -352,7 +366,7 @@ fn render_edit_form(
         let prefix = if is_sel { " ▸" } else { "  " };
         let f_style = if is_sel {
             Style::default()
-                .fg(Color::Cyan)
+                .fg(theme::accent())
                 .add_modifier(Modifier::BOLD)
         } else {
             label
@@ -384,11 +398,11 @@ fn render_edit_form(
     let block = Block::default()
         .borders(Borders::ALL)
         .border_set(border::ROUNDED)
-        .border_style(Style::default().fg(Color::Yellow))
+        .border_style(Style::default().fg(theme::warning()))
         .title(Span::styled(
             " Edit Provider ",
             Style::default()
-                .fg(Color::Yellow)
+                .fg(theme::warning())
                 .add_modifier(Modifier::BOLD),
         ));
 
@@ -402,11 +416,11 @@ fn render_bottom_bar(frame: &mut Frame, area: Rect, mgr: &ProviderManager) {
         .as_deref()
         .unwrap_or("");
     let style = if msg.contains("Delete") || msg.contains("Cannot") {
-        Style::default().fg(Color::Red)
+        Style::default().fg(theme::error())
     } else if msg.contains("added") || msg.contains("set as") || msg.contains("Updated") {
-        Style::default().fg(Color::Green)
+        Style::default().fg(theme::success())
     } else {
-        Style::default().fg(Color::Gray)
+        Style::default().fg(theme::text_secondary())
     };
 
     let paragraph = Paragraph::new(Line::from(Span::styled(
