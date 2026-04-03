@@ -1278,19 +1278,20 @@ impl AgentLoop {
                         self.finish_turn();
                         return;
                     }
-                    // Read-loop breaker: if model has done 8+ consecutive reads without
-                    // any edit, it's stuck (likely context too full to generate edits).
-                    // Force it to act or explain.
-                    if self.consecutive_reads >= 8 && self.files_edited_this_turn.is_empty() {
+                    // Read-loop breaker: consecutive reads without ANY edit in between.
+                    // Doesn't matter if files were edited earlier in the turn — what matters
+                    // is the model is currently stuck in a read loop.
+                    if self.consecutive_reads >= 5 {
                         self.conversation.add_user_message(
-                            "You have read files 8+ times without making any edit. \
-                             You are stuck. Either use edit_file NOW to fix the issue, \
-                             or summarize the problem for the user."
+                            "You have done 5+ consecutive reads without editing. \
+                             You are likely stuck. Use edit_file NOW to fix the issue, \
+                             or tell the user what's wrong."
                         );
-                    } else if self.consecutive_reads >= 12 {
-                        // Absolute hard stop — 12 consecutive reads is a death spiral
+                    }
+                    if self.consecutive_reads >= 8 {
+                        // Hard stop — 8 consecutive reads is a death spiral
                         self.conversation.add_user_message(
-                            "STOPPED: 12 consecutive reads without editing. \
+                            "STOPPED: 8 consecutive reads without editing. \
                              Summarize what you found and what the user should do."
                         );
                         self.finish_turn();
