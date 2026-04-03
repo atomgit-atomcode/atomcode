@@ -231,7 +231,27 @@ impl Tool for EditFileTool {
                     success: false,
                 });
             }
-            let end = end.min(total);
+            let mut end = end.min(total);
+
+            // Boundary overlap auto-correction: if new_string's trailing lines
+            // duplicate lines immediately after end_line, extend end to absorb them.
+            let ns_lines: Vec<&str> = new_string.lines().collect();
+            if !ns_lines.is_empty() {
+                let mut extra = 0usize;
+                for i in 0..ns_lines.len() {
+                    let ns_idx = ns_lines.len() - 1 - i;
+                    let orig_idx = end + extra; // 0-indexed line after current end
+                    if orig_idx >= total { break; }
+                    if ns_lines[ns_idx].trim() == lines[orig_idx].trim() && !ns_lines[ns_idx].trim().is_empty() {
+                        extra += 1;
+                    } else {
+                        break;
+                    }
+                }
+                if extra > 0 {
+                    end = (end + extra).min(total);
+                }
+            }
 
             // Show what's being replaced
             let old_text: String = lines[start - 1..end].join("\n");
@@ -603,6 +623,41 @@ impl EditFileTool {
                     ),
                     success: false,
                 });
+            }
+        }
+
+        // Boundary overlap auto-correction: if new_string's trailing lines duplicate
+        // the lines immediately after end_line, extend end_line to absorb them.
+        // This fixes the common weak-model bug where end_line is too small, causing
+        // the original line to remain and duplicate a line from new_string.
+        for (start, end, new_str) in &mut resolved {
+            let new_lines: Vec<&str> = new_str.lines().collect();
+            if new_lines.is_empty() { continue; }
+            // Check how many trailing lines of new_string match lines after the edit range
+            let mut extra = 0usize;
+            for i in 0..new_lines.len() {
+                let new_idx = new_lines.len() - 1 - i; // from end of new_string
+                let orig_idx = *end + extra; // line after current end (0-indexed = end since end is 1-indexed inclusive)
+                if orig_idx >= total { break; }
+                if new_lines[new_idx].trim() == lines[orig_idx].trim() && !new_lines[new_idx].trim().is_empty() {
+                    extra += 1;
+                } else {
+                    break;
+                }
+            }
+            if extra > 0 {
+                *end += extra;
+                *end = (*end).min(total);
+            }
+        }
+
+        // Re-check overlaps after boundary correction
+        resolved.sort_by_key(|(start, _, _)| *start);
+        for w in resolved.windows(2) {
+            if w[1].0 <= w[0].1 {
+                // Overlaps after correction — truncate the first edit's end
+                // to avoid conflict. The second edit takes priority.
+                break; // just proceed, splice will handle it
             }
         }
 

@@ -385,3 +385,81 @@ async fn edit_empty_old_string_returns_error() {
 
     cleanup(&path);
 }
+
+// ═══════════════════════════════════════════════════════════════
+// 6. Boundary overlap auto-correction — end_line too small
+// ═══════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn single_edit_boundary_overlap_dedup() {
+    // Model says replace line 2 only, but new_string includes line 3's content
+    let content = "\
+const a = ref(false)
+const b = ref(false)
+const c = ref(0)
+function main() {}
+";
+    let path = create_test_file(content);
+    let ctx = test_context();
+    let tool = atomcode_core::tool::edit::EditFileTool;
+
+    let args = serde_json::json!({
+        "file_path": path,
+        "start_line": 2,
+        "end_line": 2,
+        "new_string": "const b = ref(false)\nconst showTop = ref(false)\nconst c = ref(0)"
+    });
+
+    let result = tool.execute(&args.to_string(), &ctx).await.unwrap();
+    assert!(result.success);
+
+    let new_content = std::fs::read_to_string(&path).unwrap();
+    let c_count = new_content.lines().filter(|l| l.trim() == "const c = ref(0)").count();
+    assert_eq!(c_count, 1, "const c should appear exactly once (boundary auto-corrected), got:\n{}", new_content);
+
+    cleanup(&path);
+}
+
+#[tokio::test]
+async fn multi_edit_boundary_overlap_dedup() {
+    let content = "\
+import { ref } from 'vue'
+const isLiked = ref(false)
+const isBookmarked = ref(false)
+const count = ref(0)
+function setup() {}
+";
+    let path = create_test_file(content);
+    let ctx = test_context();
+    let tool = atomcode_core::tool::edit::EditFileTool;
+
+    // Model says replace lines 1-1 and 2-2, but each new_string's last line
+    // duplicates the next original line
+    let args = serde_json::json!({
+        "file_path": path,
+        "edits": [
+            {
+                "start_line": 1,
+                "end_line": 1,
+                "new_string": "import { ref, computed } from 'vue'\nconst isLiked = ref(false)"
+            },
+            {
+                "start_line": 3,
+                "end_line": 3,
+                "new_string": "const isBookmarked = ref(false)\nconst showBackToTop = ref(false)\nconst count = ref(0)"
+            }
+        ]
+    });
+
+    let result = tool.execute(&args.to_string(), &ctx).await.unwrap();
+    assert!(result.success, "Multi-edit should succeed: {}", result.output);
+
+    let new_content = std::fs::read_to_string(&path).unwrap();
+    let liked_count = new_content.lines().filter(|l| l.trim() == "const isLiked = ref(false)").count();
+    let count_count = new_content.lines().filter(|l| l.trim() == "const count = ref(0)").count();
+    assert_eq!(liked_count, 1, "isLiked should appear once (no duplicate), got:\n{}", new_content);
+    assert_eq!(count_count, 1, "count should appear once (boundary corrected), got:\n{}", new_content);
+    assert!(new_content.contains("showBackToTop"), "New code should be present");
+
+    cleanup(&path);
+}
