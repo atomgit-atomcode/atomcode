@@ -20,7 +20,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
 
     // Left: brand + path (clean, no session title)
     left.push(Span::styled(
-        format!(" atomcode ", ),
+        " Atomcode ".to_string(),
         Style::default().fg(theme::BRAND_FG).bg(theme::BRAND_BG).add_modifier(Modifier::BOLD),
     ));
     left.push(Span::styled(" ", Style::default()));
@@ -107,7 +107,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     // Model name (always)
     right.push(Span::styled(
         format!("{} ", model),
-        Style::default().fg(theme::STATUS_MODEL).add_modifier(Modifier::BOLD),
+        Style::default().fg(theme::STATUS_MODEL),
     ));
 
     // Layout

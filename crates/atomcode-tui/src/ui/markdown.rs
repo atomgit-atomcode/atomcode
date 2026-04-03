@@ -78,7 +78,7 @@ impl MarkdownRenderer {
 
         let mut lines: Vec<Line<'static>> = Vec::new();
         let mut spans: Vec<Span<'static>> = Vec::new();
-        let mut styles: Vec<Style> = vec![Style::default().fg(theme::TEXT_SECONDARY)];
+        let mut styles: Vec<Style> = vec![Style::default().fg(theme::TEXT_PRIMARY)];
         let mut in_code = false;
         let mut code_lang = String::new();
         let mut code_buf = String::new();
@@ -98,12 +98,12 @@ impl MarkdownRenderer {
                     if !lines.is_empty() && matches!(level, HeadingLevel::H1 | HeadingLevel::H2) {
                         lines.push(Line::default());
                     }
-                    let color = match level {
-                        HeadingLevel::H1 => theme::MD_H1,
-                        HeadingLevel::H2 => theme::MD_H2,
-                        _ => theme::MD_H3,
+                    let style = match level {
+                        HeadingLevel::H1 => Style::default().fg(theme::MD_H1).add_modifier(Modifier::BOLD),
+                        HeadingLevel::H2 => Style::default().fg(theme::MD_H2),
+                        _ => Style::default().fg(theme::MD_H3),
                     };
-                    styles.push(Style::default().fg(color).add_modifier(Modifier::BOLD));
+                    styles.push(style);
                 }
                 Event::End(TagEnd::Heading(_level)) => {
                     styles.pop();
@@ -155,24 +155,20 @@ impl MarkdownRenderer {
                             Span::styled("  \u{256d}\u{2500} ", Style::default().fg(theme::MD_CODE_BORDER)),
                             Span::styled(
                                 lang_display.to_string(),
-                                Style::default().fg(theme::MD_CODE_LANG).add_modifier(Modifier::BOLD),
-                            ),
-                            Span::styled(
-                                format!(" {}", "\u{2500}".repeat(30)),
-                                Style::default().fg(theme::MD_CODE_BORDER),
+                                Style::default().fg(theme::MD_CODE_LANG),
                             ),
                         ]));
                     } else {
                         lines.push(Line::from(Span::styled(
-                            format!("  \u{256d}{}", "\u{2500}".repeat(36)),
+                            "  \u{256d}",
                             Style::default().fg(theme::MD_CODE_BORDER),
                         )));
                     }
                     let highlighted = self.highlight(&code_buf, &code_lang);
                     lines.extend(highlighted);
-                    // Bottom border: ╰──────────
+                    // Bottom border: ╰
                     lines.push(Line::from(Span::styled(
-                        format!("  \u{2570}{}", "\u{2500}".repeat(36)),
+                        "  \u{2570}",
                         Style::default().fg(theme::MD_CODE_BORDER),
                     )));
                     code_buf.clear();
@@ -361,10 +357,10 @@ fn render_table(lines: &mut Vec<Line<'static>>, header: &[String], rows: &[Vec<S
     if header.is_empty() { return; }
     let cols = header.len();
     let border = Style::default().fg(theme::BORDER);
-    let hdr_style = Style::default().fg(theme::TEXT_PRIMARY).add_modifier(Modifier::BOLD);
+    let hdr_style = Style::default().fg(theme::TEXT_PRIMARY);
     let cell_style = Style::default().fg(theme::TEXT_SECONDARY);
 
-    // Column widths: content + 2 padding each side
+    // Column widths: content + 2 padding
     let mut widths: Vec<usize> = header.iter().map(|h| display_width_str(h)).collect();
     for row in rows {
         for (i, cell) in row.iter().enumerate() {
@@ -375,52 +371,42 @@ fn render_table(lines: &mut Vec<Line<'static>>, header: &[String], rows: &[Vec<S
 
     lines.push(Line::default());
 
-    // ┌───┬───┐
-    let mut top = String::from("  \u{250c}");
-    for (i, w) in widths.iter().enumerate() {
-        top.push_str(&"\u{2500}".repeat(*w));
-        top.push(if i < cols - 1 { '\u{252c}' } else { '\u{2510}' });
-    }
-    lines.push(Line::from(Span::styled(top, border)));
-
-    // │ Header │
-    let mut h: Vec<Span<'static>> = vec![Span::styled("  \u{2502}", border)];
+    // Header row (no top border — cleaner)
+    let mut h: Vec<Span<'static>> = vec![Span::styled("  ", Style::default())];
     for (i, hdr) in header.iter().enumerate() {
         let w = widths.get(i).copied().unwrap_or(4);
         let pad = w.saturating_sub(display_width_str(hdr) + 1);
         h.push(Span::styled(format!(" {}{}", hdr, " ".repeat(pad)), hdr_style));
-        h.push(Span::styled("\u{2502}", border));
+        if i < cols - 1 {
+            h.push(Span::styled(" ", Style::default()));
+        }
     }
     lines.push(Line::from(h));
 
-    // ├───┼───┤
-    let mut mid = String::from("  \u{251c}");
+    // Separator under header: ── ── ──
+    let mut sep_parts: Vec<Span<'static>> = vec![Span::styled("  ", Style::default())];
     for (i, w) in widths.iter().enumerate() {
-        mid.push_str(&"\u{2500}".repeat(*w));
-        mid.push(if i < cols - 1 { '\u{253c}' } else { '\u{2524}' });
+        sep_parts.push(Span::styled("\u{2500}".repeat(*w), border));
+        if i < cols - 1 {
+            sep_parts.push(Span::styled(" ", Style::default()));
+        }
     }
-    lines.push(Line::from(Span::styled(mid, border)));
+    lines.push(Line::from(sep_parts));
 
-    // │ Data │
+    // Data rows (no vertical borders)
     for row in rows {
-        let mut r: Vec<Span<'static>> = vec![Span::styled("  \u{2502}", border)];
+        let mut r: Vec<Span<'static>> = vec![Span::styled("  ", Style::default())];
         for i in 0..cols {
             let cell = row.get(i).map(|s| s.as_str()).unwrap_or("");
             let w = widths.get(i).copied().unwrap_or(4);
             let pad = w.saturating_sub(display_width_str(cell) + 1);
             r.push(Span::styled(format!(" {}{}", cell, " ".repeat(pad)), cell_style));
-            r.push(Span::styled("\u{2502}", border));
+            if i < cols - 1 {
+                r.push(Span::styled(" ", Style::default()));
+            }
         }
         lines.push(Line::from(r));
     }
-
-    // └───┴───┘
-    let mut bot = String::from("  \u{2514}");
-    for (i, w) in widths.iter().enumerate() {
-        bot.push_str(&"\u{2500}".repeat(*w));
-        bot.push(if i < cols - 1 { '\u{2534}' } else { '\u{2518}' });
-    }
-    lines.push(Line::from(Span::styled(bot, border)));
 
     lines.push(Line::default());
 }
