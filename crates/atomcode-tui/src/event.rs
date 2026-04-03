@@ -27,8 +27,6 @@ pub struct EventLoop {
     input_thread: Option<std::thread::JoinHandle<()>>,
     /// Handle to the tick task
     tick_task: Option<tokio::task::JoinHandle<()>>,
-    /// Whether mouse capture is currently enabled
-    mouse_enabled: Arc<AtomicBool>,
 }
 
 impl EventLoop {
@@ -40,7 +38,6 @@ impl EventLoop {
             stop_flag: Arc::new(AtomicBool::new(false)),
             input_thread: None,
             tick_task: None,
-            mouse_enabled: Arc::new(AtomicBool::new(true)),
         }
     }
 
@@ -51,13 +48,14 @@ impl EventLoop {
     pub fn start(&mut self) {
         // Reset stop flag
         self.stop_flag.store(false, Ordering::SeqCst);
-        self.mouse_enabled.store(true, Ordering::SeqCst);
+
+        // Enable mouse capture at startup (stays enabled forever)
+        let _ = execute!(io::stdout(), EnableMouseCapture);
 
         // Start keyboard/mouse reader in a dedicated thread (not tokio task)
         // This gives us more control over the input stream
         let tx = self.tx.clone();
         let stop_flag = self.stop_flag.clone();
-        let mouse_enabled = self.mouse_enabled.clone();
         let handle = std::thread::spawn(move || {
             while !stop_flag.load(Ordering::SeqCst) {
                 // Use poll with timeout to allow checking stop flag periodically
@@ -75,21 +73,13 @@ impl EventLoop {
                                         AppEvent::Key(key)
                                     }
                                     Event::Mouse(mouse) => {
-                                        // When left button is pressed, disable mouse capture
-                                        // to allow native terminal selection
-                                        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
-                                            if mouse_enabled.load(Ordering::SeqCst) {
-                                                let _ = execute!(io::stdout(), DisableMouseCapture);
-                                                mouse_enabled.store(false, Ordering::SeqCst);
-                                            }
-                                        }
-                                        // When left button is released, re-enable mouse capture
-                                        if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left)) {
-                                            if !mouse_enabled.load(Ordering::SeqCst) {
-                                                let _ = execute!(io::stdout(), EnableMouseCapture);
-                                                mouse_enabled.store(true, Ordering::SeqCst);
-                                            }
-                                        }
+                                        // CRITICAL: Mouse capture must stay ALWAYS enabled.
+                                        // We no longer toggle capture for text selection because:
+                                        // 1. When capture is disabled, terminals convert scroll wheel to Up/Down keys
+                                        // 2. This would incorrectly trigger history navigation in Input Box
+                                        // 3. Text selection still works via terminal's native selection (shift+click or drag)
+                                        
+                                        // Just forward all mouse events to the app
                                         AppEvent::Mouse(mouse)
                                     }
                                     Event::Paste(text) => AppEvent::Paste(text),

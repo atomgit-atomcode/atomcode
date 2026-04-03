@@ -1621,53 +1621,24 @@ impl App {
                 self.input.delete_forward();
             }
             // Scroll keys: Ctrl+Up/Down (3 lines), PageUp/PageDown (20 lines)
-            // Also handle plain Up/Down for scroll when input is empty AND no history available.
-            // If there's history, Up should enter history browse mode, not scroll.
-            (_, KeyCode::Up) if self.input.is_empty() && self.input_history.is_empty() => {
-                // Scroll up when input is empty (terminal scroll wheel sends Up/Down in alternate mode)
-                if self.at_bottom {
-                    let total = self.last_total_lines;
-                    self.scroll_offset = total.saturating_sub(3);
-                    self.at_bottom = false;
-                } else {
-                    self.scroll_offset = self.scroll_offset.saturating_sub(3);
-                }
-            }
-            (_, KeyCode::Down) if self.input.is_empty() && self.input_history.is_empty() => {
-                // Scroll down when input is empty (terminal scroll wheel sends Up/Down in alternate mode)
-                let vh = self.last_viewport_height as usize;
-                let max_scroll = self.last_total_lines.saturating_sub(vh);
-                self.scroll_offset = (self.scroll_offset + 3).min(max_scroll);
-                if self.scroll_offset >= max_scroll {
-                    self.at_bottom = true;
-                }
-            }
             _ if self.handle_scroll_keys(key) => {}
-            (_, KeyCode::Backspace) => {
-                self.input.backspace();
-            }
+            // Plain Up/Down are ALWAYS for history navigation, not multi-line cursor movement.
+            // This matches Claude Code's behavior.
             (_, KeyCode::Up) => {
-                // Multi-line: move cursor up within input
-                if self.input.cursor_row > 0 {
-                    self.input.cursor_row -= 1;
-                    self.input.cursor_col = snap_to_char_boundary(
-                        &self.input.lines[self.input.cursor_row],
-                        self.input.cursor_col,
-                    );
-                } else if !self.input_history.is_empty() {
-                    // Single line, at top: browse history
-                if self.history_index.is_none() {
-                    // Stash current input
-                    self.history_stash = Some(self.input.content());
-                    self.history_index = Some(self.input_history.len().saturating_sub(1));
-                } else if let Some(idx) = self.history_index {
-                    if idx > 0 {
-                        self.history_index = Some(idx - 1);
-                    } else {
-                        // Wrap around: oldest -> newest
+                // Always navigate history (when not empty)
+                if !self.input_history.is_empty() {
+                    if self.history_index.is_none() {
+                        // Stash current input
+                        self.history_stash = Some(self.input.content());
                         self.history_index = Some(self.input_history.len().saturating_sub(1));
+                    } else if let Some(idx) = self.history_index {
+                        if idx > 0 {
+                            self.history_index = Some(idx - 1);
+                        } else {
+                            // Wrap around: oldest -> newest
+                            self.history_index = Some(self.input_history.len().saturating_sub(1));
+                        }
                     }
-                }
                     if let Some(idx) = self.history_index {
                         if let Some(hist) = self.input_history.get(idx).cloned() {
                             self.suggestion = None;
@@ -1678,13 +1649,8 @@ impl App {
                 }
             }
             (_, KeyCode::Down) => {
-                if self.input.cursor_row + 1 < self.input.lines.len() {
-                    self.input.cursor_row += 1;
-                    self.input.cursor_col = snap_to_char_boundary(
-                        &self.input.lines[self.input.cursor_row],
-                        self.input.cursor_col,
-                    );
-                } else if let Some(idx) = self.history_index {
+                // Always navigate history
+                if let Some(idx) = self.history_index {
                     if idx + 1 < self.input_history.len() {
                         self.history_index = Some(idx + 1);
                         let hist = self.input_history[idx + 1].clone();
@@ -1692,6 +1658,7 @@ impl App {
                         self.pasted_text = None;
                         self.load_history_entry(&hist);
                     } else {
+                        // Exit history mode
                         self.history_index = None;
                         self.pasted_text = None;
                         self.input.clear();
@@ -1699,7 +1666,19 @@ impl App {
                             for c in stash.chars() { self.input.insert_char(c); }
                         }
                     }
+                } else if !self.input_history.is_empty() {
+                    // Enter history from newest
+                    self.history_stash = Some(self.input.content());
+                    self.history_index = Some(0);
+                    if let Some(hist) = self.input_history.first().cloned() {
+                        self.suggestion = None;
+                        self.pasted_text = None;
+                        self.load_history_entry(&hist);
+                    }
                 }
+            }
+            (_, KeyCode::Backspace) => {
+                self.input.backspace();
             }
             (_, KeyCode::Left) => {
                 if self.input.cursor_col > 0 {
