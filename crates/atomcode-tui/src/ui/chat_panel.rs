@@ -173,6 +173,11 @@ pub fn render(
         dynamic.push(Line::from(Span::styled(sep, Style::default().fg(sep_color))));
     }
 
+    // Approval prompt — render when waiting for user approval
+    if let AppMode::WaitingApproval(ref call) = mode {
+        render_approval(&mut dynamic, call);
+    }
+
     let total = cached_len + dynamic.len();
     let scroll = if at_bottom {
         total.saturating_sub(vh) as u16
@@ -560,7 +565,6 @@ fn extract_duration(output: &str) -> String {
     String::new()
 }
 // ── Approval ──
-#[allow(dead_code)]
 fn render_approval(lines: &mut Vec<Line<'static>>, call: &ToolCall) {
     let name = capitalize(&call.name);
     let border = Style::default().fg(theme::WARNING);
