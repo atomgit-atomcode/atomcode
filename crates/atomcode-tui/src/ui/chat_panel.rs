@@ -146,7 +146,7 @@ pub fn render(
     // (Spinner variables moved to the dedicated spinner_area renderer at the top)
 
     // ── Turn finished separator ──
-    // Claude Code style: "✓ Done in 47s · 3 turns" with subtle separator line
+    // Fun completion message like Claude Code's "Brewed for 47s"
     if let Some(dur) = last_turn_duration {
         let secs = dur.as_secs();
         let time_str = if secs >= 60 {
@@ -154,6 +154,12 @@ pub fn render(
         } else {
             format!("{}s", secs)
         };
+
+        let verbs = [
+            "Crafted", "Forged", "Conjured", "Assembled", "Brewed",
+            "Synthesized", "Woven", "Sculpted", "Composed", "Distilled",
+        ];
+        let verb = verbs[turn_seed % verbs.len()];
 
         dynamic.push(Line::default());
 
@@ -163,7 +169,7 @@ pub fn render(
             Style::default().fg(theme::SUCCESS),
         ));
         parts.push(Span::styled(
-            time_str,
+            format!("{} in {}", verb, time_str),
             Style::default().fg(theme::TEXT_SECONDARY),
         ));
         if finished_step_count > 0 {
