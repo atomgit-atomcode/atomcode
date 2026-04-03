@@ -262,39 +262,55 @@ impl TurnRunner {
                 });
                 conversation.add_tool_result(result);
             } else {
-                // Intercept: block read_file on a file that was recently edited.
-                // Prevents the model from wasting turns "verifying" its own edits.
-                // Checks both this batch AND across turns (recently_edited_files).
-                if call.name == "read_file" {
+                // Intercept: block read on a file that was recently edited.
+                // Covers read_file AND bash cat/head/tail on edited files.
+                let intercept_file = if call.name == "read_file" {
                     if let Ok(args) = serde_json::from_str::<serde_json::Value>(&call.arguments) {
-                        if let Some(fp) = args.get("file_path").and_then(|v| v.as_str()) {
-                            let short = std::path::Path::new(fp)
-                                .file_name()
-                                .map(|n| n.to_string_lossy().to_string())
-                                .unwrap_or_else(|| fp.to_string());
-                            let edited_recently = files_edited_this_batch.iter()
-                                .chain(self.recently_edited_files.iter())
-                                .any(|f| f == &short || fp.contains(f.as_str()));
-                            if edited_recently {
-                                let result = ToolResult {
-                                    call_id: call.id.clone(),
-                                    output: format!(
-                                        "[SKIPPED: {} was just edited. The edit result above shows the current state. \
-                                         Do NOT re-read files you just edited. Proceed to the next task or summarize.]",
-                                        short
-                                    ),
-                                    success: true,
-                                };
-                                let _ = event_tx.send(TurnEvent::ToolCallResult {
-                                    name: call.name.clone(),
-                                    output: result.output.clone(),
-                                    success: true,
-                                    duration: std::time::Duration::ZERO,
-                                });
-                                conversation.add_tool_result(result);
-                                continue;
-                            }
-                        }
+                        args.get("file_path").and_then(|v| v.as_str()).map(|s| s.to_string())
+                    } else { None }
+                } else if call.name == "bash" {
+                    // Detect bash cat/head/tail/less on recently edited files
+                    if let Ok(args) = serde_json::from_str::<serde_json::Value>(&call.arguments) {
+                        if let Some(cmd) = args.get("command").and_then(|v| v.as_str()) {
+                            let is_read_cmd = cmd.contains("cat ") || cmd.contains("head ") || cmd.contains("tail ")
+                                || cmd.contains("less ") || cmd.contains("more ");
+                            if is_read_cmd {
+                                // Extract file path from command
+                                files_edited_this_batch.iter()
+                                    .chain(self.recently_edited_files.iter())
+                                    .find(|f| cmd.contains(f.as_str()))
+                                    .map(|f| f.to_string())
+                            } else { None }
+                        } else { None }
+                    } else { None }
+                } else { None };
+
+                if let Some(ref fp) = intercept_file {
+                    let short = std::path::Path::new(fp)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| fp.to_string());
+                    let edited_recently = files_edited_this_batch.iter()
+                        .chain(self.recently_edited_files.iter())
+                        .any(|f| f == &short || fp.contains(f.as_str()));
+                    if edited_recently {
+                        let result = ToolResult {
+                            call_id: call.id.clone(),
+                            output: format!(
+                                "[BLOCKED: {} was just edited. You already have the content from the edit result. \
+                                 Do NOT read this file again. If you need to change it, use edit_file with start_line/end_line directly.]",
+                                short
+                            ),
+                            success: true,
+                        };
+                        let _ = event_tx.send(TurnEvent::ToolCallResult {
+                            name: call.name.clone(),
+                            output: result.output.clone(),
+                            success: true,
+                            duration: std::time::Duration::ZERO,
+                        });
+                        conversation.add_tool_result(result);
+                        continue;
                     }
                 }
 

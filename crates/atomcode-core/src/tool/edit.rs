@@ -891,10 +891,38 @@ fn detect_duplicate_blocks(new_content: &str, new_string: &str) -> String {
     }
 
     if hits > 1 {
-        format!(
+        return format!(
             "\n⚠ WARNING: The edit introduced DUPLICATE code blocks ({} copies detected). \
              This is likely a bug. Review the file and remove the duplicate.",
             hits
+        );
+    }
+
+    // Secondary check: scan for consecutive duplicate non-trivial lines.
+    // Catches cases where two edit regions produce the same declaration.
+    let raw_lines: Vec<&str> = new_content.lines().collect();
+    let mut dup_lines: Vec<(usize, &str)> = Vec::new();
+    for i in 1..raw_lines.len() {
+        let prev = raw_lines[i - 1].trim();
+        let curr = raw_lines[i].trim();
+        if prev == curr
+            && !curr.is_empty()
+            && curr.len() > 10  // ignore short lines like `}` or `return`
+            && !curr.starts_with("//") && !curr.starts_with("*")
+        {
+            dup_lines.push((i + 1, curr)); // 1-indexed
+        }
+    }
+
+    if !dup_lines.is_empty() {
+        let examples: String = dup_lines.iter()
+            .take(3)
+            .map(|(line, text)| format!("  L{}: {}", line, text))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!(
+            "\n⚠ WARNING: {} consecutive duplicate line(s) detected after edit:\n{}\nRemove the duplicates.",
+            dup_lines.len(), examples
         )
     } else {
         String::new()
