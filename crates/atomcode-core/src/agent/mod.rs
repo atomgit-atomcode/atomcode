@@ -100,6 +100,10 @@ pub enum AgentEvent {
         /// Total individual tool calls.
         tool_call_count: usize,
     },
+/// Turn was cancelled by user before completion.
+    /// The conversation has been cleaned up - partial messages removed.
+    /// Contains the cleaned message list for TUI to sync.
+    TurnCancelled { messages: Vec<crate::conversation::message::Message> },
     /// An error occurred.
     Error(String),
     /// Sub-agent progress (real-time parallel task display).
@@ -392,7 +396,11 @@ impl AgentLoop {
                     self.cancel_token.cancel();
                     self.cancel_token = CancellationToken::new();
                     self.phase = AgentPhase::Idle;
-                    let _ = self.event_tx.send(AgentEvent::PhaseChange(AgentPhase::Idle));
+                    // Cancel the current turn - remove partial messages from conversation
+                    self.conversation.cancel_current_turn();
+                    // Sync the cleaned messages to TUI
+                    let messages = self.conversation.messages.clone();
+                    let _ = self.event_tx.send(AgentEvent::TurnCancelled { messages });
                 }
                 AgentCommand::ApproveTool => {
                     // Approval handled inside run_turn_loop via channels
@@ -1181,6 +1189,17 @@ impl AgentLoop {
                     }
                 }
                 TurnResult::Cancelled => {
+                    // Check if turn was already cancelled by AgentCommand::Cancel
+                    // (which removes the turn from tracker immediately)
+                    if self.conversation.turn_tracker.active_turn().is_none() {
+                        // Already handled by AgentCommand::Cancel - just return
+                        return;
+                    }
+                    // Remove the current turn's messages before saving
+                    self.conversation.cancel_current_turn();
+                    // Send TurnCancelled event for TUI to sync
+                    let messages = self.conversation.messages.clone();
+                    let _ = self.event_tx.send(AgentEvent::TurnCancelled { messages });
                     self.finish_turn();
                     return;
                 }

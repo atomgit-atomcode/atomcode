@@ -235,6 +235,8 @@ pub struct App {
     pub session_selector: Option<(Vec<SessionMeta>, usize)>,
     /// Search filter for session selector.
     pub session_selector_query: String,
+    /// Last sent user input - restored to input box if turn is cancelled.
+    pub last_sent_input: Option<String>,
 }
 
 impl App {
@@ -359,12 +361,13 @@ impl App {
                agent_handle,
                model_name,
                last_checkpoint: None,
-               session_manager,
-               current_session,
-               session_selector: None,
-               session_selector_query: String::new(),
-           }
-   }
+                session_manager,
+                current_session,
+                session_selector: None,
+                             session_selector_query: String::new(),
+                             last_sent_input: None,
+                    }
+                }
 
     /// Generate a follow-up suggestion based on conversation context.
     /// Language-agnostic: never references specific file extensions or build tools.
@@ -734,6 +737,27 @@ impl App {
                 // Only save if session has messages (don't save empty default sessions)
                 if !self.current_session.messages.is_empty() {
                     let _ = self.session_manager.save(&self.current_session);
+                }
+            }
+            AgentEvent::TurnCancelled { messages } => {
+                // User cancelled - sync the cleaned conversation from agent
+                self.conversation.messages = messages;
+                self.conversation.stream_buffer = None; // Clear any partial stream
+                self.mode = AppMode::Normal;
+                self.turn_start = None;
+                self.render_cache.clear();
+                self.render_cache_msg_count = 0;
+                self.at_bottom = true;
+                // Sync to session
+                self.current_session.messages = self.conversation.messages.clone();
+                // If cancelled turn leaves session empty, delete the saved session file
+                // (session was saved during TurnComplete, need to clean up)
+                if self.current_session.messages.is_empty() {
+                    let _ = self.session_manager.delete(&self.current_session.id);
+                }
+                // Restore input box with the cancelled message for easy editing
+                if let Some(input) = self.last_sent_input.take() {
+                    self.input.insert_text(&input);
                 }
             }
             AgentEvent::Error(e) => {
@@ -2432,10 +2456,12 @@ impl App {
         // Log this turn with env info
         self.turn_log.begin_turn(&full_content, &self.model_name, self.context_window);
 
+        // Save user's original input (not full_content with attachments) for restore on cancel
+        self.last_sent_input = Some(content.clone());
+
         // Add user message to our local mirror for immediate display.
         self.conversation.add_user_message(&full_content);
         self.input.clear();
-        self.mode = AppMode::Streaming;
         self.at_bottom = true;
         self.current_step_count = 0;
         self.current_tool_call_count = 0;

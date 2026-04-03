@@ -314,6 +314,11 @@ async fn run_headless(
                 let _ = cmd_tx.send(AgentCommand::Shutdown);
                 break;
             }
+            AgentEvent::TurnCancelled { .. } => {
+                eprintln!("\n[Cancelled]");
+                let _ = cmd_tx.send(AgentCommand::Shutdown);
+                break;
+            }
             AgentEvent::Error(e) => {
                 eprintln!("\n[Error: {}]", e);
             }

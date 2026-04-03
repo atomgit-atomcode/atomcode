@@ -134,17 +134,16 @@ impl TurnRunner {
             tokio::select! {
                 biased;
 
-                _ = cancel.cancelled() => {
+_ = cancel.cancelled() => {
                     conversation.finalize_stream();
                     return TurnResult::Cancelled;
                 }
 
                 _ = tokio::time::sleep(timeout) => {
                     conversation.finalize_stream();
-                    let waited = if got_any_event { "3 min" } else { "5 min" };
                     return TurnResult::Failed(format!(
-                        "LLM stream timeout: no response for {}. Connection may have dropped.",
-                        waited,
+                        "Stream timeout: no event for {:?}",
+                        timeout
                     ));
                 }
 
@@ -152,7 +151,7 @@ impl TurnRunner {
                     match event {
                         Some(Ok(StreamEvent::Delta(text))) => {
                             got_any_event = true;
-                            // Strip model-internal tags (DeepSeek <think>, QwQ, etc.)
+                            // Strip model-internal tags (DeepSeek </think>`, QwQ, etc.)
                             let text = strip_model_tags(&text);
                             if !text.is_empty() {
                                 conversation.push_delta(&text);
@@ -160,7 +159,6 @@ impl TurnRunner {
                                 let _ = event_tx.send(TurnEvent::TextDelta(text));
                             }
                         }
-
                         Some(Ok(StreamEvent::ToolCallStart { id, name })) => {
                             got_any_event = true;
                             conversation.tool_call_buffer = Some(ToolCallBuffer {

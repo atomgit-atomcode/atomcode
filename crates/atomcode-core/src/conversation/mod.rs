@@ -102,6 +102,19 @@ impl Conversation {
         self.turn_tracker.on_user_message(idx);
     }
 
+    /// Cancel the current active turn: remove all its messages from history.
+    /// Used when user cancels before the agent completes — ensures partial
+    /// conversations don't pollute the saved history.
+    pub fn cancel_current_turn(&mut self) {
+        if let Some(turn) = self.turn_tracker.active_turn() {
+            let start_idx = turn.start_idx;
+            // Remove all messages from this turn (user message + any assistant/tool messages)
+            self.messages.truncate(start_idx);
+            // Remove the turn from tracker
+            self.turn_tracker.turns.pop();
+        }
+    }
+
     pub fn push_delta(&mut self, delta: &str) {
         match &mut self.stream_buffer {
             Some(buf) => buf.push_str(delta),

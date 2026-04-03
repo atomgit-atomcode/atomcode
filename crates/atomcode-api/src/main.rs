@@ -11,11 +11,13 @@ use axum::{
 };
 use futures::stream::StreamExt;
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
 use tokio_stream::wrappers::UnboundedReceiverStream;
+use tokio_util::sync::CancellationToken;
 use tower_http::cors::{Any, CorsLayer};
 
 use atomcode_core::config::Config;
@@ -118,11 +120,21 @@ pub struct SessionDetail {
 /// Global project state store (current working directory)
 type ProjectStateStore = Arc<RwLock<ProjectState>>;
 
+/// Active chat tasks (session_id -> cancellation token)
+type ChatTasksStore = Arc<RwLock<HashMap<String, CancellationToken>>>;
+
+/// Stopped sessions (session_id) - used to prevent saving stopped chats
+type StoppedSessionsStore = Arc<RwLock<HashSet<String>>>;
+
 /// Combined app state for Axum
 #[derive(Clone)]
 pub struct AppState {
     pub sessions: SessionStore,
     pub project: ProjectStateStore,
+    /// Active chat tasks that can be cancelled
+    pub chat_tasks: ChatTasksStore,
+    /// Sessions that were stopped - their messages should not be saved
+    pub stopped_sessions: StoppedSessionsStore,
 }
 
 /// Get default working directory
@@ -946,9 +958,12 @@ pub enum ChatEvent {
     /// Token usage update
     #[serde(rename = "tokens")]
     TokenUsage { prompt: usize, completion: usize, total: usize },
-    /// Turn completed
+    /// Chat completed
     #[serde(rename = "done")]
     Done { tokens: usize, tool_calls: usize },
+    /// Chat was stopped by user
+    #[serde(rename = "stopped")]
+    Stopped,
     /// Error occurred
     #[serde(rename = "error")]
     Error { message: String },
@@ -970,10 +985,28 @@ async fn chat_stream(
     
     let (tx, rx) = mpsc::unbounded_channel::<ChatEvent>();
     
+    // Create cancellation token for this chat
+    let cancel_token = CancellationToken::new();
+    
+    // Register this chat task if we have a session_id
+    let session_id = req.session_id.clone();
+    if let Some(ref sid) = session_id {
+        state.chat_tasks.write().await.insert(sid.clone(), cancel_token.clone());
+    }
+    
+    // Clone state for the spawned task
+    let chat_tasks = state.chat_tasks.clone();
+    let stopped_sessions = state.stopped_sessions.clone();
+    
     // Spawn the chat processing task
     tokio::spawn(async move {
-        if let Err(e) = process_chat_request(req, tx.clone()).await {
+        if let Err(e) = process_chat_request(req, tx.clone(), cancel_token, stopped_sessions.clone()).await {
             let _ = tx.send(ChatEvent::Error { message: e.to_string() });
+        }
+        
+        // Cleanup: remove from chat_tasks
+        if let Some(sid) = session_id {
+            chat_tasks.write().await.remove(&sid);
         }
     });
     let stream = UnboundedReceiverStream::new(rx).map(|event| {
@@ -994,13 +1027,14 @@ async fn chat_stream(
 async fn process_chat_request(
     req: ChatRequest,
     event_tx: mpsc::UnboundedSender<ChatEvent>,
+    cancel_token: CancellationToken,
+    stopped_sessions: StoppedSessionsStore,
 ) -> anyhow::Result<()> {
     use atomcode_core::tool::{
         bash::BashTool, read::ReadFileTool, write::WriteFileTool, edit::EditFileTool,
         grep::GrepTool, glob::GlobTool, list_dir::ListDirTool,
         web_search::WebSearchTool, web_fetch::WebFetchTool, search_replace::SearchReplaceTool,
     };
-    
     // Load config
     let config_path = Config::default_path();
     let config = Config::load(&config_path)?;
@@ -1075,7 +1109,13 @@ let session_manager = SessionManager::new(&working_dir);
     let system_prompt = build_api_system_prompt(&working_dir);
     // Create turn event channel
     let (turn_tx, mut turn_rx) = mpsc::unbounded_channel::<TurnEvent>();
-    let cancel = tokio_util::sync::CancellationToken::new();
+    
+    // Check if session was stopped before we started
+    if stopped_sessions.read().await.contains(&req.session_id.clone().unwrap_or_default()) {
+        let _ = event_tx.send(ChatEvent::Stopped);
+        let _ = event_tx.send(ChatEvent::Done { tokens: 0, tool_calls: 0 });
+        return Ok(());
+    }
     
     // Clone conversation Arc for the spawn task
     let conversation_clone = conversation.clone();
@@ -1086,7 +1126,7 @@ let session_manager = SessionManager::new(&working_dir);
         
         // Loop until LLM produces text without tool calls
         loop {
-            let result = turn_runner.run(&mut conv, &system_prompt, &turn_tx, cancel.clone()).await;
+            let result = turn_runner.run(&mut conv, &system_prompt, &turn_tx, cancel_token.clone()).await;
             
             match result {
                 TurnResult::Responded { .. } => {
@@ -1145,10 +1185,16 @@ let session_manager = SessionManager::new(&working_dir);
                 // Ignore context stats in API mode
             }
         }
-    }
+}
     
-    // Save session after conversation completes
-    {
+    // Save session after conversation completes (unless stopped)
+    let session_id_str = req.session_id.clone().unwrap_or_default();
+    let was_stopped = stopped_sessions.read().await.contains(&session_id_str);
+    
+    if was_stopped {
+        // Session was stopped, don't save the messages
+        eprintln!("Session {} was stopped, skipping save", session_id_str);
+    } else {
         let conv = conversation.lock().await;
         session.messages = conv.messages.clone();
         session.touch();
@@ -1157,12 +1203,16 @@ let session_manager = SessionManager::new(&working_dir);
         }
     }
     
+    // Clean up stopped sessions marker if present
+    if was_stopped {
+        stopped_sessions.write().await.remove(&session_id_str);
+    }
+    
     // Send done event
     let _ = event_tx.send(ChatEvent::Done {
         tokens: total_tokens,
         tool_calls: tool_call_count,
     });
-    
     Ok(())
 }
 
@@ -1190,14 +1240,52 @@ fn build_api_system_prompt(working_dir: &PathBuf) -> String {
     )
 }
 
+/// Request to stop a chat session
+#[derive(Debug, Deserialize)]
+struct StopChatRequest {
+    session_id: String,
+}
+
+/// Response for stop chat request
+#[derive(Debug, Serialize)]
+struct StopChatResponse {
+    success: bool,
+    message: String,
+}
+
+/// POST /chat/stop - Stop a running chat session
+async fn stop_chat(
+    State(state): State<AppState>,
+    Json(req): Json<StopChatRequest>,
+) -> impl IntoResponse {
+    // Add to stopped sessions set
+    state.stopped_sessions.write().await.insert(req.session_id.clone());
+    
+    // Cancel the chat task if it exists
+    if let Some(cancel_token) = state.chat_tasks.read().await.get(&req.session_id) {
+        cancel_token.cancel();
+        (axum::http::StatusCode::OK, Json(StopChatResponse {
+            success: true,
+            message: format!("Chat session {} stopped", req.session_id),
+        }))
+    } else {
+        // Session wasn't running, but we marked it as stopped
+        (axum::http::StatusCode::OK, Json(StopChatResponse {
+            success: true,
+            message: format!("Chat session {} marked as stopped (was not running)", req.session_id),
+        }))
+    }
+}
+
 #[tokio::main]
 async fn main() {
     use axum::routing::patch;
     
-    // Initialize combined app state
     let state = AppState {
         sessions: Arc::new(RwLock::new(std::collections::HashMap::new())),
         project: Arc::new(RwLock::new(init_project_state())),
+        chat_tasks: Arc::new(RwLock::new(HashMap::new())),
+        stopped_sessions: Arc::new(RwLock::new(HashSet::new())),
     };
     
     let app = Router::new()
@@ -1210,12 +1298,13 @@ async fn main() {
         // Historical projects (from sessions directory)
         .route("/projects", get(get_projects))
         .route("/projects/:hash/sessions", get(get_project_sessions))
-        .route("/projects/:hash/sessions/:id", get(get_session_detail).delete(delete_session))
+.route("/projects/:hash/sessions/:id", get(get_session_detail).delete(delete_session))
         .route("/projects/:hash/sessions/:id/rename", patch(rename_session))
         // Model API
         .route("/models", get(get_models))
         // Chat API
         .route("/chat", post(chat_stream))
+        .route("/chat/stop", post(stop_chat))
         .with_state(state)
         .layer(CorsLayer::new().allow_origin(Any).allow_methods(Any));
 
