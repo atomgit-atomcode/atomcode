@@ -3,7 +3,7 @@ name: build-macos
 on:
   push:
     tags:
-      - "v*"
+      - "atomcode-v*"
   workflow_dispatch:
 
 jobs:
