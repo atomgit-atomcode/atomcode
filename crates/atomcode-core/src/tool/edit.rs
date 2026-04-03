@@ -954,14 +954,71 @@ async fn post_edit_validate(result: ToolResult, file_path: &str, new_content: &s
 
     let dup_warn = detect_duplicate_blocks(new_content, new_string);
     let syntax_warn = post_edit_syntax_check(file_path).await;
+    let brace_warn = check_brace_balance(new_content, file_path);
 
-    if dup_warn.is_empty() && syntax_warn.is_empty() {
+    if dup_warn.is_empty() && syntax_warn.is_empty() && brace_warn.is_empty() {
         return result;
     }
 
     ToolResult {
-        output: format!("{}{}{}", result.output, dup_warn, syntax_warn),
+        output: format!("{}{}{}{}", result.output, dup_warn, syntax_warn, brace_warn),
         ..result
+    }
+}
+
+/// Check brace/bracket balance after edit. Catches missing closing `}` — the most
+/// common weak-model error in multi-edit of large files.
+fn check_brace_balance(content: &str, file_path: &str) -> String {
+    let ext = file_path.rsplit('.').next().unwrap_or("");
+    // Only check brace-based languages
+    if !matches!(ext, "js" | "ts" | "tsx" | "jsx" | "vue" | "svelte" | "java" | "rs" | "go" | "c" | "cpp" | "cs" | "json") {
+        return String::new();
+    }
+
+    let mut braces = 0i64;
+    let mut brackets = 0i64;
+    let mut parens = 0i64;
+    let mut in_string = false;
+    let mut escape = false;
+    let mut string_char = ' ';
+
+    for ch in content.chars() {
+        if escape { escape = false; continue; }
+        if ch == '\\' && in_string { escape = true; continue; }
+        if in_string {
+            if ch == string_char { in_string = false; }
+            continue;
+        }
+        match ch {
+            '\'' | '"' | '`' => { in_string = true; string_char = ch; }
+            '{' => braces += 1,
+            '}' => braces -= 1,
+            '[' => brackets += 1,
+            ']' => brackets -= 1,
+            '(' => parens += 1,
+            ')' => parens -= 1,
+            _ => {}
+        }
+    }
+
+    let mut warnings = Vec::new();
+    if braces != 0 {
+        warnings.push(format!("braces {{}} off by {}", braces.abs()));
+    }
+    if brackets != 0 {
+        warnings.push(format!("brackets [] off by {}", brackets.abs()));
+    }
+    if parens != 0 {
+        warnings.push(format!("parens () off by {}", parens.abs()));
+    }
+
+    if warnings.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n⚠ BRACE MISMATCH in {}: {}. You likely have a missing closing bracket. Fix NOW.",
+            file_path, warnings.join(", ")
+        )
     }
 }
 

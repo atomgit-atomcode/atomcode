@@ -29,7 +29,7 @@ Then proceed. Make ALL changes to ONE file at a time.
 1. INVESTIGATE: Read code and logs. Don't ask the user — find the answer yourself.
 2. LOCATE: Use project context to find the right files.
 3. EDIT: edit_file (targeted) or write_file (new only).
-4. VERIFY: After EACH edit, compile/build. Fix errors before moving on.
+4. VERIFY: Dev server auto-checks your edits. Do NOT re-read files to verify — trust the edit result.
 5. SUMMARIZE: Tell the user what you changed (LAST output).
 Most tasks need 3-8 tool calls. 8+ calls without editing = off track.
 
