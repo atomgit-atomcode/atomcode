@@ -748,11 +748,13 @@ impl AgentLoop {
 
             // Run the turn in a scoped block so all borrows of self.turn_runner
             // end before we use self.conversation again.
-            let (result, mut turn_rx) = {
+            let (result, mut turn_rx, context_collapsed) = {
                 let (turn_tx, mut turn_rx) = mpsc::unbounded_channel::<TurnEvent>();
 
                 // Destructure self to get split borrows — the borrow checker needs to see
                 // that turn_runner and the other fields are disjoint borrows.
+                let mut context_collapsed = false;
+                let context_collapsed = &mut context_collapsed;
                 let runner = &mut self.turn_runner;
                 let cmd_rx = &mut self.cmd_rx;
                 let approval_req_rx = &mut self.approval_req_rx;
@@ -882,6 +884,15 @@ impl AgentLoop {
                                     ));
                                 }
                                 TurnEvent::ContextStats { system_tokens, hot_tokens, cold_tokens, working_set_tokens, total_messages } => {
+                                    // Detect context collapse: if hot zone drops dramatically,
+                                    // model has lost most history. Reset edit tracking so BLOCKED
+                                    // doesn't prevent the model from re-reading files it forgot about.
+                                    if hot_tokens < 3000 {
+                                        // Hot zone < 3K = context collapsed. Set flag to
+                                        // clear edit tracking after select! completes.
+                                        *context_collapsed = true;
+                                    }
+
                                     let _ = event_tx.send(AgentEvent::ContextStats {
                                         system_tokens, hot_tokens, cold_tokens, working_set_tokens, total_messages,
                                     });
@@ -948,9 +959,15 @@ impl AgentLoop {
                 };
 
                 // turn_tx drops here (owned by this block), turn_fut also drops
-                (result, turn_rx)
+                (result, turn_rx, *context_collapsed)
             };
             // All borrows of self.turn_runner are now released.
+
+            // Handle context collapse: clear edit tracking so model can re-read
+            if context_collapsed {
+                self.turn_runner.recently_edited_files.clear();
+                self.turn_runner.post_edit_read_counts.clear();
+            }
 
             // Restore conversation
             self.conversation = conv;
