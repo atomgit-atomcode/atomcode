@@ -1267,9 +1267,10 @@ impl AgentLoop {
                     // and inject result. Catches errors immediately instead of
                     // letting model pile up 10 broken edits before compiling.
                     if !self.files_edited_this_turn.is_empty() {
+                        let log_sizes = self.snapshot_devserver_log_sizes();
                         self.auto_compile_verify().await;
                         self.syntax_check_edited_files().await;
-                        self.check_devserver_logs().await;
+                        self.check_devserver_logs(&log_sizes).await;
                     }
 
                     // Apply discipline: inject reminders, check step limits
@@ -1911,47 +1912,67 @@ impl AgentLoop {
         }
     }
 
-    /// Check dev server logs for errors after editing frontend/backend files.
-    /// Vite/webpack HMR errors show up in log files within ~1s of a file save.
-    /// This catches Vue SFC syntax errors that tree-sitter can't detect.
-    async fn check_devserver_logs(&mut self) {
+    /// Snapshot dev server log sizes before an edit, so we can diff after.
+    fn snapshot_devserver_log_sizes(&self) -> std::collections::HashMap<String, u64> {
         let wd = self.turn_runner.context.working_dir.try_read()
             .map(|g| g.clone()).unwrap_or_default();
-
-        // Candidate log files — covers common dev server setups
         let candidates = [
             "frontend.log", "backend.log", "server.log",
             "frontend/frontend.log", "backend/backend.log",
         ];
+        let mut sizes = std::collections::HashMap::new();
+        for name in &candidates {
+            let path = wd.join(name);
+            if let Ok(meta) = std::fs::metadata(&path) {
+                sizes.insert(name.to_string(), meta.len());
+            }
+        }
+        sizes
+    }
+
+    /// Check dev server logs for NEW errors after editing frontend/backend files.
+    /// Only reads lines appended AFTER `pre_sizes` snapshot, ignoring stale errors.
+    async fn check_devserver_logs(&mut self, pre_sizes: &std::collections::HashMap<String, u64>) {
+        let wd = self.turn_runner.context.working_dir.try_read()
+            .map(|g| g.clone()).unwrap_or_default();
 
         // Small delay to let HMR process the file change
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-        for log_name in &candidates {
+        for (log_name, &old_size) in pre_sizes {
             let log_path = wd.join(log_name);
-            if !log_path.exists() { continue; }
+            let new_size = match tokio::fs::metadata(&log_path).await {
+                Ok(m) => m.len(),
+                Err(_) => continue,
+            };
+            // No new content since edit → skip
+            if new_size <= old_size { continue; }
 
-            // Read last 30 lines
+            // Read only the NEW bytes
             let content = match tokio::fs::read_to_string(&log_path).await {
                 Ok(c) => c,
                 Err(_) => continue,
             };
-            let tail: Vec<&str> = content.lines().rev().take(30).collect();
-            if tail.is_empty() { continue; }
+            let new_content = if old_size == 0 {
+                &content
+            } else {
+                // Approximate: skip old_size bytes (may split a UTF-8 char, but log lines are mostly ASCII)
+                let skip = old_size as usize;
+                if skip < content.len() { &content[skip..] } else { continue; }
+            };
 
-            // Look for error patterns in the tail
-            let error_lines: Vec<&&str> = tail.iter()
+            // Look for error patterns in the new content only
+            let error_lines: Vec<&str> = new_content.lines()
                 .filter(|l| {
                     let lower = l.to_lowercase();
                     (lower.contains("error") || lower.contains("failed") || lower.contains("syntaxerror"))
-                        && !lower.contains("0 error") // "0 errors" is success
-                        && !lower.contains("error overlay") // Vite's error overlay script, not an actual error
+                        && !lower.contains("0 error")
+                        && !lower.contains("error overlay")
                 })
                 .collect();
 
             if !error_lines.is_empty() {
                 let errors: String = error_lines.iter()
-                    .rev() // restore chronological order
                     .take(5)
                     .map(|l| l.to_string())
                     .collect::<Vec<_>>()
