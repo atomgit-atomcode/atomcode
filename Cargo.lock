@@ -125,6 +125,7 @@ dependencies = [
  "axum",
  "dirs 5.0.1",
  "futures",
+ "regex",
  "serde",
  "serde_json",
  "tokio",

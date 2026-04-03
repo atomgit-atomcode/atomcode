@@ -172,14 +172,31 @@ fn init_project_state() -> ProjectState {
         name,
     }
 }
+/// Artifact info for API response
+#[derive(Debug, Serialize, Clone)]
+pub struct ArtifactInfo {
+    pub id: String,
+    pub artifact_type: String,  // "html", "svg", "mermaid", "code"
+    pub title: Option<String>,
+    pub language: Option<String>,
+    pub content: String,
+}
+
 /// Tool call info for API response
 #[derive(Debug, Serialize)]
 pub struct ToolCallInfo {
     pub id: String,
     pub name: String,
     pub arguments: String,
-    /// Formatted display string (CLI style)
     pub display: String,
+}
+
+/// Tool result info for API response
+#[derive(Debug, Serialize)]
+pub struct ToolResultInfo {
+    pub success: bool,
+    pub summary: String,
+    pub line_count: usize,
 }
 
 /// Message info for API response
@@ -192,14 +209,9 @@ pub struct MessageInfo {
     /// Tool result summary (for tool role messages)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_result: Option<ToolResultInfo>,
-}
-
-/// Tool result info for API response
-#[derive(Debug, Serialize)]
-pub struct ToolResultInfo {
-    pub success: bool,
-    pub summary: String,
-    pub line_count: usize,
+    /// Artifacts detected in this message (code blocks, HTML files, etc.)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifacts: Option<Vec<ArtifactInfo>>,
 }
 
 impl From<&atomcode_core::conversation::message::Message> for MessageInfo {
@@ -211,9 +223,10 @@ impl From<&atomcode_core::conversation::message::Message> for MessageInfo {
             atomcode_core::conversation::message::Role::Tool => "tool",
         };
         
-        let (content, tool_calls, tool_result) = match &msg.content {
+        let (content, tool_calls, tool_result, artifacts) = match &msg.content {
             atomcode_core::conversation::message::MessageContent::Text(s) => {
-                (s.clone(), None, None)
+                // No artifacts from plain text messages (code blocks not extracted)
+                (s.clone(), None, None, None)
             }
             atomcode_core::conversation::message::MessageContent::AssistantWithToolCalls { text, tool_calls } => {
                 let calls: Vec<ToolCallInfo> = tool_calls.iter()
@@ -224,7 +237,10 @@ impl From<&atomcode_core::conversation::message::Message> for MessageInfo {
                         display: format_tool_args(&tc.name, &tc.arguments),
                     })
                     .collect();
-                (text.clone().unwrap_or_default(), Some(calls), None)
+                
+                // Extract artifacts from tool calls (e.g., write_file for HTML)
+                let artifacts = extract_artifacts_from_tool_calls(tool_calls);
+                (text.clone().unwrap_or_default(), Some(calls), None, artifacts)
             }
             atomcode_core::conversation::message::MessageContent::ToolResult(r) => {
                 let lines = r.output.lines().count();
@@ -238,15 +254,101 @@ impl From<&atomcode_core::conversation::message::Message> for MessageInfo {
                     success: r.success,
                     summary,
                     line_count: lines,
-                }))
+                }), None)
             }
             atomcode_core::conversation::message::MessageContent::ToolResultRef(r) => {
-                (r.summary.clone(), None, None)
+                (r.summary.clone(), None, None, None)
             }
         };
         
-        Self { role: role.to_string(), content, tool_calls, tool_result }
+        Self { role: role.to_string(), content, tool_calls, tool_result, artifacts }
     }
+}
+
+/// Extract code blocks from text content as artifacts
+fn extract_code_blocks(text: &str) -> Option<Vec<ArtifactInfo>> {
+    let mut artifacts = Vec::new();
+    let mut id_counter = 0;
+    
+    // Match code blocks: ```language\ncontent\n```
+    let re = regex::Regex::new(r"```(\w+)\n([\s\S]*?)```").ok()?;
+    
+    for cap in re.captures_iter(text) {
+        let language = cap.get(1)?.as_str().to_string();
+        let content = cap.get(2)?.as_str().to_string();
+        
+        // Determine artifact type based on language
+        let artifact_type = match language.as_str() {
+            "html" | "htm" => "html",
+            "svg" => "svg",
+            "mermaid" => "mermaid",
+            "javascript" | "typescript" | "python" | "rust" | "java" => "code",
+            _ => continue,  // Skip other languages
+        };
+        
+        id_counter += 1;
+        artifacts.push(ArtifactInfo {
+            id: format!("block-{}", id_counter),
+            artifact_type: artifact_type.to_string(),
+            title: None,
+            language: Some(language),
+            content,
+        });
+    }
+    
+    if artifacts.is_empty() { None } else { Some(artifacts) }
+}
+
+/// Extract artifacts from tool calls (e.g., write_file creating HTML files)
+fn extract_artifacts_from_tool_calls(tool_calls: &[atomcode_core::tool::ToolCall]) -> Option<Vec<ArtifactInfo>> {
+    let mut artifacts = Vec::new();
+    
+    for tc in tool_calls {
+        if tc.name == "write_file" || tc.name == "edit_file" {
+            // Parse arguments
+            let args: serde_json::Value = match serde_json::from_str(&tc.arguments) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            
+            let path = match args.get("file_path").and_then(|v| v.as_str()) {
+                Some(p) => p,
+                None => continue,
+            };
+            
+            // Check if it's an artifact-worthy file type
+            let (artifact_type, language) = if path.ends_with(".html") || path.ends_with(".htm") {
+                ("html", "html")
+            } else if path.ends_with(".svg") {
+                ("svg", "xml")
+            } else if path.ends_with(".md") || path.ends_with(".markdown") {
+                ("markdown", "markdown")
+            } else {
+                continue;  // Skip other file types
+            };
+            
+            // Get content from arguments
+            let content = match args.get("content").and_then(|v| v.as_str()) {
+                Some(c) => c.to_string(),
+                None => continue,
+            };
+            
+            // Extract title from path
+            let title = PathBuf::from(path)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string());
+            
+            artifacts.push(ArtifactInfo {
+                id: format!("file-{}", artifacts.len() + 1),
+                artifact_type: artifact_type.to_string(),
+                title,
+                language: Some(language.to_string()),
+                content,
+            });
+        }
+    }
+    
+    if artifacts.is_empty() { None } else { Some(artifacts) }
 }
 
 /// Format tool arguments for display (CLI style)
@@ -958,6 +1060,20 @@ pub enum ChatEvent {
     /// Token usage update
     #[serde(rename = "tokens")]
     TokenUsage { prompt: usize, completion: usize, total: usize },
+    /// Artifact started - detected code block or HTML
+    #[serde(rename = "artifact_start")]
+    ArtifactStart {
+        id: String,
+        artifact_type: String,  // "code", "html", "markdown"
+        language: Option<String>, // for code blocks
+        title: Option<String>,
+    },
+    /// Artifact content chunk
+    #[serde(rename = "artifact_content")]
+    ArtifactContent { id: String, content: String },
+    /// Artifact ended
+    #[serde(rename = "artifact_end")]
+    ArtifactEnd { id: String },
     /// Chat completed
     #[serde(rename = "done")]
     Done { tokens: usize, tool_calls: usize },
@@ -967,6 +1083,245 @@ pub enum ChatEvent {
     /// Error occurred
     #[serde(rename = "error")]
     Error { message: String },
+}
+
+/// Artifact detector for code blocks and HTML in streaming text
+struct ArtifactDetector {
+    /// Current artifact ID counter
+    artifact_counter: usize,
+    /// Current state
+    state: ArtifactDetectorState,
+}
+
+#[derive(Debug, Clone)]
+enum ArtifactDetectorState {
+    /// Normal text output
+    Normal,
+    /// Inside a code block, collecting content
+    InCodeBlock {
+        id: String,
+        language: String,
+        artifact_type: String,
+        content: String,
+    },
+    /// Inside HTML block (detected by <html>, <!DOCTYPE, or substantial HTML tags)
+    InHtml {
+        id: String,
+        content: String,
+    },
+    /// Inside SVG block (detected by <svg> tag)
+    InSvg {
+        id: String,
+        content: String,
+    },
+}
+
+impl ArtifactDetector {
+    fn new() -> Self {
+        Self {
+            artifact_counter: 0,
+            state: ArtifactDetectorState::Normal,
+        }
+    }
+    
+    fn next_id(&mut self) -> String {
+        self.artifact_counter += 1;
+        format!("artifact_{}", self.artifact_counter)
+    }
+    
+    /// Map code block language to artifact type for rendering
+    fn artifact_type_for_language(language: &str) -> (String, Option<String>) {
+        let lang_lower = language.to_lowercase();
+        let artifact_type = match lang_lower.as_str() {
+            // Mermaid diagrams
+            "mermaid" => "mermaid",
+            // HTML content
+            "html" | "htm" => "html",
+            // SVG graphics
+            "svg" | "xmlsvg" => "svg",
+            // Markdown content
+            "markdown" | "md" => "markdown",
+            // All other code blocks
+            _ => "code",
+        };
+        let title = if artifact_type == "code" && !language.is_empty() {
+            Some(language.to_string())
+        } else {
+            None
+        };
+        (artifact_type.to_string(), title)
+    }
+    
+    /// Process incoming text delta and return events to emit
+    fn process(&mut self, text: &str) -> Vec<ChatEvent> {
+        let mut events = Vec::new();
+        
+        match &mut self.state {
+            ArtifactDetectorState::Normal => {
+                // Check for code block start
+                if text.starts_with("```") {
+                    let rest = &text[3..];
+                    let end_of_line = rest.find('\n').unwrap_or(rest.len());
+                    let language = rest[..end_of_line].trim().to_string();
+                    
+                    let (artifact_type, title) = Self::artifact_type_for_language(&language);
+                    let id = self.next_id();
+                    events.push(ChatEvent::ArtifactStart {
+                        id: id.clone(),
+                        artifact_type,
+                        language: Some(language.clone()),
+                        title,
+                    });
+                    
+                    self.state = ArtifactDetectorState::InCodeBlock {
+                        id,
+                        language,
+                        artifact_type: "code".to_string(),
+                        content: String::new(),
+                    };
+                }
+                // Check for SVG block start (standalone <svg> tag)
+                else if self.is_svg_start(text) {
+                    let id = self.next_id();
+                    events.push(ChatEvent::ArtifactStart {
+                        id: id.clone(),
+                        artifact_type: "svg".to_string(),
+                        language: None,
+                        title: None,
+                    });
+                    events.push(ChatEvent::ArtifactContent {
+                        id: id.clone(),
+                        content: text.to_string(),
+                    });
+                    
+                    self.state = ArtifactDetectorState::InSvg {
+                        id,
+                        content: text.to_string(),
+                    };
+                }
+                // Check for HTML block start
+                else if self.is_html_start(text) {
+                    let id = self.next_id();
+                    events.push(ChatEvent::ArtifactStart {
+                        id: id.clone(),
+                        artifact_type: "html".to_string(),
+                        language: None,
+                        title: None,
+                    });
+                    events.push(ChatEvent::ArtifactContent {
+                        id: id.clone(),
+                        content: text.to_string(),
+                    });
+                    
+                    self.state = ArtifactDetectorState::InHtml {
+                        id,
+                        content: text.to_string(),
+                    };
+                }
+                else {
+                    // Normal text
+                    events.push(ChatEvent::TextDelta { content: text.to_string() });
+                }
+            }
+            ArtifactDetectorState::InCodeBlock { id, language: _, artifact_type: _, content } => {
+                // Check for code block end
+                if text.trim() == "```" {
+                    // Emit the accumulated content
+                    if !content.is_empty() {
+                        events.push(ChatEvent::ArtifactContent {
+                            id: id.clone(),
+                            content: content.clone(),
+                        });
+                    }
+                    events.push(ChatEvent::ArtifactEnd { id: id.clone() });
+                    self.state = ArtifactDetectorState::Normal;
+                } else {
+                    // Accumulate content
+                    content.push_str(text);
+                    events.push(ChatEvent::ArtifactContent {
+                        id: id.clone(),
+                        content: text.to_string(),
+                    });
+                }
+            }
+            ArtifactDetectorState::InHtml { id, content } => {
+                // Check for HTML end (simple heuristic: </html> or </body>)
+                let trimmed = text.trim();
+                if trimmed.ends_with("</html>") || trimmed.ends_with("</HTML>") 
+                    || trimmed.ends_with("</body>") || trimmed.ends_with("</BODY>") {
+                    content.push_str(text);
+                    events.push(ChatEvent::ArtifactContent {
+                        id: id.clone(),
+                        content: text.to_string(),
+                    });
+                    events.push(ChatEvent::ArtifactEnd { id: id.clone() });
+                    self.state = ArtifactDetectorState::Normal;
+                } else {
+                    content.push_str(text);
+                    events.push(ChatEvent::ArtifactContent {
+                        id: id.clone(),
+                        content: text.to_string(),
+                    });
+                }
+            }
+            ArtifactDetectorState::InSvg { id, content } => {
+                // Check for SVG end (</svg> tag)
+                let trimmed = text.trim();
+                if trimmed.ends_with("</svg>") || trimmed.ends_with("</SVG>") {
+                    content.push_str(text);
+                    events.push(ChatEvent::ArtifactContent {
+                        id: id.clone(),
+                        content: text.to_string(),
+                    });
+                    events.push(ChatEvent::ArtifactEnd { id: id.clone() });
+                    self.state = ArtifactDetectorState::Normal;
+                } else {
+                    content.push_str(text);
+                    events.push(ChatEvent::ArtifactContent {
+                        id: id.clone(),
+                        content: text.to_string(),
+                    });
+                }
+            }
+        }
+        
+        events
+    }
+    
+    fn is_html_start(&self, text: &str) -> bool {
+        let trimmed = text.trim();
+        trimmed.starts_with("<!DOCTYPE html") 
+            || trimmed.starts_with("<!DOCTYPE HTML")
+            || trimmed.starts_with("<html")
+            || trimmed.starts_with("<HTML")
+    }
+    
+    fn is_svg_start(&self, text: &str) -> bool {
+        let trimmed = text.trim();
+        trimmed.starts_with("<svg") || trimmed.starts_with("<SVG")
+    }
+    
+    /// Finalize any pending artifact
+    fn finish(&mut self) -> Option<ChatEvent> {
+        match &self.state {
+            ArtifactDetectorState::InCodeBlock { id, .. } => {
+                let id = id.clone();
+                self.state = ArtifactDetectorState::Normal;
+                Some(ChatEvent::ArtifactEnd { id })
+            }
+            ArtifactDetectorState::InHtml { id, .. } => {
+                let id = id.clone();
+                self.state = ArtifactDetectorState::Normal;
+                Some(ChatEvent::ArtifactEnd { id })
+            }
+            ArtifactDetectorState::InSvg { id, .. } => {
+                let id = id.clone();
+                self.state = ArtifactDetectorState::Normal;
+                Some(ChatEvent::ArtifactEnd { id })
+            }
+            ArtifactDetectorState::Normal => None,
+        }
+    }
 }
 
 /// Global chat sessions store (in-memory for now)
@@ -1149,18 +1504,58 @@ let session_manager = SessionManager::new(&working_dir);
         }
     });
     
-    // Forward turn events to chat events
+// Forward turn events to chat events
     let mut total_tokens = 0usize;
     let mut tool_call_count = 0usize;
+    let mut artifact_detector = ArtifactDetector::new();
     
     while let Some(event) = turn_rx.recv().await {
         match event {
             TurnEvent::TextDelta(text) => {
-                let _ = event_tx.send(ChatEvent::TextDelta { content: text });
+                // Process text through artifact detector
+                for chat_event in artifact_detector.process(&text) {
+                    let _ = event_tx.send(chat_event);
+                }
             }
             TurnEvent::ToolCallStarted { name, arguments } => {
                 tool_call_count += 1;
-                let _ = event_tx.send(ChatEvent::ToolCallStarted { name, arguments });
+                let _ = event_tx.send(ChatEvent::ToolCallStarted { name: name.clone(), arguments: arguments.clone() });
+                
+                // Extract artifacts from write_file/edit_file tool calls
+                if name == "write_file" || name == "edit_file" {
+                    if let Ok(args) = serde_json::from_str::<serde_json::Value>(&arguments) {
+                        if let Some(path) = args.get("file_path").and_then(|v| v.as_str()) {
+                            let artifact_type = if path.ends_with(".html") || path.ends_with(".htm") {
+                                "html"
+                            } else if path.ends_with(".svg") {
+                                "svg"
+                            } else {
+                                ""
+                            };
+                            
+                            if !artifact_type.is_empty() {
+                                if let Some(content) = args.get("content").and_then(|v| v.as_str()) {
+                                    let id = format!("file-{}", uuid::Uuid::new_v4());
+                                    let title = std::path::PathBuf::from(path)
+                                        .file_name()
+                                        .map(|n| n.to_string_lossy().to_string());
+                                    
+                                    let _ = event_tx.send(ChatEvent::ArtifactStart {
+                                        id: id.clone(),
+                                        artifact_type: artifact_type.to_string(),
+                                        language: Some("html".to_string()),
+                                        title,
+                                    });
+                                    let _ = event_tx.send(ChatEvent::ArtifactContent {
+                                        id: id.clone(),
+                                        content: content.to_string(),
+                                    });
+                                    let _ = event_tx.send(ChatEvent::ArtifactEnd { id });
+                                }
+                            }
+                        }
+                    }
+                }
             }
             TurnEvent::ToolCallResult { name, output, success, duration } => {
                 let _ = event_tx.send(ChatEvent::ToolCallResult {
@@ -1185,7 +1580,12 @@ let session_manager = SessionManager::new(&working_dir);
                 // Ignore context stats in API mode
             }
         }
-}
+    }
+    
+    // Finalize any pending artifact
+    if let Some(event) = artifact_detector.finish() {
+        let _ = event_tx.send(event);
+    }
     
     // Save session after conversation completes (unless stopped)
     let session_id_str = req.session_id.clone().unwrap_or_default();
