@@ -991,7 +991,7 @@ async fn post_edit_validate(result: ToolResult, file_path: &str, new_content: &s
     };
 
     // HTML tag balance check for Vue/HTML/Svelte files
-    let html_warn = check_html_tag_balance(new_content, file_path);
+    let html_warn = check_html_tag_balance(new_content, file_path).await;
 
     if dup_warn.is_empty() && syntax_warn.is_empty() && brace_warn.is_empty() && html_warn.is_empty() {
         return result;
@@ -1122,49 +1122,95 @@ async fn auto_fix_braces(content: &str, file_path: &str) -> BraceFixResult {
 /// Check HTML tag balance for Vue/HTML/Svelte files.
 /// Counts common block-level tags (<div>, <section>, <main>, <aside>, <article>, etc.)
 /// and warns if opening count != closing count.
-fn check_html_tag_balance(content: &str, file_path: &str) -> String {
+/// Check and auto-fix HTML tag balance for Vue/HTML/Svelte files.
+/// For unclosed tags (opens > closes), insert missing closing tags.
+/// For extra closing tags, just warn (too risky to auto-remove).
+async fn check_html_tag_balance(content: &str, file_path: &str) -> String {
     let ext = file_path.rsplit('.').next().unwrap_or("");
     if !matches!(ext, "vue" | "html" | "svelte" | "htm" | "jsx" | "tsx") {
         return String::new();
     }
 
-    // Only check the <template> section for Vue files
-    let check_content = if ext == "vue" {
-        if let Some(start) = content.find("<template") {
-            if let Some(end) = content.rfind("</template>") {
-                &content[start..end]
-            } else { content }
-        } else { return String::new(); }
-    } else { content };
+    let lines: Vec<&str> = content.lines().collect();
 
-    let tags = ["div", "section", "main", "aside", "article", "nav", "header", "footer", "form", "ul", "ol", "table", "tbody", "thead"];
-    let mut warnings: Vec<String> = Vec::new();
+    // Find <template> section boundaries for Vue files
+    let (tpl_start, tpl_end) = if ext == "vue" {
+        let s = lines.iter().position(|l| l.trim_start().starts_with("<template")).unwrap_or(0);
+        let e = lines.iter().rposition(|l| l.trim_start().starts_with("</template>")).unwrap_or(lines.len());
+        (s, e)
+    } else {
+        (0, lines.len())
+    };
+    if tpl_start >= tpl_end { return String::new(); }
+
+    let tags = ["div", "section", "main", "aside", "article", "nav", "header", "footer", "form", "ul", "ol"];
+    let mut fixes: Vec<String> = Vec::new();
+    let mut fixed_lines: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+    let mut any_fixed = false;
 
     for tag in &tags {
         let open_pattern = format!("<{}", tag);
         let close_pattern = format!("</{}>", tag);
 
-        // Count opening tags (handles <div>, <div class="...">, etc.)
-        let opens = check_content.matches(&open_pattern).count();
-        let closes = check_content.matches(&close_pattern).count();
+        let tpl_content: String = fixed_lines[tpl_start..tpl_end].join("\n");
+        let opens = tpl_content.matches(&open_pattern).count();
+        let closes = tpl_content.matches(&close_pattern).count();
 
-        if opens != closes {
-            let diff = opens as i64 - closes as i64;
-            if diff > 0 {
-                warnings.push(format!("<{}> has {} unclosed tag(s)", tag, diff));
-            } else {
-                warnings.push(format!("<{}> has {} extra closing tag(s)", tag, diff.abs()));
+        if opens > closes {
+            let missing = opens - closes;
+            // Find the last opening tag of this type and insert closing tag after it
+            // Strategy: find the last line within template that has this opening tag,
+            // then find the next line at the same or lower indent, insert before it.
+            for _ in 0..missing {
+                // Find last unclosed opening tag by scanning backwards
+                let mut depth = 0i32;
+                let mut insert_after = tpl_end - 1;
+                for i in (tpl_start..tpl_end).rev() {
+                    let trimmed = fixed_lines[i].trim();
+                    if trimmed.contains(&close_pattern) { depth += 1; }
+                    if trimmed.contains(&open_pattern) {
+                        if depth > 0 { depth -= 1; }
+                        else {
+                            // This is an unclosed tag — insert closing after its content
+                            // Find the indent of this line
+                            let indent = fixed_lines[i].len() - fixed_lines[i].trim_start().len();
+                            let closing = format!("{}</{}>", " ".repeat(indent), tag);
+                            // Insert after the last line before template end
+                            insert_after = tpl_end - 1;
+                            fixed_lines.insert(insert_after, closing);
+                            fixes.push(format!("inserted </{}> at L{}", tag, insert_after + 1));
+                            any_fixed = true;
+                            break;
+                        }
+                    }
+                }
             }
+        } else if closes > opens {
+            fixes.push(format!("<{}> has {} extra closing tag(s) — remove manually", tag, closes - opens));
         }
     }
 
-    if warnings.is_empty() {
-        String::new()
-    } else {
+    if any_fixed {
+        let new_content = if content.ends_with('\n') {
+            format!("{}\n", fixed_lines.join("\n"))
+        } else {
+            fixed_lines.join("\n")
+        };
+        if let Ok(()) = atomic_write(file_path, &new_content).await {
+            return format!(
+                "\n[AUTO-FIXED HTML: {}. File rewritten.]",
+                fixes.join(", ")
+            );
+        }
+    }
+
+    if !fixes.is_empty() {
         format!(
-            "\n⚠ HTML TAG MISMATCH in {}: {}. Fix the template structure NOW.",
-            file_path, warnings.join("; ")
+            "\n⚠ HTML TAG MISMATCH in {}: {}. Fix NOW.",
+            file_path, fixes.join("; ")
         )
+    } else {
+        String::new()
     }
 }
 
