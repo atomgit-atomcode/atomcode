@@ -296,6 +296,7 @@ impl AgentLoop {
             permission: interactive_permission,
             result_store: ToolResultStore::new(ToolResultStore::default_dir()),
             recently_edited_files: Vec::new(),
+            post_edit_read_counts: std::collections::HashMap::new(),
         };
 
         let agent = Self {

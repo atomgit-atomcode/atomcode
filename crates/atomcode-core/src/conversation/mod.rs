@@ -522,6 +522,8 @@ impl Conversation {
     /// drops the full tool results.
     fn extract_edit_tombstones(turn_msgs: &[Message]) -> String {
         let mut tombstones: Vec<String> = Vec::new();
+        let mut seen_files: std::collections::HashSet<String> = std::collections::HashSet::new();
+
         for msg in turn_msgs {
             let (success, output) = match &msg.content {
                 MessageContent::ToolResult(r) => (r.success, r.output.as_str()),
@@ -529,11 +531,51 @@ impl Conversation {
                 _ => continue,
             };
             if !success { continue; }
+
             for line in output.lines() {
                 if line.starts_with("Edited ") || line.starts_with("Wrote ")
                     || line.starts_with("Multi-edit:")
                 {
                     tombstones.push(format!("[{}]", line.trim()));
+                }
+            }
+
+            // For read_file results in cold zone: preserve a compact skeleton summary.
+            // Detected by line-number format "  N| ..." (read_file output format).
+            if output.lines().count() > 30 && output.lines().any(|l| {
+                let t = l.trim_start();
+                t.len() > 3 && t.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) && t.contains("| ")
+            }) {
+                // Extract file name from first line and key symbols
+                let first_line = output.lines().next().unwrap_or("");
+                let line_count = output.lines().count();
+                let symbols: Vec<&str> = output.lines()
+                    .filter_map(|l| {
+                        let t = l.trim();
+                        if t.starts_with("function ") || t.starts_with("async function ")
+                            || t.starts_with("const ") || t.starts_with("class ")
+                            || t.starts_with("export ") || t.starts_with("import ")
+                            || t.starts_with("<template") || t.starts_with("<script")
+                            || t.starts_with("pub fn ") || t.starts_with("def ")
+                            || t.starts_with("public ") || t.starts_with("private ")
+                        {
+                            // Extract just the name/signature
+                            Some(t.split(|c: char| c == '(' || c == '{' || c == ':').next().unwrap_or(t))
+                        } else { None }
+                    })
+                    .take(8)
+                    .collect();
+
+                if !symbols.is_empty() {
+                    let key = format!("read_{}", line_count);
+                    if seen_files.insert(key) {
+                        tombstones.push(format!(
+                            "[Read {} ({} lines): {}]",
+                            first_line.trim().split('|').next().unwrap_or("file").trim(),
+                            line_count,
+                            symbols.join(", ")
+                        ));
+                    }
                 }
             }
         }

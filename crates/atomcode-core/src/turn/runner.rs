@@ -36,6 +36,8 @@ pub struct TurnRunner {
     /// Files edited during the current session — read_file on these is intercepted
     /// to prevent wasteful "verification reads" after editing.
     pub recently_edited_files: Vec<String>,
+    /// Post-edit read count per file. First read returns skeleton, second+ BLOCKED.
+    pub post_edit_read_counts: std::collections::HashMap<String, usize>,
 }
 
 impl TurnRunner {
@@ -294,13 +296,29 @@ impl TurnRunner {
                         .chain(self.recently_edited_files.iter())
                         .any(|f| f == &short || fp.contains(f.as_str()));
                     if edited_recently {
+                        // Track post-edit read count: first read returns skeleton, second+ BLOCKED.
+                        let read_count = self.post_edit_read_counts.entry(short.clone()).or_insert(0);
+                        *read_count += 1;
+
+                        let output = if *read_count == 1 {
+                            // First read after edit: return file skeleton (structure + line numbers)
+                            // so model can plan next edit without re-reading full content.
+                            let skeleton = match std::fs::read_to_string(fp) {
+                                Ok(content) => generate_file_skeleton(&content, &short),
+                                Err(_) => format!("[{} was just edited. Use edit_file to make further changes.]", short),
+                            };
+                            skeleton
+                        } else {
+                            format!(
+                                "[BLOCKED: {} was already read once after editing. You have the skeleton above. \
+                                 Use edit_file with start_line/end_line to make changes. Do NOT read again.]",
+                                short
+                            )
+                        };
+
                         let result = ToolResult {
                             call_id: call.id.clone(),
-                            output: format!(
-                                "[BLOCKED: {} was just edited. You already have the content from the edit result. \
-                                 Do NOT read this file again. If you need to change it, use edit_file with start_line/end_line directly.]",
-                                short
-                            ),
+                            output,
                             success: true,
                         };
                         let _ = event_tx.send(TurnEvent::ToolCallResult {
@@ -440,4 +458,56 @@ fn strip_model_tags(text: &str) -> String {
     result = result.replace("</think>", "");
     result = result.replace("<|im_start|>", "").replace("<|im_end|>", "");
     result
+}
+
+/// Generate a compact file skeleton showing structure + line numbers.
+/// Used when model tries to read a recently edited file — gives enough
+/// info to plan edits without the full content (~200 token vs ~8000).
+fn generate_file_skeleton(content: &str, filename: &str) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+    let total = lines.len();
+    let mut skeleton = Vec::new();
+
+    skeleton.push(format!("[File skeleton: {} ({} lines) — use start_line/end_line to edit:]", filename, total));
+
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        let trimmed = line.trim();
+
+        // Keep structural lines: imports, declarations, function/class signatures,
+        // Vue SFC tags, significant comments
+        let is_structural =
+            trimmed.starts_with("import ") || trimmed.starts_with("from ") ||
+            trimmed.starts_with("export ") ||
+            trimmed.starts_with("const ") || trimmed.starts_with("let ") || trimmed.starts_with("var ") ||
+            trimmed.starts_with("function ") || trimmed.starts_with("async function ") ||
+            trimmed.starts_with("class ") || trimmed.starts_with("interface ") ||
+            trimmed.starts_with("pub fn ") || trimmed.starts_with("fn ") ||
+            trimmed.starts_with("pub struct ") || trimmed.starts_with("struct ") ||
+            trimmed.starts_with("pub enum ") || trimmed.starts_with("impl ") ||
+            trimmed.starts_with("def ") || trimmed.starts_with("async def ") ||
+            trimmed.starts_with("<script") || trimmed.starts_with("</script>") ||
+            trimmed.starts_with("<template") || trimmed.starts_with("</template>") ||
+            trimmed.starts_with("<style") || trimmed.starts_with("</style>") ||
+            trimmed.starts_with("@") || // decorators/annotations
+            trimmed.starts_with("package ") ||
+            trimmed.starts_with("public ") || trimmed.starts_with("private ") || trimmed.starts_with("protected ") ||
+            trimmed.starts_with("// ==") || trimmed.starts_with("/* ==") || // section comments
+            trimmed.starts_with("## ") || trimmed.starts_with("### ");
+
+        if is_structural && !trimmed.is_empty() {
+            skeleton.push(format!("  L{}: {}", i + 1, trimmed));
+        }
+
+        i += 1;
+    }
+
+    // Cap skeleton at ~60 lines to stay under ~200 tokens
+    if skeleton.len() > 60 {
+        skeleton.truncate(60);
+        skeleton.push(format!("  ... ({} more structural lines)", total - 60));
+    }
+
+    skeleton.join("\n")
 }
