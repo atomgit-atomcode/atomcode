@@ -1,7 +1,11 @@
 /// Raw rg command test — bypasses grep tool, directly calls rg
 /// to isolate whether the issue is in rg invocation or grep tool logic.
+///
+/// These tests depend on an external repo (devpress2.0) and are slow.
+/// Run explicitly with: cargo test -p atomcode-core --test grep_raw_test -- --ignored
 
 #[tokio::test]
+#[ignore = "depends on external repo /Users/yubangxu/project/devpress2.0"]
 async fn test_raw_rg_from_rust() {
     let wd = "/Users/yubangxu/project/devpress2.0";
     let search_path = format!("{}/backend/src", wd);
@@ -35,6 +39,7 @@ async fn test_raw_rg_from_rust() {
 }
 
 #[tokio::test]
+#[ignore = "depends on external repo /Users/yubangxu/project/devpress2.0"]
 async fn test_raw_rg_regex_or() {
     let wd = "/Users/yubangxu/project/devpress2.0";
     let search_path = format!("{}/backend/src", wd);
@@ -61,10 +66,10 @@ async fn test_raw_rg_regex_or() {
 }
 
 #[tokio::test]
+#[ignore = "depends on external repo /Users/yubangxu/project/devpress2.0"]
 async fn test_raw_rg_relative_path() {
     let wd = "/Users/yubangxu/project/devpress2.0";
 
-    // Relative path (like model would pass after resolve_args)
     let output = tokio::process::Command::new("rg")
         .args(&[
             "--line-number", "--no-heading", "--color=never",
@@ -85,6 +90,7 @@ async fn test_raw_rg_relative_path() {
 }
 
 #[tokio::test]
+#[ignore = "depends on external repo /Users/yubangxu/project/devpress2.0"]
 async fn test_grep_tool_on_devpress() {
     use std::path::PathBuf;
     use atomcode_core::tool::{Tool, ToolContext};

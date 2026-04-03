@@ -13,6 +13,9 @@ lto = true             # Link-time optimization — eliminates dead code across 
 codegen-units = 1      # Single codegen unit — better optimization, slower build
 strip = true           # Strip symbols automatically
 
+[profile.test]
+debug = "line-tables-only" # Smaller binaries, faster linker
+
 [workspace.package]
 version = "2.3.0"
 edition = "2021"

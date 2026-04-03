@@ -12,9 +12,39 @@ use super::{ApprovalRequirement, Tool, ToolContext, ToolDef, ToolResult};
 
 pub struct BashTool;
 
+/// Deserialize a u64 that may arrive as a JSON string (weak models often quote integers).
+fn deserialize_lenient_u64<'de, D>(deserializer: D) -> std::result::Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de;
+
+    struct LenientU64;
+
+    impl<'de> de::Visitor<'de> for LenientU64 {
+        type Value = Option<u64>;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a u64 or a string containing a u64")
+        }
+        fn visit_none<E: de::Error>(self) -> std::result::Result<Self::Value, E> { Ok(None) }
+        fn visit_unit<E: de::Error>(self) -> std::result::Result<Self::Value, E> { Ok(None) }
+        fn visit_u64<E: de::Error>(self, v: u64) -> std::result::Result<Self::Value, E> { Ok(Some(v)) }
+        fn visit_i64<E: de::Error>(self, v: i64) -> std::result::Result<Self::Value, E> {
+            if v >= 0 { Ok(Some(v as u64)) } else { Err(de::Error::custom("negative timeout")) }
+        }
+        fn visit_f64<E: de::Error>(self, v: f64) -> std::result::Result<Self::Value, E> { Ok(Some(v as u64)) }
+        fn visit_str<E: de::Error>(self, v: &str) -> std::result::Result<Self::Value, E> {
+            v.trim().parse::<u64>().map(Some).map_err(de::Error::custom)
+        }
+    }
+
+    deserializer.deserialize_any(LenientU64)
+}
+
 #[derive(Deserialize)]
 struct BashArgs {
     command: String,
+    #[serde(default, deserialize_with = "deserialize_lenient_u64")]
     timeout: Option<u64>,
 }
 
@@ -55,10 +85,17 @@ impl Tool for BashTool {
     }
 
     fn approval(&self, args: &str) -> ApprovalRequirement {
-        if let Ok(parsed) = serde_json::from_str::<BashArgs>(args) {
-            if let Some(reason) = check_destructive_command(&parsed.command) {
-                return ApprovalRequirement::RequireApproval(reason);
+        let parsed = match serde_json::from_str::<BashArgs>(args) {
+            Ok(p) => p,
+            Err(_) => {
+                // Fail-closed: unparseable args require approval.
+                return ApprovalRequirement::RequireApproval(
+                    "Could not parse bash arguments for safety check.".to_string(),
+                );
             }
+        };
+        if let Some(reason) = check_destructive_command(&parsed.command) {
+            return ApprovalRequirement::RequireApproval(reason);
         }
         ApprovalRequirement::AutoApprove
     }

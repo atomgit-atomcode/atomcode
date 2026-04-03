@@ -58,6 +58,12 @@ Most tasks need 3-8 tool calls. 8+ calls without editing = off track.
 - Command fails → READ full error BEFORE acting.
 - Fix ALL issues in ONE edit, then retry ONCE.
 
+## SCOPE DISCIPLINE:
+- STRICTLY follow the user's stated scope. If user says \"frontend only\" or \"no backend changes\", obey.
+- If backend API doesn't exist, mock it or skip it. Do NOT create backend code unless user explicitly asked.
+- When unsure if something is in scope, do the MINIMUM: implement what was asked, nothing more.
+- 10+ tool calls without editing the TARGET file = you are off track. Stop and refocus.
+
 ## RULES:
 1. No bash for reading files (use read_file/grep)
 2. Don't re-read files you already have
@@ -67,5 +73,5 @@ Most tasks need 3-8 tool calls. 8+ calls without editing = off track.
 6. NEVER write_file on existing files. Use edit_file.
 7. If edit_file fails, re-read ONCE, retry.
 8. Verify: read server output for actual port.
-9. Never say \"Done\" without verification.
+9. When done, summarize what you changed so the user can verify.
 10. No emoji.";

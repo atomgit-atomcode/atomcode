@@ -7,11 +7,15 @@ fn test_context() -> ToolContext {
     ToolContext::new(PathBuf::from("/tmp"))
 }
 
+use std::sync::atomic::{AtomicU64, Ordering};
+static COUNTER: AtomicU64 = AtomicU64::new(0);
+
 fn create_test_file(content: &str) -> String {
     let dir = std::env::temp_dir().join("atomcode_edit_test");
     let _ = std::fs::create_dir_all(&dir);
-    let id = format!("{}_{}", std::process::id(), std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos());
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let id = format!("{}_{}_{}", std::process::id(), std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos(), seq);
     let path = dir.join(format!("test_{}.vue", id));
     std::fs::write(&path, content).unwrap();
     path.to_string_lossy().to_string()
@@ -176,7 +180,186 @@ async fn edit_creates_file_history_backup() {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// 4. Empty old_string — should error, not append
+// 4. Multi-edit — multiple regions in one call
+// ═══════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn multi_edit_line_number_mode() {
+    // Simulate a Vue SFC: imports, logic, template
+    let content = "\
+<script setup>
+import { ref } from 'vue'
+import { useRouter } from 'vue-router'
+const count = ref(0)
+function increment() { count.value++ }
+</script>
+<template>
+  <div>
+    <p>{{ count }}</p>
+    <button @click=\"increment\">+1</button>
+  </div>
+</template>
+";
+    let path = create_test_file(content);
+    let ctx = test_context();
+    let tool = atomcode_core::tool::edit::EditFileTool;
+
+    let args = serde_json::json!({
+        "file_path": path,
+        "edits": [
+            {
+                "start_line": 2,
+                "end_line": 3,
+                "new_string": "import { ref, computed } from 'vue'\nimport { useRouter } from 'vue-router'\nimport { useStore } from './store'"
+            },
+            {
+                "start_line": 5,
+                "end_line": 5,
+                "new_string": "function increment() { count.value++ }\nconst double = computed(() => count.value * 2)"
+            },
+            {
+                "start_line": 9,
+                "end_line": 10,
+                "new_string": "    <p>{{ count }} (double: {{ double }})</p>\n    <button @click=\"increment\">+1</button>\n    <span>Store loaded</span>"
+            }
+        ]
+    });
+
+    let result = tool.execute(&args.to_string(), &ctx).await.unwrap();
+    assert!(result.success, "Multi-edit should succeed: {}", result.output);
+    assert!(result.output.contains("3 edits applied"), "Should report 3 edits: {}", result.output);
+
+    let new_content = std::fs::read_to_string(&path).unwrap();
+    assert!(new_content.contains("useStore"), "Should have new import");
+    assert!(new_content.contains("computed(() =>"), "Should have computed");
+    assert!(new_content.contains("Store loaded"), "Should have new template element");
+
+    cleanup(&path);
+}
+
+#[tokio::test]
+async fn multi_edit_text_match_mode() {
+    let content = "\
+function hello() { return 'hello'; }
+function world() { return 'world'; }
+function main() { console.log(hello(), world()); }
+";
+    let path = create_test_file(content);
+    let ctx = test_context();
+    let tool = atomcode_core::tool::edit::EditFileTool;
+
+    let args = serde_json::json!({
+        "file_path": path,
+        "edits": [
+            {
+                "old_string": "function hello() { return 'hello'; }",
+                "new_string": "function hello() { return 'hi'; }"
+            },
+            {
+                "old_string": "function world() { return 'world'; }",
+                "new_string": "function world() { return 'earth'; }"
+            }
+        ]
+    });
+
+    let result = tool.execute(&args.to_string(), &ctx).await.unwrap();
+    assert!(result.success, "Multi-edit text match should succeed: {}", result.output);
+
+    let new_content = std::fs::read_to_string(&path).unwrap();
+    assert!(new_content.contains("'hi'"), "Should have replaced hello");
+    assert!(new_content.contains("'earth'"), "Should have replaced world");
+    assert!(new_content.contains("console.log"), "Untouched code should remain");
+
+    cleanup(&path);
+}
+
+#[tokio::test]
+async fn multi_edit_overlap_detection() {
+    let content = (1..=20).map(|i| format!("line {}", i)).collect::<Vec<_>>().join("\n");
+    let path = create_test_file(&content);
+    let ctx = test_context();
+    let tool = atomcode_core::tool::edit::EditFileTool;
+
+    let args = serde_json::json!({
+        "file_path": path,
+        "edits": [
+            { "start_line": 5, "end_line": 10, "new_string": "a" },
+            { "start_line": 8, "end_line": 15, "new_string": "b" }
+        ]
+    });
+
+    let result = tool.execute(&args.to_string(), &ctx).await.unwrap();
+    assert!(!result.success, "Overlapping edits should fail");
+    assert!(result.output.contains("overlapping"), "Should mention overlap: {}", result.output);
+
+    cleanup(&path);
+}
+
+#[tokio::test]
+async fn multi_edit_mixed_modes() {
+    let content = "\
+import React from 'react'
+const App = () => {
+  const name = 'old'
+  return <div>{name}</div>
+}
+export default App
+";
+    let path = create_test_file(content);
+    let ctx = test_context();
+    let tool = atomcode_core::tool::edit::EditFileTool;
+
+    // Mix line-number and text-match in the same multi-edit
+    let args = serde_json::json!({
+        "file_path": path,
+        "edits": [
+            {
+                "start_line": 1,
+                "end_line": 1,
+                "new_string": "import React, { useState } from 'react'"
+            },
+            {
+                "old_string": "const name = 'old'",
+                "new_string": "const [name, setName] = useState('new')"
+            }
+        ]
+    });
+
+    let result = tool.execute(&args.to_string(), &ctx).await.unwrap();
+    assert!(result.success, "Mixed-mode multi-edit should succeed: {}", result.output);
+
+    let new_content = std::fs::read_to_string(&path).unwrap();
+    assert!(new_content.contains("useState"), "Import should be updated");
+    assert!(new_content.contains("useState('new')"), "State hook should be added");
+
+    cleanup(&path);
+}
+
+#[tokio::test]
+async fn multi_edit_string_line_numbers() {
+    // Test lenient parsing: model sends line numbers as strings
+    let content = "line 1\nline 2\nline 3\nline 4\nline 5\n";
+    let path = create_test_file(content);
+    let ctx = test_context();
+    let tool = atomcode_core::tool::edit::EditFileTool;
+
+    let args = format!(
+        r#"{{"file_path": "{}", "edits": [{{"start_line": "2", "end_line": "3", "new_string": "replaced"}}]}}"#,
+        path
+    );
+
+    let result = tool.execute(&args, &ctx).await.unwrap();
+    assert!(result.success, "String line numbers should work via lenient parsing: {}", result.output);
+
+    let new_content = std::fs::read_to_string(&path).unwrap();
+    assert!(new_content.contains("replaced"), "Edit should have been applied");
+    assert!(!new_content.contains("line 2"), "Old content should be gone");
+
+    cleanup(&path);
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 5. Empty old_string — should error, not append
 // ═══════════════════════════════════════════════════════════════
 
 #[tokio::test]

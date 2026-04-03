@@ -227,6 +227,8 @@ pub struct AgentLoop {
     /// Current task type — drives dynamic prompt selection and planning.
     /// ATLAS-style subtask driver: decomposes plan into per-file subtasks.
     subtask_driver: subtask_driver::SubtaskDriver,
+    /// Original plan text from model's first response — used for plan adherence reminders.
+    plan_text: Option<String>,
 
     /// Discovered service URLs extracted from tool outputs (e.g., "http://localhost:3002").
     /// Persisted across turns so the model knows which ports are active.
@@ -343,6 +345,7 @@ impl AgentLoop {
             planning_phase: false,
             diagnosis_read_only_turns: 0,
             subtask_driver: subtask_driver::SubtaskDriver::new(),
+            plan_text: None,
             session_files: std::collections::HashMap::new(),
             active_services: std::collections::HashMap::new(),
             result_store: ToolResultStore::new(ToolResultStore::default_dir()),
@@ -1187,6 +1190,8 @@ impl AgentLoop {
                         && !self.subtask_driver.active
                     {
                         self.subtask_driver.extract_from_plan(text);
+                        // Store plan text for adherence reminders
+                        self.plan_text = Some(text.clone());
                         if self.subtask_driver.active {
                             // Inject first subtask instruction
                             if let Some(instr) = self.subtask_driver.current_instruction() {
@@ -1221,6 +1226,26 @@ impl AgentLoop {
                         tokio::time::sleep(Duration::from_secs(2)).await;
                         continue;
                     }
+                    // Plan completion guard: if model tries to stop but planned tasks remain,
+                    // force it to continue. Prevents premature termination (T31 scenario).
+                    if self.plan_text.is_some()
+                        && self.subtask_driver.subtasks.iter().any(|t| !t.done)
+                        && self.retry_count < 2
+                    {
+                        let remaining: Vec<&str> = self.subtask_driver.subtasks.iter()
+                            .filter(|t| !t.done)
+                            .map(|t| t.file.as_str())
+                            .collect();
+                        if !remaining.is_empty() {
+                            self.retry_count += 1;
+                            self.conversation.add_user_message(&format!(
+                                "You are NOT done. These files from your plan still need editing: {}. Continue.",
+                                remaining.join(", ")
+                            ));
+                            continue;
+                        }
+                    }
+
                     self.finish_turn();
                     return;
                 }
@@ -1244,6 +1269,7 @@ impl AgentLoop {
                     if !self.files_edited_this_turn.is_empty() {
                         self.auto_compile_verify().await;
                         self.syntax_check_edited_files().await;
+                        self.check_devserver_logs().await;
                     }
 
                     // Apply discipline: inject reminders, check step limits
@@ -1503,6 +1529,42 @@ impl AgentLoop {
                         r.output.push_str(&reminder);
                     }
                     _ => {}
+                }
+            }
+        }
+
+        // Plan adherence check: if model has a plan but is working on files NOT in the plan,
+        // inject a strong reminder to return to the plan.
+        if let Some(ref plan) = self.plan_text {
+            if self.tool_call_count >= 8 && self.subtask_driver.subtasks.iter().any(|t| !t.done) {
+                // Check if recent work (files read/edited) overlaps with planned files
+                let planned_files: Vec<&str> = self.subtask_driver.subtasks.iter()
+                    .filter(|t| !t.done)
+                    .map(|t| t.file.as_str())
+                    .collect();
+
+                let working_on_plan = self.files_read_this_turn.iter()
+                    .chain(self.files_edited_this_turn.iter())
+                    .any(|f| planned_files.iter().any(|p| f.contains(p) || p.contains(f.as_str())));
+
+                if !working_on_plan && !planned_files.is_empty() {
+                    let remaining = planned_files.join(", ");
+                    let plan_preview: String = plan.chars().take(200).collect();
+                    let adherence_warning = format!(
+                        "\n\n<system-reminder>\n\
+                         ⚠ PLAN DRIFT DETECTED — you are NOT working on any planned file.\n\
+                         YOUR ORIGINAL PLAN:\n{}\n\n\
+                         REMAINING TASKS: {}\n\
+                         STOP what you are doing. Return to your plan. \
+                         Edit the next planned file NOW.\n\
+                         </system-reminder>",
+                        plan_preview, remaining
+                    );
+                    if let Some(last_msg) = self.conversation.messages.last_mut() {
+                        if let crate::conversation::message::MessageContent::ToolResult(ref mut r) = last_msg.content {
+                            r.output.push_str(&adherence_warning);
+                        }
+                    }
                 }
             }
         }
@@ -1827,6 +1889,61 @@ impl AgentLoop {
                 warnings.join("; ")
             );
             self.conversation.add_user_message(&msg);
+        }
+    }
+
+    /// Check dev server logs for errors after editing frontend/backend files.
+    /// Vite/webpack HMR errors show up in log files within ~1s of a file save.
+    /// This catches Vue SFC syntax errors that tree-sitter can't detect.
+    async fn check_devserver_logs(&mut self) {
+        let wd = self.turn_runner.context.working_dir.try_read()
+            .map(|g| g.clone()).unwrap_or_default();
+
+        // Candidate log files — covers common dev server setups
+        let candidates = [
+            "frontend.log", "backend.log", "server.log",
+            "frontend/frontend.log", "backend/backend.log",
+        ];
+
+        // Small delay to let HMR process the file change
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        for log_name in &candidates {
+            let log_path = wd.join(log_name);
+            if !log_path.exists() { continue; }
+
+            // Read last 30 lines
+            let content = match tokio::fs::read_to_string(&log_path).await {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            let tail: Vec<&str> = content.lines().rev().take(30).collect();
+            if tail.is_empty() { continue; }
+
+            // Look for error patterns in the tail
+            let error_lines: Vec<&&str> = tail.iter()
+                .filter(|l| {
+                    let lower = l.to_lowercase();
+                    (lower.contains("error") || lower.contains("failed") || lower.contains("syntaxerror"))
+                        && !lower.contains("0 error") // "0 errors" is success
+                        && !lower.contains("error overlay") // Vite's error overlay script, not an actual error
+                })
+                .collect();
+
+            if !error_lines.is_empty() {
+                let errors: String = error_lines.iter()
+                    .rev() // restore chronological order
+                    .take(5)
+                    .map(|l| l.to_string())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let msg = format!(
+                    "[DEV SERVER ERROR in {}:]\n{}\n\nFix these errors before continuing.",
+                    log_name, errors
+                );
+                self.conversation.add_user_message(&msg);
+                break; // One log file's errors is enough
+            }
         }
     }
 

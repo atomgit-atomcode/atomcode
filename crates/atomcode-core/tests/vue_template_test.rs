@@ -1,7 +1,20 @@
 //! Vue <template> tree-sitter-html parsing tests.
+//! Uses a shared SemanticSearcher to avoid re-initializing 10 language parsers per test.
 
 use atomcode_core::semantic::SemanticSearcher;
 use std::io::Write;
+use std::sync::Mutex;
+
+static SEARCHER: std::sync::LazyLock<Mutex<SemanticSearcher>> =
+    std::sync::LazyLock::new(|| Mutex::new(SemanticSearcher::new()));
+
+fn with_searcher<F, R>(f: F) -> R
+where
+    F: FnOnce(&mut SemanticSearcher) -> R,
+{
+    let mut s = SEARCHER.lock().unwrap();
+    f(&mut s)
+}
 
 /// Create a temp Vue file and return its path.
 fn write_temp_vue(content: &str) -> (tempfile::NamedTempFile, std::path::PathBuf) {
@@ -28,8 +41,7 @@ const handleClick = () => { console.log('click'); }
 </template>
 "#;
     let (_f, path) = write_temp_vue(vue);
-    let mut searcher = SemanticSearcher::new();
-    let symbols = searcher.list_symbols(&path).unwrap();
+    let symbols = with_searcher(|s| s.list_symbols(&path).unwrap());
 
     let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
     assert!(names.contains(&"fetchData"), "Should find fetchData, got: {:?}", names);
@@ -51,8 +63,7 @@ function setup() {}
 </template>
 "#;
     let (_f, path) = write_temp_vue(vue);
-    let mut searcher = SemanticSearcher::new();
-    let symbols = searcher.list_symbols(&path).unwrap();
+    let symbols = with_searcher(|s| s.list_symbols(&path).unwrap());
 
     let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
     // Should find custom components from template
@@ -81,8 +92,7 @@ fn vue_filters_plain_divs() {
 </template>
 "#;
     let (_f, path) = write_temp_vue(vue);
-    let mut searcher = SemanticSearcher::new();
-    let symbols = searcher.list_symbols(&path).unwrap();
+    let symbols = with_searcher(|s| s.list_symbols(&path).unwrap());
 
     let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
     // Plain div/span/p should be filtered out
@@ -110,8 +120,7 @@ function setup() {}
 </template>
 "#;
     let (_f, path) = write_temp_vue(vue);
-    let mut searcher = SemanticSearcher::new();
-    let symbols = searcher.list_symbols(&path).unwrap();
+    let symbols = with_searcher(|s| s.list_symbols(&path).unwrap());
 
     let comp = symbols.iter().find(|s| s.name == "<MyComponent>").unwrap();
     // MyComponent is on line 6 (1-indexed)
@@ -131,8 +140,7 @@ function init() { return 42; }
 </script>
 "#;
     let (_f, path) = write_temp_vue(vue);
-    let mut searcher = SemanticSearcher::new();
-    let symbols = searcher.list_symbols(&path).unwrap();
+    let symbols = with_searcher(|s| s.list_symbols(&path).unwrap());
 
     let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
     assert!(names.contains(&"init"), "Should find init from script, got: {:?}", names);
@@ -157,8 +165,7 @@ function deleteUser(id: number) { return true; }
 </template>
 "#;
     let (_f, path) = write_temp_vue(vue);
-    let mut searcher = SemanticSearcher::new();
-    let skeleton = searcher.skeleton(&path).unwrap();
+    let skeleton = with_searcher(|s| s.skeleton(&path).unwrap());
 
     // Skeleton should mention both script functions and template components
     assert!(skeleton.contains("fetchUsers"), "Skeleton should contain fetchUsers");
@@ -190,8 +197,7 @@ fn html_file_extracts_elements() {
     f.flush().unwrap();
     let path = f.path().to_path_buf();
 
-    let mut searcher = SemanticSearcher::new();
-    let symbols = searcher.list_symbols(&path).unwrap();
+    let symbols = with_searcher(|s| s.list_symbols(&path).unwrap());
 
     assert!(!symbols.is_empty(), "Should find HTML elements");
     let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();

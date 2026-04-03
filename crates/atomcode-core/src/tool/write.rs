@@ -80,20 +80,27 @@ impl Tool for WriteFileTool {
     }
 
     fn approval(&self, args: &str) -> ApprovalRequirement {
-        if let Ok(parsed) = serde_json::from_str::<WriteFileArgs>(args) {
-            if is_sensitive_path(&parsed.file_path) {
+        let parsed = match serde_json::from_str::<WriteFileArgs>(args) {
+            Ok(p) => p,
+            Err(_) => {
+                // Fail-closed: if we can't parse args, require approval rather than auto-approving.
                 return ApprovalRequirement::RequireApproval(
-                    format!("Writing to sensitive system path: {}", parsed.file_path),
+                    "Could not parse write_file arguments for safety check.".to_string(),
                 );
             }
-            // Overwriting an existing non-empty file is dangerous — it destroys
-            // all code not included in the new content. Require approval.
-            let path = std::path::Path::new(&parsed.file_path);
-            if path.exists() && std::fs::metadata(path).map(|m| m.len() > 0).unwrap_or(false) {
-                return ApprovalRequirement::RequireApproval(
-                    format!("Overwriting existing file: {}. Use edit_file instead for targeted changes.", parsed.file_path),
-                );
-            }
+        };
+        if is_sensitive_path(&parsed.file_path) {
+            return ApprovalRequirement::RequireApproval(
+                format!("Writing to sensitive system path: {}", parsed.file_path),
+            );
+        }
+        // Overwriting an existing non-empty file is dangerous — it destroys
+        // all code not included in the new content. Require approval.
+        let path = std::path::Path::new(&parsed.file_path);
+        if path.exists() && std::fs::metadata(path).map(|m| m.len() > 0).unwrap_or(false) {
+            return ApprovalRequirement::RequireApproval(
+                format!("Overwriting existing file: {}. Use edit_file instead for targeted changes.", parsed.file_path),
+            );
         }
         ApprovalRequirement::AutoApprove
     }

@@ -490,6 +490,10 @@ pub async fn run(
                         Err(_) => break,
                     }
                 }
+                // Redraw immediately after processing agent events.
+                // Without this, the terminal won't update until the next user
+                // input event, causing the UI to appear "frozen".
+                terminal.draw(|frame| ui::render(frame, &mut app))?;
             }
         }
 

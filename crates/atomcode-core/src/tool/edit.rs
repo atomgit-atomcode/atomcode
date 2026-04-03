@@ -3,6 +3,39 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::json;
 
+/// Deserialize a number that may arrive as a JSON string (weak models often quote integers).
+fn deserialize_lenient_usize<'de, D>(deserializer: D) -> std::result::Result<Option<usize>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de;
+
+    struct LenientUsize;
+
+    impl<'de> de::Visitor<'de> for LenientUsize {
+        type Value = Option<usize>;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a usize or a string containing a usize")
+        }
+        fn visit_none<E: de::Error>(self) -> std::result::Result<Self::Value, E> { Ok(None) }
+        fn visit_unit<E: de::Error>(self) -> std::result::Result<Self::Value, E> { Ok(None) }
+        fn visit_u64<E: de::Error>(self, v: u64) -> std::result::Result<Self::Value, E> {
+            Ok(Some(v as usize))
+        }
+        fn visit_i64<E: de::Error>(self, v: i64) -> std::result::Result<Self::Value, E> {
+            if v >= 0 { Ok(Some(v as usize)) } else { Err(de::Error::custom("negative line number")) }
+        }
+        fn visit_f64<E: de::Error>(self, v: f64) -> std::result::Result<Self::Value, E> {
+            Ok(Some(v as usize))
+        }
+        fn visit_str<E: de::Error>(self, v: &str) -> std::result::Result<Self::Value, E> {
+            v.trim().parse::<usize>().map(Some).map_err(de::Error::custom)
+        }
+    }
+
+    deserializer.deserialize_any(LenientUsize)
+}
+
 /// Atomic write: write to temp file then rename. Prevents corruption on crash.
 /// Retries rename once after a short delay — dev servers (Vite, webpack) may
 /// briefly lock files during hot-reload, causing transient rename failures.
@@ -39,7 +72,9 @@ struct EditFileArgs {
     /// Text to find and replace. Required unless using line-number mode (start_line/end_line).
     #[serde(default)]
     old_string: Option<String>,
-    new_string: String,
+    /// Not required when using `edits` array mode.
+    #[serde(default)]
+    new_string: Option<String>,
     #[serde(default)]
     replace_all: bool,
     /// Scope edit to a specific function/class by name (tree-sitter).
@@ -47,10 +82,25 @@ struct EditFileArgs {
     symbol: Option<String>,
     /// Line-number mode: replace lines start_line..end_line with new_string.
     /// Use line numbers from read_file output. No need to copy text precisely.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_lenient_usize")]
     start_line: Option<usize>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_lenient_usize")]
     end_line: Option<usize>,
+    /// Multi-edit mode: apply multiple edits to different regions in one call.
+    /// Mutually exclusive with single-edit fields (old_string/new_string/start_line/end_line).
+    #[serde(default)]
+    edits: Option<Vec<SingleEdit>>,
+}
+
+#[derive(Deserialize)]
+struct SingleEdit {
+    #[serde(default, deserialize_with = "deserialize_lenient_usize")]
+    start_line: Option<usize>,
+    #[serde(default, deserialize_with = "deserialize_lenient_usize")]
+    end_line: Option<usize>,
+    #[serde(default)]
+    old_string: Option<String>,
+    new_string: String,
 }
 
 #[async_trait]
@@ -59,13 +109,21 @@ impl Tool for EditFileTool {
         ToolDef {
             name: "edit_file",
             description: "Replace text in a file. ALWAYS prefer this over write_file for existing files.\n\
-                Two modes:\n\
+                Three modes:\n\
                 1. LINE-NUMBER MODE (recommended): specify start_line and end_line from read_file output.\n\
                    No need to copy text — just use line numbers. Replaces lines start_line through end_line with new_string.\n\
                    Example: {\"file_path\": \"app.vue\", \"start_line\": 150, \"end_line\": 165, \"new_string\": \"<new content>\"}\n\
                 2. TEXT MATCH MODE: specify old_string to find and replace.\n\
                    old_string must be unique in the file (or use replace_all=true for bulk changes).\n\
                    Example: {\"file_path\": \"app.vue\", \"old_string\": \"bg-blue-500\", \"new_string\": \"bg-red-500\", \"replace_all\": true}\n\
+                3. MULTI-EDIT MODE: pass an edits array to change multiple regions in ONE call.\n\
+                   Each edit uses line-number or text-match mode independently. Applied back-to-front automatically.\n\
+                   PREFER THIS when you need to change 2+ non-adjacent regions (e.g. imports + logic + template).\n\
+                   Example: {\"file_path\": \"app.vue\", \"edits\": [\n\
+                     {\"start_line\": 5, \"end_line\": 6, \"new_string\": \"import { ref, computed } from 'vue'\"},\n\
+                     {\"start_line\": 30, \"end_line\": 30, \"new_string\": \"const count = ref(0)\"},\n\
+                     {\"old_string\": \"<div>old</div>\", \"new_string\": \"<div>new</div>\"}\n\
+                   ]}\n\
                 Additional options:\n\
                 - symbol: scope the edit to a specific function/class (tree-sitter). Reduces ambiguity.\n\
                 Behavior:\n\
@@ -101,9 +159,23 @@ impl Tool for EditFileTool {
                     "symbol": {
                         "type": "string",
                         "description": "Scope edit to a specific function/class name (tree-sitter)."
+                    },
+                    "edits": {
+                        "type": "array",
+                        "description": "Multi-edit: array of edits to apply in one call. Each edit has start_line/end_line or old_string, plus new_string. Use when changing 2+ non-adjacent regions.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "start_line": { "type": "integer", "description": "Start line number" },
+                                "end_line": { "type": "integer", "description": "End line number (inclusive)" },
+                                "old_string": { "type": "string", "description": "Text to find (text-match mode)" },
+                                "new_string": { "type": "string", "description": "Replacement text" }
+                            },
+                            "required": ["new_string"]
+                        }
                     }
                 },
-                "required": ["file_path", "new_string"]
+                "required": ["file_path"]
             }),
         }
     }
@@ -121,6 +193,30 @@ impl Tool for EditFileTool {
         let content = tokio::fs::read_to_string(&parsed.file_path)
             .await
             .with_context(|| format!("Failed to read {}", parsed.file_path))?;
+
+        // ── MULTI-EDIT MODE ──
+        if let Some(edits) = parsed.edits {
+            if edits.is_empty() {
+                return Ok(ToolResult {
+                    call_id: String::new(),
+                    output: "Error: edits array is empty.".to_string(),
+                    success: false,
+                });
+            }
+            return self.execute_multi_edit(&parsed.file_path, &content, edits).await;
+        }
+
+        // Single-edit mode: new_string is required
+        let new_string = match parsed.new_string {
+            Some(s) => s,
+            None => {
+                return Ok(ToolResult {
+                    call_id: String::new(),
+                    output: "Error: new_string is required for single-edit mode. Use edits array for multi-edit.".to_string(),
+                    success: false,
+                });
+            }
+        };
 
         // ── LINE-NUMBER MODE ──
         // Replace lines start_line..=end_line with new_string. No text matching needed.
@@ -140,13 +236,13 @@ impl Tool for EditFileTool {
             // Show what's being replaced
             let old_text: String = lines[start - 1..end].join("\n");
             let removed = end - start + 1;
-            let added = parsed.new_string.lines().count();
+            let added = new_string.lines().count();
 
             // Reconstruct file
             let mut new_lines: Vec<&str> = Vec::with_capacity(total);
             new_lines.extend_from_slice(&lines[..start - 1]);
             // new_string lines go in the middle
-            let new_content_lines: Vec<&str> = parsed.new_string.lines().collect();
+            let new_content_lines: Vec<&str> = new_string.lines().collect();
             new_lines.extend_from_slice(&new_content_lines);
             if end < total {
                 new_lines.extend_from_slice(&lines[end..]);
@@ -158,18 +254,19 @@ impl Tool for EditFileTool {
             };
 
             atomic_write(&parsed.file_path, &new_content).await?;
-            let diff = build_compact_diff(&old_text, &parsed.new_string);
-            let outline = post_edit_info(&new_content, &parsed.new_string);
+            let diff = build_compact_diff(&old_text, &new_string);
+            let outline = post_edit_info(&new_content, &new_string);
             let new_end = start + added.saturating_sub(1);
             let ctx = surrounding_context(&parsed.file_path, start, new_end);
-            return Ok(ToolResult {
+            let result = ToolResult {
                 call_id: String::new(),
                 output: format!(
                     "Edited {} lines {}-{} (-{} +{} lines).\n{}\n{}{}",
                     parsed.file_path, start, end, removed, added, diff, outline, ctx
                 ),
                 success: true,
-            });
+            };
+            return Ok(post_edit_validate(result, &parsed.file_path, &new_content, &new_string).await);
         }
 
         // ── old_string is required for text-match and symbol modes ──
@@ -222,9 +319,9 @@ impl Tool for EditFileTool {
 
                 // Replace within the symbol, reconstruct the full file
                 let new_sym_text = if parsed.replace_all {
-                    sym_text.replace(&old_string, &parsed.new_string)
+                    sym_text.replace(&old_string, &new_string)
                 } else {
-                    sym_text.replacen(&old_string, &parsed.new_string, 1)
+                    sym_text.replacen(&old_string, &new_string, 1)
                 };
                 let new_content = format!(
                     "{}{}{}",
@@ -239,20 +336,21 @@ impl Tool for EditFileTool {
                 let mut searcher = ctx.semantic.lock().await;
                 searcher.invalidate(path);
 
-                let diff = build_compact_diff(&old_string, &parsed.new_string);
+                let diff = build_compact_diff(&old_string, &new_string);
                 let label = if parsed.replace_all {
                     format!("replaced {} occurrences in {}", sym_count, symbol_name)
                 } else {
                     format!("in {} (lines {}-{})", symbol_name, slice.start_line, slice.end_line)
                 };
-                let outline = post_edit_info(&new_content, &parsed.new_string);
-                let (sl, el) = find_edit_lines(&parsed.file_path, &parsed.new_string);
+                let outline = post_edit_info(&new_content, &new_string);
+                let (sl, el) = find_edit_lines(&parsed.file_path, &new_string);
                 let ctx_str = surrounding_context(&parsed.file_path, sl, el);
-                return Ok(ToolResult {
+                let result = ToolResult {
                     call_id: String::new(),
                     output: format!("Edited {} {}.\n{}\n{}{}", parsed.file_path, label, diff, outline, ctx_str),
                     success: true,
-                });
+                };
+                return Ok(post_edit_validate(result, &parsed.file_path, &new_content, &new_string).await);
             } else {
                 // Symbol not found — list available symbols as hint
                 let hint = match searcher.list_symbols(path) {
@@ -277,14 +375,14 @@ impl Tool for EditFileTool {
             // Auto-fuzzy: try whitespace-normalized matching before failing.
             // This handles the common case where the model gets indentation slightly wrong.
             if let Some((fuzzy_result, fuzzy_count)) = try_fuzzy_replace(
-                &content, &old_string, &parsed.new_string, parsed.replace_all
+                &content, &old_string, &new_string, parsed.replace_all
             ) {
                 atomic_write(&parsed.file_path, &fuzzy_result).await?;
-                let diff = build_compact_diff(&old_string, &parsed.new_string);
-                let outline = post_edit_info(&fuzzy_result, &parsed.new_string);
-                let (sl, el) = find_edit_lines(&parsed.file_path, &parsed.new_string);
+                let diff = build_compact_diff(&old_string, &new_string);
+                let outline = post_edit_info(&fuzzy_result, &new_string);
+                let (sl, el) = find_edit_lines(&parsed.file_path, &new_string);
                 let ctx_str = surrounding_context(&parsed.file_path, sl, el);
-                return Ok(ToolResult {
+                let result = ToolResult {
                     call_id: String::new(),
                     output: format!(
                         "Edited {} (fuzzy match, {} occurrence{}).\n{}\n{}{}",
@@ -293,7 +391,8 @@ impl Tool for EditFileTool {
                         diff, outline, ctx_str
                     ),
                     success: true,
-                });
+                };
+                return Ok(post_edit_validate(result, &parsed.file_path, &fuzzy_result, &new_string).await);
             }
 
             let (hint, suggested_old) = find_closest_match_with_suggestion(&content, &old_string);
@@ -315,7 +414,7 @@ impl Tool for EditFileTool {
 
         // Safety check: warn about large deletions
         let old_lines = old_string.lines().count();
-        let new_lines = parsed.new_string.lines().count();
+        let new_lines = new_string.lines().count();
         let net_deleted = old_lines.saturating_sub(new_lines);
         let _deletion_warning = if net_deleted > 10 {
             format!(
@@ -339,20 +438,21 @@ impl Tool for EditFileTool {
                 String::new()
             };
 
-            let new_content = content.replace(&old_string, &parsed.new_string);
+            let new_content = content.replace(&old_string, &new_string);
             atomic_write(&parsed.file_path, &new_content).await?;
-            let diff = build_compact_diff(&old_string, &parsed.new_string);
-            let outline = post_edit_info(&new_content, &parsed.new_string);
-            let (sl, el) = find_edit_lines(&parsed.file_path, &parsed.new_string);
+            let diff = build_compact_diff(&old_string, &new_string);
+            let outline = post_edit_info(&new_content, &new_string);
+            let (sl, el) = find_edit_lines(&parsed.file_path, &new_string);
             let ctx_str = surrounding_context(&parsed.file_path, sl, el);
-            Ok(ToolResult {
+            let result = ToolResult {
                 call_id: String::new(),
                 output: format!(
                     "Edited {} (replaced {} occurrence{}).\n{}\n{}{}",
                     parsed.file_path, count, if count > 1 { "s" } else { "" }, diff, outline, ctx_str,
                 ),
                 success: true,
-            })
+            };
+            Ok(post_edit_validate(result, &parsed.file_path, &new_content, &new_string).await)
         } else {
             if count > 1 {
                 // Auto-disambiguate using tree-sitter: if only ONE symbol contains the match,
@@ -372,7 +472,7 @@ impl Tool for EditFileTool {
                         // Only one symbol contains it — auto-scope and replace
                         let sym = matching_syms[0];
                         let sym_text = &content[sym.start_byte..sym.end_byte.min(content.len())];
-                        let new_sym = sym_text.replacen(&*old_string, &parsed.new_string, 1);
+                        let new_sym = sym_text.replacen(&*old_string, &new_string, 1);
                         let new_content = format!(
                             "{}{}{}",
                             &content[..sym.start_byte],
@@ -381,18 +481,19 @@ impl Tool for EditFileTool {
                         );
                         drop(searcher);
                         atomic_write(&parsed.file_path, &new_content).await?;
-                        let diff = build_compact_diff(&old_string, &parsed.new_string);
-                        let outline = post_edit_info(&new_content, &parsed.new_string);
-                        let (sl, el) = find_edit_lines(&parsed.file_path, &parsed.new_string);
+                        let diff = build_compact_diff(&old_string, &new_string);
+                        let outline = post_edit_info(&new_content, &new_string);
+                        let (sl, el) = find_edit_lines(&parsed.file_path, &new_string);
                         let ctx_str = surrounding_context(&parsed.file_path, sl, el);
-                        return Ok(ToolResult {
+                        let result = ToolResult {
                             call_id: String::new(),
                             output: format!(
                                 "Edited {} in {}() (auto-scoped, {} global matches).\n{}\n{}{}",
                                 parsed.file_path, sym.name, count, diff, outline, ctx_str
                             ),
                             success: true,
-                        });
+                        };
+                        return Ok(post_edit_validate(result, &parsed.file_path, &new_content, &new_string).await);
                     }
                 }
                 drop(searcher);
@@ -407,24 +508,181 @@ impl Tool for EditFileTool {
                 });
             }
 
-            let new_content = content.replacen(&old_string, &parsed.new_string, 1);
+            let new_content = content.replacen(&old_string, &new_string, 1);
             atomic_write(&parsed.file_path, &new_content).await?;
 
             let removed = old_string.lines().count();
-            let added = parsed.new_string.lines().count();
-            let diff = build_compact_diff(&old_string, &parsed.new_string);
-            let outline = post_edit_info(&new_content, &parsed.new_string);
-            let (sl, el) = find_edit_lines(&parsed.file_path, &parsed.new_string);
+            let added = new_string.lines().count();
+            let diff = build_compact_diff(&old_string, &new_string);
+            let outline = post_edit_info(&new_content, &new_string);
+            let (sl, el) = find_edit_lines(&parsed.file_path, &new_string);
             let ctx_str = surrounding_context(&parsed.file_path, sl, el);
-            Ok(ToolResult {
+            let result = ToolResult {
                 call_id: String::new(),
                 output: format!(
                     "Edited {} (-{} +{} lines).\n{}\n{}{}",
                     parsed.file_path, removed, added, diff, outline, ctx_str,
                 ),
                 success: true,
-            })
+            };
+            Ok(post_edit_validate(result, &parsed.file_path, &new_content, &new_string).await)
         }
+    }
+}
+
+impl EditFileTool {
+    /// Execute multi-edit: apply multiple edits to different regions in one call.
+    /// Edits are resolved to line ranges, sorted back-to-front, then applied sequentially.
+    async fn execute_multi_edit(
+        &self,
+        file_path: &str,
+        content: &str,
+        edits: Vec<SingleEdit>,
+    ) -> Result<ToolResult> {
+        let lines: Vec<&str> = content.lines().collect();
+        let total = lines.len();
+
+        // Resolve each edit to a (start, end, new_string) tuple where start/end are 1-indexed line numbers.
+        let mut resolved: Vec<(usize, usize, String)> = Vec::with_capacity(edits.len());
+
+        for (i, edit) in edits.iter().enumerate() {
+            if let (Some(start), Some(end)) = (edit.start_line, edit.end_line) {
+                // Line-number mode
+                if start == 0 || start > total || end < start {
+                    return Ok(ToolResult {
+                        call_id: String::new(),
+                        output: format!("Error in edit #{}: invalid line range {}-{} (file has {} lines)", i + 1, start, end, total),
+                        success: false,
+                    });
+                }
+                resolved.push((start, end.min(total), edit.new_string.clone()));
+            } else if let Some(ref old_str) = edit.old_string {
+                if old_str.is_empty() {
+                    return Ok(ToolResult {
+                        call_id: String::new(),
+                        output: format!("Error in edit #{}: old_string is empty", i + 1),
+                        success: false,
+                    });
+                }
+                // Text-match mode: find the old_string and convert to line range
+                match find_text_line_range(content, old_str) {
+                    Some((start, end)) => {
+                        resolved.push((start, end, edit.new_string.clone()));
+                    }
+                    None => {
+                        return Ok(ToolResult {
+                            call_id: String::new(),
+                            output: format!(
+                                "Error in edit #{}: old_string not found in {}.\nSearched for: {:?}",
+                                i + 1, file_path, old_str.lines().next().unwrap_or("")
+                            ),
+                            success: false,
+                        });
+                    }
+                }
+            } else {
+                return Ok(ToolResult {
+                    call_id: String::new(),
+                    output: format!("Error in edit #{}: must specify start_line/end_line or old_string", i + 1),
+                    success: false,
+                });
+            }
+        }
+
+        // Check for overlapping ranges
+        resolved.sort_by_key(|(start, _, _)| *start);
+        for w in resolved.windows(2) {
+            let (_, end_a, _) = &w[0];
+            let (start_b, _, _) = &w[1];
+            if start_b <= end_a {
+                return Ok(ToolResult {
+                    call_id: String::new(),
+                    output: format!(
+                        "Error: overlapping edit ranges detected (lines {}-{} and {}-{}). Edits must not overlap.",
+                        w[0].0, end_a, start_b, w[1].1
+                    ),
+                    success: false,
+                });
+            }
+        }
+
+        // Apply edits back-to-front to preserve line numbers
+        resolved.sort_by(|a, b| b.0.cmp(&a.0));
+
+        let mut result_lines: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+        let mut summary_parts: Vec<String> = Vec::new();
+
+        for (start, end, new_str) in &resolved {
+            let removed = end - start + 1;
+            let new_edit_lines: Vec<String> = new_str.lines().map(|l| l.to_string()).collect();
+            let added = new_edit_lines.len();
+            result_lines.splice((start - 1)..*end, new_edit_lines);
+            summary_parts.push(format!("L{}-{} (-{} +{})", start, end, removed, added));
+        }
+        // Reverse so summary is top-to-bottom
+        summary_parts.reverse();
+
+        let new_content = if content.ends_with('\n') {
+            format!("{}\n", result_lines.join("\n"))
+        } else {
+            result_lines.join("\n")
+        };
+
+        atomic_write(file_path, &new_content).await?;
+
+        let edit_count = resolved.len();
+        let outline = post_edit_info(&new_content, "");
+        let all_new_strings: String = edits.iter().map(|e| e.new_string.as_str()).collect::<Vec<_>>().join("\n");
+        let result = ToolResult {
+            call_id: String::new(),
+            output: format!(
+                "Multi-edit: {} edits applied to {} [{}].\n{}",
+                edit_count, file_path, summary_parts.join(", "), outline
+            ),
+            success: true,
+        };
+        Ok(post_edit_validate(result, file_path, &new_content, &all_new_strings).await)
+    }
+}
+
+/// Find the line range (1-indexed, inclusive) where `needle` appears in `content`.
+/// Returns None if not found or if found multiple times.
+fn find_text_line_range(content: &str, needle: &str) -> Option<(usize, usize)> {
+    let needle_lines: Vec<&str> = needle.lines().collect();
+    if needle_lines.is_empty() {
+        return None;
+    }
+
+    let content_lines: Vec<&str> = content.lines().collect();
+    let mut matches: Vec<usize> = Vec::new();
+
+    // Try exact match first
+    for i in 0..content_lines.len().saturating_sub(needle_lines.len() - 1) {
+        if content_lines[i..i + needle_lines.len()] == needle_lines[..] {
+            matches.push(i);
+        }
+    }
+
+    // If no exact match, try trimmed (fuzzy) match
+    if matches.is_empty() {
+        let needle_trimmed: Vec<&str> = needle_lines.iter().map(|l| l.trim()).collect();
+        for i in 0..content_lines.len().saturating_sub(needle_trimmed.len() - 1) {
+            let window: Vec<&str> = content_lines[i..i + needle_trimmed.len()]
+                .iter()
+                .map(|l| l.trim())
+                .collect();
+            if window == needle_trimmed {
+                matches.push(i);
+            }
+        }
+    }
+
+    if matches.len() == 1 {
+        let start = matches[0] + 1; // 1-indexed
+        let end = start + needle_lines.len() - 1;
+        Some((start, end))
+    } else {
+        None // not found or ambiguous
     }
 }
 
@@ -517,6 +775,107 @@ fn try_fuzzy_replace(
 
     let count = if replace_all { matches.len() } else { 1 };
     Some((result, count))
+}
+
+/// Detect if an edit introduced duplicate blocks (a common weak-model failure mode).
+/// Checks if new_string (≥3 non-blank lines) appears more than once in the result.
+/// Returns a warning string if duplicates found, empty string otherwise.
+fn detect_duplicate_blocks(new_content: &str, new_string: &str) -> String {
+    let sig_lines: Vec<&str> = new_string.lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .collect();
+    if sig_lines.len() < 3 {
+        return String::new();
+    }
+    // Use first 3 significant lines as a fingerprint
+    let fingerprint: Vec<&str> = sig_lines[..3.min(sig_lines.len())].to_vec();
+    let content_lines: Vec<&str> = new_content.lines().map(|l| l.trim()).collect();
+
+    let mut hits = 0usize;
+    let mut i = 0;
+    while i + fingerprint.len() <= content_lines.len() {
+        if content_lines[i..i + fingerprint.len()] == fingerprint[..] {
+            hits += 1;
+            i += fingerprint.len();
+        } else {
+            i += 1;
+        }
+    }
+
+    if hits > 1 {
+        format!(
+            "\n⚠ WARNING: The edit introduced DUPLICATE code blocks ({} copies detected). \
+             This is likely a bug. Review the file and remove the duplicate.",
+            hits
+        )
+    } else {
+        String::new()
+    }
+}
+
+/// Post-edit syntax check for common file types.
+/// Runs a fast, non-destructive check and returns a warning if syntax is broken.
+async fn post_edit_syntax_check(file_path: &str) -> String {
+    let ext = file_path.rsplit('.').next().unwrap_or("");
+    let cmd = match ext {
+        "js" | "mjs" | "cjs" => Some(("node", vec!["--check".to_string(), file_path.to_string()])),
+        "json" => {
+            // Validate JSON by attempting parse
+            return match tokio::fs::read_to_string(file_path).await {
+                Ok(content) => {
+                    if serde_json::from_str::<serde_json::Value>(&content).is_err() {
+                        format!("\n⚠ SYNTAX ERROR: {} is not valid JSON. Fix before proceeding.", file_path)
+                    } else {
+                        String::new()
+                    }
+                }
+                Err(_) => String::new(),
+            };
+        }
+        "ts" | "tsx" => {
+            // npx tsc --noEmit is too slow; just check if node can parse it as a quick heuristic
+            // TypeScript syntax errors will surface when the user runs their build
+            return String::new();
+        }
+        "py" => Some(("python3", vec!["-m".to_string(), "py_compile".to_string(), file_path.to_string()])),
+        _ => None,
+    };
+
+    if let Some((program, args)) = cmd {
+        match tokio::process::Command::new(program)
+            .args(&args)
+            .output()
+            .await
+        {
+            Ok(output) if !output.status.success() => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let first_lines: String = stderr.lines().take(3).collect::<Vec<_>>().join("\n");
+                format!("\n⚠ SYNTAX ERROR in {}:\n{}", file_path, first_lines)
+            }
+            _ => String::new(),
+        }
+    } else {
+        String::new()
+    }
+}
+
+/// Run all post-edit validations: duplicate detection + syntax check.
+/// Appends warnings to the ToolResult output if issues found.
+async fn post_edit_validate(result: ToolResult, file_path: &str, new_content: &str, new_string: &str) -> ToolResult {
+    if !result.success { return result; }
+
+    let dup_warn = detect_duplicate_blocks(new_content, new_string);
+    let syntax_warn = post_edit_syntax_check(file_path).await;
+
+    if dup_warn.is_empty() && syntax_warn.is_empty() {
+        return result;
+    }
+
+    ToolResult {
+        output: format!("{}{}{}", result.output, dup_warn, syntax_warn),
+        ..result
+    }
 }
 
 /// Post-edit info: file outline for navigation.
