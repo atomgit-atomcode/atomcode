@@ -427,6 +427,10 @@ pub async fn run(
                     if let Ok(new_config) = Config::load(&config_path) {
                         app.config = new_config;
                         app.rebuild_provider();
+                        // Notify AgentLoop to switch to the new provider
+                        let _ = app.agent_handle.cmd_tx.send(
+                            atomcode_core::agent::AgentCommand::SwitchProvider(oauth_name.clone())
+                        );
                     }
                     let model_display = app.provider.model_name();
                     app.conversation.add_user_message("/login");

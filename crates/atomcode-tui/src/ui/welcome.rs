@@ -1,7 +1,7 @@
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Clear, Paragraph};
 use ratatui::Frame;
 
 use crate::app::{App, WelcomeState};
@@ -110,6 +110,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     )));
 
     let paragraph = Paragraph::new(lines);
+    frame.render_widget(Clear, area);
     frame.render_widget(paragraph, area);
 }
 
@@ -211,6 +212,7 @@ pub fn render_setup(frame: &mut Frame, area: Rect, state: &WelcomeState) {
     )));
 
     let paragraph = Paragraph::new(lines);
+    frame.render_widget(Clear, area);
     frame.render_widget(paragraph, area);
 }
 
