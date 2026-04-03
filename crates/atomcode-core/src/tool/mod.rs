@@ -1,3 +1,4 @@
+pub mod auto_fix;
 pub mod bash;
 pub mod cd;
 pub mod devserver;

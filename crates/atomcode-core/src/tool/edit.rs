@@ -63,6 +63,47 @@ async fn atomic_write(path: &str, content: &str) -> Result<()> {
 }
 
 use super::{ApprovalRequirement, Tool, ToolContext, ToolDef, ToolResult};
+use super::auto_fix;
+
+/// Validate content in memory, write to disk, then run syntax check.
+/// Returns the final content (possibly auto-fixed) and appends any warnings to `result`.
+async fn validate_write_check(
+    content: &str,
+    file_path: &str,
+    new_string: &str,
+    result: ToolResult,
+) -> Result<(ToolResult, String)> {
+    if !result.success {
+        return Ok((result, content.to_string()));
+    }
+    // 1. Validate & auto-fix in memory (before write)
+    let validated = auto_fix::validate_and_fix(content, file_path, new_string).await;
+
+    // 2. Write the validated content to disk
+    atomic_write(file_path, &validated.fixed_content).await?;
+
+    // 3. Post-write syntax check (needs file on disk)
+    let syntax_warn = auto_fix::post_edit_syntax_check(file_path).await;
+
+    // Collect all warnings
+    let mut all_warnings: Vec<String> = validated.warnings;
+    if !syntax_warn.is_empty() {
+        all_warnings.push(syntax_warn);
+    }
+
+    if all_warnings.is_empty() {
+        Ok((result, validated.fixed_content))
+    } else {
+        let combined = all_warnings.join("");
+        Ok((
+            ToolResult {
+                output: format!("{}{}", result.output, combined),
+                ..result
+            },
+            validated.fixed_content,
+        ))
+    }
+}
 
 pub struct EditFileTool;
 
@@ -291,20 +332,21 @@ impl Tool for EditFileTool {
                 new_lines.join("\n")
             };
 
-            atomic_write(&parsed.file_path, &new_content).await?;
             let diff = build_compact_diff(&old_text, &new_string);
             let outline = post_edit_info(&new_content, &new_string);
             let new_end = start + added.saturating_sub(1);
-            let ctx = surrounding_context(&parsed.file_path, start, new_end);
             let result = ToolResult {
                 call_id: String::new(),
                 output: format!(
-                    "Edited {} lines {}-{} (-{} +{} lines).\n{}\n{}{}",
-                    parsed.file_path, start, end, removed, added, diff, outline, ctx
+                    "Edited {} lines {}-{} (-{} +{} lines).\n{}\n{}",
+                    parsed.file_path, start, end, removed, added, diff, outline
                 ),
                 success: true,
             };
-            return Ok(post_edit_validate(result, &parsed.file_path, &new_content, &new_string).await);
+            let (result, _final_content) = validate_write_check(&new_content, &parsed.file_path, &new_string, result).await?;
+            let ctx = surrounding_context(&parsed.file_path, start, new_end);
+            let result = ToolResult { output: format!("{}{}", result.output, ctx), ..result };
+            return Ok(result);
         }
 
         // ── old_string is required for text-match and symbol modes ──
@@ -368,12 +410,6 @@ impl Tool for EditFileTool {
                     &content[slice.end_byte..]
                 );
 
-                atomic_write(&parsed.file_path, &new_content).await?;
-                // Invalidate AST cache for this file
-                drop(searcher); // release lock before re-acquiring
-                let mut searcher = ctx.semantic.lock().await;
-                searcher.invalidate(path);
-
                 let diff = build_compact_diff(&old_string, &new_string);
                 let label = if parsed.replace_all {
                     format!("replaced {} occurrences in {}", sym_count, symbol_name)
@@ -381,14 +417,20 @@ impl Tool for EditFileTool {
                     format!("in {} (lines {}-{})", symbol_name, slice.start_line, slice.end_line)
                 };
                 let outline = post_edit_info(&new_content, &new_string);
-                let (sl, el) = find_edit_lines(&parsed.file_path, &new_string);
-                let ctx_str = surrounding_context(&parsed.file_path, sl, el);
                 let result = ToolResult {
                     call_id: String::new(),
-                    output: format!("Edited {} {}.\n{}\n{}{}", parsed.file_path, label, diff, outline, ctx_str),
+                    output: format!("Edited {} {}.\n{}\n{}", parsed.file_path, label, diff, outline),
                     success: true,
                 };
-                return Ok(post_edit_validate(result, &parsed.file_path, &new_content, &new_string).await);
+                let (result, _final_content) = validate_write_check(&new_content, &parsed.file_path, &new_string, result).await?;
+                // Invalidate AST cache for this file
+                drop(searcher); // release lock before re-acquiring
+                let mut searcher = ctx.semantic.lock().await;
+                searcher.invalidate(path);
+                let (sl, el) = find_edit_lines(&parsed.file_path, &new_string);
+                let ctx_str = surrounding_context(&parsed.file_path, sl, el);
+                let result = ToolResult { output: format!("{}{}", result.output, ctx_str), ..result };
+                return Ok(result);
             } else {
                 // Symbol not found — list available symbols as hint
                 let hint = match searcher.list_symbols(path) {
@@ -415,22 +457,23 @@ impl Tool for EditFileTool {
             if let Some((fuzzy_result, fuzzy_count)) = try_fuzzy_replace(
                 &content, &old_string, &new_string, parsed.replace_all
             ) {
-                atomic_write(&parsed.file_path, &fuzzy_result).await?;
                 let diff = build_compact_diff(&old_string, &new_string);
                 let outline = post_edit_info(&fuzzy_result, &new_string);
-                let (sl, el) = find_edit_lines(&parsed.file_path, &new_string);
-                let ctx_str = surrounding_context(&parsed.file_path, sl, el);
                 let result = ToolResult {
                     call_id: String::new(),
                     output: format!(
-                        "Edited {} (fuzzy match, {} occurrence{}).\n{}\n{}{}",
+                        "Edited {} (fuzzy match, {} occurrence{}).\n{}\n{}",
                         parsed.file_path, fuzzy_count,
                         if fuzzy_count > 1 { "s" } else { "" },
-                        diff, outline, ctx_str
+                        diff, outline
                     ),
                     success: true,
                 };
-                return Ok(post_edit_validate(result, &parsed.file_path, &fuzzy_result, &new_string).await);
+                let (result, _final_content) = validate_write_check(&fuzzy_result, &parsed.file_path, &new_string, result).await?;
+                let (sl, el) = find_edit_lines(&parsed.file_path, &new_string);
+                let ctx_str = surrounding_context(&parsed.file_path, sl, el);
+                let result = ToolResult { output: format!("{}{}", result.output, ctx_str), ..result };
+                return Ok(result);
             }
 
             let (hint, suggested_old) = find_closest_match_with_suggestion(&content, &old_string);
@@ -477,20 +520,20 @@ impl Tool for EditFileTool {
             };
 
             let new_content = content.replace(&old_string, &new_string);
-            atomic_write(&parsed.file_path, &new_content).await?;
             let diff = build_compact_diff(&old_string, &new_string);
             let outline = post_edit_info(&new_content, &new_string);
-            let (sl, el) = find_edit_lines(&parsed.file_path, &new_string);
-            let ctx_str = surrounding_context(&parsed.file_path, sl, el);
             let result = ToolResult {
                 call_id: String::new(),
                 output: format!(
-                    "Edited {} (replaced {} occurrence{}).\n{}\n{}{}",
-                    parsed.file_path, count, if count > 1 { "s" } else { "" }, diff, outline, ctx_str,
+                    "Edited {} (replaced {} occurrence{}).\n{}\n{}",
+                    parsed.file_path, count, if count > 1 { "s" } else { "" }, diff, outline,
                 ),
                 success: true,
             };
-            Ok(post_edit_validate(result, &parsed.file_path, &new_content, &new_string).await)
+            let (result, _final_content) = validate_write_check(&new_content, &parsed.file_path, &new_string, result).await?;
+            let (sl, el) = find_edit_lines(&parsed.file_path, &new_string);
+            let ctx_str = surrounding_context(&parsed.file_path, sl, el);
+            Ok(ToolResult { output: format!("{}{}", result.output, ctx_str), ..result })
         } else {
             if count > 1 {
                 // Auto-disambiguate using tree-sitter: if only ONE symbol contains the match,
@@ -518,20 +561,20 @@ impl Tool for EditFileTool {
                             &content[sym.end_byte.min(content.len())..]
                         );
                         drop(searcher);
-                        atomic_write(&parsed.file_path, &new_content).await?;
                         let diff = build_compact_diff(&old_string, &new_string);
                         let outline = post_edit_info(&new_content, &new_string);
-                        let (sl, el) = find_edit_lines(&parsed.file_path, &new_string);
-                        let ctx_str = surrounding_context(&parsed.file_path, sl, el);
                         let result = ToolResult {
                             call_id: String::new(),
                             output: format!(
-                                "Edited {} in {}() (auto-scoped, {} global matches).\n{}\n{}{}",
-                                parsed.file_path, sym.name, count, diff, outline, ctx_str
+                                "Edited {} in {}() (auto-scoped, {} global matches).\n{}\n{}",
+                                parsed.file_path, sym.name, count, diff, outline
                             ),
                             success: true,
                         };
-                        return Ok(post_edit_validate(result, &parsed.file_path, &new_content, &new_string).await);
+                        let (result, _final_content) = validate_write_check(&new_content, &parsed.file_path, &new_string, result).await?;
+                        let (sl, el) = find_edit_lines(&parsed.file_path, &new_string);
+                        let ctx_str = surrounding_context(&parsed.file_path, sl, el);
+                        return Ok(ToolResult { output: format!("{}{}", result.output, ctx_str), ..result });
                     }
                 }
                 drop(searcher);
@@ -547,23 +590,23 @@ impl Tool for EditFileTool {
             }
 
             let new_content = content.replacen(&old_string, &new_string, 1);
-            atomic_write(&parsed.file_path, &new_content).await?;
 
             let removed = old_string.lines().count();
             let added = new_string.lines().count();
             let diff = build_compact_diff(&old_string, &new_string);
             let outline = post_edit_info(&new_content, &new_string);
-            let (sl, el) = find_edit_lines(&parsed.file_path, &new_string);
-            let ctx_str = surrounding_context(&parsed.file_path, sl, el);
             let result = ToolResult {
                 call_id: String::new(),
                 output: format!(
-                    "Edited {} (-{} +{} lines).\n{}\n{}{}",
-                    parsed.file_path, removed, added, diff, outline, ctx_str,
+                    "Edited {} (-{} +{} lines).\n{}\n{}",
+                    parsed.file_path, removed, added, diff, outline,
                 ),
                 success: true,
             };
-            Ok(post_edit_validate(result, &parsed.file_path, &new_content, &new_string).await)
+            let (result, _final_content) = validate_write_check(&new_content, &parsed.file_path, &new_string, result).await?;
+            let (sl, el) = find_edit_lines(&parsed.file_path, &new_string);
+            let ctx_str = surrounding_context(&parsed.file_path, sl, el);
+            Ok(ToolResult { output: format!("{}{}", result.output, ctx_str), ..result })
         }
     }
 }
@@ -715,8 +758,6 @@ impl EditFileTool {
             result_lines.join("\n")
         };
 
-        atomic_write(file_path, &new_content).await?;
-
         let edit_count = resolved.len();
         let outline = post_edit_info(&new_content, "");
         let all_new_strings: String = edits.iter().map(|e| e.new_string.as_str()).collect::<Vec<_>>().join("\n");
@@ -728,7 +769,8 @@ impl EditFileTool {
             ),
             success: true,
         };
-        Ok(post_edit_validate(result, file_path, &new_content, &all_new_strings).await)
+        let (result, _final_content) = validate_write_check(&new_content, file_path, &all_new_strings, result).await?;
+        Ok(result)
     }
 }
 
@@ -862,409 +904,6 @@ fn try_fuzzy_replace(
 
     let count = if replace_all { matches.len() } else { 1 };
     Some((result, count))
-}
-
-/// Detect if an edit introduced duplicate blocks (a common weak-model failure mode).
-/// Checks if new_string (≥3 non-blank lines) appears more than once in the result.
-/// Returns a warning string if duplicates found, empty string otherwise.
-fn detect_duplicate_blocks(new_content: &str, new_string: &str) -> String {
-    let sig_lines: Vec<&str> = new_string.lines()
-        .map(|l| l.trim())
-        .filter(|l| !l.is_empty())
-        .collect();
-    if sig_lines.len() < 3 {
-        return String::new();
-    }
-    // Use first 3 significant lines as a fingerprint
-    let fingerprint: Vec<&str> = sig_lines[..3.min(sig_lines.len())].to_vec();
-    let content_lines: Vec<&str> = new_content.lines().map(|l| l.trim()).collect();
-
-    let mut hits = 0usize;
-    let mut i = 0;
-    while i + fingerprint.len() <= content_lines.len() {
-        if content_lines[i..i + fingerprint.len()] == fingerprint[..] {
-            hits += 1;
-            i += fingerprint.len();
-        } else {
-            i += 1;
-        }
-    }
-
-    if hits > 1 {
-        return format!(
-            "\n⚠ WARNING: The edit introduced DUPLICATE code blocks ({} copies detected). \
-             This is likely a bug. Review the file and remove the duplicate.",
-            hits
-        );
-    }
-
-    // Secondary check: scan for consecutive duplicate non-trivial lines.
-    // Catches cases where two edit regions produce the same declaration.
-    let raw_lines: Vec<&str> = new_content.lines().collect();
-    let mut dup_lines: Vec<(usize, &str)> = Vec::new();
-    for i in 1..raw_lines.len() {
-        let prev = raw_lines[i - 1].trim();
-        let curr = raw_lines[i].trim();
-        if prev == curr
-            && !curr.is_empty()
-            && curr.len() > 10  // ignore short lines like `}` or `return`
-            && !curr.starts_with("//") && !curr.starts_with("*")
-        {
-            dup_lines.push((i + 1, curr)); // 1-indexed
-        }
-    }
-
-    if !dup_lines.is_empty() {
-        let examples: String = dup_lines.iter()
-            .take(3)
-            .map(|(line, text)| format!("  L{}: {}", line, text))
-            .collect::<Vec<_>>()
-            .join("\n");
-        format!(
-            "\n⚠ WARNING: {} consecutive duplicate line(s) detected after edit:\n{}\nRemove the duplicates.",
-            dup_lines.len(), examples
-        )
-    } else {
-        String::new()
-    }
-}
-
-/// Post-edit syntax check for common file types.
-/// Runs a fast, non-destructive check and returns a warning if syntax is broken.
-async fn post_edit_syntax_check(file_path: &str) -> String {
-    let ext = file_path.rsplit('.').next().unwrap_or("");
-    let cmd = match ext {
-        "js" | "mjs" | "cjs" => Some(("node", vec!["--check".to_string(), file_path.to_string()])),
-        "json" => {
-            // Validate JSON by attempting parse
-            return match tokio::fs::read_to_string(file_path).await {
-                Ok(content) => {
-                    if serde_json::from_str::<serde_json::Value>(&content).is_err() {
-                        format!("\n⚠ SYNTAX ERROR: {} is not valid JSON. Fix before proceeding.", file_path)
-                    } else {
-                        String::new()
-                    }
-                }
-                Err(_) => String::new(),
-            };
-        }
-        "ts" | "tsx" => {
-            // npx tsc --noEmit is too slow; just check if node can parse it as a quick heuristic
-            // TypeScript syntax errors will surface when the user runs their build
-            return String::new();
-        }
-        "py" => Some(("python3", vec!["-m".to_string(), "py_compile".to_string(), file_path.to_string()])),
-        _ => None,
-    };
-
-    if let Some((program, args)) = cmd {
-        match tokio::process::Command::new(program)
-            .args(&args)
-            .output()
-            .await
-        {
-            Ok(output) if !output.status.success() => {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                let first_lines: String = stderr.lines().take(3).collect::<Vec<_>>().join("\n");
-                format!("\n⚠ SYNTAX ERROR in {}:\n{}", file_path, first_lines)
-            }
-            _ => String::new(),
-        }
-    } else {
-        String::new()
-    }
-}
-
-/// Run all post-edit validations: duplicate detection + syntax check.
-/// Appends warnings to the ToolResult output if issues found.
-async fn post_edit_validate(result: ToolResult, file_path: &str, new_content: &str, new_string: &str) -> ToolResult {
-    if !result.success { return result; }
-
-    let dup_warn = detect_duplicate_blocks(new_content, new_string);
-    let syntax_warn = post_edit_syntax_check(file_path).await;
-
-    // Try auto-fix brace imbalance before warning the model.
-    let brace_warn = match auto_fix_braces(new_content, file_path).await {
-        BraceFixResult::Balanced => String::new(),
-        BraceFixResult::AutoFixed(msg) => msg,
-        BraceFixResult::CannotFix(msg) => msg,
-    };
-
-    // HTML tag balance check for Vue/HTML/Svelte files
-    let html_warn = check_html_tag_balance(new_content, file_path).await;
-
-    if dup_warn.is_empty() && syntax_warn.is_empty() && brace_warn.is_empty() && html_warn.is_empty() {
-        return result;
-    }
-
-    ToolResult {
-        output: format!("{}{}{}{}{}", result.output, dup_warn, syntax_warn, brace_warn, html_warn),
-        ..result
-    }
-}
-
-enum BraceFixResult {
-    Balanced,
-    AutoFixed(String),
-    CannotFix(String),
-}
-
-/// Try to auto-fix brace imbalance. If there are N missing `}`, find the deepest
-/// nesting point and insert `}` after the last non-empty line at that depth.
-/// Only attempts fix for missing closing braces (braces > 0), not extra ones.
-async fn auto_fix_braces(content: &str, file_path: &str) -> BraceFixResult {
-    let ext = file_path.rsplit('.').next().unwrap_or("");
-    if !matches!(ext, "js" | "ts" | "tsx" | "jsx" | "vue" | "svelte" | "java" | "rs" | "go" | "c" | "cpp" | "cs") {
-        return BraceFixResult::Balanced;
-    }
-
-    // Count brace balance with string awareness
-    let lines: Vec<&str> = content.lines().collect();
-    let mut depth = 0i64;
-    let mut in_string = false;
-    let mut escape = false;
-    let mut string_char = ' ';
-
-    // Track depth at each line end to find insertion points
-    let mut line_depths: Vec<i64> = Vec::with_capacity(lines.len());
-    for line in &lines {
-        for ch in line.chars() {
-            if escape { escape = false; continue; }
-            if ch == '\\' && in_string { escape = true; continue; }
-            if in_string {
-                if ch == string_char { in_string = false; }
-                continue;
-            }
-            match ch {
-                '\'' | '"' | '`' => { in_string = true; string_char = ch; }
-                '{' => depth += 1,
-                '}' => depth -= 1,
-                _ => {}
-            }
-        }
-        line_depths.push(depth);
-    }
-
-    if depth == 0 {
-        return BraceFixResult::Balanced;
-    }
-    if depth < 0 {
-        // Extra closing braces — too risky to auto-fix
-        return BraceFixResult::CannotFix(format!(
-            "\n⚠ BRACE MISMATCH in {}: {} extra closing '}}'. Remove the extra. Fix NOW.",
-            file_path, depth.abs()
-        ));
-    }
-    if depth > 3 {
-        // Too many missing — likely a structural problem, don't guess
-        return BraceFixResult::CannotFix(format!(
-            "\n⚠ BRACE MISMATCH in {}: {} unclosed '{{'. Too many to auto-fix. Fix manually.",
-            file_path, depth
-        ));
-    }
-
-    // Find insertion points: for each missing `}`, find the last line where
-    // depth drops to the target level. Insert `}` after that line.
-    let mut fixed_lines: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
-    let mut remaining = depth;
-
-    // Work backwards: find lines where depth is highest and insert `}` after them
-    for target_depth in (1..=depth).rev() {
-        // Find the last line where depth == target_depth (where the unclosed block ends)
-        let mut insert_after = None;
-        for i in (0..line_depths.len()).rev() {
-            if line_depths[i] >= target_depth && !lines[i].trim().is_empty() {
-                insert_after = Some(i);
-                break;
-            }
-        }
-        if let Some(idx) = insert_after {
-            // Determine indentation: match the line that opened this block
-            let indent = if idx > 0 {
-                let prev_line = &fixed_lines[idx];
-                let spaces = prev_line.len() - prev_line.trim_start().len();
-                if spaces >= 2 { spaces - 2 } else { 0 }
-            } else { 0 };
-            let closing = format!("{}}}", " ".repeat(indent));
-            fixed_lines.insert(idx + 1, closing);
-            remaining -= 1;
-        }
-    }
-
-    if remaining > 0 {
-        return BraceFixResult::CannotFix(format!(
-            "\n⚠ BRACE MISMATCH in {}: {} unclosed '{{'. Could not determine where to insert closing braces. Fix NOW.",
-            file_path, depth
-        ));
-    }
-
-    // Write the fixed content
-    let new_content = if content.ends_with('\n') {
-        format!("{}\n", fixed_lines.join("\n"))
-    } else {
-        fixed_lines.join("\n")
-    };
-
-    match atomic_write(file_path, &new_content).await {
-        Ok(()) => BraceFixResult::AutoFixed(format!(
-            "\n[AUTO-FIXED: inserted {} missing closing '}}' in {}. File is now balanced.]",
-            depth, file_path
-        )),
-        Err(_) => BraceFixResult::CannotFix(format!(
-            "\n⚠ BRACE MISMATCH in {}: {} unclosed '{{'. Auto-fix failed. Fix NOW.",
-            file_path, depth
-        )),
-    }
-}
-
-/// Check brace/bracket balance after edit. Catches missing closing `}` — the most
-/// common weak-model error in multi-edit of large files.
-/// Check HTML tag balance for Vue/HTML/Svelte files.
-/// Counts common block-level tags (<div>, <section>, <main>, <aside>, <article>, etc.)
-/// and warns if opening count != closing count.
-/// Check and auto-fix HTML tag balance for Vue/HTML/Svelte files.
-/// For unclosed tags (opens > closes), insert missing closing tags.
-/// For extra closing tags, just warn (too risky to auto-remove).
-async fn check_html_tag_balance(content: &str, file_path: &str) -> String {
-    let ext = file_path.rsplit('.').next().unwrap_or("");
-    if !matches!(ext, "vue" | "html" | "svelte" | "htm" | "jsx" | "tsx") {
-        return String::new();
-    }
-
-    let lines: Vec<&str> = content.lines().collect();
-
-    // Find <template> section boundaries for Vue files
-    let (tpl_start, tpl_end) = if ext == "vue" {
-        let s = lines.iter().position(|l| l.trim_start().starts_with("<template")).unwrap_or(0);
-        let e = lines.iter().rposition(|l| l.trim_start().starts_with("</template>")).unwrap_or(lines.len());
-        (s, e)
-    } else {
-        (0, lines.len())
-    };
-    if tpl_start >= tpl_end { return String::new(); }
-
-    let tags = ["div", "section", "main", "aside", "article", "nav", "header", "footer", "form", "ul", "ol"];
-    let mut fixes: Vec<String> = Vec::new();
-    let mut fixed_lines: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
-    let mut any_fixed = false;
-
-    for tag in &tags {
-        let open_pattern = format!("<{}", tag);
-        let close_pattern = format!("</{}>", tag);
-
-        let tpl_content: String = fixed_lines[tpl_start..tpl_end].join("\n");
-        let opens = tpl_content.matches(&open_pattern).count();
-        let closes = tpl_content.matches(&close_pattern).count();
-
-        if opens > closes {
-            let missing = opens - closes;
-            // Find the last opening tag of this type and insert closing tag after it
-            // Strategy: find the last line within template that has this opening tag,
-            // then find the next line at the same or lower indent, insert before it.
-            for _ in 0..missing {
-                // Find last unclosed opening tag by scanning backwards
-                let mut depth = 0i32;
-                let mut insert_after = tpl_end - 1;
-                for i in (tpl_start..tpl_end).rev() {
-                    let trimmed = fixed_lines[i].trim();
-                    if trimmed.contains(&close_pattern) { depth += 1; }
-                    if trimmed.contains(&open_pattern) {
-                        if depth > 0 { depth -= 1; }
-                        else {
-                            // This is an unclosed tag — insert closing after its content
-                            // Find the indent of this line
-                            let indent = fixed_lines[i].len() - fixed_lines[i].trim_start().len();
-                            let closing = format!("{}</{}>", " ".repeat(indent), tag);
-                            // Insert after the last line before template end
-                            insert_after = tpl_end - 1;
-                            fixed_lines.insert(insert_after, closing);
-                            fixes.push(format!("inserted </{}> at L{}", tag, insert_after + 1));
-                            any_fixed = true;
-                            break;
-                        }
-                    }
-                }
-            }
-        } else if closes > opens {
-            fixes.push(format!("<{}> has {} extra closing tag(s) — remove manually", tag, closes - opens));
-        }
-    }
-
-    if any_fixed {
-        let new_content = if content.ends_with('\n') {
-            format!("{}\n", fixed_lines.join("\n"))
-        } else {
-            fixed_lines.join("\n")
-        };
-        if let Ok(()) = atomic_write(file_path, &new_content).await {
-            return format!(
-                "\n[AUTO-FIXED HTML: {}. File rewritten.]",
-                fixes.join(", ")
-            );
-        }
-    }
-
-    if !fixes.is_empty() {
-        format!(
-            "\n⚠ HTML TAG MISMATCH in {}: {}. Fix NOW.",
-            file_path, fixes.join("; ")
-        )
-    } else {
-        String::new()
-    }
-}
-
-fn check_brace_balance(content: &str, file_path: &str) -> String {
-    let ext = file_path.rsplit('.').next().unwrap_or("");
-    if !matches!(ext, "js" | "ts" | "tsx" | "jsx" | "vue" | "svelte" | "java" | "rs" | "go" | "c" | "cpp" | "cs" | "json") {
-        return String::new();
-    }
-
-    let mut braces = 0i64;
-    let mut in_string = false;
-    let mut escape = false;
-    let mut string_char = ' ';
-    // Track where the deepest unmatched `{` is — likely where `}` is missing.
-    let mut max_depth = 0i64;
-    let mut max_depth_line = 0usize;
-    let mut line_num = 1usize;
-
-    for ch in content.chars() {
-        if ch == '\n' { line_num += 1; }
-        if escape { escape = false; continue; }
-        if ch == '\\' && in_string { escape = true; continue; }
-        if in_string {
-            if ch == string_char { in_string = false; }
-            continue;
-        }
-        match ch {
-            '\'' | '"' | '`' => { in_string = true; string_char = ch; }
-            '{' => {
-                braces += 1;
-                if braces > max_depth {
-                    max_depth = braces;
-                    max_depth_line = line_num;
-                }
-            }
-            '}' => { braces -= 1; }
-            _ => {}
-        }
-    }
-
-    if braces == 0 {
-        String::new()
-    } else if braces > 0 {
-        format!(
-            "\n⚠ BRACE MISMATCH in {}: {} unclosed '{{'. \
-             Deepest nesting at line {}. Add {} closing '}}' near that function's end. Fix NOW.",
-            file_path, braces, max_depth_line, braces
-        )
-    } else {
-        format!(
-            "\n⚠ BRACE MISMATCH in {}: {} extra closing '}}'. Remove the extra. Fix NOW.",
-            file_path, braces.abs()
-        )
-    }
 }
 
 /// Post-edit info: file outline for navigation.
