@@ -2512,18 +2512,6 @@ fn format_tool_info(call: &ToolCall) -> String {
     name
 }
 
-fn snap_to_char_boundary(s: &str, pos: usize) -> usize {
-    let pos = pos.min(s.len());
-    if s.is_char_boundary(pos) {
-        pos
-    } else {
-        s[..pos]
-            .char_indices()
-            .last()
-            .map(|(i, c)| i + c.len_utf8())
-            .unwrap_or(0)
-    }
-}
 
 fn copy_to_clipboard(text: &str) -> std::io::Result<()> {
     use std::io::Write;

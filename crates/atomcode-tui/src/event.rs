@@ -2,9 +2,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crossterm::event::{Event, KeyEvent, MouseEvent, MouseEventKind, MouseButton, poll};
+use crossterm::event::{Event, KeyEvent, MouseEvent, poll};
 use crossterm::execute;
-use crossterm::event::{EnableMouseCapture, DisableMouseCapture};
+use crossterm::event::EnableMouseCapture;
 use std::io::{self};
 use tokio::sync::mpsc;
 
