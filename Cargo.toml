@@ -17,7 +17,7 @@ strip = true           # Strip symbols automatically
 debug = "line-tables-only" # Smaller binaries, faster linker
 
 [workspace.package]
-version = "2.3.0"
+version = "2.5.0"
 edition = "2021"
 license = "MIT"
 repository = "https://gitcode.com/bangxu/atomcode"
