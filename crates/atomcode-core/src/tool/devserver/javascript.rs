@@ -8,6 +8,15 @@ use super::DetectedServer;
 pub fn detect(cmd: &str) -> Option<DetectedServer> {
     let trimmed = cmd.trim();
 
+    // Tauri dev (desktop app with embedded web server)
+    if trimmed.contains("tauri dev") || trimmed.contains("tauri:dev") {
+        return Some(DetectedServer {
+            label: "Tauri",
+            default_port: 1420,
+            pre_command: None,
+        });
+    }
+
     // Vite (via npm/yarn/pnpm or direct npx)
     if trimmed.contains("vite") && !trimmed.contains("build") {
         return Some(DetectedServer {
