@@ -180,7 +180,7 @@ pub fn text_muted() -> Color {
 
 pub fn text_on_accent() -> Color {
     match Theme::current() {
-        Theme::Dark => Color::Rgb(15, 15, 15),
+        Theme::Dark => Color::Rgb(240, 235, 255),  // Light lavender text on dark purple
         Theme::Light => Color::Rgb(255, 255, 255),
     }
 }

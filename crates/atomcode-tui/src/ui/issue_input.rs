@@ -51,9 +51,9 @@ pub fn render(frame: &mut Frame, area: Rect, state: &IssueInputState) {
     ]));
     frame.render_widget(title_label, chunks[1]);
 
-    // Title input box
+    // Title input box - use accent (light purple) for focus, with dark text for contrast
     let title_style = if state.cursor_field == IssueField::Title {
-        Style::default().fg(theme::text_on_accent()).bg(theme::brand_bg())
+        Style::default().fg(theme::text_on_accent()).bg(theme::accent())
     } else {
         Style::default().fg(theme::text_primary())
     };
@@ -103,9 +103,9 @@ pub fn render(frame: &mut Frame, area: Rect, state: &IssueInputState) {
     ]));
     frame.render_widget(desc_label, chunks[4]);
 
-    // Description input box
+    // Description input box - use accent (light purple) for focus, with dark text for contrast
     let desc_style = if state.cursor_field == IssueField::Description {
-        Style::default().fg(theme::text_on_accent()).bg(theme::brand_bg())
+        Style::default().fg(theme::text_on_accent()).bg(theme::accent())
     } else {
         Style::default().fg(theme::text_primary())
     };

@@ -157,10 +157,8 @@ async fn run() -> Result<()> {
 
     let working_dir = if let Some(d) = cli.dir {
         std::fs::canonicalize(d).unwrap_or_else(|_| std::env::current_dir().unwrap())
-    } else if let Some(ref d) = config.default_workdir {
-        let p = PathBuf::from(d);
-        if p.is_dir() { p } else { std::env::current_dir().unwrap() }
     } else {
+        // Use current directory when started in a specific directory
         std::env::current_dir().unwrap()
     };
 
