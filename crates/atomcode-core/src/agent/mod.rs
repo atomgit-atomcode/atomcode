@@ -528,6 +528,8 @@ impl AgentLoop {
         self.recent_calls.clear();
         self.files_read_this_turn.clear();
         self.files_edited_this_turn.clear();
+        self.turn_runner.recently_edited_files.clear();
+        self.turn_runner.post_edit_read_counts.clear();
         self.consecutive_reads = 0;
         self.verify_injected = false;
         self.model_produced_text = false;
