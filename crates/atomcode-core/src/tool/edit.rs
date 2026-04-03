@@ -220,7 +220,7 @@ impl Tool for EditFileTool {
 
         // ── LINE-NUMBER MODE ──
         // Replace lines start_line..=end_line with new_string. No text matching needed.
-        if let (Some(start), Some(end)) = (parsed.start_line, parsed.end_line) {
+        if let (Some(mut start), Some(end)) = (parsed.start_line, parsed.end_line) {
             let lines: Vec<&str> = content.lines().collect();
             let total = lines.len();
 
@@ -233,7 +233,7 @@ impl Tool for EditFileTool {
             }
             let mut end = end.min(total);
 
-            // Boundary overlap auto-correction: if new_string's trailing lines
+            // Boundary overlap auto-correction (trailing): if new_string's trailing lines
             // duplicate lines immediately after end_line, extend end to absorb them.
             let ns_lines: Vec<&str> = new_string.lines().collect();
             if !ns_lines.is_empty() {
@@ -250,6 +250,24 @@ impl Tool for EditFileTool {
                 }
                 if extra > 0 {
                     end = (end + extra).min(total);
+                }
+            }
+
+            // Boundary overlap auto-correction (leading): if new_string's leading lines
+            // duplicate lines immediately before start_line, extend start upward.
+            if !ns_lines.is_empty() {
+                let mut extra = 0usize;
+                for i in 0..ns_lines.len() {
+                    if start <= 1 + extra { break; } // can't go above line 1
+                    let orig_idx = start - 2 - extra; // 0-indexed line before current start
+                    if ns_lines[i].trim() == lines[orig_idx].trim() && !ns_lines[i].trim().is_empty() {
+                        extra += 1;
+                    } else {
+                        break;
+                    }
+                }
+                if extra > 0 {
+                    start = start.saturating_sub(extra).max(1);
                 }
             }
 
@@ -626,28 +644,42 @@ impl EditFileTool {
             }
         }
 
-        // Boundary overlap auto-correction: if new_string's trailing lines duplicate
-        // the lines immediately after end_line, extend end_line to absorb them.
-        // This fixes the common weak-model bug where end_line is too small, causing
-        // the original line to remain and duplicate a line from new_string.
+        // Boundary overlap auto-correction: trailing + leading.
+        // Trailing: new_string ends duplicate lines after end_line → extend end.
+        // Leading: new_string begins duplicate lines before start_line → extend start.
         for (start, end, new_str) in &mut resolved {
             let new_lines: Vec<&str> = new_str.lines().collect();
             if new_lines.is_empty() { continue; }
-            // Check how many trailing lines of new_string match lines after the edit range
-            let mut extra = 0usize;
+
+            // Trailing overlap
+            let mut trail_extra = 0usize;
             for i in 0..new_lines.len() {
-                let new_idx = new_lines.len() - 1 - i; // from end of new_string
-                let orig_idx = *end + extra; // line after current end (0-indexed = end since end is 1-indexed inclusive)
+                let new_idx = new_lines.len() - 1 - i;
+                let orig_idx = *end + trail_extra;
                 if orig_idx >= total { break; }
                 if new_lines[new_idx].trim() == lines[orig_idx].trim() && !new_lines[new_idx].trim().is_empty() {
-                    extra += 1;
+                    trail_extra += 1;
                 } else {
                     break;
                 }
             }
-            if extra > 0 {
-                *end += extra;
-                *end = (*end).min(total);
+            if trail_extra > 0 {
+                *end = (*end + trail_extra).min(total);
+            }
+
+            // Leading overlap
+            let mut lead_extra = 0usize;
+            for i in 0..new_lines.len() {
+                if *start <= 1 + lead_extra { break; }
+                let orig_idx = *start - 2 - lead_extra;
+                if new_lines[i].trim() == lines[orig_idx].trim() && !new_lines[i].trim().is_empty() {
+                    lead_extra += 1;
+                } else {
+                    break;
+                }
+            }
+            if lead_extra > 0 {
+                *start = start.saturating_sub(lead_extra).max(1);
             }
         }
 

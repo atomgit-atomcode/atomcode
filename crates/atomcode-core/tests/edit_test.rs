@@ -463,3 +463,84 @@ function setup() {}
 
     cleanup(&path);
 }
+
+// ═══════════════════════════════════════════════════════════════
+// 7. Leading boundary overlap — start_line too large
+// ═══════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn single_edit_leading_overlap_dedup() {
+    // Model says replace line 3 only, but new_string starts with line 2's content
+    let content = "\
+const router = useRouter()
+const activeTab = ref('profile')
+const user = ref(null)
+function main() {}
+";
+    let path = create_test_file(content);
+    let ctx = test_context();
+    let tool = atomcode_core::tool::edit::EditFileTool;
+
+    let args = serde_json::json!({
+        "file_path": path,
+        "start_line": 3,
+        "end_line": 3,
+        "new_string": "const activeTab = ref('profile')\nconst theme = ref('light')\nconst user = ref(null)"
+    });
+
+    let result = tool.execute(&args.to_string(), &ctx).await.unwrap();
+    assert!(result.success);
+
+    let new_content = std::fs::read_to_string(&path).unwrap();
+    let tab_count = new_content.lines().filter(|l| l.trim() == "const activeTab = ref('profile')").count();
+    assert_eq!(tab_count, 1, "activeTab should appear exactly once (leading boundary corrected), got:\n{}", new_content);
+    assert!(new_content.contains("theme"), "New code should be present");
+
+    cleanup(&path);
+}
+
+#[tokio::test]
+async fn multi_edit_leading_overlap_dedup() {
+    let content = "\
+<script setup>
+import { ref } from 'vue'
+const name = ref('')
+const age = ref(0)
+const active = ref(true)
+</script>
+<template>
+  <div>{{ name }}</div>
+</template>
+";
+    let path = create_test_file(content);
+    let ctx = test_context();
+    let tool = atomcode_core::tool::edit::EditFileTool;
+
+    // Model says start at line 3, but new_string starts with line 2's content
+    let args = serde_json::json!({
+        "file_path": path,
+        "edits": [
+            {
+                "start_line": 3,
+                "end_line": 3,
+                "new_string": "import { ref } from 'vue'\nimport { computed } from 'vue'\nconst name = ref('')"
+            },
+            {
+                "start_line": 8,
+                "end_line": 8,
+                "new_string": "  <div>{{ name }}</div>\n  <span>{{ age }}</span>"
+            }
+        ]
+    });
+
+    let result = tool.execute(&args.to_string(), &ctx).await.unwrap();
+    assert!(result.success, "Multi-edit should succeed: {}", result.output);
+
+    let new_content = std::fs::read_to_string(&path).unwrap();
+    let import_ref_count = new_content.lines().filter(|l| l.trim() == "import { ref } from 'vue'").count();
+    let div_count = new_content.lines().filter(|l| l.trim() == "<div>{{ name }}</div>").count();
+    assert_eq!(import_ref_count, 1, "import ref should appear once (leading corrected), got:\n{}", new_content);
+    assert_eq!(div_count, 1, "div should appear once (leading corrected), got:\n{}", new_content);
+
+    cleanup(&path);
+}
