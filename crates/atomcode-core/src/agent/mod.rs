@@ -985,10 +985,10 @@ impl AgentLoop {
                         }
                     }
 
-                    // Empty response from LLM (common with DeepSeek/SiliconFlow):
-                    // If we edited files, ask model to summarize before ending.
+                    // Empty response from LLM (common with DeepSeek/SiliconFlow/GLM):
+                    // Retry with a nudge — model may have hit a transient issue.
                     let is_empty = text.trim().is_empty() && tokens == 0;
-                    if is_empty && self.retry_count < 2 && self.tool_call_count > 0 {
+                    if is_empty && self.retry_count < 2 {
                         self.retry_count += 1;
                         // Ensure valid message alternation: empty LLM response didn't add
                         // an Assistant message, so add one before injecting User message.

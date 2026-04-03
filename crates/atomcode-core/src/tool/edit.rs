@@ -990,12 +990,15 @@ async fn post_edit_validate(result: ToolResult, file_path: &str, new_content: &s
         BraceFixResult::CannotFix(msg) => msg,
     };
 
-    if dup_warn.is_empty() && syntax_warn.is_empty() && brace_warn.is_empty() {
+    // HTML tag balance check for Vue/HTML/Svelte files
+    let html_warn = check_html_tag_balance(new_content, file_path);
+
+    if dup_warn.is_empty() && syntax_warn.is_empty() && brace_warn.is_empty() && html_warn.is_empty() {
         return result;
     }
 
     ToolResult {
-        output: format!("{}{}{}{}", result.output, dup_warn, syntax_warn, brace_warn),
+        output: format!("{}{}{}{}{}", result.output, dup_warn, syntax_warn, brace_warn, html_warn),
         ..result
     }
 }
@@ -1116,6 +1119,55 @@ async fn auto_fix_braces(content: &str, file_path: &str) -> BraceFixResult {
 
 /// Check brace/bracket balance after edit. Catches missing closing `}` — the most
 /// common weak-model error in multi-edit of large files.
+/// Check HTML tag balance for Vue/HTML/Svelte files.
+/// Counts common block-level tags (<div>, <section>, <main>, <aside>, <article>, etc.)
+/// and warns if opening count != closing count.
+fn check_html_tag_balance(content: &str, file_path: &str) -> String {
+    let ext = file_path.rsplit('.').next().unwrap_or("");
+    if !matches!(ext, "vue" | "html" | "svelte" | "htm" | "jsx" | "tsx") {
+        return String::new();
+    }
+
+    // Only check the <template> section for Vue files
+    let check_content = if ext == "vue" {
+        if let Some(start) = content.find("<template") {
+            if let Some(end) = content.rfind("</template>") {
+                &content[start..end]
+            } else { content }
+        } else { return String::new(); }
+    } else { content };
+
+    let tags = ["div", "section", "main", "aside", "article", "nav", "header", "footer", "form", "ul", "ol", "table", "tbody", "thead"];
+    let mut warnings: Vec<String> = Vec::new();
+
+    for tag in &tags {
+        let open_pattern = format!("<{}", tag);
+        let close_pattern = format!("</{}>", tag);
+
+        // Count opening tags (handles <div>, <div class="...">, etc.)
+        let opens = check_content.matches(&open_pattern).count();
+        let closes = check_content.matches(&close_pattern).count();
+
+        if opens != closes {
+            let diff = opens as i64 - closes as i64;
+            if diff > 0 {
+                warnings.push(format!("<{}> has {} unclosed tag(s)", tag, diff));
+            } else {
+                warnings.push(format!("<{}> has {} extra closing tag(s)", tag, diff.abs()));
+            }
+        }
+    }
+
+    if warnings.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n⚠ HTML TAG MISMATCH in {}: {}. Fix the template structure NOW.",
+            file_path, warnings.join("; ")
+        )
+    }
+}
+
 fn check_brace_balance(content: &str, file_path: &str) -> String {
     let ext = file_path.rsplit('.').next().unwrap_or("");
     if !matches!(ext, "js" | "ts" | "tsx" | "jsx" | "vue" | "svelte" | "java" | "rs" | "go" | "c" | "cpp" | "cs" | "json") {
