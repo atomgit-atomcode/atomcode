@@ -159,7 +159,7 @@ pub fn render(
         } else {
             "done".to_string()
         };
-        let label = format!(" {} \u{00b7} {} ", turns_str, time_str);
+        let label = format!(" \u{273B} Assembled in {} \u{00b7} {} ", time_str, turns_str);
         let line_char = "\u{2500}";
         let side_len = 8;
         let sep = format!(
