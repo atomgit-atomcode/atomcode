@@ -1364,6 +1364,37 @@ impl AgentLoop {
             summary.push_str(&format!("\n{}/{} sub-agents failed.\n", failed.len(), results.len()));
         }
 
+        // Merge verification: compile/build to catch cross-file errors
+        let build_cmd = if wd.join("package.json").exists() {
+            Some("npm run build 2>&1 | head -30")
+        } else if wd.join("Cargo.toml").exists() {
+            Some("cargo check 2>&1 | tail -20")
+        } else {
+            None
+        };
+
+        if let Some(cmd) = build_cmd {
+            let output = tokio::process::Command::new("sh")
+                .args(["-c", cmd])
+                .current_dir(&wd)
+                .output()
+                .await;
+            if let Ok(out) = output {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                let combined = format!("{}{}", stdout, stderr);
+                if !out.status.success() || combined.to_lowercase().contains("error") {
+                    let err_lines: String = combined.lines().take(10).collect::<Vec<_>>().join("\n");
+                    summary.push_str(&format!(
+                        "\n⚠ BUILD ERRORS after sub-agent merge:\n{}\nFix these errors before proceeding.\n",
+                        err_lines
+                    ));
+                } else {
+                    summary.push_str("\n✓ Build verification passed.\n");
+                }
+            }
+        }
+
         Some(summary)
     }
 }
