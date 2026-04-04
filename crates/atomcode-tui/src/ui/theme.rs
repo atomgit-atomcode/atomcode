@@ -269,8 +269,8 @@ pub fn selection_bg() -> Color {
 // ── Border / Separator ──
 pub fn border() -> Color {
     match Theme::current() {
-        Theme::Dark => Color::Rgb(42, 44, 55),
-        Theme::Light => Color::Rgb(180, 182, 195),
+        Theme::Dark => Color::Rgb(75, 78, 95),
+        Theme::Light => Color::Rgb(160, 163, 180),
     }
 }
 

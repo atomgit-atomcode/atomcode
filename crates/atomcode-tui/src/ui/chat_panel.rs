@@ -159,7 +159,12 @@ pub fn render(
         } else {
             "done".to_string()
         };
-        let label = format!(" \u{273B} Assembled in {} \u{00b7} {} ", time_str, turns_str);
+        let verbs = [
+            "Assembled", "Crafted", "Forged", "Wired", "Shipped",
+            "Brewed", "Compiled", "Rendered", "Deployed", "Solved",
+        ];
+        let verb = verbs[finished_step_count % verbs.len()];
+        let label = format!(" \u{273B} {} in {} \u{00b7} {} ", verb, time_str, turns_str);
         let line_char = "\u{2500}";
         let side_len = 8;
         let sep = format!(
