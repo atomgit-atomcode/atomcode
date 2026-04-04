@@ -323,6 +323,9 @@ async fn run_headless(
             AgentEvent::ContextStats { .. } => {
                 // Silent in headless mode
             }
+            AgentEvent::SubAgentProgress { file, status } => {
+                eprintln!("  ⠴ [{}] {}", file, status);
+            }
         }
     }
 
