@@ -51,12 +51,18 @@ impl SubAgentTask {
     ) -> SubAgentResult {
         // 1. Build minimal system prompt
         let rules = crate::config::prompt_sections::build_rules();
+        let vue_warning = if self.file_path.ends_with(".vue") || self.file_path.ends_with(".svelte") {
+            "\nCRITICAL: This is a Vue SFC. NEVER edit across </script>/<template> boundary in a single edit. \
+             Edit <script> section and <template> section in SEPARATE edit_file calls. \
+             Use multi-edit (edits array) with one edit per section. Keep each edit ≤30 lines."
+        } else { "" };
+
         let system_prompt = format!(
             "{}\n\n## SUB-AGENT CONTEXT\n\
              You are a sub-agent responsible for editing ONE file: {}\n\
              Make ALL needed changes in as few edit_file calls as possible.\n\
-             Do NOT read other files — sibling skeletons are provided below.",
-            rules, self.file_path,
+             Do NOT read other files — sibling skeletons are provided below.{}",
+            rules, self.file_path, vue_warning,
         );
 
         // 2. Create fresh Conversation with injected context
