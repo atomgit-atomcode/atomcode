@@ -1053,6 +1053,19 @@ impl AgentLoop {
                         }
                     }
 
+                    // Truncation guard: if model's text ends with ":" or "：" it was
+                    // mid-sentence (e.g. "现在修改 App.vue：") — the model intended to
+                    // continue with a tool call but the response got cut off.
+                    let trimmed_text = text.trim();
+                    if !trimmed_text.is_empty()
+                        && (trimmed_text.ends_with(':') || trimmed_text.ends_with('\u{FF1A}'))
+                        && self.retry_count < 2
+                    {
+                        self.retry_count += 1;
+                        self.conversation.add_user_message("Continue. Execute the edit now.");
+                        continue;
+                    }
+
                     self.finish_turn();
                     return;
                 }
