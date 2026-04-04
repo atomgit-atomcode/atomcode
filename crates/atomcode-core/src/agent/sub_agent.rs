@@ -181,17 +181,11 @@ impl SubAgentPool {
         let total = self.tasks.len();
         let mut results: Vec<SubAgentResult> = Vec::with_capacity(total);
 
-        // Emit start event for each task
-        for (i, task) in self.tasks.iter().enumerate() {
-            let short = std::path::Path::new(&task.file_path)
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| task.file_path.clone());
-            let _ = event_tx.send(super::AgentEvent::SubAgentProgress {
-                file: short,
-                status: format!("queued ({}/{})", i + 1, total),
-            });
-        }
+        // Emit header
+        let _ = event_tx.send(super::AgentEvent::SubAgentProgress {
+            file: String::new(),
+            status: format!("Dispatching {} parallel agents...", total),
+        });
 
         // Process in batches of max_concurrent
         let mut chunks = self.tasks.into_iter().peekable();
@@ -214,7 +208,7 @@ impl SubAgentPool {
                 set.spawn(async move {
                     let _ = tx.send(super::AgentEvent::SubAgentProgress {
                         file: file_name.clone(),
-                        status: "editing...".to_string(),
+                        status: "working...".to_string(),
                     });
                     let start = std::time::Instant::now();
 
@@ -225,21 +219,26 @@ impl SubAgentPool {
                     .await;
 
                     let elapsed = start.elapsed().as_secs();
+                    let time_str = if elapsed >= 60 {
+                        format!("{}m{}s", elapsed / 60, elapsed % 60)
+                    } else {
+                        format!("{}s", elapsed)
+                    };
                     match &result {
                         Ok(r) => {
                             let _ = tx.send(super::AgentEvent::SubAgentProgress {
                                 file: file_name.clone(),
                                 status: if r.success {
-                                    format!("✓ done {}s {} turns", elapsed, r.turns_used)
+                                    format!("done {} · {} turns", time_str, r.turns_used)
                                 } else {
-                                    format!("✗ failed {}s", elapsed)
+                                    format!("failed {}", time_str)
                                 },
                             });
                         }
                         Err(_) => {
                             let _ = tx.send(super::AgentEvent::SubAgentProgress {
                                 file: file_name.clone(),
-                                status: format!("✗ timeout {}s", elapsed),
+                                status: format!("timeout {}", time_str),
                             });
                         }
                     }

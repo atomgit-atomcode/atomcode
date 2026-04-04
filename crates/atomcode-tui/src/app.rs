@@ -732,8 +732,18 @@ impl App {
                 self.turn_log.log_context_stats(system_tokens, hot_tokens, cold_tokens, working_set_tokens, total_messages);
             }
             AgentEvent::SubAgentProgress { file, status } => {
-                // Display sub-agent progress in the streaming area
-                self.conversation.push_delta(&format!("\n  ⠴ [{}] {}", file, status));
+                // Claude Code style parallel task display
+                let (icon, line) = if file.is_empty() {
+                    // Header message
+                    ("".to_string(), format!("\n  {}", status))
+                } else if status.starts_with("done") {
+                    ("\u{2713}".to_string(), format!("\n  \u{2713} {} \u{2014} {}", file, status))
+                } else if status.starts_with("failed") || status.starts_with("timeout") {
+                    ("\u{2717}".to_string(), format!("\n  \u{2717} {} \u{2014} {}", file, status))
+                } else {
+                    ("\u{25b8}".to_string(), format!("\n  \u{25b8} {} \u{2014} {}", file, status))
+                };
+                self.conversation.push_delta(&line);
             }
         }
     }
