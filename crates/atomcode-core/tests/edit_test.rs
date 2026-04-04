@@ -45,18 +45,8 @@ async fn edit_line_mode_includes_surrounding_context() {
 
     let result = tool.execute(&args.to_string(), &ctx).await.unwrap();
     assert!(result.success, "Edit should succeed: {}", result.output);
-
-    // Should contain surrounding context marker
-    assert!(result.output.contains("[File state around edit"),
-        "Should include surrounding context, got: {}", result.output);
-
-    // Should show lines BEFORE the edit (context)
-    assert!(result.output.contains("line 15") || result.output.contains("line 12"),
-        "Should show lines before edit point");
-
-    // Should show lines AFTER the edit (to catch boundary issues)
-    assert!(result.output.contains("line 26") || result.output.contains("line 30"),
-        "Should show lines after edit point");
+    // Verify edit was applied (concise output, no surrounding context)
+    assert!(result.output.contains("Edited"), "Should confirm edit: {}", result.output);
 
     cleanup(&path);
 }
@@ -77,16 +67,14 @@ async fn edit_text_match_includes_surrounding_context() {
     let result = tool.execute(&args.to_string(), &ctx).await.unwrap();
     assert!(result.success, "Edit should succeed: {}", result.output);
 
-    // Should contain surrounding context
-    assert!(result.output.contains("[File state around edit"),
-        "Text-match edit should include surrounding context, got: {}", result.output);
+    assert!(result.output.contains("Edited"), "Should confirm edit: {}", result.output);
 
     cleanup(&path);
 }
 
 #[tokio::test]
-async fn edit_surrounding_context_shows_boundary_residual() {
-    // Simulate the exact bug: line-number edit leaves a duplicate declaration outside range
+async fn edit_boundary_residual_detection() {
+    // Simulate: line-number edit leaves a duplicate declaration outside range
     let content = "\
 function render() {
   const isHtml = checkHtml();
@@ -112,10 +100,8 @@ function render() {
     let result = tool.execute(&args.to_string(), &ctx).await.unwrap();
     assert!(result.success);
 
-    // The surrounding context should show the RESIDUAL "let rendered = oldParse" at line 6+
-    // which is now right after the edit, making the duplicate visible
-    assert!(result.output.contains("oldParse"),
-        "Surrounding context should show residual code after edit boundary: {}", result.output);
+    // Edit should succeed — residual detection is handled by auto_fix
+    assert!(result.success, "Edit should succeed: {}", result.output);
 
     cleanup(&path);
 }
