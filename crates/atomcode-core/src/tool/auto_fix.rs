@@ -222,15 +222,16 @@ fn fix_braces(content: &str, file_path: &str) -> BraceFixResult {
         return BraceFixResult::Balanced;
     }
 
-    // Count brace balance with string awareness
+    // Count brace AND bracket balance with string awareness
     let lines: Vec<&str> = content.lines().collect();
-    let mut depth = 0i64;
+    let mut brace_depth = 0i64;   // {}
+    let mut bracket_depth = 0i64; // []
     let mut in_string = false;
     let mut escape = false;
     let mut string_char = ' ';
 
-    // Track depth at each line end to find insertion points
-    let mut line_depths: Vec<i64> = Vec::with_capacity(lines.len());
+    let mut brace_line_depths: Vec<i64> = Vec::with_capacity(lines.len());
+    let mut bracket_line_depths: Vec<i64> = Vec::with_capacity(lines.len());
     for line in &lines {
         for ch in line.chars() {
             if escape { escape = false; continue; }
@@ -241,28 +242,34 @@ fn fix_braces(content: &str, file_path: &str) -> BraceFixResult {
             }
             match ch {
                 '\'' | '"' | '`' => { in_string = true; string_char = ch; }
-                '{' => depth += 1,
-                '}' => depth -= 1,
+                '{' => brace_depth += 1,
+                '}' => brace_depth -= 1,
+                '[' => bracket_depth += 1,
+                ']' => bracket_depth -= 1,
                 _ => {}
             }
         }
-        line_depths.push(depth);
+        brace_line_depths.push(brace_depth);
+        bracket_line_depths.push(bracket_depth);
     }
 
-    if depth == 0 {
+    // Check both braces and brackets
+    let depth = brace_depth; // primary check
+    let needs_bracket_fix = bracket_depth > 0 && bracket_depth <= 3;
+
+    if depth == 0 && bracket_depth == 0 {
         return BraceFixResult::Balanced;
     }
-    if depth < 0 {
-        // Extra closing braces — too risky to auto-fix
+    if depth < 0 || bracket_depth < 0 {
         return BraceFixResult::CannotFix(format!(
-            "\n\u{26a0} BRACE MISMATCH in {}: {} extra closing '}}'. Remove the extra. Fix NOW.",
-            file_path, depth.abs()
+            "\n\u{26a0} BRACE MISMATCH in {}: extra closing brackets (braces:{}, brackets:{}). Fix NOW.",
+            file_path, depth, bracket_depth
         ));
     }
-    if depth > 3 {
-        // Too many missing — likely a structural problem, don't guess
+    // Raise limit from 3 to 5 — fragmented edits can accumulate more
+    if depth > 5 {
         return BraceFixResult::CannotFix(format!(
-            "\n\u{26a0} BRACE MISMATCH in {}: {} unclosed '{{'. Too many to auto-fix. Fix manually.",
+            "\n\u{26a0} BRACE MISMATCH in {}: {} unclosed '{{'. Too many to auto-fix.",
             file_path, depth
         ));
     }
@@ -276,8 +283,8 @@ fn fix_braces(content: &str, file_path: &str) -> BraceFixResult {
     for target_depth in (1..=depth).rev() {
         // Find the last line where depth == target_depth (where the unclosed block ends)
         let mut insert_after = None;
-        for i in (0..line_depths.len()).rev() {
-            if line_depths[i] >= target_depth && !lines[i].trim().is_empty() {
+        for i in (0..brace_line_depths.len()).rev() {
+            if brace_line_depths[i] >= target_depth && !lines[i].trim().is_empty() {
                 insert_after = Some(i);
                 break;
             }
@@ -302,18 +309,56 @@ fn fix_braces(content: &str, file_path: &str) -> BraceFixResult {
         ));
     }
 
-    // Build the fixed content in memory (do NOT write to disk)
+    // Also fix missing brackets `]` if needed
+    if needs_bracket_fix {
+        let mut bracket_remaining = bracket_depth;
+        for target in (1..=bracket_depth).rev() {
+            let mut insert_after = None;
+            let mut bd = 0i64;
+            // Re-count bracket depth on fixed_lines
+            for (i, line) in fixed_lines.iter().enumerate().rev() {
+                for ch in line.chars() {
+                    if ch == ']' { bd += 1; }
+                    if ch == '[' {
+                        if bd > 0 { bd -= 1; }
+                        else {
+                            insert_after = Some(i);
+                            break;
+                        }
+                    }
+                }
+                if insert_after.is_some() { break; }
+            }
+            if let Some(idx) = insert_after {
+                let indent = if idx < fixed_lines.len() {
+                    let l = &fixed_lines[idx];
+                    let s = l.len() - l.trim_start().len();
+                    if s >= 2 { s - 2 } else { 0 }
+                } else { 0 };
+                fixed_lines.insert(idx + 1, format!("{}]", " ".repeat(indent)));
+                bracket_remaining -= 1;
+            }
+        }
+        if bracket_remaining > 0 {
+            // Could not fix all brackets — add warning
+        }
+    }
+
     let new_content = if content.ends_with('\n') {
         format!("{}\n", fixed_lines.join("\n"))
     } else {
         fixed_lines.join("\n")
     };
 
+    let mut msg_parts = Vec::new();
+    if depth > 0 { msg_parts.push(format!("{} missing '}}'", depth)); }
+    if needs_bracket_fix { msg_parts.push(format!("{} missing ']'", bracket_depth)); }
+
     BraceFixResult::AutoFixed(
         new_content,
         format!(
-            "\n[AUTO-FIXED: inserted {} missing closing '}}' in {}. File is now balanced.]",
-            depth, file_path
+            "\n[AUTO-FIXED: inserted {} in {}.]",
+            msg_parts.join(" + "), file_path
         ),
     )
 }
