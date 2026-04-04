@@ -1028,7 +1028,8 @@ impl AgentLoop {
 
                     // Empty response from LLM (common with DeepSeek/SiliconFlow/GLM):
                     // Retry with a nudge — model may have hit a transient issue.
-                    let is_empty = text.trim().is_empty() && tokens == 0;
+                    // Detect empty/near-empty responses — model may return whitespace or minimal tokens
+                    let is_empty = text.trim().is_empty() || (text.trim().len() < 5 && tokens < 10);
                     if is_empty && self.retry_count < 2 {
                         self.retry_count += 1;
                         // Ensure valid message alternation: empty LLM response didn't add
