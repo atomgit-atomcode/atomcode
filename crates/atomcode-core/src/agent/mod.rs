@@ -1245,6 +1245,18 @@ impl AgentLoop {
             return None;
         }
 
+        // Bug fix tasks should NOT use sub-agents — need serial diagnosis.
+        // Only feature development (create/implement/add/beautify) benefits from parallel.
+        let task_lower = self.current_task.to_lowercase();
+        let is_bugfix = task_lower.contains("报错") || task_lower.contains("错误")
+            || task_lower.contains("修复") || task_lower.contains("修一下")
+            || task_lower.contains("不行") || task_lower.contains("fix")
+            || task_lower.contains("error") || task_lower.contains("broken")
+            || task_lower.contains("bug") || task_lower.contains("还是");
+        if is_bugfix {
+            return None;
+        }
+
         let _ = self.event_tx.send(AgentEvent::TextDelta(
             format!("\n\n**Dispatching {} sub-agents in parallel...**\n", subtasks.len())
         ));
