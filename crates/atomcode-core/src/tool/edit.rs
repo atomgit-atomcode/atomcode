@@ -261,11 +261,15 @@ impl Tool for EditFileTool {
 
         // ── LINE-NUMBER MODE ──
         // Replace lines start_line..=end_line with new_string. No text matching needed.
-        if let (Some(mut start), Some(end)) = (parsed.start_line, parsed.end_line) {
+        if let (Some(mut start), Some(mut end)) = (parsed.start_line, parsed.end_line) {
             let lines: Vec<&str> = content.lines().collect();
             let total = lines.len();
 
-            if start == 0 || start > total || end < start {
+            // Auto-swap if model gave start > end
+            if end < start {
+                std::mem::swap(&mut start, &mut end);
+            }
+            if start == 0 || start > total {
                 return Ok(ToolResult {
                     call_id: String::new(),
                     output: format!("Invalid line range: {}-{} (file has {} lines)", start, end, total),
@@ -641,8 +645,9 @@ impl EditFileTool {
 
         for (i, edit) in edits.iter().enumerate() {
             if let (Some(start), Some(end)) = (edit.start_line, edit.end_line) {
-                // Line-number mode
-                if start == 0 || start > total || end < start {
+                // Auto-swap if start > end
+                let (start, end) = if end < start { (end, start) } else { (start, end) };
+                if start == 0 || start > total {
                     return Ok(ToolResult {
                         call_id: String::new(),
                         output: format!("Error in edit #{}: invalid line range {}-{} (file has {} lines)", i + 1, start, end, total),
