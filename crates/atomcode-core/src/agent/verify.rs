@@ -75,6 +75,9 @@ impl AgentLoop {
             ("build.gradle", "gradle compileJava -q 2>&1 | tail -20"),
             ("Cargo.toml", "cargo check 2>&1 | tail -20"),
             ("tsconfig.json", "npx tsc --noEmit 2>&1 | tail -20"),
+            ("vite.config.ts", "npx vite build 2>&1 | tail -20"),
+            ("vite.config.js", "npx vite build 2>&1 | tail -20"),
+            ("go.mod", "go build ./... 2>&1 | tail -20"),
         ];
 
         let wd = self.turn_runner.context.working_dir.try_read()
