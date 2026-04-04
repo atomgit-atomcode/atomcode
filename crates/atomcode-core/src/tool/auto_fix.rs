@@ -12,6 +12,9 @@ pub struct ValidateResult {
     pub fixed_content: String,
     pub warnings: Vec<String>,
     pub was_fixed: bool,
+    /// If true, the edit should be REJECTED — don't write to disk.
+    /// The model must fix its edit and retry.
+    pub rejected: bool,
 }
 
 /// Run all pre-write validations on the content in memory:
@@ -23,31 +26,38 @@ pub struct ValidateResult {
 /// The caller should write `fixed_content` to disk, then optionally call
 /// `post_edit_syntax_check` for on-disk syntax validation.
 pub async fn validate_and_fix(content: &str, file_path: &str, new_string: &str) -> ValidateResult {
-    let mut warnings: Vec<String> = Vec::new();
-    let mut was_fixed = false;
-    let mut current = content.to_string();
+    let mut errors: Vec<String> = Vec::new();
+    let current = content.to_string();
 
-    // 1. Duplicate detection (warning only, no fix)
+    // 1. Duplicate detection
     let dup_warn = detect_duplicate_blocks(&current, new_string);
     if !dup_warn.is_empty() {
-        warnings.push(dup_warn);
+        errors.push(dup_warn);
     }
 
-    // 2. Brace auto-fix
-    match fix_braces(&current, file_path) {
-        BraceFixResult::Balanced => {}
-        BraceFixResult::AutoFixed(fixed, msg) => {
-            current = fixed;
-            warnings.push(msg);
-            was_fixed = true;
-        }
-        BraceFixResult::CannotFix(msg) => {
-            warnings.push(msg);
-        }
-    }
-
-    // 2.5. Vue SFC structure check: ensure <script>/<template>/<style> are paired
+    // 2. Brace/bracket balance — REJECT, don't auto-fix
     let ext = file_path.rsplit('.').next().unwrap_or("");
+    if matches!(ext, "js" | "ts" | "tsx" | "jsx" | "vue" | "svelte" | "java" | "rs" | "go" | "c" | "cpp" | "cs") {
+        let (brace_depth, bracket_depth) = count_delimiters(&current);
+        if brace_depth != 0 {
+            let missing = if brace_depth > 0 { format!("{} missing '}}'", brace_depth) }
+                          else { format!("{} extra '}}'", brace_depth.abs()) };
+            errors.push(format!(
+                "STRUCTURAL ERROR: {}. Your edit broke the brace balance. Fix your new_string to include the correct closing braces.",
+                missing
+            ));
+        }
+        if bracket_depth != 0 {
+            let missing = if bracket_depth > 0 { format!("{} missing ']'", bracket_depth) }
+                          else { format!("{} extra ']'", bracket_depth.abs()) };
+            errors.push(format!(
+                "STRUCTURAL ERROR: {}. Fix your new_string to include the correct closing brackets.",
+                missing
+            ));
+        }
+    }
+
+    // 3. Vue SFC structure — REJECT if script/template tags unpaired
     if matches!(ext, "vue" | "svelte") {
         let has_script_open = current.contains("<script");
         let has_script_close = current.contains("</script>");
@@ -55,42 +65,97 @@ pub async fn validate_and_fix(content: &str, file_path: &str, new_string: &str) 
         let has_template_close = current.contains("</template>");
 
         if has_script_open && !has_script_close {
-            // Find where <template> starts — insert </script> before it
-            if let Some(tpl_pos) = current.find("<template") {
-                let insert_pos = current[..tpl_pos].rfind('\n').unwrap_or(tpl_pos);
-                let mut fixed = current[..insert_pos].to_string();
-                fixed.push_str("\n</script>\n");
-                fixed.push_str(&current[insert_pos..]);
-                current = fixed;
-                warnings.push(format!("\n[AUTO-FIXED: inserted missing </script> in {}]", file_path));
-                was_fixed = true;
-            }
+            errors.push("STRUCTURAL ERROR: Missing </script> tag. Your edit removed or didn't include </script>. Add it back.".to_string());
         }
         if has_template_open && !has_template_close {
-            current.push_str("\n</template>\n");
-            warnings.push(format!("\n[AUTO-FIXED: inserted missing </template> in {}]", file_path));
-            was_fixed = true;
+            errors.push("STRUCTURAL ERROR: Missing </template> tag. Add it back.".to_string());
         }
     }
 
-    // 3. HTML tag auto-fix
-    match fix_html_tags(&current, file_path) {
-        HtmlFixResult::Balanced => {}
-        HtmlFixResult::AutoFixed(fixed, msg) => {
-            current = fixed;
-            warnings.push(msg);
-            was_fixed = true;
-        }
-        HtmlFixResult::CannotFix(msg) => {
-            warnings.push(msg);
-        }
+    // 4. HTML tag balance — REJECT if unbalanced
+    if matches!(ext, "vue" | "html" | "svelte" | "htm" | "jsx" | "tsx") {
+        let html_errors = check_html_balance(&current, file_path);
+        errors.extend(html_errors);
+    }
+
+    // If any structural errors → reject (don't write)
+    if !errors.is_empty() {
+        return ValidateResult {
+            fixed_content: current,
+            warnings: errors,
+            was_fixed: false,
+            rejected: true,
+        };
     }
 
     ValidateResult {
         fixed_content: current,
-        warnings,
-        was_fixed,
+        warnings: vec![],
+        was_fixed: false,
+        rejected: false,
     }
+}
+
+/// Count brace {} and bracket [] balance, skipping strings.
+fn count_delimiters(content: &str) -> (i64, i64) {
+    let mut braces = 0i64;
+    let mut brackets = 0i64;
+    let mut in_string = false;
+    let mut escape = false;
+    let mut string_char = ' ';
+
+    for ch in content.chars() {
+        if escape { escape = false; continue; }
+        if ch == '\\' && in_string { escape = true; continue; }
+        if in_string {
+            if ch == string_char { in_string = false; }
+            continue;
+        }
+        match ch {
+            '\'' | '"' | '`' => { in_string = true; string_char = ch; }
+            '{' => braces += 1,
+            '}' => braces -= 1,
+            '[' => brackets += 1,
+            ']' => brackets -= 1,
+            _ => {}
+        }
+    }
+    (braces, brackets)
+}
+
+/// Check HTML tag balance for template-heavy files. Returns error messages.
+fn check_html_balance(content: &str, file_path: &str) -> Vec<String> {
+    let ext = file_path.rsplit('.').next().unwrap_or("");
+    let check_content = if ext == "vue" {
+        if let Some(start) = content.find("<template") {
+            if let Some(end) = content.rfind("</template>") {
+                &content[start..end]
+            } else { content }
+        } else { return vec![]; }
+    } else { content };
+
+    let tags = ["div", "section", "main", "aside", "article", "nav", "header", "footer", "form"];
+    let mut errors = Vec::new();
+
+    for tag in &tags {
+        let opens = check_content.matches(&format!("<{}", tag)).count();
+        let closes = check_content.matches(&format!("</{}>", tag)).count();
+        if opens != closes {
+            let diff = opens as i64 - closes as i64;
+            if diff > 0 {
+                errors.push(format!(
+                    "STRUCTURAL ERROR: <{}> has {} unclosed tag(s). Add the missing </{}>.",
+                    tag, diff, tag
+                ));
+            } else {
+                errors.push(format!(
+                    "STRUCTURAL ERROR: <{}> has {} extra closing tag(s). Remove the extra </{}>.",
+                    tag, diff.abs(), tag
+                ));
+            }
+        }
+    }
+    errors
 }
 
 /// Post-edit syntax check for common file types.

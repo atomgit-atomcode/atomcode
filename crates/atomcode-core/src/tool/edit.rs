@@ -76,16 +76,32 @@ async fn validate_write_check(
     if !result.success {
         return Ok((result, content.to_string()));
     }
-    // 1. Validate & auto-fix in memory (before write)
+    // 1. Validate in memory (before write)
     let validated = auto_fix::validate_and_fix(content, file_path, new_string).await;
 
-    // 2. Write the validated content to disk
+    // 2. If rejected — DON'T write, return error so model retries
+    if validated.rejected {
+        let errors = validated.warnings.join("\n");
+        return Ok((
+            ToolResult {
+                call_id: result.call_id,
+                output: format!(
+                    "EDIT REJECTED — your edit would break the file structure:\n{}\n\
+                     Fix your new_string and retry. The file was NOT modified.",
+                    errors
+                ),
+                success: false,
+            },
+            content.to_string(), // return original content, unchanged
+        ));
+    }
+
+    // 3. Write to disk (only structurally valid content reaches here)
     atomic_write(file_path, &validated.fixed_content).await?;
 
-    // 3. Post-write syntax check (needs file on disk)
+    // 4. Post-write syntax check (needs file on disk)
     let syntax_warn = auto_fix::post_edit_syntax_check(file_path).await;
 
-    // Collect all warnings
     let mut all_warnings: Vec<String> = validated.warnings;
     if !syntax_warn.is_empty() {
         all_warnings.push(syntax_warn);
