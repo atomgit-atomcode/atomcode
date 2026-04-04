@@ -655,56 +655,18 @@ impl AgentLoop {
                 self.conversation.add_user_message(&format!("[Additional context from user]: {}", input));
             }
 
-            // Planning phase: inject instruction to plan before acting
+            // Plan instruction injection removed — system prompt PLAN FIRST section
+            // already covers this. No need to duplicate in user messages.
             if self.planning_phase {
-                self.conversation.add_user_message(
-                    "[System: This is a complex task. Before using any tools, first output a brief plan \
-                     (3-5 steps) of what you'll do. Then proceed to execute it.]"
-                );
-                self.planning_phase = false; // Only inject once
+                self.planning_phase = false;
             }
 
             // NOTE: Negative feedback injection disabled — adds a System message that
             // confuses weak models and wastes context. The model sees the user's complaint
             // directly; no extra injection needed.
 
-            // Fix 6: Bug-fix diagnostic guidance — inject on first turn when user
-            // message contains bug-related keywords.
-            if self.tool_call_count == 0 {
-                let last_user = self.conversation.messages.iter().rev()
-                    .find(|m| matches!(m.role, crate::conversation::message::Role::User))
-                    .and_then(|m| m.text())
-                    .unwrap_or("")
-                    .to_string();
-                let lower = last_user.to_lowercase();
-                let has_bug_keyword = ["bug", "fix", "broken", "error", "错误", "报错", "不行",
-                    "失败", "crash", "wrong", "issue", "problem", "doesn't work", "not working"]
-                    .iter().any(|k| lower.contains(k));
-                if has_bug_keyword {
-                    let has_frontend_keyword = ["页面", "前端", "样式", "css", "html", "vue",
-                        "react", "component", "button", "render", "display", "layout", "ui"]
-                        .iter().any(|k| lower.contains(k));
-                    let strategy = if has_frontend_keyword {
-                        "[DIAGNOSTIC STRATEGY: This looks like a frontend bug. \
-                         1) Read the relevant component file. \
-                         2) Check for CSS/template issues. \
-                         3) Make the fix. \
-                         Do NOT start a dev server or run build commands until you've read the code.]"
-                    } else {
-                        "[DIAGNOSTIC STRATEGY: This looks like a bug fix task. \
-                         1) Read the most likely source file (check error messages/stack traces for clues). \
-                         2) Identify the root cause. \
-                         3) Make the fix. \
-                         Stay focused — most bugs need only 3-4 steps to fix.]"
-                    };
-                    self.conversation.messages.push(
-                        crate::conversation::message::Message::new(
-                            crate::conversation::message::Role::System,
-                            strategy,
-                        )
-                    );
-                }
-            }
+            // DIAGNOSTIC STRATEGY injection removed — the model decides its own
+            // debugging approach. System prompt PLAN FIRST section is sufficient.
 
             // Fix 5: Step budget warning — nudge the model to stop reading and start editing.
             if self.tool_call_count >= 6 && self.files_edited_this_turn.is_empty() {

@@ -48,10 +48,8 @@ impl AgentLoop {
                     let start = lines.len().saturating_sub(15);
                     let recent = lines[start..].join("\n");
                     if is_stale {
-                        diagnostics.push(format!(
-                            "[Auto-detected from {} (STALE — last modified >5min ago, errors may be old):]\n{}",
-                            log_name, recent
-                        ));
+                        // Stale logs (>5min) are noise — skip injection entirely.
+                        // The model can read them itself if needed.
                     } else {
                         diagnostics.push(format!("[Auto-detected from {}:]\n{}", log_name, recent));
                     }
