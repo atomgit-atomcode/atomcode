@@ -353,6 +353,9 @@ fn render_tool_call(lines: &mut Vec<Line<'static>>, call: &ToolCall) {
 // Diff lines shown for edit_file only. `expanded` shows full output for recent calls.
 fn render_tool_result(lines: &mut Vec<Line<'static>>, result: &ToolResult, expanded: bool) {
     let bar = Span::styled(format!("{}\u{2502} ", INDENT), Style::default().fg(theme::accent_dim()));
+    let (icon, color) = if result.success {
+        ("\u{2713}", theme::success())
+    } else {
         ("\u{2717}", theme::error())
     };
 
@@ -439,7 +442,6 @@ fn render_tool_result(lines: &mut Vec<Line<'static>>, result: &ToolResult, expan
                 diff_shown += 1;
             }
         }
-    }
     }
 
     // For errors: show a few detail lines
