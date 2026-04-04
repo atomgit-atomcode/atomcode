@@ -46,6 +46,33 @@ pub async fn validate_and_fix(content: &str, file_path: &str, new_string: &str) 
         }
     }
 
+    // 2.5. Vue SFC structure check: ensure <script>/<template>/<style> are paired
+    let ext = file_path.rsplit('.').next().unwrap_or("");
+    if matches!(ext, "vue" | "svelte") {
+        let has_script_open = current.contains("<script");
+        let has_script_close = current.contains("</script>");
+        let has_template_open = current.contains("<template");
+        let has_template_close = current.contains("</template>");
+
+        if has_script_open && !has_script_close {
+            // Find where <template> starts — insert </script> before it
+            if let Some(tpl_pos) = current.find("<template") {
+                let insert_pos = current[..tpl_pos].rfind('\n').unwrap_or(tpl_pos);
+                let mut fixed = current[..insert_pos].to_string();
+                fixed.push_str("\n</script>\n");
+                fixed.push_str(&current[insert_pos..]);
+                current = fixed;
+                warnings.push(format!("\n[AUTO-FIXED: inserted missing </script> in {}]", file_path));
+                was_fixed = true;
+            }
+        }
+        if has_template_open && !has_template_close {
+            current.push_str("\n</template>\n");
+            warnings.push(format!("\n[AUTO-FIXED: inserted missing </template> in {}]", file_path));
+            was_fixed = true;
+        }
+    }
+
     // 3. HTML tag auto-fix
     match fix_html_tags(&current, file_path) {
         HtmlFixResult::Balanced => {}
