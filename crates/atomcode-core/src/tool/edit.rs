@@ -67,6 +67,10 @@ use super::auto_fix;
 
 /// Validate content in memory, write to disk, then run syntax check.
 /// Returns the final content (possibly auto-fixed) and appends any warnings to `result`.
+/// Track consecutive rejections per file to avoid infinite loops.
+static REJECTION_COUNTS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, usize>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
 async fn validate_write_check(
     content: &str,
     file_path: &str,
@@ -79,8 +83,34 @@ async fn validate_write_check(
     // 1. Validate in memory (before write)
     let validated = auto_fix::validate_and_fix(content, file_path, new_string).await;
 
-    // 2. If rejected — DON'T write, return error so model retries
+    // 2. If rejected — DON'T write (unless rejected 3+ times → fall through with warning)
     if validated.rejected {
+        let should_force = {
+            let mut counts = REJECTION_COUNTS.lock().unwrap();
+            let count = counts.entry(file_path.to_string()).or_insert(0);
+            *count += 1;
+            if *count >= 3 {
+                *count = 0;
+                true
+            } else {
+                false
+            }
+        }; // MutexGuard dropped here
+
+        if should_force {
+            // Safety valve: stop rejecting after 3 consecutive rejections.
+            atomic_write(file_path, &validated.fixed_content).await?;
+            return Ok((
+                ToolResult {
+                    output: format!(
+                        "{}\n⚠ WARNING: Edit had structural issues but was written anyway after 3 rejections. Check the file.",
+                        result.output
+                    ),
+                    ..result
+                },
+                validated.fixed_content,
+            ));
+        }
         let errors = validated.warnings.join("\n");
         return Ok((
             ToolResult {
@@ -97,6 +127,10 @@ async fn validate_write_check(
     }
 
     // 3. Write to disk (only structurally valid content reaches here)
+    // Reset rejection counter on successful write
+    if let Ok(mut counts) = REJECTION_COUNTS.lock() {
+        counts.remove(file_path);
+    }
     atomic_write(file_path, &validated.fixed_content).await?;
 
     // 4. Post-write syntax check (needs file on disk)

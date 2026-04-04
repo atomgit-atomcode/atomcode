@@ -38,22 +38,19 @@ pub async fn validate_and_fix(content: &str, file_path: &str, new_string: &str) 
     // 2. Brace/bracket balance — REJECT, don't auto-fix
     let ext = file_path.rsplit('.').next().unwrap_or("");
     if matches!(ext, "js" | "ts" | "tsx" | "jsx" | "vue" | "svelte" | "java" | "rs" | "go" | "c" | "cpp" | "cs") {
-        let (brace_depth, bracket_depth) = count_delimiters(&current);
+        let (brace_depth, bracket_depth, deepest_line) = count_delimiters(&current);
         if brace_depth != 0 {
-            let missing = if brace_depth > 0 { format!("{} missing '}}'", brace_depth) }
-                          else { format!("{} extra '}}'", brace_depth.abs()) };
-            errors.push(format!(
-                "STRUCTURAL ERROR: {}. Your edit broke the brace balance. Fix your new_string to include the correct closing braces.",
-                missing
-            ));
+            let hint = if brace_depth > 0 {
+                format!("{} missing '}}' — deepest unclosed '{{' is near line {}. Add '}}' at the end of that block.", brace_depth, deepest_line)
+            } else {
+                format!("{} extra '}}' — remove the extra closing brace(s).", brace_depth.abs())
+            };
+            errors.push(format!("STRUCTURAL ERROR: {}", hint));
         }
         if bracket_depth != 0 {
-            let missing = if bracket_depth > 0 { format!("{} missing ']'", bracket_depth) }
-                          else { format!("{} extra ']'", bracket_depth.abs()) };
-            errors.push(format!(
-                "STRUCTURAL ERROR: {}. Fix your new_string to include the correct closing brackets.",
-                missing
-            ));
+            let hint = if bracket_depth > 0 { format!("{} missing ']' — close the array/bracket.", bracket_depth) }
+                       else { format!("{} extra ']' — remove the extra.", bracket_depth.abs()) };
+            errors.push(format!("STRUCTURAL ERROR: {}", hint));
         }
     }
 
@@ -97,14 +94,19 @@ pub async fn validate_and_fix(content: &str, file_path: &str, new_string: &str) 
 }
 
 /// Count brace {} and bracket [] balance, skipping strings.
-fn count_delimiters(content: &str) -> (i64, i64) {
+/// Returns (brace_depth, bracket_depth, deepest_brace_line).
+fn count_delimiters(content: &str) -> (i64, i64, usize) {
     let mut braces = 0i64;
     let mut brackets = 0i64;
+    let mut max_depth = 0i64;
+    let mut max_depth_line = 0usize;
+    let mut line_num = 1usize;
     let mut in_string = false;
     let mut escape = false;
     let mut string_char = ' ';
 
     for ch in content.chars() {
+        if ch == '\n' { line_num += 1; }
         if escape { escape = false; continue; }
         if ch == '\\' && in_string { escape = true; continue; }
         if in_string {
@@ -113,14 +115,17 @@ fn count_delimiters(content: &str) -> (i64, i64) {
         }
         match ch {
             '\'' | '"' | '`' => { in_string = true; string_char = ch; }
-            '{' => braces += 1,
+            '{' => {
+                braces += 1;
+                if braces > max_depth { max_depth = braces; max_depth_line = line_num; }
+            }
             '}' => braces -= 1,
             '[' => brackets += 1,
             ']' => brackets -= 1,
             _ => {}
         }
     }
-    (braces, brackets)
+    (braces, brackets, max_depth_line)
 }
 
 /// Check HTML tag balance for template-heavy files. Returns error messages.
