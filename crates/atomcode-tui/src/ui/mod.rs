@@ -126,8 +126,8 @@ fn render_selection_highlight(frame: &mut Frame, sel: &TextSelection, chat_area:
     let area_top = chat_area.y;
     let area_bottom = chat_area.y + chat_area.height;
 
-    let sel_bg = Color::Rgb(40, 80, 160);
-    let sel_fg = Color::Rgb(240, 240, 245);
+    let sel_bg = Color::Rgb(40, 80, 160);  // Selection blue - works on both themes
+    let sel_fg = theme::text_primary();
 
     // Clamp row range to chat area — leave 1-row gap before input box
     let row_start = start_row.max(area_top);
@@ -158,9 +158,9 @@ fn render_dir_selector(frame: &mut Frame, area: Rect, dirs: &[PathBuf], selected
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Rgb(80, 70, 140)))
-        .title(Span::styled(" Recent Projects ", Style::default().fg(Color::Rgb(170, 150, 240)).add_modifier(Modifier::BOLD)))
-        .style(Style::default().bg(Color::Rgb(18, 18, 26)));
+        .border_style(Style::default().fg(theme::accent_dim()))
+        .title(Span::styled(" Recent Projects ", Style::default().fg(theme::accent()).add_modifier(Modifier::BOLD)))
+        .style(Style::default().bg(theme::bg_elevated()));
 
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
@@ -169,8 +169,8 @@ fn render_dir_selector(frame: &mut Frame, area: Rect, dirs: &[PathBuf], selected
     // Current dir
     let cur_short = shorten_dir(&current.to_string_lossy());
     lines.push(Line::from(vec![
-        Span::styled("  current: ", Style::default().fg(Color::Rgb(80, 82, 95))),
-        Span::styled(cur_short, Style::default().fg(Color::Rgb(100, 170, 235))),
+        Span::styled("  current: ", Style::default().fg(theme::text_muted())),
+        Span::styled(cur_short, Style::default().fg(theme::info())),
     ]));
     lines.push(Line::default());
 
@@ -180,15 +180,15 @@ fn render_dir_selector(frame: &mut Frame, area: Rect, dirs: &[PathBuf], selected
         let is_current = dir == current;
 
         let (prefix, style) = if is_selected {
-            (" \u{25b8} ", Style::default().fg(Color::Rgb(240, 240, 245)).bg(Color::Rgb(55, 45, 110)))
+            (" \u{25b8} ", Style::default().fg(theme::text_primary()).bg(theme::brand_bg()))
         } else {
-            ("   ", Style::default().fg(Color::Rgb(170, 172, 185)))
+            ("   ", Style::default().fg(theme::text_secondary()))
         };
 
         let mut spans = vec![Span::styled(prefix, style)];
         spans.push(Span::styled(display, style));
         if is_current {
-            spans.push(Span::styled("  (current)", Style::default().fg(Color::Rgb(70, 160, 95))));
+            spans.push(Span::styled("  (current)", Style::default().fg(theme::success())));
         }
         lines.push(Line::from(spans));
     }

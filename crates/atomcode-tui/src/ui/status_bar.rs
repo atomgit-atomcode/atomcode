@@ -13,20 +13,72 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     let width = area.width as usize;
     let dir = shorten_path(&app.working_dir.to_string_lossy());
     let model = app.model_name.as_str();
-    let sep = Span::styled(" │ ", Style::default().fg(theme::STATUS_SEP));
+    let sep = Span::styled(" │ ", Style::default().fg(theme::status_sep()));
 
     let mut left: Vec<Span> = Vec::new();
     let mut right: Vec<Span> = Vec::new();
 
-    // Left: brand + path (clean, no session title)
+    // Left: brand (with build hash) + path + session
     left.push(Span::styled(
-        " Atomcode ".to_string(),
-        Style::default().fg(theme::BRAND_FG).bg(theme::BRAND_BG).add_modifier(Modifier::BOLD),
+        format!(" atomcode [{}] ", env!("ATOMCODE_BUILD_ID")),
+        Style::default().fg(theme::brand_fg()).bg(theme::brand_bg()).add_modifier(Modifier::BOLD),
     ));
     left.push(Span::styled(" ", Style::default()));
-    left.push(Span::styled(&dir, Style::default().fg(theme::STATUS_PATH)));
+    left.push(Span::styled(&dir, Style::default().fg(theme::status_path())));
 
+    // Calculate available space for session name
+    // Right side content (will be computed below)
     let is_active = app.turn_start.is_some();
+    let mut right_preview: Vec<String> = Vec::new();
+    
+    if is_active {
+        let secs = app.turn_start.unwrap().elapsed().as_secs();
+        let dur = if secs >= 60 { format!("{}m{}s", secs / 60, secs % 60) } else { format!("{}s", secs) };
+        right_preview.push(format!("{} ", SPINNER[app.tick_count % SPINNER.len()]));
+        if app.current_step_count > 0 {
+            right_preview.push(format!("turn {}", app.current_step_count));
+            right_preview.push(" │ ".to_string());
+        }
+        right_preview.push(dur);
+        right_preview.push(" │ ".to_string());
+    } else if app.last_turn_duration.is_some() || app.current_step_count > 0 {
+        right_preview.push("✓ ".to_string());
+        if app.current_step_count > 0 {
+            right_preview.push(format!("turn {}", app.current_step_count));
+            right_preview.push(" │ ".to_string());
+        }
+        if let Some(dur) = app.last_turn_duration {
+            let secs = dur.as_secs();
+            let dur_str = if secs >= 60 { format!("{}m{}s", secs / 60, secs % 60) } else { format!("{}s", secs) };
+            right_preview.push(dur_str);
+            right_preview.push(" │ ".to_string());
+        }
+    }
+    if app.ctx_used_tokens > 0 && app.context_window > 0 {
+        right_preview.push(format!("ctx {}K/{}K", app.ctx_used_tokens / 1000, app.context_window / 1000));
+        right_preview.push(" │ ".to_string());
+    }
+    right_preview.push(format!("{} ", model));
+
+    // Calculate session name max length
+    let brand_w = 10; // " atomcode " + " "
+    let dir_w = display_width(&dir);
+    let session_brackets_w = 3; // " [" + "]"
+    let right_w: usize = right_preview.iter().map(|s| display_width(s)).sum();
+    let min_padding = 1; // at least one space between left and right
+    
+    let fixed_width = brand_w + dir_w + session_brackets_w + right_w + min_padding;
+    let max_session_len = width.saturating_sub(fixed_width);
+    // Allow up to 60 chars but at least 10
+    let max_session_len = max_session_len.min(60).max(10);
+    
+    // Session name
+    left.push(Span::styled(" [", Style::default().fg(theme::text_muted())));
+    left.push(Span::styled(
+        truncate_session_name(&app.current_session.name, max_session_len),
+        Style::default().fg(theme::accent()),
+    ));
+    left.push(Span::styled("]", Style::default().fg(theme::text_muted())));
 
     // Right side: turn state + model
     if is_active {
@@ -36,13 +88,13 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         let dur = if secs >= 60 { format!("{}m{}s", secs / 60, secs % 60) } else { format!("{}s", secs) };
 
         let time_color = if secs < 10 {
-            theme::WAIT_FAST
+            theme::wait_fast()
         } else if secs < 60 {
-            theme::WAIT_NORMAL
+            theme::wait_normal()
         } else if secs < 120 {
-            theme::WAIT_SLOW
+            theme::wait_slow()
         } else {
-            theme::WAIT_VERY_SLOW
+            theme::wait_very_slow()
         };
 
         right.push(Span::styled(
@@ -51,8 +103,8 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         ));
         if app.current_step_count > 0 {
             right.push(Span::styled(
-                format!("turn {}", app.current_step_count),
-                Style::default().fg(theme::TEXT_SECONDARY),
+                format!("T{}/C{}", app.current_step_count, app.current_tool_call_count),
+                Style::default().fg(theme::text_secondary()),
             ));
             right.push(sep.clone());
         }
@@ -62,15 +114,15 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         ));
         right.push(sep.clone());
     } else if app.last_turn_duration.is_some() || app.current_step_count > 0 {
-        // ── Completed turn: ✓ + turn N + duration (green) ──
+        // ── Completed turn: ✓ + duration ──
         right.push(Span::styled(
             "✓ ",
-            Style::default().fg(theme::SUCCESS),
+            Style::default().fg(theme::success()),
         ));
         if app.current_step_count > 0 {
             right.push(Span::styled(
-                format!("turn {}", app.current_step_count),
-                Style::default().fg(theme::TEXT_SECONDARY),
+                format!("T{}/C{}", app.current_step_count, app.current_tool_call_count),
+                Style::default().fg(theme::text_secondary()),
             ));
             right.push(sep.clone());
         }
@@ -79,7 +131,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
             let dur_str = if secs >= 60 { format!("{}m{}s", secs / 60, secs % 60) } else { format!("{}s", secs) };
             right.push(Span::styled(
                 dur_str,
-                Style::default().fg(theme::SUCCESS),
+                Style::default().fg(theme::success()),
             ));
             right.push(sep.clone());
         }
@@ -91,11 +143,11 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         let total_k = app.context_window / 1000;
         let ratio = app.ctx_used_tokens as f64 / app.context_window as f64;
         let ctx_color = if ratio < 0.5 {
-            theme::SUCCESS
+            theme::success()
         } else if ratio < 0.8 {
-            theme::WAIT_NORMAL
+            theme::wait_normal()
         } else {
-            theme::WAIT_VERY_SLOW
+            theme::wait_very_slow()
         };
         right.push(Span::styled(
             format!("ctx {}K/{}K", used_k, total_k),
@@ -107,7 +159,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     // Model name (always)
     right.push(Span::styled(
         format!("{} ", model),
-        Style::default().fg(theme::STATUS_MODEL),
+        Style::default().fg(theme::status_model()).add_modifier(Modifier::BOLD),
     ));
 
     // Layout
@@ -120,7 +172,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     all.extend(right);
 
     let bar = Paragraph::new(Line::from(all))
-        .style(Style::default().bg(theme::BG_SURFACE));
+        .style(Style::default().bg(theme::bg_surface()));
     frame.render_widget(bar, area);
 }
 
@@ -157,3 +209,12 @@ fn shorten_path(path: &str) -> String {
     }
 }
 
+fn truncate_session_name(name: &str, max_len: usize) -> String {
+    let char_count = name.chars().count();
+    if char_count <= max_len {
+        name.to_string()
+    } else {
+        let truncated: String = name.chars().take(max_len.saturating_sub(3)).collect();
+        format!("{}...", truncated)
+    }
+}

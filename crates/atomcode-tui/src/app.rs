@@ -1363,9 +1363,10 @@ impl App {
             }
             (_, KeyCode::Down) if self.input.is_empty() && self.input_history.is_empty() => {
                 // Scroll down when input is empty (terminal scroll wheel sends Up/Down in alternate mode)
-                self.scroll_offset += 3;
-                let total = self.last_total_lines;
-                if self.scroll_offset >= total {
+                let vh = self.last_viewport_height as usize;
+                let max_scroll = self.last_total_lines.saturating_sub(vh);
+                self.scroll_offset = (self.scroll_offset + 3).min(max_scroll);
+                if self.scroll_offset >= max_scroll {
                     self.at_bottom = true;
                 }
             }
@@ -1500,9 +1501,10 @@ impl App {
                 true
             }
             (KeyModifiers::CONTROL, KeyCode::Down) => {
-                self.scroll_offset += 3;
-                let total = self.last_total_lines;
-                if self.scroll_offset >= total {
+                let vh = self.last_viewport_height as usize;
+                let max_scroll = self.last_total_lines.saturating_sub(vh);
+                self.scroll_offset = (self.scroll_offset + 3).min(max_scroll);
+                if self.scroll_offset >= max_scroll {
                     self.at_bottom = true;
                 }
                 true
@@ -1518,9 +1520,10 @@ impl App {
                 true
             }
             (_, KeyCode::PageDown) => {
-                self.scroll_offset += 20;
-                let total = self.last_total_lines;
-                if self.scroll_offset >= total {
+                let vh = self.last_viewport_height as usize;
+                let max_scroll = self.last_total_lines.saturating_sub(vh);
+                self.scroll_offset = (self.scroll_offset + 20).min(max_scroll);
+                if self.scroll_offset >= max_scroll {
                     self.at_bottom = true;
                 }
                 true
@@ -1544,9 +1547,10 @@ impl App {
                 }
             }
             MouseEventKind::ScrollDown => {
-                self.scroll_offset += 3;
-                let total = self.last_total_lines;
-                if self.scroll_offset >= total {
+                let vh = self.last_viewport_height as usize;
+                let max_scroll = self.last_total_lines.saturating_sub(vh);
+                self.scroll_offset = (self.scroll_offset + 3).min(max_scroll);
+                if self.scroll_offset >= max_scroll {
                     self.at_bottom = true;
                 }
             }

@@ -34,7 +34,7 @@ pub fn render(
     tick: usize,
     _turn_tokens: usize,
     _turn_elapsed_secs: Option<u64>,
-    turn_label_seed: usize,
+    _turn_label_seed: usize,
     step_count: usize,
     tool_info: &str,
     first_token_ms: Option<u64>,
@@ -126,7 +126,7 @@ pub fn render(
     let mut dynamic: Vec<Line<'static>> = Vec::new();
 
     // Streaming content — accent bar + indented markdown (same as completed assistant text)
-    let bar_style = Style::default().fg(theme::ACCENT_DIM);
+    let bar_style = Style::default().fg(theme::accent_dim());
     if let Some(ref buffer) = conversation.stream_buffer {
         if !buffer.is_empty() {
             let content_w = term_width.saturating_sub(3);
@@ -146,7 +146,7 @@ pub fn render(
     // (Spinner variables moved to the dedicated spinner_area renderer at the top)
 
     // ── Turn finished separator ──
-    // Fun completion message like Claude Code's "Brewed for 47s"
+    // (Spinner is rendered separately above the chat Paragraph — see spinner_area)
     if let Some(dur) = last_turn_duration {
         let secs = dur.as_secs();
         let time_str = if secs >= 60 {
@@ -154,37 +154,23 @@ pub fn render(
         } else {
             format!("{}s", secs)
         };
-
-        let verbs = [
-            "Crafted", "Forged", "Conjured", "Assembled", "Brewed",
-            "Synthesized", "Woven", "Sculpted", "Composed", "Distilled",
-        ];
-        let verb = verbs[turn_label_seed % verbs.len()];
-
+        let turns_str = if finished_step_count > 0 {
+            format!("{} turns", finished_step_count)
+        } else {
+            "done".to_string()
+        };
+        let label = format!(" {} \u{00b7} {} ", turns_str, time_str);
+        let line_char = "\u{2500}";
+        let side_len = 8;
+        let sep = format!(
+            "  {}{}{}",
+            line_char.repeat(side_len),
+            label,
+            line_char.repeat(side_len),
+        );
+        let sep_color = theme::separator();
         dynamic.push(Line::default());
-
-        let mut parts: Vec<Span> = Vec::new();
-        parts.push(Span::styled(
-            format!("{}  \u{2713} ", INDENT),
-            Style::default().fg(theme::SUCCESS),
-        ));
-        parts.push(Span::styled(
-            format!("{} in {}", verb, time_str),
-            Style::default().fg(theme::TEXT_SECONDARY),
-        ));
-        if finished_step_count > 0 {
-            parts.push(Span::styled(
-                format!(" \u{00b7} {} turns", finished_step_count),
-                Style::default().fg(theme::TEXT_MUTED),
-            ));
-        }
-
-        dynamic.push(Line::from(parts));
-    }
-
-    // Approval prompt — render when waiting for user approval
-    if let AppMode::WaitingApproval(ref call) = mode {
-        render_approval(&mut dynamic, call);
+        dynamic.push(Line::from(Span::styled(sep, Style::default().fg(sep_color))));
     }
 
     let total = cached_len + dynamic.len();
@@ -230,42 +216,35 @@ pub fn render(
         matches!(mode, AppMode::Streaming | AppMode::ToolExecuting)
         || step_count > 0
     );
-    if turn_active && area.height >= 3 {
-        let bar_style = Style::default().fg(theme::ACCENT_DIM);
+    if turn_active && area.height >= 2 {
+        let spin_y = area.y + area.height - 1;
+        let spin_rect = Rect::new(area.x, spin_y, area.width, 1);
+        frame.render_widget(Clear, spin_rect);
+
         let spinner = SPINNER[tick % SPINNER.len()];
+        let bar_style = Style::default().fg(theme::accent_dim());
         let wait_ms = llm_wait_ms.unwrap_or(0);
         let spin_color = if first_token_ms.is_some() {
-            theme::ACCENT
+            theme::accent()
         } else if wait_ms < 10_000 {
-            theme::WAIT_FAST
+            theme::wait_fast()
         } else if wait_ms < 60_000 {
-            theme::WAIT_NORMAL
+            theme::wait_normal()
         } else if wait_ms < 120_000 {
-            theme::WAIT_SLOW
+            theme::wait_slow()
         } else {
-            theme::WAIT_VERY_SLOW
+            theme::wait_very_slow()
         };
+        let step_prefix = if step_count > 0 { format!("[turn {}] ", step_count) } else { String::new() };
         let has_tokens = conversation.stream_buffer.as_ref().map_or(false, |b| !b.is_empty());
-
-        // Line 1: tool/result info
-        let tool_line_content = if matches!(mode, AppMode::ToolExecuting) && !tool_info.is_empty() {
-            // Currently executing a tool
-            format!("\u{25b8} {}", tool_info) // ▸ Edit File: DevCenter.vue
-        } else if !last_completed_tool.is_empty() {
-            // Last tool result
-            last_completed_tool.to_string() // ✓ edit_file Edited DevCenter.vue...
-        } else {
-            String::new()
-        };
-
-        // Line 2: thinking status + time
-        let thinking_label = if matches!(mode, AppMode::ToolExecuting) {
-            "Executing...".to_string()
+        let label = if matches!(mode, AppMode::ToolExecuting) && !tool_info.is_empty() {
+            tool_info.to_string()
         } else if has_tokens {
             "Generating...".to_string()
+        } else if step_count > 0 && !last_completed_tool.is_empty() {
+            format!("After {}, thinking", last_completed_tool)
         } else {
-            let labels = THINKING_LABELS;
-            format!("{}...", labels[turn_label_seed % labels.len()])
+            "Thinking...".to_string()
         };
         let time_str = if wait_ms >= 60_000 {
             format!("  {:.0}m{:.0}s", wait_ms / 60_000, (wait_ms % 60_000) / 1000)
@@ -275,30 +254,14 @@ pub fn render(
             String::new()
         };
 
-        // Render: 2 rows at bottom of chat area
-        let spin_y = area.y + area.height - 2;
-        let line1_rect = Rect::new(area.x, spin_y, area.width, 1);
-        let line2_rect = Rect::new(area.x, spin_y + 1, area.width, 1);
-        frame.render_widget(Clear, line1_rect);
-        frame.render_widget(Clear, line2_rect);
-
-        if !tool_line_content.is_empty() {
-            let tool_line = Line::from(vec![
-                Span::styled(format!("{}\u{2502} ", INDENT), bar_style),
-                Span::styled(tool_line_content, Style::default().fg(theme::TEXT_SECONDARY)),
-            ]);
-            frame.render_widget(Paragraph::new(vec![tool_line]), line1_rect);
-        }
-
-        let step_prefix = if step_count > 0 { format!("[turn {}] ", step_count) } else { String::new() };
-        let status_line = Line::from(vec![
+        let spin_line = Line::from(vec![
             Span::styled(format!("{}\u{2502} ", INDENT), bar_style),
             Span::styled(format!("{} ", spinner), Style::default().fg(spin_color)),
-            Span::styled(step_prefix, Style::default().fg(theme::TEXT_MUTED)),
-            Span::styled(thinking_label, Style::default().fg(spin_color)),
+            Span::styled(step_prefix, Style::default().fg(theme::text_secondary())),
+            Span::styled(label, Style::default().fg(spin_color)),
             Span::styled(time_str, Style::default().fg(spin_color)),
         ]);
-        frame.render_widget(Paragraph::new(vec![status_line]), line2_rect);
+        frame.render_widget(Paragraph::new(vec![spin_line]), spin_rect);
     }
     // Return (total_lines, scroll_offset) for scroll handling
     (total, scroll_usize)
@@ -314,13 +277,13 @@ fn render_user(lines: &mut Vec<Line<'static>>, content: &str) {
     for (i, text_line) in text_lines.iter().enumerate() {
         if i == 0 {
             lines.push(Line::from(vec![
-                Span::styled(format!("{}\u{276f} ", INDENT), Style::default().fg(theme::USER_CHEVRON).add_modifier(Modifier::BOLD)),
-                Span::styled(text_line.to_string(), Style::default().fg(theme::TEXT_PRIMARY)),
+                Span::styled(format!("{}\u{276f} ", INDENT), Style::default().fg(theme::user_chevron()).add_modifier(Modifier::BOLD)),
+                Span::styled(text_line.to_string(), Style::default().fg(theme::text_primary())),
             ]));
         } else {
             lines.push(Line::from(vec![
                 Span::styled(format!("{}  ", INDENT), Style::default()),
-                Span::styled(text_line.to_string(), Style::default().fg(theme::TEXT_PRIMARY)),
+                Span::styled(text_line.to_string(), Style::default().fg(theme::text_primary())),
             ]));
         }
     }
@@ -331,7 +294,7 @@ fn render_user(lines: &mut Vec<Line<'static>>, content: &str) {
 // Thin accent bar on the left — visual anchor that groups the response.
 // Claude Code uses this exact pattern: subtle colored bar + indented content.
 fn render_assistant(lines: &mut Vec<Line<'static>>, content: &str, max_width: usize) {
-    let bar = Span::styled(format!("{}\u{2502} ", INDENT), Style::default().fg(theme::ACCENT_DIM));
+    let bar = Span::styled(format!("{}\u{2502} ", INDENT), Style::default().fg(theme::accent_dim()));
     // Content width = terminal width minus the bar prefix (3 columns: " │ ")
     let content_w = max_width.saturating_sub(3);
     let md = wrap_lines(render_markdown(content), content_w);
@@ -345,26 +308,26 @@ fn render_assistant(lines: &mut Vec<Line<'static>>, content: &str, max_width: us
 // ── Tool Call ──
 // Accent bar continues through tool calls for visual grouping within a turn.
 fn render_tool_call(lines: &mut Vec<Line<'static>>, call: &ToolCall) {
-    let bar = Span::styled(format!("{}\u{2502} ", INDENT), Style::default().fg(theme::ACCENT_DIM));
+    let bar = Span::styled(format!("{}\u{2502} ", INDENT), Style::default().fg(theme::accent_dim()));
     let name = capitalize(&call.name);
     let detail = format_tool_detail(&call.name, &call.arguments);
 
     // Per-tool icon + color
     let (icon, icon_color) = match call.name.as_str() {
-        "read_file" => ("\u{25b8}", theme::INFO),           // ▸
-        "edit_file" => ("\u{25b8}", theme::TOOL_EDIT),  // ▸ green
-        "write_file" => ("\u{25b8}", theme::TOOL_EDIT),
-        "bash" => ("\u{25b8}", theme::TOOL_BASH),       // ▸ gold
-        "grep" | "glob" | "web_search" => ("\u{25b8}", theme::TOOL_SEARCH),
-        "web_fetch" => ("\u{25b8}", theme::TOOL_SEARCH),
-        _ => ("\u{25b8}", theme::INFO),
+        "read_file" => ("\u{25b8}", theme::info()),           // ▸
+        "edit_file" => ("\u{25b8}", theme::tool_edit()),  // ▸ green
+        "write_file" => ("\u{25b8}", theme::tool_edit()),
+        "bash" => ("\u{25b8}", theme::tool_bash()),       // ▸ gold
+        "grep" | "glob" | "web_search" => ("\u{25b8}", theme::tool_search()),
+        "web_fetch" => ("\u{25b8}", theme::tool_search()),
+        _ => ("\u{25b8}", theme::info()),
     };
 
     lines.push(Line::from(vec![
         bar.clone(),
         Span::styled(format!("  {} ", icon), Style::default().fg(icon_color)),
-        Span::styled(name, Style::default().fg(theme::INFO)),
-        Span::styled(format!("  {}", detail), Style::default().fg(theme::TEXT_MUTED)),
+        Span::styled(name, Style::default().fg(theme::info()).add_modifier(Modifier::BOLD)),
+        Span::styled(format!("  {}", detail), Style::default().fg(theme::text_muted())),
     ]));
 
     // edit_file: show old_string preview
@@ -378,7 +341,7 @@ fn render_tool_call(lines: &mut Vec<Line<'static>>, call: &ToolCall) {
                 if !display.trim().is_empty() {
                     lines.push(Line::from(vec![
                         bar.clone(),
-                        Span::styled(format!("    \u{2192} {}", display.trim()), Style::default().fg(theme::TEXT_MUTED)),
+                        Span::styled(format!("    \u{2192} {}", display.trim()), Style::default().fg(theme::text_muted())),
                     ]));
                 }
             }
@@ -387,14 +350,10 @@ fn render_tool_call(lines: &mut Vec<Line<'static>>, call: &ToolCall) {
 }
 
 // ── Tool Result ──
-// Claude Code style: compact one-line summary with duration.
 // Diff lines shown for edit_file only. `expanded` shows full output for recent calls.
 fn render_tool_result(lines: &mut Vec<Line<'static>>, result: &ToolResult, expanded: bool) {
-    let bar = Span::styled(format!("{}\u{2502} ", INDENT), Style::default().fg(theme::ACCENT_DIM));
-    let (icon, color) = if result.success {
-        ("\u{2713}", theme::SUCCESS)
-    } else {
-        ("\u{2717}", theme::ERROR)
+    let bar = Span::styled(format!("{}\u{2502} ", INDENT), Style::default().fg(theme::accent_dim()));
+        ("\u{2717}", theme::error())
     };
 
     let output = &result.output;
@@ -442,89 +401,45 @@ fn render_tool_result(lines: &mut Vec<Line<'static>>, result: &ToolResult, expan
     let expand_indicator = if expanded { "\u{25be}" } else { "\u{25b8}" };
 
     // Main result line: indicator + icon + summary + duration
+    // Main result line: icon + summary + duration
     let mut spans = vec![
         bar.clone(),
-        Span::styled(format!(" {} ", expand_indicator), Style::default().fg(theme::TEXT_MUTED)),
+        Span::styled(format!(" {} ", expand_indicator), Style::default().fg(theme::text_muted())),
         Span::styled(format!("{} ", icon), Style::default().fg(color)),
-        Span::styled(summary, Style::default().fg(theme::TEXT_MUTED)),
+        Span::styled(summary, Style::default().fg(theme::text_muted())),
     ];
     if !duration.is_empty() {
-        spans.push(Span::styled(format!(" {}", duration), Style::default().fg(theme::TEXT_MUTED)));
+        spans.push(Span::styled(format!(" {}", duration), Style::default().fg(theme::text_muted())));
     }
     lines.push(Line::from(spans));
 
-    // For edit results: show unified diff with line numbers, colored bg — max 15 lines
+    // For edit results: show diff lines (- red, + green) — max 6 lines
     if result.success && (output.contains("\n- ") || output.contains("\n+ ")) {
-        // Collect diff lines with their original line numbers from the output.
-        // The output format from edit_file is:
-        //   "Edited file (-N +M lines).\n- old1\n- old2\n+ new1\n+ new2"
-        let diff_lines: Vec<&str> = output.lines()
-            .filter(|l| {
-                let t = l.trim();
-                t.starts_with("- ") || t.starts_with("+ ")
-            })
-            .collect();
-
-        let total_diff = diff_lines.len();
-        let max_diff_lines = 15;
-        let show_count = total_diff.min(max_diff_lines);
-
-        // Assign gutter line numbers: removed lines count from 1, added lines
-        // count from 1 separately (like unified diff old/new line numbers).
-        let mut old_lineno: usize = 1;
-        let mut new_lineno: usize = 1;
-
-        for (i, diff_line) in diff_lines.iter().enumerate() {
-            if i >= show_count { break; }
-            let trimmed = diff_line.trim();
-
-            let (prefix, gutter_num, fg_color, bg_color) = if trimmed.starts_with("- ") {
-                let n = old_lineno;
-                old_lineno += 1;
-                ("-", n, theme::DIFF_REMOVE, theme::DIFF_REMOVE_BG)
-            } else {
-                let n = new_lineno;
-                new_lineno += 1;
-                ("+", n, theme::DIFF_ADD, theme::DIFF_ADD_BG)
-            };
-
-            // Content after the "- " or "+ " prefix
-            let content = &trimmed[2..];
-            let display = if content.chars().count() > 60 {
-                format!("{}...", content.chars().take(57).collect::<String>())
-            } else {
-                content.to_string()
-            };
-
-            // Gutter: right-aligned 4-char line number
-            let gutter = format!("{:>4}", gutter_num);
-
-            lines.push(Line::from(vec![
-                bar.clone(),
-                Span::styled(
-                    format!("  {}", gutter),
-                    Style::default().fg(theme::DIFF_GUTTER),
-                ),
-                Span::styled(
-                    format!(" {} ", prefix),
-                    Style::default().fg(fg_color).bg(bg_color),
-                ),
-                Span::styled(
-                    format!("{} ", display),
-                    Style::default().fg(fg_color).bg(bg_color),
-                ),
-            ]));
+        let mut diff_shown = 0;
+        for line in output.lines() {
+            if diff_shown >= 6 { break; }
+            let trimmed = line.trim();
+            if trimmed.starts_with("- ") {
+                let display = if trimmed.chars().count() > 65 {
+                    format!("{}...", trimmed.chars().take(62).collect::<String>())
+                } else { trimmed.to_string() };
+                lines.push(Line::from(vec![
+                    bar.clone(),
+                    Span::styled(format!("    {}", display), Style::default().fg(theme::diff_remove())),
+                ]));
+                diff_shown += 1;
+            } else if trimmed.starts_with("+ ") {
+                let display = if trimmed.chars().count() > 65 {
+                    format!("{}...", trimmed.chars().take(62).collect::<String>())
+                } else { trimmed.to_string() };
+                lines.push(Line::from(vec![
+                    bar.clone(),
+                    Span::styled(format!("    {}", display), Style::default().fg(theme::diff_add())),
+                ]));
+                diff_shown += 1;
+            }
         }
-
-        if total_diff > max_diff_lines {
-            lines.push(Line::from(vec![
-                bar.clone(),
-                Span::styled(
-                    format!("        ... ({} more lines)", total_diff - max_diff_lines),
-                    Style::default().fg(theme::TEXT_MUTED),
-                ),
-            ]));
-        }
+    }
     }
 
     // For errors: show a few detail lines
@@ -539,7 +454,7 @@ fn render_tool_result(lines: &mut Vec<Line<'static>>, result: &ToolResult, expan
             } else { trimmed.to_string() };
             lines.push(Line::from(vec![
                 bar.clone(),
-                Span::styled(format!("    {}", display), Style::default().fg(theme::ERROR)),
+                Span::styled(format!("    {}", display), Style::default().fg(theme::error())),
             ]));
             shown += 1;
         }
@@ -597,17 +512,18 @@ fn extract_duration(output: &str) -> String {
     String::new()
 }
 // ── Approval ──
+#[allow(dead_code)]
 fn render_approval(lines: &mut Vec<Line<'static>>, call: &ToolCall) {
     let name = capitalize(&call.name);
-    let border = Style::default().fg(theme::WARNING);
-    let key_label = Style::default().fg(theme::TEXT_MUTED);
+    let border = Style::default().fg(theme::warning());
+    let key_label = Style::default().fg(theme::text_muted());
 
     lines.push(Line::default());
     // Top border
     lines.push(Line::from(vec![
         Span::styled(format!("{}\u{256d}\u{2500}\u{2500} ", TOOL_INDENT), border),
-        Span::styled(format!("\u{26a1} {} ", name), Style::default().fg(theme::WARNING).add_modifier(Modifier::BOLD)),
-        Span::styled("\u{2500}".repeat(24), Style::default().fg(theme::SEPARATOR)),
+        Span::styled(format!("\u{26a1} {} ", name), Style::default().fg(theme::warning()).add_modifier(Modifier::BOLD)),
+        Span::styled("\u{2500}".repeat(24), Style::default().fg(theme::separator())),
     ]));
 
     // Args
@@ -631,13 +547,13 @@ fn render_approval(lines: &mut Vec<Line<'static>>, call: &ToolCall) {
                     if i == 0 {
                         lines.push(Line::from(vec![
                             Span::styled(format!("{}\u{2502} ", TOOL_INDENT), border),
-                            Span::styled(format!("{}: ", k), Style::default().fg(theme::TEXT_SECONDARY)),
-                            Span::styled(vline.to_string(), Style::default().fg(theme::TEXT_PRIMARY)),
+                            Span::styled(format!("{}: ", k), Style::default().fg(theme::text_secondary())),
+                            Span::styled(vline.to_string(), Style::default().fg(theme::text_primary())),
                         ]));
                     } else {
                         lines.push(Line::from(vec![
                             Span::styled(format!("{}\u{2502}   ", TOOL_INDENT), border),
-                            Span::styled(vline.to_string(), Style::default().fg(theme::TEXT_SECONDARY)),
+                            Span::styled(vline.to_string(), Style::default().fg(theme::text_secondary())),
                         ]));
                     }
                 }
@@ -648,19 +564,19 @@ fn render_approval(lines: &mut Vec<Line<'static>>, call: &ToolCall) {
     // Bottom border
     lines.push(Line::from(Span::styled(
         format!("{}\u{2570}{}", TOOL_INDENT, "\u{2500}".repeat(32)),
-        Style::default().fg(theme::SEPARATOR),
+        Style::default().fg(theme::separator()),
     )));
 
     // Action buttons with prominent prompt
     lines.push(Line::from(vec![
         Span::raw(format!("{}", TOOL_INDENT)),
-        Span::styled(" \u{25b6} ", Style::default().fg(theme::WARNING).add_modifier(Modifier::BOLD)),
-        Span::styled("Waiting for approval: ", Style::default().fg(theme::WARNING)),
-        Span::styled(" Y ", Style::default().fg(theme::TEXT_ON_ACCENT).bg(theme::SUCCESS).add_modifier(Modifier::BOLD)),
+        Span::styled(" \u{25b6} ", Style::default().fg(theme::warning()).add_modifier(Modifier::BOLD)),
+        Span::styled("Waiting for approval: ", Style::default().fg(theme::warning())),
+        Span::styled(" Y ", Style::default().fg(theme::TEXT_ON_ACCENT).bg(theme::success()).add_modifier(Modifier::BOLD)),
         Span::styled(" Allow  ", key_label),
-        Span::styled(" A ", Style::default().fg(theme::TEXT_ON_ACCENT).bg(theme::INFO).add_modifier(Modifier::BOLD)),
+        Span::styled(" A ", Style::default().fg(theme::TEXT_ON_ACCENT).bg(theme::info()).add_modifier(Modifier::BOLD)),
         Span::styled(" Always  ", key_label),
-        Span::styled(" N ", Style::default().fg(theme::TEXT_ON_ACCENT).bg(theme::ERROR).add_modifier(Modifier::BOLD)),
+        Span::styled(" N ", Style::default().fg(theme::TEXT_ON_ACCENT).bg(theme::error()).add_modifier(Modifier::BOLD)),
         Span::styled(" Deny", key_label),
     ]));
     lines.push(Line::default());

@@ -1,11 +1,12 @@
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::symbols::border;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Padding, Paragraph};
 use ratatui::Frame;
 
 use crate::app::InputState;
+use crate::ui::theme;
 
 const H_PADDING: u16 = 3;
 
@@ -17,17 +18,16 @@ pub fn render(frame: &mut Frame, area: Rect, input: &InputState, is_busy: bool, 
     let inner_width = inner_width.max(1);
 
     // Build visual lines by manually wrapping each logical line.
-    // This gives us exact control over cursor position (no ratatui Wrap needed).
     let (visual_lines, cursor_visual_row, cursor_visual_col) = if is_empty {
         let placeholder = if let Some(sug) = suggestion {
             vec![Line::from(vec![
-                Span::styled(sug.to_string(), Style::default().fg(Color::Rgb(60, 62, 72))),
-                Span::styled("  Tab", Style::default().fg(Color::Rgb(45, 47, 55))),
+                Span::styled(sug.to_string(), Style::default().fg(theme::text_secondary())),
+                Span::styled("  Tab", Style::default().fg(theme::text_muted())),
             ])]
         } else {
             vec![Line::from(Span::styled(
                 "Ask anything\u{2026}",
-                Style::default().fg(Color::Rgb(55, 58, 70)),
+                Style::default().fg(theme::text_muted()),
             ))]
         };
         (placeholder, 0usize, 0usize)
@@ -43,11 +43,11 @@ pub fn render(frame: &mut Frame, area: Rect, input: &InputState, is_busy: bool, 
             vis_lines.push(Line::from(vec![
                 Span::styled(
                     "\u{25a0} Pasted text ".to_string(),
-                    Style::default().fg(Color::Rgb(100, 130, 185)),
+                    Style::default().fg(theme::info()),
                 ),
                 Span::styled(
                     format!("({} lines, {} chars)", line_count, char_count),
-                    Style::default().fg(Color::Rgb(70, 75, 90)),
+                    Style::default().fg(theme::text_muted()),
                 ),
             ]));
         }
@@ -129,9 +129,8 @@ pub fn render(frame: &mut Frame, area: Rect, input: &InputState, is_busy: bool, 
         let end = (start + max_visible).min(visual_lines.len());
         (visual_lines[start..end].to_vec(), start)
     };
-
-    let border_color = if is_busy { Color::Rgb(65, 62, 48) } else { Color::Rgb(60, 62, 75) };
-    let prompt = Span::styled(" \u{276f} ", Style::default().fg(Color::Rgb(100, 180, 255)).add_modifier(Modifier::BOLD));
+    let border_color = if is_busy { theme::warning() } else { theme::border() };
+    let prompt = Span::styled(" \u{276f} ", Style::default().fg(theme::user_chevron()).add_modifier(Modifier::BOLD));
     let block = Block::default()
         .borders(Borders::ALL)
         .border_set(border::ROUNDED)
@@ -144,8 +143,8 @@ pub fn render(frame: &mut Frame, area: Rect, input: &InputState, is_busy: bool, 
         let tag_area = Rect::new(area.x, area.y, area.width, 1);
         let mut tag_spans: Vec<Span> = vec![Span::raw(" ".to_string())];
         for file in attached {
-            tag_spans.push(Span::styled(format!(" {} ", file.file_type), Style::default().fg(Color::White).bg(Color::Rgb(60, 55, 80))));
-            tag_spans.push(Span::styled(format!(" {} ", file.filename), Style::default().fg(Color::Rgb(150, 150, 160))));
+            tag_spans.push(Span::styled(format!(" {} ", file.file_type), Style::default().fg(theme::text_on_accent()).bg(theme::brand_bg())));
+            tag_spans.push(Span::styled(format!(" {} ", file.filename), Style::default().fg(theme::text_secondary())));
             tag_spans.push(Span::raw("  ".to_string()));
         }
         frame.render_widget(Paragraph::new(Line::from(tag_spans)), tag_area);
@@ -153,9 +152,8 @@ pub fn render(frame: &mut Frame, area: Rect, input: &InputState, is_busy: bool, 
     } else {
         (area, 0u16)
     };
-
     // No Wrap — we already split lines manually
-    let widget = Paragraph::new(display_lines).block(block).style(Style::default().fg(Color::White));
+    let widget = Paragraph::new(display_lines).block(block).style(Style::default().fg(theme::text_primary()));
     frame.render_widget(widget, input_area);
 
     // Cursor position — exact because we track visual rows ourselves

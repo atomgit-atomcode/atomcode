@@ -33,18 +33,18 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     let git = git_info(&app.working_dir);
 
     // Gradient: top orbit → core → bottom orbit
-    let c_orbit = theme::ACCENT_DIM;
-    let c_core = theme::ACCENT;
+    let c_orbit = theme::accent_dim();
+    let c_core = theme::accent();
 
     // Line 1: top orbit + "atomcode"
     lines.push(Line::from(vec![
         Span::styled(format!("  {}", ATOM[0]), Style::default().fg(c_orbit)),
         Span::styled(
             "  atomcode",
-            Style::default().fg(theme::TEXT_PRIMARY).add_modifier(Modifier::BOLD),
+            Style::default().fg(theme::text_primary()).add_modifier(Modifier::BOLD),
         ),
     ]));
-    // Line 2: core + version [build] · model
+    // Line 2: core + version · model
     lines.push(Line::from(vec![
         Span::styled(
             format!("  {}", ATOM[1]),
@@ -52,16 +52,12 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         ),
         Span::styled(
             format!("  v{}", env!("CARGO_PKG_VERSION")),
-            Style::default().fg(theme::TEXT_MUTED),
+            Style::default().fg(theme::text_muted()),
         ),
-        Span::styled(
-            format!(" [{}]", env!("ATOMCODE_BUILD_ID")),
-            Style::default().fg(theme::BORDER),
-        ),
-        Span::styled(" · ", Style::default().fg(theme::BORDER)),
+        Span::styled(" · ", Style::default().fg(theme::border())),
         Span::styled(
             app.model_name.clone(),
-            Style::default().fg(theme::TEXT_SECONDARY),
+            Style::default().fg(theme::text_secondary()),
         ),
     ]));
     // Line 3: bottom orbit + path (+ git)
@@ -69,19 +65,19 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         Span::styled(format!("  {}", ATOM[2]), Style::default().fg(c_orbit)),
         Span::styled(
             format!("  {}", short_home(&app.working_dir)),
-            Style::default().fg(theme::TEXT_MUTED),
+            Style::default().fg(theme::text_muted()),
         ),
     ];
     if let Some((branch, dirty)) = &git {
         path_spans.push(Span::styled("  ", Style::default()));
         path_spans.push(Span::styled(
             format!(" {}", branch),
-            Style::default().fg(theme::INFO),
+            Style::default().fg(theme::info()),
         ));
         if *dirty {
             path_spans.push(Span::styled(
                 " ✱",
-                Style::default().fg(theme::WARNING),
+                Style::default().fg(theme::warning()),
             ));
         }
     }
@@ -93,13 +89,13 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     let sep_w = (area.width as usize).min(60);
     lines.push(Line::from(Span::styled(
         format!("  {}", "─".repeat(sep_w.saturating_sub(4))),
-        Style::default().fg(theme::BORDER),
+        Style::default().fg(theme::border()),
     )));
     lines.push(Line::default());
 
     // ── Shortcuts — two-column ──
-    let k = Style::default().fg(theme::TEXT_SECONDARY);
-    let d = Style::default().fg(theme::TEXT_MUTED);
+    let k = Style::default().fg(theme::text_secondary());
+    let d = Style::default().fg(theme::text_muted());
 
     lines.push(two_col("Enter",       "Send",            "/",        "Commands", k, d));
     lines.push(two_col("Shift+Enter", "Newline",         "/model",   "Switch model", k, d));
@@ -110,7 +106,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     lines.push(Line::default());
     lines.push(Line::from(Span::styled(
         "  Type a message to get started.",
-        Style::default().fg(theme::TEXT_MUTED),
+        Style::default().fg(theme::text_muted()),
     )));
 
     let paragraph = Paragraph::new(lines);
@@ -132,8 +128,8 @@ pub fn render_setup(frame: &mut Frame, area: Rect, state: &WelcomeState) {
         lines.push(Line::default());
     }
 
-    let c_orbit = theme::ACCENT_DIM;
-    let c_core = theme::ACCENT;
+    let c_orbit = theme::accent_dim();
+    let c_core = theme::accent();
 
     // ── Atom + brand ──
     lines.push(Line::from(vec![
@@ -146,11 +142,11 @@ pub fn render_setup(frame: &mut Frame, area: Rect, state: &WelcomeState) {
         ),
         Span::styled(
             "  atomcode",
-            Style::default().fg(theme::TEXT_PRIMARY).add_modifier(Modifier::BOLD),
+            Style::default().fg(theme::text_primary()).add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             format!("  v{}", env!("CARGO_PKG_VERSION")),
-            Style::default().fg(theme::TEXT_MUTED),
+            Style::default().fg(theme::text_muted()),
         ),
     ]));
     lines.push(Line::from(vec![
@@ -162,13 +158,13 @@ pub fn render_setup(frame: &mut Frame, area: Rect, state: &WelcomeState) {
     let sep_w = (area.width as usize).min(48);
     lines.push(Line::from(Span::styled(
         format!("  {}", "─".repeat(sep_w.saturating_sub(4))),
-        Style::default().fg(theme::BORDER),
+        Style::default().fg(theme::border()),
     )));
     lines.push(Line::default());
 
     lines.push(Line::from(Span::styled(
         "  Get started:",
-        Style::default().fg(theme::TEXT_SECONDARY),
+        Style::default().fg(theme::text_secondary()),
     )));
     lines.push(Line::default());
 
@@ -181,20 +177,20 @@ pub fn render_setup(frame: &mut Frame, area: Rect, state: &WelcomeState) {
         let is_sel = i == state.selected;
         if is_sel {
             lines.push(Line::from(vec![
-                Span::styled("  ▸ ", Style::default().fg(theme::ACCENT)),
+                Span::styled("  ▸ ", Style::default().fg(theme::accent())),
                 Span::styled(
                     label.to_string(),
-                    Style::default().fg(theme::TEXT_PRIMARY).add_modifier(Modifier::BOLD),
+                    Style::default().fg(theme::text_primary()).add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
                     format!("  {}", hint),
-                    Style::default().fg(theme::TEXT_MUTED),
+                    Style::default().fg(theme::text_muted()),
                 ),
             ]));
         } else {
             lines.push(Line::from(vec![
                 Span::styled("    ", Style::default()),
-                Span::styled(label.to_string(), Style::default().fg(theme::TEXT_SECONDARY)),
+                Span::styled(label.to_string(), Style::default().fg(theme::text_secondary())),
             ]));
         }
     }
@@ -204,14 +200,14 @@ pub fn render_setup(frame: &mut Frame, area: Rect, state: &WelcomeState) {
     if let Some(ref err) = state.error {
         lines.push(Line::from(Span::styled(
             format!("  {}", err),
-            Style::default().fg(theme::ERROR),
+            Style::default().fg(theme::error()),
         )));
         lines.push(Line::default());
     }
 
     lines.push(Line::from(Span::styled(
         "  ↑↓ select · Enter confirm · Esc skip",
-        Style::default().fg(theme::TEXT_MUTED),
+        Style::default().fg(theme::text_muted()),
     )));
 
     let paragraph = Paragraph::new(lines);

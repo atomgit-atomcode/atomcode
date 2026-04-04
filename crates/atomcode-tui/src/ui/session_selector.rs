@@ -61,15 +61,15 @@ pub fn render(frame: &mut Frame, area: Rect, sessions: &[SessionMeta], selected:
     
     // Header
     lines.push(Line::from(vec![
-        Span::styled(" Resume Session", Style::default().fg(theme::BRAND_FG).add_modifier(Modifier::BOLD)),
+        Span::styled(" Resume Session", Style::default().fg(theme::brand_fg()).add_modifier(Modifier::BOLD)),
     ]));
     
     lines.push(Line::default()); // blank line
     
     // Search row - first item (index 0)
     let search_is_selected = selected == 0;
-    let search_bg = if search_is_selected { theme::BRAND_BG } else { theme::BG_SURFACE };
-    let search_fg = if search_is_selected { theme::TEXT_PRIMARY } else { theme::TEXT_SECONDARY };
+    let search_bg = if search_is_selected { theme::brand_bg() } else { theme::bg_surface() };
+    let search_fg = if search_is_selected { theme::text_primary() } else { theme::text_secondary() };
     
     let search_prompt = if query.is_empty() {
         " Type to search..."
@@ -85,7 +85,7 @@ pub fn render(frame: &mut Frame, area: Rect, sessions: &[SessionMeta], selected:
         Span::styled(
             search_prompt,
             Style::default().fg(if query.is_empty() { 
-                if search_is_selected { theme::TEXT_MUTED } else { theme::TEXT_MUTED } 
+                if search_is_selected { theme::text_muted() } else { theme::text_muted() } 
             } else { 
                 search_fg 
             }).bg(search_bg)
@@ -98,7 +98,7 @@ pub fn render(frame: &mut Frame, area: Rect, sessions: &[SessionMeta], selected:
     if search_is_selected {
         lines.push(Line::from(vec![
             Span::styled("      ", Style::default()),
-            Span::styled("Type to filter sessions", Style::default().fg(theme::TEXT_MUTED)),
+            Span::styled("Type to filter sessions", Style::default().fg(theme::text_muted())),
         ]));
     }
     
@@ -107,13 +107,13 @@ pub fn render(frame: &mut Frame, area: Rect, sessions: &[SessionMeta], selected:
     if filtered.is_empty() {
         if query.is_empty() {
             lines.push(Line::from(vec![
-                Span::styled("  No sessions found. Start a conversation first.", Style::default().fg(theme::TEXT_MUTED)),
+                Span::styled("  No sessions found. Start a conversation first.", Style::default().fg(theme::text_muted())),
             ]));
         } else {
             lines.push(Line::from(vec![
-                Span::styled("  No sessions matching '", Style::default().fg(theme::TEXT_MUTED)),
-                Span::styled(query, Style::default().fg(theme::TEXT_SECONDARY)),
-                Span::styled("'", Style::default().fg(theme::TEXT_MUTED)),
+                Span::styled("  No sessions matching '", Style::default().fg(theme::text_muted())),
+                Span::styled(query, Style::default().fg(theme::text_secondary())),
+                Span::styled("'", Style::default().fg(theme::text_muted())),
             ]));
         }
     } else {
@@ -125,9 +125,9 @@ pub fn render(frame: &mut Frame, area: Rect, sessions: &[SessionMeta], selected:
             // Line 1: Session name with indicator
             let indicator = if is_selected { " \u{25b8} " } else { "   " };
             let name_style = if is_selected {
-                Style::default().fg(theme::TEXT_PRIMARY).bg(theme::BRAND_BG).add_modifier(Modifier::BOLD)
+                Style::default().fg(theme::text_primary()).bg(theme::brand_bg()).add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(theme::TEXT_PRIMARY)
+                Style::default().fg(theme::text_primary())
             };
             
             lines.push(Line::from(vec![
@@ -140,9 +140,9 @@ pub fn render(frame: &mut Frame, area: Rect, sessions: &[SessionMeta], selected:
             let size_str = format_size(session.file_size);
             let msg_str = format!("{} messages", session.message_count);
             let meta_style = if is_selected {
-                Style::default().fg(theme::TEXT_SECONDARY)
+                Style::default().fg(theme::text_secondary())
             } else {
-                Style::default().fg(theme::TEXT_MUTED)
+                Style::default().fg(theme::text_muted())
             };
             
             lines.push(Line::from(vec![
@@ -161,14 +161,14 @@ pub fn render(frame: &mut Frame, area: Rect, sessions: &[SessionMeta], selected:
     // Help hint
     lines.push(Line::from(vec![
         Span::styled("  ", Style::default()),
-        Span::styled("\u{2191}\u{2193}", Style::default().fg(theme::TEXT_MUTED)),
-        Span::styled(" navigate  ", Style::default().fg(theme::TEXT_MUTED)),
-        Span::styled("type", Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD)),
-        Span::styled(" to search  ", Style::default().fg(theme::TEXT_MUTED)),
-        Span::styled("Enter", Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD)),
-        Span::styled(" resume  ", Style::default().fg(theme::TEXT_MUTED)),
-        Span::styled("Esc", Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD)),
-        Span::styled(" cancel", Style::default().fg(theme::TEXT_MUTED)),
+        Span::styled("\u{2191}\u{2193}", Style::default().fg(theme::text_muted())),
+        Span::styled(" navigate  ", Style::default().fg(theme::text_muted())),
+        Span::styled("type", Style::default().fg(theme::accent()).add_modifier(Modifier::BOLD)),
+        Span::styled(" to search  ", Style::default().fg(theme::text_muted())),
+        Span::styled("Enter", Style::default().fg(theme::accent()).add_modifier(Modifier::BOLD)),
+        Span::styled(" resume  ", Style::default().fg(theme::text_muted())),
+        Span::styled("Esc", Style::default().fg(theme::accent()).add_modifier(Modifier::BOLD)),
+        Span::styled(" cancel", Style::default().fg(theme::text_muted())),
     ]));
     
     let paragraph = Paragraph::new(lines);

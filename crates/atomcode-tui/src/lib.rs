@@ -318,6 +318,9 @@ pub async fn run(
     working_dir: std::path::PathBuf,
     session_to_continue: Option<atomcode_core::session::Session>,
 ) -> Result<()> {
+    // Initialize theme (detect terminal background color)
+    ui::theme::Theme::init();
+    
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
     // Clear main screen + scrollback BEFORE entering alternate screen so Terminal.app
