@@ -4,6 +4,7 @@
 
 pub mod git_checkpoint;
 pub mod knowledge;
+pub mod sub_agent;
 pub mod subtask_driver;
 pub mod task_classifier;
 
@@ -295,6 +296,9 @@ impl AgentLoop {
         // Share tool registry between AgentLoop and TurnRunner via Arc.
         let shared_tools = std::sync::Arc::new(tool_registry);
 
+        // Convert Box → Arc so provider can be shared with sub-agents.
+        let provider: std::sync::Arc<dyn LlmProvider> = std::sync::Arc::from(provider);
+
         let turn_runner = TurnRunner {
             provider,
             tools: shared_tools.clone(),
@@ -415,7 +419,7 @@ impl AgentLoop {
                         match crate::provider::create_provider(provider_config) {
                             Ok(new_provider) => {
                                 let model_name = new_provider.model_name().to_string();
-                                self.turn_runner.provider = new_provider;
+                                self.turn_runner.provider = std::sync::Arc::from(new_provider);
                                 self.turn_runner.config = self.config.clone();
                                 let _ = self.event_tx.send(AgentEvent::TextDelta(
                                     format!("**Switched to: {} / {}**\n\n", provider_name, model_name)
@@ -449,7 +453,7 @@ impl AgentLoop {
                     if let Some(provider_config) = self.config.providers.get(&new_provider_name) {
                         match crate::provider::create_provider(provider_config) {
                             Ok(new_provider) => {
-                                self.turn_runner.provider = new_provider;
+                                self.turn_runner.provider = std::sync::Arc::from(new_provider);
                                 self.turn_runner.config = self.config.clone();
                             }
                             Err(e) => {
@@ -994,7 +998,22 @@ impl AgentLoop {
                         // Store plan text for adherence reminders
                         self.plan_text = Some(text.clone());
                         if self.subtask_driver.active {
-                            // Inject first subtask instruction
+                            // Sub-agent parallel dispatch: if 2+ independent files,
+                            // spawn parallel sub-agents instead of serial subtask loop.
+                            if self.subtask_driver.subtasks.len() >= 2 {
+                                if let Some(sub_result) = self.try_sub_agent_dispatch(text).await {
+                                    // Sub-agents completed — inject summary into conversation
+                                    self.conversation.add_user_message("Sub-agent results are above. Summarize what was changed.");
+                                    let _ = self.event_tx.send(AgentEvent::TextDelta(sub_result));
+                                    // Reset subtask driver since sub-agents handled it
+                                    self.subtask_driver = subtask_driver::SubtaskDriver::new();
+                                    // Fall through to finish (model will summarize on next turn)
+                                    break;
+                                }
+                                // If sub-agent dispatch failed, fall through to serial subtask
+                            }
+
+                            // Fallback: serial subtask execution
                             if let Some(instr) = self.subtask_driver.current_instruction() {
                                 self.conversation.add_user_message(&instr);
                             }
@@ -1186,6 +1205,205 @@ impl AgentLoop {
     // detect_running_services → services.rs
     // extract_service_urls → services.rs
     // change_dir → services.rs
+
+    /// Try to dispatch sub-agents for parallel multi-file editing.
+    /// Returns Some(summary_text) if dispatch succeeded, None if it should
+    /// fall back to serial subtask execution.
+    async fn try_sub_agent_dispatch(&mut self, plan_text: &str) -> Option<String> {
+        let wd = self.turn_runner.context.working_dir.try_read()
+            .map(|g| g.clone())
+            .ok()?;
+
+        let subtasks = &self.subtask_driver.subtasks;
+        if subtasks.len() < 2 {
+            return None;
+        }
+
+        let _ = self.event_tx.send(AgentEvent::TextDelta(
+            format!("\n\n**Dispatching {} sub-agents in parallel...**\n", subtasks.len())
+        ));
+
+        // Read all target files. If any file can't be found, fall back to serial.
+        let mut tasks = Vec::new();
+        let mut all_file_contents: Vec<(String, String)> = Vec::new();
+
+        for subtask in subtasks {
+            // Try to find the file: first check direct path, then walk the tree.
+            let file_path = {
+                let direct = wd.join(&subtask.file);
+                if direct.exists() {
+                    direct
+                } else {
+                    // Walk directory tree to find the file by name
+                    match find_file_recursive(&wd, &subtask.file) {
+                        Some(p) => p,
+                        None => {
+                            let _ = self.event_tx.send(AgentEvent::TextDelta(
+                                format!("  Cannot find {}. Falling back to serial mode.\n", subtask.file)
+                            ));
+                            return None;
+                        }
+                    }
+                }
+            };
+
+            let content = match std::fs::read_to_string(&file_path) {
+                Ok(c) => c,
+                Err(_) => {
+                    let _ = self.event_tx.send(AgentEvent::TextDelta(
+                        format!("  Cannot read {}. Falling back to serial mode.\n", subtask.file)
+                    ));
+                    return None;
+                }
+            };
+
+            all_file_contents.push((
+                file_path.to_string_lossy().to_string(),
+                content,
+            ));
+        }
+
+        // Generate sibling skeletons: compact view of other files
+        for i in 0..all_file_contents.len() {
+            let (ref file_path, ref _content) = all_file_contents[i];
+            let mut siblings = String::new();
+            for (j, (ref sib_path, ref sib_content)) in all_file_contents.iter().enumerate() {
+                if i == j { continue; }
+                let short = std::path::Path::new(sib_path)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| sib_path.clone());
+                // Take first 30 lines as skeleton
+                let skeleton: String = sib_content.lines().take(30)
+                    .collect::<Vec<_>>().join("\n");
+                siblings.push_str(&format!("### {}\n```\n{}\n```\n\n", short, skeleton));
+            }
+
+            // Extract the task instruction for this file from the plan
+            let file_name = &subtasks[i].file;
+            let task_instr = extract_file_instruction(plan_text, file_name);
+
+            tasks.push(sub_agent::SubAgentTask {
+                file_path: file_path.clone(),
+                file_content: all_file_contents[i].1.clone(),
+                task_instruction: task_instr,
+                contract: extract_contract(plan_text),
+                sibling_skeletons: siblings,
+            });
+        }
+
+        // Dispatch
+        let pool = sub_agent::SubAgentPool::new(tasks);
+        let provider = self.turn_runner.provider.clone();
+        let tools = self.tool_registry.clone();
+        let config = self.config.clone();
+
+        let results = pool.execute_all(provider, tools, &config, &wd).await;
+
+        // Build summary
+        let mut summary = String::from("\n**Sub-agent results:**\n");
+        let mut all_success = true;
+        for r in &results {
+            let status = if r.success { "OK" } else { "FAILED" };
+            let short = std::path::Path::new(&r.file_path)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| r.file_path.clone());
+            summary.push_str(&format!(
+                "| {} | {} | {} turns | {} |\n",
+                short, status, r.turns_used, r.summary,
+            ));
+            if !r.success {
+                all_success = false;
+                for err in &r.errors {
+                    summary.push_str(&format!("  Error: {}\n", err));
+                }
+            }
+            // Track edited files
+            if r.success {
+                let short_name = std::path::Path::new(&r.file_path)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                if !self.files_edited_this_turn.contains(&short_name) {
+                    self.files_edited_this_turn.push(short_name);
+                }
+            }
+        }
+
+        if all_success {
+            summary.push_str(&format!("\nAll {} sub-agents completed successfully.\n", results.len()));
+        } else {
+            let failed: Vec<_> = results.iter().filter(|r| !r.success).collect();
+            summary.push_str(&format!("\n{}/{} sub-agents failed.\n", failed.len(), results.len()));
+        }
+
+        Some(summary)
+    }
+}
+
+/// Recursively search for a file by name under the given directory.
+/// Returns the first match. Skips hidden dirs, node_modules, target, etc.
+fn find_file_recursive(dir: &std::path::Path, file_name: &str) -> Option<std::path::PathBuf> {
+    let walker = ignore::WalkBuilder::new(dir)
+        .hidden(true)       // skip hidden
+        .git_ignore(true)   // respect .gitignore
+        .max_depth(Some(10))
+        .build();
+
+    for entry in walker {
+        if let Ok(e) = entry {
+            if e.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                if let Some(name) = e.path().file_name() {
+                    if name.to_string_lossy() == file_name {
+                        return Some(e.into_path());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Extract the instruction for a specific file from the plan text.
+/// Looks for lines mentioning the file name and returns them as context.
+fn extract_file_instruction(plan_text: &str, file_name: &str) -> String {
+    let mut relevant_lines = Vec::new();
+    for line in plan_text.lines() {
+        if line.contains(file_name) {
+            relevant_lines.push(line.trim().to_string());
+        }
+    }
+    if relevant_lines.is_empty() {
+        format!("Edit {} according to the plan.", file_name)
+    } else {
+        relevant_lines.join("\n")
+    }
+}
+
+/// Extract contract/interface information from the plan text.
+/// Looks for "Contract", "Interface", "API" sections.
+fn extract_contract(plan_text: &str) -> String {
+    let mut in_contract = false;
+    let mut contract_lines = Vec::new();
+    for line in plan_text.lines() {
+        let lower = line.to_lowercase();
+        if lower.contains("contract") || lower.contains("interface") || lower.contains("api") {
+            in_contract = true;
+        }
+        if in_contract {
+            contract_lines.push(line.to_string());
+            // Stop after a blank line following contract section
+            if line.trim().is_empty() && contract_lines.len() > 1 {
+                break;
+            }
+        }
+    }
+    if contract_lines.is_empty() {
+        "No explicit contract defined. Follow the plan.".to_string()
+    } else {
+        contract_lines.join("\n")
+    }
 }
 
 fn short_path(path: &str) -> String {

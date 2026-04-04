@@ -178,7 +178,7 @@ fn test_context() -> ToolContext {
 
 fn make_runner(provider: MockProvider, tools: ToolRegistry, permission: Box<dyn super::permission::PermissionDecider>) -> TurnRunner {
     TurnRunner {
-        provider: Box::new(provider),
+        provider: std::sync::Arc::new(provider),
         tools: std::sync::Arc::new(tools),
         context: test_context(),
         config: test_config(),

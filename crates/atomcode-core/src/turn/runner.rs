@@ -26,7 +26,7 @@ use super::permission::PermissionDecider;
 /// Does NOT handle: retries, discipline (anti-loop, step limits), or conversation management.
 /// The caller (AgentLoop / SubagentLoop) owns those responsibilities.
 pub struct TurnRunner {
-    pub provider: Box<dyn LlmProvider>,
+    pub provider: std::sync::Arc<dyn LlmProvider>,
     pub tools: std::sync::Arc<ToolRegistry>,
     pub context: ToolContext,
     pub config: Config,
