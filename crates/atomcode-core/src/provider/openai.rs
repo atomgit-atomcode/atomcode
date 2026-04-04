@@ -263,7 +263,7 @@ impl LlmProvider for OpenAiProvider {
                             if let Some(usage) = last_usage.take() {
                                 let _ = tx.send(Ok(StreamEvent::Usage(usage)));
                             }
-                            let _ = tx.send(Ok(StreamEvent::Done));
+                            let _ = tx.send(Ok(StreamEvent::Done { truncated: false }));
                             return;
                         }
                         if let Ok(chunk) = serde_json::from_str::<ChatChunk>(data) {
@@ -325,12 +325,16 @@ impl LlmProvider for OpenAiProvider {
                                                 )));
                                             }
                                             tool_calls.clear();
-                                            // Signal the end of this response turn
-                                            let _ = tx.send(Ok(StreamEvent::Done));
+                                            let _ = tx.send(Ok(StreamEvent::Done { truncated: false }));
+                                            return;
+                                        }
+                                        "length" | "max_tokens" => {
+                                            // Model hit token limit — response was truncated
+                                            let _ = tx.send(Ok(StreamEvent::Done { truncated: true }));
                                             return;
                                         }
                                         "stop" | _ => {
-                                            let _ = tx.send(Ok(StreamEvent::Done));
+                                            let _ = tx.send(Ok(StreamEvent::Done { truncated: false }));
                                             return;
                                         }
                                     }
@@ -341,7 +345,7 @@ impl LlmProvider for OpenAiProvider {
                 }
             }
 
-            let _ = tx.send(Ok(StreamEvent::Done));
+            let _ = tx.send(Ok(StreamEvent::Done { truncated: false }));
         });
 
         Ok(Box::pin(tokio_stream::wrappers::UnboundedReceiverStream::new(rx)))

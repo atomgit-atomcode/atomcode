@@ -303,7 +303,7 @@ impl LlmProvider for ClaudeProvider {
                             }
                         }
                         "message_stop" => {
-                            let _ = tx.send(Ok(StreamEvent::Done));
+                            let _ = tx.send(Ok(StreamEvent::Done { truncated: false }));
                             return;
                         }
                         _ => {}
@@ -311,7 +311,7 @@ impl LlmProvider for ClaudeProvider {
                 }
             }
 
-            let _ = tx.send(Ok(StreamEvent::Done));
+            let _ = tx.send(Ok(StreamEvent::Done { truncated: false }));
         });
 
         Ok(Box::pin(

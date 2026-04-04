@@ -43,7 +43,7 @@ impl MockProvider {
                     prompt_tokens: 10,
                     completion_tokens: 5,
                 }),
-                StreamEvent::Done,
+                StreamEvent::Done { truncated: false },
             ],
         }
     }
@@ -65,7 +65,7 @@ impl MockProvider {
                     prompt_tokens: 10,
                     completion_tokens: 8,
                 }),
-                StreamEvent::Done,
+                StreamEvent::Done { truncated: false },
             ],
         }
     }
@@ -213,7 +213,7 @@ async fn test_turn_runner_text_only_response() {
     let result = runner.run(&mut conv, "system", &tx, CancellationToken::new()).await;
 
     match result {
-        TurnResult::Responded { text, tokens } => {
+        TurnResult::Responded { text, tokens, .. } => {
             assert_eq!(text, "Hello, world!");
             assert!(tokens > 0);
         }
@@ -693,7 +693,7 @@ async fn test_multiple_tool_calls_results_in_context() {
             StreamEvent::ToolCallDelta(r#"{"file_path":"/tmp/x"}"#.into()),
             StreamEvent::ToolCallDone(ToolCall { id: "c2".into(), name: "read_file".into(), arguments: r#"{"file_path":"/tmp/x"}"#.into() }),
             StreamEvent::Usage(TokenUsage { prompt_tokens: 20, completion_tokens: 10 }),
-            StreamEvent::Done,
+            StreamEvent::Done { truncated: false },
         ],
     };
 

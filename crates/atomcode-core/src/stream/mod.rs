@@ -13,6 +13,8 @@ pub enum StreamEvent {
     ToolCallDelta(String),
     ToolCallDone(ToolCall),
     Usage(TokenUsage),
-    Done,
+    /// Stream finished. `truncated` = true means finish_reason was "length"
+    /// (model hit max_tokens and was cut off, should continue).
+    Done { truncated: bool },
     Error(String),
 }

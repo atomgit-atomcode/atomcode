@@ -123,6 +123,7 @@ impl TurnRunner {
         let mut text_buf = String::new();
         let mut total_tokens: usize = 0;
         let mut got_any_event = false;
+        let mut was_truncated = false;
 
         // Timeout: 180s for first token, 180s for subsequent tokens.
         // Domestic model providers (SiliconFlow, etc.) can be very slow under load.
@@ -193,13 +194,14 @@ _ = cancel.cancelled() => {
                             });
                         }
 
-                        Some(Ok(StreamEvent::Done)) => {
+                        Some(Ok(StreamEvent::Done { truncated: is_truncated })) => {
                             // Finalize conversation state
                             if !tool_calls_buf.is_empty() {
                                 conversation.finalize_stream_with_tool_calls(&tool_calls_buf);
                             } else {
                                 conversation.finalize_stream();
                             }
+                            was_truncated = is_truncated;
                             break;
                         }
 
@@ -238,6 +240,7 @@ _ = cancel.cancelled() => {
             return TurnResult::Responded {
                 text: text_buf,
                 tokens: total_tokens,
+                truncated: was_truncated,
             };
         }
 

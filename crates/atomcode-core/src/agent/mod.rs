@@ -959,7 +959,7 @@ impl AgentLoop {
 
             // Handle result
             match result {
-                TurnResult::Responded { ref text, tokens } => {
+                TurnResult::Responded { ref text, tokens, truncated } => {
                     self.turn_tokens += tokens;
                     self.total_tokens += tokens;
 
@@ -1053,30 +1053,11 @@ impl AgentLoop {
                         }
                     }
 
-                    // Incomplete turn guard: if model used tools this turn but then
-                    // Responded with short text (not a summary), it's likely mid-task
-                    // — e.g. "现在修改 App.vue：" without calling edit_file.
-                    // Real summaries are long (tables, bullet points, "完成"/"已修复").
-                    // Short intent statements mean the model wants to continue.
-                    if self.tool_call_count > 0
-                        && text.len() < 200
-                        && !text.contains("\u{5B8C}\u{6210}")    // 完成
-                        && !text.contains("\u{5DF2}\u{4FEE}\u{590D}") // 已修复
-                        && !text.contains("\u{5DF2}\u{5220}\u{9664}") // 已删除
-                        && !text.contains("\u{5DF2}\u{4FEE}\u{6539}") // 已修改
-                        && !text.contains("\u{5DF2}\u{6DFB}\u{52A0}") // 已添加
-                        && !text.contains("\u{5DF2}\u{66F4}\u{65B0}") // 已更新
-                        && !text.contains("\u{603B}\u{7ED3}")    // 总结
-                        && !text.contains("\u{4FEE}\u{6539}\u{5B8C}\u{6210}") // 修改完成
-                        && !text.contains("done")
-                        && !text.contains("summary")
-                        && !text.contains("fixed")
-                        && !text.contains("removed")
-                        && !text.contains("completed")
-                        && self.retry_count < 2
-                    {
+                    // Truncation guard: if LLM was cut off by max_tokens (finish_reason="length"),
+                    // automatically continue. No keyword heuristics needed — the API tells us.
+                    if truncated && self.retry_count < 3 {
                         self.retry_count += 1;
-                        self.conversation.add_user_message("Continue. Execute the edit now.");
+                        self.conversation.add_user_message("Continue.");
                         continue;
                     }
 

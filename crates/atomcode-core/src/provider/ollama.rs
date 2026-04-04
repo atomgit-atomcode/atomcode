@@ -133,7 +133,7 @@ impl LlmProvider for OllamaProvider {
 
                     if let Ok(chunk) = serde_json::from_str::<OllamaChunk>(&line) {
                         if chunk.done {
-                            let _ = tx.send(Ok(StreamEvent::Done));
+                            let _ = tx.send(Ok(StreamEvent::Done { truncated: false }));
                             return;
                         } else if let Some(msg) = chunk.message {
                             if !msg.content.is_empty() {
@@ -144,7 +144,7 @@ impl LlmProvider for OllamaProvider {
                 }
             }
 
-            let _ = tx.send(Ok(StreamEvent::Done));
+            let _ = tx.send(Ok(StreamEvent::Done { truncated: false }));
         });
 
         Ok(Box::pin(tokio_stream::wrappers::UnboundedReceiverStream::new(rx)))

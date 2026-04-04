@@ -36,8 +36,9 @@ pub enum TurnEvent {
 /// Result of a single turn execution
 #[derive(Debug)]
 pub enum TurnResult {
-    /// LLM produced text only, no tool calls — turn complete
-    Responded { text: String, tokens: usize },
+    /// LLM produced text only, no tool calls.
+    /// `truncated` = true means finish_reason was "length" (model hit max_tokens).
+    Responded { text: String, tokens: usize, truncated: bool },
     /// LLM called tools, results added to conversation — ready for next turn
     UsedTools { text: Option<String>, tool_count: usize, tokens: usize },
     /// Unrecoverable error
