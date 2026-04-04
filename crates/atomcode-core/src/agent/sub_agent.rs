@@ -58,10 +58,12 @@ impl SubAgentTask {
         } else { "" };
 
         let system_prompt = format!(
-            "{}\n\n## SUB-AGENT CONTEXT\n\
-             You are a sub-agent responsible for editing ONE file: {}\n\
-             Make ALL needed changes in as few edit_file calls as possible.\n\
-             Do NOT read other files — sibling skeletons are provided below.{}",
+            "{}\n\n## SUB-AGENT RULES\n\
+             You are a sub-agent. Your ONLY job: edit `{}`.\n\
+             The file content is provided below — do NOT read_file, you already have it.\n\
+             Call edit_file IMMEDIATELY on your first turn. Do NOT analyze, summarize, or plan.\n\
+             Use multi-edit (edits array) to change multiple sections in ONE call.\n\
+             You are responsible for ONE file only. Ignore other files.{}",
             rules, self.file_path, vue_warning,
         );
 
