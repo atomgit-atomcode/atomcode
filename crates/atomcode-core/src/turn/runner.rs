@@ -111,6 +111,7 @@ impl TurnRunner {
         };
 
         // 3. Start streaming
+        let stream_start = std::time::Instant::now();
         let stream_result = self.provider.chat_stream(&messages, Some(&tool_defs));
         let mut stream = match stream_result {
             Ok(s) => s,
@@ -223,6 +224,16 @@ impl TurnRunner {
                 }
             }
         }
+
+        // Log LLM response (text + tool calls)
+        let response_duration = stream_start.elapsed().as_millis() as u64;
+        super::log::log_llm_response(
+            &text_buf,
+            &tool_calls_buf,
+            self.provider.model_name(),
+            0, // step is set by caller
+            response_duration,
+        );
 
         // 5. If no tool calls, we're done — LLM produced text only
         if tool_calls_buf.is_empty() {

@@ -1,5 +1,5 @@
 use crate::conversation::message::Message;
-use crate::tool::ToolDef;
+use crate::tool::{ToolCall, ToolDef};
 
 /// Log the complete LLM request (messages + tools + metadata) to
 /// `~/.atomcode/logs/YYYY-MM-DD_HH-MM-SS_NNN.json`.
@@ -66,6 +66,59 @@ pub fn log_llm_request(
     let tmp = path.with_extension("json.tmp");
     if let Ok(mut f) = std::fs::File::create(&tmp) {
         // Use pretty print for readability.
+        let _ = f.write_all(serde_json::to_string_pretty(&log).unwrap_or_default().as_bytes());
+        let _ = std::fs::rename(&tmp, &path);
+    }
+}
+
+/// Log the LLM response (text + tool calls) to
+/// `~/.atomcode/logs/YYYY-MM-DD_HH-MM-SS_NNN_response.json`.
+pub fn log_llm_response(
+    text: &str,
+    tool_calls: &[ToolCall],
+    model: &str,
+    step: usize,
+    duration_ms: u64,
+) {
+    use std::io::Write;
+
+    let log_dir = crate::config::Config::config_dir().join("logs");
+    let _ = std::fs::create_dir_all(&log_dir);
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = now.as_secs();
+    let millis = now.subsec_millis();
+    let ts = {
+        let s = secs % 60;
+        let m = (secs / 60) % 60;
+        let h = (secs / 3600) % 24;
+        let days = secs / 86400;
+        let (y, mo, d) = epoch_days_to_ymd(days);
+        format!("{:04}-{:02}-{:02}_{:02}-{:02}-{:02}_{:03}", y, mo, d, h, m, s, millis)
+    };
+    let path = log_dir.join(format!("{}_response.json", ts));
+
+    let tools_json: Vec<serde_json::Value> = tool_calls.iter().map(|tc| {
+        serde_json::json!({
+            "id": tc.id,
+            "name": tc.name,
+            "arguments": tc.arguments,
+        })
+    }).collect();
+
+    let log = serde_json::json!({
+        "timestamp": ts,
+        "model": model,
+        "step": step,
+        "duration_ms": duration_ms,
+        "text": text,
+        "tool_calls": tools_json,
+    });
+
+    let tmp = path.with_extension("json.tmp");
+    if let Ok(mut f) = std::fs::File::create(&tmp) {
         let _ = f.write_all(serde_json::to_string_pretty(&log).unwrap_or_default().as_bytes());
         let _ = std::fs::rename(&tmp, &path);
     }
