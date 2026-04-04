@@ -1065,7 +1065,12 @@ impl AgentLoop {
                     // Phase 4 EXECUTE mode: if model's response contains edit instructions
                     // (file headers with edit descriptions), execute them in focused mode
                     // with minimal context (just the file + instruction).
-                    let edit_instrs = execute::parse_edit_instructions(text);
+                    // Skip if model already edited files this turn (avoid double-edit).
+                    let edit_instrs = if self.files_edited_this_turn.is_empty() {
+                        execute::parse_edit_instructions(text)
+                    } else {
+                        Vec::new()
+                    };
                     if !edit_instrs.is_empty() {
                         let wd = self.turn_runner.context.working_dir.try_read()
                             .map(|g| g.clone())
