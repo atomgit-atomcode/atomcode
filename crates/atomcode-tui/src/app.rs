@@ -604,7 +604,10 @@ impl App {
                 self.at_bottom = true;
             }
             AgentEvent::ToolCallResult { name, output, success, duration: _ } => {
-                self.last_completed_tool = name;
+                // Format a short result summary for spinner display
+                let icon = if success { "\u{2713}" } else { "\u{2717}" };
+                let first_line = output.lines().next().unwrap_or("").chars().take(40).collect::<String>();
+                self.last_completed_tool = format!("{} {} {}", icon, name, first_line);
                 self.turn_log.log_tool_result(&output, success);
                 // Add result to conversation mirror so it renders in the UI
                 self.conversation.add_tool_result(ToolResult {

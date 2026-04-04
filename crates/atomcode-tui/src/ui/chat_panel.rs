@@ -256,7 +256,7 @@ pub fn render(
         } else if has_tokens {
             "Generating...".to_string()
         } else if step_count > 0 && !last_completed_tool.is_empty() {
-            format!("After {}, thinking", last_completed_tool)
+            format!("{}", last_completed_tool)
         } else {
             "Thinking...".to_string()
         };
