@@ -72,13 +72,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     // Allow up to 60 chars but at least 10
     let max_session_len = max_session_len.min(60).max(10);
     
-    // Session name
-    left.push(Span::styled(" [", Style::default().fg(theme::text_muted())));
-    left.push(Span::styled(
-        truncate_session_name(&app.current_session.name, max_session_len),
-        Style::default().fg(theme::accent()),
-    ));
-    left.push(Span::styled("]", Style::default().fg(theme::text_muted())));
+    // Session name removed — takes up space without adding value.
 
     // Right side: turn state + model
     if is_active {
