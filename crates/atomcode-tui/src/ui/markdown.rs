@@ -401,8 +401,8 @@ fn render_table(lines: &mut Vec<Line<'static>>, header: &[String], rows: &[Vec<S
     }
     lines.push(Line::from(Span::styled(mid, border)));
 
-    // │ Data │
-    for row in rows {
+    // │ Data │ with ├───┼───┤ between each row
+    for (row_idx, row) in rows.iter().enumerate() {
         let mut r: Vec<Span<'static>> = vec![Span::styled("  \u{2502}", border)];
         for i in 0..cols {
             let cell = row.get(i).map(|s| s.as_str()).unwrap_or("");
@@ -412,6 +412,16 @@ fn render_table(lines: &mut Vec<Line<'static>>, header: &[String], rows: &[Vec<S
             r.push(Span::styled("\u{2502}", border));
         }
         lines.push(Line::from(r));
+
+        // Row separator (except after last row)
+        if row_idx < rows.len() - 1 {
+            let mut sep = String::from("  \u{251c}");
+            for (i, w) in widths.iter().enumerate() {
+                sep.push_str(&"\u{2500}".repeat(*w));
+                sep.push(if i < cols - 1 { '\u{253c}' } else { '\u{2524}' });
+            }
+            lines.push(Line::from(Span::styled(sep, border)));
+        }
     }
 
     // └───┴───┘
