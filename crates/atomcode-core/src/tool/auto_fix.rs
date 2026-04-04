@@ -87,9 +87,67 @@ pub async fn post_edit_syntax_check(file_path: &str) -> String {
             };
         }
         "ts" | "tsx" => {
-            // npx tsc --noEmit is too slow; just check if node can parse it as a quick heuristic
-            // TypeScript syntax errors will surface when the user runs their build
             return String::new();
+        }
+        "vue" | "svelte" => {
+            // Quick checks for common Vue SFC errors:
+            // 1. Nested backticks in <script> (template strings containing `)
+            // 2. Fast build check if no dev server is running
+            let mut warnings = Vec::new();
+
+            if let Ok(content) = tokio::fs::read_to_string(file_path).await {
+                // Check for nested backticks in <script> section
+                if let Some(script_start) = content.find("<script") {
+                    let script_end = content.find("</script>").unwrap_or(content.len());
+                    let script = &content[script_start..script_end];
+                    // Count backticks — odd number means unclosed template string
+                    let backtick_count = script.chars().filter(|c| *c == '`').count();
+                    if backtick_count % 2 != 0 {
+                        warnings.push(format!(
+                            "Unclosed template string (`) in <script> — {} backticks found (odd). \
+                             Use regular strings ('') for data containing backticks.",
+                            backtick_count
+                        ));
+                    }
+                }
+            }
+
+            // If no dev server log exists, run a quick build to catch errors
+            let file_dir = std::path::Path::new(file_path);
+            let project_root = file_dir.ancestors()
+                .find(|p| p.join("package.json").exists());
+            if let Some(root) = project_root {
+                let log_exists = root.join("frontend.log").exists()
+                    || root.join("backend.log").exists();
+                if !log_exists {
+                    // No dev server running — do a quick build check
+                    if let Ok(output) = tokio::process::Command::new("sh")
+                        .args(["-c", "npm run build 2>&1 | head -20"])
+                        .current_dir(root)
+                        .output()
+                        .await
+                    {
+                        let out = String::from_utf8_lossy(&output.stdout);
+                        let err = String::from_utf8_lossy(&output.stderr);
+                        let combined = format!("{}{}", out, err);
+                        if !output.status.success() || combined.to_lowercase().contains("error") {
+                            let err_lines: String = combined.lines()
+                                .filter(|l| l.to_lowercase().contains("error"))
+                                .take(3)
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            if !err_lines.is_empty() {
+                                warnings.push(format!("Build error:\n{}", err_lines));
+                            }
+                        }
+                    }
+                }
+            }
+
+            if warnings.is_empty() {
+                return String::new();
+            }
+            return format!("\n⚠ VUE SYNTAX: {}", warnings.join("; "));
         }
         "py" => Some(("python3", vec!["-m".to_string(), "py_compile".to_string(), file_path.to_string()])),
         _ => None,
