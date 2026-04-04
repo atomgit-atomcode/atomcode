@@ -1062,9 +1062,17 @@ impl AgentLoop {
                         && text.len() < 200
                         && !text.contains("\u{5B8C}\u{6210}")    // 完成
                         && !text.contains("\u{5DF2}\u{4FEE}\u{590D}") // 已修复
+                        && !text.contains("\u{5DF2}\u{5220}\u{9664}") // 已删除
+                        && !text.contains("\u{5DF2}\u{4FEE}\u{6539}") // 已修改
+                        && !text.contains("\u{5DF2}\u{6DFB}\u{52A0}") // 已添加
+                        && !text.contains("\u{5DF2}\u{66F4}\u{65B0}") // 已更新
                         && !text.contains("\u{603B}\u{7ED3}")    // 总结
+                        && !text.contains("\u{4FEE}\u{6539}\u{5B8C}\u{6210}") // 修改完成
                         && !text.contains("done")
                         && !text.contains("summary")
+                        && !text.contains("fixed")
+                        && !text.contains("removed")
+                        && !text.contains("completed")
                         && self.retry_count < 2
                     {
                         self.retry_count += 1;
