@@ -230,13 +230,9 @@ pub fn render(
         matches!(mode, AppMode::Streaming | AppMode::ToolExecuting)
         || step_count > 0
     );
-    if turn_active && area.height >= 2 {
-        let spin_y = area.y + area.height - 1;
-        let spin_rect = Rect::new(area.x, spin_y, area.width, 1);
-        frame.render_widget(Clear, spin_rect);
-
-        let spinner = SPINNER[tick % SPINNER.len()];
+    if turn_active && area.height >= 3 {
         let bar_style = Style::default().fg(theme::ACCENT_DIM);
+        let spinner = SPINNER[tick % SPINNER.len()];
         let wait_ms = llm_wait_ms.unwrap_or(0);
         let spin_color = if first_token_ms.is_some() {
             theme::ACCENT
@@ -249,16 +245,27 @@ pub fn render(
         } else {
             theme::WAIT_VERY_SLOW
         };
-        let step_prefix = if step_count > 0 { format!("[turn {}] ", step_count) } else { String::new() };
         let has_tokens = conversation.stream_buffer.as_ref().map_or(false, |b| !b.is_empty());
-        let label = if matches!(mode, AppMode::ToolExecuting) && !tool_info.is_empty() {
-            tool_info.to_string()
+
+        // Line 1: tool/result info
+        let tool_line_content = if matches!(mode, AppMode::ToolExecuting) && !tool_info.is_empty() {
+            // Currently executing a tool
+            format!("\u{25b8} {}", tool_info) // ▸ Edit File: DevCenter.vue
+        } else if !last_completed_tool.is_empty() {
+            // Last tool result
+            last_completed_tool.to_string() // ✓ edit_file Edited DevCenter.vue...
+        } else {
+            String::new()
+        };
+
+        // Line 2: thinking status + time
+        let thinking_label = if matches!(mode, AppMode::ToolExecuting) {
+            "Executing...".to_string()
         } else if has_tokens {
             "Generating...".to_string()
-        } else if step_count > 0 && !last_completed_tool.is_empty() {
-            format!("{}", last_completed_tool)
         } else {
-            "Thinking...".to_string()
+            let labels = THINKING_LABELS;
+            format!("{}...", labels[turn_label_seed % labels.len()])
         };
         let time_str = if wait_ms >= 60_000 {
             format!("  {:.0}m{:.0}s", wait_ms / 60_000, (wait_ms % 60_000) / 1000)
@@ -268,14 +275,30 @@ pub fn render(
             String::new()
         };
 
-        let spin_line = Line::from(vec![
+        // Render: 2 rows at bottom of chat area
+        let spin_y = area.y + area.height - 2;
+        let line1_rect = Rect::new(area.x, spin_y, area.width, 1);
+        let line2_rect = Rect::new(area.x, spin_y + 1, area.width, 1);
+        frame.render_widget(Clear, line1_rect);
+        frame.render_widget(Clear, line2_rect);
+
+        if !tool_line_content.is_empty() {
+            let tool_line = Line::from(vec![
+                Span::styled(format!("{}\u{2502} ", INDENT), bar_style),
+                Span::styled(tool_line_content, Style::default().fg(theme::TEXT_SECONDARY)),
+            ]);
+            frame.render_widget(Paragraph::new(vec![tool_line]), line1_rect);
+        }
+
+        let step_prefix = if step_count > 0 { format!("[turn {}] ", step_count) } else { String::new() };
+        let status_line = Line::from(vec![
             Span::styled(format!("{}\u{2502} ", INDENT), bar_style),
             Span::styled(format!("{} ", spinner), Style::default().fg(spin_color)),
-            Span::styled(step_prefix, Style::default().fg(theme::TEXT_SECONDARY)),
-            Span::styled(label, Style::default().fg(spin_color)),
+            Span::styled(step_prefix, Style::default().fg(theme::TEXT_MUTED)),
+            Span::styled(thinking_label, Style::default().fg(spin_color)),
             Span::styled(time_str, Style::default().fg(spin_color)),
         ]);
-        frame.render_widget(Paragraph::new(vec![spin_line]), spin_rect);
+        frame.render_widget(Paragraph::new(vec![status_line]), line2_rect);
     }
     // Return (total_lines, scroll_offset) for scroll handling
     (total, scroll_usize)
