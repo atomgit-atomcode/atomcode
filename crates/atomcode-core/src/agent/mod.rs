@@ -1072,13 +1072,14 @@ impl AgentLoop {
                         continue;
                     }
 
-                    // Phase 4 EXECUTE mode: if model's response contains edit instructions
-                    // (file headers with edit descriptions), execute them in focused mode
-                    // with minimal context (just the file + instruction).
                     // Phase 4 EXECUTE mode: parse edit instructions from REASON output.
-                    // No guard needed — edit_file is not available in REASON mode,
-                    // so the model can't have already edited files.
-                    let edit_instrs = execute::parse_edit_instructions(text);
+                    // Skip if EXECUTE already ran this turn (files_edited_this_turn non-empty).
+                    // This prevents re-triggering when model's post-EXECUTE summary mentions ### File:.
+                    let edit_instrs = if self.files_edited_this_turn.is_empty() {
+                        execute::parse_edit_instructions(text)
+                    } else {
+                        Vec::new()
+                    };
                     if !edit_instrs.is_empty() {
                         let wd = self.turn_runner.context.working_dir.try_read()
                             .map(|g| g.clone())
