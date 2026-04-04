@@ -1065,10 +1065,16 @@ impl AgentLoop {
                     // Phase 4 EXECUTE mode: if model's response contains edit instructions
                     // (file headers with edit descriptions), execute them in focused mode
                     // with minimal context (just the file + instruction).
-                    // Skip if model already used tools this turn (avoid double-edit).
-                    // Model sometimes outputs tool calls AND ### File: plan in the same
-                    // response — the tool calls already did the edit, EXECUTE would redo it.
-                    let edit_instrs = if self.tool_call_count == 0 {
+                    // EXECUTE mode: only trigger if no edit/write tool has been called this turn.
+                    // Check tool_call history — if any call was edit_file/write_file, skip.
+                    let has_edited = self.conversation.messages.iter().rev()
+                        .take(self.tool_call_count * 2 + 2)
+                        .any(|m| {
+                            if let crate::conversation::message::MessageContent::AssistantWithToolCalls { ref tool_calls, .. } = m.content {
+                                tool_calls.iter().any(|tc| tc.name == "edit_file" || tc.name == "write_file")
+                            } else { false }
+                        });
+                    let edit_instrs = if !has_edited {
                         execute::parse_edit_instructions(text)
                     } else {
                         Vec::new()
