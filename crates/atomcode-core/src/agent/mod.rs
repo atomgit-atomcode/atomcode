@@ -102,6 +102,11 @@ pub enum AgentEvent {
     },
     /// An error occurred.
     Error(String),
+    /// Sub-agent progress (real-time parallel task display).
+    SubAgentProgress {
+        file: String,
+        status: String,
+    },
     /// Working directory changed.
     WorkingDirChanged(PathBuf),
     /// Context budget stats for logging (not displayed, only written to datalog).
@@ -1298,7 +1303,7 @@ impl AgentLoop {
         let tools = self.tool_registry.clone();
         let config = self.config.clone();
 
-        let results = pool.execute_all(provider, tools, &config, &wd).await;
+        let results = pool.execute_all(provider, tools, &config, &wd, &self.event_tx).await;
 
         // Build summary
         let mut summary = String::from("\n**Sub-agent results:**\n");

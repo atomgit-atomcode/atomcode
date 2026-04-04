@@ -731,6 +731,10 @@ impl App {
                 self.ctx_used_tokens = system_tokens + hot_tokens + cold_tokens + working_set_tokens;
                 self.turn_log.log_context_stats(system_tokens, hot_tokens, cold_tokens, working_set_tokens, total_messages);
             }
+            AgentEvent::SubAgentProgress { file, status } => {
+                // Display sub-agent progress in the streaming area
+                self.conversation.push_delta(&format!("\n  ⠴ [{}] {}", file, status));
+            }
         }
     }
 

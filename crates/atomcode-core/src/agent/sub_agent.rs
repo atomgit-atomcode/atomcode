@@ -158,18 +158,32 @@ impl SubAgentPool {
         }
     }
 
-    /// Execute all tasks in parallel, respecting concurrency limit and timeout.
+    /// Execute all tasks in parallel, streaming progress events.
     pub async fn execute_all(
         self,
         provider: Arc<dyn LlmProvider>,
         tools: Arc<ToolRegistry>,
         config: &Config,
         working_dir: &std::path::Path,
+        event_tx: &tokio::sync::mpsc::UnboundedSender<super::AgentEvent>,
     ) -> Vec<SubAgentResult> {
         use tokio::task::JoinSet;
 
         let timeout = Duration::from_secs(self.timeout_secs);
-        let mut results: Vec<SubAgentResult> = Vec::with_capacity(self.tasks.len());
+        let total = self.tasks.len();
+        let mut results: Vec<SubAgentResult> = Vec::with_capacity(total);
+
+        // Emit start event for each task
+        for (i, task) in self.tasks.iter().enumerate() {
+            let short = std::path::Path::new(&task.file_path)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| task.file_path.clone());
+            let _ = event_tx.send(super::AgentEvent::SubAgentProgress {
+                file: short,
+                status: format!("queued ({}/{})", i + 1, total),
+            });
+        }
 
         // Process in batches of max_concurrent
         let mut chunks = self.tasks.into_iter().peekable();
@@ -182,13 +196,45 @@ impl SubAgentPool {
                 let tools = tools.clone();
                 let config = config.clone();
                 let working_dir = working_dir.to_path_buf();
+                let tx = event_tx.clone();
+                let file_name = std::path::Path::new(&task.file_path)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| task.file_path.clone());
 
                 set.spawn(async move {
-                    tokio::time::timeout(
+                    let _ = tx.send(super::AgentEvent::SubAgentProgress {
+                        file: file_name.clone(),
+                        status: "editing...".to_string(),
+                    });
+                    let start = std::time::Instant::now();
+
+                    let result = tokio::time::timeout(
                         timeout,
                         task.execute(provider, tools, &config, &working_dir, 5),
                     )
-                    .await
+                    .await;
+
+                    let elapsed = start.elapsed().as_secs();
+                    match &result {
+                        Ok(r) => {
+                            let _ = tx.send(super::AgentEvent::SubAgentProgress {
+                                file: file_name,
+                                status: if r.success {
+                                    format!("✓ done {}s {} turns", elapsed, r.turns_used)
+                                } else {
+                                    format!("✗ failed {}s", elapsed)
+                                },
+                            });
+                        }
+                        Err(_) => {
+                            let _ = tx.send(super::AgentEvent::SubAgentProgress {
+                                file: file_name,
+                                status: format!("✗ timeout {}s", elapsed),
+                            });
+                        }
+                    }
+                    result
                 });
             }
 
