@@ -162,7 +162,7 @@ impl SubAgentPool {
         Self {
             tasks,
             max_concurrent: 3,
-            timeout_secs: 180,
+            timeout_secs: 300,
         }
     }
 
