@@ -1053,12 +1053,18 @@ impl AgentLoop {
                         }
                     }
 
-                    // Truncation guard: if model's text ends with ":" or "：" it was
-                    // mid-sentence (e.g. "现在修改 App.vue：") — the model intended to
-                    // continue with a tool call but the response got cut off.
-                    let trimmed_text = text.trim();
-                    if !trimmed_text.is_empty()
-                        && (trimmed_text.ends_with(':') || trimmed_text.ends_with('\u{FF1A}'))
+                    // Incomplete turn guard: if model used tools this turn but then
+                    // Responded with short text (not a summary), it's likely mid-task
+                    // — e.g. "现在修改 App.vue：" without calling edit_file.
+                    // Real summaries are long (tables, bullet points, "完成"/"已修复").
+                    // Short intent statements mean the model wants to continue.
+                    if self.tool_call_count > 0
+                        && text.len() < 200
+                        && !text.contains("\u{5B8C}\u{6210}")    // 完成
+                        && !text.contains("\u{5DF2}\u{4FEE}\u{590D}") // 已修复
+                        && !text.contains("\u{603B}\u{7ED3}")    // 总结
+                        && !text.contains("done")
+                        && !text.contains("summary")
                         && self.retry_count < 2
                     {
                         self.retry_count += 1;
