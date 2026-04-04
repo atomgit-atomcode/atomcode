@@ -1065,8 +1065,10 @@ impl AgentLoop {
                     // Phase 4 EXECUTE mode: if model's response contains edit instructions
                     // (file headers with edit descriptions), execute them in focused mode
                     // with minimal context (just the file + instruction).
-                    // Skip if model already edited files this turn (avoid double-edit).
-                    let edit_instrs = if self.files_edited_this_turn.is_empty() {
+                    // Skip if model already used tools this turn (avoid double-edit).
+                    // Model sometimes outputs tool calls AND ### File: plan in the same
+                    // response — the tool calls already did the edit, EXECUTE would redo it.
+                    let edit_instrs = if self.tool_call_count == 0 {
                         execute::parse_edit_instructions(text)
                     } else {
                         Vec::new()
