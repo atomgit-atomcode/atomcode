@@ -243,11 +243,13 @@ impl Conversation {
 
         // Phase 1: Walk backwards through turns, adding full messages from
         // recent turns until we've used ~30% of the budget (hot zone).
-        // Working set (injected in call_llm) provides file skeletons separately,
-        // so conversation hot zone only needs the most recent turn's content.
+        // Guarantee: at least the 2 most recent turns are ALWAYS in hot zone,
+        // even if they exceed the budget. This prevents catastrophic context loss
+        // (20K → 1.3K) when a single large turn fills the budget.
         let hot_budget = remaining_budget * 30 / 100;
         let mut hot_tokens = 0usize;
         let mut hot_turn_start = turns.len(); // index into turns vec
+        let min_hot_turns = 2usize;
 
         for ti in (0..turns.len()).rev() {
             let turn = &turns[ti];
@@ -257,7 +259,11 @@ impl Conversation {
                 .iter()
                 .map(|m| m.estimate_tokens())
                 .sum();
-            if hot_tokens + turn_tokens > hot_budget && hot_turn_start < turns.len() {
+            let turns_included = turns.len() - ti;
+            if hot_tokens + turn_tokens > hot_budget
+                && hot_turn_start < turns.len()
+                && turns_included > min_hot_turns
+            {
                 break;
             }
             hot_tokens += turn_tokens;
@@ -954,26 +960,31 @@ mod tests {
     fn test_budgeted_condenses_old_tool_results() {
         use crate::tool::{ToolCall, ToolResult};
         let mut conv = Conversation::new();
-        conv.add_user_message("fix the bug");
 
-        for i in 0..20 {
-            let call = ToolCall {
-                id: format!("call_{}", i),
-                name: "read_file".to_string(),
-                arguments: format!(r#"{{"file_path":"/tmp/file_{}.rs"}}"#, i),
-            };
-            conv.add_assistant_tool_calls(None, vec![call]);
-            conv.add_tool_result(ToolResult {
-                call_id: format!("call_{}", i),
-                output: "x".repeat(500),
-                success: true,
-            });
+        // Create 5 turns with 4 tool calls each — enough turns so older ones
+        // get condensed while the 2 most recent stay in hot zone.
+        for turn in 0..5 {
+            conv.add_user_message(&format!("task {}", turn));
+            for i in 0..4 {
+                let idx = turn * 4 + i;
+                let call = ToolCall {
+                    id: format!("call_{}", idx),
+                    name: "read_file".to_string(),
+                    arguments: format!(r#"{{"file_path":"/tmp/file_{}.rs"}}"#, idx),
+                };
+                conv.add_assistant_tool_calls(None, vec![call]);
+                conv.add_tool_result(ToolResult {
+                    call_id: format!("call_{}", idx),
+                    output: "x".repeat(500),
+                    success: true,
+                });
+            }
         }
         conv.add_user_message("now what?");
 
         let (msgs, _stats) = conv.to_provider_messages_budgeted("sys", 4000);
         let total_chars: usize = msgs.iter().map(|m| m.text().map_or(0, |t| t.len())).sum();
-        assert!(total_chars < 8000, "Expected condensation, got {} chars", total_chars);
+        assert!(total_chars < 12000, "Expected condensation, got {} chars", total_chars);
         assert!(matches!(msgs[0].role, Role::System));
         assert_eq!(msgs.last().unwrap().text(), Some("now what?"));
     }

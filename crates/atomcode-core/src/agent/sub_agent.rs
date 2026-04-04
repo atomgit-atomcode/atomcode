@@ -52,9 +52,8 @@ impl SubAgentTask {
         // 1. Build minimal system prompt
         let rules = crate::config::prompt_sections::build_rules();
         let vue_warning = if self.file_path.ends_with(".vue") || self.file_path.ends_with(".svelte") {
-            "\nCRITICAL: This is a Vue SFC. NEVER edit across </script>/<template> boundary in a single edit. \
-             Edit <script> section and <template> section in SEPARATE edit_file calls. \
-             Use multi-edit (edits array) with one edit per section. Keep each edit ≤30 lines."
+            "\nCRITICAL: This is a Vue SFC. Edit <script> and <template> in SEPARATE edit_file calls. \
+             Use old_string/new_string for each edit. Keep each edit focused on one region."
         } else { "" };
 
         let system_prompt = format!(
@@ -62,7 +61,7 @@ impl SubAgentTask {
              You are a sub-agent. Your ONLY job: edit `{}`.\n\
              The file content is provided below — do NOT read_file, you already have it.\n\
              Call edit_file IMMEDIATELY on your first turn. Do NOT analyze, summarize, or plan.\n\
-             Use multi-edit (edits array) to change multiple sections in ONE call.\n\
+             Use old_string/new_string to find and replace text. One edit per call.\n\
              You are responsible for ONE file only. Ignore other files.{}",
             rules, self.file_path, vue_warning,
         );
@@ -300,6 +299,6 @@ mod tests {
         ]);
         assert_eq!(pool.tasks.len(), 2);
         assert_eq!(pool.max_concurrent, 3);
-        assert_eq!(pool.timeout_secs, 60);
+        assert_eq!(pool.timeout_secs, 300);
     }
 }

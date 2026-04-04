@@ -38,24 +38,29 @@ impl SubtaskDriver {
     /// Extract subtasks from model's plan text.
     /// Each unique file name mentioned = one subtask.
     /// Backend files first, then frontend.
+    /// Filters out files mentioned only as references (e.g., "参考 ProductCenter.vue 的风格").
     pub fn extract_from_plan(&mut self, plan_text: &str) {
         let mut files = Vec::new();
         let mut seen = HashSet::new();
 
-        // Extract file names from text (*.java, *.vue, *.ts, *.py, etc.)
+        // Identify files that are only mentioned as references (not edit targets).
+        // Strategy: on lines containing a reference keyword, split at the first
+        // modify keyword. Files appearing BEFORE the modify keyword are references.
+        // E.g., "参考 ProductCenter.vue 的风格，修改 TestCenter.vue"
+        //        ^^^^ reference portion ^^^^     ^^^^ modify portion ^^^^
+        let reference_files = extract_reference_files(plan_text);
+
+        // Extract all file names, skip those that are reference-only.
         for word in plan_text.split(|c: char| c.is_whitespace() || c == ',' || c == '`' || c == '"' || c == '\'' || c == '(' || c == ')') {
             let trimmed = word.trim().trim_matches(|c: char| c == '`' || c == '*' || c == ':');
             if trimmed.is_empty() { continue; }
 
-            let is_source = trimmed.ends_with(".java") || trimmed.ends_with(".vue")
-                || trimmed.ends_with(".ts") || trimmed.ends_with(".tsx")
-                || trimmed.ends_with(".py") || trimmed.ends_with(".rs")
-                || trimmed.ends_with(".go") || trimmed.ends_with(".js");
-
-            if is_source {
-                // Extract just the file name (last path component)
+            if is_source_file(trimmed) {
                 let file_name = trimmed.rsplit('/').next().unwrap_or(trimmed);
-                if !file_name.is_empty() && seen.insert(file_name.to_string()) {
+                if !file_name.is_empty()
+                    && seen.insert(file_name.to_string())
+                    && !reference_files.contains(file_name)
+                {
                     files.push(file_name.to_string());
                 }
             }
@@ -99,7 +104,7 @@ impl SubtaskDriver {
         };
 
         Some(format!(
-            "[Subtask {}/{}: Edit {} — make ALL needed changes in ONE edit. {}]",
+            "[Subtask {}/{}: Edit {} \u{2014} make ALL needed changes in ONE edit. {}]",
             self.current_idx + 1, total, task.file, next_hint,
         ))
     }
@@ -130,16 +135,79 @@ impl SubtaskDriver {
     }
 }
 
+/// Check if a string looks like a source file name.
+fn is_source_file(s: &str) -> bool {
+    s.ends_with(".java") || s.ends_with(".vue")
+        || s.ends_with(".ts") || s.ends_with(".tsx")
+        || s.ends_with(".py") || s.ends_with(".rs")
+        || s.ends_with(".go") || s.ends_with(".js")
+        || s.ends_with(".svelte")
+}
+
+/// Extract file names that appear in "reference" context only.
+/// Returns a set of file names that should NOT be treated as edit targets.
+fn extract_reference_files(plan_text: &str) -> HashSet<String> {
+    let mut refs = HashSet::new();
+
+    let ref_kw: &[&str] = &[
+        "\u{53C2}\u{8003}",   // 参考
+        "\u{53C2}\u{7167}",   // 参照
+        "\u{4EFF}\u{7167}",   // 仿照
+        "\u{7C7B}\u{4F3C}",   // 类似
+        "reference", "following", "same as", "style of", "follow",
+    ];
+    let modify_kw: &[&str] = &[
+        "\u{4FEE}\u{6539}",   // 修改
+        "\u{7F16}\u{8F91}",   // 编辑
+        "\u{66F4}\u{65B0}",   // 更新
+        "\u{6DFB}\u{52A0}",   // 添加
+        "\u{5B9E}\u{73B0}",   // 实现
+        "\u{6539}",           // 改
+        "modify", "edit", "update", "add", "change", "implement",
+    ];
+
+    for line in plan_text.lines() {
+        let lower = line.to_lowercase();
+        let has_ref = ref_kw.iter().any(|k| lower.contains(k));
+        if !has_ref { continue; }
+
+        // Find the byte position of the earliest modify keyword
+        let modify_pos = modify_kw.iter()
+            .filter_map(|k| lower.find(k))
+            .min();
+
+        // Reference portion: text before the first modify keyword
+        let ref_portion = match modify_pos {
+            Some(pos) => &line[..pos],
+            None => line,
+        };
+
+        // Extract source file names from reference portion only
+        for word in ref_portion.split(|c: char| {
+            c.is_whitespace() || c == ',' || c == '`' || c == '"'
+                || c == '\'' || c == '(' || c == ')' || c == '\u{FF0C}'
+        }) {
+            let trimmed = word.trim().trim_matches(|c: char| c == '`' || c == '*' || c == ':');
+            if is_source_file(trimmed) {
+                let file_name = trimmed.rsplit('/').next().unwrap_or(trimmed);
+                refs.insert(file_name.to_string());
+            }
+        }
+    }
+
+    refs
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn extract_files_from_plan() {
-        let plan = "我计划修改以下文件：
-1. TagRebuildTaskService.java — 添加 token 统计
-2. AITagExtractionService.java — 返回 token 消耗
-3. SettingsView.vue — 前端显示";
+        let plan = "\u{6211}\u{8BA1}\u{5212}\u{4FEE}\u{6539}\u{4EE5}\u{4E0B}\u{6587}\u{4EF6}\u{FF1A}
+1. TagRebuildTaskService.java \u{2014} \u{6DFB}\u{52A0} token \u{7EDF}\u{8BA1}
+2. AITagExtractionService.java \u{2014} \u{8FD4}\u{56DE} token \u{6D88}\u{8017}
+3. SettingsView.vue \u{2014} \u{524D}\u{7AEF}\u{663E}\u{793A}";
 
         let mut driver = SubtaskDriver::new();
         driver.extract_from_plan(plan);
@@ -154,9 +222,43 @@ mod tests {
     }
 
     #[test]
+    fn reference_files_filtered_out() {
+        // "\u{53C2}\u{8003} ProductCenter.vue \u{7684}\u{98CE}\u{683C}\u{FF0C}\u{4FEE}\u{6539} TestCenter.vue"
+        let plan = "\u{6211}\u{5C06}\u{53C2}\u{8003} ProductCenter.vue \u{7684}\u{98CE}\u{683C}\u{FF0C}\u{4FEE}\u{6539} TestCenter.vue \u{6DFB}\u{52A0}\u{72B6}\u{6001}\u{7B5B}\u{9009}\u{529F}\u{80FD}\u{3002}";
+
+        let mut driver = SubtaskDriver::new();
+        driver.extract_from_plan(plan);
+
+        // Only TestCenter.vue should be extracted, not ProductCenter.vue
+        assert_eq!(driver.subtasks.len(), 1);
+        assert_eq!(driver.subtasks[0].file, "TestCenter.vue");
+    }
+
+    #[test]
+    fn reference_file_english() {
+        let plan = "I'll follow the style of IdeaCenter.vue and modify DevCenter.vue to add code reviews.";
+
+        let mut driver = SubtaskDriver::new();
+        driver.extract_from_plan(plan);
+
+        assert_eq!(driver.subtasks.len(), 1);
+        assert_eq!(driver.subtasks[0].file, "DevCenter.vue");
+    }
+
+    #[test]
+    fn multiple_modify_targets_no_reference() {
+        let plan = "\u{4FEE}\u{6539} Service.java \u{7684}\u{63A5}\u{53E3}\u{FF0C}\u{7136}\u{540E}\u{66F4}\u{65B0} Controller.java \u{7684}\u{8C03}\u{7528}";
+
+        let mut driver = SubtaskDriver::new();
+        driver.extract_from_plan(plan);
+
+        assert_eq!(driver.subtasks.len(), 2);
+    }
+
+    #[test]
     fn instruction_format() {
         let mut driver = SubtaskDriver::new();
-        driver.extract_from_plan("修改 TagService.java 和 SettingsView.vue");
+        driver.extract_from_plan("\u{4FEE}\u{6539} TagService.java \u{548C} SettingsView.vue");
 
         let instr = driver.current_instruction().unwrap();
         assert!(instr.contains("Subtask 1/2"));
@@ -167,7 +269,7 @@ mod tests {
     #[test]
     fn advance_through_subtasks() {
         let mut driver = SubtaskDriver::new();
-        driver.extract_from_plan("修改 A.java 和 B.vue");
+        driver.extract_from_plan("\u{4FEE}\u{6539} A.java \u{548C} B.vue");
 
         assert_eq!(driver.current_idx, 0);
         driver.advance();
@@ -180,7 +282,7 @@ mod tests {
     #[test]
     fn empty_plan_no_subtasks() {
         let mut driver = SubtaskDriver::new();
-        driver.extract_from_plan("我觉得需要修改一些代码");
+        driver.extract_from_plan("\u{6211}\u{89C9}\u{5F97}\u{9700}\u{8981}\u{4FEE}\u{6539}\u{4E00}\u{4E9B}\u{4EE3}\u{7801}");
         assert!(!driver.active);
     }
 }

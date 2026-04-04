@@ -94,14 +94,8 @@ impl Tool for WriteFileTool {
                 format!("Writing to sensitive system path: {}", parsed.file_path),
             );
         }
-        // Overwriting an existing non-empty file is dangerous — it destroys
-        // all code not included in the new content. Require approval.
-        let path = std::path::Path::new(&parsed.file_path);
-        if path.exists() && std::fs::metadata(path).map(|m| m.len() > 0).unwrap_or(false) {
-            return ApprovalRequirement::RequireApproval(
-                format!("Overwriting existing file: {}. Use edit_file instead for targeted changes.", parsed.file_path),
-            );
-        }
+        // Overwriting existing files is blocked in execute() — no need to
+        // RequireApproval here. Only new file creation is auto-approved.
         ApprovalRequirement::AutoApprove
     }
 
@@ -109,16 +103,26 @@ impl Tool for WriteFileTool {
         let parsed: WriteFileArgs = serde_json::from_str(args)?;
         let path = std::path::Path::new(&parsed.file_path);
 
-        // Backup file before overwrite (file-level checkpointing).
-        ctx.file_history.lock().await.backup_before_write(&parsed.file_path).await;
-
-        // Read old content for diff summary (tech-stack agnostic)
+        // Block write_file on existing non-empty files at code level.
+        // Weak models ignore prompt rules ("NEVER write_file on existing files")
+        // and RequireApproval just shifts the burden to the user. Return an error
+        // so the model is forced to use edit_file instead.
         let is_overwrite = path.exists() && std::fs::metadata(path).map(|m| m.len() > 0).unwrap_or(false);
-        let old_content = if is_overwrite {
-            tokio::fs::read_to_string(&parsed.file_path).await.ok()
-        } else {
-            None
-        };
+        if is_overwrite {
+            return Ok(ToolResult {
+                call_id: String::new(),
+                output: format!(
+                    "ERROR: Cannot overwrite existing file '{}' with write_file. \
+                     Use edit_file with start_line/end_line to make targeted changes. \
+                     write_file is only for creating NEW files.",
+                    parsed.file_path
+                ),
+                success: false,
+            });
+        }
+
+        // Backup file before write (file-level checkpointing).
+        ctx.file_history.lock().await.backup_before_write(&parsed.file_path).await;
 
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await?;
@@ -128,45 +132,7 @@ impl Tool for WriteFileTool {
         let lines = parsed.content.lines().count();
         tokio::fs::write(&parsed.file_path, &parsed.content).await?;
 
-        let mut output = if is_overwrite {
-            format!("Overwrote {} ({} bytes, {} lines)", parsed.file_path, bytes, lines)
-        } else {
-            format!("Created new file {} ({} bytes, {} lines)", parsed.file_path, bytes, lines)
-        };
-
-        // Tech-stack agnostic diff: count preserved vs changed lines
-        if let Some(ref old) = old_content {
-            let old_lines: Vec<&str> = old.lines().collect();
-            let new_lines: Vec<&str> = parsed.content.lines().collect();
-            let mut preserved = 0usize;
-            let mut changed = 0usize;
-            for (o, n) in old_lines.iter().zip(new_lines.iter()) {
-                if o.trim() == n.trim() { preserved += 1; } else { changed += 1; }
-            }
-
-            // Find lines in old that are completely gone (imports, function calls, etc.)
-            let old_set: std::collections::HashSet<&str> = old_lines.iter().map(|l| l.trim()).collect();
-            let new_set: std::collections::HashSet<&str> = new_lines.iter().map(|l| l.trim()).collect();
-            let lost: Vec<&&str> = old_set.difference(&new_set)
-                .filter(|l| !l.is_empty() && l.len() > 10)
-                .take(5)
-                .collect();
-
-            output.push_str(&format!(" ({} lines preserved, {} changed)", preserved, changed));
-
-            if changed > preserved && preserved > 0 {
-                output.push_str(
-                    "\nWARNING: Most of the file was rewritten. Verify that imports, \
-                     API calls, and business logic are still correct."
-                );
-            }
-            if !lost.is_empty() {
-                output.push_str("\nLines REMOVED from original (verify these aren't needed):");
-                for line in &lost {
-                    output.push_str(&format!("\n  - {}", line));
-                }
-            }
-        }
+        let output = format!("Created new file {} ({} bytes, {} lines)", parsed.file_path, bytes, lines);
 
         Ok(ToolResult {
             call_id: String::new(),

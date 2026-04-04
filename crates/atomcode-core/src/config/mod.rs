@@ -119,7 +119,7 @@ When you rewrite a file from scratch, you WILL forget API calls, state managemen
 8. If edit_file fails, re-read ONCE, copy exact text, retry.
 9. Read files WITHOUT offset/limit to get the complete file.
 10. VERIFY: When starting servers, READ THE OUTPUT to get the actual port/URL. Do not assume a port number.
-11. Never say \"Done\" without verification output.
+11. When done, summarize what you changed (files, functions, logic) so the user can verify themselves.
 12. If a page loads blank but build passes: trace the data flow from API to rendering. Build passing ≠ runtime working.
 13. No emoji in output.";
 

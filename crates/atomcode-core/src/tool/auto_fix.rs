@@ -25,7 +25,9 @@ pub struct ValidateResult {
 /// Returns a `ValidateResult` with the (possibly fixed) content.
 /// The caller should write `fixed_content` to disk, then optionally call
 /// `post_edit_syntax_check` for on-disk syntax validation.
-pub async fn validate_and_fix(content: &str, file_path: &str, new_string: &str) -> ValidateResult {
+/// `content` is the post-edit content (what would be written to disk).
+/// `original_content` is the pre-edit content (for delta validation).
+pub async fn validate_and_fix(content: &str, file_path: &str, new_string: &str, original_content: &str) -> ValidateResult {
     let mut errors: Vec<String> = Vec::new();
     let current = content.to_string();
 
@@ -69,10 +71,19 @@ pub async fn validate_and_fix(content: &str, file_path: &str, new_string: &str) 
         }
     }
 
-    // 4. HTML tag balance — REJECT if unbalanced
+    // 4. HTML tag balance — DELTA validation.
+    // Only reject if the edit made the balance WORSE, not if the file
+    // was already broken. This prevents rejecting correct edits on files
+    // with pre-existing structural issues.
     if matches!(ext, "vue" | "html" | "svelte" | "htm" | "jsx" | "tsx") {
-        let html_errors = check_html_balance(&current, file_path);
-        errors.extend(html_errors);
+        let before_score = html_balance_score(original_content, file_path);
+        let after_score = html_balance_score(&current, file_path);
+        if after_score < before_score {
+            // Edit made the balance worse — report what got worse
+            let html_errors = check_html_balance(&current, file_path);
+            errors.extend(html_errors);
+        }
+        // If after_score >= before_score: edit didn't break anything (or fixed something) → accept
     }
 
     // If any structural errors → reject (don't write)
@@ -129,6 +140,30 @@ fn count_delimiters(content: &str) -> (i64, i64, usize) {
 }
 
 /// Check HTML tag balance for template-heavy files. Returns error messages.
+/// Compute a numeric "balance score" for HTML tags in a file.
+/// Score = negative sum of absolute imbalances across all tracked tags.
+/// A perfectly balanced file scores 0. Each unmatched tag subtracts 1.
+/// Used for delta validation: reject edit only if score got worse.
+pub fn html_balance_score(content: &str, file_path: &str) -> i64 {
+    let ext = file_path.rsplit('.').next().unwrap_or("");
+    let check_content = if ext == "vue" {
+        if let Some(start) = content.find("<template") {
+            if let Some(end) = content.rfind("</template>") {
+                &content[start..end]
+            } else { content }
+        } else { return 0; }
+    } else { content };
+
+    let tags = ["div", "section", "main", "aside", "article", "nav", "header", "footer", "form"];
+    let mut score: i64 = 0;
+    for tag in &tags {
+        let opens = check_content.matches(&format!("<{}", tag)).count() as i64;
+        let closes = check_content.matches(&format!("</{}>", tag)).count() as i64;
+        score -= (opens - closes).abs();
+    }
+    score
+}
+
 fn check_html_balance(content: &str, file_path: &str) -> Vec<String> {
     let ext = file_path.rsplit('.').next().unwrap_or("");
     let check_content = if ext == "vue" {

@@ -75,13 +75,15 @@ async fn validate_write_check(
     content: &str,
     file_path: &str,
     new_string: &str,
+    original_content: &str,
     result: ToolResult,
 ) -> Result<(ToolResult, String)> {
     if !result.success {
         return Ok((result, content.to_string()));
     }
-    // 1. Validate in memory (before write)
-    let validated = auto_fix::validate_and_fix(content, file_path, new_string).await;
+    // 1. Validate in memory (before write).
+    // Pass original_content for delta validation (reject only if edit made things worse).
+    let validated = auto_fix::validate_and_fix(content, file_path, new_string, original_content).await;
 
     // 2. If rejected — DON'T write (unless rejected 3+ times → fall through with warning)
     if validated.rejected {
@@ -140,6 +142,15 @@ async fn validate_write_check(
     if !syntax_warn.is_empty() {
         all_warnings.push(syntax_warn);
     }
+
+    // 5. Append surrounding context after edit — gives model the current file
+    // state around the edit point so it can construct accurate old_string
+    // for the next edit without needing a separate read_file/grep call.
+    let context_snippet = build_edit_context(&validated.fixed_content, new_string);
+    let result = ToolResult {
+        output: format!("{}{}", result.output, context_snippet),
+        ..result
+    };
 
     if all_warnings.is_empty() {
         Ok((result, validated.fixed_content))
@@ -200,26 +211,15 @@ impl Tool for EditFileTool {
         ToolDef {
             name: "edit_file",
             description: "Replace text in a file. ALWAYS prefer this over write_file for existing files.\n\
-                Three modes:\n\
-                1. LINE-NUMBER MODE (recommended): specify start_line and end_line from read_file output.\n\
-                   No need to copy text — just use line numbers. Replaces lines start_line through end_line with new_string.\n\
-                   Example: {\"file_path\": \"app.vue\", \"start_line\": 150, \"end_line\": 165, \"new_string\": \"<new content>\"}\n\
-                2. TEXT MATCH MODE: specify old_string to find and replace.\n\
-                   old_string must be unique in the file (or use replace_all=true for bulk changes).\n\
-                   Example: {\"file_path\": \"app.vue\", \"old_string\": \"bg-blue-500\", \"new_string\": \"bg-red-500\", \"replace_all\": true}\n\
-                3. MULTI-EDIT MODE: pass an edits array to change multiple regions in ONE call.\n\
-                   Each edit uses line-number or text-match mode independently. Applied back-to-front automatically.\n\
-                   PREFER THIS when you need to change 2+ non-adjacent regions (e.g. imports + logic + template).\n\
-                   Example: {\"file_path\": \"app.vue\", \"edits\": [\n\
-                     {\"start_line\": 5, \"end_line\": 6, \"new_string\": \"import { ref, computed } from 'vue'\"},\n\
-                     {\"start_line\": 30, \"end_line\": 30, \"new_string\": \"const count = ref(0)\"},\n\
-                     {\"old_string\": \"<div>old</div>\", \"new_string\": \"<div>new</div>\"}\n\
-                   ]}\n\
-                Additional options:\n\
-                - symbol: scope the edit to a specific function/class (tree-sitter). Reduces ambiguity.\n\
+                Usage: specify old_string (text to find) and new_string (replacement).\n\
+                old_string must be unique in the file. Include enough surrounding lines to make it unique.\n\
+                Example: {\"file_path\": \"app.vue\", \"old_string\": \"const count = ref(0)\", \"new_string\": \"const count = ref(42)\"}\n\
+                For bulk replace: {\"old_string\": \"bg-blue-500\", \"new_string\": \"bg-red-500\", \"replace_all\": true}\n\
+                For multiple regions: make separate edit_file calls, one per region.\n\
+                Fallback: start_line/end_line can replace a line range if text matching is impractical.\n\
                 Behavior:\n\
                 - If old_string is not found, auto-tries fuzzy matching (whitespace-normalized).\n\
-                - NEVER use write_file to modify existing files. edit_file prevents accidental code deletion.".to_string(),
+                - NEVER use write_file to modify existing files.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -229,7 +229,7 @@ impl Tool for EditFileTool {
                     },
                     "old_string": {
                         "type": "string",
-                        "description": "Text to find (text-match mode). Not needed if using start_line/end_line."
+                        "description": "Exact text to find and replace. Include enough context lines to be unique."
                     },
                     "new_string": {
                         "type": "string",
@@ -237,11 +237,11 @@ impl Tool for EditFileTool {
                     },
                     "start_line": {
                         "type": "integer",
-                        "description": "Start line number (from read_file output). Replaces lines start_line..end_line with new_string."
+                        "description": "(Fallback) Start line number. Use old_string instead when possible."
                     },
                     "end_line": {
                         "type": "integer",
-                        "description": "End line number (inclusive). Used with start_line for line-number mode."
+                        "description": "(Fallback) End line number. Use old_string instead when possible."
                     },
                     "replace_all": {
                         "type": "boolean",
@@ -251,20 +251,6 @@ impl Tool for EditFileTool {
                         "type": "string",
                         "description": "Scope edit to a specific function/class name (tree-sitter)."
                     },
-                    "edits": {
-                        "type": "array",
-                        "description": "Multi-edit: array of edits to apply in one call. Each edit has start_line/end_line or old_string, plus new_string. Use when changing 2+ non-adjacent regions.",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "start_line": { "type": "integer", "description": "Start line number" },
-                                "end_line": { "type": "integer", "description": "End line number (inclusive)" },
-                                "old_string": { "type": "string", "description": "Text to find (text-match mode)" },
-                                "new_string": { "type": "string", "description": "Replacement text" }
-                            },
-                            "required": ["new_string"]
-                        }
-                    }
                 },
                 "required": ["file_path"]
             }),
@@ -285,16 +271,19 @@ impl Tool for EditFileTool {
             .await
             .with_context(|| format!("Failed to read {}", parsed.file_path))?;
 
-        // ── MULTI-EDIT MODE ──
-        if let Some(edits) = parsed.edits {
-            if edits.is_empty() {
-                return Ok(ToolResult {
-                    call_id: String::new(),
-                    output: "Error: edits array is empty.".to_string(),
-                    success: false,
-                });
-            }
-            return self.execute_multi_edit(&parsed.file_path, &content, edits).await;
+        // ── MULTI-EDIT MODE — disabled ──
+        // Multi-edit 25次实测：apply 成功率高但改对率低，N个edit同时出错难回滚。
+        // Phase 4 EXECUTE mode 下重新启用（有精确指令，不需要模型自己算行号）。
+        // 当前强制单 edit 串行，模型每次只改一处，精度更高。
+        if let Some(_edits) = parsed.edits {
+            return Ok(ToolResult {
+                call_id: String::new(),
+                output: "Multi-edit is disabled. Use single edit_file calls instead — \
+                         one edit per call with old_string/new_string. \
+                         Make multiple calls to edit multiple regions."
+                    .to_string(),
+                success: false,
+            });
         }
 
         // Single-edit mode: new_string is required
@@ -411,7 +400,7 @@ impl Tool for EditFileTool {
                 ),
                 success: true,
             };
-            let (result, _final_content) = validate_write_check(&new_content, &parsed.file_path, &new_string, result).await?;
+            let (result, _final_content) = validate_write_check(&new_content, &parsed.file_path, &new_string, &content, result).await?;
             return Ok(result);
         }
 
@@ -487,7 +476,7 @@ impl Tool for EditFileTool {
                     output: format!("Edited {} {}.\n{}", parsed.file_path, label, diff),
                     success: true,
                 };
-                let (result, _final_content) = validate_write_check(&new_content, &parsed.file_path, &new_string, result).await?;
+                let (result, _final_content) = validate_write_check(&new_content, &parsed.file_path, &new_string, &content, result).await?;
                 // Invalidate AST cache for this file
                 drop(searcher); // release lock before re-acquiring
                 let mut searcher = ctx.semantic.lock().await;
@@ -529,7 +518,7 @@ impl Tool for EditFileTool {
                         diff),
                     success: true,
                 };
-                let (result, _final_content) = validate_write_check(&fuzzy_result, &parsed.file_path, &new_string, result).await?;
+                let (result, _final_content) = validate_write_check(&fuzzy_result, &parsed.file_path, &new_string, &content, result).await?;
                 return Ok(result);
             }
 
@@ -586,7 +575,7 @@ impl Tool for EditFileTool {
                 ),
                 success: true,
             };
-            let (result, _final_content) = validate_write_check(&new_content, &parsed.file_path, &new_string, result).await?;
+            let (result, _final_content) = validate_write_check(&new_content, &parsed.file_path, &new_string, &content, result).await?;
             Ok(result)
         } else {
             if count > 1 {
@@ -623,7 +612,7 @@ impl Tool for EditFileTool {
                                 parsed.file_path, sym.name, count, diff),
                             success: true,
                         };
-                        let (result, _final_content) = validate_write_check(&new_content, &parsed.file_path, &new_string, result).await?;
+                        let (result, _final_content) = validate_write_check(&new_content, &parsed.file_path, &new_string, &content, result).await?;
                         return Ok(result);
                     }
                 }
@@ -652,7 +641,7 @@ impl Tool for EditFileTool {
                 ),
                 success: true,
             };
-            let (result, _final_content) = validate_write_check(&new_content, &parsed.file_path, &new_string, result).await?;
+            let (result, _final_content) = validate_write_check(&new_content, &parsed.file_path, &new_string, &content, result).await?;
             Ok(result)
         }
     }
@@ -718,23 +707,6 @@ impl EditFileTool {
             }
         }
 
-        // Check for overlapping ranges
-        resolved.sort_by_key(|(start, _, _)| *start);
-        for w in resolved.windows(2) {
-            let (_, end_a, _) = &w[0];
-            let (start_b, _, _) = &w[1];
-            if start_b <= end_a {
-                return Ok(ToolResult {
-                    call_id: String::new(),
-                    output: format!(
-                        "Error: overlapping edit ranges detected (lines {}-{} and {}-{}). Edits must not overlap.",
-                        w[0].0, end_a, start_b, w[1].1
-                    ),
-                    success: false,
-                });
-            }
-        }
-
         // Boundary overlap auto-correction: trailing + leading.
         // Trailing: new_string ends duplicate lines after end_line → extend end.
         // Leading: new_string begins duplicate lines before start_line → extend start.
@@ -774,15 +746,33 @@ impl EditFileTool {
             }
         }
 
-        // Re-check overlaps after boundary correction
+        // Auto-merge overlapping ranges instead of rejecting.
+        // Weak models frequently generate edits like (264-279) + (268-279)
+        // where the second edit extends or replaces part of the first.
+        // Merge: keep the union range, second edit's new_string wins for
+        // the overlapping portion.
         resolved.sort_by_key(|(start, _, _)| *start);
-        for w in resolved.windows(2) {
-            if w[1].0 <= w[0].1 {
-                // Overlaps after correction — truncate the first edit's end
-                // to avoid conflict. The second edit takes priority.
-                break; // just proceed, splice will handle it
+        let mut merged: Vec<(usize, usize, String)> = Vec::new();
+        for edit in resolved {
+            if let Some(last) = merged.last_mut() {
+                if edit.0 <= last.1 {
+                    // Overlapping — merge (adjacent edits are NOT merged).
+                    // Strategy: the later edit (by position) wins for the
+                    // overlapping region.
+                    if edit.1 >= last.1 {
+                        // Second edit extends beyond first — take second's content
+                        // for the entire merged range (matches model intent:
+                        // it wanted to replace this whole region).
+                        last.1 = edit.1;
+                        last.2 = edit.2;
+                    }
+                    // If second is fully contained in first, first wins (skip second)
+                    continue;
+                }
             }
+            merged.push(edit);
         }
+        let mut resolved = merged;
 
         // Apply edits back-to-front to preserve line numbers
         resolved.sort_by(|a, b| b.0.cmp(&a.0));
@@ -821,7 +811,7 @@ impl EditFileTool {
                 edit_count, file_path, summary_parts.join(", ")),
             success: true,
         };
-        let (result, _final_content) = validate_write_check(&new_content, file_path, &all_new_strings, result).await?;
+        let (result, _final_content) = validate_write_check(&new_content, file_path, &all_new_strings, content, result).await?;
         Ok(result)
     }
 }
@@ -1079,6 +1069,38 @@ fn build_compact_diff(old: &str, new: &str) -> String {
     }
 
     diff.trim_end().to_string()
+}
+
+/// Build a context snippet showing ±5 lines around the edited region.
+/// This lets the model see the current file state after the edit,
+/// so it can construct accurate old_string for the next edit without grep/read.
+fn build_edit_context(content: &str, new_string: &str) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+    if lines.len() <= 15 {
+        // Small file — don't bother, the model already has it in context.
+        return String::new();
+    }
+
+    // Find where new_string appears in the content to locate the edit region.
+    let first_new_line = new_string.lines().next().unwrap_or("").trim();
+    if first_new_line.is_empty() || first_new_line.len() < 5 {
+        return String::new();
+    }
+
+    let edit_line = lines.iter().position(|l| l.trim() == first_new_line);
+    let center = match edit_line {
+        Some(idx) => idx,
+        None => return String::new(),
+    };
+
+    let start = center.saturating_sub(5);
+    let end = (center + new_string.lines().count() + 5).min(lines.len());
+
+    let mut snippet = format!("\n[File after edit, lines {}-{}:]\n", start + 1, end);
+    for (i, line) in lines[start..end].iter().enumerate() {
+        snippet.push_str(&format!("{:>4}| {}\n", start + i + 1, line));
+    }
+    snippet
 }
 
 /// Auto re-read: when old_string match fails, include current file content

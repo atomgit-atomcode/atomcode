@@ -823,8 +823,9 @@ impl AgentLoop {
                                             }
                                         }
                                     }
-                                    if let Some(pos) = output.find("Wrote ") {
-                                        let rest = &output[pos + 6..];
+                                    if let Some(pos) = output.find("Wrote ").or_else(|| output.find("Overwrote ")) {
+                                        let keyword_len = if output[pos..].starts_with("Overwrote ") { 10 } else { 6 };
+                                        let rest = &output[pos + keyword_len..];
                                         let fp_end = rest.find(|c: char| c == ' ' || c == '\n' || c == '(').unwrap_or(rest.len());
                                         let fp = rest[..fp_end].trim();
                                         if !fp.is_empty() {
@@ -969,13 +970,23 @@ impl AgentLoop {
                             // spawn parallel sub-agents instead of serial subtask loop.
                             if self.subtask_driver.subtasks.len() >= 2 {
                                 if let Some(sub_result) = self.try_sub_agent_dispatch(text).await {
-                                    // Sub-agents completed — inject summary into conversation
-                                    self.conversation.add_user_message("Sub-agent results are above. Summarize what was changed.");
-                                    let _ = self.event_tx.send(AgentEvent::TextDelta(sub_result));
+                                    let _ = self.event_tx.send(AgentEvent::TextDelta(sub_result.clone()));
                                     // Reset subtask driver since sub-agents handled it
                                     self.subtask_driver = subtask_driver::SubtaskDriver::new();
-                                    // Fall through to finish (model will summarize on next turn)
-                                    break;
+
+                                    if sub_result.contains("BUILD ERRORS") {
+                                        // Build failed after sub-agent merge — inject error
+                                        // into conversation so the main agent fixes it.
+                                        self.conversation.add_user_message(&format!(
+                                            "[Sub-agent merge build FAILED. Fix the errors below, then summarize.]\n{}",
+                                            sub_result
+                                        ));
+                                        // Continue turn loop — don't break
+                                    } else {
+                                        // Build passed — summarize and finish
+                                        self.conversation.add_user_message("Sub-agent results are above. Summarize what was changed.");
+                                        break;
+                                    }
                                 }
                                 // If sub-agent dispatch failed, fall through to serial subtask
                             }
@@ -1051,18 +1062,32 @@ impl AgentLoop {
 
                     // Sub-agent extraction from UsedTools: model may output plan text
                     // alongside tool calls (e.g. "Plan: 1. IdeaCenter.vue 2. ProductCenter.vue"
-                    // + read_file in the same turn). Extract plan and dispatch if 2+ files.
+                    // + read_file in the same turn). Only dispatch on the FIRST tool-use turn
+                    // (planning phase). If model has already been editing files, don't
+                    // re-dispatch — the text may just mention files it already changed.
                     if let Some(ref plan_text) = text {
-                        if !self.subtask_driver.active && !plan_text.trim().is_empty() {
+                        if self.tool_call_count <= tool_count  // only first tool-use response
+                            && !self.subtask_driver.active
+                            && !plan_text.trim().is_empty()
+                        {
                             self.subtask_driver.extract_from_plan(plan_text);
                             if self.subtask_driver.active && self.subtask_driver.subtasks.len() >= 2 {
                                 self.plan_text = Some(plan_text.clone());
                                 if let Some(sub_result) = self.try_sub_agent_dispatch(plan_text).await {
-                                    self.conversation.add_user_message("Sub-agent results are above. Summarize what was changed.");
-                                    let _ = self.event_tx.send(AgentEvent::TextDelta(sub_result));
+                                    let _ = self.event_tx.send(AgentEvent::TextDelta(sub_result.clone()));
                                     self.subtask_driver = subtask_driver::SubtaskDriver::new();
-                                    self.finish_turn();
-                                    return;
+
+                                    if sub_result.contains("BUILD ERRORS") {
+                                        // Build failed — inject error, continue turn loop
+                                        self.conversation.add_user_message(&format!(
+                                            "[Sub-agent merge build FAILED. Fix the errors below, then summarize.]\n{}",
+                                            sub_result
+                                        ));
+                                    } else {
+                                        self.conversation.add_user_message("Sub-agent results are above. Summarize what was changed.");
+                                        self.finish_turn();
+                                        return;
+                                    }
                                 }
                                 // Failed — fall through to serial execution
                             }
@@ -1199,6 +1224,11 @@ impl AgentLoop {
     /// Returns Some(summary_text) if dispatch succeeded, None if it should
     /// fall back to serial subtask execution.
     async fn try_sub_agent_dispatch(&mut self, plan_text: &str) -> Option<String> {
+        // Sub-agent disabled: 8 次实测全败，等 Phase 4 用 fork 模式重建。
+        // 当前 fallback 到 serial subtask execution（主 agent 串行编辑）。
+        return None;
+
+        #[allow(unreachable_code)]
         let wd = self.turn_runner.context.working_dir.try_read()
             .map(|g| g.clone())
             .ok()?;
@@ -1339,19 +1369,14 @@ impl AgentLoop {
             summary.push_str(&format!("\n{}/{} sub-agents failed.\n", failed.len(), results.len()));
         }
 
-        // Merge verification: compile/build to catch cross-file errors
-        let build_cmd = if wd.join("package.json").exists() {
-            Some("npm run build 2>&1 | head -30")
-        } else if wd.join("Cargo.toml").exists() {
-            Some("cargo check 2>&1 | tail -20")
-        } else {
-            None
-        };
+        // Merge verification: compile/build to catch cross-file errors.
+        // Search up to 2 levels deep for build markers (handles nested project dirs).
+        let build_cmd_and_dir = find_build_command(&wd);
 
-        if let Some(cmd) = build_cmd {
+        if let Some((cmd, build_dir)) = build_cmd_and_dir {
             let output = tokio::process::Command::new("sh")
-                .args(["-c", cmd])
-                .current_dir(&wd)
+                .args(["-c", &cmd])
+                .current_dir(&build_dir)
                 .output()
                 .await;
             if let Ok(out) = output {
@@ -1436,6 +1461,47 @@ fn extract_contract(plan_text: &str) -> String {
     } else {
         contract_lines.join("\n")
     }
+}
+
+/// Search for build marker files (package.json, Cargo.toml, etc.) in the given
+/// directory and up to 2 levels of subdirectories. Returns the build command and
+/// the directory containing the marker. This handles nested project structures
+/// like `project/frontend/package.json`.
+fn find_build_command(wd: &std::path::Path) -> Option<(String, std::path::PathBuf)> {
+    let markers: &[(&str, &str)] = &[
+        ("package.json", "npm run build 2>&1 | head -30"),
+        ("Cargo.toml", "cargo check 2>&1 | tail -20"),
+        ("pom.xml", "mvn compile -q 2>&1 | tail -20"),
+        ("go.mod", "go build ./... 2>&1 | tail -20"),
+    ];
+
+    // Check wd itself first
+    for &(marker, cmd) in markers {
+        if wd.join(marker).exists() {
+            return Some((cmd.to_string(), wd.to_path_buf()));
+        }
+    }
+
+    // Check immediate subdirectories (depth 1)
+    if let Ok(entries) = std::fs::read_dir(wd) {
+        for entry in entries.flatten() {
+            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                let sub = entry.path();
+                // Skip hidden dirs, node_modules, target, etc.
+                let name = sub.file_name().unwrap_or_default().to_string_lossy();
+                if name.starts_with('.') || name == "node_modules" || name == "target" {
+                    continue;
+                }
+                for &(marker, cmd) in markers {
+                    if sub.join(marker).exists() {
+                        return Some((cmd.to_string(), sub));
+                    }
+                }
+            }
+        }
+    }
+
+    None
 }
 
 fn short_path(path: &str) -> String {

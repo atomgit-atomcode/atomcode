@@ -170,6 +170,7 @@ async fn edit_creates_file_history_backup() {
 // ═══════════════════════════════════════════════════════════════
 
 #[tokio::test]
+#[ignore] // multi-edit disabled in Phase 3.5
 async fn multi_edit_line_number_mode() {
     // Simulate a Vue SFC: imports, logic, template
     let content = "\
@@ -224,6 +225,7 @@ function increment() { count.value++ }
 }
 
 #[tokio::test]
+#[ignore] // multi-edit disabled in Phase 3.5
 async fn multi_edit_text_match_mode() {
     let content = "\
 function hello() { return 'hello'; }
@@ -260,6 +262,7 @@ function main() { console.log(hello(), world()); }
 }
 
 #[tokio::test]
+#[ignore] // multi-edit disabled in Phase 3.5
 async fn multi_edit_overlap_detection() {
     let content = (1..=20).map(|i| format!("line {}", i)).collect::<Vec<_>>().join("\n");
     let path = create_test_file(&content);
@@ -275,13 +278,23 @@ async fn multi_edit_overlap_detection() {
     });
 
     let result = tool.execute(&args.to_string(), &ctx).await.unwrap();
-    assert!(!result.success, "Overlapping edits should fail");
-    assert!(result.output.contains("overlapping"), "Should mention overlap: {}", result.output);
+    // Overlapping edits are auto-merged: second edit (8-15) extends beyond
+    // first (5-10), so the merged range is 5-15 with second edit's content.
+    assert!(result.success, "Overlapping edits should be auto-merged, got: {}", result.output);
+
+    // Verify the merge result: lines 5-15 replaced with "b" (second edit wins)
+    let after = std::fs::read_to_string(&path).unwrap();
+    let after_lines: Vec<&str> = after.lines().collect();
+    assert_eq!(after_lines[0], "line 1"); // untouched
+    assert_eq!(after_lines[3], "line 4"); // untouched
+    assert_eq!(after_lines[4], "b");      // merged edit
+    assert_eq!(after_lines[5], "line 16"); // after the merged range
 
     cleanup(&path);
 }
 
 #[tokio::test]
+#[ignore] // multi-edit disabled in Phase 3.5
 async fn multi_edit_mixed_modes() {
     let content = "\
 import React from 'react'
@@ -322,6 +335,7 @@ export default App
 }
 
 #[tokio::test]
+#[ignore] // multi-edit disabled in Phase 3.5
 async fn multi_edit_string_line_numbers() {
     // Test lenient parsing: model sends line numbers as strings
     let content = "line 1\nline 2\nline 3\nline 4\nline 5\n";
@@ -407,6 +421,7 @@ function main() {}
 }
 
 #[tokio::test]
+#[ignore] // multi-edit disabled in Phase 3.5
 async fn multi_edit_boundary_overlap_dedup() {
     let content = "\
 import { ref } from 'vue'
@@ -486,6 +501,7 @@ function main() {}
 }
 
 #[tokio::test]
+#[ignore] // multi-edit disabled in Phase 3.5
 async fn multi_edit_leading_overlap_dedup() {
     let content = "\
 <script setup>
@@ -528,5 +544,99 @@ const active = ref(true)
     assert_eq!(import_ref_count, 1, "import ref should appear once (leading corrected), got:\n{}", new_content);
     assert_eq!(div_count, 1, "div should appear once (leading corrected), got:\n{}", new_content);
 
+    cleanup(&path);
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 9. Delta validation — edit on broken file should NOT be rejected
+//    if the edit didn't make the balance worse
+// ═══════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn delta_correct_edit_on_broken_file_accepted() {
+    // File already has an extra </div> (pre-existing bug).
+    // Edit changes paragraph text — doesn't touch divs — should be ACCEPTED.
+    let content = "<script setup lang=\"ts\">\nconst name = ref('hello')\n</script>\n\n<template>\n  <div class=\"root\">\n    <div class=\"inner\">\n        <p>content</p>\n    </div>\n    </div>\n  </div>\n</template>";
+
+    let path = create_test_file(content);
+    let ctx = test_context();
+    let tool = atomcode_core::tool::edit::EditFileTool;
+
+    let args = serde_json::json!({
+        "file_path": path,
+        "old_string": "<p>content</p>",
+        "new_string": "<p>updated content</p>"
+    });
+
+    let result = tool.execute(&args.to_string(), &ctx).await.unwrap();
+    assert!(result.success, "Edit on broken file should be accepted if it doesn't worsen balance: {}", result.output);
+    cleanup(&path);
+}
+
+#[tokio::test]
+async fn delta_bad_edit_on_good_file_rejected() {
+    // File is perfectly balanced. Edit removes a closing </div> — should be REJECTED.
+    let content = "<script setup lang=\"ts\">\nconst x = 1\n</script>\n\n<template>\n  <div class=\"root\">\n    <div class=\"inner\">\n      <p>hello</p>\n    </div>\n  </div>\n</template>";
+
+    let path = create_test_file(content);
+    let ctx = test_context();
+    let tool = atomcode_core::tool::edit::EditFileTool;
+
+    let args = serde_json::json!({
+        "file_path": path,
+        "old_string": "    </div>\n  </div>",
+        "new_string": "  </div>"
+    });
+
+    let result = tool.execute(&args.to_string(), &ctx).await.unwrap();
+    assert!(!result.success, "Edit that breaks balance should be rejected: {}", result.output);
+    cleanup(&path);
+}
+
+#[tokio::test]
+async fn delta_fix_edit_on_broken_file_accepted() {
+    // File has missing </div>. Edit adds it back — should be ACCEPTED (improves balance).
+    let content = "<script setup lang=\"ts\">\nconst x = 1\n</script>\n\n<template>\n  <div class=\"root\">\n    <div class=\"inner\">\n      <p>hello</p>\n  </div>\n</template>";
+
+    let path = create_test_file(content);
+    let ctx = test_context();
+    let tool = atomcode_core::tool::edit::EditFileTool;
+
+    let args = serde_json::json!({
+        "file_path": path,
+        "old_string": "      <p>hello</p>",
+        "new_string": "      <p>hello</p>\n    </div>"
+    });
+
+    let result = tool.execute(&args.to_string(), &ctx).await.unwrap();
+    assert!(result.success, "Fix edit should be accepted: {}", result.output);
+    cleanup(&path);
+}
+
+#[tokio::test]
+#[ignore] // multi-edit disabled in Phase 3.5
+async fn delta_multi_edit_on_broken_file_accepted() {
+    // File has pre-existing balance issue. Multi-edit changes script + template
+    // without changing div balance — should be ACCEPTED.
+    let content = "<script setup lang=\"ts\">\nimport { ref } from 'vue'\nconst count = ref(0)\n</script>\n\n<template>\n  <div class=\"app\">\n    <div class=\"header\">\n      <h1>Title</h1>\n    </div>\n    <div class=\"body\">\n      <p>{{ count }}</p>\n  </div>\n</template>";
+
+    let path = create_test_file(content);
+    let ctx = test_context();
+    let tool = atomcode_core::tool::edit::EditFileTool;
+
+    let args = serde_json::json!({
+        "file_path": path,
+        "edits": [
+            { "old_string": "const count = ref(0)", "new_string": "const count = ref(42)" },
+            { "old_string": "<h1>Title</h1>", "new_string": "<h1>New Title</h1>" }
+        ]
+    });
+
+    let result = tool.execute(&args.to_string(), &ctx).await.unwrap();
+    assert!(result.success, "Multi-edit that doesn't worsen balance should be accepted: {}", result.output);
+
+    let after = std::fs::read_to_string(&path).unwrap();
+    assert!(after.contains("ref(42)"));
+    assert!(after.contains("New Title"));
     cleanup(&path);
 }

@@ -292,52 +292,9 @@ impl AgentLoop {
         }
     }
 
-    /// Detect partial Vue/React SFC edits: if a single edit only touched <script>
-    /// but the file also has <template>, remind the model to use multi-edit.
+    /// No-op: Vue partial edit detection removed. Multi-edit is disabled;
+    /// serial edit_file calls with old_string/new_string are the standard approach.
     pub(crate) async fn check_vue_partial_edit(&mut self) {
-        let wd = self.turn_runner.context.working_dir.try_read()
-            .map(|g| g.clone()).unwrap_or_default();
-
-        for file in &self.files_edited_this_turn {
-            let is_sfc = file.ends_with(".vue") || file.ends_with(".svelte");
-            if !is_sfc { continue; }
-
-            let path = if std::path::Path::new(file).is_absolute() {
-                std::path::PathBuf::from(file)
-            } else {
-                wd.join(file)
-            };
-            let content = match tokio::fs::read_to_string(&path).await {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-
-            let has_script = content.contains("<script");
-            let has_template = content.contains("<template");
-            if !has_script || !has_template { continue; }
-
-            // Check if the last edit result for this file was a single edit (not multi-edit)
-            let last_edit_was_single = self.conversation.messages.iter().rev()
-                .filter_map(|m| match &m.content {
-                    crate::conversation::message::MessageContent::ToolResult(r) if r.success => Some(&r.output),
-                    _ => None,
-                })
-                .take(3)
-                .any(|o| o.contains(file) && !o.contains("Multi-edit:"));
-
-            if last_edit_was_single {
-                // Append to last tool result instead of adding user message
-                if let Some(last_msg) = self.conversation.messages.last_mut() {
-                    if let crate::conversation::message::MessageContent::ToolResult(ref mut r) = last_msg.content {
-                        r.output.push_str(&format!(
-                            "\n\n[HINT: {} is a Vue SFC with both <script> and <template>. \
-                             If you need to change both sections, use edit_file with edits array \
-                             to change ALL regions in ONE call. Do NOT make separate edits.]",
-                            file
-                        ));
-                    }
-                }
-            }
-        }
+        // Intentionally empty. Kept as stub to avoid changing call sites.
     }
 }

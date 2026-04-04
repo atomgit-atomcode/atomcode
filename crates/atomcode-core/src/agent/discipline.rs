@@ -133,8 +133,9 @@ impl AgentLoop {
     }
 
     /// Check if step limit has been reached.
+    /// Base limit is 30. Each edited file adds 5. Hard cap at 60.
     pub(crate) fn check_step_limit(&self) -> bool {
-        let dynamic_limit = 35 + (5 * self.files_edited_this_turn.len());
+        let dynamic_limit = 30 + (5 * self.files_edited_this_turn.len());
         let hard_limit = dynamic_limit.min(60);
         self.tool_call_count >= hard_limit
     }

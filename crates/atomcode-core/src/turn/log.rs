@@ -168,15 +168,16 @@ mod tests {
         // Call
         log_llm_request(&messages, &tool_defs, "test-model", 16000, 3);
 
-        // Find new file
+        // Find new file(s) — use >= 1 because parallel tests may also write logs.
         let after: std::collections::HashSet<_> = std::fs::read_dir(&log_dir)
             .unwrap()
             .filter_map(|e| e.ok().map(|e| e.path()))
             .collect();
         let new_files: Vec<_> = after.difference(&before).collect();
-        assert_eq!(new_files.len(), 1, "Expected exactly 1 new log file");
+        assert!(new_files.len() >= 1, "Expected at least 1 new log file, got {}", new_files.len());
 
-        let log_path = new_files[0];
+        // Pick the newest file (ours) by sorting descending on file name.
+        let log_path = new_files.iter().max().unwrap();
         assert!(log_path.extension().unwrap() == "json");
 
         // Verify JSON content

@@ -4,38 +4,36 @@ use atomcode_core::config::prompt_sections::build_rules;
 use atomcode_core::agent::subtask_driver::SubtaskDriver;
 
 // ═══════════════════════════════════════════════════════════════
-// 1. Unified prompt — always complete, never too short
+// 1. Unified prompt — minimal but complete
 // ═══════════════════════════════════════════════════════════════
 
 #[test]
 fn unified_prompt_has_all_sections() {
     let prompt = build_rules();
-    assert!(prompt.contains("PRINCIPLES"), "Must have principles");
-    assert!(prompt.contains("PLAN FIRST"), "Must have planning");
-    assert!(prompt.contains("WORKFLOW"), "Must have workflow");
-    assert!(prompt.contains("TOOL SELECTION"), "Must have tool guide");
-    assert!(prompt.contains("DEBUGGING"), "Must have debug guide");
-    assert!(prompt.contains("COMMAND DISCIPLINE"), "Must have command rules");
-    assert!(prompt.contains("ERROR HANDLING"), "Must have error handling");
-    assert!(prompt.contains("RULES"), "Must have rules");
+    assert!(prompt.contains("RULES"), "Must have rules section");
+    assert!(prompt.contains("PLAN FIRST"), "Must have planning rule");
+    assert!(prompt.contains("TOOLS"), "Must have tool guide");
+    assert!(prompt.contains("SCOPE"), "Must have scope discipline");
+    assert!(prompt.contains("VERIFY"), "Must have verify rule");
+    assert!(prompt.contains("edit_file"), "Must mention edit_file");
+    assert!(prompt.contains("write_file"), "Must mention write_file");
 }
 
 #[test]
 fn unified_prompt_has_key_guidance() {
     let prompt = build_rules();
-    assert!(prompt.contains("HYPOTHESIS"), "Must ask for hypothesis");
-    assert!(prompt.contains("Silent failure"), "Must cover silent failures");
-    // SecurityConfig removed — hardcoding Java class names violates tech-stack neutrality.
-    // Auth debugging is covered by generic "DEBUGGING AUTH ERRORS" section in system prompt.
-    assert!(prompt.contains("ONE file at a time"), "Must guide per-file editing");
+    assert!(prompt.contains("ACT"), "Must have action-first rule");
+    assert!(prompt.contains("old_string/new_string"), "Must guide text-match editing");
+    assert!(prompt.contains("NEVER write_file on existing"), "Must ban write_file on existing files");
 }
 
 #[test]
 fn unified_prompt_size_reasonable() {
     let prompt = build_rules();
     let tokens = prompt.len() / 4;
-    assert!(tokens > 500, "Too short: {} tokens", tokens);
-    assert!(tokens < 1500, "Too long: {} tokens", tokens);
+    // After "Less is More" refactor: ~80-200 tokens. Keep it minimal.
+    assert!(tokens > 50, "Too short: {} tokens — rules may be missing", tokens);
+    assert!(tokens < 500, "Too long: {} tokens — violates Less is More principle", tokens);
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -45,7 +43,7 @@ fn unified_prompt_size_reasonable() {
 #[test]
 fn subtask_extracts_files_from_plan() {
     let mut driver = SubtaskDriver::new();
-    driver.extract_from_plan("修改 TagRebuildTaskService.java, AITagExtractionService.java 和 SettingsView.vue");
+    driver.extract_from_plan("\u{4FEE}\u{6539} TagRebuildTaskService.java, AITagExtractionService.java \u{548C} SettingsView.vue");
     assert!(driver.active);
     assert_eq!(driver.subtasks.len(), 3);
     // Backend first
@@ -57,7 +55,7 @@ fn subtask_extracts_files_from_plan() {
 #[test]
 fn subtask_instruction_format() {
     let mut driver = SubtaskDriver::new();
-    driver.extract_from_plan("修改 TagService.java 和 SettingsView.vue");
+    driver.extract_from_plan("\u{4FEE}\u{6539} TagService.java \u{548C} SettingsView.vue");
     let instr = driver.current_instruction().unwrap();
     assert!(instr.contains("Subtask 1/2"));
     assert!(instr.contains("ONE edit"));
@@ -66,7 +64,7 @@ fn subtask_instruction_format() {
 #[test]
 fn subtask_advance_and_complete() {
     let mut driver = SubtaskDriver::new();
-    driver.extract_from_plan("修改 A.java, B.java, C.vue");
+    driver.extract_from_plan("\u{4FEE}\u{6539} A.java, B.java, C.vue");
     assert_eq!(driver.subtasks.len(), 3);
     driver.advance();
     driver.advance();
@@ -78,6 +76,6 @@ fn subtask_advance_and_complete() {
 #[test]
 fn subtask_empty_plan() {
     let mut driver = SubtaskDriver::new();
-    driver.extract_from_plan("我觉得需要修改一些代码");
+    driver.extract_from_plan("\u{6211}\u{89C9}\u{5F97}\u{9700}\u{8981}\u{4FEE}\u{6539}\u{4E00}\u{4E9B}\u{4EE3}\u{7801}");
     assert!(!driver.active);
 }

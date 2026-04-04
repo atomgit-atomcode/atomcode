@@ -112,20 +112,8 @@ impl AgentLoop {
             prompt.push_str(&format!("Recent activity: {}\n", recent_activity));
         }
 
-        // Active services detected via lsof + extracted from tool outputs.
-        if !self.active_services.is_empty() {
-            prompt.push_str("Running services (live):\n");
-            let mut has_node = false;
-            for (label, url) in &self.active_services {
-                prompt.push_str(&format!("  {} — {}\n", url, label));
-                if label.contains("node") {
-                    has_node = true;
-                }
-            }
-            if has_node {
-                prompt.push_str("(Node dev server detected — auto-reloads on save, no build needed.)\n");
-            }
-        }
+        // Active services: disabled. Server commands are BLOCKED in Phase 3.5,
+        // so detecting running services is unnecessary noise in the system prompt.
 
         prompt.push_str(&format!(
             "\n=== PROJECT STRUCTURE ===\n{project_ctx}\n"
@@ -164,19 +152,8 @@ impl AgentLoop {
             ));
         }
 
-        // Available skills (descriptions only — full content loaded lazily via use_skill tool)
-        if let Ok(reg) = self.skill_registry.read() {
-            let mut skill_lines: Vec<String> = reg.invocable_by_llm()
-                .map(|s| format!("  - {}: {}", s.name, s.description))
-                .collect();
-            if !skill_lines.is_empty() {
-                skill_lines.sort();
-                prompt.push_str("\n=== AVAILABLE SKILLS ===\n");
-                prompt.push_str("Use the `use_skill` tool to load a skill's full instructions when the task matches.\n");
-                prompt.push_str(&skill_lines.join("\n"));
-                prompt.push('\n');
-            }
-        }
+        // Skills section: disabled until skill system is implemented.
+        // Listing unavailable skills wastes context tokens.
 
         // RULES GO LAST — recency effect ensures the model remembers these
         // when it starts generating tool calls.

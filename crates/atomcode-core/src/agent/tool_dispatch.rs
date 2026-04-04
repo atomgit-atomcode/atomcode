@@ -57,8 +57,9 @@ impl AgentLoop {
                         }
                     }
                 }
-                if let Some(pos) = output.find("Wrote ") {
-                    let rest = &output[pos + 6..];
+                if let Some(pos) = output.find("Wrote ").or_else(|| output.find("Overwrote ")) {
+                    let keyword_len = if output[pos..].starts_with("Overwrote ") { 10 } else { 6 };
+                    let rest = &output[pos + keyword_len..];
                     let full_path_end = rest.find(|c: char| c == ' ' || c == '\n' || c == '(').unwrap_or(rest.len());
                     let full_path_str = rest[..full_path_end].trim();
                     if !full_path_str.is_empty() {

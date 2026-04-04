@@ -110,6 +110,11 @@ impl Tool for BashTool {
     }
 }
 
+/// Track server commands that have already been launched this session.
+/// Prevents models from repeatedly trying to start the same dev server.
+static LAUNCHED_SERVERS: std::sync::LazyLock<std::sync::Mutex<Vec<String>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
+
 async fn bash_execute(args: &str, ctx: &ToolContext) -> Result<ToolResult> {
         let mut parsed: BashArgs = serde_json::from_str(args)?;
         // Cap timeout: model may request absurdly large values. Max 5 min for
@@ -124,27 +129,26 @@ async fn bash_execute(args: &str, ctx: &ToolContext) -> Result<ToolResult> {
         #[cfg(not(target_os = "windows"))]
         {
             let cmd_trimmed = parsed.command.trim();
-            // Detect pattern: "some_command &" or "some_command & other_command"
-            // where the backgrounded part is a server/dev command
-            if devserver::is_server_command(cmd_trimmed)
-                && !cmd_trimmed.contains("nohup")
-                && !cmd_trimmed.contains(">/dev/null")
-                && !cmd_trimmed.contains("&>/dev/null")
-            {
-                // Redirect to backend.log so model can `tail` later for debugging.
-                let log_path = wd.join("backend.log");
-                let log = log_path.display();
-                if let Some(amp_pos) = cmd_trimmed.find(" &") {
-                    let bg_cmd = cmd_trimmed[..amp_pos].trim();
-                    let rest = cmd_trimmed[amp_pos + 2..].trim();
-                    if rest.is_empty() {
-                        parsed.command = format!("nohup {} > {} 2>&1 &", bg_cmd, log);
-                    } else {
-                        parsed.command = format!("nohup {} > {} 2>&1 & {}", bg_cmd, log, rest);
-                    }
-                } else {
-                    parsed.command = format!("nohup sh -c '{}' > {} 2>&1 &", cmd_trimmed.replace('\'', "'\\''"), log);
-                }
+
+            // Dev server commands (npm run dev, tauri dev, vite, etc.) cannot be
+            // reliably started from within atomcode — they need an interactive
+            // terminal, long compilation time, and desktop window access.
+            // Instead of trying (and failing silently), tell the model to ask
+            // the user to start it manually.
+            if devserver::is_server_command(cmd_trimmed) {
+                let label = devserver::detect(cmd_trimmed)
+                    .map(|d| d.label.to_string())
+                    .unwrap_or_else(|| "Dev server".to_string());
+                return Ok(ToolResult {
+                    call_id: String::new(),
+                    output: format!(
+                        "[BLOCKED] Cannot start {} from atomcode — dev servers need an interactive terminal. \
+                         Tell the user to run this command themselves in a separate terminal:\n  {}\n\
+                         Do NOT retry. Do NOT use nohup. Just tell the user.",
+                        label, cmd_trimmed
+                    ),
+                    success: false,
+                });
             }
         }
 
@@ -167,6 +171,10 @@ async fn bash_execute(args: &str, ctx: &ToolContext) -> Result<ToolResult> {
         // Detect long-running / background commands — these get their own process group
         // so they survive atomcode exit and won't be killed on timeout.
         let is_background = devserver::is_server_command(&parsed.command);
+        // Pre-record the server label for dedup tracking. Must capture BEFORE
+        // nohup wrapping changes parsed.command (detect relies on original form).
+        let server_label_for_tracking = devserver::detect(&parsed.command)
+            .map(|d| d.label.to_string());
 
         #[cfg(not(target_os = "windows"))]
         let mut child = {
@@ -271,6 +279,20 @@ async fn bash_execute(args: &str, ctx: &ToolContext) -> Result<ToolResult> {
                 let mut combined = format_output(&stdout_str, &stderr_str);
                 // For background/pkill commands: non-empty output = success
                 let effective_success = success || has_background || (has_pkill && !combined.is_empty());
+
+                // Record server launch on normal exit (path 1).
+                // nohup+& wrapping causes the shell to exit immediately with success,
+                // but the server process is running in the background.
+                if effective_success && is_background {
+                    if let Some(ref label) = server_label_for_tracking {
+                        if let Ok(mut servers) = LAUNCHED_SERVERS.lock() {
+                            if !servers.contains(label) {
+                                servers.push(label.clone());
+                            }
+                        }
+                    }
+                }
+
                 // Java compile error auto-diagnosis: extract file:line + source context
                 if !effective_success && devserver::java::is_compile_command(&parsed.command) {
                     combined = devserver::java::enhance_compile_error(&combined, &wd);
@@ -283,15 +305,35 @@ async fn bash_execute(args: &str, ctx: &ToolContext) -> Result<ToolResult> {
             Ok(None) => {
                 // Process still running but output stopped (idle timeout).
                 if is_background {
-                    // Dev server: idle = likely started successfully. Don't kill.
+                    // Dev server: check if process is actually still alive.
+                    // Tauri/Vite may exit during compilation — don't claim success
+                    // if the process already died.
+                    let still_alive = child.try_wait().map(|s| s.is_none()).unwrap_or(false);
                     let pid = child.id().map(|p| p.to_string()).unwrap_or_else(|| "?".into());
                     let combined = format_output(&stdout_str, &stderr_str);
-                    let output = if combined.is_empty() {
-                        format!("Process still running (PID: {}). No output captured yet.", pid)
+                    if still_alive {
+                        // Record this server command so we don't launch it again.
+                        if let Some(ref label) = server_label_for_tracking {
+                            if let Ok(mut servers) = LAUNCHED_SERVERS.lock() {
+                                if !servers.contains(label) {
+                                    servers.push(label.clone());
+                                }
+                            }
+                        }
+                        let output = if combined.is_empty() {
+                            format!("Process still running (PID: {}). No output captured yet.", pid)
+                        } else {
+                            format!("{}\n\n[Process running in background, PID: {}. Output stopped — likely started successfully. Do NOT wait for it to exit.]", combined, pid)
+                        };
+                        Ok(ToolResult { call_id: String::new(), output, success: true })
                     } else {
-                        format!("{}\n\n[Process running in background, PID: {}. Output stopped — likely started successfully. Do NOT wait for it to exit.]", combined, pid)
-                    };
-                    Ok(ToolResult { call_id: String::new(), output, success: true })
+                        let output = format!(
+                            "{}\n\n[Server process exited before startup completed. \
+                             Tell the user to start it manually: run the command in a separate terminal.]",
+                            combined
+                        );
+                        Ok(ToolResult { call_id: String::new(), output, success: false })
+                    }
                 } else {
                     // Non-background command: output stopped for 30s = stuck. Kill it.
                     let _ = child.kill().await;
@@ -305,18 +347,34 @@ async fn bash_execute(args: &str, ctx: &ToolContext) -> Result<ToolResult> {
             }
             Err(_) => {
                 if is_background {
-                    // Background/server command — don't kill, let it run
+                    // Background/server command — check if still alive before claiming success.
+                    let still_alive = child.try_wait().map(|s| s.is_none()).unwrap_or(false);
                     let pid = child.id().map(|p| p.to_string()).unwrap_or_else(|| "?".into());
                     let combined = format_output(&stdout_str, &stderr_str);
 
-                    // No port polling — let model verify with its own curl.
-                    // Log redirected to backend.log, model can tail it.
-                    let output = if combined.is_empty() {
-                        format!("Process running in background (PID: {}). Check backend.log for status.", pid)
+                    if still_alive {
+                        // Record this server type so dedup blocks retries.
+                        if let Some(label) = devserver::detect(&parsed.command).map(|d| d.label.to_string()) {
+                            if let Ok(mut servers) = LAUNCHED_SERVERS.lock() {
+                                if !servers.contains(&label) {
+                                    servers.push(label);
+                                }
+                            }
+                        }
+                        let output = if combined.is_empty() {
+                            format!("Process running in background (PID: {}). Check backend.log for status.", pid)
+                        } else {
+                            format!("{}\n\n[Process running in background, PID: {}]", combined, pid)
+                        };
+                        Ok(ToolResult { call_id: String::new(), output, success: true })
                     } else {
-                        format!("{}\n\n[Process running in background, PID: {}]", combined, pid)
-                    };
-                    Ok(ToolResult { call_id: String::new(), output, success: true })
+                        let output = format!(
+                            "{}\n\n[Server process exited before startup completed. \
+                             Tell the user to start it manually: run the command in a separate terminal.]",
+                            combined
+                        );
+                        Ok(ToolResult { call_id: String::new(), output, success: false })
+                    }
                 } else {
                     // Non-background command — hard timeout, kill it
                     let _ = child.kill().await;

@@ -502,27 +502,26 @@ async fn test_turn_runner_interactive_approval_deny() {
 
 #[test]
 fn test_check_step_limit_under_limit() {
-    // step limit = 35 + 5*0 = 35, min(35, 60) = 35
-    // tool_call_count = 10 < 35 → false
+    // step limit = 30 + 5*0 = 30
     assert!(!check_step_limit_impl(10, 0));
 }
 
 #[test]
 fn test_check_step_limit_at_limit() {
-    // step limit = 35 + 5*0 = 35
-    assert!(check_step_limit_impl(35, 0));
+    // step limit = 30 + 5*0 = 30
+    assert!(check_step_limit_impl(30, 0));
 }
 
 #[test]
 fn test_check_step_limit_with_edits_extends() {
-    // step limit = 35 + 5*3 = 50
+    // step limit = 30 + 5*3 = 45
     assert!(!check_step_limit_impl(40, 3));
-    assert!(check_step_limit_impl(50, 3));
+    assert!(check_step_limit_impl(45, 3));
 }
 
 #[test]
 fn test_check_step_limit_hard_cap_60() {
-    // step limit = 35 + 5*10 = 85, min(85, 60) = 60
+    // step limit = 30 + 5*10 = 80, min(80, 60) = 60
     assert!(!check_step_limit_impl(59, 10));
     assert!(check_step_limit_impl(60, 10));
 }
@@ -530,7 +529,7 @@ fn test_check_step_limit_hard_cap_60() {
 /// Standalone reimplementation of check_step_limit logic for unit testing.
 /// (AgentLoop::check_step_limit is not easily callable from tests.)
 fn check_step_limit_impl(tool_call_count: usize, files_edited_count: usize) -> bool {
-    let dynamic_limit = 35 + (5 * files_edited_count);
+    let dynamic_limit = 30 + (5 * files_edited_count);
     let hard_limit = dynamic_limit.min(60);
     tool_call_count >= hard_limit
 }
