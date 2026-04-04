@@ -8,6 +8,7 @@ pub mod sub_agent;
 pub mod subtask_driver;
 pub mod task_classifier;
 
+pub mod execute;
 mod diagnose;
 mod discipline;
 mod prompt;
@@ -1059,6 +1060,57 @@ impl AgentLoop {
                         self.retry_count += 1;
                         self.conversation.add_user_message("Continue.");
                         continue;
+                    }
+
+                    // Phase 4 EXECUTE mode: if model's response contains edit instructions
+                    // (file headers with edit descriptions), execute them in focused mode
+                    // with minimal context (just the file + instruction).
+                    let edit_instrs = execute::parse_edit_instructions(text);
+                    if !edit_instrs.is_empty() {
+                        let wd = self.turn_runner.context.working_dir.try_read()
+                            .map(|g| g.clone())
+                            .unwrap_or_default();
+
+                        let _ = self.event_tx.send(AgentEvent::TextDelta(
+                            format!("\n[EXECUTE mode: {} instruction(s)]\n", edit_instrs.len())
+                        ));
+
+                        let (summaries, all_success) = execute::execute_instructions(
+                            edit_instrs,
+                            &mut self.turn_runner,
+                            &self.event_tx,
+                            &wd,
+                        ).await;
+
+                        // Inject results into conversation
+                        let result_text = summaries.join("\n");
+                        self.conversation.add_user_message(&format!(
+                            "[EXECUTE results:]\n{}\n{}",
+                            result_text,
+                            if all_success { "All edits applied. Verify and summarize." }
+                            else { "Some edits failed. Review and fix." }
+                        ));
+
+                        // Run auto-compile after EXECUTE
+                        if all_success {
+                            // Mark files as edited for auto-compile
+                            for s in &summaries {
+                                if s.contains("edited") {
+                                    // Extract file name from summary
+                                    if let Some(fname) = s.split("— edited").next()
+                                        .and_then(|p| p.rsplit(':').next())
+                                        .map(|f| f.trim().to_string())
+                                    {
+                                        if !self.files_edited_this_turn.contains(&fname) {
+                                            self.files_edited_this_turn.push(fname);
+                                        }
+                                    }
+                                }
+                            }
+                            self.auto_compile_verify().await;
+                        }
+
+                        continue; // Back to REASON mode for verification
                     }
 
                     self.finish_turn();

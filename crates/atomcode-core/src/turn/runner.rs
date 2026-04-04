@@ -384,6 +384,55 @@ _ = cancel.cancelled() => {
         }
     }
 
+    /// EXECUTE mode: run one LLM turn with minimal context.
+    /// Reads the target file fresh from disk, sends only the file + instruction,
+    /// and only exposes edit_file. Used for precise, focused edits.
+    ///
+    /// Returns the TurnResult and whether any file was edited.
+    pub async fn run_execute(
+        &mut self,
+        file_path: &str,
+        instruction: &str,
+        event_tx: &mpsc::UnboundedSender<TurnEvent>,
+        cancel: CancellationToken,
+    ) -> TurnResult {
+        // 1. Read fresh file content from disk
+        let file_content = match std::fs::read_to_string(file_path) {
+            Ok(c) => c,
+            Err(e) => return TurnResult::Failed(format!("Cannot read {}: {}", file_path, e)),
+        };
+
+        // 2. Build minimal conversation: system + user(file + instruction)
+        let system_prompt = "You are an execution agent. Your ONLY job: apply the edit instruction to the file below.\n\
+            RULES:\n\
+            1. Call edit_file IMMEDIATELY with old_string/new_string. Do NOT explain.\n\
+            2. Do NOT read_file — the file content is already provided.\n\
+            3. Do NOT fix other issues — ONLY apply the given instruction.\n\
+            4. If the instruction is unclear, apply your best interpretation.";
+
+        let user_message = format!(
+            "## Instruction\n{}\n\n## File: {}\n```\n{}\n```",
+            instruction, file_path, file_content,
+        );
+
+        let mut mini_conv = Conversation::new();
+        mini_conv.add_user_message(&user_message);
+
+        // 3. Only expose edit_file
+        let execute_tools = &["edit_file"];
+
+        // 4. Run the LLM turn with filtered tools
+        let result = self.run_with_filter(
+            &mut mini_conv,
+            system_prompt,
+            event_tx,
+            cancel,
+            Some(execute_tools),
+        ).await;
+
+        result
+    }
+
     /// Execute a single tool call with permission checking.
     async fn execute_single_tool(
         &self,
