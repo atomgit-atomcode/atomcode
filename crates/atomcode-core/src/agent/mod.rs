@@ -1085,6 +1085,27 @@ impl AgentLoop {
                     } else {
                         self.silent_tool_rounds += 1;
                     }
+
+                    // Sub-agent extraction from UsedTools: model may output plan text
+                    // alongside tool calls (e.g. "Plan: 1. IdeaCenter.vue 2. ProductCenter.vue"
+                    // + read_file in the same turn). Extract plan and dispatch if 2+ files.
+                    if let Some(ref plan_text) = text {
+                        if !self.subtask_driver.active && !plan_text.trim().is_empty() {
+                            self.subtask_driver.extract_from_plan(plan_text);
+                            if self.subtask_driver.active && self.subtask_driver.subtasks.len() >= 2 {
+                                self.plan_text = Some(plan_text.clone());
+                                if let Some(sub_result) = self.try_sub_agent_dispatch(plan_text).await {
+                                    self.conversation.add_user_message("Sub-agent results are above. Summarize what was changed.");
+                                    let _ = self.event_tx.send(AgentEvent::TextDelta(sub_result));
+                                    self.subtask_driver = subtask_driver::SubtaskDriver::new();
+                                    self.finish_turn();
+                                    return;
+                                }
+                                // Failed — fall through to serial execution
+                            }
+                        }
+                    }
+
                     // Post-process: truncate large outputs + externalize to disk
                     self.post_process_tool_results(tool_count);
 
