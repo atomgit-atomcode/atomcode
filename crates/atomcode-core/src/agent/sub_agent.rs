@@ -154,7 +154,7 @@ impl SubAgentPool {
         Self {
             tasks,
             max_concurrent: 3,
-            timeout_secs: 60,
+            timeout_secs: 180,
         }
     }
 
@@ -202,6 +202,7 @@ impl SubAgentPool {
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_else(|| task.file_path.clone());
 
+                let file_for_error = file_name.clone();
                 set.spawn(async move {
                     let _ = tx.send(super::AgentEvent::SubAgentProgress {
                         file: file_name.clone(),
@@ -219,7 +220,7 @@ impl SubAgentPool {
                     match &result {
                         Ok(r) => {
                             let _ = tx.send(super::AgentEvent::SubAgentProgress {
-                                file: file_name,
+                                file: file_name.clone(),
                                 status: if r.success {
                                     format!("✓ done {}s {} turns", elapsed, r.turns_used)
                                 } else {
@@ -229,21 +230,22 @@ impl SubAgentPool {
                         }
                         Err(_) => {
                             let _ = tx.send(super::AgentEvent::SubAgentProgress {
-                                file: file_name,
+                                file: file_name.clone(),
                                 status: format!("✗ timeout {}s", elapsed),
                             });
                         }
                     }
-                    result
+                    // Return file_name alongside result for error reporting
+                    (file_name, result)
                 });
             }
 
             while let Some(join_result) = set.join_next().await {
                 match join_result {
-                    Ok(Ok(result)) => results.push(result),
-                    Ok(Err(_timeout)) => {
+                    Ok((_, Ok(result))) => results.push(result),
+                    Ok((name, Err(_timeout))) => {
                         results.push(SubAgentResult {
-                            file_path: "unknown".to_string(),
+                            file_path: name,
                             success: false,
                             turns_used: 0,
                             summary: "Timed out".to_string(),
