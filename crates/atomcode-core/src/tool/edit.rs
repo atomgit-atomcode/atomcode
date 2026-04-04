@@ -317,21 +317,18 @@ impl Tool for EditFileTool {
             let removed = end - start + 1;
             let added = new_string.lines().count();
 
-            // Guard: reject overly large single edits on template-heavy files.
-            // Large replacements (40+ lines) on Vue/HTML files almost always break tag structure.
-            // Model should use multi-edit with smaller regions instead.
+            // Guard: warn (not block) on large single edits on template-heavy files.
+            // Previously this was a hard block, but for bug-fix scenarios (corrupted files)
+            // the model needs to do large rewrites to restore structure.
             let ext = parsed.file_path.rsplit('.').next().unwrap_or("");
-            if removed > 40 && matches!(ext, "vue" | "html" | "svelte" | "tsx" | "jsx") {
-                return Ok(ToolResult {
-                    call_id: String::new(),
-                    output: format!(
-                        "Error: replacing {} lines at once in a {} file is too risky — it will likely break HTML structure. \
-                         Split into smaller edits (≤30 lines each) or use multi-edit with edits array to change multiple small regions.",
-                        removed, ext
-                    ),
-                    success: false,
-                });
-            }
+            let large_edit_warning = if removed > 50 && matches!(ext, "vue" | "html" | "svelte" | "tsx" | "jsx") {
+                format!(
+                    "\n⚠ Large edit ({} lines replaced). Verify HTML tag balance after this edit.",
+                    removed
+                )
+            } else {
+                String::new()
+            };
 
             // Reconstruct file
             let mut new_lines: Vec<&str> = Vec::with_capacity(total);
@@ -354,8 +351,8 @@ impl Tool for EditFileTool {
             let result = ToolResult {
                 call_id: String::new(),
                 output: format!(
-                    "Edited {} lines {}-{} (-{} +{} lines).\n{}\n{}",
-                    parsed.file_path, start, end, removed, added, diff, outline
+                    "Edited {} lines {}-{} (-{} +{} lines).\n{}\n{}{}",
+                    parsed.file_path, start, end, removed, added, diff, outline, large_edit_warning
                 ),
                 success: true,
             };
@@ -758,24 +755,10 @@ impl EditFileTool {
         let mut result_lines: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
         let mut summary_parts: Vec<String> = Vec::new();
 
-        // Guard: reject individual edits > 40 lines on template-heavy files
+        // Note: large edit guard changed from hard block to warning.
+        // Corrupted files need large rewrites to restore structure.
         let ext = file_path.rsplit('.').next().unwrap_or("");
-        if matches!(ext, "vue" | "html" | "svelte" | "tsx" | "jsx") {
-            for (start, end, _) in &resolved {
-                let removed = end - start + 1;
-                if removed > 40 {
-                    return Ok(ToolResult {
-                        call_id: String::new(),
-                        output: format!(
-                            "Error: edit #{} replaces {} lines (L{}-{}) — too large for a {} file. \
-                             Keep each edit region ≤30 lines to avoid breaking HTML structure.",
-                            resolved.iter().position(|(s, _, _)| s == start).unwrap_or(0) + 1,
-                            removed, start, end, ext
-                        ),
-                        success: false,
-                    });
-                }
-            }
+        if false { // guard disabled — auto_fix handles validation
         }
 
         for (start, end, new_str) in &resolved {
