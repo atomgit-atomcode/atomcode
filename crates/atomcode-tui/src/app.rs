@@ -513,10 +513,14 @@ impl App {
             );
             self.conversation.push_delta(&summary);
             self.conversation.finalize_stream();
-            // Update session manager for new project directory
+            // Update session manager and load latest session for this project
             self.session_manager = SessionManager::new(&self.working_dir);
-            // Create a fresh default session for the new project (don't save empty session)
-            self.current_session = Session::default_session(self.working_dir.clone());
+            self.current_session = self.session_manager.latest()
+                .ok().flatten()
+                .unwrap_or_else(|| Session::default_session(self.working_dir.clone()));
+            // Restore conversation from loaded session
+            self.conversation = atomcode_core::conversation::Conversation::new();
+            self.conversation.messages = self.current_session.messages.clone();
         } else {
             // Directory doesn't exist — create it, git init, and add CLAUDE.md
             let new_path = if path.starts_with('/') || path.starts_with('~') {

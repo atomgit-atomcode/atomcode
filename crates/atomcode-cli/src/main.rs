@@ -158,8 +158,21 @@ async fn run() -> Result<()> {
     let working_dir = if let Some(d) = cli.dir {
         std::fs::canonicalize(d).unwrap_or_else(|_| std::env::current_dir().unwrap())
     } else {
-        // Use current directory when started in a specific directory
-        std::env::current_dir().unwrap()
+        // Check if last session was in a different directory (user used /cd last time).
+        // If so, offer to resume there. Otherwise use current directory.
+        let cwd = std::env::current_dir().unwrap();
+        let last_dir_path = atomcode_core::config::Config::config_dir().join("recent_dirs.txt");
+        if let Ok(content) = std::fs::read_to_string(&last_dir_path) {
+            if let Some(last) = content.lines().next() {
+                let last_path = std::path::PathBuf::from(last);
+                if last_path != cwd && last_path.exists() {
+                    // Last /cd was to a different directory — use it
+                    last_path
+                } else {
+                    cwd
+                }
+            } else { cwd }
+        } else { cwd }
     };
 
     let mut tool_registry = ToolRegistry::new();
