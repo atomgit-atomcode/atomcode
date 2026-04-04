@@ -112,37 +112,8 @@ pub async fn post_edit_syntax_check(file_path: &str) -> String {
                 }
             }
 
-            // If no dev server log exists, run a quick build to catch errors
-            let file_dir = std::path::Path::new(file_path);
-            let project_root = file_dir.ancestors()
-                .find(|p| p.join("package.json").exists());
-            if let Some(root) = project_root {
-                let log_exists = root.join("frontend.log").exists()
-                    || root.join("backend.log").exists();
-                if !log_exists {
-                    // No dev server running — do a quick build check
-                    if let Ok(output) = tokio::process::Command::new("sh")
-                        .args(["-c", "npm run build 2>&1 | head -20"])
-                        .current_dir(root)
-                        .output()
-                        .await
-                    {
-                        let out = String::from_utf8_lossy(&output.stdout);
-                        let err = String::from_utf8_lossy(&output.stderr);
-                        let combined = format!("{}{}", out, err);
-                        if !output.status.success() || combined.to_lowercase().contains("error") {
-                            let err_lines: String = combined.lines()
-                                .filter(|l| l.to_lowercase().contains("error"))
-                                .take(3)
-                                .collect::<Vec<_>>()
-                                .join("\n");
-                            if !err_lines.is_empty() {
-                                warnings.push(format!("Build error:\n{}", err_lines));
-                            }
-                        }
-                    }
-                }
-            }
+            // NOTE: auto-build removed — violates "do NOT deploy" principle.
+            // Model should run build manually via bash when it wants to verify.
 
             if warnings.is_empty() {
                 return String::new();
