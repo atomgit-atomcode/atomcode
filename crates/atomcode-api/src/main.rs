@@ -316,22 +316,26 @@ fn extract_artifacts_from_tool_calls(tool_calls: &[atomcode_core::tool::ToolCall
                 None => continue,
             };
             
-            // Check if it's an artifact-worthy file type
             let (artifact_type, language) = if path.ends_with(".html") || path.ends_with(".htm") {
                 ("html", "html")
             } else if path.ends_with(".svg") {
                 ("svg", "xml")
             } else if path.ends_with(".md") || path.ends_with(".markdown") {
                 ("markdown", "markdown")
+            } else if path.ends_with(".pptx") {
+                ("pptx", "pptx")
+            } else if path.ends_with(".docx") {
+                ("docx", "docx")
+            } else if path.ends_with(".xlsx") {
+                ("xlsx", "xlsx")
+            } else if path.ends_with(".pdf") {
+                ("pdf", "pdf")
             } else {
                 continue;  // Skip other file types
             };
             
-            // Get content from arguments
-            let content = match args.get("content").and_then(|v| v.as_str()) {
-                Some(c) => c.to_string(),
-                None => continue,
-            };
+            // Get content from arguments (optional for binary files)
+            let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string();
             
             // Extract title from path
             let title = PathBuf::from(path)
@@ -345,10 +349,131 @@ fn extract_artifacts_from_tool_calls(tool_calls: &[atomcode_core::tool::ToolCall
                 language: Some(language.to_string()),
                 content,
             });
+        } else if tc.name == "bash" {
+            // Extract artifacts from bash commands that create files
+            let args: serde_json::Value = match serde_json::from_str(&tc.arguments) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            
+            let command = match args.get("command").and_then(|v| v.as_str()) {
+                Some(c) => c,
+                None => continue,
+            };
+            
+            // Look for file redirection ( > or >> ) to artifact file types
+            if let Some(path) = extract_output_file_from_bash(command) {
+                let (artifact_type, language) = if path.ends_with(".html") || path.ends_with(".htm") {
+                    ("html", "html")
+                } else if path.ends_with(".svg") {
+                    ("svg", "xml")
+                } else if path.ends_with(".md") || path.ends_with(".markdown") {
+                    ("markdown", "markdown")
+                } else if path.ends_with(".pptx") {
+                    ("pptx", "pptx")
+                } else if path.ends_with(".docx") {
+                    ("docx", "docx")
+                } else if path.ends_with(".xlsx") {
+                    ("xlsx", "xlsx")
+                } else if path.ends_with(".pdf") {
+                    ("pdf", "pdf")
+                } else {
+                    continue;
+                };
+                
+                let title = PathBuf::from(&path)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string());
+                
+                artifacts.push(ArtifactInfo {
+                    id: format!("file-{}", artifacts.len() + 1),
+                    artifact_type: artifact_type.to_string(),
+                    title,
+                    language: Some(language.to_string()),
+                    content: String::new(), // Content not available from bash
+                });
+            }
         }
     }
     
     if artifacts.is_empty() { None } else { Some(artifacts) }
+}
+
+/// Extract output file path from bash command (handles > and >> redirection, and quoted paths)
+fn extract_output_file_from_bash(command: &str) -> Option<String> {
+    // Artifact file extensions to look for
+    let artifact_extensions = [".html", ".htm", ".svg", ".md", ".markdown", ".pptx", ".docx", ".xlsx", ".pdf"];
+    
+    // First, try to find > or >> redirection
+    let chars: Vec<char> = command.chars().collect();
+    let mut i = 0;
+    
+    while i < chars.len() {
+        if chars[i] == '>' {
+            // Found redirection
+            let append_mode = i + 1 < chars.len() && chars[i + 1] == '>';
+            let start = if append_mode { i + 2 } else { i + 1 };
+            
+            // Skip whitespace
+            let mut j = start;
+            while j < chars.len() && chars[j].is_whitespace() {
+                j += 1;
+            }
+            
+            // Extract file path until whitespace or end
+            let mut path_end = j;
+            while path_end < chars.len() && !chars[path_end].is_whitespace() && chars[path_end] != ';' && chars[path_end] != '&' {
+                path_end += 1;
+            }
+            
+            if j < path_end {
+                let path: String = chars[j..path_end].iter().collect();
+                // Remove quotes if present
+                let path = path.trim_matches(|c| c == '"' || c == '\'').to_string();
+                if artifact_extensions.iter().any(|ext| path.ends_with(ext)) {
+                    return Some(path);
+                }
+            }
+        }
+        i += 1;
+    }
+    
+    // Look for quoted paths with artifact extensions
+    // Pattern: 'path.pptx' or "path.docx"
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut quote_start = 0usize;
+    let chars: Vec<char> = command.chars().collect();
+    
+    for (idx, &ch) in chars.iter().enumerate() {
+        if ch == '\'' && !in_double_quote {
+            if in_single_quote {
+                // End of single-quoted string
+                let path: String = chars[quote_start..idx].iter().collect();
+                if artifact_extensions.iter().any(|ext| path.ends_with(ext)) {
+                    return Some(path);
+                }
+                in_single_quote = false;
+            } else {
+                in_single_quote = true;
+                quote_start = idx + 1;
+            }
+        } else if ch == '"' && !in_single_quote {
+            if in_double_quote {
+                // End of double-quoted string
+                let path: String = chars[quote_start..idx].iter().collect();
+                if artifact_extensions.iter().any(|ext| path.ends_with(ext)) {
+                    return Some(path);
+                }
+                in_double_quote = false;
+            } else {
+                in_double_quote = true;
+                quote_start = idx + 1;
+            }
+        }
+    }
+    
+    None
 }
 
 /// Format tool arguments for display (CLI style)
