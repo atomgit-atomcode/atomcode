@@ -175,25 +175,15 @@ async fn run() -> Result<()> {
     tool_registry.register(Box::new(SearchReplaceTool));
     let tool_context = ToolContext::new(working_dir.clone());
 
-    // Only continue the previous session when --continue is explicitly specified
-    let session_to_continue = if cli.continue_last {
+    // Auto-continue the latest session for this working directory.
+    // Same behavior as Claude Code: re-entering a project resumes where you left off.
+    // Use --new to force a fresh session.
+    let session_to_continue = {
         let session_manager = SessionManager::new(&working_dir);
         match session_manager.latest() {
-            Ok(Some(session)) => {
-                eprintln!("Continuing session: {}", session.name);
-                Some(session)
-            }
-            Ok(None) => {
-                eprintln!("No previous session found. Starting fresh.");
-                None
-            }
-            Err(e) => {
-                eprintln!("Warning: Failed to load last session ({}). Starting fresh.", e);
-                None
-            }
+            Ok(Some(session)) => Some(session),
+            _ => None,
         }
-    } else {
-        None
     };
 
     // Start with a fresh conversation each session.
