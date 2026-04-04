@@ -754,19 +754,29 @@ impl AgentLoop {
                 let consecutive_reads = &mut self.consecutive_reads;
                 let session_files = &mut self.session_files;
 
-                // Run TurnRunner concurrently with command processing.
-                // Diagnosis tasks: restrict to read-only tools for N turns.
-                // This forces the model to read code before curl/edit.
+                // Phase 4 REASON mode: edit_file is NOT available.
+                // Model must output ### File: plan → EXECUTE mode handles editing.
+                // This prevents "边做边说" (edit + plan in same response).
+                //
+                // Available tools in REASON mode:
+                //   read_file, grep, glob, list_directory, bash, write_file (new files only)
+                //   find_references, list_symbols, read_symbol
+                // NOT available: edit_file (only in EXECUTE mode)
                 let read_only_tools: &[&str] = &[
                     "read_file", "grep", "glob", "list_directory",
                     "find_references", "list_symbols", "read_symbol",
                 ];
-                let use_filter = self.diagnosis_read_only_turns > 0
+                let reason_tools: &[&str] = &[
+                    "read_file", "grep", "glob", "list_directory", "bash",
+                    "write_file", "search_replace",
+                    "find_references", "list_symbols", "read_symbol",
+                ];
+                let use_read_only = self.diagnosis_read_only_turns > 0
                     || (self.planning_phase && self.tool_call_count == 0);
-                let tool_filter: Option<&[&str]> = if use_filter {
+                let tool_filter: Option<&[&str]> = if use_read_only {
                     Some(read_only_tools)
                 } else {
-                    None
+                    Some(reason_tools) // REASON mode: no edit_file
                 };
                 let turn_fut = runner.run_with_filter(
                     &mut conv, &system_prompt, &turn_tx, cancel, tool_filter,
@@ -1065,20 +1075,10 @@ impl AgentLoop {
                     // Phase 4 EXECUTE mode: if model's response contains edit instructions
                     // (file headers with edit descriptions), execute them in focused mode
                     // with minimal context (just the file + instruction).
-                    // EXECUTE mode: only trigger if no edit/write tool has been called this turn.
-                    // Check tool_call history — if any call was edit_file/write_file, skip.
-                    let has_edited = self.conversation.messages.iter().rev()
-                        .take(self.tool_call_count * 2 + 2)
-                        .any(|m| {
-                            if let crate::conversation::message::MessageContent::AssistantWithToolCalls { ref tool_calls, .. } = m.content {
-                                tool_calls.iter().any(|tc| tc.name == "edit_file" || tc.name == "write_file")
-                            } else { false }
-                        });
-                    let edit_instrs = if !has_edited {
-                        execute::parse_edit_instructions(text)
-                    } else {
-                        Vec::new()
-                    };
+                    // Phase 4 EXECUTE mode: parse edit instructions from REASON output.
+                    // No guard needed — edit_file is not available in REASON mode,
+                    // so the model can't have already edited files.
+                    let edit_instrs = execute::parse_edit_instructions(text);
                     if !edit_instrs.is_empty() {
                         let wd = self.turn_runner.context.working_dir.try_read()
                             .map(|g| g.clone())
