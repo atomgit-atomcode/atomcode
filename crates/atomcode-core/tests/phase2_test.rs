@@ -10,11 +10,11 @@ use atomcode_core::agent::subtask_driver::SubtaskDriver;
 #[test]
 fn unified_prompt_has_all_sections() {
     let prompt = build_rules();
+    assert!(prompt.contains("WORKFLOW"), "Must have workflow section");
     assert!(prompt.contains("RULES"), "Must have rules section");
-    assert!(prompt.contains("PLAN FIRST"), "Must have planning rule");
     assert!(prompt.contains("TOOLS"), "Must have tool guide");
     assert!(prompt.contains("SCOPE"), "Must have scope discipline");
-    assert!(prompt.contains("VERIFY"), "Must have verify rule");
+    assert!(prompt.contains("VERIFY"), "Must have verify step");
     assert!(prompt.contains("edit_file"), "Must mention edit_file");
     assert!(prompt.contains("write_file"), "Must mention write_file");
 }
@@ -22,7 +22,7 @@ fn unified_prompt_has_all_sections() {
 #[test]
 fn unified_prompt_has_key_guidance() {
     let prompt = build_rules();
-    assert!(prompt.contains("ACT"), "Must have action-first rule");
+    assert!(prompt.contains("### File:"), "Must guide EXECUTE mode format");
     assert!(prompt.contains("old_string/new_string"), "Must guide text-match editing");
     assert!(prompt.contains("NEVER write_file on existing"), "Must ban write_file on existing files");
 }
