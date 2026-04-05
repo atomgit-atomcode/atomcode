@@ -612,8 +612,7 @@ impl AgentLoop {
         // Diagnosis/follow-up tasks: restrict to read-only tools for first 3 turns.
         // Forces the model to read code before curl/edit — prevents the "blind curl" pattern.
         self.diagnosis_read_only_turns = match task_type {
-            task_classifier::TaskType::BugFix => 3,
-            task_classifier::TaskType::FollowUp => 2,
+            task_classifier::TaskType::BugFix => 1,
             _ => 0,
         };
 
@@ -763,8 +762,7 @@ impl AgentLoop {
                     "read_file", "grep", "glob", "list_directory",
                     "find_references", "list_symbols", "read_symbol",
                 ];
-                let use_read_only = self.diagnosis_read_only_turns > 0
-                    || (self.planning_phase && self.tool_call_count == 0);
+                let use_read_only = self.diagnosis_read_only_turns > 0;
                 let tool_filter: Option<&[&str]> = if use_read_only {
                     Some(read_only_tools)
                 } else {
