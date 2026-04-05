@@ -261,6 +261,28 @@ _ = cancel.cancelled() => {
             if cancel.is_cancelled() {
                 return TurnResult::Cancelled;
             }
+            // Enforce tool filter at execution time — LLM may call tools
+            // not in the provided tool_defs (e.g., edit_file in REASON mode).
+            if let Some(filter) = allowed_tools {
+                if !filter.contains(&call.name.as_str()) {
+                    let result = ToolResult {
+                        call_id: call.id.clone(),
+                        output: format!(
+                            "Tool '{}' is not available. To edit files, output your plan using ### File: format.",
+                            call.name
+                        ),
+                        success: false,
+                    };
+                    let _ = event_tx.send(TurnEvent::ToolCallResult {
+                        name: call.name.clone(),
+                        output: result.output.clone(),
+                        success: false,
+                        duration: std::time::Duration::ZERO,
+                    });
+                    conversation.add_tool_result(result);
+                    continue;
+                }
+            }
             if is_dup[i] {
                 let result = ToolResult {
                     call_id: call.id.clone(),
