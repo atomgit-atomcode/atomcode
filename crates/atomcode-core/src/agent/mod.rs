@@ -1064,6 +1064,18 @@ impl AgentLoop {
                         continue;
                     }
 
+                    // Colon guard: model said "现在我来创建：" then stopped.
+                    // finish_reason is "stop" but text ends with colon = mid-sentence.
+                    let trimmed_end = text.trim();
+                    if !trimmed_end.is_empty()
+                        && (trimmed_end.ends_with(':') || trimmed_end.ends_with('\u{FF1A}'))
+                        && self.retry_count < 2
+                    {
+                        self.retry_count += 1;
+                        self.conversation.add_user_message("Continue.");
+                        continue;
+                    }
+
                     self.finish_turn();
                     return;
                 }

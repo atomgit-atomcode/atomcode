@@ -8,6 +8,13 @@ use super::DetectedServer;
 pub fn detect(cmd: &str) -> Option<DetectedServer> {
     let trimmed = cmd.trim();
 
+    // Skip package manager commands — "pip install uvicorn" is not a server start
+    if trimmed.contains("pip ") || trimmed.contains("pip3 ")
+        || trimmed.contains("conda ") || trimmed.contains("poetry ")
+    {
+        return None;
+    }
+
     if trimmed.contains("uvicorn ") {
         return Some(DetectedServer {
             label: "Uvicorn",
