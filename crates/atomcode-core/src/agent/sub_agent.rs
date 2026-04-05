@@ -203,7 +203,6 @@ impl SubAgentPool {
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_else(|| task.file_path.clone());
 
-                let file_for_error = file_name.clone();
                 set.spawn(async move {
                     let _ = tx.send(super::AgentEvent::SubAgentProgress {
                         file: file_name.clone(),

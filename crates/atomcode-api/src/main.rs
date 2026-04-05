@@ -174,10 +174,13 @@ fn init_project_state() -> ProjectState {
 }
 /// Artifact info for API response
 #[derive(Debug, Serialize, Clone)]
+#[allow(dead_code)]
 pub struct ArtifactInfo {
     pub id: String,
+    #[allow(dead_code)]
     pub artifact_type: String,  // "html", "svg", "mermaid", "code"
     pub title: Option<String>,
+    #[allow(dead_code)]
     pub language: Option<String>,
     pub content: String,
 }
@@ -266,6 +269,7 @@ impl From<&atomcode_core::conversation::message::Message> for MessageInfo {
 }
 
 /// Extract code blocks from text content as artifacts
+#[allow(dead_code)]
 fn extract_code_blocks(text: &str) -> Option<Vec<ArtifactInfo>> {
     let mut artifacts = Vec::new();
     let mut id_counter = 0;
@@ -1219,6 +1223,7 @@ struct ArtifactDetector {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 enum ArtifactDetectorState {
     /// Normal text output
     Normal,
@@ -1574,8 +1579,8 @@ let session_manager = SessionManager::new(&working_dir);
     
     // Create turn runner with auto-bypass permission (API mode - no interactive approval)
     let permission = Box::new(AutoPermissionDecider::new(AutoPermissionMode::BypassAll));
-    let turn_runner = TurnRunner {
-        provider,
+    let mut turn_runner = TurnRunner {
+        provider: provider.into(),
         tools: shared_tools,
         context: tool_context,
         config: config.clone(),
@@ -1583,6 +1588,8 @@ let session_manager = SessionManager::new(&working_dir);
         result_store: atomcode_core::tool::result_store::ToolResultStore::new(
             atomcode_core::tool::result_store::ToolResultStore::default_dir()
         ),
+        recently_edited_files: Vec::new(),
+        post_edit_read_counts: std::collections::HashMap::new(),
     };
     
     // Build system prompt (minimal for API)

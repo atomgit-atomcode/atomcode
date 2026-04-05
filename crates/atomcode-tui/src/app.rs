@@ -798,7 +798,7 @@ impl App {
             }
             AgentEvent::SubAgentProgress { file, status } => {
                 // Claude Code style parallel task display
-                let (icon, line) = if file.is_empty() {
+                let (_icon, line) = if file.is_empty() {
                     // Header message
                     ("".to_string(), format!("\n  {}", status))
                 } else if status.starts_with("done") {

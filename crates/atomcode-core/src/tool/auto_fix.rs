@@ -341,6 +341,7 @@ fn detect_duplicate_blocks(new_content: &str, new_string: &str) -> String {
     }
 }
 
+#[allow(dead_code)]
 enum BraceFixResult {
     Balanced,
     AutoFixed(String, String),   // (fixed_content, message)
@@ -348,6 +349,7 @@ enum BraceFixResult {
 }
 
 /// Try to fix brace imbalance in memory. Returns the fixed content if successful.
+#[allow(dead_code)]
 fn fix_braces(content: &str, file_path: &str) -> BraceFixResult {
     let ext = file_path.rsplit('.').next().unwrap_or("");
     if !matches!(ext, "js" | "ts" | "tsx" | "jsx" | "vue" | "svelte" | "java" | "rs" | "go" | "c" | "cpp" | "cs") {
@@ -444,7 +446,7 @@ fn fix_braces(content: &str, file_path: &str) -> BraceFixResult {
     // Also fix missing brackets `]` if needed
     if needs_bracket_fix {
         let mut bracket_remaining = bracket_depth;
-        for target in (1..=bracket_depth).rev() {
+        for _target in (1..=bracket_depth).rev() {
             let mut insert_after = None;
             let mut bd = 0i64;
             // Re-count bracket depth on fixed_lines
@@ -495,6 +497,7 @@ fn fix_braces(content: &str, file_path: &str) -> BraceFixResult {
     )
 }
 
+#[allow(dead_code)]
 enum HtmlFixResult {
     Balanced,
     AutoFixed(String, String),   // (fixed_content, message)
@@ -502,6 +505,7 @@ enum HtmlFixResult {
 }
 
 /// Check and auto-fix HTML tag balance for Vue/HTML/Svelte files in memory.
+#[allow(dead_code)]
 fn fix_html_tags(content: &str, file_path: &str) -> HtmlFixResult {
     let ext = file_path.rsplit('.').next().unwrap_or("");
     if !matches!(ext, "vue" | "html" | "svelte" | "htm" | "jsx" | "tsx") {

@@ -620,7 +620,7 @@ impl AgentLoop {
         // Data shows this changes model behavior from "pattern match → quick fix (often wrong)"
         // to "systematic diagnosis → correct fix". Placed in user message (not system prompt)
         // because models comply with user instructions more reliably.
-        let content = match task_type {
+        let _content = match task_type {
             task_classifier::TaskType::BugFix
             | task_classifier::TaskType::FollowUp => {
                 format!("Analyze the root cause before making changes.\n\n{}", content)
@@ -1279,7 +1279,7 @@ impl AgentLoop {
     /// Try to dispatch sub-agents for parallel multi-file editing.
     /// Returns Some(summary_text) if dispatch succeeded, None if it should
     /// fall back to serial subtask execution.
-    async fn try_sub_agent_dispatch(&mut self, plan_text: &str) -> Option<String> {
+    async fn try_sub_agent_dispatch(&mut self, _plan_text: &str) -> Option<String> {
         // Sub-agent disabled: 8 次实测全败，等 Phase 4 用 fork 模式重建。
         // 当前 fallback 到 serial subtask execution（主 agent 串行编辑）。
         return None;
@@ -1368,13 +1368,13 @@ impl AgentLoop {
 
             // Extract the task instruction for this file from the plan
             let file_name = &subtasks[i].file;
-            let task_instr = extract_file_instruction(plan_text, file_name);
+            let task_instr = extract_file_instruction(_plan_text, file_name);
 
             tasks.push(sub_agent::SubAgentTask {
                 file_path: file_path.clone(),
                 file_content: all_file_contents[i].1.clone(),
                 task_instruction: task_instr,
-                contract: extract_contract(plan_text),
+                contract: extract_contract(_plan_text),
                 sibling_skeletons: siblings,
             });
         }

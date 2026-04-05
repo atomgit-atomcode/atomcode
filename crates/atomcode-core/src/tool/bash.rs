@@ -116,7 +116,7 @@ static LAUNCHED_SERVERS: std::sync::LazyLock<std::sync::Mutex<Vec<String>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
 
 async fn bash_execute(args: &str, ctx: &ToolContext) -> Result<ToolResult> {
-        let mut parsed: BashArgs = serde_json::from_str(args)?;
+        let parsed: BashArgs = serde_json::from_str(args)?;
         // Cap timeout: model may request absurdly large values. Max 5 min for
         // normal commands, 3 min for background/server commands.
         let timeout_secs = parsed.timeout.unwrap_or(30).min(300);

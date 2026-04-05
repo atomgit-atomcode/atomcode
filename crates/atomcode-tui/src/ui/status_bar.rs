@@ -70,7 +70,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     let fixed_width = brand_w + dir_w + session_brackets_w + right_w + min_padding;
     let max_session_len = width.saturating_sub(fixed_width);
     // Allow up to 60 chars but at least 10
-    let max_session_len = max_session_len.min(60).max(10);
+    let _max_session_len = max_session_len.min(60).max(10);
     
     // Session name removed — takes up space without adding value.
 
@@ -203,6 +203,7 @@ fn shorten_path(path: &str) -> String {
     }
 }
 
+#[allow(dead_code)]
 fn truncate_session_name(name: &str, max_len: usize) -> String {
     let char_count = name.chars().count();
     if char_count <= max_len {

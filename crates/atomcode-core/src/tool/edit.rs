@@ -378,7 +378,7 @@ impl Tool for EditFileTool {
             // Previously this was a hard block, but for bug-fix scenarios (corrupted files)
             // the model needs to do large rewrites to restore structure.
             let ext = parsed.file_path.rsplit('.').next().unwrap_or("");
-            let large_edit_warning = if removed > 50 && matches!(ext, "vue" | "html" | "svelte" | "tsx" | "jsx") {
+            let _large_edit_warning = if removed > 50 && matches!(ext, "vue" | "html" | "svelte" | "tsx" | "jsx") {
                 format!(
                     "\n⚠ Large edit ({} lines replaced). Verify HTML tag balance after this edit.",
                     removed
@@ -403,7 +403,7 @@ impl Tool for EditFileTool {
             };
 
             let diff = build_compact_diff(&old_text, &new_string);
-            let new_end = start + added.saturating_sub(1);
+            let _new_end = start + added.saturating_sub(1);
             // Concise output: just confirmation + short diff. No outline, no surrounding context.
             // Verbose output pollutes context and pushes file content out of the hot zone.
             let result = ToolResult {
@@ -796,7 +796,7 @@ impl EditFileTool {
 
         // Note: large edit guard changed from hard block to warning.
         // Corrupted files need large rewrites to restore structure.
-        let ext = file_path.rsplit('.').next().unwrap_or("");
+        let _ext = file_path.rsplit('.').next().unwrap_or("");
         if false { // guard disabled — auto_fix handles validation
         }
 
@@ -963,6 +963,7 @@ fn try_fuzzy_replace(
 }
 
 /// Post-edit info: file outline for navigation.
+#[allow(dead_code)]
 fn post_edit_info(new_content: &str, _new_string: &str) -> String {
     file_outline(new_content)
 }
@@ -1019,6 +1020,7 @@ fn post_edit_context(new_content: &str, new_string: &str) -> String {
 /// Shows top-level lines (indent 0-1) with line numbers so the model
 /// knows the file's structure and can plan its next edit without re-reading.
 /// Only generated for files > 100 lines (small files don't need it).
+#[allow(dead_code)]
 fn file_outline(content: &str) -> String {
     let lines: Vec<&str> = content.lines().collect();
     if lines.len() <= 100 {
