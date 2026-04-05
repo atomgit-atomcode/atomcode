@@ -305,11 +305,13 @@ _ = cancel.cancelled() => {
                         args.get("file_path").and_then(|v| v.as_str()).map(|s| s.to_string())
                     } else { None }
                 } else if call.name == "bash" {
-                    // Detect bash cat/head/tail/less on recently edited files
+                    // Detect bash cat/head/tail on recently edited files.
+                    // Do NOT block grep — grep is search, not read.
                     if let Ok(args) = serde_json::from_str::<serde_json::Value>(&call.arguments) {
                         if let Some(cmd) = args.get("command").and_then(|v| v.as_str()) {
-                            let is_read_cmd = cmd.contains("cat ") || cmd.contains("head ") || cmd.contains("tail ")
-                                || cmd.contains("less ") || cmd.contains("more ");
+                            let is_read_cmd = (cmd.contains("cat ") || cmd.contains("head ") || cmd.contains("tail ")
+                                || cmd.contains("less ") || cmd.contains("more "))
+                                && !cmd.contains("grep ");
                             if is_read_cmd {
                                 // Extract file path from command
                                 files_edited_this_batch.iter()

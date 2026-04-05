@@ -156,17 +156,35 @@ impl AgentLoop {
                     let enhanced = crate::tool::devserver::java::enhance_compile_error(
                         &combined, &compile_dir,
                     );
-                    // Trim to keep context small
+                    // Trim to keep context small. Include TS error lines (file:line format).
                     let error_lines: String = enhanced.lines()
-                        .filter(|l| l.contains("[ERROR]") || l.contains(">>>") || l.contains("---") || l.contains("[AUTO"))
+                        .filter(|l| {
+                            l.contains("[ERROR]") || l.contains(">>>") || l.contains("---")
+                            || l.contains("[AUTO") || l.contains("error TS")
+                            || l.contains(": error")
+                        })
                         .take(20)
                         .collect::<Vec<_>>()
                         .join("\n");
-                    let msg = if error_lines.is_empty() {
+                    let mut msg = if error_lines.is_empty() {
                         format!("[Auto-compile: FAILED]\n{}", combined.lines().take(15).collect::<Vec<_>>().join("\n"))
                     } else {
                         format!("[Auto-compile: FAILED]\n{}", error_lines)
                     };
+
+                    // If errors are "unused variable/function" across multiple files,
+                    // suggest search_replace to remove them in bulk.
+                    let unused_count = combined.lines()
+                        .filter(|l| l.contains("TS6133") || l.contains("is declared but") || l.contains("never used"))
+                        .count();
+                    if unused_count >= 3 {
+                        msg.push_str(&format!(
+                            "\n[HINT: {} unused variable/function errors. If the same names repeat across files, \
+                             use search_replace to remove them in bulk instead of editing each file.]",
+                            unused_count
+                        ));
+                    }
+
                     self.conversation.add_user_message(&msg);
                 }
             }
