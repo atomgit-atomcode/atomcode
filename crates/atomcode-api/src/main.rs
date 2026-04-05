@@ -286,6 +286,7 @@ fn extract_code_blocks(text: &str) -> Option<Vec<ArtifactInfo>> {
             "html" | "htm" => "html",
             "svg" => "svg",
             "mermaid" => "mermaid",
+            "markdown" | "md" => "markdown",
             "javascript" | "typescript" | "python" | "rust" | "java" => "code",
             _ => continue,  // Skip other languages
         };
