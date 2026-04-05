@@ -36,12 +36,16 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     let c_orbit = theme::accent_dim();
     let c_core = theme::accent();
 
-    // Line 1: top orbit + "atomcode"
+    // Line 1: top orbit + "AtomCode" (split color: white Atom + green Code)
     lines.push(Line::from(vec![
         Span::styled(format!("  {}", ATOM[0]), Style::default().fg(c_orbit)),
         Span::styled(
-            "  atomcode",
+            "  Atom",
             Style::default().fg(theme::text_primary()).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "Code",
+            Style::default().fg(theme::accent()).add_modifier(Modifier::BOLD),
         ),
     ]));
     // Line 2: core + version · model
@@ -142,8 +146,12 @@ pub fn render_setup(frame: &mut Frame, area: Rect, state: &WelcomeState) {
             Style::default().fg(c_core).add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            "  atomcode",
+            "  Atom",
             Style::default().fg(theme::text_primary()).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "Code",
+            Style::default().fg(theme::accent()).add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             format!("  v{}", env!("CARGO_PKG_VERSION")),

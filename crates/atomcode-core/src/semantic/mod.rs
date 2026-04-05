@@ -56,7 +56,7 @@ impl SemanticSearcher {
 
             Some(symbols)
         } else {
-            Some(self.list_symbols_indent(&source))
+            Some(self.list_symbols_indent(&source, path))
         }
     }
 
@@ -90,7 +90,7 @@ impl SemanticSearcher {
         if let Some(lang) = lang {
             self.skeleton_treesitter(path, &source, lang)
         } else {
-            Some(self.skeleton_indent(&source))
+            Some(self.skeleton_indent(&source, path))
         }
     }
 
@@ -498,12 +498,16 @@ impl SemanticSearcher {
             }
         }
 
-        // Also add <template> and <style> as pseudo-symbols for skeleton
+        // Add SFC section boundaries (<template>/<script>/<style>) as pseudo-symbols.
+        // This lets the skeleton show where each section lives, so the model can
+        // target-read the right section (e.g., template for HTML, script for logic).
         let lines: Vec<&str> = source.lines().collect();
         for (i, line) in lines.iter().enumerate() {
             let trimmed = line.trim();
-            if trimmed.starts_with("<template") || trimmed.starts_with("<style") {
-                let tag = if trimmed.starts_with("<template") { "template" } else { "style" };
+            if trimmed.starts_with("<template") || trimmed.starts_with("<script") || trimmed.starts_with("<style") {
+                let tag = if trimmed.starts_with("<template") { "template" }
+                    else if trimmed.starts_with("<script") { "script" }
+                    else { "style" };
                 let close_tag = format!("</{}>", tag);
                 let end_line = lines[i..].iter().position(|l| l.trim().starts_with(&close_tag))
                     .map(|p| i + p + 1)
@@ -525,24 +529,130 @@ impl SemanticSearcher {
         Some(symbols)
     }
 
-    // ── Indent-based fallback for unsupported languages ──
+    // ── File-type-aware fallback for languages without tree-sitter ──
+    //
+    // Single source of truth for skeleton generation of CSS/HTML/JSON/YAML/Markdown
+    // and code files without tree-sitter support. read.rs has ZERO file-type logic.
 
-    fn list_symbols_indent(&self, source: &str) -> Vec<Symbol> {
-        let mut symbols = Vec::new();
+    fn list_symbols_indent(&self, source: &str, path: &Path) -> Vec<Symbol> {
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
         let lines: Vec<&str> = source.lines().collect();
+
+        match ext {
+            "css" | "scss" | "less" | "sass" => self.list_symbols_css(&lines),
+            "html" | "htm" => self.list_symbols_html(&lines),
+            "json" => self.list_symbols_json(&lines),
+            "yaml" | "yml" | "toml" => self.list_symbols_yaml(&lines),
+            "md" | "mdx" => self.list_symbols_markdown(&lines),
+            _ => self.list_symbols_code_indent(&lines),
+        }
+    }
+
+    /// CSS/SCSS: :root, @rules, comment headers, top-level selectors
+    fn list_symbols_css(&self, lines: &[&str]) -> Vec<Symbol> {
+        let mut symbols = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() { continue; }
+            let indent = line.len() - line.trim_start().len();
+            let is_match = trimmed.starts_with(":root")
+                || trimmed.starts_with("@keyframes")
+                || trimmed.starts_with("@media")
+                || trimmed.starts_with("@layer")
+                || trimmed.starts_with("@import")
+                || trimmed.starts_with("@font-face")
+                || trimmed.starts_with("/* ===")
+                || trimmed.starts_with("/* ---")
+                || trimmed.starts_with("/* ***")
+                || (indent == 0 && trimmed.starts_with('.') && trimmed.contains('{'))
+                || (indent == 0 && trimmed.starts_with('#') && trimmed.contains('{'));
+
+            if is_match {
+                // Find the block end (matching closing brace)
+                let end = find_block_end(lines, i);
+                let name = trimmed.split('{').next().unwrap_or(trimmed).trim().to_string();
+                symbols.push(make_symbol(name, "css_rule", i, end, lines));
+            }
+        }
+        symbols
+    }
+
+    /// HTML: structural tags
+    fn list_symbols_html(&self, lines: &[&str]) -> Vec<Symbol> {
+        let mut symbols = Vec::new();
+        let tags = ["<head", "<body", "<header", "<main", "<footer", "<nav", "<section", "<article", "<!DOCTYPE"];
+        for (i, line) in lines.iter().enumerate() {
+            let trimmed = line.trim();
+            if tags.iter().any(|t| trimmed.starts_with(t)) {
+                let name = trimmed.split(|c: char| c == '>' || c == ' ').next().unwrap_or(trimmed).to_string();
+                symbols.push(make_symbol(name, "html_tag", i, i + 1, lines));
+            }
+        }
+        symbols
+    }
+
+    /// JSON: top-level keys
+    fn list_symbols_json(&self, lines: &[&str]) -> Vec<Symbol> {
+        let mut symbols = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            let trimmed = line.trim();
+            let indent = line.len() - line.trim_start().len();
+            // Top-level keys: indent ≤ 2, starts with "
+            if indent <= 2 && trimmed.starts_with('"') && trimmed.contains(':') {
+                let name = trimmed.split(':').next().unwrap_or(trimmed).trim_matches('"').trim().to_string();
+                symbols.push(make_symbol(name, "json_key", i, i + 1, lines));
+            }
+        }
+        symbols
+    }
+
+    /// YAML/TOML: top-level keys
+    fn list_symbols_yaml(&self, lines: &[&str]) -> Vec<Symbol> {
+        let mut symbols = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            let trimmed = line.trim();
+            let indent = line.len() - line.trim_start().len();
+            if indent == 0 && !trimmed.is_empty() && !trimmed.starts_with('#') && !trimmed.starts_with("---") {
+                let name = trimmed.split(':').next().unwrap_or(trimmed).trim().to_string();
+                if !name.is_empty() {
+                    symbols.push(make_symbol(name, "yaml_key", i, i + 1, lines));
+                }
+            }
+        }
+        symbols
+    }
+
+    /// Markdown: headings
+    fn list_symbols_markdown(&self, lines: &[&str]) -> Vec<Symbol> {
+        let mut symbols = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('#') {
+                let name = trimmed.trim_start_matches('#').trim().to_string();
+                // Find next heading or end
+                let end = lines[i + 1..].iter().position(|l| l.trim().starts_with('#'))
+                    .map(|p| i + 1 + p)
+                    .unwrap_or(lines.len());
+                symbols.push(make_symbol(name, "heading", i, end, lines));
+            }
+        }
+        symbols
+    }
+
+    /// Code files: indent-level-0 definitions (fn/class/def/etc.)
+    fn list_symbols_code_indent(&self, lines: &[&str]) -> Vec<Symbol> {
+        let mut symbols = Vec::new();
         let mut i = 0;
 
         while i < lines.len() {
             let line = lines[i];
             let trimmed = line.trim();
 
-            // Skip empty lines and comments
             if trimmed.is_empty() || trimmed.starts_with("//") || trimmed.starts_with('#') {
                 i += 1;
                 continue;
             }
 
-            // A line at indent level 0 that looks like a definition
             let indent = line.len() - line.trim_start().len();
             if indent == 0 && !trimmed.starts_with('}') && !trimmed.starts_with(')') {
                 let is_def = trimmed.starts_with("fn ")
@@ -565,41 +675,20 @@ impl SemanticSearcher {
                     || trimmed.starts_with("protected ");
 
                 if is_def {
-                    // Find the end: next line at indent 0
                     let start = i;
                     let mut end = i + 1;
                     while end < lines.len() {
                         let next = lines[end];
                         let next_trimmed = next.trim();
-                        if next_trimmed.is_empty() {
-                            end += 1;
-                            continue;
-                        }
+                        if next_trimmed.is_empty() { end += 1; continue; }
                         let next_indent = next.len() - next.trim_start().len();
-                        if next_indent == 0 && !next_trimmed.starts_with('}') {
-                            break;
-                        }
+                        if next_indent == 0 && !next_trimmed.starts_with('}') { break; }
                         end += 1;
                     }
-                    // Include closing brace
-                    if end < lines.len() && lines[end].trim() == "}" {
-                        end += 1;
-                    }
+                    if end < lines.len() && lines[end].trim() == "}" { end += 1; }
 
-                    // Extract name: first word after keyword
                     let name = extract_indent_name(trimmed);
-
-                    let start_byte = lines[..start].iter().map(|l| l.len() + 1).sum::<usize>();
-                    let end_byte = lines[..end].iter().map(|l| l.len() + 1).sum::<usize>();
-
-                    symbols.push(Symbol {
-                        name,
-                        start_line: start + 1,
-                        end_line: end,
-                        start_byte,
-                        end_byte,
-                        kind: "indent_block".to_string(),
-                    });
+                    symbols.push(make_symbol(name, "indent_block", start, end, lines));
 
                     i = end;
                     continue;
@@ -611,8 +700,8 @@ impl SemanticSearcher {
         symbols
     }
 
-    fn skeleton_indent(&self, source: &str) -> String {
-        let symbols = self.list_symbols_indent(source);
+    fn skeleton_indent(&self, source: &str, path: &Path) -> String {
+        let symbols = self.list_symbols_indent(source, path);
         let lines: Vec<&str> = source.lines().collect();
         let mut out = String::new();
 
@@ -645,6 +734,35 @@ pub struct SymbolSlice {
     pub start_byte: usize,
     pub end_byte: usize,
     pub text: String,
+}
+
+/// Create a Symbol from line indices.
+fn make_symbol(name: String, kind: &str, start: usize, end: usize, lines: &[&str]) -> Symbol {
+    let start_byte = lines[..start].iter().map(|l| l.len() + 1).sum::<usize>();
+    let end_byte = lines[..end].iter().map(|l| l.len() + 1).sum::<usize>();
+    Symbol {
+        name,
+        start_line: start + 1,
+        end_line: end,
+        start_byte,
+        end_byte,
+        kind: kind.to_string(),
+    }
+}
+
+/// Find the end of a CSS block starting at `start` (matching closing brace).
+fn find_block_end(lines: &[&str], start: usize) -> usize {
+    let mut depth = 0i32;
+    for i in start..lines.len() {
+        for ch in lines[i].chars() {
+            if ch == '{' { depth += 1; }
+            if ch == '}' { depth -= 1; }
+        }
+        if depth <= 0 && i > start {
+            return i + 1;
+        }
+    }
+    (start + 1).min(lines.len())
 }
 
 /// Extract a plausible name from an indent-level-0 definition line.

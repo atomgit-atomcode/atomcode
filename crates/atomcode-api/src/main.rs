@@ -308,7 +308,7 @@ fn extract_artifacts_from_tool_calls(tool_calls: &[atomcode_core::tool::ToolCall
     let mut artifacts = Vec::new();
     
     for tc in tool_calls {
-        if tc.name == "write_file" || tc.name == "edit_file" {
+        if tc.name == "create_file" || tc.name == "edit_file" {
             // Parse arguments
             let args: serde_json::Value = match serde_json::from_str(&tc.arguments) {
                 Ok(v) => v,
@@ -499,7 +499,7 @@ fn format_tool_args(tool_name: &str, args_json: &str) -> String {
             }
             s
         }
-        "write_file" => {
+        "create_file" => {
             let path = args.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
             let size = args.get("content").and_then(|v| v.as_str()).map(|s| s.len()).unwrap_or(0);
             format!("{} ({} bytes)", short_path(path), size)
@@ -1654,7 +1654,7 @@ let session_manager = SessionManager::new(&working_dir);
                 let _ = event_tx.send(ChatEvent::ToolCallStarted { name: name.clone(), arguments: arguments.clone() });
                 
                 // Extract artifacts from write_file/edit_file tool calls
-                if name == "write_file" || name == "edit_file" {
+                if name == "create_file" || name == "edit_file" {
                     if let Ok(args) = serde_json::from_str::<serde_json::Value>(&arguments) {
                         if let Some(path) = args.get("file_path").and_then(|v| v.as_str()) {
                             let artifact_type = if path.ends_with(".html") || path.ends_with(".htm") {

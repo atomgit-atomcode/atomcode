@@ -27,70 +27,27 @@ pub struct ValidateResult {
 /// `post_edit_syntax_check` for on-disk syntax validation.
 /// `content` is the post-edit content (what would be written to disk).
 /// `original_content` is the pre-edit content (for delta validation).
-pub async fn validate_and_fix(content: &str, file_path: &str, new_string: &str, original_content: &str) -> ValidateResult {
-    let mut errors: Vec<String> = Vec::new();
+pub async fn validate_and_fix(content: &str, file_path: &str, new_string: &str, _original_content: &str) -> ValidateResult {
+    let mut warnings: Vec<String> = Vec::new();
     let current = content.to_string();
 
-    // 1. Duplicate detection
+    // 1. Duplicate detection — the only pre-write check that stays.
+    // Catches model repeating the same code block (compiler won't catch this).
     let dup_warn = detect_duplicate_blocks(&current, new_string);
     if !dup_warn.is_empty() {
-        errors.push(dup_warn);
+        warnings.push(dup_warn);
     }
 
-    // 2. Brace/bracket balance — REJECT, don't auto-fix
-    let ext = file_path.rsplit('.').next().unwrap_or("");
-    if matches!(ext, "js" | "ts" | "tsx" | "jsx" | "vue" | "svelte" | "java" | "rs" | "go" | "c" | "cpp" | "cs") {
-        let (brace_depth, bracket_depth, deepest_line) = count_delimiters(&current);
-        if brace_depth != 0 {
-            let hint = if brace_depth > 0 {
-                format!("{} missing '}}' — deepest unclosed '{{' is near line {}. Add '}}' at the end of that block.", brace_depth, deepest_line)
-            } else {
-                format!("{} extra '}}' — remove the extra closing brace(s).", brace_depth.abs())
-            };
-            errors.push(format!("STRUCTURAL ERROR: {}", hint));
-        }
-        if bracket_depth != 0 {
-            let hint = if bracket_depth > 0 { format!("{} missing ']' — close the array/bracket.", bracket_depth) }
-                       else { format!("{} extra ']' — remove the extra.", bracket_depth.abs()) };
-            errors.push(format!("STRUCTURAL ERROR: {}", hint));
-        }
-    }
+    // Structural checks (brace balance, HTML balance, Vue SFC) REMOVED.
+    // auto-compile after edit catches all structural errors with better
+    // diagnostics (line number + error type from compiler).
+    // Delta validation was net negative: 7 false rejections today, 0 true catches.
+    // Principle: "don't block the model, enhance the tool."
 
-    // 3. Vue SFC structure — REJECT if script/template tags unpaired
-    if matches!(ext, "vue" | "svelte") {
-        let has_script_open = current.contains("<script");
-        let has_script_close = current.contains("</script>");
-        let has_template_open = current.contains("<template");
-        let has_template_close = current.contains("</template>");
-
-        if has_script_open && !has_script_close {
-            errors.push("STRUCTURAL ERROR: Missing </script> tag. Your edit removed or didn't include </script>. Add it back.".to_string());
-        }
-        if has_template_open && !has_template_close {
-            errors.push("STRUCTURAL ERROR: Missing </template> tag. Add it back.".to_string());
-        }
-    }
-
-    // 4. HTML tag balance — DELTA validation.
-    // Only reject if the edit made the balance WORSE, not if the file
-    // was already broken. This prevents rejecting correct edits on files
-    // with pre-existing structural issues.
-    if matches!(ext, "vue" | "html" | "svelte" | "htm" | "jsx" | "tsx") {
-        let before_score = html_balance_score(original_content, file_path);
-        let after_score = html_balance_score(&current, file_path);
-        if after_score < before_score {
-            // Edit made the balance worse — report what got worse
-            let html_errors = check_html_balance(&current, file_path);
-            errors.extend(html_errors);
-        }
-        // If after_score >= before_score: edit didn't break anything (or fixed something) → accept
-    }
-
-    // If any structural errors → reject (don't write)
-    if !errors.is_empty() {
+    if !warnings.is_empty() {
         return ValidateResult {
             fixed_content: current,
-            warnings: errors,
+            warnings,
             was_fixed: false,
             rejected: true,
         };

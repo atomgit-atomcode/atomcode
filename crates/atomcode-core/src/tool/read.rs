@@ -87,12 +87,47 @@ impl Tool for ReadFileTool {
         let lines: Vec<&str> = content.lines().collect();
         let total_lines = lines.len();
 
+        // Large file auto-skeleton: >200 lines with no offset/limit → return
+        // tree-sitter skeleton instead of full content. Model reads specific
+        // regions via offset/limit or read_symbol after seeing the structure.
+        // 200 lines ≈ 2.5K tok. Files under 200 lines return full content.
+        let auto_skeleton = total_lines > 200
+            && parsed.offset.is_none()
+            && parsed.limit.is_none();
+
+        if auto_skeleton {
+            let mut searcher = ctx.semantic.lock().await;
+            let skeleton = if let Some(symbols) = searcher.list_symbols(path) {
+                let fname = path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
+                let mut skel = format!("[File skeleton: {} ({} lines) — use read_symbol or offset/limit to read specific sections:]\n\n",
+                    fname, total_lines);
+                // Skeleton is fully driven by semantic layer's list_symbols().
+                // For Vue/Svelte, list_symbols already includes <template>/<style> sections
+                // as pseudo-symbols alongside script functions.
+                for s in &symbols {
+                    let sig = lines.get(s.start_line.saturating_sub(1))
+                        .map(|l| l.trim())
+                        .unwrap_or(&s.name);
+                    let sig_short = if sig.chars().count() > 70 {
+                        format!("{}...", sig.chars().take(67).collect::<String>())
+                    } else {
+                        sig.to_string()
+                    };
+                    skel.push_str(&format!("{:>4}| {}  (L{}-{})\n", s.start_line, sig_short, s.start_line, s.end_line));
+                }
+                skel
+            } else {
+                // Unreachable: list_symbols always returns Some via indent fallback.
+                // Kept as safety net — produces minimal skeleton.
+                let fname = path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
+                format!("[File skeleton: {} ({} lines) — use grep to find relevant lines, then read with offset/limit.]\n",
+                    fname, total_lines)
+            };
+            return Ok(ToolResult { call_id: String::new(), output: skeleton, success: true });
+        }
+
         let offset = parsed.offset.unwrap_or(1).max(1) - 1;
 
-        // Only truncate very large files (>1500 lines).
-        // 1500 lines ≈ 20K tokens. Covers 95%+ of real files
-        // (Vue SFC, Java services, TS modules typically <1200 lines).
-        // Truncating smaller files causes 3x re-reads that waste more steps.
         let limit = match parsed.limit {
             Some(l) => l,
             None => {

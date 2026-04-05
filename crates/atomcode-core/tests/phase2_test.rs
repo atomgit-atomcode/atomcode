@@ -16,7 +16,7 @@ fn unified_prompt_has_all_sections() {
     assert!(prompt.contains("SCOPE"), "Must have scope discipline");
     assert!(prompt.contains("VERIFY"), "Must have verify step");
     assert!(prompt.contains("edit_file"), "Must mention edit_file");
-    assert!(prompt.contains("write_file"), "Must mention write_file");
+    assert!(prompt.contains("create_file"), "Must mention write_file");
 }
 
 #[test]

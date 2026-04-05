@@ -386,7 +386,7 @@ impl App {
 
         let had_write = recent.iter().any(|m| matches!(&m.content,
             MessageContent::AssistantWithToolCalls { tool_calls, .. }
-            if tool_calls.iter().any(|c| c.name == "write_file" || c.name == "edit_file")
+            if tool_calls.iter().any(|c| c.name == "create_file" || c.name == "edit_file")
         ));
         let had_bash = recent.iter().any(|m| matches!(&m.content,
             MessageContent::AssistantWithToolCalls { tool_calls, .. }

@@ -6,7 +6,8 @@ pub mod git_checkpoint;
 pub mod knowledge;
 pub mod sub_agent;
 pub mod subtask_driver;
-pub mod task_classifier;
+// task_classifier removed — replaced by state-based decisions in handle_send_message.
+// pub mod task_classifier;
 
 pub mod execute;
 mod diagnose;
@@ -179,6 +180,14 @@ pub struct AgentLoop {
     files_edited_this_turn: Vec<String>,
     /// Consecutive read-type calls without an edit (for read budget enforcement)
     consecutive_reads: usize,
+    /// Consecutive turns with no new files read and no edits (stagnation detection).
+    stagnant_turns: usize,
+    /// Snapshot of known files count at last stagnation check.
+    last_known_files: usize,
+    /// Count of targeted reads (with offset/limit) — these are always progress.
+    targeted_read_count: usize,
+    /// Snapshot of targeted reads at last stagnation check.
+    last_targeted_reads: usize,
     /// Whether verify prompt was already injected this turn (fire at most once)
     verify_injected: bool,
     /// Whether the model produced any text output this turn (if so, skip auto-summary)
@@ -342,6 +351,10 @@ impl AgentLoop {
             files_read_this_turn: Vec::new(),
             files_edited_this_turn: Vec::new(),
             consecutive_reads: 0,
+            stagnant_turns: 0,
+            last_known_files: 0,
+            targeted_read_count: 0,
+            last_targeted_reads: 0,
             verify_injected: false,
             model_produced_text: false,
             silent_tool_rounds: 0,
@@ -604,32 +617,18 @@ impl AgentLoop {
             }
         }
 
-        // Classify task to decide planning and read-only constraint.
-        let has_previous = !self.conversation.messages.is_empty();
-        let task_type = task_classifier::classify(&content, has_previous);
-        self.planning_phase = task_type.needs_planning();
+        // State-based decisions (replaces keyword-based task_classifier).
+        // Two facts, not guesses:
 
-        // Diagnosis/follow-up tasks: restrict to read-only tools for first 3 turns.
-        // Forces the model to read code before curl/edit — prevents the "blind curl" pattern.
-        self.diagnosis_read_only_turns = match task_type {
-            task_classifier::TaskType::BugFix => 1,
-            _ => 0,
-        };
+        // 1. Has the model read any files this session? If not → read-only first turn.
+        let has_file_context = !self.files_read_this_turn.is_empty()
+            || !self.files_edited_this_turn.is_empty();
+        self.diagnosis_read_only_turns = if has_file_context { 0 } else { 1 };
+        self.planning_phase = !has_file_context;
 
-        // Prepend "analyze first" to user message for complex tasks.
-        // Data shows this changes model behavior from "pattern match → quick fix (often wrong)"
-        // to "systematic diagnosis → correct fix". Placed in user message (not system prompt)
-        // because models comply with user instructions more reliably.
-        let _content = match task_type {
-            task_classifier::TaskType::BugFix
-            | task_classifier::TaskType::FollowUp => {
-                format!("Analyze the root cause before making changes.\n\n{}", content)
-            }
-            task_classifier::TaskType::FeatureDev => {
-                format!("Read the relevant code first, then plan and implement.\n\n{}", content)
-            }
-            _ => content,
-        };
+        // Unified prepend — no task classification, no auto-build injection.
+        // Build command detection deferred to Phase 5 (LLM-inferred project config).
+        let content = format!("Read the relevant code first, then plan and implement.\n\n{}", content);
 
         self.phase = AgentPhase::Thinking;
         let _ = self
@@ -663,10 +662,20 @@ impl AgentLoop {
                 self.conversation.add_user_message(&format!("[Additional context from user]: {}", input));
             }
 
-            // Plan instruction injection removed — system prompt PLAN FIRST section
-            // already covers this. No need to duplicate in user messages.
-            if self.planning_phase {
+            // Planning phase: inject a planning reminder on the SECOND turn
+            // (first turn is read-only, second turn is where the model starts editing).
+            // This ensures the model plans ALL changes before making the first edit.
+            if self.planning_phase && self.turn_count == 2 {
                 self.planning_phase = false;
+                self.conversation.messages.push(
+                    crate::conversation::message::Message::new(
+                        crate::conversation::message::Role::System,
+                        "[PLAN BEFORE EDITING] Based on the files you just read, list ALL changes needed. \
+                         For each file, identify EVERY region to modify. \
+                         Then use edit_file with edits array to apply ALL changes to each file in ONE call. \
+                         Do NOT edit a file, then come back to edit it again.",
+                    )
+                );
             }
 
             // NOTE: Negative feedback injection disabled — adds a System message that
@@ -676,22 +685,37 @@ impl AgentLoop {
             // DIAGNOSTIC STRATEGY injection removed — the model decides its own
             // debugging approach. System prompt PLAN FIRST section is sufficient.
 
-            // Fix 5: Step budget warning — nudge the model to stop reading and start editing.
-            if self.tool_call_count >= 6 && self.files_edited_this_turn.is_empty() {
-                let warning = format!(
-                    "[STEP BUDGET WARNING: You have made {} tool calls with ZERO edits. \
-                     You are off track. Most bug fixes need 3-4 steps. \
-                     STOP reading more files. Based on what you already know, make your edit NOW. \
-                     Files you've read: {}]",
-                    self.tool_call_count,
-                    self.files_read_this_turn.join(", "),
-                );
-                self.conversation.messages.push(
-                    crate::conversation::message::Message::new(
-                        crate::conversation::message::Role::System,
-                        warning,
-                    )
-                );
+            // Stagnation detection: warn only when the model makes no progress
+            // for 3+ consecutive turns (no new files read, no edits).
+            // Replaces the old tool_call_count >= 6 check which was incompatible
+            // with the skeleton workflow (reading 10 skeletons ≠ being stuck).
+            {
+                let known = self.files_read_this_turn.len() + self.files_edited_this_turn.len();
+                let targeted = self.targeted_read_count;
+                // Progress = new files discovered OR new targeted reads OR new edits
+                if known > self.last_known_files || targeted > self.last_targeted_reads {
+                    self.stagnant_turns = 0;
+                } else {
+                    self.stagnant_turns += 1;
+                }
+                self.last_known_files = known;
+                self.last_targeted_reads = targeted;
+
+                if self.stagnant_turns >= 3 {
+                    let warning = format!(
+                        "[STAGNATION WARNING: {} consecutive turns with no new files read and no edits. \
+                         You have file skeletons — use offset/limit to read the sections you need, then edit. \
+                         Files you've read: {}]",
+                        self.stagnant_turns,
+                        self.files_read_this_turn.join(", "),
+                    );
+                    self.conversation.messages.push(
+                        crate::conversation::message::Message::new(
+                            crate::conversation::message::Role::System,
+                            warning,
+                        )
+                    );
+                }
             }
 
             let system_prompt = self.build_system_prompt();
@@ -751,6 +775,7 @@ impl AgentLoop {
                 let files_read_this_turn = &mut self.files_read_this_turn;
                 let file_read_counts = &mut self.file_read_counts;
                 let consecutive_reads = &mut self.consecutive_reads;
+                let targeted_read_count = &mut self.targeted_read_count;
                 let session_files = &mut self.session_files;
 
                 // Tool filtering: diagnosis phase uses read-only tools.
@@ -792,7 +817,7 @@ impl AgentLoop {
                                     let _ = event_tx.send(AgentEvent::PhaseChange(phase.clone()));
 
                                     // Track files for Working Set + read counts
-                                    if matches!(name.as_str(), "read_file" | "edit_file" | "write_file" | "search_replace" | "glob" | "grep") {
+                                    if matches!(name.as_str(), "read_file" | "edit_file" | "create_file" | "search_replace" | "glob" | "grep") {
                                         if let Ok(args) = serde_json::from_str::<serde_json::Value>(arguments) {
                                             // Try file_path first, then path (glob/grep use path)
                                             let fp = args.get("file_path").and_then(|v| v.as_str())
@@ -808,6 +833,11 @@ impl AgentLoop {
                                                     *file_read_counts.entry(short.clone()).or_insert(0) += 1;
                                                     if !files_read_this_turn.contains(&short) {
                                                         files_read_this_turn.push(short);
+                                                    }
+                                                    // Targeted reads (offset/limit) are always progress
+                                                    let has_offset = args.get("offset").is_some() || args.get("limit").is_some();
+                                                    if has_offset {
+                                                        *targeted_read_count += 1;
                                                     }
                                                 }
                                             }
@@ -851,7 +881,7 @@ impl AgentLoop {
                                     }
                                     if matches!(name.as_str(), "read_file" | "list_directory" | "glob" | "grep") {
                                         *consecutive_reads += 1;
-                                    } else if matches!(name.as_str(), "edit_file" | "write_file") {
+                                    } else if matches!(name.as_str(), "edit_file" | "create_file") {
                                         *consecutive_reads = 0;
                                     }
                                     let _ = event_tx.send(AgentEvent::ToolCallResult {
@@ -1128,16 +1158,19 @@ impl AgentLoop {
                     // Post-process: truncate large outputs + externalize to disk
                     self.post_process_tool_results(tool_count);
 
-                    // ATLAS-style auto-verify: if files were edited, auto-compile
-                    // and inject result. Catches errors immediately instead of
-                    // letting model pile up 10 broken edits before compiling.
-                    if !self.files_edited_this_turn.is_empty() {
-                        let log_sizes = self.snapshot_devserver_log_sizes();
-                        self.auto_compile_verify().await;
-                        self.syntax_check_edited_files().await;
-                        self.check_devserver_logs(&log_sizes).await;
-                        self.check_vue_partial_edit().await;
-                    }
+                    // ATLAS auto-verify: DISABLED.
+                    // Phase 4.2 edit success rate 90%+ makes auto-compile mostly overhead
+                    // (10-30s blocking per edit, 0 real errors caught today).
+                    // Model runs build itself when needed. Re-enable via config if needed.
+                    // Feature codename: "Guardian" — see docs/archive/guardian-auto-compile.md
+                    //
+                    // if !self.files_edited_this_turn.is_empty() {
+                    //     let log_sizes = self.snapshot_devserver_log_sizes();
+                    //     self.auto_compile_verify().await;
+                    //     self.syntax_check_edited_files().await;
+                    //     self.check_devserver_logs(&log_sizes).await;
+                    //     self.check_vue_partial_edit().await;
+                    // }
 
                     // Apply discipline: inject reminders, check step limits
                     self.apply_post_turn_discipline();
@@ -1145,39 +1178,10 @@ impl AgentLoop {
                         self.finish_turn();
                         return;
                     }
-                    // Bulk read guard: if model read 3+ files without editing,
-                    // it's loading too much into context. Guide to use grep/search_replace.
-                    // For 1000-file projects this prevents context explosion.
-                    if self.files_read_this_turn.len() >= 3 && self.files_edited_this_turn.is_empty() {
-                        let read_count = self.files_read_this_turn.len();
-                        self.conversation.add_user_message(&format!(
-                            "[WARNING: You've read {} files without editing. This wastes context.\n\
-                             For batch changes (colors, classes, patterns): use search_replace directly.\n\
-                             For targeted edits: use grep to find the target, then read ONLY that file.\n\
-                             Do NOT read more files. Act now with the information you have.]",
-                            read_count
-                        ));
-                    }
-
-                    // Read-loop breaker: consecutive reads without ANY edit in between.
-                    // Doesn't matter if files were edited earlier in the turn — what matters
-                    // is the model is currently stuck in a read loop.
-                    if self.consecutive_reads >= 5 {
-                        self.conversation.add_user_message(
-                            "You have done 5+ consecutive reads without editing. \
-                             You are likely stuck. Use edit_file NOW to fix the issue, \
-                             or tell the user what's wrong."
-                        );
-                    }
-                    if self.consecutive_reads >= 8 {
-                        // Hard stop — 8 consecutive reads is a death spiral
-                        self.conversation.add_user_message(
-                            "STOPPED: 8 consecutive reads without editing. \
-                             Summarize what you found and what the user should do."
-                        );
-                        self.finish_turn();
-                        return;
-                    }
+                    // Bulk-read and consecutive-read guards removed.
+                    // Skeleton mode makes multi-file reads cheap (~30 tok each).
+                    // Stagnation detection (stagnant_turns >= 3) handles the "truly stuck" case.
+                    // Step limit (50) is the hard cap.
                     // Continue to next turn
                     self.phase = AgentPhase::Thinking;
                     let _ = self.event_tx.send(AgentEvent::PhaseChange(AgentPhase::Thinking));
@@ -1519,10 +1523,9 @@ fn extract_contract(plan_text: &str) -> String {
     }
 }
 
-/// Search for build marker files (package.json, Cargo.toml, etc.) in the given
-/// directory and up to 2 levels of subdirectories. Returns the build command and
-/// the directory containing the marker. This handles nested project structures
-/// like `project/frontend/package.json`.
+/// LEGACY: Hardcoded build marker detection. Used only by sub-agent merge verification.
+/// Phase 5 replaces this with LLM-inferred project config (codename: "ProjectSense").
+/// See docs/phase5-the-final-five.md
 fn find_build_command(wd: &std::path::Path) -> Option<(String, std::path::PathBuf)> {
     let markers: &[(&str, &str)] = &[
         ("package.json", "npm run build 2>&1 | head -30"),

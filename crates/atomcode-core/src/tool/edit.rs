@@ -66,11 +66,8 @@ use super::{ApprovalRequirement, Tool, ToolContext, ToolDef, ToolResult};
 use super::auto_fix;
 
 /// Validate content in memory, write to disk, then run syntax check.
-/// Returns the final content (possibly auto-fixed) and appends any warnings to `result`.
-/// Track consecutive rejections per file to avoid infinite loops.
-static REJECTION_COUNTS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, usize>>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-
+/// Only check remaining: duplicate block detection. Structural checks
+/// (brace/HTML/Vue SFC) removed — auto-compile handles those better.
 async fn validate_write_check(
     content: &str,
     file_path: &str,
@@ -81,58 +78,25 @@ async fn validate_write_check(
     if !result.success {
         return Ok((result, content.to_string()));
     }
-    // 1. Validate in memory (before write).
-    // Pass original_content for delta validation (reject only if edit made things worse).
     let validated = auto_fix::validate_and_fix(content, file_path, new_string, original_content).await;
 
-    // 2. If rejected — DON'T write (unless rejected 3+ times → fall through with warning)
+    // Duplicate detection is the only remaining rejection.
     if validated.rejected {
-        let should_force = {
-            let mut counts = REJECTION_COUNTS.lock().unwrap();
-            let count = counts.entry(file_path.to_string()).or_insert(0);
-            *count += 1;
-            if *count >= 3 {
-                *count = 0;
-                true
-            } else {
-                false
-            }
-        }; // MutexGuard dropped here
-
-        if should_force {
-            // Safety valve: stop rejecting after 3 consecutive rejections.
-            atomic_write(file_path, &validated.fixed_content).await?;
-            return Ok((
-                ToolResult {
-                    output: format!(
-                        "{}\n⚠ WARNING: Edit had structural issues but was written anyway after 3 rejections. Check the file.",
-                        result.output
-                    ),
-                    ..result
-                },
-                validated.fixed_content,
-            ));
-        }
         let errors = validated.warnings.join("\n");
         return Ok((
             ToolResult {
                 call_id: result.call_id,
                 output: format!(
-                    "EDIT REJECTED — your edit would break the file structure:\n{}\n\
+                    "EDIT REJECTED — duplicate code detected:\n{}\n\
                      Fix your new_string and retry. The file was NOT modified.",
                     errors
                 ),
                 success: false,
             },
-            content.to_string(), // return original content, unchanged
+            content.to_string(),
         ));
     }
 
-    // 3. Write to disk (only structurally valid content reaches here)
-    // Reset rejection counter on successful write
-    if let Ok(mut counts) = REJECTION_COUNTS.lock() {
-        counts.remove(file_path);
-    }
     atomic_write(file_path, &validated.fixed_content).await?;
 
     // 4. Post-write syntax check (needs file on disk)
@@ -818,11 +782,15 @@ impl EditFileTool {
 
         let edit_count = resolved.len();
         let all_new_strings: String = edits.iter().map(|e| e.new_string.as_str()).collect::<Vec<_>>().join("\n");
+        let short_name = std::path::Path::new(file_path)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| file_path.to_string());
         let result = ToolResult {
             call_id: String::new(),
             output: format!(
-                "Multi-edit: {} edits applied to {} [{}].",
-                edit_count, file_path, summary_parts.join(", ")),
+                "Multi-edit: {} edits applied to {} [{}].\n\u{2713} {} updated. Proceed to your next file.",
+                edit_count, file_path, summary_parts.join(", "), short_name),
             success: true,
         };
         let (result, _final_content) = validate_write_check(&new_content, file_path, &all_new_strings, content, result).await?;

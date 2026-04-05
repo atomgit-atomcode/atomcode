@@ -20,7 +20,7 @@ pub enum AutoPermissionMode {
     DenyAll,
 }
 
-const EDIT_TOOLS: &[&str] = &["write_file", "edit_file", "search_replace"];
+const EDIT_TOOLS: &[&str] = &["create_file", "edit_file", "search_replace"];
 
 /// Automatic permission decider (used by SubagentLoop)
 pub struct AutoPermissionDecider {
@@ -133,7 +133,7 @@ mod tests {
     #[tokio::test]
     async fn test_auto_accept_edits_allows_write() {
         let d = AutoPermissionDecider::new(AutoPermissionMode::AcceptEdits);
-        assert!(matches!(d.decide(&make_call("write_file"), "write").await, PermissionDecision::Allow));
+        assert!(matches!(d.decide(&make_call("create_file"), "write").await, PermissionDecision::Allow));
         assert!(matches!(d.decide(&make_call("edit_file"), "edit").await, PermissionDecision::Allow));
         assert!(matches!(d.decide(&make_call("search_replace"), "sr").await, PermissionDecision::Allow));
     }

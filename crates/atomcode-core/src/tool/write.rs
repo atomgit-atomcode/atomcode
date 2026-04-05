@@ -55,24 +55,16 @@ struct WriteFileArgs {
 impl Tool for WriteFileTool {
     fn definition(&self) -> ToolDef {
         ToolDef {
-            name: "write_file",
-            description: "Write content to a file (creates or overwrites).\n\
-                DANGER: This REPLACES the entire file. Any existing code not included will be permanently lost.\n\
-                When to use:\n\
-                - Creating a NEW file that doesn't exist yet.\n\
-                - Complete rewrites ONLY when the user explicitly requests it.\n\
-                When NOT to use:\n\
-                - Modifying existing files — use edit_file instead. It only changes matched text, preserving everything else.\n\
-                - NEVER read a file, then write_file with small changes. Use edit_file for targeted modifications.\n\
-                Behavior:\n\
-                - Overwriting an existing non-empty file requires user approval.\n\
-                - Parent directories are NOT auto-created — ensure the directory exists first.\n\
-                - Uses atomic write (temp file + rename) to prevent corruption.".to_string(),
+            name: "create_file",
+            description: "Create a NEW file. ONLY for files that do NOT exist yet.\n\
+                CANNOT overwrite existing files — use edit_file instead.\n\
+                Parent directories are NOT auto-created — ensure the directory exists first.\n\
+                Uses atomic write (temp file + rename) to prevent corruption.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "file_path": { "type": "string", "description": "Absolute path to the file to write" },
-                    "content": { "type": "string", "description": "The full content to write to the file" }
+                    "file_path": { "type": "string", "description": "Absolute path to the new file to create" },
+                    "content": { "type": "string", "description": "The full content for the new file" }
                 },
                 "required": ["file_path", "content"]
             }),
@@ -85,7 +77,7 @@ impl Tool for WriteFileTool {
             Err(_) => {
                 // Fail-closed: if we can't parse args, require approval rather than auto-approving.
                 return ApprovalRequirement::RequireApproval(
-                    "Could not parse write_file arguments for safety check.".to_string(),
+                    "Could not parse create_file arguments for safety check.".to_string(),
                 );
             }
         };
@@ -103,19 +95,23 @@ impl Tool for WriteFileTool {
         let parsed: WriteFileArgs = serde_json::from_str(args)?;
         let path = std::path::Path::new(&parsed.file_path);
 
-        // Block write_file on existing non-empty files at code level.
-        // Weak models ignore prompt rules ("NEVER write_file on existing files")
-        // and RequireApproval just shifts the burden to the user. Return an error
-        // so the model is forced to use edit_file instead.
+        // Block create_file on existing non-empty files.
+        // Return an error with specific edit_file alternative.
         let is_overwrite = path.exists() && std::fs::metadata(path).map(|m| m.len() > 0).unwrap_or(false);
         if is_overwrite {
+            // Count lines to give the model a concrete edit_file alternative
+            let total_lines = std::fs::read_to_string(path)
+                .map(|c| c.lines().count())
+                .unwrap_or(0);
             return Ok(ToolResult {
                 call_id: String::new(),
                 output: format!(
-                    "ERROR: Cannot overwrite existing file '{}' with write_file. \
-                     Use edit_file with start_line/end_line to make targeted changes. \
-                     write_file is only for creating NEW files.",
-                    parsed.file_path
+                    "ERROR: Cannot overwrite existing file '{}' ({} lines).\n\
+                     To rewrite a section: edit_file(file_path=\"{}\", start_line=N, end_line=M, new_string=\"...\")\n\
+                     To rewrite the entire file: edit_file(file_path=\"{}\", start_line=1, end_line={}, new_string=\"...\")",
+                    parsed.file_path, total_lines,
+                    parsed.file_path,
+                    parsed.file_path, total_lines,
                 ),
                 success: false,
             });

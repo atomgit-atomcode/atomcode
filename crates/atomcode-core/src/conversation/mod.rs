@@ -428,7 +428,7 @@ impl Conversation {
                     MessageContent::AssistantWithToolCalls { text, tool_calls } => {
                         // Strip write_file content from tool call arguments
                         let compressed_calls: Vec<ToolCall> = tool_calls.iter().map(|tc| {
-                            if tc.name == "write_file" {
+                            if tc.name == "create_file" {
                                 let mut tc = tc.clone();
                                 // Replace content with size summary
                                 if let Ok(mut args) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
@@ -644,7 +644,7 @@ impl Conversation {
                                         "read_file" => {
                                             if !files_read.contains(&short) { files_read.push(short); }
                                         }
-                                        "edit_file" | "write_file" => {
+                                        "edit_file" | "create_file" => {
                                             if !files_edited.contains(&short) { files_edited.push(short); }
                                         }
                                         _ => {}

@@ -371,7 +371,7 @@ mod tests {
         let mut store = PermissionStore::new();
         store.grant_session("bash");
         // Other tools are unaffected.
-        let decision = store.check("write_file", &ApprovalRequirement::RequireApproval("write".into()));
+        let decision = store.check("create_file", &ApprovalRequirement::RequireApproval("write".into()));
         assert!(matches!(decision, PermissionDecision::Ask(_)));
     }
 }

@@ -20,8 +20,16 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
 
     // Left: brand (with build hash) + path + session
     left.push(Span::styled(
-        format!(" atomcode [{}] ", env!("ATOMCODE_BUILD_ID")),
+        " Atom",
         Style::default().fg(theme::brand_fg()).bg(theme::brand_bg()).add_modifier(Modifier::BOLD),
+    ));
+    left.push(Span::styled(
+        "Code ",
+        Style::default().fg(theme::accent()).bg(theme::brand_bg()).add_modifier(Modifier::BOLD),
+    ));
+    left.push(Span::styled(
+        format!("[{}] ", env!("ATOMCODE_BUILD_ID")),
+        Style::default().fg(theme::brand_fg()).bg(theme::brand_bg()),
     ));
     left.push(Span::styled(" ", Style::default()));
     left.push(Span::styled(&dir, Style::default().fg(theme::status_path())));

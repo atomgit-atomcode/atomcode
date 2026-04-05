@@ -24,7 +24,7 @@ impl AgentLoop {
                 }
 
                 // Track files for Working Set
-                if matches!(name.as_str(), "read_file" | "edit_file" | "write_file" | "search_replace" | "glob" | "grep") {
+                if matches!(name.as_str(), "read_file" | "edit_file" | "create_file" | "search_replace" | "glob" | "grep") {
                     if let Ok(args) = serde_json::from_str::<serde_json::Value>(arguments) {
                         let fp = args.get("file_path").and_then(|v| v.as_str())
                             .or_else(|| args.get("path").and_then(|v| v.as_str()));
@@ -74,7 +74,7 @@ impl AgentLoop {
                 }
                 if matches!(name.as_str(), "read_file" | "list_directory" | "glob" | "grep") {
                     self.consecutive_reads += 1;
-                } else if matches!(name.as_str(), "edit_file" | "write_file") {
+                } else if matches!(name.as_str(), "edit_file" | "create_file") {
                     self.consecutive_reads = 0;
                 }
 
@@ -85,7 +85,7 @@ impl AgentLoop {
                         || cmd.contains("ps aux") || cmd.contains("tail") {
                         self.scouting_count += 1;
                     }
-                } else if matches!(name.as_str(), "read_file" | "edit_file" | "write_file") {
+                } else if matches!(name.as_str(), "read_file" | "edit_file" | "create_file") {
                     self.scouting_count = 0;
                 }
 
@@ -250,7 +250,7 @@ impl AgentLoop {
         let mut repeat_count = 0usize;
         let mut saw_edit = false;
         for entry in self.recent_calls.iter().rev() {
-            if entry.0 == "edit_file" || entry.0 == "write_file" {
+            if entry.0 == "edit_file" || entry.0 == "create_file" {
                 saw_edit = true;
             }
             if *entry == sig {
@@ -277,7 +277,7 @@ impl AgentLoop {
         // ── Same-file multi-edit detection ──
         // Track consecutive edits to the same file. On the 3rd+ edit without
         // reading the file in between, block and force a re-read.
-        if tool_name == "edit_file" || tool_name == "write_file" {
+        if tool_name == "edit_file" || tool_name == "create_file" {
             if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(args) {
                 if let Some(fp) = parsed.get("file_path").and_then(|v| v.as_str()) {
                     let short = short_path(fp);

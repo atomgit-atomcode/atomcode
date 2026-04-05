@@ -107,6 +107,20 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         slash_menu::render(frame, chunks[2], &app.slash_menu);
     }
 
+    // Approval overlay — rendered at bottom of chat area when waiting for user
+    if let crate::app::AppMode::WaitingApproval(ref call) = app.mode {
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        chat_panel::render_approval(&mut lines, call);
+        let height = (lines.len() as u16).min(chunks[1].height);
+        let y = chunks[1].y + chunks[1].height - height;
+        let overlay_area = Rect::new(chunks[1].x, y, chunks[1].width, height);
+        frame.render_widget(Clear, overlay_area);
+        frame.render_widget(
+            Paragraph::new(lines).style(Style::default().bg(theme::bg_surface())),
+            overlay_area,
+        );
+    }
+
     // Model selector popup (overlay)
     if matches!(app.mode, crate::app::AppMode::ModelSelector) {
         model_selector::render(frame, frame.area(), app);

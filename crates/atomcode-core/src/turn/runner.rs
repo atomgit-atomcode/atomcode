@@ -102,13 +102,53 @@ impl TurnRunner {
 
         // 3. Get tool definitions for the LLM
         let all_tool_defs = self.tools.get_definitions();
-        let tool_defs: Vec<_> = if let Some(filter) = allowed_tools {
+        let mut tool_defs: Vec<_> = if let Some(filter) = allowed_tools {
             all_tool_defs.into_iter()
                 .filter(|d| filter.contains(&d.name))
                 .collect()
         } else {
             all_tool_defs
         };
+
+        // Inject ALL known-existing files into write_file description.
+        // Includes both edited AND read files — anything the model touched exists on disk.
+        {
+            let mut known_files: Vec<String> = self.recently_edited_files.clone();
+            // Extract read files from conversation tool calls
+            for msg in &messages {
+                if let crate::conversation::message::MessageContent::AssistantWithToolCalls { tool_calls, .. } = &msg.content {
+                    for call in tool_calls {
+                        if call.name == "read_file" {
+                            if let Ok(args) = serde_json::from_str::<serde_json::Value>(&call.arguments) {
+                                if let Some(fp) = args.get("file_path").and_then(|v| v.as_str()) {
+                                    let short = fp.rsplit('/').next().unwrap_or(fp).to_string();
+                                    if !known_files.contains(&short) {
+                                        known_files.push(short);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if !known_files.is_empty() {
+                if let Some(wf) = tool_defs.iter_mut().find(|d| d.name == "create_file") {
+                    // Display basenames for readability in tool description
+                    let display_names: Vec<&str> = known_files.iter()
+                        .map(|p| p.rsplit('/').next().unwrap_or(p.as_str()))
+                        .collect();
+                    let list = if display_names.len() <= 6 {
+                        display_names.join(", ")
+                    } else {
+                        format!("{}, ... ({} files)", display_names[..5].join(", "), display_names.len())
+                    };
+                    wf.description.push_str(&format!(
+                        "\nThese files ALREADY EXIST — use edit_file instead: {}",
+                        list,
+                    ));
+                }
+            }
+        }
 
         // 3. Start streaming
         let stream_start = std::time::Instant::now();
@@ -244,7 +284,11 @@ _ = cancel.cancelled() => {
             };
         }
 
-        // 6. Execute tool calls (with dedup for identical calls in the same batch)
+        // 6. Auto-merge multiple edit_file calls on the same file into one multi-edit.
+        // Models often generate 2+ separate edit_file calls for the same file instead of
+        // using the edits array. Merging at framework level is 100% reliable vs prompt ~50%.
+        merge_edit_calls(&mut tool_calls_buf);
+
         let tool_count = tool_calls_buf.len();
         let mut seen_calls: std::collections::HashMap<(String, String), usize> = std::collections::HashMap::new();
         let mut is_dup: Vec<bool> = vec![false; tool_calls_buf.len()];
@@ -298,11 +342,17 @@ _ = cancel.cancelled() => {
                 });
                 conversation.add_tool_result(result);
             } else {
-                // Intercept: block read on a file that was recently edited.
-                // Covers read_file AND bash cat/head/tail on edited files.
+                // Intercept: block FULL re-read on a file that was recently edited.
+                // Targeted reads (with offset/limit) are always allowed — they're
+                // the skeleton workflow reading different sections of the same file.
                 let intercept_file = if call.name == "read_file" {
                     if let Ok(args) = serde_json::from_str::<serde_json::Value>(&call.arguments) {
-                        args.get("file_path").and_then(|v| v.as_str()).map(|s| s.to_string())
+                        let has_offset = args.get("offset").is_some() || args.get("limit").is_some();
+                        if has_offset {
+                            None // Targeted read — never intercept
+                        } else {
+                            args.get("file_path").and_then(|v| v.as_str()).map(|s| s.to_string())
+                        }
                     } else { None }
                 } else if call.name == "bash" {
                     // Detect bash cat/head/tail on recently edited files.
@@ -324,19 +374,18 @@ _ = cancel.cancelled() => {
                 } else { None };
 
                 if let Some(ref fp) = intercept_file {
+                    // Use full file path for tracking — basename causes false matches
+                    // (e.g., api/__init__.py vs schemas/__init__.py).
+                    let file_key = fp.to_string();
                     let short = std::path::Path::new(fp)
                         .file_name()
                         .map(|n| n.to_string_lossy().to_string())
                         .unwrap_or_else(|| fp.to_string());
                     let edited_recently = files_edited_this_batch.iter()
                         .chain(self.recently_edited_files.iter())
-                        .any(|f| f == &short || fp.contains(f.as_str()));
+                        .any(|f| f == &file_key);
                     if edited_recently {
-                        // Track post-edit read count:
-                        //   1st: return skeleton (plan next edit)
-                        //   2nd: allow actual read (verify fix in bug-fix scenarios)
-                        //   3rd+: BLOCKED
-                        let read_count = self.post_edit_read_counts.entry(short.clone()).or_insert(0);
+                        let read_count = self.post_edit_read_counts.entry(file_key.clone()).or_insert(0);
                         *read_count += 1;
 
                         let intercept_output = if *read_count == 1 {
@@ -376,18 +425,17 @@ _ = cancel.cancelled() => {
                 let result = self.execute_single_tool(call, event_tx).await;
 
                 // Track files edited for read interception (batch + cross-turn)
-                if matches!(call.name.as_str(), "edit_file" | "write_file") && result.success {
+                // Use full file path as key to avoid basename collisions
+                // (e.g., api/__init__.py vs schemas/__init__.py).
+                if matches!(call.name.as_str(), "edit_file" | "create_file") && result.success {
                     if let Ok(args) = serde_json::from_str::<serde_json::Value>(&call.arguments) {
                         if let Some(fp) = args.get("file_path").and_then(|v| v.as_str()) {
-                            let short = std::path::Path::new(fp)
-                                .file_name()
-                                .map(|n| n.to_string_lossy().to_string())
-                                .unwrap_or_else(|| fp.to_string());
-                            if !files_edited_this_batch.contains(&short) {
-                                files_edited_this_batch.push(short.clone());
+                            let file_key = fp.to_string();
+                            if !files_edited_this_batch.contains(&file_key) {
+                                files_edited_this_batch.push(file_key.clone());
                             }
-                            if !self.recently_edited_files.contains(&short) {
-                                self.recently_edited_files.push(short);
+                            if !self.recently_edited_files.contains(&file_key) {
+                                self.recently_edited_files.push(file_key);
                             }
                         }
                     }
@@ -650,4 +698,67 @@ fn generate_file_skeleton(content: &str, filename: &str) -> String {
     }
 
     skeleton.join("\n")
+}
+
+/// Merge multiple edit_file calls targeting the same file into a single multi-edit call.
+/// The model often generates 2+ separate edit_file(file, old, new) for the same file;
+/// we merge them into one edit_file(file, edits=[...]) before execution.
+fn merge_edit_calls(calls: &mut Vec<ToolCall>) {
+    use std::collections::HashMap;
+
+    // Group edit_file calls by file_path. Preserve order of first occurrence.
+    let mut file_groups: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut file_order: Vec<String> = Vec::new();
+    for (i, call) in calls.iter().enumerate() {
+        if call.name != "edit_file" { continue; }
+        let fp = serde_json::from_str::<serde_json::Value>(&call.arguments).ok()
+            .and_then(|a| a.get("file_path").and_then(|v| v.as_str()).map(String::from));
+        if let Some(fp) = fp {
+            let entry = file_groups.entry(fp.clone()).or_default();
+            if entry.is_empty() { file_order.push(fp); }
+            entry.push(i);
+        }
+    }
+
+    // Only merge groups with 2+ calls
+    let merge_targets: Vec<(String, Vec<usize>)> = file_order.into_iter()
+        .filter_map(|fp| {
+            let indices = file_groups.remove(&fp)?;
+            if indices.len() >= 2 { Some((fp, indices)) } else { None }
+        })
+        .collect();
+
+    if merge_targets.is_empty() { return; }
+
+    let mut remove_indices: Vec<usize> = Vec::new();
+    for (file_path, indices) in &merge_targets {
+        // Build edits array from individual calls
+        let mut edits: Vec<serde_json::Value> = Vec::new();
+        for &idx in indices {
+            let args: serde_json::Value = serde_json::from_str(&calls[idx].arguments)
+                .unwrap_or_default();
+            let mut edit = serde_json::Map::new();
+            if let Some(v) = args.get("old_string") { edit.insert("old_string".into(), v.clone()); }
+            if let Some(v) = args.get("new_string") { edit.insert("new_string".into(), v.clone()); }
+            if let Some(v) = args.get("start_line") { edit.insert("start_line".into(), v.clone()); }
+            if let Some(v) = args.get("end_line") { edit.insert("end_line".into(), v.clone()); }
+            edits.push(serde_json::Value::Object(edit));
+        }
+
+        // Replace first call with merged version, mark rest for removal
+        let first_idx = indices[0];
+        let merged_args = serde_json::json!({
+            "file_path": file_path,
+            "edits": edits,
+        });
+        calls[first_idx].arguments = merged_args.to_string();
+        remove_indices.extend(&indices[1..]);
+    }
+
+    // Remove merged calls (reverse order to preserve indices)
+    remove_indices.sort_unstable();
+    remove_indices.dedup();
+    for idx in remove_indices.into_iter().rev() {
+        calls.remove(idx);
+    }
 }

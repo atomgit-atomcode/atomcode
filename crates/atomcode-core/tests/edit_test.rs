@@ -568,8 +568,9 @@ async fn delta_correct_edit_on_broken_file_accepted() {
 }
 
 #[tokio::test]
-async fn delta_bad_edit_on_good_file_rejected() {
-    // File is perfectly balanced. Edit removes a closing </div> — should be REJECTED.
+async fn delta_bad_edit_on_good_file_accepted() {
+    // Structural delta validation removed — auto-compile handles structural errors.
+    // Edits that break balance are now accepted (written to disk) and caught by compile.
     let content = "<script setup lang=\"ts\">\nconst x = 1\n</script>\n\n<template>\n  <div class=\"root\">\n    <div class=\"inner\">\n      <p>hello</p>\n    </div>\n  </div>\n</template>";
 
     let path = create_test_file(content);
@@ -583,7 +584,7 @@ async fn delta_bad_edit_on_good_file_rejected() {
     });
 
     let result = tool.execute(&args.to_string(), &ctx).await.unwrap();
-    assert!(!result.success, "Edit that breaks balance should be rejected: {}", result.output);
+    assert!(result.success, "Edit should be accepted (auto-compile catches structural issues): {}", result.output);
     cleanup(&path);
 }
 

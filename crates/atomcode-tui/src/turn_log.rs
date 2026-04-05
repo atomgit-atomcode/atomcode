@@ -251,7 +251,7 @@ fn format_tool_args(tool_name: &str, args_json: &str) -> String {
             }
             s
         }
-        "write_file" => {
+        "create_file" => {
             let path = args.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
             let size = args.get("content").and_then(|v| v.as_str()).map(|s| s.len()).unwrap_or(0);
             format!("{} ({} bytes)", short_path(path), size)

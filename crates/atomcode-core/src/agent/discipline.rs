@@ -158,7 +158,7 @@ impl AgentLoop {
             for msg in self.conversation.messages.iter().rev() {
                 if let crate::conversation::message::MessageContent::AssistantWithToolCalls { tool_calls, .. } = &msg.content {
                     for tc in tool_calls {
-                        if tc.name == "edit_file" || tc.name == "write_file" {
+                        if tc.name == "edit_file" || tc.name == "create_file" {
                             if let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
                                 if let Some(fp) = args.get("file_path").and_then(|v| v.as_str()) {
                                     let path = std::path::Path::new(fp);
