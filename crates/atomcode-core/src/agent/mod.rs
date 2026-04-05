@@ -1133,6 +1133,20 @@ impl AgentLoop {
                         self.finish_turn();
                         return;
                     }
+                    // Bulk read guard: if model read 3+ files without editing,
+                    // it's loading too much into context. Guide to use grep/search_replace.
+                    // For 1000-file projects this prevents context explosion.
+                    if self.files_read_this_turn.len() >= 3 && self.files_edited_this_turn.is_empty() {
+                        let read_count = self.files_read_this_turn.len();
+                        self.conversation.add_user_message(&format!(
+                            "[WARNING: You've read {} files without editing. This wastes context.\n\
+                             For batch changes (colors, classes, patterns): use search_replace directly.\n\
+                             For targeted edits: use grep to find the target, then read ONLY that file.\n\
+                             Do NOT read more files. Act now with the information you have.]",
+                            read_count
+                        ));
+                    }
+
                     // Read-loop breaker: consecutive reads without ANY edit in between.
                     // Doesn't matter if files were edited earlier in the turn — what matters
                     // is the model is currently stuck in a read loop.
