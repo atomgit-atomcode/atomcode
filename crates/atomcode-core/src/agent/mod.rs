@@ -832,8 +832,10 @@ impl AgentLoop {
                                             }
                                         }
                                     }
-                                    if let Some(pos) = output.find("Wrote ").or_else(|| output.find("Overwrote ")) {
-                                        let keyword_len = if output[pos..].starts_with("Overwrote ") { 10 } else { 6 };
+                                    if let Some(pos) = output.find("Wrote ").or_else(|| output.find("Overwrote ")).or_else(|| output.find("Created new file ")) {
+                                        let keyword_len = if output[pos..].starts_with("Overwrote ") { 10 }
+                                            else if output[pos..].starts_with("Created new file ") { 17 }
+                                            else { 6 };
                                         let rest = &output[pos + keyword_len..];
                                         let fp_end = rest.find(|c: char| c == ' ' || c == '\n' || c == '(').unwrap_or(rest.len());
                                         let fp = rest[..fp_end].trim();
