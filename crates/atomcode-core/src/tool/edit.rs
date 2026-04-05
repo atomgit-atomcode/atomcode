@@ -251,6 +251,20 @@ impl Tool for EditFileTool {
                         "type": "string",
                         "description": "Scope edit to a specific function/class name (tree-sitter)."
                     },
+                    "edits": {
+                        "type": "array",
+                        "description": "Multi-edit: array of edits to apply in one call. Each edit uses old_string/new_string. Use when changing 2+ non-adjacent regions.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "old_string": { "type": "string", "description": "Text to find" },
+                                "new_string": { "type": "string", "description": "Replacement text" },
+                                "start_line": { "type": "integer", "description": "(Fallback) Start line" },
+                                "end_line": { "type": "integer", "description": "(Fallback) End line" }
+                            },
+                            "required": ["new_string"]
+                        }
+                    },
                 },
                 "required": ["file_path"]
             }),
@@ -273,17 +287,17 @@ impl Tool for EditFileTool {
 
         // ── MULTI-EDIT MODE — disabled ──
         // Multi-edit 25次实测：apply 成功率高但改对率低，N个edit同时出错难回滚。
-        // Phase 4 EXECUTE mode 下重新启用（有精确指令，不需要模型自己算行号）。
-        // 当前强制单 edit 串行，模型每次只改一处，精度更高。
-        if let Some(_edits) = parsed.edits {
-            return Ok(ToolResult {
-                call_id: String::new(),
-                output: "Multi-edit is disabled. Use single edit_file calls instead — \
-                         one edit per call with old_string/new_string. \
-                         Make multiple calls to edit multiple regions."
-                    .to_string(),
-                success: false,
-            });
+        // Multi-edit mode: apply multiple edits in one call.
+        // Re-enabled with overlapping auto-merge + delta validation.
+        if let Some(edits) = parsed.edits {
+            if edits.is_empty() {
+                return Ok(ToolResult {
+                    call_id: String::new(),
+                    output: "Error: edits array is empty.".to_string(),
+                    success: false,
+                });
+            }
+            return self.execute_multi_edit(&parsed.file_path, &content, edits).await;
         }
 
         // Single-edit mode: new_string is required

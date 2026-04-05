@@ -754,21 +754,13 @@ impl AgentLoop {
                 let consecutive_reads = &mut self.consecutive_reads;
                 let session_files = &mut self.session_files;
 
-                // Phase 4 REASON mode: edit_file is NOT available.
-                // Model must output ### File: plan → EXECUTE mode handles editing.
-                // This prevents "边做边说" (edit + plan in same response).
-                //
-                // Available tools in REASON mode:
-                //   read_file, grep, glob, list_directory, bash, write_file (new files only)
-                //   find_references, list_symbols, read_symbol
-                // NOT available: edit_file (only in EXECUTE mode)
+                // Tool filtering: diagnosis phase uses read-only tools.
+                // All other turns have full tool access (including edit_file).
+                // EXECUTE thinking is applied INSIDE edit_file (fresh file read,
+                // ±5 lines context return, fuzzy match, delta validation) —
+                // not by blocking tools at the agent loop level.
                 let read_only_tools: &[&str] = &[
                     "read_file", "grep", "glob", "list_directory",
-                    "find_references", "list_symbols", "read_symbol",
-                ];
-                let reason_tools: &[&str] = &[
-                    "read_file", "grep", "glob", "list_directory", "bash",
-                    "write_file", "search_replace",
                     "find_references", "list_symbols", "read_symbol",
                 ];
                 let use_read_only = self.diagnosis_read_only_turns > 0
@@ -776,7 +768,7 @@ impl AgentLoop {
                 let tool_filter: Option<&[&str]> = if use_read_only {
                     Some(read_only_tools)
                 } else {
-                    Some(reason_tools) // REASON mode: no edit_file
+                    None // Full tool access — model can read, edit, bash, search_replace
                 };
                 let turn_fut = runner.run_with_filter(
                     &mut conv, &system_prompt, &turn_tx, cancel, tool_filter,
@@ -1070,61 +1062,6 @@ impl AgentLoop {
                         self.retry_count += 1;
                         self.conversation.add_user_message("Continue.");
                         continue;
-                    }
-
-                    // Phase 4 EXECUTE mode: parse edit instructions from REASON output.
-                    // Skip if EXECUTE already ran this turn (files_edited_this_turn non-empty).
-                    // This prevents re-triggering when model's post-EXECUTE summary mentions ### File:.
-                    let edit_instrs = if self.files_edited_this_turn.is_empty() {
-                        execute::parse_edit_instructions(text)
-                    } else {
-                        Vec::new()
-                    };
-                    if !edit_instrs.is_empty() {
-                        let wd = self.turn_runner.context.working_dir.try_read()
-                            .map(|g| g.clone())
-                            .unwrap_or_default();
-
-                        let _ = self.event_tx.send(AgentEvent::TextDelta(
-                            format!("\n[EXECUTE mode: {} instruction(s)]\n", edit_instrs.len())
-                        ));
-
-                        let (summaries, all_success) = execute::execute_instructions(
-                            edit_instrs,
-                            &mut self.turn_runner,
-                            &self.event_tx,
-                            &wd,
-                        ).await;
-
-                        // Inject results into conversation
-                        let result_text = summaries.join("\n");
-                        self.conversation.add_user_message(&format!(
-                            "[EXECUTE results:]\n{}\n{}",
-                            result_text,
-                            if all_success { "All edits applied. Verify and summarize." }
-                            else { "Some edits failed. Review and fix." }
-                        ));
-
-                        // Run auto-compile after EXECUTE
-                        if all_success {
-                            // Mark files as edited for auto-compile
-                            for s in &summaries {
-                                if s.contains("edited") {
-                                    // Extract file name from summary
-                                    if let Some(fname) = s.split("— edited").next()
-                                        .and_then(|p| p.rsplit(':').next())
-                                        .map(|f| f.trim().to_string())
-                                    {
-                                        if !self.files_edited_this_turn.contains(&fname) {
-                                            self.files_edited_this_turn.push(fname);
-                                        }
-                                    }
-                                }
-                            }
-                            self.auto_compile_verify().await;
-                        }
-
-                        continue; // Back to REASON mode for verification
                     }
 
                     self.finish_turn();

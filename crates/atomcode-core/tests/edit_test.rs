@@ -170,7 +170,7 @@ async fn edit_creates_file_history_backup() {
 // ═══════════════════════════════════════════════════════════════
 
 #[tokio::test]
-#[ignore] // multi-edit disabled in Phase 3.5
+
 async fn multi_edit_line_number_mode() {
     // Simulate a Vue SFC: imports, logic, template
     let content = "\
@@ -225,7 +225,6 @@ function increment() { count.value++ }
 }
 
 #[tokio::test]
-#[ignore] // multi-edit disabled in Phase 3.5
 async fn multi_edit_text_match_mode() {
     let content = "\
 function hello() { return 'hello'; }
@@ -262,7 +261,6 @@ function main() { console.log(hello(), world()); }
 }
 
 #[tokio::test]
-#[ignore] // multi-edit disabled in Phase 3.5
 async fn multi_edit_overlap_detection() {
     let content = (1..=20).map(|i| format!("line {}", i)).collect::<Vec<_>>().join("\n");
     let path = create_test_file(&content);
@@ -294,7 +292,6 @@ async fn multi_edit_overlap_detection() {
 }
 
 #[tokio::test]
-#[ignore] // multi-edit disabled in Phase 3.5
 async fn multi_edit_mixed_modes() {
     let content = "\
 import React from 'react'
@@ -335,7 +332,6 @@ export default App
 }
 
 #[tokio::test]
-#[ignore] // multi-edit disabled in Phase 3.5
 async fn multi_edit_string_line_numbers() {
     // Test lenient parsing: model sends line numbers as strings
     let content = "line 1\nline 2\nline 3\nline 4\nline 5\n";
@@ -421,7 +417,6 @@ function main() {}
 }
 
 #[tokio::test]
-#[ignore] // multi-edit disabled in Phase 3.5
 async fn multi_edit_boundary_overlap_dedup() {
     let content = "\
 import { ref } from 'vue'
@@ -501,7 +496,6 @@ function main() {}
 }
 
 #[tokio::test]
-#[ignore] // multi-edit disabled in Phase 3.5
 async fn multi_edit_leading_overlap_dedup() {
     let content = "\
 <script setup>
@@ -614,7 +608,6 @@ async fn delta_fix_edit_on_broken_file_accepted() {
 }
 
 #[tokio::test]
-#[ignore] // multi-edit disabled in Phase 3.5
 async fn delta_multi_edit_on_broken_file_accepted() {
     // File has pre-existing balance issue. Multi-edit changes script + template
     // without changing div balance — should be ACCEPTED.

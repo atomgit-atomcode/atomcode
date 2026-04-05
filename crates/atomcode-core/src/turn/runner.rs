@@ -262,13 +262,13 @@ _ = cancel.cancelled() => {
                 return TurnResult::Cancelled;
             }
             // Enforce tool filter at execution time — LLM may call tools
-            // not in the provided tool_defs (e.g., edit_file in REASON mode).
+            // not in the provided tool_defs (e.g., during diagnosis read-only phase).
             if let Some(filter) = allowed_tools {
                 if !filter.contains(&call.name.as_str()) {
                     let result = ToolResult {
                         call_id: call.id.clone(),
                         output: format!(
-                            "Tool '{}' is not available. To edit files, output your plan using ### File: format.",
+                            "Tool '{}' is not available in this phase. Read the code first, then edit.",
                             call.name
                         ),
                         success: false,
