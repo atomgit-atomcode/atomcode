@@ -536,7 +536,7 @@ impl Conversation {
     /// Does NOT depend on turn_tracker (which may be empty across sessions).
     /// Splits by User messages as turn boundaries instead.
     /// Keeps the most recent ~30% of messages intact, summarizes the rest.
-    fn compact_messages(&mut self, target_tokens: usize, _system_tokens: usize) {
+    fn compact_messages(&mut self, _target_tokens: usize, _system_tokens: usize) {
         if self.messages.len() < 10 { return; }
 
         // Find User message boundaries (each User msg starts a "turn")

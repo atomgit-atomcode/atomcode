@@ -1591,6 +1591,7 @@ let session_manager = SessionManager::new(&working_dir);
         ),
         recently_edited_files: Vec::new(),
         post_edit_read_counts: std::collections::HashMap::new(),
+        cache_cold: true, // API mode: start with cold cache
     };
     
     // Build system prompt (minimal for API)

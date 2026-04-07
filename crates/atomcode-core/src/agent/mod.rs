@@ -629,7 +629,7 @@ impl AgentLoop {
 
         // Unified prepend — no task classification, no auto-build injection.
         // Build command detection deferred to Phase 5 (LLM-inferred project config).
-        let content = format!("Read the relevant code first, then plan and implement.\n\n{}", content);
+        let _content = format!("Read the relevant code first, then plan and implement.\n\n{}", content);
 
         self.phase = AgentPhase::Thinking;
         let _ = self
