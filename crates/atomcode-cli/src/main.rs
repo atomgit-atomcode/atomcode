@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -24,6 +25,25 @@ use atomcode_core::tool::web_fetch::WebFetchTool;
 use atomcode_core::tool::search_replace::SearchReplaceTool;
 
 mod auth;
+
+/// Set to `true` at the start of `run_headless` so the panic hook and the
+/// top-level error handler can skip TUI cleanup. In headless mode we never
+/// entered the alternate screen, so calling `LeaveAlternateScreen` would
+/// emit `\x1b[?1049l` to stdout and corrupt pipe-friendly output.
+static HEADLESS_MODE: AtomicBool = AtomicBool::new(false);
+
+/// Restore terminal state if (and only if) we ever entered TUI mode.
+/// No-op in headless mode — see [`HEADLESS_MODE`].
+fn restore_terminal_if_tui() {
+    if HEADLESS_MODE.load(Ordering::Relaxed) {
+        return;
+    }
+    let _ = crossterm::terminal::disable_raw_mode();
+    let _ = crossterm::execute!(
+        std::io::stdout(),
+        crossterm::terminal::LeaveAlternateScreen,
+    );
+}
 
 /// Truncate a string to at most `max_chars` *characters* (not bytes), replacing
 /// any newlines with spaces and appending "..." when truncated.
@@ -86,12 +106,7 @@ enum Commands {
 async fn main() {
     // Set panic hook to show errors cleanly
     std::panic::set_hook(Box::new(|info| {
-        // Restore terminal before printing panic
-        let _ = crossterm::terminal::disable_raw_mode();
-        let _ = crossterm::execute!(
-            std::io::stdout(),
-            crossterm::terminal::LeaveAlternateScreen,
-        );
+        restore_terminal_if_tui();
         eprintln!("\nAtomCode crashed: {}", info);
         if let Some(location) = info.location() {
             eprintln!("  at {}:{}:{}", location.file(), location.line(), location.column());
@@ -102,12 +117,7 @@ async fn main() {
     match run().await {
         Ok(code) => std::process::exit(code),
         Err(e) => {
-            // Restore terminal before printing error
-            let _ = crossterm::terminal::disable_raw_mode();
-            let _ = crossterm::execute!(
-                std::io::stdout(),
-                crossterm::terminal::LeaveAlternateScreen,
-            );
+            restore_terminal_if_tui();
             eprintln!("\nAtomCode error: {:#}", e);
             std::process::exit(1);
         }
@@ -249,6 +259,10 @@ async fn run_headless(
     prompt: String,
     _provider_name: Option<&str>,
 ) -> Result<i32> {
+    // Tell the panic hook / error path to skip TUI cleanup — we never enter
+    // the alternate screen here, so LeaveAlternateScreen would corrupt stdout.
+    HEADLESS_MODE.store(true, Ordering::Relaxed);
+
     let (cmd_tx, mut event_rx) = {
         let handle = agent_handle;
         (handle.cmd_tx, handle.event_rx)
