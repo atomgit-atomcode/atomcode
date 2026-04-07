@@ -1,5 +1,5 @@
 [package]
-name = "atomcode-api"
+name = "atomcode-daemon"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

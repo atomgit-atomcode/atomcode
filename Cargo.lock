@@ -117,25 +117,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "atomcode-api"
-version = "2.5.0"
-dependencies = [
- "anyhow",
- "atomcode-core",
- "axum",
- "dirs 5.0.1",
- "futures",
- "regex",
- "serde",
- "serde_json",
- "tokio",
- "tokio-stream",
- "tokio-util",
- "tower-http 0.5.2",
- "uuid",
-]
-
-[[package]]
 name = "atomcode-core"
 version = "2.5.0"
 dependencies = [
@@ -164,6 +145,25 @@ dependencies = [
  "tree-sitter-python",
  "tree-sitter-rust",
  "tree-sitter-typescript",
+ "uuid",
+]
+
+[[package]]
+name = "atomcode-daemon"
+version = "2.5.0"
+dependencies = [
+ "anyhow",
+ "atomcode-core",
+ "axum",
+ "dirs 5.0.1",
+ "futures",
+ "regex",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tower-http 0.5.2",
  "uuid",
 ]
 

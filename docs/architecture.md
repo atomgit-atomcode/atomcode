@@ -9,7 +9,7 @@
 | **atomcode-core** | 16,843 | Agent 引擎 — 工具、上下文、语义分析、LLM 通信 |
 | **atomcode-tui** | 7,793 | 终端 UI — 渲染、输入、主题、session 管理 |
 | **atomcode-cli** | 736 | CLI 入口 — 参数解析、OAuth 登录 |
-| **atomcode-api** | 647 | HTTP API 服务（独立部署） |
+| **atomcode-daemon** | 647 | 后台服务 — HTTP API 服务（独立部署） |
 
 ---
 
