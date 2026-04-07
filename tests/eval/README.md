@@ -1,77 +1,77 @@
-# AtomCode Eval — Case Authoring Guide
+# AtomCode Eval — Case 编写指南
 
-This directory holds the case set for the batch eval harness. The runner
-lives at `scripts/eval/run.sh`. The full design is at
-[`docs/superpowers/specs/2026-04-07-batch-eval-harness-design.md`](../../docs/superpowers/specs/2026-04-07-batch-eval-harness-design.md).
+本目录存放批量 eval harness 的 case 集合。runner 脚本位于
+`scripts/eval/run.sh`。完整设计见
+[`docs/superpowers/specs/2026-04-07-batch-eval-harness-design.md`](../../docs/superpowers/specs/2026-04-07-batch-eval-harness-design.md)。
 
-## Quick start
+## 快速开始
 
 ```bash
-# Run all cases
+# 跑全部 case
 ./scripts/eval/run.sh
 
-# Run one case
+# 只跑一个 case
 ./scripts/eval/run.sh --only 001-fizzbuzz
 
-# Override provider for all cases (otherwise each case uses its
-# own frontmatter provider if pinned, else config.toml's default_provider)
+# 为所有 case 覆盖 provider（否则：case frontmatter 里钉了谁就用谁，
+# 没钉就用 config.toml 里的 default_provider）
 ./scripts/eval/run.sh --provider siliconflow
 
-# View results
+# 查看结果
 open runs/<latest>/index.html
 ```
 
-## Two case formats
+## 两种 case 格式
 
-### Form A — single file (small / no seed / inline seed)
+### Form A — 单文件（小体量 / 无 seed / 内联 seed）
 
 ```
 tests/eval/cases/
   001-fizzbuzz.md
 ```
 
-Use form A when:
-- No starter files needed, OR
-- Just 1-3 small text files inline
+Form A 适用场景：
+- 不需要任何起始文件，或
+- 只需要 1–3 个很小的文本文件（内联在 frontmatter 的 `[seed_files]` 里）
 
-The case id must match the filename (without `.md`).
+case id 必须和文件名（去掉 `.md`）完全一致。
 
-### Form B — directory (multi-file seed / real project mock)
+### Form B — 目录（多文件 seed / 模拟真实项目）
 
 ```
 tests/eval/cases/
   010-rust-refactor/
     case.md
-    seed/                ← copied to cwd/ at run time
+    seed/                ← 运行时会被拷贝到 cwd/
       Cargo.toml
       src/main.rs
 ```
 
-Use form B when:
-- You need a multi-file starter project
-- Files are large or binary
-- You want to edit the seed in your IDE rather than as TOML strings
+Form B 适用场景：
+- 需要一个多文件的起始工程
+- seed 文件较大或是二进制
+- 想直接在 IDE 里编辑 seed 文件而不是塞进 TOML 字符串
 
-The case id must match the directory name.
+case id 必须和目录名完全一致。
 
-## Frontmatter (TOML)
+## Frontmatter（TOML）
 
-Every case starts with a `+++` TOML frontmatter block:
+每个 case 的开头都是一个 `+++` 包裹的 TOML frontmatter 块：
 
 ```markdown
 +++
-id = "001-fizzbuzz"          # required, must match filename/dirname
+id = "001-fizzbuzz"          # 必需，必须和文件名/目录名一致
 
-description = "..."          # optional, shown in index.html
-timeout_secs = 60            # optional, default 120
-tags = ["code-gen", "smoke"] # optional, V1 just displays them
+description = "..."          # 可选，会显示在 index.html
+timeout_secs = 60            # 可选，缺省 120
+tags = ["code-gen", "smoke"] # 可选，V1 仅展示，不参与逻辑
 
-# OPTIONAL — pins this case to a specific provider. Omit to use
-# config.toml's default_provider. The --provider CLI flag overrides
-# both the pin AND the default.
+# 可选 —— 把当前 case 钉到某个 provider。省略时会用 config.toml 的
+# default_provider。--provider CLI 参数的优先级高于 frontmatter 钉死值
+# 和 config 的默认值。
 provider = "siliconflow"
 
-# Form A only — form B uses seed/ directory instead
+# 仅 Form A 有效；Form B 用 seed/ 目录代替
 [seed_files]
 "hint.txt" = "useful hint"
 "src/main.py" = """
@@ -79,74 +79,74 @@ print("placeholder")
 """
 +++
 
-your prompt body here, exactly as it would be passed to atomcode -p
+下面是 prompt 正文，原样传给 atomcode -p
 ```
 
-### Field constraints
+### 字段约束
 
-- `id`: charset `[a-zA-Z0-9_-]`, must match filename/dirname (required)
-- `provider`: optional string. When set, must be non-empty. Absent → case
-  uses `config.toml`'s `default_provider`. `--provider` CLI flag overrides.
-- `seed_files` keys: relative paths only, no `..`, no absolute paths
-- `seed/` (form B): no symlinks, soft 50MB limit (warning only)
+- `id`：字符集 `[a-zA-Z0-9_-]`，必须和文件名/目录名一致（必需）
+- `provider`：可选字符串。设置时不能为空字符串。省略 → 使用
+  `config.toml` 的 `default_provider`。`--provider` CLI 参数优先级最高。
+- `seed_files` 的 key：只能是相对路径，禁止 `..`，禁止绝对路径
+- `seed/`（Form B）：禁止 symlink，软性大小限制 50 MB（仅警告）
 
-## What `-p` mode can and can't do
+## `-p` 模式能做什么，不能做什么
 
-**Works fine** (95% of cases):
-- Read files (read_file, glob, grep, list_dir, ...)
-- Edit existing files (edit_file, search_replace)
-- Create new files (create_file on a non-existing path)
-- Run normal bash: `cargo build`, `pytest`, `npm install`, `git status`,
-  `python script.py`, `curl`, ...
-- Multi-step verification flows ("write code, then run it")
+**正常工作**（95% 的 case）：
+- 读文件（read_file / glob / grep / list_dir / …）
+- 编辑已有文件（edit_file / search_replace）
+- 创建新文件（create_file，路径不存在时）
+- 跑常规 bash：`cargo build`、`pytest`、`npm install`、`git status`、
+  `python script.py`、`curl` 等等
+- 多步验证流程（"先写代码、再跑起来"）
 
-**Will be auto-denied** (the model gets a "denied" observation and may
-pivot to a workaround, but the case result is degraded):
-- `rm -rf`, `rmdir` — use edit_file to write empty content instead
-- `git reset --hard`, `git push --force`, `git clean -f`
-- `drop table`, `drop database`
-- `mkfs`, `format`, `dd if=`, `chmod 777`
-- `kill -9` without a numeric PID (`kill -9 12345` is fine)
+**会被自动拒绝**（模型会收到一个 "denied" observation，可能会绕道，
+但 case 的结果会被降级）：
+- `rm -rf`、`rmdir` —— 用 edit_file 写空内容代替
+- `git reset --hard`、`git push --force`、`git clean -f`
+- `drop table`、`drop database`
+- `mkfs`、`format`、`dd if=`、`chmod 777`
+- 不带数字 PID 的 `kill -9`（`kill -9 12345` 没问题）
 
-**See `crates/atomcode-core/src/tool/bash.rs:430-450`** for the full
-denylist. Don't write cases whose "correct" solution requires these.
+**完整拒绝清单见** `crates/atomcode-core/src/tool/bash.rs:430-450`。
+不要写"标准答案依赖这些命令"的 case。
 
-## Triage tips
+## 诊断与排查
 
-When a case looks wrong, here's where to look (in order):
+当某个 case 看起来不对劲时，按以下顺序查：
 
-1. **`runs/<ts>/<case-id>/meta.json`** — exit_code, status, had_denial,
-   wall_ms. If `had_denial: true`, jump straight to step 3.
-2. **`runs/<ts>/<case-id>/cwd/`** — what the model actually produced.
-   `diff -ru tests/eval/cases/<id>/seed/ runs/<ts>/<id>/cwd/` is great
-   for form B cases.
-3. **`runs/<ts>/<case-id>/stderr.txt`** — `[tool→ ...]` / `[tool← ...]`
-   timeline + any `[approval-denied]` lines. Quick scan of the agent's
-   tool calls in time order.
-4. **`runs/<ts>/<case-id>/home/logs/*.json`** — the gold mine. Each
-   pair is one LLM round-trip with full messages, tool definitions,
-   token counts, step number. Open the request file for "what we sent"
-   and the matching `*_response.json` for "what we got back".
+1. **`runs/<ts>/<case-id>/meta.json`** —— exit_code / status / had_denial
+   / wall_ms。如果 `had_denial: true`，直接跳到第 3 步。
+2. **`runs/<ts>/<case-id>/cwd/`** —— 模型实际产出的文件系统。Form B
+   case 推荐用
+   `diff -ru tests/eval/cases/<id>/seed/ runs/<ts>/<id>/cwd/` 快速对比。
+3. **`runs/<ts>/<case-id>/stderr.txt`** —— `[tool→ ...]` / `[tool← ...]`
+   时间线，以及所有 `[approval-denied]` 行。按时间顺序看 agent 的工具
+   调用轨迹。
+4. **`runs/<ts>/<case-id>/home/logs/*.json`** —— 金矿。每一对
+   (request / response) 文件都是一次完整的 LLM round-trip，含 messages、
+   tool 定义、token 数、step 编号。request 文件是"我们发了什么"，对应
+   的 `*_response.json` 是"模型回了什么"。
 
-## Why TOML, not YAML?
+## 为什么是 TOML，不是 YAML？
 
-The runner is bash + python stdlib only. Python 3.11+ has `tomllib`
-built in but no `yaml`. Switching to TOML avoids forcing every user
-to `pip install pyyaml`. TOML's `"""..."""` covers multi-line strings
-adequately for prompts and seed files. The decision is documented in
+runner 只用 bash + python 标准库。Python 3.11+ 自带 `tomllib`，但没有
+对应的 yaml 解析器。改用 TOML 可以避免让每个使用者 `pip install pyyaml`。
+TOML 的 `"""..."""` 多行字符串足以承载 prompt 和 seed 文件。这个决定
+记录在
 `docs/superpowers/plans/2026-04-07-batch-eval-harness.md`
-under "Deviations from spec".
+的 "Deviations from spec" 段落。
 
-## V1 limitations
+## V1 的刻意限制
 
-Things V1 deliberately does NOT do (planned for V1.5+):
-- No triage badges (`long-turn`, `repeat-tool`, `token-heavy`, ...)
-- No cross-run diff
-- No `notes.md` annotation
-- No `--rerun-failed`
-- No grading (LLM-as-judge or hard assertions)
-- No multi-provider matrix
-- No multi-turn cases
-- No `--dangerous-allow-all` flag (and never will — see CLAUDE.md §3)
+V1 **故意不做**以下事情（规划到 V1.5+）：
+- 无 triage 徽章（`long-turn` / `repeat-tool` / `token-heavy` …）
+- 无跨 run diff
+- 无 `notes.md` 标注
+- 无 `--rerun-failed`
+- 无评分（LLM-as-judge 或硬断言）
+- 无 multi-provider 矩阵
+- 无 multi-turn case
+- 无 `--dangerous-allow-all`（并且永远不会有，见 CLAUDE.md §3）
 
-When you need any of these, the spec has the design path forward.
+需要以上任何一项时，spec 里有对应的演进路径。
