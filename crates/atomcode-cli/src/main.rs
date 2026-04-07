@@ -87,24 +87,27 @@ async fn main() {
         eprintln!("\nPlease report this at: https://github.com/atomcode/atomcode/issues");
     }));
 
-    if let Err(e) = run().await {
-        // Restore terminal before printing error
-        let _ = crossterm::terminal::disable_raw_mode();
-        let _ = crossterm::execute!(
-            std::io::stdout(),
-            crossterm::terminal::LeaveAlternateScreen,
-        );
-        eprintln!("\nAtomCode error: {:#}", e);
-        std::process::exit(1);
+    match run().await {
+        Ok(code) => std::process::exit(code),
+        Err(e) => {
+            // Restore terminal before printing error
+            let _ = crossterm::terminal::disable_raw_mode();
+            let _ = crossterm::execute!(
+                std::io::stdout(),
+                crossterm::terminal::LeaveAlternateScreen,
+            );
+            eprintln!("\nAtomCode error: {:#}", e);
+            std::process::exit(1);
+        }
     }
 }
 
-async fn run() -> Result<()> {
+async fn run() -> Result<i32> {
     let cli = Cli::parse();
 
     // Handle subcommands
     if let Some(cmd) = cli.command {
-        return handle_command(cmd).await;
+        return handle_command(cmd).await.map(|_| 0);
     }
 
     // Default: start TUI
@@ -225,119 +228,112 @@ async fn run() -> Result<()> {
     }
 
     tokio::spawn(agent_loop.run());
-    atomcode_tui::run(config, model_name, agent_handle, tool_context, working_dir, session_to_continue).await
+    atomcode_tui::run(config, model_name, agent_handle, tool_context, working_dir, session_to_continue).await?;
+    Ok(0)
 }
 
-/// Run agent in headless mode (no TUI, output to stdout).
+/// Run agent in headless mode (pipe-friendly: stdout = LLM text only,
+/// logs/diagnostics → stderr, approvals auto-denied).
 async fn run_headless(
     agent_loop: AgentLoop,
     agent_handle: atomcode_core::agent::AgentHandle,
     prompt: String,
     _provider_name: Option<&str>,
-) -> Result<()> {
+) -> Result<i32> {
     let (cmd_tx, mut event_rx) = {
         let handle = agent_handle;
         (handle.cmd_tx, handle.event_rx)
     };
 
-    // Spawn agent loop
     tokio::spawn(agent_loop.run());
-
-    // Send the prompt
     cmd_tx.send(AgentCommand::SendMessage(prompt))?;
 
-    // Process events until completion
+    let mut exit_code: i32 = 0;
+    let mut had_denial = false;
+    let mut last_text_ended_with_newline = true;
+
     while let Some(event) = event_rx.recv().await {
         match event {
             AgentEvent::TextDelta(text) => {
+                if !text.is_empty() {
+                    last_text_ended_with_newline = text.ends_with('\n');
+                }
                 print!("{}", text);
                 io::stdout().flush()?;
             }
             AgentEvent::ToolCallStarted { name, arguments } => {
-                println!("\n[Tool: {}]", name);
-                if arguments.len() > 200 {
-                    println!("  {}...", &arguments[..200]);
+                let args = if arguments.len() > 200 {
+                    format!("{}...", &arguments[..200])
                 } else {
-                    println!("  {}", arguments);
-                }
+                    arguments
+                };
+                eprintln!("[tool→ {} args={}]", name, args.replace('\n', " "));
             }
             AgentEvent::ToolCallResult { name, output, success, duration } => {
                 let status = if success { "OK" } else { "FAILED" };
                 let dur_ms = duration.as_millis();
-                if output.is_empty() {
-                    println!("[{}: {} {}ms]", name, status, dur_ms);
-                } else if output.len() > 500 {
-                    println!("[{}: {} {}ms]\n  {}...\n", name, status, dur_ms, &output[..500]);
+                let trimmed = output.trim_end();
+                if trimmed.is_empty() {
+                    eprintln!("[tool← {} {} {}ms]", name, status, dur_ms);
+                } else if trimmed.len() > 500 {
+                    let snippet = trimmed[..500].replace('\n', " ");
+                    eprintln!("[tool← {} {} {}ms] {}...", name, status, dur_ms, snippet);
                 } else {
-                    println!("[{}: {} {}ms]\n  {}\n", name, status, dur_ms, output);
+                    let snippet = trimmed.replace('\n', " ");
+                    eprintln!("[tool← {} {} {}ms] {}", name, status, dur_ms, snippet);
                 }
             }
             AgentEvent::ApprovalNeeded { tool_name, reason, .. } => {
-                println!("\n[Approval Required] {}", tool_name);
-                println!("  Reason: {}", reason);
-                println!("  [Y] Approve  [A] Always allow  [N] Deny");
-                print!("> ");
-                io::stdout().flush()?;
-
-                let mut input = String::new();
-                io::stdin().read_line(&mut input)?;
-                match input.trim().to_lowercase().as_str() {
-                    "y" | "yes" => {
-                        cmd_tx.send(AgentCommand::ApproveTool)?;
-                    }
-                    "a" | "always" => {
-                        cmd_tx.send(AgentCommand::ApproveToolAlways)?;
-                    }
-                    _ => {
-                        cmd_tx.send(AgentCommand::DenyTool)?;
-                    }
-                }
+                eprintln!("[approval-denied] tool={} reason={}", tool_name, reason);
+                cmd_tx.send(AgentCommand::DenyTool)?;
+                had_denial = true;
             }
             AgentEvent::TokenUsage(usage) => {
-                // Silent in headless mode, or optionally show
-                eprintln!("[Tokens: {} prompt + {} completion]", usage.prompt_tokens, usage.completion_tokens);
+                eprintln!("[tokens] prompt={} completion={}", usage.prompt_tokens, usage.completion_tokens);
             }
-            AgentEvent::PhaseChange(phase) => {
-                // Optional: show phase changes
-                match phase {
-                    atomcode_core::agent::AgentPhase::Idle => {}
-                    atomcode_core::agent::AgentPhase::Thinking => {
-                        eprintln!("[Thinking...]");
-                    }
-                    atomcode_core::agent::AgentPhase::CallingTool(name) => {
-                        eprintln!("[Executing: {}]", name);
-                    }
-                    atomcode_core::agent::AgentPhase::WaitingApproval => {}
-                }
+            AgentEvent::PhaseChange(_) => {
+                // Silent in headless mode
             }
             AgentEvent::TurnComplete { duration, total_tokens, turn_count, tool_call_count } => {
-                println!("\n[Done: {:.1}s, {} tokens, {} turns, {} tool calls]",
+                if !last_text_ended_with_newline {
+                    println!();
+                    io::stdout().flush()?;
+                }
+                eprintln!("[done] {:.1}s tokens={} turns={} tool_calls={}",
                     duration.as_secs_f64(), total_tokens, turn_count, tool_call_count);
-                // In headless mode, exit after turn completes
                 let _ = cmd_tx.send(AgentCommand::Shutdown);
                 break;
             }
             AgentEvent::TurnCancelled { .. } => {
-                eprintln!("\n[Cancelled]");
+                eprintln!("[cancelled]");
+                exit_code = 130;
                 let _ = cmd_tx.send(AgentCommand::Shutdown);
                 break;
             }
             AgentEvent::Error(e) => {
-                eprintln!("\n[Error: {}]", e);
+                eprintln!("[error] {}", e);
+                exit_code = 1;
+                let _ = cmd_tx.send(AgentCommand::Shutdown);
+                break;
             }
             AgentEvent::WorkingDirChanged(new_dir) => {
-                eprintln!("[Working directory: {}]", new_dir.display());
+                eprintln!("[cwd] {}", new_dir.display());
             }
             AgentEvent::ContextStats { .. } => {
                 // Silent in headless mode
             }
             AgentEvent::SubAgentProgress { file, status } => {
-                eprintln!("  ⠴ [{}] {}", file, status);
+                eprintln!("[sub-agent] {} {}", file, status);
             }
         }
     }
 
-    Ok(())
+    // Priority: Error(1) > Denial(2) > 0; TurnCancelled(130) is absolute.
+    if exit_code == 0 && had_denial {
+        exit_code = 2;
+    }
+
+    Ok(exit_code)
 }
 
 /// Handle subcommands (login, logout, status)
