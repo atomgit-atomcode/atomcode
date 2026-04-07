@@ -90,6 +90,11 @@ struct Cli {
     /// Prompt to run in headless (non-interactive) mode. If omitted, launches the TUI.
     #[arg(short = 'p', long)]
     prompt: Option<String>,
+
+    /// Show tool calls, token usage, and turn summary on stderr (headless mode only).
+    /// Without this flag, headless output is the assistant reply only — Claude Code -p style.
+    #[arg(short = 'v', long)]
+    verbose: bool,
 }
 
 #[derive(Subcommand)]
@@ -243,7 +248,7 @@ async fn run() -> Result<i32> {
 
     // Headless mode: -p / --prompt triggers non-interactive execution.
     if let Some(prompt) = cli.prompt.clone() {
-        return run_headless(agent_loop, agent_handle, prompt, cli.provider.as_deref()).await;
+        return run_headless(agent_loop, agent_handle, prompt, cli.provider.as_deref(), cli.verbose).await;
     }
 
     tokio::spawn(agent_loop.run());
@@ -253,11 +258,19 @@ async fn run() -> Result<i32> {
 
 /// Run agent in headless mode (pipe-friendly: stdout = LLM text only,
 /// logs/diagnostics → stderr, approvals auto-denied).
+///
+/// `verbose=false` (default): Claude Code -p style — only the assistant reply
+/// reaches the user. Tool calls, token usage, and turn summary are silent.
+/// Errors, approval denials, and cancellations are still surfaced on stderr.
+///
+/// `verbose=true`: also emit tool calls, token usage, [done] summary, working
+/// dir changes, and sub-agent progress on stderr.
 async fn run_headless(
     agent_loop: AgentLoop,
     agent_handle: atomcode_core::agent::AgentHandle,
     prompt: String,
     _provider_name: Option<&str>,
+    verbose: bool,
 ) -> Result<i32> {
     // Tell the panic hook / error path to skip TUI cleanup — we never enter
     // the alternate screen here, so LeaveAlternateScreen would corrupt stdout.
@@ -285,61 +298,77 @@ async fn run_headless(
                 io::stdout().flush()?;
             }
             AgentEvent::ToolCallStarted { name, arguments } => {
-                let args = truncate_log_line(&arguments, 200);
-                eprintln!("[tool→ {} args={}]", name, args);
+                if verbose {
+                    let args = truncate_log_line(&arguments, 200);
+                    eprintln!("[tool→ {} args={}]", name, args);
+                }
             }
             AgentEvent::ToolCallResult { name, output, success, duration } => {
-                let status = if success { "OK" } else { "FAILED" };
-                let dur_ms = duration.as_millis();
-                let trimmed = output.trim_end();
-                if trimmed.is_empty() {
-                    eprintln!("[tool← {} {} {}ms]", name, status, dur_ms);
-                } else {
-                    let snippet = truncate_log_line(trimmed, 500);
-                    eprintln!("[tool← {} {} {}ms] {}", name, status, dur_ms, snippet);
+                if verbose {
+                    let status = if success { "OK" } else { "FAILED" };
+                    let dur_ms = duration.as_millis();
+                    let trimmed = output.trim_end();
+                    if trimmed.is_empty() {
+                        eprintln!("[tool← {} {} {}ms]", name, status, dur_ms);
+                    } else {
+                        let snippet = truncate_log_line(trimmed, 500);
+                        eprintln!("[tool← {} {} {}ms] {}", name, status, dur_ms, snippet);
+                    }
                 }
             }
             AgentEvent::ApprovalNeeded { tool_name, reason, .. } => {
+                // Always shown — security signal must not be silent.
                 eprintln!("[approval-denied] tool={} reason={}", tool_name, reason);
                 cmd_tx.send(AgentCommand::DenyTool)?;
                 had_denial = true;
             }
             AgentEvent::TokenUsage(usage) => {
-                eprintln!("[tokens] prompt={} completion={}", usage.prompt_tokens, usage.completion_tokens);
+                if verbose {
+                    eprintln!("[tokens] prompt={} completion={}", usage.prompt_tokens, usage.completion_tokens);
+                }
             }
             AgentEvent::PhaseChange(_) => {
-                // Silent in headless mode
+                // Silent in headless mode (in both default and verbose).
             }
             AgentEvent::TurnComplete { duration, total_tokens, turn_count, tool_call_count } => {
+                // Always ensure stdout ends with a newline so downstream parsers see a clean line.
                 if !last_text_ended_with_newline {
                     println!();
                     io::stdout().flush()?;
                 }
-                eprintln!("[done] {:.1}s tokens={} turns={} tool_calls={}",
-                    duration.as_secs_f64(), total_tokens, turn_count, tool_call_count);
+                if verbose {
+                    eprintln!("[done] {:.1}s tokens={} turns={} tool_calls={}",
+                        duration.as_secs_f64(), total_tokens, turn_count, tool_call_count);
+                }
                 let _ = cmd_tx.send(AgentCommand::Shutdown);
                 break;
             }
             AgentEvent::TurnCancelled { .. } => {
+                // Always shown — user needs to know cancellation happened.
                 eprintln!("[cancelled]");
                 exit_code = 130;
                 let _ = cmd_tx.send(AgentCommand::Shutdown);
                 break;
             }
             AgentEvent::Error(e) => {
+                // Always shown — errors are not noise.
                 eprintln!("[error] {}", e);
                 exit_code = 1;
                 let _ = cmd_tx.send(AgentCommand::Shutdown);
                 break;
             }
             AgentEvent::WorkingDirChanged(new_dir) => {
-                eprintln!("[cwd] {}", new_dir.display());
+                if verbose {
+                    eprintln!("[cwd] {}", new_dir.display());
+                }
             }
             AgentEvent::ContextStats { .. } => {
                 // Silent in headless mode
             }
             AgentEvent::SubAgentProgress { file, status } => {
-                eprintln!("[sub-agent] {} {}", file, status);
+                if verbose {
+                    eprintln!("[sub-agent] {} {}", file, status);
+                }
             }
         }
     }

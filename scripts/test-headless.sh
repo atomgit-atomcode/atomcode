@@ -115,7 +115,8 @@ echo ""
 if [ -z "${ATOMCODE_TEST_PROVIDER:-}" ]; then
     skip "T1: -p emits stdout                  (needs ATOMCODE_TEST_PROVIDER)"
     skip "T2: stdout has no decoration markers (needs ATOMCODE_TEST_PROVIDER)"
-    skip "T3: stderr has log/diagnostic output (needs ATOMCODE_TEST_PROVIDER)"
+    skip "T3: -v stderr has log/diagnostic output (needs ATOMCODE_TEST_PROVIDER)"
+    skip "T3b: default headless stderr is clean    (needs ATOMCODE_TEST_PROVIDER)"
     skip "T4: -p does not block on stdin       (needs ATOMCODE_TEST_PROVIDER)"
 else
     PROV="$ATOMCODE_TEST_PROVIDER"
@@ -160,22 +161,45 @@ else
     echo ""
 
     ###########################################################################
-    # T3: stderr has at least one diagnostic line during a tool-using turn
+    # T3: --verbose stderr has diagnostic lines during a tool-using turn
     ###########################################################################
-    T3="T3: -p stderr has at least one log line"
-    echo "[T3] Running: -p (tool-using prompt)"
+    T3="T3: -v stderr has at least one log line"
+    echo "[T3] Running: -v -p (tool-using prompt)"
     out="$TMPDIR_T/t3.out"; err="$TMPDIR_T/t3.err"; rc=0
     run_atom 60 "$out" "$err" \
-        --provider "$PROV" \
+        --provider "$PROV" -v \
         -p "List the files in the current directory then reply DONE" || rc=$?
     if [ "$rc" -eq 124 ]; then
         fail "$T3 — process hung"
     elif [ "$rc" -ne 0 ]; then
         fail "$T3 — exit=$rc; stderr tail: $(tail -3 "$err" | tr '\n' ' ')"
     elif [ ! -s "$err" ]; then
-        fail "$T3 — stderr empty (expected at least one diagnostic line)"
+        fail "$T3 — stderr empty (expected at least one diagnostic line under -v)"
     else
         pass "$T3 ($(wc -l <"$err" | tr -d ' ') lines on stderr)"
+    fi
+    echo ""
+
+    ###########################################################################
+    # T3b: default mode (no -v) MUST keep stderr clean — no tool / tokens /
+    #      [done] noise. Only Error/Approval/Cancel are allowed; happy path
+    #      should produce zero stderr bytes.
+    ###########################################################################
+    T3B="T3b: default headless stderr is clean (Claude Code -p style)"
+    echo "[T3b] Running: -p (no -v, happy path)"
+    out="$TMPDIR_T/t3b.out"; err="$TMPDIR_T/t3b.err"; rc=0
+    run_atom 30 "$out" "$err" \
+        --provider "$PROV" -p "Reply with the single word: ok" || rc=$?
+    if [ "$rc" -eq 124 ]; then
+        fail "$T3B — process hung"
+    elif [ "$rc" -ne 0 ]; then
+        fail "$T3B — exit=$rc; stderr tail: $(tail -3 "$err" | tr '\n' ' ')"
+    elif [ -s "$err" ]; then
+        fail "$T3B — stderr should be empty, got: $(head -3 "$err" | tr '\n' ' ')"
+    elif [ ! -s "$out" ]; then
+        fail "$T3B — stdout empty (expected assistant reply)"
+    else
+        pass "$T3B (stdout=$(wc -c <"$out" | tr -d ' ') bytes, stderr clean)"
     fi
     echo ""
 

@@ -131,3 +131,40 @@ Headless 重写落地后，紧接着把 `--headless` flag 整个删掉，让 `-p
 - `docs/headless-pipe-plan.md`（本文件）追加本段。
 
 **不做**：不引入 `--initial` / `--tui` / 任何新 flag；不留 deprecation alias；不动 agent / tool 接口。
+
+## 7. 默认静默 + `-v / --verbose`（addendum）
+
+用户反馈：Claude Code 的 `-p` 模式输出**只有最终回复**，干净。AtomCode 在 §2 之后虽然把工具日志/tokens 摘要从 stdout 移到了 stderr，但终端默认会同时显示 stdout+stderr，**视觉上仍然夹杂 `[tool→ …]`、`[tokens] …`、`[done] …` 噪音**，体验比 Claude Code 差。
+
+**新默认（Claude Code -p style）**：
+
+| Event | 默认 | `-v` |
+|------|------|------|
+| `TextDelta` | stdout（不变）| stdout |
+| `ToolCallStarted/Result` | **silent** | stderr |
+| `TokenUsage` | **silent** | stderr |
+| `TurnComplete` 摘要 | **silent**（仍补 stdout 末尾换行）| stderr |
+| `WorkingDirChanged` | **silent** | stderr |
+| `SubAgentProgress` | **silent** | stderr |
+| `PhaseChange` | silent（不变）| silent |
+| `ApprovalNeeded` | stderr（**安全信号必须可见**）| stderr |
+| `Error` | stderr（不变）| stderr |
+| `TurnCancelled` | stderr（不变）| stderr |
+
+**新增 flag**：
+```text
+/// Show tool calls, token usage, and turn summary on stderr (headless mode only).
+/// Without this flag, headless output is the assistant reply only — Claude Code -p style.
+#[arg(short = 'v', long)]
+verbose: bool,
+```
+
+**改动点**：
+- `Cli.verbose: bool` 新增字段
+- `run_headless` 增加 `verbose: bool` 参数
+- 主循环里 6 处 `eprintln!`（ToolCallStarted/Result, TokenUsage, TurnComplete summary, WorkingDirChanged, SubAgentProgress）改为 `if verbose { … }`
+- ApprovalNeeded / Error / TurnCancelled 三个仍然无条件输出
+- `scripts/test-headless.sh`：T3 加 `-v`，新增 T3b 验证默认 stderr 全空
+
+**为何 `-v` 是 opt-in 而非默认 + `--quiet` opt-out**：用户常态使用 `-p` 都是要"干净答案"，verbose 是少数 debug 场景。把多数路径设为默认更符合最少惊讶原则。
+
