@@ -1,6 +1,5 @@
 +++
 id = "002-bash-verify"
-provider = "kimi"
 description = "代码生成 + bash 验证"
 timeout_secs = 90
 tags = ["code-gen", "bash-verify"]

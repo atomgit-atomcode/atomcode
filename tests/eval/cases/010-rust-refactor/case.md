@@ -1,6 +1,5 @@
 +++
 id = "010-rust-refactor"
-provider = "kimi"
 description = "把臃肿 main.rs 拆成 lib + main"
 timeout_secs = 180
 tags = ["refactor", "rust", "bash-verify"]

@@ -13,8 +13,9 @@ lives at `scripts/eval/run.sh`. The full design is at
 # Run one case
 ./scripts/eval/run.sh --only 001-fizzbuzz
 
-# Override provider for everyone
-./scripts/eval/run.sh --provider kimi
+# Override provider for all cases (otherwise each case uses its
+# own frontmatter provider if pinned, else config.toml's default_provider)
+./scripts/eval/run.sh --provider siliconflow
 
 # View results
 open runs/<latest>/index.html
@@ -60,11 +61,15 @@ Every case starts with a `+++` TOML frontmatter block:
 ```markdown
 +++
 id = "001-fizzbuzz"          # required, must match filename/dirname
-provider = "kimi"            # required
 
 description = "..."          # optional, shown in index.html
 timeout_secs = 60            # optional, default 120
 tags = ["code-gen", "smoke"] # optional, V1 just displays them
+
+# OPTIONAL — pins this case to a specific provider. Omit to use
+# config.toml's default_provider. The --provider CLI flag overrides
+# both the pin AND the default.
+provider = "siliconflow"
 
 # Form A only — form B uses seed/ directory instead
 [seed_files]
@@ -79,7 +84,9 @@ your prompt body here, exactly as it would be passed to atomcode -p
 
 ### Field constraints
 
-- `id`: charset `[a-zA-Z0-9_-]`, must match filename/dirname
+- `id`: charset `[a-zA-Z0-9_-]`, must match filename/dirname (required)
+- `provider`: optional string. When set, must be non-empty. Absent → case
+  uses `config.toml`'s `default_provider`. `--provider` CLI flag overrides.
 - `seed_files` keys: relative paths only, no `..`, no absolute paths
 - `seed/` (form B): no symlinks, soft 50MB limit (warning only)
 
