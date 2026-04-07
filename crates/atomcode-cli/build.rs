@@ -1,5 +1,14 @@
 fn main() {
-    // Re-run on git HEAD changes so the hash stays fresh.
+    // Best-effort rebuild hints. These paths do NOT exist inside a git
+    // worktree (where .git is a file, not a directory), so cargo will
+    // silently treat them as "always re-run" — that's fine: the git
+    // subprocess calls are cheap, and the env-var output is stable
+    // between commits anyway. If you build inside a regular checkout
+    // these become real cache hints.
+    //
+    // We watch .git/index (not .git/refs/heads/ like the tui crate does)
+    // because dirty detection cares about staging-area changes, not
+    // branch switches.
     println!("cargo:rerun-if-changed=../../.git/HEAD");
     println!("cargo:rerun-if-changed=../../.git/index");
 
@@ -12,9 +21,10 @@ fn main() {
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_else(|| "unknown".to_string());
 
-    // Detect dirty working tree.
+    // Detect dirty working tree. --untracked-files=no matches the
+    // 'git describe --dirty' convention: only tracked-file changes count.
     let dirty = std::process::Command::new("git")
-        .args(["status", "--porcelain"])
+        .args(["status", "--porcelain", "--untracked-files=no"])
         .output()
         .ok()
         .map(|o| !o.stdout.is_empty())
