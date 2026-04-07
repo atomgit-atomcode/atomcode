@@ -51,11 +51,7 @@ struct Cli {
     #[arg(long, short = 'C')]
     dir: Option<PathBuf>,
 
-    /// Run in headless mode (no TUI, just execute the prompt)
-    #[arg(long)]
-    headless: bool,
-
-    /// Prompt to send in headless mode (required if --headless)
+    /// Prompt to run in headless (non-interactive) mode. If omitted, launches the TUI.
     #[arg(short = 'p', long)]
     prompt: Option<String>,
 }
@@ -219,11 +215,8 @@ async fn run() -> Result<i32> {
         conversation,
     );
 
-    // Headless mode: run without TUI
-    if cli.headless {
-        let prompt = cli.prompt.clone().ok_or_else(|| {
-            anyhow::anyhow!("--prompt is required in headless mode")
-        })?;
+    // Headless mode: -p / --prompt triggers non-interactive execution.
+    if let Some(prompt) = cli.prompt.clone() {
         return run_headless(agent_loop, agent_handle, prompt, cli.provider.as_deref()).await;
     }
 

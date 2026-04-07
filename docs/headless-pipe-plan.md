@@ -106,3 +106,28 @@
 4. `cargo build -p atomcode-cli` + `cargo clippy -p atomcode-cli -- -D warnings`。
 5. `./scripts/test-all.sh` 全绿。
 6. SendMessage 给 qa，触发 Task #3 / #4。
+
+## 6. UX 简化（addendum，Task #5）
+
+Headless 重写落地后，紧接着把 `--headless` flag 整个删掉，让 `-p / --prompt` 单独触发非交互模式。
+
+**动机**：
+- `-p` 名字本身就是 print/non-interactive 暗示，`--headless` 是 noise。
+- 与 Claude Code (`claude -p "..."`) 习惯一致，迁移摩擦最小。
+- atomcode 仍 pre-1.0，不留 deprecation alias，避免后续清理负担。
+
+**新语义**：
+
+| 命令 | 行为 |
+|------|------|
+| `atomcode` | TUI（不变）|
+| `atomcode -p "X"` | headless 跑 X |
+| `atomcode --headless ...` | clap 报 `unexpected argument`，exit 2 |
+
+**改动点**：
+- `Cli` struct 删 `headless: bool` 字段。
+- `run()` 里 `if cli.headless { … }` → `if let Some(prompt) = cli.prompt.clone() { … }`。
+- `--prompt` 的 doc comment 更新为 "Prompt to run in headless (non-interactive) mode. If omitted, launches the TUI."
+- `docs/headless-pipe-plan.md`（本文件）追加本段。
+
+**不做**：不引入 `--initial` / `--tui` / 任何新 flag；不留 deprecation alias；不动 agent / tool 接口。

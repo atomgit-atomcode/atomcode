@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
-# AtomCode --headless mode smoke tests
+# AtomCode headless-mode smoke tests
+#
+# Headless mode is triggered by `-p / --prompt`. The legacy `--headless`
+# flag was removed in Task #5 — clap should now reject it.
 #
 # Usage: ./scripts/test-headless.sh
 #
 # Optional environment:
 #   ATOMCODE_TEST_PROVIDER   Provider name to use for live (network) tests
 #                            (e.g. "openai", "kimi"). When unset, only the
-#                            offline argument-validation test runs and the
+#                            offline CLI-surface tests run and the
 #                            network-dependent tests are skipped.
 #
 # Exit codes:
@@ -65,22 +68,44 @@ echo "  Provider: ${ATOMCODE_TEST_PROVIDER:-<unset — network tests will be ski
 echo ""
 
 ###############################################################################
-# T5 (offline): missing --prompt → non-zero exit, stderr explains why
-#               This is the only test that runs without a configured provider.
+# T5 (offline): the legacy `--headless` flag must be rejected by clap.
 ###############################################################################
-T5="T5: --headless without --prompt errors with helpful message"
-echo "[T5] Running: --headless (no -p)"
+T5="T5: legacy --headless flag is rejected by clap"
+echo "[T5] Running: --headless (legacy flag, must be unknown)"
 out="$TMPDIR_T/t5.out"; err="$TMPDIR_T/t5.err"; rc=0
 run_atom 5 "$out" "$err" --headless || rc=$?
 
 if [ "$rc" -eq 0 ]; then
-    fail "$T5 — expected non-zero exit, got 0"
+    fail "$T5 — expected non-zero exit, got 0 (flag was accepted!)"
 elif [ "$rc" -eq 124 ]; then
     fail "$T5 — process hung (timed out)"
-elif ! grep -qi "prompt is required" "$err"; then
-    fail "$T5 — stderr missing 'prompt is required' (got: $(head -2 "$err" | tr '\n' ' '))"
+elif ! grep -qiE "unexpected argument|unrecognized|unknown argument" "$err"; then
+    fail "$T5 — stderr missing clap rejection text (got: $(head -2 "$err" | tr '\n' ' '))"
 else
     pass "$T5 (exit=$rc)"
+fi
+echo ""
+
+###############################################################################
+# T5b (offline): `-p` is recognized as the headless trigger. Use a bogus
+# provider so we exit at the runtime "Provider not found" stage rather than
+# at clap parsing — proves -p flowed past CLI parse into the run() body.
+###############################################################################
+T5B="T5b: -p triggers headless path (CLI parse OK; fails at provider lookup)"
+echo "[T5b] Running: --provider __nonexistent_qa_probe__ -p 'x'"
+out="$TMPDIR_T/t5b.out"; err="$TMPDIR_T/t5b.err"; rc=0
+run_atom 5 "$out" "$err" --provider __nonexistent_qa_probe__ -p "x" || rc=$?
+
+if [ "$rc" -eq 0 ]; then
+    fail "$T5B — expected non-zero exit, got 0"
+elif [ "$rc" -eq 124 ]; then
+    fail "$T5B — process hung (timed out)"
+elif grep -qiE "unexpected argument|unrecognized|unknown argument" "$err"; then
+    fail "$T5B — failed at clap parse, not at runtime (stderr: $(head -2 "$err" | tr '\n' ' '))"
+elif ! grep -qiE "provider.*(not found|missing|unknown)" "$err"; then
+    fail "$T5B — stderr missing 'Provider not found' style message (got: $(head -3 "$err" | tr '\n' ' '))"
+else
+    pass "$T5B (exit=$rc)"
 fi
 echo ""
 
@@ -88,21 +113,21 @@ echo ""
 # Network-gated tests — require a configured provider.
 ###############################################################################
 if [ -z "${ATOMCODE_TEST_PROVIDER:-}" ]; then
-    skip "T1: --headless -p emits stdout                  (needs ATOMCODE_TEST_PROVIDER)"
-    skip "T2: --headless stdout has no decoration markers (needs ATOMCODE_TEST_PROVIDER)"
-    skip "T3: --headless stderr has log/diagnostic output (needs ATOMCODE_TEST_PROVIDER)"
-    skip "T4: --headless does not block on stdin          (needs ATOMCODE_TEST_PROVIDER)"
+    skip "T1: -p emits stdout                  (needs ATOMCODE_TEST_PROVIDER)"
+    skip "T2: stdout has no decoration markers (needs ATOMCODE_TEST_PROVIDER)"
+    skip "T3: stderr has log/diagnostic output (needs ATOMCODE_TEST_PROVIDER)"
+    skip "T4: -p does not block on stdin       (needs ATOMCODE_TEST_PROVIDER)"
 else
     PROV="$ATOMCODE_TEST_PROVIDER"
 
     ###########################################################################
-    # T1: --headless -p succeeds and emits non-empty stdout
+    # T1: -p succeeds and emits non-empty stdout
     ###########################################################################
-    T1="T1: --headless -p exits 0 with non-empty stdout"
-    echo "[T1] Running: --headless -p (provider=$PROV)"
+    T1="T1: -p exits 0 with non-empty stdout"
+    echo "[T1] Running: -p (provider=$PROV)"
     out="$TMPDIR_T/t1.out"; err="$TMPDIR_T/t1.err"; rc=0
     run_atom 30 "$out" "$err" \
-        --provider "$PROV" --headless -p "Reply with the single word: ok" || rc=$?
+        --provider "$PROV" -p "Reply with the single word: ok" || rc=$?
     if [ "$rc" -eq 124 ]; then
         fail "$T1 — process hung"
     elif [ "$rc" -ne 0 ]; then
@@ -115,13 +140,13 @@ else
     echo ""
 
     ###########################################################################
-    # T2: --headless stdout has only LLM text — no [Tool: ...] / [Done ...] etc.
+    # T2: -p stdout has only LLM text — no [Tool: ...] / [Done ...] etc.
     ###########################################################################
-    T2="T2: --headless stdout has no decoration markers"
-    echo "[T2] Running: --headless -p"
+    T2="T2: -p stdout has no decoration markers"
+    echo "[T2] Running: -p"
     out="$TMPDIR_T/t2.out"; err="$TMPDIR_T/t2.err"; rc=0
     run_atom 30 "$out" "$err" \
-        --provider "$PROV" --headless -p "Reply with the single word: ok" || rc=$?
+        --provider "$PROV" -p "Reply with the single word: ok" || rc=$?
     if [ "$rc" -eq 124 ]; then
         fail "$T2 — process hung"
     elif [ "$rc" -ne 0 ]; then
@@ -137,11 +162,11 @@ else
     ###########################################################################
     # T3: stderr has at least one diagnostic line during a tool-using turn
     ###########################################################################
-    T3="T3: --headless stderr has at least one log line"
-    echo "[T3] Running: --headless -p (tool-using prompt)"
+    T3="T3: -p stderr has at least one log line"
+    echo "[T3] Running: -p (tool-using prompt)"
     out="$TMPDIR_T/t3.out"; err="$TMPDIR_T/t3.err"; rc=0
     run_atom 60 "$out" "$err" \
-        --provider "$PROV" --headless \
+        --provider "$PROV" \
         -p "List the files in the current directory then reply DONE" || rc=$?
     if [ "$rc" -eq 124 ]; then
         fail "$T3 — process hung"
@@ -155,15 +180,15 @@ else
     echo ""
 
     ###########################################################################
-    # T4: --headless with stdin closed must not block. The </dev/null in
-    #     run_atom guarantees stdin is closed; if approval logic still tries
-    #     to read it, the timeout will fire and rc will be 124.
+    # T4: -p with stdin closed must not block. The </dev/null in run_atom
+    #     guarantees stdin is closed; if approval logic still tries to read
+    #     it, the timeout will fire and rc will be 124.
     ###########################################################################
-    T4="T4: --headless does not block on stdin (stdin closed)"
-    echo "[T4] Running: --headless -p </dev/null"
+    T4="T4: -p does not block on stdin (stdin closed)"
+    echo "[T4] Running: -p </dev/null"
     out="$TMPDIR_T/t4.out"; err="$TMPDIR_T/t4.err"; rc=0
     run_atom 30 "$out" "$err" \
-        --provider "$PROV" --headless -p "Reply with the single word: ok" || rc=$?
+        --provider "$PROV" -p "Reply with the single word: ok" || rc=$?
     if [ "$rc" -eq 124 ]; then
         fail "$T4 — process hung (likely blocked on stdin)"
     elif [ "$rc" -ne 0 ]; then
