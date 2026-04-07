@@ -25,6 +25,22 @@ use atomcode_core::tool::search_replace::SearchReplaceTool;
 
 mod auth;
 
+/// Truncate a string to at most `max_chars` *characters* (not bytes), replacing
+/// any newlines with spaces and appending "..." when truncated.
+///
+/// Used for headless-mode log lines on stderr. **Counts characters, not bytes**,
+/// so multi-byte UTF-8 (e.g. CJK) is safe — `&s[..N]` would panic when N falls
+/// inside a multi-byte char.
+fn truncate_log_line(s: &str, max_chars: usize) -> String {
+    let single_line: String = s.chars().map(|c| if c == '\n' { ' ' } else { c }).collect();
+    if single_line.chars().count() > max_chars {
+        let head: String = single_line.chars().take(max_chars).collect();
+        format!("{}...", head)
+    } else {
+        single_line
+    }
+}
+
 #[derive(Parser)]
 #[command(name = "atomcode", version = env!("CARGO_PKG_VERSION"), about = "AI coding assistant in your terminal")]
 struct Cli {
@@ -255,12 +271,8 @@ async fn run_headless(
                 io::stdout().flush()?;
             }
             AgentEvent::ToolCallStarted { name, arguments } => {
-                let args = if arguments.len() > 200 {
-                    format!("{}...", &arguments[..200])
-                } else {
-                    arguments
-                };
-                eprintln!("[tool→ {} args={}]", name, args.replace('\n', " "));
+                let args = truncate_log_line(&arguments, 200);
+                eprintln!("[tool→ {} args={}]", name, args);
             }
             AgentEvent::ToolCallResult { name, output, success, duration } => {
                 let status = if success { "OK" } else { "FAILED" };
@@ -268,11 +280,8 @@ async fn run_headless(
                 let trimmed = output.trim_end();
                 if trimmed.is_empty() {
                     eprintln!("[tool← {} {} {}ms]", name, status, dur_ms);
-                } else if trimmed.len() > 500 {
-                    let snippet = trimmed[..500].replace('\n', " ");
-                    eprintln!("[tool← {} {} {}ms] {}...", name, status, dur_ms, snippet);
                 } else {
-                    let snippet = trimmed.replace('\n', " ");
+                    let snippet = truncate_log_line(trimmed, 500);
                     eprintln!("[tool← {} {} {}ms] {}", name, status, dur_ms, snippet);
                 }
             }
@@ -359,5 +368,44 @@ async fn handle_command(cmd: Commands) -> Result<()> {
             }
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::truncate_log_line;
+
+    #[test]
+    fn ascii_short_unchanged() {
+        assert_eq!(truncate_log_line("hello", 10), "hello");
+    }
+
+    #[test]
+    fn ascii_long_truncated_with_ellipsis() {
+        assert_eq!(truncate_log_line("0123456789abcdef", 10), "0123456789...");
+    }
+
+    #[test]
+    fn newlines_become_spaces() {
+        assert_eq!(truncate_log_line("a\nb\nc", 10), "a b c");
+    }
+
+    #[test]
+    fn mixed_ascii_cjk_truncates_at_char_boundary() {
+        // 8 chars: ['a','b','c','计','算','d','e','f']; max 5 → "abc计算..."
+        assert_eq!(truncate_log_line("abc计算def", 5), "abc计算...");
+    }
+
+    /// Regression test for panic at `crates/atomcode-cli/src/main.rs:272:42`:
+    /// "byte index 500 is not a char boundary; it is inside '计' (bytes 498..501)".
+    /// Triggered when ToolCallResult output was a CJK-heavy string > 500 bytes
+    /// and the old code did `trimmed[..500]` (byte slice). Pure CJK at 3 bytes
+    /// per char means almost any 500-byte cut lands inside a multi-byte char.
+    #[test]
+    fn cjk_truncation_does_not_panic() {
+        let s: String = "计算".repeat(500); // 1000 chars, 3000 bytes
+        let result = truncate_log_line(&s, 500);
+        assert_eq!(result.chars().count(), 503); // 500 + "..."
+        assert!(result.ends_with("..."));
     }
 }
