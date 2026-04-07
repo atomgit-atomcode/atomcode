@@ -78,8 +78,16 @@ fn truncate_log_line(s: &str, max_chars: usize) -> String {
     }
 }
 
+const VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (",
+    env!("ATOMCODE_BUILD_ID"),
+    env!("ATOMCODE_BUILD_DIRTY"),
+    ")"
+);
+
 #[derive(Parser)]
-#[command(name = "atomcode", version = env!("CARGO_PKG_VERSION"), about = "AI coding assistant in your terminal")]
+#[command(name = "atomcode", version = VERSION, about = "AI coding assistant in your terminal")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
