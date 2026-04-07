@@ -77,10 +77,24 @@ impl Config {
             .with_context(|| format!("Provider '{}' not found in config", name))
     }
 
-    pub fn config_dir() -> std::path::PathBuf {
-        dirs::home_dir()
-            .unwrap_or_else(|| std::path::PathBuf::from("."))
+    /// Resolve the atomcode config dir. Pure function for testability —
+    /// `config_dir()` is a thin wrapper that injects real env + real home.
+    fn resolve_config_dir(
+        env_atomcode_home: Option<String>,
+        home: Option<std::path::PathBuf>,
+    ) -> std::path::PathBuf {
+        if let Some(p) = env_atomcode_home {
+            return std::path::PathBuf::from(p);
+        }
+        home.unwrap_or_else(|| std::path::PathBuf::from("."))
             .join(".atomcode")
+    }
+
+    pub fn config_dir() -> std::path::PathBuf {
+        Self::resolve_config_dir(
+            std::env::var("ATOMCODE_HOME").ok(),
+            dirs::home_dir(),
+        )
     }
 
     pub fn default_path() -> std::path::PathBuf {
@@ -91,6 +105,30 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_resolve_config_dir_uses_env_when_set() {
+        let result = Config::resolve_config_dir(
+            Some("/tmp/custom-atomcode-home".to_string()),
+            Some(std::path::PathBuf::from("/Users/foo")),
+        );
+        assert_eq!(result, std::path::PathBuf::from("/tmp/custom-atomcode-home"));
+    }
+
+    #[test]
+    fn test_resolve_config_dir_falls_back_to_home() {
+        let result = Config::resolve_config_dir(
+            None,
+            Some(std::path::PathBuf::from("/Users/foo")),
+        );
+        assert_eq!(result, std::path::PathBuf::from("/Users/foo/.atomcode"));
+    }
+
+    #[test]
+    fn test_resolve_config_dir_falls_back_to_dot_when_no_home() {
+        let result = Config::resolve_config_dir(None, None);
+        assert_eq!(result, std::path::PathBuf::from("./.atomcode"));
+    }
 
     #[test]
     fn test_parse_minimal_config() {
