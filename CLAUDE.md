@@ -27,7 +27,11 @@
 - **每次改动必须跑全量测试：** `./scripts/test-all.sh`，177+ 测试全过才能提交。
 - **测试报告：** 生成 `test-report.md`，包含每个测试套件的通过/失败数。
 - **新功能必须附带测试：** 任何新增模块必须在 `tests/` 下有对应测试文件。
-- **已知失败：** `grep_test::test_excludes_target` 是已知旧 bug，不阻塞提交。
+- **已知失败（不阻塞提交，但都需要立 issue 跟进）：**
+  1. `grep_test::test_excludes_target` — 旧 bug，长期未修。
+  2. `phase2_test::unified_prompt_has_key_guidance` — 断言 prompt 含 `"### File:"`，但 Phase 4.x 重构后该 marker 已被替换，断言 stale。修复路径：找到当前 prompt 里等价的 EXECUTE 模式 guidance 字符串，更新断言。
+  3. `phase2_test::unified_prompt_size_reasonable` — 限定 unified prompt < 500 token ("Less is More" 守则)，但 Phase 4.x 后 prompt 涨到 ~827 token。**这是真问题**，不该靠调高阈值绕过；正确做法是 trim prompt 回 < 500 token。临时办法是给测试加 `#[ignore]`，但要在 issue 里记账。
+  4. `turn::log::tests::test_log_llm_request_creates_json` — parallelism flake：与其它写 `~/.atomcode/logs/` 的测试 race，单跑必过 (`cargo test ... -- --test-threads=1`)。修复需加 `serial_test` 依赖或让 logger 支持 per-test temp dir 注入。
 
 # 交互与输出规范
 - **克制且专业的终端 UI：** 在实现控制台输出时，使用清晰的颜色区分 Thought（内部思考）、Action（执行动作）和 Response（最终回复）。
