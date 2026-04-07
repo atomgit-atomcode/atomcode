@@ -45,6 +45,23 @@ fn restore_terminal_if_tui() {
     );
 }
 
+/// Resolve the working directory at startup. **Always** uses the current
+/// working directory unless the user explicitly passed `-C / --dir`.
+///
+/// We deliberately do **not** read `~/.atomcode/recent_dirs.txt` (or any other
+/// "remembered" path). The previous implementation silently substituted the
+/// first entry of recent_dirs for the user's cwd, which made commands like
+/// `atomcode -p "describe this project"` operate on whatever directory the
+/// TUI happened to visit last — a violation of least surprise. recent_dirs
+/// remains a TUI picker convenience only; it must never override cwd.
+fn resolve_working_dir(cli_dir: Option<PathBuf>) -> PathBuf {
+    if let Some(d) = cli_dir {
+        std::fs::canonicalize(&d).unwrap_or(d)
+    } else {
+        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+    }
+}
+
 /// Truncate a string to at most `max_chars` *characters* (not bytes), replacing
 /// any newlines with spaces and appending "..." when truncated.
 ///
@@ -187,25 +204,7 @@ async fn run() -> Result<i32> {
     };
     let provider = create_provider(&provider_config)?;
 
-    let working_dir = if let Some(d) = cli.dir {
-        std::fs::canonicalize(d).unwrap_or_else(|_| std::env::current_dir().unwrap())
-    } else {
-        // Check if last session was in a different directory (user used /cd last time).
-        // If so, offer to resume there. Otherwise use current directory.
-        let cwd = std::env::current_dir().unwrap();
-        let last_dir_path = atomcode_core::config::Config::config_dir().join("recent_dirs.txt");
-        if let Ok(content) = std::fs::read_to_string(&last_dir_path) {
-            if let Some(last) = content.lines().next() {
-                let last_path = std::path::PathBuf::from(last);
-                if last_path != cwd && last_path.exists() {
-                    // Last /cd was to a different directory — use it
-                    last_path
-                } else {
-                    cwd
-                }
-            } else { cwd }
-        } else { cwd }
-    };
+    let working_dir = resolve_working_dir(cli.dir.clone());
 
     let mut tool_registry = ToolRegistry::new();
     tool_registry.register(Box::new(ReadFileTool));
@@ -416,7 +415,8 @@ async fn handle_command(cmd: Commands) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::truncate_log_line;
+    use super::{resolve_working_dir, truncate_log_line};
+    use std::path::PathBuf;
 
     #[test]
     fn ascii_short_unchanged() {
@@ -450,5 +450,30 @@ mod tests {
         let result = truncate_log_line(&s, 500);
         assert_eq!(result.chars().count(), 503); // 500 + "..."
         assert!(result.ends_with("..."));
+    }
+
+    /// Regression test for cwd-override bug: when no `-C` is given, working dir
+    /// must equal `std::env::current_dir()`. Old code silently substituted the
+    /// first line of `~/.atomcode/recent_dirs.txt`, breaking `atomcode -p` from
+    /// any directory that wasn't the TUI's last-visited project.
+    #[test]
+    fn resolve_working_dir_uses_cwd_when_no_cli_dir() {
+        let expected = std::env::current_dir().unwrap();
+        assert_eq!(resolve_working_dir(None), expected);
+    }
+
+    #[test]
+    fn resolve_working_dir_honors_cli_dir() {
+        let temp = std::env::temp_dir();
+        let canon = std::fs::canonicalize(&temp).unwrap_or(temp.clone());
+        assert_eq!(resolve_working_dir(Some(temp)), canon);
+    }
+
+    #[test]
+    fn resolve_working_dir_falls_back_to_input_when_canonicalize_fails() {
+        // Use a non-existent path so canonicalize() returns Err and the
+        // function falls back to the raw input rather than panicking.
+        let bogus = PathBuf::from("/nonexistent/atomcode-test-path-xyzzy");
+        assert_eq!(resolve_working_dir(Some(bogus.clone())), bogus);
     }
 }
