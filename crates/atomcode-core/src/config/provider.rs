@@ -1,5 +1,21 @@
 use serde::{Deserialize, Serialize};
 
+/// Context management strategy.
+/// - `budgeted`: Per-turn hot/cold zone reconstruction (current, no cache benefit).
+/// - `cache_optimized`: Append-only + compact when approaching limit (cache friendly).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextStrategy {
+    Budgeted,
+    CacheOptimized,
+}
+
+impl Default for ContextStrategy {
+    fn default() -> Self {
+        ContextStrategy::Budgeted
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderConfig {
     #[serde(rename = "type")]
@@ -18,10 +34,20 @@ pub struct ProviderConfig {
     /// Defaults vary by provider type; use `default_context_window_for` after deserialization.
     #[serde(default = "default_context_window")]
     pub context_window: usize,
+    /// OpenRouter provider routing. Specifies preferred provider(s) for the model.
+    /// Example: {"order": ["Z.ai"], "allow_fallbacks": false}
+    /// See: https://openrouter.ai/docs/features/provider-routing
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<serde_json::Value>,
+    /// Context management strategy.
+    /// "budgeted" (default): per-turn hot/cold zone — works everywhere.
+    /// "cache_optimized": append-only + compact — for providers with prefix caching.
+    #[serde(default)]
+    pub context_strategy: ContextStrategy,
 }
 
 fn default_context_window() -> usize {
-    128000
+    64000
 }
 
 /// Sensible default context window per provider type.
@@ -31,8 +57,8 @@ fn default_context_window() -> usize {
 /// for the current task + recent context, not the entire conversation.
 pub fn default_context_window_for(provider_type: &str) -> usize {
     match provider_type {
-        "claude" => 128000,
-        "openai" => 32000,   // Most OpenAI-compatible models support 32K+
+        "claude" => 64000,
+        "openai" => 64000,
         "ollama" => 8000,
         _ => 32000,
     }

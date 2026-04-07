@@ -140,6 +140,8 @@ async fn run() -> Result<()> {
             system_prompt: None,
             user_agent: None,
             context_window: default_context_window_for("openai"),
+            provider: None,
+            context_strategy: Default::default(),
         };
         (dummy, String::new())
     } else {

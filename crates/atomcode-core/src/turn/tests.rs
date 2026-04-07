@@ -163,6 +163,8 @@ fn test_config() -> Config {
             system_prompt: None,
             user_agent: None,
             context_window: 16000,
+            provider: None,
+            context_strategy: Default::default(),
         },
     );
     Config {
@@ -188,6 +190,7 @@ fn make_runner(provider: MockProvider, tools: ToolRegistry, permission: Box<dyn 
         ),
         recently_edited_files: Vec::new(),
         post_edit_read_counts: std::collections::HashMap::new(),
+        cache_cold: false,
     }
 }
 

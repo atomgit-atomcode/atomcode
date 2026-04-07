@@ -91,6 +91,7 @@ impl SubAgentTask {
             result_store: ToolResultStore::new(ToolResultStore::default_dir()),
             recently_edited_files: Vec::new(),
             post_edit_read_counts: std::collections::HashMap::new(),
+            cache_cold: false,
         };
 
         // 4. Event channel (we drain but don't forward — sub-agent is silent)

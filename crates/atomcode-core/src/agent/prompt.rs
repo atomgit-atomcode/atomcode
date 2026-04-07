@@ -155,6 +155,24 @@ impl AgentLoop {
         // Skills section: disabled until skill system is implemented.
         // Listing unavailable skills wastes context tokens.
 
+        // Working set: files the model is actively editing this session.
+        // Placed before RULES (recency zone edge) so model knows what to re-read
+        // if context was compressed.
+        if !self.files_edited_this_turn.is_empty() || !self.files_read_this_turn.is_empty() {
+            prompt.push_str("\n=== WORKING SET ===\nFiles this session: ");
+            for f in &self.files_edited_this_turn {
+                let name = f.rsplit('/').next().unwrap_or(f);
+                prompt.push_str(&format!("{} (edited), ", name));
+            }
+            for f in &self.files_read_this_turn {
+                if !self.files_edited_this_turn.contains(f) {
+                    let name = f.rsplit('/').next().unwrap_or(f);
+                    prompt.push_str(&format!("{} (read), ", name));
+                }
+            }
+            prompt.push_str("\nIf their content is not in recent messages, re-read before editing.\n");
+        }
+
         // RULES GO LAST — recency effect ensures the model remembers these
         // when it starts generating tool calls.
         prompt.push_str(&format!("\n=== RULES (follow these strictly) ===\n{rules}\n"));

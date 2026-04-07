@@ -20,6 +20,8 @@ pub struct OpenAiProvider {
     api_key: String,
     model: String,
     base_url: String,
+    /// OpenRouter provider routing config (injected into request body).
+    provider_routing: Option<serde_json::Value>,
 }
 
 impl OpenAiProvider {
@@ -36,6 +38,7 @@ impl OpenAiProvider {
                 .base_url
                 .clone()
                 .unwrap_or_else(|| "https://api.openai.com/v1".to_string()),
+            provider_routing: config.provider.clone(),
         })
     }
 
@@ -185,8 +188,12 @@ impl LlmProvider for OpenAiProvider {
                         "parameters": td.parameters,
                     }
                 })).collect::<Vec<_>>());
-                // Allow the model to decide whether to call multiple tools in parallel
             }
+        }
+
+        // OpenRouter provider routing (e.g., {"order": ["Z.ai"], "allow_fallbacks": false})
+        if let Some(ref provider) = self.provider_routing {
+            body["provider"] = provider.clone();
         }
 
         let request = self

@@ -140,8 +140,10 @@ fn add_atomgit_provider(access_token: &str, provider_name: &str) -> anyhow::Resu
         system_prompt: None,
         user_agent: None,
         context_window: 32000,
+        provider: None,
+        context_strategy: Default::default(),
     };
-    
+
     config.providers.insert(provider_name.to_string(), atomgit_provider);
     config.default_provider = provider_name.to_string();
 

@@ -327,6 +327,7 @@ impl AgentLoop {
             result_store: ToolResultStore::new(ToolResultStore::default_dir()),
             recently_edited_files: Vec::new(),
             post_edit_read_counts: std::collections::HashMap::new(),
+            cache_cold: true, // First turn of session = cache cold
         };
 
         let agent = Self {
@@ -1155,8 +1156,17 @@ impl AgentLoop {
                         }
                     }
 
-                    // Post-process: truncate large outputs + externalize to disk
-                    self.post_process_tool_results(tool_count);
+                    // Post-process: truncate large outputs + externalize to disk.
+                    // Skip in cache_optimized mode — externalization converts
+                    // ToolResult → ToolResultRef, changing message content and
+                    // breaking prefix stability (cache miss on every turn).
+                    let strategy = self.config.providers
+                        .get(&self.config.default_provider)
+                        .map(|p| p.context_strategy.clone())
+                        .unwrap_or_default();
+                    if strategy != crate::config::provider::ContextStrategy::CacheOptimized {
+                        self.post_process_tool_results(tool_count);
+                    }
 
                     // ATLAS auto-verify: DISABLED.
                     // Phase 4.2 edit success rate 90%+ makes auto-compile mostly overhead
@@ -1188,6 +1198,9 @@ impl AgentLoop {
                     continue;
                 }
                 TurnResult::Failed(e) => {
+                    // Mark cache as cold — provider may have switched on retry
+                    self.turn_runner.cache_cold = true;
+
                     // Retry logic for transient errors
                     let is_rate_limited = e.contains("429") || e.contains("rate") || e.contains("Too Many");
                     let is_auth_error = e.contains("401 ") || e.contains("403 ");

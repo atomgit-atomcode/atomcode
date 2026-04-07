@@ -473,6 +473,161 @@ impl Conversation {
         (result, stats)
     }
 
+    // ── Cache-optimized context strategy ──
+    //
+    // Append-only: messages stay in original order (prefix stable → cache hit).
+    // Compact only when approaching ctx_window limit.
+
+    /// Estimate total tokens in conversation (fast, approximate).
+    pub fn estimate_total_tokens(&self) -> usize {
+        self.messages.iter().map(|m| m.estimate_tokens()).sum()
+    }
+
+    /// Cache-optimized message builder with hybrid compaction.
+    ///
+    /// Normal: append-only (prefix stable → cache hit → fast).
+    /// Cache-cold events: compact to shorter prefix (reduce miss penalty).
+    ///
+    /// Cache-cold triggers:
+    /// - `cache_cold = true`: session start, API error, provider switch
+    /// - Total tokens > 80% budget: approaching context limit
+    pub fn to_provider_messages_cached(
+        &mut self,
+        system_prompt: &str,
+        token_budget: usize,
+        cache_cold: bool,
+    ) -> (Vec<Message>, ContextStats) {
+        let system_msg = Message::new(Role::System, system_prompt);
+        let system_tokens = system_msg.estimate_tokens();
+
+        let msg_tokens: usize = self.messages.iter().map(|m| m.estimate_tokens()).sum();
+        let total = system_tokens + msg_tokens;
+
+        // Compact on cache-cold events: reduce miss penalty from 60K → 15K
+        // Also compact when approaching 80% of budget (normal pressure)
+        let should_compact = (cache_cold && msg_tokens > token_budget * 30 / 100)
+            || (total > token_budget * 80 / 100);
+
+        if should_compact && self.messages.len() > 4 {
+            let target = token_budget * 30 / 100;
+            self.compact_messages(target, system_tokens);
+        }
+
+        let msg_tokens_after: usize = self.messages.iter().map(|m| m.estimate_tokens()).sum();
+
+        let mut result = Vec::with_capacity(self.messages.len() + 1);
+        result.push(system_msg);
+        result.extend(self.messages.iter().cloned());
+
+        // Sanitize broken tool_call/tool_result pairs
+        Self::sanitize_messages(&mut result);
+
+        let stats = ContextStats {
+            system_tokens,
+            hot_tokens: msg_tokens_after,
+            cold_tokens: 0,
+            total_messages: result.len(),
+        };
+
+        (result, stats)
+    }
+
+    /// One-time compaction: compress old messages into a summary.
+    /// Does NOT depend on turn_tracker (which may be empty across sessions).
+    /// Splits by User messages as turn boundaries instead.
+    /// Keeps the most recent ~30% of messages intact, summarizes the rest.
+    fn compact_messages(&mut self, target_tokens: usize, _system_tokens: usize) {
+        if self.messages.len() < 10 { return; }
+
+        // Find User message boundaries (each User msg starts a "turn")
+        let user_indices: Vec<usize> = self.messages.iter().enumerate()
+            .filter(|(_, m)| matches!(m.role, Role::User) && matches!(m.content, MessageContent::Text(_)))
+            .map(|(i, _)| i)
+            .collect();
+
+        if user_indices.len() < 3 { return; }
+
+        // Keep the last 3 "turns" (from the 3rd-to-last User message onward)
+        let keep_from_user = user_indices.len().saturating_sub(3);
+        let keep_start = user_indices[keep_from_user];
+
+        // Everything before keep_start gets summarized
+        let old_msgs = &self.messages[..keep_start];
+        if old_msgs.is_empty() { return; }
+
+        // Build summary: extract user questions + outcomes from old messages
+        let mut summary_parts: Vec<String> = Vec::new();
+        let mut i = 0;
+        while i < old_msgs.len() {
+            // Find user message
+            if matches!(old_msgs[i].role, Role::User) {
+                let user_q = old_msgs[i].text().unwrap_or("(unknown)");
+                let user_short = if user_q.chars().count() > 100 {
+                    format!("{}...", user_q.chars().take(97).collect::<String>())
+                } else {
+                    user_q.to_string()
+                };
+
+                // Find the last assistant text before the next user message
+                let mut outcome = String::new();
+                let next_user = old_msgs[i + 1..].iter().position(|m|
+                    matches!(m.role, Role::User) && matches!(m.content, MessageContent::Text(_))
+                ).map(|p| i + 1 + p).unwrap_or(old_msgs.len());
+
+                for j in (i + 1..next_user).rev() {
+                    if let Some(text) = old_msgs[j].text() {
+                        if matches!(old_msgs[j].role, Role::Assistant) && !text.trim().is_empty() {
+                            outcome = if text.chars().count() > 200 {
+                                format!("{}...", text.chars().take(197).collect::<String>())
+                            } else {
+                                text.to_string()
+                            };
+                            break;
+                        }
+                    }
+                }
+
+                // Extract edit tombstones
+                let turn_slice = &old_msgs[i..next_user];
+                let tombstones = Self::extract_edit_tombstones(turn_slice);
+                if !tombstones.is_empty() {
+                    if !outcome.is_empty() { outcome.push('\n'); }
+                    outcome.push_str(&tombstones);
+                }
+
+                if !outcome.is_empty() {
+                    summary_parts.push(format!("- User: \"{}\"\n  Result: {}", user_short, outcome));
+                }
+
+                i = next_user;
+                continue;
+            }
+            i += 1;
+        }
+
+        // Build compacted prefix
+        let mut compacted: Vec<Message> = Vec::new();
+        if !summary_parts.is_empty() {
+            let summary = format!(
+                "[Session history ({} turns compacted)]\n{}",
+                summary_parts.len(),
+                summary_parts.join("\n")
+            );
+            let summary = if summary.chars().count() > 3000 {
+                format!("{}...(truncated)", summary.chars().take(2997).collect::<String>())
+            } else {
+                summary
+            };
+            compacted.push(Message::new(Role::System, summary));
+        }
+
+        // Append kept messages (recent, intact)
+        compacted.extend(self.messages[keep_start..].iter().cloned());
+
+        self.messages = compacted;
+        self.turn_tracker = crate::conversation::turn::TurnTracker::new();
+    }
+
     /// Synthesize a brief outcome description for a turn that has no assistant
     /// text (e.g., model only made tool calls, or turn was terminated by step limit).
     /// Scans tool results for success/failure signals and tool call names.
