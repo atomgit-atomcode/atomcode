@@ -1,6 +1,9 @@
 # Build
 /target
 
+# Git worktrees (used by superpowers:using-git-worktrees)
+/.worktrees/
+
 # OS
 .DS_Store
 Thumbs.db
