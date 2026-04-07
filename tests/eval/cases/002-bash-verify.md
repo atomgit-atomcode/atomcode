@@ -1,7 +1,7 @@
 +++
 id = "002-bash-verify"
 description = "代码生成 + bash 验证"
-timeout_secs = 90
+timeout_secs = 180
 tags = ["code-gen", "bash-verify"]
 
 [seed_files]

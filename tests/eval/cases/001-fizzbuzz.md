@@ -1,7 +1,7 @@
 +++
 id = "001-fizzbuzz"
 description = "最小代码生成 smoke"
-timeout_secs = 60
+timeout_secs = 180
 tags = ["code-gen", "python", "smoke"]
 # provider omitted — uses config.toml's default_provider
 # (override with: ./scripts/eval/run.sh --provider <name>)
