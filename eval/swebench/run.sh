@@ -538,6 +538,12 @@ PYEOF
 generate_summary
 
 # ---------------------------------------------------------------------------
+# Render HTML report (index.html + per-case case.html)
+# ---------------------------------------------------------------------------
+python3 "$EVAL_DIR/scripts/render_index.py" "$EVAL_RUN_DIR" 2>/dev/null || \
+    echo "warning: render_index.py failed; summary.json is still authoritative" >&2
+
+# ---------------------------------------------------------------------------
 # Print human-readable summary to stdout
 # ---------------------------------------------------------------------------
 python3 - "$EVAL_RUN_DIR/summary.json" <<'PYEOF'
