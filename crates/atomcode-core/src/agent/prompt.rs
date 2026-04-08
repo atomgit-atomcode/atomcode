@@ -67,8 +67,13 @@ impl AgentLoop {
 
         // Strategy 3: previous turn edited files → include them and their callees
         for prev_file in &self.prev_turn_edited_files {
+            let prev_basename = std::path::Path::new(prev_file)
+                .file_name()
+                .map(|f| f.to_string_lossy().to_string())
+                .unwrap_or_default();
+            if prev_basename.is_empty() { continue; }
             for (path, _) in &graph.file_symbols {
-                if path.file_name().map(|f| f.to_string_lossy().contains(prev_file)).unwrap_or(false) {
+                if path.file_name().map(|f| f.to_string_lossy() == prev_basename).unwrap_or(false) {
                     if seen_files.insert(path.clone()) {
                         chain_files.push(path.clone());
                     }
