@@ -523,8 +523,6 @@ _ = cancel.cancelled() => {
     ) -> ToolResult {
         // Auto-fix common tool name aliases (models trained on other agents use different names)
         let corrected_name = match call.name.as_str() {
-            "write_file" => "create_file",
-            "search" => "grep",
             "find" | "find_files" => "glob",
             "run" | "execute" | "shell" | "terminal" => "bash",
             "list_files" | "ls" => "list_directory",
@@ -537,9 +535,15 @@ _ = cancel.cancelled() => {
                     .map(|(name, _)| name.as_ref())
                     .collect::<Vec<&str>>()
                     .join(", ");
+                // Give specific guidance for common wrong tool names
+                let hint = match call.name.as_str() {
+                    "write_file" => "\nTo rewrite an existing file entirely: edit_file(file_path, start_line=1, end_line=9999, new_string=\"...\")\nTo create a new file: create_file(file_path, content=\"...\")",
+                    "search" => "\nFor file content search: grep(pattern, path)\nFor web search: web_search(query)",
+                    _ => "",
+                };
                 let output = format!(
-                    "Error: unknown tool '{}'. Available tools: {}. Use one of these exact names.",
-                    call.name, available
+                    "Error: unknown tool '{}'. Available tools: {}.{}",
+                    call.name, available, hint
                 );
                 let _ = event_tx.send(TurnEvent::ToolCallResult {
                     name: call.name.clone(),
