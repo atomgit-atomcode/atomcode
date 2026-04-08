@@ -185,6 +185,53 @@ impl AgentLoop {
                         ));
                     }
 
+                    // If errors reference a third-party crate type/method the model doesn't know,
+                    // guide it to read the crate source instead of guessing.
+                    if self.build_fail_count >= 2 {
+                        let crate_hints: Vec<String> = combined.lines()
+                            .filter_map(|l| {
+                                if l.contains("defined in crate `") {
+                                    let start = l.find("defined in crate `")? + 18;
+                                    let end = l[start..].find('`')? + start;
+                                    Some(l[start..end].to_string())
+                                } else if l.contains("not found in `") {
+                                    let start = l.find("not found in `")? + 14;
+                                    let end = l[start..].find('`')? + start;
+                                    let name = &l[start..end];
+                                    if name.contains("::") || name.contains("_client") || name.contains("_sdk") {
+                                        Some(name.split("::").next().unwrap_or(name).to_string())
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect::<std::collections::HashSet<_>>()
+                            .into_iter()
+                            .take(2)
+                            .collect();
+
+                        if !crate_hints.is_empty() {
+                            msg.push_str(&format!(
+                                "\n[HINT: {} consecutive compile failures. You may be guessing the API for crate `{}`. \
+                                 STOP guessing. Read the actual source: \
+                                 bash(\"grep -r 'pub fn\\|pub struct\\|pub enum' ~/.cargo/registry/src/*/{}*/src/ | head -30\") \
+                                 to learn the real API before your next edit.]",
+                                self.build_fail_count,
+                                crate_hints.join("`, `"),
+                                crate_hints[0],
+                            ));
+                        } else if self.build_fail_count >= 3 {
+                            msg.push_str(&format!(
+                                "\n[HINT: {} consecutive compile failures on the same file. \
+                                 STOP and re-read the error carefully. If you are unsure about an API, \
+                                 read the library source in ~/.cargo/registry/src/ before trying again.]",
+                                self.build_fail_count,
+                            ));
+                        }
+                    }
+
                     self.conversation.add_user_message(&msg);
                 }
             }

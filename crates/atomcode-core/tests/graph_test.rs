@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tokio::sync::RwLock;
@@ -487,4 +487,188 @@ pub fn fetch_data() -> String {
         .collect();
     assert!(dep_names.contains(&"handler.rs".to_string()),
         "expected handler.rs in dependents of fetcher.rs: {:?}", dep_names);
+}
+
+// ── Auto-injection summary tests ──
+
+#[test]
+fn test_empty_graph_queries() {
+    let graph = CodeGraph::new();
+    assert!(!graph.is_ready());
+    assert_eq!(graph.node_count(), 0);
+    assert!(graph.find_by_name("anything").is_empty());
+    assert!(graph.callees(12345).is_none());
+    assert!(graph.callers(12345).is_none());
+    assert_eq!(graph.trace_callers(12345, 3), vec![]);
+    assert_eq!(graph.trace_callees(12345, 3), vec![]);
+    assert_eq!(graph.shortest_path(1, 2), None);
+    assert!(graph.file_dependents(std::path::Path::new("x.rs"), 3).is_empty());
+}
+
+#[test]
+fn test_cycle_detection() {
+    let mut graph = CodeGraph::new();
+    let file = PathBuf::from("cycle.rs");
+    let sym_a = make_test_symbol(&file, "a", 1);
+    let sym_b = make_test_symbol(&file, "b", 10);
+    let sym_c = make_test_symbol(&file, "c", 20);
+    let id_a = sym_a.id;
+    let id_b = sym_b.id;
+    let id_c = sym_c.id;
+    graph.add_symbol(sym_a);
+    graph.add_symbol(sym_b);
+    graph.add_symbol(sym_c);
+    graph.add_edge(id_a, Edge { to: id_b, kind: EdgeKind::Calls, line: 2 });
+    graph.add_edge(id_b, Edge { to: id_c, kind: EdgeKind::Calls, line: 12 });
+    graph.add_edge(id_c, Edge { to: id_a, kind: EdgeKind::Calls, line: 22 });
+
+    let callees = graph.trace_callees(id_a, 10);
+    assert_eq!(callees.len(), 2);
+    assert!(callees.iter().all(|(id, _)| *id != id_a));
+}
+
+#[test]
+fn test_diamond_dependency() {
+    let mut graph = CodeGraph::new();
+    let file = PathBuf::from("diamond.rs");
+    let sym_a = make_test_symbol(&file, "a", 1);
+    let sym_b = make_test_symbol(&file, "b", 10);
+    let sym_c = make_test_symbol(&file, "c", 20);
+    let sym_d = make_test_symbol(&file, "d", 30);
+    let id_a = sym_a.id;
+    let id_b = sym_b.id;
+    let id_c = sym_c.id;
+    let id_d = sym_d.id;
+    graph.add_symbol(sym_a);
+    graph.add_symbol(sym_b);
+    graph.add_symbol(sym_c);
+    graph.add_symbol(sym_d);
+    graph.add_edge(id_a, Edge { to: id_b, kind: EdgeKind::Calls, line: 2 });
+    graph.add_edge(id_a, Edge { to: id_c, kind: EdgeKind::Calls, line: 3 });
+    graph.add_edge(id_b, Edge { to: id_d, kind: EdgeKind::Calls, line: 12 });
+    graph.add_edge(id_c, Edge { to: id_d, kind: EdgeKind::Calls, line: 22 });
+
+    let callers = graph.trace_callers(id_d, 3);
+    assert_eq!(callers.len(), 3);
+    let depth1: Vec<_> = callers.iter().filter(|(_, d)| *d == 1).collect();
+    assert_eq!(depth1.len(), 2);
+}
+
+#[test]
+fn test_depth_limit_respected() {
+    let mut graph = CodeGraph::new();
+    let file = PathBuf::from("deep.rs");
+    let names = ["a", "b", "c", "d", "e", "f"];
+    let mut ids = Vec::new();
+    for (i, name) in names.iter().enumerate() {
+        let sym = make_test_symbol(&file, name, (i * 10 + 1) as usize);
+        ids.push(sym.id);
+        graph.add_symbol(sym);
+    }
+    for i in 0..5 {
+        graph.add_edge(ids[i], Edge { to: ids[i + 1], kind: EdgeKind::Calls, line: 2 });
+    }
+    let callees = graph.trace_callees(ids[0], 2);
+    assert_eq!(callees.len(), 2);
+    assert!(graph.trace_callees(ids[0], 0).is_empty());
+}
+
+#[test]
+fn test_serialize_roundtrip_with_edges() {
+    let mut graph = CodeGraph::new();
+    let file = PathBuf::from("rt.rs");
+    let sym_a = make_test_symbol(&file, "alpha", 1);
+    let sym_b = make_test_symbol(&file, "beta", 10);
+    let id_a = sym_a.id;
+    let id_b = sym_b.id;
+    graph.add_symbol(sym_a);
+    graph.add_symbol(sym_b);
+    graph.add_edge(id_a, Edge { to: id_b, kind: EdgeKind::Calls, line: 5 });
+
+    let bytes = persist::serialize(&graph).unwrap();
+    let restored = persist::deserialize(&bytes).unwrap();
+    assert_eq!(restored.node_count(), 2);
+    assert_eq!(restored.callees(id_a).unwrap().len(), 1);
+}
+
+#[test]
+fn test_file_dependency_summary() {
+    let mut graph = CodeGraph::new();
+    let handler_file = PathBuf::from("src/handler.rs");
+    let fetcher_file = PathBuf::from("src/fetcher.rs");
+    let main_file = PathBuf::from("src/main.rs");
+
+    let handler_sym = make_test_symbol(&handler_file, "handle", 1);
+    let fetcher_sym = make_test_symbol(&fetcher_file, "fetch", 1);
+    let main_sym = make_test_symbol(&main_file, "main", 1);
+    let handler_id = handler_sym.id;
+    let fetcher_id = fetcher_sym.id;
+    let main_id = main_sym.id;
+
+    graph.add_symbol(handler_sym);
+    graph.add_symbol(fetcher_sym);
+    graph.add_symbol(main_sym);
+    graph.add_edge(handler_id, Edge { to: fetcher_id, kind: EdgeKind::Calls, line: 3 });
+    graph.add_edge(main_id, Edge { to: handler_id, kind: EdgeKind::Calls, line: 2 });
+
+    let summary = graph.file_dependency_summary("handler.rs").unwrap();
+    assert!(summary.contains("Graph: handler.rs"), "{}", summary);
+    assert!(summary.contains("fetcher.rs"), "{}", summary);
+    assert!(summary.contains("main.rs"), "{}", summary);
+    assert!(graph.file_dependency_summary("nope.rs").is_none());
+}
+
+#[test]
+fn test_call_chain_summary() {
+    let mut graph = CodeGraph::new();
+    let files = [PathBuf::from("main.rs"), PathBuf::from("handler.rs"),
+                 PathBuf::from("fetcher.rs"), PathBuf::from("http.rs")];
+    let names = ["main", "handle", "fetch", "http_get"];
+    let mut ids = Vec::new();
+    for (i, name) in names.iter().enumerate() {
+        let sym = make_test_symbol(&files[i], name, 1);
+        ids.push(sym.id);
+        graph.add_symbol(sym);
+    }
+    for i in 0..3 {
+        graph.add_edge(ids[i], Edge { to: ids[i + 1], kind: EdgeKind::Calls, line: 5 });
+    }
+
+    let chain = graph.call_chain_summary("main").unwrap();
+    assert!(chain.contains("Call chain: main()"), "{}", chain);
+    assert!(chain.contains("handle()"), "{}", chain);
+    assert!(chain.contains("http_get()"), "{}", chain);
+    assert!(graph.call_chain_summary("http_get").is_none());
+    assert!(graph.call_chain_summary("nonexistent").is_none());
+}
+
+#[tokio::test]
+async fn test_indexer_deleted_file() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("keep.rs"), "fn keep() {}\n").unwrap();
+    std::fs::write(dir.path().join("remove.rs"), "fn remove() {}\n").unwrap();
+
+    let graph = Arc::new(RwLock::new(CodeGraph::new()));
+    let mut indexer = GraphIndexer::new(graph.clone(), dir.path().to_path_buf());
+    indexer.index_all().await;
+    assert!(!graph.read().await.find_by_name("remove").is_empty());
+
+    std::fs::remove_file(dir.path().join("remove.rs")).unwrap();
+    indexer.index_all().await;
+    assert!(graph.read().await.find_by_name("remove").is_empty());
+    assert!(!graph.read().await.find_by_name("keep").is_empty());
+}
+
+#[tokio::test]
+async fn test_indexer_python_files() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("app.py"), "def main():\n    result = process()\n\ndef process():\n    return 'done'\n").unwrap();
+
+    let graph = Arc::new(RwLock::new(CodeGraph::new()));
+    let mut indexer = GraphIndexer::new(graph.clone(), dir.path().to_path_buf());
+    indexer.index_all().await;
+
+    let g = graph.read().await;
+    assert!(!g.find_by_name("main").is_empty());
+    assert!(!g.find_by_name("process").is_empty());
 }

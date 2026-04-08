@@ -310,6 +310,80 @@ impl CodeGraph {
         }
         dependent_files.into_iter().collect()
     }
+
+    /// Generate a dependency summary for a file: what it uses, what uses it.
+    pub fn file_dependency_summary(&self, filename: &str) -> Option<String> {
+        let (path, sym_ids) = self.file_symbols.iter()
+            .find(|(p, _)| {
+                p.file_name()
+                    .map(|f| f.to_string_lossy() == filename)
+                    .unwrap_or(false)
+            })?;
+        let path = path.clone();
+
+        let mut uses: Vec<String> = Vec::new();
+        for &sid in sym_ids.iter().take(10) {
+            if let Some(edges) = self.callees(sid) {
+                for edge in edges {
+                    if let Some(node) = self.node(edge.to) {
+                        if node.file != path {
+                            let f = node.file.file_name()
+                                .map(|n| n.to_string_lossy().to_string())
+                                .unwrap_or_default();
+                            if !uses.contains(&f) {
+                                uses.push(f);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let deps = self.file_dependents(&path, 2);
+        let dep_names: Vec<String> = deps.iter()
+            .filter_map(|p| p.file_name().map(|f| f.to_string_lossy().to_string()))
+            .collect();
+
+        if uses.is_empty() && dep_names.is_empty() {
+            return None;
+        }
+
+        let mut info = format!("[Graph: {}]", filename);
+        if !uses.is_empty() {
+            info.push_str(&format!(" uses: {}", uses.join(", ")));
+        }
+        if !dep_names.is_empty() {
+            info.push_str(&format!(" | used by: {}", dep_names.join(", ")));
+        }
+        Some(info)
+    }
+
+    /// Generate a call chain summary for a function.
+    pub fn call_chain_summary(&self, fn_name: &str) -> Option<String> {
+        let symbols = self.find_by_name(fn_name);
+        let sym = symbols.first()?;
+
+        let callees = self.trace_callees(sym.id, 3);
+        if callees.is_empty() {
+            return None;
+        }
+
+        let mut chain = format!("[Call chain: {}()", fn_name);
+        for (callee_id, depth) in &callees {
+            if let Some(node) = self.node(*callee_id) {
+                let short_file = node.file.file_name()
+                    .map(|f| f.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let indent = " → ".repeat(*depth);
+                chain.push_str(&format!(
+                    "\n  {}{}() ({}:{})",
+                    indent, node.name, short_file, node.start_line
+                ));
+            }
+        }
+        chain.push(']');
+        Some(chain)
+    }
 }
 
 impl Default for CodeGraph {

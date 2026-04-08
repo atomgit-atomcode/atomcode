@@ -104,6 +104,29 @@ impl Tool for ReadFileTool {
                 // Skeleton is fully driven by semantic layer's list_symbols().
                 // For Vue/Svelte, list_symbols already includes <template>/<style> sections
                 // as pseudo-symbols alongside script functions.
+                // Score symbols for auto-expansion: high-interest names get priority
+                let interest_keywords = ["handle", "process", "route", "search", "query",
+                    "fetch", "execute", "dispatch", "run", "main", "serve"];
+                let mut scored: Vec<(usize, &crate::semantic::Symbol)> = symbols.iter()
+                    .map(|s| {
+                        let name_lower = s.name.to_lowercase();
+                        let body_lines = s.end_line.saturating_sub(s.start_line) + 1;
+                        let keyword_score = if interest_keywords.iter().any(|k| name_lower.contains(k)) { 100 } else { 0 };
+                        (keyword_score + body_lines, s)
+                    })
+                    .collect();
+                scored.sort_by(|a, b| b.0.cmp(&a.0));
+
+                // Pick top 2 functions to auto-expand (5-50 lines each)
+                let expand_candidates: Vec<&crate::semantic::Symbol> = scored.iter()
+                    .filter(|(_, s)| {
+                        let body = s.end_line.saturating_sub(s.start_line) + 1;
+                        body >= 5 && body <= 50
+                    })
+                    .take(2)
+                    .map(|(_, s)| *s)
+                    .collect();
+
                 for s in &symbols {
                     let sig = lines.get(s.start_line.saturating_sub(1))
                         .map(|l| l.trim())
@@ -113,7 +136,22 @@ impl Tool for ReadFileTool {
                     } else {
                         sig.to_string()
                     };
-                    skel.push_str(&format!("{:>4}| {}  (L{}-{})\n", s.start_line, sig_short, s.start_line, s.end_line));
+
+                    if expand_candidates.iter().any(|c| c.start_line == s.start_line && c.name == s.name) {
+                        // Auto-expand: show full body
+                        skel.push_str(&format!("{:>4}| {}  (L{}-{}) [auto-expanded]\n",
+                            s.start_line, sig_short, s.start_line, s.end_line));
+                        let start = s.start_line.saturating_sub(1);
+                        let end = s.end_line.min(total_lines);
+                        for i in (start + 1)..end {
+                            if let Some(line) = lines.get(i) {
+                                skel.push_str(&format!("{:>4}| {}\n", i + 1, line));
+                            }
+                        }
+                    } else {
+                        skel.push_str(&format!("{:>4}| {}  (L{}-{})\n",
+                            s.start_line, sig_short, s.start_line, s.end_line));
+                    }
                 }
                 skel
             } else {

@@ -162,6 +162,46 @@ impl AgentLoop {
 
         drop(searcher);
 
+        // Phase 3: Auto-inject call chain from code graph.
+        {
+            let graph = self.turn_runner.context.graph.read().await;
+            if graph.is_ready() {
+                let mut injected_chains = Vec::new();
+                let mut fn_names: Vec<String> = Vec::new();
+
+                for code in &extracted_code {
+                    if let Some(start) = code.find("→ ") {
+                        let rest = &code[start + 4..];
+                        if let Some(end) = rest.find("()") {
+                            fn_names.push(rest[..end].to_string());
+                        }
+                    }
+                }
+
+                let fn_re = regex::Regex::new(r"\b([a-z_][a-z0-9_]{3,})\b")
+                    .unwrap_or_else(|_| regex::Regex::new(".^").unwrap());
+                for cap in fn_re.captures_iter(content) {
+                    let name = &cap[1];
+                    if !graph.find_by_name(name).is_empty() && !fn_names.contains(&name.to_string()) {
+                        fn_names.push(name.to_string());
+                    }
+                }
+
+                for fn_name in fn_names.iter().take(2) {
+                    if let Some(chain) = graph.call_chain_summary(fn_name) {
+                        injected_chains.push(chain);
+                    }
+                }
+
+                if !injected_chains.is_empty() {
+                    extracted_code.push(format!(
+                        "\n[Code graph — execution flow (trace the chain to find the root cause):]\n{}",
+                        injected_chains.join("\n")
+                    ));
+                }
+            }
+        }
+
         // Extract exception signature (e.g. "TransactionRequiredException") for recurrence detection.
         let exception_re = regex::Regex::new(r"(\w+Exception|\w+Error)")
             .unwrap_or_else(|_| regex::Regex::new(".^").unwrap());
@@ -218,5 +258,34 @@ impl AgentLoop {
             None
         }
         walk(wd, filename, 0)
+    }
+
+    /// Auto-inject graph context into user message.
+    /// Detects file names in the message, queries the code graph for dependencies.
+    pub(crate) async fn auto_inject_graph_context(&self, content: &str) -> String {
+        let graph = self.turn_runner.context.graph.read().await;
+        if !graph.is_ready() {
+            return content.to_string();
+        }
+
+        let mut injections = Vec::new();
+        let file_re = regex::Regex::new(r"\b(\w+\.(?:rs|py|js|ts|tsx|java|go|vue|c|cpp))\b")
+            .unwrap_or_else(|_| regex::Regex::new(".^").unwrap());
+        let mut seen = std::collections::HashSet::new();
+
+        for cap in file_re.captures_iter(content) {
+            let filename = &cap[1];
+            if !seen.insert(filename.to_string()) { continue; }
+            if let Some(info) = graph.file_dependency_summary(filename) {
+                injections.push(info);
+            }
+        }
+
+        if injections.is_empty() {
+            return content.to_string();
+        }
+
+        injections.truncate(3);
+        format!("{}\n\n{}", content, injections.join("\n"))
     }
 }

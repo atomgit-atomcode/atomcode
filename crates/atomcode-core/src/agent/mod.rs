@@ -646,6 +646,11 @@ impl AgentLoop {
         } else {
             enriched
         };
+
+        // Auto-inject graph context: if user mentions a file that exists
+        // in the graph, inject its dependencies so the model knows what's connected.
+        let clean = self.auto_inject_graph_context(&clean).await;
+
         self.conversation.add_user_message(&clean);
         self.turn_tokens = 0;
         self.tool_call_count = 0;

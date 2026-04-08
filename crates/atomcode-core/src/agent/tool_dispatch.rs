@@ -287,24 +287,25 @@ impl AgentLoop {
                         self.consecutive_edits_file = Some(short.clone());
                         self.consecutive_edits_count = 1;
                     }
-                    if self.consecutive_edits_count >= 8 {
+                    if self.consecutive_edits_count >= 4 {
                         return Some(format!(
-                            "[BLOCKED: You have edited {} {} times in a row. \
-                             STOP and re-read the file first to see the current state, \
-                             then make ONE comprehensive edit. \
-                             Multiple small edits means you're not seeing the full picture.]",
+                            "[BLOCKED: You have edited {} {} times. \
+                             STOP guessing. Before your next edit: \
+                             (1) Re-read the file to see its CURRENT state. \
+                             (2) If errors reference a third-party crate API, read the library source \
+                             (bash: grep -r 'pub fn\\|pub struct' ~/.cargo/registry/src/*/CRATE*/src/ | head -30). \
+                             (3) Make ONE correct, comprehensive edit.]",
                             short, self.consecutive_edits_count
                         ));
                     }
                 }
             }
-        } else {
-            // Any non-edit tool resets the consecutive edit counter.
-            if tool_name == "read_file" {
-                // Reading resets the counter — model is re-orienting.
-                self.consecutive_edits_file = None;
-                self.consecutive_edits_count = 0;
-            }
+        } else if tool_name == "read_file" {
+            // Only read_file resets the counter — model is re-orienting.
+            // bash (cargo check) does NOT reset, so edit→check→edit→check→edit
+            // still counts as consecutive edits to the same file.
+            self.consecutive_edits_file = None;
+            self.consecutive_edits_count = 0;
         }
 
         match tool_name {
