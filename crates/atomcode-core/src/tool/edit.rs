@@ -501,18 +501,35 @@ impl Tool for EditFileTool {
             }
 
             let (hint, suggested_old) = find_closest_match_with_suggestion(&content, &old_string);
-            let suggestion = if let Some(ref s) = suggested_old {
-                format!(
-                    "\n\n[SUGGESTED FIX: Use this exact text as old_string (copy it precisely):]\n```\n{}\n```",
-                    s
-                )
-            } else {
-                String::new()
-            };
+
+            // Auto-fallback: if we found a high-confidence match, apply the edit
+            // using the suggested text instead of failing. This eliminates the
+            // re-read → retry cycle that wastes 2+ turns.
+            if let Some(ref suggested) = suggested_old {
+                let suggested_count = content.matches(suggested.as_str()).count();
+                if suggested_count == 1 {
+                    // High confidence: exact unique match with the suggested text.
+                    // Apply the edit using suggested as old_string.
+                    let new_content = content.replacen(suggested.as_str(), &new_string, 1);
+                    let diff = build_compact_diff(suggested, &new_string);
+                    let result = ToolResult {
+                        call_id: String::new(),
+                        output: format!(
+                            "Edited {} (auto-corrected old_string).\n{}",
+                            parsed.file_path, diff
+                        ),
+                        success: true,
+                    };
+                    let (result, _) = validate_write_check(&new_content, &parsed.file_path, &new_string, &content, result).await?;
+                    return Ok(result);
+                }
+            }
+
+            // No auto-fix possible — return error with compact context
             let reread = auto_reread_content(&content, &old_string);
             return Ok(ToolResult {
                 call_id: String::new(),
-                output: format!("Error: old_string not found in {}.\n{}{}\n{}", parsed.file_path, hint, suggestion, reread),
+                output: format!("Error: old_string not found in {}.\n{}\n{}", parsed.file_path, hint, reread),
                 success: false,
             });
         }
@@ -1102,42 +1119,41 @@ fn auto_reread_content(content: &str, old_string: &str) -> String {
 
     let mut out = String::new();
 
-    if total <= 200 {
+    // Find approximate target area
+    let target_line = old_string
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .map(|first| first.trim());
+
+    let center = target_line
+        .and_then(|needle| {
+            lines.iter().position(|l| l.trim().contains(needle))
+        })
+        .unwrap_or(0);
+
+    // Cap output to prevent context explosion when multiple edits fail in one turn.
+    // ≤100 lines: return full file (~1.2K tok, safe even with 5 failures = 6K tok)
+    // 101-300 lines: return ±15 lines around target (~30 lines = 400 tok)
+    // >300 lines: return ±7 lines around target (~15 lines = 200 tok)
+    if total <= 100 {
         out.push_str(&format!(
-            "\n[Edit failed: old_string not found. Current file content ({} lines):]\n",
+            "\n[Edit failed. Full file ({} lines) — copy EXACT text for old_string:]\n",
             total
         ));
         for (i, line) in lines.iter().enumerate() {
             out.push_str(&format!("{:>4}| {}\n", i + 1, line));
         }
     } else {
-        // Find approximate target area using the first non-empty line of old_string
-        let target_line = old_string
-            .lines()
-            .find(|l| !l.trim().is_empty())
-            .map(|first| first.trim());
-
-        let center = target_line
-            .and_then(|needle| {
-                lines.iter().position(|l| l.trim().contains(needle))
-            })
-            .unwrap_or(0);
-
-        let start = center.saturating_sub(25);
-        let end = (center + 25).min(total);
+        let half = if total <= 300 { 15 } else { 7 };
+        let start = center.saturating_sub(half);
+        let end = (center + half + 1).min(total);
 
         out.push_str(&format!(
-            "\n[Edit failed: old_string not found. Current file content (lines {}-{} of {}):]\n",
+            "\n[Edit failed. Lines {}-{} of {} (use EXACT text from below as old_string):]\n",
             start + 1, end, total
         ));
-        if start > 0 {
-            out.push_str(&format!("     ... ({} lines above)\n", start));
-        }
         for i in start..end {
             out.push_str(&format!("{:>4}| {}\n", i + 1, lines[i]));
-        }
-        if end < total {
-            out.push_str(&format!("     ... ({} lines below)\n", total - end));
         }
     }
 
