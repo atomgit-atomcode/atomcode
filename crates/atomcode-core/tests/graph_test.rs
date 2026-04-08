@@ -334,3 +334,90 @@ fn gamma() {}
         count_after_first
     );
 }
+
+// ── BFS query method tests ──
+
+fn make_chain_graph() -> (CodeGraph, u64, u64, u64) {
+    // A → B → C
+    let mut graph = CodeGraph::new();
+    let file = PathBuf::from("chain.rs");
+    let sym_a = make_test_symbol(&file, "a", 1);
+    let sym_b = make_test_symbol(&file, "b", 10);
+    let sym_c = make_test_symbol(&file, "c", 20);
+    let id_a = sym_a.id;
+    let id_b = sym_b.id;
+    let id_c = sym_c.id;
+    graph.add_symbol(sym_a);
+    graph.add_symbol(sym_b);
+    graph.add_symbol(sym_c);
+    graph.add_edge(id_a, Edge { to: id_b, kind: EdgeKind::Calls, line: 3 });
+    graph.add_edge(id_b, Edge { to: id_c, kind: EdgeKind::Calls, line: 12 });
+    (graph, id_a, id_b, id_c)
+}
+
+#[test]
+fn test_trace_callers_bfs() {
+    let (graph, id_a, id_b, id_c) = make_chain_graph();
+    let callers = graph.trace_callers(id_c, 2);
+    assert_eq!(callers.len(), 2);
+    assert!(callers.contains(&(id_b, 1)), "should contain B at depth 1");
+    assert!(callers.contains(&(id_a, 2)), "should contain A at depth 2");
+}
+
+#[test]
+fn test_trace_callees_bfs() {
+    let (graph, id_a, id_b, id_c) = make_chain_graph();
+    let callees = graph.trace_callees(id_a, 3);
+    assert_eq!(callees.len(), 2);
+    assert!(callees.contains(&(id_b, 1)), "should contain B at depth 1");
+    assert!(callees.contains(&(id_c, 2)), "should contain C at depth 2");
+}
+
+#[test]
+fn test_shortest_path() {
+    let (graph, id_a, id_b, id_c) = make_chain_graph();
+    let path = graph.shortest_path(id_a, id_c);
+    assert_eq!(path, Some(vec![id_a, id_b, id_c]));
+
+    // Reverse direction — no path
+    let no_path = graph.shortest_path(id_c, id_a);
+    assert_eq!(no_path, None);
+}
+
+#[test]
+fn test_file_dependents() {
+    let mut graph = CodeGraph::new();
+    let widget_file = PathBuf::from("widget.rs");
+    let app_file = PathBuf::from("app.rs");
+
+    let widget_sym = SymbolNode {
+        id: CodeGraph::make_id(&widget_file, "Widget", 1),
+        name: "Widget".into(),
+        kind: SymbolKind::Struct,
+        visibility: Visibility::Public,
+        file: widget_file.clone(),
+        start_line: 1,
+        end_line: 5,
+        signature: None,
+    };
+    let use_widget_sym = SymbolNode {
+        id: CodeGraph::make_id(&app_file, "use_widget", 1),
+        name: "use_widget".into(),
+        kind: SymbolKind::Function,
+        visibility: Visibility::Public,
+        file: app_file.clone(),
+        start_line: 1,
+        end_line: 5,
+        signature: None,
+    };
+    let widget_id = widget_sym.id;
+    let use_widget_id = use_widget_sym.id;
+
+    graph.add_symbol(widget_sym);
+    graph.add_symbol(use_widget_sym);
+    graph.add_edge(use_widget_id, Edge { to: widget_id, kind: EdgeKind::Calls, line: 3 });
+
+    let dependents = graph.file_dependents(std::path::Path::new("widget.rs"), 3);
+    assert_eq!(dependents.len(), 1);
+    assert!(dependents.contains(&app_file));
+}

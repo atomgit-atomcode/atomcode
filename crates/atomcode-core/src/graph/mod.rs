@@ -3,9 +3,9 @@ pub mod persist;
 pub mod resolve;
 
 use std::collections::hash_map::DefaultHasher;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -204,6 +204,111 @@ impl CodeGraph {
     /// Whether the graph has any data.
     pub fn is_ready(&self) -> bool {
         !self.nodes.is_empty()
+    }
+
+    /// BFS reverse traversal — find all transitive callers up to `max_depth`.
+    pub fn trace_callers(&self, id: SymbolId, max_depth: usize) -> Vec<(SymbolId, usize)> {
+        let mut visited = HashSet::new();
+        let mut queue = VecDeque::new();
+        let mut result = Vec::new();
+        visited.insert(id);
+        queue.push_back((id, 0usize));
+        while let Some((current, depth)) = queue.pop_front() {
+            if depth >= max_depth {
+                continue;
+            }
+            if let Some(edges) = self.callers(current) {
+                for edge in edges {
+                    if visited.insert(edge.to) {
+                        result.push((edge.to, depth + 1));
+                        queue.push_back((edge.to, depth + 1));
+                    }
+                }
+            }
+        }
+        result
+    }
+
+    /// BFS forward traversal — find all transitive callees up to `max_depth`.
+    pub fn trace_callees(&self, id: SymbolId, max_depth: usize) -> Vec<(SymbolId, usize)> {
+        let mut visited = HashSet::new();
+        let mut queue = VecDeque::new();
+        let mut result = Vec::new();
+        visited.insert(id);
+        queue.push_back((id, 0usize));
+        while let Some((current, depth)) = queue.pop_front() {
+            if depth >= max_depth {
+                continue;
+            }
+            if let Some(edges) = self.callees(current) {
+                for edge in edges {
+                    if visited.insert(edge.to) {
+                        result.push((edge.to, depth + 1));
+                        queue.push_back((edge.to, depth + 1));
+                    }
+                }
+            }
+        }
+        result
+    }
+
+    /// BFS shortest path from `from` to `to`, max 10 hops.
+    /// Returns the ordered path `[from, ..., to]` or `None`.
+    pub fn shortest_path(&self, from: SymbolId, to: SymbolId) -> Option<Vec<SymbolId>> {
+        if from == to {
+            return Some(vec![from]);
+        }
+        let max_hops = 10;
+        let mut visited = HashSet::new();
+        let mut queue = VecDeque::new();
+        let mut parent: HashMap<SymbolId, SymbolId> = HashMap::new();
+        visited.insert(from);
+        queue.push_back((from, 0usize));
+        while let Some((current, depth)) = queue.pop_front() {
+            if depth >= max_hops {
+                continue;
+            }
+            if let Some(edges) = self.callees(current) {
+                for edge in edges {
+                    if visited.insert(edge.to) {
+                        parent.insert(edge.to, current);
+                        if edge.to == to {
+                            // Reconstruct path
+                            let mut path = vec![to];
+                            let mut cur = to;
+                            while let Some(&p) = parent.get(&cur) {
+                                path.push(p);
+                                cur = p;
+                            }
+                            path.reverse();
+                            return Some(path);
+                        }
+                        queue.push_back((edge.to, depth + 1));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Find all files that depend on (call into) symbols in the given file.
+    pub fn file_dependents(&self, file: &Path, max_depth: usize) -> Vec<PathBuf> {
+        let file_buf = file.to_path_buf();
+        let symbol_ids = match self.file_symbols.get(&file_buf) {
+            Some(ids) => ids.clone(),
+            None => return Vec::new(),
+        };
+        let mut dependent_files = HashSet::new();
+        for &sym_id in &symbol_ids {
+            for (caller_id, _depth) in self.trace_callers(sym_id, max_depth) {
+                if let Some(node) = self.node(caller_id) {
+                    if node.file != file_buf {
+                        dependent_files.insert(node.file.clone());
+                    }
+                }
+            }
+        }
+        dependent_files.into_iter().collect()
     }
 }
 
