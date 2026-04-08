@@ -9,17 +9,38 @@ grader 评分。完全自包含：删除 `eval/swebench/` 这个目录 SWE-bench
 
 ## 首次运行
 
-### 1. 装依赖
+### 1. 装依赖（用 venv 隔离）
+
+Homebrew Python 3.11+ 默认锁住了 system pip（PEP 668），必须用虚拟环境：
 
 ```bash
+# 在仓库根建 venv（只做一次）
+python3 -m venv .venv-swebench
+
+# 激活（每次开新 shell 跑 SWE-bench 之前都要执行）
+source .venv-swebench/bin/activate
+
+# 装依赖（只做一次）
 pip install datasets swebench
 ```
 
-### 2. 确认 docker 在跑
+激活后 shell prompt 会出现 `(.venv-swebench)` 前缀。之后 `./run.sh` / `./grade.sh` 都在激活状态下跑，`deactivate` 退出。
+
+`.venv-swebench/` 已经在 `.gitignore` 里，不会被追踪。
+
+### 2. 确认 docker 在跑（grade 阶段需要）
 
 ```bash
 docker info
 ```
+
+### 2.5. macOS 还要装 flock
+
+```bash
+brew install flock
+```
+
+Linux 自带 flock，跳过此步。
 
 ### 3. 预热缓存
 
@@ -111,6 +132,12 @@ open eval/runs/<latest>/index.html
 | `tests/smoke.sh` | 端到端 smoke |
 
 ## 常见问题
+
+**Q: `pip install` 报 `error: externally-managed-environment`**
+A: Homebrew Python 的 PEP 668 保护。走上面的 venv 流程（`python3 -m venv .venv-swebench` + `source .venv-swebench/bin/activate`），不要用 `--break-system-packages`。
+
+**Q: `fetch_dataset.py` 报 ``error: `datasets` package not installed``**
+A: 忘了 `source .venv-swebench/bin/activate`。激活 venv 后再跑。
 
 **Q: `grade.sh` 报 "docker daemon is not running"**
 A: 启动 Docker Desktop / `systemctl start docker`

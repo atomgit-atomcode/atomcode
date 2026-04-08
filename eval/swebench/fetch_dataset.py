@@ -40,6 +40,31 @@ def _import_load_dataset():
         print("error: `datasets` package not installed. Run: pip install datasets", file=sys.stderr)
         sys.exit(2)
 
+
+def _resolve_hf_dataset_sha(name: str) -> str:
+    """Resolve the real HuggingFace git commit SHA for a dataset repo.
+
+    Uses huggingface_hub (transitive dep of datasets). This is the true
+    revision pin — ds.info.version returns a Version object ("0.0.0")
+    that's both useless as a pin and not JSON-serializable.
+    """
+    try:
+        from huggingface_hub import HfApi
+    except ImportError:
+        print("error: `huggingface_hub` package not installed. Run: pip install huggingface_hub", file=sys.stderr)
+        sys.exit(2)
+    try:
+        info = HfApi().dataset_info(name)
+    except Exception as e:
+        msg = str(e).lower()
+        if "401" in msg or "403" in msg or "unauthorized" in msg or "gated" in msg:
+            print(f"\nerror: {name} appears to require authentication.", file=sys.stderr)
+            print("Fix: run `huggingface-cli login` or set `HF_TOKEN` env var, then retry.", file=sys.stderr)
+            sys.exit(3)
+        print(f"error: failed to query HF dataset info for {name}: {e}", file=sys.stderr)
+        sys.exit(4)
+    return info.sha
+
 HERE = Path(__file__).resolve().parent
 MANIFEST_PATH = HERE / "manifest.toml"
 CACHE_DIR = HERE / "cache"
@@ -98,22 +123,9 @@ def main() -> int:
     load_dataset = _import_load_dataset()
 
     if not revision:
-        print(f"No revision pinned in manifest.toml. Fetching {name} @ main to determine current SHA...")
-        try:
-            ds = load_dataset(name, split=split)
-        except Exception as e:
-            msg = str(e).lower()
-            if "401" in msg or "403" in msg or "unauthorized" in msg or "gated" in msg:
-                print(f"\nerror: {name} appears to require authentication.", file=sys.stderr)
-                print("Fix: run `huggingface-cli login` or set `HF_TOKEN` env var, then retry.", file=sys.stderr)
-                return 3
-            print(f"error: failed to load dataset: {e}", file=sys.stderr)
-            return 4
-
-        # Get the dataset's git SHA from _info.
-        suggested = getattr(ds.info, "version", None) or getattr(ds, "_fingerprint", "unknown")
+        print(f"No revision pinned in manifest.toml. Resolving {name} HEAD commit SHA via HuggingFace Hub...")
+        suggested = _resolve_hf_dataset_sha(name)
         print(f"\nSuggested manifest revision: {suggested}")
-        print(f"Dataset has {len(ds)} instances at this revision.")
 
         if args.accept_suggested_revision:
             confirmed = True
