@@ -33,9 +33,18 @@ pub async fn validate_and_fix(content: &str, file_path: &str, new_string: &str, 
 
     // 1. Duplicate detection — the only pre-write check that stays.
     // Catches model repeating the same code block (compiler won't catch this).
-    let dup_warn = detect_duplicate_blocks(&current, new_string);
-    if !dup_warn.is_empty() {
-        warnings.push(dup_warn);
+    // SKIP for HTML/CSS/Vue: these files naturally have repeated patterns
+    // (<div class="...">, <button>, etc.) which trigger false positives.
+    let ext = std::path::Path::new(file_path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    let is_markup = matches!(ext, "html" | "htm" | "css" | "scss" | "vue" | "svelte" | "svg" | "xml" | "jsx" | "tsx");
+    if !is_markup {
+        let dup_warn = detect_duplicate_blocks(&current, new_string);
+        if !dup_warn.is_empty() {
+            warnings.push(dup_warn);
+        }
     }
 
     // Structural checks (brace balance, HTML balance, Vue SFC) REMOVED.
