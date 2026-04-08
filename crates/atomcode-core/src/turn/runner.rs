@@ -521,7 +521,16 @@ _ = cancel.cancelled() => {
         call: &ToolCall,
         event_tx: &mpsc::UnboundedSender<TurnEvent>,
     ) -> ToolResult {
-        let tool = match self.tools.get(&call.name) {
+        // Auto-fix common tool name aliases (models trained on other agents use different names)
+        let corrected_name = match call.name.as_str() {
+            "write_file" => "create_file",
+            "search" => "grep",
+            "find" | "find_files" => "glob",
+            "run" | "execute" | "shell" | "terminal" => "bash",
+            "list_files" | "ls" => "list_directory",
+            other => other,
+        };
+        let tool = match self.tools.get(corrected_name) {
             Some(t) => t,
             None => {
                 let available: String = self.tools.iter()
@@ -544,6 +553,17 @@ _ = cancel.cancelled() => {
                     success: false,
                 };
             }
+        };
+
+        // Use corrected name for all subsequent checks
+        let call = if corrected_name != call.name.as_str() {
+            &ToolCall {
+                id: call.id.clone(),
+                name: corrected_name.to_string(),
+                arguments: call.arguments.clone(),
+            }
+        } else {
+            call
         };
 
         // Intercept deployment/restart commands — these waste 5-8 turns and
