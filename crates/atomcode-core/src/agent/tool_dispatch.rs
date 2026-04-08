@@ -301,11 +301,24 @@ impl AgentLoop {
                 }
             }
         } else if tool_name == "read_file" {
-            // Only read_file resets the counter — model is re-orienting.
-            // bash (cargo check) does NOT reset, so edit→check→edit→check→edit
-            // still counts as consecutive edits to the same file.
-            self.consecutive_edits_file = None;
-            self.consecutive_edits_count = 0;
+            // Only reading a DIFFERENT file resets the counter.
+            // Reading the SAME file you just edited (to check your work) should NOT
+            // reset — otherwise edit→read_same→edit→read_same bypasses the limit.
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(args) {
+                let read_file = parsed.get("file_path")
+                    .and_then(|v| v.as_str())
+                    .map(|fp| {
+                        fp.rsplit('/').next().unwrap_or(fp).to_string()
+                    });
+                let is_same_file = match (&read_file, &self.consecutive_edits_file) {
+                    (Some(rf), Some(ef)) => rf == ef,
+                    _ => false,
+                };
+                if !is_same_file {
+                    self.consecutive_edits_file = None;
+                    self.consecutive_edits_count = 0;
+                }
+            }
         }
 
         match tool_name {
