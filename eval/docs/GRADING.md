@@ -428,6 +428,33 @@ V1.5 / V2 可能会加的东西，你提前留好扩展点：
   `denial-triggered` 这些早期信号可以从 stderr 直接扒出来，V1.5 先
   统计出现频率再决定怎么用。
 
+## SWE-bench dual-score 解读
+
+SWE-bench instance 的 meta.json 里有两层独立的分数，评分 agent 必须同时看：
+
+### Primary — 上游 binary（不可改）
+- `swebench_resolved: true/false` — 上游 docker grader 跑隐藏测试的二元结果
+- `swebench_failure_mode` — 失败时的细分原因：`applied_but_failed` / `failed_to_apply` / `grade_error`
+- 这是对外汇报用的硬指标，**忠实记录即可**
+
+### Secondary — 我们自己的效率指标（工程优化用）
+- `efficiency.turns` — LLM 轮数
+- `efficiency.prompt_tokens` / `completion_tokens`
+- `efficiency.tool_calls` / `tool_breakdown` — 调了哪些工具、各多少次
+- `efficiency.stop_reason` — `natural` / `turn_limit` / `step_limit` / `cancelled` / `error`
+- `efficiency.estimated_cost_usd`
+
+### 读取规则
+
+1. **primary 和 secondary 可能背离。** Agent 可能在 30 turn 里反复挣扎最终过了 grader（primary=resolved，secondary 差），也可能 2 turn 就放弃但 patch 碰巧对了（primary=resolved，secondary 优）。评语里 flag 出这种。
+2. **`stop_reason == "turn_limit"` 是危险信号。** 被 cap 截断的 instance，它的 patch 可能只是半成品。即使 primary=resolved 也要提示"可能是运气"。
+3. **Efficiency by outcome 对比是金矿。** 看 summary.json 的 `secondary_metrics.by_outcome`：如果 failed 组平均 turns 远大于 predicted/resolved 组，说明 agent 在失败 instance 上原地打转；修法是 context 管理或早退机制。
+4. **`cost_per_resolved_usd`** 是最实用的 ROI 指标。跨 run 对比时用这个，不要直接比 `total_estimated_cost_usd`（取决于 instance 数）。
+
+### 跨 run 对比
+- 只有 `dataset_revision` + `prompt_template` + `provider` 三项完全一致的两个 run 才能直接比较
+- 其它情况下，对比是有噪音的
+
 ---
 
 **最后一句话：** V1 的哲学是"信号齐全，判断推迟"。
