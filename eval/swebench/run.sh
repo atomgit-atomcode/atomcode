@@ -428,3 +428,143 @@ echo "[aggregate] wrote $PRED_COUNT predictions to $AGG" >&2
 touch "$ABORT_FLAG" 2>/dev/null || true
 kill $MONITOR_PID 2>/dev/null || true
 wait $MONITOR_PID 2>/dev/null || true
+
+# ---------------------------------------------------------------------------
+# Post-run: generate summary.json and print summary
+# ---------------------------------------------------------------------------
+generate_summary() {
+    python3 - "$EVAL_RUN_DIR" "$BIN" "$DATASET_REVISION" "$PROMPT_TEMPLATE" "$INCLUDE_HINTS" "$PROVIDER" <<'PYEOF'
+import json
+import os
+import sys
+from datetime import datetime, timezone
+from collections import defaultdict
+
+run_dir = sys.argv[1]
+bin_path = sys.argv[2]
+dataset_rev = sys.argv[3]
+prompt_tpl = sys.argv[4]
+include_hints = sys.argv[5] == "true"
+provider = sys.argv[6]
+
+# Collect all per-instance meta.json files
+metas = []
+for name in sorted(os.listdir(run_dir)):
+    mpath = os.path.join(run_dir, name, "meta.json")
+    if os.path.exists(mpath):
+        try:
+            with open(mpath) as f:
+                metas.append(json.load(f))
+        except Exception:
+            pass
+
+# Status counts
+totals = defaultdict(int)
+for m in metas:
+    totals[m.get("status", "unknown")] += 1
+
+# Efficiency aggregates
+n = len(metas)
+def avg(key_path):
+    vals = []
+    for m in metas:
+        v = m
+        for k in key_path.split("."):
+            v = v.get(k) if isinstance(v, dict) else None
+            if v is None:
+                break
+        if isinstance(v, (int, float)):
+            vals.append(v)
+    return sum(vals) / len(vals) if vals else 0
+
+total_cost = sum(
+    m.get("efficiency", {}).get("estimated_cost_usd", 0) for m in metas
+)
+resolved = sum(1 for m in metas if m.get("swebench_resolved") is True)
+cost_per_resolved = (total_cost / resolved) if resolved > 0 else None
+
+# By-outcome comparison
+def group_stats(filter_fn):
+    group = [m for m in metas if filter_fn(m)]
+    if not group:
+        return {"n": 0}
+    return {
+        "n": len(group),
+        "avg_turns": sum(m.get("efficiency", {}).get("turns", 0) for m in group) / len(group),
+        "avg_prompt_tokens": sum(m.get("efficiency", {}).get("prompt_tokens", 0) for m in group) / len(group),
+        "avg_completion_tokens": sum(m.get("efficiency", {}).get("completion_tokens", 0) for m in group) / len(group),
+        "avg_wall_seconds": sum(m.get("wall_ms", 0) for m in group) / 1000.0 / len(group),
+    }
+
+summary = {
+    "started_at": metas[0]["started_at"] if metas else "",
+    "ended_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00","Z"),
+    "status": "done",
+    "runner_version": f"eval/swebench/run.sh",
+    "case_count": len(metas),
+    "concurrency": int(os.environ.get("CONCURRENCY", "4") or 4),
+    "totals": dict(totals),
+    "swebench": {
+        "dataset": "princeton-nlp/SWE-bench_Verified",
+        "dataset_revision": dataset_rev,
+        "prompt_template": prompt_tpl,
+        "include_hints": include_hints,
+        "provider": provider,
+        "model": None,
+        "primary_score": None,  # populated by grade phase
+        "secondary_metrics": {
+            "avg_turns": avg("efficiency.turns"),
+            "avg_prompt_tokens": avg("efficiency.prompt_tokens"),
+            "avg_completion_tokens": avg("efficiency.completion_tokens"),
+            "avg_tool_calls": avg("efficiency.tool_calls"),
+            "avg_wall_seconds": avg("wall_ms") / 1000.0 if n else 0,
+            "total_estimated_cost_usd": round(total_cost, 4),
+            "cost_per_resolved_usd": round(cost_per_resolved, 4) if cost_per_resolved else None,
+            "by_outcome": {
+                "predicted": group_stats(lambda m: m.get("status") == "predicted"),
+                "failed":    group_stats(lambda m: m.get("status") in ("fail","error","timeout","denied")),
+            },
+        },
+    },
+}
+
+out_path = os.path.join(run_dir, "summary.json")
+with open(out_path, "w", encoding="utf-8") as f:
+    json.dump(summary, f, indent=2)
+print(f"summary.json written to {out_path}")
+PYEOF
+}
+
+generate_summary
+
+# ---------------------------------------------------------------------------
+# Print human-readable summary to stdout
+# ---------------------------------------------------------------------------
+python3 - "$EVAL_RUN_DIR/summary.json" <<'PYEOF'
+import json, sys
+s = json.load(open(sys.argv[1]))
+sw = s["swebench"]
+sm = sw["secondary_metrics"]
+print()
+print("=" * 50)
+print("PREDICT PHASE COMPLETE")
+print("=" * 50)
+print(f"Run dir:     {sys.argv[1].rsplit('/',1)[0]}")
+print(f"Dataset:     {sw['dataset_revision']}")
+print(f"Prompt:      {sw['prompt_template']}")
+print(f"Provider:    {sw['provider'] or '<config default>'}")
+print()
+print("Totals:")
+for status, count in sorted(s["totals"].items()):
+    print(f"  {status:10s}: {count}")
+print()
+print("Secondary (efficiency) metrics:")
+print(f"  avg turns:             {sm['avg_turns']:.1f}")
+print(f"  avg prompt tokens:     {sm['avg_prompt_tokens']:.0f}")
+print(f"  avg completion tokens: {sm['avg_completion_tokens']:.0f}")
+print(f"  avg tool calls:        {sm['avg_tool_calls']:.1f}")
+print(f"  avg wall time:         {sm['avg_wall_seconds']:.1f}s")
+print(f"  estimated cost:        ${sm['total_estimated_cost_usd']:.2f}")
+print()
+print(f"Next: ./eval/swebench/grade.sh {sys.argv[1].rsplit('/',1)[0]}")
+PYEOF
