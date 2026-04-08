@@ -76,13 +76,23 @@ impl TurnRunner {
         // 2. Inflate ToolResultRef → ToolResult for recent messages.
         // Conversation stores large results as compact refs on disk;
         // inflate the last 20 so the LLM sees actual tool output.
+        // Respect context_window: stop inflating when total tokens approach limit.
+        // Without this, 32K models receive 56K+ tokens of inflated content.
         {
+            let pre_inflate_tokens: usize = messages.iter().map(|m| m.estimate_tokens()).sum();
+            let inflate_budget = context_window.saturating_sub(pre_inflate_tokens);
             let mut inflated = 0usize;
+            let mut inflated_tokens = 0usize;
             for msg in messages.iter_mut().rev() {
                 if inflated >= 20 { break; }
                 if let crate::conversation::message::MessageContent::ToolResultRef(ref r) = msg.content {
                     let full = self.result_store.inflate(r);
+                    let cost = full.output.len() / 4; // rough token estimate
+                    if inflated_tokens + cost > inflate_budget && inflated > 0 {
+                        break; // stop: would exceed context_window
+                    }
                     msg.content = crate::conversation::message::MessageContent::ToolResult(full);
+                    inflated_tokens += cost;
                     inflated += 1;
                 }
             }
