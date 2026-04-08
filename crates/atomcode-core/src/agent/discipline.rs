@@ -140,6 +140,13 @@ impl AgentLoop {
         self.tool_call_count >= hard_limit
     }
 
+    /// Check if the turn budget (AgentLoop.max_turns) has been reached.
+    /// Returns false when no cap is set (unbounded — historical behavior).
+    /// Mirrored by `check_turn_limit_impl` in turn/tests.rs; keep both in sync.
+    pub(crate) fn check_turn_limit(&self) -> bool {
+        self.max_turns.map_or(false, |m| self.turn_count >= m)
+    }
+
     /// Find sibling files (same directory, same extension) of edited files
     /// and suggest the model check them for the same bug pattern.
     pub(crate) fn find_sibling_files_hint(&self) -> String {

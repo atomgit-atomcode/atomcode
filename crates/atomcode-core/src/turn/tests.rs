@@ -536,6 +536,47 @@ fn check_step_limit_impl(tool_call_count: usize, files_edited_count: usize) -> b
     tool_call_count >= hard_limit
 }
 
+// ---------------------------------------------------------------------------
+// Turn limit tests (mirror of check_turn_limit in agent/discipline.rs)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_check_turn_limit_none_unbounded() {
+    // No cap set → never stops regardless of turn_count.
+    assert!(!check_turn_limit_impl(0, None));
+    assert!(!check_turn_limit_impl(1, None));
+    assert!(!check_turn_limit_impl(1_000_000, None));
+}
+
+#[test]
+fn test_check_turn_limit_under_limit() {
+    // cap = 3: turns 0, 1, 2 all still "under" → loop continues.
+    assert!(!check_turn_limit_impl(0, Some(3)));
+    assert!(!check_turn_limit_impl(1, Some(3)));
+    assert!(!check_turn_limit_impl(2, Some(3)));
+}
+
+#[test]
+fn test_check_turn_limit_at_or_over_limit() {
+    // cap = 3: at turn_count == 3, loop should stop (before running a 4th turn).
+    assert!(check_turn_limit_impl(3, Some(3)));
+    assert!(check_turn_limit_impl(4, Some(3)));
+    assert!(check_turn_limit_impl(100, Some(3)));
+}
+
+#[test]
+fn test_check_turn_limit_zero_stops_immediately() {
+    // Degenerate but valid: cap = 0 means "run zero turns".
+    assert!(check_turn_limit_impl(0, Some(0)));
+}
+
+/// Standalone reimplementation of check_turn_limit for unit testing.
+/// Must match the formula used by AgentLoop::check_turn_limit in
+/// agent/discipline.rs. If you change one, change both.
+fn check_turn_limit_impl(turn_count: usize, max_turns: Option<usize>) -> bool {
+    max_turns.map_or(false, |m| turn_count >= m)
+}
+
 #[test]
 fn test_discipline_reminder_triggers_every_4_steps() {
     // Reminders should fire at steps 4, 8, 12, 16...

@@ -699,7 +699,7 @@ impl App {
                     }
                 }
             }
-            AgentEvent::TurnComplete { duration, total_tokens: _, turn_count: _, tool_call_count } => {
+            AgentEvent::TurnComplete { duration, total_tokens: _, turn_count: _, tool_call_count, stop_reason: _ } => {
                 // Finalize stream FIRST so auto-summary TextDelta becomes a message
                 self.conversation.finalize_stream();
                 // Then log the final assistant text

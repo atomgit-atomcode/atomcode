@@ -120,6 +120,13 @@ struct Cli {
     /// Without this flag, headless output is the assistant reply only — Claude Code -p style.
     #[arg(short = 'v', long)]
     verbose: bool,
+
+    /// Maximum number of LLM turns before the agent loop is force-stopped.
+    /// Bounds context accumulation on long-running tasks (e.g. SWE-bench eval).
+    /// Default: unbounded — the agent stops naturally when the model returns
+    /// no tool calls or when the step budget (tool-call cap) is reached.
+    #[arg(long)]
+    max_turns: Option<usize>,
 }
 
 #[derive(Subcommand)]
@@ -245,13 +252,14 @@ async fn run() -> Result<i32> {
     // stale file paths from old working directories, and 100+ message context pollution.
     let conversation = Conversation::new();
 
-    let (agent_loop, agent_handle) = AgentLoop::new(
+    let (mut agent_loop, agent_handle) = AgentLoop::new(
         config.clone(),
         provider,
         tool_registry,
         tool_context.clone(),
         conversation,
     );
+    agent_loop.set_max_turns(cli.max_turns);
 
     // Headless mode: -p / --prompt triggers non-interactive execution.
     if let Some(prompt) = cli.prompt.clone() {
@@ -337,15 +345,24 @@ async fn run_headless(
             AgentEvent::PhaseChange(_) => {
                 // Silent in headless mode (in both default and verbose).
             }
-            AgentEvent::TurnComplete { duration, total_tokens, turn_count, tool_call_count } => {
+            AgentEvent::TurnComplete { duration, total_tokens, turn_count, tool_call_count, stop_reason } => {
                 // Always ensure stdout ends with a newline so downstream parsers see a clean line.
                 if !last_text_ended_with_newline {
                     println!();
                     io::stdout().flush()?;
                 }
                 if verbose {
-                    eprintln!("[done] {:.1}s tokens={} turns={} tool_calls={}",
-                        duration.as_secs_f64(), total_tokens, turn_count, tool_call_count);
+                    // Natural completion stays silent on the stop reason to
+                    // preserve the familiar Claude Code -p [done] format.
+                    // Budget-enforced / error / cancel truncation gets an
+                    // explicit `stopped=<tag>` suffix so eval runners and
+                    // humans can tell "natural end" from "we hit a limit".
+                    let suffix = match stop_reason {
+                        atomcode_core::agent::TurnStopReason::Natural => String::new(),
+                        other => format!(" stopped={}", other.as_tag()),
+                    };
+                    eprintln!("[done] {:.1}s tokens={} turns={} tool_calls={}{}",
+                        duration.as_secs_f64(), total_tokens, turn_count, tool_call_count, suffix);
                 }
                 let _ = cmd_tx.send(AgentCommand::Shutdown);
                 break;

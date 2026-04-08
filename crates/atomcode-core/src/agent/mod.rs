@@ -66,6 +66,36 @@ pub enum AgentCommand {
     Shutdown,
 }
 
+/// Reason the agent's turn loop stopped. Carried on TurnComplete so downstream
+/// consumers (CLI [done] line, eval harness) can distinguish natural completion
+/// from budget-enforced truncation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnStopReason {
+    /// Model responded with text only — no more tool calls, conversation done.
+    Natural,
+    /// Turn budget (AgentLoop.max_turns) was reached.
+    TurnLimit,
+    /// Step budget (check_step_limit tool-call cap) was reached.
+    StepLimit,
+    /// User cancelled the turn.
+    Cancelled,
+    /// API or internal error terminated the loop.
+    Error,
+}
+
+impl TurnStopReason {
+    /// Short machine-parseable tag (snake_case) for logs / CLI output.
+    pub fn as_tag(&self) -> &'static str {
+        match self {
+            TurnStopReason::Natural => "natural",
+            TurnStopReason::TurnLimit => "turn_limit",
+            TurnStopReason::StepLimit => "step_limit",
+            TurnStopReason::Cancelled => "cancelled",
+            TurnStopReason::Error => "error",
+        }
+    }
+}
+
 /// Events sent FROM the agent loop TO the UI.
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
@@ -101,6 +131,9 @@ pub enum AgentEvent {
         turn_count: usize,
         /// Total individual tool calls.
         tool_call_count: usize,
+        /// Why the loop stopped. `Natural` for ordinary completion; see
+        /// TurnStopReason for budget / cancel / error variants.
+        stop_reason: TurnStopReason,
     },
 /// Turn was cancelled by user before completion.
     /// The conversation has been cleaned up - partial messages removed.
@@ -156,6 +189,11 @@ pub struct AgentLoop {
     /// Each iteration of run_turn_loop = 1 turn, regardless of how many
     /// tools were called in that iteration.
     turn_count: usize,
+    /// Optional hard cap on turn_count. When Some(n), run_turn_loop exits
+    /// via finish_turn(TurnStopReason::TurnLimit) before starting turn n+1.
+    /// None = unbounded (historical behavior — loop stops naturally when the
+    /// LLM returns no tool calls, or when the step budget is hit).
+    max_turns: Option<usize>,
     retry_count: usize,
 
     // Approval channel endpoints for InteractivePermissionDecider
@@ -342,6 +380,7 @@ impl AgentLoop {
             turn_start: None,
             tool_call_count: 0,
             turn_count: 0,
+            max_turns: None,
             retry_count: 0,
             approval_req_rx,
             approval_resp_tx,
@@ -394,6 +433,14 @@ impl AgentLoop {
         let handle = AgentHandle { cmd_tx, event_rx };
 
         (agent, handle)
+    }
+
+    /// Set an optional hard cap on the number of LLM turns this agent will
+    /// run. When the cap is reached, run_turn_loop exits via
+    /// finish_turn(TurnStopReason::TurnLimit). `None` (the default) is
+    /// unbounded. Used by the CLI `--max-turns` flag.
+    pub fn set_max_turns(&mut self, max: Option<usize>) {
+        self.max_turns = max;
     }
 
     /// Run the agent loop. This is the main entry point — call from a tokio task.
@@ -651,6 +698,15 @@ impl AgentLoop {
     /// discipline (reminders, step limits) and decides whether to continue.
     async fn run_turn_loop(&mut self) {
         loop {
+            // Turn budget check BEFORE incrementing, so the reported
+            // turn_count equals the number of turns actually executed
+            // (not including the "would-be" next turn we refuse to run).
+            // The stop reason is propagated via TurnComplete.stop_reason;
+            // the CLI [done] line surfaces it as `stopped=turn_limit`.
+            if self.check_turn_limit() {
+                self.finish_turn(TurnStopReason::TurnLimit);
+                return;
+            }
             self.turn_count += 1;
 
             // Decrement diagnosis read-only counter each turn.
@@ -1107,7 +1163,7 @@ impl AgentLoop {
                         continue;
                     }
 
-                    self.finish_turn();
+                    self.finish_turn(TurnStopReason::Natural);
                     return;
                 }
                 TurnResult::UsedTools { tool_count, tokens, text } => {
@@ -1147,7 +1203,7 @@ impl AgentLoop {
                                         ));
                                     } else {
                                         self.conversation.add_user_message("Sub-agent results are above. Summarize what was changed.");
-                                        self.finish_turn();
+                                        self.finish_turn(TurnStopReason::Natural);
                                         return;
                                     }
                                 }
@@ -1185,7 +1241,7 @@ impl AgentLoop {
                     // Apply discipline: inject reminders, check step limits
                     self.apply_post_turn_discipline();
                     if self.check_step_limit() {
-                        self.finish_turn();
+                        self.finish_turn(TurnStopReason::StepLimit);
                         return;
                     }
                     // Bulk-read and consecutive-read guards removed.
@@ -1226,7 +1282,7 @@ impl AgentLoop {
                         continue;
                     } else if is_auth_error {
                         let _ = self.event_tx.send(AgentEvent::Error(e));
-                        self.finish_turn();
+                        self.finish_turn(TurnStopReason::Error);
                         return;
                     } else if self.retry_count < 3 {
                         self.retry_count += 1;
@@ -1238,7 +1294,7 @@ impl AgentLoop {
                         continue;
                     } else {
                         let _ = self.event_tx.send(AgentEvent::Error(e));
-                        self.finish_turn();
+                        self.finish_turn(TurnStopReason::Error);
                         return;
                     }
                 }
@@ -1254,7 +1310,7 @@ impl AgentLoop {
                     // Send TurnCancelled event for TUI to sync
                     let messages = self.conversation.messages.clone();
                     let _ = self.event_tx.send(AgentEvent::TurnCancelled { messages });
-                    self.finish_turn();
+                    self.finish_turn(TurnStopReason::Cancelled);
                     return;
                 }
             }
@@ -1264,7 +1320,7 @@ impl AgentLoop {
     // forward_turn_event → tool_dispatch.rs
     // post_process_tool_results → tool_dispatch.rs
 
-    fn finish_turn(&mut self) {
+    fn finish_turn(&mut self, stop_reason: TurnStopReason) {
         // Mark the current turn as completed in the tracker.
         self.conversation.turn_tracker.complete_current();
 
@@ -1276,6 +1332,7 @@ impl AgentLoop {
             total_tokens: self.turn_tokens,
             turn_count: self.turn_count,
             tool_call_count: self.tool_call_count,
+            stop_reason,
         });
         let _ = self
             .event_tx
