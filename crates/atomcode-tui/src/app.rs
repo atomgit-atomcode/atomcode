@@ -351,8 +351,6 @@ impl App {
                    system_prompt: None,
                    user_agent: None,
                    context_window: atomcode_core::config::provider::default_context_window_for("openai"),
-                   provider: None,
-                   context_strategy: Default::default(),
                }).unwrap_or_else(|_| {
                    // Fallback: should never reach production path since AgentLoop handles LLM
                    panic!("Failed to create placeholder provider")

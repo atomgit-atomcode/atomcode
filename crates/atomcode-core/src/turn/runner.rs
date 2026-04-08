@@ -38,9 +38,6 @@ pub struct TurnRunner {
     pub recently_edited_files: Vec<String>,
     /// Post-edit read count per file. First read returns skeleton, second+ BLOCKED.
     pub post_edit_read_counts: std::collections::HashMap<String, usize>,
-    /// Cache-cold flag: set on session start, API error, or provider switch.
-    /// Triggers immediate compaction in cache_optimized mode to reduce miss penalty.
-    pub cache_cold: bool,
 }
 
 impl TurnRunner {
@@ -65,23 +62,16 @@ impl TurnRunner {
         cancel: CancellationToken,
         allowed_tools: Option<&[&str]>,
     ) -> TurnResult {
-        // 1. Build messages — strategy depends on provider config
-        let provider_config = self.config.providers.get(&self.config.default_provider);
-        let context_window = provider_config.map(|p| p.context_window).unwrap_or(16000);
-        let strategy = provider_config
-            .map(|p| p.context_strategy.clone())
-            .unwrap_or_default();
+        // 1. Build messages within token budget
+        let context_window = self
+            .config
+            .providers
+            .get(&self.config.default_provider)
+            .map(|p| p.context_window)
+            .unwrap_or(16000);
 
-        let (mut messages, ctx_stats) = match strategy {
-            crate::config::provider::ContextStrategy::CacheOptimized => {
-                let cold = self.cache_cold;
-                if cold { self.cache_cold = false; } // reset after first use
-                conversation.to_provider_messages_cached(system_prompt, context_window, cold)
-            }
-            crate::config::provider::ContextStrategy::Budgeted => {
-                conversation.to_provider_messages_budgeted(system_prompt, context_window)
-            }
-        };
+        let (mut messages, ctx_stats) =
+            conversation.to_provider_messages_budgeted(system_prompt, context_window);
 
         // 2. Inflate ToolResultRef → ToolResult for recent messages.
         // Conversation stores large results as compact refs on disk;

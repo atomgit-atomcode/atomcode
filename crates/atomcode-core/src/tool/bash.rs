@@ -298,40 +298,7 @@ async fn bash_execute(args: &str, ctx: &ToolContext) -> Result<ToolResult> {
                     combined = devserver::java::enhance_compile_error(&combined, &wd);
                 }
                 if !effective_success && !combined.is_empty() {
-                    let cmd_lower = parsed.command.to_lowercase();
-                    let is_build_cmd = cmd_lower.contains("cargo check")
-                        || cmd_lower.contains("cargo build")
-                        || cmd_lower.contains("npm run build")
-                        || cmd_lower.contains("npx vite build")
-                        || cmd_lower.contains("npx tsc")
-                        || cmd_lower.contains("mvn compile")
-                        || cmd_lower.contains("go build");
-                    if is_build_cmd {
-                        combined.push_str("\n\n[BUILD FAILED. Fix ALL errors above in ONE round of edits. Do NOT re-run build until every error is fixed.]");
-                    } else {
-                        combined.push_str("\n\n[IMPORTANT: Command failed. Read the error above and fix the root cause. Do NOT retry the same command.]");
-                    }
-                }
-                // Build commands that PASS with warnings: tell model not to fix warnings.
-                // Prevents scope creep (model sees TS6133 "unused variable" → spends 9 turns
-                // fixing unrelated files). Only applies when exit code = 0.
-                if effective_success {
-                    let cmd_lower = parsed.command.to_lowercase();
-                    let is_build = cmd_lower.contains("npm run build")
-                        || cmd_lower.contains("npx vite build")
-                        || cmd_lower.contains("npx tsc")
-                        || cmd_lower.contains("cargo build")
-                        || cmd_lower.contains("cargo check")
-                        || cmd_lower.contains("mvn compile")
-                        || cmd_lower.contains("gradle compile")
-                        || cmd_lower.contains("go build");
-                    let has_warnings = combined.contains("warning")
-                        || combined.contains("TS6133")
-                        || combined.contains("unused")
-                        || combined.contains("deprecated");
-                    if is_build && has_warnings {
-                        combined.push_str("\n\n[Build PASSED. Warnings above are informational — do NOT fix them unless the user asks.]");
-                    }
+                    combined.push_str("\n\n[IMPORTANT: Command failed. Read the error above and fix the root cause. Do NOT retry the same command.]");
                 }
                 Ok(ToolResult { call_id: String::new(), output: combined, success: effective_success })
             }

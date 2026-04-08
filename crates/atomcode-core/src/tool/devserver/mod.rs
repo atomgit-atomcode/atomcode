@@ -87,37 +87,7 @@ pub fn is_server_command(cmd: &str) -> bool {
     if trimmed.ends_with('&') || trimmed.contains("nohup ") || trimmed.contains("setsid ") {
         return true;
     }
-
-    // Extract the primary command (first token before pipes/&&).
-    // "npm install @vitejs/plugin-vue" → primary is "npm"
-    // "ps aux | grep uvicorn" → primary is "ps"
-    // "uvicorn app:main" → primary is "uvicorn"
-    let primary = trimmed
-        .split(|c: char| c == '|' || c == '&' || c == ';')
-        .next()
-        .unwrap_or(trimmed)
-        .trim();
-
-    // Non-server commands: never block these regardless of arguments
-    let safe_prefixes = [
-        "npm install", "npm i ", "npm ci", "npm add",
-        "pip install", "pip3 install", "pip ", "pip3 ",
-        "cargo add", "cargo install",
-        "yarn add", "pnpm add", "pnpm install", "bun add", "bun install",
-        "apt ", "brew ", "winget ", "choco ",
-        "ps ", "grep ", "kill ", "pkill ", "pgrep ",
-        "cat ", "head ", "tail ", "less ", "more ",
-        "ls ", "find ", "which ", "where ", "type ",
-        "curl ", "wget ",
-        "mkdir ", "rm ", "mv ", "cp ",
-        "git ", "docker ",
-    ];
-    let primary_lower = primary.to_lowercase();
-    if safe_prefixes.iter().any(|p| primary_lower.starts_with(p)) {
-        return false;
-    }
-
-    detect(primary).is_some()
+    detect(trimmed).is_some()
 }
 
 /// Extract port number from a command string + project config files.

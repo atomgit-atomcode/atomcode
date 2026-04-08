@@ -343,8 +343,6 @@ impl ProviderManager {
                             system_prompt: None,
                             user_agent: None,
                             context_window: atomcode_core::config::provider::default_context_window_for(&self.new_type),
-                            provider: None,
-                            context_strategy: Default::default(),
                         };
                         return Some(ManagerAction::Add(self.new_name.clone(), provider));
                     }
