@@ -121,6 +121,10 @@ CASE_DETAIL_TMPL = Template("""<!DOCTYPE html>
   .badge.error    { background: #fde0e0; color: #a01515; }
   .badge.invalid  { background: #e8e8e8; color: #666; font-style: italic; }
   .badge.aborted, .badge.cancelled { background: #e8e8e8; color: #666; }
+  .badge.resolved   { background: #d4edda; color: #155724; }
+  .badge.unresolved { background: #f8d7da; color: #721c24; }
+  .badge.predicted  { background: #d1ecf1; color: #0c5460; }
+  .badge.num        { background: #e9ecef; color: #495057; font-size: 11px; padding: 2px 6px; border-radius: 3px; }
   table.kv { font-size: 0.88em; border-collapse: collapse; margin-top: 0.4em; }
   table.kv td { padding: 0.15em 0.8em 0.15em 0; vertical-align: top; }
   table.kv td.k { color: #888; min-width: 5em; }
@@ -131,6 +135,7 @@ CASE_DETAIL_TMPL = Template("""<!DOCTYPE html>
         line-height: 1.45; white-space: pre-wrap; word-wrap: break-word;
         max-height: 28em; }
   pre.empty { color: #888; font-style: italic; }
+  p.empty { color: #888; font-style: italic; font-size: 0.88em; }
   ul.files { font-size: 0.88em; padding-left: 1.4em; margin-top: 0.4em; }
   ul.files li { margin: 0.18em 0; }
   ul.raw { font-size: 0.88em; padding-left: 1.4em; margin-top: 0.4em; }
@@ -157,6 +162,11 @@ CASE_DETAIL_TMPL = Template("""<!DOCTYPE html>
                         margin-left: 0.3em; }
   .turn pre.reply { margin: 0.4em 0 0 0; max-height: 12em; }
   .turn .empty { color: #888; font-size: 0.85em; font-style: italic; }
+  pre.diff { background:#f6f8fa; padding:12px; border-radius:4px; font-size:12px; overflow-x:auto; line-height:1.4; }
+  pre.diff .diff-head { color:#6f42c1; font-weight:600; }
+  pre.diff .diff-hunk { color:#005cc5; font-weight:600; display:block; margin-top:4px; }
+  pre.diff .diff-add  { color:#22863a; background:#e6ffec; display:block; }
+  pre.diff .diff-del  { color:#b31d28; background:#ffeef0; display:block; }
 </style>
 </head>
 <body>
@@ -189,21 +199,13 @@ $stdout_block
 <h2>Per-turn breakdown</h2>
 $turns_block
 
-<h2>Files in <code>cwd/</code></h2>
-$cwd_files_block
+$cwd_or_patch_block
 
 <h2>Tool timeline (last 25 lines of stderr)</h2>
 $stderr_tail_block
 
 <h2>Raw artifacts</h2>
-<ul class="raw">
-<li><a href="./prompt.md">prompt.md</a> &mdash; original case file</li>
-<li><a href="./stdout.txt">stdout.txt</a> &mdash; full atomcode reply</li>
-<li><a href="./stderr.txt">stderr.txt</a> &mdash; full -v diagnostic stream</li>
-<li><a href="./meta.json">meta.json</a> &mdash; runner metadata</li>
-<li><a href="./cwd/">cwd/</a> &mdash; final working directory tree</li>
-<li><a href="./home/logs/">home/logs/</a> &mdash; full LLM I/O ($log_count files)</li>
-</ul>
+$raw_artifacts_block
 
 </body>
 </html>
@@ -503,6 +505,33 @@ def _render_turns_section(turns: list) -> str:
     return f'<div class="turns">{"".join(blocks)}</div>'
 
 
+def render_patch_diff_html(patch_path: Path) -> str:
+    """Render a unified git diff as syntax-highlighted HTML (pure manual coloring)."""
+    if not patch_path.exists():
+        return '<p class="empty">(no patch.diff)</p>'
+    try:
+        patch = patch_path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return '<p class="empty">(patch.diff unreadable)</p>'
+    if not patch.strip():
+        return '<p class="empty">(empty patch)</p>'
+
+    lines = []
+    for ln in patch.splitlines():
+        escaped = esc(ln)
+        if ln.startswith("+++") or ln.startswith("---"):
+            lines.append(f'<span class="diff-head">{escaped}</span>')
+        elif ln.startswith("@@"):
+            lines.append(f'<span class="diff-hunk">{escaped}</span>')
+        elif ln.startswith("+"):
+            lines.append(f'<span class="diff-add">{escaped}</span>')
+        elif ln.startswith("-"):
+            lines.append(f'<span class="diff-del">{escaped}</span>')
+        else:
+            lines.append(escaped)
+    return '<pre class="diff">' + "\n".join(lines) + "</pre>"
+
+
 def render_case_detail(case_dir: Path, meta: dict) -> None:
     """Generate <case_dir>/case.html — a one-page summary of this case's
     run, linked from index.html's row 'view' link. Reads prompt.md, stdout.txt,
@@ -566,17 +595,73 @@ def render_case_detail(case_dir: Path, meta: dict) -> None:
     stderr_text = _safe_read(case_dir / "stderr.txt")
     stderr_block = _render_pre(_stderr_tail(stderr_text), "(empty stderr)")
 
-    # Cwd files list
-    cwd_files_block = _list_cwd_files(case_dir / "cwd")
-
     # Per-turn breakdown
     turns_block = _render_turns_section(turns)
+
+    # Branch: swebench cases show patch.diff + swebench metadata instead of cwd tree.
+    form = meta.get("form")
+    if form == "swebench":
+        sw = meta.get("swebench", {})
+        # Build swebench-specific metadata block (repo, base_commit, etc.)
+        sw_rows = "".join(
+            f'<tr><td class="k">{esc(k)}</td><td><code>{esc(str(v))}</code></td></tr>'
+            for k, v in [
+                ("repo",              sw.get("repo")),
+                ("base_commit",       sw.get("base_commit")),
+                ("prompt_template",   sw.get("prompt_template")),
+                ("include_hints",     sw.get("include_hints")),
+                ("dataset_revision",  sw.get("dataset_revision")),
+                ("patch_size_bytes",  sw.get("patch_size_bytes")),
+            ]
+        )
+        swebench_meta_block = (
+            '<h2>SWE-bench metadata</h2>'
+            '<table class="kv">' + sw_rows + '</table>'
+        )
+        # Efficiency badges at top (rendered after h1 via description_block slot)
+        eff_badges = render_swebench_badges(meta)
+        if description_block:
+            description_block = f'<div class="swbadges">{eff_badges}</div>' + description_block
+        else:
+            description_block = f'<div class="swbadges">{eff_badges}</div>'
+
+        # patch.diff rendering in place of cwd tree
+        patch_html = render_patch_diff_html(case_dir / "patch.diff")
+        cwd_or_patch_block = (
+            swebench_meta_block
+            + '<h2>patch.diff</h2>'
+            + patch_html
+        )
+        raw_artifacts_block = (
+            '<ul class="raw">'
+            '<li><a href="./patch.diff">patch.diff</a> &mdash; generated patch</li>'
+            '<li><a href="./prompt.rendered.txt">prompt.rendered.txt</a> &mdash; rendered prompt sent to LLM</li>'
+            '<li><a href="./stdout.txt">stdout.txt</a> &mdash; full atomcode reply</li>'
+            '<li><a href="./stderr.txt">stderr.txt</a> &mdash; full -v diagnostic stream</li>'
+            '<li><a href="./meta.json">meta.json</a> &mdash; runner metadata</li>'
+            '</ul>'
+        )
+    else:
+        cwd_or_patch_block = (
+            '<h2>Files in <code>cwd/</code></h2>'
+            + _list_cwd_files(case_dir / "cwd")
+        )
+        raw_artifacts_block = (
+            '<ul class="raw">'
+            f'<li><a href="./prompt.md">prompt.md</a> &mdash; original case file</li>'
+            f'<li><a href="./stdout.txt">stdout.txt</a> &mdash; full atomcode reply</li>'
+            f'<li><a href="./stderr.txt">stderr.txt</a> &mdash; full -v diagnostic stream</li>'
+            f'<li><a href="./meta.json">meta.json</a> &mdash; runner metadata</li>'
+            f'<li><a href="./cwd/">cwd/</a> &mdash; final working directory tree</li>'
+            f'<li><a href="./home/logs/">home/logs/</a> &mdash; full LLM I/O ({esc(log_count)} files)</li>'
+            '</ul>'
+        )
 
     html_out = CASE_DETAIL_TMPL.substitute(
         case_id=esc(case_id),
         status=esc(status),
         description_block=description_block,
-        form=esc(meta.get("form")),
+        form=esc(form),
         provider=esc(meta.get("provider") or "(default)"),
         exit_code=esc(meta.get("exit_code")),
         wall_display=esc(fmt_wall(meta.get("wall_ms"))),
@@ -588,9 +673,9 @@ def render_case_detail(case_dir: Path, meta: dict) -> None:
         prompt_block=prompt_block,
         stdout_block=stdout_block,
         turns_block=turns_block,
-        cwd_files_block=cwd_files_block,
+        cwd_or_patch_block=cwd_or_patch_block,
         stderr_tail_block=stderr_block,
-        log_count=esc(log_count),
+        raw_artifacts_block=raw_artifacts_block,
     )
 
     (case_dir / "case.html").write_text(html_out, encoding="utf-8")
