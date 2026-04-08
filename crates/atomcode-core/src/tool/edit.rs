@@ -505,6 +505,16 @@ impl Tool for EditFileTool {
             // Auto-fallback: if we found a high-confidence match, apply the edit
             // using the suggested text instead of failing. This eliminates the
             // re-read → retry cycle that wastes 2+ turns.
+            //
+            // DISABLED for HTML/CSS/Vue/SVG: these files have too many repeated
+            // patterns (<div>, <button>, class="..."). Auto-correct matches the
+            // wrong location and destroys file structure.
+            let ext = std::path::Path::new(&parsed.file_path)
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("");
+            let is_markup = matches!(ext, "html" | "htm" | "css" | "scss" | "vue" | "svelte" | "svg" | "xml" | "jsx" | "tsx");
+            if !is_markup {
             if let Some(ref suggested) = suggested_old {
                 let suggested_count = content.matches(suggested.as_str()).count();
                 if suggested_count == 1 {
@@ -524,6 +534,7 @@ impl Tool for EditFileTool {
                     return Ok(result);
                 }
             }
+            } // end if !is_markup
 
             // Auto-fallback to line mode: if we found the approximate location,
             // suggest the model use start_line/end_line instead of retrying text match.
