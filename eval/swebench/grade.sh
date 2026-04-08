@@ -173,12 +173,14 @@ python3 -m swebench.harness.run_evaluation \
     }
 
 # The harness writes its report to the current working directory as
-# `<run_id>.<model>.json` or similar. Find and normalize it.
-GRADER_OUT=$(find . -maxdepth 2 -name "$RUN_ID*.json" -type f | head -1)
+# `<model_name>.<run_id>.json` (e.g. atomcode-2.5.0-default-default.2026-04-08_19-28-44.json).
+# Match by RUN_ID anywhere in the filename, pick the most recently modified.
+GRADER_OUT=$(find . -maxdepth 2 -name "*${RUN_ID}*.json" -type f -exec stat -f "%m %N" {} \; 2>/dev/null | sort -rn | head -1 | awk '{print $2}')
 if [ -z "$GRADER_OUT" ]; then
-    echo "error: could not locate grader output JSON" >&2
+    echo "error: could not locate grader output JSON (expected *${RUN_ID}*.json in cwd)" >&2
     exit 6
 fi
+echo "[grade] grader report: $GRADER_OUT"
 
 # Normalize into our grading.json shape
 python3 - "$GRADER_OUT" "$RUN_DIR/grading/grading.json" "$RUN_ID" <<'PYEOF'
@@ -192,16 +194,20 @@ run_id = sys.argv[3]
 # Upstream report shape varies; handle the common forms.
 resolved_ids = src.get("resolved_ids") or []
 unresolved_ids = src.get("unresolved_ids") or []
+error_ids = src.get("error_ids") or []
 per_instance = {}
 for iid in resolved_ids:
     per_instance[iid] = {"resolved": True, "failure_mode": None}
 for iid in unresolved_ids:
     per_instance[iid] = {"resolved": False, "failure_mode": src.get("failure_modes", {}).get(iid, "applied_but_failed")}
+for iid in error_ids:
+    per_instance[iid] = {"resolved": False, "failure_mode": "grader_error"}
 
 totals = {
     "resolved": len(resolved_ids),
     "unresolved": len(unresolved_ids),
-    "total": len(resolved_ids) + len(unresolved_ids),
+    "error": len(error_ids),
+    "total": len(resolved_ids) + len(unresolved_ids) + len(error_ids),
 }
 
 out = {
@@ -259,5 +265,12 @@ python3 "$SCRIPT_DIR/../scripts/render_index.py" "$RUN_DIR" 2>/dev/null || true
 
 echo ""
 echo "=== grade complete ==="
-cat "$RUN_DIR/grading/grading.json" | python3 -c 'import json,sys; t=json.load(sys.stdin)["totals"]; print(f"  resolved:   {t[\"resolved\"]}"); print(f"  unresolved: {t[\"unresolved\"]}"); print(f"  total:      {t[\"total\"]}")'
+python3 - "$RUN_DIR/grading/grading.json" <<'PYEOF'
+import json, sys
+t = json.load(open(sys.argv[1]))["totals"]
+print(f"  resolved:   {t.get('resolved', 0)}")
+print(f"  unresolved: {t.get('unresolved', 0)}")
+print(f"  error:      {t.get('error', 0)}")
+print(f"  total:      {t.get('total', 0)}")
+PYEOF
 exit 0
