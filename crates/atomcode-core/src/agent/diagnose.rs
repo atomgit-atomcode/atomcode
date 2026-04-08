@@ -6,7 +6,9 @@ impl AgentLoop {
     pub(crate) async fn auto_diagnose_errors(&self, content: &str) -> String {
         let lower = content.to_lowercase();
         let has_error_keyword = ["错误", "报错", "失败", "error", "500", "404", "crash",
-            "异常", "exception", "内部错误", "not work", "不行", "不好使", "bug"]
+            "异常", "exception", "内部错误", "not work", "不行", "不好使", "bug",
+            "不对", "有问题", "不正确", "不应该", "还是不行", "没有用", "没效果",
+            "显示错误", "返回错误", "结果不对", "broken", "wrong", "incorrect"]
             .iter().any(|k| lower.contains(k));
 
         if !has_error_keyword {
@@ -261,7 +263,12 @@ impl AgentLoop {
     }
 
     /// Auto-inject graph context into user message.
-    /// Detects file names in the message, queries the code graph for dependencies.
+    ///
+    /// Three detection strategies (any user message, not just errors):
+    /// 1. File names: "parser.rs" → inject file_dependency_summary
+    /// 2. Function names: if a word matches a function in the graph → inject call_chain_summary
+    /// 3. Domain keywords: extract Chinese/English nouns, search graph nodes for matching
+    ///    function names (e.g., user says "天气" → find "fetch_weather" in graph)
     pub(crate) async fn auto_inject_graph_context(&self, content: &str) -> String {
         let graph = self.turn_runner.context.graph.read().await;
         if !graph.is_ready() {
@@ -269,6 +276,8 @@ impl AgentLoop {
         }
 
         let mut injections = Vec::new();
+
+        // Strategy 1: Detect file names (*.rs, *.py, etc.)
         let file_re = regex::Regex::new(r"\b(\w+\.(?:rs|py|js|ts|tsx|java|go|vue|c|cpp))\b")
             .unwrap_or_else(|_| regex::Regex::new(".^").unwrap());
         let mut seen = std::collections::HashSet::new();
@@ -281,11 +290,89 @@ impl AgentLoop {
             }
         }
 
+        // Strategy 2: Detect function-like names that exist in graph
+        let fn_re = regex::Regex::new(r"\b([a-z_][a-z0-9_]{3,})\b")
+            .unwrap_or_else(|_| regex::Regex::new(".^").unwrap());
+        for cap in fn_re.captures_iter(content) {
+            let name = &cap[1];
+            if seen.contains(name) { continue; }
+            if !graph.find_by_name(name).is_empty() {
+                seen.insert(name.to_string());
+                if let Some(chain) = graph.call_chain_summary(name) {
+                    injections.push(chain);
+                }
+            }
+        }
+
+        // Strategy 3: Domain keyword → graph node search
+        // Extract meaningful words from user message, search for graph nodes
+        // whose names contain these keywords (e.g., "天气" → "fetch_weather")
+        let domain_keywords = Self::extract_domain_keywords(content);
+        for keyword in domain_keywords.iter().take(3) {
+            if seen.contains(keyword.as_str()) { continue; }
+            // Search graph nodes for functions containing this keyword
+            let matches: Vec<_> = graph.nodes.values()
+                .filter(|n| {
+                    let name_lower = n.name.to_lowercase();
+                    name_lower.contains(keyword)
+                })
+                .take(2)
+                .collect();
+            for node in matches {
+                if seen.insert(node.name.clone()) {
+                    if let Some(chain) = graph.call_chain_summary(&node.name) {
+                        injections.push(chain);
+                    }
+                }
+            }
+        }
+
         if injections.is_empty() {
             return content.to_string();
         }
 
         injections.truncate(3);
         format!("{}\n\n{}", content, injections.join("\n"))
+    }
+
+    /// Extract domain keywords from user message for graph node matching.
+    /// Maps Chinese domain terms to English function name fragments.
+    fn extract_domain_keywords(content: &str) -> Vec<String> {
+        let mut keywords = Vec::new();
+
+        // Chinese → English domain keyword mapping
+        let mappings: &[(&[&str], &str)] = &[
+            (&["天气", "气温", "温度", "下雨", "晴"], "weather"),
+            (&["查询", "搜索", "检索"], "query"),
+            (&["路由", "请求", "接口", "api"], "route"),
+            (&["缓存", "cache"], "cache"),
+            (&["数据库", "存储", "索引"], "store"),
+            (&["登录", "认证", "权限"], "auth"),
+            (&["用户", "账号"], "user"),
+            (&["订单", "支付"], "order"),
+            (&["商圈", "poi", "地点", "位置"], "poi"),
+            (&["新闻", "资讯"], "news"),
+            (&["解析", "parser"], "parse"),
+            (&["获取", "抓取", "fetch"], "fetch"),
+        ];
+
+        let lower = content.to_lowercase();
+        for (zh_terms, en_keyword) in mappings {
+            if zh_terms.iter().any(|t| lower.contains(t)) {
+                keywords.push(en_keyword.to_string());
+            }
+        }
+
+        // Also extract English words directly
+        let word_re = regex::Regex::new(r"\b([a-z]{3,})\b")
+            .unwrap_or_else(|_| regex::Regex::new(".^").unwrap());
+        for cap in word_re.captures_iter(&lower) {
+            let w = cap[1].to_string();
+            if !keywords.contains(&w) {
+                keywords.push(w);
+            }
+        }
+
+        keywords
     }
 }
