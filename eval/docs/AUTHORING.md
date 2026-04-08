@@ -1,24 +1,24 @@
 # AtomCode Eval — Case 编写指南
 
 本目录存放批量 eval harness 的 case 集合。runner 脚本位于
-`scripts/eval/run.sh`。完整设计见
+`eval/scripts/run.sh`。完整设计见
 [`docs/superpowers/specs/2026-04-07-batch-eval-harness-design.md`](../../docs/superpowers/specs/2026-04-07-batch-eval-harness-design.md)。
 
 ## 快速开始
 
 ```bash
 # 跑全部 case
-./scripts/eval/run.sh
+./eval/scripts/run.sh
 
 # 只跑一个 case
-./scripts/eval/run.sh --only 001-fizzbuzz
+./eval/scripts/run.sh --only 001-fizzbuzz
 
 # 为所有 case 覆盖 provider（否则：case frontmatter 里钉了谁就用谁，
 # 没钉就用 config.toml 里的 default_provider）
-./scripts/eval/run.sh --provider siliconflow
+./eval/scripts/run.sh --provider siliconflow
 
 # 查看结果
-open runs/<latest>/index.html
+open eval/runs/<latest>/index.html
 ```
 
 ## 两种 case 格式
@@ -26,7 +26,7 @@ open runs/<latest>/index.html
 ### Form A — 单文件（小体量 / 无 seed / 内联 seed）
 
 ```
-tests/eval/cases/
+eval/cases/
   001-fizzbuzz.md
 ```
 
@@ -39,7 +39,7 @@ case id 必须和文件名（去掉 `.md`）完全一致。
 ### Form B — 目录（多文件 seed / 模拟真实项目）
 
 ```
-tests/eval/cases/
+eval/cases/
   010-rust-refactor/
     case.md
     seed/                ← 运行时会被拷贝到 cwd/
@@ -119,7 +119,7 @@ print("placeholder")
    / wall_ms。如果 `had_denial: true`，直接跳到第 3 步。
 2. **`runs/<ts>/<case-id>/cwd/`** —— 模型实际产出的文件系统。Form B
    case 推荐用
-   `diff -ru tests/eval/cases/<id>/seed/ runs/<ts>/<id>/cwd/` 快速对比。
+   `diff -ru eval/cases/<id>/seed/ eval/runs/<ts>/<id>/cwd/` 快速对比。
 3. **`runs/<ts>/<case-id>/stderr.txt`** —— `[tool→ ...]` / `[tool← ...]`
    时间线，以及所有 `[approval-denied]` 行。按时间顺序看 agent 的工具
    调用轨迹。

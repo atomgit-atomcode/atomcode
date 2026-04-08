@@ -1,6 +1,7 @@
 # Build
 /target
 /runs
+/eval/runs
 
 # Git worktrees (used by superpowers:using-git-worktrees)
 /.worktrees/

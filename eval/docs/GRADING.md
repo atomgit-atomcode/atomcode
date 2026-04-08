@@ -9,14 +9,14 @@
 
 ## 先读这些背景
 
-- [`README.md`](README.md) — case 编写规范，你要评分的输入就是按这里
+- [`AUTHORING.md`](AUTHORING.md) — case 编写规范，你要评分的输入就是按这里
   的规则写出来的。
 - [`CASES.md`](CASES.md) — 当前 case 的完整索引，含每个 case 的"目的"
   （它在考察 agent 的哪个维度）。**评分时先看这个表判断 case 想测什么，
   再去验证是否真的达到了。**
 - `docs/superpowers/specs/2026-04-07-batch-eval-harness-design.md` —
   harness 的完整设计。
-- `scripts/eval/render_index.py` — 生成 `case.html` 的脚本，从中可以
+- `eval/scripts/render_index.py` — 生成 `case.html` 的脚本，从中可以
   看到 V1 把哪些信号呈现给人类 reviewer，你至少要用到这些。
 
 ## Run 目录结构
@@ -54,7 +54,7 @@ runs/<yyyy-mm-dd_HH-MM-SS>/
 | `status` | `done` 表示 runner 正常结束；其它值要当成基础设施异常，不要去评分 |
 | `atomcode.version_string` | e.g. `"atomcode 2.5.0 (851ccd2)"` — **务必写进报告**，不同版本的分数不能混谈 |
 | `atomcode.binary_sha256` | 防止有人改了 binary 但忘记 bump 版本 |
-| `runner_version` | `scripts/eval/run.sh @ <commit>` — runner 本身的版本 |
+| `runner_version` | `eval/scripts/run.sh @ <commit>` — runner 本身的版本 |
 | `case_count` / `concurrency` | 如果 concurrency 很高要小心，后面会讲并发对 wall_ms 的影响 |
 | `totals` | runner 算出的粗糙桶：`pass/fail/denied/timeout/cancelled/error/invalid/aborted`。这 **不是** 你的最终评分，只是起点 |
 
@@ -64,7 +64,7 @@ runs/<yyyy-mm-dd_HH-MM-SS>/
 
 | 字段 | 解读 |
 |---|---|
-| `id` / `form` | 对应 `tests/eval/cases/<id>` 下的 case 文件 |
+| `id` / `form` | 对应 `eval/cases/<id>` 下的 case 文件 |
 | `provider` | 空串表示用了 config.toml 的 default_provider |
 | `exit_code` | atomcode -p 的退出码。0 = 正常；非 0 = atomcode 层面出错（**注意：这不代表任务失败**，仅代表进程没走到干净退出） |
 | `wall_ms` | 挂钟时间。并发运行会导致 wall_ms 之和 > run 真实时长，但单个 case 的 wall_ms 仍然是真实的 |
@@ -132,7 +132,7 @@ atomcode 在 `-p` 模式下的 stdout，就是"模型最终给用户的回复"�
 
 | 操作 | 用途 |
 |---|---|
-| `diff -ru tests/eval/cases/<id>/seed/ runs/<ts>/<id>/cwd/` | 直观看出"agent 到底改了什么 / 新建了什么" |
+| `diff -ru eval/cases/<id>/seed/ eval/runs/<ts>/<id>/cwd/` | 直观看出"agent 到底改了什么 / 新建了什么" |
 | 自己再跑一次验证命令（`python3 <id>/cwd/output.py`、`cargo test --manifest-path <id>/cwd/Cargo.toml`）| **推荐做法**：不要只相信 agent 自己跑的结果，自己重跑一次是最硬的 ground truth |
 | 对比 cwd 下某文件的 sha256 和 seed 下的 | 判断是不是"agent 根本没改" |
 

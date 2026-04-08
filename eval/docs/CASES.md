@@ -1,7 +1,7 @@
 # AtomCode Eval — Case 索引
 
-本文件是 `tests/eval/cases/` 目录下所有 case 的人工可读索引。
-写 case 的规范和运行方式见 [`README.md`](README.md)。
+本文件是 `eval/cases/` 目录下所有 case 的人工可读索引。
+写 case 的规范和运行方式见 [`AUTHORING.md`](AUTHORING.md)。
 
 **最近更新：** 2026-04-07
 **Case 数：** 31（30 个真实 case + 1 个故意非法的 case）
