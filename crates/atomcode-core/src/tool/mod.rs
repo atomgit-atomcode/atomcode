@@ -1,8 +1,10 @@
 pub mod auto_fix;
 pub mod bash;
+pub mod blast_radius;
 pub mod cd;
 pub mod devserver;
 pub mod edit;
+pub mod file_deps;
 pub mod file_history;
 pub mod find_references;
 pub mod glob;
@@ -13,6 +15,9 @@ pub mod read;
 pub mod read_symbol;
 pub mod result_store;
 pub mod search_replace;
+pub mod trace_callers;
+pub mod trace_callees;
+pub mod trace_chain;
 pub mod use_skill;
 pub mod web_fetch;
 pub mod web_search;
@@ -154,6 +159,7 @@ pub struct ToolContext {
     pub working_dir: Arc<RwLock<PathBuf>>,
     pub semantic: Arc<Mutex<crate::semantic::SemanticSearcher>>,
     pub file_history: Arc<Mutex<file_history::FileHistory>>,
+    pub graph: Arc<RwLock<crate::graph::CodeGraph>>,
 }
 
 impl ToolContext {
@@ -166,14 +172,17 @@ impl ToolContext {
             working_dir: Arc::new(RwLock::new(working_dir)),
             semantic: Arc::new(Mutex::new(crate::semantic::SemanticSearcher::new())),
             file_history: Arc::new(Mutex::new(file_history::FileHistory::new(session_id))),
+            graph: Arc::new(RwLock::new(crate::graph::CodeGraph::new())),
         }
     }
 
     /// Create an isolated copy: same working directory value, independent Arc.
-    /// Used when passing context across Agent boundaries (subagents, tests).
+    /// Shares the same graph (read-only for tools) but independent working_dir.
     pub async fn isolate(&self) -> Self {
         let wd = self.working_dir.read().await.clone();
-        Self::new(wd)
+        let mut ctx = Self::new(wd);
+        ctx.graph = self.graph.clone();
+        ctx
     }
 }
 

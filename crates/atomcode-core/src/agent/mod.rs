@@ -338,6 +338,13 @@ impl AgentLoop {
         let skill_registry = std::sync::Arc::new(std::sync::RwLock::new(registry));
         tool_registry.register(Box::new(UseSkillTool { registry: skill_registry.clone() }));
 
+        // Register graph query tools
+        tool_registry.register(Box::new(crate::tool::trace_callers::TraceCallersTool));
+        tool_registry.register(Box::new(crate::tool::trace_callees::TraceCalleesTool));
+        tool_registry.register(Box::new(crate::tool::trace_chain::TraceChainTool));
+        tool_registry.register(Box::new(crate::tool::file_deps::FileDependenciesTool));
+        tool_registry.register(Box::new(crate::tool::blast_radius::BlastRadiusTool));
+
         // Build approval channels for interactive permission flow
         let (approval_req_tx, approval_req_rx) = mpsc::unbounded_channel();
         let (approval_resp_tx, approval_resp_rx) = mpsc::unbounded_channel();

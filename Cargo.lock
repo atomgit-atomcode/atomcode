@@ -122,6 +122,7 @@ version = "2.5.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "bincode",
  "chrono",
  "dirs 6.0.0",
  "futures",
