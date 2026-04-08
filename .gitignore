@@ -45,3 +45,6 @@ config.toml
 /doc/
 backend.log
 .venv-swebench/
+
+# AtomCode local data (graph cache, etc.)
+.atomcode/

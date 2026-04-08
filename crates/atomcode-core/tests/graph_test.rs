@@ -1,5 +1,7 @@
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+
+use tokio::sync::RwLock;
 
 use atomcode_core::graph::{
     indexer::GraphIndexer, persist, resolve, CodeGraph, Edge, EdgeKind, SymbolKind, SymbolNode,
@@ -227,8 +229,8 @@ fn test_rust_call_query() {
     assert_eq!(callees.len(), 3, "expected exactly 3 callees: {:?}", callees);
 }
 
-#[test]
-fn test_indexer_indexes_rust_files() {
+#[tokio::test]
+async fn test_indexer_indexes_rust_files() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
 
@@ -255,9 +257,9 @@ fn test_indexer_indexes_rust_files() {
     let graph = Arc::new(RwLock::new(CodeGraph::new()));
     let mut indexer = GraphIndexer::new(graph.clone(), dir.to_path_buf());
 
-    indexer.index_all();
+    indexer.index_all().await;
 
-    let g = graph.read().unwrap();
+    let g = graph.read().await;
 
     // Should have at least 2 symbols: main and greet
     assert!(
@@ -287,8 +289,8 @@ fn test_indexer_indexes_rust_files() {
     );
 }
 
-#[test]
-fn test_indexer_incremental_update() {
+#[tokio::test]
+async fn test_indexer_incremental_update() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
 
@@ -303,10 +305,10 @@ fn test_indexer_incremental_update() {
     let graph = Arc::new(RwLock::new(CodeGraph::new()));
     let mut indexer = GraphIndexer::new(graph.clone(), dir.to_path_buf());
 
-    indexer.index_all();
+    indexer.index_all().await;
 
     let count_after_first = {
-        let g = graph.read().unwrap();
+        let g = graph.read().await;
         assert!(g.node_count() >= 1, "should have at least 1 symbol after first index");
         g.node_count()
     };
@@ -320,10 +322,10 @@ fn gamma() {}
     )
     .unwrap();
 
-    indexer.index_all();
+    indexer.index_all().await;
 
     let count_after_second = {
-        let g = graph.read().unwrap();
+        let g = graph.read().await;
         g.node_count()
     };
 
@@ -420,4 +422,69 @@ fn test_file_dependents() {
     let dependents = graph.file_dependents(std::path::Path::new("widget.rs"), 3);
     assert_eq!(dependents.len(), 1);
     assert!(dependents.contains(&app_file));
+}
+
+#[tokio::test]
+async fn test_full_pipeline_index_and_query() {
+    let dir = tempfile::tempdir().unwrap();
+
+    std::fs::write(dir.path().join("main.rs"), r#"
+fn main() {
+    let result = handle_request();
+    println!("{}", result);
+}
+"#).unwrap();
+
+    std::fs::write(dir.path().join("handler.rs"), r#"
+pub fn handle_request() -> String {
+    let data = fetch_data();
+    format_response(data)
+}
+
+fn format_response(data: String) -> String {
+    format!("Response: {}", data)
+}
+"#).unwrap();
+
+    std::fs::write(dir.path().join("fetcher.rs"), r#"
+pub fn fetch_data() -> String {
+    "hello".to_string()
+}
+"#).unwrap();
+
+    let graph = Arc::new(RwLock::new(CodeGraph::new()));
+    let mut indexer = GraphIndexer::new(graph.clone(), dir.path().to_path_buf());
+    indexer.index_all().await;
+
+    let g = graph.read().await;
+
+    // Verify: main calls handle_request
+    let mains = g.find_by_name("main");
+    assert!(!mains.is_empty(), "should find 'main'");
+
+    let callees = g.trace_callees(mains[0].id, 3);
+    let callee_names: Vec<String> = callees.iter()
+        .filter_map(|(id, _)| g.node(*id).map(|n| n.name.clone()))
+        .collect();
+    assert!(callee_names.contains(&"handle_request".to_string()),
+        "expected handle_request in callees of main: {:?}", callee_names);
+
+    // Verify: fetch_data callers include handle_request
+    let fetchers = g.find_by_name("fetch_data");
+    if !fetchers.is_empty() {
+        let callers = g.trace_callers(fetchers[0].id, 3);
+        let caller_names: Vec<String> = callers.iter()
+            .filter_map(|(id, _)| g.node(*id).map(|n| n.name.clone()))
+            .collect();
+        assert!(caller_names.contains(&"handle_request".to_string()),
+            "expected handle_request in callers of fetch_data: {:?}", caller_names);
+    }
+
+    // Verify: blast radius of fetcher.rs includes handler.rs
+    let deps = g.file_dependents(&dir.path().join("fetcher.rs"), 3);
+    let dep_names: Vec<String> = deps.iter()
+        .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+        .collect();
+    assert!(dep_names.contains(&"handler.rs".to_string()),
+        "expected handler.rs in dependents of fetcher.rs: {:?}", dep_names);
 }

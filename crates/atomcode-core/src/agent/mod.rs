@@ -306,6 +306,9 @@ pub struct AgentLoop {
     // Skill registry — provides descriptions for system prompt and powers use_skill tool
     skill_registry: std::sync::Arc<std::sync::RwLock<SkillRegistry>>,
 
+    // Code graph background indexer channel
+    reindex_tx: Option<mpsc::UnboundedSender<PathBuf>>,
+
     // Channels
     cmd_rx: mpsc::UnboundedReceiver<AgentCommand>,
     event_tx: mpsc::UnboundedSender<AgentEvent>,
@@ -323,7 +326,7 @@ impl AgentLoop {
         config: Config,
         provider: Box<dyn LlmProvider>,
         mut tool_registry: ToolRegistry,
-        tool_context: ToolContext,
+        mut tool_context: ToolContext,
         conversation: Conversation,
     ) -> (Self, AgentHandle) {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
@@ -333,6 +336,12 @@ impl AgentLoop {
         let working_dir = tool_context.working_dir.try_read()
             .map(|g| g.clone())
             .unwrap_or_else(|_| std::path::PathBuf::from("."));
+
+        // Load persisted code graph from disk and share with ToolContext
+        let graph_path = working_dir.join(".atomcode").join("graph.bin");
+        let code_graph = crate::graph::persist::load(&graph_path);
+        let graph = std::sync::Arc::new(tokio::sync::RwLock::new(code_graph));
+        tool_context.graph = graph.clone();
         let mut registry = SkillRegistry::new();
         registry.reload(&working_dir);
         let skill_registry = std::sync::Arc::new(std::sync::RwLock::new(registry));
@@ -432,6 +441,7 @@ impl AgentLoop {
             active_services: std::collections::HashMap::new(),
             result_store: ToolResultStore::new(ToolResultStore::default_dir()),
             skill_registry,
+            reindex_tx: None,
             cmd_rx,
             event_tx,
         };
@@ -454,6 +464,30 @@ impl AgentLoop {
     pub async fn run(mut self) {
         // Detect already-running dev servers on startup.
         self.detect_running_services().await;
+
+        // Spawn background code graph indexer
+        {
+            let working_dir = self.turn_runner.context.working_dir.read().await.clone();
+            let graph = self.turn_runner.context.graph.clone();
+            let (reindex_tx, mut reindex_rx) = mpsc::unbounded_channel::<PathBuf>();
+            let wd_for_indexer = working_dir.clone();
+            tokio::spawn(async move {
+                let mut indexer = crate::graph::indexer::GraphIndexer::new(
+                    graph.clone(), wd_for_indexer.clone(),
+                );
+                indexer.index_all().await;
+                // Persist after initial indexing
+                let gp = wd_for_indexer.join(".atomcode").join("graph.bin");
+                if let Ok(g) = graph.try_read() {
+                    let _ = crate::graph::persist::save(&g, &gp);
+                }
+                // Listen for reindex requests
+                while let Some(path) = reindex_rx.recv().await {
+                    indexer.reindex_file(&path).await;
+                }
+            });
+            self.reindex_tx = Some(reindex_tx);
+        }
 
         while let Some(cmd) = self.cmd_rx.recv().await {
             match cmd {
@@ -840,6 +874,7 @@ impl AgentLoop {
                 let consecutive_reads = &mut self.consecutive_reads;
                 let targeted_read_count = &mut self.targeted_read_count;
                 let session_files = &mut self.session_files;
+                let reindex_tx = &self.reindex_tx;
 
                 // Tool filtering: diagnosis phase uses read-only tools.
                 // All other turns have full tool access (including edit_file).
@@ -946,6 +981,21 @@ impl AgentLoop {
                                         *consecutive_reads += 1;
                                     } else if matches!(name.as_str(), "edit_file" | "create_file") {
                                         *consecutive_reads = 0;
+                                    }
+                                    // Notify background indexer to reindex edited/created files
+                                    if matches!(name.as_str(), "edit_file" | "create_file") && success {
+                                        if let Some(ref tx) = reindex_tx {
+                                            let path_str = output.lines().next().unwrap_or("")
+                                                .trim_start_matches("Edited ")
+                                                .trim_start_matches("Created new file ")
+                                                .trim_start_matches("Created ")
+                                                .trim_start_matches("Wrote ")
+                                                .trim_start_matches("Overwrote ")
+                                                .split_whitespace().next().unwrap_or("");
+                                            if !path_str.is_empty() {
+                                                let _ = tx.send(PathBuf::from(path_str));
+                                            }
+                                        }
                                     }
                                     let _ = event_tx.send(AgentEvent::ToolCallResult {
                                         name, output, success, duration,

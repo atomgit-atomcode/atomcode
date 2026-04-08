@@ -1,6 +1,8 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+
+use tokio::sync::RwLock;
 
 use ignore::WalkBuilder;
 use tree_sitter::{Parser, Query, QueryCursor, StreamingIterator};
@@ -54,14 +56,14 @@ impl GraphIndexer {
     /// 3. Detect deleted files — remove from graph
     /// 4. Parse dirty files, extract symbols and calls
     /// 5. Resolve calls to edges
-    pub fn index_all(&mut self) {
+    pub async fn index_all(&mut self) {
         let files = self.collect_files();
 
         let current_paths: HashSet<PathBuf> = files.iter().map(|(p, _)| p.clone()).collect();
 
         // Detect deleted files
         let deleted: Vec<PathBuf> = {
-            let graph = self.graph.read().unwrap();
+            let graph = self.graph.read().await;
             graph
                 .file_mtimes
                 .keys()
@@ -72,7 +74,7 @@ impl GraphIndexer {
 
         // Remove deleted files from graph
         if !deleted.is_empty() {
-            let mut graph = self.graph.write().unwrap();
+            let mut graph = self.graph.write().await;
             for path in &deleted {
                 graph.remove_file(path);
             }
@@ -80,7 +82,7 @@ impl GraphIndexer {
 
         // Find dirty/new files by comparing mtimes
         let dirty_files: Vec<(PathBuf, u64)> = {
-            let graph = self.graph.read().unwrap();
+            let graph = self.graph.read().await;
             files
                 .into_iter()
                 .filter(|(path, mtime)| {
@@ -102,7 +104,7 @@ impl GraphIndexer {
         }
 
         // Insert into graph
-        let mut graph = self.graph.write().unwrap();
+        let mut graph = self.graph.write().await;
 
         for (path, mtime, result) in &all_results {
             // Remove old data for this file first
@@ -145,7 +147,7 @@ impl GraphIndexer {
     }
 
     /// Re-index a single file (for live updates after edit).
-    pub fn reindex_file(&mut self, path: &Path) {
+    pub async fn reindex_file(&mut self, path: &Path) {
         let mtime = match std::fs::metadata(path) {
             Ok(meta) => {
                 use std::time::UNIX_EPOCH;
@@ -157,7 +159,7 @@ impl GraphIndexer {
             }
             Err(_) => {
                 // File was deleted
-                let mut graph = self.graph.write().unwrap();
+                let mut graph = self.graph.write().await;
                 graph.remove_file(&path.to_path_buf());
                 return;
             }
@@ -168,7 +170,7 @@ impl GraphIndexer {
             None => return,
         };
 
-        let mut graph = self.graph.write().unwrap();
+        let mut graph = self.graph.write().await;
         let path_buf = path.to_path_buf();
 
         // Remove old data
