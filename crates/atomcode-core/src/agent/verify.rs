@@ -148,7 +148,17 @@ impl AgentLoop {
                             );
                         }
                     } else {
-                        self.conversation.add_user_message("[Auto-compile: PASSED. Continue.]");
+                        // Compile passed without subtask driver.
+                        // If model has already edited files, this is likely task completion.
+                        // Don't say "Continue" — that encourages scope creep.
+                        if self.files_edited_this_turn.is_empty() {
+                            self.conversation.add_user_message("[Auto-compile: PASSED. Continue.]");
+                        } else {
+                            self.conversation.add_user_message(
+                                "[Auto-compile: PASSED. You have made edits and they compile. \
+                                 STOP and summarize what you changed. Do NOT add features the user didn't ask for.]"
+                            );
+                        }
                     }
                 } else {
                     // Compile failed — inject error with source diagnosis

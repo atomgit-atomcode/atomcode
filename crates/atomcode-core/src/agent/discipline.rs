@@ -24,7 +24,11 @@ impl AgentLoop {
                 self.files_edited_this_turn.join(", ")
             };
 
-            let urgency = if self.tool_call_count >= 15 {
+            let urgency = if !self.files_edited_this_turn.is_empty() && self.build_fail_count == 0 && self.tool_call_count >= 12 {
+                "SCOPE CHECK: You already edited files and compile passed. \
+                 Are you still working on the user's original request? \
+                 If yes, continue. If you're adding unrequested features — STOP and summarize NOW."
+            } else if self.tool_call_count >= 15 {
                 "URGENT: You MUST take action NOW. Either edit code, restart a service, or explain the issue to the user."
             } else if self.files_edited_this_turn.is_empty() && self.tool_call_count >= 10 {
                 "STOP diagnosing. Take action NOW: edit code, restart service, or explain to user."

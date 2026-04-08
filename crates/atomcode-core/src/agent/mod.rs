@@ -772,10 +772,13 @@ impl AgentLoop {
                 self.conversation.messages.push(
                     crate::conversation::message::Message::new(
                         crate::conversation::message::Role::System,
-                        "[PLAN BEFORE EDITING] Based on the files you just read, list ALL changes needed. \
-                         For each file, identify EVERY region to modify. \
-                         Then use edit_file with edits array to apply ALL changes to each file in ONE call. \
-                         Do NOT edit a file, then come back to edit it again.",
+                        "[PLAN BEFORE EDITING] STOP. Before ANY edit, output your plan:\n\
+                         1. WHAT: What exactly will you change? (one sentence)\n\
+                         2. FILES: List every file you will modify (file path only)\n\
+                         3. VERIFY: How will you confirm it works? (compile/test/curl)\n\
+                         4. SCOPE: Do NOT add features the user didn't ask for.\n\n\
+                         Then execute the plan. ONE edit per file, use edits array for multiple regions.\n\
+                         When compile passes and your plan is done → summarize and STOP.",
                     )
                 );
             }
