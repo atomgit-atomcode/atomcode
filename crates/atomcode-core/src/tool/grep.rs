@@ -61,12 +61,25 @@ impl Tool for GrepTool {
         let parsed: GrepArgs = serde_json::from_str(args)?;
         let path = parsed.path.as_deref().unwrap_or(".");
 
-        // Graph-first: if pattern is a simple identifier, check graph before ripgrep.
-        // Graph lookup is instant and returns structured results (definition + references + call chain).
-        if is_simple_identifier(&parsed.pattern) {
+        // Graph-first: extract English identifiers from the pattern and check graph.
+        // Handles patterns like "weather|天气" → extract "weather" → graph lookup.
+        // Also handles simple identifiers like "SearchFilter" directly.
+        let graph_query = extract_graph_candidates(&parsed.pattern);
+        if let Some(ref query_word) = graph_query {
             let graph = ctx.graph.read().await;
             if graph.is_ready() {
-                let symbols = graph.find_by_name(&parsed.pattern);
+                // Try exact name match first
+                let mut symbols = graph.find_by_name(query_word);
+                // If no exact match, try partial match (nodes whose name contains the word)
+                if symbols.is_empty() {
+                    symbols = graph.nodes.values()
+                        .filter(|n| {
+                            n.name.to_lowercase().contains(&query_word.to_lowercase())
+                                && matches!(n.kind,
+                                    crate::graph::SymbolKind::Function | crate::graph::SymbolKind::Method)
+                        })
+                        .collect();
+                }
                 if !symbols.is_empty() {
                     let mut out = String::new();
                     for sym in symbols.iter().take(5) {
@@ -319,11 +332,37 @@ impl Tool for GrepTool {
     }
 }
 
-/// Check if a pattern is a simple identifier (no regex special chars).
-/// e.g., "fetch_weather", "SearchFilter", "QueryRouter" → true
-/// e.g., "fetch|query", "error.*line", "def\s+" → false
-fn is_simple_identifier(pattern: &str) -> bool {
-    !pattern.is_empty()
-        && pattern.len() >= 3
-        && pattern.chars().all(|c| c.is_alphanumeric() || c == '_')
+/// Extract the best English identifier candidate from a grep pattern for graph lookup.
+///
+/// Handles all pattern types:
+/// - "fetch_weather" → Some("fetch_weather")        (simple identifier)
+/// - "weather|天气"  → Some("weather")              (extract English from mixed)
+/// - "SearchFilter|from_intent" → Some("SearchFilter")  (pick longest)
+/// - "pub struct QueryIntent" → Some("QueryIntent")     (skip keywords)
+/// - "(科技|财经|体育)" → None                        (pure Chinese, no graph match)
+/// - "error.*line" → Some("error")                    (extract before regex chars)
+fn extract_graph_candidates(pattern: &str) -> Option<String> {
+    // Split on non-identifier characters (|, spaces, regex chars, Chinese, etc.)
+    let skip_keywords = ["pub", "fn", "struct", "enum", "impl", "use", "let", "const",
+        "async", "trait", "type", "mod", "crate", "self", "super", "for", "def", "class",
+        "function", "var", "import", "from", "export"];
+
+    let mut best: Option<String> = None;
+    let mut best_len = 0;
+
+    for word in pattern.split(|c: char| !c.is_ascii_alphanumeric() && c != '_') {
+        let w = word.trim();
+        if w.len() < 3 { continue; }
+        if !w.chars().next().map(|c| c.is_ascii_alphabetic() || c == '_').unwrap_or(false) { continue; }
+        if !w.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') { continue; }
+        if skip_keywords.contains(&w.to_lowercase().as_str()) { continue; }
+
+        // Prefer longer identifiers (more specific)
+        if w.len() > best_len {
+            best = Some(w.to_string());
+            best_len = w.len();
+        }
+    }
+
+    best
 }
