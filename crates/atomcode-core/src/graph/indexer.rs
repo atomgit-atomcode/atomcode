@@ -58,92 +58,73 @@ impl GraphIndexer {
     /// 5. Resolve calls to edges
     pub async fn index_all(&mut self) {
         let files = self.collect_files();
-
         let current_paths: HashSet<PathBuf> = files.iter().map(|(p, _)| p.clone()).collect();
 
-        // Detect deleted files
-        let deleted: Vec<PathBuf> = {
+        // Snapshot mtimes under a short read lock to determine dirty files.
+        let (deleted, dirty_files) = {
             let graph = self.graph.read().await;
-            graph
-                .file_mtimes
-                .keys()
+            let deleted: Vec<PathBuf> = graph.file_mtimes.keys()
                 .filter(|p| !current_paths.contains(*p))
                 .cloned()
-                .collect()
-        };
-
-        // Remove deleted files from graph
-        if !deleted.is_empty() {
-            let mut graph = self.graph.write().await;
-            for path in &deleted {
-                graph.remove_file(path);
-            }
-        }
-
-        // Find dirty/new files by comparing mtimes
-        let dirty_files: Vec<(PathBuf, u64)> = {
-            let graph = self.graph.read().await;
-            files
-                .into_iter()
+                .collect();
+            let dirty: Vec<(PathBuf, u64)> = files.into_iter()
                 .filter(|(path, mtime)| {
-                    match graph.file_mtimes.get(path) {
-                        Some(old_mtime) => *mtime != *old_mtime,
-                        None => true, // new file
-                    }
+                    graph.file_mtimes.get(path) != Some(mtime)
                 })
-                .collect()
+                .collect();
+            (deleted, dirty)
         };
+        // Read lock released here.
 
-        // Parse dirty files and collect results
+        // Parse dirty files OUTSIDE the lock (CPU-intensive, no graph access needed).
         let mut all_results: Vec<(PathBuf, u64, FileParseResult)> = Vec::new();
-
         for (path, mtime) in dirty_files {
             if let Some(result) = self.parse_file(&path) {
                 all_results.push((path, mtime, result));
             }
         }
 
-        // Insert into graph
+        if deleted.is_empty() && all_results.is_empty() {
+            return; // Nothing to update
+        }
+
+        // Single write lock for ALL mutations — atomic from readers' perspective.
+        // Grep/trace_callees will block briefly here but never see partial state.
         let mut graph = self.graph.write().await;
 
-        for (path, mtime, result) in &all_results {
-            // Remove old data for this file first
+        // Remove deleted files
+        for path in &deleted {
             graph.remove_file(path);
+        }
 
-            // Insert symbols
+        // Remove + re-insert dirty files
+        for (path, mtime, result) in &all_results {
+            graph.remove_file(path);
             for sym in &result.symbols {
                 graph.add_symbol(sym.clone());
             }
-
-            // Record mtime
             graph.file_mtimes.insert(path.clone(), *mtime);
         }
 
-        // Resolve calls to edges (second pass, after all symbols are inserted)
+        // Resolve calls to edges (all symbols inserted, safe to resolve)
         for (_path, _mtime, result) in &all_results {
             for raw_call in &result.raw_calls {
-                // Find the caller symbol
                 let caller_candidates = graph.find_by_name(&raw_call.caller_name);
                 let caller_id = caller_candidates.first().map(|s| s.id);
-
                 if let Some(caller_id) = caller_id {
                     let caller_file = graph.node(caller_id).unwrap().file.clone();
-                    // Resolve the callee
                     if let Some(callee_id) =
                         resolve_callee(&graph, &raw_call.callee_name, &caller_file, &[])
                     {
                         graph.add_edge(
                             caller_id,
-                            Edge {
-                                to: callee_id,
-                                kind: EdgeKind::Calls,
-                                line: raw_call.line,
-                            },
+                            Edge { to: callee_id, kind: EdgeKind::Calls, line: raw_call.line },
                         );
                     }
                 }
             }
         }
+        // Write lock released here — graph is fully consistent.
     }
 
     /// Re-index a single file (for live updates after edit).
