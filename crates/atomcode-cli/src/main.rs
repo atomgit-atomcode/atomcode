@@ -116,6 +116,11 @@ struct Cli {
     #[arg(short = 'p', long)]
     prompt: Option<String>,
 
+    /// Read the prompt from a file (alternative to -p). Useful for long prompts
+    /// that would exceed ARG_MAX or whose trailing newlines matter.
+    #[arg(long, value_name = "PATH", conflicts_with = "prompt")]
+    prompt_file: Option<std::path::PathBuf>,
+
     /// Show tool calls, token usage, and turn summary on stderr (headless mode only).
     /// Without this flag, headless output is the assistant reply only — Claude Code -p style.
     #[arg(short = 'v', long)]
@@ -261,8 +266,25 @@ async fn run() -> Result<i32> {
     );
     agent_loop.set_max_turns(cli.max_turns);
 
-    // Headless mode: -p / --prompt triggers non-interactive execution.
-    if let Some(prompt) = cli.prompt.clone() {
+    // Resolve effective prompt: --prompt-file reads from disk; -p is inline.
+    // clap's conflicts_with ensures only one can be given at a time.
+    let effective_prompt: Option<String> = match (cli.prompt.as_ref(), cli.prompt_file.as_ref()) {
+        (Some(p), None) => Some(p.clone()),
+        (None, Some(path)) => {
+            match std::fs::read_to_string(path) {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    eprintln!("error: failed to read --prompt-file {}: {}", path.display(), e);
+                    std::process::exit(2);
+                }
+            }
+        }
+        (None, None) => None,
+        (Some(_), Some(_)) => unreachable!("clap conflicts_with prevents this"),
+    };
+
+    // Headless mode: -p / --prompt-file triggers non-interactive execution.
+    if let Some(prompt) = effective_prompt {
         return run_headless(agent_loop, agent_handle, prompt, cli.provider.as_deref(), cli.verbose).await;
     }
 
@@ -500,5 +522,23 @@ mod tests {
         // function falls back to the raw input rather than panicking.
         let bogus = PathBuf::from("/nonexistent/atomcode-test-path-xyzzy");
         assert_eq!(resolve_working_dir(Some(bogus.clone())), bogus);
+    }
+
+    /// Verify that std::fs::read_to_string reads a temp file correctly,
+    /// which is the core of --prompt-file. This is a unit-level stand-in for
+    /// the integration test (full CLI parse requires a running provider).
+    #[test]
+    fn prompt_file_read_preserves_trailing_newline() {
+        use std::io::Write as _;
+        let path = std::env::temp_dir().join("atomcode_test_prompt_file.txt");
+        let content = "fix the bug\n";
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            f.write_all(content.as_bytes()).unwrap();
+        }
+        let read_back = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(read_back, content,
+            "--prompt-file must preserve trailing newline (unlike bash $(...))");
     }
 }

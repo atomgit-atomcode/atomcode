@@ -201,7 +201,7 @@ START_ISO=$(python3 -c 'from datetime import datetime, timezone; print(datetime.
 atomcode_args=(
     -v
     --max-turns "${EVAL_MAX_TURNS:-30}"
-    -p "$(cat "$PROMPT_FILE")"
+    --prompt-file "$PROMPT_FILE"
 )
 if [ -n "${EVAL_CONFIG_PATH:-}" ]; then
     atomcode_args=(--config "$EVAL_CONFIG_PATH" "${atomcode_args[@]}")
@@ -389,21 +389,24 @@ with open(out, "w", encoding="utf-8") as f:
 PYEOF
 
 # ---------------------------------------------------------------------------
-# Append to predictions.jsonl (atomic append via single line)
+# Per-case prediction (run.sh concatenates these at end of predict phase)
 # ---------------------------------------------------------------------------
-MODEL_NAME="atomcode-$(${EVAL_BIN} --version 2>/dev/null | head -1 | awk '{print $2}' || echo 'unknown')-${EVAL_PROVIDER:-default}-${PROMPT_TEMPLATE}"
-PATCH_CONTENT=$(cat "$CASE_DIR/patch.diff")
+# Quote EVAL_BIN to handle paths with spaces.
+ATOMCODE_VERSION=$("$EVAL_BIN" --version 2>/dev/null | head -1 | awk '{print $2}')
+MODEL_NAME="atomcode-${ATOMCODE_VERSION:-unknown}-${EVAL_PROVIDER:-default}-${PROMPT_TEMPLATE}"
 
-python3 - "$EVAL_RUN_DIR/predictions.jsonl" "$INSTANCE_ID" "$MODEL_NAME" "$PATCH_CONTENT" <<'PYEOF'
+# Pass patch via file path so we don't hit ARG_MAX on big patches (>256KB on macOS).
+python3 - "$CASE_DIR/prediction.json" "$INSTANCE_ID" "$MODEL_NAME" "$CASE_DIR/patch.diff" <<'PYEOF'
 import json, sys
-(_, out, iid, model, patch) = sys.argv
+(_, out, iid, model, patch_path) = sys.argv
+with open(patch_path, "r", encoding="utf-8", errors="replace") as f:
+    patch = f.read()
 pred = {
     "instance_id": iid,
     "model_name_or_path": model,
     "model_patch": patch,
 }
-# Append atomically — a single write of one JSON line.
-with open(out, "a", encoding="utf-8") as f:
+with open(out, "w", encoding="utf-8") as f:
     f.write(json.dumps(pred) + "\n")
 PYEOF
 
