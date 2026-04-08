@@ -525,10 +525,18 @@ fn render_tool_result(lines: &mut Vec<Line<'static>>, result: &ToolResult, expan
     }
 
     // Expanded view: show up to 30 lines of full tool output for recent calls.
-    // Skip if this is a diff result (already shown above) or error (shown above).
+    // Skip: diff results (shown above), errors (shown above), read_file content (too noisy).
     let is_diff_output = result.success && (output.contains("\n- ") || output.contains("\n+ "));
     let is_error = !result.success;
-    if expanded && !is_diff_output && !is_error {
+    // Detect read_file output: lines start with line numbers like "  60|" or "   1|"
+    let is_file_content = output.lines().take(3).any(|l| {
+        let t = l.trim_start();
+        t.len() > 2 && t.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false)
+            && t.contains('|')
+    });
+    // Also detect skeleton output: "[File skeleton: ..."
+    let is_skeleton = output.starts_with("[File skeleton:");
+    if expanded && !is_diff_output && !is_error && !is_file_content && !is_skeleton {
         let output_lines: Vec<&str> = output.lines().collect();
         // Skip the first line (already shown in summary)
         if output_lines.len() > 1 {
