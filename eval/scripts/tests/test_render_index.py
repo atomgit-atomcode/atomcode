@@ -343,5 +343,155 @@ class TestRenderIndex(unittest.TestCase):
         self.assertIn('href="./home/logs/"', detail)
 
 
+class TestRenderSwebench(unittest.TestCase):
+    """Tests for the form=swebench rendering branch."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.tmp_path = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_renders_swebench_row_in_index(self):
+        run_dir = make_run(
+            self.tmp_path,
+            summary={
+                "started_at": "2026-04-08T10:00:00Z",
+                "ended_at": "2026-04-08T10:30:00Z",
+                "status": "done",
+                "atomcode": {
+                    "version_string": "atomcode 2.5.0 (abc1234)",
+                    "binary_path": "/tmp/atomcode",
+                    "binary_sha256": "deadbeef",
+                    "binary_mtime": "2026-04-08T09:00:00Z",
+                },
+                "runner_version": "eval/swebench/run.sh",
+                "case_count": 1,
+                "concurrency": 1,
+                "totals": {"pass": 0, "fail": 0, "denied": 0, "timeout": 0,
+                           "cancelled": 0, "error": 0, "invalid": 0, "aborted": 0,
+                           "predicted": 1},
+            },
+            cases=[],
+        )
+        # Write a swebench case dir manually
+        case_dir = run_dir / "sympy__sympy-20590"
+        case_dir.mkdir()
+        (case_dir / "meta.json").write_text(json.dumps({
+            "id": "sympy__sympy-20590",
+            "form": "swebench",
+            "provider": "siliconflow",
+            "exit_code": 0,
+            "wall_ms": 127000,
+            "timed_out": False,
+            "had_denial": False,
+            "denial_count": 0,
+            "started_at": "2026-04-08T10:00:00Z",
+            "ended_at":   "2026-04-08T10:02:07Z",
+            "run_id": "2026-04-08_10-00-00",
+            "status": "predicted",
+            "swebench": {
+                "repo": "sympy/sympy",
+                "base_commit": "cffd4e0f86fefd4802349a9f9b19ed70934ea354",
+                "prompt_template": "default",
+                "include_hints": False,
+                "dataset_revision": "abcdef",
+                "patch_size_bytes": 1847,
+            },
+            "efficiency": {
+                "turns": 14,
+                "prompt_tokens": 32000,
+                "completion_tokens": 2700,
+                "tool_calls": 18,
+                "tool_breakdown": {"read_file": 7, "grep": 4, "edit_file": 3},
+                "stop_reason": "natural",
+                "estimated_cost_usd": 0.082,
+            },
+        }))
+        (case_dir / "patch.diff").write_text(
+            "diff --git a/sympy/core/symbol.py b/sympy/core/symbol.py\n"
+            "--- a/sympy/core/symbol.py\n"
+            "+++ b/sympy/core/symbol.py\n"
+            "@@ -10,6 +10,7 @@ class Symbol:\n"
+            "+    __slots__ = ()\n"
+            "     pass\n"
+        )
+        (case_dir / "stdout.txt").write_text("Fixed by adding __slots__.")
+        (case_dir / "stderr.txt").write_text(
+            "[tokens] prompt=32000 completion=2700\n"
+            "[done] 127.0s tokens=34700 turns=14 tool_calls=18\n"
+        )
+
+        result = subprocess.run(
+            ["python3", str(RENDER), str(run_dir)],
+            capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(result.returncode, 0, f"stderr: {result.stderr}")
+
+        index = (run_dir / "index.html").read_text()
+        self.assertIn("sympy__sympy-20590", index)
+        self.assertIn("Predicted", index)      # status badge for ungraded instance
+        self.assertIn("14 turns", index)       # efficiency badge
+        self.assertIn("$0.08", index)          # cost badge
+
+        case_html = (case_dir / "case.html").read_text()
+        self.assertIn("sympy/sympy", case_html)
+        self.assertIn("diff-add", case_html)   # patch.diff rendered with syntax coloring
+        self.assertIn("__slots__", case_html)
+
+    def test_resolved_instance_shows_green_badge(self):
+        run_dir = make_run(
+            self.tmp_path,
+            summary={
+                "started_at": "2026-04-08T10:00:00Z",
+                "ended_at": "2026-04-08T11:00:00Z",
+                "status": "done",
+                "atomcode": {
+                    "version_string": "atomcode 2.5.0",
+                    "binary_path": "/tmp/atomcode",
+                    "binary_sha256": "deadbeef",
+                    "binary_mtime": "2026-04-08T09:00:00Z",
+                },
+                "runner_version": "swebench",
+                "case_count": 1,
+                "concurrency": 1,
+                "totals": {"pass": 0, "fail": 0, "denied": 0, "timeout": 0,
+                           "cancelled": 0, "error": 0, "invalid": 0, "aborted": 0,
+                           "resolved": 1},
+            },
+            cases=[],
+        )
+        case_dir = run_dir / "sympy__sympy-1"
+        case_dir.mkdir()
+        (case_dir / "meta.json").write_text(json.dumps({
+            "id": "sympy__sympy-1",
+            "form": "swebench",
+            "status": "resolved",
+            "swebench_resolved": True,
+            "swebench_failure_mode": None,
+            "graded_at": "2026-04-08T11:00:00Z",
+            "provider": "",
+            "exit_code": 0,
+            "wall_ms": 60000,
+            "had_denial": False,
+            "denial_count": 0,
+            "started_at": "2026-04-08T10:00:00Z",
+            "ended_at": "2026-04-08T10:01:00Z",
+            "run_id": "run1",
+            "timed_out": False,
+            "swebench": {"repo":"sympy/sympy","base_commit":"abc","prompt_template":"default","include_hints":False,"dataset_revision":"","patch_size_bytes":100},
+            "efficiency": {"turns":5,"prompt_tokens":10000,"completion_tokens":500,"tool_calls":5,"tool_breakdown":{},"stop_reason":"natural","estimated_cost_usd":0.01},
+        }))
+        (case_dir / "patch.diff").write_text("diff --git a b\n+add\n-del\n")
+        (case_dir / "stdout.txt").write_text("ok")
+        (case_dir / "stderr.txt").write_text("[done] 60s tokens=10500 turns=5 tool_calls=5\n")
+
+        subprocess.run(["python3", str(RENDER), str(run_dir)], check=False)
+        index = (run_dir / "index.html").read_text()
+        self.assertIn("Resolved", index)
+        self.assertIn("resolved", index.lower())
+
+
 if __name__ == "__main__":
     unittest.main()
