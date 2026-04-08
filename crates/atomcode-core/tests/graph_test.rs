@@ -1,7 +1,9 @@
 use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
 
 use atomcode_core::graph::{
-    persist, resolve, CodeGraph, Edge, EdgeKind, SymbolKind, SymbolNode, Visibility,
+    indexer::GraphIndexer, persist, resolve, CodeGraph, Edge, EdgeKind, SymbolKind, SymbolNode,
+    Visibility,
 };
 use atomcode_core::semantic::language::Lang;
 use tree_sitter::StreamingIterator;
@@ -223,4 +225,112 @@ fn test_rust_call_query() {
     assert!(callees.contains(&"baz".to_string()), "missing baz: {:?}", callees);
     assert!(callees.contains(&"method".to_string()), "missing method: {:?}", callees);
     assert_eq!(callees.len(), 3, "expected exactly 3 callees: {:?}", callees);
+}
+
+#[test]
+fn test_indexer_indexes_rust_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+
+    // main.rs calls greet()
+    std::fs::write(
+        dir.join("main.rs"),
+        r#"fn main() {
+    greet();
+}
+"#,
+    )
+    .unwrap();
+
+    // lib.rs defines greet()
+    std::fs::write(
+        dir.join("lib.rs"),
+        r#"pub fn greet() {
+    println!("hello");
+}
+"#,
+    )
+    .unwrap();
+
+    let graph = Arc::new(RwLock::new(CodeGraph::new()));
+    let mut indexer = GraphIndexer::new(graph.clone(), dir.to_path_buf());
+
+    indexer.index_all();
+
+    let g = graph.read().unwrap();
+
+    // Should have at least 2 symbols: main and greet
+    assert!(
+        g.node_count() >= 2,
+        "expected at least 2 symbols, got {}",
+        g.node_count()
+    );
+
+    // Verify greet symbol exists
+    let greets = g.find_by_name("greet");
+    assert!(!greets.is_empty(), "greet symbol not found");
+
+    // Verify main symbol exists
+    let mains = g.find_by_name("main");
+    assert!(!mains.is_empty(), "main symbol not found");
+
+    // Verify main -> greet edge
+    let main_id = mains[0].id;
+    let callees = g.callees(main_id);
+    assert!(callees.is_some(), "main should have callees");
+    let callees = callees.unwrap();
+    let greet_id = greets[0].id;
+    assert!(
+        callees.iter().any(|e| e.to == greet_id),
+        "main should call greet, edges: {:?}",
+        callees
+    );
+}
+
+#[test]
+fn test_indexer_incremental_update() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+
+    // Start with one file
+    std::fs::write(
+        dir.join("first.rs"),
+        r#"fn alpha() {}
+"#,
+    )
+    .unwrap();
+
+    let graph = Arc::new(RwLock::new(CodeGraph::new()));
+    let mut indexer = GraphIndexer::new(graph.clone(), dir.to_path_buf());
+
+    indexer.index_all();
+
+    let count_after_first = {
+        let g = graph.read().unwrap();
+        assert!(g.node_count() >= 1, "should have at least 1 symbol after first index");
+        g.node_count()
+    };
+
+    // Add a second file
+    std::fs::write(
+        dir.join("second.rs"),
+        r#"fn beta() {}
+fn gamma() {}
+"#,
+    )
+    .unwrap();
+
+    indexer.index_all();
+
+    let count_after_second = {
+        let g = graph.read().unwrap();
+        g.node_count()
+    };
+
+    assert!(
+        count_after_second > count_after_first,
+        "symbol count should increase after adding second file: {} vs {}",
+        count_after_second,
+        count_after_first
+    );
 }
