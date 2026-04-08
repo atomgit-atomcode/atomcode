@@ -28,6 +28,13 @@ impl AgentLoop {
                 "SCOPE CHECK: You already edited files and compile passed. \
                  Are you still working on the user's original request? \
                  If yes, continue. If you're adding unrequested features — STOP and summarize NOW."
+            } else if self.files_edited_this_turn.is_empty() && self.tool_call_count >= 20 {
+                "HARD STOP: You have read code for 20+ steps without editing ANYTHING. \
+                 You are going in circles. STOP reading code and do ONE of these:\n\
+                 1. If this is a DESIGN question → explain your analysis to the user, propose 2-3 options, and ASK which approach they prefer.\n\
+                 2. If this is a BUG → state your hypothesis and edit the ONE file you suspect.\n\
+                 3. If you are STUCK → tell the user what you don't understand and ask for help.\n\
+                 Do NOT read another file."
             } else if self.tool_call_count >= 15 {
                 "URGENT: You MUST take action NOW. Either edit code, restart a service, or explain the issue to the user."
             } else if self.files_edited_this_turn.is_empty() && self.tool_call_count >= 10 {

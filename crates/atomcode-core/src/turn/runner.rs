@@ -514,7 +514,14 @@ _ = cancel.cancelled() => {
         let tool = match self.tools.get(&call.name) {
             Some(t) => t,
             None => {
-                let output = format!("Error: unknown tool '{}'", call.name);
+                let available: String = self.tools.iter()
+                    .map(|(name, _)| name.as_ref())
+                    .collect::<Vec<&str>>()
+                    .join(", ");
+                let output = format!(
+                    "Error: unknown tool '{}'. Available tools: {}. Use one of these exact names.",
+                    call.name, available
+                );
                 let _ = event_tx.send(TurnEvent::ToolCallResult {
                     name: call.name.clone(),
                     output: output.clone(),
