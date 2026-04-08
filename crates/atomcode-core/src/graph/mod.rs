@@ -359,9 +359,14 @@ impl CodeGraph {
     }
 
     /// Generate a call chain summary for a function.
+    /// Skips struct/enum/trait nodes (they don't have call edges).
+    /// If multiple functions match, picks the one with the most callees.
     pub fn call_chain_summary(&self, fn_name: &str) -> Option<String> {
         let symbols = self.find_by_name(fn_name);
-        let sym = symbols.first()?;
+        // Filter to functions/methods only, pick the one with most callees
+        let sym = symbols.iter()
+            .filter(|s| matches!(s.kind, SymbolKind::Function | SymbolKind::Method))
+            .max_by_key(|s| self.callees(s.id).map(|e| e.len()).unwrap_or(0))?;
 
         let callees = self.trace_callees(sym.id, 3);
         if callees.is_empty() {

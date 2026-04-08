@@ -310,11 +310,14 @@ impl AgentLoop {
         let domain_keywords = Self::extract_domain_keywords(content);
         for keyword in domain_keywords.iter().take(3) {
             if seen.contains(keyword.as_str()) { continue; }
-            // Search graph nodes for functions containing this keyword
+            // Search graph nodes for FUNCTIONS containing this keyword
+            // Skip structs/enums/traits — they don't have call edges
             let matches: Vec<_> = graph.nodes.values()
                 .filter(|n| {
                     let name_lower = n.name.to_lowercase();
                     name_lower.contains(keyword)
+                        && matches!(n.kind, crate::graph::SymbolKind::Function
+                            | crate::graph::SymbolKind::Method)
                 })
                 .take(2)
                 .collect();
