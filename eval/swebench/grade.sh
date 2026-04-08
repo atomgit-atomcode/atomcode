@@ -106,6 +106,131 @@ echo "  run dir:     $RUN_DIR"
 echo "  to grade:    $GRADE_COUNT instances"
 echo ""
 
-# placeholder for actual grader invocation — task 16 will fill this in
-echo "[stub] would invoke swebench.harness.run_evaluation here"
+# ---------------------------------------------------------------------------
+# Build a filtered predictions subset (only instances we're grading)
+# ---------------------------------------------------------------------------
+FILTERED_PREDS="$RUN_DIR/grading/predictions.filtered.jsonl"
+mkdir -p "$RUN_DIR/grading"
+
+python3 - "$PREDICTIONS_FILE" "$FILTERED_PREDS" <<PYEOF
+import json, sys
+want = set("""$FILTER_INSTANCES""".strip().splitlines())
+with open(sys.argv[1]) as inp, open(sys.argv[2], "w") as out:
+    for line in inp:
+        try:
+            rec = json.loads(line)
+        except Exception:
+            continue
+        if rec.get("instance_id") in want:
+            out.write(line)
+PYEOF
+
+# ---------------------------------------------------------------------------
+# Invoke upstream grader
+# ---------------------------------------------------------------------------
+RUN_ID="$(basename "$RUN_DIR")"
+MAX_WORKERS_ARG=""
+if [ -n "$MAX_WORKERS" ]; then
+    MAX_WORKERS_ARG="--max_workers $MAX_WORKERS"
+fi
+
+echo "[grade] invoking swebench.harness.run_evaluation..."
+python3 -m swebench.harness.run_evaluation \
+    --dataset_name "princeton-nlp/SWE-bench_Verified" \
+    --predictions_path "$FILTERED_PREDS" \
+    --run_id "$RUN_ID" \
+    $MAX_WORKERS_ARG \
+    || {
+        echo "error: swebench.harness.run_evaluation failed" >&2
+        exit 5
+    }
+
+# The harness writes its report to the current working directory as
+# `<run_id>.<model>.json` or similar. Find and normalize it.
+GRADER_OUT=$(find . -maxdepth 2 -name "$RUN_ID*.json" -type f | head -1)
+if [ -z "$GRADER_OUT" ]; then
+    echo "error: could not locate grader output JSON" >&2
+    exit 6
+fi
+
+# Normalize into our grading.json shape
+python3 - "$GRADER_OUT" "$RUN_DIR/grading/grading.json" "$RUN_ID" <<'PYEOF'
+import json, sys
+from datetime import datetime, timezone
+
+src = json.load(open(sys.argv[1]))
+out_path = sys.argv[2]
+run_id = sys.argv[3]
+
+# Upstream report shape varies; handle the common forms.
+resolved_ids = src.get("resolved_ids") or []
+unresolved_ids = src.get("unresolved_ids") or []
+per_instance = {}
+for iid in resolved_ids:
+    per_instance[iid] = {"resolved": True, "failure_mode": None}
+for iid in unresolved_ids:
+    per_instance[iid] = {"resolved": False, "failure_mode": src.get("failure_modes", {}).get(iid, "applied_but_failed")}
+
+totals = {
+    "resolved": len(resolved_ids),
+    "unresolved": len(unresolved_ids),
+    "total": len(resolved_ids) + len(unresolved_ids),
+}
+
+out = {
+    "run_id": run_id,
+    "graded_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00","Z"),
+    "grader_version": "swebench-harness",  # could read from package version
+    "totals": totals,
+    "report": per_instance,
+}
+
+with open(out_path, "w") as f:
+    json.dump(out, f, indent=2)
+PYEOF
+
+# ---------------------------------------------------------------------------
+# Ingest: write results back to per-instance meta.json
+# ---------------------------------------------------------------------------
+python3 "$SCRIPT_DIR/ingest_grading.py" \
+    --run-dir "$RUN_DIR" \
+    --grader-report "$RUN_DIR/grading/grading.json"
+
+# ---------------------------------------------------------------------------
+# Update summary.json with primary_score
+# ---------------------------------------------------------------------------
+python3 - "$RUN_DIR/summary.json" "$RUN_DIR/grading/grading.json" <<'PYEOF'
+import json, sys
+summary_path, grading_path = sys.argv[1], sys.argv[2]
+with open(summary_path) as f:
+    s = json.load(f)
+with open(grading_path) as f:
+    g = json.load(f)
+
+totals = g.get("totals", {})
+resolved = totals.get("resolved", 0)
+unresolved = totals.get("unresolved", 0)
+total = totals.get("total", 0)
+rate = (resolved / total) if total else 0.0
+
+s["swebench"]["primary_score"] = {
+    "resolved": resolved,
+    "unresolved": unresolved,
+    "total": total,
+    "resolved_rate": round(rate, 4),
+}
+
+with open(summary_path, "w") as f:
+    json.dump(s, f, indent=2)
+print(f"primary_score updated: {resolved}/{total} = {rate*100:.1f}%")
+PYEOF
+
+# ---------------------------------------------------------------------------
+# Refresh render_index.py HTML
+# ---------------------------------------------------------------------------
+python3 "$SCRIPT_DIR/../scripts/render_index.py" "$RUN_DIR" 2>/dev/null || true
+
+echo ""
+echo "=== grade complete ==="
+cat "$RUN_DIR/grading/grading.json" | python3 -c 'import json,sys; t=json.load(sys.stdin)["totals"]; print(f"  resolved:   {t[\"resolved\"]}"); print(f"  unresolved: {t[\"unresolved\"]}"); print(f"  total:      {t[\"total\"]}")'
 exit 0
