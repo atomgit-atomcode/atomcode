@@ -82,7 +82,6 @@ impl AgentLoop {
             // Reload code graph for the new project
             let graph_path = resolved.join(".atomcode").join("graph.bin");
             let new_graph = crate::graph::persist::load(&graph_path);
-            eprintln!("[cd] reloaded graph from {:?}: nodes={}", graph_path, new_graph.node_count());
             // Swap graph data (reuse the same Arc, just replace contents)
             {
                 let mut g = self.turn_runner.context.graph.write().await;

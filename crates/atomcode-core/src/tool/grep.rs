@@ -67,18 +67,9 @@ impl Tool for GrepTool {
         let graph_query = extract_graph_candidates(&parsed.pattern);
         if let Some(ref query_word) = graph_query {
             let graph = ctx.graph.read().await;
-            let ready = graph.is_ready();
-            eprintln!(
-                "[grep-graph] pattern='{}' candidate='{}' ready={} nodes={}",
-                parsed.pattern, query_word, ready, graph.node_count()
-            );
-            if ready {
+            if graph.is_ready() {
                 // Try exact name match first
                 let mut symbols = graph.find_by_name(query_word);
-                eprintln!(
-                    "[grep-graph] lookup '{}' exact={} partial={}",
-                    query_word, symbols.len(), symbols.is_empty()
-                );
                 // If no exact match, try partial match (nodes whose name contains the word)
                 if symbols.is_empty() {
                     symbols = graph.nodes.values()

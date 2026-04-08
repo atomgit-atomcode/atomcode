@@ -9,12 +9,7 @@ impl AgentLoop {
     /// Budget: total preread ≤ 25% of remaining context.
     pub(crate) async fn build_preread_context(&mut self, content: &str) -> String {
         let graph = self.turn_runner.context.graph.read().await;
-        eprintln!(
-            "[preread] graph ready={} nodes={} files={}",
-            graph.is_ready(), graph.node_count(), graph.file_count()
-        );
         if !graph.is_ready() {
-            eprintln!("[preread] graph not ready, skipping preread");
             return String::new();
         }
 
@@ -83,12 +78,6 @@ impl AgentLoop {
         }
 
         drop(graph);
-
-        eprintln!(
-            "[preread] chain_files={} {:?}",
-            chain_files.len(),
-            chain_files.iter().map(|p| p.file_name().unwrap_or_default().to_string_lossy().to_string()).collect::<Vec<_>>()
-        );
 
         if chain_files.is_empty() {
             return String::new();
