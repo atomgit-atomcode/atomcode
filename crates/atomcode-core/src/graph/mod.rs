@@ -382,10 +382,8 @@ impl CodeGraph {
             }
         }
         chain.push_str("]\n");
-        chain.push_str("[DEBUG HINT: The bug is in ONE function in this chain. \
-            Start from the LAST function (closest to data source) and check: \
-            does it receive the correct input? Does it return the correct output? \
-            Read ONLY functions in this chain — do not explore other files.]");
+        chain.push_str("[SCOPE: The issue is in ONE of these functions. \
+            Read ONLY these files — do not explore outside this chain.]");
         Some(chain)
     }
 }
