@@ -60,6 +60,81 @@ impl Tool for GrepTool {
     async fn execute(&self, args: &str, ctx: &ToolContext) -> Result<ToolResult> {
         let parsed: GrepArgs = serde_json::from_str(args)?;
         let path = parsed.path.as_deref().unwrap_or(".");
+
+        // Graph-first: if pattern is a simple identifier, check graph before ripgrep.
+        // Graph lookup is instant and returns structured results (definition + references + call chain).
+        if is_simple_identifier(&parsed.pattern) {
+            let graph = ctx.graph.read().await;
+            if graph.is_ready() {
+                let symbols = graph.find_by_name(&parsed.pattern);
+                if !symbols.is_empty() {
+                    let mut out = String::new();
+                    for sym in symbols.iter().take(5) {
+                        let short_file = sym.file.file_name()
+                            .map(|f| f.to_string_lossy().to_string())
+                            .unwrap_or_default();
+                        out.push_str(&format!(
+                            "{} {:?} in {}:{}\n",
+                            sym.name, sym.kind, short_file, sym.start_line
+                        ));
+                    }
+
+                    // Add call chain for functions
+                    let funcs: Vec<_> = symbols.iter()
+                        .filter(|s| matches!(s.kind,
+                            crate::graph::SymbolKind::Function | crate::graph::SymbolKind::Method))
+                        .collect();
+                    if let Some(func) = funcs.first() {
+                        // Callers
+                        let callers = graph.trace_callers(func.id, 2);
+                        if !callers.is_empty() {
+                            out.push_str("\nCalled by:\n");
+                            for (cid, depth) in &callers {
+                                if let Some(n) = graph.node(*cid) {
+                                    let f = n.file.file_name()
+                                        .map(|f| f.to_string_lossy().to_string())
+                                        .unwrap_or_default();
+                                    out.push_str(&format!("  {}{}() ({}:{})\n",
+                                        "  ".repeat(*depth), n.name, f, n.start_line));
+                                }
+                            }
+                        }
+                        // Callees
+                        let callees = graph.trace_callees(func.id, 2);
+                        if !callees.is_empty() {
+                            out.push_str("\nCalls:\n");
+                            for (cid, depth) in &callees {
+                                if let Some(n) = graph.node(*cid) {
+                                    let f = n.file.file_name()
+                                        .map(|f| f.to_string_lossy().to_string())
+                                        .unwrap_or_default();
+                                    out.push_str(&format!("  {}{}() ({}:{})\n",
+                                        "  ".repeat(*depth), n.name, f, n.start_line));
+                                }
+                            }
+                        }
+                    }
+
+                    // Also include file dependency info
+                    if let Some(func) = funcs.first() {
+                        let fname = func.file.file_name()
+                            .map(|f| f.to_string_lossy().to_string())
+                            .unwrap_or_default();
+                        if let Some(dep) = graph.file_dependency_summary(&fname) {
+                            out.push_str(&format!("\n{}\n", dep));
+                        }
+                    }
+
+                    return Ok(ToolResult {
+                        call_id: String::new(),
+                        output: format!("[Graph: {} results for '{}']\n{}", symbols.len(), parsed.pattern, out),
+                        success: true,
+                    });
+                }
+            }
+        }
+
+        // Fallback: normal ripgrep
         let max = parsed.max_results;
         let context_lines = parsed.context.min(10);
 
@@ -242,4 +317,13 @@ impl Tool for GrepTool {
             success: !matches.is_empty(),
         })
     }
+}
+
+/// Check if a pattern is a simple identifier (no regex special chars).
+/// e.g., "fetch_weather", "SearchFilter", "QueryRouter" → true
+/// e.g., "fetch|query", "error.*line", "def\s+" → false
+fn is_simple_identifier(pattern: &str) -> bool {
+    !pattern.is_empty()
+        && pattern.len() >= 3
+        && pattern.chars().all(|c| c.is_alphanumeric() || c == '_')
 }

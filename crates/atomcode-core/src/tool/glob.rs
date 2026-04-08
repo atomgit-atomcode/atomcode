@@ -141,7 +141,27 @@ impl Tool for GlobTool {
         } else {
             let total = files.len();
             let shown: Vec<&str> = files.into_iter().take(100).collect();
-            let mut out = shown.join("\n");
+
+            // Annotate files with graph dependency info (if graph ready and ≤20 files)
+            let graph = ctx.graph.read().await;
+            let annotated = if graph.is_ready() && shown.len() <= 20 {
+                shown.iter().map(|f| {
+                    let fname = std::path::Path::new(f)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    if let Some(dep) = graph.file_dependency_summary(&fname) {
+                        format!("{}  {}", f, dep)
+                    } else {
+                        f.to_string()
+                    }
+                }).collect::<Vec<_>>()
+            } else {
+                shown.iter().map(|f| f.to_string()).collect()
+            };
+            drop(graph);
+
+            let mut out = annotated.join("\n");
             if total > 100 {
                 out.push_str(&format!("\n\n[{} more files not shown]", total - 100));
             }
