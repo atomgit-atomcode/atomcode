@@ -7,10 +7,37 @@ use super::{ApprovalRequirement, Tool, ToolContext, ToolDef, ToolResult};
 
 pub struct ReadFileTool;
 
+/// Deserialize a number that may arrive as a float string (weak models often send "50.0" instead of 50).
+fn deserialize_lenient_usize<'de, D>(deserializer: D) -> std::result::Result<Option<usize>, D::Error>
+where D: serde::Deserializer<'de> {
+    use serde::de;
+    struct V;
+    impl<'de> de::Visitor<'de> for V {
+        type Value = Option<usize>;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result { f.write_str("usize or string") }
+        fn visit_none<E: de::Error>(self) -> std::result::Result<Self::Value, E> { Ok(None) }
+        fn visit_unit<E: de::Error>(self) -> std::result::Result<Self::Value, E> { Ok(None) }
+        fn visit_u64<E: de::Error>(self, v: u64) -> std::result::Result<Self::Value, E> { Ok(Some(v as usize)) }
+        fn visit_i64<E: de::Error>(self, v: i64) -> std::result::Result<Self::Value, E> {
+            if v >= 0 { Ok(Some(v as usize)) } else { Ok(None) }
+        }
+        fn visit_f64<E: de::Error>(self, v: f64) -> std::result::Result<Self::Value, E> { Ok(Some(v as usize)) }
+        fn visit_str<E: de::Error>(self, v: &str) -> std::result::Result<Self::Value, E> {
+            // Handle "50.0" → 50
+            if let Ok(n) = v.trim().parse::<usize>() { return Ok(Some(n)); }
+            if let Ok(f) = v.trim().parse::<f64>() { return Ok(Some(f as usize)); }
+            Ok(None)
+        }
+    }
+    deserializer.deserialize_any(V)
+}
+
 #[derive(Deserialize)]
 struct ReadFileArgs {
     file_path: String,
+    #[serde(default, deserialize_with = "deserialize_lenient_usize")]
     offset: Option<usize>,
+    #[serde(default, deserialize_with = "deserialize_lenient_usize")]
     limit: Option<usize>,
 }
 

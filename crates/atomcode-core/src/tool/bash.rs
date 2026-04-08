@@ -142,9 +142,11 @@ async fn bash_execute(args: &str, ctx: &ToolContext) -> Result<ToolResult> {
                 return Ok(ToolResult {
                     call_id: String::new(),
                     output: format!(
-                        "[BLOCKED] Cannot start {} from atomcode — dev servers need an interactive terminal. \
-                         Tell the user to run this command themselves in a separate terminal:\n  {}\n\
-                         Do NOT retry. Do NOT use nohup. Just tell the user.",
+                        "[BLOCKED] Cannot start {} from atomcode.\n\
+                         Tell the user: run `{}` in a separate terminal.\n\
+                         Do NOT retry this command in any form (nohup, &, background).\n\
+                         Instead: verify your code with `python -c \"import app; print('OK')\"` or `cargo check`.\n\
+                         Then STOP and summarize what you've done.",
                         label, cmd_trimmed
                     ),
                     success: false,
