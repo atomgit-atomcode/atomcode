@@ -304,32 +304,6 @@ impl AgentLoop {
             }
         }
 
-        // Strategy 3: Domain keyword → graph node search
-        // Extract meaningful words from user message, search for graph nodes
-        // whose names contain these keywords (e.g., "天气" → "fetch_weather")
-        let domain_keywords = Self::extract_domain_keywords(content);
-        for keyword in domain_keywords.iter().take(3) {
-            if seen.contains(keyword.as_str()) { continue; }
-            // Search graph nodes for FUNCTIONS containing this keyword
-            // Skip structs/enums/traits — they don't have call edges
-            let matches: Vec<_> = graph.nodes.values()
-                .filter(|n| {
-                    let name_lower = n.name.to_lowercase();
-                    name_lower.contains(keyword)
-                        && matches!(n.kind, crate::graph::SymbolKind::Function
-                            | crate::graph::SymbolKind::Method)
-                })
-                .take(2)
-                .collect();
-            for node in matches {
-                if seen.insert(node.name.clone()) {
-                    if let Some(chain) = graph.call_chain_summary(&node.name) {
-                        injections.push(chain);
-                    }
-                }
-            }
-        }
-
         if injections.is_empty() {
             return content.to_string();
         }
@@ -338,44 +312,4 @@ impl AgentLoop {
         format!("{}\n\n{}", content, injections.join("\n"))
     }
 
-    /// Extract domain keywords from user message for graph node matching.
-    /// Maps Chinese domain terms to English function name fragments.
-    fn extract_domain_keywords(content: &str) -> Vec<String> {
-        let mut keywords = Vec::new();
-
-        // Chinese → English domain keyword mapping
-        let mappings: &[(&[&str], &str)] = &[
-            (&["天气", "气温", "温度", "下雨", "晴"], "weather"),
-            (&["查询", "搜索", "检索"], "query"),
-            (&["路由", "请求", "接口", "api"], "route"),
-            (&["缓存", "cache"], "cache"),
-            (&["数据库", "存储", "索引"], "store"),
-            (&["登录", "认证", "权限"], "auth"),
-            (&["用户", "账号"], "user"),
-            (&["订单", "支付"], "order"),
-            (&["商圈", "poi", "地点", "位置"], "poi"),
-            (&["新闻", "资讯"], "news"),
-            (&["解析", "parser"], "parse"),
-            (&["获取", "抓取", "fetch"], "fetch"),
-        ];
-
-        let lower = content.to_lowercase();
-        for (zh_terms, en_keyword) in mappings {
-            if zh_terms.iter().any(|t| lower.contains(t)) {
-                keywords.push(en_keyword.to_string());
-            }
-        }
-
-        // Also extract English words directly
-        let word_re = regex::Regex::new(r"\b([a-z]{3,})\b")
-            .unwrap_or_else(|_| regex::Regex::new(".^").unwrap());
-        for cap in word_re.captures_iter(&lower) {
-            let w = cap[1].to_string();
-            if !keywords.contains(&w) {
-                keywords.push(w);
-            }
-        }
-
-        keywords
-    }
 }
