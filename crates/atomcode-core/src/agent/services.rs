@@ -78,6 +78,27 @@ impl AgentLoop {
             if let Ok(mut reg) = self.skill_registry.write() {
                 reg.reload(&resolved);
             }
+            // Reload code graph for the new project
+            let graph_path = resolved.join(".atomcode").join("graph.bin");
+            let new_graph = crate::graph::persist::load(&graph_path);
+            eprintln!("[cd] reloaded graph from {:?}: nodes={}", graph_path, new_graph.node_count());
+            // Swap graph data (reuse the same Arc, just replace contents)
+            if let Ok(mut g) = self.turn_runner.context.graph.try_write() {
+                *g = new_graph;
+            }
+            // Spawn new indexer for the new project
+            let graph_clone = self.turn_runner.context.graph.clone();
+            let wd_for_indexer = resolved.clone();
+            tokio::spawn(async move {
+                let mut indexer = crate::graph::indexer::GraphIndexer::new(
+                    graph_clone.clone(), wd_for_indexer.clone(),
+                );
+                indexer.index_all().await;
+                let gp = wd_for_indexer.join(".atomcode").join("graph.bin");
+                if let Ok(g) = graph_clone.try_read() {
+                    let _ = crate::graph::persist::save(&g, &gp);
+                }
+            });
             let _ = self
                 .event_tx
                 .send(AgentEvent::WorkingDirChanged(resolved));
