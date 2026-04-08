@@ -5,7 +5,8 @@
 # the result back into per-instance meta.json and summary.json.
 #
 # Usage:
-#   ./eval/swebench/grade.sh eval/runs/<ts>              # grade all predicted instances
+#   ./eval/swebench/grade.sh eval/runs/<ts>              # grade all predicted (local docker)
+#   ./eval/swebench/grade.sh --modal eval/runs/<ts>      # grade on Modal (no local docker)
 #   ./eval/swebench/grade.sh --regrade eval/runs/<ts>    # re-grade already-graded
 #   ./eval/swebench/grade.sh --instance-id <id> <dir>    # grade single instance
 
@@ -17,13 +18,15 @@ REGRADE=0
 INSTANCE_ID=""
 MAX_WORKERS=""
 RUN_DIR=""
+USE_MODAL=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --regrade)     REGRADE=1; shift ;;
         --instance-id) INSTANCE_ID="$2"; shift 2 ;;
         --max-workers) MAX_WORKERS="$2"; shift 2 ;;
-        --help|-h)     sed -n '2,12p' "$0" | sed 's/^# \?//'; exit 0 ;;
+        --modal)       USE_MODAL=1; shift ;;
+        --help|-h)     sed -n '2,14p' "$0" | sed 's/^# \?//'; exit 0 ;;
         -*)            echo "unknown flag: $1" >&2; exit 2 ;;
         *)             RUN_DIR="$1"; shift ;;
     esac
@@ -46,18 +49,33 @@ if [ ! -f "$PREDICTIONS_FILE" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Precheck: docker + swebench package
+# Precheck: docker (skipped for --modal) + swebench package (+ modal for --modal)
 # ---------------------------------------------------------------------------
-if ! docker info >/dev/null 2>&1; then
-    echo "error: docker daemon is not running" >&2
-    echo "       fix: start Docker Desktop (or systemctl start docker)" >&2
-    exit 4
+if [ "$USE_MODAL" = "0" ]; then
+    if ! docker info >/dev/null 2>&1; then
+        echo "error: docker daemon is not running" >&2
+        echo "       fix: start Docker Desktop, or add --modal to run on Modal.com instead" >&2
+        exit 4
+    fi
 fi
 
 if ! python3 -c 'import swebench' 2>/dev/null; then
     echo "error: python package 'swebench' not installed" >&2
     echo "       fix: pip install swebench" >&2
     exit 4
+fi
+
+if [ "$USE_MODAL" = "1" ]; then
+    if ! python3 -c 'import modal' 2>/dev/null; then
+        echo "error: --modal requires the 'modal' package" >&2
+        echo "       fix: pip install modal && modal token new" >&2
+        exit 4
+    fi
+    if [ ! -f "$HOME/.modal.toml" ]; then
+        echo "error: modal token not configured" >&2
+        echo "       fix: run 'modal token new' to authenticate" >&2
+        exit 4
+    fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -134,12 +152,21 @@ if [ -n "$MAX_WORKERS" ]; then
     MAX_WORKERS_ARG="--max_workers $MAX_WORKERS"
 fi
 
+MODAL_ARG=""
+if [ "$USE_MODAL" = "1" ]; then
+    MODAL_ARG="--modal True"
+    echo "[grade] running on Modal.com (no local docker)"
+else
+    echo "[grade] running on local docker"
+fi
+
 echo "[grade] invoking swebench.harness.run_evaluation..."
 python3 -m swebench.harness.run_evaluation \
     --dataset_name "princeton-nlp/SWE-bench_Verified" \
     --predictions_path "$FILTERED_PREDS" \
     --run_id "$RUN_ID" \
     $MAX_WORKERS_ARG \
+    $MODAL_ARG \
     || {
         echo "error: swebench.harness.run_evaluation failed" >&2
         exit 5
