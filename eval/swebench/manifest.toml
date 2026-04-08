@@ -1,0 +1,41 @@
+# SWE-bench subsystem configuration.
+#
+# Run ./fetch_dataset.py first to populate the [dataset] revision field.
+# Do not edit [dataset] manually unless you know what you're doing — a wrong
+# revision will silently change which instances get graded.
+
+[dataset]
+name = "princeton-nlp/SWE-bench_Verified"
+revision = ""                       # set by fetch_dataset.py first run
+split = "test"
+
+[filter]
+repos = []                          # empty = all repos
+instance_ids = []                   # empty = all instances
+exclude_instance_ids = []
+limit = 0                           # 0 = no limit
+
+[predict]
+prompt_template = "default"
+include_hints = false
+timeout_secs = 600
+concurrency = 4
+max_turns = 30
+abort_on_consecutive_failures = 10
+abort_on_consecutive_denials = 5
+
+[grade]
+max_workers = 8
+timeout_secs = 1800
+
+[cost.providers.siliconflow]
+prompt_per_m = 0.14
+completion_per_m = 0.28
+
+[cost.providers."anthropic-sonnet-4-6"]
+prompt_per_m = 3.00
+completion_per_m = 15.00
+
+[cost.providers.kimi]
+prompt_per_m = 0.20
+completion_per_m = 0.50
