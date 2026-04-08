@@ -160,5 +160,82 @@ STATUS3=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("s
 [ "$STATUS3" = "fail" ] && ok "scenario 3: status=fail" || bad "scenario 3 status wrong: $STATUS3"
 
 echo ""
+echo "=== Scenario 4: run.sh dispatch with 3 fake instances ==="
+
+# Build a fake dataset cache with 3 instances
+FAKE_CACHE_DIR="$TMPROOT/fake-dataset-cache"
+mkdir -p "$FAKE_CACHE_DIR"
+cat > "$FAKE_CACHE_DIR/dataset.json" <<EOF
+{
+  "revision": "fake-rev-abcdef",
+  "instances": [
+    {
+      "instance_id": "fake-owner__fake-repo-10",
+      "repo": "fake-owner/fake-repo",
+      "base_commit": "$BASE_COMMIT",
+      "problem_statement": "FAKE_NATURAL: issue 10",
+      "hints_text": ""
+    },
+    {
+      "instance_id": "fake-owner__fake-repo-11",
+      "repo": "fake-owner/fake-repo",
+      "base_commit": "$BASE_COMMIT",
+      "problem_statement": "FAKE_NATURAL: issue 11",
+      "hints_text": ""
+    },
+    {
+      "instance_id": "fake-owner__fake-repo-12",
+      "repo": "fake-owner/fake-repo",
+      "base_commit": "$BASE_COMMIT",
+      "problem_statement": "FAKE_NATURAL: issue 12",
+      "hints_text": ""
+    }
+  ]
+}
+EOF
+
+# Symlink the fake cache into the swebench dir's cache path
+rm -rf "$SWEBENCH_DIR/cache"
+ln -s "$FAKE_CACHE_DIR" "$SWEBENCH_DIR/cache"
+
+# Symlink the fake bare repo into HOME cache so run.sh finds it (option c fix)
+mkdir -p "$HOME/.cache/atomcode-eval/swebench/repos"
+ln -sf "$TMPCACHE/fake-owner__fake-repo.git" "$HOME/.cache/atomcode-eval/swebench/repos/fake-owner__fake-repo.git"
+
+# Update trap to restore swebench cache dir and clean up HOME cache symlink on exit
+trap 'rm -rf "$TMPROOT"; rm -f "$SWEBENCH_DIR/cache"; mkdir -p "$SWEBENCH_DIR/cache"; touch "$SWEBENCH_DIR/cache/.gitkeep"; rm -f "$HOME/.cache/atomcode-eval/swebench/repos/fake-owner__fake-repo.git"' EXIT
+
+RUN4_DIR="$TMPROOT/runs/run4"
+"$SWEBENCH_DIR/run.sh" \
+    --bin "$FAKE" \
+    --config "" \
+    --runs-dir "$RUN4_DIR/ts" \
+    --concurrency 2 \
+    --provider siliconflow 2>&1 | tail -30
+
+[ -f "$RUN4_DIR/ts/predictions.jsonl" ] && ok "M4: predictions.jsonl created" || bad "M4: predictions.jsonl missing"
+PRED_COUNT=$(wc -l < "$RUN4_DIR/ts/predictions.jsonl" | tr -d ' ')
+[ "$PRED_COUNT" = "3" ] && ok "M4: 3 predictions" || bad "M4: expected 3 predictions, got $PRED_COUNT"
+
+[ -f "$RUN4_DIR/ts/summary.json" ] && ok "M4: summary.json created" || bad "M4: summary.json missing"
+PREDICTED_COUNT=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["totals"].get("predicted",0))' "$RUN4_DIR/ts/summary.json")
+[ "$PREDICTED_COUNT" = "3" ] && ok "M4: 3 predicted" || bad "M4: expected 3 predicted, got $PREDICTED_COUNT"
+
+echo ""
+echo "=== Scenario 5: resume skips completed instances ==="
+
+# Re-run the same dispatch; should skip all 3 (they're already in predictions.jsonl)
+"$SWEBENCH_DIR/run.sh" \
+    --bin "$FAKE" \
+    --config "" \
+    --runs-dir "$RUN4_DIR/ts" \
+    --concurrency 2 \
+    --provider siliconflow 2>&1 | tail -10
+
+# predictions.jsonl line count should still be 3 (no dupes)
+PRED_COUNT2=$(wc -l < "$RUN4_DIR/ts/predictions.jsonl" | tr -d ' ')
+[ "$PRED_COUNT2" = "3" ] && ok "M4: resume skipped completed (still 3 predictions)" || bad "M4: resume broke — got $PRED_COUNT2 predictions"
+
+echo ""
 echo "=== SWE-bench smoke summary: $PASSED pass, $FAILED fail ==="
 [ "$FAILED" = "0" ] && exit 0 || exit 1

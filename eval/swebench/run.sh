@@ -402,7 +402,7 @@ for inst in cache["instances"]:
 PYEOF
 )
 
-printf '%s\n' "$INSTANCE_B64_LIST" | grep -v '^$' | xargs -n1 -P "$CONCURRENCY" -I{} \
+printf '%s\n' "$INSTANCE_B64_LIST" | grep -v '^$' | xargs -n1 -P "$CONCURRENCY" -I{} -S 65536 \
     bash -c '
         [ -f "$EVAL_RUN_DIR/.abort" ] && exit 0
         EVAL_INSTANCE_JSON_B64="$1" "$0" 2>&1 | sed "s|^|  |"
