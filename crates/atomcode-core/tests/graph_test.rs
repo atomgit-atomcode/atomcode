@@ -1,8 +1,10 @@
 use std::path::PathBuf;
 
 use atomcode_core::graph::{
-    persist, CodeGraph, Edge, EdgeKind, SymbolKind, SymbolNode, Visibility,
+    persist, resolve, CodeGraph, Edge, EdgeKind, SymbolKind, SymbolNode, Visibility,
 };
+use atomcode_core::semantic::language::Lang;
+use tree_sitter::StreamingIterator;
 
 fn make_test_symbol(file: &PathBuf, name: &str, line: usize) -> SymbolNode {
     SymbolNode {
@@ -124,4 +126,76 @@ fn test_serialize_roundtrip() {
     assert_eq!(node.name, "round");
     assert_eq!(node.start_line, 5);
     assert!(restored.is_ready());
+}
+
+#[test]
+fn test_resolve_same_file_wins() {
+    let mut graph = CodeGraph::new();
+    let file_a = PathBuf::from("src/a.rs");
+    let file_b = PathBuf::from("src/b.rs");
+
+    let helper_a = make_test_symbol(&file_a, "helper", 10);
+    let helper_b = make_test_symbol(&file_b, "helper", 10);
+    let id_a = helper_a.id;
+
+    graph.add_symbol(helper_a);
+    graph.add_symbol(helper_b);
+
+    // Caller is in file_a, so "helper" in file_a should win
+    let resolved = resolve::resolve_callee(&graph, "helper", &file_a, &[]);
+    assert_eq!(resolved, Some(id_a));
+}
+
+#[test]
+fn test_resolve_import_wins_over_distant() {
+    let mut graph = CodeGraph::new();
+    let file_caller = PathBuf::from("src/app.rs");
+    let file_local = PathBuf::from("lib/utils/date.rs");
+    let file_distant = PathBuf::from("vendor/legacy/date.rs");
+
+    let fmt_local = make_test_symbol(&file_local, "format_date", 5);
+    let fmt_distant = make_test_symbol(&file_distant, "format_date", 5);
+    let id_local = fmt_local.id;
+
+    graph.add_symbol(fmt_local);
+    graph.add_symbol(fmt_distant);
+
+    // "format_date" from file_local is imported
+    let imported = vec!["format_date".to_string()];
+    let resolved = resolve::resolve_callee(&graph, "format_date", &file_caller, &imported);
+    assert_eq!(resolved, Some(id_local));
+}
+
+#[test]
+fn test_rust_call_query() {
+    let source = b"fn main() { foo(); bar::baz(x); obj.method(42); }";
+    let lang = Lang::Rust;
+
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&lang.grammar()).unwrap();
+    let tree = parser.parse(&source[..], None).unwrap();
+
+    let query_src = lang.calls_query().expect("Rust should have a calls query");
+    let query = tree_sitter::Query::new(&lang.grammar(), query_src).unwrap();
+    let mut cursor = tree_sitter::QueryCursor::new();
+
+    let mut matches = cursor.matches(&query, tree.root_node(), &source[..]);
+    let callee_idx = query
+        .capture_index_for_name("callee")
+        .unwrap();
+
+    let mut callees: Vec<String> = Vec::new();
+    while let Some(m) = matches.next() {
+        for cap in m.captures {
+            if cap.index == callee_idx {
+                let name = cap.node.utf8_text(source).unwrap();
+                callees.push(name.to_string());
+            }
+        }
+    }
+
+    assert!(callees.contains(&"foo".to_string()), "missing foo: {:?}", callees);
+    assert!(callees.contains(&"baz".to_string()), "missing baz: {:?}", callees);
+    assert!(callees.contains(&"method".to_string()), "missing method: {:?}", callees);
+    assert_eq!(callees.len(), 3, "expected exactly 3 callees: {:?}", callees);
 }

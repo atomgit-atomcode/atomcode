@@ -52,6 +52,21 @@ impl Lang {
         }
     }
 
+    /// The tree-sitter query for extracting call expressions (callee names).
+    pub fn calls_query(&self) -> Option<&'static str> {
+        match self {
+            Lang::Rust => Some(include_str!("../graph/queries/rust_calls.scm")),
+            Lang::Python => Some(include_str!("../graph/queries/python_calls.scm")),
+            Lang::JavaScript | Lang::TypeScript | Lang::Tsx | Lang::Vue => {
+                Some(include_str!("../graph/queries/javascript_calls.scm"))
+            }
+            Lang::Java => Some(include_str!("../graph/queries/java_calls.scm")),
+            Lang::Go => Some(include_str!("../graph/queries/go_calls.scm")),
+            Lang::C | Lang::Cpp => None,
+            Lang::Html => None,
+        }
+    }
+
     /// Whether this language is a Vue SFC (needs dual parsing).
     pub fn is_vue(&self) -> bool {
         matches!(self, Lang::Vue)
