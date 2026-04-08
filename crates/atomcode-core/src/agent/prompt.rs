@@ -167,6 +167,32 @@ impl AgentLoop {
             prompt.push('\n');
         }
 
+        // Inject previous turn's edited files — helps model avoid re-exploring
+        if !self.prev_turn_edited_files.is_empty() {
+            let files = self.prev_turn_edited_files.join(", ");
+            prompt.push_str(&format!(
+                "\n[Previous turn: you edited {}. If the user reports the same issue, start from these files.]\n",
+                files
+            ));
+        }
+
+        // Inject current task at the very end (recency bias).
+        // The model attends most to the last ~200 tokens of system prompt.
+        // Putting the task here ensures it's the first thing the model "thinks about"
+        // when generating Turn 1 — no more blind glob/grep before reading the task.
+        if !self.current_task.is_empty() {
+            let task_short = if self.current_task.chars().count() > 300 {
+                format!("{}...", self.current_task.chars().take(297).collect::<String>())
+            } else {
+                self.current_task.clone()
+            };
+            prompt.push_str(&format!(
+                "\n=== CURRENT TASK ===\n{}\n\
+                 Act on this task directly. Do NOT search for files you already know about.\n",
+                task_short
+            ));
+        }
+
         prompt
     }
 

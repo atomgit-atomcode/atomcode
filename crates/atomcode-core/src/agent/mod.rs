@@ -270,6 +270,10 @@ pub struct AgentLoop {
     /// Used to detect when the same error recurs after a "fix" attempt.
     last_diagnosed_error: String,
 
+    /// Files edited in the previous turn — injected into system prompt so the model
+    /// knows where to start when the user reports the same issue again.
+    prev_turn_edited_files: Vec<String>,
+
     /// Last git checkpoint ref (SHA) for /undo rollback.
     pub last_checkpoint: Option<String>,
 
@@ -430,6 +434,7 @@ impl AgentLoop {
             category_fail_streak: std::collections::HashMap::new(),
             last_bash_cmd: String::new(),
             last_diagnosed_error: String::new(),
+            prev_turn_edited_files: Vec::new(),
             last_checkpoint: None,
             active_file: None,
             pending_input: None,
@@ -657,6 +662,8 @@ impl AgentLoop {
         self.turn_count = 0;
         self.retry_count = 0;
         self.recent_calls.clear();
+        // Save current turn's edits before clearing — used in next turn's system prompt
+        self.prev_turn_edited_files = self.files_edited_this_turn.clone();
         self.files_read_this_turn.clear();
         self.files_edited_this_turn.clear();
         self.turn_runner.recently_edited_files.clear();

@@ -525,11 +525,31 @@ impl Tool for EditFileTool {
                 }
             }
 
-            // No auto-fix possible — return error with compact context
+            // Auto-fallback to line mode: if we found the approximate location,
+            // suggest the model use start_line/end_line instead of retrying text match.
+            let line_hint = {
+                let old_first = old_string.lines().find(|l| !l.trim().is_empty())
+                    .map(|l| l.trim());
+                let lines: Vec<&str> = content.lines().collect();
+                old_first.and_then(|needle| {
+                    lines.iter().position(|l| l.trim().contains(needle))
+                        .map(|center| {
+                            let old_line_count = old_string.lines().count();
+                            let start = center + 1; // 1-indexed
+                            let end = (center + old_line_count).min(lines.len());
+                            format!(
+                                "\n[TIP: Use line mode instead — edit_file(file_path=\"{}\", \
+                                 start_line={}, end_line={}, new_string=\"...\")]",
+                                parsed.file_path, start, end
+                            )
+                        })
+                }).unwrap_or_default()
+            };
+
             let reread = auto_reread_content(&content, &old_string);
             return Ok(ToolResult {
                 call_id: String::new(),
-                output: format!("Error: old_string not found in {}.\n{}\n{}", parsed.file_path, hint, reread),
+                output: format!("Error: old_string not found in {}.\n{}{}\n{}", parsed.file_path, hint, line_hint, reread),
                 success: false,
             });
         }

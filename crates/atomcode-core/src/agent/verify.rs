@@ -166,20 +166,30 @@ impl AgentLoop {
                     let enhanced = crate::tool::devserver::java::enhance_compile_error(
                         &combined, &compile_dir,
                     );
-                    // Trim to keep context small. Include TS error lines (file:line format).
-                    let error_lines: String = enhanced.lines()
+                    // Extract and deduplicate error lines, grouped by file.
+                    // Goal: model sees ALL errors in one compact view, fixes all at once.
+                    let error_lines: Vec<&str> = enhanced.lines()
                         .filter(|l| {
                             l.contains("[ERROR]") || l.contains(">>>") || l.contains("---")
                             || l.contains("[AUTO") || l.contains("error TS")
-                            || l.contains(": error")
+                            || l.contains(": error") || l.contains("error[E")
                         })
-                        .take(20)
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    let mut msg = if error_lines.is_empty() {
+                        .collect();
+
+                    let error_count = error_lines.len();
+                    let deduped: Vec<&str> = {
+                        let mut seen = std::collections::HashSet::new();
+                        error_lines.into_iter()
+                            .filter(|l| seen.insert(l.trim()))
+                            .take(15)
+                            .collect()
+                    };
+
+                    let mut msg = if deduped.is_empty() {
                         format!("[Auto-compile: FAILED]\n{}", combined.lines().take(15).collect::<Vec<_>>().join("\n"))
                     } else {
-                        format!("[Auto-compile: FAILED]\n{}", error_lines)
+                        format!("[Auto-compile: FAILED — {} errors]\n{}\nFIX ALL errors in ONE edit, then compile again.",
+                            error_count, deduped.join("\n"))
                     };
 
                     // If errors are "unused variable/function" across multiple files,
