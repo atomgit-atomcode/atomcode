@@ -47,7 +47,7 @@ impl AgentLoop {
         }
     }
 
-    pub(crate) fn change_dir(&mut self, path: &str) {
+    pub(crate) async fn change_dir(&mut self, path: &str) {
         let new_path = if path.starts_with('/') {
             std::path::PathBuf::from(path)
         } else if path.starts_with('~') {
@@ -66,7 +66,8 @@ impl AgentLoop {
 
         let resolved = std::fs::canonicalize(&new_path).unwrap_or(new_path);
         if resolved.is_dir() {
-            if let Ok(mut wd) = self.turn_runner.context.working_dir.try_write() {
+            {
+                let mut wd = self.turn_runner.context.working_dir.write().await;
                 *wd = resolved.clone();
             }
             self.project_context_cache = None; // invalidate on dir change
@@ -83,7 +84,8 @@ impl AgentLoop {
             let new_graph = crate::graph::persist::load(&graph_path);
             eprintln!("[cd] reloaded graph from {:?}: nodes={}", graph_path, new_graph.node_count());
             // Swap graph data (reuse the same Arc, just replace contents)
-            if let Ok(mut g) = self.turn_runner.context.graph.try_write() {
+            {
+                let mut g = self.turn_runner.context.graph.write().await;
                 *g = new_graph;
             }
             // Spawn new indexer for the new project

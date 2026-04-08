@@ -585,7 +585,7 @@ impl AgentLoop {
                     }
                 }
                 AgentCommand::ChangeDir(path) => {
-                    self.change_dir(&path);
+                    self.change_dir(&path).await;
                 }
                 AgentCommand::AppendInput(text) => {
                     // Queue user input to be injected before the next LLM call.
