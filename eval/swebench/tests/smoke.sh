@@ -194,16 +194,33 @@ cat > "$FAKE_CACHE_DIR/dataset.json" <<EOF
 }
 EOF
 
-# Symlink the fake cache into the swebench dir's cache path
-rm -rf "$SWEBENCH_DIR/cache"
+# Preserve any real user cache by moving it aside; restored on trap.
+# Without this, running the smoke on a dev machine wipes the user's
+# real dataset.json (300MB+) as a side effect of the symlink swap.
+CACHE_BACKUP=""
+if [ -e "$SWEBENCH_DIR/cache" ] && [ ! -L "$SWEBENCH_DIR/cache" ]; then
+    CACHE_BACKUP="$TMPROOT/cache-backup"
+    mv "$SWEBENCH_DIR/cache" "$CACHE_BACKUP"
+fi
 ln -s "$FAKE_CACHE_DIR" "$SWEBENCH_DIR/cache"
 
 # Symlink the fake bare repo into HOME cache so run.sh finds it (option c fix)
 mkdir -p "$HOME/.cache/atomcode-eval/swebench/repos"
 ln -sf "$TMPCACHE/fake-owner__fake-repo.git" "$HOME/.cache/atomcode-eval/swebench/repos/fake-owner__fake-repo.git"
 
-# Update trap to restore swebench cache dir and clean up HOME cache symlink on exit
-trap 'rm -rf "$TMPROOT"; rm -f "$SWEBENCH_DIR/cache"; mkdir -p "$SWEBENCH_DIR/cache"; touch "$SWEBENCH_DIR/cache/.gitkeep"; rm -f "$HOME/.cache/atomcode-eval/swebench/repos/fake-owner__fake-repo.git"' EXIT
+# Updated trap: restore the user's real cache if we backed one up, otherwise
+# leave a minimal .gitkeep stub. Clean up HOME cache symlink + TMPROOT.
+trap '
+    rm -f "$SWEBENCH_DIR/cache"
+    if [ -n "$CACHE_BACKUP" ] && [ -e "$CACHE_BACKUP" ]; then
+        mv "$CACHE_BACKUP" "$SWEBENCH_DIR/cache"
+    else
+        mkdir -p "$SWEBENCH_DIR/cache"
+        touch "$SWEBENCH_DIR/cache/.gitkeep"
+    fi
+    rm -f "$HOME/.cache/atomcode-eval/swebench/repos/fake-owner__fake-repo.git"
+    rm -rf "$TMPROOT"
+' EXIT
 
 RUN4_DIR="$TMPROOT/runs/run4"
 "$SWEBENCH_DIR/run.sh" \

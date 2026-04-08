@@ -127,6 +127,14 @@ echo "[instance $INSTANCE_ID] repo=$REPO base=${BASE_COMMIT:0:8}" >&2
 mkdir -p "$EVAL_REPO_CACHE"
 BARE_REPO="$EVAL_REPO_CACHE/$REPO_DIR.git"
 
+# Validate existing bare repo: must have a resolvable HEAD. A half-cloned
+# stub (warm-cache killed mid-fetch) passes `[ -d ]` but `git rev-parse HEAD`
+# fails — delete it so we re-clone cleanly.
+if [ -d "$BARE_REPO" ] && ! git -C "$BARE_REPO" rev-parse --quiet --verify HEAD >/dev/null 2>&1; then
+    echo "[instance $INSTANCE_ID] stale/corrupt bare cache, removing: $BARE_REPO" >&2
+    rm -rf "$BARE_REPO"
+fi
+
 if [ ! -d "$BARE_REPO" ]; then
     # Serialize concurrent populators: only one run_one_instance.sh at a
     # time may populate the same bare repo. Other workers block on the
@@ -137,6 +145,7 @@ if [ ! -d "$BARE_REPO" ]; then
             echo "[instance $INSTANCE_ID] first-time bare clone: $REPO" >&2
             if ! git clone --bare "https://github.com/$REPO.git" "$BARE_REPO" 2>>"$CASE_DIR/clone.log"; then
                 echo "[instance $INSTANCE_ID] bare clone failed, see $CASE_DIR/clone.log" >&2
+                rm -rf "$BARE_REPO"  # don't leave a corrupt stub for the next run
                 exit 1
             fi
         fi
@@ -154,6 +163,9 @@ git -C "$BARE_REPO" config gc.auto 0 2>/dev/null || true
 # ---------------------------------------------------------------------------
 # --local --shared: hard-links objects from bare cache via .git/objects/info/alternates.
 # Each per-instance cwd is ~50MB (working tree + tiny index), not 500MB.
+# Wipe any stale cwd from a previous failed attempt on the same instance
+# (resume path). git clone refuses non-empty targets.
+rm -rf "$CWD_DIR"
 if ! git clone --local --shared --quiet "$BARE_REPO" "$CWD_DIR" 2>>"$CASE_DIR/clone.log"; then
     write_error_meta "clone_from_cache_failed" "git clone --local --shared failed"
     exit 0
