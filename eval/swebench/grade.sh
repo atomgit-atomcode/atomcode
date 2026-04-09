@@ -230,7 +230,19 @@ fi
 # The harness writes its report to the current working directory as
 # `<model_name>.<run_id>.json` (e.g. atomcode-2.5.0-default-default.2026-04-08_19-28-44.json).
 # Match by RUN_ID anywhere in the filename, pick the most recently modified.
-GRADER_OUT=$(find . -maxdepth 2 -name "*${RUN_ID}*.json" -type f -exec stat -f "%m %N" {} \; 2>/dev/null | sort -rn | head -1 | awk '{print $2}')
+# Portable: BSD stat uses -f "%m %N"; GNU uses -c '%Y %n'. Python avoids the split.
+GRADER_OUT=$(RUN_ID="$RUN_ID" python3 - <<'PYEOF'
+import glob, os
+run_id = os.environ["RUN_ID"]
+paths = []
+for pattern in (f"./*{run_id}*.json", f"./*/*{run_id}*.json"):
+    paths.extend(p for p in glob.glob(pattern) if os.path.isfile(p))
+if not paths:
+    print("")
+else:
+    print(max(paths, key=lambda p: os.path.getmtime(p)))
+PYEOF
+)
 if [ -z "$GRADER_OUT" ]; then
     # Fall back to the salvaged report (only present when harness crashed/was killed).
     if [ -s "$RUN_DIR/grading/salvaged_report.json" ]; then
