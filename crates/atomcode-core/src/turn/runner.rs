@@ -102,6 +102,13 @@ impl TurnRunner {
         // Pre-inflate stats were misleading (ToolResultRef counted as ~50 tokens,
         // but inflate expands them to 5K-20K).
         let actual_tokens: usize = messages.iter().map(|m| m.estimate_tokens()).sum();
+
+        // Set budget hint for read_file dynamic threshold.
+        // read_file checks this to decide full content vs skeleton.
+        self.context.ctx_budget_hint.store(
+            context_window.saturating_sub(actual_tokens),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         let _ = event_tx.send(TurnEvent::ContextStats {
             system_tokens: ctx_stats.system_tokens,
             hot_tokens: actual_tokens.saturating_sub(ctx_stats.system_tokens),

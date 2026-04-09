@@ -160,6 +160,9 @@ pub struct ToolContext {
     pub semantic: Arc<Mutex<crate::semantic::SemanticSearcher>>,
     pub file_history: Arc<Mutex<file_history::FileHistory>>,
     pub graph: Arc<RwLock<crate::graph::CodeGraph>>,
+    /// Remaining context tokens budget. Set by TurnRunner before each tool batch.
+    /// read_file uses this to decide full content vs skeleton.
+    pub ctx_budget_hint: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl ToolContext {
@@ -172,6 +175,7 @@ impl ToolContext {
             working_dir: Arc::new(RwLock::new(working_dir)),
             semantic: Arc::new(Mutex::new(crate::semantic::SemanticSearcher::new())),
             file_history: Arc::new(Mutex::new(file_history::FileHistory::new(session_id))),
+            ctx_budget_hint: Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX)),
             graph: Arc::new(RwLock::new(crate::graph::CodeGraph::new())),
         }
     }

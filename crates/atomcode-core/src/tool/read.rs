@@ -114,11 +114,13 @@ impl Tool for ReadFileTool {
         let lines: Vec<&str> = content.lines().collect();
         let total_lines = lines.len();
 
-        // Large file auto-skeleton: >200 lines with no offset/limit → return
-        // tree-sitter skeleton instead of full content. Model reads specific
-        // regions via offset/limit or read_symbol after seeing the structure.
-        // 200 lines ≈ 2.5K tok. Files under 200 lines return full content.
-        let auto_skeleton = total_lines > 200
+        // Dynamic skeleton threshold based on remaining context budget.
+        // Full content when ctx has room, skeleton when filling up.
+        // Single file capped at 20% of remaining budget (÷5).
+        let file_tokens = total_lines * 12;
+        let budget = ctx.ctx_budget_hint.load(std::sync::atomic::Ordering::Relaxed);
+        let single_file_limit = budget / 5;
+        let auto_skeleton = file_tokens > single_file_limit
             && parsed.offset.is_none()
             && parsed.limit.is_none();
 
