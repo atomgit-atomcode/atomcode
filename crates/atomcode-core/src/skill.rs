@@ -388,6 +388,10 @@ impl SkillRegistry {
         self.skills.get(name)
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.skills.is_empty()
+    }
+
     /// All skills, regardless of invocation flags.
     pub fn all(&self) -> impl Iterator<Item = &Skill> {
         self.skills.values()

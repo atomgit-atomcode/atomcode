@@ -348,8 +348,13 @@ impl AgentLoop {
         tool_context.graph = graph.clone();
         let mut registry = SkillRegistry::new();
         registry.reload(&working_dir);
+        let has_skills = !registry.is_empty();
         let skill_registry = std::sync::Arc::new(std::sync::RwLock::new(registry));
-        tool_registry.register(Box::new(UseSkillTool { registry: skill_registry.clone() }));
+        // Only register use_skill tool when skills are available.
+        // Otherwise the model invents skill names and wastes turns.
+        if has_skills {
+            tool_registry.register(Box::new(UseSkillTool { registry: skill_registry.clone() }));
+        }
 
         // Register graph query tools
         tool_registry.register(Box::new(crate::tool::trace_callers::TraceCallersTool));
