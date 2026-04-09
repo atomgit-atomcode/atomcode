@@ -18,11 +18,18 @@ limit = 0                           # 0 = no limit
 [predict]
 prompt_template = "default"
 include_hints = false
-timeout_secs = 600
+timeout_secs = 1200
 concurrency = 4
 max_turns = 30
 abort_on_consecutive_failures = 10
 abort_on_consecutive_denials = 5
+# Tools disabled in SWE-bench mode. bash is gone because the eval sandbox
+# can't actually run the project's test suite (no `pip install -e .`, missing
+# system deps), so every bash call is wasted budget — and on this run 134
+# bash calls produced one denial-loop failure (astropy-14508). web_fetch and
+# web_search are disabled because the model occasionally tries to look up the
+# fix on GitHub instead of reasoning from the code.
+disabled_tools = ["bash", "web_fetch", "web_search"]
 
 [grade]
 max_workers = 8

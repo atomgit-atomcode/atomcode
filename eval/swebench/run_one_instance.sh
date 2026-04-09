@@ -119,6 +119,24 @@ HOME_DIR="$CASE_DIR/home"
 
 mkdir -p "$CASE_DIR" "$CWD_DIR" "$HOME_DIR"
 
+# Catch any unexpected early exit (e.g. set -e bailing on a transient git
+# failure) so we leave a breadcrumb for diagnosis instead of a silent empty
+# case dir. The trap is replaced with a no-op once the LLM call begins so
+# normal completion isn't logged as an early exit.
+on_early_exit() {
+    local rc=$?
+    if [ $rc -ne 0 ]; then
+        {
+            echo "early exit rc=$rc at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "instance=$INSTANCE_ID repo=$REPO base=$BASE_COMMIT"
+            echo "stage=$EARLY_STAGE"
+            echo "last command failed before LLM was invoked — likely git/clone/checkout/render error."
+        } > "$CASE_DIR/early_exit.log" 2>/dev/null || true
+    fi
+}
+EARLY_STAGE="init"
+trap on_early_exit EXIT
+
 echo "[instance $INSTANCE_ID] repo=$REPO base=${BASE_COMMIT:0:8}" >&2
 
 # ---------------------------------------------------------------------------
@@ -135,6 +153,7 @@ if [ -d "$BARE_REPO" ] && ! git -C "$BARE_REPO" rev-parse --quiet --verify HEAD 
     rm -rf "$BARE_REPO"
 fi
 
+EARLY_STAGE="bare_clone"
 if [ ! -d "$BARE_REPO" ]; then
     # Serialize concurrent populators: only one run_one_instance.sh at a
     # time may populate the same bare repo. Other workers block on the
@@ -165,17 +184,20 @@ git -C "$BARE_REPO" config gc.auto 0 2>/dev/null || true
 # Each per-instance cwd is ~50MB (working tree + tiny index), not 500MB.
 # Wipe any stale cwd from a previous failed attempt on the same instance
 # (resume path). git clone refuses non-empty targets.
+EARLY_STAGE="clone_from_cache"
 rm -rf "$CWD_DIR"
 if ! git clone --local --shared --quiet "$BARE_REPO" "$CWD_DIR" 2>>"$CASE_DIR/clone.log"; then
     write_error_meta "clone_from_cache_failed" "git clone --local --shared failed"
     exit 0
 fi
 
+EARLY_STAGE="checkout"
 if ! git -C "$CWD_DIR" checkout --quiet "$BASE_COMMIT" 2>>"$CASE_DIR/clone.log"; then
     write_error_meta "checkout_failed" "could not checkout $BASE_COMMIT"
     exit 0
 fi
 
+EARLY_STAGE="git_clean"
 if ! git -C "$CWD_DIR" clean -fdx --quiet 2>>"$CASE_DIR/clone.log"; then
     write_error_meta "clean_failed" "git clean -fdx failed"
     exit 0
@@ -190,6 +212,7 @@ if [ "${EVAL_INCLUDE_HINTS:-false}" = "true" ]; then
     INCLUDE_HINTS_FLAG="--include-hints"
 fi
 
+EARLY_STAGE="render_prompt"
 PROMPT_FILE="$CASE_DIR/prompt.rendered.txt"
 if ! printf '%s' "$INSTANCE_JSON" | python3 "$SCRIPT_DIR/render_prompt.py" \
      --template "$PROMPT_TEMPLATE" \
@@ -205,6 +228,11 @@ printf '%s\n' "$INSTANCE_JSON" > "$CASE_DIR/prompt.md"
 # ---------------------------------------------------------------------------
 # Invoke atomcode
 # ---------------------------------------------------------------------------
+# Past this point any failure is from the LLM/agent itself, not the runner —
+# remove the early-exit trap so we don't mislabel real timeouts.
+trap - EXIT
+EARLY_STAGE="llm_running"
+
 START_MS=$(python3 -c 'import time; print(int(time.time()*1000))')
 START_ISO=$(python3 -c 'from datetime import datetime, timezone; print(datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00","Z"))')
 
@@ -247,13 +275,17 @@ PATCH_SIZE=$(wc -c < "$CASE_DIR/patch.diff" | tr -d ' ')
 # ---------------------------------------------------------------------------
 # Parse stderr for efficiency metrics
 # ---------------------------------------------------------------------------
-# We use a Python helper to read stderr.txt and extract:
-#   - turns (from [done] line)
-#   - prompt_tokens / completion_tokens (sum of all [tokens] lines)
-#   - tool_calls (count of [tool→] lines)
-#   - tool_breakdown (count per tool name)
-#   - stop_reason (from [done] line's optional `stopped=<tag>` suffix; default "natural")
-#   - denial_count (count of [approval-denied] lines)
+# Beyond the cumulative totals, we also extract observability fields that
+# previously cost an analyst (me) two wrong hypotheses to figure out:
+#   - peak_prompt_tokens: max single-call prompt size (≠ cumulative). Tells
+#     you whether the run actually approached the model's context window.
+#   - first_edit_turn: at which [tokens] index the first edit_file/write_file
+#     /search_replace happened. Distinguishes "explorer that never acted"
+#     (django-11433) from "actor that polished too long" (astropy-13977).
+#   - repeated_read_count: how many distinct files were read >= 2 times.
+#     Detects re-read loops.
+#   - tool_call_parse_failures: count of stderr lines matching the model
+#     emitting malformed tool calls. Useful when validating GLM-style models.
 
 METRICS_JSON=$(python3 - "$CASE_DIR/stderr.txt" <<'PYEOF'
 import json, re, sys
@@ -268,47 +300,87 @@ except FileNotFoundError:
 
 prompt_tokens = 0
 completion_tokens = 0
+peak_prompt_tokens = 0
 tool_counts = Counter()
 turns = 0
-stop_reason = "natural"
+turn_count_from_tokens = 0
+stop_reason = None
 denial_count = 0
+saw_done = False
+first_edit_turn = None
+read_file_paths: Counter = Counter()
+tool_call_parse_failures = 0
 
-# [tokens] prompt=N completion=M
+EDIT_TOOLS = {"edit_file", "write_file", "create_file", "search_replace"}
+READ_TOOLS = {"read_file"}
+
 re_tokens = re.compile(r"\[tokens\] prompt=(\d+) completion=(\d+)")
-# [tool→ name args=...]
-re_tool = re.compile(r"\[tool→ (\w+)")
-# [done] <d>s tokens=N turns=M tool_calls=K [stopped=<tag>]
+re_tool = re.compile(r"\[tool→ (\w+)(?: args=(\{.*?\}))?")
 re_done = re.compile(r"\[done\].*turns=(\d+).*tool_calls=(\d+)(?:.*stopped=(\w+))?")
-# [approval-denied]
 re_denied = re.compile(r"\[approval-denied\]")
+# Heuristic for tool-call parse problems. atomcode emits these markers when
+# the model produces structurally-invalid tool_calls JSON or unparseable args.
+re_parse_fail = re.compile(r"\[(tool-parse-error|json-repair|invalid tool call)")
 
 for line in lines:
     m = re_tokens.search(line)
     if m:
-        prompt_tokens += int(m.group(1))
+        p = int(m.group(1))
+        prompt_tokens += p
         completion_tokens += int(m.group(2))
+        if p > peak_prompt_tokens:
+            peak_prompt_tokens = p
+        turn_count_from_tokens += 1
         continue
     m = re_tool.search(line)
     if m:
-        tool_counts[m.group(1)] += 1
+        name = m.group(1)
+        tool_counts[name] += 1
+        if name in EDIT_TOOLS and first_edit_turn is None:
+            # turn_count_from_tokens counts [tokens] lines seen so far; the
+            # current edit happened in the LLM response immediately following
+            # the most recent [tokens] line, so the 1-based turn index is
+            # turn_count_from_tokens.
+            first_edit_turn = turn_count_from_tokens
+        if name in READ_TOOLS and m.group(2):
+            try:
+                args = json.loads(m.group(2))
+                fp = args.get("file_path") if isinstance(args, dict) else None
+                if isinstance(fp, str):
+                    read_file_paths[fp] += 1
+            except Exception:
+                pass
         continue
     m = re_done.search(line)
     if m:
+        saw_done = True
         turns = int(m.group(1))
-        if m.group(3):
-            stop_reason = m.group(3)
+        stop_reason = m.group(3) if m.group(3) else "natural"
         continue
     if re_denied.search(line):
         denial_count += 1
+        continue
+    if re_parse_fail.search(line):
+        tool_call_parse_failures += 1
+
+if not saw_done:
+    turns = turn_count_from_tokens
+    stop_reason = "killed_or_truncated" if turn_count_from_tokens > 0 else "no_llm_call"
+
+repeated_read_count = sum(1 for c in read_file_paths.values() if c >= 2)
 
 json.dump({
     "turns": turns,
     "prompt_tokens": prompt_tokens,
     "completion_tokens": completion_tokens,
+    "peak_prompt_tokens": peak_prompt_tokens,
     "tool_calls": sum(tool_counts.values()),
     "tool_breakdown": dict(tool_counts),
     "stop_reason": stop_reason,
     "denial_count": denial_count,
+    "first_edit_turn": first_edit_turn,
+    "repeated_read_count": repeated_read_count,
+    "tool_call_parse_failures": tool_call_parse_failures,
 }, sys.stdout)
 PYEOF
 )
@@ -330,6 +402,10 @@ ESTIMATED_COST=$(python3 "$SCRIPT_DIR/pricing.py" "${EVAL_PROVIDER:-siliconflow}
 # ---------------------------------------------------------------------------
 # Derive status
 # ---------------------------------------------------------------------------
+# A non-empty patch.diff means the LLM successfully produced code edits,
+# regardless of whether the process exited cleanly. Honour that signal so
+# the grade phase can pick the patch up. Failure modes (timeout/error/etc.)
+# only apply when no patch was captured.
 case "$EXIT_CODE" in
     0)
         if [ "$HAD_DENIAL" = "true" ]; then
@@ -344,6 +420,13 @@ case "$EXIT_CODE" in
     130) STATUS="cancelled" ;;
     *)   STATUS="error" ;;
 esac
+# Promote any non-empty-patch outcome to "predicted" so it reaches the grader.
+# Preserve the original failure tag in failure_reason for analysis.
+FAILURE_REASON=""
+if [ "$STATUS" != "predicted" ] && [ "$STATUS" != "denied" ] && [ "$PATCH_SIZE" -gt 0 ]; then
+    FAILURE_REASON="$STATUS"
+    STATUS="predicted"
+fi
 
 RUN_ID="$(basename "$EVAL_RUN_DIR")"
 
@@ -356,12 +439,12 @@ python3 - \
     "$HAD_DENIAL" "$DENIAL_COUNT" "$START_ISO" "$END_ISO" "$RUN_ID" \
     "$REPO" "$BASE_COMMIT" "$PROMPT_TEMPLATE" "${EVAL_INCLUDE_HINTS:-false}" \
     "${EVAL_DATASET_REVISION:-}" "$PATCH_SIZE" "${EVAL_PROVIDER:-}" \
-    "$ESTIMATED_COST" "$METRICS_JSON" <<'PYEOF'
+    "$ESTIMATED_COST" "$METRICS_JSON" "${FAILURE_REASON:-}" <<'PYEOF'
 import json, sys
 
 (_, out, iid, status, ec, wms, denial_str, dc, start, end, run,
  repo, sha, template, include_hints_str, dataset_rev, patch_size, provider,
- cost_str, metrics_json) = sys.argv
+ cost_str, metrics_json, failure_reason) = sys.argv
 
 metrics = json.loads(metrics_json)
 
@@ -378,6 +461,7 @@ meta = {
     "ended_at": end,
     "run_id": run,
     "status": status,
+    "failure_reason": failure_reason or None,  # set when status was promoted
     "swebench": {
         "repo": repo,
         "base_commit": sha,
@@ -390,9 +474,13 @@ meta = {
         "turns": metrics["turns"],
         "prompt_tokens": metrics["prompt_tokens"],
         "completion_tokens": metrics["completion_tokens"],
+        "peak_prompt_tokens": metrics.get("peak_prompt_tokens", 0),
         "tool_calls": metrics["tool_calls"],
         "tool_breakdown": metrics["tool_breakdown"],
         "stop_reason": metrics["stop_reason"],
+        "first_edit_turn": metrics.get("first_edit_turn"),
+        "repeated_read_count": metrics.get("repeated_read_count", 0),
+        "tool_call_parse_failures": metrics.get("tool_call_parse_failures", 0),
         "estimated_cost_usd": float(cost_str),
     },
 }

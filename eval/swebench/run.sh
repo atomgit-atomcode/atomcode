@@ -183,6 +183,13 @@ ABORT_N_FAIL=$(read_manifest_val "predict.abort_on_consecutive_failures")
 [ -z "$ABORT_N_FAIL" ]    && ABORT_N_FAIL=10
 ABORT_N_DENY=$(read_manifest_val "predict.abort_on_consecutive_denials")
 [ -z "$ABORT_N_DENY" ]    && ABORT_N_DENY=5
+# disabled_tools is a list — flatten to comma-separated for env handoff to atomcode
+DISABLED_TOOLS=$(python3 -c '
+import tomllib
+m = tomllib.load(open("'"$MANIFEST"'", "rb"))
+v = m.get("predict", {}).get("disabled_tools", [])
+print(",".join(v) if isinstance(v, list) else "")
+' 2>/dev/null || echo "")
 
 # ---------------------------------------------------------------------------
 # Filter instances per flags
@@ -246,6 +253,10 @@ else
     fi
 fi
 mkdir -p "$EVAL_RUN_DIR"
+# Force EVAL_RUN_DIR to be absolute. run_one_instance.sh's worker subshell
+# does `cd "$CWD_DIR"` before redirecting stdout/stderr, so any relative
+# CASE_DIR path becomes invalid mid-run and the whole case silently fails.
+EVAL_RUN_DIR="$(cd "$EVAL_RUN_DIR" && pwd)"
 
 # Compute the "skip set" from existing per-case prediction.json files.
 # (We adopted per-case JSON in T7.5 to avoid concurrent append races.
@@ -346,15 +357,18 @@ import json, sys
 files = sys.stdin.read().strip().splitlines()
 if not files:
     sys.exit(0)
+# Healthy outcomes: a predict succeeded ("predicted"), or a previous run was
+# already graded ("resolved"/"unresolved"). Anything else (fail/error/timeout/
+# bare_clone_failed/...) counts toward the consecutive failure streak.
+HEALTHY = {"predicted", "resolved", "unresolved"}
 streak = 0
 for f in files:
     try:
         with open(f) as fp:
             st = json.load(fp).get("status", "")
-        if st not in ("predicted",):
-            streak += 1
-        else:
+        if st in HEALTHY:
             break
+        streak += 1
     except Exception:
         pass
 print(streak)
@@ -387,6 +401,9 @@ export EVAL_TIMEOUT_SECS="$TIMEOUT_SECS"
 export EVAL_MAX_TURNS="$MAX_TURNS"
 export EVAL_PROVIDER="$PROVIDER"
 export EVAL_DATASET_REVISION="$DATASET_REVISION"
+# Forwarded to atomcode via env (the binary reads ATOMCODE_DISABLE_TOOLS in main.rs).
+# Empty string is fine — atomcode treats unset / empty the same.
+export ATOMCODE_DISABLE_TOOLS="$DISABLED_TOOLS"
 export CONCURRENCY
 
 # Build per-instance JSON (base64) then pipe to xargs. Each line is a
@@ -402,7 +419,7 @@ for inst in cache["instances"]:
 PYEOF
 )
 
-printf '%s\n' "$INSTANCE_B64_LIST" | grep -v '^$' | xargs -n1 -P "$CONCURRENCY" -I{} -S 65536 \
+printf '%s\n' "$INSTANCE_B64_LIST" | grep -v '^$' | xargs -n1 -P "$CONCURRENCY" -I{} -S 524288 \
     bash -c '
         [ -f "$EVAL_RUN_DIR/.abort" ] && exit 0
         EVAL_INSTANCE_JSON_B64="$1" "$0" 2>&1 | sed "s|^|  |"
@@ -446,6 +463,36 @@ dataset_rev = sys.argv[3]
 prompt_tpl = sys.argv[4]
 include_hints = sys.argv[5] == "true"
 provider = sys.argv[6]
+
+# Identify the binary that produced this run. The HTML report header expects
+# summary["atomcode"]["version_string" | "binary_path" | "binary_sha256"];
+# without these the header rendered as three "—" placeholders.
+def fingerprint_binary(path: str) -> dict:
+    import hashlib, os, subprocess
+    info = {
+        "binary_path": os.path.abspath(path) if path else None,
+        "version_string": None,
+        "binary_sha256": None,
+    }
+    if not path or not os.path.isfile(path):
+        return info
+    try:
+        out = subprocess.run([path, "--version"], capture_output=True, text=True, timeout=5)
+        v = (out.stdout or out.stderr or "").strip().splitlines()
+        info["version_string"] = v[0] if v else None
+    except Exception:
+        pass
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        info["binary_sha256"] = h.hexdigest()
+    except Exception:
+        pass
+    return info
+
+atomcode_info = fingerprint_binary(bin_path)
 
 # Collect all per-instance meta.json files
 metas = []
@@ -492,9 +539,66 @@ def group_stats(filter_fn):
         "n": len(group),
         "avg_turns": sum(m.get("efficiency", {}).get("turns", 0) for m in group) / len(group),
         "avg_prompt_tokens": sum(m.get("efficiency", {}).get("prompt_tokens", 0) for m in group) / len(group),
+        "avg_peak_prompt_tokens": sum(m.get("efficiency", {}).get("peak_prompt_tokens", 0) for m in group) / len(group),
         "avg_completion_tokens": sum(m.get("efficiency", {}).get("completion_tokens", 0) for m in group) / len(group),
         "avg_wall_seconds": sum(m.get("wall_ms", 0) for m in group) / 1000.0 / len(group),
     }
+
+# Failure-mode classification. Each case lands in exactly one bucket. The
+# point is to make the dominant failure mode of a run obvious at a glance,
+# without anyone having to grep stderr after the fact.
+def classify_failure(m):
+    """Return None if this case is healthy, otherwise a short failure tag."""
+    status = m.get("status", "")
+    sw = m.get("swebench_resolved")
+    if sw is True:
+        return None
+    eff = m.get("efficiency") or {}
+    patch_size = (m.get("swebench") or {}).get("patch_size_bytes", 0) or 0
+    first_edit_turn = eff.get("first_edit_turn")
+    timed_out = (
+        m.get("timed_out", False)
+        or status == "timeout"
+        or eff.get("stop_reason") == "killed_or_truncated"
+    )
+    # Real grader verdict trumps structural inference.
+    if sw is False:
+        return "graded_unresolved"
+    # Empty patch — agent never produced any edits.
+    if patch_size == 0:
+        if first_edit_turn is None and (eff.get("turns") or 0) > 0:
+            return "patch_empty_pure_explore"  # ran turns, never edited (django-11433)
+        if (eff.get("turns") or 0) == 0:
+            return "patch_empty_no_llm_call"   # never even called the model
+        return "patch_empty_other"
+    # Has patch but graded missing — fell into another bucket.
+    if status == "denied":
+        return "denied_by_safety_policy"
+    if timed_out:
+        return "wall_timeout_with_patch"      # patch saved but post-edit verification killed it
+    if status == "fail":
+        return "agent_internal_error"         # exit 1 from atomcode (e.g. stream timeout retries)
+    if sw is None:
+        return "ungraded"                     # has patch but grader did not run it
+    return "unknown"
+
+failure_buckets = defaultdict(int)
+for m in metas:
+    tag = classify_failure(m)
+    if tag is not None:
+        failure_buckets[tag] += 1
+
+first_edit_turns = [
+    m.get("efficiency", {}).get("first_edit_turn") for m in metas
+    if isinstance(m.get("efficiency", {}).get("first_edit_turn"), int)
+]
+avg_first_edit = (sum(first_edit_turns) / len(first_edit_turns)) if first_edit_turns else None
+
+cases_no_edit = sum(
+    1 for m in metas
+    if m.get("efficiency", {}).get("first_edit_turn") is None
+    and (m.get("efficiency", {}).get("turns") or 0) > 0
+)
 
 summary = {
     "started_at": metas[0]["started_at"] if metas else "",
@@ -504,6 +608,7 @@ summary = {
     "case_count": len(metas),
     "concurrency": int(os.environ.get("CONCURRENCY", "4") or 4),
     "totals": dict(totals),
+    "atomcode": atomcode_info,
     "swebench": {
         "dataset": "princeton-nlp/SWE-bench_Verified",
         "dataset_revision": dataset_rev,
@@ -515,15 +620,25 @@ summary = {
         "secondary_metrics": {
             "avg_turns": avg("efficiency.turns"),
             "avg_prompt_tokens": avg("efficiency.prompt_tokens"),
+            "avg_peak_prompt_tokens": avg("efficiency.peak_prompt_tokens"),
             "avg_completion_tokens": avg("efficiency.completion_tokens"),
             "avg_tool_calls": avg("efficiency.tool_calls"),
             "avg_wall_seconds": avg("wall_ms") / 1000.0 if n else 0,
+            "avg_first_edit_turn": avg_first_edit,
+            "cases_with_no_edit": cases_no_edit,
+            "total_repeated_reads": sum(
+                m.get("efficiency", {}).get("repeated_read_count", 0) or 0 for m in metas
+            ),
+            "total_tool_call_parse_failures": sum(
+                m.get("efficiency", {}).get("tool_call_parse_failures", 0) or 0 for m in metas
+            ),
             "total_estimated_cost_usd": round(total_cost, 4),
             "cost_per_resolved_usd": round(cost_per_resolved, 4) if cost_per_resolved else None,
             "by_outcome": {
                 "predicted": group_stats(lambda m: m.get("status") == "predicted"),
                 "failed":    group_stats(lambda m: m.get("status") in ("fail","error","timeout","denied")),
             },
+            "by_failure_mode": dict(failure_buckets),
         },
     },
 }
@@ -565,12 +680,24 @@ for status, count in sorted(s["totals"].items()):
     print(f"  {status:10s}: {count}")
 print()
 print("Secondary (efficiency) metrics:")
-print(f"  avg turns:             {sm['avg_turns']:.1f}")
-print(f"  avg prompt tokens:     {sm['avg_prompt_tokens']:.0f}")
-print(f"  avg completion tokens: {sm['avg_completion_tokens']:.0f}")
-print(f"  avg tool calls:        {sm['avg_tool_calls']:.1f}")
-print(f"  avg wall time:         {sm['avg_wall_seconds']:.1f}s")
-print(f"  estimated cost:        ${sm['total_estimated_cost_usd']:.2f}")
+print(f"  avg turns:               {sm['avg_turns']:.1f}")
+print(f"  avg prompt tokens:       {sm['avg_prompt_tokens']:.0f}  (cumulative across turns)")
+print(f"  avg peak prompt tokens:  {sm.get('avg_peak_prompt_tokens') or 0:.0f}  (single-call max — vs context window)")
+print(f"  avg completion tokens:   {sm['avg_completion_tokens']:.0f}")
+print(f"  avg tool calls:          {sm['avg_tool_calls']:.1f}")
+print(f"  avg wall time:           {sm['avg_wall_seconds']:.1f}s")
+afe = sm.get("avg_first_edit_turn")
+print(f"  avg first edit turn:     {afe:.1f}" if isinstance(afe, (int, float)) else "  avg first edit turn:     n/a")
+print(f"  cases with no edit:      {sm.get('cases_with_no_edit', 0)}")
+print(f"  total repeated reads:    {sm.get('total_repeated_reads', 0)}")
+print(f"  parse failures:          {sm.get('total_tool_call_parse_failures', 0)}")
+print(f"  estimated cost:          ${sm['total_estimated_cost_usd']:.2f}")
 print()
+fb = sm.get("by_failure_mode") or {}
+if fb:
+    print("Failure mode breakdown:")
+    for tag, count in sorted(fb.items(), key=lambda kv: (-kv[1], kv[0])):
+        print(f"  {tag:32s} {count}")
+    print()
 print(f"Next: ./eval/swebench/grade.sh {sys.argv[1].rsplit('/',1)[0]}")
 PYEOF

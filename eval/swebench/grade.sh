@@ -79,8 +79,10 @@ if [ "$USE_MODAL" = "1" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Filter: only instances that are status=predicted and not yet graded
-# (unless --regrade).
+# Filter: any instance with a non-empty patch that has not yet been graded
+# (unless --regrade). The status field is unreliable — a case can have
+# status=timeout (wall-killed during post-edit verification) yet still hold
+# a complete patch.diff. Always trust patch presence over status.
 # ---------------------------------------------------------------------------
 FILTER_INSTANCES=$(python3 - "$RUN_DIR" "$REGRADE" "$INSTANCE_ID" <<'PYEOF'
 import json, os, sys
@@ -100,11 +102,24 @@ for name in sorted(os.listdir(run_dir)):
         continue
     if single and meta.get("id") != single:
         continue
-    if meta.get("status") != "predicted" and meta.get("swebench_resolved") is None:
-        # Non-predicted instances (fail/error/timeout) are not graded
-        continue
     if not regrade and meta.get("swebench_resolved") is not None:
         # Already graded
+        continue
+    # Trust patch presence, not status. A case is gradeable iff it has
+    # a non-empty patch in either patch.diff or prediction.json.
+    patch_size = 0
+    patch_path = os.path.join(case_dir, "patch.diff")
+    if os.path.exists(patch_path):
+        patch_size = os.path.getsize(patch_path)
+    if patch_size == 0:
+        pred_path = os.path.join(case_dir, "prediction.json")
+        if os.path.exists(pred_path):
+            try:
+                with open(pred_path) as f:
+                    patch_size = len(json.load(f).get("model_patch", ""))
+            except Exception:
+                pass
+    if patch_size == 0:
         continue
     selected.append(meta["id"])
 
@@ -161,24 +176,70 @@ else
 fi
 
 echo "[grade] invoking swebench.harness.run_evaluation..."
+# Capture harness output to a log so we can salvage partial results when the
+# upstream grader hangs/crashes/SIGTERMs (e.g. modal sandbox retry storms).
+HARNESS_LOG="$RUN_DIR/grading/harness.log"
+mkdir -p "$RUN_DIR/grading"
+
 python3 -m swebench.harness.run_evaluation \
     --dataset_name "princeton-nlp/SWE-bench_Verified" \
     --predictions_path "$FILTERED_PREDS" \
     --run_id "$RUN_ID" \
     $MAX_WORKERS_ARG \
-    $MODAL_ARG \
-    || {
-        echo "error: swebench.harness.run_evaluation failed" >&2
+    $MODAL_ARG 2>&1 | tee "$HARNESS_LOG"
+HARNESS_RC="${PIPESTATUS[0]}"
+
+if [ "$HARNESS_RC" -ne 0 ]; then
+    echo "warning: swebench.harness.run_evaluation exited $HARNESS_RC — attempting partial salvage from $HARNESS_LOG" >&2
+    # Last-resort: parse "Result for <id>: resolved: True/False" lines from
+    # the harness stdout (these are emitted per case as they finish, even if
+    # the harness itself later crashes or is killed). Build a synthetic
+    # report so the rest of the pipeline can still produce a grading.json.
+    python3 - "$HARNESS_LOG" "$RUN_DIR/grading/salvaged_report.json" "$RUN_ID" <<'PYEOF'
+import json, re, sys
+log_path, out_path, run_id = sys.argv[1:]
+results = {}
+try:
+    with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            m = re.match(r"^Result for (\S+): resolved: (True|False)", line)
+            if m:
+                results[m.group(1)] = m.group(2) == "True"
+except FileNotFoundError:
+    pass
+if not results:
+    print("salvage: no per-case results found in harness log", file=sys.stderr)
+    sys.exit(0)
+report = {
+    "salvaged": True,
+    "salvaged_from": log_path,
+    "resolved_ids":   [i for i, ok in results.items() if ok],
+    "unresolved_ids": [i for i, ok in results.items() if not ok],
+    "error_ids": [],
+}
+with open(out_path, "w") as f:
+    json.dump(report, f, indent=2)
+print(f"salvage: wrote {len(results)} results ({sum(results.values())} resolved) to {out_path}", file=sys.stderr)
+PYEOF
+    if [ ! -s "$RUN_DIR/grading/salvaged_report.json" ]; then
+        echo "error: salvage failed; no usable grading output" >&2
         exit 5
-    }
+    fi
+fi
 
 # The harness writes its report to the current working directory as
 # `<model_name>.<run_id>.json` (e.g. atomcode-2.5.0-default-default.2026-04-08_19-28-44.json).
 # Match by RUN_ID anywhere in the filename, pick the most recently modified.
 GRADER_OUT=$(find . -maxdepth 2 -name "*${RUN_ID}*.json" -type f -exec stat -f "%m %N" {} \; 2>/dev/null | sort -rn | head -1 | awk '{print $2}')
 if [ -z "$GRADER_OUT" ]; then
-    echo "error: could not locate grader output JSON (expected *${RUN_ID}*.json in cwd)" >&2
-    exit 6
+    # Fall back to the salvaged report (only present when harness crashed/was killed).
+    if [ -s "$RUN_DIR/grading/salvaged_report.json" ]; then
+        GRADER_OUT="$RUN_DIR/grading/salvaged_report.json"
+        echo "[grade] using salvaged report (upstream harness produced no JSON)" >&2
+    else
+        echo "error: could not locate grader output JSON (expected *${RUN_ID}*.json in cwd)" >&2
+        exit 6
+    fi
 fi
 echo "[grade] grader report: $GRADER_OUT"
 
