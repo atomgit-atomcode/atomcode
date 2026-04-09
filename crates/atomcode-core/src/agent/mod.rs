@@ -638,6 +638,19 @@ impl AgentLoop {
             .unwrap_or_default();
         self.last_checkpoint = git_checkpoint::create_checkpoint(&wd);
 
+        // Reset ctx_budget_hint to full window at start of each user message.
+        // Without this, the first tool call in a new turn reads the stale budget
+        // from the previous turn's last LLM call (when ctx was full), causing
+        // 670-line files to skeleton when there's plenty of room.
+        let ctx_window = self.config.providers
+            .get(&self.config.default_provider)
+            .map(|p| p.context_window)
+            .unwrap_or(64000);
+        self.turn_runner.context.ctx_budget_hint.store(
+            ctx_window,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+
         self.preread_context = self.build_preread_context(&content).await;
 
         // Auto-diagnose: if user mentions error keywords, scan logs and attach findings.
