@@ -529,12 +529,31 @@ _ = cancel.cancelled() => {
         event_tx: &mpsc::UnboundedSender<TurnEvent>,
     ) -> ToolResult {
         // Auto-fix common tool name aliases (models trained on other agents use different names)
-        let corrected_name = match call.name.as_str() {
+        // Case-insensitive matching: models may output "Run", "Bash", "Edit_File", etc.
+        let name_lower = call.name.to_lowercase();
+        let corrected_name = match name_lower.as_str() {
             "create_file" => "write_file",
             "find" | "find_files" => "glob",
-            "run" | "execute" | "shell" | "terminal" => "bash",
+            "run" | "run_command" | "run_server" | "run_shell" | "run_app"
+                | "execute" | "shell" | "terminal" => "bash",
             "list_files" | "ls" => "list_directory",
-            other => other,
+            "search" => "grep",
+            _ => "",
+        };
+        let corrected_name = if corrected_name.is_empty() {
+            // No alias match — try case-insensitive lookup in registry
+            if self.tools.get(&call.name).is_some() {
+                call.name.as_str()
+            } else if let Some(name) = self.tools.iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(&call.name))
+                .map(|(k, _)| k.as_ref())
+            {
+                name
+            } else {
+                call.name.as_str()
+            }
+        } else {
+            corrected_name
         };
         let tool = match self.tools.get(corrected_name) {
             Some(t) => t,
