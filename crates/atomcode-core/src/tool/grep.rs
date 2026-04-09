@@ -61,98 +61,19 @@ impl Tool for GrepTool {
         let parsed: GrepArgs = serde_json::from_str(args)?;
         let path = parsed.path.as_deref().unwrap_or(".");
 
-        // Graph-first: extract English identifiers from the pattern and check graph.
-        // Handles patterns like "weather|天气" → extract "weather" → graph lookup.
-        // Also handles simple identifiers like "SearchFilter" directly.
-        let graph_query = extract_graph_candidates(&parsed.pattern);
-        if let Some(ref query_word) = graph_query {
-            let graph = ctx.graph.read().await;
-            if graph.is_ready() {
-                // Try exact name match first
-                let mut symbols = graph.find_by_name(query_word);
-                // If no exact match, try partial match (nodes whose name contains the word)
-                if symbols.is_empty() {
-                    symbols = graph.nodes.values()
-                        .filter(|n| {
-                            n.name.to_lowercase().contains(&query_word.to_lowercase())
-                                && matches!(n.kind,
-                                    crate::graph::SymbolKind::Function | crate::graph::SymbolKind::Method)
-                        })
-                        .collect();
-                }
-                if !symbols.is_empty() {
-                    let mut out = String::new();
-                    for sym in symbols.iter().take(5) {
-                        let short_file = sym.file.file_name()
-                            .map(|f| f.to_string_lossy().to_string())
-                            .unwrap_or_default();
-                        out.push_str(&format!(
-                            "{} {:?} in {}:{}\n",
-                            sym.name, sym.kind, short_file, sym.start_line
-                        ));
-                    }
+        let wd = ctx.working_dir.read().await.clone();
 
-                    // Add call chain for functions
-                    let funcs: Vec<_> = symbols.iter()
-                        .filter(|s| matches!(s.kind,
-                            crate::graph::SymbolKind::Function | crate::graph::SymbolKind::Method))
-                        .collect();
-                    if let Some(func) = funcs.first() {
-                        // Callers
-                        let callers = graph.trace_callers(func.id, 2);
-                        if !callers.is_empty() {
-                            out.push_str("\nCalled by:\n");
-                            for (cid, depth) in &callers {
-                                if let Some(n) = graph.node(*cid) {
-                                    let f = n.file.file_name()
-                                        .map(|f| f.to_string_lossy().to_string())
-                                        .unwrap_or_default();
-                                    out.push_str(&format!("  {}{}() ({}:{})\n",
-                                        "  ".repeat(*depth), n.name, f, n.start_line));
-                                }
-                            }
-                        }
-                        // Callees
-                        let callees = graph.trace_callees(func.id, 2);
-                        if !callees.is_empty() {
-                            out.push_str("\nCalls:\n");
-                            for (cid, depth) in &callees {
-                                if let Some(n) = graph.node(*cid) {
-                                    let f = n.file.file_name()
-                                        .map(|f| f.to_string_lossy().to_string())
-                                        .unwrap_or_default();
-                                    out.push_str(&format!("  {}{}() ({}:{})\n",
-                                        "  ".repeat(*depth), n.name, f, n.start_line));
-                                }
-                            }
-                        }
-                    }
+        // Graph enhancement: build a short header when pattern looks like an
+        // identifier and no specific path is given (project-wide search).
+        // The header is prepended to ripgrep results — it never replaces them.
+        let graph_header = if parsed.path.is_none() {
+            self.build_graph_header(&parsed.pattern, ctx, &wd).await
+        } else {
+            None
+        };
 
-                    // Also include file dependency info
-                    if let Some(func) = funcs.first() {
-                        let fname = func.file.file_name()
-                            .map(|f| f.to_string_lossy().to_string())
-                            .unwrap_or_default();
-                        if let Some(dep) = graph.file_dependency_summary(&fname) {
-                            out.push_str(&format!("\n{}\n", dep));
-                        }
-                    }
-
-                    return Ok(ToolResult {
-                        call_id: String::new(),
-                        output: format!("[Graph: {} results for '{}']\n{}", symbols.len(), parsed.pattern, out),
-                        success: true,
-                    });
-                }
-            }
-        }
-
-        // Fallback: normal ripgrep
         let max = parsed.max_results;
         let context_lines = parsed.context.min(10);
-
-        // Resolve path against working directory
-        let wd = ctx.working_dir.read().await.clone();
         let resolved = if std::path::Path::new(path).is_absolute() {
             std::path::PathBuf::from(path)
         } else {
@@ -311,17 +232,22 @@ impl Tool for GrepTool {
         }
         drop(searcher);
 
-        let output = if annotated.is_empty() {
-            let mut msg = format!("No matches found for '{}' in {}", parsed.pattern, path);
-            msg.push_str(&format!(" ({} files searched)", files_searched));
-            msg
+        let mut output = String::new();
+
+        if let Some(header) = graph_header {
+            output.push_str(&header);
+            output.push('\n');
+        }
+
+        if annotated.is_empty() {
+            output.push_str(&format!("No matches found for '{}' in {}", parsed.pattern, path));
+            output.push_str(&format!(" ({} files searched)", files_searched));
         } else {
             let total = annotated.len();
-            let mut out = annotated.join("\n");
+            output.push_str(&annotated.join("\n"));
             if total >= max {
-                out.push_str(&format!("\n\n[Results capped at {} matches]", max));
+                output.push_str(&format!("\n\n[Results capped at {} matches]", max));
             }
-            out
         };
 
         Ok(ToolResult {
@@ -332,32 +258,119 @@ impl Tool for GrepTool {
     }
 }
 
-/// Extract the best English identifier candidate from a grep pattern for graph lookup.
+impl GrepTool {
+    /// Build a short graph-based header for the grep output.
+    /// Returns None if graph is not ready, no identifier is extractable,
+    /// or no symbols match.
+    async fn build_graph_header(
+        &self,
+        pattern: &str,
+        ctx: &ToolContext,
+        wd: &std::path::Path,
+    ) -> Option<String> {
+        let query_word = extract_graph_candidates(pattern)?;
+        let graph = ctx.graph.read().await;
+        if !graph.is_ready() {
+            return None;
+        }
+
+        let symbols = graph.find_by_name(&query_word);
+        if symbols.is_empty() {
+            return None;
+        }
+
+        let mut out = format!("[Graph: {} definitions for '{}']\n", symbols.len(), query_word);
+        for sym in symbols.iter().take(5) {
+            let rel = sym.file.strip_prefix(wd)
+                .unwrap_or(&sym.file)
+                .to_string_lossy();
+            out.push_str(&format!(
+                "  {} {:?} in {}:{}\n",
+                sym.name, sym.kind, rel, sym.start_line
+            ));
+        }
+
+        let funcs: Vec<_> = symbols.iter()
+            .filter(|s| matches!(s.kind,
+                crate::graph::SymbolKind::Function | crate::graph::SymbolKind::Method))
+            .collect();
+        if let Some(func) = funcs.first() {
+            let callers = graph.trace_callers(func.id, 2);
+            if !callers.is_empty() {
+                out.push_str("Called by:\n");
+                for (cid, depth) in &callers {
+                    if let Some(n) = graph.node(*cid) {
+                        let f = n.file.strip_prefix(wd)
+                            .unwrap_or(&n.file)
+                            .to_string_lossy();
+                        out.push_str(&format!("  {}{}() ({}:{})\n",
+                            "  ".repeat(*depth), n.name, f, n.start_line));
+                    }
+                }
+            }
+            let callees = graph.trace_callees(func.id, 2);
+            if !callees.is_empty() {
+                out.push_str("Calls:\n");
+                for (cid, depth) in &callees {
+                    if let Some(n) = graph.node(*cid) {
+                        let f = n.file.strip_prefix(wd)
+                            .unwrap_or(&n.file)
+                            .to_string_lossy();
+                        out.push_str(&format!("  {}{}() ({}:{})\n",
+                            "  ".repeat(*depth), n.name, f, n.start_line));
+                    }
+                }
+            }
+        }
+
+        Some(out)
+    }
+}
+
+/// Extract a likely code identifier from a grep pattern for graph lookup.
 ///
-/// Handles all pattern types:
-/// - "fetch_weather" → Some("fetch_weather")        (simple identifier)
-/// - "weather|天气"  → Some("weather")              (extract English from mixed)
-/// - "SearchFilter|from_intent" → Some("SearchFilter")  (pick longest)
-/// - "pub struct QueryIntent" → Some("QueryIntent")     (skip keywords)
-/// - "(科技|财经|体育)" → None                        (pure Chinese, no graph match)
-/// - "error.*line" → Some("error")                    (extract before regex chars)
+/// Only returns Some when the word strongly resembles a code symbol:
+/// - Contains underscore (snake_case): "fetch_weather" → Some("fetch_weather")
+/// - Contains mixed case (CamelCase): "SearchFilter" → Some("SearchFilter")
+/// - Pure lowercase words like "error", "table", "search" are rejected to
+///   avoid false positives with common English words.
+///
+/// Examples:
+/// - "fetch_weather" → Some("fetch_weather")
+/// - "SearchFilter"  → Some("SearchFilter")
+/// - "NdarrayMixin"  → Some("NdarrayMixin")
+/// - "weather|天气"  → None  (no identifier-like word)
+/// - "Structured ndarray gets viewed" → None  (plain English)
+/// - "error.*line" → None  (too generic)
+/// - "console\\.log" → None  (too generic)
 fn extract_graph_candidates(pattern: &str) -> Option<String> {
-    // Split on non-identifier characters (|, spaces, regex chars, Chinese, etc.)
     let skip_keywords = ["pub", "fn", "struct", "enum", "impl", "use", "let", "const",
         "async", "trait", "type", "mod", "crate", "self", "super", "for", "def", "class",
-        "function", "var", "import", "from", "export"];
+        "function", "var", "import", "from", "export", "return", "match", "where",
+        "static", "mut", "ref", "true", "false", "none", "some", "null", "this",
+        "not", "and", "the", "with"];
 
     let mut best: Option<String> = None;
     let mut best_len = 0;
 
     for word in pattern.split(|c: char| !c.is_ascii_alphanumeric() && c != '_') {
         let w = word.trim();
-        if w.len() < 3 { continue; }
+        if w.len() < 4 { continue; }
         if !w.chars().next().map(|c| c.is_ascii_alphabetic() || c == '_').unwrap_or(false) { continue; }
         if !w.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') { continue; }
         if skip_keywords.contains(&w.to_lowercase().as_str()) { continue; }
 
-        // Prefer longer identifiers (more specific)
+        let has_underscore = w.contains('_');
+        // Require real CamelCase (lower→upper transition like "SearchFilter")
+        // not just a capitalized word ("Structured").
+        let has_camel_transition = w.as_bytes().windows(2).any(|pair| {
+            pair[0].is_ascii_lowercase() && pair[1].is_ascii_uppercase()
+        });
+
+        if !has_underscore && !has_camel_transition {
+            continue;
+        }
+
         if w.len() > best_len {
             best = Some(w.to_string());
             best_len = w.len();
@@ -365,4 +378,77 @@ fn extract_graph_candidates(pattern: &str) -> Option<String> {
     }
 
     best
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extract_graph_candidates;
+
+    #[test]
+    fn snake_case_identifier() {
+        assert_eq!(extract_graph_candidates("fetch_weather"), Some("fetch_weather".into()));
+    }
+
+    #[test]
+    fn camel_case_identifier() {
+        assert_eq!(extract_graph_candidates("SearchFilter"), Some("SearchFilter".into()));
+        assert_eq!(extract_graph_candidates("NdarrayMixin"), Some("NdarrayMixin".into()));
+    }
+
+    #[test]
+    fn mixed_cjk_ascii_no_identifier() {
+        assert_eq!(extract_graph_candidates("weather|天气"), None);
+    }
+
+    #[test]
+    fn plain_english_rejected() {
+        assert_eq!(extract_graph_candidates("Structured ndarray gets viewed"), None);
+        assert_eq!(extract_graph_candidates("error"), None);
+        assert_eq!(extract_graph_candidates("table"), None);
+        assert_eq!(extract_graph_candidates("search"), None);
+        assert_eq!(extract_graph_candidates("console"), None);
+    }
+
+    #[test]
+    fn regex_pattern_rejected() {
+        assert_eq!(extract_graph_candidates("error.*line"), None);
+        assert_eq!(extract_graph_candidates("console\\.log"), None);
+    }
+
+    #[test]
+    fn keywords_rejected() {
+        assert_eq!(extract_graph_candidates("pub struct"), None);
+        assert_eq!(extract_graph_candidates("import from"), None);
+    }
+
+    #[test]
+    fn keyword_then_identifier() {
+        assert_eq!(extract_graph_candidates("pub struct QueryIntent"), Some("QueryIntent".into()));
+        assert_eq!(extract_graph_candidates("def process_data"), Some("process_data".into()));
+    }
+
+    #[test]
+    fn pure_chinese_rejected() {
+        assert_eq!(extract_graph_candidates("(科技|财经|体育)"), None);
+    }
+
+    #[test]
+    fn short_words_rejected() {
+        assert_eq!(extract_graph_candidates("fn"), None);
+        assert_eq!(extract_graph_candidates("FnX"), None); // 3 chars, below threshold of 4
+    }
+
+    #[test]
+    fn or_pattern_picks_best_identifier() {
+        assert_eq!(
+            extract_graph_candidates("SearchFilter|from_intent"),
+            Some("SearchFilter".into()),
+        );
+    }
+
+    #[test]
+    fn not_prefix_rejected() {
+        // "not data_is_mixin" — "not" is a keyword, "data_is_mixin" has underscore → match
+        assert_eq!(extract_graph_candidates("not data_is_mixin"), Some("data_is_mixin".into()));
+    }
 }

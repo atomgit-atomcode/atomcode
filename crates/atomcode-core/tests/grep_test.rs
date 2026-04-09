@@ -93,3 +93,32 @@ async fn test_mixed_cjk_ascii_or() {
     let result = run_grep("搜索|search|keyword", "src", &wd()).await;
     assert!(result.success, "CJK|ASCII OR should find 'search'. Output: {}", result.output);
 }
+
+#[tokio::test]
+async fn test_with_path_always_returns_code_lines() {
+    // When `path` is specified, grep must return actual matching code lines,
+    // never a Graph-only summary. Verify output contains `:` line-number format.
+    let result = run_grep("GrepTool", "src/tool/grep.rs", &wd()).await;
+    assert!(result.success, "should find GrepTool in grep.rs. Output: {}", result.output);
+    assert!(!result.output.starts_with("[Graph:"),
+        "with path specified, output must not be Graph-only. Output: {}", result.output);
+    let has_line_ref = result.output.lines().any(|l| {
+        // ripgrep output format: "file:line:content"
+        let parts: Vec<&str> = l.splitn(3, ':').collect();
+        parts.len() >= 3 && parts[1].parse::<usize>().is_ok()
+    });
+    assert!(has_line_ref, "output must contain file:line:content format. Output: {}", result.output);
+}
+
+#[tokio::test]
+async fn test_no_path_still_returns_code_lines() {
+    // Even without path, ripgrep results should always be present.
+    let result = run_grep_no_path("GrepTool", &wd()).await;
+    assert!(result.success);
+    let has_line_ref = result.output.lines().any(|l| {
+        let parts: Vec<&str> = l.splitn(3, ':').collect();
+        parts.len() >= 3 && parts[1].parse::<usize>().is_ok()
+    });
+    assert!(has_line_ref,
+        "output must contain ripgrep line results even when graph is active. Output: {}", result.output);
+}
