@@ -55,16 +55,16 @@ struct WriteFileArgs {
 impl Tool for WriteFileTool {
     fn definition(&self) -> ToolDef {
         ToolDef {
-            name: "create_file",
-            description: "Create a NEW file. ONLY for files that do NOT exist yet.\n\
-                CANNOT overwrite existing files — use edit_file instead.\n\
-                Parent directories are NOT auto-created — ensure the directory exists first.\n\
-                Uses atomic write (temp file + rename) to prevent corruption.".to_string(),
+            name: "write_file",
+            description: "Write content to a file. Creates new files or overwrites existing ones.\n\
+                Use this for: creating new files, or rewriting an entire file from scratch.\n\
+                For small edits to existing files, prefer edit_file instead.\n\
+                Parent directories are auto-created if they don't exist.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "file_path": { "type": "string", "description": "Absolute path to the new file to create" },
-                    "content": { "type": "string", "description": "The full content for the new file" }
+                    "file_path": { "type": "string", "description": "Absolute path to the file" },
+                    "content": { "type": "string", "description": "The full content to write" }
                 },
                 "required": ["file_path", "content"]
             }),
@@ -95,40 +95,45 @@ impl Tool for WriteFileTool {
         let parsed: WriteFileArgs = serde_json::from_str(args)?;
         let path = std::path::Path::new(&parsed.file_path);
 
-        // Block create_file on existing non-empty files.
-        // Return an error with specific edit_file alternative.
-        let is_overwrite = path.exists() && std::fs::metadata(path).map(|m| m.len() > 0).unwrap_or(false);
-        if is_overwrite {
-            // Count lines to give the model a concrete edit_file alternative
-            let total_lines = std::fs::read_to_string(path)
+        // Backup before write (git checkpoint + file-level backup)
+        ctx.file_history.lock().await.backup_before_write(&parsed.file_path).await;
+
+        // Check if overwriting existing file — build appropriate output message
+        let overwrite_info = if path.exists() {
+            let old_lines = std::fs::read_to_string(path)
                 .map(|c| c.lines().count())
                 .unwrap_or(0);
-            return Ok(ToolResult {
-                call_id: String::new(),
-                output: format!(
-                    "ERROR: Cannot overwrite existing file '{}' ({} lines).\n\
-                     To rewrite a section: edit_file(file_path=\"{}\", start_line=N, end_line=M, new_string=\"...\")\n\
-                     To rewrite the entire file: edit_file(file_path=\"{}\", start_line=1, end_line={}, new_string=\"...\")",
-                    parsed.file_path, total_lines,
-                    parsed.file_path,
-                    parsed.file_path, total_lines,
-                ),
-                success: false,
-            });
-        }
-
-        // Backup file before write (file-level checkpointing).
-        ctx.file_history.lock().await.backup_before_write(&parsed.file_path).await;
+            Some(old_lines)
+        } else {
+            None
+        };
 
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
 
+        let new_lines = parsed.content.lines().count();
         let bytes = parsed.content.len();
-        let lines = parsed.content.lines().count();
         tokio::fs::write(&parsed.file_path, &parsed.content).await?;
 
-        let output = format!("Created new file {} ({} bytes, {} lines)", parsed.file_path, bytes, lines);
+        let output = if let Some(old_lines) = overwrite_info {
+            let diff = new_lines as i64 - old_lines as i64;
+            let sign = if diff >= 0 { "+" } else { "" };
+            let mut msg = format!(
+                "Overwrote {} (was {} lines, now {} lines, {}{})",
+                parsed.file_path, old_lines, new_lines, sign, diff
+            );
+            // Warn if significant content reduction (might have lost code)
+            if old_lines > 20 && new_lines < old_lines / 2 {
+                msg.push_str(&format!(
+                    "\n⚠ WARNING: File shrank by {}%. Verify no important code was lost. Use /undo to revert if needed.",
+                    100 - (new_lines * 100 / old_lines)
+                ));
+            }
+            msg
+        } else {
+            format!("Created new file {} ({} bytes, {} lines)", parsed.file_path, bytes, new_lines)
+        };
 
         Ok(ToolResult {
             call_id: String::new(),
