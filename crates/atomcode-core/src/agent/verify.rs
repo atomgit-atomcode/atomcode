@@ -67,6 +67,7 @@ impl AgentLoop {
     /// Detects the project's compile command and runs it.
     /// Injects result into conversation so model sees errors immediately.
     /// Only runs once per "batch" of edits (tracked by last_compile_at_step).
+    #[allow(dead_code)]
     pub(crate) async fn auto_compile_verify(&mut self) {
         // Only auto-compile for compiled languages (Java/Rust/Go/TS).
         // Skip if we already compiled at this step count.
@@ -274,6 +275,7 @@ impl AgentLoop {
     /// Language-agnostic: works on any file tree-sitter can parse.
     /// Catches bracket mismatches, missing closings, duplicate declarations
     /// that build tools may miss (e.g., Vite doesn't catch Vue SFC syntax errors).
+    #[allow(dead_code)]
     pub(crate) async fn syntax_check_edited_files(&mut self) {
         let wd = self.turn_runner.context.working_dir.try_read()
             .map(|g| g.clone()).unwrap_or_default();
@@ -314,6 +316,7 @@ impl AgentLoop {
     }
 
     /// Snapshot dev server log sizes before an edit, so we can diff after.
+    #[allow(dead_code)]
     pub(crate) fn snapshot_devserver_log_sizes(&self) -> std::collections::HashMap<String, u64> {
         let wd = self.turn_runner.context.working_dir.try_read()
             .map(|g| g.clone()).unwrap_or_default();
@@ -333,6 +336,7 @@ impl AgentLoop {
 
     /// Check dev server logs for NEW errors after editing frontend/backend files.
     /// Only reads lines appended AFTER `pre_sizes` snapshot, ignoring stale errors.
+    #[allow(dead_code)]
     pub(crate) async fn check_devserver_logs(&mut self, pre_sizes: &std::collections::HashMap<String, u64>) {
         let wd = self.turn_runner.context.working_dir.try_read()
             .map(|g| g.clone()).unwrap_or_default();
@@ -390,6 +394,7 @@ impl AgentLoop {
 
     /// No-op: Vue partial edit detection removed. Multi-edit is disabled;
     /// serial edit_file calls with old_string/new_string are the standard approach.
+    #[allow(dead_code)]
     pub(crate) async fn check_vue_partial_edit(&mut self) {
         // Intentionally empty. Kept as stub to avoid changing call sites.
     }

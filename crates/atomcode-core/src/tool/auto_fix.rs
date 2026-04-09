@@ -27,8 +27,8 @@ pub struct ValidateResult {
 /// `post_edit_syntax_check` for on-disk syntax validation.
 /// `content` is the post-edit content (what would be written to disk).
 /// `original_content` is the pre-edit content (for delta validation).
-pub async fn validate_and_fix(content: &str, file_path: &str, new_string: &str, _original_content: &str) -> ValidateResult {
-    let mut warnings: Vec<String> = Vec::new();
+pub async fn validate_and_fix(content: &str, _file_path: &str, _new_string: &str, _original_content: &str) -> ValidateResult {
+    let warnings: Vec<String> = Vec::new();
     let current = content.to_string();
 
     // Duplicate detection REMOVED.
@@ -61,6 +61,7 @@ pub async fn validate_and_fix(content: &str, file_path: &str, new_string: &str, 
 
 /// Count brace {} and bracket [] balance, skipping strings.
 /// Returns (brace_depth, bracket_depth, deepest_brace_line).
+#[allow(dead_code)]
 fn count_delimiters(content: &str) -> (i64, i64, usize) {
     let mut braces = 0i64;
     let mut brackets = 0i64;
@@ -119,6 +120,7 @@ pub fn html_balance_score(content: &str, file_path: &str) -> i64 {
     score
 }
 
+#[allow(dead_code)]
 fn check_html_balance(content: &str, file_path: &str) -> Vec<String> {
     let ext = file_path.rsplit('.').next().unwrap_or("");
     let check_content = if ext == "vue" {
@@ -234,6 +236,7 @@ pub async fn post_edit_syntax_check(file_path: &str) -> String {
 /// Detect if an edit introduced duplicate blocks (a common weak-model failure mode).
 /// Checks if new_string (>= 3 non-blank lines) appears more than once in the result.
 /// Returns a warning string if duplicates found, empty string otherwise.
+#[allow(dead_code)]
 fn detect_duplicate_blocks(new_content: &str, new_string: &str) -> String {
     let sig_lines: Vec<&str> = new_string.lines()
         .map(|l| l.trim())
