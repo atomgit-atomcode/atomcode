@@ -1172,6 +1172,71 @@ impl AgentLoop {
                         self.subtask_driver.extract_from_plan(text);
                         // Store plan text for adherence reminders
                         self.plan_text = Some(text.clone());
+
+                        // Graph: check if plan covers all dependent files.
+                        // If the plan mentions router.rs and weather.rs but both depend
+                        // on types.rs, warn that types.rs might also need changes.
+                        if self.subtask_driver.active {
+                            let graph = self.turn_runner.context.graph.read().await;
+                            if graph.is_ready() {
+                                let plan_files: Vec<&str> = self.subtask_driver.subtasks
+                                    .iter().map(|s| s.file.as_str()).collect();
+                                let mut missing_deps: Vec<String> = Vec::new();
+                                let mut seen = std::collections::HashSet::new();
+
+                                for plan_file in &plan_files {
+                                    seen.insert(plan_file.to_string());
+                                }
+
+                                for plan_file in &plan_files {
+                                    // Find this file in graph and get its dependencies
+                                    for (path, _) in &graph.file_symbols {
+                                        let basename = path.file_name()
+                                            .map(|f| f.to_string_lossy().to_string())
+                                            .unwrap_or_default();
+                                        if basename == *plan_file {
+                                            // Check files this file depends on (callees' files)
+                                            let sym_ids = graph.symbols_in_file(path);
+                                            if let Some(ids) = sym_ids {
+                                                for &sid in ids.iter().take(20) {
+                                                    if let Some(edges) = graph.callees(sid) {
+                                                        for edge in edges {
+                                                            if let Some(node) = graph.node(edge.to) {
+                                                                let dep_name = node.file.file_name()
+                                                                    .map(|f| f.to_string_lossy().to_string())
+                                                                    .unwrap_or_default();
+                                                                if !dep_name.is_empty()
+                                                                    && !seen.contains(&dep_name)
+                                                                    && dep_name != basename
+                                                                {
+                                                                    seen.insert(dep_name.clone());
+                                                                    missing_deps.push(dep_name);
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            break;
+                                        }
+                                    }
+                                }
+
+                                if !missing_deps.is_empty() {
+                                    missing_deps.truncate(5);
+                                    let warning = format!(
+                                        "\n\n[PLAN CHECK: Your plan edits {} but these files are also connected: {}. \
+                                         Consider whether they need changes too.]",
+                                        plan_files.join(", "),
+                                        missing_deps.join(", "),
+                                    );
+                                    // Append to the model's text output so it sees it
+                                    self.conversation.add_user_message(&warning);
+                                }
+                            }
+                            drop(graph);
+                        }
+
                         if self.subtask_driver.active {
                             // Sub-agent parallel dispatch: if 2+ independent files,
                             // spawn parallel sub-agents instead of serial subtask loop.
