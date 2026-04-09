@@ -141,6 +141,55 @@ impl AgentLoop {
 
         // NOTE: Silent-round progress prompt disabled — add_user_message injections
         // confuse weak models and waste context. Let the model work silently.
+
+        // Turn-budget phase reminders. Triggered when a max_turns cap is set
+        // (typical for non-interactive runs like the SWE-bench eval harness).
+        // We inject ONCE when the turn count crosses the 50% and 80% marks
+        // of the budget, telling the LLM in command form to stop exploring
+        // and start writing code. Weak models (e.g. GLM-5) ignore implicit
+        // "you have N turns left" hints; explicit imperatives perform better.
+        if let Some(max) = self.max_turns {
+            if max >= 6 {
+                let half = max / 2;
+                let near_end = max.saturating_sub(5).max(half + 1);
+                let just_crossed = |threshold: usize| -> bool {
+                    self.turn_count == threshold
+                };
+                let phase_msg: Option<&str> = if just_crossed(half) {
+                    Some(
+                        "<system-reminder>\n\
+                         [BUDGET 50%] You have used half of your turn budget. \
+                         STOP opening new files for exploration. Based on what you \
+                         already know, decide the root cause and start producing \
+                         the fix with edit_file/write_file in the next turn. \
+                         If you still have not located the bug, make an educated \
+                         guess from the context you have rather than reading more.\n\
+                         </system-reminder>"
+                    )
+                } else if just_crossed(near_end) {
+                    Some(
+                        "<system-reminder>\n\
+                         [FINAL ROUNDS] Only a few turns remain. Do NOT call \
+                         read_file or grep again. Verify the patch you have \
+                         already produced (re-read only the files you edited if \
+                         strictly necessary) and emit your final answer. If your \
+                         patch is incomplete, finish it now — partial code is \
+                         still gradeable, but no patch is not.\n\
+                         </system-reminder>"
+                    )
+                } else {
+                    None
+                };
+                if let Some(msg) = phase_msg {
+                    if let Some(last_msg) = self.conversation.messages.last_mut() {
+                        if let crate::conversation::message::MessageContent::ToolResult(ref mut r) = last_msg.content {
+                            r.output.push_str("\n\n");
+                            r.output.push_str(msg);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Check if step limit has been reached.

@@ -132,6 +132,16 @@ struct Cli {
     /// no tool calls or when the step budget (tool-call cap) is reached.
     #[arg(long)]
     max_turns: Option<usize>,
+
+    /// Comma-separated list of tool names to exclude from the registry.
+    /// Use this to disable tools that are useless or harmful in a particular
+    /// environment — e.g. `--disable-tools bash,web_fetch` for SWE-bench eval
+    /// where the sandbox can't run commands and offline mode is required.
+    /// Tools the LLM tries to call after disabling will be invisible to it
+    /// (they won't appear in the schemas list at all), so the model will not
+    /// retry against a permanently-blocked tool.
+    #[arg(long, value_delimiter = ',', value_name = "NAMES")]
+    disable_tools: Vec<String>,
 }
 
 #[derive(Subcommand)]
@@ -224,17 +234,35 @@ async fn run() -> Result<i32> {
 
     let working_dir = resolve_working_dir(cli.dir.clone());
 
+    // Build the disabled-tool set from --disable-tools (CLI) merged with the
+    // ATOMCODE_DISABLE_TOOLS env var. The env var allows the SWE-bench
+    // harness to opt-out of bash without rebuilding atomcode or threading a
+    // CLI flag through every shell wrapper.
+    let mut disabled_tools: std::collections::HashSet<String> =
+        cli.disable_tools.iter().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+    if let Ok(env_list) = std::env::var("ATOMCODE_DISABLE_TOOLS") {
+        for name in env_list.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            disabled_tools.insert(name.to_string());
+        }
+    }
+    if !disabled_tools.is_empty() {
+        let mut sorted: Vec<&String> = disabled_tools.iter().collect();
+        sorted.sort();
+        eprintln!("[atomcode] tools disabled: {}", sorted.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "));
+    }
+    let enabled = |name: &str| !disabled_tools.contains(name);
+
     let mut tool_registry = ToolRegistry::new();
-    tool_registry.register(Box::new(ReadFileTool));
-    tool_registry.register(Box::new(WriteFileTool));
-    tool_registry.register(Box::new(EditFileTool));
-    tool_registry.register(Box::new(BashTool));
-    tool_registry.register(Box::new(GrepTool));
-    tool_registry.register(Box::new(GlobTool));
-    tool_registry.register(Box::new(ListDirTool));
-    tool_registry.register(Box::new(WebSearchTool));
-    tool_registry.register(Box::new(WebFetchTool));
-    tool_registry.register(Box::new(SearchReplaceTool));
+    if enabled("read_file")      { tool_registry.register(Box::new(ReadFileTool)); }
+    if enabled("write_file")     { tool_registry.register(Box::new(WriteFileTool)); }
+    if enabled("edit_file")      { tool_registry.register(Box::new(EditFileTool)); }
+    if enabled("bash")           { tool_registry.register(Box::new(BashTool)); }
+    if enabled("grep")           { tool_registry.register(Box::new(GrepTool)); }
+    if enabled("glob")           { tool_registry.register(Box::new(GlobTool)); }
+    if enabled("list_directory") { tool_registry.register(Box::new(ListDirTool)); }
+    if enabled("web_search")     { tool_registry.register(Box::new(WebSearchTool)); }
+    if enabled("web_fetch")      { tool_registry.register(Box::new(WebFetchTool)); }
+    if enabled("search_replace") { tool_registry.register(Box::new(SearchReplaceTool)); }
     let tool_context = ToolContext::new(working_dir.clone());
 
     // Auto-continue the latest session for this working directory.

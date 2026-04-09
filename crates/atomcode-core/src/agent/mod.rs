@@ -352,16 +352,36 @@ impl AgentLoop {
         let skill_registry = std::sync::Arc::new(std::sync::RwLock::new(registry));
         // Only register use_skill tool when skills are available.
         // Otherwise the model invents skill names and wastes turns.
-        if has_skills {
+        // Honour ATOMCODE_DISABLE_TOOLS here too — main.rs filters the base
+        // CLI tools at construction time, but AgentLoop::new adds internal
+        // tools (graph queries, use_skill) that must respect the same
+        // gate so `--disable-tools trace_callers` actually works.
+        let disabled_internal: std::collections::HashSet<String> = std::env::var("ATOMCODE_DISABLE_TOOLS")
+            .ok()
+            .map(|v| v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
+            .unwrap_or_default();
+        let internal_enabled = |name: &str| !disabled_internal.contains(name);
+
+        if has_skills && internal_enabled("use_skill") {
             tool_registry.register(Box::new(UseSkillTool { registry: skill_registry.clone() }));
         }
 
         // Register graph query tools
-        tool_registry.register(Box::new(crate::tool::trace_callers::TraceCallersTool));
-        tool_registry.register(Box::new(crate::tool::trace_callees::TraceCalleesTool));
-        tool_registry.register(Box::new(crate::tool::trace_chain::TraceChainTool));
-        tool_registry.register(Box::new(crate::tool::file_deps::FileDependenciesTool));
-        tool_registry.register(Box::new(crate::tool::blast_radius::BlastRadiusTool));
+        if internal_enabled("trace_callers") {
+            tool_registry.register(Box::new(crate::tool::trace_callers::TraceCallersTool));
+        }
+        if internal_enabled("trace_callees") {
+            tool_registry.register(Box::new(crate::tool::trace_callees::TraceCalleesTool));
+        }
+        if internal_enabled("trace_chain") {
+            tool_registry.register(Box::new(crate::tool::trace_chain::TraceChainTool));
+        }
+        if internal_enabled("file_dependencies") {
+            tool_registry.register(Box::new(crate::tool::file_deps::FileDependenciesTool));
+        }
+        if internal_enabled("blast_radius") {
+            tool_registry.register(Box::new(crate::tool::blast_radius::BlastRadiusTool));
+        }
 
         // Build approval channels for interactive permission flow
         let (approval_req_tx, approval_req_rx) = mpsc::unbounded_channel();

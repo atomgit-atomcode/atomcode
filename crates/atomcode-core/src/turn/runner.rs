@@ -182,13 +182,24 @@ impl TurnRunner {
         let mut got_any_event = false;
         let mut was_truncated = false;
 
-        // Timeout: 180s for first token, 180s for subsequent tokens.
-        // Domestic model providers (SiliconFlow, etc.) can be very slow under load.
-        const FIRST_TOKEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
-        const STREAM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+        // Stream timeouts. Defaults are 300s for both first-token and
+        // subsequent-token waits, since slow domestic model providers
+        // (SiliconFlow, Zhipu GLM, etc.) under thinking mode can take >3min
+        // to emit a single token after a large prompt. Override via env
+        // ATOMCODE_FIRST_TOKEN_TIMEOUT_SECS / ATOMCODE_STREAM_TIMEOUT_SECS
+        // for environments where you want a tighter "real hang" detector.
+        fn timeout_from_env(var: &str, default_secs: u64) -> std::time::Duration {
+            std::env::var(var)
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .map(std::time::Duration::from_secs)
+                .unwrap_or_else(|| std::time::Duration::from_secs(default_secs))
+        }
+        let first_token_timeout = timeout_from_env("ATOMCODE_FIRST_TOKEN_TIMEOUT_SECS", 300);
+        let stream_timeout = timeout_from_env("ATOMCODE_STREAM_TIMEOUT_SECS", 300);
 
         loop {
-            let timeout = if got_any_event { STREAM_TIMEOUT } else { FIRST_TOKEN_TIMEOUT };
+            let timeout = if got_any_event { stream_timeout } else { first_token_timeout };
             tokio::select! {
                 biased;
 
