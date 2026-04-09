@@ -128,7 +128,7 @@ impl Tool for ReadFileTool {
             let mut searcher = ctx.semantic.lock().await;
             let skeleton = if let Some(symbols) = searcher.list_symbols(path) {
                 let fname = path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
-                let mut skel = format!("[File skeleton: {} ({} lines) — use read_symbol or offset/limit to read specific sections:]\n\n",
+                let mut skel = format!("[File skeleton: {} ({} lines) — to see full content, call read_file again without offset/limit:]\n\n",
                     fname, total_lines);
                 // Skeleton is fully driven by semantic layer's list_symbols().
                 // For Vue/Svelte, list_symbols already includes <template>/<style> sections
