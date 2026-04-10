@@ -233,10 +233,25 @@ impl AgentLoop {
         // Loop detection: if the same (tool, args) appears 3+ times in recent calls, block it.
         // EXCEPTION: if there was an edit_file/write_file between repeats, the model is
         // retrying after a fix — that's legitimate, not a loop. Reset the counter on edits.
+        // For read_file: hash only file_path (ignore offset/limit) to catch
+        // re-reading the same file with different pagination params.
         let args_hash = {
             use std::hash::{Hash, Hasher};
             let mut h = std::collections::hash_map::DefaultHasher::new();
-            args.hash(&mut h);
+            if tool_name == "read_file" {
+                // Only hash file_path — different offset/limit is still the same file
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(args) {
+                    if let Some(fp) = v.get("file_path").and_then(|v| v.as_str()) {
+                        fp.hash(&mut h);
+                    } else {
+                        args.hash(&mut h);
+                    }
+                } else {
+                    args.hash(&mut h);
+                }
+            } else {
+                args.hash(&mut h);
+            }
             h.finish()
         };
         let sig = (tool_name.to_string(), args_hash);
