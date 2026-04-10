@@ -171,9 +171,41 @@ pub fn render(frame: &mut Frame, area: Rect, sessions: &[SessionMeta], selected:
         Span::styled(" cancel", Style::default().fg(theme::text_muted())),
     ]));
     
-    let paragraph = Paragraph::new(lines);
+    // Calculate scroll offset to keep selected item visible
+    let total_lines = lines.len();
+    let visible_height = area.height as usize;
+    
+    // Each session item occupies 3 lines (name + meta + blank)
+    // Search row starts at line 4 (header + blank + search + hint? + blank)
+    // Calculate which line the selected item starts on
+    let selected_line = if selected == 0 {
+        // Search row is at line 2 (0-indexed: header=0, blank=1, search=2)
+        2
+    } else {
+        // Session items start at line 5 or 6 depending on search hint
+        // Header = 1, blank = 1, search = 1, hint (if search selected) = 1, blank = 1
+        let header_lines = if search_is_selected { 6 } else { 5 };
+        // Each session item = 3 lines
+        header_lines + (selected - 1) * 3
+    };
+    
+    // Calculate scroll offset
+    let scroll_offset = if selected_line >= visible_height {
+        // Scroll to keep selected item visible, with some context above
+        selected_line.saturating_sub(visible_height.saturating_sub(5))
+    } else {
+        0
+    };
+    
+    // Apply scroll offset
+    let visible_lines: Vec<Line> = lines.into_iter()
+        .skip(scroll_offset)
+        .take(visible_height)
+        .collect();
+    
+    let paragraph = Paragraph::new(visible_lines);
     frame.render_widget(paragraph, area);
     
-    // Return line count for scroll calculation
-    filtered.len() * 3 + 8 // each session = 3 lines (name + meta + blank), plus header + search row
+    // Return total line count for scroll calculation
+    total_lines
 }
