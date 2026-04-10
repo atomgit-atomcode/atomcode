@@ -114,15 +114,10 @@ impl AgentLoop {
         let compile_cmd = match compile_cmd {
             Some(c) => c,
             None => {
-                // No compiler available (HTML/CSS/Vue/Python without build tool).
-                // After 2+ edits, remind model to let user verify in browser.
-                if self.files_edited_this_turn.len() >= 2 {
-                    self.conversation.add_user_message(
-                        "[No compiler available for this project. \
-                         STOP editing and ask the user to verify the page in their browser. \
-                         Do NOT make more changes until the user confirms what works and what doesn't.]"
-                    );
-                }
+                // No compiler available — use tree-sitter syntax check instead.
+                // Same role as auto-compile but for non-compiled languages:
+                // catches syntax errors automatically, doesn't interrupt the model.
+                self.syntax_check_edited_files().await;
                 return;
             }
         };
@@ -275,7 +270,7 @@ impl AgentLoop {
     /// Language-agnostic: works on any file tree-sitter can parse.
     /// Catches bracket mismatches, missing closings, duplicate declarations
     /// that build tools may miss (e.g., Vite doesn't catch Vue SFC syntax errors).
-    #[allow(dead_code)]
+    /// Called for non-compiled projects as an auto-compile equivalent.
     pub(crate) async fn syntax_check_edited_files(&mut self) {
         let wd = self.turn_runner.context.working_dir.try_read()
             .map(|g| g.clone()).unwrap_or_default();
