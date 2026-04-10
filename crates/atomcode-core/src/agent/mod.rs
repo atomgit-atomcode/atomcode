@@ -863,10 +863,13 @@ impl AgentLoop {
             let system_prompt = self.build_system_prompt();
             let cancel = self.cancel_token.clone();
 
-            // Auto-summarize old turns when context approaches limit (> 70%).
-            // This happens BEFORE the LLM call so the model sees a compact summary
-            // instead of losing context entirely.
-            self.maybe_summarize_old_turns(&system_prompt).await;
+            // Auto-summarize disabled — too aggressive. In long sessions it
+            // summarized too many turns at once, causing the model to lose all
+            // context and enter an infinite read loop. The CC-style drop-oldest
+            // in to_provider_messages_budgeted is the safety net.
+            // TODO: re-enable with a more conservative strategy (summarize 1-2
+            // turns at a time, not 5-8).
+            // self.maybe_summarize_old_turns(&system_prompt).await;
 
             // Move conversation out to avoid borrow conflicts with self in select!
             let mut conv = std::mem::take(&mut self.conversation);
@@ -1475,6 +1478,7 @@ impl AgentLoop {
     /// Makes a lightweight LLM call to compress old turn content into a
     /// short summary, so the model retains awareness of prior work without
     /// the full message cost.
+    #[allow(dead_code)]
     async fn maybe_summarize_old_turns(&mut self, system_prompt: &str) {
         let context_window = self.config
             .providers
