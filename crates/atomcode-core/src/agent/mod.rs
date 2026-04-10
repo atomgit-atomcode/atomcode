@@ -361,21 +361,27 @@ impl AgentLoop {
             tool_registry.register(Box::new(UseSkillTool { registry: skill_registry.clone() }));
         }
 
-        // Register graph query tools
-        if internal_enabled("trace_callers") {
-            tool_registry.register(Box::new(crate::tool::trace_callers::TraceCallersTool));
-        }
-        if internal_enabled("trace_callees") {
-            tool_registry.register(Box::new(crate::tool::trace_callees::TraceCalleesTool));
-        }
-        if internal_enabled("trace_chain") {
-            tool_registry.register(Box::new(crate::tool::trace_chain::TraceChainTool));
-        }
-        if internal_enabled("file_dependencies") {
-            tool_registry.register(Box::new(crate::tool::file_deps::FileDependenciesTool));
-        }
-        if internal_enabled("blast_radius") {
-            tool_registry.register(Box::new(crate::tool::blast_radius::BlastRadiusTool));
+        // Graph query tools: not exposed to model (adds 5 tool definitions that
+        // weak models never use correctly). Graph data is still injected automatically
+        // via grep's graph header and auto_inject_graph_context — the model benefits
+        // from graph without needing to call these tools directly.
+        // To re-enable: set ATOMCODE_GRAPH_TOOLS=1
+        if std::env::var("ATOMCODE_GRAPH_TOOLS").map(|v| v == "1").unwrap_or(false) {
+            if internal_enabled("trace_callers") {
+                tool_registry.register(Box::new(crate::tool::trace_callers::TraceCallersTool));
+            }
+            if internal_enabled("trace_callees") {
+                tool_registry.register(Box::new(crate::tool::trace_callees::TraceCalleesTool));
+            }
+            if internal_enabled("trace_chain") {
+                tool_registry.register(Box::new(crate::tool::trace_chain::TraceChainTool));
+            }
+            if internal_enabled("file_dependencies") {
+                tool_registry.register(Box::new(crate::tool::file_deps::FileDependenciesTool));
+            }
+            if internal_enabled("blast_radius") {
+                tool_registry.register(Box::new(crate::tool::blast_radius::BlastRadiusTool));
+            }
         }
 
         // Build approval channels for interactive permission flow
