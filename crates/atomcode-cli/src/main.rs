@@ -320,7 +320,9 @@ async fn run() -> Result<i32> {
 }
 
 /// Run agent in headless mode (pipe-friendly: stdout = LLM text only,
-/// logs/diagnostics → stderr, approvals auto-denied).
+/// logs/diagnostics → stderr). Non-interactive: `bash` approvals are
+/// auto-allowed (stderr logs the reason); other tools that require approval
+/// are still denied.
 ///
 /// `verbose=false` (default): Claude Code -p style — only the assistant reply
 /// reaches the user. Tool calls, token usage, and turn summary are silent.
@@ -380,10 +382,16 @@ async fn run_headless(
                 }
             }
             AgentEvent::ApprovalNeeded { tool_name, reason, .. } => {
-                // Always shown — security signal must not be silent.
-                eprintln!("[approval-denied] tool={} reason={}", tool_name, reason);
-                cmd_tx.send(AgentCommand::DenyTool)?;
-                had_denial = true;
+                if tool_name == "bash" {
+                    // -p / headless cannot prompt; user opts in by using non-interactive mode.
+                    eprintln!("[headless] auto-approved bash: {}", reason);
+                    cmd_tx.send(AgentCommand::ApproveTool)?;
+                } else {
+                    // Always shown — security signal must not be silent.
+                    eprintln!("[approval-denied] tool={} reason={}", tool_name, reason);
+                    cmd_tx.send(AgentCommand::DenyTool)?;
+                    had_denial = true;
+                }
             }
             AgentEvent::TokenUsage(usage) => {
                 if verbose {
