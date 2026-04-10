@@ -1,6 +1,5 @@
 use crate::conversation::message::{Message, MessageContent};
 use crate::tool::ToolResult;
-use crate::tool::result_store::ToolResultStore;
 
 /// Dispatch to per-tool truncation based on tool name, then apply a hard char limit.
 /// `context_window` drives the hard char limit — larger context windows allow more output.
@@ -299,51 +298,22 @@ pub(crate) fn truncate_generic(result: &mut ToolResult, max_lines: usize, head: 
     }
 }
 
-/// Apply truncation and disk externalization to all tool result messages
+/// Apply truncation to all tool result messages
 /// in the last `tool_count` messages of the conversation.
 pub fn post_process_tool_results(
     messages: &mut Vec<Message>,
     tool_count: usize,
     current_tool_name: &str,
-    result_store: &ToolResultStore,
     context_window: usize,
 ) {
     let len = messages.len();
     let start = len.saturating_sub(tool_count);
 
-    // Collect indices of ToolResult messages to process
-    let mut to_process: Vec<usize> = Vec::new();
     for i in start..len {
-        if matches!(messages[i].content, MessageContent::ToolResult(_)) {
-            to_process.push(i);
-        }
-    }
-
-    // Phase 1: Truncate outputs — extract, truncate, put back to satisfy borrow checker
-    for &i in &to_process {
         if let MessageContent::ToolResult(ref r) = messages[i].content {
             let mut result = r.clone();
             truncate_output(&mut result, current_tool_name, context_window);
             messages[i].content = MessageContent::ToolResult(result);
-        }
-    }
-
-    // Phase 2: Externalize large results to disk (replace ToolResult with ToolResultRef)
-    for &i in &to_process {
-        let should_externalize = if let MessageContent::ToolResult(ref r) = messages[i].content {
-            // Don't externalize structured agent outputs (full_restart, auto-diagnosis)
-            // — they're already concise summaries, not raw command output.
-            r.output.len() >= 512 && !r.output.starts_with("[Step ")
-                && !r.output.starts_with("[AUTO-DIAGNOSIS")
-        } else {
-            false
-        };
-
-        if should_externalize {
-            if let MessageContent::ToolResult(ref result) = messages[i].content {
-                let result_ref = result_store.store(result);
-                messages[i].content = MessageContent::ToolResultRef(result_ref);
-            }
         }
     }
 }
@@ -352,7 +322,6 @@ pub fn post_process_tool_results(
 mod tests {
     use super::*;
     use crate::tool::ToolResult;
-    use crate::tool::result_store::ToolResultStore;
     use crate::conversation::message::{Message, MessageContent, Role};
 
     fn make_result(output: &str) -> ToolResult {
@@ -368,12 +337,6 @@ mod tests {
             role: Role::Tool,
             content: MessageContent::ToolResult(make_result(output)),
         }
-    }
-
-    fn temp_store() -> (ToolResultStore, tempfile::TempDir) {
-        let dir = tempfile::tempdir().unwrap();
-        let store = ToolResultStore::new(dir.path().to_path_buf());
-        (store, dir)
     }
 
     // --- truncate_bash tests ---
@@ -483,22 +446,25 @@ mod tests {
     // --- post_process_tool_results tests ---
 
     #[test]
-    fn post_process_externalizes_large_results() {
-        let (store, _dir) = temp_store();
-        let large_output = "x".repeat(600); // over 512 threshold
+    fn post_process_truncates_results() {
+        let large_output = "x".repeat(20000);
         let mut messages = vec![make_tool_result_message(&large_output)];
-        post_process_tool_results(&mut messages, 1, "bash", &store, 16000);
-        // Should have been externalized to ToolResultRef
-        assert!(matches!(messages[0].content, MessageContent::ToolResultRef(_)));
+        post_process_tool_results(&mut messages, 1, "unknown_tool", 16000);
+        // Should be truncated but remain inline ToolResult
+        assert!(matches!(messages[0].content, MessageContent::ToolResult(_)));
+        if let MessageContent::ToolResult(ref r) = messages[0].content {
+            assert!(r.output.len() <= 16100);
+        }
     }
 
     #[test]
-    fn post_process_keeps_small_results_inline() {
-        let (store, _dir) = temp_store();
+    fn post_process_keeps_small_results_unchanged() {
         let small_output = "short output";
         let mut messages = vec![make_tool_result_message(small_output)];
-        post_process_tool_results(&mut messages, 1, "bash", &store, 16000);
-        // Should remain as ToolResult (small enough)
+        post_process_tool_results(&mut messages, 1, "bash", 16000);
         assert!(matches!(messages[0].content, MessageContent::ToolResult(_)));
+        if let MessageContent::ToolResult(ref r) = messages[0].content {
+            assert_eq!(r.output, "short output");
+        }
     }
 }

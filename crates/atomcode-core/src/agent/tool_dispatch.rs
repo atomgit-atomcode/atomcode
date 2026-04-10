@@ -101,17 +101,18 @@ impl AgentLoop {
                     name, output, success, duration,
                 });
             }
-            TurnEvent::TokenUsage { prompt_tokens, completion_tokens, total_tokens: _ } => {
+            TurnEvent::TokenUsage { prompt_tokens, completion_tokens, total_tokens: _, cached_tokens } => {
                 let _ = self.event_tx.send(AgentEvent::TokenUsage(
                     crate::stream::TokenUsage {
                         prompt_tokens,
                         completion_tokens,
+                        cached_tokens,
                     }
                 ));
             }
-            TurnEvent::ContextStats { system_tokens, hot_tokens, cold_tokens, working_set_tokens, total_messages } => {
+            TurnEvent::ContextStats { system_tokens, sent_tokens, dropped_tokens, working_set_tokens, total_messages } => {
                 let _ = self.event_tx.send(AgentEvent::ContextStats {
-                    system_tokens, hot_tokens, cold_tokens, working_set_tokens, total_messages,
+                    system_tokens, sent_tokens, dropped_tokens, working_set_tokens, total_messages,
                 });
             }
             TurnEvent::Error(e) => {
@@ -120,8 +121,7 @@ impl AgentLoop {
         }
     }
 
-    /// Post-process tool results added by TurnRunner: truncate large outputs
-    /// and externalize to disk store. TurnRunner adds raw results; we clean them up.
+    /// Post-process tool results added by TurnRunner: truncate large outputs.
     pub(crate) fn post_process_tool_results(&mut self, tool_count: usize) {
         let context_window = self.config
             .providers
@@ -132,7 +132,6 @@ impl AgentLoop {
             &mut self.conversation.messages,
             tool_count,
             &self.current_tool_name,
-            &self.result_store,
             context_window,
         );
     }
@@ -358,23 +357,6 @@ impl AgentLoop {
         }
     }
 
-    /// Inflate ToolResultRef messages in the provider message list.
-    // inflate_recent_refs — moved to TurnRunner.run() where messages are built.
-
-    /// Add a tool result to the conversation, externalizing large outputs to disk.
-    /// Results smaller than the threshold are stored inline for simplicity.
-    /// Note: post_process_tool_results() now handles this for TurnRunner-added messages.
-    /// This method is retained for any future direct-add paths.
-    #[allow(dead_code)]
-    pub(crate) fn store_tool_result(&mut self, result: ToolResult) {
-        const EXTERNALIZE_THRESHOLD: usize = 512;
-        if result.output.len() >= EXTERNALIZE_THRESHOLD {
-            let result_ref = self.result_store.store(&result);
-            self.conversation.add_tool_result_ref(result_ref);
-        } else {
-            self.conversation.add_tool_result(result);
-        }
-    }
 }
 
 /// Normalize a bash command for repeated-execution detection.

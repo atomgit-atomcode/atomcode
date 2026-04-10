@@ -22,12 +22,13 @@ pub enum TurnEvent {
         prompt_tokens: usize,
         completion_tokens: usize,
         total_tokens: usize,
+        cached_tokens: usize,
     },
     /// Context budget stats for logging
     ContextStats {
         system_tokens: usize,
-        hot_tokens: usize,
-        cold_tokens: usize,
+        sent_tokens: usize,
+        dropped_tokens: usize,
         working_set_tokens: usize,
         total_messages: usize,
     },

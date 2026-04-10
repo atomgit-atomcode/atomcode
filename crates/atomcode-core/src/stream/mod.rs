@@ -4,6 +4,8 @@ use crate::tool::ToolCall;
 pub struct TokenUsage {
     pub prompt_tokens: usize,
     pub completion_tokens: usize,
+    /// Tokens served from provider's prompt cache (0 if not supported).
+    pub cached_tokens: usize,
 }
 
 #[derive(Debug, Clone)]

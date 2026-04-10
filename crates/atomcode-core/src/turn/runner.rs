@@ -31,8 +31,6 @@ pub struct TurnRunner {
     pub context: ToolContext,
     pub config: Config,
     pub permission: Box<dyn PermissionDecider>,
-    /// Tool result store — used to inflate ToolResultRef messages before sending to LLM.
-    pub result_store: crate::tool::result_store::ToolResultStore,
     /// Files edited during the current session — read_file on these is intercepted
     /// to prevent wasteful "verification reads" after editing.
     pub recently_edited_files: Vec<String>,
@@ -70,37 +68,9 @@ impl TurnRunner {
             .map(|p| p.context_window)
             .unwrap_or(16000);
 
-        let (mut messages, ctx_stats) =
+        let (messages, ctx_stats) =
             conversation.to_provider_messages_budgeted(system_prompt, context_window);
 
-        // 2. Inflate ToolResultRef → ToolResult for recent messages.
-        // Conversation stores large results as compact refs on disk;
-        // inflate the last 20 so the LLM sees actual tool output.
-        // Respect context_window: stop inflating when total tokens approach limit.
-        // Without this, 32K models receive 56K+ tokens of inflated content.
-        {
-            let pre_inflate_tokens: usize = messages.iter().map(|m| m.estimate_tokens()).sum();
-            let inflate_budget = context_window.saturating_sub(pre_inflate_tokens);
-            let mut inflated = 0usize;
-            let mut inflated_tokens = 0usize;
-            for msg in messages.iter_mut().rev() {
-                if inflated >= 20 { break; }
-                if let crate::conversation::message::MessageContent::ToolResultRef(ref r) = msg.content {
-                    let full = self.result_store.inflate(r);
-                    let cost = full.output.len() / 4; // rough token estimate
-                    if inflated_tokens + cost > inflate_budget && inflated > 0 {
-                        break; // stop: would exceed context_window
-                    }
-                    msg.content = crate::conversation::message::MessageContent::ToolResult(full);
-                    inflated_tokens += cost;
-                    inflated += 1;
-                }
-            }
-        }
-
-        // Emit context stats AFTER inflate so datalog reflects actual tokens sent to LLM.
-        // Pre-inflate stats were misleading (ToolResultRef counted as ~50 tokens,
-        // but inflate expands them to 5K-20K).
         let actual_tokens: usize = messages.iter().map(|m| m.estimate_tokens()).sum();
 
         // Set budget hint for read_file dynamic threshold.
@@ -111,8 +81,8 @@ impl TurnRunner {
         );
         let _ = event_tx.send(TurnEvent::ContextStats {
             system_tokens: ctx_stats.system_tokens,
-            hot_tokens: actual_tokens.saturating_sub(ctx_stats.system_tokens),
-            cold_tokens: ctx_stats.cold_tokens,
+            sent_tokens: actual_tokens.saturating_sub(ctx_stats.system_tokens),
+            dropped_tokens: ctx_stats.dropped_tokens,
             working_set_tokens: 0,
             total_messages: messages.len(),
         });
@@ -259,6 +229,7 @@ _ = cancel.cancelled() => {
                                 prompt_tokens: usage.prompt_tokens,
                                 completion_tokens: usage.completion_tokens,
                                 total_tokens: usage.prompt_tokens + usage.completion_tokens,
+                                cached_tokens: usage.cached_tokens,
                             });
                         }
 

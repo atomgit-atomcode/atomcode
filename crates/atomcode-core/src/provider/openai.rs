@@ -132,6 +132,18 @@ struct ChatChunk {
 struct ChunkUsage {
     prompt_tokens: Option<usize>,
     completion_tokens: Option<usize>,
+    // Provider-specific cache fields (different providers use different names):
+    // OpenAI: prompt_tokens_details.cached_tokens
+    // DeepSeek/SiliconFlow: prompt_cache_hit_tokens
+    // Zhipu: cached_tokens
+    prompt_cache_hit_tokens: Option<usize>,
+    cached_tokens: Option<usize>,
+    prompt_tokens_details: Option<PromptTokensDetails>,
+}
+
+#[derive(Deserialize)]
+struct PromptTokensDetails {
+    cached_tokens: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -270,9 +282,16 @@ impl LlmProvider for OpenAiProvider {
                             // Store usage — don't emit yet. Some providers send cumulative
                             // usage in multiple chunks; we only want the final value.
                             if let Some(usage) = &chunk.usage {
+                                // Extract cached tokens from whichever field the provider uses
+                                let cached = usage.prompt_cache_hit_tokens
+                                    .or(usage.cached_tokens)
+                                    .or_else(|| usage.prompt_tokens_details.as_ref()
+                                        .and_then(|d| d.cached_tokens))
+                                    .unwrap_or(0);
                                 last_usage = Some(crate::stream::TokenUsage {
                                     prompt_tokens: usage.prompt_tokens.unwrap_or(0),
                                     completion_tokens: usage.completion_tokens.unwrap_or(0),
+                                    cached_tokens: cached,
                                 });
                             }
                             for choice in chunk.choices {

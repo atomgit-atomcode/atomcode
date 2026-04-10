@@ -2,7 +2,6 @@ pub mod message;
 pub mod turn;
 
 use crate::tool::{ToolCall, ToolCallBuffer, ToolResult};
-use crate::tool::result_store::ToolResultRef;
 use message::{Message, MessageContent, Role};
 use turn::TurnTracker;
 
@@ -10,8 +9,10 @@ use turn::TurnTracker;
 #[derive(Debug, Clone, Default)]
 pub struct ContextStats {
     pub system_tokens: usize,
-    pub hot_tokens: usize,
-    pub cold_tokens: usize,
+    /// Tokens actually sent to the LLM (excluding system prompt).
+    pub sent_tokens: usize,
+    /// Tokens dropped (oldest turns removed to fit context window).
+    pub dropped_tokens: usize,
     pub total_messages: usize,
 }
 
@@ -156,15 +157,6 @@ impl Conversation {
         self.turn_tracker.on_message_added(idx);
     }
 
-    pub fn add_tool_result_ref(&mut self, result_ref: ToolResultRef) {
-        let idx = self.messages.len();
-        self.messages.push(Message {
-            role: Role::Tool,
-            content: MessageContent::ToolResultRef(result_ref),
-        });
-        self.turn_tracker.on_message_added(idx);
-    }
-
     pub fn finalize_stream_with_tool_call(&mut self, tool_call: ToolCall) {
         let text = self.stream_buffer.take();
         self.add_assistant_tool_calls(text.as_deref(), vec![tool_call]);
@@ -223,17 +215,9 @@ impl Conversation {
         msgs
     }
 
-    /// Turn-aware token-budget windowing. Fits messages within `token_budget` by:
-    ///
-    /// 1. **Hot turns** (most recent): all messages at full fidelity.
-    /// 2. **Cold turns** (older completed): only user message + assistant's final
-    ///    text response. Intermediate tool calls/results are dropped — the model
-    ///    sees *what was asked* and *what the outcome was*, not every step.
-    /// 3. **Summarized turns**: a single summary message (Phase 3).
-    /// 4. Oldest turns dropped if still over budget.
-    ///
-    /// This preserves semantic context across long conversations far better than
-    /// the per-message condensation it replaces.
+    /// CC-style context management: keep all messages, drop oldest complete turns
+    /// when total tokens exceed 80% of the context window.
+    /// Simple and predictable — no hot/cold zones, no summarization, no inflate.
     pub fn to_provider_messages_budgeted(
         &self,
         system_prompt: &str,
@@ -245,25 +229,46 @@ impl Conversation {
 
         let system_msg = Message::new(Role::System, system_prompt);
         let system_tokens = system_msg.estimate_tokens();
-        let remaining_budget = token_budget.saturating_sub(system_tokens);
+        let budget_80pct = token_budget * 80 / 100;
 
         let turns = &self.turn_tracker.turns;
 
-        // If no turns tracked (edge case), fall back to simple tail windowing.
+        // No turns tracked — fall back to simple tail windowing.
         if turns.is_empty() {
-            return (self.to_provider_messages_budgeted_fallback(system_msg, remaining_budget), ContextStats::default());
+            let remaining = token_budget.saturating_sub(system_tokens);
+            return (self.to_provider_messages_budgeted_fallback(system_msg, remaining), ContextStats::default());
         }
 
-        // Phase 1: Walk backwards through turns, adding full messages from
-        // recent turns until we've used ~30% of the budget (hot zone).
-        // Guarantee: at least the 1 most recent turn is ALWAYS in hot zone.
-        // Additional turns only if they fit within the budget.
-        // HARD CAP: hot zone never exceeds remaining_budget (prevents 85K on 64K window).
-        let hot_budget = remaining_budget * 30 / 100;
-        let mut hot_tokens = 0usize;
-        let mut hot_turn_start = turns.len();
+        // Calculate total tokens for all messages.
+        let total_tokens: usize = system_tokens + self.messages.iter()
+            .map(|m| m.estimate_tokens())
+            .sum::<usize>();
 
-        for ti in (0..turns.len()).rev() {
+        // If under 80% budget, send everything.
+        if total_tokens <= budget_80pct {
+            let mut result = Vec::with_capacity(self.messages.len() + 1);
+            result.push(system_msg);
+            result.extend(self.messages.iter().cloned());
+            Self::sanitize_messages(&mut result);
+
+            let sent_tokens = total_tokens.saturating_sub(system_tokens);
+            let stats = ContextStats {
+                system_tokens,
+                sent_tokens,
+                dropped_tokens: 0,
+                total_messages: result.len(),
+            };
+            return (result, stats);
+        }
+
+        // Over budget — drop oldest complete turns until we fit.
+        // Always keep at least the most recent turn.
+        let mut drop_up_to_turn = 0usize; // exclusive: drop turns [0..drop_up_to_turn)
+        let mut dropped_tokens = 0usize;
+        let tokens_to_drop = total_tokens - budget_80pct;
+
+        for ti in 0..turns.len().saturating_sub(1) {
+            if dropped_tokens >= tokens_to_drop { break; }
             let turn = &turns[ti];
             let end = turn.end_idx().min(self.messages.len());
             if turn.start_idx >= self.messages.len() { continue; }
@@ -271,220 +276,46 @@ impl Conversation {
                 .iter()
                 .map(|m| m.estimate_tokens())
                 .sum();
-            let turns_included = turns.len() - ti;
-
-            // Always include the most recent turn (turns_included == 1).
-            // For additional turns, respect the hot_budget.
-            // Never exceed remaining_budget regardless of turn count.
-            if turns_included > 1
-                && (hot_tokens + turn_tokens > hot_budget
-                    || hot_tokens + turn_tokens > remaining_budget)
-            {
-                break;
-            }
-            // Even the first turn: cap at remaining_budget
-            if turns_included == 1 && turn_tokens > remaining_budget {
-                // Single turn exceeds entire budget — still include but it will be
-                // condensed in Phase 3 (only latest turn keeps full fidelity,
-                // and inflate budget will cap the final size).
-            }
-            hot_tokens += turn_tokens;
-            hot_turn_start = ti;
+            dropped_tokens += turn_tokens;
+            drop_up_to_turn = ti + 1;
         }
 
-        // Phase 1.5: Mid-session summarization.
-        // When cold zone has 5+ turns, merge the oldest ones into a single summary.
-        // Keeps context stable at ~14K regardless of session length.
-        let cold_turn_count = hot_turn_start;
-        let summary_cutoff = if cold_turn_count > 5 {
-            cold_turn_count.saturating_sub(3) // keep the most recent 3 cold turns individual
+        // Build result: system + surviving messages
+        let msg_start = if drop_up_to_turn < turns.len() {
+            turns[drop_up_to_turn].start_idx
         } else {
-            0
+            // Shouldn't happen (we keep at least 1 turn), but safety fallback
+            turns.last().map(|t| t.start_idx).unwrap_or(0)
         };
 
-        // Phase 2: For older turns (before hot_turn_start), build condensed
-        // representations: user message + assistant final text only.
-        let cold_budget = remaining_budget.saturating_sub(hot_tokens);
-        let mut cold_messages: Vec<Message> = Vec::new();
-        let mut cold_tokens = 0usize;
-
-        // Inject batch summary for oldest turns (if applicable)
-        if summary_cutoff > 0 {
-            let batch_summary = self.build_batch_summary(0, summary_cutoff);
-            if !batch_summary.is_empty() {
-                let summary_msg = Message::new(Role::System,
-                    format!("[Session history (turns 1-{})]\n{}", summary_cutoff, batch_summary)
-                );
-                let tokens = summary_msg.estimate_tokens();
-                if tokens < cold_budget / 2 {
-                    cold_tokens += tokens;
-                    cold_messages.push(summary_msg);
-                }
-            }
-        }
-
-        // Walk from most recent cold turn backward (newest cold = most relevant).
-        // Skip turns already covered by batch summary.
-        let cold_start = if summary_cutoff > 0 { summary_cutoff } else { 0 };
-        for ti in (cold_start..hot_turn_start).rev() {
-            let turn = &turns[ti];
-
-            // Summarized turns: inject the summary as a single message.
-            if let Some(ref summary) = turn.summary {
-                let summary_msg = Message::new(Role::User, format!("[Previous task summary] {}", summary));
-                let tokens = summary_msg.estimate_tokens();
-                if cold_tokens + tokens > cold_budget {
-                    break; // No more budget for older turns
-                }
-                cold_tokens += tokens;
-                cold_messages.push(summary_msg);
-                continue;
-            }
-
-            // Completed turns without summary: keep user message + last assistant text.
-            let end = turn.end_idx().min(self.messages.len());
-            if turn.start_idx >= self.messages.len() { continue; }
-            let turn_msgs = &self.messages[turn.start_idx..end];
-            let mut turn_condensed: Vec<Message> = Vec::new();
-            let mut turn_cost = 0usize;
-
-            // Always include the user message (first in turn).
-            if let Some(user_msg) = turn_msgs.first() {
-                if matches!(user_msg.role, Role::User) {
-                    turn_cost += user_msg.estimate_tokens();
-                    turn_condensed.push(user_msg.clone());
-                }
-            }
-
-            // Find the last assistant text message in this turn (the "outcome").
-            // Priority: pure text response > tool call with text > synthetic from tool results.
-            let mut found_outcome = false;
-            let mut outcome_text = String::new();
-            for msg in turn_msgs.iter().rev() {
-                match &msg.content {
-                    MessageContent::Text(s) if matches!(msg.role, Role::Assistant) => {
-                        outcome_text = s.clone();
-                        found_outcome = true;
-                        break;
-                    }
-                    MessageContent::AssistantWithToolCalls { text: Some(t), .. } if !t.is_empty() => {
-                        outcome_text = t.clone();
-                        found_outcome = true;
-                        break;
-                    }
-                    _ => continue,
-                }
-            }
-
-            // Fallback: no assistant text found (model only did tool calls, or
-            // turn was terminated by step limit). Synthesize a brief outcome
-            // from the last tool result so the model knows what happened.
-            if !found_outcome {
-                outcome_text = self.synthesize_turn_outcome(turn_msgs);
-            }
-
-            // Always append edit/write tombstones so the model knows which files
-            // were changed in this turn, even after compression drops tool results.
-            let edit_tombstones = Self::extract_edit_tombstones(turn_msgs);
-            if !edit_tombstones.is_empty() {
-                if !outcome_text.is_empty() {
-                    outcome_text.push('\n');
-                }
-                outcome_text.push_str(&edit_tombstones);
-            }
-
-            if !outcome_text.is_empty() {
-                let outcome_msg = Message::new(Role::Assistant, outcome_text);
-                turn_cost += outcome_msg.estimate_tokens();
-                turn_condensed.push(outcome_msg);
-            }
-
-            if cold_tokens + turn_cost > cold_budget {
-                break; // Can't fit this turn, stop adding cold turns
-            }
-            cold_tokens += turn_cost;
-            cold_messages.extend(turn_condensed);
-        }
-
-        // Cold messages were added newest-first, reverse to chronological order.
-        cold_messages.reverse();
-
-        // Phase 3: Assemble — system + cold turns + hot turns.
-        // Within the hot zone, only the LATEST turn keeps full tool results.
-        // Older hot turns get condensed tool results (first line only) to save tokens.
-        // This prevents old read_file/write_file content from bloating the context.
-        let hot_msg_start = turns[hot_turn_start].start_idx;
-        let latest_turn_start = if turns.len() > 0 {
-            turns[turns.len() - 1].start_idx
-        } else {
-            self.messages.len()
-        };
-
-        let mut result = Vec::with_capacity(
-            1 + cold_messages.len() + (self.messages.len() - hot_msg_start),
-        );
+        let mut result = Vec::with_capacity(1 + self.messages.len() - msg_start);
         result.push(system_msg);
-        result.extend(cold_messages);
 
-        for (i, msg) in self.messages[hot_msg_start..].iter().enumerate() {
-            let abs_idx = hot_msg_start + i;
-            if abs_idx < latest_turn_start {
-                // Older hot turn — condense large tool results & strip write_file content
-                match &msg.content {
-                    MessageContent::ToolResult(r) if r.output.len() > 500 => {
-                        result.push(msg.condensed());
-                    }
-                    MessageContent::AssistantWithToolCalls { text, tool_calls } => {
-                        // Strip write_file content from tool call arguments
-                        let compressed_calls: Vec<ToolCall> = tool_calls.iter().map(|tc| {
-                            if tc.name == "create_file" {
-                                let mut tc = tc.clone();
-                                // Replace content with size summary
-                                if let Ok(mut args) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
-                                    if let Some(content) = args.get("content").and_then(|v| v.as_str()) {
-                                        let lines = content.lines().count();
-                                        let bytes = content.len();
-                                        args["content"] = serde_json::json!(format!("[{} lines, {} bytes]", lines, bytes));
-                                        tc.arguments = serde_json::to_string(&args).unwrap_or(tc.arguments);
-                                    }
-                                }
-                                tc
-                            } else {
-                                tc.clone()
-                            }
-                        }).collect();
-                        result.push(Message {
-                            role: msg.role.clone(),
-                            content: MessageContent::AssistantWithToolCalls {
-                                text: text.clone(),
-                                tool_calls: compressed_calls,
-                            },
-                        });
-                    }
-                    _ => result.push(msg.clone()),
-                }
-            } else {
-                // Latest turn — keep everything at full fidelity
-                result.push(msg.clone());
-            }
+        // If we dropped turns, inject a brief note so the model knows context was truncated
+        if drop_up_to_turn > 0 {
+            result.push(Message::new(Role::System,
+                format!("[Context: {} earlier turn(s) were dropped to fit context window. \
+                         The conversation continues from the remaining messages below.]",
+                    drop_up_to_turn)
+            ));
         }
 
-        // Phase 4: Sanitize broken tool_call/tool_result pairs.
+        result.extend(self.messages[msg_start..].iter().cloned());
         Self::sanitize_messages(&mut result);
 
+        let sent_tokens: usize = result.iter().map(|m| m.estimate_tokens()).sum::<usize>()
+            .saturating_sub(system_tokens);
         let stats = ContextStats {
             system_tokens,
-            hot_tokens,
-            cold_tokens,
+            sent_tokens,
+            dropped_tokens: dropped_tokens,
             total_messages: result.len(),
         };
 
         (result, stats)
     }
 
-    /// Synthesize a brief outcome description for a turn that has no assistant
-    /// text (e.g., model only made tool calls, or turn was terminated by step limit).
-    /// Scans tool results for success/failure signals and tool call names.
+    /// Synthesize a brief outcome description for a turn that has no assistant text.
     pub fn synthesize_turn_outcome(&self, turn_msgs: &[Message]) -> String {
         let mut tool_names: Vec<&str> = Vec::new();
         let mut last_success = true;
@@ -502,7 +333,6 @@ impl Conversation {
                     last_success = r.success;
                     last_output = &r.output;
                     if r.success && (r.output.contains("Edited ") || r.output.contains("Wrote ")) {
-                        // Extract the first line as an edit summary
                         if let Some(line) = r.output.lines().next() {
                             edits.push(line.to_string());
                         }
@@ -511,9 +341,6 @@ impl Conversation {
                 MessageContent::ToolResultRef(r) => {
                     last_success = r.success;
                     last_output = &r.summary;
-                    if r.success && (r.summary.contains("Edited ") || r.summary.contains("Wrote ")) {
-                        edits.push(r.summary.clone());
-                    }
                 }
                 _ => {}
             }
@@ -544,174 +371,30 @@ impl Conversation {
         outcome
     }
 
-    /// Extract edit/write tombstones from a turn's messages.
-    /// Returns lines like `[edited: NoteService.java L94-95]` so the model
-    /// remembers which files it changed even after cold-zone compression
-    /// drops the full tool results.
-    fn extract_edit_tombstones(turn_msgs: &[Message]) -> String {
-        let mut tombstones: Vec<String> = Vec::new();
-        let mut seen_files: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-        for msg in turn_msgs {
-            let (success, output) = match &msg.content {
-                MessageContent::ToolResult(r) => (r.success, r.output.as_str()),
-                MessageContent::ToolResultRef(r) => (r.success, r.summary.as_str()),
-                _ => continue,
-            };
-            if !success { continue; }
-
-            for line in output.lines() {
-                if line.starts_with("Edited ") || line.starts_with("Wrote ")
-                    || line.starts_with("Multi-edit:")
-                {
-                    tombstones.push(format!("[{}]", line.trim()));
-                }
-            }
-
-            // For read_file results in cold zone: preserve a compact skeleton summary.
-            // Detected by line-number format "  N| ..." (read_file output format).
-            if output.lines().count() > 30 && output.lines().any(|l| {
-                let t = l.trim_start();
-                t.len() > 3 && t.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) && t.contains("| ")
-            }) {
-                // Extract file name from first line and key symbols
-                let first_line = output.lines().next().unwrap_or("");
-                let line_count = output.lines().count();
-                let symbols: Vec<&str> = output.lines()
-                    .filter_map(|l| {
-                        let t = l.trim();
-                        if t.starts_with("function ") || t.starts_with("async function ")
-                            || t.starts_with("const ") || t.starts_with("class ")
-                            || t.starts_with("export ") || t.starts_with("import ")
-                            || t.starts_with("<template") || t.starts_with("<script")
-                            || t.starts_with("pub fn ") || t.starts_with("def ")
-                            || t.starts_with("public ") || t.starts_with("private ")
-                        {
-                            // Extract just the name/signature
-                            Some(t.split(|c: char| c == '(' || c == '{' || c == ':').next().unwrap_or(t))
-                        } else { None }
-                    })
-                    .take(8)
-                    .collect();
-
-                if !symbols.is_empty() {
-                    let key = format!("read_{}", line_count);
-                    if seen_files.insert(key) {
-                        tombstones.push(format!(
-                            "[Read {} ({} lines): {}]",
-                            first_line.trim().split('|').next().unwrap_or("file").trim(),
-                            line_count,
-                            symbols.join(", ")
-                        ));
-                    }
-                }
-            }
-        }
-        tombstones.join("\n")
-    }
-
-    /// Build a batch summary for turns[start..end].
-    /// Extracts: user requests, files read/edited, key outcomes.
-    /// Returns a compact paragraph (~100-200 tokens) replacing 1000+ tokens of individual turns.
-    fn build_batch_summary(&self, start: usize, end: usize) -> String {
-        let turns = &self.turn_tracker.turns;
-        if start >= end || end > turns.len() { return String::new(); }
-
-        let mut user_requests: Vec<String> = Vec::new();
-        let mut files_read: Vec<String> = Vec::new();
-        let mut files_edited: Vec<String> = Vec::new();
-        let mut tools_used: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut had_errors = false;
-
-        for ti in start..end {
-            let turn = &turns[ti];
-            let turn_msgs = &self.messages[turn.start_idx..turn.end_idx().min(self.messages.len())];
-
-            for msg in turn_msgs {
-                match &msg.content {
-                    MessageContent::Text(s) if matches!(msg.role, Role::User) => {
-                        let short = if s.chars().count() > 60 {
-                            format!("{}...", s.chars().take(57).collect::<String>())
-                        } else {
-                            s.clone()
-                        };
-                        if !short.starts_with("[") { // skip system-injected messages
-                            user_requests.push(short);
-                        }
-                    }
-                    MessageContent::AssistantWithToolCalls { tool_calls, .. } => {
-                        for tc in tool_calls {
-                            tools_used.insert(tc.name.clone());
-                            // Extract file paths
-                            if let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
-                                if let Some(fp) = args.get("file_path").and_then(|v| v.as_str()) {
-                                    let short = std::path::Path::new(fp)
-                                        .file_name()
-                                        .map(|n| n.to_string_lossy().to_string())
-                                        .unwrap_or_else(|| fp.to_string());
-                                    match tc.name.as_str() {
-                                        "read_file" => {
-                                            if !files_read.contains(&short) { files_read.push(short); }
-                                        }
-                                        "edit_file" | "create_file" => {
-                                            if !files_edited.contains(&short) { files_edited.push(short); }
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    MessageContent::ToolResult(r) if !r.success => { had_errors = true; }
-                    _ => {}
-                }
-            }
-        }
-
-        let mut summary = String::new();
-
-        if !user_requests.is_empty() {
-            summary.push_str(&format!("Tasks: {}\n", user_requests.join(" → ")));
-        }
-        if !files_read.is_empty() {
-            files_read.truncate(8);
-            summary.push_str(&format!("Read: {}\n", files_read.join(", ")));
-        }
-        if !files_edited.is_empty() {
-            files_edited.truncate(8);
-            summary.push_str(&format!("Edited: {}\n", files_edited.join(", ")));
-        }
-        if had_errors {
-            summary.push_str("Had errors (resolved).\n");
-        }
-
-        summary
-    }
-
-    /// Fallback windowing when no turns are tracked. Uses the original
-    /// per-message approach: recent messages at full fidelity, older ones condensed.
+    /// Fallback windowing when no turns are tracked.
+    /// Keeps as many recent messages as fit within 60% of remaining budget.
     fn to_provider_messages_budgeted_fallback(
         &self,
         system_msg: Message,
         remaining_budget: usize,
     ) -> Vec<Message> {
-        let hot_budget = remaining_budget * 60 / 100;
-        let mut hot_tokens = 0usize;
-        let mut hot_start = self.messages.len();
+        let budget = remaining_budget * 60 / 100;
+        let mut used = 0usize;
+        let mut start = self.messages.len();
 
         for i in (0..self.messages.len()).rev() {
             let msg_tokens = self.messages[i].estimate_tokens();
-            if hot_tokens + msg_tokens > hot_budget {
+            if used + msg_tokens > budget {
                 break;
             }
-            hot_tokens += msg_tokens;
-            hot_start = i;
+            used += msg_tokens;
+            start = i;
         }
-        hot_start = self.snap_to_valid_boundary(hot_start);
+        start = self.snap_to_valid_boundary(start);
 
-        let mut result = Vec::with_capacity(self.messages.len() - hot_start + 1);
+        let mut result = Vec::with_capacity(self.messages.len() - start + 1);
         result.push(system_msg);
-        result.extend(self.messages[hot_start..].iter().cloned());
+        result.extend(self.messages[start..].iter().cloned());
         Self::sanitize_messages(&mut result);
         result
     }
@@ -979,12 +662,43 @@ mod tests {
     }
 
     #[test]
-    fn test_budgeted_condenses_old_tool_results() {
+    fn test_budgeted_sends_all_when_under_80pct() {
         use crate::tool::{ToolCall, ToolResult};
         let mut conv = Conversation::new();
 
-        // Create 5 turns with 4 tool calls each — enough turns so older ones
-        // get condensed while the 2 most recent stay in hot zone.
+        // Create 2 turns with small tool results — should all fit
+        for turn in 0..2 {
+            conv.add_user_message(&format!("task {}", turn));
+            let call = ToolCall {
+                id: format!("call_{}", turn),
+                name: "read_file".to_string(),
+                arguments: format!(r#"{{"file_path":"/tmp/file_{}.rs"}}"#, turn),
+            };
+            conv.add_assistant_tool_calls(None, vec![call]);
+            conv.add_tool_result(ToolResult {
+                call_id: format!("call_{}", turn),
+                output: "short result".to_string(),
+                success: true,
+            });
+        }
+        conv.add_user_message("now what?");
+
+        // Large budget — everything fits
+        let (msgs, stats) = conv.to_provider_messages_budgeted("sys", 100000);
+        // system + 7 messages (2 turns * 3 msgs each + final user)
+        assert_eq!(msgs.len(), 8);
+        assert!(matches!(msgs[0].role, Role::System));
+        assert_eq!(msgs.last().unwrap().text(), Some("now what?"));
+        assert_eq!(stats.dropped_tokens, 0, "Nothing should be dropped");
+    }
+
+    #[test]
+    fn test_budgeted_drops_oldest_turns_when_over_budget() {
+        use crate::tool::{ToolCall, ToolResult};
+        let mut conv = Conversation::new();
+
+        // Create 5 turns with large tool results (2000 chars each ≈ 500 tokens)
+        // Total ≈ 5 * 4 * 500 = 10000 tokens + overhead, budget 80% of 4000 = 3200
         for turn in 0..5 {
             conv.add_user_message(&format!("task {}", turn));
             for i in 0..4 {
@@ -997,45 +711,109 @@ mod tests {
                 conv.add_assistant_tool_calls(None, vec![call]);
                 conv.add_tool_result(ToolResult {
                     call_id: format!("call_{}", idx),
-                    output: "x".repeat(500),
+                    output: "x".repeat(2000),
                     success: true,
                 });
             }
         }
         conv.add_user_message("now what?");
 
-        let (msgs, _stats) = conv.to_provider_messages_budgeted("sys", 4000);
-        let total_chars: usize = msgs.iter().map(|m| m.text().map_or(0, |t| t.len())).sum();
-        assert!(total_chars < 12000, "Expected condensation, got {} chars", total_chars);
-        assert!(matches!(msgs[0].role, Role::System));
+        let (msgs, stats) = conv.to_provider_messages_budgeted("sys", 4000);
+        // Oldest turns should be dropped
+        assert!(stats.dropped_tokens > 0, "Some turns should have been dropped");
+        // Most recent user message must survive
         assert_eq!(msgs.last().unwrap().text(), Some("now what?"));
+        // System prompt must be first
+        assert!(matches!(msgs[0].role, Role::System));
     }
 
     #[test]
-    fn test_budgeted_preserves_first_user_message() {
+    fn test_budgeted_always_keeps_latest_turn() {
         use crate::tool::{ToolCall, ToolResult};
         let mut conv = Conversation::new();
-        conv.add_user_message("original task: redesign the page");
 
-        for i in 0..10 {
+        // Create a single turn with very large output
+        conv.add_user_message("big task");
+        let call = ToolCall {
+            id: "c0".to_string(),
+            name: "bash".to_string(),
+            arguments: "{}".to_string(),
+        };
+        conv.add_assistant_tool_calls(Some("running..."), vec![call]);
+        conv.add_tool_result(ToolResult {
+            call_id: "c0".to_string(),
+            output: "z".repeat(50000),
+            success: true,
+        });
+
+        // Very small budget — but latest turn must still be kept
+        let (msgs, _stats) = conv.to_provider_messages_budgeted("sys", 1000);
+        assert!(msgs.len() >= 4, "Must keep system + user + tool_call + result");
+        assert!(matches!(msgs[0].role, Role::System));
+        let has_user = msgs.iter().any(|m| m.text() == Some("big task"));
+        assert!(has_user, "User message from latest turn must survive");
+    }
+
+    #[test]
+    fn test_budgeted_injects_drop_notice() {
+        use crate::tool::{ToolCall, ToolResult};
+        let mut conv = Conversation::new();
+
+        // Create 3 turns with large content (4000 chars each ≈ 1000 tokens)
+        for turn in 0..3 {
+            conv.add_user_message(&format!("task {}", turn));
             let call = ToolCall {
-                id: format!("c{}", i),
+                id: format!("c{}", turn),
                 name: "bash".to_string(),
                 arguments: "{}".to_string(),
             };
-            conv.add_assistant_tool_calls(Some("working..."), vec![call]);
+            conv.add_assistant_tool_calls(Some("ok"), vec![call]);
             conv.add_tool_result(ToolResult {
-                call_id: format!("c{}", i),
-                output: "y".repeat(200),
+                call_id: format!("c{}", turn),
+                output: "x".repeat(4000),
                 success: true,
             });
         }
 
-        let (msgs, _stats) = conv.to_provider_messages_budgeted("sys", 3000);
-        let has_original = msgs.iter().any(|m| {
-            m.text() == Some("original task: redesign the page")
+        // Small budget — force dropping (3 turns * ~1000 tokens >> 80% of 2000)
+        let (msgs, _stats) = conv.to_provider_messages_budgeted("sys", 2000);
+        // When turns are dropped, a notice should be injected
+        let has_notice = msgs.iter().any(|m| {
+            m.text().map_or(false, |t| t.contains("earlier turn(s) were dropped"))
         });
-        assert!(has_original, "Original user message should be preserved");
+        assert!(has_notice, "Should inject drop notice when turns are removed");
+    }
+
+    #[test]
+    fn test_budgeted_no_drop_notice_when_all_fit() {
+        let mut conv = Conversation::new();
+        conv.add_user_message("hello");
+        conv.messages.push(Message::new(Role::Assistant, "hi there"));
+
+        let (msgs, _stats) = conv.to_provider_messages_budgeted("sys", 100000);
+        let has_notice = msgs.iter().any(|m| {
+            m.text().map_or(false, |t| t.contains("earlier turn(s) were dropped"))
+        });
+        assert!(!has_notice, "No drop notice when everything fits");
+    }
+
+    #[test]
+    fn test_budgeted_preserves_message_order() {
+        let mut conv = Conversation::new();
+        conv.add_user_message("first");
+        conv.messages.push(Message::new(Role::Assistant, "response 1"));
+        conv.add_user_message("second");
+        conv.messages.push(Message::new(Role::Assistant, "response 2"));
+        conv.add_user_message("third");
+
+        let (msgs, _stats) = conv.to_provider_messages_budgeted("sys", 100000);
+        // system + 5 messages
+        assert_eq!(msgs.len(), 6);
+        assert_eq!(msgs[1].text(), Some("first"));
+        assert_eq!(msgs[2].text(), Some("response 1"));
+        assert_eq!(msgs[3].text(), Some("second"));
+        assert_eq!(msgs[4].text(), Some("response 2"));
+        assert_eq!(msgs[5].text(), Some("third"));
     }
 
     #[test]

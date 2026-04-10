@@ -30,9 +30,7 @@ use crate::provider::LlmProvider;
 use crate::skill::SkillRegistry;
 use crate::tool::{
     PermissionDecision, PermissionStore, ToolCall, ToolContext, ToolRegistry,
-    ToolResult,
 };
-use crate::tool::result_store::ToolResultStore;
 use crate::tool::use_skill::UseSkillTool;
 use crate::turn::event::{TurnEvent, TurnResult};
 use crate::turn::runner::TurnRunner;
@@ -151,8 +149,8 @@ pub enum AgentEvent {
     /// Context budget stats for logging (not displayed, only written to datalog).
     ContextStats {
         system_tokens: usize,
-        hot_tokens: usize,
-        cold_tokens: usize,
+        sent_tokens: usize,
+        dropped_tokens: usize,
         working_set_tokens: usize,
         total_messages: usize,
     },
@@ -304,9 +302,6 @@ pub struct AgentLoop {
     /// Key: label (e.g., "frontend", "backend"), Value: URL.
     active_services: std::collections::HashMap<String, String>,
 
-    // Tool result cache (content-addressed disk store)
-    result_store: ToolResultStore,
-
     // Skill registry — provides descriptions for system prompt and powers use_skill tool
     skill_registry: std::sync::Arc<std::sync::RwLock<SkillRegistry>>,
 
@@ -407,7 +402,6 @@ impl AgentLoop {
             context: tool_context.clone(),
             config: config.clone(),
             permission: interactive_permission,
-            result_store: ToolResultStore::new(ToolResultStore::default_dir()),
             recently_edited_files: Vec::new(),
             post_edit_read_counts: std::collections::HashMap::new(),
         };
@@ -469,7 +463,6 @@ impl AgentLoop {
             plan_text: None,
             session_files: std::collections::HashMap::new(),
             active_services: std::collections::HashMap::new(),
-            result_store: ToolResultStore::new(ToolResultStore::default_dir()),
             skill_registry,
             reindex_tx: None,
             cmd_rx,
@@ -723,7 +716,6 @@ impl AgentLoop {
         self.category_fail_streak.clear();
         // Clear session_files on each new user message.
         // Working Set only tracks files from the CURRENT task.
-        // Previous files are remembered via cold zone summaries.
         self.session_files.clear();
         self.turn_start = Some(Instant::now());
         self.cancel_token = CancellationToken::new();
@@ -881,14 +873,7 @@ impl AgentLoop {
                     .get(&self.config.default_provider)
                     .map(|p| p.context_window)
                     .unwrap_or(16000);
-                let (mut msgs, _) = conv.to_provider_messages_budgeted(&system_prompt, context_window);
-                // Inflate ToolResultRef → ToolResult so logs contain actual content
-                for msg in msgs.iter_mut().rev().take(20) {
-                    if let crate::conversation::message::MessageContent::ToolResultRef(ref r) = msg.content {
-                        let full = self.turn_runner.result_store.inflate(r);
-                        msg.content = crate::conversation::message::MessageContent::ToolResult(full);
-                    }
-                }
+                let (msgs, _) = conv.to_provider_messages_budgeted(&system_prompt, context_window);
                 let tool_defs = self.turn_runner.tools.get_definitions();
                 crate::turn::log::log_llm_request(
                     &msgs,
@@ -1054,26 +1039,25 @@ impl AgentLoop {
                                         name, output, success, duration,
                                     });
                                 }
-                                TurnEvent::TokenUsage { prompt_tokens, completion_tokens, total_tokens: _ } => {
+                                TurnEvent::TokenUsage { prompt_tokens, completion_tokens, total_tokens: _, cached_tokens } => {
                                     let _ = event_tx.send(AgentEvent::TokenUsage(
                                         crate::stream::TokenUsage {
                                             prompt_tokens,
                                             completion_tokens,
+                                            cached_tokens,
                                         }
                                     ));
                                 }
-                                TurnEvent::ContextStats { system_tokens, hot_tokens, cold_tokens, working_set_tokens, total_messages } => {
-                                    // Detect context collapse: if hot zone drops dramatically,
+                                TurnEvent::ContextStats { system_tokens, sent_tokens, dropped_tokens, working_set_tokens, total_messages } => {
+                                    // Detect context collapse: if sent tokens drop dramatically,
                                     // model has lost most history. Reset edit tracking so BLOCKED
                                     // doesn't prevent the model from re-reading files it forgot about.
-                                    if hot_tokens < 3000 {
-                                        // Hot zone < 3K = context collapsed. Set flag to
-                                        // clear edit tracking after select! completes.
+                                    if sent_tokens < 3000 {
                                         *context_collapsed = true;
                                     }
 
                                     let _ = event_tx.send(AgentEvent::ContextStats {
-                                        system_tokens, hot_tokens, cold_tokens, working_set_tokens, total_messages,
+                                        system_tokens, sent_tokens, dropped_tokens, working_set_tokens, total_messages,
                                     });
                                 }
                                 TurnEvent::Error(e) => {

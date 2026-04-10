@@ -1603,9 +1603,6 @@ let session_manager = SessionManager::new(&working_dir);
         context: tool_context,
         config: config.clone(),
         permission,
-        result_store: atomcode_core::tool::result_store::ToolResultStore::new(
-            atomcode_core::tool::result_store::ToolResultStore::default_dir()
-        ),
         recently_edited_files: Vec::new(),
         post_edit_read_counts: std::collections::HashMap::new(),
     };
@@ -1715,7 +1712,7 @@ let session_manager = SessionManager::new(&working_dir);
                     duration_ms: duration.as_millis() as u64,
                 });
             }
-            TurnEvent::TokenUsage { prompt_tokens, completion_tokens, total_tokens: tt } => {
+            TurnEvent::TokenUsage { prompt_tokens, completion_tokens, total_tokens: tt, cached_tokens: _ } => {
                 total_tokens = tt;
                 let _ = event_tx.send(ChatEvent::TokenUsage {
                     prompt: prompt_tokens,

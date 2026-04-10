@@ -11,7 +11,7 @@ pub struct ToolResultRef {
     pub call_id: String,
     /// Hex hash of the full output (content-addressed key).
     pub hash: String,
-    /// One-line summary for cold-zone context injection.
+    /// One-line summary for compact context representation.
     pub summary: String,
     /// Byte length of the full output.
     pub byte_size: usize,
@@ -91,7 +91,7 @@ fn content_hash(content: &str) -> String {
     format!("{:016x}", hasher.finish())
 }
 
-/// Generate a one-line summary of tool output for cold-zone injection.
+/// Generate a one-line summary of tool output.
 fn make_summary(output: &str, success: bool) -> String {
     let first_line = output.lines().next().unwrap_or(if success { "OK" } else { "Error" });
     if success {

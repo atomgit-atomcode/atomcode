@@ -13,7 +13,6 @@ use tokio_util::sync::CancellationToken;
 use crate::config::Config;
 use crate::conversation::Conversation;
 use crate::provider::LlmProvider;
-use crate::tool::result_store::ToolResultStore;
 use crate::tool::{ToolContext, ToolRegistry};
 use crate::turn::event::{TurnEvent, TurnResult};
 use crate::turn::permission::{AutoPermissionDecider, AutoPermissionMode};
@@ -88,7 +87,6 @@ impl SubAgentTask {
             context: ctx,
             config: config.clone(),
             permission,
-            result_store: ToolResultStore::new(ToolResultStore::default_dir()),
             recently_edited_files: Vec::new(),
             post_edit_read_counts: std::collections::HashMap::new(),
         };

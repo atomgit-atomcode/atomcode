@@ -42,6 +42,7 @@ impl MockProvider {
                 StreamEvent::Usage(TokenUsage {
                     prompt_tokens: 10,
                     completion_tokens: 5,
+                    cached_tokens: 0,
                 }),
                 StreamEvent::Done { truncated: false },
             ],
@@ -64,6 +65,7 @@ impl MockProvider {
                 StreamEvent::Usage(TokenUsage {
                     prompt_tokens: 10,
                     completion_tokens: 8,
+                    cached_tokens: 0,
                 }),
                 StreamEvent::Done { truncated: false },
             ],
@@ -183,9 +185,6 @@ fn make_runner(provider: MockProvider, tools: ToolRegistry, permission: Box<dyn 
         context: test_context(),
         config: test_config(),
         permission,
-        result_store: crate::tool::result_store::ToolResultStore::new(
-            crate::tool::result_store::ToolResultStore::default_dir()
-        ),
         recently_edited_files: Vec::new(),
         post_edit_read_counts: std::collections::HashMap::new(),
     }
@@ -732,7 +731,7 @@ async fn test_multiple_tool_calls_results_in_context() {
             StreamEvent::ToolCallStart { id: "c2".into(), name: "read_file".into() },
             StreamEvent::ToolCallDelta(r#"{"file_path":"/tmp/x"}"#.into()),
             StreamEvent::ToolCallDone(ToolCall { id: "c2".into(), name: "read_file".into(), arguments: r#"{"file_path":"/tmp/x"}"#.into() }),
-            StreamEvent::Usage(TokenUsage { prompt_tokens: 20, completion_tokens: 10 }),
+            StreamEvent::Usage(TokenUsage { prompt_tokens: 20, completion_tokens: 10, cached_tokens: 0 }),
             StreamEvent::Done { truncated: false },
         ],
     };

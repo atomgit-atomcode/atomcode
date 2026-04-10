@@ -369,7 +369,6 @@ impl Tool for EditFileTool {
             let diff = build_compact_diff(&old_text, &new_string);
             let _new_end = start + added.saturating_sub(1);
             // Concise output: just confirmation + short diff. No outline, no surrounding context.
-            // Verbose output pollutes context and pushes file content out of the hot zone.
             let result = ToolResult {
                 call_id: String::new(),
                 output: format!(

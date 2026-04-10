@@ -777,6 +777,9 @@ impl App {
             AgentEvent::TokenUsage(usage) => {
                 self.turn_tokens += usage.completion_tokens;
                 self.total_tokens += usage.completion_tokens;
+                if usage.cached_tokens > 0 {
+                    self.turn_log.log_cache_hit(usage.prompt_tokens, usage.cached_tokens);
+                }
             }
             AgentEvent::WorkingDirChanged(new_dir) => {
                 // Only /cd (user command) triggers this — LLM tools cannot change working dir.
@@ -792,9 +795,9 @@ impl App {
                 self.config.default_workdir = Some(new_dir.to_string_lossy().to_string());
                 let _ = self.config.save(&Config::default_path());
             }
-            AgentEvent::ContextStats { system_tokens, hot_tokens, cold_tokens, working_set_tokens, total_messages } => {
-                self.ctx_used_tokens = system_tokens + hot_tokens + cold_tokens + working_set_tokens;
-                self.turn_log.log_context_stats(system_tokens, hot_tokens, cold_tokens, working_set_tokens, total_messages);
+            AgentEvent::ContextStats { system_tokens, sent_tokens, dropped_tokens, working_set_tokens, total_messages } => {
+                self.ctx_used_tokens = system_tokens + sent_tokens;
+                self.turn_log.log_context_stats(system_tokens, sent_tokens, dropped_tokens, working_set_tokens, total_messages);
             }
             AgentEvent::SubAgentProgress { file, status } => {
                 // Claude Code style parallel task display

@@ -113,14 +113,25 @@ impl TurnLog {
 
     /// Log context statistics for debugging.
     /// Called from AgentLoop before each LLM call.
-    pub fn log_context_stats(&mut self, system_tokens: usize, hot_tokens: usize,
-                              cold_tokens: usize, working_set_tokens: usize,
+    pub fn log_context_stats(&mut self, system_tokens: usize, sent_tokens: usize,
+                              dropped_tokens: usize, _working_set_tokens: usize,
                               total_messages: usize) {
         if !self.active { return; }
-        let total = system_tokens + hot_tokens + cold_tokens + working_set_tokens;
+        let total = system_tokens + sent_tokens;
         let _ = writeln!(&mut self.buf,
-            "  _[ctx: {}tok = sys:{}+hot:{}+cold:{}+ws:{}, msgs:{}]_",
-            total, system_tokens, hot_tokens, cold_tokens, working_set_tokens, total_messages
+            "  _[ctx: {}tok = sys:{}+sent:{}+dropped:{}, msgs:{}]_",
+            total, system_tokens, sent_tokens, dropped_tokens, total_messages
+        );
+        self.flush();
+    }
+
+    /// Log prompt cache hit info (only when provider reports cached_tokens > 0).
+    pub fn log_cache_hit(&mut self, prompt_tokens: usize, cached_tokens: usize) {
+        if !self.active { return; }
+        let pct = if prompt_tokens > 0 { cached_tokens * 100 / prompt_tokens } else { 0 };
+        let _ = writeln!(&mut self.buf,
+            "  _[cache: {}/{}tok = {}% hit]_",
+            cached_tokens, prompt_tokens, pct
         );
         self.flush();
     }
