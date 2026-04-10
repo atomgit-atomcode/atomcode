@@ -34,7 +34,11 @@ where
         }
         fn visit_f64<E: de::Error>(self, v: f64) -> std::result::Result<Self::Value, E> { Ok(Some(v as u64)) }
         fn visit_str<E: de::Error>(self, v: &str) -> std::result::Result<Self::Value, E> {
-            v.trim().parse::<u64>().map(Some).map_err(de::Error::custom)
+            let s = v.trim();
+            // Try u64 first, then f64 (models often send "60.0" instead of 60)
+            s.parse::<u64>().map(Some)
+                .or_else(|_| s.parse::<f64>().map(|f| Some(f as u64)))
+                .map_err(de::Error::custom)
         }
     }
 
