@@ -21,7 +21,7 @@ pub struct ProviderConfig {
 }
 
 fn default_context_window() -> usize {
-    128000
+    32000
 }
 
 /// Sensible default context window per provider type.
