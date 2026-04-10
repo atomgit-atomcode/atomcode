@@ -60,23 +60,10 @@ impl Tool for BashTool {
     fn definition(&self) -> ToolDef {
         ToolDef {
             name: "bash",
-            description: "Execute a shell command and return its output (stdout + stderr).\n\
-                When to use:\n\
-                - Build/compile: npm run build, cargo build, make, etc.\n\
-                - Run tests: npm test, pytest, cargo test, etc.\n\
-                - Git commands: git status, git diff, git log, git add, git commit, etc.\n\
-                - Install packages: npm install, pip install, cargo add, etc.\n\
-                - Start/restart servers: npm run dev, python manage.py runserver, etc.\n\
-                - System commands: ls, mkdir, which, curl (for API testing), etc.\n\
-                When NOT to use (use dedicated tools instead):\n\
-                - Reading files: use read_file, NOT cat/head/tail\n\
-                - Searching content: use grep tool, NOT bash grep/rg/awk\n\
-                - Finding files: use glob tool, NOT bash find\n\
-                - Editing files: use edit_file, NOT sed/awk\n\
-                Behavior:\n\
-                - Default timeout: 30 seconds. Use 'timeout' parameter for longer commands.\n\
-                - Long-running server processes: returns after 10s with partial output (server keeps running).\n\
-                - Destructive commands (rm -rf, drop, etc.) require user confirmation.".to_string(),
+            description: "Execute a shell command. Use for: build, test, git, install deps.\n\
+                Do NOT use for: reading files (use read_file), searching (use grep), editing (use edit_file).\n\
+                Do NOT start servers or long-running processes — the user manages those.\n\
+                Default timeout: 30s. Destructive commands require user confirmation.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
