@@ -805,21 +805,19 @@ impl AgentLoop {
                 self.conversation.add_user_message(&format!("[Additional context from user]: {}", input));
             }
 
-            // Planning phase: inject a planning reminder on the SECOND turn
-            // (first turn is read-only, second turn is where the model starts editing).
-            // This ensures the model plans ALL changes before making the first edit.
-            if self.planning_phase && self.turn_count == 2 {
+            // Planning phase: inject planning reminder on turn 3.
+            // Turn 1-2: model reads files to understand the task.
+            // Turn 3: "you've read enough, now plan and edit."
+            if self.planning_phase && self.turn_count == 3 {
                 self.planning_phase = false;
                 self.conversation.messages.push(
                     crate::conversation::message::Message::new(
                         crate::conversation::message::Role::System,
-                        "[PLAN BEFORE EDITING] STOP. Before ANY edit, output your plan:\n\
-                         1. WHAT: What exactly will you change? (one sentence)\n\
-                         2. FILES: List every file you will modify (file path only)\n\
-                         3. VERIFY: How will you confirm it works? (compile/test/curl)\n\
-                         4. SCOPE: Do NOT add features the user didn't ask for.\n\n\
-                         Then execute the plan. ONE edit per file, use edits array for multiple regions.\n\
-                         When compile passes and your plan is done → summarize and STOP.",
+                        "[PLAN NOW] You have read enough files. Plan your changes and start editing:\n\
+                         1. WHAT: What exactly will you change?\n\
+                         2. FILES: Which files will you modify?\n\
+                         3. SCOPE: Only what the user asked for.\n\
+                         Then edit immediately. Do NOT read more files unless absolutely necessary.",
                     )
                 );
             }
