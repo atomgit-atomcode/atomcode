@@ -1,0 +1,8 @@
+default_provider = "openrouter"
+
+[providers.openrouter]
+type = "openai"
+api_key = "xxx"
+model = "xxx"
+base_url = "https://openrouter.ai/api/v1"
+context_window = 16000

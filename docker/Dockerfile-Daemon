@@ -1,0 +1,29 @@
+FROM debian:bookworm-slim
+
+# Install required utilities
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+# Create non-root user
+RUN useradd -r -s /bin/bash atomcode
+
+WORKDIR /home/atomcode
+
+# Copy pre-built Linux binaries from dist directory
+COPY dist/atomcode-v*/atomcode-daemon-*-linux-x64.tar.gz /tmp/atomcode-daemon.tar.gz
+
+# Extract and install binaries
+RUN cd /tmp && \
+    tar xzf atomcode-daemon.tar.gz && \
+    mv /tmp/atomcode-daemon-atomcode-v*-linux-x64 /usr/local/bin/atomcode-daemon && \
+    chmod +x /usr/local/bin/atomcode-daemon && \
+    rm -f /tmp/*.tar.gz
+
+# Expose daemon port
+EXPOSE 13456
+
+WORKDIR /workspace
+
+# Start daemon only
+ENTRYPOINT ["atomcode-daemon"]
