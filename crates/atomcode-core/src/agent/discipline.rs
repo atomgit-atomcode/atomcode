@@ -106,30 +106,22 @@ impl AgentLoop {
             }
         }
 
-        // Re-read guard: inject warnings for files read too many times.
-        // count >= 3: hard block warning — the model is looping on the same file.
-        // count >= 2 without offset in last read: warn about full re-reads.
-        let mut reread_warnings: Vec<String> = Vec::new();
+        // Re-read guard: hard block when the same file is read 4+ times.
+        // Injected as a User message so the model cannot ignore it.
+        let mut blocked_files: Vec<String> = Vec::new();
         for (file, count) in &self.file_read_counts {
-            if *count >= 3 {
-                reread_warnings.push(format!(
-                    "[BLOCKED: You have read {} {} times this turn. \
-                     You already have the content. STOP re-reading and use what you have. \
-                     If you need to edit, use edit_file now.]",
-                    file, count
-                ));
+            if *count >= 4 {
+                blocked_files.push(file.clone());
             }
         }
-        if !reread_warnings.is_empty() {
-            let warning = reread_warnings.join("\n");
-            if let Some(last_msg) = self.conversation.messages.last_mut() {
-                match &mut last_msg.content {
-                    crate::conversation::message::MessageContent::ToolResult(ref mut r) => {
-                        r.output.push_str(&format!("\n{}", warning));
-                    }
-                    _ => {}
-                }
-            }
+        if !blocked_files.is_empty() {
+            let warning = format!(
+                "[HARD BLOCK: You have read {} 4+ times. You ALREADY have the content. \
+                 Do NOT call read_file on these files again. \
+                 Use edit_file to make changes NOW, or explain to the user what's wrong.]",
+                blocked_files.join(", ")
+            );
+            self.conversation.add_user_message(&warning);
         }
 
         // NOTE: Silent-round progress prompt disabled — add_user_message injections
