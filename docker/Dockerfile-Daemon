@@ -1,5 +1,9 @@
 FROM debian:bookworm-slim
 
+# Use China mirror for faster downloads
+RUN sed -i 's|http://deb.debian.org|http://mirrors.aliyun.com|g' /etc/apt/sources.list.d/debian.sources 2>/dev/null || \
+    sed -i 's|http://deb.debian.org|http://mirrors.aliyun.com|g' /etc/apt/sources.list 2>/dev/null || true
+
 # Install required utilities
 RUN apt-get update && \
     apt-get install -y --no-install-recommends ca-certificates && \
