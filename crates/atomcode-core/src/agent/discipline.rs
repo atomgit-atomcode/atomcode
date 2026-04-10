@@ -106,22 +106,32 @@ impl AgentLoop {
             }
         }
 
-        // Re-read guard: hard block when the same file is read 4+ times.
-        // Injected as a User message so the model cannot ignore it.
+        // Re-read guard: when the same file is read 4+ times, the model is stuck.
+        // Re-inject the original task and force a re-plan.
         let mut blocked_files: Vec<String> = Vec::new();
         for (file, count) in &self.file_read_counts {
             if *count >= 4 {
-                blocked_files.push(file.clone());
+                blocked_files.push(format!("{} ({}x)", file, count));
             }
         }
         if !blocked_files.is_empty() {
+            let task = if self.current_task.is_empty() {
+                "the user's request".to_string()
+            } else {
+                format!("\"{}\"", self.current_task)
+            };
             let warning = format!(
-                "[HARD BLOCK: You have read {} 4+ times. You ALREADY have the content. \
-                 Do NOT call read_file on these files again. \
-                 Use edit_file to make changes NOW, or explain to the user what's wrong.]",
-                blocked_files.join(", ")
+                "[You are stuck — read {} repeatedly without making progress.]\n\
+                 STOP reading. Re-read the original task: {}\n\
+                 Now re-plan from scratch:\n\
+                 1. What EXACTLY needs to change?\n\
+                 2. Which file, which lines?\n\
+                 3. Edit NOW or tell the user you cannot do it.",
+                blocked_files.join(", "), task
             );
             self.conversation.add_user_message(&warning);
+            // Reset counts so the model gets another chance after re-planning
+            self.file_read_counts.clear();
         }
 
         // NOTE: Silent-round progress prompt disabled — add_user_message injections
