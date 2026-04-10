@@ -1046,30 +1046,39 @@ fn build_compact_diff(old: &str, new: &str) -> String {
     diff.trim_end().to_string()
 }
 
-/// Build a context snippet showing ±5 lines around the edited region.
+/// Build a context snippet showing ±4 lines around the edited region.
 /// This lets the model see the current file state after the edit,
-/// so it can construct accurate old_string for the next edit without grep/read.
+/// so it can construct accurate old_string for the next edit without re-reading.
 fn build_edit_context(content: &str, new_string: &str) -> String {
     let lines: Vec<&str> = content.lines().collect();
-    if lines.len() <= 15 {
-        // Small file — don't bother, the model already has it in context.
+    if lines.len() <= 20 {
+        return String::new(); // Small file, model already has it
+    }
+
+    // Find where new_string appears in the final content using substring search.
+    // More reliable than line-by-line matching (handles indentation changes).
+    let new_trimmed = new_string.trim();
+    if new_trimmed.is_empty() {
         return String::new();
     }
 
-    // Find where new_string appears in the content to locate the edit region.
-    let first_new_line = new_string.lines().next().unwrap_or("").trim();
-    if first_new_line.is_empty() || first_new_line.len() < 5 {
+    // Find the first non-empty line of new_string in the file
+    let search_line = new_trimmed.lines()
+        .find(|l| l.trim().len() >= 5)
+        .unwrap_or("");
+    if search_line.is_empty() {
         return String::new();
     }
 
-    let edit_line = lines.iter().position(|l| l.trim() == first_new_line);
-    let center = match edit_line {
+    let center = match lines.iter().position(|l| l.contains(search_line.trim())) {
         Some(idx) => idx,
         None => return String::new(),
     };
 
-    let start = center.saturating_sub(5);
-    let end = (center + new_string.lines().count() + 5).min(lines.len());
+    let ctx = 4;
+    let new_lines_count = new_string.lines().count();
+    let start = center.saturating_sub(ctx);
+    let end = (center + new_lines_count + ctx).min(lines.len());
 
     let mut snippet = format!("\n[File after edit, lines {}-{}:]\n", start + 1, end);
     for (i, line) in lines[start..end].iter().enumerate() {
