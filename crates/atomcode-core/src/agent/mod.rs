@@ -287,8 +287,7 @@ pub struct AgentLoop {
     session_files: std::collections::HashMap<String, PathBuf>,
     /// Whether planning phase is active (first LLM call without tools to force a plan).
     planning_phase: bool,
-    /// Remaining read-only turns for diagnosis tasks. When > 0, only read_file/grep/glob/
-    /// list_directory/find_references/list_symbols/read_symbol are available.
+    /// Remaining read-only turns for diagnosis tasks. When > 0, only read-only tools are available.
     /// Decremented each turn. Forces the model to read code before curl/edit.
     diagnosis_read_only_turns: usize,
     /// Current task type — drives dynamic prompt selection and planning.
@@ -383,7 +382,6 @@ impl AgentLoop {
                 tool_registry.register(Box::new(crate::tool::blast_radius::BlastRadiusTool));
             }
         }
-
         // Build approval channels for interactive permission flow
         let (approval_req_tx, approval_req_rx) = mpsc::unbounded_channel();
         let (approval_resp_tx, approval_resp_rx) = mpsc::unbounded_channel();
@@ -688,10 +686,6 @@ impl AgentLoop {
             enriched
         };
 
-        // Auto-inject graph context: if user mentions a file that exists
-        // in the graph, inject its dependencies so the model knows what's connected.
-        let clean = self.auto_inject_graph_context(&clean).await;
-
         self.conversation.add_user_message(&clean);
         self.turn_tokens = 0;
         self.tool_call_count = 0;
@@ -928,7 +922,8 @@ impl AgentLoop {
                 // not by blocking tools at the agent loop level.
                 let read_only_tools: &[&str] = &[
                     "read_file", "grep", "glob", "list_directory",
-                    "find_references", "list_symbols", "read_symbol",
+                    "trace_callees", "trace_callers", "trace_chain",
+                    "file_dependencies", "blast_radius",
                 ];
                 let use_read_only = self.diagnosis_read_only_turns > 0;
                 let tool_filter: Option<&[&str]> = if use_read_only {

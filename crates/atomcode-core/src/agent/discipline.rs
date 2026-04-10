@@ -25,32 +25,25 @@ impl AgentLoop {
             };
 
             let urgency = if !self.files_edited_this_turn.is_empty() && self.build_fail_count == 0 && self.tool_call_count >= 12 {
-                "SCOPE CHECK: You already edited files and compile passed. \
-                 Are you still working on the user's original request? \
-                 If yes, continue. If you're adding unrequested features — STOP and summarize NOW."
+                "REMINDER: You already edited files and compile passed. \
+                 Verify you are still working on the original request. \
+                 If done, summarize your changes."
             } else if self.files_edited_this_turn.is_empty() && self.tool_call_count >= 20 {
-                "HARD STOP: You have read code for 20+ steps without editing ANYTHING. \
-                 You are going in circles. STOP reading code and do ONE of these:\n\
-                 1. If this is a DESIGN question → explain your analysis to the user, propose 2-3 options, and ASK which approach they prefer.\n\
-                 2. If this is a BUG → state your hypothesis and edit the ONE file you suspect.\n\
-                 3. If you are STUCK → tell the user what you don't understand and ask for help.\n\
-                 Do NOT read another file."
+                "GUIDANCE: 20+ steps without editing. Consider one of:\n\
+                 1. DESIGN question → explain analysis and propose options.\n\
+                 2. BUG → state hypothesis and edit the suspected file.\n\
+                 3. STUCK → tell the user what is unclear."
             } else if self.tool_call_count >= 15 {
-                "URGENT: You MUST take action NOW. Either edit code, restart a service, or explain the issue to the user."
+                "REMINDER: 15+ steps used. Prioritize taking action: edit code or explain findings."
             } else if self.files_edited_this_turn.is_empty() && self.tool_call_count >= 10 {
-                "STOP diagnosing. Take action NOW: edit code, restart service, or explain to user."
+                "REMINDER: 10+ steps without edits. Consider acting: edit_file, bash, or explain to user."
             } else if self.files_edited_this_turn.is_empty() && self.tool_call_count >= 6 {
-                "Decide NOW: code bug → edit_file. Service old code → restart. Can't tell → ask user."
+                "Focus on files you plan to edit."
             } else {
-                "Only read files you plan to edit."
+                "Focus on files you plan to edit."
             };
 
-            // Find sibling files that might have the same bug pattern
-            let sibling_hint = if !self.files_edited_this_turn.is_empty() {
-                self.find_sibling_files_hint()
-            } else {
-                String::new()
-            };
+            let sibling_hint = String::new();
 
             let reminder = format!(
                 "\n\n<system-reminder>\n\
@@ -209,6 +202,7 @@ impl AgentLoop {
 
     /// Find sibling files (same directory, same extension) of edited files
     /// and suggest the model check them for the same bug pattern.
+    #[allow(dead_code)]
     pub(crate) fn find_sibling_files_hint(&self) -> String {
         let wd: PathBuf = self.turn_runner.context.working_dir
             .try_read()

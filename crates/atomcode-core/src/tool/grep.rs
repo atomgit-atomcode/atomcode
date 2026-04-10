@@ -290,39 +290,6 @@ impl GrepTool {
             ));
         }
 
-        let funcs: Vec<_> = symbols.iter()
-            .filter(|s| matches!(s.kind,
-                crate::graph::SymbolKind::Function | crate::graph::SymbolKind::Method))
-            .collect();
-        if let Some(func) = funcs.first() {
-            let callers = graph.trace_callers(func.id, 2);
-            if !callers.is_empty() {
-                out.push_str("Called by:\n");
-                for (cid, depth) in &callers {
-                    if let Some(n) = graph.node(*cid) {
-                        let f = n.file.strip_prefix(wd)
-                            .unwrap_or(&n.file)
-                            .to_string_lossy();
-                        out.push_str(&format!("  {}{}() ({}:{})\n",
-                            "  ".repeat(*depth), n.name, f, n.start_line));
-                    }
-                }
-            }
-            let callees = graph.trace_callees(func.id, 2);
-            if !callees.is_empty() {
-                out.push_str("Calls:\n");
-                for (cid, depth) in &callees {
-                    if let Some(n) = graph.node(*cid) {
-                        let f = n.file.strip_prefix(wd)
-                            .unwrap_or(&n.file)
-                            .to_string_lossy();
-                        out.push_str(&format!("  {}{}() ({}:{})\n",
-                            "  ".repeat(*depth), n.name, f, n.start_line));
-                    }
-                }
-            }
-        }
-
         Some(out)
     }
 }

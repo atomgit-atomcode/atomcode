@@ -383,7 +383,8 @@ impl Tool for EditFileTool {
                     return Ok(ToolResult {
                         call_id: String::new(),
                         output: format!(
-                            "Error: old_string not found in symbol '{}' (lines {}-{}).\n{}\n{}",
+                            "Error: old_string not found in symbol '{}' (lines {}-{}).\n{}\n{}\n\
+                             [HINT: Copy the EXACT text from the returned content as your new old_string.]",
                             symbol_name, slice.start_line, slice.end_line, hint, reread
                         ),
                         success: false,
@@ -497,7 +498,12 @@ impl Tool for EditFileTool {
             let reread = auto_reread_content(&content, &old_string);
             return Ok(ToolResult {
                 call_id: String::new(),
-                output: format!("Error: old_string not found in {}.\n{}{}\n{}", parsed.file_path, hint, line_hint, reread),
+                output: format!(
+                    "Error: old_string not found in {}.\n{}{}\n{}\n\
+                     [HINT: old_string did not match. The file content around your target has been \
+                     returned above. Copy the EXACT text from the returned content as your new old_string.]",
+                    parsed.file_path, hint, line_hint, reread
+                ),
                 success: false,
             });
         }
