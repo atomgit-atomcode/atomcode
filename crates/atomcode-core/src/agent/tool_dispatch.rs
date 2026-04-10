@@ -260,20 +260,27 @@ impl AgentLoop {
             self.recent_calls.remove(0);
         }
 
-        // Count consecutive repeats of this exact call, but reset if an edit happened in between.
+        // Count consecutive repeats of this exact call.
+        // For read_file: only reset if the SAME file was edited between reads.
+        // Editing app.js should not reset the read count for app.py.
         let mut repeat_count = 0usize;
-        let mut saw_edit = false;
         for entry in self.recent_calls.iter().rev() {
-            if entry.0 == "edit_file" || entry.0 == "create_file" {
-                saw_edit = true;
-            }
-            if *entry == sig {
-                if saw_edit {
-                    // An edit happened between this repeat and the previous one.
-                    // This is "fix then retry", not a blind loop. Don't count earlier repeats.
+            if tool_name == "read_file" {
+                // For read_file: only an edit on the same file resets the counter
+                if matches!(entry.0.as_str(), "edit_file" | "write_file" | "create_file")
+                    && entry.1 == args_hash
+                {
                     repeat_count += 1;
                     break;
                 }
+            } else {
+                // For other tools: any edit resets the counter (original behavior)
+                if matches!(entry.0.as_str(), "edit_file" | "write_file" | "create_file") {
+                    repeat_count += 1;
+                    break;
+                }
+            }
+            if *entry == sig {
                 repeat_count += 1;
             }
         }

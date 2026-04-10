@@ -46,15 +46,9 @@ impl Tool for ReadFileTool {
     fn definition(&self) -> ToolDef {
         ToolDef {
             name: "read_file",
-            description: "Read the contents of a file. Returns file text with line numbers (cat -n format).\n\
-                Usage:\n\
-                - file_path must be an absolute path, not a relative path.\n\
-                - By default reads the full file. For large files (500+ lines), use offset and limit to read specific sections.\n\
-                - When you already know which part of the file you need (e.g. a specific function), only read that part.\n\
-                - If the path is a directory, returns a listing of its contents instead of an error.\n\
-                - Binary files are detected and reported (not dumped as garbage text).\n\
-                - You can call read_file multiple times in parallel to read several files at once.\n\
-                - NEVER use bash (cat/head/tail/sed) to read files — always use this tool.".to_string(),
+            description: "Read a file. Returns text with line numbers.\n\
+                Reads the FULL file by default — do NOT use offset/limit unless instructed.\n\
+                NEVER use bash (cat/head/tail) to read files.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -254,9 +248,9 @@ impl Tool for ReadFileTool {
             };
 
             output.push_str(&format!(
-                "\n\n[Showing lines {}-{} of {} total. To read more: offset={} limit=200. \
-                 To edit: use start_line/end_line.]{}",
-                offset + 1, end, total_lines, end + 1, remaining_skeleton
+                "\n\n[Showing lines {}-{} of {} total. \
+                 To read the full file: call read_file without offset/limit.]{}",
+                offset + 1, end, total_lines, remaining_skeleton
             ));
         }
 
