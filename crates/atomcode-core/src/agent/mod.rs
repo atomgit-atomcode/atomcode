@@ -256,6 +256,8 @@ pub struct AgentLoop {
     sleep_count: usize,
     /// Consecutive verification-only bash commands (--version, list, status, which, ls).
     consecutive_verify_count: usize,
+    /// Recent consecutive error messages (first 60 chars) for repeated-error detection.
+    recent_errors: Vec<String>,
     /// Normalized bash commands executed this turn → count.
     /// Used to detect repeated execution of the same command.
     executed_cmds: std::collections::HashMap<String, usize>,
@@ -452,6 +454,7 @@ impl AgentLoop {
             consecutive_edits_count: 0,
             sleep_count: 0,
             consecutive_verify_count: 0,
+            recent_errors: Vec::new(),
             executed_cmds: std::collections::HashMap::new(),
             category_fail_streak: std::collections::HashMap::new(),
             last_bash_cmd: String::new(),
@@ -710,6 +713,7 @@ impl AgentLoop {
         self.consecutive_edits_count = 0;
         self.sleep_count = 0;
         self.consecutive_verify_count = 0;
+        self.recent_errors.clear();
         self.executed_cmds.clear();
         self.category_fail_streak.clear();
         // Clear session_files on each new user message.

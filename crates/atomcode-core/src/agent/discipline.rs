@@ -183,6 +183,46 @@ impl AgentLoop {
                 }
             }
         }
+
+        // Repeated error detection: if the last 3 tool results all failed with
+        // the same error message, inject guidance to try a different approach.
+        // This catches loops like: bash timeout="60.0" failing 18 times,
+        // or edit_file missing new_string 5 times.
+        {
+            let mut recent_fail_msg: Option<String> = None;
+            for msg in self.conversation.messages.iter().rev().take(6) {
+                if let crate::conversation::message::MessageContent::ToolResult(ref r) = msg.content {
+                    if !r.success {
+                        let err_key: String = r.output.chars().take(60).collect();
+                        if !err_key.is_empty() {
+                            self.recent_errors.push(err_key);
+                        }
+                    } else {
+                        // Success breaks the streak
+                        break;
+                    }
+                }
+            }
+            // Check if last 3 errors are the same
+            if self.recent_errors.len() >= 3 {
+                let last = &self.recent_errors[self.recent_errors.len() - 1];
+                let consecutive = self.recent_errors.iter().rev().take(3)
+                    .all(|e| e == last);
+                if consecutive {
+                    recent_fail_msg = Some(last.clone());
+                }
+            }
+            if let Some(err) = recent_fail_msg {
+                let warning = format!(
+                    "\n\n[REPEATED ERROR: The same error occurred 3+ times: \"{}...\"]\n\
+                     STOP retrying the same approach. The error is NOT in the command — \
+                     it is in how you are calling the tool. Try a completely different approach.",
+                    err
+                );
+                self.conversation.add_user_message(&warning);
+                self.recent_errors.clear();
+            }
+        }
     }
 
     /// Check if step limit has been reached.
