@@ -755,6 +755,23 @@ fn load_session(project_hash: &str, session_id: &str) -> std::io::Result<Session
 
 // ============== HTTP Handlers ==============
 
+/// Health check response
+#[derive(Debug, Serialize)]
+pub struct HealthResponse {
+    pub status: &'static str,
+    pub version: &'static str,
+    pub service: &'static str,
+}
+
+/// GET /health - Health check endpoint
+async fn health() -> impl IntoResponse {
+    Json(HealthResponse {
+        status: "ok",
+        version: env!("CARGO_PKG_VERSION"),
+        service: "atomcode-daemon",
+    })
+}
+
 /// GET /project - Get current project state
 async fn get_project_state(
     State(state): State<AppState>,
@@ -1822,6 +1839,8 @@ async fn main() {
     };
     
     let app = Router::new()
+        // Health check
+        .route("/health", get(health))
         // Session APIs
         .route("/sessions", get(get_all_sessions).post(create_session))
         .route("/sessions/search", get(search_sessions))
@@ -1844,6 +1863,7 @@ async fn main() {
     let addr = "0.0.0.0:13456";
     println!("AtomCode API server listening on http://{}", addr);
     println!("\nAPI endpoints:");
+    println!("  GET    /health                        - Health check");
     println!("  GET    /project                        - Get current working directory");
     println!("  POST   /cd                             - Change working directory (like /cd command)");
     println!("  GET    /projects                       - List historical projects");
