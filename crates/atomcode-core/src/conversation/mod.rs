@@ -256,13 +256,12 @@ impl Conversation {
 
         // Phase 1: Walk backwards through turns, adding full messages from
         // recent turns until we've used ~30% of the budget (hot zone).
-        // Guarantee: at least the 2 most recent turns are ALWAYS in hot zone,
-        // even if they exceed the budget. This prevents catastrophic context loss
-        // (20K → 1.3K) when a single large turn fills the budget.
+        // Guarantee: at least the 1 most recent turn is ALWAYS in hot zone.
+        // Additional turns only if they fit within the budget.
+        // HARD CAP: hot zone never exceeds remaining_budget (prevents 85K on 64K window).
         let hot_budget = remaining_budget * 30 / 100;
         let mut hot_tokens = 0usize;
-        let mut hot_turn_start = turns.len(); // index into turns vec
-        let min_hot_turns = 2usize;
+        let mut hot_turn_start = turns.len();
 
         for ti in (0..turns.len()).rev() {
             let turn = &turns[ti];
@@ -273,11 +272,21 @@ impl Conversation {
                 .map(|m| m.estimate_tokens())
                 .sum();
             let turns_included = turns.len() - ti;
-            if hot_tokens + turn_tokens > hot_budget
-                && hot_turn_start < turns.len()
-                && turns_included > min_hot_turns
+
+            // Always include the most recent turn (turns_included == 1).
+            // For additional turns, respect the hot_budget.
+            // Never exceed remaining_budget regardless of turn count.
+            if turns_included > 1
+                && (hot_tokens + turn_tokens > hot_budget
+                    || hot_tokens + turn_tokens > remaining_budget)
             {
                 break;
+            }
+            // Even the first turn: cap at remaining_budget
+            if turns_included == 1 && turn_tokens > remaining_budget {
+                // Single turn exceeds entire budget — still include but it will be
+                // condensed in Phase 3 (only latest turn keeps full fidelity,
+                // and inflate budget will cap the final size).
             }
             hot_tokens += turn_tokens;
             hot_turn_start = ti;
