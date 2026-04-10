@@ -215,9 +215,11 @@ impl Conversation {
         msgs
     }
 
-    /// CC-style context management: keep all messages, drop oldest complete turns
-    /// when total tokens exceed 80% of the context window.
-    /// Simple and predictable — no hot/cold zones, no summarization, no inflate.
+    /// CC-style context management with auto-summarization.
+    ///
+    /// 1. Summarized turns → inject their summary as a single System message
+    /// 2. Unsummarized turns → send full messages
+    /// 3. If still over 80% budget → drop oldest turns (safety fallback)
     pub fn to_provider_messages_budgeted(
         &self,
         system_prompt: &str,
@@ -233,74 +235,75 @@ impl Conversation {
 
         let turns = &self.turn_tracker.turns;
 
-        // No turns tracked — fall back to simple tail windowing.
         if turns.is_empty() {
             let remaining = token_budget.saturating_sub(system_tokens);
             return (self.to_provider_messages_budgeted_fallback(system_msg, remaining), ContextStats::default());
         }
 
-        // Calculate total tokens for all messages.
-        let total_tokens: usize = system_tokens + self.messages.iter()
-            .map(|m| m.estimate_tokens())
-            .sum::<usize>();
-
-        // If under 80% budget, send everything.
-        if total_tokens <= budget_80pct {
-            let mut result = Vec::with_capacity(self.messages.len() + 1);
-            result.push(system_msg);
-            result.extend(self.messages.iter().cloned());
-            Self::sanitize_messages(&mut result);
-
-            let sent_tokens = total_tokens.saturating_sub(system_tokens);
-            let stats = ContextStats {
-                system_tokens,
-                sent_tokens,
-                dropped_tokens: 0,
-                total_messages: result.len(),
-            };
-            return (result, stats);
-        }
-
-        // Over budget — drop oldest complete turns until we fit.
-        // Always keep at least the most recent turn.
-        let mut drop_up_to_turn = 0usize; // exclusive: drop turns [0..drop_up_to_turn)
-        let mut dropped_tokens = 0usize;
-        let tokens_to_drop = total_tokens - budget_80pct;
-
-        for ti in 0..turns.len().saturating_sub(1) {
-            if dropped_tokens >= tokens_to_drop { break; }
-            let turn = &turns[ti];
-            let end = turn.end_idx().min(self.messages.len());
-            if turn.start_idx >= self.messages.len() { continue; }
-            let turn_tokens: usize = self.messages[turn.start_idx..end]
-                .iter()
-                .map(|m| m.estimate_tokens())
-                .sum();
-            dropped_tokens += turn_tokens;
-            drop_up_to_turn = ti + 1;
-        }
-
-        // Build result: system + surviving messages
-        let msg_start = if drop_up_to_turn < turns.len() {
-            turns[drop_up_to_turn].start_idx
-        } else {
-            // Shouldn't happen (we keep at least 1 turn), but safety fallback
-            turns.last().map(|t| t.start_idx).unwrap_or(0)
-        };
-
-        let mut result = Vec::with_capacity(1 + self.messages.len() - msg_start);
+        // Build message list: summarized turns become a summary message,
+        // non-summarized turns keep their full messages.
+        let mut result = Vec::with_capacity(self.messages.len() + 1);
         result.push(system_msg);
 
-        // If we dropped turns, inject a brief note so the model knows context was truncated
-        if drop_up_to_turn > 0 {
+        // Collect all summaries into one block at the top
+        let mut summaries: Vec<String> = Vec::new();
+        let mut first_unsummarized_turn = 0usize;
+
+        for (ti, turn) in turns.iter().enumerate() {
+            if let Some(ref summary) = turn.summary {
+                summaries.push(summary.clone());
+                first_unsummarized_turn = ti + 1;
+            } else {
+                break; // Summaries are always contiguous from the start
+            }
+        }
+
+        if !summaries.is_empty() {
             result.push(Message::new(Role::System,
-                format!("[Context: {} earlier turn(s) were dropped to fit context window. \
-                         The conversation continues from the remaining messages below.]",
-                    drop_up_to_turn)
+                format!("[Earlier conversation summary]\n{}", summaries.join("\n\n"))
             ));
         }
 
+        // Add full messages from unsummarized turns
+        let msg_start = if first_unsummarized_turn < turns.len() {
+            turns[first_unsummarized_turn].start_idx
+        } else {
+            self.messages.len() // All turns summarized — no raw messages
+        };
         result.extend(self.messages[msg_start..].iter().cloned());
+
+        // Check budget — if still over 80%, drop oldest unsummarized turns
+        let total_tokens: usize = result.iter().map(|m| m.estimate_tokens()).sum();
+        let mut dropped_tokens = 0usize;
+
+        if total_tokens > budget_80pct {
+            let tokens_to_drop = total_tokens - budget_80pct;
+            let mut drop_up_to_turn = first_unsummarized_turn;
+
+            for ti in first_unsummarized_turn..turns.len().saturating_sub(1) {
+                if dropped_tokens >= tokens_to_drop { break; }
+                let turn = &turns[ti];
+                let end = turn.end_idx().min(self.messages.len());
+                if turn.start_idx >= self.messages.len() { continue; }
+                let turn_tokens: usize = self.messages[turn.start_idx..end]
+                    .iter()
+                    .map(|m| m.estimate_tokens())
+                    .sum();
+                dropped_tokens += turn_tokens;
+                drop_up_to_turn = ti + 1;
+            }
+
+            // Rebuild result with dropped turns removed
+            let new_msg_start = if drop_up_to_turn < turns.len() {
+                turns[drop_up_to_turn].start_idx
+            } else {
+                turns.last().map(|t| t.start_idx).unwrap_or(0)
+            };
+
+            result.truncate(if summaries.is_empty() { 1 } else { 2 }); // keep system + summary
+            result.extend(self.messages[new_msg_start..].iter().cloned());
+        }
+
         Self::sanitize_messages(&mut result);
 
         let sent_tokens: usize = result.iter().map(|m| m.estimate_tokens()).sum::<usize>()
@@ -308,11 +311,133 @@ impl Conversation {
         let stats = ContextStats {
             system_tokens,
             sent_tokens,
-            dropped_tokens: dropped_tokens,
+            dropped_tokens,
             total_messages: result.len(),
         };
 
         (result, stats)
+    }
+
+    /// Check if conversation needs summarization (context > 70% of budget).
+    /// Returns the number of turns that should be summarized.
+    pub fn turns_needing_summary(&self, system_prompt_tokens: usize, token_budget: usize) -> usize {
+        let turns = &self.turn_tracker.turns;
+        if turns.len() < 3 { return 0; } // Need at least 3 turns to summarize
+
+        let total_tokens: usize = system_prompt_tokens + self.messages.iter()
+            .map(|m| m.estimate_tokens())
+            .sum::<usize>();
+
+        let budget_70pct = token_budget * 70 / 100;
+        if total_tokens <= budget_70pct { return 0; }
+
+        // Summarize enough old turns to get under 50% budget
+        let target = token_budget * 50 / 100;
+        let tokens_to_free = total_tokens.saturating_sub(target);
+        let mut freed = 0usize;
+        let mut count = 0usize;
+
+        for turn in turns.iter() {
+            if turn.summary.is_some() { continue; } // Already summarized
+            if count >= turns.len().saturating_sub(2) { break; } // Keep at least 2 recent turns
+
+            let end = turn.end_idx().min(self.messages.len());
+            if turn.start_idx >= self.messages.len() { continue; }
+            let turn_tokens: usize = self.messages[turn.start_idx..end]
+                .iter()
+                .map(|m| m.estimate_tokens())
+                .sum();
+
+            freed += turn_tokens;
+            count += 1;
+            if freed >= tokens_to_free { break; }
+        }
+
+        count
+    }
+
+    /// Build the content to summarize: extract user requests + outcomes from
+    /// the first `n_turns` unsummarized turns.
+    pub fn build_summary_content(&self, n_turns: usize) -> String {
+        let turns = &self.turn_tracker.turns;
+        let mut content = String::new();
+
+        let mut count = 0;
+        for turn in turns.iter() {
+            if turn.summary.is_some() { continue; }
+            if count >= n_turns { break; }
+
+            let end = turn.end_idx().min(self.messages.len());
+            if turn.start_idx >= self.messages.len() { continue; }
+            let turn_msgs = &self.messages[turn.start_idx..end];
+
+            content.push_str(&format!("--- Turn {} ---\n", count + 1));
+            for msg in turn_msgs {
+                match (&msg.role, &msg.content) {
+                    (Role::User, MessageContent::Text(s)) => {
+                        content.push_str(&format!("User: {}\n", s));
+                    }
+                    (Role::Assistant, MessageContent::Text(s)) => {
+                        let short = if s.chars().count() > 200 {
+                            format!("{}...", s.chars().take(197).collect::<String>())
+                        } else {
+                            s.clone()
+                        };
+                        content.push_str(&format!("Assistant: {}\n", short));
+                    }
+                    (_, MessageContent::AssistantWithToolCalls { text, tool_calls }) => {
+                        for tc in tool_calls {
+                            content.push_str(&format!("Tool: {}()\n", tc.name));
+                        }
+                        if let Some(t) = text {
+                            if !t.is_empty() {
+                                let short = if t.chars().count() > 100 {
+                                    format!("{}...", t.chars().take(97).collect::<String>())
+                                } else {
+                                    t.clone()
+                                };
+                                content.push_str(&format!("  text: {}\n", short));
+                            }
+                        }
+                    }
+                    (_, MessageContent::ToolResult(r)) => {
+                        let first_line = r.output.lines().next().unwrap_or("");
+                        let short = if first_line.chars().count() > 80 {
+                            format!("{}...", first_line.chars().take(77).collect::<String>())
+                        } else {
+                            first_line.to_string()
+                        };
+                        let status = if r.success { "+" } else { "x" };
+                        content.push_str(&format!("  {} {}\n", status, short));
+                    }
+                    _ => {}
+                }
+            }
+            count += 1;
+        }
+
+        content
+    }
+
+    /// Apply a summary to the first `n_turns` unsummarized turns.
+    /// The original messages are kept (for history save) but turns are marked
+    /// as Summarized so `to_provider_messages_budgeted` uses the summary.
+    pub fn apply_summary(&mut self, n_turns: usize, summary: String) {
+        let mut count = 0;
+        for turn in self.turn_tracker.turns.iter_mut() {
+            if turn.summary.is_some() { continue; }
+            if count >= n_turns { break; }
+
+            if count == 0 {
+                // First turn gets the full summary
+                turn.summary = Some(summary.clone());
+            } else {
+                // Subsequent turns get an empty marker (content is in the first one)
+                turn.summary = Some(String::new());
+            }
+            turn.status = turn::TurnStatus::Summarized;
+            count += 1;
+        }
     }
 
     /// Synthesize a brief outcome description for a turn that has no assistant text.
@@ -755,11 +880,11 @@ mod tests {
     }
 
     #[test]
-    fn test_budgeted_injects_drop_notice() {
+    fn test_budgeted_uses_summaries() {
         use crate::tool::{ToolCall, ToolResult};
         let mut conv = Conversation::new();
 
-        // Create 3 turns with large content (4000 chars each ≈ 1000 tokens)
+        // Create 3 turns with large content
         for turn in 0..3 {
             conv.add_user_message(&format!("task {}", turn));
             let call = ToolCall {
@@ -775,26 +900,44 @@ mod tests {
             });
         }
 
-        // Small budget — force dropping (3 turns * ~1000 tokens >> 80% of 2000)
-        let (msgs, _stats) = conv.to_provider_messages_budgeted("sys", 2000);
-        // When turns are dropped, a notice should be injected
-        let has_notice = msgs.iter().any(|m| {
-            m.text().map_or(false, |t| t.contains("earlier turn(s) were dropped"))
+        // Apply summary to first 2 turns
+        conv.apply_summary(2, "User ran task 0 and task 1 with bash.".to_string());
+
+        // Large budget — summary + last turn should fit
+        let (msgs, _stats) = conv.to_provider_messages_budgeted("sys", 100000);
+        let has_summary = msgs.iter().any(|m| {
+            m.text().map_or(false, |t| t.contains("Earlier conversation summary"))
         });
-        assert!(has_notice, "Should inject drop notice when turns are removed");
+        assert!(has_summary, "Should inject summary for summarized turns");
+        // Last turn's messages should still be present
+        assert_eq!(msgs.last().unwrap().text().map(|t| t.len() > 100), Some(true));
     }
 
     #[test]
-    fn test_budgeted_no_drop_notice_when_all_fit() {
+    fn test_budgeted_drops_when_no_summary_and_over_budget() {
+        use crate::tool::{ToolCall, ToolResult};
         let mut conv = Conversation::new();
-        conv.add_user_message("hello");
-        conv.messages.push(Message::new(Role::Assistant, "hi there"));
 
-        let (msgs, _stats) = conv.to_provider_messages_budgeted("sys", 100000);
-        let has_notice = msgs.iter().any(|m| {
-            m.text().map_or(false, |t| t.contains("earlier turn(s) were dropped"))
-        });
-        assert!(!has_notice, "No drop notice when everything fits");
+        // Create 3 turns with large content (no summaries)
+        for turn in 0..3 {
+            conv.add_user_message(&format!("task {}", turn));
+            let call = ToolCall {
+                id: format!("c{}", turn),
+                name: "bash".to_string(),
+                arguments: "{}".to_string(),
+            };
+            conv.add_assistant_tool_calls(Some("ok"), vec![call]);
+            conv.add_tool_result(ToolResult {
+                call_id: format!("c{}", turn),
+                output: "x".repeat(4000),
+                success: true,
+            });
+        }
+
+        // Small budget — force dropping
+        let (msgs, stats) = conv.to_provider_messages_budgeted("sys", 2000);
+        assert!(stats.dropped_tokens > 0, "Should drop turns when over budget");
+        assert!(matches!(msgs[0].role, Role::System));
     }
 
     #[test]
