@@ -16,6 +16,24 @@
 docker build -t atomcode-daemon:v4.2.0 -f docker/Dockerfile-Daemon .
 ```
 
+### 推送到华为云 SWR
+
+华为云 SWR 基础版不支持 OCI 规范的镜像格式。如果你使用的是较新版本的 Docker（BuildKit），需要添加 `--provenance=false` 参数：
+
+```bash
+# 标记镜像
+docker tag atomcode-daemon:v4.2.0 swr.cn-north-4.myhuaweicloud.com/gitcode-be/atomcode-daemon:v4.2.0
+
+# 使用 buildx 构建并推送（推荐）
+docker buildx build --provenance=false --platform linux/amd64 -t swr.cn-north-4.myhuaweicloud.com/gitcode-be/atomcode-daemon:v4.2.0 --push -f docker/Dockerfile-Daemon .
+
+# 或者先构建再推送
+docker build --provenance=false -t swr.cn-north-4.myhuaweicloud.com/gitcode-be/atomcode-daemon:v4.2.0 -f docker/Dockerfile-Daemon .
+docker push swr.cn-north-4.myhuaweicloud.com/gitcode-be/atomcode-daemon:v4.2.0
+```
+
+> **注意**: 如果不添加 `--provenance=false`，推送时会报错: `Invalid image, fail to parse 'manifest.json'`
+
 ## 运行容器
 
 ### 基本运行
