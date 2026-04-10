@@ -34,8 +34,8 @@ pub fn render(
     at_bottom: bool,
     mode: &AppMode,
     tick: usize,
-    _turn_tokens: usize,
-    _turn_elapsed_secs: Option<u64>,
+    turn_tokens: usize,
+    turn_elapsed_secs: Option<u64>,
     _turn_label_seed: usize,
     step_count: usize,
     tool_info: &str,
@@ -316,12 +316,22 @@ pub fn render(
             String::new()
         };
 
+        // Token speed + accumulation
+        let tok_str = if turn_tokens > 0 {
+            let elapsed = turn_elapsed_secs.unwrap_or(1).max(1);
+            let speed = turn_tokens as f64 / elapsed as f64;
+            format!("  {}tok {:.0}tok/s", turn_tokens, speed)
+        } else {
+            String::new()
+        };
+
         let spin_line = Line::from(vec![
             Span::styled(format!("{}\u{2502} ", INDENT), bar_style),
             Span::styled(format!("{} ", spinner), Style::default().fg(spin_color)),
             Span::styled(step_prefix, Style::default().fg(theme::text_secondary())),
             Span::styled(label, Style::default().fg(spin_color)),
             Span::styled(time_str, Style::default().fg(spin_color)),
+            Span::styled(tok_str, Style::default().fg(theme::text_muted())),
         ]);
         frame.render_widget(Paragraph::new(vec![spin_line]), spin_rect);
     }

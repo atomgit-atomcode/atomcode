@@ -115,6 +115,15 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(time_color).add_modifier(Modifier::BOLD),
         ));
         right.push(sep.clone());
+        // Token speed
+        if app.turn_tokens > 0 {
+            let speed = app.turn_tokens as f64 / secs.max(1) as f64;
+            right.push(Span::styled(
+                format!("{}tok {:.0}t/s", app.turn_tokens, speed),
+                Style::default().fg(theme::text_muted()),
+            ));
+            right.push(sep.clone());
+        }
     } else if app.last_turn_duration.is_some() || app.current_step_count > 0 {
         // ── Completed turn: ✓ + duration ──
         right.push(Span::styled(
@@ -136,6 +145,13 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
                 Style::default().fg(theme::success()),
             ));
             right.push(sep.clone());
+            if app.turn_tokens > 0 {
+                right.push(Span::styled(
+                    format!("{}tok", app.turn_tokens),
+                    Style::default().fg(theme::text_muted()),
+                ));
+                right.push(sep.clone());
+            }
         }
     }
 
