@@ -863,13 +863,10 @@ impl AgentLoop {
             let system_prompt = self.build_system_prompt();
             let cancel = self.cancel_token.clone();
 
-            // Auto-summarize disabled — too aggressive. In long sessions it
-            // summarized too many turns at once, causing the model to lose all
-            // context and enter an infinite read loop. The CC-style drop-oldest
-            // in to_provider_messages_budgeted is the safety net.
-            // TODO: re-enable with a more conservative strategy (summarize 1-2
-            // turns at a time, not 5-8).
-            // self.maybe_summarize_old_turns(&system_prompt).await;
+            // Context compression: when > 70% budget, pause and compress
+            // old turns via LLM call. Keeps last 5 turns full, compressed
+            // history goes to cold zone (FIFO, max 3 entries).
+            self.maybe_compress_history(&system_prompt).await;
 
             // Move conversation out to avoid borrow conflicts with self in select!
             let mut conv = std::mem::take(&mut self.conversation);
@@ -1478,6 +1475,62 @@ impl AgentLoop {
     /// Makes a lightweight LLM call to compress old turn content into a
     /// short summary, so the model retains awareness of prior work without
     /// the full message cost.
+    /// Compress old turns when context > 70% budget.
+    /// Pauses the task, calls LLM to summarize, stores in cold zone.
+    /// Falls back to mechanical compression if LLM fails.
+    async fn maybe_compress_history(&mut self, system_prompt: &str) {
+        let context_window = self.config
+            .providers
+            .get(&self.config.default_provider)
+            .map(|p| p.context_window)
+            .unwrap_or(16000);
+
+        let sys_tokens = system_prompt.len() / 4 + 4;
+        if !self.conversation.needs_compression(sys_tokens, context_window) {
+            return;
+        }
+
+        let (content, n_turns) = self.conversation.build_compression_content();
+        if content.is_empty() || n_turns == 0 { return; }
+
+        // Try LLM compression
+        let summarize_prompt = format!(
+            "Summarize this conversation history in 3-5 concise sentences. \
+             Keep: file names, what was changed, key decisions, errors encountered. \
+             Drop: exact code content, tool arguments, line numbers.\n\n{}",
+            content
+        );
+
+        let mut mini_conv = crate::conversation::Conversation::new();
+        mini_conv.add_user_message(&summarize_prompt);
+        let msgs = mini_conv.to_provider_messages(
+            "You are a conversation summarizer. Output ONLY the summary."
+        );
+
+        let mut summary = String::new();
+        if let Ok(mut stream) = self.turn_runner.provider.chat_stream(&msgs, None) {
+            use futures::StreamExt;
+            let timeout = std::time::Duration::from_secs(15);
+            loop {
+                match tokio::time::timeout(timeout, stream.next()).await {
+                    Ok(Some(Ok(crate::stream::StreamEvent::Delta(text)))) => {
+                        summary.push_str(&text);
+                    }
+                    Ok(Some(Ok(crate::stream::StreamEvent::Done { .. }))) => break,
+                    Ok(Some(Ok(_))) => continue,
+                    _ => break,
+                }
+            }
+        }
+
+        // Fallback: if LLM failed, use mechanical compression
+        if summary.trim().is_empty() {
+            summary = content; // mechanical one-liners from build_compression_content
+        }
+
+        self.conversation.apply_compression(n_turns, summary);
+    }
+
     #[allow(dead_code)]
     async fn maybe_summarize_old_turns(&mut self, system_prompt: &str) {
         let context_window = self.config

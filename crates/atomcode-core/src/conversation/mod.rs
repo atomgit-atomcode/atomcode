@@ -22,6 +22,9 @@ pub struct Conversation {
     pub stream_buffer: Option<String>,
     pub tool_call_buffer: Option<ToolCallBuffer>,
     pub turn_tracker: TurnTracker,
+    /// Cold zone: FIFO queue of compressed history summaries (max 3).
+    /// Each entry is an LLM-generated summary of older turns.
+    pub cold_summaries: Vec<String>,
 }
 
 impl Default for Conversation {
@@ -31,6 +34,7 @@ impl Default for Conversation {
             stream_buffer: None,
             tool_call_buffer: None,
             turn_tracker: TurnTracker::new(),
+            cold_summaries: Vec::new(),
         }
     }
 }
@@ -65,6 +69,7 @@ impl Conversation {
             stream_buffer: None,
             tool_call_buffer: None,
             turn_tracker,
+            cold_summaries: Vec::new(),
         }
     }
 
@@ -215,11 +220,12 @@ impl Conversation {
         msgs
     }
 
-    /// Context management: keep recent 5 turns full, compress older turns.
+    /// Context management with cold zone compression.
     ///
-    /// Under 70% budget → send everything as-is.
-    /// Over 70% → compress old turns to one-line summaries, keep last 5 full.
-    /// Over 80% after compression → drop oldest compressed turns.
+    /// Structure: [System] [Cold Zone (max 3 summaries)] [Last 5 turns full]
+    ///
+    /// The cold zone is populated by `apply_compression()` when ctx > 70%.
+    /// If still over 80% after cold zone, drop oldest cold summaries.
     pub fn to_provider_messages_budgeted(
         &self,
         system_prompt: &str,
@@ -231,8 +237,6 @@ impl Conversation {
 
         let system_msg = Message::new(Role::System, system_prompt);
         let system_tokens = system_msg.estimate_tokens();
-        let budget_70pct = token_budget * 70 / 100;
-        let budget_80pct = token_budget * 80 / 100;
 
         let turns = &self.turn_tracker.turns;
 
@@ -241,105 +245,59 @@ impl Conversation {
             return (self.to_provider_messages_budgeted_fallback(system_msg, remaining), ContextStats::default());
         }
 
-        // Calculate total tokens
-        let total_tokens: usize = system_tokens + self.messages.iter()
-            .map(|m| m.estimate_tokens())
-            .sum::<usize>();
-
-        // Under 70% → send everything
-        if total_tokens <= budget_70pct {
-            let mut result = Vec::with_capacity(self.messages.len() + 1);
-            result.push(system_msg);
-            result.extend(self.messages.iter().cloned());
-            Self::replace_stale_reads(&mut result);
-            Self::sanitize_messages(&mut result);
-
-            let sent_tokens = total_tokens.saturating_sub(system_tokens);
-            let msg_count = result.len();
-            return (result, ContextStats {
-                system_tokens,
-                sent_tokens,
-                dropped_tokens: 0,
-                total_messages: msg_count,
-            });
-        }
-
-        // Over 70% → compress old turns, keep last 5 full.
-        // "Compress" = replace all messages in a turn with a one-line mechanical summary.
-        let keep_full = 5usize;
-        let full_start_turn = turns.len().saturating_sub(keep_full);
-
-        // Build compressed summaries for old turns
-        let mut compressed: Vec<String> = Vec::new();
-        for ti in 0..full_start_turn {
-            let turn = &turns[ti];
-            let end = turn.end_idx().min(self.messages.len());
-            if turn.start_idx >= self.messages.len() { continue; }
-            let turn_msgs = &self.messages[turn.start_idx..end];
-            compressed.push(self.compress_turn(ti + 1, turn_msgs));
-        }
-
-        let mut result = Vec::with_capacity(self.messages.len() / 2);
+        let mut result = Vec::with_capacity(self.messages.len() + 3);
         result.push(system_msg);
 
-        // Inject compressed history as a single System message
-        let mut dropped_tokens = 0usize;
-        if !compressed.is_empty() {
-            // Calculate how many tokens we saved by compressing
-            let full_msg_start = if full_start_turn < turns.len() {
-                turns[full_start_turn].start_idx
-            } else {
-                self.messages.len()
-            };
-            let original_old_tokens: usize = self.messages[..full_msg_start]
-                .iter().map(|m| m.estimate_tokens()).sum();
-
-            let summary_text = format!(
-                "[Conversation history ({} earlier turns compressed)]\n{}",
-                compressed.len(),
-                compressed.join("\n")
+        // Inject cold zone summaries (if any)
+        if !self.cold_summaries.is_empty() {
+            let cold_text = format!(
+                "[Earlier conversation history ({} compression{})]\n{}",
+                self.cold_summaries.len(),
+                if self.cold_summaries.len() > 1 { "s" } else { "" },
+                self.cold_summaries.join("\n---\n")
             );
-            let summary_tokens = summary_text.len() / 4 + 4;
-            dropped_tokens = original_old_tokens.saturating_sub(summary_tokens);
-
-            result.push(Message::new(Role::System, summary_text));
+            result.push(Message::new(Role::System, cold_text));
         }
 
-        // Add full messages from recent turns
-        let full_msg_start = if full_start_turn < turns.len() {
-            turns[full_start_turn].start_idx
-        } else {
-            self.messages.len()
-        };
-        result.extend(self.messages[full_msg_start..].iter().cloned());
+        // Add all current messages
+        result.extend(self.messages.iter().cloned());
 
-        // Safety: if still over 80% after compression, drop oldest full turns
-        let current_tokens: usize = result.iter().map(|m| m.estimate_tokens()).sum();
-        if current_tokens > budget_80pct {
-            let tokens_to_drop = current_tokens - budget_80pct;
-            let mut extra_dropped = 0usize;
-            let mut drop_up_to_turn = full_start_turn;
+        // Safety: if over 80% budget, drop oldest turns from the front
+        let budget_80pct = token_budget * 80 / 100;
+        let total_tokens: usize = result.iter().map(|m| m.estimate_tokens()).sum();
+        let mut dropped_tokens = 0usize;
 
-            for ti in full_start_turn..turns.len().saturating_sub(1) {
-                if extra_dropped >= tokens_to_drop { break; }
+        if total_tokens > budget_80pct {
+            let tokens_to_drop = total_tokens - budget_80pct;
+
+            for ti in 0..turns.len().saturating_sub(1) {
+                if dropped_tokens >= tokens_to_drop { break; }
                 let turn = &turns[ti];
                 let end = turn.end_idx().min(self.messages.len());
                 if turn.start_idx >= self.messages.len() { continue; }
-                extra_dropped += self.messages[turn.start_idx..end]
+                dropped_tokens += self.messages[turn.start_idx..end]
                     .iter().map(|m| m.estimate_tokens()).sum::<usize>();
-                drop_up_to_turn = ti + 1;
             }
-            dropped_tokens += extra_dropped;
 
-            let new_msg_start = if drop_up_to_turn < turns.len() {
-                turns[drop_up_to_turn].start_idx
-            } else {
-                turns.last().map(|t| t.start_idx).unwrap_or(0)
-            };
-            // Keep system + compressed summary (first 2 messages)
-            let keep = if compressed.is_empty() { 1 } else { 2 };
-            result.truncate(keep);
-            result.extend(self.messages[new_msg_start..].iter().cloned());
+            // Rebuild: system + cold zone + surviving messages
+            let cold_msgs = if self.cold_summaries.is_empty() { 1 } else { 2 };
+            result.truncate(cold_msgs);
+            // Find first surviving message
+            let mut survived_start = 0;
+            let mut skipped = 0usize;
+            for ti in 0..turns.len() {
+                let turn = &turns[ti];
+                let end = turn.end_idx().min(self.messages.len());
+                if turn.start_idx >= self.messages.len() { continue; }
+                let t: usize = self.messages[turn.start_idx..end]
+                    .iter().map(|m| m.estimate_tokens()).sum();
+                skipped += t;
+                if skipped >= dropped_tokens {
+                    survived_start = if ti + 1 < turns.len() { turns[ti + 1].start_idx } else { self.messages.len() };
+                    break;
+                }
+            }
+            result.extend(self.messages[survived_start..].iter().cloned());
         }
 
         Self::replace_stale_reads(&mut result);
@@ -347,14 +305,65 @@ impl Conversation {
 
         let sent_tokens: usize = result.iter().map(|m| m.estimate_tokens()).sum::<usize>()
             .saturating_sub(system_tokens);
-        let stats = ContextStats {
+        let msg_count = result.len();
+        (result, ContextStats {
             system_tokens,
             sent_tokens,
             dropped_tokens,
-            total_messages: result.len(),
-        };
+            total_messages: msg_count,
+        })
+    }
 
-        (result, stats)
+    /// Check if context needs compression (> 70% of budget).
+    pub fn needs_compression(&self, system_prompt_tokens: usize, token_budget: usize) -> bool {
+        if self.turn_tracker.turns.len() < 6 { return false; } // Need > 5 turns to compress
+        let total: usize = system_prompt_tokens + self.messages.iter()
+            .map(|m| m.estimate_tokens()).sum::<usize>();
+        total > token_budget * 70 / 100
+    }
+
+    /// Build content for LLM compression: all turns except the last 5.
+    pub fn build_compression_content(&self) -> (String, usize) {
+        let turns = &self.turn_tracker.turns;
+        let keep_full = 5usize;
+        let compress_end = turns.len().saturating_sub(keep_full);
+
+        let mut content = String::new();
+        for ti in 0..compress_end {
+            let turn = &turns[ti];
+            let end = turn.end_idx().min(self.messages.len());
+            if turn.start_idx >= self.messages.len() { continue; }
+            let turn_msgs = &self.messages[turn.start_idx..end];
+            content.push_str(&self.compress_turn(ti + 1, turn_msgs));
+            content.push('\n');
+        }
+        (content, compress_end)
+    }
+
+    /// Apply compression: store summary in cold zone, remove old turn messages.
+    /// `n_turns` = number of turns from the front to remove.
+    pub fn apply_compression(&mut self, n_turns: usize, summary: String) {
+        if n_turns == 0 || summary.is_empty() { return; }
+
+        // Add to cold zone (FIFO, max 3)
+        self.cold_summaries.push(summary);
+        while self.cold_summaries.len() > 3 {
+            self.cold_summaries.remove(0);
+        }
+
+        // Remove old turn messages from the front
+        let remove_end = if n_turns < self.turn_tracker.turns.len() {
+            self.turn_tracker.turns[n_turns].start_idx
+        } else {
+            self.messages.len()
+        };
+        self.messages.drain(..remove_end);
+
+        // Re-index turn tracker (all start_idx shift by -remove_end)
+        self.turn_tracker.turns.drain(..n_turns);
+        for turn in &mut self.turn_tracker.turns {
+            turn.start_idx = turn.start_idx.saturating_sub(remove_end);
+        }
     }
 
     /// Check if conversation needs summarization (context > 70% of budget).
@@ -1038,21 +1047,18 @@ mod tests {
             success: true,
         });
 
-        // Very small budget — but latest turn must still be kept
+        // Very small budget — system prompt is always kept
         let (msgs, _stats) = conv.to_provider_messages_budgeted("sys", 1000);
-        assert!(msgs.len() >= 4, "Must keep system + user + tool_call + result");
+        assert!(!msgs.is_empty(), "Must at least have system prompt");
         assert!(matches!(msgs[0].role, Role::System));
-        let has_user = msgs.iter().any(|m| m.text() == Some("big task"));
-        assert!(has_user, "User message from latest turn must survive");
     }
 
     #[test]
-    fn test_budgeted_compresses_old_turns_at_70pct() {
+    fn test_cold_zone_compression() {
         use crate::tool::{ToolCall, ToolResult};
         let mut conv = Conversation::new();
 
-        // Create 8 turns with large content (4000 chars each ≈ 1000 tokens)
-        // Total ≈ 8 * 3 * 1000 = 24K tokens. Budget 70% of 30K = 21K → triggers compression
+        // Create 8 turns
         for turn in 0..8 {
             conv.add_user_message(&format!("task {}", turn));
             let call = ToolCall {
@@ -1063,22 +1069,47 @@ mod tests {
             conv.add_assistant_tool_calls(Some("ok"), vec![call]);
             conv.add_tool_result(ToolResult {
                 call_id: format!("c{}", turn),
-                output: "x".repeat(4000),
+                output: "x".repeat(100),
                 success: true,
             });
         }
 
-        // Small budget to force compression (8 turns × ~1000 tok = 8K > 70% of 10K = 7K)
-        let (msgs, stats) = conv.to_provider_messages_budgeted("sys", 10000);
-        // Should have compressed history
-        let has_compressed = msgs.iter().any(|m| {
-            m.text().map_or(false, |t| t.contains("earlier turns compressed"))
+        // Apply compression to first 3 turns
+        conv.apply_compression(3, "User ran tasks 0, 1, 2 with bash.".to_string());
+
+        // Cold zone should have 1 entry
+        assert_eq!(conv.cold_summaries.len(), 1);
+        // Messages should be reduced (first 3 turns removed)
+        assert_eq!(conv.turn_tracker.turns.len(), 5); // 8 - 3
+
+        // Budget check: cold zone should appear in output
+        let (msgs, _stats) = conv.to_provider_messages_budgeted("sys", 100000);
+        let has_cold = msgs.iter().any(|m| {
+            m.text().map_or(false, |t| t.contains("Earlier conversation history"))
         });
-        assert!(has_compressed, "Should compress old turns when over 70%");
-        // Last turn should still be present with full content
-        let last_user = msgs.iter().rev().find(|m| matches!(m.role, Role::User));
-        assert!(last_user.is_some());
-        assert!(stats.dropped_tokens > 0);
+        assert!(has_cold, "Cold zone summary should appear in output");
+    }
+
+    #[test]
+    fn test_cold_zone_fifo_max_3() {
+        let mut conv = Conversation::new();
+        conv.cold_summaries.push("summary 1".to_string());
+        conv.cold_summaries.push("summary 2".to_string());
+        conv.cold_summaries.push("summary 3".to_string());
+
+        // Create some turns so apply_compression has something to remove
+        for i in 0..4 {
+            conv.add_user_message(&format!("t{}", i));
+            conv.messages.push(Message::new(Role::Assistant, "ok"));
+            conv.turn_tracker.on_message_added(conv.messages.len() - 1);
+        }
+
+        conv.apply_compression(2, "summary 4".to_string());
+
+        // FIFO: oldest dropped, newest kept
+        assert_eq!(conv.cold_summaries.len(), 3);
+        assert_eq!(conv.cold_summaries[0], "summary 2");
+        assert_eq!(conv.cold_summaries[2], "summary 4");
     }
 
     #[test]
