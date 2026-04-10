@@ -215,11 +215,11 @@ impl Conversation {
         msgs
     }
 
-    /// CC-style context management with auto-summarization.
+    /// Context management: keep recent 5 turns full, compress older turns.
     ///
-    /// 1. Summarized turns → inject their summary as a single System message
-    /// 2. Unsummarized turns → send full messages
-    /// 3. If still over 80% budget → drop oldest turns (safety fallback)
+    /// Under 70% budget → send everything as-is.
+    /// Over 70% → compress old turns to one-line summaries, keep last 5 full.
+    /// Over 80% after compression → drop oldest compressed turns.
     pub fn to_provider_messages_budgeted(
         &self,
         system_prompt: &str,
@@ -231,6 +231,7 @@ impl Conversation {
 
         let system_msg = Message::new(Role::System, system_prompt);
         let system_tokens = system_msg.estimate_tokens();
+        let budget_70pct = token_budget * 70 / 100;
         let budget_80pct = token_budget * 80 / 100;
 
         let turns = &self.turn_tracker.turns;
@@ -240,75 +241,108 @@ impl Conversation {
             return (self.to_provider_messages_budgeted_fallback(system_msg, remaining), ContextStats::default());
         }
 
-        // Build message list: summarized turns become a summary message,
-        // non-summarized turns keep their full messages.
-        let mut result = Vec::with_capacity(self.messages.len() + 1);
+        // Calculate total tokens
+        let total_tokens: usize = system_tokens + self.messages.iter()
+            .map(|m| m.estimate_tokens())
+            .sum::<usize>();
+
+        // Under 70% → send everything
+        if total_tokens <= budget_70pct {
+            let mut result = Vec::with_capacity(self.messages.len() + 1);
+            result.push(system_msg);
+            result.extend(self.messages.iter().cloned());
+            Self::replace_stale_reads(&mut result);
+            Self::sanitize_messages(&mut result);
+
+            let sent_tokens = total_tokens.saturating_sub(system_tokens);
+            let msg_count = result.len();
+            return (result, ContextStats {
+                system_tokens,
+                sent_tokens,
+                dropped_tokens: 0,
+                total_messages: msg_count,
+            });
+        }
+
+        // Over 70% → compress old turns, keep last 5 full.
+        // "Compress" = replace all messages in a turn with a one-line mechanical summary.
+        let keep_full = 5usize;
+        let full_start_turn = turns.len().saturating_sub(keep_full);
+
+        // Build compressed summaries for old turns
+        let mut compressed: Vec<String> = Vec::new();
+        for ti in 0..full_start_turn {
+            let turn = &turns[ti];
+            let end = turn.end_idx().min(self.messages.len());
+            if turn.start_idx >= self.messages.len() { continue; }
+            let turn_msgs = &self.messages[turn.start_idx..end];
+            compressed.push(self.compress_turn(ti + 1, turn_msgs));
+        }
+
+        let mut result = Vec::with_capacity(self.messages.len() / 2);
         result.push(system_msg);
 
-        // Collect all summaries into one block at the top
-        let mut summaries: Vec<String> = Vec::new();
-        let mut first_unsummarized_turn = 0usize;
-
-        for (ti, turn) in turns.iter().enumerate() {
-            if let Some(ref summary) = turn.summary {
-                summaries.push(summary.clone());
-                first_unsummarized_turn = ti + 1;
-            } else {
-                break; // Summaries are always contiguous from the start
-            }
-        }
-
-        if !summaries.is_empty() {
-            result.push(Message::new(Role::System,
-                format!("[Earlier conversation summary]\n{}", summaries.join("\n\n"))
-            ));
-        }
-
-        // Add full messages from unsummarized turns
-        let msg_start = if first_unsummarized_turn < turns.len() {
-            turns[first_unsummarized_turn].start_idx
-        } else {
-            self.messages.len() // All turns summarized — no raw messages
-        };
-        result.extend(self.messages[msg_start..].iter().cloned());
-
-        // Check budget — if still over 80%, drop oldest unsummarized turns
-        let total_tokens: usize = result.iter().map(|m| m.estimate_tokens()).sum();
+        // Inject compressed history as a single System message
         let mut dropped_tokens = 0usize;
+        if !compressed.is_empty() {
+            // Calculate how many tokens we saved by compressing
+            let full_msg_start = if full_start_turn < turns.len() {
+                turns[full_start_turn].start_idx
+            } else {
+                self.messages.len()
+            };
+            let original_old_tokens: usize = self.messages[..full_msg_start]
+                .iter().map(|m| m.estimate_tokens()).sum();
 
-        if total_tokens > budget_80pct {
-            let tokens_to_drop = total_tokens - budget_80pct;
-            let mut drop_up_to_turn = first_unsummarized_turn;
+            let summary_text = format!(
+                "[Conversation history ({} earlier turns compressed)]\n{}",
+                compressed.len(),
+                compressed.join("\n")
+            );
+            let summary_tokens = summary_text.len() / 4 + 4;
+            dropped_tokens = original_old_tokens.saturating_sub(summary_tokens);
 
-            for ti in first_unsummarized_turn..turns.len().saturating_sub(1) {
-                if dropped_tokens >= tokens_to_drop { break; }
+            result.push(Message::new(Role::System, summary_text));
+        }
+
+        // Add full messages from recent turns
+        let full_msg_start = if full_start_turn < turns.len() {
+            turns[full_start_turn].start_idx
+        } else {
+            self.messages.len()
+        };
+        result.extend(self.messages[full_msg_start..].iter().cloned());
+
+        // Safety: if still over 80% after compression, drop oldest full turns
+        let current_tokens: usize = result.iter().map(|m| m.estimate_tokens()).sum();
+        if current_tokens > budget_80pct {
+            let tokens_to_drop = current_tokens - budget_80pct;
+            let mut extra_dropped = 0usize;
+            let mut drop_up_to_turn = full_start_turn;
+
+            for ti in full_start_turn..turns.len().saturating_sub(1) {
+                if extra_dropped >= tokens_to_drop { break; }
                 let turn = &turns[ti];
                 let end = turn.end_idx().min(self.messages.len());
                 if turn.start_idx >= self.messages.len() { continue; }
-                let turn_tokens: usize = self.messages[turn.start_idx..end]
-                    .iter()
-                    .map(|m| m.estimate_tokens())
-                    .sum();
-                dropped_tokens += turn_tokens;
+                extra_dropped += self.messages[turn.start_idx..end]
+                    .iter().map(|m| m.estimate_tokens()).sum::<usize>();
                 drop_up_to_turn = ti + 1;
             }
+            dropped_tokens += extra_dropped;
 
-            // Rebuild result with dropped turns removed
             let new_msg_start = if drop_up_to_turn < turns.len() {
                 turns[drop_up_to_turn].start_idx
             } else {
                 turns.last().map(|t| t.start_idx).unwrap_or(0)
             };
-
-            result.truncate(if summaries.is_empty() { 1 } else { 2 }); // keep system + summary
+            // Keep system + compressed summary (first 2 messages)
+            let keep = if compressed.is_empty() { 1 } else { 2 };
+            result.truncate(keep);
             result.extend(self.messages[new_msg_start..].iter().cloned());
         }
 
-        // View replacement: if a file was read then later edited, replace the
-        // stale read result with current disk content. The model always sees the
-        // latest version — no stale old_string, no fuzzy match loops.
         Self::replace_stale_reads(&mut result);
-
         Self::sanitize_messages(&mut result);
 
         let sent_tokens: usize = result.iter().map(|m| m.estimate_tokens()).sum::<usize>()
@@ -442,6 +476,69 @@ impl Conversation {
             }
             turn.status = turn::TurnStatus::Summarized;
             count += 1;
+        }
+    }
+
+    /// Compress a turn into a one-line mechanical summary.
+    /// No LLM call — deterministic, fast, never fails.
+    /// Format: "Turn N: user asked X → read file.js, edited file.js (-3 +5 lines)"
+    fn compress_turn(&self, turn_num: usize, turn_msgs: &[Message]) -> String {
+        let mut user_text = String::new();
+        let mut tools: Vec<String> = Vec::new();
+
+        for msg in turn_msgs {
+            match (&msg.role, &msg.content) {
+                (Role::User, MessageContent::Text(s)) => {
+                    if !s.starts_with('[') { // skip system-injected messages
+                        user_text = if s.chars().count() > 60 {
+                            format!("{}...", s.chars().take(57).collect::<String>())
+                        } else {
+                            s.clone()
+                        };
+                    }
+                }
+                (_, MessageContent::AssistantWithToolCalls { tool_calls, .. }) => {
+                    for tc in tool_calls {
+                        let short = if let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
+                            let fp = args.get("file_path").and_then(|v| v.as_str())
+                                .map(|p| std::path::Path::new(p).file_name()
+                                    .map(|n| n.to_string_lossy().to_string())
+                                    .unwrap_or_else(|| p.to_string()));
+                            match (tc.name.as_str(), fp) {
+                                ("read_file", Some(f)) => format!("read {}", f),
+                                ("edit_file", Some(f)) => format!("edit {}", f),
+                                ("write_file", Some(f)) => format!("write {}", f),
+                                ("grep", _) => {
+                                    let pat = args.get("pattern").and_then(|v| v.as_str()).unwrap_or("?");
+                                    format!("grep({})", pat)
+                                }
+                                ("bash", _) => {
+                                    let cmd = args.get("command").and_then(|v| v.as_str()).unwrap_or("?");
+                                    let short_cmd: String = cmd.chars().take(30).collect();
+                                    format!("bash({})", short_cmd)
+                                }
+                                (name, _) => name.to_string(),
+                            }
+                        } else {
+                            tc.name.clone()
+                        };
+                        if !tools.contains(&short) {
+                            tools.push(short);
+                        }
+                    }
+                }
+                (_, MessageContent::ToolResult(r)) if !r.success => {
+                    tools.push("FAILED".to_string());
+                }
+                _ => {}
+            }
+        }
+
+        let tools_str = if tools.is_empty() { "no tools".to_string() } else { tools.join(", ") };
+        if user_text.is_empty() {
+            format!("- Turn {}: {}", turn_num, tools_str)
+        } else {
+            format!("- Turn {}: \"{}\" → {}", turn_num, user_text, tools_str)
         }
     }
 
@@ -950,12 +1047,13 @@ mod tests {
     }
 
     #[test]
-    fn test_budgeted_uses_summaries() {
+    fn test_budgeted_compresses_old_turns_at_70pct() {
         use crate::tool::{ToolCall, ToolResult};
         let mut conv = Conversation::new();
 
-        // Create 3 turns with large content
-        for turn in 0..3 {
+        // Create 8 turns with large content (4000 chars each ≈ 1000 tokens)
+        // Total ≈ 8 * 3 * 1000 = 24K tokens. Budget 70% of 30K = 21K → triggers compression
+        for turn in 0..8 {
             conv.add_user_message(&format!("task {}", turn));
             let call = ToolCall {
                 id: format!("c{}", turn),
@@ -970,17 +1068,17 @@ mod tests {
             });
         }
 
-        // Apply summary to first 2 turns
-        conv.apply_summary(2, "User ran task 0 and task 1 with bash.".to_string());
-
-        // Large budget — summary + last turn should fit
-        let (msgs, _stats) = conv.to_provider_messages_budgeted("sys", 100000);
-        let has_summary = msgs.iter().any(|m| {
-            m.text().map_or(false, |t| t.contains("Earlier conversation summary"))
+        // Small budget to force compression (8 turns × ~1000 tok = 8K > 70% of 10K = 7K)
+        let (msgs, stats) = conv.to_provider_messages_budgeted("sys", 10000);
+        // Should have compressed history
+        let has_compressed = msgs.iter().any(|m| {
+            m.text().map_or(false, |t| t.contains("earlier turns compressed"))
         });
-        assert!(has_summary, "Should inject summary for summarized turns");
-        // Last turn's messages should still be present
-        assert_eq!(msgs.last().unwrap().text().map(|t| t.len() > 100), Some(true));
+        assert!(has_compressed, "Should compress old turns when over 70%");
+        // Last turn should still be present with full content
+        let last_user = msgs.iter().rev().find(|m| matches!(m.role, Role::User));
+        assert!(last_user.is_some());
+        assert!(stats.dropped_tokens > 0);
     }
 
     #[test]
