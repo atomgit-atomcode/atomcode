@@ -270,7 +270,10 @@ impl Tool for EditFileTool {
             None => {
                 return Ok(ToolResult {
                     call_id: String::new(),
-                    output: "Error: new_string is required for single-edit mode. Use edits array for multi-edit.".to_string(),
+                    output: "Error: missing new_string.\n\
+                        To REPLACE: edit_file({file_path, old_string: \"old code\", new_string: \"new code\"})\n\
+                        To DELETE:  edit_file({file_path, old_string: \"old code\", new_string: \"\"})\n\
+                        You MUST include new_string in every edit_file call.".to_string(),
                     success: false,
                 });
             }
