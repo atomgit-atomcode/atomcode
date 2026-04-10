@@ -1,11 +1,6 @@
 # Build
 /target
 /runs
-/eval/runs
-
-# SWE-bench dataset cache and repo bare clones — runtime artifacts, not source.
-/eval/swebench/cache/*
-!/eval/swebench/cache/.gitkeep
 
 # Git worktrees (used by superpowers:using-git-worktrees)
 /.worktrees/
