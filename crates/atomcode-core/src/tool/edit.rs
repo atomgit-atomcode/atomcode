@@ -175,15 +175,10 @@ impl Tool for EditFileTool {
         ToolDef {
             name: "edit_file",
             description: "Replace text in a file. ALWAYS prefer this over write_file for existing files.\n\
-                Usage: specify old_string (text to find) and new_string (replacement).\n\
-                old_string must be unique in the file. Include enough surrounding lines to make it unique.\n\
-                Example: {\"file_path\": \"app.vue\", \"old_string\": \"const count = ref(0)\", \"new_string\": \"const count = ref(42)\"}\n\
-                For bulk replace: {\"old_string\": \"bg-blue-500\", \"new_string\": \"bg-red-500\", \"replace_all\": true}\n\
-                For multiple regions: make separate edit_file calls, one per region.\n\
-                Fallback: start_line/end_line can replace a line range if text matching is impractical.\n\
-                Behavior:\n\
-                - If old_string is not found, auto-tries fuzzy matching (whitespace-normalized).\n\
-                - NEVER use write_file to modify existing files.".to_string(),
+                Provide old_string (text to find) and new_string (replacement text).\n\
+                To delete text, set new_string to empty string.\n\
+                old_string must be unique — include surrounding lines if needed.\n\
+                For multiple changes in one file: make separate edit_file calls, one per region.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -193,44 +188,18 @@ impl Tool for EditFileTool {
                     },
                     "old_string": {
                         "type": "string",
-                        "description": "Exact text to find and replace. Include enough context lines to be unique."
+                        "description": "Exact text to find and replace. Include enough context to be unique."
                     },
                     "new_string": {
                         "type": "string",
-                        "description": "Replacement text"
-                    },
-                    "start_line": {
-                        "type": "integer",
-                        "description": "(Fallback) Start line number. Use old_string instead when possible."
-                    },
-                    "end_line": {
-                        "type": "integer",
-                        "description": "(Fallback) End line number. Use old_string instead when possible."
+                        "description": "Replacement text. Use empty string to delete."
                     },
                     "replace_all": {
                         "type": "boolean",
-                        "description": "Replace ALL occurrences of old_string (text-match mode only)."
-                    },
-                    "symbol": {
-                        "type": "string",
-                        "description": "Scope edit to a specific function/class name (tree-sitter)."
-                    },
-                    "edits": {
-                        "type": "array",
-                        "description": "Multi-edit: array of edits to apply in one call. Each edit uses old_string/new_string. Use when changing 2+ non-adjacent regions.",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "old_string": { "type": "string", "description": "Text to find" },
-                                "new_string": { "type": "string", "description": "Replacement text" },
-                                "start_line": { "type": "integer", "description": "(Fallback) Start line" },
-                                "end_line": { "type": "integer", "description": "(Fallback) End line" }
-                            },
-                            "required": ["new_string"]
-                        }
-                    },
+                        "description": "Replace ALL occurrences (default: first only)"
+                    }
                 },
-                "required": ["file_path"]
+                "required": ["file_path", "old_string", "new_string"]
             }),
         }
     }
