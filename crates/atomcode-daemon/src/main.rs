@@ -1604,7 +1604,6 @@ let session_manager = SessionManager::new(&working_dir);
         config: config.clone(),
         permission,
         recently_edited_files: Vec::new(),
-        post_edit_read_counts: std::collections::HashMap::new(),
     };
     
     // Build system prompt (minimal for API)

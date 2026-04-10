@@ -31,11 +31,8 @@ pub struct TurnRunner {
     pub context: ToolContext,
     pub config: Config,
     pub permission: Box<dyn PermissionDecider>,
-    /// Files edited during the current session — read_file on these is intercepted
-    /// to prevent wasteful "verification reads" after editing.
+    /// Files edited during the current session (tracked for context awareness).
     pub recently_edited_files: Vec<String>,
-    /// Post-edit read count per file. First read returns skeleton, second+ BLOCKED.
-    pub post_edit_read_counts: std::collections::HashMap<String, usize>,
 }
 
 impl TurnRunner {
@@ -341,86 +338,6 @@ _ = cancel.cancelled() => {
                 });
                 conversation.add_tool_result(result);
             } else {
-                // Intercept: block FULL re-read on a file that was recently edited.
-                // Targeted reads (with offset/limit) are always allowed — they're
-                // the skeleton workflow reading different sections of the same file.
-                let intercept_file = if call.name == "read_file" {
-                    if let Ok(args) = serde_json::from_str::<serde_json::Value>(&call.arguments) {
-                        let has_offset = args.get("offset").is_some() || args.get("limit").is_some();
-                        if has_offset {
-                            None // Targeted read — never intercept
-                        } else {
-                            args.get("file_path").and_then(|v| v.as_str()).map(|s| s.to_string())
-                        }
-                    } else { None }
-                } else if call.name == "bash" {
-                    // Detect bash cat/head/tail on recently edited files.
-                    // Do NOT block grep — grep is search, not read.
-                    if let Ok(args) = serde_json::from_str::<serde_json::Value>(&call.arguments) {
-                        if let Some(cmd) = args.get("command").and_then(|v| v.as_str()) {
-                            let is_read_cmd = (cmd.contains("cat ") || cmd.contains("head ") || cmd.contains("tail ")
-                                || cmd.contains("less ") || cmd.contains("more "))
-                                && !cmd.contains("grep ");
-                            if is_read_cmd {
-                                // Extract file path from command
-                                files_edited_this_batch.iter()
-                                    .chain(self.recently_edited_files.iter())
-                                    .find(|f| cmd.contains(f.as_str()))
-                                    .map(|f| f.to_string())
-                            } else { None }
-                        } else { None }
-                    } else { None }
-                } else { None };
-
-                if let Some(ref fp) = intercept_file {
-                    // Use full file path for tracking — basename causes false matches
-                    // (e.g., api/__init__.py vs schemas/__init__.py).
-                    let file_key = fp.to_string();
-                    let short = std::path::Path::new(fp)
-                        .file_name()
-                        .map(|n| n.to_string_lossy().to_string())
-                        .unwrap_or_else(|| fp.to_string());
-                    let edited_recently = files_edited_this_batch.iter()
-                        .chain(self.recently_edited_files.iter())
-                        .any(|f| f == &file_key);
-                    if edited_recently {
-                        let read_count = self.post_edit_read_counts.entry(file_key.clone()).or_insert(0);
-                        *read_count += 1;
-
-                        let intercept_output = if *read_count == 1 {
-                            let skeleton = match std::fs::read_to_string(fp) {
-                                Ok(content) => generate_file_skeleton(&content, &short),
-                                Err(_) => format!("[{} was just edited. Use edit_file to make further changes.]", short),
-                            };
-                            Some(skeleton)
-                        } else if *read_count == 2 {
-                            None // allow normal execution — model may be verifying a bug fix
-                        } else {
-                            Some(format!(
-                                "[BLOCKED: {} read {} times after editing. Use edit_file to make changes.]",
-                                short, read_count
-                            ))
-                        };
-
-                        if let Some(output) = intercept_output {
-                            let result = ToolResult {
-                                call_id: call.id.clone(),
-                                output,
-                                success: true,
-                            };
-                            let _ = event_tx.send(TurnEvent::ToolCallResult {
-                                name: call.name.clone(),
-                                output: result.output.clone(),
-                                success: true,
-                                duration: std::time::Duration::ZERO,
-                            });
-                            conversation.add_tool_result(result);
-                            continue;
-                        }
-                        // read_count == 2: fall through to normal execution
-                    }
-                }
-
                 let result = self.execute_single_tool(call, event_tx).await;
 
                 // Track files edited for read interception (batch + cross-turn)
@@ -578,32 +495,6 @@ _ = cancel.cancelled() => {
             call
         };
 
-        // Intercept deployment/restart commands — these waste 5-8 turns and
-        // should be done by the user, not the agent.
-        if call.name == "bash" {
-            if let Ok(args) = serde_json::from_str::<serde_json::Value>(&call.arguments) {
-                if let Some(cmd) = args.get("command").and_then(|v| v.as_str()) {
-                    if let Some(reason) = detect_deployment_command(cmd) {
-                        let output = format!(
-                            "[STOPPED: {}. Tell the user to do this manually instead of attempting it yourself.]",
-                            reason
-                        );
-                        let _ = event_tx.send(TurnEvent::ToolCallResult {
-                            name: call.name.clone(),
-                            output: output.clone(),
-                            success: false,
-                            duration: std::time::Duration::ZERO,
-                        });
-                        return ToolResult {
-                            call_id: call.id.clone(),
-                            output,
-                            success: false,
-                        };
-                    }
-                }
-            }
-        }
-
         // Check permission via the injected PermissionDecider.
         // AutoApprove tools execute immediately; RequireApproval tools go through
         // the decider which handles interactive prompts or automatic policy.
@@ -671,82 +562,6 @@ fn strip_model_tags(text: &str) -> String {
     result = result.replace("</think>", "");
     result = result.replace("<|im_start|>", "").replace("<|im_end|>", "");
     result
-}
-
-/// Detect deployment/restart/auth-debug commands that waste agent turns.
-/// Returns Some(reason) if the command should be blocked.
-fn detect_deployment_command(cmd: &str) -> Option<String> {
-    let trimmed = cmd.trim();
-
-    // Backend server restart patterns
-    if (trimmed.contains("java -jar") || trimmed.contains("mvn spring-boot:run")
-        || trimmed.contains("mvn spring-boot:start") || trimmed.contains("gradle bootRun"))
-        && !trimmed.contains("mvn compile")
-    {
-        return Some("Backend server deployment should be done by the user".to_string());
-    }
-
-    // Auth/token debugging via curl (waste of turns — agent can't fix auth)
-    if trimmed.contains("curl") && (
-        trimmed.contains("Authorization") || trimmed.contains("Bearer")
-        || trimmed.contains("token") || trimmed.contains("login")
-    ) {
-        return Some("Authentication debugging via curl should be done by the user".to_string());
-    }
-
-    None
-}
-
-/// Generate a compact file skeleton showing structure + line numbers.
-/// Used when model tries to read a recently edited file — gives enough
-/// info to plan edits without the full content (~200 token vs ~8000).
-fn generate_file_skeleton(content: &str, filename: &str) -> String {
-    let lines: Vec<&str> = content.lines().collect();
-    let total = lines.len();
-    let mut skeleton = Vec::new();
-
-    skeleton.push(format!("[File skeleton: {} ({} lines) — use start_line/end_line to edit:]", filename, total));
-
-    let mut i = 0;
-    while i < lines.len() {
-        let line = lines[i];
-        let trimmed = line.trim();
-
-        // Keep structural lines: imports, declarations, function/class signatures,
-        // Vue SFC tags, significant comments
-        let is_structural =
-            trimmed.starts_with("import ") || trimmed.starts_with("from ") ||
-            trimmed.starts_with("export ") ||
-            trimmed.starts_with("const ") || trimmed.starts_with("let ") || trimmed.starts_with("var ") ||
-            trimmed.starts_with("function ") || trimmed.starts_with("async function ") ||
-            trimmed.starts_with("class ") || trimmed.starts_with("interface ") ||
-            trimmed.starts_with("pub fn ") || trimmed.starts_with("fn ") ||
-            trimmed.starts_with("pub struct ") || trimmed.starts_with("struct ") ||
-            trimmed.starts_with("pub enum ") || trimmed.starts_with("impl ") ||
-            trimmed.starts_with("def ") || trimmed.starts_with("async def ") ||
-            trimmed.starts_with("<script") || trimmed.starts_with("</script>") ||
-            trimmed.starts_with("<template") || trimmed.starts_with("</template>") ||
-            trimmed.starts_with("<style") || trimmed.starts_with("</style>") ||
-            trimmed.starts_with("@") || // decorators/annotations
-            trimmed.starts_with("package ") ||
-            trimmed.starts_with("public ") || trimmed.starts_with("private ") || trimmed.starts_with("protected ") ||
-            trimmed.starts_with("// ==") || trimmed.starts_with("/* ==") || // section comments
-            trimmed.starts_with("## ") || trimmed.starts_with("### ");
-
-        if is_structural && !trimmed.is_empty() {
-            skeleton.push(format!("  L{}: {}", i + 1, trimmed));
-        }
-
-        i += 1;
-    }
-
-    // Cap skeleton at ~60 lines to stay under ~200 tokens
-    if skeleton.len() > 60 {
-        skeleton.truncate(60);
-        skeleton.push(format!("  ... ({} more structural lines)", total - 60));
-    }
-
-    skeleton.join("\n")
 }
 
 /// Merge multiple edit_file calls targeting the same file into a single multi-edit call.

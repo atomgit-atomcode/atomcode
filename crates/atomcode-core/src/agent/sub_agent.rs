@@ -88,7 +88,6 @@ impl SubAgentTask {
             config: config.clone(),
             permission,
             recently_edited_files: Vec::new(),
-            post_edit_read_counts: std::collections::HashMap::new(),
         };
 
         // 4. Event channel (we drain but don't forward — sub-agent is silent)
