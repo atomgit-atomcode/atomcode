@@ -308,14 +308,25 @@ impl AgentLoop {
                         self.consecutive_edits_file = Some(short.clone());
                         self.consecutive_edits_count = 1;
                     }
-                    if self.consecutive_edits_count >= 4 {
+                    // After 3+ edits to same file, auto-inject current content
+                    // so the model has fresh state for the next edit.
+                    if self.consecutive_edits_count == 3 {
+                        if let Ok(content) = std::fs::read_to_string(fp) {
+                            let lines = content.lines().count();
+                            if lines <= 300 {
+                                let numbered: String = content.lines().enumerate()
+                                    .map(|(i, l)| format!("{:>4}| {}", i + 1, l))
+                                    .collect::<Vec<_>>()
+                                    .join("\n");
+                                self.conversation.add_user_message(&format!(
+                                    "[Auto-refresh: {} has been edited 3 times. Current content ({} lines):]\n{}",
+                                    short, lines, numbered
+                                ));
+                            }
+                        }
+                    } else if self.consecutive_edits_count >= 6 {
                         return Some(format!(
-                            "[BLOCKED: You have edited {} {} times. \
-                             STOP guessing. Before your next edit: \
-                             (1) Re-read the file to see its CURRENT state. \
-                             (2) If errors reference a third-party crate API, read the library source \
-                             (bash: grep -r 'pub fn\\|pub struct' ~/.cargo/registry/src/*/CRATE*/src/ | head -30). \
-                             (3) Make ONE correct, comprehensive edit.]",
+                            "[BLOCKED: {} edited {} times. Re-read the file before continuing.]",
                             short, self.consecutive_edits_count
                         ));
                     }

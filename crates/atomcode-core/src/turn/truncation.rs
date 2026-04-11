@@ -158,7 +158,36 @@ fn try_compress_compile_errors(lines: &[&str]) -> Option<String> {
         return None; // Not enough savings — let the general path handle it.
     }
 
-    let mut output = assemble_important_lines(lines, &important);
+    // Build a deduped error summary so the model sees ALL unique errors at a glance.
+    let mut unique_errors: Vec<String> = Vec::new();
+    {
+        let mut seen = std::collections::HashSet::new();
+        for line in lines {
+            let trimmed = line.trim();
+            // Extract error codes/types: "error[E0433]", "error TS2304", "Error:", etc.
+            let is_error = trimmed.contains("error[E") || trimmed.contains("error TS")
+                || trimmed.starts_with("error:") || trimmed.starts_with("Error:")
+                || trimmed.contains(": error") || trimmed.contains("[ERROR]");
+            if is_error {
+                // Normalize: take first 100 chars as dedup key
+                let key: String = trimmed.chars().take(100).collect();
+                if seen.insert(key) {
+                    unique_errors.push(trimmed.to_string());
+                }
+            }
+        }
+    }
+
+    let mut output = String::new();
+    if unique_errors.len() > 1 {
+        output.push_str(&format!("[{} unique errors — fix ALL before re-running build:]\n", unique_errors.len()));
+        for (i, err) in unique_errors.iter().take(15).enumerate() {
+            output.push_str(&format!("  {}. {}\n", i + 1, err));
+        }
+        output.push('\n');
+    }
+
+    output.push_str(&assemble_important_lines(lines, &important));
     output.push_str(&format!(
         "\n[{} lines of build output compressed to {} lines — showing errors only]",
         lines.len(),
