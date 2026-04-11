@@ -262,8 +262,8 @@ impl Conversation {
         // Add all current messages
         result.extend(self.messages.iter().cloned());
 
-        // Safety: if over 80% budget, drop oldest turns from the front
-        let budget_80pct = token_budget * 80 / 100;
+        // Safety: if over 80% (or 60K absolute cap), drop oldest turns
+        let budget_80pct = (token_budget * 80 / 100).min(60000);
         let total_tokens: usize = result.iter().map(|m| m.estimate_tokens()).sum();
         let mut dropped_tokens = 0usize;
 
@@ -314,12 +314,15 @@ impl Conversation {
         })
     }
 
-    /// Check if context needs compression (> 70% of budget).
+    /// Check if context needs compression.
+    /// Threshold: min(70% of window, 50K tokens). Prevents large windows from
+    /// accumulating 100K+ context that causes model hallucinations and slow prefill.
     pub fn needs_compression(&self, system_prompt_tokens: usize, token_budget: usize) -> bool {
-        if self.turn_tracker.turns.len() < 6 { return false; } // Need > 5 turns to compress
+        if self.turn_tracker.turns.len() < 6 { return false; }
         let total: usize = system_prompt_tokens + self.messages.iter()
             .map(|m| m.estimate_tokens()).sum::<usize>();
-        total > token_budget * 70 / 100
+        let threshold = (token_budget * 70 / 100).min(50000);
+        total > threshold
     }
 
     /// Build content for LLM compression: all turns except the last 5.
