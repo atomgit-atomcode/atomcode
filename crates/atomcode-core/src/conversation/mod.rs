@@ -649,10 +649,10 @@ impl Conversation {
     /// to one-line summaries. Recent 5 turns keep full content.
     /// Zero LLM calls — purely mechanical compression.
     fn microcompact(msgs: &mut Vec<Message>, turns: &[turn::Turn], _total_msg_count: usize) {
-        if turns.len() <= 5 { return; }
+        if turns.len() <= 3 { return; }
 
-        // Find the message index where "recent 5 turns" starts
-        let recent_start_turn = turns.len().saturating_sub(5);
+        // Find the message index where "recent 3 turns" starts
+        let recent_start_turn = turns.len().saturating_sub(3);
         let recent_start_idx = turns[recent_start_turn].start_idx;
 
         // Build call_id → tool_name map for identifying what each ToolResult is

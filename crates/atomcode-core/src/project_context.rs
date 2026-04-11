@@ -120,22 +120,27 @@ fn detect_tech_stack(working_dir: &Path) -> String {
 }
 
 /// Build project context by scanning the tree and including raw descriptor file contents.
+/// Build project context. `graph` is optional — when available, file tree
+/// includes cross-file call relationships so the model can skip grepping.
 pub fn build_project_context(dir: &Path) -> ProjectContext {
+    build_project_context_with_graph(dir, None)
+}
+
+pub fn build_project_context_with_graph(dir: &Path, graph: Option<&crate::graph::CodeGraph>) -> ProjectContext {
     let mut ctx = String::new();
     let mut included_files = HashSet::new();
 
-    // 0. Tech stack summary — model sees this first, no need to explore marker files
+    // 0. Tech stack summary
     let tech_stack = detect_tech_stack(dir);
     if !tech_stack.is_empty() {
         ctx.push_str(&tech_stack);
         ctx.push('\n');
     }
 
-    // 1. File tree (3 levels) with tree-sitter annotations
-    // Each source file gets top-level symbol names so the model can navigate without grepping
+    // 1. File tree (3 levels) with tree-sitter annotations + graph call relationships
     let mut searcher = crate::semantic::SemanticSearcher::new();
     ctx.push_str("Project files:\n");
-    ctx.push_str(&scan_tree(dir, 0, 3, &mut searcher, dir));
+    ctx.push_str(&scan_tree(dir, 0, 3, &mut searcher, dir, graph));
 
     // 1.5. Deep scan for config files — these live in deep directories
     // (e.g., backend/src/main/java/.../SecurityConfig.java) but are critical for diagnosis.
@@ -276,6 +281,7 @@ fn scan_tree(
     max_depth: usize,
     searcher: &mut crate::semantic::SemanticSearcher,
     _project_root: &Path,
+    graph: Option<&crate::graph::CodeGraph>,
 ) -> String {
     if depth > max_depth { return String::new(); }
 
@@ -290,8 +296,6 @@ fn scan_tree(
         .collect();
     items.sort_by_key(|e| e.file_name());
 
-    // Directories first (always show), then files capped at 20 per directory.
-    // Prevents large directories (e.g., 295 datalog files) from drowning the tree.
     let (dirs, files): (Vec<_>, Vec<_>) = items.iter()
         .partition(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false));
     let mut visible: Vec<&std::fs::DirEntry> = dirs.clone();
@@ -306,7 +310,7 @@ fn scan_tree(
         let indent = "  ".repeat(depth);
         if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
             out.push_str(&format!("{}{}/\n", indent, name));
-            out.push_str(&scan_tree(&entry.path(), depth + 1, max_depth, searcher, _project_root));
+            out.push_str(&scan_tree(&entry.path(), depth + 1, max_depth, searcher, _project_root, graph));
         } else {
             let entry_path = entry.path();
 
@@ -329,13 +333,22 @@ fn scan_tree(
                     .unwrap_or(0);
                 if let Some(symbols) = searcher.list_symbols(&entry.path()) {
                     let sym_names: Vec<&str> = symbols.iter()
-                        .filter(|s| !s.name.starts_with('<')) // skip <template>/<style> pseudo-symbols
+                        .filter(|s| !s.name.starts_with('<'))
                         .map(|s| s.name.as_str())
                         .take(5)
                         .collect();
                     if !sym_names.is_empty() {
                         out.push_str(&format!("{}{} ({}L): {}\n",
                             indent, name, line_count, sym_names.join(", ")));
+
+                        // Graph: append cross-file call targets (max 3)
+                        if let Some(g) = graph {
+                            let callees = graph_file_callees(g, &entry_path);
+                            if !callees.is_empty() {
+                                out.push_str(&format!("{}  → {}\n", indent,
+                                    callees.iter().take(3).cloned().collect::<Vec<_>>().join(", ")));
+                            }
+                        }
                         continue;
                     }
                 }
@@ -484,4 +497,31 @@ fn extract_config_summary(name: &str, path: &Path) -> Option<String> {
     }
 
     Some(lines.join("\n"))
+}
+
+/// Get cross-file callee file names for a source file using the code graph.
+/// Returns deduplicated set of file basenames that this file calls into.
+fn graph_file_callees(graph: &crate::graph::CodeGraph, file_path: &Path) -> Vec<String> {
+    let file_buf = file_path.to_path_buf();
+    let symbol_ids = match graph.symbols_in_file(&file_buf) {
+        Some(ids) => ids.clone(),
+        None => return Vec::new(),
+    };
+    let mut callee_files: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for sid in &symbol_ids {
+        for (callee_id, _depth) in graph.trace_callees(*sid, 1) {
+            if let Some(callee) = graph.node(callee_id) {
+                if callee.file != file_path {
+                    if let Some(name) = callee.file.file_name() {
+                        callee_files.insert(name.to_string_lossy().to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    let mut result: Vec<String> = callee_files.into_iter().collect();
+    result.sort();
+    result
 }

@@ -261,6 +261,11 @@ pub struct AgentLoop {
     consecutive_verify_count: usize,
     /// Recent consecutive error messages (first 60 chars) for repeated-error detection.
     recent_errors: Vec<String>,
+    /// Completion pending: model produced long summary text in previous turn
+    /// with only read-only tools. Next turn: if edit → cancel, if read-only → stop.
+    completion_pending: bool,
+    /// Snapshot of files_edited count when completion_pending was set.
+    completion_edits_snapshot: usize,
     /// Normalized bash commands executed this turn → count.
     /// Used to detect repeated execution of the same command.
     executed_cmds: std::collections::HashMap<String, usize>,
@@ -458,6 +463,8 @@ impl AgentLoop {
             sleep_count: 0,
             consecutive_verify_count: 0,
             recent_errors: Vec::new(),
+            completion_pending: false,
+            completion_edits_snapshot: 0,
             executed_cmds: std::collections::HashMap::new(),
             category_fail_streak: std::collections::HashMap::new(),
             last_bash_cmd: String::new(),
@@ -717,6 +724,7 @@ impl AgentLoop {
         self.sleep_count = 0;
         self.consecutive_verify_count = 0;
         self.recent_errors.clear();
+        self.completion_pending = false;
         self.executed_cmds.clear();
         self.category_fail_streak.clear();
         // Clear session_files on each new user message.
@@ -790,6 +798,18 @@ impl AgentLoop {
             // (not including the "would-be" next turn we refuse to run).
             // The stop reason is propagated via TurnComplete.stop_reason;
             // the CLI [done] line surfaces it as `stopped=turn_limit`.
+            // Completion detection: if previous turn signaled "done" (long text + read-only tools),
+            // check if this turn has new edits. If not → task is complete, stop.
+            if self.completion_pending {
+                self.completion_pending = false;
+                // If no new files were edited since the completion signal → truly done
+                if self.files_edited_this_turn.len() <= self.completion_edits_snapshot {
+                    self.finish_turn(TurnStopReason::Natural);
+                    return;
+                }
+                // else: new edits happened → model was not done, continue
+            }
+
             if self.check_turn_limit() {
                 self.finish_turn(TurnStopReason::TurnLimit);
                 return;
@@ -1413,6 +1433,22 @@ impl AgentLoop {
                             );
                             self.finish_turn(TurnStopReason::NeedsInput);
                             return;
+                        }
+                    }
+
+                    // Completion detection: if model produced long summary text
+                    // AND only did read-only tools (no edit/write/bash) → likely done.
+                    // Set pending flag; next turn checks if there's really more work.
+                    if let Some(ref model_text) = text {
+                        if model_text.len() > 200 && self.tool_call_count >= 3 {
+                            // Check if this turn had any writes
+                            let edits_before = self.completion_edits_snapshot;
+                            let edits_now = self.files_edited_this_turn.len();
+                            let had_new_edits = edits_now > edits_before;
+                            if !had_new_edits {
+                                self.completion_pending = true;
+                                self.completion_edits_snapshot = edits_now;
+                            }
                         }
                     }
 

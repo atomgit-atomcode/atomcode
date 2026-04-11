@@ -34,7 +34,14 @@ impl AgentLoop {
         let project_ctx = match &self.project_context_cache {
             Some((cached_wd, cached_ctx)) if cached_wd == &wd => cached_ctx.clone(),
             _ => {
-                let pc = crate::project_context::build_project_context(&wd);
+                // Pass graph for cross-file call annotations in file tree
+                let graph_ref = self.turn_runner.context.graph.try_read()
+                    .ok();
+                let pc = if let Some(ref g) = graph_ref {
+                    crate::project_context::build_project_context_with_graph(&wd, Some(g))
+                } else {
+                    crate::project_context::build_project_context(&wd)
+                };
                 self.project_context_cache = Some((wd.clone(), pc.text.clone()));
                 self.context_included_files = pc.included_files;
                 pc.text

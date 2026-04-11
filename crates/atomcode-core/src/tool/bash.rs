@@ -107,7 +107,9 @@ static LAUNCHED_SERVERS: std::sync::LazyLock<std::sync::Mutex<Vec<String>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
 
 async fn bash_execute(args: &str, ctx: &ToolContext) -> Result<ToolResult> {
-        let parsed: BashArgs = serde_json::from_str(args)?;
+        let mut parsed: BashArgs = serde_json::from_str(args)?;
+        // Strip model-added tail/head pipes — framework's truncation handles output length.
+        parsed.command = strip_output_pipes(&parsed.command);
         // Cap timeout: model may request absurdly large values. Max 5 min for
         // normal commands, 3 min for background/server commands.
         let timeout_secs = parsed.timeout.unwrap_or(30).min(300);
@@ -454,6 +456,25 @@ fn check_destructive_command(command: &str) -> Option<String> {
     None
 }
 
+
+/// Strip model-added `| tail -N` / `| head -N` from the end of bash commands.
+/// The framework's truncation system manages output length — model shouldn't self-truncate.
+/// Preserves `tail -f` (streaming), `| grep` (filtering), `| sort` (semantics).
+fn strip_output_pipes(cmd: &str) -> String {
+    let trimmed = cmd.trim_end();
+    // Find last pipe
+    if let Some(pipe_pos) = trimmed.rfind('|') {
+        let after_pipe = trimmed[pipe_pos + 1..].trim();
+        // Check if it's `tail -N`, `tail -n N`, `head -N`, `head -n N`
+        let is_tail_head = (after_pipe.starts_with("tail ") || after_pipe.starts_with("head "))
+            && !after_pipe.contains("-f")  // preserve tail -f (streaming)
+            && after_pipe.chars().any(|c| c.is_ascii_digit()); // must have a number
+        if is_tail_head {
+            return trimmed[..pipe_pos].trim_end().to_string();
+        }
+    }
+    cmd.to_string()
+}
 
 fn format_output(stdout: &str, stderr: &str) -> String {
     let stdout = stdout.trim();
