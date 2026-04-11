@@ -1678,8 +1678,21 @@ impl AgentLoop {
     }
 
     fn finish_turn(&mut self, stop_reason: TurnStopReason) {
-        // Mark the current turn as completed in the tracker.
         self.conversation.turn_tracker.complete_current();
+
+        // Record session activity to project knowledge (cross-session memory).
+        if !self.files_edited_this_turn.is_empty() {
+            let wd = self.turn_runner.context.working_dir.try_read()
+                .map(|g| g.clone()).unwrap_or_default();
+            let last_curl = knowledge::find_last_curl(&self.conversation.messages);
+            knowledge::record_session(
+                &wd,
+                &self.current_task,
+                &self.files_edited_this_turn,
+                last_curl.as_deref(),
+                self.build_fail_count == 0,
+            );
+        }
 
         let duration = self.turn_start.map(|t| t.elapsed()).unwrap_or_default();
         self.turn_start = None;
@@ -1694,7 +1707,6 @@ impl AgentLoop {
         let _ = self
             .event_tx
             .send(AgentEvent::PhaseChange(AgentPhase::Idle));
-        // Persist conversation history.
         self.conversation.save(&Conversation::history_path());
     }
 

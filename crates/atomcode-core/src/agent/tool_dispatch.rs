@@ -89,14 +89,6 @@ impl AgentLoop {
                     self.scouting_count = 0;
                 }
 
-                // Extract and persist cross-session knowledge (db credentials, ports, etc.)
-                let entries = knowledge::extract_knowledge(&output);
-                if !entries.is_empty() {
-                    let wd = self.turn_runner.context.working_dir.try_read()
-                        .map(|g| g.clone()).unwrap_or_default();
-                    knowledge::save_knowledge(&wd, &entries);
-                }
-
                 let _ = self.event_tx.send(AgentEvent::ToolCallResult {
                     name, output, success, duration,
                 });
