@@ -79,8 +79,6 @@ pub enum TurnStopReason {
     Cancelled,
     /// API or internal error terminated the loop.
     Error,
-    /// Model asked a clarifying question — waiting for user input.
-    NeedsInput,
 }
 
 impl TurnStopReason {
@@ -92,7 +90,6 @@ impl TurnStopReason {
             TurnStopReason::StepLimit => "step_limit",
             TurnStopReason::Cancelled => "cancelled",
             TurnStopReason::Error => "error",
-            TurnStopReason::NeedsInput => "needs_input",
         }
     }
 }
@@ -261,11 +258,6 @@ pub struct AgentLoop {
     consecutive_verify_count: usize,
     /// Recent consecutive error messages (first 60 chars) for repeated-error detection.
     recent_errors: Vec<String>,
-    /// Completion pending: model produced long summary text in previous turn
-    /// with only read-only tools. Next turn: if edit → cancel, if read-only → stop.
-    completion_pending: bool,
-    /// Snapshot of files_edited count when completion_pending was set.
-    completion_edits_snapshot: usize,
     /// Normalized bash commands executed this turn → count.
     /// Used to detect repeated execution of the same command.
     executed_cmds: std::collections::HashMap<String, usize>,
@@ -463,8 +455,6 @@ impl AgentLoop {
             sleep_count: 0,
             consecutive_verify_count: 0,
             recent_errors: Vec::new(),
-            completion_pending: false,
-            completion_edits_snapshot: 0,
             executed_cmds: std::collections::HashMap::new(),
             category_fail_streak: std::collections::HashMap::new(),
             last_bash_cmd: String::new(),
@@ -724,7 +714,6 @@ impl AgentLoop {
         self.sleep_count = 0;
         self.consecutive_verify_count = 0;
         self.recent_errors.clear();
-        self.completion_pending = false;
         self.executed_cmds.clear();
         self.category_fail_streak.clear();
         // Clear session_files on each new user message.
@@ -798,18 +787,6 @@ impl AgentLoop {
             // (not including the "would-be" next turn we refuse to run).
             // The stop reason is propagated via TurnComplete.stop_reason;
             // the CLI [done] line surfaces it as `stopped=turn_limit`.
-            // Completion detection: if previous turn signaled "done" (long text + read-only tools),
-            // check if this turn has new edits. If not → task is complete, stop.
-            if self.completion_pending {
-                self.completion_pending = false;
-                // If no new files were edited since the completion signal → truly done
-                if self.files_edited_this_turn.len() <= self.completion_edits_snapshot {
-                    self.finish_turn(TurnStopReason::Natural);
-                    return;
-                }
-                // else: new edits happened → model was not done, continue
-            }
-
             if self.check_turn_limit() {
                 self.finish_turn(TurnStopReason::TurnLimit);
                 return;
@@ -1421,48 +1398,6 @@ impl AgentLoop {
                         self.finish_turn(TurnStopReason::StepLimit);
                         return;
                     }
-                    // Question detection: if the model asked the user a question
-                    // (numbered options like "1. ... 2. ... 3. ...") while also calling tools,
-                    // stop and wait for user input instead of continuing.
-                    // Without this, the model self-answers its own question and goes
-                    // in the wrong direction for 20+ turns.
-                    if let Some(ref model_text) = text {
-                        if Self::looks_like_question(model_text) && self.tool_call_count <= 3 {
-                            self.conversation.add_user_message(
-                                "[The model asked a clarifying question. Waiting for your response.]"
-                            );
-                            self.finish_turn(TurnStopReason::NeedsInput);
-                            return;
-                        }
-                    }
-
-                    // Completion detection: if model produced long summary text
-                    // AND this turn only did read-only tools (no edit/write/bash) → likely done.
-                    // bash counts as "action" — model may be testing/verifying, not done.
-                    // Completion detection: only trigger if model HAS edited files
-                    // this session AND this turn's text is long AND no action tools.
-                    // Never trigger if no edits happened yet (model is still exploring).
-                    if let Some(ref model_text) = text {
-                        let has_ever_edited = !self.files_edited_this_turn.is_empty();
-                        if has_ever_edited && model_text.len() > 200 {
-                            let edits_now = self.files_edited_this_turn.len();
-                            let had_new_edits = edits_now > self.completion_edits_snapshot;
-                            // Check if this turn had action tools (bash, edit, write)
-                            let had_action = {
-                                let recent = self.conversation.messages.iter().rev().take(tool_count * 2 + 1);
-                                recent.filter(|m| {
-                                    if let crate::conversation::message::MessageContent::AssistantWithToolCalls { tool_calls, .. } = &m.content {
-                                        tool_calls.iter().any(|tc| matches!(tc.name.as_str(), "bash" | "edit_file" | "write_file" | "search_replace"))
-                                    } else { false }
-                                }).count() > 0
-                            };
-                            if !had_new_edits && !had_action {
-                                self.completion_pending = true;
-                                self.completion_edits_snapshot = edits_now;
-                            }
-                        }
-                    }
-
                     // Continue to next turn
                     self.phase = AgentPhase::Thinking;
                     let _ = self.event_tx.send(AgentEvent::PhaseChange(AgentPhase::Thinking));
@@ -1654,27 +1589,6 @@ impl AgentLoop {
             }
             Err(_) => {} // Summarization failed — proceed without it
         }
-    }
-
-    /// Detect if model text looks like it's asking the user a question.
-    /// Pattern: numbered options (1. ... 2. ... 3. ...) or explicit question marks.
-    fn looks_like_question(text: &str) -> bool {
-        let has_numbered_options = {
-            let mut found = 0u8;
-            for line in text.lines() {
-                let t = line.trim();
-                if t.starts_with("1.") || t.starts_with("1、") || t.starts_with("1）") { found |= 1; }
-                if t.starts_with("2.") || t.starts_with("2、") || t.starts_with("2）") { found |= 2; }
-                if t.starts_with("3.") || t.starts_with("3、") || t.starts_with("3）") { found |= 4; }
-            }
-            found >= 7 // has 1, 2, and 3
-        };
-        let has_question = text.contains("请问") || text.contains("请告诉我")
-            || text.contains("您希望") || text.contains("你想")
-            || text.contains("Which option") || text.contains("What would you like")
-            || text.contains("请选择") || text.contains("你觉得");
-
-        has_numbered_options && has_question
     }
 
     fn finish_turn(&mut self, stop_reason: TurnStopReason) {
