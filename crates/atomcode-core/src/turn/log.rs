@@ -65,9 +65,17 @@ pub fn log_llm_request(
     // Write atomically via temp file.
     let tmp = path.with_extension("json.tmp");
     if let Ok(mut f) = std::fs::File::create(&tmp) {
-        // Use pretty print for readability.
         let _ = f.write_all(serde_json::to_string_pretty(&log).unwrap_or_default().as_bytes());
         let _ = std::fs::rename(&tmp, &path);
+    }
+
+    // Append one-line call record to calls.log (CSV: timestamp, model, step, msgs, tokens, ctx_window)
+    let calls_path = log_dir.join("calls.log");
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&calls_path) {
+        let _ = f.write_all(format!(
+            "{},{},{},{},{},{}\n",
+            ts, model, step, messages.len(), total_tokens, context_window
+        ).as_bytes());
     }
 }
 
@@ -121,6 +129,18 @@ pub fn log_llm_response(
     if let Ok(mut f) = std::fs::File::create(&tmp) {
         let _ = f.write_all(serde_json::to_string_pretty(&log).unwrap_or_default().as_bytes());
         let _ = std::fs::rename(&tmp, &path);
+    }
+
+    // Append to calls.log: response line with duration and tool count
+    let calls_path = log_dir.join("calls.log");
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&calls_path) {
+        let tool_names: Vec<&str> = tool_calls.iter().map(|tc| tc.name.as_str()).collect();
+        let _ = f.write_all(format!(
+            "  → {}ms, {} tool(s): {}\n",
+            duration_ms,
+            tool_calls.len(),
+            if tool_names.is_empty() { "text_only".to_string() } else { tool_names.join(", ") }
+        ).as_bytes());
     }
 }
 
