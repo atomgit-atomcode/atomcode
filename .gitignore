@@ -43,3 +43,6 @@ backend.log
 
 # AtomCode local data (graph cache, etc.)
 .atomcode/
+
+# Eval results (generated, not committed)
+scripts/eval/results/
