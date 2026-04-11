@@ -309,6 +309,9 @@ pub struct AgentLoop {
     // Code graph background indexer channel
     reindex_tx: Option<mpsc::UnboundedSender<PathBuf>>,
 
+    // Datalog writer — writes per-turn markdown logs to datalog/ directory.
+    datalog: crate::turn::datalog::DatalogWriter,
+
     // Channels
     cmd_rx: mpsc::UnboundedReceiver<AgentCommand>,
     event_tx: mpsc::UnboundedSender<AgentEvent>,
@@ -471,6 +474,7 @@ impl AgentLoop {
             active_services: std::collections::HashMap::new(),
             skill_registry,
             reindex_tx: None,
+            datalog: crate::turn::datalog::DatalogWriter::new(&working_dir),
             cmd_rx,
             event_tx,
         };
@@ -623,6 +627,7 @@ impl AgentLoop {
                 AgentCommand::ClearConversation => {
                     // Clear the conversation history in the agent loop.
                     self.conversation = Conversation::new();
+                    self.datalog.clear();
                 }
                 AgentCommand::SetMessages(messages) => {
                     // Set messages from a resumed session.
@@ -721,6 +726,14 @@ impl AgentLoop {
         self.session_files.clear();
         self.turn_start = Some(Instant::now());
         self.cancel_token = CancellationToken::new();
+
+        // Initialize datalog for this turn
+        {
+            let model_name = self.turn_runner.provider.model_name().to_string();
+            let ctx_window = self.config.providers.get(&self.config.default_provider)
+                .map(|p| p.context_window).unwrap_or(32000);
+            self.datalog.begin_turn(&content, &model_name, ctx_window);
+        }
 
         // "记住这个" / "remember this" — save last assistant response as knowledge.
         let lower_content = content.to_lowercase();
@@ -871,6 +884,9 @@ impl AgentLoop {
             // Move conversation out to avoid borrow conflicts with self in select!
             let mut conv = std::mem::take(&mut self.conversation);
 
+            // Datalog: mark the start of a new LLM round-trip
+            self.datalog.log_llm_call();
+
             // Log LLM request to ~/.atomcode/logs/ (caller responsibility, not TurnRunner's)
             {
                 let context_window = self.config
@@ -910,6 +926,7 @@ impl AgentLoop {
                 let phase = &mut self.phase;
                 let model_produced_text = &mut self.model_produced_text;
                 let current_tool_name = &mut self.current_tool_name;
+                let datalog = &mut self.datalog;
                 let files_edited_this_turn = &mut self.files_edited_this_turn;
                 let active_file = &mut self.active_file;
                 let files_read_this_turn = &mut self.files_read_this_turn;
@@ -940,6 +957,9 @@ impl AgentLoop {
                 );
                 tokio::pin!(turn_fut);
 
+                // Accumulate text deltas for datalog (flushed on tool call or turn end)
+                let mut datalog_text_accum = String::new();
+
                 let result = loop {
                     tokio::select! {
                         biased;
@@ -951,9 +971,17 @@ impl AgentLoop {
                             match event {
                                 TurnEvent::TextDelta(text) => {
                                     *model_produced_text = true;
+                                    datalog_text_accum.push_str(&text);
                                     let _ = event_tx.send(AgentEvent::TextDelta(text));
                                 }
                                 TurnEvent::ToolCallStarted { ref name, ref arguments } => {
+                                    // Flush accumulated model text to datalog before logging tool call
+                                    if !datalog_text_accum.is_empty() {
+                                        datalog.log_model_text(&datalog_text_accum);
+                                        datalog_text_accum.clear();
+                                    }
+                                    datalog.log_tool_call(name, arguments);
+
                                     *current_tool_name = name.clone();
                                     *phase = AgentPhase::CallingTool(name.clone());
                                     let _ = event_tx.send(AgentEvent::PhaseChange(phase.clone()));
@@ -1041,11 +1069,15 @@ impl AgentLoop {
                                             }
                                         }
                                     }
+                                    datalog.log_tool_result(&output, success);
                                     let _ = event_tx.send(AgentEvent::ToolCallResult {
                                         name, output, success, duration,
                                     });
                                 }
                                 TurnEvent::TokenUsage { prompt_tokens, completion_tokens, total_tokens: _, cached_tokens } => {
+                                    if cached_tokens > 0 {
+                                        datalog.log_cache_hit(prompt_tokens, cached_tokens);
+                                    }
                                     let _ = event_tx.send(AgentEvent::TokenUsage(
                                         crate::stream::TokenUsage {
                                             prompt_tokens,
@@ -1055,6 +1087,8 @@ impl AgentLoop {
                                     ));
                                 }
                                 TurnEvent::ContextStats { system_tokens, sent_tokens, dropped_tokens, working_set_tokens, total_messages } => {
+                                    datalog.log_context_stats(system_tokens, sent_tokens, dropped_tokens, working_set_tokens, total_messages);
+
                                     // Detect context collapse: if sent tokens drop dramatically,
                                     // model has lost most history. Reset edit tracking so BLOCKED
                                     // doesn't prevent the model from re-reading files it forgot about.
@@ -1126,6 +1160,11 @@ impl AgentLoop {
                         }
                     }
                 };
+
+                // Flush any remaining accumulated text to datalog
+                if !datalog_text_accum.is_empty() {
+                    datalog.log_model_text(&datalog_text_accum);
+                }
 
                 // turn_tx drops here (owned by this block), turn_fut also drops
                 (result, turn_rx, *context_collapsed)
@@ -1593,6 +1632,9 @@ impl AgentLoop {
 
     fn finish_turn(&mut self, stop_reason: TurnStopReason) {
         self.conversation.turn_tracker.complete_current();
+
+        // Flush datalog with final stats
+        self.datalog.end_turn(self.turn_tokens, self.tool_call_count);
 
         // Record session activity to project knowledge (cross-session memory).
         if !self.files_edited_this_turn.is_empty() {

@@ -2,6 +2,7 @@ use super::*;
 
 impl AgentLoop {
     /// Forward a TurnEvent to the TUI as an AgentEvent.
+    /// Also writes to the datalog for persistent turn logging.
     pub(crate) fn forward_turn_event(&mut self, event: TurnEvent) {
         match event {
             TurnEvent::TextDelta(text) => {
@@ -9,6 +10,8 @@ impl AgentLoop {
                 let _ = self.event_tx.send(AgentEvent::TextDelta(text));
             }
             TurnEvent::ToolCallStarted { ref name, ref arguments } => {
+                self.datalog.log_tool_call(name, arguments);
+
                 self.current_tool_name = name.clone();
                 self.phase = AgentPhase::CallingTool(name.clone());
                 let _ = self.event_tx.send(AgentEvent::PhaseChange(self.phase.clone()));
@@ -89,11 +92,15 @@ impl AgentLoop {
                     self.scouting_count = 0;
                 }
 
+                self.datalog.log_tool_result(&output, success);
                 let _ = self.event_tx.send(AgentEvent::ToolCallResult {
                     name, output, success, duration,
                 });
             }
             TurnEvent::TokenUsage { prompt_tokens, completion_tokens, total_tokens: _, cached_tokens } => {
+                if cached_tokens > 0 {
+                    self.datalog.log_cache_hit(prompt_tokens, cached_tokens);
+                }
                 let _ = self.event_tx.send(AgentEvent::TokenUsage(
                     crate::stream::TokenUsage {
                         prompt_tokens,
@@ -103,6 +110,7 @@ impl AgentLoop {
                 ));
             }
             TurnEvent::ContextStats { system_tokens, sent_tokens, dropped_tokens, working_set_tokens, total_messages } => {
+                self.datalog.log_context_stats(system_tokens, sent_tokens, dropped_tokens, working_set_tokens, total_messages);
                 let _ = self.event_tx.send(AgentEvent::ContextStats {
                     system_tokens, sent_tokens, dropped_tokens, working_set_tokens, total_messages,
                 });

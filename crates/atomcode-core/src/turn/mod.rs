@@ -1,3 +1,4 @@
+pub mod datalog;
 pub mod event;
 pub mod json_repair;
 pub mod log;

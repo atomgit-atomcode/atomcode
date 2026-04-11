@@ -71,6 +71,7 @@ impl AgentLoop {
                 *wd = resolved.clone();
             }
             self.project_context_cache = None; // invalidate on dir change
+            self.datalog.set_working_dir(&resolved);
             // Clear conversation history — old paths from previous directory will confuse the model
             self.conversation.messages.clear();
             self.conversation.turn_tracker = crate::conversation::turn::TurnTracker::new();
