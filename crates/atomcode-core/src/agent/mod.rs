@@ -79,6 +79,8 @@ pub enum TurnStopReason {
     Cancelled,
     /// API or internal error terminated the loop.
     Error,
+    /// Model asked a clarifying question — waiting for user input.
+    NeedsInput,
 }
 
 impl TurnStopReason {
@@ -90,6 +92,7 @@ impl TurnStopReason {
             TurnStopReason::StepLimit => "step_limit",
             TurnStopReason::Cancelled => "cancelled",
             TurnStopReason::Error => "error",
+            TurnStopReason::NeedsInput => "needs_input",
         }
     }
 }
@@ -1398,10 +1401,21 @@ impl AgentLoop {
                         self.finish_turn(TurnStopReason::StepLimit);
                         return;
                     }
-                    // Bulk-read and consecutive-read guards removed.
-                    // Skeleton mode makes multi-file reads cheap (~30 tok each).
-                    // Stagnation detection (stagnant_turns >= 3) handles the "truly stuck" case.
-                    // Step limit (50) is the hard cap.
+                    // Question detection: if the model asked the user a question
+                    // (numbered options like "1. ... 2. ... 3. ...") while also calling tools,
+                    // stop and wait for user input instead of continuing.
+                    // Without this, the model self-answers its own question and goes
+                    // in the wrong direction for 20+ turns.
+                    if let Some(ref model_text) = text {
+                        if Self::looks_like_question(model_text) && self.tool_call_count <= 3 {
+                            self.conversation.add_user_message(
+                                "[The model asked a clarifying question. Waiting for your response.]"
+                            );
+                            self.finish_turn(TurnStopReason::NeedsInput);
+                            return;
+                        }
+                    }
+
                     // Continue to next turn
                     self.phase = AgentPhase::Thinking;
                     let _ = self.event_tx.send(AgentEvent::PhaseChange(AgentPhase::Thinking));
@@ -1593,6 +1607,27 @@ impl AgentLoop {
             }
             Err(_) => {} // Summarization failed — proceed without it
         }
+    }
+
+    /// Detect if model text looks like it's asking the user a question.
+    /// Pattern: numbered options (1. ... 2. ... 3. ...) or explicit question marks.
+    fn looks_like_question(text: &str) -> bool {
+        let has_numbered_options = {
+            let mut found = 0u8;
+            for line in text.lines() {
+                let t = line.trim();
+                if t.starts_with("1.") || t.starts_with("1、") || t.starts_with("1）") { found |= 1; }
+                if t.starts_with("2.") || t.starts_with("2、") || t.starts_with("2）") { found |= 2; }
+                if t.starts_with("3.") || t.starts_with("3、") || t.starts_with("3）") { found |= 4; }
+            }
+            found >= 7 // has 1, 2, and 3
+        };
+        let has_question = text.contains("请问") || text.contains("请告诉我")
+            || text.contains("您希望") || text.contains("你想")
+            || text.contains("Which option") || text.contains("What would you like")
+            || text.contains("请选择") || text.contains("你觉得");
+
+        has_numbered_options && has_question
     }
 
     fn finish_turn(&mut self, stop_reason: TurnStopReason) {
