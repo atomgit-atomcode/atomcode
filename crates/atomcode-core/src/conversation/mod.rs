@@ -782,7 +782,9 @@ impl Conversation {
 
                         if info.offset.is_some() || info.limit.is_some() {
                             // Partial read: re-read the same line range from disk
+                            // Clamp to current file size (file may have shrunk after edit)
                             let start = info.offset.unwrap_or(1).max(1) - 1;
+                            let start = start.min(total);
                             let end = info.limit.map(|l| (start + l).min(total)).unwrap_or(total);
                             let display: String = all_lines[start..end].iter().enumerate()
                                 .map(|(i, l)| format!("{:>4}| {}", start + i + 1, l))
