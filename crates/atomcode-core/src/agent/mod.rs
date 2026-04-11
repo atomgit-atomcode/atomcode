@@ -1437,15 +1437,23 @@ impl AgentLoop {
                     }
 
                     // Completion detection: if model produced long summary text
-                    // AND only did read-only tools (no edit/write/bash) → likely done.
-                    // Set pending flag; next turn checks if there's really more work.
+                    // AND this turn only did read-only tools (no edit/write/bash) → likely done.
+                    // bash counts as "action" — model may be testing/verifying, not done.
                     if let Some(ref model_text) = text {
                         if model_text.len() > 200 && self.tool_call_count >= 3 {
-                            // Check if this turn had any writes
                             let edits_before = self.completion_edits_snapshot;
                             let edits_now = self.files_edited_this_turn.len();
                             let had_new_edits = edits_now > edits_before;
-                            if !had_new_edits {
+                            // Check recent tool calls for action tools (bash, edit, write)
+                            let had_action = {
+                                let recent = self.conversation.messages.iter().rev().take(tool_count * 2 + 1);
+                                recent.filter(|m| {
+                                    if let crate::conversation::message::MessageContent::AssistantWithToolCalls { tool_calls, .. } = &m.content {
+                                        tool_calls.iter().any(|tc| matches!(tc.name.as_str(), "bash" | "edit_file" | "write_file" | "search_replace"))
+                                    } else { false }
+                                }).count() > 0
+                            };
+                            if !had_new_edits && !had_action {
                                 self.completion_pending = true;
                                 self.completion_edits_snapshot = edits_now;
                             }

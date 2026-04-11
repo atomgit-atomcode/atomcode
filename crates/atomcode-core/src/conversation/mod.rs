@@ -737,9 +737,13 @@ impl Conversation {
     /// When a file was read then later edited, the old read result is outdated.
     /// This replaces it so the model always sees the latest version.
     fn replace_stale_reads(msgs: &mut Vec<Message>) {
-        // Step 1: Scan tool calls to build call_id → (tool_name, file_path) map
-        // and collect which files were edited.
-        let mut call_id_to_file: std::collections::HashMap<String, (String, String)> = std::collections::HashMap::new();
+        // Step 1: Scan tool calls to build call_id → (tool_name, file_path, offset, limit)
+        struct ReadInfo {
+            file_path: String,
+            offset: Option<usize>,
+            limit: Option<usize>,
+        }
+        let mut call_id_to_read: std::collections::HashMap<String, ReadInfo> = std::collections::HashMap::new();
         let mut edited_files: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         for msg in msgs.iter() {
@@ -750,7 +754,11 @@ impl Conversation {
                             .and_then(|v| v.as_str())
                             .unwrap_or("")
                             .to_string();
-                        call_id_to_file.insert(tc.id.clone(), (tc.name.clone(), file_path.clone()));
+                        if tc.name == "read_file" && !file_path.is_empty() {
+                            let offset = args.get("offset").and_then(|v| v.as_u64()).map(|v| v as usize);
+                            let limit = args.get("limit").and_then(|v| v.as_u64()).map(|v| v as usize);
+                            call_id_to_read.insert(tc.id.clone(), ReadInfo { file_path: file_path.clone(), offset, limit });
+                        }
                         if matches!(tc.name.as_str(), "edit_file" | "write_file" | "create_file") && !file_path.is_empty() {
                             edited_files.insert(file_path);
                         }
@@ -760,37 +768,39 @@ impl Conversation {
         }
 
         if edited_files.is_empty() {
-            return; // No edits — nothing to replace
+            return;
         }
 
-        // Step 2: Read current content for edited files
-        let mut current_content: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-        for file_path in &edited_files {
-            if let Ok(content) = std::fs::read_to_string(file_path) {
-                let lines = content.lines().count();
-                let display = if lines <= 300 {
-                    content.lines().enumerate()
-                        .map(|(i, l)| format!("{:>4}| {}", i + 1, l))
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                } else {
-                    format!("[{} ({} lines) — file too large, use read_file to view sections]",
-                        std::path::Path::new(file_path).file_name()
-                            .map(|n| n.to_string_lossy().to_string())
-                            .unwrap_or_else(|| file_path.to_string()),
-                        lines)
-                };
-                current_content.insert(file_path.clone(), display);
-            }
-        }
-
-        // Step 3: Replace stale read_file results
+        // Step 2: Replace stale read_file results (both full and partial reads)
         for msg in msgs.iter_mut() {
             if let MessageContent::ToolResult(ref mut r) = msg.content {
-                if let Some((tool_name, file_path)) = call_id_to_file.get(&r.call_id) {
-                    if tool_name == "read_file" && edited_files.contains(file_path) {
-                        if let Some(fresh) = current_content.get(file_path) {
-                            r.output = fresh.clone();
+                if let Some(info) = call_id_to_read.get(&r.call_id) {
+                    if !edited_files.contains(&info.file_path) { continue; }
+                    if let Ok(content) = std::fs::read_to_string(&info.file_path) {
+                        let all_lines: Vec<&str> = content.lines().collect();
+                        let total = all_lines.len();
+
+                        if info.offset.is_some() || info.limit.is_some() {
+                            // Partial read: re-read the same line range from disk
+                            let start = info.offset.unwrap_or(1).max(1) - 1;
+                            let end = info.limit.map(|l| (start + l).min(total)).unwrap_or(total);
+                            let display: String = all_lines[start..end].iter().enumerate()
+                                .map(|(i, l)| format!("{:>4}| {}", start + i + 1, l))
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            r.output = display;
+                        } else if total <= 300 {
+                            // Full read, small file: replace with current content
+                            r.output = all_lines.iter().enumerate()
+                                .map(|(i, l)| format!("{:>4}| {}", i + 1, l))
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                        } else {
+                            r.output = format!("[{} ({} lines) — file too large, use read_file to view sections]",
+                                std::path::Path::new(&info.file_path).file_name()
+                                    .map(|n| n.to_string_lossy().to_string())
+                                    .unwrap_or_else(|| info.file_path.clone()),
+                                total);
                         }
                     }
                 }
