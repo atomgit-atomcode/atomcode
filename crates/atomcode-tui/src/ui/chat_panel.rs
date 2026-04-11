@@ -398,7 +398,7 @@ fn render_tool_call(lines: &mut Vec<Line<'static>>, call: &ToolCall) {
     lines.push(Line::from(vec![
         bar.clone(),
         Span::styled(format!("  {} ", icon), Style::default().fg(icon_color)),
-        Span::styled(name, Style::default().fg(theme::text_secondary())),
+        Span::styled(name, Style::default().fg(theme::text_primary()).add_modifier(Modifier::BOLD)),
         Span::styled(format!("  {}", detail), Style::default().fg(theme::text_muted())),
     ]));
 
