@@ -1439,12 +1439,15 @@ impl AgentLoop {
                     // Completion detection: if model produced long summary text
                     // AND this turn only did read-only tools (no edit/write/bash) → likely done.
                     // bash counts as "action" — model may be testing/verifying, not done.
+                    // Completion detection: only trigger if model HAS edited files
+                    // this session AND this turn's text is long AND no action tools.
+                    // Never trigger if no edits happened yet (model is still exploring).
                     if let Some(ref model_text) = text {
-                        if model_text.len() > 200 && self.tool_call_count >= 3 {
-                            let edits_before = self.completion_edits_snapshot;
+                        let has_ever_edited = !self.files_edited_this_turn.is_empty();
+                        if has_ever_edited && model_text.len() > 200 {
                             let edits_now = self.files_edited_this_turn.len();
-                            let had_new_edits = edits_now > edits_before;
-                            // Check recent tool calls for action tools (bash, edit, write)
+                            let had_new_edits = edits_now > self.completion_edits_snapshot;
+                            // Check if this turn had action tools (bash, edit, write)
                             let had_action = {
                                 let recent = self.conversation.messages.iter().rev().take(tool_count * 2 + 1);
                                 recent.filter(|m| {
