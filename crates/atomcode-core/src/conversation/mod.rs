@@ -300,6 +300,13 @@ impl Conversation {
             result.extend(self.messages[survived_start..].iter().cloned());
         }
 
+        // Microcompact: condense old turn ToolResults to one-liners.
+        // Recent 5 turns keep full fidelity. Older turns' large tool results
+        // (read_file full content, bash output) are replaced with compact summaries.
+        // This reduces context growth without LLM calls.
+        // View replacement runs AFTER microcompact — edited files stay fresh.
+        Self::microcompact(&mut result, &self.turn_tracker.turns, self.messages.len());
+
         Self::replace_stale_reads(&mut result);
         Self::sanitize_messages(&mut result);
 
@@ -638,7 +645,94 @@ impl Conversation {
         result
     }
 
-    /// Remove messages that would cause "messages illegal" API errors.
+    /// Microcompact: condense ToolResult messages from old turns (>5 turns ago)
+    /// to one-line summaries. Recent 5 turns keep full content.
+    /// Zero LLM calls — purely mechanical compression.
+    fn microcompact(msgs: &mut Vec<Message>, turns: &[turn::Turn], _total_msg_count: usize) {
+        if turns.len() <= 5 { return; }
+
+        // Find the message index where "recent 5 turns" starts
+        let recent_start_turn = turns.len().saturating_sub(5);
+        let recent_start_idx = turns[recent_start_turn].start_idx;
+
+        // Build call_id → tool_name map for identifying what each ToolResult is
+        let mut call_id_to_tool: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        for msg in msgs.iter() {
+            if let MessageContent::AssistantWithToolCalls { tool_calls, .. } = &msg.content {
+                for tc in tool_calls {
+                    call_id_to_tool.insert(tc.id.clone(), tc.name.clone());
+                }
+            }
+        }
+
+        // Condense old ToolResults (those corresponding to messages before recent_start_idx)
+        // We track position by counting Tool messages from the start
+        let cold_msgs = if msgs.first().map(|m| matches!(m.role, Role::System)).unwrap_or(false) {
+            // Skip system messages (system prompt + cold zone)
+            let first_non_system = msgs.iter().position(|m| !matches!(m.role, Role::System)).unwrap_or(0);
+            first_non_system
+        } else {
+            0
+        };
+
+        // Count how many conversation messages are from old turns
+        // Use heuristic: messages in `msgs` after system messages correspond to self.messages
+        // Old turn messages = those before recent_start_idx in self.messages
+        let old_msg_count = recent_start_idx;
+        let condense_end = cold_msgs + old_msg_count;
+
+        for i in cold_msgs..condense_end.min(msgs.len()) {
+            if let MessageContent::ToolResult(ref r) = msgs[i].content {
+                // Only condense large results (>500 chars)
+                if r.output.len() <= 500 { continue; }
+
+                let tool_name = call_id_to_tool.get(&r.call_id)
+                    .map(|s| s.as_str())
+                    .unwrap_or("tool");
+
+                let summary = match tool_name {
+                    "read_file" => {
+                        let line_count = r.output.lines().count();
+                        let first_line = r.output.lines().next().unwrap_or("");
+                        // Extract filename from first line (format: "   1| // Comment")
+                        // or from output content
+                        let hint: String = first_line.chars().take(60).collect();
+                        format!("[Read file ({} lines): {}]", line_count, hint)
+                    }
+                    "bash" => {
+                        let first_line = r.output.lines().next().unwrap_or("(empty)");
+                        let line_count = r.output.lines().count();
+                        let short: String = first_line.chars().take(80).collect();
+                        if r.success {
+                            format!("[bash ({} lines): {}]", line_count, short)
+                        } else {
+                            format!("[bash FAILED ({} lines): {}]", line_count, short)
+                        }
+                    }
+                    "grep" => {
+                        let match_count = r.output.lines().filter(|l| l.contains(':')).count();
+                        format!("[grep: {} matches]", match_count)
+                    }
+                    "glob" => {
+                        let file_count = r.output.lines().count();
+                        format!("[glob: {} files]", file_count)
+                    }
+                    _ => {
+                        let first_line = r.output.lines().next().unwrap_or("");
+                        let short: String = first_line.chars().take(80).collect();
+                        format!("[{}: {}]", tool_name, short)
+                    }
+                };
+
+                msgs[i].content = MessageContent::ToolResult(crate::tool::ToolResult {
+                    call_id: r.call_id.clone(),
+                    output: summary,
+                    success: r.success,
+                });
+            }
+        }
+    }
+
     /// Replace stale read_file results with current disk content.
     /// When a file was read then later edited, the old read result is outdated.
     /// This replaces it so the model always sees the latest version.
