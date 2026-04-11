@@ -522,67 +522,77 @@ pub fn wait_very_slow() -> Color {
 // LEGACY CONSTANTS (deprecated - use functions above for theme support)
 // ═══════════════════════════════════════════════════════════════════════════
 
-pub const BG_SURFACE: Color = Color::Rgb(18, 18, 24);
-pub const BG_ELEVATED: Color = Color::Rgb(30, 30, 40);
-pub const BG_CODE: Color = Color::Rgb(22, 22, 32);
-pub const BG_INLINE_CODE: Color = Color::Rgb(40, 38, 50);
+// CC-aligned minimal palette: white/gray base, muted blue accent.
+// Principle: information through layout, not color. Color only for status.
+pub const BG_SURFACE: Color = Color::Rgb(18, 18, 22);
+pub const BG_ELEVATED: Color = Color::Rgb(28, 28, 34);
+pub const BG_CODE: Color = Color::Rgb(22, 22, 28);
+pub const BG_INLINE_CODE: Color = Color::Rgb(38, 38, 46);
 
-pub const TEXT_PRIMARY: Color = Color::Rgb(220, 222, 230);
-pub const TEXT_SECONDARY: Color = Color::Rgb(150, 153, 168);
-pub const TEXT_MUTED: Color = Color::Rgb(90, 93, 108);
+pub const TEXT_PRIMARY: Color = Color::Rgb(230, 230, 235);
+pub const TEXT_SECONDARY: Color = Color::Rgb(140, 142, 155);
+pub const TEXT_MUTED: Color = Color::Rgb(85, 88, 100);
 pub const TEXT_ON_ACCENT: Color = Color::Rgb(15, 15, 15);
 
-pub const ACCENT: Color = Color::Rgb(170, 145, 255);
-pub const ACCENT_DIM: Color = Color::Rgb(60, 50, 110);
-pub const BRAND_FG: Color = Color::Rgb(195, 185, 250);
-pub const BRAND_BG: Color = Color::Rgb(55, 38, 120);
+// Accent: muted blue (CC-style), not purple
+pub const ACCENT: Color = Color::Rgb(100, 160, 240);
+pub const ACCENT_DIM: Color = Color::Rgb(40, 55, 80);
+pub const BRAND_FG: Color = Color::Rgb(140, 175, 230);
+pub const BRAND_BG: Color = Color::Rgb(30, 42, 65);
 
-pub const SUCCESS: Color = Color::Rgb(75, 195, 115);
-pub const ERROR: Color = Color::Rgb(235, 80, 80);
-pub const WARNING: Color = Color::Rgb(215, 170, 45);
-pub const INFO: Color = Color::Rgb(80, 165, 230);
+// Status: muted versions — not screaming
+pub const SUCCESS: Color = Color::Rgb(70, 170, 100);
+pub const ERROR: Color = Color::Rgb(210, 75, 75);
+pub const WARNING: Color = Color::Rgb(195, 155, 45);
+pub const INFO: Color = Color::Rgb(90, 155, 210);
 
-pub const DIFF_ADD: Color = Color::Rgb(95, 190, 115);
-pub const DIFF_REMOVE: Color = Color::Rgb(200, 95, 95);
+// Diff: subdued
+pub const DIFF_ADD: Color = Color::Rgb(80, 165, 100);
+pub const DIFF_REMOVE: Color = Color::Rgb(180, 85, 85);
 
-pub const BORDER: Color = Color::Rgb(42, 44, 55);
-pub const SEPARATOR: Color = Color::Rgb(55, 58, 70);
+pub const BORDER: Color = Color::Rgb(38, 40, 48);
+pub const SEPARATOR: Color = Color::Rgb(48, 50, 58);
 
-pub const USER_CHEVRON: Color = Color::Rgb(90, 170, 255);
+// User chevron: same muted blue as accent
+pub const USER_CHEVRON: Color = Color::Rgb(100, 160, 240);
 
-pub const TOOL_EDIT: Color = Color::Rgb(100, 200, 150);
-pub const TOOL_BASH: Color = Color::Rgb(200, 180, 100);
-pub const TOOL_SEARCH: Color = Color::Rgb(170, 140, 230);
+// Tool colors: all same muted gray — no per-tool color
+pub const TOOL_EDIT: Color = Color::Rgb(140, 142, 155);
+pub const TOOL_BASH: Color = Color::Rgb(140, 142, 155);
+pub const TOOL_SEARCH: Color = Color::Rgb(140, 142, 155);
 
-pub const MD_H1: Color = Color::Rgb(115, 170, 240);
-pub const MD_H2: Color = Color::Rgb(160, 140, 225);
-pub const MD_H3: Color = Color::Rgb(130, 190, 160);
-pub const MD_LINK: Color = Color::Rgb(100, 150, 230);
-pub const MD_INLINE_CODE: Color = Color::Rgb(220, 180, 120);
-pub const MD_CODE_BORDER: Color = Color::Rgb(50, 54, 68);
-pub const MD_CODE_LANG: Color = Color::Rgb(110, 120, 150);
-pub const MD_CODE_LINENUM: Color = Color::Rgb(70, 75, 95);
-pub const MD_CODE_GUTTER: Color = Color::Rgb(18, 18, 28);
-pub const MD_BULLET: Color = Color::Rgb(85, 105, 140);
-pub const MD_QUOTE_BAR: Color = Color::Rgb(55, 55, 70);
-pub const MD_QUOTE_TEXT: Color = Color::Rgb(155, 157, 170);
+// Markdown: mostly white/gray, minimal color
+pub const MD_H1: Color = Color::Rgb(230, 230, 235);
+pub const MD_H2: Color = Color::Rgb(200, 200, 210);
+pub const MD_H3: Color = Color::Rgb(180, 180, 190);
+pub const MD_LINK: Color = Color::Rgb(100, 150, 210);
+pub const MD_INLINE_CODE: Color = Color::Rgb(200, 175, 120);
+pub const MD_CODE_BORDER: Color = Color::Rgb(45, 48, 58);
+pub const MD_CODE_LANG: Color = Color::Rgb(100, 105, 120);
+pub const MD_CODE_LINENUM: Color = Color::Rgb(60, 65, 80);
+pub const MD_CODE_GUTTER: Color = Color::Rgb(18, 18, 24);
+pub const MD_BULLET: Color = Color::Rgb(85, 88, 100);
+pub const MD_QUOTE_BAR: Color = Color::Rgb(48, 50, 58);
+pub const MD_QUOTE_TEXT: Color = Color::Rgb(155, 157, 165);
 
-pub const STATUS_PATH: Color = Color::Rgb(110, 112, 128);
-pub const STATUS_MODEL: Color = Color::Rgb(175, 178, 200);
-pub const STATUS_SEP: Color = Color::Rgb(42, 44, 55);
+pub const STATUS_PATH: Color = Color::Rgb(100, 102, 118);
+pub const STATUS_MODEL: Color = Color::Rgb(160, 162, 178);
+pub const STATUS_SEP: Color = Color::Rgb(38, 40, 48);
 
-pub const MODE_STREAMING_FG: Color = Color::Rgb(28, 24, 10);
-pub const MODE_STREAMING_BG: Color = Color::Rgb(215, 170, 40);
-pub const MODE_RUNNING_FG: Color = Color::Rgb(12, 22, 38);
-pub const MODE_RUNNING_BG: Color = Color::Rgb(65, 160, 225);
-pub const MODE_APPROVAL_FG: Color = Color::Rgb(32, 18, 8);
-pub const MODE_APPROVAL_BG: Color = Color::Rgb(230, 155, 45);
-pub const MODE_OVERLAY_FG: Color = Color::Rgb(225, 215, 255);
-pub const MODE_OVERLAY_BG: Color = Color::Rgb(75, 55, 150);
-pub const MODE_EXIT_FG: Color = Color::Rgb(255, 225, 225);
-pub const MODE_EXIT_BG: Color = Color::Rgb(175, 45, 45);
+// Mode badges: less saturated
+pub const MODE_STREAMING_FG: Color = Color::Rgb(20, 20, 10);
+pub const MODE_STREAMING_BG: Color = Color::Rgb(195, 155, 40);
+pub const MODE_RUNNING_FG: Color = Color::Rgb(12, 18, 30);
+pub const MODE_RUNNING_BG: Color = Color::Rgb(70, 145, 200);
+pub const MODE_APPROVAL_FG: Color = Color::Rgb(28, 18, 8);
+pub const MODE_APPROVAL_BG: Color = Color::Rgb(210, 145, 45);
+pub const MODE_OVERLAY_FG: Color = Color::Rgb(210, 210, 230);
+pub const MODE_OVERLAY_BG: Color = Color::Rgb(50, 55, 85);
+pub const MODE_EXIT_FG: Color = Color::Rgb(240, 220, 220);
+pub const MODE_EXIT_BG: Color = Color::Rgb(160, 50, 50);
 
-pub const WAIT_FAST: Color = Color::Rgb(75, 195, 115);
-pub const WAIT_NORMAL: Color = Color::Rgb(215, 170, 45);
-pub const WAIT_SLOW: Color = Color::Rgb(230, 140, 50);
-pub const WAIT_VERY_SLOW: Color = Color::Rgb(235, 80, 80);
+// Wait colors: green → yellow → orange → red (keep functional)
+pub const WAIT_FAST: Color = Color::Rgb(70, 170, 100);
+pub const WAIT_NORMAL: Color = Color::Rgb(195, 155, 45);
+pub const WAIT_SLOW: Color = Color::Rgb(210, 130, 50);
+pub const WAIT_VERY_SLOW: Color = Color::Rgb(210, 75, 75);

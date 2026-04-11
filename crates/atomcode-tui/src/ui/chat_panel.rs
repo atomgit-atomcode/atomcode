@@ -398,7 +398,7 @@ fn render_tool_call(lines: &mut Vec<Line<'static>>, call: &ToolCall) {
     lines.push(Line::from(vec![
         bar.clone(),
         Span::styled(format!("  {} ", icon), Style::default().fg(icon_color)),
-        Span::styled(name, Style::default().fg(theme::info()).add_modifier(Modifier::BOLD)),
+        Span::styled(name, Style::default().fg(theme::text_secondary())),
         Span::styled(format!("  {}", detail), Style::default().fg(theme::text_muted())),
     ]));
 
@@ -634,7 +634,7 @@ fn render_batch_read_call(lines: &mut Vec<Line<'static>>, count: usize, paths: &
         bar,
         Span::styled(
             format!("  \u{25b8} Read File \u{00d7}{}", count),
-            Style::default().fg(theme::info()).add_modifier(Modifier::BOLD),
+            Style::default().fg(theme::text_secondary()),
         ),
         Span::styled(
             format!("  {}", detail),
