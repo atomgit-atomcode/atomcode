@@ -24,10 +24,10 @@ impl AgentLoop {
                 self.files_edited_this_turn.join(", ")
             };
 
-            let urgency = if !self.files_edited_this_turn.is_empty() && self.build_fail_count == 0 && self.tool_call_count >= 12 {
-                "REMINDER: You already edited files and compile passed. \
-                 Verify you are still working on the original request. \
-                 If done, summarize your changes."
+            let urgency = if !self.files_edited_this_turn.is_empty() && self.build_fail_count == 0 {
+                "You have edited files and they compile. \
+                 If done, summarize what you changed and STOP. \
+                 Do NOT start servers or do extra verification."
             } else if self.files_edited_this_turn.is_empty() && self.tool_call_count >= 20 {
                 "GUIDANCE: 20+ steps without editing. Consider one of:\n\
                  1. DESIGN question → explain analysis and propose options.\n\
@@ -37,10 +37,10 @@ impl AgentLoop {
                 "REMINDER: 15+ steps used. Prioritize taking action: edit code or explain findings."
             } else if self.files_edited_this_turn.is_empty() && self.tool_call_count >= 10 {
                 "REMINDER: 10+ steps without edits. Consider acting: edit_file, bash, or explain to user."
-            } else if self.files_edited_this_turn.is_empty() && self.tool_call_count >= 6 {
-                "Focus on files you plan to edit."
+            } else if self.files_edited_this_turn.is_empty() {
+                "Focus on the task."
             } else {
-                "Focus on files you plan to edit."
+                "Focus on the task."
             };
 
             let sibling_hint = String::new();
