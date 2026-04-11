@@ -1,20 +1,24 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-/// Descriptor files to include (filename, max_lines).
-/// The model reads these directly — no interpretation by us.
-/// Descriptor files: only build/dependency configs. No README (wastes tokens on prose).
-const DESCRIPTORS: &[(&str, usize)] = &[
-    ("package.json", 10),
-    ("Cargo.toml", 10),
-    ("pyproject.toml", 10),
-    ("go.mod", 5),
-    ("pom.xml", 10),
-    ("build.gradle", 10),
-    ("requirements.txt", 10),
-    ("docker-compose.yml", 10),
-    ("Makefile", 10),
+/// Descriptor files to include in project context.
+/// No per-file line limit — controlled by total token budget instead.
+const DESCRIPTORS: &[&str] = &[
+    "package.json",
+    "Cargo.toml",
+    "pyproject.toml",
+    "go.mod",
+    "pom.xml",
+    "build.gradle",
+    "requirements.txt",
+    "docker-compose.yml",
+    "Makefile",
 ];
+
+/// Total token budget for all descriptor files combined.
+/// Each file gets up to ~200 tokens (~50 lines). Ensures model sees
+/// dependency lists (e.g. [dependencies] in Cargo.toml) not just metadata.
+const DESCRIPTOR_BUDGET_TOKENS: usize = 1200;
 
 use crate::tool::SKIP_DIRS;
 
@@ -150,24 +154,28 @@ pub fn build_project_context_with_graph(dir: &Path, graph: Option<&crate::graph:
         ctx.push_str(&config_summaries);
     }
 
-    // 2. Include raw content of descriptor files the model can read
+    // 2. Include raw content of descriptor files (token-budgeted)
     let mut included_names = Vec::new();
-    for &(filename, max_lines) in DESCRIPTORS {
+    let mut descriptor_tokens_used = 0usize;
+    for &filename in DESCRIPTORS {
+        if descriptor_tokens_used >= DESCRIPTOR_BUDGET_TOKENS { break; }
         let path = dir.join(filename);
         if path.exists() {
             if let Ok(content) = std::fs::read_to_string(&path) {
-                let summary: String = content
-                    .lines()
-                    .take(max_lines)
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                let summary = if summary.len() > 2000 {
-                    summary.chars().take(2000).collect::<String>() + "..."
+                let remaining = DESCRIPTOR_BUDGET_TOKENS - descriptor_tokens_used;
+                // ~4 chars per token
+                let max_chars = remaining * 4;
+                let summary = if content.len() > max_chars {
+                    let mut end = max_chars;
+                    // Truncate at line boundary
+                    if let Some(pos) = content[..end].rfind('\n') { end = pos; }
+                    format!("{}...", &content[..end])
                 } else {
-                    summary
+                    content.clone()
                 };
+                let tokens = summary.len() / 4 + 4;
+                descriptor_tokens_used += tokens;
                 ctx.push_str(&format!("\n[{}]\n{}\n", filename, summary));
-                // Store the canonical absolute path for matching
                 if let Ok(abs) = std::fs::canonicalize(&path) {
                     included_files.insert(abs);
                 } else {
