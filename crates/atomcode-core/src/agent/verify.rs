@@ -170,12 +170,9 @@ impl AgentLoop {
                 } else {
                     // Compile failed — inject error with source diagnosis
                     self.build_fail_count += 1;
-                    let enhanced = crate::tool::devserver::java::enhance_compile_error(
-                        &combined, &compile_dir,
-                    );
                     // Extract and deduplicate error lines, grouped by file.
                     // Goal: model sees ALL errors in one compact view, fixes all at once.
-                    let error_lines: Vec<&str> = enhanced.lines()
+                    let error_lines: Vec<&str> = combined.lines()
                         .filter(|l| {
                             l.contains("[ERROR]") || l.contains(">>>") || l.contains("---")
                             || l.contains("[AUTO") || l.contains("error TS")

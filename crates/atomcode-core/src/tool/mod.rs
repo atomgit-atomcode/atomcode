@@ -2,7 +2,6 @@ pub mod auto_fix;
 pub mod bash;
 pub mod blast_radius;
 pub mod cd;
-pub mod devserver;
 pub mod edit;
 pub mod file_deps;
 pub mod file_history;
