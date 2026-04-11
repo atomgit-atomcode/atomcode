@@ -270,18 +270,69 @@ impl Conversation {
         if total_tokens > budget_80pct {
             let tokens_to_drop = total_tokens - budget_80pct;
 
+            // First pass: identify which turns to drop and extract their reasoning
+            let mut drop_summaries: Vec<String> = Vec::new();
+            let mut drop_count = 0usize;
+
             for ti in 0..turns.len().saturating_sub(1) {
                 if dropped_tokens >= tokens_to_drop { break; }
                 let turn = &turns[ti];
                 let end = turn.end_idx().min(self.messages.len());
                 if turn.start_idx >= self.messages.len() { continue; }
-                dropped_tokens += self.messages[turn.start_idx..end]
-                    .iter().map(|m| m.estimate_tokens()).sum::<usize>();
+
+                // Extract model reasoning and tool calls before dropping
+                let turn_msgs = &self.messages[turn.start_idx..end];
+                let mut parts: Vec<String> = Vec::new();
+                for msg in turn_msgs {
+                    match &msg.content {
+                        MessageContent::Text(t) if msg.role == Role::Assistant => {
+                            let short: String = t.chars().take(150).collect();
+                            if !short.trim().is_empty() {
+                                parts.push(short);
+                            }
+                        }
+                        MessageContent::AssistantWithToolCalls { text, tool_calls, .. } => {
+                            if let Some(t) = text {
+                                let short: String = t.chars().take(150).collect();
+                                if !short.trim().is_empty() {
+                                    parts.push(short);
+                                }
+                            }
+                            let tools: Vec<&str> = tool_calls.iter()
+                                .map(|tc| tc.name.as_str()).collect();
+                            if !tools.is_empty() {
+                                parts.push(format!("tools: {}", tools.join(", ")));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if !parts.is_empty() {
+                    drop_summaries.push(parts.join(" | "));
+                }
+
+                dropped_tokens += turn_msgs.iter()
+                    .map(|m| m.estimate_tokens()).sum::<usize>();
+                drop_count += 1;
             }
 
-            // Rebuild: system + cold zone + surviving messages
+            // Rebuild: system + cold zone + drop digest + surviving messages
             let cold_msgs = if self.cold_summaries.is_empty() { 1 } else { 2 };
             result.truncate(cold_msgs);
+
+            // Inject mechanical digest of dropped turns so model retains reasoning chain
+            if !drop_summaries.is_empty() {
+                let digest = format!(
+                    "[Context overflow: {} earlier turns compressed]\n{}",
+                    drop_count,
+                    drop_summaries.iter().enumerate()
+                        .map(|(i, s)| format!("{}. {}", i + 1, s))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                );
+                result.push(Message::new(Role::System, digest));
+            }
+
             // Find first surviving message
             let mut survived_start = 0;
             let mut skipped = 0usize;
@@ -322,13 +373,14 @@ impl Conversation {
     }
 
     /// Check if context needs compression.
-    /// Threshold: min(70% of window, 50K tokens). Prevents large windows from
-    /// accumulating 100K+ context that causes model hallucinations and slow prefill.
+    /// Threshold: min(55% of window, 40K tokens). Triggers early so LLM-based
+    /// summarization runs before the 80% hard-drop boundary, preventing loss of
+    /// the model's earlier reasoning chain.
     pub fn needs_compression(&self, system_prompt_tokens: usize, token_budget: usize) -> bool {
         if self.turn_tracker.turns.len() < 6 { return false; }
         let total: usize = system_prompt_tokens + self.messages.iter()
             .map(|m| m.estimate_tokens()).sum::<usize>();
-        let threshold = (token_budget * 70 / 100).min(50000);
+        let threshold = (token_budget * 55 / 100).min(40000);
         total > threshold
     }
 

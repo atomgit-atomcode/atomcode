@@ -1,7 +1,7 @@
 use crate::tool::{ToolCall, ToolResult};
 use crate::tool::result_store::ToolResultRef;
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Role {
     System,
     User,
