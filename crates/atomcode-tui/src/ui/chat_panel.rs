@@ -548,9 +548,9 @@ fn render_tool_result(lines: &mut Vec<Line<'static>>, result: &ToolResult, expan
     let is_skeleton = output.starts_with("[File skeleton:");
     if expanded && !is_diff_output && !is_error && !is_file_content && !is_skeleton {
         let output_lines: Vec<&str> = output.lines().collect();
-        // Skip the first line (already shown in summary)
+        // Skip the first line (already shown in summary). Show max 8 lines.
         if output_lines.len() > 1 {
-            let max_expanded = 30;
+            let max_expanded = 8;
             let show_lines = &output_lines[1..(output_lines.len()).min(1 + max_expanded)];
             for ol in show_lines {
                 let trimmed = ol.trim_end();
