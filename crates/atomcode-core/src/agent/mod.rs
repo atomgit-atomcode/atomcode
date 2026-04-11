@@ -1510,11 +1510,19 @@ impl AgentLoop {
         let mut summary = String::new();
         if let Ok(mut stream) = self.turn_runner.provider.chat_stream(&msgs, None) {
             use futures::StreamExt;
-            let timeout = std::time::Duration::from_secs(15);
+            // 30s first token + 30s between tokens. OpenRouter can be slow.
+            let first_timeout = std::time::Duration::from_secs(30);
+            let stream_timeout = std::time::Duration::from_secs(30);
+            let mut got_token = false;
             loop {
+                let timeout = if got_token { stream_timeout } else { first_timeout };
                 match tokio::time::timeout(timeout, stream.next()).await {
                     Ok(Some(Ok(crate::stream::StreamEvent::Delta(text)))) => {
-                        summary.push_str(&text);
+                        got_token = true;
+                        // Strip model thinking tags (compression doesn't go through TurnRunner)
+                        let clean = text.replace("<think>", "").replace("</think>", "")
+                            .replace("<|im_start|>", "").replace("<|im_end|>", "");
+                        summary.push_str(&clean);
                     }
                     Ok(Some(Ok(crate::stream::StreamEvent::Done { .. }))) => break,
                     Ok(Some(Ok(_))) => continue,
