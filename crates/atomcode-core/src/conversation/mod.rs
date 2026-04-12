@@ -376,14 +376,14 @@ impl Conversation {
     }
 
     /// Check if context needs compression.
-    /// Threshold: min(55% of window, 40K tokens). Triggers early so LLM-based
-    /// summarization runs before the 80% hard-drop boundary, preventing loss of
-    /// the model's earlier reasoning chain.
+    /// Threshold: min(65% of window, 48K tokens). Balances early compression
+    /// (before 80% hard-drop) with avoiding over-eager compression that wipes
+    /// too much history in write-heavy sessions.
     pub fn needs_compression(&self, system_prompt_tokens: usize, token_budget: usize) -> bool {
         if self.turn_tracker.turns.len() < 6 { return false; }
         let total: usize = system_prompt_tokens + self.messages.iter()
             .map(|m| m.estimate_tokens()).sum::<usize>();
-        let threshold = (token_budget * 55 / 100).min(40000);
+        let threshold = (token_budget * 65 / 100).min(48000);
         total > threshold
     }
 
