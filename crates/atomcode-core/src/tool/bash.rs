@@ -210,25 +210,53 @@ async fn bash_execute(args: &str, ctx: &ToolContext) -> Result<ToolResult> {
                 // Process still running but output stopped for 30s = stuck. Kill it.
                 let _ = child.kill().await;
                 let combined = format_output(&stdout_str, &stderr_str);
+                let hint = stall_hint(&parsed.command);
                 if combined.is_empty() {
-                    Ok(ToolResult { call_id: String::new(), output: "Command produced no output and was killed after 30s idle. Try a different approach.".to_string(), success: false })
+                    Ok(ToolResult { call_id: String::new(), output: format!(
+                        "Command produced no output and was killed after 30s idle.\n{}", hint
+                    ), success: false })
                 } else {
-                    Ok(ToolResult { call_id: String::new(), output: format!("{}\n\n[Command stalled — no output for 30s. Killed. Output above is partial.]", combined), success: false })
+                    Ok(ToolResult { call_id: String::new(), output: format!(
+                        "{}\n\n[Command stalled — no output for 30s. Killed.]\n{}", combined, hint
+                    ), success: false })
                 }
             }
             Err(_) => {
                 // Hard timeout — kill it
                 let _ = child.kill().await;
                 let combined = format_output(&stdout_str, &stderr_str);
+                let hint = stall_hint(&parsed.command);
                 let output = if combined.is_empty() {
-                    format!("Timed out after {}s with no output.", timeout_secs)
+                    format!("Timed out after {}s with no output.\n{}", timeout_secs, hint)
                 } else {
-                    format!("{}\n\n[Timed out after {}s, process killed]", combined, timeout_secs)
+                    format!("{}\n\n[Timed out after {}s, process killed]\n{}", combined, timeout_secs, hint)
                 };
                 Ok(ToolResult { call_id: String::new(), output, success: false })
             }
         }
     }
+
+/// Provide actionable guidance when a bash command stalls or times out.
+/// Instead of vague "try a different approach", tell the model what likely went wrong.
+fn stall_hint(command: &str) -> String {
+    let cmd = command.to_lowercase();
+    if cmd.contains("cargo run") || cmd.contains("python") && cmd.contains("run")
+        || cmd.contains("npm start") || cmd.contains("flask run") || cmd.contains("uvicorn")
+    {
+        "[HINT: This looks like a server/long-running process. Do NOT run servers — \
+         use other tools to verify (cargo test, read_file, grep).]".to_string()
+    } else if cmd.contains("cargo build") || cmd.contains("cargo check") || cmd.contains("mvn") || cmd.contains("gradle") {
+        "[HINT: Build timed out. Check for compilation errors in the output above. \
+         If the build is too slow, try building a smaller scope (single package).]".to_string()
+    } else if cmd.contains("curl") || cmd.contains("wget") {
+        "[HINT: Network request timed out. The service may not be running or the port is wrong. \
+         Check if the server is up, or read the code to verify the correct port/endpoint.]".to_string()
+    } else if cmd.contains("pip install") || cmd.contains("npm install") || cmd.contains("cargo install") {
+        "[HINT: Package installation timed out. Try installing with --no-deps or check network.]".to_string()
+    } else {
+        "[HINT: Command stalled. Analyze the partial output (if any) and try a different approach.]".to_string()
+    }
+}
 
 /// Check if a shell command contains destructive patterns that require user approval.
 fn check_destructive_command(command: &str) -> Option<String> {
