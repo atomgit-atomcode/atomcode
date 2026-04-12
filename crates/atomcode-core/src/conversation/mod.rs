@@ -265,12 +265,15 @@ impl Conversation {
         // Add all current messages
         result.extend(self.messages.iter().cloned());
 
-        // Safety: if over 80% (or 60K absolute cap), drop oldest turns
+        // Safety: if over 80% (or 60K absolute cap), drop oldest turns.
+        // BUT: skip if cold_summaries exist — that means LLM compression just ran
+        // and we're looking at the "keep_full=5" survivor set. Dropping those too
+        // would wipe ALL context (the bug that caused sent=0 in audit sessions).
         let budget_80pct = (token_budget * 80 / 100).min(60000);
         let total_tokens: usize = result.iter().map(|m| m.estimate_tokens()).sum();
         let mut dropped_tokens = 0usize;
 
-        if total_tokens > budget_80pct {
+        if total_tokens > budget_80pct && self.cold_summaries.is_empty() {
             let tokens_to_drop = total_tokens - budget_80pct;
 
             // First pass: identify which turns to drop and extract their reasoning
