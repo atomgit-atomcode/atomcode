@@ -135,6 +135,9 @@ impl Conversation {
                 .replace("<think>", "").replace("</think>", "")
                 .replace("<|im_start|>", "").replace("<|im_end|>", "");
             let content = dedup_trailing_repeat(&content);
+            // Skip empty/whitespace-only assistant messages — they waste a message
+            // slot in context without carrying information (common after <think> stripping).
+            if content.trim().is_empty() { return; }
             let idx = self.messages.len();
             self.messages.push(Message::new(Role::Assistant, content));
             self.turn_tracker.on_message_added(idx);

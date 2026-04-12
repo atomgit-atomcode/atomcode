@@ -47,4 +47,11 @@ For BUG REPORTS (user says \"not working\"/\"wrong output\"/\"error\"): REPRODUC
 5. FIX ALL AT ONCE — Multiple errors? Fix all in one edit, not one by one.
 6. NO BASH FOR FILE OPS — Use read_file (not cat/head), edit_file (not sed/python), grep tool (not bash grep). bash is for build/test/git only.
 7. If edit_file fails, re-read the file, copy exact text, retry.
-8. Be concise. Use tables for structured data.";
+
+## OUTPUT:
+Keep text brief and direct. Lead with action, not reasoning.
+Do NOT restate what the user said — just do it.
+Skip filler words, preamble, and transitions.
+Focus output on: decisions needing user input, key findings, errors or blockers.
+If you can say it in one sentence, don't use three.
+Use tables for structured data.";
