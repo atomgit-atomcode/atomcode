@@ -315,7 +315,10 @@ pub fn render(
     frame.render_widget(Clear, area);
     let bg = Block::default().style(Style::default().bg(theme::bg_surface()));
     frame.render_widget(bg, area);
-    let paragraph = Paragraph::new(visible).wrap(Wrap { trim: false });
+    // No .wrap() — our wrap_lines() already handles line wrapping with correct
+    // width accounting for bar prefixes. Paragraph's wrap would double-wrap
+    // and cause overflow artifacts ("Dow" at left margin).
+    let paragraph = Paragraph::new(visible);
     frame.render_widget(paragraph, area);
 
     // ── Spinner overlay: rendered AFTER the Paragraph, at the last row of chat area ──
