@@ -25,9 +25,9 @@ impl AgentLoop {
             };
 
             let urgency = if !self.files_edited_this_turn.is_empty() && self.build_fail_count == 0 {
-                "You have edited files. Verify your changes work — \
-                 run the appropriate check for this project (build, test, lint, or run). \
-                 If already verified, summarize what you changed and STOP."
+                "You have edited files. If not verified yet, run ONE quick check \
+                 (build, test, or run). Then summarize what you changed and STOP. \
+                 Do NOT explore unrelated files or start servers."
             } else if self.files_edited_this_turn.is_empty() && self.tool_call_count >= 20 {
                 "GUIDANCE: 20+ steps without editing. Consider one of:\n\
                  1. DESIGN question → explain analysis and propose options.\n\
