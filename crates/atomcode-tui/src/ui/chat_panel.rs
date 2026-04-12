@@ -182,7 +182,7 @@ pub fn render(
                     };
                     let _ = is_ref;
                     let expanded = tool_result_idx >= expand_threshold;
-                    render_tool_result(render_cache, &result_for_render, expanded);
+                    render_tool_result(render_cache, &result_for_render, expanded, term_width);
                     render_cache.push(Line::default());
                     tool_result_idx += 1;
                 }
@@ -315,7 +315,10 @@ pub fn render(
     frame.render_widget(Clear, area);
     let bg = Block::default().style(Style::default().bg(theme::bg_surface()));
     frame.render_widget(bg, area);
-    let paragraph = Paragraph::new(visible).wrap(Wrap { trim: false });
+    // NO .wrap() — scroll offset is calculated in logical lines, but Paragraph::wrap
+    // adds physical lines, causing scroll/render mismatch and "Dow" ghost artifacts.
+    // All content lines are pre-wrapped by wrap_lines() or truncated to fit area.width.
+    let paragraph = Paragraph::new(visible);
     frame.render_widget(paragraph, area);
 
     // ── Spinner overlay: rendered AFTER the Paragraph, at the last row of chat area ──
@@ -460,8 +463,10 @@ fn render_tool_call(lines: &mut Vec<Line<'static>>, call: &ToolCall, icon_overri
 
 // ── Tool Result ──
 // Diff lines shown for edit_file only. `expanded` shows full output for recent calls.
-fn render_tool_result(lines: &mut Vec<Line<'static>>, result: &ToolResult, expanded: bool) {
+fn render_tool_result(lines: &mut Vec<Line<'static>>, result: &ToolResult, expanded: bool, max_width: usize) {
     let bar = Span::styled(format!("{}\u{2502} ", INDENT), Style::default().fg(theme::accent_dim()));
+    // Max chars for content text (bar=4 + indent=4 + safety=2)
+    let text_limit = max_width.saturating_sub(10);
     let (icon, color) = if result.success {
         ("\u{2713}", theme::success())
     } else {
@@ -487,7 +492,7 @@ fn render_tool_result(lines: &mut Vec<Line<'static>>, result: &ToolResult, expan
         // Error: show first line
         let first = output.lines().next().unwrap_or("Error");
         if first.chars().count() > 70 {
-            format!("{}...", first.chars().take(67).collect::<String>())
+            format!("{}...", first.chars().take(text_limit).collect::<String>())
         } else {
             first.to_string()
         }
@@ -498,7 +503,7 @@ fn render_tool_result(lines: &mut Vec<Line<'static>>, result: &ToolResult, expan
         let line_count = output.lines().count();
         let first = output.lines().next().unwrap_or("");
         let first_short = if first.chars().count() > 50 {
-            format!("{}...", first.chars().take(47).collect::<String>())
+            format!("{}...", first.chars().take(text_limit.min(50)).collect::<String>())
         } else {
             first.to_string()
         };
@@ -535,7 +540,7 @@ fn render_tool_result(lines: &mut Vec<Line<'static>>, result: &ToolResult, expan
             let trimmed = line.trim();
             if trimmed.starts_with("- ") {
                 let display = if trimmed.chars().count() > 65 {
-                    format!("{}...", trimmed.chars().take(62).collect::<String>())
+                    format!("{}...", trimmed.chars().take(text_limit).collect::<String>())
                 } else { trimmed.to_string() };
                 lines.push(Line::from(vec![
                     bar.clone(),
@@ -544,7 +549,7 @@ fn render_tool_result(lines: &mut Vec<Line<'static>>, result: &ToolResult, expan
                 diff_shown += 1;
             } else if trimmed.starts_with("+ ") {
                 let display = if trimmed.chars().count() > 65 {
-                    format!("{}...", trimmed.chars().take(62).collect::<String>())
+                    format!("{}...", trimmed.chars().take(text_limit).collect::<String>())
                 } else { trimmed.to_string() };
                 lines.push(Line::from(vec![
                     bar.clone(),
@@ -563,7 +568,7 @@ fn render_tool_result(lines: &mut Vec<Line<'static>>, result: &ToolResult, expan
             let trimmed = line.trim();
             if trimmed.is_empty() { continue; }
             let display = if trimmed.chars().count() > 65 {
-                format!("{}...", trimmed.chars().take(62).collect::<String>())
+                format!("{}...", trimmed.chars().take(text_limit).collect::<String>())
             } else { trimmed.to_string() };
             lines.push(Line::from(vec![
                 bar.clone(),
@@ -595,7 +600,7 @@ fn render_tool_result(lines: &mut Vec<Line<'static>>, result: &ToolResult, expan
                 let trimmed = ol.trim_end();
                 if trimmed.is_empty() { continue; }
                 let display = if trimmed.chars().count() > 70 {
-                    format!("{}...", trimmed.chars().take(67).collect::<String>())
+                    format!("{}...", trimmed.chars().take(text_limit).collect::<String>())
                 } else {
                     trimmed.to_string()
                 };
