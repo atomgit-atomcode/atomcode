@@ -199,7 +199,7 @@ pub fn render(
     let bar_style = Style::default().fg(theme::accent_dim());
     if let Some(ref buffer) = conversation.stream_buffer {
         if !buffer.is_empty() {
-            let content_w = term_width.saturating_sub(5); // 2(indent) + 1(│) + 1(space) + 1(safety)
+            let content_w = term_width.saturating_sub(7); // 2(indent) + 1(│) + 1(space) + 1(safety)
             // Trim trailing incomplete markdown tokens before rendering.
             // During streaming, the buffer may end with partial backtick fences
             // (`, ``, ```) that cause the parser to misinterpret subsequent text.
@@ -419,7 +419,7 @@ fn render_user(lines: &mut Vec<Line<'static>>, content: &str) {
 fn render_assistant(lines: &mut Vec<Line<'static>>, content: &str, max_width: usize) {
     let bar = Span::styled(format!("{}\u{2502} ", INDENT), Style::default().fg(theme::accent_dim()));
     // Content width = terminal width minus bar prefix (4 cols: "  │ ") + safety margin
-    let content_w = max_width.saturating_sub(5);
+    let content_w = max_width.saturating_sub(7);
     let md = wrap_lines(render_markdown(content), content_w);
     for line in md {
         let mut spans = vec![bar.clone()];
