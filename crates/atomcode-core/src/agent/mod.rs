@@ -1349,7 +1349,10 @@ impl AgentLoop {
                     // automatically continue. No keyword heuristics needed — the API tells us.
                     if truncated && self.retry_count < 3 {
                         self.retry_count += 1;
-                        self.conversation.add_user_message("Continue.");
+                        self.conversation.add_user_message(
+                            "Output limit hit. Resume directly — no recap, no apology. \
+                             Pick up where you left off."
+                        );
                         continue;
                     }
 

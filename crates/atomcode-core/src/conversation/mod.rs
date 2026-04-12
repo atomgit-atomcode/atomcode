@@ -362,7 +362,7 @@ impl Conversation {
         Self::microcompact(&mut result, &self.turn_tracker.turns, self.messages.len());
 
         Self::replace_stale_reads(&mut result);
-        Self::sanitize_messages(&mut result);
+        Self::clean_message_pipeline(&mut result);
 
         let sent_tokens: usize = result.iter().map(|m| m.estimate_tokens()).sum::<usize>()
             .saturating_sub(system_tokens);
@@ -945,6 +945,62 @@ impl Conversation {
             }
         }
         start
+    }
+
+    /// Clean message pipeline before sending to API.
+    /// Removes noise that degrades model decision quality:
+    /// - Empty/whitespace-only assistant messages
+    /// - Orphaned tool results (no matching tool_use)
+    /// - Consecutive same-role user messages (merge into one)
+    fn clean_message_pipeline(msgs: &mut Vec<Message>) {
+        // 1. Remove empty assistant messages (e.g., after <think> stripping)
+        msgs.retain(|m| {
+            if m.role == Role::Assistant {
+                match &m.content {
+                    MessageContent::Text(t) => !t.trim().is_empty(),
+                    _ => true,
+                }
+            } else {
+                true
+            }
+        });
+
+        // 2. Collect valid tool_use IDs from assistant messages
+        let mut valid_call_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for msg in msgs.iter() {
+            if let MessageContent::AssistantWithToolCalls { tool_calls, .. } = &msg.content {
+                for tc in tool_calls {
+                    valid_call_ids.insert(tc.id.clone());
+                }
+            }
+        }
+
+        // 3. Remove orphaned tool results (no matching tool_use)
+        msgs.retain(|m| {
+            if let MessageContent::ToolResult(ref r) = m.content {
+                valid_call_ids.contains(&r.call_id)
+            } else if let MessageContent::ToolResultRef(ref r) = m.content {
+                valid_call_ids.contains(&r.call_id)
+            } else {
+                true
+            }
+        });
+
+        // 4. Merge consecutive user messages into one
+        let mut i = 1;
+        while i < msgs.len() {
+            if msgs[i].role == Role::User && msgs[i - 1].role == Role::User {
+                if let (MessageContent::Text(prev), MessageContent::Text(curr)) =
+                    (&msgs[i - 1].content, &msgs[i].content)
+                {
+                    let merged = format!("{}\n{}", prev, curr);
+                    msgs[i - 1].content = MessageContent::Text(merged);
+                    msgs.remove(i);
+                    continue;
+                }
+            }
+            i += 1;
+        }
     }
 }
 
