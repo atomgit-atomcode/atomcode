@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
@@ -85,11 +85,19 @@ pub fn render(
 
         // Pre-build call_id → tool_name map for batch-read detection.
         let mut call_id_to_tool: HashMap<&str, &str> = HashMap::new();
+        // Track which tool calls already have results (completed vs in-flight).
+        // In-flight tool calls are skipped here — rendered dynamically below with animated spinner icon.
+        let mut completed_call_ids: HashSet<&str> = HashSet::new();
         for msg in &conversation.messages {
-            if let MessageContent::AssistantWithToolCalls { tool_calls, .. } = &msg.content {
-                for call in tool_calls {
-                    call_id_to_tool.insert(&call.id, &call.name);
+            match &msg.content {
+                MessageContent::AssistantWithToolCalls { tool_calls, .. } => {
+                    for call in tool_calls {
+                        call_id_to_tool.insert(&call.id, &call.name);
+                    }
                 }
+                MessageContent::ToolResult(r) => { completed_call_ids.insert(r.call_id.as_str()); }
+                MessageContent::ToolResultRef(r) => { completed_call_ids.insert(r.call_id.as_str()); }
+                _ => {}
             }
         }
 
@@ -110,29 +118,34 @@ pub fn render(
                             render_cache.push(Line::default());
                         }
                     }
+                    // Skip in-flight tool calls (no matching ToolResult yet) — they're rendered
+                    // dynamically below with animated spinner icon for live feedback.
+                    let completed_calls: Vec<&ToolCall> = tool_calls.iter()
+                        .filter(|c| completed_call_ids.contains(c.id.as_str()))
+                        .collect();
                     // Batch consecutive read_file calls within the same tool_calls group.
                     let mut ci = 0;
-                    while ci < tool_calls.len() {
-                        if tool_calls[ci].name == "read_file" {
+                    while ci < completed_calls.len() {
+                        if completed_calls[ci].name == "read_file" {
                             let batch_start = ci;
-                            while ci < tool_calls.len() && tool_calls[ci].name == "read_file" {
+                            while ci < completed_calls.len() && completed_calls[ci].name == "read_file" {
                                 ci += 1;
                             }
                             let batch_count = ci - batch_start;
                             if batch_count >= 3 {
-                                let paths: Vec<String> = tool_calls[batch_start..ci].iter().map(|c| {
+                                let paths: Vec<String> = completed_calls[batch_start..ci].iter().map(|c| {
                                     serde_json::from_str::<serde_json::Value>(&c.arguments).ok()
                                         .and_then(|a| a.get("file_path").or_else(|| a.get("path")).and_then(|v| v.as_str().map(String::from)))
                                         .unwrap_or_else(|| "unknown".to_string())
                                 }).collect();
                                 render_batch_read_call(render_cache, batch_count, &paths);
                             } else {
-                                for c in &tool_calls[batch_start..ci] {
-                                    render_tool_call(render_cache, c);
+                                for c in &completed_calls[batch_start..ci] {
+                                    render_tool_call(render_cache, c, None);
                                 }
                             }
                         } else {
-                            render_tool_call(render_cache, &tool_calls[ci]);
+                            render_tool_call(render_cache, completed_calls[ci], None);
                             ci += 1;
                         }
                     }
@@ -186,7 +199,7 @@ pub fn render(
     let bar_style = Style::default().fg(theme::accent_dim());
     if let Some(ref buffer) = conversation.stream_buffer {
         if !buffer.is_empty() {
-            let content_w = term_width.saturating_sub(3);
+            let content_w = term_width.saturating_sub(5); // 2(indent) + 1(│) + 1(space) + 1(safety)
             // Trim trailing incomplete markdown tokens before rendering.
             // During streaming, the buffer may end with partial backtick fences
             // (`, ``, ```) that cause the parser to misinterpret subsequent text.
@@ -200,7 +213,41 @@ pub fn render(
         }
     }
 
-    // (Spinner variables moved to the dedicated spinner_area renderer at the top)
+    // ── In-flight tool calls ──
+    // Render tool calls that don't have matching ToolResults yet, with an animated spinner
+    // frame as their icon. This gives live "⠋ Write(file.rs)" feedback from the moment
+    // ToolCallStarted fires — not after the tool finishes.
+    //
+    // Important: we push a trailing blank line so the in-flight row is NOT on the last
+    // visible row. The bottom spinner overlay clears the last row, so without this pad
+    // the in-flight row would be erased by the overlay and look like "nothing shows up
+    // until the tool completes" (2026-04-12 user report).
+    {
+        let mut completed_ids: HashSet<&str> = HashSet::new();
+        for msg in &conversation.messages {
+            match &msg.content {
+                MessageContent::ToolResult(r) => { completed_ids.insert(r.call_id.as_str()); }
+                MessageContent::ToolResultRef(r) => { completed_ids.insert(r.call_id.as_str()); }
+                _ => {}
+            }
+        }
+        let spinner_frame = SPINNER[tick % SPINNER.len()];
+        let mut rendered_any = false;
+        for msg in &conversation.messages {
+            if let MessageContent::AssistantWithToolCalls { tool_calls, .. } = &msg.content {
+                for call in tool_calls {
+                    if !completed_ids.contains(call.id.as_str()) {
+                        render_tool_call(&mut dynamic, call, Some(spinner_frame));
+                        rendered_any = true;
+                    }
+                }
+            }
+        }
+        if rendered_any {
+            // Pad so the last in-flight row sits above the bottom spinner overlay.
+            dynamic.push(Line::default());
+        }
+    }
 
     // ── Turn finished separator ──
     // (Spinner is rendered separately above the chat Paragraph — see spinner_area)
@@ -299,7 +346,11 @@ pub fn render(
         };
         let step_prefix = if step_count > 0 { format!("[turn {}] ", step_count) } else { String::new() };
         let has_tokens = conversation.stream_buffer.as_ref().map_or(false, |b| !b.is_empty());
-        let label = if matches!(mode, AppMode::ToolExecuting) && !tool_info.is_empty() {
+        // tool_info is set in two cases now:
+        //   1. ToolExecuting mode: "Write File: src/main.rs" (full tool detail)
+        //   2. Streaming mode with streaming_tool_name set: "Preparing Write File…"
+        // Either way, prefer it over the generic "Generating…" label.
+        let label = if !tool_info.is_empty() {
             tool_info.to_string()
         } else if has_tokens {
             "Generating...".to_string()
@@ -367,8 +418,8 @@ fn render_user(lines: &mut Vec<Line<'static>>, content: &str) {
 // Claude Code uses this exact pattern: subtle colored bar + indented content.
 fn render_assistant(lines: &mut Vec<Line<'static>>, content: &str, max_width: usize) {
     let bar = Span::styled(format!("{}\u{2502} ", INDENT), Style::default().fg(theme::accent_dim()));
-    // Content width = terminal width minus the bar prefix (3 columns: " │ ")
-    let content_w = max_width.saturating_sub(3);
+    // Content width = terminal width minus bar prefix (4 cols: "  │ ") + safety margin
+    let content_w = max_width.saturating_sub(5);
     let md = wrap_lines(render_markdown(content), content_w);
     for line in md {
         let mut spans = vec![bar.clone()];
@@ -379,46 +430,32 @@ fn render_assistant(lines: &mut Vec<Line<'static>>, content: &str, max_width: us
 
 // ── Tool Call ──
 // Accent bar continues through tool calls for visual grouping within a turn.
-fn render_tool_call(lines: &mut Vec<Line<'static>>, call: &ToolCall) {
+// `icon_override`: Some(frame) when tool is in-flight (animated spinner frame from caller);
+// None uses the default static `▸` icon for completed calls.
+fn render_tool_call(lines: &mut Vec<Line<'static>>, call: &ToolCall, icon_override: Option<&str>) {
     let bar = Span::styled(format!("{}\u{2502} ", INDENT), Style::default().fg(theme::accent_dim()));
     let name = capitalize(&call.name);
     let detail = format_tool_detail(&call.name, &call.arguments);
 
-    // Per-tool icon + color
-    let (icon, icon_color) = match call.name.as_str() {
-        "read_file" => ("\u{25b8}", theme::info()),           // ▸
-        "edit_file" => ("\u{25b8}", theme::tool_edit()),  // ▸ green
-        "create_file" => ("\u{25b8}", theme::tool_edit()),
-        "bash" => ("\u{25b8}", theme::tool_bash()),       // ▸ gold
-        "grep" | "glob" | "web_search" => ("\u{25b8}", theme::tool_search()),
-        "web_fetch" => ("\u{25b8}", theme::tool_search()),
-        _ => ("\u{25b8}", theme::info()),
-    };
+    // All tools share the same muted gray — distinction is in the tool name, not color.
+    // In-flight calls use a spinner frame (animated) instead of the static `▸`.
+    let icon = icon_override.unwrap_or("\u{25b8}");
+    let icon_color = if icon_override.is_some() { theme::accent() } else { theme::text_secondary() };
 
-    lines.push(Line::from(vec![
+    // CC-style single line: `▸ Read(src/main.rs)` — name and args in one compact unit,
+    // args wrapped in parens. Edit diff preview is handled by the tool result renderer
+    // so we don't duplicate it here.
+    let mut spans = vec![
         bar.clone(),
         Span::styled(format!("  {} ", icon), Style::default().fg(icon_color)),
         Span::styled(name, Style::default().fg(theme::text_primary()).add_modifier(Modifier::BOLD)),
-        Span::styled(format!("  {}", detail), Style::default().fg(theme::text_muted())),
-    ]));
-
-    // edit_file: show old_string preview
-    if call.name == "edit_file" {
-        if let Ok(args) = serde_json::from_str::<serde_json::Value>(&call.arguments) {
-            if let Some(old) = args.get("old_string").and_then(|v| v.as_str()) {
-                let preview = old.lines().next().unwrap_or("");
-                let display = if preview.chars().count() > 55 {
-                    format!("{}...", preview.chars().take(52).collect::<String>())
-                } else { preview.to_string() };
-                if !display.trim().is_empty() {
-                    lines.push(Line::from(vec![
-                        bar.clone(),
-                        Span::styled(format!("    \u{2192} {}", display.trim()), Style::default().fg(theme::text_muted())),
-                    ]));
-                }
-            }
-        }
+    ];
+    if !detail.is_empty() {
+        spans.push(Span::styled("(", Style::default().fg(theme::text_muted())));
+        spans.push(Span::styled(detail, Style::default().fg(theme::text_secondary())));
+        spans.push(Span::styled(")", Style::default().fg(theme::text_muted())));
     }
+    lines.push(Line::from(spans));
 }
 
 // ── Tool Result ──
@@ -475,16 +512,18 @@ fn render_tool_result(lines: &mut Vec<Line<'static>>, result: &ToolResult, expan
     // Expand/collapse indicator: ▾ for expanded, ▸ for collapsed
     let expand_indicator = if expanded { "\u{25be}" } else { "\u{25b8}" };
 
-    // Main result line: indicator + icon + summary + duration
-    // Main result line: icon + summary + duration
+    // Main result line: indicator + icon + summary + duration.
+    // DIM modifier makes the result text visually recede ("one size smaller") vs the
+    // tool call line above, so users' eyes land on the action, not the outcome noise.
+    let result_text_style = Style::default().fg(theme::text_muted()).add_modifier(Modifier::DIM);
     let mut spans = vec![
         bar.clone(),
-        Span::styled(format!(" {} ", expand_indicator), Style::default().fg(theme::text_muted())),
+        Span::styled(format!(" {} ", expand_indicator), result_text_style),
         Span::styled(format!("{} ", icon), Style::default().fg(color)),
-        Span::styled(summary, Style::default().fg(theme::text_muted())),
+        Span::styled(summary, result_text_style),
     ];
     if !duration.is_empty() {
-        spans.push(Span::styled(format!(" {}", duration), Style::default().fg(theme::text_muted())));
+        spans.push(Span::styled(format!(" {}", duration), result_text_style));
     }
     lines.push(Line::from(spans));
 
