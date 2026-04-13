@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Block, Clear, Paragraph};
 use ratatui::Frame;
 
 use atomcode_core::conversation::Conversation;

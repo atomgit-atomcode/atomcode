@@ -78,6 +78,7 @@ impl AgentLoop {
     /// Catches bracket mismatches, missing closings, duplicate declarations
     /// that build tools may miss (e.g., Vite doesn't catch Vue SFC syntax errors).
     /// Called for non-compiled projects as an auto-compile equivalent.
+    #[allow(dead_code)]
     pub(crate) async fn syntax_check_edited_files(&mut self) {
         let wd = self.turn_runner.context.working_dir.try_read()
             .map(|g| g.clone()).unwrap_or_default();

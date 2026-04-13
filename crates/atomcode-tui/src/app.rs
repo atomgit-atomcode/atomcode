@@ -644,6 +644,10 @@ impl App {
                 self.tool_start = Some(Instant::now());
                 self.at_bottom = true;
             }
+            AgentEvent::ToolCallStreaming { name: _ } => {
+                // Tool call name arrived while streaming — no action needed,
+                // full ToolCallStarted with arguments follows shortly.
+            }
             AgentEvent::ToolCallResult { name, output, success, duration: _ } => {
                 // Format a short result summary for spinner display
                 let icon = if success { "\u{2713}" } else { "\u{2717}" };

@@ -978,13 +978,10 @@ impl AgentLoop {
                                     datalog_text_accum.push_str(&text);
                                     let _ = event_tx.send(AgentEvent::TextDelta(text));
                                 }
-                                TurnEvent::ToolCallStreaming { name } => {
-                                    // Pass through so the UI can show the tool name the
-                                    // moment streaming begins — without waiting for args.
-                                    let _ = event_tx.send(AgentEvent::ToolCallStreaming { name });
-                                }
                                 TurnEvent::ToolCallStarted { ref name, ref arguments } => {
-                                    // Flush accumulated model text to datalog before logging tool call
+                                    // Forward tool name immediately for UI spinner
+                                    let _ = event_tx.send(AgentEvent::ToolCallStreaming { name: name.clone() });
+                                    // Flush accumulated model text to datalog before logging tool call accumulated model text to datalog before logging tool call
                                     if !datalog_text_accum.is_empty() {
                                         datalog.log_model_text(&datalog_text_accum);
                                         datalog_text_accum.clear();

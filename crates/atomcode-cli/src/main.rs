@@ -445,10 +445,13 @@ async fn run_headless(
             AgentEvent::ContextStats { .. } => {
                 // Silent in headless mode
             }
-            AgentEvent::SubAgentProgress { file, status } => {
+AgentEvent::SubAgentProgress { file, status } => {
                 if verbose {
                     eprintln!("[sub-agent] {} {}", file, status);
                 }
+            }
+            AgentEvent::ToolCallStreaming { name: _ } => {
+                // Tool call name arrived while streaming — no action needed in headless
             }
         }
     }
