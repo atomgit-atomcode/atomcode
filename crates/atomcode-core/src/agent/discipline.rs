@@ -24,8 +24,13 @@ impl AgentLoop {
                 self.files_edited_this_turn.join(", ")
             };
 
-            // Pure status — no STOP commands, no urgency. Model decides when to finish.
-            let urgency = "Continue working on the task.";
+            // Status + gentle finish signal. No forced STOP, but remind model
+            // that finishing is an option when the task is done.
+            let urgency = if !self.files_edited_this_turn.is_empty() {
+                "If the task is complete and verified, summarize and finish."
+            } else {
+                "Continue working on the task."
+            };
 
             let sibling_hint = String::new();
 

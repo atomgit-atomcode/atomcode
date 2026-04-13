@@ -1106,6 +1106,9 @@ impl AgentLoop {
                                         system_tokens, sent_tokens, dropped_tokens, working_set_tokens, total_messages,
                                     });
                                 }
+                                TurnEvent::ToolCallStreaming { name } => {
+                                    let _ = event_tx.send(AgentEvent::ToolCallStreaming { name });
+                                }
                                 TurnEvent::Error(e) => {
                                     let _ = event_tx.send(AgentEvent::Error(e));
                                 }
