@@ -729,6 +729,41 @@ impl App {
                 // Clear any lingering streaming tool state — turn is over.
                 self.streaming_tool_name = None;
                 self.executing_tool_info.clear();
+                // Orphan tool_call guard: if the turn ended but some tool_calls in
+                // conversation don't have matching ToolResults, the in-flight renderer
+                // will keep animating their spinner icon forever (2026-04-13 bug:
+                // "edit 完成后 spinner 还在转"). This can happen when agent-core merges
+                // parallel tool_calls (merge_edit_calls) — emits N ToolCallStarted but
+                // only 1 ToolCallResult for the merged call. Synthesize placeholders so
+                // the UI knows those calls are done.
+                {
+                    use atomcode_core::conversation::message::MessageContent;
+                    let mut existing_results: std::collections::HashSet<String> = std::collections::HashSet::new();
+                    for msg in &self.conversation.messages {
+                        match &msg.content {
+                            MessageContent::ToolResult(r) => { existing_results.insert(r.call_id.clone()); }
+                            MessageContent::ToolResultRef(r) => { existing_results.insert(r.call_id.clone()); }
+                            _ => {}
+                        }
+                    }
+                    let mut orphans: Vec<String> = Vec::new();
+                    for msg in &self.conversation.messages {
+                        if let MessageContent::AssistantWithToolCalls { tool_calls, .. } = &msg.content {
+                            for call in tool_calls {
+                                if !existing_results.contains(&call.id) {
+                                    orphans.push(call.id.clone());
+                                }
+                            }
+                        }
+                    }
+                    for orphan_id in orphans {
+                        self.conversation.add_tool_result(ToolResult {
+                            call_id: orphan_id,
+                            output: "[merged into an adjacent tool call]".to_string(),
+                            success: true,
+                        });
+                    }
+                }
                 // Finalize stream FIRST so auto-summary TextDelta becomes a message
                 self.conversation.finalize_stream();
                 // Then log the final assistant text

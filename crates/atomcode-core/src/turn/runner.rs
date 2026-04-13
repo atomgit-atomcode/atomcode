@@ -288,7 +288,20 @@ _ = cancel.cancelled() => {
         // 6. Auto-merge multiple edit_file calls on the same file into one multi-edit.
         // Models often generate 2+ separate edit_file calls for the same file instead of
         // using the edits array. Merging at framework level is 100% reliable vs prompt ~50%.
-        merge_edit_calls(&mut tool_calls_buf);
+        //
+        // Each merged-away call had its own ToolCallStarted emitted upstream — we MUST
+        // emit a matching ToolCallResult so the TUI's in-flight spinner stops animating
+        // for those orphan ids.
+        let merged_away_ids = merge_edit_calls(&mut tool_calls_buf);
+        for merged_id in &merged_away_ids {
+            let _ = event_tx.send(TurnEvent::ToolCallResult {
+                call_id: merged_id.clone(),
+                name: "edit_file".to_string(),
+                output: "[merged into adjacent edit_file call on same file]".to_string(),
+                success: true,
+                duration: std::time::Duration::ZERO,
+            });
+        }
 
         let tool_count = tool_calls_buf.len();
         let mut seen_calls: std::collections::HashMap<(String, String), usize> = std::collections::HashMap::new();
@@ -577,7 +590,12 @@ fn strip_model_tags(text: &str) -> String {
 /// Merge multiple edit_file calls targeting the same file into a single multi-edit call.
 /// The model often generates 2+ separate edit_file(file, old, new) for the same file;
 /// we merge them into one edit_file(file, edits=[...]) before execution.
-fn merge_edit_calls(calls: &mut Vec<ToolCall>) {
+/// Merge multiple edit_file calls on the same file into one multi-edit call.
+/// Returns the ids of calls that were merged away (removed from the vec) — the caller
+/// MUST emit synthetic `TurnEvent::ToolCallResult` for each of these ids, otherwise the
+/// TUI sees orphan AssistantWithToolCalls entries (started but never completed) and
+/// keeps spinning an in-flight icon forever (2026-04-13 "edit 完成 spinner 还在转" bug).
+fn merge_edit_calls(calls: &mut Vec<ToolCall>) -> Vec<String> {
     use std::collections::HashMap;
 
     // Group edit_file calls by file_path. Preserve order of first occurrence.
@@ -602,9 +620,10 @@ fn merge_edit_calls(calls: &mut Vec<ToolCall>) {
         })
         .collect();
 
-    if merge_targets.is_empty() { return; }
+    if merge_targets.is_empty() { return Vec::new(); }
 
     let mut remove_indices: Vec<usize> = Vec::new();
+    let mut removed_ids: Vec<String> = Vec::new();
     for (file_path, indices) in &merge_targets {
         // Build edits array from individual calls
         let mut edits: Vec<serde_json::Value> = Vec::new();
@@ -626,7 +645,10 @@ fn merge_edit_calls(calls: &mut Vec<ToolCall>) {
             "edits": edits,
         });
         calls[first_idx].arguments = merged_args.to_string();
-        remove_indices.extend(&indices[1..]);
+        for &idx in &indices[1..] {
+            removed_ids.push(calls[idx].id.clone());
+            remove_indices.push(idx);
+        }
     }
 
     // Remove merged calls (reverse order to preserve indices)
@@ -635,4 +657,6 @@ fn merge_edit_calls(calls: &mut Vec<ToolCall>) {
     for idx in remove_indices.into_iter().rev() {
         calls.remove(idx);
     }
+
+    removed_ids
 }
