@@ -276,7 +276,19 @@ impl Conversation {
         if total_tokens > budget_80pct && self.cold_summaries.is_empty() {
             let tokens_to_drop = total_tokens - budget_80pct;
 
-            // First pass: identify which turns to drop and extract their reasoning
+            // ── HARD FLOOR: the last turn is sacred and NEVER dropped ──
+            // Without this floor, a single oversized tool_result could make `tokens_to_drop`
+            // exceed the sum of all earlier turns, and the `survived_start` calculation below
+            // would settle on `self.messages.len()` → NO messages survive → sent=0 → agent
+            // goes blind and repeats searches forever (2026-04-12 21:25 session pathology).
+            let last_turn_idx = turns.len().saturating_sub(1);
+            let last_turn_start = turns.get(last_turn_idx)
+                .map(|t| t.start_idx)
+                .unwrap_or(0)
+                .min(self.messages.len());
+
+            // First pass: identify which turns to drop and extract their reasoning.
+            // Loop bound `turns.len()-1` ensures we never touch the last turn.
             let mut drop_summaries: Vec<String> = Vec::new();
             let mut drop_count = 0usize;
 
@@ -339,7 +351,7 @@ impl Conversation {
                 result.push(Message::new(Role::System, digest));
             }
 
-            // Find first surviving message
+            // Find first surviving message, clamped to last_turn_start so the last turn always survives.
             let mut survived_start = 0;
             let mut skipped = 0usize;
             for ti in 0..turns.len() {
@@ -350,11 +362,36 @@ impl Conversation {
                     .iter().map(|m| m.estimate_tokens()).sum();
                 skipped += t;
                 if skipped >= dropped_tokens {
-                    survived_start = if ti + 1 < turns.len() { turns[ti + 1].start_idx } else { self.messages.len() };
+                    survived_start = if ti + 1 < turns.len() {
+                        turns[ti + 1].start_idx
+                    } else {
+                        // Old code set this to self.messages.len() → no survivors.
+                        // Clamp to last_turn_start to preserve at least the last turn.
+                        last_turn_start
+                    };
                     break;
                 }
             }
+            // Final clamp: survived_start must not skip past the last turn.
+            survived_start = survived_start.min(last_turn_start);
             result.extend(self.messages[survived_start..].iter().cloned());
+        }
+
+        // ── ABSOLUTE FLOOR: if all compaction/cleanup somehow left only system messages,
+        //    graft back the last user message so the LLM has *something* to respond to.
+        //    Losing all message history silently is strictly worse than any alternative —
+        //    even "just user message" beats "blind re-search loop".
+        let non_system_count = result.iter().filter(|m| !matches!(m.role, Role::System)).count();
+        if non_system_count == 0 {
+            if let Some(last_user) = self.messages.iter().rev()
+                .find(|m| matches!(m.role, Role::User) && matches!(m.content, MessageContent::Text(..)))
+            {
+                result.push(Message::new(
+                    Role::System,
+                    "[Emergency: prior conversation was dropped during compaction. Only the latest user message is preserved.]"
+                ));
+                result.push(last_user.clone());
+            }
         }
 
         // Microcompact: condense old turn ToolResults to one-liners.
@@ -1274,6 +1311,85 @@ mod tests {
         let (msgs, _stats) = conv.to_provider_messages_budgeted("sys", 1000);
         assert!(!msgs.is_empty(), "Must at least have system prompt");
         assert!(matches!(msgs[0].role, Role::System));
+    }
+
+    #[test]
+    fn test_budgeted_never_returns_system_only_when_messages_exist() {
+        // Regression for 2026-04-13 bug: a single oversized tool_result caused
+        // `survived_start = self.messages.len()` → no non-system messages in result
+        // → sent=0 → agent blind.
+        //
+        // Invariant: if self.messages is non-empty, to_provider_messages_budgeted
+        // must always include at least one non-system message.
+        use crate::tool::{ToolCall, ToolResult};
+        let mut conv = Conversation::new();
+
+        // 5 normal turns
+        for i in 0..5 {
+            conv.add_user_message(&format!("task {}", i));
+            let call = ToolCall {
+                id: format!("c{}", i),
+                name: "bash".to_string(),
+                arguments: "{}".to_string(),
+            };
+            conv.add_assistant_tool_calls(Some("ok"), vec![call]);
+            conv.add_tool_result(ToolResult {
+                call_id: format!("c{}", i),
+                output: "x".repeat(500),
+                success: true,
+            });
+        }
+
+        // 6th turn with a pathologically oversized output (50K tokens worth of 'z')
+        conv.add_user_message("find everything");
+        let call = ToolCall {
+            id: "c5".to_string(),
+            name: "bash".to_string(),
+            arguments: "{}".to_string(),
+        };
+        conv.add_assistant_tool_calls(Some("finding..."), vec![call]);
+        conv.add_tool_result(ToolResult {
+            call_id: "c5".to_string(),
+            output: "z".repeat(200_000), // huge
+            success: true,
+        });
+
+        // Budget too small to fit the huge output — compaction MUST still leave
+        // at least one non-system message.
+        let (msgs, _stats) = conv.to_provider_messages_budgeted("sys", 10_000);
+        let non_system = msgs.iter().filter(|m| !matches!(m.role, Role::System)).count();
+        assert!(
+            non_system > 0,
+            "never return system-only result when messages exist — got msgs.len()={}",
+            msgs.len()
+        );
+    }
+
+    #[test]
+    fn test_budgeted_emergency_restores_last_user_when_all_else_dropped() {
+        // Even if every turn gets dropped by some path, the emergency fallback at
+        // the bottom of to_provider_messages_budgeted should graft back the last
+        // user message rather than return system-only.
+        let mut conv = Conversation::new();
+        conv.add_user_message("original question");
+        // Add 20 turns of huge assistant+tool content to force aggressive drop
+        for i in 0..20 {
+            use crate::tool::{ToolCall, ToolResult};
+            conv.add_assistant_tool_calls(Some(&format!("reasoning {}", i)), vec![ToolCall {
+                id: format!("c{}", i),
+                name: "bash".to_string(),
+                arguments: "{}".to_string(),
+            }]);
+            conv.add_tool_result(ToolResult {
+                call_id: format!("c{}", i),
+                output: "y".repeat(10_000),
+                success: true,
+            });
+        }
+
+        let (msgs, _stats) = conv.to_provider_messages_budgeted("sys", 5_000);
+        let has_user = msgs.iter().any(|m| matches!(m.role, Role::User));
+        assert!(has_user, "last user message must always survive, got {} msgs", msgs.len());
     }
 
     #[test]

@@ -1,8 +1,21 @@
 use crate::conversation::message::{Message, MessageContent};
 use crate::tool::ToolResult;
 
-/// Dispatch to per-tool truncation based on tool name, then apply a hard char limit.
-/// `context_window` drives the hard char limit — larger context windows allow more output.
+/// Dispatch to per-tool truncation based on tool name, then enforce universal upper bounds.
+///
+/// Per-tool truncation is the first line of defense (bash strips build noise, read_file
+/// extracts outlines, etc.). The universal caps below are the LAST line of defense —
+/// they cap `result.output` regardless of which tool produced it, so a single oversized
+/// `ToolResult` can never dominate the ctx budget:
+///
+/// - `UNIVERSAL_MAX_LINES`: line-count ceiling (head 50 + tail 50 + "[N lines omitted]")
+/// - `hard_char_limit`: char ceiling scaled to ~8K tokens, never more than 1/8 of window
+///
+/// 2026-04-13 context: a 14072-line `find` output contributed to a sent=0 cascade.
+/// Per-tool truncate handled that case (head 10 + tail 20), but other pathological
+/// outputs (unknown tools, huge grep, edit results with diffs) could still slip through
+/// the old `char_limit = max(16000, context_window)` formula which scaled UP with ctx
+/// window and let a single message consume 25% of a 64K budget.
 pub fn truncate_output(result: &mut ToolResult, tool_name: &str, context_window: usize) {
     match tool_name {
         "bash" => truncate_bash(result),
@@ -10,11 +23,44 @@ pub fn truncate_output(result: &mut ToolResult, tool_name: &str, context_window:
         "web_fetch" => truncate_generic(result, 150, 20, 40),
         _ => truncate_generic(result, 200, 30, 50),
     }
-    // Hard char limit as a safety net — scales with context window.
-    let char_limit = (context_window).max(16000);
-    if result.output.len() > char_limit {
-        result.output = result.output.chars().take(char_limit).collect::<String>()
-            + &format!("\n[output truncated at {} chars]", char_limit);
+
+    // ── Universal line-count ceiling ──
+    // Applies after per-tool truncate. Protects against: unknown tools with no
+    // per-tool logic, compile error compression that fails to shrink, edge-case
+    // formats with embedded huge blobs.
+    const UNIVERSAL_MAX_LINES: usize = 300;
+    let line_count = result.output.lines().count();
+    if line_count > UNIVERSAL_MAX_LINES {
+        let lines: Vec<&str> = result.output.lines().collect();
+        const HEAD: usize = 50;
+        const TAIL: usize = 50;
+        let head_part = lines[..HEAD].join("\n");
+        let tail_part = lines[lines.len() - TAIL..].join("\n");
+        result.output = format!(
+            "{}\n\n[... {} lines omitted (universal 300-line cap) ...]\n\n{}",
+            head_part,
+            line_count - HEAD - TAIL,
+            tail_part,
+        );
+    }
+
+    // ── Universal char-count ceiling ──
+    // Cap at ~8K tokens (32K chars) OR 1/8 of context window, whichever is smaller.
+    // No single tool_result should eat more than ~12% of the budget even when the
+    // window is huge — we want many turns, not one fat turn.
+    let hard_char_limit = (context_window / 8).min(32_000).max(8_000);
+    if result.output.len() > hard_char_limit {
+        // Preserve head AND tail when cutting — tools often put errors/status at the end.
+        let chars: Vec<char> = result.output.chars().collect();
+        let head_chars = hard_char_limit * 2 / 3;
+        let tail_chars = hard_char_limit / 3;
+        let head_part: String = chars[..head_chars.min(chars.len())].iter().collect();
+        let tail_part: String = chars[chars.len().saturating_sub(tail_chars)..].iter().collect();
+        let omitted = chars.len().saturating_sub(head_chars + tail_chars);
+        result.output = format!(
+            "{}\n\n[... {} chars omitted (universal {} char cap) ...]\n\n{}",
+            head_part, omitted, hard_char_limit, tail_part,
+        );
     }
 }
 
@@ -460,16 +506,37 @@ mod tests {
         assert!(result.output.contains("lines omitted"));
     }
 
-    // --- truncate_output hard char limit test ---
+    // --- truncate_output universal cap tests ---
 
     #[test]
     fn truncate_output_hard_char_limit() {
-        // Create output that's way over 16000 chars (minimum limit)
+        // With ctx_window=16000, new formula gives hard_char_limit = max(16000/8, 8000) = 8000.
         let output = "x".repeat(20000);
         let mut result = make_result(&output);
         truncate_output(&mut result, "unknown_tool", 16000);
-        assert!(result.output.len() <= 16000 + 100); // allow for truncation message
-        assert!(result.output.contains("[output truncated at 16000 chars]"));
+        // Result should be at most ~8000 chars + omission marker.
+        assert!(result.output.len() <= 8_500, "got {} chars", result.output.len());
+        assert!(result.output.contains("chars omitted"), "got: {}", result.output);
+    }
+
+    #[test]
+    fn truncate_output_universal_line_cap() {
+        // 500-line output should get capped to ~100 lines (50 head + 50 tail) + markers.
+        let output: String = (0..500).map(|i| format!("line {}", i)).collect::<Vec<_>>().join("\n");
+        let mut result = make_result(&output);
+        truncate_output(&mut result, "unknown_tool", 64_000);
+        let line_count = result.output.lines().count();
+        assert!(line_count <= 110, "got {} lines, expected ≤ 110", line_count);
+        assert!(result.output.contains("lines omitted"));
+    }
+
+    #[test]
+    fn truncate_output_caps_never_grow_with_huge_window() {
+        // Even with a 1M ctx window, a single tool_result must stay ≤ 32K chars.
+        let output = "x".repeat(200_000);
+        let mut result = make_result(&output);
+        truncate_output(&mut result, "unknown_tool", 1_000_000);
+        assert!(result.output.len() <= 33_000, "single tool output should never exceed 32K chars, got {}", result.output.len());
     }
 
     // --- post_process_tool_results tests ---
@@ -482,7 +549,8 @@ mod tests {
         // Should be truncated but remain inline ToolResult
         assert!(matches!(messages[0].content, MessageContent::ToolResult(_)));
         if let MessageContent::ToolResult(ref r) = messages[0].content {
-            assert!(r.output.len() <= 16100);
+            // 8K cap + omission marker ≈ 8500 chars worst case.
+            assert!(r.output.len() <= 8_500);
         }
     }
 
