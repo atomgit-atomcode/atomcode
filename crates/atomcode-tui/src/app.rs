@@ -1110,12 +1110,12 @@ impl App {
                     }
                 } else if (key.code == KeyCode::Enter && key.modifiers == KeyModifiers::NONE)
                     || (key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('j')) {
-                    // During streaming: if input has content, append it as additional context.
+                    // During streaming: queue user input for AFTER the current turn ends.
+                    // Do NOT inject into assistant stream — that mixes roles and causes
+                    // the model to treat user input as its own reasoning (e.g., auto-selecting
+                    // options without waiting for confirmation).
                     let content = self.input.content();
                     if !content.trim().is_empty() {
-                        // Show the appended input in the chat
-                        self.conversation.push_delta(&format!("\n\n[User added: {}]\n", content.trim()));
-                        // Send to agent loop
                         let _ = self.agent_handle.cmd_tx.send(
                             atomcode_core::agent::AgentCommand::AppendInput(content)
                         );
