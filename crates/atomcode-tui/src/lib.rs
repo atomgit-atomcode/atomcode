@@ -4,7 +4,8 @@ pub mod event;
 pub mod file_attach;
 pub mod project_context;
 pub mod provider_manager;
-pub mod turn_log;
+// turn_log removed 2026-04-13: atomcode-core owns datalog (DatalogWriter) —
+// having two per-turn loggers wrote 2 files per turn (one per crate).
 pub mod ui;
 
 use std::io::Write;

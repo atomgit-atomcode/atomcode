@@ -227,8 +227,6 @@ pub struct App {
     pub agent_handle: AgentHandle,
     /// Display name of the active model (cached so we don't need the provider ref).
     pub model_name: String,
-    /// Per-turn logger: writes each turn to datalog/ as a markdown file.
-    pub turn_log: crate::turn_log::TurnLog,
     /// Last git checkpoint SHA for /undo.
     pub last_checkpoint: Option<String>,
     /// Session manager for persistence.
@@ -314,7 +312,6 @@ impl App {
            last_completed_tool: String::new(),
            tool_start: None,
            last_turn_duration: None,
-           turn_log: crate::turn_log::TurnLog::new(&working_dir),
            tool_context,
            previous_working_dir: None,
            recent_dirs: {
@@ -461,7 +458,6 @@ impl App {
 
         if resolved.is_dir() {
             self.working_dir = resolved.clone();
-            self.turn_log.set_working_dir(&resolved);
             // Sync tool context (best-effort; won't block since we're in the main task)
             if let Ok(mut wd) = self.tool_context.working_dir.try_write() {
                 *wd = resolved.clone();
@@ -473,7 +469,6 @@ impl App {
         } else if new_path.is_dir() {
             // canonicalize failed but path exists as dir
             self.working_dir = new_path.clone();
-            self.turn_log.set_working_dir(&new_path);
             if let Ok(mut wd) = self.tool_context.working_dir.try_write() {
                 *wd = new_path.clone();
             }
@@ -642,7 +637,6 @@ impl App {
                 if let Some(ref buf) = self.conversation.stream_buffer {
                     let text = buf.trim();
                     if !text.is_empty() {
-                        self.turn_log.log_model_text(text);
                     }
                 }
                 // If model produced text before tool calls (looks like a premature summary),
@@ -650,7 +644,6 @@ impl App {
                 if self.conversation.stream_buffer.as_ref().map_or(false, |b| b.len() > 50) {
                     self.conversation.push_delta("\n\n---\n*[continuing...]*\n");
                 }
-                self.turn_log.log_tool_call(&name, &arguments);
                 // Use the provider's real call id so ToolCallResult can pair with this
                 // specific tool call — regardless of timing (PhaseChange(Thinking) bumping
                 // step_count between start and result, or parallel tool calls sharing a step).
@@ -671,7 +664,6 @@ impl App {
                 let icon = if success { "\u{2713}" } else { "\u{2717}" };
                 let first_line = output.lines().next().unwrap_or("").chars().take(40).collect::<String>();
                 self.last_completed_tool = format!("{} {} {}", icon, name, first_line);
-                self.turn_log.log_tool_result(&output, success);
                 // Use the same call_id the agent recorded on ToolCallStarted so chat_panel's
                 // "in-flight tool call" detection (call.id ∈ completed_call_ids) matches.
                 self.conversation.add_tool_result(ToolResult {
@@ -700,7 +692,6 @@ impl App {
                         self.mode = AppMode::Streaming;
                         // Count LLM round-trips (not individual tool calls) — matches Claude Code's step counting.
                         self.current_step_count += 1;
-                        self.turn_log.log_llm_call();
                         // Reset TTFT for each LLM call (not just the first in a turn)
                         self.first_token_ms = None;
                         self.llm_call_start = Some(Instant::now());
@@ -725,7 +716,7 @@ impl App {
                     }
                 }
             }
-            AgentEvent::TurnComplete { duration, total_tokens: _, turn_count: _, tool_call_count, stop_reason: _ } => {
+            AgentEvent::TurnComplete { duration, total_tokens: _, turn_count: _, tool_call_count: _, stop_reason: _ } => {
                 // Clear any lingering streaming tool state — turn is over.
                 self.streaming_tool_name = None;
                 self.executing_tool_info.clear();
@@ -766,15 +757,8 @@ impl App {
                 }
                 // Finalize stream FIRST so auto-summary TextDelta becomes a message
                 self.conversation.finalize_stream();
-                // Then log the final assistant text
-                if let Some(last) = self.conversation.messages.last() {
-                    if matches!(last.role, atomcode_core::conversation::message::Role::Assistant) {
-                        if let Some(text) = last.text() {
-                            self.turn_log.log_text(text);
-                        }
-                    }
-                }
-                self.turn_log.end_turn(self.turn_tokens, tool_call_count);
+                // Final assistant text logging is handled by atomcode-core's DatalogWriter
+                // (see TurnResult::Responded in agent/mod.rs). TUI no longer writes datalog.
                 self.mode = AppMode::Normal;
                 self.last_turn_duration = Some(duration);
                 self.turn_start = None;
@@ -833,8 +817,6 @@ impl App {
             AgentEvent::Error(e) => {
                 self.streaming_tool_name = None;
                 self.executing_tool_info.clear();
-                self.turn_log.log_error(&e);
-                self.turn_log.end_turn(self.turn_tokens, 0);
                 self.conversation.push_delta(&format!("\n\n[Error: {}]", e));
                 self.conversation.finalize_stream();
                 self.mode = AppMode::Normal;
@@ -846,14 +828,12 @@ impl App {
                 self.turn_tokens += usage.completion_tokens;
                 self.total_tokens += usage.completion_tokens;
                 if usage.cached_tokens > 0 {
-                    self.turn_log.log_cache_hit(usage.prompt_tokens, usage.cached_tokens);
                 }
             }
             AgentEvent::WorkingDirChanged(new_dir) => {
                 // Only /cd (user command) triggers this — LLM tools cannot change working dir.
                 self.previous_working_dir = Some(self.working_dir.clone());
                 self.working_dir = new_dir.clone();
-                self.turn_log.set_working_dir(&new_dir);
                 self.project_context_cache = None;
                 // Sync recent dirs + config so /cd list and next startup remember this dir
                 self.recent_dirs.retain(|d| d != &new_dir);
@@ -863,9 +843,8 @@ impl App {
                 self.config.default_workdir = Some(new_dir.to_string_lossy().to_string());
                 let _ = self.config.save(&Config::default_path());
             }
-            AgentEvent::ContextStats { system_tokens, sent_tokens, dropped_tokens, working_set_tokens, total_messages } => {
+            AgentEvent::ContextStats { system_tokens, sent_tokens, dropped_tokens: _, working_set_tokens: _, total_messages: _ } => {
                 self.ctx_used_tokens = system_tokens + sent_tokens;
-                self.turn_log.log_context_stats(system_tokens, sent_tokens, dropped_tokens, working_set_tokens, total_messages);
             }
             AgentEvent::SubAgentProgress { file, status } => {
                 // Claude Code style parallel task display
@@ -2203,7 +2182,6 @@ impl App {
                 self.render_cache.clear();
                 self.render_cache_msg_count = 0;
                 // Clear the turn log (deletes the current log file)
-                self.turn_log.clear();
                 // Add a placeholder message to indicate conversation was cleared
                 self.conversation.push_delta("(conversation cleared)");
                 self.conversation.finalize_stream();
@@ -2529,7 +2507,6 @@ impl App {
         };
 
         // Log this turn with env info
-        self.turn_log.begin_turn(&full_content, &self.model_name, self.context_window);
 
         // Save user's original input (not full_content with attachments) for restore on cancel
         self.last_sent_input = Some(content.clone());

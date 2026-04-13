@@ -1215,6 +1215,11 @@ impl AgentLoop {
                 TurnResult::Responded { ref text, tokens, truncated } => {
                     self.turn_tokens += tokens;
                     self.total_tokens += tokens;
+                    // Log the final assistant text to datalog (TUI used to do this —
+                    // absorbed here now that TUI's duplicate TurnLog was removed).
+                    if !text.trim().is_empty() {
+                        self.datalog.log_text(text);
+                    }
 
                     // ATLAS subtask extraction: if model just output a plan (FeatureDev,
                     // first response with text, no tools used yet), extract subtasks
@@ -1507,6 +1512,7 @@ impl AgentLoop {
                         tokio::time::sleep(Duration::from_secs(wait)).await;
                         continue;
                     } else if is_auth_error {
+                        self.datalog.log_error(&e);
                         let _ = self.event_tx.send(AgentEvent::Error(e));
                         self.finish_turn(TurnStopReason::Error);
                         return;
@@ -1519,6 +1525,7 @@ impl AgentLoop {
                         tokio::time::sleep(Duration::from_secs(wait)).await;
                         continue;
                     } else {
+                        self.datalog.log_error(&e);
                         let _ = self.event_tx.send(AgentEvent::Error(e));
                         self.finish_turn(TurnStopReason::Error);
                         return;
