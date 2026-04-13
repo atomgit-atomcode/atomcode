@@ -844,6 +844,8 @@ impl Conversation {
             limit: Option<usize>,
         }
         let mut call_id_to_read: std::collections::HashMap<String, ReadInfo> = std::collections::HashMap::new();
+        // Map edit/write/create call_ids to their file paths (pending verification)
+        let mut edit_call_to_file: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         let mut edited_files: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         for msg in msgs.iter() {
@@ -860,8 +862,17 @@ impl Conversation {
                             call_id_to_read.insert(tc.id.clone(), ReadInfo { file_path: file_path.clone(), offset, limit });
                         }
                         if matches!(tc.name.as_str(), "edit_file" | "write_file" | "create_file") && !file_path.is_empty() {
-                            edited_files.insert(file_path);
+                            edit_call_to_file.insert(tc.id.clone(), file_path);
                         }
+                    }
+                }
+            }
+            // Only count edits that actually succeeded — a failed edit_file
+            // doesn't change the file, so the read result is still fresh.
+            if let MessageContent::ToolResult(ref r) = msg.content {
+                if let Some(file_path) = edit_call_to_file.get(&r.call_id) {
+                    if !r.output.starts_with("Error") {
+                        edited_files.insert(file_path.clone());
                     }
                 }
             }
@@ -898,11 +909,12 @@ impl Conversation {
                                 .collect::<Vec<_>>()
                                 .join("\n");
                         } else {
-                            r.output = format!("[{} ({} lines) — file too large, use read_file to view sections]",
-                                std::path::Path::new(&info.file_path).file_name()
-                                    .map(|n| n.to_string_lossy().to_string())
-                                    .unwrap_or_else(|| info.file_path.clone()),
-                                total);
+                            // Large file full-read: the existing result may already
+                            // be a useful skeleton (outline). Don't destroy it with
+                            // a one-line "[file too large]" stub — keep the original
+                            // content which the model can still reference.
+                            // Only replace if the original was also full content
+                            // (i.e. longer than the new summary would be).
                         }
                     }
                 }
