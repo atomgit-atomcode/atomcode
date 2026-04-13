@@ -491,7 +491,12 @@ fn extract_config_summary(name: &str, path: &Path) -> Option<String> {
         if is_high_value {
             // Truncate very long lines (e.g., base64 encoded secrets)
             let display = if trimmed.len() > 120 {
-                format!("{}...", &trimmed[..117])
+                // Find a valid char boundary at or before byte 117
+                let mut end = 117;
+                while !trimmed.is_char_boundary(end) {
+                    end -= 1;
+                }
+                format!("{}...", &trimmed[..end])
             } else {
                 trimmed.to_string()
             };

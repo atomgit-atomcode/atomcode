@@ -729,6 +729,12 @@ impl AgentLoop {
         self.recent_errors.clear();
         self.executed_cmds.clear();
         self.category_fail_streak.clear();
+        // Reset stagnation tracking — new user message = fresh turn,
+        // previous stagnation state must not carry over.
+        self.stagnant_turns = 0;
+        self.last_known_files = 0;
+        self.last_targeted_reads = 0;
+        self.targeted_read_count = 0;
         // Clear session_files on each new user message.
         // Working Set only tracks files from the CURRENT task.
         self.session_files.clear();

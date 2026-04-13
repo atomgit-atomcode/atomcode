@@ -191,7 +191,11 @@ impl SemanticSearcher {
             let call_text = &source[node.start_byte()..node.end_byte()];
             // Truncate long call texts (keep first 80 chars)
             let short = if call_text.len() > 80 {
-                format!("{}...", &call_text[..77])
+                let mut end = 77;
+                while !call_text.is_char_boundary(end) {
+                    end -= 1;
+                }
+                format!("{}...", &call_text[..end])
             } else {
                 call_text.to_string()
             };
