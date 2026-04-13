@@ -166,8 +166,16 @@ pub fn build_project_context_with_graph(dir: &Path, graph: Option<&crate::graph:
                 // ~4 chars per token
                 let max_chars = remaining * 4;
                 let summary = if content.len() > max_chars {
-                    let mut end = max_chars;
-                    // Truncate at line boundary
+                    // Walk backward from max_chars to a valid UTF-8 codepoint boundary
+                    // so `content[..end]` never panics on CJK/emoji content.
+                    // (Matches the is_char_boundary pattern used in the line-level
+                    // truncation below — keeps this file's two byte-slice sites
+                    // consistent.)
+                    let mut end = max_chars.min(content.len());
+                    while end > 0 && !content.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    // Snap to last newline within the safe range for cleaner output.
                     if let Some(pos) = content[..end].rfind('\n') { end = pos; }
                     format!("{}...", &content[..end])
                 } else {

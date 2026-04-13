@@ -44,6 +44,11 @@ pub fn render(
     last_completed_tool: &str,
     last_turn_duration: Option<std::time::Duration>,
     finished_step_count: usize,
+    // Name of a tool whose args are STILL streaming (LLM emitted the name but
+    // hasn't finished sending args yet). Rendered as a pseudo in-flight row so
+    // the chat visually syncs with the bottom spinner label during long args
+    // streaming windows (e.g. big write_file content that takes 30-60s).
+    streaming_tool_name: Option<&str>,
     render_cache: &mut Vec<Line<'static>>,
     render_cache_msg_count: &mut usize,
 ) -> (usize, usize) {
@@ -247,6 +252,33 @@ pub fn render(
             // Pad so the last in-flight row sits above the bottom spinner overlay.
             dynamic.push(Line::default());
         }
+    }
+
+    // ── Streaming tool call (name known, args still arriving) ──
+    // LLM has emitted the tool name but is still streaming the args JSON. The
+    // bottom spinner shows "Preparing Write File…" but the chat itself was blank
+    // during this window (often 30-60s for big write_file content), leaving the
+    // user staring at nothing. Drop a pseudo in-flight row in chat so the visual
+    // syncs with the spinner. Replaced by the real in-flight row the moment
+    // ToolCallStarted fires (args fully assembled).
+    //
+    // Suppress if we already have an in-flight tool call rendered above —
+    // avoids double rows when Started fires just as streaming ends.
+    if let Some(name) = streaming_tool_name {
+        let bar = Span::styled(
+            format!("{}\u{2502} ", INDENT),
+            Style::default().fg(theme::accent_dim()),
+        );
+        let spinner_frame = SPINNER[tick % SPINNER.len()];
+        let display_name = capitalize(name);
+        dynamic.push(Line::from(vec![
+            bar.clone(),
+            Span::styled(format!("  {} ", spinner_frame), Style::default().fg(theme::accent())),
+            Span::styled(display_name, Style::default().fg(theme::text_primary()).add_modifier(Modifier::BOLD)),
+            Span::styled("(...)", Style::default().fg(theme::text_muted())),
+        ]));
+        // Blank pad so this row isn't clobbered by the bottom spinner overlay.
+        dynamic.push(Line::default());
     }
 
     // ── Turn finished separator ──

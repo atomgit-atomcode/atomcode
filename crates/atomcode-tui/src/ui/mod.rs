@@ -119,6 +119,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             app.current_step_count, tool_info_ref,
             app.first_token_ms, llm_wait_ms, &app.last_completed_tool,
             app.last_turn_duration, app.current_step_count,
+            app.streaming_tool_name.as_deref(),
             &mut app.render_cache, &mut app.render_cache_msg_count,
         );
         app.last_rendered_scroll = rendered_scroll;
