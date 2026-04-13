@@ -362,13 +362,18 @@ async fn run_headless(
                 print!("{}", text);
                 io::stdout().flush()?;
             }
-            AgentEvent::ToolCallStarted { name, arguments } => {
+            AgentEvent::ToolCallStreaming { name } => {
+                if verbose {
+                    eprintln!("[tool-streaming← {}]", name);
+                }
+            }
+            AgentEvent::ToolCallStarted { id: _, name, arguments } => {
                 if verbose {
                     let args = truncate_log_line(&arguments, 200);
                     eprintln!("[tool→ {} args={}]", name, args);
                 }
             }
-            AgentEvent::ToolCallResult { name, output, success, duration } => {
+            AgentEvent::ToolCallResult { call_id: _, name, output, success, duration } => {
                 if verbose {
                     let status = if success { "OK" } else { "FAILED" };
                     let dur_ms = duration.as_millis();
@@ -449,9 +454,6 @@ AgentEvent::SubAgentProgress { file, status } => {
                 if verbose {
                     eprintln!("[sub-agent] {} {}", file, status);
                 }
-            }
-            AgentEvent::ToolCallStreaming { name: _ } => {
-                // Tool call name arrived while streaming — no action needed in headless
             }
         }
     }

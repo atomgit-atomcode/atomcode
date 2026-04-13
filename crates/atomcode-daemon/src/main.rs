@@ -1663,7 +1663,7 @@ let session_manager = SessionManager::new(&working_dir);
                     let _ = event_tx.send(chat_event);
                 }
             }
-            TurnEvent::ToolCallStarted { name, arguments } => {
+            TurnEvent::ToolCallStarted { id: _, name, arguments } => {
                 tool_call_count += 1;
                 let _ = event_tx.send(ChatEvent::ToolCallStarted { name: name.clone(), arguments: arguments.clone() });
                 
@@ -1703,7 +1703,7 @@ let session_manager = SessionManager::new(&working_dir);
                     }
                 }
             }
-            TurnEvent::ToolCallResult { name, output, success, duration } => {
+            TurnEvent::ToolCallResult { call_id: _, name, output, success, duration } => {
                 let _ = event_tx.send(ChatEvent::ToolCallResult {
                     name,
                     output,
@@ -1724,6 +1724,10 @@ let session_manager = SessionManager::new(&working_dir);
             }
             TurnEvent::ContextStats { .. } => {
                 // Ignore context stats in API mode
+            }
+            TurnEvent::ToolCallStreaming { .. } => {
+                // Daemon/HTTP mode doesn't surface the "tool name streaming" phase —
+                // API clients receive the complete ToolCallStarted event when args are ready.
             }
         }
     }

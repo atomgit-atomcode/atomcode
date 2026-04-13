@@ -12,7 +12,7 @@ use std::io::Write;
 use anyhow::Result;
 use crossterm::{
     execute,
-    event::{EnableBracketedPaste, DisableBracketedPaste, EnableMouseCapture, DisableMouseCapture},
+    event::{EnableBracketedPaste, DisableBracketedPaste, DisableMouseCapture},
     terminal::{
         disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
         SetTitle, Clear, ClearType,
@@ -332,7 +332,9 @@ pub async fn run(
         SetTitle("AtomCode"),
         Clear(ClearType::All),
         EnableBracketedPaste,
-        EnableMouseCapture,
+        // Scroll-only mouse mode is enabled in EventLoop::start (mode 1000+1006 only,
+        // no 1002 drag tracking). See event.rs::enable_mouse_scroll_only for rationale:
+        // we get wheel scroll events without blocking native click-drag text selection.
     )?;
 
     let backend = CrosstermBackend::new(stdout);
@@ -393,7 +395,7 @@ pub async fn run(
                 SetTitle("AtomCode"),
                 Clear(ClearType::All),
                 EnableBracketedPaste,
-                EnableMouseCapture,
+                // Mouse mode is re-enabled by EventLoop::start (scroll-only). See startup comment.
             )?;
             terminal.clear()?;
             event_loop.start();
@@ -456,7 +458,7 @@ pub async fn run(
                 SetTitle("AtomCode"),
                 Clear(ClearType::All),
                 EnableBracketedPaste,
-                EnableMouseCapture,
+                // Mouse mode is re-enabled by EventLoop::start (scroll-only). See startup comment.
             )?;
             terminal.clear()?;
             continue;

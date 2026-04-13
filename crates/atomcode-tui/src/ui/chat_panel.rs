@@ -324,10 +324,14 @@ pub fn render(
     // ── Spinner overlay: rendered AFTER the Paragraph, at the last row of chat area ──
     // This overwrites whatever the Paragraph put there. Immune to Wrap-induced
     // scroll miscalculations because it doesn't depend on the Paragraph's content.
-    let turn_active = last_turn_duration.is_none() && (
-        matches!(mode, AppMode::Streaming | AppMode::ToolExecuting)
-        || step_count > 0
-    );
+    // Spinner runs ONLY while the agent is actively producing — not as a side-effect
+    // of "there has been at least one turn in this session". The old `step_count > 0`
+    // branch was leaving the spinner on after TurnComplete fired in edge cases where
+    // mode reset lagged behind the user perceiving the turn as done (2026-04-13 bug:
+    // spinner still spinning after UI build finished).
+    let _ = step_count;
+    let turn_active = last_turn_duration.is_none()
+        && matches!(mode, AppMode::Streaming | AppMode::ToolExecuting);
     if turn_active && area.height >= 2 {
         let spin_y = area.y + area.height - 1;
         let spin_rect = Rect::new(area.x, spin_y, area.width, 1);

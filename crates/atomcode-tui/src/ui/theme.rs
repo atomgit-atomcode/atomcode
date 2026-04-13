@@ -157,24 +157,26 @@ pub fn bg_inline_code() -> Color {
 }
 
 // ── Text ──
+// All three tiers bumped one notch brighter (more contrast vs background) per
+// 2026-04-12 feedback that overall text felt dim.
 pub fn text_primary() -> Color {
     match Theme::current() {
-        Theme::Dark => Color::Rgb(220, 222, 230),
-        Theme::Light => Color::Rgb(25, 25, 35),
+        Theme::Dark => Color::Rgb(238, 240, 248),
+        Theme::Light => Color::Rgb(10, 10, 20),
     }
 }
 
 pub fn text_secondary() -> Color {
     match Theme::current() {
-        Theme::Dark => Color::Rgb(150, 153, 168),
-        Theme::Light => Color::Rgb(80, 83, 98),
+        Theme::Dark => Color::Rgb(185, 188, 202),
+        Theme::Light => Color::Rgb(55, 58, 73),
     }
 }
 
 pub fn text_muted() -> Color {
     match Theme::current() {
-        Theme::Dark => Color::Rgb(90, 93, 108),
-        Theme::Light => Color::Rgb(130, 133, 148),
+        Theme::Dark => Color::Rgb(125, 128, 142),
+        Theme::Light => Color::Rgb(100, 103, 118),
     }
 }
 
@@ -290,47 +292,36 @@ pub fn user_chevron() -> Color {
 }
 
 // ── Tool Call ──
+// All tools share the same muted gray — distinction is in the tool name, not color.
+// CC-aligned: information through layout, not hue.
 pub fn tool_edit() -> Color {
-    match Theme::current() {
-        Theme::Dark => Color::Rgb(100, 200, 150),
-        Theme::Light => Color::Rgb(50, 150, 100),
-    }
+    text_secondary()
 }
 
 pub fn tool_bash() -> Color {
-    match Theme::current() {
-        Theme::Dark => Color::Rgb(200, 180, 100),
-        Theme::Light => Color::Rgb(160, 130, 50),
-    }
+    text_secondary()
 }
 
 pub fn tool_search() -> Color {
-    match Theme::current() {
-        Theme::Dark => Color::Rgb(170, 140, 230),
-        Theme::Light => Color::Rgb(120, 90, 190),
-    }
+    text_secondary()
 }
 
 // ── Markdown ──
+// Headings use white/gray gradient (no hue). Hierarchy via brightness + weight only.
+// CC-aligned: h1 brightest primary text, h2 standard primary, h3 secondary.
 pub fn md_h1() -> Color {
-    match Theme::current() {
-        Theme::Dark => Color::Rgb(115, 170, 240),
-        Theme::Light => Color::Rgb(65, 120, 190),
-    }
+    text_primary()
 }
 
 pub fn md_h2() -> Color {
     match Theme::current() {
-        Theme::Dark => Color::Rgb(160, 140, 225),
-        Theme::Light => Color::Rgb(110, 90, 175),
+        Theme::Dark => Color::Rgb(200, 202, 215),
+        Theme::Light => Color::Rgb(45, 48, 65),
     }
 }
 
 pub fn md_h3() -> Color {
-    match Theme::current() {
-        Theme::Dark => Color::Rgb(130, 190, 160),
-        Theme::Light => Color::Rgb(80, 150, 120),
-    }
+    text_secondary()
 }
 
 pub fn md_link() -> Color {

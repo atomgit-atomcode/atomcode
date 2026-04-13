@@ -18,20 +18,26 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     let mut left: Vec<Span> = Vec::new();
     let mut right: Vec<Span> = Vec::new();
 
-    // Left: brand (with build hash) + path + session
+    // Left: compact logo (reuse the middle row of the welcome Atom) + brand text + path.
+    // Dropped the purple brand_bg rectangle — text + logo glyph are enough, backgrounds
+    // felt like a ribbon label glued onto the bar.
     left.push(Span::styled(
-        " Atom",
-        Style::default().fg(theme::brand_fg()).bg(theme::brand_bg()).add_modifier(Modifier::BOLD),
+        " ( \u{25c9} )  ",
+        Style::default().fg(theme::accent()).add_modifier(Modifier::BOLD),
     ));
     left.push(Span::styled(
-        "Code ",
-        Style::default().fg(theme::accent()).bg(theme::brand_bg()).add_modifier(Modifier::BOLD),
+        "Atom",
+        Style::default().fg(theme::text_primary()).add_modifier(Modifier::BOLD),
     ));
     left.push(Span::styled(
-        format!("[{}] ", env!("ATOMCODE_BUILD_ID")),
-        Style::default().fg(theme::brand_fg()).bg(theme::brand_bg()),
+        "Code",
+        Style::default().fg(theme::accent()).add_modifier(Modifier::BOLD),
     ));
-    left.push(Span::styled(" ", Style::default()));
+    left.push(Span::styled(
+        format!(" [{}]", env!("ATOMCODE_BUILD_ID")),
+        Style::default().fg(theme::text_muted()),
+    ));
+    left.push(Span::styled("  ", Style::default()));
     left.push(Span::styled(&dir, Style::default().fg(theme::status_path())));
 
     // Calculate available space for session name
@@ -115,15 +121,8 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(time_color).add_modifier(Modifier::BOLD),
         ));
         right.push(sep.clone());
-        // Token speed
-        if app.turn_tokens > 0 {
-            let speed = app.turn_tokens as f64 / secs.max(1) as f64;
-            right.push(Span::styled(
-                format!("{}tok {:.0}t/s", app.turn_tokens, speed),
-                Style::default().fg(theme::text_muted()),
-            ));
-            right.push(sep.clone());
-        }
+        // Token speed dropped from status bar — noise in most cases, the bottom spinner
+        // overlay already shows it during active turns for users who care.
     } else if app.last_turn_duration.is_some() || app.current_step_count > 0 {
         // ── Completed turn: ✓ + duration ──
         right.push(Span::styled(
@@ -145,13 +144,8 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
                 Style::default().fg(theme::success()),
             ));
             right.push(sep.clone());
-            if app.turn_tokens > 0 {
-                right.push(Span::styled(
-                    format!("{}tok", app.turn_tokens),
-                    Style::default().fg(theme::text_muted()),
-                ));
-                right.push(sep.clone());
-            }
+            // Total tokens dropped from status bar — kept context usage below which is
+            // the metric that actually affects user behavior (compaction thresholds).
         }
     }
 

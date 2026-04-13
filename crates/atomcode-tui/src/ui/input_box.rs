@@ -129,12 +129,22 @@ pub fn render(frame: &mut Frame, area: Rect, input: &InputState, is_busy: bool, 
         let end = (start + max_visible).min(visual_lines.len());
         (visual_lines[start..end].to_vec(), start)
     };
-    let border_color = if is_busy { theme::warning() } else { theme::border() };
+    // Focus state: idle (ready) = bright bold border to signal "you can type here";
+    // busy (agent working) = dim muted border to signal "input is locked right now".
+    let (border_color, border_bold) = if is_busy {
+        (theme::text_muted(), false)
+    } else {
+        (theme::text_secondary(), true)
+    };
+    let mut border_style = Style::default().fg(border_color);
+    if border_bold {
+        border_style = border_style.add_modifier(Modifier::BOLD);
+    }
     let prompt = Span::styled(" \u{276f} ", Style::default().fg(theme::user_chevron()).add_modifier(Modifier::BOLD));
     let block = Block::default()
         .borders(Borders::ALL)
         .border_set(border::ROUNDED)
-        .border_style(Style::default().fg(border_color))
+        .border_style(border_style)
         .title(prompt)
         .padding(Padding::horizontal(H_PADDING));
 

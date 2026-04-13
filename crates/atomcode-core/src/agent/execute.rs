@@ -187,8 +187,9 @@ pub async fn execute_instructions(
         // Forward turn events to agent event channel
         while let Ok(event) = turn_rx.try_recv() {
             match event {
-                TurnEvent::ToolCallResult { ref name, ref output, success, .. } => {
+                TurnEvent::ToolCallResult { ref call_id, ref name, ref output, success, .. } => {
                     let _ = event_tx.send(AgentEvent::ToolCallResult {
+                        call_id: call_id.clone(),
                         name: name.clone(),
                         output: output.clone(),
                         success,

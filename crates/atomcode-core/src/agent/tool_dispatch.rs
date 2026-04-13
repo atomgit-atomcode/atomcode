@@ -9,7 +9,10 @@ impl AgentLoop {
                 self.model_produced_text = true;
                 let _ = self.event_tx.send(AgentEvent::TextDelta(text));
             }
-            TurnEvent::ToolCallStarted { ref name, ref arguments } => {
+            TurnEvent::ToolCallStreaming { name } => {
+                let _ = self.event_tx.send(AgentEvent::ToolCallStreaming { name });
+            }
+            TurnEvent::ToolCallStarted { ref id, ref name, ref arguments } => {
                 self.datalog.log_tool_call(name, arguments);
 
                 self.current_tool_name = name.clone();
@@ -41,9 +44,9 @@ impl AgentLoop {
                     }
                 }
 
-                let _ = self.event_tx.send(AgentEvent::ToolCallStarted { name: name.clone(), arguments: arguments.clone() });
+                let _ = self.event_tx.send(AgentEvent::ToolCallStarted { id: id.clone(), name: name.clone(), arguments: arguments.clone() });
             }
-            TurnEvent::ToolCallResult { name, output, success, duration } => {
+            TurnEvent::ToolCallResult { call_id, name, output, success, duration } => {
                 // Track files for discipline
                 if let Some(pos) = output.find("Edited ") {
                     // Extract full path from "Edited /path/to/file ..." or "Edited /path/to/file\n..."
@@ -94,7 +97,7 @@ impl AgentLoop {
 
                 self.datalog.log_tool_result(&output, success);
                 let _ = self.event_tx.send(AgentEvent::ToolCallResult {
-                    name, output, success, duration,
+                    call_id, name, output, success, duration,
                 });
             }
             TurnEvent::TokenUsage { prompt_tokens, completion_tokens, total_tokens: _, cached_tokens } => {

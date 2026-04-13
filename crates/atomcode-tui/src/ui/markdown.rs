@@ -68,7 +68,15 @@ impl MarkdownRenderer {
     fn new() -> Self {
         let syntax_set = SyntaxSet::load_defaults_newlines();
         let theme_set = ThemeSet::load_defaults();
-        let theme = theme_set.themes["base16-ocean.dark"].clone();
+        // Pick highlighting theme based on detected terminal background.
+        // Light mode needs darker foreground tokens for contrast.
+        let theme_name = match super::theme::Theme::current() {
+            super::theme::Theme::Dark => "base16-ocean.dark",
+            super::theme::Theme::Light => "InspiredGitHub",
+        };
+        let theme = theme_set.themes.get(theme_name)
+            .cloned()
+            .unwrap_or_else(|| theme_set.themes["base16-ocean.dark"].clone());
         Self { syntax_set, theme }
     }
 
@@ -148,33 +156,15 @@ impl MarkdownRenderer {
                 }
                 Event::End(TagEnd::CodeBlock) => {
                     in_code = false;
-                    // Top border: ╭─ language ────────
-                    let lang_display = if code_lang.is_empty() { "" } else { &code_lang };
-                    if !lang_display.is_empty() {
-                        lines.push(Line::from(vec![
-                            Span::styled("  \u{256d}\u{2500} ", Style::default().fg(theme::md_code_border())),
-                            Span::styled(
-                                lang_display.to_string(),
-                                Style::default().fg(theme::md_code_lang()).add_modifier(Modifier::BOLD),
-                            ),
-                            Span::styled(
-                                format!(" {}", "\u{2500}".repeat(30)),
-                                Style::default().fg(theme::md_code_border()),
-                            ),
-                        ]));
-                    } else {
-                        lines.push(Line::from(Span::styled(
-                            format!("  \u{256d}{}", "\u{2500}".repeat(36)),
-                            Style::default().fg(theme::md_code_border()),
-                        )));
+                    // CC-style: no borders, no language label, no line numbers.
+                    // Just a blank line of breathing room + highlighted tokens + blank line.
+                    // The syntax highlighting itself is the visual cue that this is code.
+                    if lines.last().map_or(false, |l| !l.spans.is_empty()) {
+                        lines.push(Line::default());
                     }
                     let highlighted = self.highlight(&code_buf, &code_lang);
                     lines.extend(highlighted);
-                    // Bottom border: ╰──────────
-                    lines.push(Line::from(Span::styled(
-                        format!("  \u{2570}{}", "\u{2500}".repeat(36)),
-                        Style::default().fg(theme::md_code_border()),
-                    )));
+                    lines.push(Line::default());
                     code_buf.clear();
                 }
 
@@ -274,9 +264,10 @@ impl MarkdownRenderer {
                     }
                 }
                 Event::Code(code) => {
+                    // CC-style: no background, no padding spaces. Color alone distinguishes code from prose.
                     spans.push(Span::styled(
-                        format!(" {} ", code),
-                        Style::default().fg(theme::md_inline_code()).bg(theme::bg_inline_code()),
+                        code.to_string(),
+                        Style::default().fg(theme::md_inline_code()),
                     ));
                 }
                 Event::SoftBreak | Event::HardBreak => { flush(&mut lines, &mut spans); }
@@ -305,7 +296,8 @@ impl MarkdownRenderer {
         deduped
     }
 
-    /// Syntax-highlighted code with line numbers, left border, and background.
+    /// Syntax-highlighted code — CC-style minimal: 2-space indent + token colors only.
+    /// No line numbers, no borders, no background fill. Just typography.
     fn highlight(&self, code: &str, lang: &str) -> Vec<Line<'static>> {
         let syntax = if lang.is_empty() {
             self.syntax_set.find_syntax_plain_text()
@@ -315,33 +307,15 @@ impl MarkdownRenderer {
         };
 
         let mut hl = HighlightLines::new(syntax, &self.theme);
-        let line_count = code.lines().count();
-        let gutter_width = if line_count < 10 { 1 } else if line_count < 100 { 2 } else if line_count < 1000 { 3 } else { 4 };
-        let gutter_bg = theme::md_code_gutter();
-
-        code.lines().enumerate().map(|(i, line)| {
+        code.lines().map(|line| {
             let regions = hl.highlight_line(line, &self.syntax_set).unwrap_or_default();
-            let mut s: Vec<Span<'static>> = Vec::new();
-
-            // Left border
-            s.push(Span::styled("  \u{2502}", Style::default().fg(theme::md_code_border())));
-
-            // Line number gutter — dim, with subtle background
-            s.push(Span::styled(
-                format!(" {:>width$} ", i + 1, width = gutter_width),
-                Style::default().fg(theme::md_code_linenum()).bg(gutter_bg),
-            ));
-            // Gutter separator
-            s.push(Span::styled("\u{2502} ", Style::default().fg(theme::md_code_border()).bg(theme::bg_code())));
-
-            // Highlighted code
+            let mut s: Vec<Span<'static>> = Vec::with_capacity(regions.len() + 1);
+            // Subtle 2-space indent groups the block visually without borders.
+            s.push(Span::raw("  "));
             for (style, text) in regions {
                 let fg = Color::Rgb(style.foreground.r, style.foreground.g, style.foreground.b);
-                s.push(Span::styled(text.to_string(), Style::default().fg(fg).bg(theme::bg_code())));
+                s.push(Span::styled(text.to_string(), Style::default().fg(fg)));
             }
-
-            // Pad right side with background
-            s.push(Span::styled("  ", Style::default().bg(theme::bg_code())));
             Line::from(s)
         }).collect()
     }
@@ -360,7 +334,10 @@ fn flush(lines: &mut Vec<Line<'static>>, spans: &mut Vec<Span<'static>>) {
 fn render_table(lines: &mut Vec<Line<'static>>, header: &[String], rows: &[Vec<String>]) {
     if header.is_empty() { return; }
     let cols = header.len();
-    let border = Style::default().fg(theme::border());
+    // Border at text_primary brightness — the box drawing chars read as structural
+    // furniture, so they need to be as visible as the cell text itself. Anything dimmer
+    // makes the table "recede into the background".
+    let border = Style::default().fg(theme::text_primary());
     let hdr_style = Style::default().fg(theme::text_primary()).add_modifier(Modifier::BOLD);
     let cell_style = Style::default().fg(theme::text_secondary());
 
@@ -538,9 +515,12 @@ mod tests {
     fn test_code_block() {
         let md = "```rust\nfn main() {}\n```";
         let lines = render_markdown(md);
-        assert!(lines.len() >= 2);
-        let has_lang = lines.iter().any(|l| l.spans.iter().any(|s| s.content.contains("rust")));
-        assert!(has_lang);
+        // CC-style minimal rendering: no language label, no borders — just the highlighted code.
+        assert!(!lines.is_empty());
+        let joined: String = lines.iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect();
+        assert!(joined.contains("fn") && joined.contains("main"));
     }
 
     #[test]

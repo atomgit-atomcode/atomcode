@@ -197,6 +197,10 @@ _ = cancel.cancelled() => {
                         }
                         Some(Ok(StreamEvent::ToolCallStart { id, name })) => {
                             got_any_event = true;
+                            // Surface the tool name to UI immediately — otherwise users see
+                            // "Generating…" for the entire args-streaming window (can be 30s+
+                            // for large write_file calls).
+                            let _ = event_tx.send(TurnEvent::ToolCallStreaming { name: name.clone() });
                             conversation.tool_call_buffer = Some(ToolCallBuffer {
                                 id,
                                 name,
@@ -214,6 +218,7 @@ _ = cancel.cancelled() => {
                         Some(Ok(StreamEvent::ToolCallDone(call))) => {
                             conversation.tool_call_buffer = None;
                             let _ = event_tx.send(TurnEvent::ToolCallStarted {
+                                id: call.id.clone(),
                                 name: call.name.clone(),
                                 arguments: call.arguments.clone(),
                             });
@@ -314,6 +319,7 @@ _ = cancel.cancelled() => {
                         success: false,
                     };
                     let _ = event_tx.send(TurnEvent::ToolCallResult {
+                        call_id: call.id.clone(),
                         name: call.name.clone(),
                         output: result.output.clone(),
                         success: false,
@@ -331,6 +337,7 @@ _ = cancel.cancelled() => {
                     success: true,
                 };
                 let _ = event_tx.send(TurnEvent::ToolCallResult {
+                    call_id: call.id.clone(),
                     name: call.name.clone(),
                     output: result.output.clone(),
                     success: true,
@@ -471,6 +478,7 @@ _ = cancel.cancelled() => {
                     call.name, available, hint
                 );
                 let _ = event_tx.send(TurnEvent::ToolCallResult {
+                    call_id: call.id.clone(),
                     name: call.name.clone(),
                     output: output.clone(),
                     success: false,
@@ -504,6 +512,7 @@ _ = cancel.cancelled() => {
             if !matches!(decision, PermissionDecision::Allow) {
                 let output = format!("Tool '{}' was denied by the user.", call.name);
                 let _ = event_tx.send(TurnEvent::ToolCallResult {
+                    call_id: call.id.clone(),
                     name: call.name.clone(),
                     output: output.clone(),
                     success: false,
@@ -535,6 +544,7 @@ _ = cancel.cancelled() => {
         };
 
         let _ = event_tx.send(TurnEvent::ToolCallResult {
+            call_id: call.id.clone(),
             name: call.name.clone(),
             output: tool_result.output.clone(),
             success: tool_result.success,

@@ -193,6 +193,11 @@ pub struct App {
     pub current_tool_call_count: usize,
     /// Cached tool info string for ToolExecuting mode (avoid per-frame JSON parse).
     pub executing_tool_info: String,
+    /// Tool name the LLM is currently streaming (name known, args still arriving).
+    /// Cleared when ToolCallStarted fires (args fully assembled) or turn ends.
+    /// Used by the spinner label so users see "⠋ Preparing write_file…" instead of
+    /// an opaque "Generating…" during multi-second tool-call arg streams.
+    pub streaming_tool_name: Option<String>,
     /// Estimated token counts for the current session.
     pub total_tokens: usize,
     /// Tokens used in the current turn.
@@ -302,6 +307,7 @@ impl App {
            current_step_count: 0,
            current_tool_call_count: 0,
            executing_tool_info: String::new(),
+           streaming_tool_name: None,
            turn_start: None,
            first_token_ms: None,
            llm_call_start: None,
@@ -611,7 +617,20 @@ impl App {
                 }
                 self.conversation.push_delta(&text);
             }
-            AgentEvent::ToolCallStarted { name, arguments } => {
+            AgentEvent::ToolCallStreaming { name } => {
+                // Tool name known, args still streaming. Show it in the spinner label
+                // so the user isn't staring at "Generating…" for the whole args window.
+                // Track TTFT here too — a tool call is a first-token signal just like text.
+                if self.first_token_ms.is_none() {
+                    if let Some(start) = self.llm_call_start {
+                        self.first_token_ms = Some(start.elapsed().as_millis() as u64);
+                    }
+                }
+                self.streaming_tool_name = Some(name);
+            }
+            AgentEvent::ToolCallStarted { id, name, arguments } => {
+                // Args fully assembled — streaming phase done.
+                self.streaming_tool_name = None;
                 self.current_tool_call_count += 1;
                 // Track TTFT — tool call is also a "first token" from the LLM
                 if self.first_token_ms.is_none() {
@@ -632,8 +651,11 @@ impl App {
                     self.conversation.push_delta("\n\n---\n*[continuing...]*\n");
                 }
                 self.turn_log.log_tool_call(&name, &arguments);
+                // Use the provider's real call id so ToolCallResult can pair with this
+                // specific tool call — regardless of timing (PhaseChange(Thinking) bumping
+                // step_count between start and result, or parallel tool calls sharing a step).
                 let call = ToolCall {
-                    id: format!("call_{}", self.current_step_count),
+                    id: id.clone(),
                     name: name.clone(),
                     arguments: arguments.clone(),
                 };
@@ -644,19 +666,16 @@ impl App {
                 self.tool_start = Some(Instant::now());
                 self.at_bottom = true;
             }
-            AgentEvent::ToolCallStreaming { name: _ } => {
-                // Tool call name arrived while streaming — no action needed,
-                // full ToolCallStarted with arguments follows shortly.
-            }
-            AgentEvent::ToolCallResult { name, output, success, duration: _ } => {
+            AgentEvent::ToolCallResult { call_id, name, output, success, duration: _ } => {
                 // Format a short result summary for spinner display
                 let icon = if success { "\u{2713}" } else { "\u{2717}" };
                 let first_line = output.lines().next().unwrap_or("").chars().take(40).collect::<String>();
                 self.last_completed_tool = format!("{} {} {}", icon, name, first_line);
                 self.turn_log.log_tool_result(&output, success);
-                // Add result to conversation mirror so it renders in the UI
+                // Use the same call_id the agent recorded on ToolCallStarted so chat_panel's
+                // "in-flight tool call" detection (call.id ∈ completed_call_ids) matches.
                 self.conversation.add_tool_result(ToolResult {
-                    call_id: format!("call_{}", self.current_step_count),
+                    call_id,
                     output,
                     success,
                 });
@@ -702,6 +721,8 @@ impl App {
                 }
             }
             AgentEvent::TurnComplete { duration, total_tokens: _, turn_count: _, tool_call_count, stop_reason: _ } => {
+                // Clear any lingering streaming tool state — turn is over.
+                self.streaming_tool_name = None;
                 // Finalize stream FIRST so auto-summary TextDelta becomes a message
                 self.conversation.finalize_stream();
                 // Then log the final assistant text
@@ -769,6 +790,7 @@ impl App {
                 }
             }
             AgentEvent::Error(e) => {
+                self.streaming_tool_name = None;
                 self.turn_log.log_error(&e);
                 self.turn_log.end_turn(self.turn_tokens, 0);
                 self.conversation.push_delta(&format!("\n\n[Error: {}]", e));

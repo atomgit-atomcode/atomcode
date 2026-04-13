@@ -3,10 +3,36 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crossterm::event::{Event, KeyEvent, MouseEvent, poll};
-use crossterm::execute;
-use crossterm::event::EnableMouseCapture;
-use std::io::{self};
+use std::io::{self, Write};
 use tokio::sync::mpsc;
+
+/// Enable only mouse button reporting (click + wheel) WITHOUT drag-motion tracking.
+///
+/// This is NOT what `crossterm::EnableMouseCapture` does — that enables 1000+1002+1015+1006
+/// which also captures drag, breaking the terminal's native click-drag text selection.
+///
+/// We enable:
+///  - `?1000h` — X11 mouse reporting (button press/release, scroll wheel as button 64/65)
+///  - `?1006h` — SGR extended coordinate encoding (supports >223 columns)
+///
+/// We deliberately OMIT `?1002h` (button-event tracking / drag motion). Most modern
+/// terminals then leave click-drag alone for native text selection while still reporting
+/// wheel + click events to us. See TUI docs.
+const ENABLE_MOUSE_SCROLL_ONLY: &str = "\x1B[?1000h\x1B[?1006h";
+const DISABLE_MOUSE_SCROLL_ONLY: &str = "\x1B[?1006l\x1B[?1000l";
+
+fn enable_mouse_scroll_only() {
+    let mut stdout = io::stdout();
+    let _ = stdout.write_all(ENABLE_MOUSE_SCROLL_ONLY.as_bytes());
+    let _ = stdout.flush();
+}
+
+#[allow(dead_code)]
+pub fn disable_mouse_scroll_only() {
+    let mut stdout = io::stdout();
+    let _ = stdout.write_all(DISABLE_MOUSE_SCROLL_ONLY.as_bytes());
+    let _ = stdout.flush();
+}
 
 #[derive(Debug)]
 pub enum AppEvent {
@@ -49,8 +75,9 @@ impl EventLoop {
         // Reset stop flag
         self.stop_flag.store(false, Ordering::SeqCst);
 
-        // Enable mouse capture at startup (stays enabled forever)
-        let _ = execute!(io::stdout(), EnableMouseCapture);
+        // Enable scroll-only mouse reporting (mode 1000 + 1006, no 1002 drag tracking).
+        // Goal: get wheel scroll events in-app while preserving native click-drag selection.
+        enable_mouse_scroll_only();
 
         // Start keyboard/mouse reader in a dedicated thread (not tokio task)
         // This gives us more control over the input stream

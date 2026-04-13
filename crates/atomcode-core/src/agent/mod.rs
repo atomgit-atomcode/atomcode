@@ -104,12 +104,16 @@ pub enum AgentEvent {
     /// immediately instead of waiting for the full args.
     ToolCallStreaming { name: String },
     /// A tool call is about to execute (for display).
+    /// `id` pairs with `ToolCallResult.call_id` so the UI can match start→result
+    /// across parallel or interleaved calls without reconstructing ids from counters.
     ToolCallStarted {
+        id: String,
         name: String,
         arguments: String,
     },
     /// A tool call completed with a result.
     ToolCallResult {
+        call_id: String,
         name: String,
         output: String,
         success: bool,
@@ -978,7 +982,7 @@ impl AgentLoop {
                                     datalog_text_accum.push_str(&text);
                                     let _ = event_tx.send(AgentEvent::TextDelta(text));
                                 }
-                                TurnEvent::ToolCallStarted { ref name, ref arguments } => {
+                                TurnEvent::ToolCallStarted { ref id, ref name, ref arguments } => {
                                     // Forward tool name immediately for UI spinner
                                     let _ = event_tx.send(AgentEvent::ToolCallStreaming { name: name.clone() });
                                     // Flush accumulated model text to datalog before logging tool call accumulated model text to datalog before logging tool call
@@ -1020,9 +1024,9 @@ impl AgentLoop {
                                         }
                                     }
 
-                                    let _ = event_tx.send(AgentEvent::ToolCallStarted { name: name.clone(), arguments: arguments.clone() });
+                                    let _ = event_tx.send(AgentEvent::ToolCallStarted { id: id.clone(), name: name.clone(), arguments: arguments.clone() });
                                 }
-                                TurnEvent::ToolCallResult { name, output, success, duration } => {
+                                TurnEvent::ToolCallResult { call_id, name, output, success, duration } => {
                                     // Track files for discipline
                                     if let Some(pos) = output.find("Edited ") {
                                         let rest = &output[pos + 7..];
@@ -1077,7 +1081,7 @@ impl AgentLoop {
                                     }
                                     datalog.log_tool_result(&output, success);
                                     let _ = event_tx.send(AgentEvent::ToolCallResult {
-                                        name, output, success, duration,
+                                        call_id, name, output, success, duration,
                                     });
                                 }
                                 TurnEvent::TokenUsage { prompt_tokens, completion_tokens, total_tokens: _, cached_tokens } => {

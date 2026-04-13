@@ -19,6 +19,20 @@ use ratatui::Frame;
 
 use crate::app::{App, TextSelection};
 
+/// Convert snake_case tool name to "Snake Case" for display.
+fn format_tool_display_name(name: &str) -> String {
+    name.split('_')
+        .map(|w| {
+            let mut c = w.chars();
+            match c.next() {
+                None => String::new(),
+                Some(f) => f.to_uppercase().to_string() + c.as_str(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 // Note: render takes &mut App to update render cache. This is fine since
 // render is the only place that reads the cache, called from the main loop.
 
@@ -86,11 +100,23 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         let turn_elapsed = app.turn_start.map(|t| t.elapsed().as_secs());
         let turn_seed = app.conversation.messages.len();
         let llm_wait_ms = app.llm_call_start.map(|s| s.elapsed().as_millis() as u64);
+        // Fallback: when ToolCallStreaming has fired but ToolCallStarted hasn't yet,
+        // the args are still arriving. Show the tool name in the spinner label so the
+        // UI reacts the moment streaming starts.
+        let streaming_label;
+        let tool_info_ref: &str = if !app.executing_tool_info.is_empty() {
+            &app.executing_tool_info
+        } else if let Some(ref name) = app.streaming_tool_name {
+            streaming_label = format!("Preparing {}\u{2026}", format_tool_display_name(name));
+            &streaming_label
+        } else {
+            ""
+        };
         let (total_lines, rendered_scroll) = chat_panel::render(
             frame, chunks[1], &app.conversation,
             app.scroll_offset, app.at_bottom, &app.mode, app.tick_count,
             app.turn_tokens, turn_elapsed, turn_seed,
-            app.current_step_count, &app.executing_tool_info,
+            app.current_step_count, tool_info_ref,
             app.first_token_ms, llm_wait_ms, &app.last_completed_tool,
             app.last_turn_duration, app.current_step_count,
             &mut app.render_cache, &mut app.render_cache_msg_count,
