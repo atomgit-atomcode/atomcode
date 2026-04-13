@@ -639,11 +639,6 @@ impl App {
                     if !text.is_empty() {
                     }
                 }
-                // If model produced text before tool calls (looks like a premature summary),
-                // append a visual separator so the user knows more work is coming.
-                if self.conversation.stream_buffer.as_ref().map_or(false, |b| b.len() > 50) {
-                    self.conversation.push_delta("\n\n---\n*[continuing...]*\n");
-                }
                 // Use the provider's real call id so ToolCallResult can pair with this
                 // specific tool call — regardless of timing (PhaseChange(Thinking) bumping
                 // step_count between start and result, or parallel tool calls sharing a step).
