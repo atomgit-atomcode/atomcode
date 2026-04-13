@@ -99,6 +99,10 @@ impl TurnStopReason {
 pub enum AgentEvent {
     /// LLM text delta (streaming).
     TextDelta(String),
+    /// LLM has started emitting a tool call — only the name is known so far,
+    /// arguments are still streaming. UI uses this to display the tool name
+    /// immediately instead of waiting for the full args.
+    ToolCallStreaming { name: String },
     /// A tool call is about to execute (for display).
     ToolCallStarted {
         name: String,
@@ -974,6 +978,11 @@ impl AgentLoop {
                                     datalog_text_accum.push_str(&text);
                                     let _ = event_tx.send(AgentEvent::TextDelta(text));
                                 }
+                                TurnEvent::ToolCallStreaming { name } => {
+                                    // Pass through so the UI can show the tool name the
+                                    // moment streaming begins — without waiting for args.
+                                    let _ = event_tx.send(AgentEvent::ToolCallStreaming { name });
+                                }
                                 TurnEvent::ToolCallStarted { ref name, ref arguments } => {
                                     // Flush accumulated model text to datalog before logging tool call
                                     if !datalog_text_accum.is_empty() {
@@ -1434,8 +1443,9 @@ impl AgentLoop {
                     //     self.check_vue_partial_edit().await;
                     // }
 
-                    // Apply discipline: inject reminders, check step limits
+                    // Apply discipline: inject status reminders (no STOP commands).
                     self.apply_post_turn_discipline();
+                    // Safety cap at 200 tool calls — only for runaway cost protection.
                     if self.check_step_limit() {
                         self.finish_turn(TurnStopReason::StepLimit);
                         return;

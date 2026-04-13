@@ -24,38 +24,21 @@ impl AgentLoop {
                 self.files_edited_this_turn.join(", ")
             };
 
-            let urgency = if !self.files_edited_this_turn.is_empty() && self.build_fail_count == 0 {
-                "You have edited files. If not verified yet, run ONE quick check \
-                 (build, test, or run). Then summarize what you changed and STOP. \
-                 Do NOT explore unrelated files or start servers."
-            } else if self.files_edited_this_turn.is_empty() && self.tool_call_count >= 20 {
-                "GUIDANCE: 20+ steps without editing. Consider one of:\n\
-                 1. DESIGN question → explain analysis and propose options.\n\
-                 2. BUG → state hypothesis and edit the suspected file.\n\
-                 3. STUCK → tell the user what is unclear."
-            } else if self.tool_call_count >= 15 {
-                "REMINDER: 15+ steps used. Prioritize taking action: edit code or explain findings."
-            } else if self.files_edited_this_turn.is_empty() && self.tool_call_count >= 10 {
-                "REMINDER: 10+ steps without edits. Consider acting: edit_file, bash, or explain to user."
-            } else if self.files_edited_this_turn.is_empty() {
-                "Focus on the task."
-            } else {
-                "Focus on the task."
-            };
+            // Pure status — no STOP commands, no urgency. Model decides when to finish.
+            let urgency = "Continue working on the task.";
 
             let sibling_hint = String::new();
 
             let reminder = format!(
                 "\n\n<system-reminder>\n\
                  TASK: \"{}\"\n\
-                 STEP: {}/{}\n\
+                 STEP: {}\n\
                  FILES READ: {}\n\
                  FILES EDITED: {}\n\
                  {}\n\
                  {}\
                  </system-reminder>",
                 task_hint, self.tool_call_count,
-                25 + self.files_edited_this_turn.len() * 5,
                 read_list, edit_list, urgency, sibling_hint
             );
 
@@ -228,11 +211,10 @@ impl AgentLoop {
     }
 
     /// Check if step limit has been reached.
-    /// Base limit is 50. Each edited/created file adds 5. Hard cap at 100.
+    /// No hard limit — model decides when to stop. Only a safety cap at 200
+    /// to prevent runaway API costs from infinite loops.
     pub(crate) fn check_step_limit(&self) -> bool {
-        let dynamic_limit = 50 + (5 * self.files_edited_this_turn.len());
-        let hard_limit = dynamic_limit.min(100);
-        self.tool_call_count >= hard_limit
+        self.tool_call_count >= 200
     }
 
     /// Check if the turn budget (AgentLoop.max_turns) has been reached.
