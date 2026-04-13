@@ -341,14 +341,37 @@ fn render_table(lines: &mut Vec<Line<'static>>, header: &[String], rows: &[Vec<S
     let hdr_style = Style::default().fg(theme::text_primary()).add_modifier(Modifier::BOLD);
     let cell_style = Style::default().fg(theme::text_secondary());
 
-    // Column widths: content + 2 padding each side
-    let mut widths: Vec<usize> = header.iter().map(|h| display_width_str(h)).collect();
+    // Column widths: content + 2 padding, capped to prevent terminal overflow.
+    // Max 40 chars per column — long content is truncated with "…".
+    const MAX_COL_WIDTH: usize = 40;
+    let mut widths: Vec<usize> = header.iter().map(|h| display_width_str(h).min(MAX_COL_WIDTH)).collect();
     for row in rows {
         for (i, cell) in row.iter().enumerate() {
-            if i < widths.len() { widths[i] = widths[i].max(display_width_str(cell)); }
+            if i < widths.len() {
+                widths[i] = widths[i].max(display_width_str(cell).min(MAX_COL_WIDTH));
+            }
         }
     }
     let widths: Vec<usize> = widths.iter().map(|w| w + 2).collect();
+
+    // Helper: truncate cell text to fit column width
+    let truncate_cell = |text: &str, max_w: usize| -> String {
+        let dw = display_width_str(text);
+        if dw <= max_w {
+            text.to_string()
+        } else {
+            let mut result = String::new();
+            let mut w = 0;
+            for c in text.chars() {
+                let cw = if (c as u32) >= 0x4E00 { 2 } else { 1 };
+                if w + cw > max_w.saturating_sub(1) { break; }
+                result.push(c);
+                w += cw;
+            }
+            result.push('…');
+            result
+        }
+    };
 
     lines.push(Line::default());
 
@@ -364,8 +387,9 @@ fn render_table(lines: &mut Vec<Line<'static>>, header: &[String], rows: &[Vec<S
     let mut h: Vec<Span<'static>> = vec![Span::styled("  \u{2502}", border)];
     for (i, hdr) in header.iter().enumerate() {
         let w = widths.get(i).copied().unwrap_or(4);
-        let pad = w.saturating_sub(display_width_str(hdr) + 1);
-        h.push(Span::styled(format!(" {}{}", hdr, " ".repeat(pad)), hdr_style));
+        let display = truncate_cell(hdr, w.saturating_sub(2));
+        let pad = w.saturating_sub(display_width_str(&display) + 1);
+        h.push(Span::styled(format!(" {}{}", display, " ".repeat(pad)), hdr_style));
         h.push(Span::styled("\u{2502}", border));
     }
     lines.push(Line::from(h));
@@ -384,8 +408,9 @@ fn render_table(lines: &mut Vec<Line<'static>>, header: &[String], rows: &[Vec<S
         for i in 0..cols {
             let cell = row.get(i).map(|s| s.as_str()).unwrap_or("");
             let w = widths.get(i).copied().unwrap_or(4);
-            let pad = w.saturating_sub(display_width_str(cell) + 1);
-            r.push(Span::styled(format!(" {}{}", cell, " ".repeat(pad)), cell_style));
+            let display = truncate_cell(cell, w.saturating_sub(2));
+            let pad = w.saturating_sub(display_width_str(&display) + 1);
+            r.push(Span::styled(format!(" {}{}", display, " ".repeat(pad)), cell_style));
             r.push(Span::styled("\u{2502}", border));
         }
         lines.push(Line::from(r));
