@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -10,6 +10,18 @@ use tokio::process::Command;
 use super::{ApprovalRequirement, Tool, ToolContext, ToolDef, ToolResult};
 
 pub struct BashTool;
+
+/// Default overall timeout for bash commands. Bumped from 30→60 so common long
+/// commands (cargo build cold, mvn download, npm install, git clone) don't need
+/// the model to remember to pass `timeout`. Still capped at 300s in execute().
+const DEFAULT_TIMEOUT_SECS: u64 = 60;
+
+/// How long a process can be silent (no new stdout/stderr) AFTER having emitted
+/// something, before we kill it. Bumped from 30→90 to tolerate legitimate silent
+/// phases (file lock waits, dependency downloads, linker blocking, large file
+/// reads). This is NOT tool- or language-specific — any process with these
+/// patterns benefits. Tradeoff: genuine deadlocks wait 60s longer than before.
+const SILENT_KILL_SECS: u64 = 90;
 
 /// Deserialize a u64 that may arrive as a JSON string (weak models often quote integers).
 fn deserialize_lenient_u64<'de, D>(deserializer: D) -> std::result::Result<Option<u64>, D::Error>
@@ -59,12 +71,12 @@ impl Tool for BashTool {
             description: "Execute a shell command. Use for: build, test, git, install deps.\n\
                 Do NOT use for: reading files (use read_file), searching (use grep), editing (use edit_file).\n\
                 Do NOT start servers or long-running processes — the user manages those.\n\
-                Default timeout: 30s. Destructive commands require user confirmation.".to_string(),
+                Default timeout: 60s. Destructive commands require user confirmation.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "command": { "type": "string", "description": "The bash command to execute" },
-                    "timeout": { "type": "integer", "description": "Max wait seconds (default 30)" }
+                    "timeout": { "type": "integer", "description": "Max wait seconds (default 60, max 300)" }
                 },
                 "required": ["command"]
             }),
@@ -102,7 +114,8 @@ async fn bash_execute(args: &str, ctx: &ToolContext) -> Result<ToolResult> {
         // Strip model-added tail/head pipes — framework's truncation handles output length.
         parsed.command = strip_output_pipes(&parsed.command);
         // Cap timeout: model may request absurdly large values. Max 5 min.
-        let timeout_secs = parsed.timeout.unwrap_or(30).min(300);
+        let timeout_secs = parsed.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS).min(300);
+        let start_instant = Instant::now();
 
         let wd = ctx.working_dir.read().await.clone();
 
@@ -131,9 +144,12 @@ async fn bash_execute(args: &str, ctx: &ToolContext) -> Result<ToolResult> {
         let mut stderr_buf = Vec::new();
 
         // Wait for process to finish or timeout. Read stdout/stderr concurrently.
-        // Idle detection: if output stops for 30s after having produced some output,
-        // the command is likely stuck. Kill it early instead of waiting for the full timeout.
-        let idle_timeout = Duration::from_secs(30);
+        // Idle detection: if output stops for SILENT_KILL_SECS after having produced
+        // some output, assume the command is truly stuck. This threshold needs to
+        // tolerate legitimate silent phases common across many tools/languages
+        // (build cache scan, dep lock waits, dep downloads, large file I/O, linking,
+        // compiler type-check pass, etc.) — none of which emit progress to stdout.
+        let idle_timeout = Duration::from_secs(SILENT_KILL_SECS);
         let has_any_output = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let has_out_1 = has_any_output.clone();
         let has_out_2 = has_any_output.clone();
@@ -195,6 +211,12 @@ async fn bash_execute(args: &str, ctx: &ToolContext) -> Result<ToolResult> {
         let has_background = parsed.command.contains(" &");
         let has_pkill = parsed.command.contains("pkill");
 
+        // Total elapsed wall-clock — appended to every result so the agent can
+        // judge "slow but succeeded" vs "stalled/hung" without any per-tool
+        // pattern matching. Purely numeric, tech-neutral.
+        let elapsed_secs = start_instant.elapsed().as_secs_f64();
+        let elapsed_marker = format!("[elapsed: {:.1}s]", elapsed_secs);
+
         match result {
             Ok(Some(success)) => {
                 let mut combined = format_output(&stdout_str, &stderr_str);
@@ -204,26 +226,43 @@ async fn bash_execute(args: &str, ctx: &ToolContext) -> Result<ToolResult> {
                 if !effective_success && !combined.is_empty() {
                     combined.push_str("\n\n[IMPORTANT: Command failed. Read the error above and fix the root cause. Do NOT retry the same command.]");
                 }
-                Ok(ToolResult { call_id: String::new(), output: combined, success: effective_success })
+                // Prepend elapsed so it's visible even when output is truncated later
+                let output = if combined.is_empty() {
+                    elapsed_marker
+                } else {
+                    format!("{}\n{}", elapsed_marker, combined)
+                };
+                Ok(ToolResult { call_id: String::new(), output, success: effective_success })
             }
             Ok(None) => {
-                // Process still running but output stopped for 30s = stuck. Kill it.
+                // Process still running but output stopped for SILENT_KILL_SECS = likely stuck.
+                // Kill it. Include elapsed time so agent can tell slow-work vs deadlock.
                 let _ = child.kill().await;
                 let combined = format_output(&stdout_str, &stderr_str);
-                if combined.is_empty() {
-                    Ok(ToolResult { call_id: String::new(), output: "Command produced no output and was killed after 30s idle. Try a different approach.".to_string(), success: false })
+                let output = if combined.is_empty() {
+                    format!(
+                        "{} [killed: no output for {}s — treat as stuck, don't retry the same command]",
+                        elapsed_marker, SILENT_KILL_SECS
+                    )
                 } else {
-                    Ok(ToolResult { call_id: String::new(), output: format!("{}\n\n[Command stalled — no output for 30s. Killed. Output above is partial.]", combined), success: false })
-                }
+                    format!(
+                        "{}\n{}\n\n[killed: no new output for {}s — output above is partial]",
+                        elapsed_marker, combined, SILENT_KILL_SECS
+                    )
+                };
+                Ok(ToolResult { call_id: String::new(), output, success: false })
             }
             Err(_) => {
                 // Hard timeout — kill it
                 let _ = child.kill().await;
                 let combined = format_output(&stdout_str, &stderr_str);
                 let output = if combined.is_empty() {
-                    format!("Timed out after {}s with no output.", timeout_secs)
+                    format!("{} [timed out after {}s with no output]", elapsed_marker, timeout_secs)
                 } else {
-                    format!("{}\n\n[Timed out after {}s, process killed]", combined, timeout_secs)
+                    format!(
+                        "{}\n{}\n\n[timed out after {}s — consider passing a larger `timeout` if this command legitimately takes longer]",
+                        elapsed_marker, combined, timeout_secs
+                    )
                 };
                 Ok(ToolResult { call_id: String::new(), output, success: false })
             }
