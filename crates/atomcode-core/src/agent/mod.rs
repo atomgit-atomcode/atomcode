@@ -735,6 +735,13 @@ impl AgentLoop {
         self.last_known_files = 0;
         self.last_targeted_reads = 0;
         self.targeted_read_count = 0;
+        // Reset subtask driver and plan — previous turn's plan must not
+        // bleed into the new turn. Without this, a text-only Q&A response
+        // that mentions file names (e.g. as examples) triggers extract_from_plan,
+        // and the plan completion guard then forces the loop to continue
+        // editing files that were never part of the user's actual request.
+        self.subtask_driver = subtask_driver::SubtaskDriver::new();
+        self.plan_text = None;
         // Clear session_files on each new user message.
         // Working Set only tracks files from the CURRENT task.
         self.session_files.clear();
@@ -1212,7 +1219,17 @@ impl AgentLoop {
                     // ATLAS subtask extraction: if model just output a plan (FeatureDev,
                     // first response with text, no tools used yet), extract subtasks
                     // and drive execution file-by-file.
+                    //
+                    // Guard: only extract when the model was truncated (it wanted to
+                    // continue but hit max_tokens). A Natural stop means the model
+                    // considers its response complete — it may be answering a question,
+                    // discussing design, or giving examples that mention file names.
+                    // Extracting subtasks from such text produces phantom plans
+                    // (e.g. "auth.rs" mentioned as an example gets treated as an
+                    // edit target, and plan-completion-guard then forces the loop
+                    // to keep running).
                     if self.tool_call_count == 0
+                        && truncated
                         && !text.trim().is_empty()
                         && !self.subtask_driver.active
                     {
