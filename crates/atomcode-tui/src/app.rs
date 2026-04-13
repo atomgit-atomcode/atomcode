@@ -679,6 +679,11 @@ impl App {
                     output,
                     success,
                 });
+                // Clear the tool-info label so the spinner doesn't keep flashing
+                // "Edit File: xxx" while the LLM is streaming its follow-up text.
+                // Without this the label stays stale until the next tool call overwrites
+                // it — users see "edit done but spinner still says edit" (2026-04-13 bug).
+                self.executing_tool_info.clear();
                 self.render_cache_msg_count = 0;
                 self.at_bottom = true;
             }
@@ -723,6 +728,7 @@ impl App {
             AgentEvent::TurnComplete { duration, total_tokens: _, turn_count: _, tool_call_count, stop_reason: _ } => {
                 // Clear any lingering streaming tool state — turn is over.
                 self.streaming_tool_name = None;
+                self.executing_tool_info.clear();
                 // Finalize stream FIRST so auto-summary TextDelta becomes a message
                 self.conversation.finalize_stream();
                 // Then log the final assistant text
@@ -791,6 +797,7 @@ impl App {
             }
             AgentEvent::Error(e) => {
                 self.streaming_tool_name = None;
+                self.executing_tool_info.clear();
                 self.turn_log.log_error(&e);
                 self.turn_log.end_turn(self.turn_tokens, 0);
                 self.conversation.push_delta(&format!("\n\n[Error: {}]", e));

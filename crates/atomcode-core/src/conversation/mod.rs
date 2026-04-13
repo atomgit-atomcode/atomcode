@@ -377,10 +377,25 @@ impl Conversation {
             result.extend(self.messages[survived_start..].iter().cloned());
         }
 
-        // ── ABSOLUTE FLOOR: if all compaction/cleanup somehow left only system messages,
-        //    graft back the last user message so the LLM has *something* to respond to.
-        //    Losing all message history silently is strictly worse than any alternative —
-        //    even "just user message" beats "blind re-search loop".
+        // Microcompact: condense old turn ToolResults to one-liners.
+        // Recent 5 turns keep full fidelity. Older turns' large tool results
+        // (read_file full content, bash output) are replaced with compact summaries.
+        // This reduces context growth without LLM calls.
+        // View replacement runs AFTER microcompact — edited files stay fresh.
+        Self::microcompact(&mut result, &self.turn_tracker.turns, self.messages.len());
+
+        Self::replace_stale_reads(&mut result);
+        Self::clean_message_pipeline(&mut result);
+
+        // ── ABSOLUTE FLOOR (runs AFTER all cleanup, right before sent_tokens calc) ──
+        // If compaction + cleanup somehow left us with only system messages, graft back
+        // the last user message so the LLM has *something* to respond to. This is the
+        // strictest possible invariant: whenever self.messages is non-empty, the result
+        // must contain at least one non-system message.
+        //
+        // Placement matters: previously this ran BEFORE clean_message_pipeline, which
+        // could theoretically strip the graft (step 1 removes empty assistants, but not
+        // user text — still, defense in depth says put the floor last).
         let non_system_count = result.iter().filter(|m| !matches!(m.role, Role::System)).count();
         if non_system_count == 0 {
             if let Some(last_user) = self.messages.iter().rev()
@@ -393,16 +408,6 @@ impl Conversation {
                 result.push(last_user.clone());
             }
         }
-
-        // Microcompact: condense old turn ToolResults to one-liners.
-        // Recent 5 turns keep full fidelity. Older turns' large tool results
-        // (read_file full content, bash output) are replaced with compact summaries.
-        // This reduces context growth without LLM calls.
-        // View replacement runs AFTER microcompact — edited files stay fresh.
-        Self::microcompact(&mut result, &self.turn_tracker.turns, self.messages.len());
-
-        Self::replace_stale_reads(&mut result);
-        Self::clean_message_pipeline(&mut result);
 
         let sent_tokens: usize = result.iter().map(|m| m.estimate_tokens()).sum::<usize>()
             .saturating_sub(system_tokens);
