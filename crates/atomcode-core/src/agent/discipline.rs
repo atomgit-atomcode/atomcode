@@ -24,10 +24,13 @@ impl AgentLoop {
                 self.files_edited_this_turn.join(", ")
             };
 
-            // Status + gentle finish signal. No forced STOP, but remind model
-            // that finishing is an option when the task is done.
-            let urgency = if !self.files_edited_this_turn.is_empty() {
-                "If the task is complete and verified, summarize and finish."
+            // GLM-5 needs explicit finish signals — it won't self-terminate like Opus.
+            // After edits: tell it to verify then stop. Before edits: let it work.
+            let urgency = if !self.files_edited_this_turn.is_empty() && self.tool_call_count >= 8 {
+                "You have made edits. Verify with ONE check (build/test/run), \
+                 then summarize what you changed and STOP."
+            } else if self.files_edited_this_turn.is_empty() && self.tool_call_count >= 30 {
+                "30+ steps without edits. Either edit now or explain your findings and STOP."
             } else {
                 "Continue working on the task."
             };
