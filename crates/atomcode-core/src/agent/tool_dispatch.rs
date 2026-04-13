@@ -1,4 +1,5 @@
 use super::*;
+use crate::conversation::message::MessageContent;
 
 impl AgentLoop {
     /// Forward a TurnEvent to the TUI as an AgentEvent.
@@ -124,7 +125,8 @@ impl AgentLoop {
         }
     }
 
-    /// Post-process tool results added by TurnRunner: truncate large outputs.
+    /// Post-process tool results added by TurnRunner: truncate large outputs,
+    /// then extract file paths from error output and pre-read them.
     pub(crate) fn post_process_tool_results(&mut self, tool_count: usize) {
         let context_window = self.config
             .providers
@@ -137,6 +139,57 @@ impl AgentLoop {
             &self.current_tool_name,
             context_window,
         );
+
+        // Error file pre-injection: when a bash command fails, extract file paths
+        // from the output and inject their content. This saves the model from
+        // manually reading files mentioned in error messages (e.g., rustc errors
+        // like "src/api.rs:42:5: error").
+        // Language-agnostic: just find paths that exist on disk.
+        if self.current_tool_name == "bash" {
+            let wd = self.turn_runner.context.working_dir
+                .try_read().map(|g| g.clone()).unwrap_or_default();
+
+            // Only for failed bash results
+            let len = self.conversation.messages.len();
+            let start = len.saturating_sub(tool_count);
+            let mut files_to_inject: Vec<(String, String)> = Vec::new();
+
+            for i in start..len {
+                if let MessageContent::ToolResult(ref r) = self.conversation.messages[i].content {
+                    if !r.success {
+                        // Extract file paths from error output
+                        let paths = extract_file_paths(&r.output, &wd);
+                        for path in paths.into_iter().take(3) {
+                            // Skip files already read this turn
+                            let short = path.strip_prefix(&wd)
+                                .map(|p| p.to_string_lossy().to_string())
+                                .unwrap_or_else(|_| path.to_string_lossy().to_string());
+                            if self.files_read_this_turn.iter().any(|f| f.contains(&short) || short.contains(f)) {
+                                continue;
+                            }
+                            if let Ok(content) = std::fs::read_to_string(&path) {
+                                let lines: Vec<&str> = content.lines().collect();
+                                let preview = if lines.len() > 50 {
+                                    format!("{}\n[... {} more lines]",
+                                        lines[..50].join("\n"), lines.len() - 50)
+                                } else {
+                                    content.clone()
+                                };
+                                files_to_inject.push((short, preview));
+                            }
+                        }
+                    }
+                }
+            }
+
+            if !files_to_inject.is_empty() {
+                let injection = files_to_inject.iter()
+                    .map(|(path, content)| format!("[Auto-read from error: {}]\n{}", path, content))
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
+                self.conversation.add_user_message(&injection);
+            }
+        }
     }
 
     #[allow(dead_code)]
@@ -425,4 +478,48 @@ pub(crate) fn normalize_bash_cmd(cmd: &str) -> String {
 
     // Collapse whitespace
     s.split_whitespace().collect::<Vec<&str>>().join(" ")
+}
+
+/// Extract file paths from error output. Language-agnostic: finds tokens
+/// that look like file paths (contain `/` or `\`, have a code extension)
+/// and checks if they exist on disk.
+fn extract_file_paths(output: &str, working_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut paths: Vec<std::path::PathBuf> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    let code_extensions = [
+        "rs", "py", "js", "ts", "tsx", "jsx", "java", "go", "c", "cpp", "h",
+        "vue", "svelte", "html", "css", "scss", "toml", "yaml", "yml", "json",
+    ];
+
+    for line in output.lines() {
+        // Split on common delimiters to find path-like tokens
+        for token in line.split(&[' ', ':', '"', '\'', '(', ')', ',', '='][..]) {
+            let token = token.trim();
+            if token.len() < 4 || token.len() > 300 { continue; }
+            if !token.contains('/') && !token.contains('\\') { continue; }
+
+            // Strip trailing :line:col (e.g., "src/main.rs:42:5" → "src/main.rs")
+            let path_str = token.split(':').next().unwrap_or(token);
+
+            // Check extension
+            let has_code_ext = code_extensions.iter()
+                .any(|ext| path_str.ends_with(&format!(".{}", ext)));
+            if !has_code_ext { continue; }
+
+            // Try as absolute path first, then relative to working dir
+            let path = std::path::Path::new(path_str);
+            let full_path = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                working_dir.join(path_str)
+            };
+
+            if full_path.is_file() && !seen.contains(&full_path) {
+                seen.insert(full_path.clone());
+                paths.push(full_path);
+            }
+        }
+    }
+    paths
 }

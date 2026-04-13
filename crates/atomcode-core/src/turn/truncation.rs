@@ -375,6 +375,10 @@ pub(crate) fn truncate_generic(result: &mut ToolResult, max_lines: usize, head: 
 
 /// Apply truncation to all tool result messages
 /// in the last `tool_count` messages of the conversation.
+///
+/// Two-pass: first per-result truncation, then per-turn budget enforcement.
+/// Per-turn budget = 1/4 of context window (max 16K chars). If all results
+/// in this turn exceed that, aggressively shrink the largest results.
 pub fn post_process_tool_results(
     messages: &mut Vec<Message>,
     tool_count: usize,
@@ -384,11 +388,45 @@ pub fn post_process_tool_results(
     let len = messages.len();
     let start = len.saturating_sub(tool_count);
 
+    // Pass 1: per-result truncation
     for i in start..len {
         if let MessageContent::ToolResult(ref r) = messages[i].content {
             let mut result = r.clone();
             truncate_output(&mut result, current_tool_name, context_window);
             messages[i].content = MessageContent::ToolResult(result);
+        }
+    }
+
+    // Pass 2: per-turn budget enforcement
+    // Total tool results in this turn shouldn't exceed 1/4 of context window.
+    let turn_budget = (context_window / 4).min(16_000).max(4_000);
+    let mut total_chars: usize = 0;
+    for i in start..len {
+        if let MessageContent::ToolResult(ref r) = messages[i].content {
+            total_chars += r.output.len();
+        }
+    }
+
+    if total_chars > turn_budget {
+        // Over budget — shrink each result proportionally
+        let ratio = turn_budget as f64 / total_chars as f64;
+        for i in start..len {
+            if let MessageContent::ToolResult(ref r) = messages[i].content {
+                let target = (r.output.len() as f64 * ratio) as usize;
+                if r.output.len() > target && target > 200 {
+                    let mut result = r.clone();
+                    let chars: Vec<char> = result.output.chars().collect();
+                    let head = target * 2 / 3;
+                    let tail = target / 3;
+                    let head_part: String = chars[..head.min(chars.len())].iter().collect();
+                    let tail_part: String = chars[chars.len().saturating_sub(tail)..].iter().collect();
+                    result.output = format!(
+                        "{}\n[... trimmed to fit turn budget ...]\n{}",
+                        head_part, tail_part,
+                    );
+                    messages[i].content = MessageContent::ToolResult(result);
+                }
+            }
         }
     }
 }

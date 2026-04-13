@@ -1612,6 +1612,29 @@ impl AgentLoop {
         }
 
         self.conversation.apply_compression(n_turns, summary);
+
+        // Post-compression task state restoration:
+        // After compression, the model loses track of what it was doing.
+        // Inject a brief status message so it can resume without re-exploring.
+        let mut state_parts: Vec<String> = Vec::new();
+        if !self.current_task.is_empty() {
+            let task_short: String = self.current_task.chars().take(200).collect();
+            state_parts.push(format!("TASK: {}", task_short));
+        }
+        if !self.files_edited_this_turn.is_empty() {
+            state_parts.push(format!("FILES EDITED: {}", self.files_edited_this_turn.join(", ")));
+        }
+        if !self.files_read_this_turn.is_empty() {
+            let recent: Vec<&str> = self.files_read_this_turn.iter()
+                .rev().take(5).map(|s| s.as_str()).collect();
+            state_parts.push(format!("RECENTLY READ: {}", recent.join(", ")));
+        }
+        if !state_parts.is_empty() {
+            self.conversation.add_user_message(&format!(
+                "[Context was compressed. Here is your current state:]\n{}",
+                state_parts.join("\n")
+            ));
+        }
     }
 
     #[allow(dead_code)]
