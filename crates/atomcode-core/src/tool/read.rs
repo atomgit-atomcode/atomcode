@@ -69,6 +69,31 @@ impl Tool for ReadFileTool {
         let parsed: ReadFileArgs = serde_json::from_str(args)?;
         let path = std::path::Path::new(&parsed.file_path);
 
+        // ── Read cache lookup ──
+        // If we've rendered this exact (path, offset, limit) before AND the file's
+        // on-disk mtime hasn't changed, return the previous output. Saves a disk
+        // read + UTF-8 check + skeleton generation (semantic analysis is the
+        // heaviest cost for large files). Edit/write tools change mtime → cache
+        // invalidates naturally. Tech-neutral: works for any language/file type.
+        let cache_key: crate::tool::ReadCacheKey = (
+            path.to_path_buf(),
+            parsed.offset,
+            parsed.limit,
+        );
+        let disk_mtime = tokio::fs::metadata(&parsed.file_path).await.ok()
+            .and_then(|m| m.modified().ok());
+        if let Some(mtime) = disk_mtime {
+            if let Some((cached_mtime, cached_output)) = ctx.read_cache.read().await.get(&cache_key).cloned() {
+                if cached_mtime == mtime {
+                    return Ok(ToolResult {
+                        call_id: String::new(),
+                        output: cached_output,
+                        success: true,
+                    });
+                }
+            }
+        }
+
         // Auto-recover: if the path is a directory, return a listing instead of an error.
         if path.is_dir() {
             let mut entries: Vec<String> = Vec::new();
@@ -101,6 +126,9 @@ impl Tool for ReadFileTool {
                     "Binary file ({} bytes), cannot display as text.",
                     bytes.len()
                 );
+                if let Some(mtime) = disk_mtime {
+                    ctx.read_cache.write().await.insert(cache_key.clone(), (mtime, output.clone()));
+                }
                 return Ok(ToolResult { call_id: String::new(), output, success: true });
             }
         };
@@ -184,6 +212,9 @@ impl Tool for ReadFileTool {
                 format!("[File skeleton: {} ({} lines) — use grep to find relevant lines, then read with offset/limit.]\n",
                     fname, total_lines)
             };
+            if let Some(mtime) = disk_mtime {
+                ctx.read_cache.write().await.insert(cache_key.clone(), (mtime, skeleton.clone()));
+            }
             return Ok(ToolResult { call_id: String::new(), output: skeleton, success: true });
         }
 
@@ -254,6 +285,65 @@ impl Tool for ReadFileTool {
             ));
         }
 
+        if let Some(mtime) = disk_mtime {
+            ctx.read_cache.write().await.insert(cache_key, (mtime, output.clone()));
+        }
         Ok(ToolResult { call_id: String::new(), output, success: true })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    /// Cache hit on re-read of an unchanged file — second call should be served
+    /// from ToolContext.read_cache and produce byte-identical output to the first.
+    #[tokio::test]
+    async fn read_cache_hits_when_file_unchanged() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("a.rs");
+        std::fs::write(&path, "fn main() {}\n").unwrap();
+
+        let ctx = ToolContext::new(dir.path().to_path_buf());
+        let tool = ReadFileTool;
+        let args = format!(r#"{{"file_path":"{}"}}"#, path.display());
+
+        let r1 = tool.execute(&args, &ctx).await.unwrap();
+        assert!(r1.success);
+
+        // Modify the cached entry in place so we can prove the 2nd call came from cache.
+        let cache_key: crate::tool::ReadCacheKey = (path.clone(), None, None);
+        {
+            let mut cache = ctx.read_cache.write().await;
+            let (mtime, _) = cache.get(&cache_key).cloned().expect("cache populated on first read");
+            cache.insert(cache_key.clone(), (mtime, "CACHED-SENTINEL".to_string()));
+        }
+
+        let r2 = tool.execute(&args, &ctx).await.unwrap();
+        assert_eq!(r2.output, "CACHED-SENTINEL", "2nd read should return cached entry verbatim");
+    }
+
+    /// Cache miss after file content changes — mtime shifts, cached entry is ignored.
+    #[tokio::test]
+    async fn read_cache_misses_when_mtime_changes() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("b.rs");
+        std::fs::write(&path, "fn main() {}\n").unwrap();
+
+        let ctx = ToolContext::new(dir.path().to_path_buf());
+        let tool = ReadFileTool;
+        let args = format!(r#"{{"file_path":"{}"}}"#, path.display());
+
+        let r1 = tool.execute(&args, &ctx).await.unwrap();
+        let out1 = r1.output.clone();
+
+        // Touch the file with new content + force a visible mtime change.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::fs::write(&path, "fn main() { println!(\"hi\"); }\n").unwrap();
+
+        let r2 = tool.execute(&args, &ctx).await.unwrap();
+        assert_ne!(r2.output, out1, "2nd read must re-read from disk when mtime changed");
+        assert!(r2.output.contains("println"));
     }
 }

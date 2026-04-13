@@ -152,6 +152,15 @@ impl PermissionStore {
 }
 
 /// Shared execution context passed to every tool invocation.
+/// Read cache key: (canonical path, offset, limit). offset/limit are the raw
+/// args the model sent — different slicing windows cache separately.
+pub type ReadCacheKey = (PathBuf, Option<usize>, Option<usize>);
+
+/// Read cache entry: (file mtime at cache time, rendered tool output).
+/// mtime acts as the invalidation signal — if disk mtime differs on next read,
+/// the cache is stale regardless of other state (edit/write tools change mtime).
+pub type ReadCacheEntry = (std::time::SystemTime, String);
+
 /// Holds a shared working directory that tools can read (and `CdTool` can write).
 #[derive(Clone)]
 pub struct ToolContext {
@@ -162,6 +171,10 @@ pub struct ToolContext {
     /// Remaining context tokens budget. Set by TurnRunner before each tool batch.
     /// read_file uses this to decide full content vs skeleton.
     pub ctx_budget_hint: Arc<std::sync::atomic::AtomicUsize>,
+    /// Per-session read-file output cache. Hit is valid only when on-disk mtime
+    /// still matches. Avoids redoing UTF-8 parsing + semantic skeleton generation
+    /// when the model re-reads the same file — these are CPU-heavy, not just I/O.
+    pub read_cache: Arc<RwLock<std::collections::HashMap<ReadCacheKey, ReadCacheEntry>>>,
 }
 
 impl ToolContext {
@@ -176,6 +189,7 @@ impl ToolContext {
             file_history: Arc::new(Mutex::new(file_history::FileHistory::new(session_id))),
             ctx_budget_hint: Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX)),
             graph: Arc::new(RwLock::new(crate::graph::CodeGraph::new())),
+            read_cache: Arc::new(RwLock::new(std::collections::HashMap::new())),
         }
     }
 
