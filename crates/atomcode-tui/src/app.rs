@@ -633,12 +633,6 @@ impl App {
                         self.first_token_ms = Some(start.elapsed().as_millis() as u64);
                     }
                 }
-                // Log model text if it output text before tool calls (plan, explanation)
-                if let Some(ref buf) = self.conversation.stream_buffer {
-                    let text = buf.trim();
-                    if !text.is_empty() {
-                    }
-                }
                 // Use the provider's real call id so ToolCallResult can pair with this
                 // specific tool call — regardless of timing (PhaseChange(Thinking) bumping
                 // step_count between start and result, or parallel tool calls sharing a step).
