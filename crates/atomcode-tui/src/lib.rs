@@ -418,8 +418,9 @@ pub async fn run(
                     app.config.providers.insert(oauth_name.clone(), oauth_provider);
                     app.config.default_provider = oauth_name.clone();
                     app.rebuild_provider();
+                    // Send full config to AgentLoop so it has the new provider in memory.
                     let _ = app.agent_handle.cmd_tx.send(
-                        atomcode_core::agent::AgentCommand::SwitchProvider(oauth_name.clone())
+                        atomcode_core::agent::AgentCommand::ReloadConfig(app.config.clone())
                     );
                     let model_display = app.provider.model_name();
                     app.conversation.add_user_message("/login");
