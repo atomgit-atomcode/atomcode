@@ -7,6 +7,7 @@ pub mod provider_manager;
 // turn_log removed 2026-04-13: atomcode-core owns datalog (DatalogWriter) —
 // having two per-turn loggers wrote 2 files per turn (one per crate).
 pub mod ui;
+pub mod wecom_login;
 
 use std::io::Write;
 
@@ -124,6 +125,21 @@ fn build_oauth_provider(access_token: &str) -> ProviderConfig {
         api_key: Some(access_token.to_string()),
         model: "MiniMax-M2.7".to_string(),
         base_url: Some("https://api-ai.gitcode.com/v1".to_string()),
+        system_prompt: None,
+        user_agent: None,
+        context_window: 64000,
+        ephemeral: true,
+    }
+}
+
+/// Build an in-memory ProviderConfig from broker-minted credentials.
+/// Broker supplies model + api_base per user, so we don't hardcode them.
+fn build_wecom_provider(creds: &wecom_login::BrokerCreds) -> ProviderConfig {
+    ProviderConfig {
+        provider_type: "openai".to_string(),
+        api_key: Some(creds.api_key.clone()),
+        model: creds.model.clone(),
+        base_url: Some(creds.api_base.clone()),
         system_prompt: None,
         user_agent: None,
         context_window: 64000,
@@ -454,6 +470,72 @@ pub async fn run(
                 SetTitle("AtomCode"),
                 Clear(ClearType::All),
                 // Mouse mode is re-enabled by EventLoop::start (scroll-only). See startup comment.
+            )?;
+            #[cfg(not(target_os = "windows"))]
+            execute!(terminal.backend_mut(), EnableBracketedPaste)?;
+            terminal.clear()?;
+            continue;
+        }
+
+        // Handle pending WeCom login
+        if app.pending_wecom_login {
+            app.pending_wecom_login = false;
+
+            disable_raw_mode()?;
+            execute!(
+                terminal.backend_mut(),
+                DisableMouseCapture,
+                LeaveAlternateScreen
+            )?;
+            #[cfg(not(target_os = "windows"))]
+            execute!(terminal.backend_mut(), DisableBracketedPaste)?;
+            terminal.show_cursor()?;
+
+            // reqwest::blocking owns a tokio runtime; run on a dedicated
+            // blocking thread so its Drop doesn't panic from async context.
+            let login_result = tokio::task::spawn_blocking(wecom_login::login)
+                .await
+                .unwrap_or_else(|e| Err(anyhow::anyhow!("login task panicked: {}", e)));
+
+            match login_result {
+                Ok((identity, Some(creds))) => {
+                    let display_name = identity.name.clone().unwrap_or_else(|| identity.userid.clone());
+                    println!("\n  Login successful! WeCom user: {} ({})", display_name, identity.userid);
+                    let provider_name = wecom_login::INTERNAL_PROVIDER_NAME.to_string();
+                    let provider = build_wecom_provider(&creds);
+                    app.config.providers.insert(provider_name.clone(), provider);
+                    app.config.default_provider = provider_name.clone();
+                    app.rebuild_provider();
+                    app.sync_config_to_agent();
+                    let model_display = app.provider.model_name();
+                    app.conversation.add_user_message("/login-inner");
+                    app.conversation.push_delta(&format!(
+                        "Login successful! WeCom user: **{}** ({}).\n\nProvider `{}` active (in-memory, not saved to config).\nModel: `{}`",
+                        display_name, identity.userid, provider_name, model_display
+                    ));
+                    app.conversation.finalize_stream();
+                }
+                Ok((_identity, None)) => {
+                    println!("\n  Broker returned no credentials; provider not registered.");
+                    app.conversation.add_user_message("/login-inner");
+                    app.conversation.push_delta("Login completed, but broker returned no credentials. Contact the GitCode platform team.");
+                    app.conversation.finalize_stream();
+                }
+                Err(e) => {
+                    println!("\n  WeCom login failed: {}", e);
+                    app.conversation.add_user_message("/login-inner");
+                    app.conversation.push_delta(&format!("Login failed: {}", e));
+                    app.conversation.finalize_stream();
+                }
+            }
+
+            enable_raw_mode()?;
+            clear_scrollback(terminal.backend_mut())?;
+            execute!(
+                terminal.backend_mut(),
+                EnterAlternateScreen,
+                SetTitle("AtomCode"),
+                Clear(ClearType::All),
             )?;
             #[cfg(not(target_os = "windows"))]
             execute!(terminal.backend_mut(), EnableBracketedPaste)?;

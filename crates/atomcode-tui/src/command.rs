@@ -26,6 +26,7 @@ pub const BUILTIN_COMMANDS: &[(&str, &str)] = &[
     ("/provider", "Manage providers"),
     ("/model",    "Switch model/provider"),
     ("/login",    "Login with AtomGit OAuth"),
+    ("/login-inner", "Login via WeCom QR (GitCode internal)"),
     ("/cd",       "Change working directory"),
     
     // === Utilities ===
