@@ -1,14 +1,32 @@
 use crate::conversation::message::Message;
 use crate::tool::{ToolCall, ToolDef};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
-/// Log the complete LLM request (messages + tools + metadata) under
-/// `<working_dir>/datalog/llm/YYYY-MM-DD_HH-MM-SS_NNN.json`.
+/// Per-round LLM log files live under `<working_dir>/datalog/llm/`.
+/// One file per LLM round-trip, containing both `request` and `response`
+/// sections. Filename = timestamp. calls.log is a one-line-per-round index.
 ///
-/// Moved from `~/.atomcode/logs/` (2026-04-14): per-project logs colocate with
-/// the turn-level datalog `.md` files so a project's entire session history is
-/// in one place and can be zipped/deleted/shared atomically.
-/// This is fire-and-forget — logging failures are silently ignored.
+/// Split-file layout (prior design) produced two JSONs per round plus a CSV
+/// entry per half — hard to read and review. One-file-per-round is both
+/// AI-friendly (single JSON to grep/diff/feed back) and human-friendly.
+
+/// Shared state: path of the in-progress request file. The caller of
+/// `log_llm_request` writes the request JSON to a file and stashes the path
+/// here; when `log_llm_response` runs (same process, sequential), it reads
+/// the file back, merges the response, and writes the final JSON in place.
+///
+/// Single-threaded in atomcode (one agent turn at a time), so a plain Mutex
+/// is enough — no race. If future parallelism is added, this needs to become
+/// a per-task thread-local or passed explicitly.
+fn pending_request_path() -> &'static Mutex<Option<PathBuf>> {
+    static P: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
+    P.get_or_init(|| Mutex::new(None))
+}
+
+/// Log the LLM request. Writes a JSON file containing the `request` section
+/// under `<working_dir>/datalog/llm/<timestamp>.json` and stashes the path
+/// for the subsequent `log_llm_response` call to append to.
 pub fn log_llm_request(
     working_dir: &Path,
     messages: &[Message],
@@ -22,29 +40,10 @@ pub fn log_llm_request(
     let log_dir = working_dir.join("datalog").join("llm");
     let _ = std::fs::create_dir_all(&log_dir);
 
-    // Build timestamp filename.
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    let secs = now.as_secs();
-    let millis = now.subsec_millis();
-    // Format as readable timestamp (UTC).
-    let ts = {
-        // Simple manual formatting to avoid adding chrono dependency.
-        let s = secs % 60;
-        let m = (secs / 60) % 60;
-        let h = (secs / 3600) % 24;
-        let days = secs / 86400;
-        // Days since epoch → approximate date (good enough for filenames).
-        let (y, mo, d) = epoch_days_to_ymd(days);
-        format!("{:04}-{:02}-{:02}_{:02}-{:02}-{:02}_{:03}", y, mo, d, h, m, s, millis)
-    };
+    let ts = timestamp();
     let path = log_dir.join(format!("{}.json", ts));
 
-    // Serialize messages.
     let msgs_json = serde_json::to_value(messages).unwrap_or(serde_json::json!([]));
-
-    // Serialize tool defs (not Serialize-derived, so do it manually).
     let tools_json: Vec<serde_json::Value> = tool_defs.iter().map(|td| {
         serde_json::json!({
             "name": td.name,
@@ -52,8 +51,6 @@ pub fn log_llm_request(
             "parameters": td.parameters,
         })
     }).collect();
-
-    // Token estimate.
     let total_tokens: usize = messages.iter().map(|m| m.estimate_tokens()).sum();
 
     let log = serde_json::json!({
@@ -61,32 +58,31 @@ pub fn log_llm_request(
         "model": model,
         "context_window": context_window,
         "step": step,
-        "message_count": messages.len(),
-        "estimated_tokens": total_tokens,
-        "tool_count": tool_defs.len(),
-        "messages": msgs_json,
-        "tools": tools_json,
+        "request": {
+            "message_count": messages.len(),
+            "estimated_tokens": total_tokens,
+            "tool_count": tool_defs.len(),
+            "messages": msgs_json,
+            "tools": tools_json,
+        },
+        // `response` key is inserted by log_llm_response.
     });
 
-    // Write atomically via temp file.
     let tmp = path.with_extension("json.tmp");
     if let Ok(mut f) = std::fs::File::create(&tmp) {
         let _ = f.write_all(serde_json::to_string_pretty(&log).unwrap_or_default().as_bytes());
         let _ = std::fs::rename(&tmp, &path);
     }
 
-    // Append one-line call record to calls.log (CSV: timestamp, model, step, msgs, tokens, ctx_window)
-    let calls_path = log_dir.join("calls.log");
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&calls_path) {
-        let _ = f.write_all(format!(
-            "{},{},{},{},{},{}\n",
-            ts, model, step, messages.len(), total_tokens, context_window
-        ).as_bytes());
+    // Remember for log_llm_response.
+    if let Ok(mut guard) = pending_request_path().lock() {
+        *guard = Some(path);
     }
 }
 
-/// Log the LLM response (text + tool calls) under
-/// `<working_dir>/datalog/llm/YYYY-MM-DD_HH-MM-SS_NNN_response.json`.
+/// Log the LLM response by reading the pending request file, adding a
+/// `response` section, and writing the merged JSON back. Also appends a
+/// one-line summary to `calls.log`.
 pub fn log_llm_response(
     working_dir: &Path,
     text: &str,
@@ -100,20 +96,9 @@ pub fn log_llm_response(
     let log_dir = working_dir.join("datalog").join("llm");
     let _ = std::fs::create_dir_all(&log_dir);
 
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    let secs = now.as_secs();
-    let millis = now.subsec_millis();
-    let ts = {
-        let s = secs % 60;
-        let m = (secs / 60) % 60;
-        let h = (secs / 3600) % 24;
-        let days = secs / 86400;
-        let (y, mo, d) = epoch_days_to_ymd(days);
-        format!("{:04}-{:02}-{:02}_{:02}-{:02}-{:02}_{:03}", y, mo, d, h, m, s, millis)
-    };
-    let path = log_dir.join(format!("{}_response.json", ts));
+    let path = pending_request_path()
+        .lock().ok()
+        .and_then(|mut g| g.take());
 
     let tools_json: Vec<serde_json::Value> = tool_calls.iter().map(|tc| {
         serde_json::json!({
@@ -122,33 +107,78 @@ pub fn log_llm_response(
             "arguments": tc.arguments,
         })
     }).collect();
-
-    let log = serde_json::json!({
-        "timestamp": ts,
-        "model": model,
-        "step": step,
+    let response_value = serde_json::json!({
         "duration_ms": duration_ms,
         "text": text,
         "tool_calls": tools_json,
     });
 
-    let tmp = path.with_extension("json.tmp");
+    // Determine target path: prefer the stashed pending request so we
+    // merge into the same file. Fallback: standalone orphan file, marked
+    // so the reader knows the pairing was lost (shouldn't happen in normal
+    // operation but we don't want to drop data on the floor).
+    let (target_path, merged) = match path.as_ref().and_then(|p| std::fs::read_to_string(p).ok()) {
+        Some(existing) => {
+            let mut val: serde_json::Value = serde_json::from_str(&existing)
+                .unwrap_or_else(|_| serde_json::json!({}));
+            if let Some(obj) = val.as_object_mut() {
+                obj.insert("response".into(), response_value);
+            }
+            (path.unwrap(), val)
+        }
+        None => {
+            let ts = timestamp();
+            let orphan = log_dir.join(format!("{}_orphan_response.json", ts));
+            let val = serde_json::json!({
+                "timestamp": ts,
+                "model": model,
+                "step": step,
+                "warning": "no matching request found for this response",
+                "response": response_value,
+            });
+            (orphan, val)
+        }
+    };
+
+    let tmp = target_path.with_extension("json.tmp");
     if let Ok(mut f) = std::fs::File::create(&tmp) {
-        let _ = f.write_all(serde_json::to_string_pretty(&log).unwrap_or_default().as_bytes());
-        let _ = std::fs::rename(&tmp, &path);
+        let _ = f.write_all(serde_json::to_string_pretty(&merged).unwrap_or_default().as_bytes());
+        let _ = std::fs::rename(&tmp, &target_path);
     }
 
-    // Append to calls.log: response line with duration and tool count
+    // One-line summary to calls.log. Example:
+    //   2026-04-14_12-50-54_123  glm-5  step=3  msgs=20/15000tok  →  4200ms  tools=2 [read_file, grep]
+    let ts_for_log = merged.get("timestamp").and_then(|v| v.as_str()).unwrap_or("?").to_string();
+    let msg_count = merged.pointer("/request/message_count").and_then(|v| v.as_u64()).unwrap_or(0);
+    let est_tokens = merged.pointer("/request/estimated_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+    let tool_names: Vec<&str> = tool_calls.iter().map(|tc| tc.name.as_str()).collect();
+    let tools_str = if tool_names.is_empty() {
+        "text_only".to_string()
+    } else {
+        format!("[{}]", tool_names.join(", "))
+    };
     let calls_path = log_dir.join("calls.log");
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&calls_path) {
-        let tool_names: Vec<&str> = tool_calls.iter().map(|tc| tc.name.as_str()).collect();
-        let _ = f.write_all(format!(
-            "  → {}ms, {} tool(s): {}\n",
-            duration_ms,
-            tool_calls.len(),
-            if tool_names.is_empty() { "text_only".to_string() } else { tool_names.join(", ") }
-        ).as_bytes());
+        let _ = writeln!(
+            f,
+            "{}  {}  step={}  msgs={}/{}tok  →  {}ms  tools={} {}",
+            ts_for_log, model, step, msg_count, est_tokens, duration_ms, tool_calls.len(), tools_str,
+        );
     }
+}
+
+fn timestamp() -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = now.as_secs();
+    let millis = now.subsec_millis();
+    let s = secs % 60;
+    let m = (secs / 60) % 60;
+    let h = (secs / 3600) % 24;
+    let days = secs / 86400;
+    let (y, mo, d) = epoch_days_to_ymd(days);
+    format!("{:04}-{:02}-{:02}_{:02}-{:02}-{:02}_{:03}", y, mo, d, h, m, s, millis)
 }
 
 /// Convert days since Unix epoch to (year, month, day). Simple civil calendar math.
@@ -171,56 +201,81 @@ fn epoch_days_to_ymd(days: u64) -> (u64, u64, u64) {
 mod tests {
     use super::*;
     use crate::conversation::message::{Message, Role};
-    use crate::tool::ToolDef;
+    use crate::tool::{ToolCall, ToolDef};
 
     #[test]
-    fn test_log_llm_request_creates_json() {
+    fn test_request_response_merged_into_single_file() {
         let tmp = tempfile::TempDir::new().unwrap();
         let messages = vec![
             Message::new(Role::System, "You are helpful."),
             Message::new(Role::User, "Hello"),
         ];
-        let tool_defs = vec![ToolDef {
+        let tools = vec![ToolDef {
             name: "bash",
             description: "Run a command".to_string(),
             parameters: serde_json::json!({"type": "object"}),
         }];
 
-        log_llm_request(tmp.path(), &messages, &tool_defs, "test-model", 16000, 3);
+        log_llm_request(tmp.path(), &messages, &tools, "test-model", 16000, 3);
+        log_llm_response(
+            tmp.path(),
+            "hi back",
+            &[ToolCall {
+                id: "c1".into(),
+                name: "bash".into(),
+                arguments: "{}".into(),
+            }],
+            "test-model",
+            3,
+            123,
+        );
 
-        // Should have created <tmp>/datalog/llm/*.json — exactly one file.
         let log_dir = tmp.path().join("datalog").join("llm");
-        let files: Vec<_> = std::fs::read_dir(&log_dir).unwrap()
+        let json_files: Vec<_> = std::fs::read_dir(&log_dir).unwrap()
             .filter_map(|e| e.ok().map(|e| e.path()))
             .filter(|p| p.extension().map_or(false, |ext| ext == "json"))
             .collect();
-        assert_eq!(files.len(), 1, "Expected exactly 1 JSON log under {:?}, got {}", log_dir, files.len());
+        assert_eq!(json_files.len(), 1, "expected one merged file, got {}", json_files.len());
 
-        // Verify JSON content
-        let content = std::fs::read_to_string(&files[0]).unwrap();
-        let json: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let content = std::fs::read_to_string(&json_files[0]).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(v["model"], "test-model");
+        assert_eq!(v["request"]["message_count"], 2);
+        assert_eq!(v["request"]["tool_count"], 1);
+        assert_eq!(v["response"]["duration_ms"], 123);
+        assert_eq!(v["response"]["text"], "hi back");
+        assert_eq!(v["response"]["tool_calls"][0]["name"], "bash");
 
-        assert_eq!(json["model"], "test-model");
-        assert_eq!(json["context_window"], 16000);
-        assert_eq!(json["step"], 3);
-        assert_eq!(json["message_count"], 2);
-        assert_eq!(json["tool_count"], 1);
-        assert!(json["messages"].is_array());
-        assert!(json["tools"].is_array());
-        assert_eq!(json["tools"][0]["name"], "bash");
-        // TempDir auto-cleans when dropped.
+        // calls.log should have exactly one line for this round.
+        let calls = std::fs::read_to_string(log_dir.join("calls.log")).unwrap();
+        assert_eq!(calls.lines().count(), 1);
+        assert!(calls.contains("test-model"));
+        assert!(calls.contains("step=3"));
+    }
+
+    #[test]
+    fn test_orphan_response_when_no_matching_request() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Wipe any stashed pending path from previous tests (single static).
+        if let Ok(mut g) = pending_request_path().lock() { *g = None; }
+
+        log_llm_response(tmp.path(), "bare text", &[], "solo-model", 7, 50);
+
+        let log_dir = tmp.path().join("datalog").join("llm");
+        let orphans: Vec<_> = std::fs::read_dir(&log_dir).unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.file_name().map_or(false, |n| n.to_string_lossy().contains("orphan")))
+            .collect();
+        assert_eq!(orphans.len(), 1);
+        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&orphans[0]).unwrap()).unwrap();
+        assert!(v["warning"].as_str().unwrap().contains("no matching request"));
     }
 
     #[test]
     fn test_epoch_days_to_ymd() {
-        // Unix epoch day 0 = 1970-01-01
         assert_eq!(epoch_days_to_ymd(0), (1970, 1, 1));
-        // 1970-01-02
         assert_eq!(epoch_days_to_ymd(1), (1970, 1, 2));
-        // 2000-01-01 = day 10957
         assert_eq!(epoch_days_to_ymd(10957), (2000, 1, 1));
-        // 2024-03-01: days since epoch = 19783
-        // Verify it's in the right year/month
         let (y, m, _d) = epoch_days_to_ymd(19783);
         assert_eq!(y, 2024);
         assert_eq!(m, 3);
