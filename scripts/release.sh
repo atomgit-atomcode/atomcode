@@ -66,6 +66,16 @@ else
     echo "  !! Skipped: mingw-w64 not installed (brew install mingw-w64)"
 fi
 
+# --- Sign macOS atomcode binaries (skip with ATOMCODE_SKIP_SIGN=1) ---
+if [ "${ATOMCODE_SKIP_SIGN:-0}" != "1" ]; then
+    echo ""
+    echo "=== Signing macOS atomcode binaries ==="
+    "$(dirname "$0")/sign-macos.sh" "$DIST"
+else
+    echo ""
+    echo "=== Skipping macOS signing (ATOMCODE_SKIP_SIGN=1) ==="
+fi
+
 # --- Package ---
 echo ""
 echo "=== Packaging ==="
