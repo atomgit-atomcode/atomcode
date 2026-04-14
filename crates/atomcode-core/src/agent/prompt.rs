@@ -165,6 +165,31 @@ impl AgentLoop {
         // when it starts generating tool calls.
         prompt.push_str(&format!("\n=== RULES (follow these strictly) ===\n{rules}\n"));
 
+        // Language discipline: some models (MiniMax, Qwen, DeepSeek) default to
+        // English chain-of-thought even when the user speaks Chinese, causing
+        // reasoning blocks like "I need to..."/"Let me..." to leak into the
+        // visible output. For those, force Chinese reasoning + <think> wrapping.
+        // For Claude/GPT/GLM, skip — they don't have this drift problem.
+        let model_id = self.config.providers
+            .get(&self.config.default_provider)
+            .map(|p| p.model.to_lowercase())
+            .unwrap_or_default();
+        let needs_cn_lock = model_id.contains("minimax")
+            || model_id.contains("qwen")
+            || model_id.contains("deepseek")
+            || model_id.contains("kimi");
+        if needs_cn_lock {
+            prompt.push_str(
+                "\n=== 语言纪律（关键）===\n\
+                 所有 reasoning、计划、步骤说明必须用中文。禁止使用 \"I need to\"、\
+                 \"Let me\"、\"Now I'll\"、\"First,\"、\"Okay,\" 等英文 CoT 句式。\n\
+                 如果必须用英文想概念，请用 <think>...</think> 包裹，\
+                 用户可见的最终输出必须 100% 中文。\n\
+                 工具返回的英文内容（stack trace、log）需要用中文复述再处理。\n\
+                 违反这条视为严重错误。\n"
+            );
+        }
+
         // Platform-specific rules — only injected on the target OS.
         // macOS/Linux get nothing extra; Windows gets cmd.exe syntax rules.
         let platform = crate::config::platform_rules();

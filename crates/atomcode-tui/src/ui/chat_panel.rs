@@ -205,10 +205,16 @@ pub fn render(
     if let Some(ref buffer) = conversation.stream_buffer {
         if !buffer.is_empty() {
             let content_w = term_width.saturating_sub(7); // 2(indent) + 1(│) + 1(space) + 1(safety)
+            // Strip <think>...</think> blocks in-flight. Some models (MiniMax, Qwen,
+            // DeepSeek) default to English chain-of-thought inside <think>; if we
+            // waited for finalize_stream to strip, the user would still see the
+            // English reasoning flash across the screen during stream. Strip now
+            // so stream-time display is clean.
+            let visible_buf = strip_think_blocks_streaming(buffer);
             // Trim trailing incomplete markdown tokens before rendering.
             // During streaming, the buffer may end with partial backtick fences
             // (`, ``, ```) that cause the parser to misinterpret subsequent text.
-            let safe_buf = trim_incomplete_markdown(buffer);
+            let safe_buf = trim_incomplete_markdown(&visible_buf);
             let md = wrap_lines(render_markdown(&safe_buf), content_w);
             for line in md {
                 let mut spans = vec![Span::styled(format!("{}\u{2502} ", INDENT), bar_style)];
@@ -974,6 +980,46 @@ fn format_args_oneline(args_json: &str) -> String {
     String::new()
 }
 
+/// Strip `<think>...</think>` reasoning blocks from a streaming buffer before
+/// we render it to screen. Handles three states per block:
+/// - closed (both tags seen): drop the entire `<think>...</think>` range
+/// - open (only `<think>` seen so far): drop everything from `<think>` onward —
+///   the reasoning is still streaming, keep it hidden until `</think>` arrives
+/// - none: no-op, return buffer as-is
+///
+/// Rationale: MiniMax / Qwen / DeepSeek often do chain-of-thought in English
+/// inside `<think>`. conversation/mod.rs::finalize_stream already strips these
+/// at turn end, but that's too late for the streaming view — users see the
+/// English reasoning flash across the screen before it's cleaned. Doing it
+/// here makes the stream-time display match the final display.
+fn strip_think_blocks_streaming(buf: &str) -> String {
+    let mut out = String::with_capacity(buf.len());
+    let mut rest = buf;
+    loop {
+        match rest.find("<think>") {
+            None => {
+                out.push_str(rest);
+                break;
+            }
+            Some(open_idx) => {
+                out.push_str(&rest[..open_idx]);
+                let after_open = &rest[open_idx + "<think>".len()..];
+                match after_open.find("</think>") {
+                    Some(close_idx) => {
+                        // Block fully received — skip past it and continue scanning.
+                        rest = &after_open[close_idx + "</think>".len()..];
+                    }
+                    None => {
+                        // Block still streaming — swallow the rest; nothing more to show.
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Trim trailing incomplete markdown tokens from a streaming buffer.
 /// Handles: incomplete code fences (`, ``, ```), unclosed bold/italic (* or **),
 /// and trailing backslash escapes.
@@ -1038,4 +1084,41 @@ pub fn total_lines(conversation: &Conversation) -> usize {
         count += render_markdown(buffer).len() + 1;
     }
     count
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strip_think_closed_block() {
+        let s = "before<think>English reasoning</think>after";
+        assert_eq!(strip_think_blocks_streaming(s), "beforeafter");
+    }
+
+    #[test]
+    fn strip_think_still_streaming() {
+        // Block still open — everything from <think> onward is hidden.
+        let s = "visible text<think>Let me analyze";
+        assert_eq!(strip_think_blocks_streaming(s), "visible text");
+    }
+
+    #[test]
+    fn strip_think_multiple_blocks() {
+        let s = "a<think>t1</think>b<think>t2</think>c";
+        assert_eq!(strip_think_blocks_streaming(s), "abc");
+    }
+
+    #[test]
+    fn strip_think_no_tag() {
+        let s = "纯中文内容，无 think 标签";
+        assert_eq!(strip_think_blocks_streaming(s), s);
+    }
+
+    #[test]
+    fn strip_think_mixed_complete_and_streaming() {
+        // First block closed, second still streaming.
+        let s = "a<think>closed</think>b<think>still open";
+        assert_eq!(strip_think_blocks_streaming(s), "ab");
+    }
 }
