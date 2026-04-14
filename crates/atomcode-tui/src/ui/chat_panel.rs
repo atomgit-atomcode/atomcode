@@ -171,7 +171,7 @@ pub fn render(
                         MessageContent::ToolResultRef(r) => r.call_id.as_str(),
                         _ => unreachable!(),
                     };
-                    let is_read = call_id_to_tool.get(call_id) == Some(&"read_file");
+let _is_read = call_id_to_tool.get(call_id) == Some(&"read_file");
 
                     // Batch ≥2 consecutive same-type tool results.
                     // Fold early results, keep last 3 expanded for live progress.
@@ -724,50 +724,7 @@ fn render_tool_result(lines: &mut Vec<Line<'static>>, result: &ToolResult, expan
     }
 }
 
-/// Scan forward from `start` for consecutive read_file results.
-/// Returns `Some((batch_end, paths))` if ≥3 found, None otherwise.
-fn try_batch_reads(
-    start: usize,
-    msgs: &[atomcode_core::conversation::message::Message],
-    call_id_to_tool: &HashMap<&str, &str>,
-    all_msgs: &[atomcode_core::conversation::message::Message],
-) -> Option<(usize, Vec<String>)> {
-    let mut end = start + 1;
-    while end < msgs.len() {
-        let cid = match &msgs[end].content {
-            MessageContent::ToolResult(r) => Some(r.call_id.as_str()),
-            MessageContent::ToolResultRef(r) => Some(r.call_id.as_str()),
-            _ => None,
-        };
-        if let Some(cid) = cid {
-            if call_id_to_tool.get(cid) == Some(&"read_file") {
-                end += 1;
-                continue;
-            }
-        }
-        break;
-    }
-    let count = end - start;
-    if count < 3 {
-        return None;
-    }
-    let mut paths = Vec::with_capacity(count);
-    for j in start..end {
-        let cid = match &msgs[j].content {
-            MessageContent::ToolResult(r) => &r.call_id,
-            MessageContent::ToolResultRef(r) => &r.call_id,
-            _ => continue,
-        };
-        paths.push(find_read_file_path(all_msgs, cid));
-    }
-    Some((end, paths))
-}
-
-// ── Batch Read Call ──
-// Renders ≥3 consecutive read_file tool calls as a single collapsed line.
-/// Render ≥2 consecutive same-type tool calls as a single collapsed line.
-/// Format: "  ▸ Read ×4  (file1, file2, file3, file4)"
-///         "  ⎿ Done"
+// ── Tool Call Detail Extraction ──
 fn render_batch_tool_calls(lines: &mut Vec<Line<'static>>, tool_name: &str, count: usize, details: &[String]) {
     let bar = Span::styled(format!("{}\u{2502} ", INDENT), Style::default().fg(theme::accent_dim()));
     let display_name = capitalize(tool_name);
@@ -831,55 +788,7 @@ fn extract_tool_detail_short(tool_name: &str, args_json: &str) -> String {
     }
 }
 
-fn render_batch_read_call(lines: &mut Vec<Line<'static>>, count: usize, paths: &[String]) {
-    let bar = Span::styled(format!("{}\u{2502} ", INDENT), Style::default().fg(theme::accent_dim()));
-    let names: Vec<&str> = paths.iter().map(|p| p.rsplit('/').next().unwrap_or(p.as_str())).collect();
-    let detail = if names.len() <= 4 {
-        names.join(", ")
-    } else {
-        format!("{}, {} \u{2026}", names[..3].join(", "), names.last().unwrap_or(&""))
-    };
-    lines.push(Line::from(vec![
-        bar,
-        Span::styled(
-            format!("  \u{25b8} Read File \u{00d7}{}", count),
-            Style::default().fg(theme::text_secondary()),
-        ),
-        Span::styled(
-            format!("  {}", detail),
-            Style::default().fg(theme::text_muted()),
-        ),
-    ]));
-}
-
-// ── Batch Read Group ──
-// Renders ≥3 consecutive read_file results as a single collapsed line.
-fn render_batch_read(lines: &mut Vec<Line<'static>>, count: usize, paths: &[String]) {
-    let bar = Span::styled(format!("{}\u{2502} ", INDENT), Style::default().fg(theme::accent_dim()));
-    // Abbreviated file names (basename only)
-    let names: Vec<&str> = paths.iter().map(|p| {
-        p.rsplit('/').next().unwrap_or(p.as_str())
-    }).collect();
-    let detail = if names.len() <= 4 {
-        names.join(", ")
-    } else {
-        format!("{}, {} \u{2026}", names[..3].join(", "), names.last().unwrap_or(&""))
-    };
-    lines.push(Line::from(vec![
-        bar,
-        Span::styled(" \u{25b8} ", Style::default().fg(theme::text_muted())),
-        Span::styled(
-            format!("Reading {} files\u{2026}", count),
-            Style::default().fg(theme::info()),
-        ),
-        Span::styled(
-            format!("  ({})", detail),
-            Style::default().fg(theme::text_muted()),
-        ),
-    ]));
-}
-
-/// Find file_path from a read_file tool call by matching call_id.
+/// Extract a short detail string from tool arguments for batch display.
 fn find_read_file_path(messages: &[atomcode_core::conversation::message::Message], call_id: &str) -> String {
     for msg in messages {
         if let MessageContent::AssistantWithToolCalls { tool_calls, .. } = &msg.content {
