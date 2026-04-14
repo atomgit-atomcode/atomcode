@@ -425,35 +425,70 @@ impl Conversation {
     /// across many real sessions. Do NOT lower without validating on long
     /// write-heavy sessions (agentarena) — 55% caused total context wipeout.
     pub fn needs_compression(&self, system_prompt_tokens: usize, token_budget: usize) -> bool {
-        if self.turn_tracker.turns.len() < 6 { return false; }
+        // Guard: need enough messages to make compression worthwhile.
+        // Uses message count instead of turn count because turn_tracker counts
+        // USER MESSAGES (1 user msg = 1 turn), but a single user message can
+        // produce 15+ LLM calls with 35+ messages. The old `turns.len() < 6`
+        // guard caused compression to NEVER trigger in agent-loop scenarios.
+        if self.messages.len() < 12 { return false; }
         let total: usize = system_prompt_tokens + self.messages.iter()
             .map(|m| m.estimate_tokens()).sum::<usize>();
         let threshold = (token_budget * 70 / 100).min(50000);
         total > threshold
     }
 
-    /// Build content for LLM compression: all turns except the last 5.
+    /// Build content for LLM compression.
+    ///
+    /// Strategy: keep the last `KEEP_MESSAGES` messages at full fidelity,
+    /// compress everything before that into one-line-per-round summaries.
+    /// Returns (compressed_text, number_of_messages_to_remove).
+    ///
+    /// This operates at MESSAGE level, not turn level, because turn_tracker
+    /// counts user messages (1 user msg = 1 turn) but a single user message
+    /// can produce 15+ LLM calls with 35+ messages.
     pub fn build_compression_content(&self) -> (String, usize) {
-        let turns = &self.turn_tracker.turns;
-        let keep_full = 5usize;
-        let compress_end = turns.len().saturating_sub(keep_full);
+        const KEEP_MESSAGES: usize = 20;
 
+        if self.messages.len() <= KEEP_MESSAGES {
+            return (String::new(), 0);
+        }
+
+        let compress_end_idx = self.messages.len() - KEEP_MESSAGES;
+
+        // Group messages into logical rounds (assistant + tool_calls + tool_results)
+        // and compress each round into a one-liner.
         let mut content = String::new();
-        for ti in 0..compress_end {
-            let turn = &turns[ti];
-            let end = turn.end_idx().min(self.messages.len());
-            if turn.start_idx >= self.messages.len() { continue; }
-            let turn_msgs = &self.messages[turn.start_idx..end];
-            content.push_str(&self.compress_turn(ti + 1, turn_msgs));
+        let mut round = 0usize;
+        let compress_msgs = &self.messages[..compress_end_idx];
+        let mut i = 0;
+        while i < compress_msgs.len() {
+            // Collect messages for this round
+            let round_start = i;
+            // A round starts at a User or Assistant message and includes
+            // all subsequent tool results until the next User/Assistant.
+            i += 1;
+            while i < compress_msgs.len() {
+                match compress_msgs[i].role {
+                    message::Role::User | message::Role::Assistant => break,
+                    _ => i += 1,
+                }
+            }
+            round += 1;
+            let round_msgs = &compress_msgs[round_start..i];
+            content.push_str(&self.compress_turn(round, round_msgs));
             content.push('\n');
         }
-        (content, compress_end)
+
+        // Return message count (not turn count) for apply_compression
+        (content, compress_end_idx)
     }
 
-    /// Apply compression: store summary in cold zone, remove old turn messages.
-    /// `n_turns` = number of turns from the front to remove.
-    pub fn apply_compression(&mut self, n_turns: usize, summary: String) {
-        if n_turns == 0 || summary.is_empty() { return; }
+    /// Apply compression: store summary in cold zone, remove old messages.
+    /// `remove_count` = number of messages from the front to remove.
+    /// (Changed from turn-based to message-based to support single-user-message
+    /// sessions where turn_tracker has only 1-2 turns but 30+ messages.)
+    pub fn apply_compression(&mut self, remove_count: usize, summary: String) {
+        if remove_count == 0 || summary.is_empty() { return; }
 
         // Add to cold zone (FIFO, max 3)
         self.cold_summaries.push(summary);
@@ -461,18 +496,22 @@ impl Conversation {
             self.cold_summaries.remove(0);
         }
 
-        // Remove old turn messages from the front
-        let remove_end = if n_turns < self.turn_tracker.turns.len() {
-            self.turn_tracker.turns[n_turns].start_idx
-        } else {
-            self.messages.len()
-        };
+        // Remove old messages from the front
+        let remove_end = remove_count.min(self.messages.len());
         self.messages.drain(..remove_end);
 
-        // Re-index turn tracker (all start_idx shift by -remove_end)
-        self.turn_tracker.turns.drain(..n_turns);
+        // Re-index turn tracker: remove turns that are fully within the drained range,
+        // adjust surviving turns' start_idx.
+        self.turn_tracker.turns.retain(|t| t.start_idx >= remove_end || t.end_idx() > remove_end);
         for turn in &mut self.turn_tracker.turns {
-            turn.start_idx = turn.start_idx.saturating_sub(remove_end);
+            if turn.start_idx >= remove_end {
+                turn.start_idx -= remove_end;
+            } else {
+                // Turn partially overlaps the drain — adjust both start and count
+                let overlap = remove_end - turn.start_idx;
+                turn.start_idx = 0;
+                turn.msg_count = turn.msg_count.saturating_sub(overlap);
+            }
         }
     }
 
@@ -745,15 +784,14 @@ impl Conversation {
         result
     }
 
-    /// Microcompact: condense ToolResult messages from old turns (>5 turns ago)
-    /// to one-line summaries. Recent 5 turns keep full content.
+    /// Microcompact: condense ToolResult messages from old rounds
+    /// to one-line summaries. Recent 20 messages keep full content.
     /// Zero LLM calls — purely mechanical compression.
-    fn microcompact(msgs: &mut Vec<Message>, turns: &[turn::Turn], _total_msg_count: usize) {
-        if turns.len() <= 3 { return; }
+    fn microcompact(msgs: &mut Vec<Message>, _turns: &[turn::Turn], total_msg_count: usize) {
+        if total_msg_count <= 20 { return; }
 
-        // Find the message index where "recent 3 turns" starts
-        let recent_start_turn = turns.len().saturating_sub(3);
-        let recent_start_idx = turns[recent_start_turn].start_idx;
+        // Keep the last 20 messages at full fidelity, compact everything before
+        let recent_start_idx = total_msg_count.saturating_sub(20);
 
         // Build call_id → tool_name map for identifying what each ToolResult is
         let mut call_id_to_tool: std::collections::HashMap<String, String> = std::collections::HashMap::new();
@@ -1430,8 +1468,8 @@ mod tests {
             });
         }
 
-        // Apply compression to first 3 turns
-        conv.apply_compression(3, "User ran tasks 0, 1, 2 with bash.".to_string());
+        // Apply compression: remove first 9 messages (3 turns × 3 msgs each)
+        conv.apply_compression(9, "User ran tasks 0, 1, 2 with bash.".to_string());
 
         // Cold zone should have 1 entry
         assert_eq!(conv.cold_summaries.len(), 1);

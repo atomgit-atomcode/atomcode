@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph};
 use ratatui::Frame;
@@ -49,6 +49,8 @@ pub fn render(
     // the chat visually syncs with the bottom spinner label during long args
     // streaming windows (e.g. big write_file content that takes 30-60s).
     streaming_tool_name: Option<&str>,
+    streaming_tools: &[(String, String)],
+    streaming_tool_hint: &str,
     // User inputs queued via AppendInput during streaming. Rendered as dim
     // "queued" previews above the input box so the user sees Enter was accepted
     // — without this, typing during streaming looks like it did nothing.
@@ -216,13 +218,19 @@ let _is_read = call_id_to_tool.get(call_id) == Some(&"read_file");
                                 format!("{}, \u{2026} +{} more", names[..3].join(", "), names.len() - 3)
                             };
                             let bar = Span::styled(format!("{}\u{2502} ", INDENT), Style::default().fg(theme::accent_dim()));
-                            let result_style = Style::default().fg(theme::text_muted()).add_modifier(Modifier::DIM);
+                            let detail_display = if detail_str.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" ({})", detail_str)
+                            };
                             render_cache.push(Line::from(vec![
                                 bar,
+                                Span::styled("  \u{2713} ", Style::default().fg(Color::Green)),
                                 Span::styled(
-                                    format!("  \u{23BF} {} \u{00d7}{}  {}", capitalize(tool_name), batch_count, detail_str),
-                                    result_style,
+                                    format!("{} \u{00d7}{}", capitalize(tool_name), batch_count),
+                                    Style::default().fg(theme::text_secondary()),
                                 ),
+                                Span::styled(detail_display, Style::default().fg(theme::text_muted())),
                             ]));
                             render_cache.push(Line::default());
                             tool_result_idx += batch_count;
@@ -293,20 +301,29 @@ let _is_read = call_id_to_tool.get(call_id) == Some(&"read_file");
     //
     // Suppress if we already have an in-flight tool call rendered above —
     // avoids double rows when Started fires just as streaming ends.
-    if let Some(name) = streaming_tool_name {
+    if !streaming_tools.is_empty() {
         let bar = Span::styled(
             format!("{}\u{2502} ", INDENT),
             Style::default().fg(theme::accent_dim()),
         );
-        let spinner_frame = SPINNER[tick % SPINNER.len()];
-        let display_name = capitalize(name);
-        dynamic.push(Line::from(vec![
-            bar.clone(),
-            Span::styled(format!("  {} ", spinner_frame), Style::default().fg(theme::accent())),
-            Span::styled(display_name, Style::default().fg(theme::text_primary()).add_modifier(Modifier::BOLD)),
-            Span::styled("(...)", Style::default().fg(theme::text_muted())),
-        ]));
-        // Blank pad so this row isn't clobbered by the bottom spinner overlay.
+        // Each tool gets its own spinner phase (offset by index) so they all animate
+        // but don't spin in lockstep — looks more organic.
+        for (i, (tool_name, hint)) in streaming_tools.iter().enumerate() {
+            let phase = (tick + i * 2) % SPINNER.len();
+            let spinner_frame = SPINNER[phase];
+            let display_name = capitalize(tool_name);
+            let hint_span = if hint.is_empty() {
+                Span::styled("", Style::default())
+            } else {
+                Span::styled(format!(" {}", hint), Style::default().fg(theme::text_muted()))
+            };
+            dynamic.push(Line::from(vec![
+                bar.clone(),
+                Span::styled(format!("  {} ", spinner_frame), Style::default().fg(theme::accent())),
+                Span::styled(display_name, Style::default().fg(theme::text_primary()).add_modifier(Modifier::BOLD)),
+                hint_span,
+            ]));
+        }
         dynamic.push(Line::default());
     }
 
@@ -728,30 +745,23 @@ fn render_tool_result(lines: &mut Vec<Line<'static>>, result: &ToolResult, expan
 fn render_batch_tool_calls(lines: &mut Vec<Line<'static>>, tool_name: &str, count: usize, details: &[String]) {
     let bar = Span::styled(format!("{}\u{2502} ", INDENT), Style::default().fg(theme::accent_dim()));
     let display_name = capitalize(tool_name);
-    // Join details, truncate if too many
-    let detail_str = if details.len() <= 4 {
-        details.join(", ")
+    // Filter out empty details, join with comma
+    let non_empty: Vec<&str> = details.iter().map(|s| s.as_str()).filter(|s| !s.is_empty()).collect();
+    let detail_str = if non_empty.is_empty() {
+        String::new()
+    } else if non_empty.len() <= 4 {
+        format!(" ({})", non_empty.join(", "))
     } else {
-        format!("{}, \u{2026} +{} more", details[..3].join(", "), details.len() - 3)
+        format!(" ({}, +{} more)", non_empty[..3].join(", "), non_empty.len() - 3)
     };
     lines.push(Line::from(vec![
-        bar.clone(),
-        Span::styled(
-            format!("  \u{25b8} {}(\u{00d7}{})", display_name, count),
-            Style::default().fg(theme::text_secondary()).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!("  {}", detail_str),
-            Style::default().fg(theme::text_muted()),
-        ),
-    ]));
-    // CC-style "⎿ Done" line
-    lines.push(Line::from(vec![
         bar,
+        Span::styled("  \u{2713} ", Style::default().fg(Color::Green)),
         Span::styled(
-            format!("    \u{23BF} Done ({} calls)", count),
-            Style::default().fg(theme::text_muted()).add_modifier(Modifier::DIM),
+            format!("{} \u{00d7}{}", display_name, count),
+            Style::default().fg(theme::text_secondary()),
         ),
+        Span::styled(detail_str, Style::default().fg(theme::text_muted())),
     ]));
 }
 

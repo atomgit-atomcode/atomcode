@@ -65,6 +65,8 @@ pub struct ToolCallBuffer {
     pub id: String,
     pub name: String,
     pub arguments: String,
+    /// True once we've extracted and sent a path hint — avoids resending on every delta.
+    pub hint_sent: bool,
 }
 
 pub enum ApprovalRequirement {

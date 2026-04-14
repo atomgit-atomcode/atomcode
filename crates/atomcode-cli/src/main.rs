@@ -224,7 +224,7 @@ async fn run() -> Result<i32> {
             system_prompt: None,
             user_agent: None,
             context_window: default_context_window_for("openai"),
-            ephemeral: true,
+            ephemeral: false,
         };
         (dummy, String::new())
     } else {
@@ -370,9 +370,10 @@ async fn run_headless(
                 print!("{}", text);
                 io::stdout().flush()?;
             }
-            AgentEvent::ToolCallStreaming { name } => {
+            AgentEvent::ToolCallStreaming { name, hint } => {
                 if verbose {
-                    eprintln!("[tool-streaming← {}]", name);
+                    let detail = if hint.is_empty() { String::new() } else { format!(" → {}", hint) };
+                    eprintln!("[tool-streaming← {}{}]", name, detail);
                 }
             }
             AgentEvent::ToolCallStarted { id: _, name, arguments } => {

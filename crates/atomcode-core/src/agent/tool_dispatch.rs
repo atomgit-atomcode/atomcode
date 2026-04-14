@@ -10,8 +10,8 @@ impl AgentLoop {
                 self.discipline_state.model_produced_text = true;
                 let _ = self.event_tx.send(AgentEvent::TextDelta(text));
             }
-            TurnEvent::ToolCallStreaming { name } => {
-                let _ = self.event_tx.send(AgentEvent::ToolCallStreaming { name });
+            TurnEvent::ToolCallStreaming { name, hint } => {
+                let _ = self.event_tx.send(AgentEvent::ToolCallStreaming { name, hint });
             }
             TurnEvent::ToolCallStarted { ref id, ref name, ref arguments } => {
                 self.datalog.log_tool_call(name, arguments);

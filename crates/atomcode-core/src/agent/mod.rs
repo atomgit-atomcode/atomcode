@@ -101,7 +101,7 @@ pub enum AgentEvent {
     /// LLM has started emitting a tool call — only the name is known so far,
     /// arguments are still streaming. UI uses this to display the tool name
     /// immediately instead of waiting for the full args.
-    ToolCallStreaming { name: String },
+    ToolCallStreaming { name: String, hint: String },
     /// A tool call is about to execute (for display).
     /// `id` pairs with `ToolCallResult.call_id` so the UI can match start→result
     /// across parallel or interleaved calls without reconstructing ids from counters.
@@ -886,7 +886,7 @@ impl AgentLoop {
                                 }
                                 TurnEvent::ToolCallStarted { ref id, ref name, ref arguments } => {
                                     // Forward tool name immediately for UI spinner
-                                    let _ = event_tx.send(AgentEvent::ToolCallStreaming { name: name.clone() });
+                                    let _ = event_tx.send(AgentEvent::ToolCallStreaming { name: name.clone(), hint: String::new() });
                                     // Flush accumulated model text to datalog before logging tool call accumulated model text to datalog before logging tool call
                                     if !datalog_text_accum.is_empty() {
                                         datalog.log_model_text(&datalog_text_accum);
@@ -1012,8 +1012,8 @@ impl AgentLoop {
                                         system_tokens, sent_tokens, dropped_tokens, working_set_tokens, total_messages,
                                     });
                                 }
-                                TurnEvent::ToolCallStreaming { name } => {
-                                    let _ = event_tx.send(AgentEvent::ToolCallStreaming { name });
+                                TurnEvent::ToolCallStreaming { name, hint } => {
+                                    let _ = event_tx.send(AgentEvent::ToolCallStreaming { name, hint });
                                 }
                                 TurnEvent::Error(e) => {
                                     let _ = event_tx.send(AgentEvent::Error(e));

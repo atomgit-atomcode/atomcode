@@ -107,7 +107,12 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         let tool_info_ref: &str = if !app.executing_tool_info.is_empty() {
             &app.executing_tool_info
         } else if let Some(ref name) = app.streaming_tool_name {
-            streaming_label = format!("Preparing {}\u{2026}", format_tool_display_name(name));
+            let hint = if app.streaming_tool_hint.is_empty() {
+                String::new()
+            } else {
+                format!(" {}", app.streaming_tool_hint)
+            };
+            streaming_label = format!("{}{}\u{2026}", format_tool_display_name(name), hint);
             &streaming_label
         } else {
             ""
@@ -120,6 +125,8 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             app.first_token_ms, llm_wait_ms, &app.last_completed_tool,
             app.last_turn_duration, app.current_step_count,
             app.streaming_tool_name.as_deref(),
+            &app.streaming_tools,
+            &app.streaming_tool_hint,
             &app.pending_appends,
             &mut app.render_cache, &mut app.render_cache_msg_count,
         );

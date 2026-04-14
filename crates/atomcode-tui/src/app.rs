@@ -217,6 +217,11 @@ pub struct App {
     /// Used by the spinner label so users see "⠋ Preparing write_file…" instead of
     /// an opaque "Generating…" during multi-second tool-call arg streams.
     pub streaming_tool_name: Option<String>,
+    /// All tool names currently streaming (LLM emitting args).
+    /// Each entry = (tool_name, file_path_hint). Rendered as individual in-flight rows.
+    pub streaming_tools: Vec<(String, String)>,
+    /// File path hint extracted from partial tool call args (e.g. "src/main.rs").
+    pub streaming_tool_hint: String,
     /// Estimated token counts for the current session.
     pub total_tokens: usize,
     /// Tokens used in the current turn.
@@ -328,6 +333,8 @@ impl App {
            current_tool_call_count: 0,
            executing_tool_info: String::new(),
            streaming_tool_name: None,
+           streaming_tools: Vec::new(),
+           streaming_tool_hint: String::new(),
            turn_start: None,
            first_token_ms: None,
            llm_call_start: None,
@@ -644,7 +651,7 @@ impl App {
                 }
                 self.conversation.push_delta(&text);
             }
-            AgentEvent::ToolCallStreaming { name } => {
+            AgentEvent::ToolCallStreaming { name, hint } => {
                 // Tool name known, args still streaming. Show it in the spinner label
                 // so the user isn't staring at "Generating…" for the whole args window.
                 // Track TTFT here too — a tool call is a first-token signal just like text.
@@ -653,11 +660,31 @@ impl App {
                         self.first_token_ms = Some(start.elapsed().as_millis() as u64);
                     }
                 }
-                self.streaming_tool_name = Some(name);
+                self.streaming_tool_name = Some(name.clone());
+                if !hint.is_empty() {
+                    // Hint update for the current tool — update in-place
+                    if let Some(entry) = self.streaming_tools.last_mut() {
+                        entry.1 = hint.clone();
+                    }
+                    self.streaming_tool_hint = hint;
+                } else {
+                    // New tool name arriving — only keep this one visible.
+                    // Earlier tools already transitioned to ToolCallStarted
+                    // and are rendered by the normal tool call display above.
+                    self.streaming_tools.clear();
+                    self.streaming_tools.push((name, String::new()));
+                }
             }
             AgentEvent::ToolCallStarted { id, name, arguments } => {
-                // Args fully assembled — streaming phase done.
-                self.streaming_tool_name = None;
+                // Args fully assembled — streaming phase done for this tool.
+                // Remove from streaming list (first match only).
+                if let Some(pos) = self.streaming_tools.iter().position(|(n, _)| n == &name) {
+                    self.streaming_tools.remove(pos);
+                }
+                if self.streaming_tools.is_empty() {
+                    self.streaming_tool_name = None;
+                    self.streaming_tool_hint.clear();
+                }
                 self.current_tool_call_count += 1;
                 // Track TTFT — tool call is also a "first token" from the LLM
                 if self.first_token_ms.is_none() {
@@ -740,6 +767,8 @@ impl App {
             AgentEvent::TurnComplete { duration, total_tokens: _, turn_count: _, tool_call_count: _, stop_reason: _ } => {
                 // Clear any lingering streaming tool state — turn is over.
                 self.streaming_tool_name = None;
+                self.streaming_tools.clear();
+                self.streaming_tool_hint.clear();
                 self.executing_tool_info.clear();
                 // Orphan tool_call guard: if the turn ended but some tool_calls in
                 // conversation don't have matching ToolResults, the in-flight renderer
@@ -844,6 +873,7 @@ impl App {
             }
             AgentEvent::Error(e) => {
                 self.streaming_tool_name = None;
+                self.streaming_tools.clear();
                 self.executing_tool_info.clear();
                 self.conversation.push_delta(&format!("\n\n[Error: {}]", e));
                 self.conversation.finalize_stream();

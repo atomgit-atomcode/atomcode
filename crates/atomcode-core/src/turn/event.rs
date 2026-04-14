@@ -10,7 +10,7 @@ pub enum TurnEvent {
     /// Fires once per tool call, BEFORE the full args have arrived. Lets the UI surface
     /// the tool name immediately so users see "⠋ Write File…" instead of an opaque
     /// "Generating…" while the model spends seconds streaming args.
-    ToolCallStreaming { name: String },
+    ToolCallStreaming { name: String, hint: String },
     /// Tool call fully assembled, about to execute.
     /// `id` is the provider-supplied call id — pairs with the matching `ToolCallResult.call_id`.
     ToolCallStarted { id: String, name: String, arguments: String },

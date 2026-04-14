@@ -200,11 +200,12 @@ _ = cancel.cancelled() => {
                             // Surface the tool name to UI immediately — otherwise users see
                             // "Generating…" for the entire args-streaming window (can be 30s+
                             // for large write_file calls).
-                            let _ = event_tx.send(TurnEvent::ToolCallStreaming { name: name.clone() });
+                            let _ = event_tx.send(TurnEvent::ToolCallStreaming { name: name.clone(), hint: String::new() });
                             conversation.tool_call_buffer = Some(ToolCallBuffer {
                                 id,
                                 name,
                                 arguments: String::new(),
+                                hint_sent: false,
                             });
                         }
 
@@ -212,6 +213,16 @@ _ = cancel.cancelled() => {
                             got_any_event = true;
                             if let Some(ref mut buf) = conversation.tool_call_buffer {
                                 buf.arguments.push_str(&args);
+                                // Extract file_path from partial args (once only).
+                                if !buf.hint_sent && buf.arguments.len() < 300 {
+                                    if let Some(hint) = extract_path_hint(&buf.arguments) {
+                                        buf.hint_sent = true;
+                                        let _ = event_tx.send(TurnEvent::ToolCallStreaming {
+                                            name: buf.name.clone(),
+                                            hint,
+                                        });
+                                    }
+                                }
                             }
                         }
 
@@ -572,6 +583,30 @@ _ = cancel.cancelled() => {
 }
 
 /// Strip model-internal reasoning tags from streaming output.
+/// Extract a file path hint from partial JSON args (e.g. `{"file_path":"/src/main.rs"`).
+/// Returns the short filename on success, empty on failure. Only fires once — caller
+/// should stop calling after the first hit.
+fn extract_path_hint(partial_json: &str) -> Option<String> {
+    // Look for "file_path":"..." or "path":"..."
+    for key in &["file_path", "path"] {
+        let needle = format!("\"{}\":\"", key);
+        if let Some(start) = partial_json.find(&needle) {
+            let val_start = start + needle.len();
+            let rest = &partial_json[val_start..];
+            // Find the closing quote (or take what we have so far)
+            let end = rest.find('"').unwrap_or(rest.len());
+            let full_path = &rest[..end];
+            if !full_path.is_empty() {
+                // Return just the filename or last 2 path components
+                let short = full_path.rsplit('/').take(2).collect::<Vec<_>>();
+                let display = short.into_iter().rev().collect::<Vec<_>>().join("/");
+                return Some(display);
+            }
+        }
+    }
+    None
+}
+
 /// DeepSeek uses `<think>...</think>`, QwQ uses similar patterns.
 /// These should not be shown to the user or stored in conversation.
 fn strip_model_tags(text: &str) -> String {

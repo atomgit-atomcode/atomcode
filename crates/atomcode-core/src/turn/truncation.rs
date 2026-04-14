@@ -28,20 +28,29 @@ pub fn truncate_output(result: &mut ToolResult, tool_name: &str, context_window:
     // Applies after per-tool truncate. Protects against: unknown tools with no
     // per-tool logic, compile error compression that fails to shrink, edge-case
     // formats with embedded huge blobs.
-    const UNIVERSAL_MAX_LINES: usize = 300;
-    let line_count = result.output.lines().count();
-    if line_count > UNIVERSAL_MAX_LINES {
-        let lines: Vec<&str> = result.output.lines().collect();
-        const HEAD: usize = 50;
-        const TAIL: usize = 50;
-        let head_part = lines[..HEAD].join("\n");
-        let tail_part = lines[lines.len() - TAIL..].join("\n");
-        result.output = format!(
-            "{}\n\n[... {} lines omitted (universal 300-line cap) ...]\n\n{}",
-            head_part,
-            line_count - HEAD - TAIL,
-            tail_part,
-        );
+    //
+    // SKIP for read_file: it has its own 2000-line intelligent truncation
+    // (truncate_read_file) that extracts outlines. The 300-line blanket cap
+    // is too aggressive for typical source files (Vue SFC 300-500 lines,
+    // Java 200-400 lines) — it cuts navItems/data definitions in the middle,
+    // causing edit_file old_string mismatch on the next turn.
+    // The hard_char_limit (Layer 3 below) still applies as the safety net.
+    if tool_name != "read_file" {
+        const UNIVERSAL_MAX_LINES: usize = 300;
+        let line_count = result.output.lines().count();
+        if line_count > UNIVERSAL_MAX_LINES {
+            let lines: Vec<&str> = result.output.lines().collect();
+            const HEAD: usize = 50;
+            const TAIL: usize = 50;
+            let head_part = lines[..HEAD].join("\n");
+            let tail_part = lines[lines.len() - TAIL..].join("\n");
+            result.output = format!(
+                "{}\n\n[... {} lines omitted (universal 300-line cap) ...]\n\n{}",
+                head_part,
+                line_count - HEAD - TAIL,
+                tail_part,
+            );
+        }
     }
 
     // ── Universal char-count ceiling ──

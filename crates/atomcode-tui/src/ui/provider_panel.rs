@@ -251,13 +251,13 @@ fn render_add_form(frame: &mut Frame, area: Rect, mgr: &ProviderManager, step: &
             let display = if mgr.input_buf.is_empty() {
                 "(optional, press Enter to skip)".to_string()
             } else {
-                format!("{}*", &mgr.input_buf[..3.min(mgr.input_buf.len())])
+                format!("{}*", mgr.input_buf.chars().take(3).collect::<String>())
             };
             display
         } else if mgr.new_api_key.is_empty() {
             "(none)".to_string()
         } else {
-            format!("{}***", &mgr.new_api_key[..3.min(mgr.new_api_key.len())])
+            format!("{}***", mgr.new_api_key.chars().take(3).collect::<String>())
         };
         lines.push(Line::from(vec![
             Span::styled("  API Key:  ", style),
@@ -347,7 +347,7 @@ fn render_edit_form(
                 .unwrap_or(p.provider_type.clone()),
             p.api_key
                 .as_ref()
-                .map(|k| format!("{}***", &k[..3.min(k.len())]))
+                .map(|k| format!("{}***", k.chars().take(3).collect::<String>()))
                 .unwrap_or("(none)".to_string()),
             p.base_url.clone().unwrap_or("(default)".to_string()),
             p.model.clone(),

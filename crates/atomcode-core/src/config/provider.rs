@@ -25,16 +25,16 @@ pub struct ProviderConfig {
 }
 
 fn default_context_window() -> usize {
-    128000
+    64000
 }
 
-/// Default context window per provider type. All families default to 128K —
-/// modern hosted models (Claude Sonnet, GLM-5, MiniMax M2.7, Qwen3-Max,
-/// DeepSeek-V3, Kimi-K2, GPT-4o) all support ≥128K natively. Users who want
-/// a tighter budget for weak local models (ollama) can override in config.
+/// Default context window per provider type.
+/// 64K is the safe default — most models advertise 128K+ but their effective
+/// attention span is much smaller. Oversized context causes "lost in the middle"
+/// and prevents compression from triggering. Users can override in config.
 pub fn default_context_window_for(provider_type: &str) -> usize {
     match provider_type {
-        "ollama" => 8000,  // local quantized models often can't handle 128K cleanly
-        _ => 128000,
+        "ollama" => 8000,
+        _ => 64000,
     }
 }

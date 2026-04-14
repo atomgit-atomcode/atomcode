@@ -126,8 +126,7 @@ fn build_oauth_provider(access_token: &str) -> ProviderConfig {
         base_url: Some("https://api-ai.gitcode.com/v1".to_string()),
         system_prompt: None,
         user_agent: None,
-        context_window: 32000,
-        // OAuth creds stay in memory only — don't persist to disk.
+        context_window: 64000,
         ephemeral: true,
     }
 }
@@ -276,15 +275,9 @@ fn run_oauth_login() -> anyhow::Result<AuthInfo> {
         let _ = std::fs::create_dir_all(parent);
     }
 
-    let auth_content = format!(
-        "access_token = \"{}\"\n[user]\nid = {}\nusername = \"{}\"\n",
-        auth_info.access_token,
-        auth_info.user.id,
-        auth_info.user.username
-    );
-    std::fs::write(&auth_path, auth_content)?;
-
-    println!("  Auth saved to: {}\n", auth_path.display());
+    // Auth token kept in memory only — not written to disk.
+    // Previously saved to auth.toml; removed for security.
+    println!("  Auth active (in-memory only)\n");
 
     Ok(auth_info)
 }
@@ -365,8 +358,24 @@ pub async fn run(
                 if exit_status.success() {
                     let config_path = Config::default_path();
                     if std::path::Path::new(&file_path) == config_path {
-                        if let Ok(new_config) = Config::load(&config_path) {
+                        if let Ok(mut new_config) = Config::load(&config_path) {
+                            // Preserve ephemeral providers (e.g. OAuth /login) —
+                            // they only exist in memory, not on disk.
+                            for (name, provider) in &app.config.providers {
+                                if provider.ephemeral {
+                                    new_config.providers.insert(name.clone(), provider.clone());
+                                }
+                            }
+                            // If the previous default was ephemeral and still exists, keep it
+                            if app.config.providers.get(&app.config.default_provider)
+                                .map(|p| p.ephemeral).unwrap_or(false)
+                                && new_config.providers.contains_key(&app.config.default_provider)
+                            {
+                                new_config.default_provider = app.config.default_provider.clone();
+                            }
                             app.config = new_config;
+                            app.rebuild_provider();
+                            app.sync_config_to_agent();
                             let default_name = app.config.default_provider.clone();
                             if let Ok(provider) = app.config.active_provider(None) {
                                 app.model_name = format!("{} / {}", default_name, provider.model);
@@ -420,10 +429,7 @@ pub async fn run(
                     app.config.providers.insert(oauth_name.clone(), oauth_provider);
                     app.config.default_provider = oauth_name.clone();
                     app.rebuild_provider();
-                    // Send full config to AgentLoop so it has the new provider in memory.
-                    let _ = app.agent_handle.cmd_tx.send(
-                        atomcode_core::agent::AgentCommand::ReloadConfig(app.config.clone())
-                    );
+                    app.sync_config_to_agent();
                     let model_display = app.provider.model_name();
                     app.conversation.add_user_message("/login");
                     app.conversation.push_delta(&format!(

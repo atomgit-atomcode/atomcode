@@ -65,7 +65,17 @@ impl Config {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let content = toml::to_string_pretty(self)?;
+        // Filter out ephemeral providers (e.g. OAuth /login) — they live in memory only.
+        let mut persistent = self.clone();
+        persistent.providers.retain(|_, v| !v.ephemeral);
+        // If default_provider is ephemeral, don't change the saved default
+        if !self.providers.get(&self.default_provider).map(|p| !p.ephemeral).unwrap_or(true) {
+            // Restore original default from disk if possible
+            if let Ok(disk) = Config::load(path) {
+                persistent.default_provider = disk.default_provider;
+            }
+        }
+        let content = toml::to_string_pretty(&persistent)?;
         std::fs::write(path, content)?;
         Ok(())
     }
