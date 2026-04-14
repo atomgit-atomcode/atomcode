@@ -1,10 +1,16 @@
 use crate::conversation::message::Message;
 use crate::tool::{ToolCall, ToolDef};
+use std::path::Path;
 
-/// Log the complete LLM request (messages + tools + metadata) to
-/// `~/.atomcode/logs/YYYY-MM-DD_HH-MM-SS_NNN.json`.
+/// Log the complete LLM request (messages + tools + metadata) under
+/// `<working_dir>/datalog/llm/YYYY-MM-DD_HH-MM-SS_NNN.json`.
+///
+/// Moved from `~/.atomcode/logs/` (2026-04-14): per-project logs colocate with
+/// the turn-level datalog `.md` files so a project's entire session history is
+/// in one place and can be zipped/deleted/shared atomically.
 /// This is fire-and-forget — logging failures are silently ignored.
 pub fn log_llm_request(
+    working_dir: &Path,
     messages: &[Message],
     tool_defs: &[ToolDef],
     model: &str,
@@ -13,7 +19,7 @@ pub fn log_llm_request(
 ) {
     use std::io::Write;
 
-    let log_dir = crate::config::Config::config_dir().join("logs");
+    let log_dir = working_dir.join("datalog").join("llm");
     let _ = std::fs::create_dir_all(&log_dir);
 
     // Build timestamp filename.
@@ -79,9 +85,10 @@ pub fn log_llm_request(
     }
 }
 
-/// Log the LLM response (text + tool calls) to
-/// `~/.atomcode/logs/YYYY-MM-DD_HH-MM-SS_NNN_response.json`.
+/// Log the LLM response (text + tool calls) under
+/// `<working_dir>/datalog/llm/YYYY-MM-DD_HH-MM-SS_NNN_response.json`.
 pub fn log_llm_response(
+    working_dir: &Path,
     text: &str,
     tool_calls: &[ToolCall],
     model: &str,
@@ -90,7 +97,7 @@ pub fn log_llm_response(
 ) {
     use std::io::Write;
 
-    let log_dir = crate::config::Config::config_dir().join("logs");
+    let log_dir = working_dir.join("datalog").join("llm");
     let _ = std::fs::create_dir_all(&log_dir);
 
     let now = std::time::SystemTime::now()
@@ -168,6 +175,7 @@ mod tests {
 
     #[test]
     fn test_log_llm_request_creates_json() {
+        let tmp = tempfile::TempDir::new().unwrap();
         let messages = vec![
             Message::new(Role::System, "You are helpful."),
             Message::new(Role::User, "Hello"),
@@ -178,30 +186,18 @@ mod tests {
             parameters: serde_json::json!({"type": "object"}),
         }];
 
-        // Record files before
-        let log_dir = crate::config::Config::config_dir().join("logs");
-        let before: std::collections::HashSet<_> = std::fs::read_dir(&log_dir)
-            .ok()
-            .map(|rd| rd.filter_map(|e| e.ok().map(|e| e.path())).collect())
-            .unwrap_or_default();
+        log_llm_request(tmp.path(), &messages, &tool_defs, "test-model", 16000, 3);
 
-        // Call
-        log_llm_request(&messages, &tool_defs, "test-model", 16000, 3);
-
-        // Find new file(s) — use >= 1 because parallel tests may also write logs.
-        let after: std::collections::HashSet<_> = std::fs::read_dir(&log_dir)
-            .unwrap()
+        // Should have created <tmp>/datalog/llm/*.json — exactly one file.
+        let log_dir = tmp.path().join("datalog").join("llm");
+        let files: Vec<_> = std::fs::read_dir(&log_dir).unwrap()
             .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().map_or(false, |ext| ext == "json"))
             .collect();
-        let new_files: Vec<_> = after.difference(&before).collect();
-        assert!(new_files.len() >= 1, "Expected at least 1 new log file, got {}", new_files.len());
-
-        // Pick the newest file (ours) by sorting descending on file name.
-        let log_path = new_files.iter().max().unwrap();
-        assert!(log_path.extension().unwrap() == "json");
+        assert_eq!(files.len(), 1, "Expected exactly 1 JSON log under {:?}, got {}", log_dir, files.len());
 
         // Verify JSON content
-        let content = std::fs::read_to_string(log_path).unwrap();
+        let content = std::fs::read_to_string(&files[0]).unwrap();
         let json: serde_json::Value = serde_json::from_str(&content).unwrap();
 
         assert_eq!(json["model"], "test-model");
@@ -212,9 +208,7 @@ mod tests {
         assert!(json["messages"].is_array());
         assert!(json["tools"].is_array());
         assert_eq!(json["tools"][0]["name"], "bash");
-
-        // Cleanup
-        let _ = std::fs::remove_file(log_path);
+        // TempDir auto-cleans when dropped.
     }
 
     #[test]

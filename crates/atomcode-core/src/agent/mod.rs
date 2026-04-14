@@ -835,7 +835,7 @@ impl AgentLoop {
             // Datalog: mark the start of a new LLM round-trip
             self.datalog.log_llm_call();
 
-            // Log LLM request to ~/.atomcode/logs/ (caller responsibility, not TurnRunner's)
+            // Log LLM request to <working_dir>/datalog/llm/ — colocated with turn .md files.
             {
                 let context_window = self.config
                     .providers
@@ -844,7 +844,10 @@ impl AgentLoop {
                     .unwrap_or(16000);
                 let (msgs, _) = conv.to_provider_messages_budgeted(&system_prompt, context_window);
                 let tool_defs = self.turn_runner.tools.get_definitions();
+                let wd = self.turn_runner.context.working_dir
+                    .try_read().map(|g| g.clone()).unwrap_or_default();
                 crate::turn::log::log_llm_request(
+                    &wd,
                     &msgs,
                     &tool_defs,
                     self.turn_runner.provider.model_name(),

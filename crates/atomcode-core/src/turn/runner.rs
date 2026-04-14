@@ -266,9 +266,12 @@ _ = cancel.cancelled() => {
             }
         }
 
-        // Log LLM response (text + tool calls)
+        // Log LLM response (text + tool calls) to <working_dir>/datalog/llm/
         let response_duration = stream_start.elapsed().as_millis() as u64;
+        let wd = self.context.working_dir
+            .try_read().map(|g| g.clone()).unwrap_or_default();
         super::log::log_llm_response(
+            &wd,
             &text_buf,
             &tool_calls_buf,
             self.provider.model_name(),
