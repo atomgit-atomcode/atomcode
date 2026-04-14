@@ -2582,29 +2582,37 @@ fn copy_to_clipboard(text: &str) -> std::io::Result<()> {
 
 /// Read text from system clipboard.
 fn read_clipboard() -> Option<String> {
-    use std::process::Command;
+    #[cfg(target_os = "windows")]
+    {
+        // Native Windows clipboard API — avoids ~1s PowerShell cold-start that
+        // froze the TUI on Ctrl+V.
+        return clipboard_win::get_clipboard_string()
+            .ok()
+            .map(|t| t.replace("\r\n", "\n").replace('\r', "\n"))
+            .filter(|s| !s.is_empty());
+    }
 
-    let output = if cfg!(target_os = "macos") {
-        Command::new("pbpaste").output().ok()
-    } else if cfg!(target_os = "windows") {
-        Command::new("powershell")
-            .args(&["-Command", "Get-Clipboard"])
-            .output().ok()
-    } else {
-        Command::new("xclip")
-            .args(&["-selection", "clipboard", "-o"])
-            .output().ok()
-            .or_else(|| Command::new("xsel").args(&["--clipboard", "--output"]).output().ok())
-    };
+    #[cfg(not(target_os = "windows"))]
+    {
+        use std::process::Command;
 
-    output
-        .filter(|o| o.status.success())
-        .map(|o| {
-            let text = String::from_utf8_lossy(&o.stdout).to_string();
-            // Normalize line endings: \r\n -> \n, \r -> \n
-            text.replace("\r\n", "\n").replace('\r', "\n")
-        })
-        .filter(|s| !s.is_empty())
+        let output = if cfg!(target_os = "macos") {
+            Command::new("pbpaste").output().ok()
+        } else {
+            Command::new("xclip")
+                .args(&["-selection", "clipboard", "-o"])
+                .output().ok()
+                .or_else(|| Command::new("xsel").args(&["--clipboard", "--output"]).output().ok())
+        };
+
+        output
+            .filter(|o| o.status.success())
+            .map(|o| {
+                let text = String::from_utf8_lossy(&o.stdout).to_string();
+                text.replace("\r\n", "\n").replace('\r', "\n")
+            })
+            .filter(|s| !s.is_empty())
+    }
 }
 
 /// Load recent project directories from ~/.atomcode/recent_dirs.txt

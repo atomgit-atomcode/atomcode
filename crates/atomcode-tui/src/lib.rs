@@ -13,12 +13,14 @@ use std::io::Write;
 use anyhow::Result;
 use crossterm::{
     execute,
-    event::{EnableBracketedPaste, DisableBracketedPaste, DisableMouseCapture},
+    event::DisableMouseCapture,
     terminal::{
         disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
         SetTitle, Clear, ClearType,
     },
 };
+#[cfg(not(target_os = "windows"))]
+use crossterm::event::{EnableBracketedPaste, DisableBracketedPaste};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
@@ -332,13 +334,23 @@ pub async fn run(
         EnterAlternateScreen,
         SetTitle("AtomCode"),
         Clear(ClearType::All),
-        EnableBracketedPaste,
-        // Scroll-only mouse mode is enabled in EventLoop::start (mode 1000+1006 only,
-        // no 1002 drag tracking). See event.rs::enable_mouse_scroll_only for rationale:
-        // we get wheel scroll events without blocking native click-drag text selection.
     )?;
+    // Bracketed paste: reliable on macOS/Linux only. On Windows conhost it can
+    // mis-interpret Enter/typing as paste events, which caused "second Enter
+    // doesn't submit" (the key arrived as AppEvent::Paste containing "\n" and
+    // got inserted into the input buffer instead of triggering send_message).
+    // Ctrl+V on Windows reads the clipboard directly (see app.rs::read_clipboard).
+    #[cfg(not(target_os = "windows"))]
+    execute!(stdout, EnableBracketedPaste)?;
 
-    let backend = CrosstermBackend::new(stdout);
+    // Wrap stdout in BufWriter: crossterm emits many small writes per frame
+    // (cursor moves, style changes, cells). On Windows each write is a
+    // WriteConsole syscall, which is orders of magnitude slower than Unix tty
+    // writes — unbuffered stdout caused visible per-keystroke lag. ratatui
+    // flushes the backend at the end of every draw, so latency is unaffected.
+    // 64KB capacity: a full-screen frame of ANSI output often exceeds the
+    // default 8KB buffer, which would force multiple flushes per frame.
+    let backend = CrosstermBackend::new(std::io::BufWriter::with_capacity(64 * 1024, stdout));
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
     let mut app = App::new(model_name, config, agent_handle, tool_context, working_dir, session_to_continue);
@@ -355,9 +367,10 @@ pub async fn run(
             execute!(
                 terminal.backend_mut(),
                 DisableMouseCapture,
-                DisableBracketedPaste,
                 LeaveAlternateScreen
             )?;
+            #[cfg(not(target_os = "windows"))]
+            execute!(terminal.backend_mut(), DisableBracketedPaste)?;
             terminal.show_cursor()?;
 
             event_loop.stop();
@@ -395,9 +408,10 @@ pub async fn run(
                 EnterAlternateScreen,
                 SetTitle("AtomCode"),
                 Clear(ClearType::All),
-                EnableBracketedPaste,
                 // Mouse mode is re-enabled by EventLoop::start (scroll-only). See startup comment.
             )?;
+            #[cfg(not(target_os = "windows"))]
+            execute!(terminal.backend_mut(), EnableBracketedPaste)?;
             terminal.clear()?;
             event_loop.start();
             continue;
@@ -411,9 +425,10 @@ pub async fn run(
             execute!(
                 terminal.backend_mut(),
                 DisableMouseCapture,
-                DisableBracketedPaste,
                 LeaveAlternateScreen
             )?;
+            #[cfg(not(target_os = "windows"))]
+            execute!(terminal.backend_mut(), DisableBracketedPaste)?;
             terminal.show_cursor()?;
 
             println!("\n  AtomCode AtomGit Login");
@@ -458,9 +473,10 @@ pub async fn run(
                 EnterAlternateScreen,
                 SetTitle("AtomCode"),
                 Clear(ClearType::All),
-                EnableBracketedPaste,
                 // Mouse mode is re-enabled by EventLoop::start (scroll-only). See startup comment.
             )?;
+            #[cfg(not(target_os = "windows"))]
+            execute!(terminal.backend_mut(), EnableBracketedPaste)?;
             terminal.clear()?;
             continue;
         }
@@ -521,9 +537,10 @@ pub async fn run(
     execute!(
         terminal.backend_mut(),
         DisableMouseCapture,
-        DisableBracketedPaste,
         LeaveAlternateScreen,
     )?;
+    #[cfg(not(target_os = "windows"))]
+    execute!(terminal.backend_mut(), DisableBracketedPaste)?;
     terminal.show_cursor()?;
 
     Ok(())

@@ -13,7 +13,7 @@ futures = "0.3"
 pulldown-cmark = "0.12"
 ratatui = "0.29"
 serde_json = "1"
-syntect = "5"
+syntect = { version = "5", default-features = false, features = ["default-fancy"] }
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
 base64 = "0.22"
@@ -22,3 +22,6 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 serde = { version = "1", features = ["derive"] }
 libc = "0.2"
 terminal-link = "0.1"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+clipboard-win = "5"

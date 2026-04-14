@@ -101,8 +101,11 @@ impl Tool for WebFetchTool {
 
         // Truncate if too long
         let output = if text.len() > max {
-            let truncated = &text[..text.floor_char_boundary(max)];
-            format!("{}\n\n[Truncated at {} chars, {} total]", truncated, max, text.len())
+            let mut end = max;
+            while end > 0 && !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            format!("{}\n\n[Truncated at {} chars, {} total]", &text[..end], max, text.len())
         } else {
             text
         };
