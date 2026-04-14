@@ -123,35 +123,40 @@ pub fn render(
                             render_cache.push(Line::default());
                         }
                     }
-                    // Skip in-flight tool calls (no matching ToolResult yet) — they're rendered
-                    // dynamically below with animated spinner icon for live feedback.
-                    let completed_calls: Vec<&ToolCall> = tool_calls.iter()
-                        .filter(|c| completed_call_ids.contains(c.id.as_str()))
-                        .collect();
-                    // Batch consecutive same-type tool calls.
-                    // Keep last 3 calls expanded (recent work visible),
-                    // fold earlier ones into compact summary.
-                    let total_completed = completed_calls.len();
+                    // Show ALL tool calls inline — both completed and in-flight.
+                    // In-flight calls get ⏳ icon, completed get ▸.
+                    // This ensures every tool call is visible in the chat flow
+                    // the moment it starts (not hidden until result arrives).
+                    let all_calls: Vec<&ToolCall> = tool_calls.iter().collect();
+                    let total_calls = all_calls.len();
                     let keep_recent = 3usize;
-                    let fold_before = total_completed.saturating_sub(keep_recent);
+                    let fold_before = total_calls.saturating_sub(keep_recent);
 
                     let mut ci = 0;
-                    while ci < completed_calls.len() {
+                    while ci < all_calls.len() {
                         let batch_start = ci;
-                        let batch_tool = &completed_calls[ci].name;
-                        while ci < completed_calls.len() && completed_calls[ci].name == *batch_tool {
+                        let batch_tool = &all_calls[ci].name;
+                        let batch_completed = completed_call_ids.contains(all_calls[ci].id.as_str());
+                        while ci < all_calls.len()
+                            && all_calls[ci].name == *batch_tool
+                            && completed_call_ids.contains(all_calls[ci].id.as_str()) == batch_completed
+                        {
                             ci += 1;
                         }
                         let batch_count = ci - batch_start;
-                        // Fold if: ≥2 same-type AND all in the "old" region (before keep_recent)
-                        if batch_count >= 2 && ci <= fold_before {
-                            let details: Vec<String> = completed_calls[batch_start..ci].iter().map(|c| {
+                        if batch_count >= 2 && ci <= fold_before && batch_completed {
+                            let details: Vec<String> = all_calls[batch_start..ci].iter().map(|c| {
                                 extract_tool_detail_short(&c.name, &c.arguments)
                             }).collect();
                             render_batch_tool_calls(render_cache, batch_tool, batch_count, &details);
                         } else {
-                            for c in &completed_calls[batch_start..ci] {
-                                render_tool_call(render_cache, c, None);
+                            for c in &all_calls[batch_start..ci] {
+                                if completed_call_ids.contains(c.id.as_str()) {
+                                    render_tool_call(render_cache, c, None);
+                                } else {
+                                    // In-flight: show with ⏳ icon
+                                    render_tool_call(render_cache, c, Some("\u{23F3}"));
+                                }
                             }
                         }
                     }
@@ -271,41 +276,8 @@ pub fn render(
         }
     }
 
-    // ── In-flight tool calls ──
-    // Render tool calls that don't have matching ToolResults yet, with an animated spinner
-    // frame as their icon. This gives live "⠋ Write(file.rs)" feedback from the moment
-    // ToolCallStarted fires — not after the tool finishes.
-    //
-    // Important: we push a trailing blank line so the in-flight row is NOT on the last
-    // visible row. The bottom spinner overlay clears the last row, so without this pad
-    // the in-flight row would be erased by the overlay and look like "nothing shows up
-    // until the tool completes" (2026-04-12 user report).
-    {
-        let mut completed_ids: HashSet<&str> = HashSet::new();
-        for msg in &conversation.messages {
-            match &msg.content {
-                MessageContent::ToolResult(r) => { completed_ids.insert(r.call_id.as_str()); }
-                MessageContent::ToolResultRef(r) => { completed_ids.insert(r.call_id.as_str()); }
-                _ => {}
-            }
-        }
-        let spinner_frame = SPINNER[tick % SPINNER.len()];
-        let mut rendered_any = false;
-        for msg in &conversation.messages {
-            if let MessageContent::AssistantWithToolCalls { tool_calls, .. } = &msg.content {
-                for call in tool_calls {
-                    if !completed_ids.contains(call.id.as_str()) {
-                        render_tool_call(&mut dynamic, call, Some(spinner_frame));
-                        rendered_any = true;
-                    }
-                }
-            }
-        }
-        if rendered_any {
-            // Pad so the last in-flight row sits above the bottom spinner overlay.
-            dynamic.push(Line::default());
-        }
-    }
+    // In-flight tool calls are now rendered inline in the cached section above
+    // (with ⏳ icon). No need for separate dynamic rendering — avoids duplication.
 
     // ── Streaming tool call (name known, args still arriving) ──
     // LLM has emitted the tool name but is still streaming the args JSON. The
