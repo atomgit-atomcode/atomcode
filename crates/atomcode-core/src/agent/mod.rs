@@ -803,20 +803,9 @@ impl AgentLoop {
 
             // Planning phase: inject planning reminder on turn 3.
             // Turn 1-2: model reads files to understand the task.
-            // Turn 3: "you've read enough, now plan and edit."
-            if self.planning_phase && self.turn_count == 3 {
-                self.planning_phase = false;
-                self.conversation.messages.push(
-                    crate::conversation::message::Message::new(
-                        crate::conversation::message::Role::System,
-                        "[PLAN NOW] You have read enough files. Plan your changes and start editing:\n\
-                         1. WHAT: What exactly will you change?\n\
-                         2. FILES: Which files will you modify?\n\
-                         3. SCOPE: Only what the user asked for.\n\
-                         Then edit immediately. Do NOT read more files unless absolutely necessary.",
-                    )
-                );
-            }
+            // Planning phase injection: REMOVED.
+            // Was injecting "[PLAN NOW]" at turn 3, but this is arbitrary timing.
+            // The system prompt WORKFLOW section already guides planning.
 
             // NOTE: Negative feedback injection disabled — adds a System message that
             // confuses weak models and wastes context. The model sees the user's complaint
