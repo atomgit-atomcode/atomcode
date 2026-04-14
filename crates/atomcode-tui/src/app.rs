@@ -351,7 +351,7 @@ impl App {
            turn_tokens: 0,
            ctx_used_tokens: 0,
            context_window: config.providers.get(&config.default_provider)
-               .map(|p| p.context_window).unwrap_or(32000),
+               .map(|p| p.context_window).unwrap_or(128000),
            suggestion: None,
            render_cache: Vec::new(),
            render_cache_msg_count: 0,
@@ -373,6 +373,7 @@ impl App {
                    system_prompt: None,
                    user_agent: None,
                    context_window: atomcode_core::config::provider::default_context_window_for("openai"),
+                   ephemeral: false,
                }).unwrap_or_else(|_| {
                    // Fallback: should never reach production path since AgentLoop handles LLM
                    panic!("Failed to create placeholder provider")
@@ -618,6 +619,14 @@ impl App {
                 self.provider = new_provider;
             }
         }
+    }
+
+    /// Sync in-memory config (including ephemeral providers) to AgentLoop.
+    /// Call this after any config change that should take effect immediately.
+    pub(crate) fn sync_config_to_agent(&self) {
+        let _ = self.agent_handle.cmd_tx.send(
+            AgentCommand::ReloadConfig(self.config.clone())
+        );
     }
 
     /// Process an event coming from the AgentLoop. Updates local conversation mirror and UI state.
@@ -1190,8 +1199,7 @@ impl App {
                     self.config.default_provider = name.clone();
                     let _ = self.config.save(&Config::default_path());
                     self.rebuild_provider();
-                    // Tell AgentLoop to switch to the new provider
-                    let _ = self.agent_handle.cmd_tx.send(AgentCommand::SwitchProvider(name));
+                    self.sync_config_to_agent();
                 }
                 self.mode = AppMode::Normal;
             }
@@ -1532,8 +1540,8 @@ impl App {
                 ManagerAction::Close => {
                     let config_path = Config::default_path();
                     let _ = self.config.save(&config_path);
-                    // Rebuild provider from current config
                     self.rebuild_provider();
+                    self.sync_config_to_agent();
                     self.provider_mgr = None;
                     self.mode = AppMode::Normal;
                 }
@@ -1542,6 +1550,7 @@ impl App {
                     let config_path = Config::default_path();
                     let _ = self.config.save(&config_path);
                     self.rebuild_provider();
+                    self.sync_config_to_agent();
                 }
                 ManagerAction::Delete(name) => {
                     self.config.providers.remove(&name);
@@ -1550,6 +1559,7 @@ impl App {
                     }
                     let config_path = Config::default_path();
                     let _ = self.config.save(&config_path);
+                    self.sync_config_to_agent();
                 }
                 ManagerAction::Add(name, provider_config) => {
                     self.config.providers.insert(name, provider_config);
@@ -1558,6 +1568,7 @@ impl App {
                     }
                     let config_path = Config::default_path();
                     let _ = self.config.save(&config_path);
+                    self.sync_config_to_agent();
                 }
                 ManagerAction::StartAtomGitOAuth(name) => {
                     // Store the desired provider name, then trigger the existing OAuth flow.
@@ -1587,6 +1598,7 @@ impl App {
                     }
                     let config_path = Config::default_path();
                     let _ = self.config.save(&config_path);
+                    self.sync_config_to_agent();
                 }
             }
         }
@@ -2305,35 +2317,27 @@ impl App {
                     }
                 }
                 
-                // 2. Remove AtomGit provider from config.toml
-                let config_path = Config::default_path();
-                if config_path.exists() {
-                    if let Ok(mut config) = Config::load(&config_path) {
-                        // Case-insensitive search for AtomGit provider
-                        let atomgit_key = config.providers.keys()
-                            .find(|k| k.to_lowercase() == "atomgit")
-                            .cloned();
-                            
-                        if let Some(key) = atomgit_key {
-                            config.providers.remove(&key);
-                            messages.push("AtomGit provider removed from config.".to_string());
-                            
-                            // If default provider was AtomGit, switch to another
-                            if config.default_provider.to_lowercase() == "atomgit" {
-                                if let Some(new_default) = config.providers.keys().next().cloned() {
-                                    config.default_provider = new_default.clone();
-                                    messages.push(format!("Switched default provider to: {}", new_default));
-                                }
-                            }
-                            
-                            let _ = config.save(&config_path);
-                            
-                            // Update app config and rebuild provider
-                            self.config = config;
-                            self.rebuild_provider();
-                            logged_out = true;
+                // 2. Remove AtomGit provider from in-memory config
+                let atomgit_key = self.config.providers.keys()
+                    .find(|k| k.to_lowercase() == "atomgit")
+                    .cloned();
+
+                if let Some(key) = atomgit_key {
+                    self.config.providers.remove(&key);
+                    messages.push("AtomGit provider removed.".to_string());
+
+                    // If default provider was AtomGit, switch to another
+                    if self.config.default_provider.to_lowercase() == "atomgit" {
+                        if let Some(new_default) = self.config.providers.keys().next().cloned() {
+                            self.config.default_provider = new_default.clone();
+                            messages.push(format!("Switched default provider to: {}", new_default));
                         }
                     }
+
+                    let _ = self.config.save(&Config::default_path());
+                    self.rebuild_provider();
+                    self.sync_config_to_agent();
+                    logged_out = true;
                 }
                 
                 // 3. Show result message

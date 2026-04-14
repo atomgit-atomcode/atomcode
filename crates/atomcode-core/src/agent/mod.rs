@@ -48,9 +48,8 @@ pub enum AgentCommand {
     ApproveToolAlways,
     /// Deny a pending tool call.
     DenyTool,
-    /// Switch to a different provider.
-    SwitchProvider(String),
-    /// Reload config (e.g. after OAuth login) and switch to the new default provider.
+    /// Reload config from TUI (the single source of truth for in-memory config,
+    /// including ephemeral OAuth providers). Switches to the new default provider.
     ReloadConfig(crate::config::Config),
     /// Change working directory.
     ChangeDir(String),
@@ -518,46 +517,6 @@ impl AgentLoop {
                 AgentCommand::DenyTool => {
                     // Denial handled inside run_turn_loop via channels
                 }
-                AgentCommand::SwitchProvider(provider_name) => {
-                    // Reload config from file first (in case new providers were added via /login or /provider)
-                    let config_path = Config::default_path();
-                    if let Ok(new_config) = Config::load(&config_path) {
-                        self.config = new_config;
-                    }
-                    
-                    // Try exact match first, then case-insensitive match
-                    let provider_config = self.config.providers.get(&provider_name)
-                        .or_else(|| {
-                            // Try case-insensitive match
-                            self.config.providers.iter()
-                                .find(|(k, _)| k.to_lowercase() == provider_name.to_lowercase())
-                                .map(|(_, v)| v)
-                        });
-                    
-                    if let Some(provider_config) = provider_config {
-                        self.config.default_provider = provider_name.clone();
-                        match crate::provider::create_provider(provider_config) {
-                            Ok(new_provider) => {
-                                let model_name = new_provider.model_name().to_string();
-                                self.turn_runner.provider = std::sync::Arc::from(new_provider);
-                                self.turn_runner.config = self.config.clone();
-                                let _ = self.event_tx.send(AgentEvent::TextDelta(
-                                    format!("**Switched to: {} / {}**\n\n", provider_name, model_name)
-                                ));
-                            }
-                            Err(e) => {
-                                let _ = self.event_tx.send(AgentEvent::TextDelta(
-                                    format!("**Failed to create provider: {}**\n\n", e)
-                                ));
-                            }
-                        }
-                    } else {
-                        let available: Vec<_> = self.config.providers.keys().collect();
-                        let _ = self.event_tx.send(AgentEvent::TextDelta(
-                            format!("**Provider '{}' not found. Available: {:?}**\n\n", provider_name, available)
-                        ));
-                    }
-                }
                 AgentCommand::ReloadConfig(new_config) => {
                     let old_provider = self.config.default_provider.clone();
                     self.config = new_config;
@@ -641,7 +600,7 @@ impl AgentLoop {
         let ctx_window = self.config.providers
             .get(&self.config.default_provider)
             .map(|p| p.context_window)
-            .unwrap_or(64000);
+            .unwrap_or(128000);
         self.turn_runner.context.ctx_budget_hint.store(
             ctx_window,
             std::sync::atomic::Ordering::Relaxed,
@@ -716,7 +675,7 @@ impl AgentLoop {
         {
             let model_name = self.turn_runner.provider.model_name().to_string();
             let ctx_window = self.config.providers.get(&self.config.default_provider)
-                .map(|p| p.context_window).unwrap_or(32000);
+                .map(|p| p.context_window).unwrap_or(128000);
             self.datalog.begin_turn(&content, &model_name, ctx_window);
         }
 
@@ -841,7 +800,7 @@ impl AgentLoop {
                     .providers
                     .get(&self.config.default_provider)
                     .map(|p| p.context_window)
-                    .unwrap_or(16000);
+                    .unwrap_or(128000);
                 let (msgs, _) = conv.to_provider_messages_budgeted(&system_prompt, context_window);
                 let tool_defs = self.turn_runner.tools.get_definitions();
                 let wd = self.turn_runner.context.working_dir
@@ -1440,7 +1399,7 @@ impl AgentLoop {
             .providers
             .get(&self.config.default_provider)
             .map(|p| p.context_window)
-            .unwrap_or(16000);
+            .unwrap_or(128000);
 
         let sys_tokens = system_prompt.len() / 4 + 4;
         if !self.conversation.needs_compression(sys_tokens, context_window) {
@@ -1525,7 +1484,7 @@ impl AgentLoop {
             .providers
             .get(&self.config.default_provider)
             .map(|p| p.context_window)
-            .unwrap_or(16000);
+            .unwrap_or(128000);
 
         let sys_tokens = system_prompt.len() / 4 + 4;
         let n_turns = self.conversation.turns_needing_summary(sys_tokens, context_window);

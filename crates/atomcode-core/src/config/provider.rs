@@ -18,22 +18,23 @@ pub struct ProviderConfig {
     /// Defaults vary by provider type; use `default_context_window_for` after deserialization.
     #[serde(default = "default_context_window")]
     pub context_window: usize,
+    /// If true, this provider was added at runtime (e.g. OAuth /login)
+    /// and should NOT be persisted to config.toml on save.
+    #[serde(skip)]
+    pub ephemeral: bool,
 }
 
 fn default_context_window() -> usize {
-    32000
+    128000
 }
 
-/// Sensible default context window per provider type.
-/// Context budget sent to the model per request. This is NOT the model's max
-/// context — it controls how much conversation history to include. Larger values
-/// keep more history but dilute the model's attention. The sweet spot is enough
-/// for the current task + recent context, not the entire conversation.
+/// Default context window per provider type. All families default to 128K —
+/// modern hosted models (Claude Sonnet, GLM-5, MiniMax M2.7, Qwen3-Max,
+/// DeepSeek-V3, Kimi-K2, GPT-4o) all support ≥128K natively. Users who want
+/// a tighter budget for weak local models (ollama) can override in config.
 pub fn default_context_window_for(provider_type: &str) -> usize {
     match provider_type {
-        "claude" => 128000,
-        "openai" => 32000,   // Most OpenAI-compatible models support 32K+
-        "ollama" => 8000,
-        _ => 32000,
+        "ollama" => 8000,  // local quantized models often can't handle 128K cleanly
+        _ => 128000,
     }
 }

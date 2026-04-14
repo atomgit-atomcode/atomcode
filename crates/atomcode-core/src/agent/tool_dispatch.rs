@@ -132,7 +132,7 @@ impl AgentLoop {
             .providers
             .get(&self.config.default_provider)
             .map(|p| p.context_window)
-            .unwrap_or(16000);
+            .unwrap_or(128000);
         crate::turn::truncation::post_process_tool_results(
             &mut self.conversation.messages,
             tool_count,

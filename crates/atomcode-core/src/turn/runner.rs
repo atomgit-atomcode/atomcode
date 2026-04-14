@@ -63,7 +63,7 @@ impl TurnRunner {
             .providers
             .get(&self.config.default_provider)
             .map(|p| p.context_window)
-            .unwrap_or(16000);
+            .unwrap_or(128000);
 
         let (messages, ctx_stats) =
             conversation.to_provider_messages_budgeted(system_prompt, context_window);
