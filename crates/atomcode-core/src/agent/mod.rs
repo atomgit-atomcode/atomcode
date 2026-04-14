@@ -133,7 +133,7 @@ pub enum AgentEvent {
     TurnComplete {
         duration: Duration,
         total_tokens: usize,
-        /// LLM round-trips (Claude Code-compatible metric).
+        /// LLM round-trips (standard agent metric).
         turn_count: usize,
         /// Total individual tool calls.
         tool_call_count: usize,
@@ -221,7 +221,7 @@ pub struct AgentLoop {
 
     // Per-turn counters
     tool_call_count: usize,
-    /// LLM round-trip count (Claude Code-compatible "turn" metric).
+    /// LLM round-trip count (standard "turn" metric).
     /// Each iteration of run_turn_loop = 1 turn, regardless of how many
     /// tools were called in that iteration.
     turn_count: usize,
@@ -818,7 +818,7 @@ impl AgentLoop {
             // Was injecting "[STAGNATION WARNING]" after 3 turns without edits.
             // Bug: triggered after model output a completion summary (pure text,
             // no edits), preventing it from stopping. The warning was interpreted
-            // as "keep working" by the model. CC doesn't do stagnation detection —
+            // as "keep working" by the model. Stagnation detection was harmful —
             // the prompt guides the model to work efficiently.
 
             let system_prompt = self.build_system_prompt();
@@ -1221,7 +1221,7 @@ impl AgentLoop {
                                     }
                                 }
 
-                                // PLAN CHECK injection: REMOVED. CC doesn't inject
+                                // PLAN CHECK injection: REMOVED. Dependency warnings are not needed —
                                 // dependency warnings. Model discovers deps itself.
                                 let _ = missing_deps; // suppress unused warning
                             }
@@ -1277,7 +1277,7 @@ impl AgentLoop {
                         continue;
                     }
 
-                    // Colon guard: REMOVED. CC doesn't check end-of-text punctuation.
+                    // Colon guard: REMOVED. End-of-text punctuation check is unnecessary.
                     // If model stops mid-sentence, user can say "继续".
 
                     self.finish_turn(TurnStopReason::Natural);

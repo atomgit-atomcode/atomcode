@@ -49,7 +49,7 @@ impl AgentLoop {
         };
 
         // No file suggestions — let the model decide which files to read
-        // based on the project structure and conversation context (like Claude Code).
+        // based on the project structure and conversation context (let model decide).
 
         // Load project-level instructions (.atomcode.md or ATOMCODE.md)
         let project_instructions = [".atomcode.md", "ATOMCODE.md"]

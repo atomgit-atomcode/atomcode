@@ -5,7 +5,7 @@ impl AgentLoop {
     /// Minimal injections only — model is brain, agent is channel.
     /// Removed: periodic reminders (every 4 steps), plan drift detection,
     /// stagnation warnings. These polluted context and prevented model
-    /// from stopping. CC doesn't do any of these.
+    /// from stopping. These were harmful noise injections.
     pub(crate) fn apply_post_turn_discipline(&mut self) {
         // Re-read guard: when the same file is read 4+ times, the model is stuck.
         // Re-inject the original task and force a re-plan.

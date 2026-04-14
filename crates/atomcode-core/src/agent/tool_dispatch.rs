@@ -365,7 +365,7 @@ impl AgentLoop {
                         self.discipline_state.consecutive_edits_count = 1;
                     }
                     // Auto-refresh and edit blocking: REMOVED.
-                    // CC doesn't inject file content or block edits.
+                    // Auto-refresh is redundant with view replacement.
                     // View replacement already updates stale reads in context.
                 }
             }
