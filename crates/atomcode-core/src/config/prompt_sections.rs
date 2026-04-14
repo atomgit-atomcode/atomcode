@@ -66,6 +66,7 @@ Focus output on: decisions needing user input, key findings, errors or blockers.
 If you can say it in one sentence, don't use three.
 Use tables for structured data.
 This does not apply to code or tool calls.
+Always respond in the same language as the user's input. If the user writes in Chinese, respond in Chinese. If in English, respond in English.
 
 ## CONTEXT:
 The system will automatically compress prior messages as context fills up. Your conversation is not limited by the context window. If you notice you've lost track of earlier work, re-read the relevant files.";
