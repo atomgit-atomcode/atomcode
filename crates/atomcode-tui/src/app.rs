@@ -140,6 +140,10 @@ pub struct App {
     pub pending_login: bool,
     /// Last key event timestamp — for paste detection when bracketed paste isn't available.
     pub last_key_time: Instant,
+    /// Buffer of rapid-fire typed keys (<10ms apart) — coalesces Windows terminal
+    /// paste bursts into one operation. Flushed on slow key or Tick. Big enough
+    /// bursts are promoted to `pasted_text` as a reference.
+    pub rapid_buf: String,
     /// Files attached to the next message (detected from pasted paths).
     pub attached_files: Vec<crate::file_attach::AttachedFile>,
     pub pasted_text: Option<String>,
@@ -287,6 +291,7 @@ impl App {
            at_bottom: true,
            confirm_quit: false,
            last_key_time: Instant::now(),
+           rapid_buf: String::new(),
            pending_editor: None,
            pending_login: false,
            attached_files: Vec::new(),
@@ -858,10 +863,17 @@ impl App {
             AppEvent::Key(key) => {
                 self.selection.has_selection = false;
 
-                // Paste detection for terminals without bracketed paste (macOS/Linux only).
-                // Windows terminals don't support bracketed paste reliably, and the
-                // rapid-key detection causes input lag and IME issues. On Windows,
-                // paste is handled via Ctrl+V → clipboard read instead.
+                // Paste detection for terminals without bracketed paste. On Windows
+                // we keep bracketed paste DISABLED (it mis-parsed Enter), so a paste
+                // arrives as a burst of individual Key events. Without coalescing,
+                // each char triggers String::insert (O(n)) + a full render → O(n²)
+                // freeze on long pastes, and no paste reference is shown.
+                //
+                // Strategy: any typable key <10ms after the last one goes into
+                // `self.rapid_buf` instead of `self.input`. A slow key or a Tick
+                // flushes the buffer: large bursts (>200 chars or >3 newlines) become
+                // `pasted_text` (shown as `[pasted N chars]`), small bursts go into
+                // the input box via a single `insert_text` call.
                 let now = Instant::now();
                 let interval_ms = now.duration_since(self.last_key_time).as_millis();
                 self.last_key_time = now;
@@ -871,21 +883,33 @@ impl App {
                 let is_overlay_mode = matches!(self.mode, AppMode::ProviderManager | AppMode::ModelSelector)
                     || matches!(self.mode, AppMode::IssueInput(_));
 
-                if !is_overlay_mode && !cfg!(target_os = "windows") && interval_ms < 10
+                let is_typable_nomods = key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT;
+                let is_typable = is_typable_nomods && matches!(key.code, KeyCode::Char(_) | KeyCode::Enter);
+
+                if !is_overlay_mode && interval_ms < 10 && is_typable
                     && !matches!(self.mode, AppMode::WaitingApproval(_) | AppMode::Exiting)
                 {
-                    match key.code {
-                        KeyCode::Enter => {
-                            self.input.insert_newline();
-                            return;
+                    // First rapid key: steal the previous char from input (it was
+                    // inserted via the slow path one key ago — move it into the
+                    // buffer so the whole burst lives together).
+                    if self.rapid_buf.is_empty() {
+                        if let Some(c) = self.input.pop_last_typed_char() {
+                            self.rapid_buf.push(c);
                         }
-                        KeyCode::Char(c) => {
-                            self.input.insert_char(c);
-                            self.suggestion = None;
-                            return;
-                        }
-                        _ => {}
                     }
+                    match key.code {
+                        KeyCode::Enter => self.rapid_buf.push('\n'),
+                        KeyCode::Char(c) => self.rapid_buf.push(c),
+                        _ => unreachable!(),
+                    }
+                    self.suggestion = None;
+                    return;
+                }
+
+                // Non-rapid key or non-typable key: flush any accumulated burst first
+                // so it ends up in the right place before this key is handled.
+                if !self.rapid_buf.is_empty() {
+                    self.flush_rapid_buf();
                 }
 
                 // Ctrl+V: clipboard paste
@@ -932,6 +956,15 @@ impl App {
             AppEvent::Resize(_, _) => {}
             AppEvent::Tick => {
                 self.tick_count = self.tick_count.wrapping_add(1);
+                // Flush a settled rapid-paste burst — if the user pasted and then
+                // stopped typing, we need to materialize the buffer without waiting
+                // for a follow-up keystroke.
+                if !self.rapid_buf.is_empty()
+                    && Instant::now().duration_since(self.last_key_time)
+                        > std::time::Duration::from_millis(50)
+                {
+                    self.flush_rapid_buf();
+                }
             }
             AppEvent::IssueCreated { success, message } => {
                 if success {
@@ -2446,6 +2479,32 @@ impl App {
         }
     }
 
+    /// Flush a rapid-key burst (Windows paste without bracketed paste). Big bursts
+    /// become a `[pasted N chars]` reference; small bursts go into the input box
+    /// via a single `insert_text` call so we avoid O(n²) char-by-char insertion.
+    fn flush_rapid_buf(&mut self) {
+        if self.rapid_buf.is_empty() {
+            return;
+        }
+        let buf = std::mem::take(&mut self.rapid_buf);
+        let line_count = buf.matches('\n').count() + 1;
+        if line_count > 3 || buf.len() > 200 {
+            // Large burst — if there's already a pending paste reference, concat;
+            // otherwise stash as a new reference.
+            match self.pasted_text.take() {
+                Some(mut prev) => {
+                    prev.push('\n');
+                    prev.push_str(&buf);
+                    self.pasted_text = Some(prev);
+                }
+                None => self.pasted_text = Some(buf),
+            }
+        } else {
+            self.input.insert_text(&buf);
+        }
+        self.suggestion = None;
+    }
+
     fn send_message(&mut self, _event_tx: &mpsc::UnboundedSender<AppEvent>) {
         let typed = self.input.content();
         let content = if let Some(pasted) = self.pasted_text.take() {
@@ -2743,17 +2802,48 @@ impl InputState {
         self.cursor_col = self.lines[self.cursor_row].len();
     }
 
+    /// Remove and return the char immediately before the cursor. Used by the
+    /// rapid-paste coalescer to pull back the first burst char (which went in via
+    /// the slow path) so the whole burst lives in one buffer. Returns `'\n'` if
+    /// the previous char was a line break.
+    pub fn pop_last_typed_char(&mut self) -> Option<char> {
+        if self.cursor_col > 0 {
+            let line = &self.lines[self.cursor_row];
+            let (prev_i, c) = line[..self.cursor_col].char_indices().last()?;
+            self.lines[self.cursor_row].remove(prev_i);
+            self.cursor_col = prev_i;
+            Some(c)
+        } else if self.cursor_row > 0 {
+            let current = self.lines.remove(self.cursor_row);
+            self.cursor_row -= 1;
+            self.cursor_col = self.lines[self.cursor_row].len();
+            self.lines[self.cursor_row].push_str(&current);
+            Some('\n')
+        } else {
+            None
+        }
+    }
+
     /// Insert a block of text (paste). Handles multi-line correctly.
     pub fn insert_text(&mut self, text: &str) {
         for (i, chunk) in text.split('\n').enumerate() {
             if i > 0 {
                 self.insert_newline();
             }
-            for c in chunk.chars() {
-                if c != '\r' { // Skip \r from Windows line endings
-                    self.insert_char(c);
-                }
+            // Strip CR from CRLF line endings, then insert the whole chunk in one
+            // O(n) String::insert_str — avoids the O(n²) char-by-char path that
+            // previously froze the UI on long pastes.
+            let clean: String = if chunk.contains('\r') {
+                chunk.chars().filter(|&c| c != '\r').collect()
+            } else {
+                chunk.to_string()
+            };
+            if clean.is_empty() {
+                continue;
             }
+            let line = &mut self.lines[self.cursor_row];
+            line.insert_str(self.cursor_col, &clean);
+            self.cursor_col += clean.len();
         }
     }
 
