@@ -417,7 +417,7 @@ Contributions are welcome! AtomCode is in active development.
 
 ### Guidelines
 
-- Follow the principles in `CLAUDE.md` — especially **tech-stack neutrality**
+- Follow the principles in `ATOMCODE.md` — especially **tech-stack neutrality**
 - All tool failures must be graceful — return error as observation to the LLM, never panic
 - Destructive operations must require user approval
 - Keep the system prompt compact (~1.5K tokens)

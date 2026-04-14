@@ -523,7 +523,7 @@ impl App {
             self.conversation = atomcode_core::conversation::Conversation::new();
             self.conversation.messages = self.current_session.messages.clone();
         } else {
-            // Directory doesn't exist — create it, git init, and add CLAUDE.md
+            // Directory doesn't exist — create it, git init, and add ATOMCODE.md
             let new_path = if path.starts_with('/') || path.starts_with('~') {
                 if path.starts_with('~') {
                     dirs::home_dir()
@@ -548,12 +548,13 @@ impl App {
                 .current_dir(&new_path)
                 .output();
 
-            // Create CLAUDE.md with project name
+            // Create ATOMCODE.md with project name (seed file for project instructions;
+            // atomcode's prompt builder reads `.atomcode.md` or `ATOMCODE.md`).
             let project_name = new_path.file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_else(|| "project".to_string());
-            let claude_md = format!("# {}\n\nNew project.\n", project_name);
-            let _ = std::fs::write(new_path.join("CLAUDE.md"), &claude_md);
+            let atomcode_md = format!("# {}\n\nNew project.\n", project_name);
+            let _ = std::fs::write(new_path.join("ATOMCODE.md"), &atomcode_md);
 
             // Now cd into it
             let created_path = new_path.to_string_lossy().to_string();
@@ -572,7 +573,7 @@ impl App {
                 self.scroll_offset = 0;
                 self.at_bottom = true;
                 let summary = format!(
-                    "Created and switched to `{}`\n\nInitialized git repo and CLAUDE.md.",
+                    "Created and switched to `{}`\n\nInitialized git repo and ATOMCODE.md.",
                     self.working_dir.display()
                 );
                 self.conversation.push_delta(&summary);
