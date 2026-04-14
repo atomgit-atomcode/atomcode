@@ -825,38 +825,12 @@ impl AgentLoop {
             // DIAGNOSTIC STRATEGY injection removed — the model decides its own
             // debugging approach. System prompt PLAN FIRST section is sufficient.
 
-            // Stagnation detection: warn only when the model makes no progress
-            // for 3+ consecutive turns (no new files read, no edits).
-            // Replaces the old tool_call_count >= 6 check which was incompatible
-            // with the skeleton workflow (reading 10 skeletons ≠ being stuck).
-            {
-                let known = self.files_read_this_turn.len() + self.files_edited_this_turn.len();
-                let targeted = self.discipline_state.targeted_read_count;
-                // Progress = new files discovered OR new targeted reads OR new edits
-                if known > self.discipline_state.last_known_files || targeted > self.discipline_state.last_targeted_reads {
-                    self.discipline_state.stagnant_turns = 0;
-                } else {
-                    self.discipline_state.stagnant_turns += 1;
-                }
-                self.discipline_state.last_known_files = known;
-                self.discipline_state.last_targeted_reads = targeted;
-
-                if self.discipline_state.stagnant_turns >= 3 {
-                    let warning = format!(
-                        "[STAGNATION WARNING: {} consecutive turns with no new files read and no edits. \
-                         You have file skeletons — use offset/limit to read the sections you need, then edit. \
-                         Files you've read: {}]",
-                        self.discipline_state.stagnant_turns,
-                        self.files_read_this_turn.join(", "),
-                    );
-                    self.conversation.messages.push(
-                        crate::conversation::message::Message::new(
-                            crate::conversation::message::Role::System,
-                            warning,
-                        )
-                    );
-                }
-            }
+            // Stagnation detection: REMOVED.
+            // Was injecting "[STAGNATION WARNING]" after 3 turns without edits.
+            // Bug: triggered after model output a completion summary (pure text,
+            // no edits), preventing it from stopping. The warning was interpreted
+            // as "keep working" by the model. CC doesn't do stagnation detection —
+            // the prompt guides the model to work efficiently.
 
             let system_prompt = self.build_system_prompt();
             let cancel = self.cancel_token.clone();
