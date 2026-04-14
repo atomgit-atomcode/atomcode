@@ -2527,6 +2527,56 @@ impl App {
     /// opaque "Pasted text" block. Whatever isn't a valid path falls back to
     /// the usual rule: long remainder → `pasted_blocks`, short → inline input.
     fn stage_paste(&mut self, text: &str) {
+        // Windows Explorer Ctrl+C on files populates CF_HDROP on the clipboard.
+        // Windows Terminal's Ctrl+V intercepts and only injects CF_UNICODETEXT
+        // (at most the last selected filename), so the `text` we receive here
+        // is an incomplete representation. Peek CF_HDROP directly — if it has
+        // files, that's the authoritative list.
+        #[cfg(target_os = "windows")]
+        {
+            if let Ok(files) = clipboard_win::get_clipboard::<Vec<String>, _>(
+                clipboard_win::formats::FileList,
+            ) {
+                if !files.is_empty() {
+                    // Guard against false positives. CF_HDROP sticks around
+                    // across unrelated operations — if the user copied files
+                    // earlier and then just typed fast enough to trigger
+                    // rapid_buf, we'd pull in stale files from the clipboard.
+                    // Only consume CF_HDROP if the pasted text actually
+                    // contains one of the filenames (or full paths) from it,
+                    // which is the signature of a real file-paste event.
+                    let related = files.iter().any(|p| {
+                        if text.contains(p) {
+                            return true;
+                        }
+                        std::path::Path::new(p)
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .map(|fname| !fname.is_empty() && text.contains(fname))
+                            .unwrap_or(false)
+                    });
+
+                    if related {
+                        let as_text = files.join("\n");
+                        let (attachments, _remainder) = crate::file_attach::extract_file_paths(
+                            &as_text,
+                            &self.working_dir,
+                        );
+                        let mut any_added = false;
+                        for file in attachments {
+                            if !self.attached_files.iter().any(|f| f.path == file.path) {
+                                self.attached_files.push(file);
+                                any_added = true;
+                            }
+                        }
+                        if any_added {
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+
         let normalized = if text.contains('\r') {
             text.replace("\r\n", "\n").replace('\r', "\n")
         } else {
@@ -2701,18 +2751,22 @@ fn copy_to_clipboard(text: &str) -> std::io::Result<()> {
 fn read_clipboard() -> Option<String> {
     #[cfg(target_os = "windows")]
     {
-        use clipboard_win::formats;
-        use clipboard_win::Getter;
-
         // Try CF_HDROP first — Explorer's Ctrl+C on files puts the file list
         // there. CF_UNICODETEXT only gets the last selected filename as a
-        // fallback, so without this check pasting 4 copied files would yield
-        // just one attachment. Joined with '\n' so the downstream extractor
-        // (see stage_paste → extract_file_paths) treats it as newline-separated
-        // paths.
-        let mut files: Vec<String> = Vec::new();
-        if formats::FileList.read_clipboard(&mut files).is_ok() && !files.is_empty() {
-            return Some(files.join("\n"));
+        // fallback, so without this check pasting N copied files would yield
+        // just one attachment.
+        //
+        // IMPORTANT: must use `get_clipboard()` helper, NOT `Getter::read_clipboard`
+        // directly — the latter requires the caller to have already opened the
+        // clipboard via `Clipboard::new()`. `get_clipboard` handles open/close.
+        match clipboard_win::get_clipboard::<Vec<String>, _>(clipboard_win::formats::FileList) {
+            Ok(files) if !files.is_empty() => {
+                // Join with '\n' so the downstream extractor treats it as
+                // newline-separated paths (and doesn't tokenize on spaces
+                // inside e.g. `C:\My Docs\file.txt`).
+                return Some(files.join("\n"));
+            }
+            _ => {}
         }
 
         // Normal text path — native Win32 API avoids ~1s PowerShell cold start.
