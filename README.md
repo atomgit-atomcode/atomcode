@@ -417,7 +417,9 @@ Contributions are welcome! AtomCode is in active development.
 
 ### Guidelines
 
-- Follow the principles in `CLAUDE.md` — especially **tech-stack neutrality**
+- Follow the project's core principles — especially **tech-stack neutrality**
+  (no language/framework-specific logic in the core engine; detect via probes
+  like `package.json` / `Cargo.toml` / `pom.xml` and route through adapters)
 - All tool failures must be graceful — return error as observation to the LLM, never panic
 - Destructive operations must require user approval
 - Keep the system prompt compact (~1.5K tokens)

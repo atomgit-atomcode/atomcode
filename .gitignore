@@ -44,5 +44,10 @@ backend.log
 # AtomCode local data (graph cache, etc.)
 .atomcode/
 
+# Claude Code's project instructions — kept locally for the IDE/agent that
+# maintains atomcode source, but NOT pushed (it's personal guidance, may
+# diverge between contributors, and shouldn't imply official project rules).
+/CLAUDE.md
+
 # Eval results (generated, not committed)
 scripts/eval/results/
