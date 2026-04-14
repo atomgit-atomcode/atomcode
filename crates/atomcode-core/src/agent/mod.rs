@@ -1355,8 +1355,8 @@ impl AgentLoop {
                     if truncated && self.retry_count < 3 {
                         self.retry_count += 1;
                         self.conversation.add_user_message(
-                            "Output limit hit. Resume directly — no recap, no apology. \
-                             Pick up where you left off."
+                            "Output limit hit. If the task is already complete, just output a \
+                             short summary and stop (no tool calls). Otherwise resume where you left off."
                         );
                         continue;
                     }
