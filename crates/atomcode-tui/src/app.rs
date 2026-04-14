@@ -957,10 +957,8 @@ impl App {
                             if let Some(ref mut mgr) = self.provider_mgr {
                                 mgr.input_buf.push_str(&text);
                             }
-                        } else if text.lines().count() > 3 || text.len() > 200 {
-                            self.pasted_blocks.push(text);
                         } else {
-                            self.input.insert_text(&text);
+                            self.stage_paste(&text);
                         }
                         self.suggestion = None;
                     }
@@ -977,13 +975,7 @@ impl App {
                         mgr.input_buf.push_str(&text.replace("\r\n", "\n").replace('\r', "\n"));
                     }
                 } else if matches!(self.mode, AppMode::Normal | AppMode::Streaming | AppMode::ToolExecuting) {
-                    // Normalize line endings: \r\n -> \n, \r -> \n
-                    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
-                    if normalized.lines().count() > 3 || normalized.len() > 200 {
-                        self.pasted_blocks.push(normalized);
-                    } else {
-                        self.input.insert_text(&normalized);
-                    }
+                    self.stage_paste(&text);
                     self.suggestion = None;
                 }
             }
@@ -2519,21 +2511,48 @@ impl App {
         }
     }
 
-    /// Flush a rapid-key burst (Windows paste without bracketed paste). Big bursts
-    /// become a `[pasted N chars]` reference; small bursts go into the input box
-    /// via a single `insert_text` call so we avoid O(n²) char-by-char insertion.
+    /// Flush a rapid-key burst (Windows paste without bracketed paste).
     fn flush_rapid_buf(&mut self) {
         if self.rapid_buf.is_empty() {
             return;
         }
         let buf = std::mem::take(&mut self.rapid_buf);
-        let line_count = buf.matches('\n').count() + 1;
-        if line_count > 3 || buf.len() > 200 {
-            self.pasted_blocks.push(buf);
-        } else {
-            self.input.insert_text(&buf);
-        }
+        self.stage_paste(&buf);
         self.suggestion = None;
+    }
+
+    /// Single entry point for every paste pathway (Ctrl+V, bracketed paste,
+    /// rapid-key burst). Runs file-path extraction first so drag-and-drop of
+    /// multiple files from Explorer becomes N attachment tags instead of one
+    /// opaque "Pasted text" block. Whatever isn't a valid path falls back to
+    /// the usual rule: long remainder → `pasted_blocks`, short → inline input.
+    fn stage_paste(&mut self, text: &str) {
+        let normalized = if text.contains('\r') {
+            text.replace("\r\n", "\n").replace('\r', "\n")
+        } else {
+            text.to_string()
+        };
+
+        let (files, remainder) = crate::file_attach::extract_file_paths(
+            &normalized,
+            &self.working_dir,
+        );
+
+        for file in files {
+            if !self.attached_files.iter().any(|f| f.path == file.path) {
+                self.attached_files.push(file);
+            }
+        }
+
+        let remainder = remainder.trim();
+        if remainder.is_empty() {
+            return;
+        }
+        if remainder.lines().count() > 3 || remainder.len() > 200 {
+            self.pasted_blocks.push(remainder.to_string());
+        } else {
+            self.input.insert_text(remainder);
+        }
     }
 
     fn send_message(&mut self, _event_tx: &mpsc::UnboundedSender<AppEvent>) {
