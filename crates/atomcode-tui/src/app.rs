@@ -2701,8 +2701,21 @@ fn copy_to_clipboard(text: &str) -> std::io::Result<()> {
 fn read_clipboard() -> Option<String> {
     #[cfg(target_os = "windows")]
     {
-        // Native Windows clipboard API — avoids ~1s PowerShell cold-start that
-        // froze the TUI on Ctrl+V.
+        use clipboard_win::formats;
+        use clipboard_win::Getter;
+
+        // Try CF_HDROP first — Explorer's Ctrl+C on files puts the file list
+        // there. CF_UNICODETEXT only gets the last selected filename as a
+        // fallback, so without this check pasting 4 copied files would yield
+        // just one attachment. Joined with '\n' so the downstream extractor
+        // (see stage_paste → extract_file_paths) treats it as newline-separated
+        // paths.
+        let mut files: Vec<String> = Vec::new();
+        if formats::FileList.read_clipboard(&mut files).is_ok() && !files.is_empty() {
+            return Some(files.join("\n"));
+        }
+
+        // Normal text path — native Win32 API avoids ~1s PowerShell cold start.
         return clipboard_win::get_clipboard_string()
             .ok()
             .map(|t| t.replace("\r\n", "\n").replace('\r', "\n"))

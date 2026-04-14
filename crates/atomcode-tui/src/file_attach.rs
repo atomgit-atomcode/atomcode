@@ -138,11 +138,22 @@ pub fn extract_file_paths(input: &str, working_dir: &Path) -> (Vec<AttachedFile>
             continue;
         }
 
+        // First try the ENTIRE line as one path. CF_HDROP gives us paths one
+        // per line, and `C:\My Documents\a.txt` must not be split on its
+        // internal space.
+        if let Some(file) = detect_file_path(line, working_dir) {
+            if !attached.iter().any(|f| f.path == file.path) {
+                attached.push(file);
+            }
+            continue;
+        }
+
+        // Fall back to token-level splitting for lines like
+        // `"C:\a.txt" "C:\b.txt"` or `please read ~/foo.md`.
         let tokens = split_respecting_quotes(line);
         let mut non_path_tokens: Vec<String> = Vec::new();
         for tok in tokens {
             if let Some(file) = detect_file_path(&tok, working_dir) {
-                // Dedup against already-extracted paths in this call.
                 if !attached.iter().any(|f| f.path == file.path) {
                     attached.push(file);
                 }
@@ -430,6 +441,28 @@ mod tests {
 
         let _ = fs::remove_file(&p1);
         let _ = fs::remove_file(&p2);
+    }
+
+    #[test]
+    fn extract_respects_path_with_internal_space_when_newline_separated() {
+        // Simulates CF_HDROP output: one path per line, no quotes, path may
+        // contain spaces. Must not be split on the internal space.
+        let tmp = std::env::temp_dir();
+        let dir_with_space = tmp.join("atom code space dir");
+        fs::create_dir_all(&dir_with_space).unwrap();
+        let p1 = dir_with_space.join("a.txt");
+        let p2 = dir_with_space.join("b.txt");
+        fs::write(&p1, "x").unwrap();
+        fs::write(&p2, "y").unwrap();
+
+        let pasted = format!("{}\n{}\n", p1.display(), p2.display());
+        let (attached, remainder) = extract_file_paths(&pasted, &tmp);
+        assert_eq!(attached.len(), 2, "got {:?} remainder {:?}", attached, remainder);
+        assert!(remainder.is_empty());
+
+        let _ = fs::remove_file(&p1);
+        let _ = fs::remove_file(&p2);
+        let _ = fs::remove_dir(&dir_with_space);
     }
 
     #[test]
