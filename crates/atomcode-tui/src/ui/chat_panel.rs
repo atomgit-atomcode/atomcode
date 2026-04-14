@@ -128,30 +128,23 @@ pub fn render(
                     let completed_calls: Vec<&ToolCall> = tool_calls.iter()
                         .filter(|c| completed_call_ids.contains(c.id.as_str()))
                         .collect();
-                    // Batch consecutive read_file calls within the same tool_calls group.
+                    // Batch consecutive same-type tool calls into collapsed lines.
+                    // ≥2 consecutive calls of same tool → "▸ Read ×4 (file1, file2, ...)"
                     let mut ci = 0;
                     while ci < completed_calls.len() {
-                        if completed_calls[ci].name == "read_file" {
-                            let batch_start = ci;
-                            while ci < completed_calls.len() && completed_calls[ci].name == "read_file" {
-                                ci += 1;
-                            }
-                            let batch_count = ci - batch_start;
-                            if batch_count >= 3 {
-                                let paths: Vec<String> = completed_calls[batch_start..ci].iter().map(|c| {
-                                    serde_json::from_str::<serde_json::Value>(&c.arguments).ok()
-                                        .and_then(|a| a.get("file_path").or_else(|| a.get("path")).and_then(|v| v.as_str().map(String::from)))
-                                        .unwrap_or_else(|| "unknown".to_string())
-                                }).collect();
-                                render_batch_read_call(render_cache, batch_count, &paths);
-                            } else {
-                                for c in &completed_calls[batch_start..ci] {
-                                    render_tool_call(render_cache, c, None);
-                                }
-                            }
-                        } else {
-                            render_tool_call(render_cache, completed_calls[ci], None);
+                        let batch_start = ci;
+                        let batch_tool = &completed_calls[ci].name;
+                        while ci < completed_calls.len() && completed_calls[ci].name == *batch_tool {
                             ci += 1;
+                        }
+                        let batch_count = ci - batch_start;
+                        if batch_count >= 2 {
+                            let details: Vec<String> = completed_calls[batch_start..ci].iter().map(|c| {
+                                extract_tool_detail_short(&c.name, &c.arguments)
+                            }).collect();
+                            render_batch_tool_calls(render_cache, batch_tool, batch_count, &details);
+                        } else {
+                            render_tool_call(render_cache, completed_calls[batch_start], None);
                         }
                     }
                 }
@@ -163,11 +156,55 @@ pub fn render(
                     };
                     let is_read = call_id_to_tool.get(call_id) == Some(&"read_file");
 
-                    // Try to batch ≥3 consecutive read_file results into one collapsed line.
-                    if is_read {
-                        if let Some((batch_end, paths)) = try_batch_reads(i, msgs, &call_id_to_tool, &conversation.messages) {
-                            let batch_count = batch_end - i;
-                            render_batch_read(render_cache, batch_count, &paths);
+                    // Try to batch ≥2 consecutive same-type tool results into one collapsed line.
+                    let tool_name = call_id_to_tool.get(call_id).map(|s| &**s).unwrap_or("");
+                    {
+                        // Look ahead for consecutive results of the same tool type
+                        let mut batch_end = i + 1;
+                        while batch_end < msgs.len() {
+                            let next_cid = match &msgs[batch_end].content {
+                                MessageContent::ToolResult(r) => Some(r.call_id.as_str()),
+                                MessageContent::ToolResultRef(r) => Some(r.call_id.as_str()),
+                                _ => None,
+                            };
+                            if let Some(cid) = next_cid {
+                                if call_id_to_tool.get(cid).map(|s| &**s) == Some(tool_name) {
+                                    batch_end += 1;
+                                } else {
+                                    break;
+                                }
+                            } else {
+                                break;
+                            }
+                        }
+                        let batch_count = batch_end - i;
+                        if batch_count >= 2 {
+                            // Collect short details for the batch
+                            let details: Vec<String> = (i..batch_end).map(|idx| {
+                                let cid = match &msgs[idx].content {
+                                    MessageContent::ToolResult(r) => r.call_id.as_str(),
+                                    MessageContent::ToolResultRef(r) => r.call_id.as_str(),
+                                    _ => "",
+                                };
+                                find_read_file_path(&conversation.messages, cid)
+                            }).collect();
+                            let names: Vec<&str> = details.iter()
+                                .map(|p| p.rsplit('/').next().unwrap_or(p.as_str()))
+                                .collect();
+                            let detail_str = if names.len() <= 4 {
+                                names.join(", ")
+                            } else {
+                                format!("{}, \u{2026} +{} more", names[..3].join(", "), names.len() - 3)
+                            };
+                            let bar = Span::styled(format!("{}\u{2502} ", INDENT), Style::default().fg(theme::accent_dim()));
+                            let result_style = Style::default().fg(theme::text_muted()).add_modifier(Modifier::DIM);
+                            render_cache.push(Line::from(vec![
+                                bar,
+                                Span::styled(
+                                    format!("  \u{23BF} {} \u{00d7}{}  {}", capitalize(tool_name), batch_count, detail_str),
+                                    result_style,
+                                ),
+                            ]));
                             render_cache.push(Line::default());
                             tool_result_idx += batch_count;
                             i = batch_end;
@@ -708,6 +745,72 @@ fn try_batch_reads(
 
 // ── Batch Read Call ──
 // Renders ≥3 consecutive read_file tool calls as a single collapsed line.
+/// Render ≥2 consecutive same-type tool calls as a single collapsed line.
+/// Format: "  ▸ Read ×4  (file1, file2, file3, file4)"
+///         "  ⎿ Done"
+fn render_batch_tool_calls(lines: &mut Vec<Line<'static>>, tool_name: &str, count: usize, details: &[String]) {
+    let bar = Span::styled(format!("{}\u{2502} ", INDENT), Style::default().fg(theme::accent_dim()));
+    let display_name = capitalize(tool_name);
+    // Join details, truncate if too many
+    let detail_str = if details.len() <= 4 {
+        details.join(", ")
+    } else {
+        format!("{}, \u{2026} +{} more", details[..3].join(", "), details.len() - 3)
+    };
+    lines.push(Line::from(vec![
+        bar.clone(),
+        Span::styled(
+            format!("  \u{25b8} {}(\u{00d7}{})", display_name, count),
+            Style::default().fg(theme::text_secondary()).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("  {}", detail_str),
+            Style::default().fg(theme::text_muted()),
+        ),
+    ]));
+    // CC-style "⎿ Done" line
+    lines.push(Line::from(vec![
+        bar,
+        Span::styled(
+            format!("    \u{23BF} Done ({} calls)", count),
+            Style::default().fg(theme::text_muted()).add_modifier(Modifier::DIM),
+        ),
+    ]));
+}
+
+/// Extract a short detail string from tool arguments for batch display.
+fn extract_tool_detail_short(tool_name: &str, args_json: &str) -> String {
+    let args: serde_json::Value = match serde_json::from_str(args_json) {
+        Ok(v) => v,
+        Err(_) => return String::new(),
+    };
+    match tool_name {
+        "read_file" | "write_file" | "create_file" | "edit_file" => {
+            args.get("file_path").or_else(|| args.get("path"))
+                .and_then(|v| v.as_str())
+                .map(|p| p.rsplit('/').next().unwrap_or(p).to_string())
+                .unwrap_or_default()
+        }
+        "bash" => {
+            args.get("command").and_then(|v| v.as_str())
+                .map(|c| {
+                    let first = c.lines().next().unwrap_or(c);
+                    if first.len() > 30 { format!("{}…", &first[..27]) } else { first.to_string() }
+                })
+                .unwrap_or_default()
+        }
+        "grep" => {
+            args.get("pattern").and_then(|v| v.as_str())
+                .unwrap_or("").to_string()
+        }
+        "glob" => {
+            args.get("pattern").and_then(|v| v.as_str())
+                .unwrap_or("").to_string()
+        }
+        _ => String::new(),
+    }
+}
+
 fn render_batch_read_call(lines: &mut Vec<Line<'static>>, count: usize, paths: &[String]) {
     let bar = Span::styled(format!("{}\u{2502} ", INDENT), Style::default().fg(theme::accent_dim()));
     let names: Vec<&str> = paths.iter().map(|p| p.rsplit('/').next().unwrap_or(p.as_str())).collect();
