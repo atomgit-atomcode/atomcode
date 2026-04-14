@@ -20,3 +20,9 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 dirs = "6"
+
+# Windows-only: default HeapAlloc is 3-5x slower than Linux glibc for the
+# small-string/Line-clone heavy render loop. mimalloc cuts per-frame alloc
+# cost enough to make typing feel smooth again on Windows Terminal / ConHost.
+[target.'cfg(target_os = "windows")'.dependencies]
+mimalloc = { version = "0.1", default-features = false }

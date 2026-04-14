@@ -1,3 +1,10 @@
+// Swap in mimalloc on Windows — the default HeapAlloc is the biggest single
+// contributor to per-keystroke render latency (hundreds of small Line/Span
+// clones per frame). No-op on macOS/Linux where the system allocator is fine.
+#[cfg(target_os = "windows")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::PathBuf;
