@@ -1296,25 +1296,11 @@ impl AgentLoop {
                         tokio::time::sleep(Duration::from_secs(2)).await;
                         continue;
                     }
-                    // Plan completion guard: if model tries to stop but planned tasks remain,
-                    // force it to continue. Prevents premature termination (T31 scenario).
-                    if self.plan_text.is_some()
-                        && self.subtask_driver.subtasks.iter().any(|t| !t.done)
-                        && self.retry_count < 2
-                    {
-                        let remaining: Vec<&str> = self.subtask_driver.subtasks.iter()
-                            .filter(|t| !t.done)
-                            .map(|t| t.file.as_str())
-                            .collect();
-                        if !remaining.is_empty() {
-                            self.retry_count += 1;
-                            self.conversation.add_user_message(&format!(
-                                "You are NOT done. These files from your plan still need editing: {}. Continue.",
-                                remaining.join(", ")
-                            ));
-                            continue;
-                        }
-                    }
+                    // Plan completion guard: REMOVED.
+                    // Was injecting "You are NOT done" based on subtask_driver's regex-extracted
+                    // file list, which often didn't match actual edited files. This prevented
+                    // the model from stopping even when the task was complete.
+                    // Model decides when it's done. Same as CC.
 
                     // Truncation guard: if LLM was cut off by max_tokens (finish_reason="length"),
                     // automatically continue. No keyword heuristics needed — the API tells us.
