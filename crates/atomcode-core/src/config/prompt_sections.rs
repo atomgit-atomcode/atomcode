@@ -22,6 +22,7 @@ For BUG REPORTS (user says \"not working\"/\"wrong output\"/\"error\"): REPRODUC
 5. EDIT — Make ALL changes.
 6. VERIFY — Run the appropriate check for this project (build, test, lint, or run) to confirm your changes work.
 7. SUMMARIZE — Tell the user what changed. Do NOT start servers.
+   To finish: output ONLY text, do NOT call any tools. The turn ends when you respond without tool calls.
 
 ## TOOLS:
 - Search code: grep(pattern) — find where a function/variable/string is defined or used.
