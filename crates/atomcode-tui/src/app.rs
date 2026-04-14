@@ -11,8 +11,6 @@ use atomcode_core::provider::LlmProvider;
 use atomcode_core::session::{Session, SessionManager, SessionMeta};
 use atomcode_core::tool::{ToolCall, ToolContext, ToolResult};
 
-use base64::Engine as _;
-
 use crate::command::{build_command_list, SlashMenu};
 use crate::event::AppEvent;
 use crate::provider_manager::{ManagerAction, ProviderManager};
@@ -1046,21 +1044,9 @@ impl App {
     }
 
     fn handle_key(&mut self, key: KeyEvent, event_tx: &mpsc::UnboundedSender<AppEvent>) {
-        // nothing here — key timing handled in handle_key_normal
-
-        // Ctrl+Shift+C: copy selection to clipboard (like Ctrl+C in Claude Code with selection)
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.modifiers.contains(KeyModifiers::SHIFT)
-            && key.code == KeyCode::Char('C')
-        {
-            if self.selection.has_selection {
-                self.copy_selection_to_clipboard();
-            }
-            return;
-        }
-
         // Global Ctrl+C handling — like Claude Code:
         // 1st press: cancel current operation
-        // 2nd press (within 1s): exit program
+        // 2nd press (within 1s): exit
         if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('c') {
             let now = Instant::now();
             let double_press = self.last_ctrl_c
@@ -1792,20 +1778,36 @@ impl App {
             }
             // Scroll keys: Ctrl+Up/Down (3 lines), PageUp/PageDown (20 lines)
             _ if self.handle_scroll_keys(key) => {}
-            // Plain Up/Down are ALWAYS for history navigation, not multi-line cursor movement.
-            // This matches Claude Code's behavior.
-            (_, KeyCode::Up) => {
-                // Always navigate history (when not empty)
+            // Plain Up/Down scroll the conversation by 1 line.
+            // In ?1007h (Alternate Scroll) mode, the scroll wheel also generates
+            // Up/Down key events, so this handles both keyboard and wheel scrolling.
+            (KeyModifiers::NONE, KeyCode::Up) => {
+                if self.at_bottom {
+                    let total = self.last_total_lines;
+                    self.scroll_offset = total.saturating_sub(1);
+                    self.at_bottom = false;
+                } else {
+                    self.scroll_offset = self.scroll_offset.saturating_sub(1);
+                }
+            }
+            (KeyModifiers::NONE, KeyCode::Down) => {
+                let vh = self.last_viewport_height as usize;
+                let max_scroll = self.last_total_lines.saturating_sub(vh);
+                self.scroll_offset = (self.scroll_offset + 1).min(max_scroll);
+                if self.scroll_offset >= max_scroll {
+                    self.at_bottom = true;
+                }
+            }
+            // Alt+Up/Down: navigate input history
+            (KeyModifiers::ALT, KeyCode::Up) => {
                 if !self.input_history.is_empty() {
                     if self.history_index.is_none() {
-                        // Stash current input
                         self.history_stash = Some(self.input.content());
                         self.history_index = Some(self.input_history.len().saturating_sub(1));
                     } else if let Some(idx) = self.history_index {
                         if idx > 0 {
                             self.history_index = Some(idx - 1);
                         } else {
-                            // Wrap around: oldest -> newest
                             self.history_index = Some(self.input_history.len().saturating_sub(1));
                         }
                     }
@@ -1818,8 +1820,8 @@ impl App {
                     }
                 }
             }
-            (_, KeyCode::Down) => {
-                // Always navigate history
+            (KeyModifiers::ALT, KeyCode::Down) => {
+                // Navigate input history forward
                 if let Some(idx) = self.history_index {
                     if idx + 1 < self.input_history.len() {
                         self.history_index = Some(idx + 1);
@@ -1956,8 +1958,9 @@ impl App {
         }
     }
 
-    /// Handle mouse events: scroll wheel only.
-    /// Mouse selection is now handled natively by the terminal (mouse capture is disabled during drag).
+    /// Handle mouse events: scroll wheel and click-drag text selection.
+    /// Drag events come from terminal mode ?1002h; we highlight the selected
+    /// region and copy to clipboard on mouse-up.
     fn handle_mouse(&mut self, mouse: MouseEvent) {
         match mouse.kind {
             // ── Scroll wheel ──
@@ -1982,87 +1985,8 @@ impl App {
         }
     }
 
-    /// Extract text from the rendered content between the selection coordinates,
-    /// then copy it to the system clipboard.
-    /// On macOS/Windows/Linux local: use native clipboard commands (no permission prompt).
-    /// On SSH: use OSC 52 escape sequence (requires terminal support).
-    fn copy_selection_to_clipboard(&self) {
-        let text = self.extract_selection_text();
-        if text.is_empty() {
-            return;
-        }
-
-        // Check if we're in an SSH session
-        let is_ssh = std::env::var("SSH_CONNECTION").is_ok()
-            || std::env::var("SSH_TTY").is_ok()
-            || std::env::var("SSH_CLIENT").is_ok();
-
-        if is_ssh {
-            // OSC 52 clipboard (works across SSH and on terminals that support it)
-            let encoded = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
-            let osc = format!("\x1b]52;c;{}\x07", encoded);
-            let _ = std::io::Write::write_all(&mut std::io::stdout(), osc.as_bytes());
-            let _ = std::io::Write::flush(&mut std::io::stdout());
-        } else {
-            // Local: use native clipboard commands (no permission prompt on iTerm2)
-            let _ = copy_to_clipboard(&text);
-        }
-    }
-
-    /// Extract the selected text from render cache + dynamic content.
-    /// Maps terminal coordinates to the rendered lines using the current scroll offset.
-    fn extract_selection_text(&self) -> String {
-        let ((start_col, start_row), (end_col, end_row)) = self.selection.normalized();
-
-        // The layout is: row 0 = status bar (1 line), then chat panel, then input box.
-        // Chat panel starts at row 1. We need to map terminal rows to render_cache indices.
-        let chat_start_row: u16 = 1;
-
-        // Convert terminal rows to line indices in the full content
-        let start_line = (start_row.saturating_sub(chat_start_row)) as usize + self.effective_scroll();
-        let end_line = (end_row.saturating_sub(chat_start_row)) as usize + self.effective_scroll();
-
-        let mut result = String::new();
-        for i in start_line..=end_line {
-            let line_text = if i < self.render_cache.len() {
-                // Get text from render cache line
-                self.render_cache[i]
-                    .spans
-                    .iter()
-                    .map(|s| s.content.as_ref())
-                    .collect::<String>()
-            } else {
-                continue;
-            };
-
-            let chars: Vec<char> = line_text.chars().collect();
-
-            if i == start_line && i == end_line {
-                // Single line selection
-                let s = start_col as usize;
-                let e = end_col as usize;
-                let slice: String = chars[s.min(chars.len())..=e.min(chars.len().saturating_sub(1))]
-                    .iter()
-                    .collect();
-                result.push_str(&slice);
-            } else if i == start_line {
-                let s = start_col as usize;
-                let slice: String = chars[s.min(chars.len())..].iter().collect();
-                result.push_str(&slice);
-                result.push('\n');
-            } else if i == end_line {
-                let e = end_col as usize;
-                let slice: String = chars[..=e.min(chars.len().saturating_sub(1))].iter().collect();
-                result.push_str(&slice);
-            } else {
-                result.push_str(&line_text);
-                result.push('\n');
-            }
-        }
-        result
-    }
-
     /// Get the effective scroll offset (uses the value computed during the last render).
+    #[allow(dead_code)]
     fn effective_scroll(&self) -> usize {
         self.last_rendered_scroll
     }
@@ -2479,8 +2403,8 @@ impl App {
                 help.push_str("  `/quit` — Exit\n");
                 help.push_str("\n**Copy text:**\n\n");
                 help.push_str("  `/copy` — Copy last AI response to clipboard\n");
-                help.push_str("  `Drag` — Native text selection and copy\n");
-                help.push_str("  `Ctrl+Shift+C` — Copy current selection\n");
+                help.push_str("  `Drag` — Select text, then `Cmd+C` / `Ctrl+Shift+C` to copy\n");
+                help.push_str("  `Alt+Up/Down` — Navigate input history\n");
                 self.conversation.push_delta(&help);
                 self.conversation.finalize_stream();
             }
