@@ -12,8 +12,8 @@ const H_PADDING: u16 = 3;
 
 use crate::file_attach::AttachedFile;
 
-pub fn render(frame: &mut Frame, area: Rect, input: &InputState, is_busy: bool, suggestion: Option<&str>, attached: &[AttachedFile], pasted: Option<&str>) {
-    let is_empty = input.is_empty() && pasted.is_none();
+pub fn render(frame: &mut Frame, area: Rect, input: &InputState, is_busy: bool, suggestion: Option<&str>, attached: &[AttachedFile], pasted: &[String]) {
+    let is_empty = input.is_empty() && pasted.is_empty();
     let inner_width = area.width.saturating_sub(2 + H_PADDING * 2) as usize;
     let inner_width = inner_width.max(1);
 
@@ -36,15 +36,19 @@ pub fn render(frame: &mut Frame, area: Rect, input: &InputState, is_busy: bool, 
         let mut cursor_vrow = 0usize;
         let mut cursor_vcol = 0usize;
 
-        // Pasted text: compact tag (like Claude Code file attachment style)
-        if let Some(pt) = pasted {
+        // Pasted text: one compact tag per staged paste block. Multiple pastes
+        // are preserved (see App::pasted_blocks); each shows on its own line so
+        // the user can see "I pasted 3 blocks" at a glance.
+        for (i, pt) in pasted.iter().enumerate() {
             let line_count = pt.lines().count();
             let char_count = pt.len();
+            let label = if pasted.len() > 1 {
+                format!("\u{25a0} Pasted text #{} ", i + 1)
+            } else {
+                "\u{25a0} Pasted text ".to_string()
+            };
             vis_lines.push(Line::from(vec![
-                Span::styled(
-                    "\u{25a0} Pasted text ".to_string(),
-                    Style::default().fg(theme::info()),
-                ),
+                Span::styled(label, Style::default().fg(theme::info())),
                 Span::styled(
                     format!("({} lines, {} chars)", line_count, char_count),
                     Style::default().fg(theme::text_muted()),
@@ -197,9 +201,10 @@ fn is_wide_char(c: char) -> bool {
 }
 
 /// Input box height: counts visual lines (including manual wrapping).
-pub fn height(input: &InputState, terminal_height: u16, terminal_width: u16, has_attachments: bool, has_paste: bool) -> u16 {
+pub fn height(input: &InputState, terminal_height: u16, terminal_width: u16, has_attachments: bool, paste_block_count: usize) -> u16 {
     let tag_height = if has_attachments { 1 } else { 0 };
-    let paste_height: u16 = if has_paste { 1 } else { 0 };
+    // One row per staged paste block so multiple pastes are all visible.
+    let paste_height: u16 = paste_block_count.min(5) as u16;
     let min_height = 3 + tag_height;
     let max_content: u16 = 8;
     let max_height = (max_content + 2 + tag_height).min(terminal_height / 2);

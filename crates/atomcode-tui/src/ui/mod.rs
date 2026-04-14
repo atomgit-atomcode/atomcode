@@ -62,7 +62,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 
     let terminal_height = frame.area().height;
     let terminal_width = frame.area().width;
-    let input_height = input_box::height(&app.input, terminal_height, terminal_width, !app.attached_files.is_empty(), app.pasted_text.is_some());
+    let input_height = input_box::height(&app.input, terminal_height, terminal_width, !app.attached_files.is_empty(), app.pasted_blocks.len());
 
     let show_welcome = app.conversation.messages.is_empty()
         && app.conversation.stream_buffer.is_none();
@@ -83,14 +83,14 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         if let Some((ref sessions, selected)) = app.session_selector {
             session_selector::render(frame, chunks[1], sessions, selected, &app.session_selector_query);
         }
-        input_box::render(frame, chunks[2], &app.input, false, None, &app.attached_files, app.pasted_text.as_deref());
+        input_box::render(frame, chunks[2], &app.input, false, None, &app.attached_files, &app.pasted_blocks);
         return;
     }
 
     // Issue input mode: render issue form in chat area
     if let crate::app::AppMode::IssueInput(ref state) = app.mode {
         issue_input::render(frame, chunks[1], state);
-        input_box::render(frame, chunks[2], &app.input, false, None, &app.attached_files, app.pasted_text.as_deref());
+        input_box::render(frame, chunks[2], &app.input, false, None, &app.attached_files, &app.pasted_blocks);
         return;
     }
 
@@ -128,7 +128,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         app.last_total_lines = total_lines;
     }
 
-    input_box::render(frame, chunks[2], &app.input, app.mode.is_streaming_or_executing(), app.suggestion.as_deref(), &app.attached_files, app.pasted_text.as_deref());
+    input_box::render(frame, chunks[2], &app.input, app.mode.is_streaming_or_executing(), app.suggestion.as_deref(), &app.attached_files, &app.pasted_blocks);
 
     // Render slash menu as overlay above input box
     if app.slash_menu.visible {

@@ -127,6 +127,8 @@ fn build_oauth_provider(access_token: &str) -> ProviderConfig {
         system_prompt: None,
         user_agent: None,
         context_window: 32000,
+        // OAuth creds stay in memory only — don't persist to disk.
+        ephemeral: true,
     }
 }
 

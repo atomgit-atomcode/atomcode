@@ -224,6 +224,7 @@ async fn run() -> Result<i32> {
             system_prompt: None,
             user_agent: None,
             context_window: default_context_window_for("openai"),
+            ephemeral: true,
         };
         (dummy, String::new())
     } else {

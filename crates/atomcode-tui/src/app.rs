@@ -158,7 +158,10 @@ pub struct App {
     pub pending_appends: Vec<String>,
     /// Files attached to the next message (detected from pasted paths).
     pub attached_files: Vec<crate::file_attach::AttachedFile>,
-    pub pasted_text: Option<String>,
+    /// Blocks of pasted text staged for the next message. One entry per paste
+    /// event (Ctrl+V, bracketed paste, rapid-key burst). Multiple pastes are
+    /// preserved — `send_message` joins them with `\n\n` before dispatch.
+    pub pasted_blocks: Vec<String>,
     pub slash_menu: SlashMenu,
     pub provider_mgr: Option<ProviderManager>,
     pub welcome_state: WelcomeState,
@@ -309,7 +312,7 @@ impl App {
            pending_editor: None,
            pending_login: false,
            attached_files: Vec::new(),
-           pasted_text: None,
+           pasted_blocks: Vec::new(),
            slash_menu: SlashMenu::new(),
            provider_mgr: None,
            welcome_state: WelcomeState::new(),
@@ -955,7 +958,7 @@ impl App {
                                 mgr.input_buf.push_str(&text);
                             }
                         } else if text.lines().count() > 3 || text.len() > 200 {
-                            self.pasted_text = Some(text);
+                            self.pasted_blocks.push(text);
                         } else {
                             self.input.insert_text(&text);
                         }
@@ -977,7 +980,7 @@ impl App {
                     // Normalize line endings: \r\n -> \n, \r -> \n
                     let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
                     if normalized.lines().count() > 3 || normalized.len() > 200 {
-                        self.pasted_text = Some(normalized);
+                        self.pasted_blocks.push(normalized);
                     } else {
                         self.input.insert_text(&normalized);
                     }
@@ -1718,8 +1721,10 @@ impl App {
                 self.send_message(event_tx);
             }
             (_, KeyCode::Esc) => {
-                if self.pasted_text.is_some() {
-                    self.pasted_text = None;
+                if !self.pasted_blocks.is_empty() {
+                    // Esc peels off one paste block at a time so users can undo
+                    // an accidental extra paste without losing the rest.
+                    self.pasted_blocks.pop();
                 } else if !self.input.is_empty() {
                     self.input.clear();
                     self.slash_menu.close();
@@ -1785,7 +1790,7 @@ impl App {
                     if let Some(idx) = self.history_index {
                         if let Some(hist) = self.input_history.get(idx).cloned() {
                             self.suggestion = None;
-                            self.pasted_text = None;
+                            self.pasted_blocks.clear();
                             self.load_history_entry(&hist);
                         }
                     }
@@ -1798,12 +1803,12 @@ impl App {
                         self.history_index = Some(idx + 1);
                         let hist = self.input_history[idx + 1].clone();
                         self.suggestion = None;
-                        self.pasted_text = None;
+                        self.pasted_blocks.clear();
                         self.load_history_entry(&hist);
                     } else {
                         // Exit history mode
                         self.history_index = None;
-                        self.pasted_text = None;
+                        self.pasted_blocks.clear();
                         self.input.clear();
                         if let Some(stash) = self.history_stash.take() {
                             for c in stash.chars() { self.input.insert_char(c); }
@@ -1815,7 +1820,7 @@ impl App {
                     self.history_index = Some(0);
                     if let Some(hist) = self.input_history.first().cloned() {
                         self.suggestion = None;
-                        self.pasted_text = None;
+                        self.pasted_blocks.clear();
                         self.load_history_entry(&hist);
                     }
                 }
@@ -2500,13 +2505,14 @@ impl App {
         true
     }
 
-    /// Load a history entry into input. Long entries shown as pasted_text reference.
+    /// Load a history entry into input. Long entries shown as a paste reference.
     fn load_history_entry(&mut self, entry: &str) {
         self.input.clear();
+        self.pasted_blocks.clear();
         let line_count = entry.lines().count();
         if line_count > 3 || entry.len() > 200 {
             // Long entry — show as pasted reference
-            self.pasted_text = Some(entry.to_string());
+            self.pasted_blocks.push(entry.to_string());
         } else {
             // Short entry — load inline using insert_text to preserve newlines
             self.input.insert_text(entry);
@@ -2523,16 +2529,7 @@ impl App {
         let buf = std::mem::take(&mut self.rapid_buf);
         let line_count = buf.matches('\n').count() + 1;
         if line_count > 3 || buf.len() > 200 {
-            // Large burst — if there's already a pending paste reference, concat;
-            // otherwise stash as a new reference.
-            match self.pasted_text.take() {
-                Some(mut prev) => {
-                    prev.push('\n');
-                    prev.push_str(&buf);
-                    self.pasted_text = Some(prev);
-                }
-                None => self.pasted_text = Some(buf),
-            }
+            self.pasted_blocks.push(buf);
         } else {
             self.input.insert_text(&buf);
         }
@@ -2541,7 +2538,14 @@ impl App {
 
     fn send_message(&mut self, _event_tx: &mpsc::UnboundedSender<AppEvent>) {
         let typed = self.input.content();
-        let content = if let Some(pasted) = self.pasted_text.take() {
+        let pasted = if self.pasted_blocks.is_empty() {
+            None
+        } else {
+            // Join all staged paste blocks with a blank line between them so the
+            // model sees them as distinct sections. Drains the Vec (`mem::take`).
+            Some(std::mem::take(&mut self.pasted_blocks).join("\n\n"))
+        };
+        let content = if let Some(pasted) = pasted {
             if typed.trim().is_empty() { pasted }
             else { format!("{}\n\n{}", typed, pasted) }
         } else {
