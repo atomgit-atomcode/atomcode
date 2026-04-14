@@ -7,7 +7,7 @@ impl AgentLoop {
     pub(crate) fn forward_turn_event(&mut self, event: TurnEvent) {
         match event {
             TurnEvent::TextDelta(text) => {
-                self.model_produced_text = true;
+                self.discipline_state.model_produced_text = true;
                 let _ = self.event_tx.send(AgentEvent::TextDelta(text));
             }
             TurnEvent::ToolCallStreaming { name } => {
@@ -23,7 +23,7 @@ impl AgentLoop {
                 // Track bash command for failure categorization
                 if name == "bash" {
                     if let Ok(args) = serde_json::from_str::<serde_json::Value>(arguments) {
-                        self.last_bash_cmd = args.get("command")
+                        self.discipline_state.last_bash_cmd = args.get("command")
                             .and_then(|v| v.as_str())
                             .unwrap_or("")
                             .to_string();
@@ -80,20 +80,20 @@ impl AgentLoop {
                     }
                 }
                 if matches!(name.as_str(), "read_file" | "list_directory" | "glob" | "grep") {
-                    self.consecutive_reads += 1;
+                    self.discipline_state.consecutive_reads += 1;
                 } else if matches!(name.as_str(), "edit_file" | "create_file") {
-                    self.consecutive_reads = 0;
+                    self.discipline_state.consecutive_reads = 0;
                 }
 
                 // Track scouting commands for datalog metrics (no injection).
                 if name == "bash" {
-                    let cmd = self.last_bash_cmd.to_lowercase();
+                    let cmd = self.discipline_state.last_bash_cmd.to_lowercase();
                     if cmd.contains("curl") || cmd.contains("lsof")
                         || cmd.contains("ps aux") || cmd.contains("tail") {
-                        self.scouting_count += 1;
+                        self.discipline_state.scouting_count += 1;
                     }
                 } else if matches!(name.as_str(), "read_file" | "edit_file" | "create_file") {
-                    self.scouting_count = 0;
+                    self.discipline_state.scouting_count = 0;
                 }
 
                 self.datalog.log_tool_result(&output, success);
@@ -236,7 +236,7 @@ impl AgentLoop {
             if call.name == "read_file" {
                 if let Some(fp) = args.get("file_path").and_then(|v| v.as_str()) {
                     let short = short_path(fp);
-                    let read_count = self.file_read_counts.get(&short).copied().unwrap_or(0);
+                    let read_count = self.discipline_state.file_read_counts.get(&short).copied().unwrap_or(0);
                     if read_count == 0 && (args.get("offset").is_some() || args.get("limit").is_some()) {
                         // First read — remove offset/limit to get the full file.
                         if let Some(obj) = args.as_object_mut() {
@@ -274,7 +274,7 @@ impl AgentLoop {
                         .file_name()
                         .map(|n| n.to_string_lossy().to_string())
                         .unwrap_or_else(|| fp.to_string());
-                    let count = self.file_read_counts.get(&short).copied().unwrap_or(0);
+                    let count = self.discipline_state.file_read_counts.get(&short).copied().unwrap_or(0);
                     if count >= 5 {
                         return Some(format!(
                             "BLOCKED: You have read {} {} times. You already have the content. \
@@ -311,16 +311,16 @@ impl AgentLoop {
             h.finish()
         };
         let sig = (tool_name.to_string(), args_hash);
-        self.recent_calls.push(sig.clone());
-        if self.recent_calls.len() > 20 {
-            self.recent_calls.remove(0);
+        self.discipline_state.recent_calls.push(sig.clone());
+        if self.discipline_state.recent_calls.len() > 20 {
+            self.discipline_state.recent_calls.remove(0);
         }
 
         // Count consecutive repeats of this exact call.
         // For read_file: only reset if the SAME file was edited between reads.
         // Editing app.js should not reset the read count for app.py.
         let mut repeat_count = 0usize;
-        for entry in self.recent_calls.iter().rev() {
+        for entry in self.discipline_state.recent_calls.iter().rev() {
             if tool_name == "read_file" {
                 // For read_file: only an edit on the same file resets the counter
                 if matches!(entry.0.as_str(), "edit_file" | "write_file" | "create_file")
@@ -358,15 +358,15 @@ impl AgentLoop {
             if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(args) {
                 if let Some(fp) = parsed.get("file_path").and_then(|v| v.as_str()) {
                     let short = short_path(fp);
-                    if self.consecutive_edits_file.as_deref() == Some(&short) {
-                        self.consecutive_edits_count += 1;
+                    if self.discipline_state.consecutive_edits_file.as_deref() == Some(&short) {
+                        self.discipline_state.consecutive_edits_count += 1;
                     } else {
-                        self.consecutive_edits_file = Some(short.clone());
-                        self.consecutive_edits_count = 1;
+                        self.discipline_state.consecutive_edits_file = Some(short.clone());
+                        self.discipline_state.consecutive_edits_count = 1;
                     }
                     // After 3+ edits to same file, auto-inject current content
                     // so the model has fresh state for the next edit.
-                    if self.consecutive_edits_count == 3 {
+                    if self.discipline_state.consecutive_edits_count == 3 {
                         if let Ok(content) = std::fs::read_to_string(fp) {
                             let lines = content.lines().count();
                             if lines <= 300 {
@@ -380,10 +380,10 @@ impl AgentLoop {
                                 ));
                             }
                         }
-                    } else if self.consecutive_edits_count >= 6 {
+                    } else if self.discipline_state.consecutive_edits_count >= 6 {
                         return Some(format!(
                             "[BLOCKED: {} edited {} times. Re-read the file before continuing.]",
-                            short, self.consecutive_edits_count
+                            short, self.discipline_state.consecutive_edits_count
                         ));
                     }
                 }
@@ -398,13 +398,13 @@ impl AgentLoop {
                     .map(|fp| {
                         fp.rsplit('/').next().unwrap_or(fp).to_string()
                     });
-                let is_same_file = match (&read_file, &self.consecutive_edits_file) {
+                let is_same_file = match (&read_file, &self.discipline_state.consecutive_edits_file) {
                     (Some(rf), Some(ef)) => rf == ef,
                     _ => false,
                 };
                 if !is_same_file {
-                    self.consecutive_edits_file = None;
-                    self.consecutive_edits_count = 0;
+                    self.discipline_state.consecutive_edits_file = None;
+                    self.discipline_state.consecutive_edits_count = 0;
                 }
             }
         }

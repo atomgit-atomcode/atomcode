@@ -173,6 +173,36 @@ pub enum AgentPhase {
     WaitingApproval,     // Waiting for user to approve
 }
 
+/// Discipline tracking state — counters for loop detection, stagnation,
+/// error streaks, and tool usage patterns. Extracted from AgentLoop to
+/// keep the God Object manageable.
+#[derive(Default)]
+pub(crate) struct DisciplineState {
+    pub consecutive_reads: usize,
+    pub stagnant_turns: usize,
+    pub last_known_files: usize,
+    pub targeted_read_count: usize,
+    pub last_targeted_reads: usize,
+    pub verify_injected: bool,
+    pub model_produced_text: bool,
+    pub silent_tool_rounds: usize,
+    pub is_negative_feedback: bool,
+    pub recent_calls: Vec<(String, u64)>,
+    pub build_fail_count: usize,
+    pub file_read_counts: std::collections::HashMap<String, usize>,
+    pub scouting_count: usize,
+    pub api_confirmed_working: bool,
+    pub consecutive_edits_file: Option<String>,
+    pub consecutive_edits_count: usize,
+    pub sleep_count: usize,
+    pub consecutive_verify_count: usize,
+    pub recent_errors: Vec<String>,
+    pub executed_cmds: std::collections::HashMap<String, usize>,
+    pub category_fail_streak: std::collections::HashMap<String, usize>,
+    pub last_bash_cmd: String,
+    pub last_diagnosed_error: String,
+}
+
 /// The agent loop state.
 pub struct AgentLoop {
     // Core components
@@ -218,65 +248,21 @@ pub struct AgentLoop {
     /// Absolute paths of descriptor files included in the project context.
     /// Used to intercept redundant read_file calls.
     context_included_files: HashSet<PathBuf>,
+    /// Discipline tracking — all counters for loop detection, stagnation,
+    /// error streaks, and tool usage patterns. Extracted from AgentLoop to
+    /// reduce God Object complexity (was 22 fields inline).
+    pub(crate) discipline_state: DisciplineState,
+
     /// Files read this turn (for tracking read-but-not-edit waste)
     files_read_this_turn: Vec<String>,
     /// Files edited/written this turn
     files_edited_this_turn: Vec<String>,
-    /// Consecutive read-type calls without an edit (for read budget enforcement)
-    consecutive_reads: usize,
-    /// Consecutive turns with no new files read and no edits (stagnation detection).
-    stagnant_turns: usize,
-    /// Snapshot of known files count at last stagnation check.
-    last_known_files: usize,
-    /// Count of targeted reads (with offset/limit) — these are always progress.
-    targeted_read_count: usize,
-    /// Snapshot of targeted reads at last stagnation check.
-    last_targeted_reads: usize,
-    /// Whether verify prompt was already injected this turn (fire at most once)
-    verify_injected: bool,
-    /// Whether the model produced any text output this turn (if so, skip auto-summary)
-    model_produced_text: bool,
-    /// Consecutive LLM rounds with tool calls but zero text output.
-    /// Reset to 0 whenever the model produces text. Used to inject progress prompts.
-    silent_tool_rounds: usize,
-    /// True when the user's message is negative feedback on the previous turn's work.
-    is_negative_feedback: bool,
-    /// Last N tool call signatures for loop detection. (name, args_hash)
-    recent_calls: Vec<(String, u64)>,
     /// The user's original task message for this turn (re-injected as reminders).
     current_task: String,
     /// Name of the tool currently being executed (for smart truncation).
     current_tool_name: String,
     /// Pre-read file contents injected as system context (not synthetic tool calls).
     preread_context: String,
-    /// Consecutive build/compile failures without a successful build in between.
-    build_fail_count: usize,
-    /// Per-file read count this turn — detects reading the same file repeatedly.
-    file_read_counts: std::collections::HashMap<String, usize>,
-    /// Number of scouting commands (curl/lsof/ps/kill) this turn.
-    scouting_count: usize,
-    /// Set when curl/wget returns valid data (not error) — backend is confirmed working.
-    api_confirmed_working: bool,
-    /// Consecutive edit_file calls to the same file without any other tool in between.
-    consecutive_edits_file: Option<String>,
-    consecutive_edits_count: usize,
-    /// Count of `sleep` commands this turn — detects sleep polling loops.
-    sleep_count: usize,
-    /// Consecutive verification-only bash commands (--version, list, status, which, ls).
-    consecutive_verify_count: usize,
-    /// Recent consecutive error messages (first 60 chars) for repeated-error detection.
-    recent_errors: Vec<String>,
-    /// Normalized bash commands executed this turn → count.
-    /// Used to detect repeated execution of the same command.
-    executed_cmds: std::collections::HashMap<String, usize>,
-    /// Consecutive failures by command category (e.g., "curl", "mysql").
-    /// Reset on success. Used to detect "same approach keeps failing" patterns.
-    category_fail_streak: std::collections::HashMap<String, usize>,
-    /// Last bash command string (set on ToolCallStarted, used on ToolCallResult).
-    last_bash_cmd: String,
-    /// Exception signature from previous auto_diagnose (e.g. "TransactionRequiredException").
-    /// Used to detect when the same error recurs after a "fix" attempt.
-    last_diagnosed_error: String,
 
     /// Files edited in the previous turn — injected into system prompt so the model
     /// knows where to start when the user reports the same issue again.
@@ -442,34 +428,12 @@ impl AgentLoop {
             cancel_token: CancellationToken::new(),
             project_context_cache: None,
             context_included_files: HashSet::new(),
+            discipline_state: DisciplineState::default(),
             files_read_this_turn: Vec::new(),
             files_edited_this_turn: Vec::new(),
-            consecutive_reads: 0,
-            stagnant_turns: 0,
-            last_known_files: 0,
-            targeted_read_count: 0,
-            last_targeted_reads: 0,
-            verify_injected: false,
-            model_produced_text: false,
-            silent_tool_rounds: 0,
-            is_negative_feedback: false,
-            recent_calls: Vec::new(),
             current_task: String::new(),
             current_tool_name: String::new(),
             preread_context: String::new(),
-            build_fail_count: 0,
-            file_read_counts: std::collections::HashMap::new(),
-            scouting_count: 0,
-            api_confirmed_working: false,
-            consecutive_edits_file: None,
-            consecutive_edits_count: 0,
-            sleep_count: 0,
-            consecutive_verify_count: 0,
-            recent_errors: Vec::new(),
-            executed_cmds: std::collections::HashMap::new(),
-            category_fail_streak: std::collections::HashMap::new(),
-            last_bash_cmd: String::new(),
-            last_diagnosed_error: String::new(),
             prev_turn_edited_files: Vec::new(),
             last_checkpoint: None,
             active_file: None,
@@ -661,7 +625,7 @@ impl AgentLoop {
             "wrong", "not right", "still broken", "doesn't work", "undo",
             "revert", "go back", "that's worse", "stop", "broken",
         ];
-        self.is_negative_feedback = content.chars().count() < 80
+        self.discipline_state.is_negative_feedback = content.chars().count() < 80
             && negative_keywords.iter().any(|kw| lower.contains(kw));
 
         // Git checkpoint: snapshot working tree before agent starts editing.
@@ -692,7 +656,7 @@ impl AgentLoop {
         if let Some(pos) = enriched.find("<!-- diag_exception:") {
             let rest = &enriched[pos + 20..];
             if let Some(end) = rest.find(" -->") {
-                self.last_diagnosed_error = rest[..end].to_string();
+                self.discipline_state.last_diagnosed_error = rest[..end].to_string();
             }
         }
         // Strip the hidden marker before adding to conversation
@@ -707,34 +671,34 @@ impl AgentLoop {
         self.tool_call_count = 0;
         self.turn_count = 0;
         self.retry_count = 0;
-        self.recent_calls.clear();
+        self.discipline_state.recent_calls.clear();
         // Save current turn's edits before clearing — used in next turn's system prompt
         self.prev_turn_edited_files = self.files_edited_this_turn.clone();
         self.files_read_this_turn.clear();
         self.files_edited_this_turn.clear();
         self.turn_runner.recently_edited_files.clear();
-        self.consecutive_reads = 0;
-        self.verify_injected = false;
-        self.model_produced_text = false;
-        self.silent_tool_rounds = 0;
+        self.discipline_state.consecutive_reads = 0;
+        self.discipline_state.verify_injected = false;
+        self.discipline_state.model_produced_text = false;
+        self.discipline_state.silent_tool_rounds = 0;
         // Note: is_negative_feedback is set above, do not reset here.
-        self.build_fail_count = 0;
-        self.file_read_counts.clear();
-        self.scouting_count = 0;
-        self.api_confirmed_working = false;
-        self.consecutive_edits_file = None;
-        self.consecutive_edits_count = 0;
-        self.sleep_count = 0;
-        self.consecutive_verify_count = 0;
-        self.recent_errors.clear();
-        self.executed_cmds.clear();
-        self.category_fail_streak.clear();
+        self.discipline_state.build_fail_count = 0;
+        self.discipline_state.file_read_counts.clear();
+        self.discipline_state.scouting_count = 0;
+        self.discipline_state.api_confirmed_working = false;
+        self.discipline_state.consecutive_edits_file = None;
+        self.discipline_state.consecutive_edits_count = 0;
+        self.discipline_state.sleep_count = 0;
+        self.discipline_state.consecutive_verify_count = 0;
+        self.discipline_state.recent_errors.clear();
+        self.discipline_state.executed_cmds.clear();
+        self.discipline_state.category_fail_streak.clear();
         // Reset stagnation tracking — new user message = fresh turn,
         // previous stagnation state must not carry over.
-        self.stagnant_turns = 0;
-        self.last_known_files = 0;
-        self.last_targeted_reads = 0;
-        self.targeted_read_count = 0;
+        self.discipline_state.stagnant_turns = 0;
+        self.discipline_state.last_known_files = 0;
+        self.discipline_state.last_targeted_reads = 0;
+        self.discipline_state.targeted_read_count = 0;
         // Reset subtask driver and plan — previous turn's plan must not
         // bleed into the new turn. Without this, a text-only Q&A response
         // that mentions file names (e.g. as examples) triggers extract_from_plan,
@@ -867,22 +831,22 @@ impl AgentLoop {
             // with the skeleton workflow (reading 10 skeletons ≠ being stuck).
             {
                 let known = self.files_read_this_turn.len() + self.files_edited_this_turn.len();
-                let targeted = self.targeted_read_count;
+                let targeted = self.discipline_state.targeted_read_count;
                 // Progress = new files discovered OR new targeted reads OR new edits
-                if known > self.last_known_files || targeted > self.last_targeted_reads {
-                    self.stagnant_turns = 0;
+                if known > self.discipline_state.last_known_files || targeted > self.discipline_state.last_targeted_reads {
+                    self.discipline_state.stagnant_turns = 0;
                 } else {
-                    self.stagnant_turns += 1;
+                    self.discipline_state.stagnant_turns += 1;
                 }
-                self.last_known_files = known;
-                self.last_targeted_reads = targeted;
+                self.discipline_state.last_known_files = known;
+                self.discipline_state.last_targeted_reads = targeted;
 
-                if self.stagnant_turns >= 3 {
+                if self.discipline_state.stagnant_turns >= 3 {
                     let warning = format!(
                         "[STAGNATION WARNING: {} consecutive turns with no new files read and no edits. \
                          You have file skeletons — use offset/limit to read the sections you need, then edit. \
                          Files you've read: {}]",
-                        self.stagnant_turns,
+                        self.discipline_state.stagnant_turns,
                         self.files_read_this_turn.join(", "),
                     );
                     self.conversation.messages.push(
@@ -945,15 +909,15 @@ impl AgentLoop {
                 let last_approval_request = &mut self.last_approval_request;
                 let pending_input = &mut self.pending_input;
                 let phase = &mut self.phase;
-                let model_produced_text = &mut self.model_produced_text;
+                let model_produced_text = &mut self.discipline_state.model_produced_text;
                 let current_tool_name = &mut self.current_tool_name;
                 let datalog = &mut self.datalog;
                 let files_edited_this_turn = &mut self.files_edited_this_turn;
                 let active_file = &mut self.active_file;
                 let files_read_this_turn = &mut self.files_read_this_turn;
-                let file_read_counts = &mut self.file_read_counts;
-                let consecutive_reads = &mut self.consecutive_reads;
-                let targeted_read_count = &mut self.targeted_read_count;
+                let file_read_counts = &mut self.discipline_state.file_read_counts;
+                let consecutive_reads = &mut self.discipline_state.consecutive_reads;
+                let targeted_read_count = &mut self.discipline_state.targeted_read_count;
                 let session_files = &mut self.session_files;
                 let reindex_tx = &self.reindex_tx;
 
@@ -1419,9 +1383,9 @@ impl AgentLoop {
                     // Track silent rounds: model used tools without explaining anything.
                     let had_text = text.as_ref().map(|t| !t.trim().is_empty()).unwrap_or(false);
                     if had_text {
-                        self.silent_tool_rounds = 0;
+                        self.discipline_state.silent_tool_rounds = 0;
                     } else {
-                        self.silent_tool_rounds += 1;
+                        self.discipline_state.silent_tool_rounds += 1;
                     }
 
                     // Sub-agent extraction from UsedTools: model may output plan text
@@ -1720,7 +1684,7 @@ impl AgentLoop {
                 &self.current_task,
                 &self.files_edited_this_turn,
                 last_curl.as_deref(),
-                self.build_fail_count == 0,
+                self.discipline_state.build_fail_count == 0,
             );
         }
 

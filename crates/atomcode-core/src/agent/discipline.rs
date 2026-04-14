@@ -100,7 +100,7 @@ impl AgentLoop {
         // Re-read guard: when the same file is read 4+ times, the model is stuck.
         // Re-inject the original task and force a re-plan.
         let mut blocked_files: Vec<String> = Vec::new();
-        for (file, count) in &self.file_read_counts {
+        for (file, count) in &self.discipline_state.file_read_counts {
             if *count >= 4 {
                 blocked_files.push(format!("{} ({}x)", file, count));
             }
@@ -122,7 +122,7 @@ impl AgentLoop {
             );
             self.conversation.add_user_message(&warning);
             // Reset counts so the model gets another chance after re-planning
-            self.file_read_counts.clear();
+            self.discipline_state.file_read_counts.clear();
         }
 
         // NOTE: Silent-round progress prompt disabled — add_user_message injections
@@ -188,7 +188,7 @@ impl AgentLoop {
                     if !r.success {
                         let err_key: String = r.output.chars().take(60).collect();
                         if !err_key.is_empty() {
-                            self.recent_errors.push(err_key);
+                            self.discipline_state.recent_errors.push(err_key);
                         }
                     } else {
                         // Success breaks the streak
@@ -197,9 +197,9 @@ impl AgentLoop {
                 }
             }
             // Check if last 3 errors are the same
-            if self.recent_errors.len() >= 3 {
-                let last = &self.recent_errors[self.recent_errors.len() - 1];
-                let consecutive = self.recent_errors.iter().rev().take(3)
+            if self.discipline_state.recent_errors.len() >= 3 {
+                let last = &self.discipline_state.recent_errors[self.discipline_state.recent_errors.len() - 1];
+                let consecutive = self.discipline_state.recent_errors.iter().rev().take(3)
                     .all(|e| e == last);
                 if consecutive {
                     recent_fail_msg = Some(last.clone());
@@ -213,7 +213,7 @@ impl AgentLoop {
                     err
                 );
                 self.conversation.add_user_message(&warning);
-                self.recent_errors.clear();
+                self.discipline_state.recent_errors.clear();
             }
         }
     }

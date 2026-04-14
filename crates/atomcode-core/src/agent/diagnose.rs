@@ -216,7 +216,7 @@ impl AgentLoop {
 
         // If the same exception recurs after a previous fix attempt, tell the model
         // its approach isn't working and it needs a different strategy.
-        if !current_exception.is_empty() && current_exception == self.last_diagnosed_error {
+        if !current_exception.is_empty() && current_exception == self.discipline_state.last_diagnosed_error {
             result.push_str(&format!(
                 "\n\n[RECURRING ERROR: {} appeared again after your previous fix. \
                  Your last approach did not resolve it. Try a fundamentally different fix — \
@@ -224,7 +224,7 @@ impl AgentLoop {
                 current_exception
             ));
         }
-        // Store for next comparison (caller updates self.last_diagnosed_error)
+        // Store for next comparison (caller updates self.discipline_state.last_diagnosed_error)
         // We embed it in the result with a hidden marker for the caller to extract.
         if !current_exception.is_empty() {
             result.push_str(&format!("\n<!-- diag_exception:{} -->", current_exception));
