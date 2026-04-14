@@ -129,7 +129,9 @@ pub fn render(
                         .filter(|c| completed_call_ids.contains(c.id.as_str()))
                         .collect();
                     // Batch consecutive same-type tool calls into collapsed lines.
-                    // ≥2 consecutive calls of same tool → "▸ Read ×4 (file1, file2, ...)"
+                    // Only fold calls from PREVIOUS turns (before last_user_idx).
+                    // Current turn calls stay individual so user sees live progress.
+                    let is_old_turn = i < last_user_idx;
                     let mut ci = 0;
                     while ci < completed_calls.len() {
                         let batch_start = ci;
@@ -138,13 +140,15 @@ pub fn render(
                             ci += 1;
                         }
                         let batch_count = ci - batch_start;
-                        if batch_count >= 2 {
+                        if batch_count >= 2 && is_old_turn {
                             let details: Vec<String> = completed_calls[batch_start..ci].iter().map(|c| {
                                 extract_tool_detail_short(&c.name, &c.arguments)
                             }).collect();
                             render_batch_tool_calls(render_cache, batch_tool, batch_count, &details);
                         } else {
-                            render_tool_call(render_cache, completed_calls[batch_start], None);
+                            for c in &completed_calls[batch_start..ci] {
+                                render_tool_call(render_cache, c, None);
+                            }
                         }
                     }
                 }
@@ -156,7 +160,9 @@ pub fn render(
                     };
                     let is_read = call_id_to_tool.get(call_id) == Some(&"read_file");
 
-                    // Try to batch ≥2 consecutive same-type tool results into one collapsed line.
+                    // Batch ≥2 consecutive same-type tool results — only for OLD turns.
+                    // Current turn stays individual so user sees progress in real time.
+                    let is_old_turn_result = i < last_user_idx;
                     let tool_name = call_id_to_tool.get(call_id).map(|s| &**s).unwrap_or("");
                     {
                         // Look ahead for consecutive results of the same tool type
@@ -178,7 +184,7 @@ pub fn render(
                             }
                         }
                         let batch_count = batch_end - i;
-                        if batch_count >= 2 {
+                        if batch_count >= 2 && is_old_turn_result {
                             // Collect short details for the batch
                             let details: Vec<String> = (i..batch_end).map(|idx| {
                                 let cid = match &msgs[idx].content {
