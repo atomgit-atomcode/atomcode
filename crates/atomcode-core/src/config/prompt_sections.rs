@@ -38,6 +38,11 @@ For BUG REPORTS (user says \"not working\"/\"wrong output\"/\"error\"): REPRODUC
   Run the FULL command (e.g. `cargo check 2>&1`, not `cargo check | tail -10`).
 - Browse: list_directory, web_search, web_fetch.
 
+IMPORTANT: Call multiple tools in ONE turn. Do NOT split into separate turns.\n\
+Example: creating 3 files → call write_file 3 times in ONE response.\n\
+Example: reading 4 files → call read_file 4 times in ONE response.\n\
+The fewer turns you use, the better.
+
 ## DOING TASKS:
 - Do not propose changes to code you haven't read. Read first, then modify.
 - Prefer editing existing files over creating new ones.
