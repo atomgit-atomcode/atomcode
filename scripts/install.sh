@@ -1,0 +1,102 @@
+#!/bin/sh
+# AtomCode installer — curl | sh
+#
+#   curl -fsSL https://gitcode.com/gitcode-ai/atomcode-release/raw/main/install.sh | sh
+#
+# Env overrides:
+#   ATOMCODE_VERSION   release tag to install (default: v4.15.0)
+#   ATOMCODE_PREFIX    install dir (default: /usr/local/bin, falls back to ~/.local/bin)
+set -eu
+
+VERSION="${ATOMCODE_VERSION:-v4.15.0}"
+REPO_BASE="https://gitcode.com/gitcode-ai/atomcode-release/releases/download"
+
+# --- detect platform ---
+uname_s=$(uname -s)
+uname_m=$(uname -m)
+
+case "$uname_s" in
+    Darwin) os="darwin" ;;
+    Linux)  os="linux"  ;;
+    *) echo "Unsupported OS: $uname_s (Windows users: download the zip from the release page)"; exit 1 ;;
+esac
+
+case "$uname_m" in
+    arm64|aarch64) arch="arm64" ;;
+    x86_64|amd64)  arch="x64"   ;;
+    *) echo "Unsupported arch: $uname_m"; exit 1 ;;
+esac
+
+# Linux only ships x64
+if [ "$os" = "linux" ] && [ "$arch" != "x64" ]; then
+    echo "Unsupported platform: linux-$arch (only linux-x64 is released)"
+    exit 1
+fi
+
+BIN_NAME="atomcode-${VERSION}-${os}-${arch}"
+URL="${REPO_BASE}/${VERSION}/${BIN_NAME}"
+
+# --- pick install dir ---
+if [ -n "${ATOMCODE_PREFIX:-}" ]; then
+    PREFIX="$ATOMCODE_PREFIX"
+elif [ -w /usr/local/bin ] 2>/dev/null; then
+    PREFIX="/usr/local/bin"
+elif [ "$(id -u)" -eq 0 ]; then
+    PREFIX="/usr/local/bin"
+else
+    PREFIX="$HOME/.local/bin"
+fi
+mkdir -p "$PREFIX"
+
+# --- download ---
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
+DEST="$TMP/atomcode"
+
+echo "==> Downloading $BIN_NAME"
+echo "    from $URL"
+if command -v curl >/dev/null 2>&1; then
+    curl -fL --progress-bar -o "$DEST" "$URL"
+elif command -v wget >/dev/null 2>&1; then
+    wget --show-progress -O "$DEST" "$URL"
+else
+    echo "Error: need curl or wget."
+    exit 1
+fi
+
+# Sanity check: must be a real binary, not an HTML 404 page
+if head -c 4 "$DEST" | grep -q "<" 2>/dev/null; then
+    echo "Error: download looks like an HTML page, not a binary."
+    echo "       The release may not exist for your platform, or the URL is wrong."
+    echo "       URL: $URL"
+    exit 1
+fi
+
+chmod +x "$DEST"
+
+# --- install ---
+TARGET="$PREFIX/atomcode"
+if [ -e "$TARGET" ] && [ ! -w "$TARGET" ]; then
+    echo "==> Installing to $TARGET (sudo required)"
+    sudo mv "$DEST" "$TARGET"
+elif [ ! -w "$PREFIX" ]; then
+    echo "==> Installing to $TARGET (sudo required)"
+    sudo mv "$DEST" "$TARGET"
+else
+    echo "==> Installing to $TARGET"
+    mv "$DEST" "$TARGET"
+fi
+
+# --- done ---
+echo ""
+echo "Installed: $TARGET"
+"$TARGET" --version 2>/dev/null || true
+
+case ":$PATH:" in
+    *":$PREFIX:"*) ;;
+    *)
+        echo ""
+        echo "Note: $PREFIX is not in your PATH. Add this line to your shell rc:"
+        echo "    export PATH=\"$PREFIX:\$PATH\""
+        ;;
+esac
