@@ -48,9 +48,9 @@ pub fn render(
     // hasn't finished sending args yet). Rendered as a pseudo in-flight row so
     // the chat visually syncs with the bottom spinner label during long args
     // streaming windows (e.g. big write_file content that takes 30-60s).
-    streaming_tool_name: Option<&str>,
+    _streaming_tool_name: Option<&str>,
     streaming_tools: &[(String, String)],
-    streaming_tool_hint: &str,
+    _streaming_tool_hint: &str,
     // User inputs queued via AppendInput during streaming. Rendered as dim
     // "queued" previews above the input box so the user sees Enter was accepted
     // — without this, typing during streaming looks like it did nothing.

@@ -6,31 +6,31 @@ use crossterm::event::{Event, KeyEvent, MouseEvent, poll};
 use std::io::{self, Write};
 use tokio::sync::mpsc;
 
-/// Enable alternate scroll mode — converts scroll wheel to Up/Down key events.
+/// Enable only mouse button reporting (click + wheel) WITHOUT drag-motion tracking.
 ///
-/// We use `?1007h` (Alternate Scroll Mode) instead of `?1000h` (X11 mouse reporting)
-/// because:
-/// - `?1000h` captures mouse button press/release, which blocks native text selection
-///   (drag to select + copy) in all terminals.
-/// - `?1007h` ONLY converts scroll wheel events to Up/Down key presses — it does NOT
-///   capture mouse clicks or drags, so native terminal text selection works normally
-///   (just click and drag to select, then Cmd+C / Ctrl+Shift+C to copy).
+/// This is NOT what `crossterm::EnableMouseCapture` does — that enables 1000+1002+1015+1006
+/// which also captures drag, breaking the terminal's native click-drag text selection.
 ///
-/// Trade-off: scroll events arrive as Key(Up)/Key(Down) instead of Mouse(ScrollUp/ScrollDown),
-/// so we handle them in the key handler rather than the mouse handler.
-const ENABLE_ALT_SCROLL: &str = "\x1B[?1007h";
-const DISABLE_ALT_SCROLL: &str = "\x1B[?1007l";
+/// We enable:
+///  - `?1000h` — X11 mouse reporting (button press/release, scroll wheel as button 64/65)
+///  - `?1006h` — SGR extended coordinate encoding (supports >223 columns)
+///
+/// We deliberately OMIT `?1002h` (button-event tracking / drag motion). Most modern
+/// terminals then leave click-drag alone for native text selection while still reporting
+/// wheel + click events to us. See TUI docs.
+const ENABLE_MOUSE_SCROLL_ONLY: &str = "\x1B[?1000h\x1B[?1006h";
+const DISABLE_MOUSE_SCROLL_ONLY: &str = "\x1B[?1006l\x1B[?1000l";
 
-fn enable_alt_scroll() {
+fn enable_mouse_scroll_only() {
     let mut stdout = io::stdout();
-    let _ = stdout.write_all(ENABLE_ALT_SCROLL.as_bytes());
+    let _ = stdout.write_all(ENABLE_MOUSE_SCROLL_ONLY.as_bytes());
     let _ = stdout.flush();
 }
 
 #[allow(dead_code)]
-pub fn disable_alt_scroll() {
+pub fn disable_mouse_scroll_only() {
     let mut stdout = io::stdout();
-    let _ = stdout.write_all(DISABLE_ALT_SCROLL.as_bytes());
+    let _ = stdout.write_all(DISABLE_MOUSE_SCROLL_ONLY.as_bytes());
     let _ = stdout.flush();
 }
 
@@ -75,9 +75,9 @@ impl EventLoop {
         // Reset stop flag
         self.stop_flag.store(false, Ordering::SeqCst);
 
-        // Enable alternate scroll mode (?1007h) — converts scroll wheel to Up/Down keys.
-        // This does NOT capture mouse clicks or drags, so native text selection works.
-        enable_alt_scroll();
+        // Enable scroll-only mouse reporting (mode 1000 + 1006, no 1002 drag tracking).
+        // Goal: get wheel scroll events in-app while preserving native click-drag selection.
+        enable_mouse_scroll_only();
 
         // Start keyboard/mouse reader in a dedicated thread (not tokio task)
         // This gives us more control over the input stream
@@ -100,9 +100,13 @@ impl EventLoop {
                                         AppEvent::Key(key)
                                     }
                                     Event::Mouse(mouse) => {
-                                        // Forward mouse events (click, scroll) to the app.
-                                        // Drag events are NOT captured (no ?1002h) so native
-                                        // terminal text selection works (Option+drag / Shift+drag).
+                                        // CRITICAL: Mouse capture must stay ALWAYS enabled.
+                                        // We no longer toggle capture for text selection because:
+                                        // 1. When capture is disabled, terminals convert scroll wheel to Up/Down keys
+                                        // 2. This would incorrectly trigger history navigation in Input Box
+                                        // 3. Text selection still works via terminal's native selection (shift+click or drag)
+                                        
+                                        // Just forward all mouse events to the app
                                         AppEvent::Mouse(mouse)
                                     }
                                     Event::Paste(text) => AppEvent::Paste(text),
