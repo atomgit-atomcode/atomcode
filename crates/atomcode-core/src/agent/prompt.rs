@@ -190,6 +190,24 @@ impl AgentLoop {
             );
         }
 
+        // File-creation discipline: soft constraint to discourage 500+ line
+        // one-shot writes common with GLM-5 / MiniMax / Qwen. LLM attention
+        // degrades in long generations (later sections often have copy-pasted
+        // duplication / missing imports / mismatched braces). Soft — the model
+        // can still create big files when the task truly warrants it (HTML
+        // pages, complete Vue SFCs), but must justify it.
+        //
+        // Applied to ALL models, not just CN-weak — Claude also occasionally
+        // one-shots an over-stuffed class; the reminder is cheap.
+        prompt.push_str(
+            "\n=== 文件创建纪律 ===\n\
+             - 首次创建文件目标 ≤ 300 行；超 500 行必须在回复里明确说明为什么这个文件必须这么大\n\
+             - 典型合法大文件：HTML 落地页（内联 CSS/JS 可达 800+）、Vue/React 单文件组件（含 template+script+style）、配置/翻译字典\n\
+             - 典型应拆分：多职责混合的 Java 类、多组件塞同一个 .tsx、超长 util.ts/helpers.py、500+ 行的 Service 层\n\
+             - 不确定时宁拆不合：拆过度代价小（多一个 import），合并过度代价大（后续 edit/review/rollback 都痛）\n\
+             - 生成到 300 行后注意力容易衰减，容易出现 import 漏了/括号不配/重复粘贴 —— 主动停下分拆比硬写到尾更可靠\n"
+        );
+
         // Platform-specific rules — only injected on the target OS.
         // macOS/Linux get nothing extra; Windows gets cmd.exe syntax rules.
         let platform = crate::config::platform_rules();
