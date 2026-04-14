@@ -1221,53 +1221,17 @@ impl AgentLoop {
                                     }
                                 }
 
-                                if !missing_deps.is_empty() {
-                                    missing_deps.truncate(5);
-                                    let warning = format!(
-                                        "\n\n[PLAN CHECK: Your plan edits {} but these files are also connected: {}. \
-                                         Consider whether they need changes too.]",
-                                        plan_files.join(", "),
-                                        missing_deps.join(", "),
-                                    );
-                                    // Append to the model's text output so it sees it
-                                    self.conversation.add_user_message(&warning);
-                                }
+                                // PLAN CHECK injection: REMOVED. CC doesn't inject
+                                // dependency warnings. Model discovers deps itself.
+                                let _ = missing_deps; // suppress unused warning
                             }
                             drop(graph);
                         }
 
-                        if self.subtask_driver.active {
-                            // Sub-agent parallel dispatch: if 2+ independent files,
-                            // spawn parallel sub-agents instead of serial subtask loop.
-                            if self.subtask_driver.subtasks.len() >= 2 {
-                                if let Some(sub_result) = self.try_sub_agent_dispatch(text).await {
-                                    let _ = self.event_tx.send(AgentEvent::TextDelta(sub_result.clone()));
-                                    // Reset subtask driver since sub-agents handled it
-                                    self.subtask_driver = subtask_driver::SubtaskDriver::new();
-
-                                    if sub_result.contains("BUILD ERRORS") {
-                                        // Build failed after sub-agent merge — inject error
-                                        // into conversation so the main agent fixes it.
-                                        self.conversation.add_user_message(&format!(
-                                            "[Sub-agent merge build FAILED. Fix the errors below, then summarize.]\n{}",
-                                            sub_result
-                                        ));
-                                        // Continue turn loop — don't break
-                                    } else {
-                                        // Build passed — summarize and finish
-                                        self.conversation.add_user_message("Sub-agent results are above. Summarize what was changed.");
-                                        break;
-                                    }
-                                }
-                                // If sub-agent dispatch failed, fall through to serial subtask
-                            }
-
-                            // Fallback: serial subtask execution
-                            if let Some(instr) = self.subtask_driver.current_instruction() {
-                                self.conversation.add_user_message(&instr);
-                            }
-                            continue; // Don't finish — drive subtask execution
-                        }
+                        // Subtask driver serial execution: REMOVED.
+                        // Was injecting "now edit file X" instructions from regex-extracted
+                        // plan. Batch prompt now lets model handle multi-file work itself.
+                        // Sub-agent dispatch also disabled (try_sub_agent_dispatch returns None).
                     }
 
                     // Empty response from LLM (common with DeepSeek/SiliconFlow/GLM):
@@ -1313,17 +1277,8 @@ impl AgentLoop {
                         continue;
                     }
 
-                    // Colon guard: model said "现在我来创建：" then stopped.
-                    // finish_reason is "stop" but text ends with colon = mid-sentence.
-                    let trimmed_end = text.trim();
-                    if !trimmed_end.is_empty()
-                        && (trimmed_end.ends_with(':') || trimmed_end.ends_with('\u{FF1A}'))
-                        && self.retry_count < 2
-                    {
-                        self.retry_count += 1;
-                        self.conversation.add_user_message("Continue.");
-                        continue;
-                    }
+                    // Colon guard: REMOVED. CC doesn't check end-of-text punctuation.
+                    // If model stops mid-sentence, user can say "继续".
 
                     self.finish_turn(TurnStopReason::Natural);
                     return;

@@ -364,28 +364,9 @@ impl AgentLoop {
                         self.discipline_state.consecutive_edits_file = Some(short.clone());
                         self.discipline_state.consecutive_edits_count = 1;
                     }
-                    // After 3+ edits to same file, auto-inject current content
-                    // so the model has fresh state for the next edit.
-                    if self.discipline_state.consecutive_edits_count == 3 {
-                        if let Ok(content) = std::fs::read_to_string(fp) {
-                            let lines = content.lines().count();
-                            if lines <= 300 {
-                                let numbered: String = content.lines().enumerate()
-                                    .map(|(i, l)| format!("{:>4}| {}", i + 1, l))
-                                    .collect::<Vec<_>>()
-                                    .join("\n");
-                                self.conversation.add_user_message(&format!(
-                                    "[Auto-refresh: {} has been edited 3 times. Current content ({} lines):]\n{}",
-                                    short, lines, numbered
-                                ));
-                            }
-                        }
-                    } else if self.discipline_state.consecutive_edits_count >= 6 {
-                        return Some(format!(
-                            "[BLOCKED: {} edited {} times. Re-read the file before continuing.]",
-                            short, self.discipline_state.consecutive_edits_count
-                        ));
-                    }
+                    // Auto-refresh and edit blocking: REMOVED.
+                    // CC doesn't inject file content or block edits.
+                    // View replacement already updates stale reads in context.
                 }
             }
         } else if tool_name == "read_file" {
