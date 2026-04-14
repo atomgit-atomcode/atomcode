@@ -299,7 +299,32 @@ fn scan_tree(
     _project_root: &Path,
     graph: Option<&crate::graph::CodeGraph>,
 ) -> String {
-    if depth > max_depth { return String::new(); }
+    if depth > max_depth {
+        // At max depth: if this directory has a single-child chain (like
+        // src/main/java/com/openops/), collapse it and show leaf contents.
+        // This lets Java/Go projects show their source files despite depth limits.
+        let collapsed = collapse_single_child_chain(dir);
+        if let Some((collapsed_path, leaf_dir)) = collapsed {
+            let indent = "  ".repeat(depth);
+            let mut out = format!("{}{}/ (deep path collapsed)\n", indent, collapsed_path);
+            if let Ok(entries) = std::fs::read_dir(&leaf_dir) {
+                let mut items: Vec<_> = entries.filter_map(|e| e.ok())
+                    .filter(|e| !SKIP_DIRS.contains(&e.file_name().to_string_lossy().as_ref()))
+                    .collect();
+                items.sort_by_key(|e| e.file_name());
+                for entry in items.iter().take(15) {
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                        out.push_str(&format!("{}  {}/\n", indent, name));
+                    } else {
+                        out.push_str(&format!("{}  {}\n", indent, name));
+                    }
+                }
+            }
+            return out;
+        }
+        return String::new();
+    }
 
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
@@ -545,4 +570,45 @@ fn graph_file_callees(graph: &crate::graph::CodeGraph, file_path: &Path) -> Vec<
     let mut result: Vec<String> = callee_files.into_iter().collect();
     result.sort();
     result
+}
+
+/// Follow single-child directory chains (e.g., src/main/java/com/openops/)
+/// and return the collapsed path + the leaf directory.
+/// Returns None if the chain is less than 2 levels deep.
+fn collapse_single_child_chain(dir: &Path) -> Option<(String, std::path::PathBuf)> {
+    let mut current = dir.to_path_buf();
+    let mut parts: Vec<String> = Vec::new();
+
+    loop {
+        let entries: Vec<_> = match std::fs::read_dir(&current) {
+            Ok(e) => e.filter_map(|e| e.ok())
+                .filter(|e| !SKIP_DIRS.contains(&e.file_name().to_string_lossy().as_ref()))
+                .collect(),
+            Err(_) => break,
+        };
+
+        // Count subdirectories vs files
+        let subdirs: Vec<_> = entries.iter()
+            .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+            .collect();
+        let files: Vec<_> = entries.iter()
+            .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+            .collect();
+
+        if subdirs.len() == 1 && files.is_empty() {
+            // Single child directory, no files — continue collapsing
+            let child = &subdirs[0];
+            parts.push(child.file_name().to_string_lossy().to_string());
+            current = child.path();
+        } else {
+            // Multiple children or has files — stop here
+            break;
+        }
+    }
+
+    if parts.len() >= 2 {
+        Some((parts.join("/"), current))
+    } else {
+        None
+    }
 }

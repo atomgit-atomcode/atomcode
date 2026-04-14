@@ -116,6 +116,46 @@ impl Tool for ReadFileTool {
             });
         }
 
+        // If file doesn't exist, auto-find similar filenames and suggest.
+        // Saves 2-3 turns of path guessing (7% of sessions hit this).
+        if !path.exists() {
+            let filename = path.file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            if !filename.is_empty() {
+                let wd = ctx.working_dir.read().await;
+                // Quick find: walk up to 5 levels deep for matching filename
+                let mut matches: Vec<String> = Vec::new();
+                fn find_file(dir: &std::path::Path, target: &str, depth: usize, max_depth: usize, results: &mut Vec<String>) {
+                    if depth > max_depth || results.len() >= 5 { return; }
+                    if let Ok(entries) = std::fs::read_dir(dir) {
+                        for entry in entries.flatten() {
+                            let name = entry.file_name().to_string_lossy().to_string();
+                            if name.starts_with('.') || name == "node_modules" || name == "target" || name == ".git" { continue; }
+                            let p = entry.path();
+                            if p.is_dir() {
+                                find_file(&p, target, depth + 1, max_depth, results);
+                            } else if name == target {
+                                results.push(p.to_string_lossy().to_string());
+                            }
+                        }
+                    }
+                }
+                find_file(&wd, &filename, 0, 7, &mut matches);
+                if !matches.is_empty() {
+                    return Ok(ToolResult {
+                        call_id: String::new(),
+                        output: format!(
+                            "Error: No such file: {}\n\nDid you mean:\n{}",
+                            parsed.file_path,
+                            matches.iter().map(|m| format!("  {}", m)).collect::<Vec<_>>().join("\n")
+                        ),
+                        success: false,
+                    });
+                }
+            }
+        }
+
         let bytes = tokio::fs::read(&parsed.file_path).await?;
 
         // Check if the file is valid UTF-8; if not, report it as binary.

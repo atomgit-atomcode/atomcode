@@ -1495,12 +1495,16 @@ impl AgentLoop {
 
                     if is_messages_illegal && self.retry_count == 0 {
                         self.retry_count += 1;
+                        // Try compression first (preserve semantics), fall back to truncation.
+                        let sys_prompt = self.build_system_prompt();
+                        self.maybe_compress_history(&sys_prompt).await;
+                        // If compression didn't help enough, truncate as last resort.
                         let len = self.conversation.messages.len();
-                        if len > 4 {
+                        if len > 10 {
                             self.conversation.messages.truncate(len - 4);
                         }
                         let _ = self.event_tx.send(AgentEvent::TextDelta(
-                            "\n[Recovering from API error — retrying with reduced context...]\n".to_string()
+                            "\n[Context overflow — compressed history and retrying...]\n".to_string()
                         ));
                         continue;
                     } else if is_rate_limited && self.retry_count < 5 {
