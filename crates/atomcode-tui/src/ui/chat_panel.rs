@@ -128,10 +128,13 @@ pub fn render(
                     let completed_calls: Vec<&ToolCall> = tool_calls.iter()
                         .filter(|c| completed_call_ids.contains(c.id.as_str()))
                         .collect();
-                    // Batch consecutive same-type tool calls into collapsed lines.
-                    // Only fold calls from PREVIOUS turns (before last_user_idx).
-                    // Current turn calls stay individual so user sees live progress.
-                    let is_old_turn = i < last_user_idx;
+                    // Batch consecutive same-type tool calls.
+                    // Keep last 3 calls expanded (recent work visible),
+                    // fold earlier ones into compact summary.
+                    let total_completed = completed_calls.len();
+                    let keep_recent = 3usize;
+                    let fold_before = total_completed.saturating_sub(keep_recent);
+
                     let mut ci = 0;
                     while ci < completed_calls.len() {
                         let batch_start = ci;
@@ -140,7 +143,8 @@ pub fn render(
                             ci += 1;
                         }
                         let batch_count = ci - batch_start;
-                        if batch_count >= 2 && is_old_turn {
+                        // Fold if: ≥2 same-type AND all in the "old" region (before keep_recent)
+                        if batch_count >= 2 && ci <= fold_before {
                             let details: Vec<String> = completed_calls[batch_start..ci].iter().map(|c| {
                                 extract_tool_detail_short(&c.name, &c.arguments)
                             }).collect();
@@ -160,9 +164,9 @@ pub fn render(
                     };
                     let is_read = call_id_to_tool.get(call_id) == Some(&"read_file");
 
-                    // Batch ≥2 consecutive same-type tool results — only for OLD turns.
-                    // Current turn stays individual so user sees progress in real time.
-                    let is_old_turn_result = i < last_user_idx;
+                    // Batch ≥2 consecutive same-type tool results.
+                    // Fold early results, keep last 3 expanded for live progress.
+                    let is_early_result = tool_result_idx + 2 < total_tool_results;
                     let tool_name = call_id_to_tool.get(call_id).map(|s| &**s).unwrap_or("");
                     {
                         // Look ahead for consecutive results of the same tool type
@@ -184,7 +188,7 @@ pub fn render(
                             }
                         }
                         let batch_count = batch_end - i;
-                        if batch_count >= 2 && is_old_turn_result {
+                        if batch_count >= 2 && is_early_result {
                             // Collect short details for the batch
                             let details: Vec<String> = (i..batch_end).map(|idx| {
                                 let cid = match &msgs[idx].content {
