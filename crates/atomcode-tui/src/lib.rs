@@ -122,7 +122,7 @@ fn build_oauth_provider(access_token: &str) -> ProviderConfig {
     ProviderConfig {
         provider_type: "openai".to_string(),
         api_key: Some(access_token.to_string()),
-        model: "Qwen/Qwen3.5-35B-A3B".to_string(),
+        model: "MiniMax-M2.7".to_string(),
         base_url: Some("https://api-ai.gitcode.com/v1".to_string()),
         system_prompt: None,
         user_agent: None,
