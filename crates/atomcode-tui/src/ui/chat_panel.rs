@@ -49,6 +49,10 @@ pub fn render(
     // the chat visually syncs with the bottom spinner label during long args
     // streaming windows (e.g. big write_file content that takes 30-60s).
     streaming_tool_name: Option<&str>,
+    // User inputs queued via AppendInput during streaming. Rendered as dim
+    // "queued" previews above the input box so the user sees Enter was accepted
+    // — without this, typing during streaming looks like it did nothing.
+    pending_appends: &[String],
     render_cache: &mut Vec<Line<'static>>,
     render_cache_msg_count: &mut usize,
 ) -> (usize, usize) {
@@ -303,6 +307,40 @@ pub fn render(
             Span::styled("(...)", Style::default().fg(theme::text_muted())),
         ]));
         // Blank pad so this row isn't clobbered by the bottom spinner overlay.
+        dynamic.push(Line::default());
+    }
+
+    // ── Queued user appends (pressed Enter during streaming) ──
+    // Dim-styled preview of inputs that will be sent as a user message when the
+    // current turn finishes. Without this, Enter during streaming gives zero
+    // visual feedback and looks broken.
+    if !pending_appends.is_empty() {
+        let indent_w = term_width.saturating_sub(INDENT.len() + 5);
+        for queued in pending_appends {
+            dynamic.push(Line::default());
+            dynamic.push(Line::from(Span::styled(
+                format!("{}\u{21b5} queued \u{00b7} will send after this turn", INDENT),
+                Style::default().fg(theme::text_muted()).add_modifier(Modifier::ITALIC),
+            )));
+            for raw_line in queued.lines() {
+                // Soft-wrap long queued lines so they don't run off-screen.
+                let mut remaining = raw_line;
+                loop {
+                    let take = remaining.char_indices()
+                        .take(indent_w)
+                        .last()
+                        .map(|(i, c)| i + c.len_utf8())
+                        .unwrap_or(remaining.len());
+                    let (head, tail) = remaining.split_at(take.min(remaining.len()));
+                    dynamic.push(Line::from(vec![
+                        Span::styled(format!("{}\u{2502} ", INDENT), Style::default().fg(theme::text_muted())),
+                        Span::styled(head.to_string(), Style::default().fg(theme::text_secondary())),
+                    ]));
+                    if tail.is_empty() { break; }
+                    remaining = tail;
+                }
+            }
+        }
         dynamic.push(Line::default());
     }
 

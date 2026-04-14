@@ -150,6 +150,12 @@ pub struct App {
     /// Flushed on slow key or Tick. Big enough bursts are promoted to
     /// `pasted_text` as a reference.
     pub rapid_buf: String,
+    /// User inputs queued via AppendInput during the current streaming turn.
+    /// Shown in the chat area as dim "queued" previews so the user gets immediate
+    /// feedback that Enter was accepted, even though the text won't reach the LLM
+    /// until the next turn starts. Cleared on TurnComplete / TurnCancelled — by
+    /// then the agent has injected them as real user messages.
+    pub pending_appends: Vec<String>,
     /// Files attached to the next message (detected from pasted paths).
     pub attached_files: Vec<crate::file_attach::AttachedFile>,
     pub pasted_text: Option<String>,
@@ -299,6 +305,7 @@ impl App {
            last_key_time: Instant::now(),
            rapid_streak: 0,
            rapid_buf: String::new(),
+           pending_appends: Vec::new(),
            pending_editor: None,
            pending_login: false,
            attached_files: Vec::new(),
@@ -765,6 +772,10 @@ impl App {
                 self.last_turn_duration = Some(duration);
                 self.turn_start = None;
                 self.render_cache_msg_count = 0; // Invalidate cache
+                // Drop queued append previews — the next turn (if any) will pick
+                // these up from the agent's pending_input and render them as real
+                // user messages, so the previews would duplicate otherwise.
+                self.pending_appends.clear();
                 self.suggestion = self.generate_suggestion();
                 self.at_bottom = true;
                 // Auto-save session after each turn
@@ -804,6 +815,9 @@ impl App {
                 self.render_cache.clear();
                 self.render_cache_msg_count = 0;
                 self.at_bottom = true;
+                // Queued previews are dropped on cancel — the agent side also
+                // discards its pending_input when the turn cancels.
+                self.pending_appends.clear();
                 // Sync to session
                 self.current_session.messages = self.conversation.messages.clone();
                 // If cancelled turn leaves session empty, delete the saved session file
@@ -1130,9 +1144,14 @@ impl App {
                     let content = self.input.content();
                     if !content.trim().is_empty() {
                         let _ = self.agent_handle.cmd_tx.send(
-                            atomcode_core::agent::AgentCommand::AppendInput(content)
+                            atomcode_core::agent::AgentCommand::AppendInput(content.clone())
                         );
+                        // Mirror the queue locally so the chat panel can show a
+                        // "queued" preview — without this, Enter during streaming
+                        // gives zero visual feedback and looks broken.
+                        self.pending_appends.push(content);
                         self.input.clear();
+                        self.render_cache_msg_count = 0;
                     }
                 } else {
                     // All other keys work normally: scroll, type, Ctrl+A/E, etc.
