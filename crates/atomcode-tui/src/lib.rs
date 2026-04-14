@@ -116,26 +116,10 @@ struct UserResponse {
 }
 
 /// Add AtomGit provider to config and set as default
-fn add_atomgit_provider(access_token: &str, provider_name: &str) -> anyhow::Result<()> {
-    let config_path = Config::default_path();
-    
-    // Load existing config or create new one
-    let mut config = if config_path.exists() {
-        Config::load(&config_path).unwrap_or_else(|_| Config {
-            default_provider: "AtomGit".to_string(),
-            default_workdir: None,
-            providers: std::collections::HashMap::new(),
-        })
-    } else {
-        Config {
-            default_provider: "AtomGit".to_string(),
-            default_workdir: None,
-            providers: std::collections::HashMap::new(),
-        }
-    };
-    
-    // Add or update AtomGit provider
-    let atomgit_provider = ProviderConfig {
+/// Build an in-memory ProviderConfig from OAuth token.
+/// Does NOT write to config file — credentials stay in memory only.
+fn build_oauth_provider(access_token: &str) -> ProviderConfig {
+    ProviderConfig {
         provider_type: "openai".to_string(),
         api_key: Some(access_token.to_string()),
         model: "Qwen/Qwen3.5-35B-A3B".to_string(),
@@ -143,17 +127,7 @@ fn add_atomgit_provider(access_token: &str, provider_name: &str) -> anyhow::Resu
         system_prompt: None,
         user_agent: None,
         context_window: 32000,
-    };
-    
-    config.providers.insert(provider_name.to_string(), atomgit_provider);
-    config.default_provider = provider_name.to_string();
-
-    // Save config
-    config.save(&config_path)?;
-
-    println!("  {} provider added to config: {}\n", provider_name, config_path.display());
-    
-    Ok(())
+    }
 }
 
 /// Run OAuth login flow (blocking)
@@ -438,22 +412,19 @@ pub async fn run(
                 Ok(auth) => {
                     println!("\n  Login successful! Logged in as: {}", auth.user.username);
                     let oauth_name = app.pending_oauth_name.take().unwrap_or_else(|| "AtomGit".to_string());
-                    if let Err(e) = add_atomgit_provider(&auth.access_token, &oauth_name) {
-                        println!("  Warning: Failed to add provider: {}", e);
-                    }
-                    let config_path = Config::default_path();
-                    if let Ok(new_config) = Config::load(&config_path) {
-                        app.config = new_config;
-                        app.rebuild_provider();
-                        // Notify AgentLoop to switch to the new provider
-                        let _ = app.agent_handle.cmd_tx.send(
-                            atomcode_core::agent::AgentCommand::SwitchProvider(oauth_name.clone())
-                        );
-                    }
+                    // Add provider to in-memory config only — no disk write.
+                    // Credentials stay in memory for this session.
+                    let oauth_provider = build_oauth_provider(&auth.access_token);
+                    app.config.providers.insert(oauth_name.clone(), oauth_provider);
+                    app.config.default_provider = oauth_name.clone();
+                    app.rebuild_provider();
+                    let _ = app.agent_handle.cmd_tx.send(
+                        atomcode_core::agent::AgentCommand::SwitchProvider(oauth_name.clone())
+                    );
                     let model_display = app.provider.model_name();
                     app.conversation.add_user_message("/login");
                     app.conversation.push_delta(&format!(
-                        "Login successful! Logged in as: **{}** (ID: {})\n\nProvider `{}` added and set as default.\nModel: `{}`",
+                        "Login successful! Logged in as: **{}** (ID: {})\n\nProvider `{}` active (in-memory, not saved to config).\nModel: `{}`",
                         auth.user.username, auth.user.id, oauth_name, model_display
                     ));
                     app.conversation.finalize_stream();
