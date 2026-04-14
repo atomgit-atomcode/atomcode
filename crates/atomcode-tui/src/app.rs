@@ -136,6 +136,8 @@ pub struct App {
     pub pending_editor: Option<String>,
     /// Flag to trigger OAuth login flow.
     pub pending_login: bool,
+    /// Flag to trigger WeCom QR login flow (GitCode internal).
+    pub pending_wecom_login: bool,
     /// Last key event timestamp — for paste detection when bracketed paste isn't available.
     pub last_key_time: Instant,
     /// Count of consecutive typable keys arriving <10ms apart. Only after
@@ -314,6 +316,7 @@ impl App {
            pending_appends: Vec::new(),
            pending_editor: None,
            pending_login: false,
+           pending_wecom_login: false,
            attached_files: Vec::new(),
            pasted_blocks: Vec::new(),
            slash_menu: SlashMenu::new(),
@@ -2247,6 +2250,11 @@ impl App {
             "/login" => {
                 self.pending_login = true;
                 self.conversation.push_delta("Opening browser for AtomGit login...");
+                self.conversation.finalize_stream();
+            }
+            "/login-inner" => {
+                self.pending_wecom_login = true;
+                self.conversation.push_delta("Opening browser for WeCom QR login...");
                 self.conversation.finalize_stream();
             }
             "/logout" => {
