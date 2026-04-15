@@ -18,8 +18,25 @@ use super::theme;
 // Braille spinner
 const SPINNER: &[&str] = &["\u{280b}", "\u{2819}", "\u{2839}", "\u{2838}", "\u{283c}", "\u{2834}", "\u{2826}", "\u{2827}", "\u{2807}", "\u{280f}"];
 
-#[allow(dead_code)]
-const THINKING_LABELS: &[&str] = &["Thinking", "Pondering", "Reasoning", "Contemplating", "Analyzing", "Processing"];
+// Progress bar animation — a wave that pulses across 8 chars
+const PROGRESS_BAR: &[&str] = &[
+    "▰▱▱▱▱▱▱▱", "▰▰▱▱▱▱▱▱", "▱▰▰▱▱▱▱▱", "▱▱▰▰▱▱▱▱",
+    "▱▱▱▰▰▱▱▱", "▱▱▱▱▰▰▱▱", "▱▱▱▱▱▰▰▱", "▱▱▱▱▱▱▰▰",
+    "▱▱▱▱▱▱▱▰", "▱▱▱▱▱▱▰▰", "▱▱▱▱▱▰▰▱", "▱▱▱▱▰▰▱▱",
+    "▱▱▱▰▰▱▱▱", "▱▱▰▰▱▱▱▱", "▱▰▰▱▱▱▱▱", "▰▰▱▱▱▱▱▱",
+];
+
+// Fun tips shown while waiting — rotates every ~8 seconds
+const TIPS: &[&str] = &[
+    "Brewing…",
+    "Crafting a plan…",
+    "Reading the codebase…",
+    "Connecting the dots…",
+    "Almost there…",
+    "Thinking hard…",
+    "Exploring options…",
+    "Weighing trade-offs…",
+];
 
 // Left indent for content
 const INDENT: &str = " ";
@@ -476,7 +493,9 @@ let _is_read = call_id_to_tool.get(call_id) == Some(&"read_file");
         } else if step_count > 0 && !last_completed_tool.is_empty() {
             format!("After {}, thinking", last_completed_tool)
         } else {
-            "Thinking...".to_string()
+            // Rotate fun tips every ~8 seconds (tick is ~100ms intervals)
+            let tip_idx = (tick / 80) % TIPS.len();
+            TIPS[tip_idx].to_string()
         };
         let time_str = if wait_ms >= 60_000 {
             format!("  {:.0}m{:.0}s", wait_ms / 60_000, (wait_ms % 60_000) / 1000)
@@ -495,11 +514,15 @@ let _is_read = call_id_to_tool.get(call_id) == Some(&"read_file");
             String::new()
         };
 
+        // Progress bar — pulsing wave animation
+        let progress = PROGRESS_BAR[tick % PROGRESS_BAR.len()];
+
         let spin_line = Line::from(vec![
             Span::styled(format!("{}\u{2502} ", INDENT), bar_style),
             Span::styled(format!("{} ", spinner), Style::default().fg(spin_color)),
             Span::styled(step_prefix, Style::default().fg(theme::text_secondary())),
             Span::styled(label, Style::default().fg(spin_color)),
+            Span::styled(format!("  {} ", progress), Style::default().fg(spin_color)),
             Span::styled(time_str, Style::default().fg(spin_color)),
             Span::styled(tok_str, Style::default().fg(theme::text_muted())),
         ]);

@@ -798,14 +798,15 @@ impl Conversation {
     /// Microcompact: condense ToolResult messages from old rounds
     /// to one-line summaries. Zero LLM calls — purely mechanical compression.
     ///
-    /// "Read and forget" strategy: read_file results are condensed after 3 LLM
+    /// "Read and forget" strategy: read_file results are condensed after 5 LLM
     /// rounds (not message count). A round = one Assistant message + its tool
-    /// results. This avoids clearing reads too early when a single round
-    /// produces many messages (e.g. batch read 4 files = 5+ messages per round).
+    /// results. 5 rounds accommodates the common pattern of segmented reads
+    /// (read L1-200, read L500-700, read full) followed by multi-edit — all
+    /// reads stay in context through the edit phase.
     ///
     /// Other tool results keep the standard 20-message window.
     fn microcompact(msgs: &mut Vec<Message>, _turns: &[turn::Turn], total_msg_count: usize) {
-        const READ_KEEP_ROUNDS: usize = 3;
+        const READ_KEEP_ROUNDS: usize = 5;
         const OTHER_KEEP: usize = 20;
 
         if total_msg_count <= 6 { return; }
