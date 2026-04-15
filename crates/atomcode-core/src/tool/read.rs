@@ -275,6 +275,59 @@ impl Tool for ReadFileTool {
         let offset = if offset > 0 && limit >= total_lines { 0 } else { offset };
 
         let end = (offset + limit).min(total_lines);
+
+        // Smart char limit: if full output would exceed ctx/8, show head + tree-sitter skeleton.
+        // This replaces the brutal head+tail truncation in truncation.rs — the model sees
+        // real code for the beginning + function signatures with line numbers for the rest.
+        let char_budget = ctx.ctx_budget_hint.load(std::sync::atomic::Ordering::Relaxed);
+        let char_limit = (char_budget / 2).max(8_000); // per-file: half of remaining budget, min 8K chars
+        let full_output_estimate = (end - offset) * 45; // ~45 chars per formatted line
+
+        if full_output_estimate > char_limit && parsed.offset.is_none() {
+            // Output would exceed budget — show head lines + tree-sitter skeleton for the rest.
+            let head_lines = (char_limit * 2 / 3) / 45; // 2/3 budget for real code
+            let head_end = (offset + head_lines).min(end);
+
+            let mut output: String = lines[offset..head_end]
+                .iter()
+                .enumerate()
+                .map(|(i, line)| format!("{:>4}| {}", offset + i + 1, line))
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            // Tree-sitter skeleton for the truncated portion
+            let mut searcher = ctx.semantic.lock().await;
+            let skeleton = if let Some(symbols) = searcher.list_symbols(path) {
+                let beyond: Vec<String> = symbols.iter()
+                    .filter(|s| s.start_line > head_end)
+                    .map(|s| {
+                        let sig = lines.get(s.start_line.saturating_sub(1))
+                            .map(|l| l.trim())
+                            .unwrap_or(&s.name);
+                        let sig_short: String = sig.chars().take(70).collect();
+                        format!("{:>4}| {}  (L{}-{})", s.start_line, sig_short, s.start_line, s.end_line)
+                    })
+                    .collect();
+                if !beyond.is_empty() {
+                    beyond.join("\n")
+                } else {
+                    String::new()
+                }
+            } else {
+                String::new()
+            };
+
+            output.push_str(&format!(
+                "\n\n[Showing {}/{} lines. Remaining structure:]\n{}",
+                head_end - offset, total_lines, skeleton
+            ));
+
+            if let Some(mtime) = disk_mtime {
+                ctx.read_cache.write().await.insert(cache_key, (mtime, output.clone()));
+            }
+            return Ok(ToolResult { call_id: String::new(), output, success: true });
+        }
+
         let returned_all = offset == 0 && end >= total_lines;
 
         let mut output: String = lines[offset..end]
@@ -285,43 +338,9 @@ impl Tool for ReadFileTool {
             .join("\n");
 
         if !returned_all {
-            // Generate skeleton of the unseen portion using tree-sitter.
-            // This tells the model what functions/sections exist beyond the truncation point,
-            // so it can target-read with offset instead of re-reading the full file.
-            let remaining_skeleton = if end < total_lines && parsed.offset.is_none() {
-                let mut searcher = ctx.semantic.lock().await;
-                if let Some(symbols) = searcher.list_symbols(path) {
-                    let beyond: Vec<String> = symbols.iter()
-                        .filter(|s| s.start_line > end)
-                        .map(|s| {
-                            let sig = lines.get(s.start_line - 1)
-                                .map(|l| l.trim())
-                                .unwrap_or(&s.name);
-                            let sig_short = if sig.chars().count() > 60 {
-                                format!("{}...", sig.chars().take(57).collect::<String>())
-                            } else {
-                                sig.to_string()
-                            };
-                            format!("{:>4}| {}  (L{}-{})", s.start_line, sig_short, s.start_line, s.end_line)
-                        })
-                        .collect();
-                    if !beyond.is_empty() {
-                        format!("\n\n[Remaining structure (lines {}-{}):\n{}]",
-                            end + 1, total_lines, beyond.join("\n"))
-                    } else {
-                        String::new()
-                    }
-                } else {
-                    String::new()
-                }
-            } else {
-                String::new()
-            };
-
             output.push_str(&format!(
-                "\n\n[Showing lines {}-{} of {} total. \
-                 To read the full file: call read_file without offset/limit.]{}",
-                offset + 1, end, total_lines, remaining_skeleton
+                "\n\n[Showing lines {}-{} of {} total.]",
+                offset + 1, end, total_lines
             ));
         }
 
