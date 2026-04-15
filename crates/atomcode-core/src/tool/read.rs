@@ -279,8 +279,10 @@ impl Tool for ReadFileTool {
         // Smart char limit: if full output would exceed ctx/8, show head + tree-sitter skeleton.
         // This replaces the brutal head+tail truncation in truncation.rs — the model sees
         // real code for the beginning + function signatures with line numbers for the rest.
-        let char_budget = ctx.ctx_budget_hint.load(std::sync::atomic::Ordering::Relaxed);
-        let char_limit = (char_budget / 2).max(8_000); // per-file: half of remaining budget, min 8K chars
+        // Fixed 8K char limit per read — matches truncation.rs ctx/8 cap.
+        // Using a fixed limit instead of dynamic budget ensures the skeleton
+        // ALWAYS triggers for large files, regardless of how much context remains.
+        let char_limit: usize = 8_000;
         let full_output_estimate = (end - offset) * 45; // ~45 chars per formatted line
 
         if full_output_estimate > char_limit && parsed.offset.is_none() {
