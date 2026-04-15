@@ -384,6 +384,7 @@ impl App {
                    system_prompt: None,
                    user_agent: None,
                    context_window: atomcode_core::config::provider::default_context_window_for("openai"),
+                   max_tokens: None,
                    ephemeral: false,
                }).unwrap_or_else(|_| {
                    // Fallback: should never reach production path since AgentLoop handles LLM

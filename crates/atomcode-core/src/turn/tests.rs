@@ -165,6 +165,7 @@ fn test_config() -> Config {
             system_prompt: None,
             user_agent: None,
             context_window: 16000,
+            max_tokens: None,
             ephemeral: false,
         },
     );

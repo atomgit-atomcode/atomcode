@@ -18,6 +18,11 @@ pub struct ProviderConfig {
     /// Defaults vary by provider type; use `default_context_window_for` after deserialization.
     #[serde(default = "default_context_window")]
     pub context_window: usize,
+    /// Maximum tokens the model can output per response.
+    /// Larger values allow batching multiple write_file calls in one turn.
+    /// If not set, defaults to context_window / 4.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<usize>,
     /// If true, this provider was added at runtime (e.g. OAuth /login)
     /// and should NOT be persisted to config.toml on save.
     #[serde(skip)]

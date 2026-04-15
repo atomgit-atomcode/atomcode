@@ -20,6 +20,7 @@ pub struct OpenAiProvider {
     api_key: String,
     model: String,
     base_url: String,
+    max_tokens: usize,
 }
 
 impl OpenAiProvider {
@@ -36,6 +37,7 @@ impl OpenAiProvider {
                 .base_url
                 .clone()
                 .unwrap_or_else(|| "https://api.openai.com/v1".to_string()),
+            max_tokens: config.max_tokens.unwrap_or(config.context_window / 4),
         })
     }
 
@@ -185,7 +187,7 @@ impl LlmProvider for OpenAiProvider {
             "messages": Self::format_messages(messages),
             "stream": true,
             "stream_options": { "include_usage": true },
-            "max_tokens": 16384,
+            "max_tokens": self.max_tokens,
         });
 
         if let Some(tool_defs) = tools {

@@ -19,6 +19,7 @@ pub struct ClaudeProvider {
     client: Client,
     api_key: String,
     model: String,
+    max_tokens: usize,
 }
 
 impl ClaudeProvider {
@@ -31,6 +32,7 @@ impl ClaudeProvider {
             client: super::build_http_client(config.user_agent.as_deref()),
             api_key,
             model: config.model.clone(),
+            max_tokens: config.max_tokens.unwrap_or(config.context_window / 4),
         })
     }
 
@@ -154,7 +156,7 @@ impl LlmProvider for ClaudeProvider {
         let mut body = json!({
             "model": self.model,
             "messages": msgs,
-            "max_tokens": 4096,
+            "max_tokens": self.max_tokens,
             "stream": true,
         });
 

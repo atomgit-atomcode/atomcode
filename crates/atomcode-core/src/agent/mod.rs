@@ -788,6 +788,25 @@ impl AgentLoop {
             // history goes to cold zone (FIFO, max 3 entries).
             self.maybe_compress_history(&system_prompt).await;
 
+            // Conditional batch reminder: if we're past the initial exploration phase
+            // (turn > 3) and the last LLM call used only 1 tool, nudge the model to
+            // batch. Only fires when the model is clearly in single-tool-per-turn mode.
+            if self.turn_count > 3 {
+                let last_was_single = self.conversation.messages.iter().rev()
+                    .find_map(|m| match &m.content {
+                        crate::conversation::message::MessageContent::AssistantWithToolCalls { tool_calls, .. } => Some(tool_calls.len()),
+                        _ => None,
+                    })
+                    .map(|n| n == 1)
+                    .unwrap_or(false);
+                if last_was_single {
+                    self.conversation.add_user_message(
+                        "[Batch reminder: call MULTIPLE tools in one response when they are independent. \
+                         Example: read_file + read_file, or bash + bash, or edit_file + edit_file on different files.]"
+                    );
+                }
+            }
+
             // Move conversation out to avoid borrow conflicts with self in select!
             let mut conv = std::mem::take(&mut self.conversation);
 

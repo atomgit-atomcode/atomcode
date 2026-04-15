@@ -785,15 +785,41 @@ impl Conversation {
     }
 
     /// Microcompact: condense ToolResult messages from old rounds
-    /// to one-line summaries. Recent 20 messages keep full content.
-    /// Zero LLM calls — purely mechanical compression.
+    /// to one-line summaries. Zero LLM calls — purely mechanical compression.
+    ///
+    /// "Read and forget" strategy: read_file results are condensed after 3 LLM
+    /// rounds (not message count). A round = one Assistant message + its tool
+    /// results. This avoids clearing reads too early when a single round
+    /// produces many messages (e.g. batch read 4 files = 5+ messages per round).
+    ///
+    /// Other tool results keep the standard 20-message window.
     fn microcompact(msgs: &mut Vec<Message>, _turns: &[turn::Turn], total_msg_count: usize) {
-        if total_msg_count <= 20 { return; }
+        const READ_KEEP_ROUNDS: usize = 3;
+        const OTHER_KEEP: usize = 20;
 
-        // Keep the last 20 messages at full fidelity, compact everything before
-        let recent_start_idx = total_msg_count.saturating_sub(20);
+        if total_msg_count <= 6 { return; }
 
-        // Build call_id → tool_name map for identifying what each ToolResult is
+        // Find the message index where "recent N rounds" starts.
+        // A round boundary = an Assistant or AssistantWithToolCalls message.
+        let cold_msgs = msgs.iter()
+            .position(|m| !matches!(m.role, Role::System))
+            .unwrap_or(0);
+
+        let mut round_count = 0;
+        let mut read_cutoff_idx = 0; // index into msgs (after cold_msgs offset)
+        for i in (cold_msgs..msgs.len()).rev() {
+            if matches!(msgs[i].role, Role::Assistant) {
+                round_count += 1;
+                if round_count >= READ_KEEP_ROUNDS {
+                    read_cutoff_idx = i.saturating_sub(cold_msgs);
+                    break;
+                }
+            }
+        }
+
+        let other_cutoff = total_msg_count.saturating_sub(OTHER_KEEP);
+
+        // Build call_id → tool_name map
         let mut call_id_to_tool: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         for msg in msgs.iter() {
             if let MessageContent::AssistantWithToolCalls { tool_calls, .. } = &msg.content {
@@ -803,24 +829,24 @@ impl Conversation {
             }
         }
 
-        // Condense old ToolResults (those corresponding to messages before recent_start_idx)
-        // We track position by counting Tool messages from the start
-        let cold_msgs = if msgs.first().map(|m| matches!(m.role, Role::System)).unwrap_or(false) {
-            // Skip system messages (system prompt + cold zone)
-            let first_non_system = msgs.iter().position(|m| !matches!(m.role, Role::System)).unwrap_or(0);
-            first_non_system
-        } else {
-            0
-        };
-
-        // Count how many conversation messages are from old turns
-        // Use heuristic: messages in `msgs` after system messages correspond to self.messages
-        // Old turn messages = those before recent_start_idx in self.messages
-        let old_msg_count = recent_start_idx;
-        let condense_end = cold_msgs + old_msg_count;
+        // Condense: different cutoffs for read_file vs other tools
+        let max_cutoff = read_cutoff_idx.max(other_cutoff);
+        let condense_end = cold_msgs + max_cutoff;
 
         for i in cold_msgs..condense_end.min(msgs.len()) {
             if let MessageContent::ToolResult(ref r) = msgs[i].content {
+                let tool_name = call_id_to_tool.get(&r.call_id)
+                    .map(|s| s.as_str())
+                    .unwrap_or("tool");
+
+                // Determine which cutoff applies to this tool
+                let msg_idx = i.saturating_sub(cold_msgs);
+                let is_old = match tool_name {
+                    "read_file" => msg_idx < read_cutoff_idx,
+                    _ => msg_idx < other_cutoff,
+                };
+                if !is_old { continue; }
+
                 // Only condense large results (>500 chars)
                 if r.output.len() <= 500 { continue; }
 
