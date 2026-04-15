@@ -1049,10 +1049,15 @@ fn build_compact_diff(old: &str, new: &str) -> String {
 /// Build a context snippet showing ±4 lines around the edited region.
 /// This lets the model see the current file state after the edit,
 /// so it can construct accurate old_string for the next edit without re-reading.
+///
+/// Threshold raised 20 → 100: for small/medium files the diff is already enough
+/// context, and the snippet just duplicates content that recency-reinjection or
+/// the next read_file will surface. Large files (> 100 lines) still get the
+/// snippet because they're the only case where re-reading is expensive.
 fn build_edit_context(content: &str, new_string: &str) -> String {
     let lines: Vec<&str> = content.lines().collect();
-    if lines.len() <= 20 {
-        return String::new(); // Small file, model already has it
+    if lines.len() <= 100 {
+        return String::new();
     }
 
     // Find where new_string appears in the final content using substring search.

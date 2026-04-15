@@ -131,37 +131,6 @@ impl AgentLoop {
                 }
             }
         }
-        // If the stack trace mentions a specific object/call (e.g., "tagRepository.count"),
-        // scan the entire file for ALL similar calls so the model can fix them all at once.
-        // This prevents the "fix one call, miss nine others" pattern.
-        {
-            let obj_re = regex::Regex::new(r"(\w+Repository|\w+Service|\w+Dao)\.\w+")
-                .unwrap_or_else(|_| regex::Regex::new(".^").unwrap());
-            // First pass: collect object names to scan
-            let mut objects_to_scan: Vec<String> = Vec::new();
-            for code in &extracted_code {
-                for cap in obj_re.captures_iter(code) {
-                    let obj_name = cap[1].to_string();
-                    if !objects_to_scan.contains(&obj_name) {
-                        objects_to_scan.push(obj_name);
-                    }
-                }
-            }
-            // Second pass: scan and append results
-            for obj_name in &objects_to_scan {
-                for fp in &seen_files {
-                    if let Some(file_path) = Self::find_file_in_project(&wd, fp) {
-                        if let Some(call_list) = searcher.find_similar_calls(&file_path, &obj_name.to_lowercase()) {
-                            extracted_code.push(format!(
-                                "\n[All {} calls in this file — fix ALL at once:]\n{}",
-                                obj_name, call_list
-                            ));
-                        }
-                    }
-                }
-            }
-        }
-
         drop(searcher);
 
         // Phase 3: Auto-inject call chain from code graph.
@@ -218,9 +187,7 @@ impl AgentLoop {
         // its approach isn't working and it needs a different strategy.
         if !current_exception.is_empty() && current_exception == self.discipline_state.last_diagnosed_error {
             result.push_str(&format!(
-                "\n\n[RECURRING ERROR: {} appeared again after your previous fix. \
-                 Your last approach did not resolve it. Try a fundamentally different fix — \
-                 e.g. add @Transactional at the method level instead of wrapping individual calls.]",
+                "\n\n[RECURRING ERROR: {} appeared again after your previous fix. Try a different approach.]",
                 current_exception
             ));
         }

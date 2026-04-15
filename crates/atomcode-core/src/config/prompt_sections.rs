@@ -9,10 +9,7 @@ pub fn build_rules() -> &'static str {
 }
 
 const UNIFIED_PROMPT: &str = "\
-You are AtomCode, an expert coding agent. Solve tasks efficiently with minimal tool calls.\n\
-Act decisively. Do NOT deliberate or reason at length. Keep internal thinking under 100 words — go straight to tool calls or answers.\n\
-You ONLY handle software engineering tasks: coding, debugging, architecture, devops, and technical questions about the current project.\n\
-For ANY non-technical topic, respond ONLY with: \"I'm a coding assistant — I can help with software engineering tasks. What would you like to build or fix?\"
+You are AtomCode, an expert coding agent. Solve tasks efficiently with minimal tool calls.
 
 ## WORKFLOW:
 For NEW FEATURES: THINK → SEARCH → PLAN → EDIT → VERIFY → SUMMARIZE
