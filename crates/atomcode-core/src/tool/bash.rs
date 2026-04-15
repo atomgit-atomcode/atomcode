@@ -362,6 +362,8 @@ fn strip_output_pipes(cmd: &str) -> String {
 }
 
 fn format_output(stdout: &str, stderr: &str) -> String {
+    let stdout = sanitize_terminal_output(stdout);
+    let stderr = sanitize_terminal_output(stderr);
     let stdout = stdout.trim();
     let stderr = stderr.trim();
     if stderr.is_empty() {
@@ -370,5 +372,140 @@ fn format_output(stdout: &str, stderr: &str) -> String {
         format!("STDERR:\n{}", stderr)
     } else {
         format!("{}\nSTDERR:\n{}", stdout, stderr)
+    }
+}
+
+/// Strip ANSI escape sequences and resolve `\r` progress-line rewrites so bash
+/// output is safe to splice into ratatui cells. Without this, git hooks / cargo /
+/// docker / progress bars emit CSI sequences and `\r` cursor-returns; ratatui
+/// stores them verbatim in buffer cells, and when crossterm flushes, the host
+/// terminal executes them — shifting the cursor mid-frame, stranding `[PASSED]`
+/// fragments at the right edge of the screen, and leaking content outside the
+/// tool block that captured it.
+fn sanitize_terminal_output(s: &str) -> String {
+    if s.is_empty() {
+        return String::new();
+    }
+    // Strip ANSI escape sequences: CSI (`ESC [ … final`), OSC (`ESC ] … BEL|ST`),
+    // and solo two-byte escapes (`ESC X`). Done in a single pass over bytes so
+    // we don't need the `regex` crate here.
+    let bytes = s.as_bytes();
+    let mut stripped: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == 0x1b && i + 1 < bytes.len() {
+            let next = bytes[i + 1];
+            match next {
+                b'[' => {
+                    // CSI: ESC [ (params: 0x30-0x3f) (intermediates: 0x20-0x2f) (final: 0x40-0x7e)
+                    let mut j = i + 2;
+                    while j < bytes.len() && (0x30..=0x3f).contains(&bytes[j]) { j += 1; }
+                    while j < bytes.len() && (0x20..=0x2f).contains(&bytes[j]) { j += 1; }
+                    if j < bytes.len() { j += 1; } // consume final byte
+                    i = j;
+                    continue;
+                }
+                b']' => {
+                    // OSC: ESC ] ... (BEL | ESC \)
+                    let mut j = i + 2;
+                    while j < bytes.len() {
+                        if bytes[j] == 0x07 { j += 1; break; }
+                        if bytes[j] == 0x1b && j + 1 < bytes.len() && bytes[j + 1] == b'\\' {
+                            j += 2; break;
+                        }
+                        j += 1;
+                    }
+                    i = j;
+                    continue;
+                }
+                _ => {
+                    // Two-byte escape (e.g. ESC =, ESC >, ESC M, …) — drop both.
+                    i += 2;
+                    continue;
+                }
+            }
+        }
+        stripped.push(b);
+        i += 1;
+    }
+    // Lossy decode: the strip phase removes whole escape sequences, but a
+    // pathological ESC followed by a UTF-8 continuation byte could still
+    // produce invalid UTF-8 — lossy keeps us safe without another allocation
+    // in the common case.
+    let cleaned = String::from_utf8_lossy(&stripped).into_owned();
+
+    // Resolve `\r` progress rewrites. For each logical line, when `\r` appears
+    // mid-line the terminal would repaint from column 0, so only the suffix
+    // after the final `\r` is actually visible to the user. We keep just that.
+    let mut out = String::with_capacity(cleaned.len());
+    for (idx, line) in cleaned.split('\n').enumerate() {
+        if idx > 0 {
+            out.push('\n');
+        }
+        let line = line.trim_end_matches('\r');
+        if let Some(pos) = line.rfind('\r') {
+            out.push_str(&line[pos + 1..]);
+        } else {
+            out.push_str(line);
+        }
+    }
+
+    // Drop any remaining C0 control characters except tab — they render as
+    // glyph garbage or misbehave in ratatui cells.
+    out.chars()
+        .filter(|c| *c == '\n' || *c == '\t' || !c.is_control())
+        .collect()
+}
+
+#[cfg(test)]
+mod sanitize_tests {
+    use super::sanitize_terminal_output;
+
+    #[test]
+    fn strips_csi_color_sequences() {
+        let input = "\x1b[32m[PASSED]\x1b[0m done";
+        assert_eq!(sanitize_terminal_output(input), "[PASSED] done");
+    }
+
+    #[test]
+    fn collapses_progress_rewrites() {
+        let input = "Downloading 10%\rDownloading 50%\rDownloading 100%";
+        assert_eq!(sanitize_terminal_output(input), "Downloading 100%");
+    }
+
+    #[test]
+    fn preserves_multiline_progress() {
+        let input = "step1: ok\nDownloading 10%\rDownloading 100%\nstep3: ok";
+        assert_eq!(
+            sanitize_terminal_output(input),
+            "step1: ok\nDownloading 100%\nstep3: ok"
+        );
+    }
+
+    #[test]
+    fn strips_cursor_movement() {
+        let input = "remote: Checking\x1b[K\r\x1b[A[PASSED]";
+        let out = sanitize_terminal_output(input);
+        assert!(!out.contains('\x1b'));
+        assert!(!out.contains('\r'));
+    }
+
+    #[test]
+    fn normalizes_crlf() {
+        let input = "a\r\nb\r\nc";
+        assert_eq!(sanitize_terminal_output(input), "a\nb\nc");
+    }
+
+    #[test]
+    fn keeps_utf8() {
+        let input = "中文 \x1b[1m粗体\x1b[0m 结束";
+        assert_eq!(sanitize_terminal_output(input), "中文 粗体 结束");
+    }
+
+    #[test]
+    fn drops_bel_and_other_c0() {
+        let input = "hello\x07world\x08";
+        assert_eq!(sanitize_terminal_output(input), "helloworld");
     }
 }
