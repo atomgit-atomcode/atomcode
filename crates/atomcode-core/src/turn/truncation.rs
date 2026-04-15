@@ -54,11 +54,21 @@ pub fn truncate_output(result: &mut ToolResult, tool_name: &str, context_window:
     }
 
     // ── Universal char-count ceiling ──
-    // Cap at ~8K tokens (32K chars) OR 1/8 of context window, whichever is smaller.
-    // No single tool_result should eat more than ~12% of the budget even when the
-    // window is huge — we want many turns, not one fat turn.
+    // SKIP for read_file: it has its own 2000-line truncation + microcompact
+    // (READ_KEEP=5 rounds) for context management. The char cap was the REAL
+    // bottleneck — a 950-line file (38K chars) got truncated to 8K (200 lines),
+    // forcing the model into 20+ turns of grep/read fragments to understand
+    // a single file. Without this skip, any file > 200 lines is unreadable
+    // in a single pass on a 64K window.
+    //
+    // Other tools (bash, grep, etc.) still get the char cap.
     let hard_char_limit = (context_window / 8).min(32_000).max(8_000);
-    if result.output.len() > hard_char_limit {
+    if tool_name == "read_file" {
+        // read_file: no char cap. Managed by:
+        // 1. truncate_read_file (>2000 lines → outline extraction)
+        // 2. microcompact (READ_KEEP=5 rounds → cleared to one-liner)
+        // 3. task boundary compression (new user message → old reads compressed)
+    } else if result.output.len() > hard_char_limit {
         // Preserve head AND tail when cutting — tools often put errors/status at the end.
         let chars: Vec<char> = result.output.chars().collect();
         let head_chars = hard_char_limit * 2 / 3;
