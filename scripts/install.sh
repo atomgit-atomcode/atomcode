@@ -1,7 +1,7 @@
 #!/bin/sh
 # AtomCode installer — curl | sh
 #
-#   curl -fsSL https://gitcode.com/gitcode-ai/atomcode-release/raw/main/install.sh | sh
+#   curl -fsSL https://gitcode.com/atomgit_atomcode/atomcode-release/raw/main/install.sh | sh
 #
 # Env overrides:
 #   ATOMCODE_VERSION   release tag to install (default: v4.15.1)
@@ -9,7 +9,7 @@
 set -eu
 
 VERSION="${ATOMCODE_VERSION:-v4.15.1}"
-REPO_BASE="https://gitcode.com/gitcode-ai/atomcode-release/releases/download"
+REPO_BASE="https://gitcode.com/atomgit_atomcode/atomcode-release/releases/download"
 
 # --- detect platform ---
 uname_s=$(uname -s)
