@@ -4,11 +4,11 @@
 #   curl -fsSL https://gitcode.com/gitcode-ai/atomcode-release/raw/main/install.sh | sh
 #
 # Env overrides:
-#   ATOMCODE_VERSION   release tag to install (default: v4.15.0)
+#   ATOMCODE_VERSION   release tag to install (default: v4.15.1)
 #   ATOMCODE_PREFIX    install dir (default: /usr/local/bin, falls back to ~/.local/bin)
 set -eu
 
-VERSION="${ATOMCODE_VERSION:-v4.15.0}"
+VERSION="${ATOMCODE_VERSION:-v4.15.1}"
 REPO_BASE="https://gitcode.com/gitcode-ai/atomcode-release/releases/download"
 
 # --- detect platform ---
