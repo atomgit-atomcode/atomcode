@@ -50,14 +50,78 @@ fn flush_stdin() {
 
 #[cfg(not(unix))]
 fn flush_stdin() {
-    // On non-Unix systems, we can't flush stdin directly
-    // Just drain any available input
-    use std::io::Read;
-    let mut stdin = std::io::stdin();
-    let mut buf = [0u8; 64];
-    while let Ok(n) = stdin.read(&mut buf) {
-        if n == 0 { break; }
+    // Previously tried to drain via stdin.read() in a loop, but Windows
+    // console stdin never returns n==0 when empty — it blocks waiting for
+    // input. That hung the entire TUI the moment the user ran `/config`:
+    // the alternate screen was left, flush_stdin blocked forever, the user
+    // saw a blank terminal and assumed the app "exited".
+    //
+    // Any buffered keystrokes will just be consumed by the child editor,
+    // which is harmless (worst case: a few extra keypresses in vim/notepad).
+    // If we ever need a real flush on Windows, use FlushConsoleInputBuffer
+    // from windows-sys — not a blocking read loop.
+}
+
+/// Look up an executable on PATH, honouring Windows' PATHEXT suffixes.
+fn which(cmd: &str) -> Option<std::path::PathBuf> {
+    if cmd.contains(std::path::MAIN_SEPARATOR) || cmd.contains('/') {
+        // Already a path — trust it as-is.
+        let p = std::path::PathBuf::from(cmd);
+        return if p.is_file() { Some(p) } else { None };
     }
+    let path_var = std::env::var_os("PATH")?;
+    let exts: Vec<String> = if cfg!(windows) {
+        std::env::var("PATHEXT")
+            .unwrap_or_else(|_| ".EXE;.BAT;.CMD;.COM".to_string())
+            .split(';')
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .chain(std::iter::once(String::new()))
+            .collect()
+    } else {
+        vec![String::new()]
+    };
+    for dir in std::env::split_paths(&path_var) {
+        for ext in &exts {
+            let candidate = dir.join(format!("{}{}", cmd, ext));
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+/// Resolve which editor to launch for `/config`. Honours `$EDITOR` / `$VISUAL`
+/// first, then falls back to a platform candidate list — picking the first one
+/// that actually exists on PATH so we don't try to spawn a binary the user
+/// doesn't have (e.g. `vim` on minimal macOS/Linux installs).
+fn resolve_editor() -> Result<String, String> {
+    for var in ["EDITOR", "VISUAL"] {
+        if let Ok(v) = std::env::var(var) {
+            let trimmed = v.trim();
+            if !trimmed.is_empty() {
+                return Ok(trimmed.to_string());
+            }
+        }
+    }
+    let candidates: &[&str] = if cfg!(target_os = "windows") {
+        &["notepad", "code"]
+    } else if cfg!(target_os = "macos") {
+        &["vim", "vi", "nano", "pico", "open"]
+    } else {
+        &["vim", "vi", "nano", "pico"]
+    };
+    for c in candidates {
+        if which(c).is_some() {
+            return Ok(c.to_string());
+        }
+    }
+    Err(format!(
+        "Could not find a default editor. Tried: {}. \
+         Set the EDITOR env var to a working editor (e.g. `code --wait`, `notepad`, `vim`).",
+        candidates.join(", ")
+    ))
 }
 
 use atomcode_core::agent::AgentHandle;
@@ -362,40 +426,54 @@ pub async fn run(
             let _ = std::io::stdout().flush();
             flush_stdin();
 
-            let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vim".to_string());
-            let status = std::process::Command::new(&editor)
-                .arg(&file_path)
-                .stdin(std::process::Stdio::inherit())
-                .stdout(std::process::Stdio::inherit())
-                .stderr(std::process::Stdio::inherit())
-                .status();
+            let mut spawn_error: Option<String> = None;
+            match resolve_editor() {
+                Err(msg) => {
+                    spawn_error = Some(msg);
+                }
+                Ok(editor) => {
+                    let status = std::process::Command::new(&editor)
+                        .arg(&file_path)
+                        .stdin(std::process::Stdio::inherit())
+                        .stdout(std::process::Stdio::inherit())
+                        .stderr(std::process::Stdio::inherit())
+                        .status();
 
-            if let Ok(exit_status) = status {
-                if exit_status.success() {
-                    let config_path = Config::default_path();
-                    if std::path::Path::new(&file_path) == config_path {
-                        if let Ok(mut new_config) = Config::load(&config_path) {
-                            // Preserve ephemeral providers (e.g. OAuth /login) —
-                            // they only exist in memory, not on disk.
-                            for (name, provider) in &app.config.providers {
-                                if provider.ephemeral {
-                                    new_config.providers.insert(name.clone(), provider.clone());
+                    match status {
+                        Ok(exit_status) if exit_status.success() => {
+                            let config_path = Config::default_path();
+                            if std::path::Path::new(&file_path) == config_path {
+                                if let Ok(mut new_config) = Config::load(&config_path) {
+                                    // Preserve ephemeral providers (e.g. OAuth /login) —
+                                    // they only exist in memory, not on disk.
+                                    for (name, provider) in &app.config.providers {
+                                        if provider.ephemeral {
+                                            new_config.providers.insert(name.clone(), provider.clone());
+                                        }
+                                    }
+                                    // If the previous default was ephemeral and still exists, keep it.
+                                    if app.config.providers.get(&app.config.default_provider)
+                                        .map(|p| p.ephemeral).unwrap_or(false)
+                                        && new_config.providers.contains_key(&app.config.default_provider)
+                                    {
+                                        new_config.default_provider = app.config.default_provider.clone();
+                                    }
+                                    app.config = new_config;
+                                    app.rebuild_provider();
+                                    app.sync_config_to_agent();
+                                    let default_name = app.config.default_provider.clone();
+                                    if let Ok(provider) = app.config.active_provider(None) {
+                                        app.model_name = format!("{} / {}", default_name, provider.model);
+                                    }
                                 }
                             }
-                            // If the previous default was ephemeral and still exists, keep it
-                            if app.config.providers.get(&app.config.default_provider)
-                                .map(|p| p.ephemeral).unwrap_or(false)
-                                && new_config.providers.contains_key(&app.config.default_provider)
-                            {
-                                new_config.default_provider = app.config.default_provider.clone();
-                            }
-                            app.config = new_config;
-                            app.rebuild_provider();
-                            app.sync_config_to_agent();
-                            let default_name = app.config.default_provider.clone();
-                            if let Ok(provider) = app.config.active_provider(None) {
-                                app.model_name = format!("{} / {}", default_name, provider.model);
-                            }
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            spawn_error = Some(format!(
+                                "Failed to launch editor `{}`: {}\nSet the EDITOR env var to a working editor and retry.",
+                                editor, e
+                            ));
                         }
                     }
                 }
@@ -415,6 +493,10 @@ pub async fn run(
             execute!(terminal.backend_mut(), EnableBracketedPaste)?;
             terminal.clear()?;
             event_loop.start();
+            if let Some(msg) = spawn_error {
+                app.conversation.push_delta(&msg);
+                app.conversation.finalize_stream();
+            }
             continue;
         }
 
