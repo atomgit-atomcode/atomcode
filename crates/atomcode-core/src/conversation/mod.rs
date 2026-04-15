@@ -128,12 +128,23 @@ impl Conversation {
         }
     }
 
+    /// Clear the stream buffer without finalizing (used when text output
+    /// is actually a malformed tool call that will be re-processed).
+    pub fn clear_stream_buffer(&mut self) {
+        self.stream_buffer = None;
+    }
+
     pub fn finalize_stream(&mut self) {
         if let Some(content) = self.stream_buffer.take() {
             // Clean up model artifacts
             let content = content
                 .replace("<think>", "").replace("</think>", "")
                 .replace("<|im_start|>", "").replace("<|im_end|>", "");
+            // Strip leaked reasoning: MiniMax/DeepSeek sometimes output
+            // reasoning as plain text (no <think> tag) followed by the
+            // actual response. Detect by looking for the pattern:
+            //   "要求/需要/让我/用户..." (analysis) → blank line → actual reply
+            let content = strip_leaked_reasoning(&content);
             let content = dedup_trailing_repeat(&content);
             // Skip empty/whitespace-only assistant messages — they waste a message
             // slot in context without carrying information (common after <think> stripping).
@@ -1126,6 +1137,56 @@ impl Conversation {
 }
 
 /// Strip trailing duplicate content from model output.
+/// Strip leaked reasoning that wasn't wrapped in <think> tags.
+/// MiniMax and some models output their internal reasoning as plain text
+/// before the actual response, separated by blank lines. Pattern:
+///   "要求.../需要.../这个问题..." (reasoning) \n\n "actual reply"
+/// We detect this by checking if the first paragraph looks like self-analysis
+/// and strip it, keeping only the final response.
+fn strip_leaked_reasoning(text: &str) -> String {
+    let trimmed = text.trim();
+    // Only process short text-only responses (not code/tool output)
+    if trimmed.len() > 1000 || trimmed.contains("```") {
+        return text.to_string();
+    }
+
+    // Split into paragraphs (separated by blank lines)
+    let paragraphs: Vec<&str> = trimmed.split("\n\n")
+        .map(|p| p.trim())
+        .filter(|p| !p.is_empty())
+        .collect();
+
+    if paragraphs.len() < 2 {
+        return text.to_string();
+    }
+
+    // Check if first paragraph is reasoning (self-analysis patterns)
+    let first = paragraphs[0];
+    let reasoning_markers = [
+        "要求", "需要", "这个问题", "用户", "根据规则", "我应该",
+        "让我", "分析", "涉及到", "敏感", "回避",
+        "I need to", "I should", "Let me", "The user",
+    ];
+    let is_reasoning = reasoning_markers.iter()
+        .any(|m| first.starts_with(m) || first.contains(m));
+
+    if is_reasoning {
+        // Keep only the last paragraph(s) — the actual response
+        // Find the first paragraph that doesn't look like reasoning
+        let mut start = paragraphs.len() - 1;
+        for (i, p) in paragraphs.iter().enumerate().skip(1) {
+            let still_reasoning = reasoning_markers.iter().any(|m| p.starts_with(m) || p.contains(m));
+            if !still_reasoning {
+                start = i;
+                break;
+            }
+        }
+        return paragraphs[start..].join("\n\n");
+    }
+
+    text.to_string()
+}
+
 /// Weak models sometimes repeat their summary verbatim at the end.
 /// Strategy: find a repeated heading/marker line and truncate at the second occurrence.
 fn dedup_trailing_repeat(text: &str) -> String {

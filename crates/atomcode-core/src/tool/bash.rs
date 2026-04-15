@@ -113,6 +113,22 @@ async fn bash_execute(args: &str, ctx: &ToolContext) -> Result<ToolResult> {
         let mut parsed: BashArgs = serde_json::from_str(args)?;
         // Strip model-added tail/head pipes — framework's truncation handles output length.
         parsed.command = strip_output_pipes(&parsed.command);
+
+        // Block foreground dev server commands — they never exit, eat the timeout,
+        // and the model can't see browser output anyway. Return guidance instead.
+        if is_foreground_server(&parsed.command) {
+            return Ok(ToolResult {
+                call_id: String::new(),
+                output: format!(
+                    "Blocked: `{}` is a long-running server that won't exit.\n\
+                     You cannot verify visual changes by starting a dev server — you can't see the browser.\n\
+                     Instead: use `npm run build` or `cargo check` to verify compilation, then tell the user to check the result.",
+                    parsed.command.chars().take(60).collect::<String>(),
+                ),
+                success: false,
+            });
+        }
+
         // Cap timeout: model may request absurdly large values. Max 5 min.
         let timeout_secs = parsed.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS).min(300);
         let start_instant = Instant::now();
@@ -358,6 +374,27 @@ fn strip_output_pipes(cmd: &str) -> String {
         }
     }
     cmd.to_string()
+}
+
+/// Detect foreground dev server commands that block forever.
+/// Only matches foreground invocations — `&` suffix (background) is allowed.
+fn is_foreground_server(cmd: &str) -> bool {
+    let trimmed = cmd.trim();
+    // Allow background execution (trailing &)
+    if trimmed.ends_with('&') { return false; }
+    // Common dev server patterns
+    let server_patterns = [
+        "npm run dev", "npm start", "npm run serve",
+        "yarn dev", "yarn start", "pnpm dev",
+        "npx vite", "npx next dev", "npx nuxt dev",
+        "tauri dev", "npm run tauri dev",
+        "cargo run", "cargo watch",
+        "python manage.py runserver", "python -m http.server",
+        "flask run", "uvicorn", "gunicorn",
+        "node server", "nodemon",
+        "php artisan serve", "rails server", "rails s",
+    ];
+    server_patterns.iter().any(|p| trimmed.contains(p))
 }
 
 fn format_output(stdout: &str, stderr: &str) -> String {

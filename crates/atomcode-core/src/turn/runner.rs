@@ -247,6 +247,18 @@ _ = cancel.cancelled() => {
                         }
 
                         Some(Ok(StreamEvent::Done { truncated: is_truncated })) => {
+                            // Rescue tool calls embedded as text (GLM-5 sometimes
+                            // outputs `<tool_call>name(args)</tool_call>` instead of
+                            // using the standard function calling format).
+                            if tool_calls_buf.is_empty() {
+                                let rescued = rescue_text_tool_calls(&text_buf);
+                                if !rescued.is_empty() {
+                                    // Clear the text delta (it was a tool call, not text)
+                                    conversation.clear_stream_buffer();
+                                    tool_calls_buf.extend(rescued);
+                                }
+                            }
+
                             // Finalize conversation state
                             if !tool_calls_buf.is_empty() {
                                 conversation.finalize_stream_with_tool_calls(&tool_calls_buf);
@@ -623,6 +635,67 @@ fn strip_model_tags(text: &str) -> String {
     result = result.replace("</think>", "");
     result = result.replace("<|im_start|>", "").replace("<|im_end|>", "");
     result
+}
+
+/// Rescue tool calls embedded as text in the model's response.
+/// Some models (GLM-5 via OpenRouter) sometimes output tool calls as
+/// `<tool_call>name(arg=value)</tool_call>` or `<tool_call>name(json)</tool_call>`
+/// instead of using the standard function calling format.
+/// Returns rescued ToolCalls, empty vec if nothing found.
+fn rescue_text_tool_calls(text: &str) -> Vec<ToolCall> {
+    let mut calls = Vec::new();
+    let mut remaining = text;
+
+    while let Some(start) = remaining.find("<tool_call>") {
+        let after_tag = &remaining[start + "<tool_call>".len()..];
+        let end = after_tag.find("</tool_call>")
+            .or_else(|| after_tag.find('\n'))
+            .unwrap_or(after_tag.len());
+        let body = after_tag[..end].trim();
+
+        // Parse: "name(key=value, ...)" or "name({json})"
+        if let Some(paren) = body.find('(') {
+            let name = body[..paren].trim();
+            let args_raw = body[paren + 1..].trim_end_matches(')').trim();
+
+            if !name.is_empty() {
+                // Try parsing as JSON first
+                let args_json = if args_raw.starts_with('{') {
+                    args_raw.to_string()
+                } else {
+                    // Convert key=value pairs to JSON
+                    let mut json_parts = Vec::new();
+                    for part in args_raw.split(',') {
+                        let part = part.trim();
+                        if let Some(eq) = part.find('=') {
+                            let k = part[..eq].trim();
+                            let v = part[eq + 1..].trim();
+                            // Quote the value if not already quoted
+                            let v_quoted = if v.starts_with('"') || v.starts_with('{') || v.starts_with('[')
+                                || v == "true" || v == "false" || v.parse::<f64>().is_ok() {
+                                v.to_string()
+                            } else {
+                                format!("\"{}\"", v.replace('\\', "\\\\").replace('"', "\\\""))
+                            };
+                            json_parts.push(format!("\"{}\":{}", k, v_quoted));
+                        }
+                    }
+                    format!("{{{}}}", json_parts.join(","))
+                };
+
+                let call_id = format!("rescued_{}", calls.len());
+                calls.push(ToolCall {
+                    id: call_id,
+                    name: name.to_string(),
+                    arguments: args_json,
+                });
+            }
+        }
+
+        remaining = &after_tag[end..];
+    }
+
+    calls
 }
 
 /// Merge multiple edit_file calls targeting the same file into a single multi-edit call.

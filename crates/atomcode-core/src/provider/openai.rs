@@ -157,6 +157,12 @@ struct ChunkChoice {
 #[derive(Deserialize)]
 struct ChunkDelta {
     content: Option<String>,
+    /// MiniMax M2.7 / DeepSeek R1 send thinking via this field.
+    /// We parse it to prevent it from leaking into `content` (some providers
+    /// fall back to stuffing reasoning into content when this field is absent
+    /// from the request schema). Parsed but intentionally not forwarded to UI.
+    #[allow(dead_code)]
+    reasoning_content: Option<String>,
     tool_calls: Option<Vec<DeltaToolCall>>,
 }
 
