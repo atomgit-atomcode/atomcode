@@ -37,7 +37,7 @@ impl OpenAiProvider {
                 .base_url
                 .clone()
                 .unwrap_or_else(|| "https://api.openai.com/v1".to_string()),
-            max_tokens: config.max_tokens.unwrap_or(config.context_window / 4),
+            max_tokens: config.max_tokens.unwrap_or((config.context_window / 4).max(16_000)),
         })
     }
 

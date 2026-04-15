@@ -849,6 +849,13 @@ impl AgentLoop {
                     context_window,
                     self.tool_call_count,
                 );
+                // Dump request to datalog for inline debugging
+                self.datalog.log_llm_dump(
+                    &msgs,
+                    tool_defs.len(),
+                    self.turn_runner.provider.model_name(),
+                    context_window,
+                );
             }
 
             // Run the turn in a scoped block so all borrows of self.turn_runner
@@ -1023,6 +1030,7 @@ impl AgentLoop {
                                     });
                                 }
                                 TurnEvent::TokenUsage { prompt_tokens, completion_tokens, total_tokens: _, cached_tokens } => {
+                                    datalog.log_token_usage(prompt_tokens, completion_tokens, cached_tokens);
                                     if cached_tokens > 0 {
                                         datalog.log_cache_hit(prompt_tokens, cached_tokens);
                                     }
@@ -1230,9 +1238,20 @@ impl AgentLoop {
                     }
 
                     // Empty response from LLM (common with DeepSeek/SiliconFlow/GLM):
-                    // Retry with a nudge — model may have hit a transient issue.
-                    // Detect empty/near-empty responses — model may return whitespace or minimal tokens
+                    // Retry with a nudge — but ONLY if the response was fast (<60s).
+                    // Slow empty responses (300s) mean the model spent all max_tokens
+                    // on internal reasoning — retrying will produce the same result.
                     let is_empty = text.trim().is_empty() || (text.trim().len() < 5 && tokens < 10);
+                    let turn_elapsed = self.turn_start.map(|t| t.elapsed().as_secs()).unwrap_or(0);
+                    let is_slow_empty = is_empty && turn_elapsed > 60;
+                    if is_slow_empty {
+                        // Don't retry — model burned max_tokens on thinking
+                        let _ = self.event_tx.send(AgentEvent::TextDelta(
+                            "\n[Model produced no visible output after extended thinking. Try rephrasing your request more specifically.]\n".to_string()
+                        ));
+                        self.finish_turn(TurnStopReason::Natural);
+                        return;
+                    }
                     if is_empty && self.retry_count < 2 {
                         self.retry_count += 1;
                         // Ensure valid message alternation: empty LLM response didn't add

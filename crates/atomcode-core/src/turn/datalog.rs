@@ -136,6 +136,63 @@ impl DatalogWriter {
         self.flush();
     }
 
+    /// Log token usage for the current LLM round-trip.
+    pub fn log_token_usage(&mut self, prompt_tokens: usize, completion_tokens: usize, cached_tokens: usize) {
+        if !self.active { return; }
+        let cache_str = if cached_tokens > 0 {
+            format!(", cache={}tok", cached_tokens)
+        } else {
+            String::new()
+        };
+        let _ = writeln!(&mut self.buf,
+            "  _[tokens: prompt={}+completion={}{}]_",
+            prompt_tokens, completion_tokens, cache_str
+        );
+        self.flush();
+    }
+
+    /// Dump full LLM request as JSON into the datalog for debugging.
+    /// Appends to a single JSONL file (one JSON object per line) colocated
+    /// with the turn .md file: `<turn_timestamp>_requests.jsonl`.
+    /// Each line has the step number so you can correlate with the md.
+    pub fn log_llm_dump(&mut self, messages: &[crate::conversation::message::Message],
+                         tool_count: usize, model: &str, context_window: usize) {
+        if !self.active { return; }
+
+        // Derive JSONL path from the md file path: same name but .jsonl extension
+        let jsonl_path = self.file_path.as_ref()
+            .map(|p| p.with_extension("jsonl"));
+
+        if let Some(ref path) = jsonl_path {
+            let msgs_json = serde_json::to_value(messages).unwrap_or(serde_json::json!([]));
+            let total_tokens: usize = messages.iter()
+                .map(|m| m.estimate_tokens()).sum();
+            let dump = serde_json::json!({
+                "step": self.step,
+                "model": model,
+                "context_window": context_window,
+                "message_count": messages.len(),
+                "estimated_tokens": total_tokens,
+                "tool_count": tool_count,
+                "messages": msgs_json,
+            });
+            // Append as single line (compact JSON) to JSONL
+            if let Ok(json_line) = serde_json::to_string(&dump) {
+                use std::io::Write;
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true).append(true).open(path)
+                {
+                    let _ = writeln!(f, "{}", json_line);
+                }
+            }
+            let _ = writeln!(&mut self.buf,
+                "  _[request: {}msgs · {}tok · {}tools]_",
+                messages.len(), total_tokens, tool_count
+            );
+            self.flush();
+        }
+    }
+
     /// Log a tool call start (within the current LLM turn).
     pub fn log_tool_call(&mut self, name: &str, args: &str) {
         if !self.active { return; }

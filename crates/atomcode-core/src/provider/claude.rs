@@ -32,7 +32,7 @@ impl ClaudeProvider {
             client: super::build_http_client(config.user_agent.as_deref()),
             api_key,
             model: config.model.clone(),
-            max_tokens: config.max_tokens.unwrap_or(config.context_window / 4),
+            max_tokens: config.max_tokens.unwrap_or((config.context_window / 4).max(16_000)),
         })
     }
 

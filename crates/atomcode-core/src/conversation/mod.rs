@@ -795,55 +795,48 @@ impl Conversation {
         result
     }
 
-    /// Microcompact: condense ToolResult messages from old rounds
-    /// to one-line summaries. Zero LLM calls — purely mechanical compression.
+    /// Microcompact: condense old ToolResult messages to one-line summaries.
+    /// Zero LLM calls — purely mechanical compression.
     ///
-    /// "Read and forget" strategy: read_file results are condensed after 5 LLM
-    /// rounds (not message count). A round = one Assistant message + its tool
-    /// results. 5 rounds accommodates the common pattern of segmented reads
-    /// (read L1-200, read L500-700, read full) followed by multi-edit — all
-    /// reads stay in context through the edit phase.
+    /// read_file results are NEVER condensed by microcompact. They stay in
+    /// context for the entire task so the model can cross-reference files
+    /// freely. Cleanup happens at two higher levels:
+    /// 1. Task boundary compression (new user message → old task compressed)
+    /// 2. 50% LLM compression threshold (context > 32K → oldest turns compressed)
     ///
-    /// Other tool results keep the standard 20-message window.
+    /// Other tool results (bash, grep, edit, etc.) are condensed after
+    /// 20 messages to keep context growth in check.
     fn microcompact(msgs: &mut Vec<Message>, _turns: &[turn::Turn], total_msg_count: usize) {
-        const READ_KEEP_ROUNDS: usize = 5;
         const OTHER_KEEP: usize = 20;
 
-        if total_msg_count <= 6 { return; }
-
-        // Find the message index where "recent N rounds" starts.
-        // A round boundary = an Assistant or AssistantWithToolCalls message.
-        let cold_msgs = msgs.iter()
-            .position(|m| !matches!(m.role, Role::System))
-            .unwrap_or(0);
-
-        let mut round_count = 0;
-        let mut read_cutoff_idx = 0; // index into msgs (after cold_msgs offset)
-        for i in (cold_msgs..msgs.len()).rev() {
-            if matches!(msgs[i].role, Role::Assistant) {
-                round_count += 1;
-                if round_count >= READ_KEEP_ROUNDS {
-                    read_cutoff_idx = i.saturating_sub(cold_msgs);
-                    break;
-                }
-            }
-        }
+        if total_msg_count <= OTHER_KEEP { return; }
 
         let other_cutoff = total_msg_count.saturating_sub(OTHER_KEEP);
 
-        // Build call_id → tool_name map
+        // Build call_id → tool_name map + call_id → file_path for read_file dedup
         let mut call_id_to_tool: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let mut call_id_to_read_file: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         for msg in msgs.iter() {
             if let MessageContent::AssistantWithToolCalls { tool_calls, .. } = &msg.content {
                 for tc in tool_calls {
                     call_id_to_tool.insert(tc.id.clone(), tc.name.clone());
+                    if tc.name == "read_file" {
+                        if let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
+                            if let Some(fp) = args.get("file_path").and_then(|v| v.as_str()) {
+                                call_id_to_read_file.insert(tc.id.clone(), fp.to_string());
+                            }
+                        }
+                    }
                 }
             }
         }
 
-        // Condense: different cutoffs for read_file vs other tools
-        let max_cutoff = read_cutoff_idx.max(other_cutoff);
-        let condense_end = cold_msgs + max_cutoff;
+        // Skip system messages at the front
+        let cold_msgs = msgs.iter()
+            .position(|m| !matches!(m.role, Role::System))
+            .unwrap_or(0);
+
+        let condense_end = cold_msgs + other_cutoff;
 
         for i in cold_msgs..condense_end.min(msgs.len()) {
             if let MessageContent::ToolResult(ref r) = msgs[i].content {
@@ -851,13 +844,30 @@ impl Conversation {
                     .map(|s| s.as_str())
                     .unwrap_or("tool");
 
-                // Determine which cutoff applies to this tool
+                // read_file: only condense if a NEWER read of the same file exists.
+                // Keeps the latest read of each file; clears older reads of the same file.
+                if tool_name == "read_file" {
+                    // Check if there's a newer read of the same file later in msgs
+                    let my_file = call_id_to_read_file.get(&r.call_id);
+                    if let Some(file_path) = my_file {
+                        let has_newer = msgs[i+1..].iter().any(|later_msg| {
+                            if let MessageContent::ToolResult(ref later_r) = later_msg.content {
+                                call_id_to_read_file.get(&later_r.call_id)
+                                    .map(|f| f == file_path)
+                                    .unwrap_or(false)
+                            } else {
+                                false
+                            }
+                        });
+                        if !has_newer { continue; } // newest read of this file — keep it
+                        // else: fall through to condense (older read of same file)
+                    } else {
+                        continue; // can't identify file — keep it safe
+                    }
+                }
+
                 let msg_idx = i.saturating_sub(cold_msgs);
-                let is_old = match tool_name {
-                    "read_file" => msg_idx < read_cutoff_idx,
-                    _ => msg_idx < other_cutoff,
-                };
-                if !is_old { continue; }
+                if msg_idx >= other_cutoff { continue; }
 
                 // Only condense large results (>500 chars)
                 if r.output.len() <= 500 { continue; }
