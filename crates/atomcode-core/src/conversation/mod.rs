@@ -433,7 +433,7 @@ impl Conversation {
         if self.messages.len() < 12 { return false; }
         let total: usize = system_prompt_tokens + self.messages.iter()
             .map(|m| m.estimate_tokens()).sum::<usize>();
-        let threshold = (token_budget * 70 / 100).min(50000);
+        let threshold = (token_budget * 50 / 100).min(50000);
         total > threshold
     }
 

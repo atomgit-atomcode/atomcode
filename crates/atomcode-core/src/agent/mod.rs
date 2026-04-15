@@ -625,6 +625,23 @@ impl AgentLoop {
             enriched
         };
 
+        // ── Task boundary cleanup ──
+        // New user message = new task. If there's old context from the
+        // previous task (>12 messages), compress it unconditionally.
+        // This prevents dirty-start degradation where 20K+ of stale
+        // conversation dilutes the batch prompt for the new task.
+        // Unlike maybe_compress_history (which checks the 50% threshold),
+        // this fires at every task boundary regardless of token count.
+        if self.conversation.messages.len() > 12 {
+            let (content, n_msgs) = self.conversation.build_compression_content();
+            if !content.is_empty() && n_msgs > 0 {
+                // Mechanical compression — no LLM call needed at task boundary.
+                // The compressed content from build_compression_content is already
+                // one-line-per-round summaries, compact enough for cold zone.
+                self.conversation.apply_compression(n_msgs, content);
+            }
+        }
+
         self.conversation.add_user_message(&clean);
         self.turn_tokens = 0;
         self.tool_call_count = 0;
