@@ -63,12 +63,7 @@ pub fn truncate_output(result: &mut ToolResult, tool_name: &str, context_window:
     //
     // Other tools (bash, grep, etc.) still get the char cap.
     let hard_char_limit = (context_window / 8).min(32_000).max(8_000);
-    if tool_name == "read_file" {
-        // read_file: no char cap. Managed by:
-        // 1. truncate_read_file (>2000 lines → outline extraction)
-        // 2. microcompact (READ_KEEP=5 rounds → cleared to one-liner)
-        // 3. task boundary compression (new user message → old reads compressed)
-    } else if result.output.len() > hard_char_limit {
+    if result.output.len() > hard_char_limit {
         // Preserve head AND tail when cutting — tools often put errors/status at the end.
         let chars: Vec<char> = result.output.chars().collect();
         let head_chars = hard_char_limit * 2 / 3;
@@ -420,36 +415,19 @@ pub fn post_process_tool_results(
         }
     }
 
-    // Pass 2: per-turn budget enforcement (non-read tools only).
-    // read_file results are excluded — they're managed by 50% LLM compression
-    // and task boundary cleanup, not per-turn budgets.
+    // Pass 2: per-turn budget enforcement.
     let turn_budget = (context_window / 4).min(16_000).max(4_000);
-    // Build call_id → tool_name map for this turn
-    let mut turn_call_ids: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    for i in start..len {
-        if let MessageContent::AssistantWithToolCalls { tool_calls, .. } = &messages[i].content {
-            for tc in tool_calls {
-                turn_call_ids.insert(tc.id.clone(), tc.name.clone());
-            }
-        }
-    }
     let mut total_chars: usize = 0;
     for i in start..len {
         if let MessageContent::ToolResult(ref r) = messages[i].content {
-            let is_read = turn_call_ids.get(&r.call_id).map(|n| n == "read_file").unwrap_or(false);
-            if !is_read {
-                total_chars += r.output.len();
-            }
+            total_chars += r.output.len();
         }
     }
 
     if total_chars > turn_budget {
-        // Over budget — shrink each non-read result proportionally
         let ratio = turn_budget as f64 / total_chars as f64;
         for i in start..len {
             if let MessageContent::ToolResult(ref r) = messages[i].content {
-                let is_read = turn_call_ids.get(&r.call_id).map(|n| n == "read_file").unwrap_or(false);
-                if is_read { continue; }
                 let target = (r.output.len() as f64 * ratio) as usize;
                 if r.output.len() > target && target > 200 {
                     let mut result = r.clone();

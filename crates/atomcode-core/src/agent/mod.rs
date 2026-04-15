@@ -15,6 +15,7 @@ mod discipline;
 mod prompt;
 mod services;
 mod tool_dispatch;
+mod verify;
 
 use std::collections::HashSet;
 use std::path::PathBuf;

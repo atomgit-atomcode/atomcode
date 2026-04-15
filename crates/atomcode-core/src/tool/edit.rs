@@ -982,7 +982,7 @@ fn post_edit_context(new_content: &str, new_string: &str) -> String {
 #[allow(dead_code)]
 fn file_outline(content: &str) -> String {
     let lines: Vec<&str> = content.lines().collect();
-    if lines.len() <= 100 {
+    if lines.len() <= 20 {
         return String::new(); // Small file — diff is enough context.
     }
 
@@ -1056,7 +1056,7 @@ fn build_compact_diff(old: &str, new: &str) -> String {
 /// snippet because they're the only case where re-reading is expensive.
 fn build_edit_context(content: &str, new_string: &str) -> String {
     let lines: Vec<&str> = content.lines().collect();
-    if lines.len() <= 100 {
+    if lines.len() <= 20 {
         return String::new();
     }
 

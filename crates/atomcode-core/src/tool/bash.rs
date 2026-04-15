@@ -101,13 +101,9 @@ impl Tool for BashTool {
 
     async fn execute(&self, args: &str, ctx: &ToolContext) -> Result<ToolResult> {
         let mut result = bash_execute(args, ctx).await?;
-        // Only append cwd on failure — the "no POM in this directory" loop is a
-        // failure-mode problem, and successful outputs already make context clear.
-        // Saves ~20 chars per successful bash call, which adds up on long sessions.
-        if !result.success {
-            let wd = ctx.working_dir.read().await;
-            result.output.push_str(&format!("\n[cwd: {}]", wd.display()));
-        }
+        // Append cwd to every bash result so model always knows where it is.
+        let wd = ctx.working_dir.read().await;
+        result.output.push_str(&format!("\n[cwd: {}]", wd.display()));
         Ok(result)
     }
 }
