@@ -208,6 +208,7 @@ fn build_wecom_provider(creds: &wecom_login::BrokerCreds) -> ProviderConfig {
         system_prompt: None,
         user_agent: None,
         context_window: 64000,
+        max_tokens: None,
         ephemeral: true,
     }
 }

@@ -17,8 +17,8 @@ use std::net::TcpListener;
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
-pub const BROKER_AUTHORIZE_URL: &str = "https://test-zouwu.gitcode.com/login?popup=1&corp=gitcode";
-pub const BROKER_LOGIN_URL: &str = "https://test-zouwu.gitcode.com/api/v1/broker/exchange";
+pub const BROKER_AUTHORIZE_URL: &str = "https://zouwu.gitcode.com/login?popup=1&corp=gitcode";
+pub const BROKER_LOGIN_URL: &str = "https://zouwu.gitcode.com/api/v1/broker/exchange";
 pub const REDIRECT_PORT: u16 = 8766;
 pub const REDIRECT_URI: &str = "http://127.0.0.1:8766/callback";
 pub const INTERNAL_PROVIDER_NAME: &str = "GitCode-Internal";
