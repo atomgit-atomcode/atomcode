@@ -4,6 +4,13 @@ set -e
 # Always run from project root
 cd "$(dirname "$0")/.."
 
+# Prefer rustup toolchain over Homebrew rustc — Homebrew's rust ships only the
+# host target, so cross-compiling to x86_64-apple-darwin fails with "can't find
+# crate for `core`". rustup supports `rustup target add` for extra targets.
+if [ -x "$HOME/.cargo/bin/rustc" ]; then
+    export PATH="$HOME/.cargo/bin:$PATH"
+fi
+
 VERSION=$(git describe --tags --abbrev=0 2>/dev/null)
 if [ -z "$VERSION" ]; then
     echo "No git tag found. Create one first: git tag -a v1.0.0 -m 'v1.0.0'"
