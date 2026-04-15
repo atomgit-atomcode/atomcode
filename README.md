@@ -13,6 +13,10 @@
 </p>
 
 <p align="center">
+  English · <a href="./README.zh-CN.md">简体中文</a>
+</p>
+
+<p align="center">
   <a href="#installation">Install</a> ·
   <a href="#quick-start">Quick Start</a> ·
   <a href="#features">Features</a> ·
@@ -22,10 +26,10 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-2.1.0-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-4.15.0-blue" alt="version">
   <img src="https://img.shields.io/badge/rust-1.75%2B-orange" alt="rust">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="license">
-  <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey" alt="platform">
+  <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey" alt="platform">
 </p>
 
 ---
@@ -36,27 +40,46 @@
 
 AtomCode is an AI coding agent that lives in your terminal. Give it a task in natural language, and it will read your codebase, edit files, run commands, and verify its work — autonomously.
 
-Think of it as an open-source alternative to Claude Code / Cursor Agent, but running entirely in your terminal, connecting to any OpenAI-compatible API.
+Think of it as an open-source alternative to Claude Code / Cursor Agent, but running entirely in your terminal and connecting to any OpenAI-compatible API.
 
 ## Features
 
 ### Agent Loop
 
 - **Autonomous multi-step execution** — reads files, edits code, runs tests, fixes errors, all in a loop
-- **8 built-in tools**: `read_file`, `write_file`, `edit_file`, `bash`, `grep`, `glob`, `list_directory`, `change_dir`
-- **Verification loop** — automatically verifies edits by running syntax checks before declaring success
-- **Dynamic step limits** — 25 base + 5 per edited file, max 50 steps per turn
-- **Loop detection** — detects and breaks out of repetitive tool call patterns
-- **3-layer JSON repair** — handles malformed tool call arguments from weaker models
+- **Verification loop** — automatically verifies edits via syntax checks before declaring success
+- **Dynamic step budget** — scales with the number of edited files, capped per turn to bound cost
+- **Loop detection** — detects and breaks out of repetitive tool-call patterns
+- **3-layer JSON repair** — recovers malformed tool-call arguments from weaker models
+- **Turn-level datalog** — structured per-turn logs for replay, debugging, and eval harnesses
+
+### Built-in Tools
+
+File & shell:
+
+- `read_file`, `write_file`, `edit_file`, `search_replace`
+- `bash`, `grep`, `glob`, `list_directory`, `change_dir`
+- `web_search`, `web_fetch`
+
+Code graph (language-aware code intelligence):
+
+- `list_symbols`, `read_symbol`, `find_references`
+- `trace_callers`, `trace_callees`, `trace_chain`
+- `file_deps`, `blast_radius`
+
+Automation:
+
+- `auto_fix` — automatic lint/typecheck fix loop
+- `use_skill` — invoke a user-defined skill
 
 ### Multi-Provider Support
 
-Connect to any LLM that supports OpenAI's function calling API:
+Connect to any LLM that supports OpenAI's function-calling API:
 
 | Provider | Function Calling | Tested Models |
 |----------|:---:|---|
-| OpenAI | Yes | GPT-4o, GPT-4.1 |
 | Claude (Anthropic) | Yes | Claude Sonnet 4.5/4.6, Opus 4.6 |
+| OpenAI | Yes | GPT-4o, GPT-4.1 |
 | DeepSeek | Yes | DeepSeek V3, DeepSeek R1 |
 | Zhipu (GLM) | Yes | GLM-4, GLM-5 |
 | Qwen (Alibaba) | Yes | Qwen-Plus, Qwen-Max |
@@ -64,15 +87,24 @@ Connect to any LLM that supports OpenAI's function calling API:
 | Ollama (local) | Partial | Llama 3, Qwen2, etc. |
 | Any OpenAI-compatible API | Yes | — |
 
+### Sessions & Login
+
+- **Persistent sessions** — every conversation is saved; resume or switch with `/resume`
+- **AtomGit OAuth login** — `/login` (or `atomcode login`) pairs your CLI with your AtomGit account
+- **WeCom QR login** — `/login-inner` for GitCode internal users
+- **Headless mode** — `atomcode -p "..."` runs a single prompt non-interactively and streams the reply on stdout (Claude Code `-p` style)
+- **Daemon mode** — `atomcode-daemon` exposes an HTTP API for session history and SSE streaming chat
+
 ### Terminal UI
 
 - **Real-time streaming** with markdown rendering and syntax highlighting
 - **Code blocks** with language labels, line numbers, and `base16-ocean.dark` theme
 - **Multi-line input** with Shift+Enter, auto-growing height, input history
 - **Text selection** with mouse drag, auto-scroll, and clipboard copy
-- **Slash commands** — `/model`, `/provider`, `/clear`, `/compact` with autocomplete
+- **Slash commands** — `/model`, `/provider`, `/resume`, `/diff`, `/undo`, `/cost`, `/clear`, `/compact`, etc. (see table below)
 - **File attachment** — paste file paths to attach content as context
 - **Bracketed paste** — long paste content collapsed to a compact indicator
+- **Skills** — user-defined commands loaded from your skill directory, invoked like any slash command
 
 ### Safety
 
@@ -80,6 +112,7 @@ Connect to any LLM that supports OpenAI's function calling API:
 - **Sensitive file protection** — writes to `/etc`, `~/.ssh`, shell configs require approval
 - **Per-session permission grants** — approve once per tool pattern, or always-allow
 - **Source file deletion requires approval** — `rm` on code files is never auto-approved
+- **Undo** — `/undo` rolls back the last turn's file edits via file-history snapshots
 
 ### Weak Model Optimization
 
@@ -87,17 +120,17 @@ AtomCode is specifically engineered to work well with weaker/cheaper models (Dee
 
 - **Compact system prompt** (~1.5K tokens) with rules at the END (recency effect)
 - **No source file pre-reading** — the model reads what it needs, avoiding attention dilution
-- **Token-budget-aware conversation windowing** — hot/cold zones with tool result condensation
-- **System reminders** every 4 steps to keep the model on track
-- **Specialized JSON repair** for models that produce malformed function call arguments
-- **Edit surrounding context** — returns 10 lines around each edit to help the model stay oriented
+- **Token-budget-aware conversation windowing** — hot/cold zones with tool-result condensation
+- **System reminders** every few steps to keep the model on track
+- **Specialized JSON repair** for models that produce malformed function-call arguments
+- **Edit surrounding context** — returns lines around each edit to help the model stay oriented
 
 ## Installation
 
 ### From Source (recommended)
 
 ```bash
-git clone https://gitcode.com/bangxu/atomcode.git
+git clone https://atomgit.com/atomgit_atomcode/atomcode.git
 cd atomcode
 cargo build --release
 ```
@@ -114,7 +147,7 @@ sudo cp target/release/atomcode /usr/local/bin/
 ### Requirements
 
 - Rust 1.75+ (for building)
-- An API key from any supported provider
+- An API key from any supported provider (or an AtomGit account for `/login`)
 
 ## Quick Start
 
@@ -132,7 +165,7 @@ Welcome to AtomCode! Let's set up your first provider.
 Select provider:
   [1] Claude (Anthropic)
   [2] OpenAI
-  [3] OpenAI Compatible (Deepseek, Qwen, Zhipu, Moonshot...)
+  [3] OpenAI Compatible (DeepSeek, Qwen, Zhipu, Moonshot...)
   [4] Ollama (local)
 ```
 
@@ -165,6 +198,12 @@ atomcode -C /path/to/project
 
 # Or specify model
 atomcode --model gpt-4o
+
+# Headless (single prompt, reply on stdout)
+atomcode -p "Explain the agent loop in this repo"
+
+# Read prompt from file
+atomcode --prompt-file task.md
 ```
 
 Then just type what you want:
@@ -204,47 +243,65 @@ Then just type what you want:
 | `Ctrl+Shift+C` | Copy selection |
 | `Ctrl+C` | Cancel operation (double-tap to exit) |
 
-### Commands
+### Slash Commands
 
 | Command | Action |
 |---------|--------|
-| `/model` | Switch model |
+| `/resume` | Resume or switch session |
+| `/session` | Create a new session |
 | `/provider` | Manage providers |
+| `/model` | Switch model / provider |
+| `/login` | Login with AtomGit OAuth |
+| `/cd` | Change working directory |
+| `/undo` | Undo last turn's edits |
+| `/diff` | Show git diff of current changes |
+| `/cost` | Show token usage for this session |
+| `/copy` | Copy last AI response |
 | `/clear` | Clear conversation |
-| `/compact` | Compact conversation history |
+| `/issue` | Create issue on AtomGit |
+| `/config` | Edit config file |
+| `/status` | Show login status and model info |
+| `/logout` | Logout from AtomGit |
+| `/help` | Show commands & shortcuts |
+| `/quit` | Exit (or Ctrl+C ×2) |
 
 ## Architecture
 
-AtomCode is a Rust workspace with 3 crates:
+AtomCode is a Rust workspace with four crates:
 
 ```
 atomcode/
   crates/
     atomcode-core/     # Headless library — no TUI dependency
       agent/           # AgentLoop: autonomous tool-use loop
+      turn/            # TurnRunner, datalog, permission decider
       config/          # Config loading, provider configs
       conversation/    # Message types, windowed context
       provider/        # LlmProvider trait + OpenAI/Claude/Ollama
-      tool/            # Tool trait + 8 tool implementations
-      stream/          # StreamEvent protocol
+      tool/            # Tool trait + built-in tool implementations
+      session/         # Persistent sessions
+      skill.rs         # User-defined skills
 
     atomcode-tui/      # Terminal UI — ratatui + crossterm
       app.rs           # App state machine
       ui/              # Render: chat, input, status bar, markdown
 
-    atomcode-cli/      # Binary entry point
+    atomcode-cli/      # Binary entry point (TUI + headless -p mode)
       main.rs          # CLI args, first-run wizard, launch
+      auth/            # AtomGit OAuth client
+
+    atomcode-daemon/   # HTTP/SSE API server over atomcode-core
 ```
 
 ### Design Principles
 
-1. **Tech-stack agnostic** — never hardcodes language-specific logic. Detects project type dynamically from descriptor files (package.json, Cargo.toml, pyproject.toml, etc.)
+1. **Tech-stack agnostic** — never hardcodes language-specific logic. Detects project type dynamically from descriptor files (`package.json`, `Cargo.toml`, `pyproject.toml`, `pom.xml`, etc.).
 
-2. **Decoupled agent** — `AgentLoop` runs as an independent async task, communicating with the TUI via channels (`AgentCommand` / `AgentEvent`). The core library has zero TUI dependencies.
+2. **Decoupled agent** — `AgentLoop` runs as an independent async task, communicating with the TUI via channels (`AgentCommand` / `AgentEvent`). The core library has zero TUI dependencies, which is also what makes the daemon possible.
 
 3. **Tool safety** — all destructive operations require explicit user approval. Tool failures become LLM observations, never panics.
 
-4. **Context-aware** — token-budget-aware conversation windowing, project file tree injection, and per-turn system reminders keep the model focused without exceeding context limits.
+4. **Context-aware** — token-budget-aware conversation windowing, project file-tree injection, and per-turn system reminders keep the model focused without exceeding context limits.
 
 ## Project Instruction File
 
@@ -262,33 +319,6 @@ This is a Vue 3 + TypeScript project using Pinia for state management.
 
 AtomCode reads this file automatically and includes it in the system prompt.
 
-## Comparison with Claude Code
-
-| Feature | AtomCode | Claude Code |
-|---------|:---:|:---:|
-| Open source | Yes | No |
-| Custom LLM provider | Yes (any OpenAI-compatible) | Claude only |
-| Local model support | Yes (Ollama) | No |
-| Terminal UI | Yes | Yes |
-| Autonomous agent loop | Yes | Yes |
-| File editing | Yes | Yes |
-| Command execution | Yes | Yes |
-| Safety approvals | Yes | Yes |
-| MCP support | Planned | Yes |
-| Multi-file context | Planned | Yes |
-| Cost | Your API costs only | Subscription + API |
-
-## Roadmap
-
-- [ ] MCP (Model Context Protocol) server support
-- [ ] Multi-file context window with smart selection
-- [ ] Image/screenshot understanding (vision models)
-- [ ] Git-aware context (branch, diff, blame)
-- [ ] Plugin system for custom tools
-- [ ] Conversation branching and checkpoints
-- [ ] Persistent memory across sessions
-- [ ] Web UI mode (optional browser interface)
-
 ## Development
 
 ### Prerequisites
@@ -300,7 +330,7 @@ AtomCode reads this file automatically and includes it in the system prompt.
 ### Build from Source
 
 ```bash
-git clone https://gitcode.com/bangxu/atomcode.git
+git clone https://atomgit.com/atomgit_atomcode/atomcode.git
 cd atomcode
 
 # Debug build (fast compilation, slower runtime)
@@ -313,15 +343,18 @@ cargo build --release
 ### Run in Development
 
 ```bash
-# Run directly with cargo (debug mode)
-cargo run
+# Run the TUI directly (debug mode)
+cargo run -p atomcode-cli
 
-# Run with arguments
-cargo run -- -C /path/to/project
-cargo run -- --model gpt-4o
+# With arguments
+cargo run -p atomcode-cli -- -C /path/to/project
+cargo run -p atomcode-cli -- --model gpt-4o
 
-# Run release build
-cargo run --release
+# Headless mode
+cargo run -p atomcode-cli -- -p "summarize this repo"
+
+# Daemon (HTTP API)
+cargo run -p atomcode-daemon
 ```
 
 ### Testing
@@ -336,29 +369,6 @@ cargo test -p atomcode-tui
 
 # Run a specific test
 cargo test -p atomcode-core test_name
-```
-
-### Project Structure
-
-```
-atomcode/
-  Cargo.toml                 # Workspace root — version defined here
-  crates/
-    atomcode-core/           # Headless library (no TUI dependency)
-      src/
-        agent/               # AgentLoop: autonomous tool-use loop
-        config/              # Config loading, provider configs
-        conversation/        # Message types, windowed context
-        provider/            # LlmProvider trait + OpenAI/Claude/Ollama
-        tool/                # Tool trait + built-in tool implementations
-        stream/              # StreamEvent protocol
-    atomcode-tui/            # Terminal UI (ratatui + crossterm)
-      src/
-        app.rs               # App state machine
-        ui/                  # Render: chat, input, status bar, markdown
-    atomcode-cli/            # Binary entry point
-      src/
-        main.rs              # CLI args, first-run wizard, launch
 ```
 
 ### Useful Commands
@@ -383,10 +393,10 @@ Contributions are welcome! AtomCode is in active development.
 
 ### How to Contribute
 
-1. **Fork** the repository on GitHub
+1. **Fork** the repository on AtomGit
 2. **Clone** your fork locally:
    ```bash
-   git clone https://gitcode.com/<your-username>/atomcode.git
+   git clone https://atomgit.com/<your-username>/atomcode.git
    cd atomcode
    ```
 3. **Create a branch** for your change:
@@ -420,7 +430,7 @@ Contributions are welcome! AtomCode is in active development.
 - Follow the project's core principles — especially **tech-stack neutrality**
   (no language/framework-specific logic in the core engine; detect via probes
   like `package.json` / `Cargo.toml` / `pom.xml` and route through adapters)
-- All tool failures must be graceful — return error as observation to the LLM, never panic
+- All tool failures must be graceful — return the error as an observation to the LLM, never panic
 - Destructive operations must require user approval
 - Keep the system prompt compact (~1.5K tokens)
 - Run `cargo fmt` and `cargo clippy` before submitting
@@ -430,7 +440,7 @@ Contributions are welcome! AtomCode is in active development.
 - **Add a new tool** — implement the `Tool` trait in `crates/atomcode-core/src/tool/`
 - **Add a new provider** — implement `LlmProvider` in `crates/atomcode-core/src/provider/`
 - **Improve the UI** — rendering lives in `crates/atomcode-tui/src/ui/`
-- **Fix bugs** — check [Issues](https://gitcode.com/bangxu/atomcode/issues) for open bugs
+- **Fix bugs** — check [Issues](https://atomgit.com/atomgit_atomcode/atomcode/issues) for open bugs
 
 ## License
 

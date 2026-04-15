@@ -75,19 +75,52 @@
     [data-theme="light"] .text-white { color: var(--text-primary) !important; }
     [data-theme="light"] .text-slate-300 { color: #334155 !important; }
     [data-theme="light"] .text-slate-400 { color: #475569 !important; }
-    [data-theme="light"] .text-slate-500 { color: #475569 !important; }
-    [data-theme="light"] .text-slate-600 { color: #334155 !important; }
+    [data-theme="light"] .text-slate-500 { color: #64748b !important; }
+    [data-theme="light"] .text-slate-600 { color: #94a3b8 !important; }
     [data-theme="light"] .border-white\/5 { border-color: var(--border-color) !important; }
-    [data-theme="light"] .bg-white\/5 { background: rgba(0,0,0,0.04); }
-    [data-theme="light"] .bg-white\/10 { background: rgba(0,0,0,0.06); }
-    [data-theme="light"] .hover\:bg-white\/10:hover { background: rgba(0,0,0,0.06); }
-    [data-theme="light"] .shadow-black\/50 { box-shadow: 0 25px 50px -12px rgba(0,0,0,0.15); }
-    [data-theme="light"] .glass { background: rgba(255,255,255,0.8); border-color: rgba(0,0,0,0.08); }
-    [data-theme="light"] #settingsDropdown { background: rgba(255,255,255,0.95); border-color: rgba(0,0,0,0.08); }
-    
+    [data-theme="light"] .border-white\/10 { border-color: rgba(0,0,0,0.12) !important; }
+    [data-theme="light"] .bg-white\/5 { background: rgba(15,23,42,0.04); }
+    [data-theme="light"] .bg-white\/10 { background: rgba(15,23,42,0.06); }
+    [data-theme="light"] .hover\:bg-white\/10:hover { background: rgba(15,23,42,0.08); }
+    [data-theme="light"] .shadow-black\/50 { box-shadow: 0 25px 50px -12px rgba(15,23,42,0.15); }
+    [data-theme="light"] .glass { background: rgba(255,255,255,0.85); border-color: rgba(15,23,42,0.08); box-shadow: 0 1px 3px rgba(15,23,42,0.04); }
+    [data-theme="light"] #settingsDropdown { background: rgba(255,255,255,0.98); border-color: rgba(15,23,42,0.08); }
+
+    /* Light theme accent colors — darkened for AA contrast on white bg */
+    [data-theme="light"] .text-brand-400 { color: #7c3aed !important; }
+    [data-theme="light"] .text-emerald-400 { color: #059669 !important; }
+    [data-theme="light"] .text-amber-400 { color: #b45309 !important; }
+    [data-theme="light"] .text-cyan-400 { color: #0e7490 !important; }
+    [data-theme="light"] .text-rose-400 { color: #be123c !important; }
+    [data-theme="light"] .text-red-400 { color: #b91c1c !important; }
+    [data-theme="light"] .text-indigo-400 { color: #4338ca !important; }
+    [data-theme="light"] .text-fuchsia-400 { color: #a21caf !important; }
+    [data-theme="light"] .text-teal-400 { color: #0f766e !important; }
+    [data-theme="light"] .text-sky-400 { color: #0369a1 !important; }
+    [data-theme="light"] .text-blue-400 { color: #1d4ed8 !important; }
+    [data-theme="light"] .text-yellow-400 { color: #a16207 !important; }
+    [data-theme="light"] .text-green-400 { color: #15803d !important; }
+
+    /* Keep white text on solid brand-colored buttons/surfaces in light mode.
+       Without this, the global .text-white override above would turn the
+       "Get Started" button label dark on a purple background. */
+    [data-theme="light"] .bg-brand-600.text-white,
+    [data-theme="light"] .bg-brand-500.text-white,
+    [data-theme="light"] .bg-brand-700.text-white,
+    [data-theme="light"] .bg-brand-600 .text-white,
+    [data-theme="light"] .bg-brand-500 .text-white,
+    [data-theme="light"] .bg-brand-700 .text-white { color: #ffffff !important; }
+
     /* Light theme hover fixes */
-    [data-theme="light"] .hover\:text-white:hover { color: #2563eb !important; }
-    [data-theme="light"] .hover\:bg-white\/5:hover { background: rgba(37,99,235,0.08); }
+    [data-theme="light"] .hover\:text-white:hover { color: #7c3aed !important; }
+    [data-theme="light"] .hover\:bg-white\/5:hover { background: rgba(124,58,237,0.06); }
+
+    /* Light theme nav & code-block tweaks */
+    [data-theme="light"] nav { box-shadow: 0 1px 0 rgba(15,23,42,0.06); }
+    [data-theme="light"] .code-block { background: #f1f5f9; border-color: rgba(15,23,42,0.08); }
+    [data-theme="light"] ::-webkit-scrollbar-thumb { background: #cbd5e1; }
+    [data-theme="light"] .stat-glow { box-shadow: 0 1px 20px rgba(124,58,237,0.06); }
+    [data-theme="light"] .table-row:hover { background: rgba(124,58,237,0.05); }
     
     /* Mobile table scroll */
     .table-container { overflow-x: auto; -webkit-overflow-scrolling: touch; }
@@ -109,7 +142,7 @@
       <div class="flex items-center gap-2 md:gap-3 flex-shrink-0">
         <img src="https://cdn-news.gitcode.com/news/atomcode.png" alt="AtomCode" class="w-7 h-7 md:w-8 md:h-8 rounded-lg">
         <span class="text-base md:text-lg font-semibold tracking-tight">AtomCode</span>
-        <span class="text-xs px-1.5 md:px-2 py-0.5 rounded-full bg-brand-600/20 text-brand-400 font-medium">v2.3.0</span>
+        <span class="text-xs px-1.5 md:px-2 py-0.5 rounded-full bg-brand-600/20 text-brand-400 font-medium">v4.15.1</span>
       </div>
       
       <!-- Center: Navigation Links (Desktop) -->
@@ -117,7 +150,7 @@
         <a href="#features" class="hover:text-white transition" data-i18n="nav.features">功能特性</a>
         <a href="#comparison" class="hover:text-white transition" data-i18n="nav.comparison">对比 Claude Code</a>
         <a href="#install" class="hover:text-white transition" data-i18n="nav.install">安装指南</a>
-        <a href="https://atomgit.com/bangxu/atomcode" target="_blank" class="hover:text-white transition flex items-center gap-1.5">
+        <a href="https://atomgit.com/atomgit_atomcode/atomcode" target="_blank" class="hover:text-white transition flex items-center gap-1.5">
           <img src="https://cdn-static.gitcode.host/static/images/logo-favicon.png" alt="AtomGit" class="w-4 h-4">
           <span data-i18n="nav.repo">开源仓库</span>
         </a>
@@ -191,7 +224,7 @@
           <a href="#features" class="mobile-nav-link px-4 py-3 text-base text-slate-300 hover:text-white hover:bg-white/5 transition border-b border-white/5" data-i18n="nav.features">功能特性</a>
           <a href="#comparison" class="mobile-nav-link px-4 py-3 text-base text-slate-300 hover:text-white hover:bg-white/5 transition border-b border-white/5" data-i18n="nav.comparison">对比 Claude Code</a>
           <a href="#install" class="mobile-nav-link px-4 py-3 text-base text-slate-300 hover:text-white hover:bg-white/5 transition border-b border-white/5" data-i18n="nav.install">安装指南</a>
-          <a href="https://atomgit.com/bangxu/atomcode" target="_blank" class="mobile-nav-link px-4 py-3 text-base text-slate-300 hover:text-white hover:bg-white/5 transition flex items-center gap-2">
+          <a href="https://atomgit.com/atomgit_atomcode/atomcode" target="_blank" class="mobile-nav-link px-4 py-3 text-base text-slate-300 hover:text-white hover:bg-white/5 transition flex items-center gap-2">
             <img src="https://cdn-static.gitcode.host/static/images/logo-favicon.png" alt="AtomGit" class="w-5 h-5">
             <span data-i18n="nav.repo">开源仓库</span>
           </a>
@@ -273,15 +306,15 @@
   <section class="py-16 border-y border-white/5">
     <div class="max-w-5xl mx-auto px-6 grid grid-cols-2 md:grid-cols-4 gap-6">
       <div class="text-center glass rounded-2xl p-6 stat-glow">
-        <div class="text-3xl font-bold text-brand-400 mb-1">10</div>
+        <div class="text-3xl font-bold text-brand-400 mb-1">21</div>
         <div class="text-sm text-slate-500" data-i18n="stats.tools">内置工具</div>
       </div>
       <div class="text-center glass rounded-2xl p-6 stat-glow">
-        <div class="text-3xl font-bold text-emerald-400 mb-1">2-3</div>
-        <div class="text-sm text-slate-500" data-i18n="stats.steps">简单任务步骤</div>
+        <div class="text-3xl font-bold text-emerald-400 mb-1">8</div>
+        <div class="text-sm text-slate-500" data-i18n="stats.graph">代码图谱工具</div>
       </div>
       <div class="text-center glass rounded-2xl p-6 stat-glow">
-        <div class="text-3xl font-bold text-cyan-400 mb-1">7+</div>
+        <div class="text-3xl font-bold text-cyan-400 mb-1">8+</div>
         <div class="text-sm text-slate-500" data-i18n="stats.providers">支持的模型</div>
       </div>
       <div class="text-center glass rounded-2xl p-6 stat-glow">
@@ -301,33 +334,33 @@
       <div class="grid md:grid-cols-3 gap-5">
         <div class="glass rounded-2xl p-6 hover:border-brand-600/30 transition group">
           <div class="w-10 h-10 rounded-xl bg-brand-600/15 flex items-center justify-center text-brand-400 text-lg mb-4 group-hover:bg-brand-600/25 transition">&#9881;</div>
-          <h3 class="text-base font-semibold mb-2" data-i18n="features.agent.title">智能循环</h3>
-          <p class="text-sm text-slate-400 leading-relaxed" data-i18n="features.agent.desc">自主多步骤执行。读取、编辑、运行、验证 — 循环执行直到任务完成。</p>
+          <h3 class="text-base font-semibold mb-2" data-i18n="features.agent.title">智能 Agent 循环</h3>
+          <p class="text-sm text-slate-400 leading-relaxed" data-i18n="features.agent.desc">自主多步执行：读取、编辑、运行、网络检索、自我验证 —— 循环执行直至任务完成。</p>
         </div>
         <div class="glass rounded-2xl p-6 hover:border-brand-600/30 transition group">
           <div class="w-10 h-10 rounded-xl bg-cyan-600/15 flex items-center justify-center text-cyan-400 text-lg mb-4 group-hover:bg-cyan-600/25 transition">&#9729;</div>
           <h3 class="text-base font-semibold mb-2" data-i18n="features.provider.title">多模型支持</h3>
-          <p class="text-sm text-slate-400 leading-relaxed" data-i18n="features.provider.desc">OpenAI、Claude、DeepSeek、GLM、Qwen、Ollama — 连接任意 OpenAI 兼容 API。</p>
+          <p class="text-sm text-slate-400 leading-relaxed" data-i18n="features.provider.desc">Claude、OpenAI、DeepSeek、GLM、Qwen、Ollama —— 任意 OpenAI 兼容 API 皆可接入，国产大模型一视同仁。</p>
+        </div>
+        <div class="glass rounded-2xl p-6 hover:border-brand-600/30 transition group">
+          <div class="w-10 h-10 rounded-xl bg-fuchsia-600/15 flex items-center justify-center text-fuchsia-400 text-lg mb-4 group-hover:bg-fuchsia-600/25 transition">&#128279;</div>
+          <h3 class="text-base font-semibold mb-2" data-i18n="features.graph.title">代码图谱</h3>
+          <p class="text-sm text-slate-400 leading-relaxed" data-i18n="features.graph.desc">符号索引、调用链追踪、引用查找、影响面分析 —— 8 个内置工具让模型真正读懂大型代码库。</p>
         </div>
         <div class="glass rounded-2xl p-6 hover:border-brand-600/30 transition group">
           <div class="w-10 h-10 rounded-xl bg-emerald-600/15 flex items-center justify-center text-emerald-400 text-lg mb-4 group-hover:bg-emerald-600/25 transition">&#9888;</div>
-          <h3 class="text-base font-semibold mb-2" data-i18n="features.safety.title">安全优先</h3>
-          <p class="text-sm text-slate-400 leading-relaxed" data-i18n="features.safety.desc">危险命令需要确认。错误不会导致崩溃 — 它们会成为 LLM 的观察信息。</p>
+          <h3 class="text-base font-semibold mb-2" data-i18n="features.safety.title">安全与一键回滚</h3>
+          <p class="text-sm text-slate-400 leading-relaxed" data-i18n="features.safety.desc">危险命令需显式确认，工具错误不崩溃而是成为模型的观察信息；<code class="text-brand-400">/undo</code> 一键回滚上一轮所有文件编辑。</p>
         </div>
         <div class="glass rounded-2xl p-6 hover:border-brand-600/30 transition group">
-          <div class="w-10 h-10 rounded-xl bg-amber-600/15 flex items-center justify-center text-amber-400 text-lg mb-4 group-hover:bg-amber-600/25 transition">&#128270;</div>
-          <h3 class="text-base font-semibold mb-2" data-i18n="features.web.title">网络搜索</h3>
-          <p class="text-sm text-slate-400 leading-relaxed" data-i18n="features.web.desc">搜索网页并获取文档。不再有"我无法访问互联网"的限制。</p>
+          <div class="w-10 h-10 rounded-xl bg-teal-600/15 flex items-center justify-center text-teal-400 text-lg mb-4 group-hover:bg-teal-600/25 transition">&#128274;</div>
+          <h3 class="text-base font-semibold mb-2" data-i18n="features.atomgit.title">AtomGit 原生集成</h3>
+          <p class="text-sm text-slate-400 leading-relaxed" data-i18n="features.atomgit.desc">AtomGit OAuth 一键登录、终端内 <code class="text-brand-400">/issue</code> 创建 Issue、企业微信扫码登录 —— 与 AtomGit 开源生态无缝对接。</p>
         </div>
         <div class="glass rounded-2xl p-6 hover:border-brand-600/30 transition group">
-          <div class="w-10 h-10 rounded-xl bg-rose-600/15 flex items-center justify-center text-rose-400 text-lg mb-4 group-hover:bg-rose-600/25 transition">&#128640;</div>
-          <h3 class="text-base font-semibold mb-2" data-i18n="features.weak.title">弱模型优化</h3>
-          <p class="text-sm text-slate-400 leading-relaxed" data-i18n="features.weak.desc">三层 JSON 修复、grep 字面回退、详细错误诊断。让廉价模型也能工作。</p>
-        </div>
-        <div class="glass rounded-2xl p-6 hover:border-brand-600/30 transition group">
-          <div class="w-10 h-10 rounded-xl bg-indigo-600/15 flex items-center justify-center text-indigo-400 text-lg mb-4 group-hover:bg-indigo-600/25 transition">&#128187;</div>
-          <h3 class="text-base font-semibold mb-2" data-i18n="features.cross.title">跨平台</h3>
-          <p class="text-sm text-slate-400 leading-relaxed" data-i18n="features.cross.desc">macOS (ARM + Intel)、Windows、Linux。平台感知的 Shell、剪贴板和系统提示。</p>
+          <div class="w-10 h-10 rounded-xl bg-sky-600/15 flex items-center justify-center text-sky-400 text-lg mb-4 group-hover:bg-sky-600/25 transition">&#128221;</div>
+          <h3 class="text-base font-semibold mb-2" data-i18n="features.session.title">会话与 Skills</h3>
+          <p class="text-sm text-slate-400 leading-relaxed" data-i18n="features.session.desc">持久化会话 <code class="text-brand-400">/resume</code> 随时恢复，自定义 Skill 扩展斜杠命令；支持 Headless 模式与 Daemon HTTP API。</p>
         </div>
       </div>
     </div>
@@ -357,21 +390,15 @@
           </thead>
           <tbody class="text-slate-300">
             <tr class="table-row border-b border-white/5">
-              <td class="px-6 py-3.5" data-i18n="comparison.task1">简单编辑（样式修改）</td>
-              <td class="px-6 py-3.5 text-center font-mono text-brand-400">2-3 步</td>
-              <td class="px-6 py-3.5 text-center font-mono text-slate-400">2-3 步</td>
-              <td class="px-6 py-3.5 text-center"><span class="px-2.5 py-1 rounded-full bg-emerald-500/10 text-emerald-400 text-xs font-medium" data-i18n="comparison.equal">持平</span></td>
-            </tr>
-            <tr class="table-row border-b border-white/5">
-              <td class="px-6 py-3.5" data-i18n="comparison.task2">模块重构</td>
-              <td class="px-6 py-3.5 text-center font-mono text-brand-400">9-10 步</td>
-              <td class="px-6 py-3.5 text-center font-mono text-slate-400">8-10 步</td>
-              <td class="px-6 py-3.5 text-center"><span class="px-2.5 py-1 rounded-full bg-emerald-500/10 text-emerald-400 text-xs font-medium" data-i18n="comparison.equal">持平</span></td>
-            </tr>
-            <tr class="table-row border-b border-white/5">
               <td class="px-6 py-3.5" data-i18n="comparison.task3">启动开发服务器</td>
               <td class="px-6 py-3.5 text-center font-mono text-brand-400">1 步</td>
               <td class="px-6 py-3.5 text-center font-mono text-slate-400">1 步</td>
+              <td class="px-6 py-3.5 text-center"><span class="px-2.5 py-1 rounded-full bg-emerald-500/10 text-emerald-400 text-xs font-medium" data-i18n="comparison.equal">持平</span></td>
+            </tr>
+            <tr class="table-row border-b border-white/5">
+              <td class="px-6 py-3.5" data-i18n="comparison.task1">简单编辑（样式修改）</td>
+              <td class="px-6 py-3.5 text-center font-mono text-brand-400">2-3 步</td>
+              <td class="px-6 py-3.5 text-center font-mono text-slate-400">2-3 步</td>
               <td class="px-6 py-3.5 text-center"><span class="px-2.5 py-1 rounded-full bg-emerald-500/10 text-emerald-400 text-xs font-medium" data-i18n="comparison.equal">持平</span></td>
             </tr>
             <tr class="table-row border-b border-white/5">
@@ -379,6 +406,12 @@
               <td class="px-6 py-3.5 text-center font-mono text-brand-400">4-6 步</td>
               <td class="px-6 py-3.5 text-center font-mono text-slate-400">3-5 步</td>
               <td class="px-6 py-3.5 text-center"><span class="px-2.5 py-1 rounded-full bg-sky-500/10 text-sky-400 text-xs font-medium" data-i18n="comparison.close">接近</span></td>
+            </tr>
+            <tr class="table-row border-b border-white/5">
+              <td class="px-6 py-3.5" data-i18n="comparison.task2">模块重构</td>
+              <td class="px-6 py-3.5 text-center font-mono text-brand-400">9-10 步</td>
+              <td class="px-6 py-3.5 text-center font-mono text-slate-400">8-10 步</td>
+              <td class="px-6 py-3.5 text-center"><span class="px-2.5 py-1 rounded-full bg-emerald-500/10 text-emerald-400 text-xs font-medium" data-i18n="comparison.equal">持平</span></td>
             </tr>
             <tr class="table-row">
               <td class="px-6 py-3.5" data-i18n="comparison.task5">复杂任务（新库+调试）</td>
@@ -406,14 +439,14 @@
           </thead>
           <tbody class="text-slate-300">
             <tr class="table-row border-b border-white/5">
-              <td class="px-6 py-3" data-i18n="comp.f1">开源免费</td>
-              <td class="px-6 py-3 text-center text-emerald-400">&#10003;</td>
-              <td class="px-6 py-3 text-center text-slate-600">&#10007;</td>
+              <td class="px-6 py-3" data-i18n="comp.f1">开源协议</td>
+              <td class="px-6 py-3 text-center text-emerald-400" data-i18n="comp.mit">&#10003; MIT 开源</td>
+              <td class="px-6 py-3 text-center text-slate-500" data-i18n="comp.closed">闭源</td>
             </tr>
             <tr class="table-row border-b border-white/5">
-              <td class="px-6 py-3" data-i18n="comp.f2">自定义大模型</td>
+              <td class="px-6 py-3" data-i18n="comp.f2">模型接入</td>
               <td class="px-6 py-3 text-center text-emerald-400" data-i18n="comp.any">&#10003; 任意 OpenAI 兼容</td>
-              <td class="px-6 py-3 text-center text-slate-600" data-i18n="comp.claudeonly">仅 Claude</td>
+              <td class="px-6 py-3 text-center text-slate-500" data-i18n="comp.claudeonly">仅 Claude</td>
             </tr>
             <tr class="table-row border-b border-white/5">
               <td class="px-6 py-3" data-i18n="comp.f3">本地模型 (Ollama)</td>
@@ -421,14 +454,19 @@
               <td class="px-6 py-3 text-center text-slate-600">&#10007;</td>
             </tr>
             <tr class="table-row border-b border-white/5">
-              <td class="px-6 py-3" data-i18n="comp.f4">弱模型优化</td>
-              <td class="px-6 py-3 text-center text-emerald-400" data-i18n="comp.jsonrepair">&#10003; JSON 修复 + 回退</td>
-              <td class="px-6 py-3 text-center text-slate-500" data-i18n="comp.notneeded">无需</td>
+              <td class="px-6 py-3" data-i18n="comp.fgraph">代码图谱工具</td>
+              <td class="px-6 py-3 text-center text-emerald-400" data-i18n="comp.graph8">&#10003; 8 个内置</td>
+              <td class="px-6 py-3 text-center text-slate-500" data-i18n="comp.basic">基础文本检索</td>
             </tr>
             <tr class="table-row border-b border-white/5">
-              <td class="px-6 py-3" data-i18n="comp.f5">网络搜索与获取</td>
+              <td class="px-6 py-3" data-i18n="comp.fundo"><code class="text-brand-400">/undo</code> 一键回滚</td>
               <td class="px-6 py-3 text-center text-emerald-400">&#10003;</td>
-              <td class="px-6 py-3 text-center text-emerald-400">&#10003;</td>
+              <td class="px-6 py-3 text-center text-slate-500" data-i18n="comp.viagit">手动 git</td>
+            </tr>
+            <tr class="table-row border-b border-white/5">
+              <td class="px-6 py-3" data-i18n="comp.fatomgit">AtomGit 原生集成</td>
+              <td class="px-6 py-3 text-center text-emerald-400" data-i18n="comp.oauthissue">&#10003; OAuth + /issue</td>
+              <td class="px-6 py-3 text-center text-slate-600">&#10007;</td>
             </tr>
             <tr class="table-row border-b border-white/5">
               <td class="px-6 py-3" data-i18n="comp.f6">MCP 支持</td>
@@ -452,36 +490,6 @@
     </div>
   </section>
 
-  <!-- Progress -->
-  <section class="py-24 border-t border-white/5">
-    <div class="max-w-4xl mx-auto px-6 text-center">
-      <h2 class="text-3xl md:text-4xl font-bold mb-4" data-i18n="progress.title">从 35 步到 3 步</h2>
-      <p class="text-slate-400 text-lg mb-12" data-i18n="progress.desc">三天的优化让 AtomCode 从原型达到 Claude Code 水平。</p>
-      <div class="flex flex-col md:flex-row items-center justify-center gap-4">
-        <div class="glass rounded-2xl p-8 flex-1 max-w-xs">
-          <div class="text-sm text-slate-500 mb-2 font-medium">v1.0 — <span data-i18n="progress.day1">第一天</span></div>
-          <div class="text-4xl font-bold text-red-400 mb-2">35+</div>
-          <div class="text-sm text-slate-500" data-i18n="progress.steps1">简单任务步骤数</div>
-          <div class="text-xs text-slate-600 mt-2" data-i18n="progress.note1">复杂任务经常失败</div>
-        </div>
-        <div class="text-3xl text-slate-600">&#8594;</div>
-        <div class="glass rounded-2xl p-8 flex-1 max-w-xs">
-          <div class="text-sm text-slate-500 mb-2 font-medium">v1.2 — <span data-i18n="progress.day2">第二天</span></div>
-          <div class="text-4xl font-bold text-amber-400 mb-2">9-10</div>
-          <div class="text-sm text-slate-500" data-i18n="progress.steps2">中等任务步骤数</div>
-          <div class="text-xs text-slate-600 mt-2" data-i18n="progress.note2">接近 Claude Code 水平</div>
-        </div>
-        <div class="text-3xl text-slate-600">&#8594;</div>
-        <div class="glass rounded-2xl p-8 flex-1 max-w-xs stat-glow">
-          <div class="text-sm text-brand-400 mb-2 font-medium">v1.3 — <span data-i18n="progress.day3">第三天</span></div>
-          <div class="text-4xl font-bold text-emerald-400 mb-2">2-3</div>
-          <div class="text-sm text-slate-500" data-i18n="progress.steps3">简单任务步骤数</div>
-          <div class="text-xs text-emerald-400/60 mt-2" data-i18n="progress.note3">达到 Claude Code 水平</div>
-        </div>
-      </div>
-    </div>
-  </section>
-
   <!-- Install -->
   <section id="install" class="py-24 border-t border-white/5">
     <div class="max-w-3xl mx-auto px-6">
@@ -491,19 +499,25 @@
       </div>
       <div class="space-y-4">
         <div class="code-block rounded-xl p-5">
+          <div class="text-xs text-slate-500 mb-3 font-medium" data-i18n="install.oneclick">一键安装（macOS / Linux）</div>
+          <pre class="font-mono text-sm text-emerald-400 whitespace-pre-wrap break-all">curl -fsSL https://gitcode.com/atomgit_atomcode/atomcode-release/releases/download/v4.15.1/install.sh | sh</pre>
+        </div>
+        <div class="code-block rounded-xl p-5">
           <div class="text-xs text-slate-500 mb-3 font-medium" data-i18n="install.build">从源码构建</div>
-          <pre class="font-mono text-sm text-emerald-400">git clone https://atomgit.com/bangxu/atomcode.git
+          <pre class="font-mono text-sm text-emerald-400">git clone https://atomgit.com/atomgit_atomcode/atomcode.git
 cd atomcode
 cargo build --release
 cp target/release/atomcode ~/.local/bin/</pre>
         </div>
         <div class="code-block rounded-xl p-5">
-          <div class="text-xs text-slate-500 mb-3 font-medium" data-i18n="install.wizard">首次运行 — 设置向导</div>
+          <div class="text-xs text-slate-500 mb-3 font-medium" data-i18n="install.wizard">首次运行 — 欢迎界面</div>
           <pre class="font-mono text-sm"><span class="text-slate-400">$</span> <span class="text-emerald-400">atomcode</span>
 
-<span class="text-slate-300" data-i18n="install.welcome">欢迎使用 AtomCode！请选择模型提供商：</span>
-  <span class="text-slate-400">[1]</span> Claude     <span class="text-slate-400">[2]</span> OpenAI
-  <span class="text-slate-400">[3]</span> DeepSeek   <span class="text-slate-400">[4]</span> Ollama (本地)</pre>
+<span class="text-slate-300" data-i18n="install.welcome">欢迎使用 AtomCode · 开始使用：</span>
+
+  <span class="text-brand-400">&#9656;</span> <span class="text-white font-semibold">Login with AtomGit</span>   <span class="text-slate-500" data-i18n="install.oauth">OAuth · 推荐</span>
+    <span class="text-slate-300">Configure manually</span>   <span class="text-slate-500" data-i18n="install.apikey">API Key</span>
+    <span class="text-slate-300">Skip for now</span>          <span class="text-slate-500" data-i18n="install.skip">先看看再说</span></pre>
         </div>
         <div class="code-block rounded-xl p-5">
           <div class="text-xs text-slate-500 mb-3 font-medium" data-i18n="install.download">或下载预编译二进制文件</div>
@@ -534,7 +548,7 @@ cp target/release/atomcode ~/.local/bin/</pre>
         <span class="text-sm text-slate-500" data-i18n="footer.tagline">AtomCode · 开源终端 AI 编码助手</span>
       </div>
       <div class="flex items-center gap-6 text-sm text-slate-500">
-        <a href="https://atomgit.com/bangxu/atomcode" class="hover:text-white transition">AtomGit</a>
+        <a href="https://atomgit.com/atomgit_atomcode/atomcode" class="hover:text-white transition">AtomGit</a>
         <span data-i18n="footer.license">MIT 许可证</span>
         <span data-i18n="footer.rust">用 Rust 构建</span>
       </div>
@@ -553,29 +567,33 @@ cp target/release/atomcode ~/.local/bin/</pre>
         'terminal.task': '修复登录后 404 的 bug', 'terminal.investigate': '我来检查 OAuth 回调处理器。',
         'terminal.read': '读取文件', 'terminal.edit': '编辑文件', 'terminal.edited': '已编辑 src/auth/callback.ts',
         'terminal.build': '构建成功', 'terminal.fixed': '已修复。重定向 URL 缺少基础路径。',
-        'stats.tools': '内置工具', 'stats.steps': '简单任务步骤', 'stats.providers': '支持的模型', 'stats.platforms': '支持平台',
+        'stats.tools': '内置工具', 'stats.graph': '代码图谱工具', 'stats.providers': '支持的模型', 'stats.platforms': '支持平台',
         'features.title': '功能齐全', 'features.desc': '为需要 Claude Code 强大能力但想使用任意大模型的开发者打造。',
-        'features.agent.title': '智能循环', 'features.agent.desc': '自主多步骤执行。读取、编辑、运行、验证 — 循环执行直到任务完成。',
-        'features.provider.title': '多模型支持', 'features.provider.desc': 'OpenAI、Claude、DeepSeek、GLM、Qwen、Ollama — 连接任意 OpenAI 兼容 API。',
-        'features.safety.title': '安全优先', 'features.safety.desc': '危险命令需要确认。错误不会导致崩溃 — 它们会成为 LLM 的观察信息。',
-        'features.web.title': '网络搜索', 'features.web.desc': '搜索网页并获取文档。不再有"我无法访问互联网"的限制。',
-        'features.weak.title': '弱模型优化', 'features.weak.desc': '三层 JSON 修复、grep 字面回退、详细错误诊断。让廉价模型也能工作。',
-        'features.cross.title': '跨平台', 'features.cross.desc': 'macOS (ARM + Intel)、Windows、Linux。平台感知的 Shell、剪贴板和系统提示。',
+        'features.agent.title': '智能 Agent 循环', 'features.agent.desc': '自主多步执行：读取、编辑、运行、网络检索、自我验证 —— 循环执行直至任务完成。',
+        'features.provider.title': '多模型支持', 'features.provider.desc': 'Claude、OpenAI、DeepSeek、GLM、Qwen、Ollama —— 任意 OpenAI 兼容 API 皆可接入，国产大模型一视同仁。',
+        'features.graph.title': '代码图谱', 'features.graph.desc': '符号索引、调用链追踪、引用查找、影响面分析 —— 8 个内置工具让模型真正读懂大型代码库。',
+        'features.safety.title': '安全与一键回滚', 'features.safety.desc': '危险命令需显式确认，工具错误不崩溃而是成为模型的观察信息；/undo 一键回滚上一轮所有文件编辑。',
+        'features.atomgit.title': 'AtomGit 原生集成', 'features.atomgit.desc': 'AtomGit OAuth 一键登录、终端内 /issue 创建 Issue、企业微信扫码登录 —— 与 AtomGit 开源生态无缝对接。',
+        'features.session.title': '会话与 Skills', 'features.session.desc': '持久化会话 /resume 随时恢复，自定义 Skill 扩展斜杠命令；支持 Headless 模式与 Daemon HTTP API。',
         'comparison.title': 'AtomCode 与 Claude Code 对比', 'comparison.desc': '相同模型基准测试。基于真实编程任务测量。',
         'comparison.performance': '任务性能（相同模型）', 'comparison.task': '任务类型', 'comparison.status': '状态', 'comparison.features': '功能对比', 'comparison.feature': '功能',
         'comparison.task1': '简单编辑（样式修改）', 'comparison.task2': '模块重构', 'comparison.task3': '启动开发服务器',
         'comparison.task4': 'Bug 修复', 'comparison.task5': '复杂任务（新库+调试）',
         'comparison.equal': '持平', 'comparison.close': '接近', 'comparison.gap': '差距 ~50%',
-        'comp.f1': '开源免费', 'comp.f2': '自定义大模型', 'comp.f3': '本地模型 (Ollama)', 'comp.f4': '弱模型优化',
-        'comp.f5': '网络搜索与获取', 'comp.f6': 'MCP 支持', 'comp.f7': '视觉 / 截图', 'comp.f8': '费用',
-        'comp.any': '✓ 任意 OpenAI 兼容', 'comp.claudeonly': '仅 Claude', 'comp.jsonrepair': '✓ JSON 修复 + 回退',
-        'comp.notneeded': '无需', 'comp.planned': '计划中', 'comp.yourcost': '仅 API 费用', 'comp.sub': '订阅 + API',
-        'progress.title': '从 35 步到 3 步', 'progress.desc': '三天的优化让 AtomCode 从原型达到 Claude Code 水平。',
-        'progress.day1': '第一天', 'progress.day2': '第二天', 'progress.day3': '第三天',
-        'progress.steps1': '简单任务步骤数', 'progress.steps2': '中等任务步骤数', 'progress.steps3': '简单任务步骤数',
-        'progress.note1': '复杂任务经常失败', 'progress.note2': '接近 Claude Code 水平', 'progress.note3': '达到 Claude Code 水平',
-        'install.title': '30 秒快速开始', 'install.desc': '克隆、构建、运行。就是这么简单。',
-        'install.build': '从源码构建', 'install.wizard': '首次运行 — 设置向导', 'install.welcome': '欢迎使用 AtomCode！请选择模型提供商：',
+        'comp.f1': '开源协议', 'comp.f2': '模型接入', 'comp.f3': '本地模型 (Ollama)',
+        'comp.fgraph': '代码图谱工具', 'comp.fundo': '/undo 一键回滚',
+        'comp.fatomgit': 'AtomGit 原生集成',
+        'comp.f6': 'MCP 支持', 'comp.f7': '视觉 / 截图', 'comp.f8': '费用',
+        'comp.mit': '✓ MIT 开源', 'comp.closed': '闭源',
+        'comp.any': '✓ 任意 OpenAI 兼容', 'comp.claudeonly': '仅 Claude',
+        'comp.graph8': '✓ 8 个内置', 'comp.basic': '基础文本检索',
+        'comp.viagit': '手动 git',
+        'comp.oauthissue': '✓ OAuth + /issue',
+        'comp.planned': '计划中', 'comp.yourcost': '仅 API 费用', 'comp.sub': '订阅 + API',
+        'install.title': '30 秒快速开始', 'install.desc': '一条命令完成安装，就是这么简单！',
+        'install.oneclick': '一键安装（macOS / Linux）',
+        'install.build': '从源码构建', 'install.wizard': '首次运行 — 欢迎界面', 'install.welcome': '欢迎使用 AtomCode · 开始使用：',
+        'install.oauth': 'OAuth · 推荐', 'install.apikey': 'API Key', 'install.skip': '先看看再说',
         'install.download': '或下载预编译二进制文件', 'install.apple': 'Apple Silicon',
         'footer.tagline': 'AtomCode · 开源终端 AI 编码助手', 'footer.license': 'MIT 许可证', 'footer.rust': '用 Rust 构建'
       },
@@ -588,29 +606,33 @@ cp target/release/atomcode ~/.local/bin/</pre>
         'terminal.task': 'Fix the login bug where users get 404 after OAuth', 'terminal.investigate': "I'll investigate the OAuth callback handler.",
         'terminal.read': 'Read File', 'terminal.edit': 'Edit File', 'terminal.edited': 'Edited src/auth/callback.ts',
         'terminal.build': 'Build succeeded', 'terminal.fixed': 'Fixed. The redirect URL was missing the base path.',
-        'stats.tools': 'Built-in Tools', 'stats.steps': 'Steps for Simple Tasks', 'stats.providers': 'LLM Providers', 'stats.platforms': 'Platforms',
+        'stats.tools': 'Built-in Tools', 'stats.graph': 'Code Graph Tools', 'stats.providers': 'LLM Providers', 'stats.platforms': 'Platforms',
         'features.title': 'Everything You Need', 'features.desc': "Built for developers who want Claude Code's power with any LLM provider.",
-        'features.agent.title': 'Agent Loop', 'features.agent.desc': 'Autonomous multi-step execution. Read, edit, run, verify — all in a loop until the task is done.',
-        'features.provider.title': 'Multi-Provider', 'features.provider.desc': 'OpenAI, Claude, DeepSeek, GLM, Qwen, Ollama — connect any OpenAI-compatible API.',
-        'features.safety.title': 'Safety First', 'features.safety.desc': 'Destructive commands require approval. Errors never crash — they become observations for the LLM.',
-        'features.web.title': 'Web Search & Fetch', 'features.web.desc': 'Search the web and fetch documentation. No more "I can\'t access the internet".',
-        'features.weak.title': 'Weak Model Optimization', 'features.weak.desc': '3-layer JSON repair, grep literal fallback, detailed error diagnostics. Works with cheap models.',
-        'features.cross.title': 'Cross-Platform', 'features.cross.desc': 'macOS (ARM + Intel), Windows, Linux. Platform-aware shell, clipboard, and system prompt.',
+        'features.agent.title': 'Agent Loop', 'features.agent.desc': 'Autonomous multi-step execution: read, edit, run, web-search, self-verify — looping until the task is done.',
+        'features.provider.title': 'Multi-Provider', 'features.provider.desc': 'Claude, OpenAI, DeepSeek, GLM, Qwen, Ollama — connect any OpenAI-compatible API, with first-class support for Chinese models.',
+        'features.graph.title': 'Code Graph', 'features.graph.desc': 'Symbol index, call-chain tracing, reference lookup, blast-radius analysis — 8 built-in tools so the model truly understands large codebases.',
+        'features.safety.title': 'Safety & One-Click Undo', 'features.safety.desc': 'Destructive commands require approval; tool errors become observations instead of crashes; /undo rolls back every edit from the last turn.',
+        'features.atomgit.title': 'Native AtomGit Integration', 'features.atomgit.desc': 'AtomGit OAuth login, create issues via /issue from the terminal, WeCom QR login — seamlessly integrated with the AtomGit ecosystem.',
+        'features.session.title': 'Sessions & Skills', 'features.session.desc': 'Persistent sessions via /resume, custom Skills extending slash commands, plus headless mode and a daemon HTTP API.',
         'comparison.title': 'AtomCode vs Claude Code', 'comparison.desc': 'Same-model benchmarks. Measured on real-world coding tasks.',
         'comparison.performance': 'Task Performance (Same Model)', 'comparison.task': 'Task Type', 'comparison.status': 'Status', 'comparison.features': 'Feature Comparison', 'comparison.feature': 'Feature',
         'comparison.task1': 'Simple edit (style change)', 'comparison.task2': 'Module refactor', 'comparison.task3': 'Dev server launch',
         'comparison.task4': 'Bug fix', 'comparison.task5': 'Complex (new lib + debug)',
         'comparison.equal': 'Equal', 'comparison.close': 'Close', 'comparison.gap': 'Gap ~50%',
-        'comp.f1': 'Open source', 'comp.f2': 'Custom LLM provider', 'comp.f3': 'Local model (Ollama)', 'comp.f4': 'Weak model optimization',
-        'comp.f5': 'Web search & fetch', 'comp.f6': 'MCP support', 'comp.f7': 'Vision / screenshots', 'comp.f8': 'Cost',
-        'comp.any': '✓ Any OpenAI-compatible', 'comp.claudeonly': 'Claude only', 'comp.jsonrepair': '✓ JSON repair + fallbacks',
-        'comp.notneeded': 'Not needed', 'comp.planned': 'Planned', 'comp.yourcost': 'Your API costs only', 'comp.sub': 'Subscription + API',
-        'progress.title': 'From 35 Steps to 3', 'progress.desc': 'Three days of optimization transformed AtomCode from a prototype to Claude Code-level performance.',
-        'progress.day1': 'Day 1', 'progress.day2': 'Day 2', 'progress.day3': 'Day 3',
-        'progress.steps1': 'steps per simple task', 'progress.steps2': 'steps per medium task', 'progress.steps3': 'steps per simple task',
-        'progress.note1': 'Complex tasks often failed', 'progress.note2': 'Approaching Claude Code level', 'progress.note3': 'Claude Code level achieved',
-        'install.title': 'Get Started in 30 Seconds', 'install.desc': "Clone, build, run. That's it.",
-        'install.build': 'Build from source', 'install.wizard': 'First run — setup wizard', 'install.welcome': 'Welcome to AtomCode! Select provider:',
+        'comp.f1': 'License', 'comp.f2': 'Model access', 'comp.f3': 'Local model (Ollama)',
+        'comp.fgraph': 'Code graph tools', 'comp.fundo': '/undo rollback',
+        'comp.fatomgit': 'Native AtomGit integration',
+        'comp.f6': 'MCP support', 'comp.f7': 'Vision / screenshots', 'comp.f8': 'Cost',
+        'comp.mit': '✓ MIT open source', 'comp.closed': 'Closed source',
+        'comp.any': '✓ Any OpenAI-compatible', 'comp.claudeonly': 'Claude only',
+        'comp.graph8': '✓ 8 built-in', 'comp.basic': 'Basic text search',
+        'comp.viagit': 'Manual git',
+        'comp.oauthissue': '✓ OAuth + /issue',
+        'comp.planned': 'Planned', 'comp.yourcost': 'Your API costs only', 'comp.sub': 'Subscription + API',
+        'install.title': 'Get Started in 30 Seconds', 'install.desc': "One command to install. That's it.",
+        'install.oneclick': 'One-click install (macOS / Linux)',
+        'install.build': 'Build from source', 'install.wizard': 'First run — welcome screen', 'install.welcome': 'Welcome to AtomCode · Get started:',
+        'install.oauth': 'OAuth · recommended', 'install.apikey': 'API Key', 'install.skip': 'explore first',
         'install.download': 'Or download a pre-built binary', 'install.apple': 'Apple Silicon',
         'footer.tagline': 'AtomCode · Open source terminal AI coding agent', 'footer.license': 'MIT License', 'footer.rust': 'Built with Rust'
       }

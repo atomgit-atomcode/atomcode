@@ -170,7 +170,7 @@ async fn main() {
         if let Some(location) = info.location() {
             eprintln!("  at {}:{}:{}", location.file(), location.line(), location.column());
         }
-        eprintln!("\nPlease report this at: https://github.com/atomcode/atomcode/issues");
+        eprintln!("\nPlease report this at: https://atomgit.com/atomgit_atomcode/atomcode/issues");
     }));
 
     match run().await {
