@@ -25,6 +25,9 @@ pub const INTERNAL_PROVIDER_NAME: &str = "GitCode-Internal";
 
 #[cfg(not(debug_assertions))]
 const _RELEASE_GUARD: () = {
+    const fn starts_with_placeholder(s: &[u8]) -> bool {
+        s.len() >= 3 && s[0] == b'_' && s[1] == b'_' && s[2] == b'_'
+    }
     assert!(
         !starts_with_placeholder(BROKER_AUTHORIZE_URL.as_bytes()),
         "wecom_login: BROKER_AUTHORIZE_URL not filled — cannot build release with placeholder"
@@ -34,11 +37,6 @@ const _RELEASE_GUARD: () = {
         "wecom_login: BROKER_LOGIN_URL not filled — cannot build release with placeholder"
     );
 };
-
-#[cfg(not(debug_assertions))]
-const fn starts_with_placeholder(s: &[u8]) -> bool {
-    s.len() >= 3 && s[0] == b'_' && s[1] == b'_' && s[2] == b'_'
-}
 
 /// Identity returned by the broker after a successful exchange.
 #[derive(Debug, Clone)]
