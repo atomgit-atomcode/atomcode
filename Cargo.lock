@@ -101,7 +101,7 @@ dependencies = [
 
 [[package]]
 name = "atomcode"
-version = "4.15.0"
+version = "4.15.1"
 dependencies = [
  "anyhow",
  "atomcode-core",
@@ -119,7 +119,7 @@ dependencies = [
 
 [[package]]
 name = "atomcode-core"
-version = "4.15.0"
+version = "4.15.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -152,7 +152,7 @@ dependencies = [
 
 [[package]]
 name = "atomcode-daemon"
-version = "4.15.0"
+version = "4.15.1"
 dependencies = [
  "anyhow",
  "atomcode-core",
@@ -171,7 +171,7 @@ dependencies = [
 
 [[package]]
 name = "atomcode-tui"
-version = "4.15.0"
+version = "4.15.1"
 dependencies = [
  "anyhow",
  "atomcode-core",

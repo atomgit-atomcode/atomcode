@@ -18,7 +18,7 @@ panic = "abort"        # Remove panic unwinding code — saves ~200-500KB
 debug = "line-tables-only" # Smaller binaries, faster linker
 
 [workspace.package]
-version = "4.15.0"
+version = "4.15.1"
 edition = "2021"
 license = "MIT"
 repository = "https://gitcode.com/bangxu/atomcode"
