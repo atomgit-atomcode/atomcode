@@ -180,13 +180,7 @@ impl AgentLoop {
             || model_id.contains("kimi");
         if needs_cn_lock {
             prompt.push_str(
-                "\n=== 语言纪律（关键）===\n\
-                 所有 reasoning、计划、步骤说明必须用中文。禁止使用 \"I need to\"、\
-                 \"Let me\"、\"Now I'll\"、\"First,\"、\"Okay,\" 等英文 CoT 句式。\n\
-                 如果必须用英文想概念，请用 <think>...</think> 包裹，\
-                 用户可见的最终输出必须 100% 中文。\n\
-                 工具返回的英文内容（stack trace、log）需要用中文复述再处理。\n\
-                 违反这条视为严重错误。\n"
+                "\n用户可见的输出请用中文。工具调用和代码保持原样。\n"
             );
         }
 
