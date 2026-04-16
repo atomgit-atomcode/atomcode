@@ -231,7 +231,6 @@ pub struct App {
     /// Context budget: total context window size.
     pub context_window: usize,
     /// Suggested next prompt shown as ghost text in the input box.
-    pub suggestion: Option<String>,
     /// Cache of rendered lines for completed messages. Invalidated on message count change.
     pub render_cache: Vec<ratatui::text::Line<'static>>,
     pub render_cache_msg_count: usize,
@@ -364,7 +363,6 @@ impl App {
            ctx_used_tokens: 0,
            context_window: config.providers.get(&config.default_provider)
                .map(|p| p.context_window).unwrap_or(128000),
-           suggestion: None,
            render_cache: Vec::new(),
            render_cache_msg_count: 0,
            selection: TextSelection::new(),
@@ -405,72 +403,6 @@ impl App {
                              last_sent_input: None,
                     }
                 }
-
-    /// Generate a follow-up suggestion based on conversation context.
-    /// Language-agnostic: never references specific file extensions or build tools.
-    fn generate_suggestion(&self) -> Option<String> {
-        use atomcode_core::conversation::message::MessageContent;
-
-        let msgs = &self.conversation.messages;
-        if msgs.is_empty() {
-            return None;
-        }
-
-        let last = &msgs[msgs.len() - 1];
-
-        // Only scan last 20 messages (not entire conversation)
-        let recent = if msgs.len() > 20 { &msgs[msgs.len()-20..] } else { msgs.as_slice() };
-
-        let had_write = recent.iter().any(|m| matches!(&m.content,
-            MessageContent::AssistantWithToolCalls { tool_calls, .. }
-            if tool_calls.iter().any(|c| c.name == "create_file" || c.name == "edit_file")
-        ));
-        let had_bash = recent.iter().any(|m| matches!(&m.content,
-            MessageContent::AssistantWithToolCalls { tool_calls, .. }
-            if tool_calls.iter().any(|c| c.name == "bash")
-        ));
-        let had_error = recent.iter().rev().take(3).any(|m| matches!(&m.content,
-            MessageContent::ToolResult(r) if !r.success
-        ));
-
-        // Last assistant text for context
-        let last_text = last.text().unwrap_or("");
-        let last_lower = last_text.to_lowercase();
-
-        // Error happened recently -> suggest fix
-        if had_error {
-            return Some("Fix the error".to_string());
-        }
-
-        // Wrote/edited files -> suggest testing (no language-specific commands)
-        if had_write && !had_bash {
-            return Some("Run the project to test changes".to_string());
-        }
-
-        // Ran a command -> suggest follow-up
-        if had_bash && !had_write {
-            if last_lower.contains("error") || last_lower.contains("failed") {
-                return Some("Fix the issue".to_string());
-            }
-            if last_lower.contains("test") && last_lower.contains("pass") {
-                return Some("Commit the changes".to_string());
-            }
-        }
-
-        // Wrote files + ran commands successfully -> suggest commit
-        if had_write && had_bash && !had_error {
-            if last_lower.contains("success") || last_lower.contains("pass") || last_lower.contains("done") {
-                return Some("Commit the changes with a descriptive message".to_string());
-            }
-        }
-
-        // Generic: conversation has content, suggest continue
-        if msgs.len() >= 2 {
-            return Some("Continue".to_string());
-        }
-
-        None
-    }
 
     /// Try to change working directory. Returns (success, message).
     fn try_change_dir(&mut self, path: &str) -> (bool, String) {
@@ -833,7 +765,6 @@ impl App {
                 // these up from the agent's pending_input and render them as real
                 // user messages, so the previews would duplicate otherwise.
                 self.pending_appends.clear();
-                self.suggestion = self.generate_suggestion();
                 self.at_bottom = true;
                 // Auto-save session after each turn
                 self.current_session.messages = self.conversation.messages.clone();
@@ -991,8 +922,7 @@ impl App {
                         KeyCode::Char(c) => self.rapid_buf.push(c),
                         _ => unreachable!(),
                     }
-                    self.suggestion = None;
-                    return;
+                                        return;
                 }
 
                 // Ctrl+V: clipboard paste
@@ -1006,8 +936,7 @@ impl App {
                         } else {
                             self.stage_paste(&text);
                         }
-                        self.suggestion = None;
-                    }
+                                            }
                     return;
                 }
 
@@ -1022,8 +951,7 @@ impl App {
                     }
                 } else if matches!(self.mode, AppMode::Normal | AppMode::Streaming | AppMode::ToolExecuting) {
                     self.stage_paste(&text);
-                    self.suggestion = None;
-                }
+                                    }
             }
             AppEvent::Mouse(mouse) => {
                 self.handle_mouse(mouse);
@@ -1793,8 +1721,7 @@ impl App {
                 self.current_tool_call_count = 0;
                 self.turn_tokens = 0;
                 self.total_tokens = 0;
-                self.suggestion = None;
-            }
+                            }
             // Emacs-style line editing (like Claude Code)
             (KeyModifiers::CONTROL, KeyCode::Char('a')) => {
                 self.input.move_home();
@@ -1841,8 +1768,7 @@ impl App {
                     }
                     if let Some(idx) = self.history_index {
                         if let Some(hist) = self.input_history.get(idx).cloned() {
-                            self.suggestion = None;
-                            self.pasted_blocks.clear();
+                                                        self.pasted_blocks.clear();
                             self.load_history_entry(&hist);
                         }
                     }
@@ -1854,8 +1780,7 @@ impl App {
                     if idx + 1 < self.input_history.len() {
                         self.history_index = Some(idx + 1);
                         let hist = self.input_history[idx + 1].clone();
-                        self.suggestion = None;
-                        self.pasted_blocks.clear();
+                                                self.pasted_blocks.clear();
                         self.load_history_entry(&hist);
                     } else {
                         // Exit history mode
@@ -1871,8 +1796,7 @@ impl App {
                     self.history_stash = Some(self.input.content());
                     self.history_index = Some(0);
                     if let Some(hist) = self.input_history.first().cloned() {
-                        self.suggestion = None;
-                        self.pasted_blocks.clear();
+                                                self.pasted_blocks.clear();
                         self.load_history_entry(&hist);
                     }
                 }
@@ -1907,25 +1831,10 @@ impl App {
                         .unwrap_or(line.len());
                 }
             }
-            (_, KeyCode::Tab) => {
-                // Accept suggestion into input
-                if let Some(ref suggestion) = self.suggestion.take() {
-                    self.input.clear();
-                    for c in suggestion.chars() {
-                        self.input.insert_char(c);
-                    }
-                }
-                return; // Don't clear suggestion below
-            }
             (_, KeyCode::Char(c)) => {
                 self.input.insert_char(c);
             }
             _ => {}
-        }
-
-        // Clear suggestion on any input change (except Tab which was handled above)
-        if !self.input.is_empty() {
-            self.suggestion = None;
         }
 
         // After any input change, update the slash menu (uses pre-built list, no alloc)
@@ -2485,7 +2394,6 @@ impl App {
                 help.push_str("  `Enter` — Send message\n");
                 help.push_str("  `Esc` — Clear input\n");
                 help.push_str("  `Ctrl+Up/Down` — Scroll chat\n");
-                help.push_str("  `Tab` — Accept suggestion\n");
                 help.push_str("  `/quit` — Exit\n");
                 help.push_str("\n**Copy text:**\n\n");
                 help.push_str("  `/copy` — Copy last AI response to clipboard\n");
@@ -2558,8 +2466,7 @@ impl App {
         }
         let buf = std::mem::take(&mut self.rapid_buf);
         self.stage_paste(&buf);
-        self.suggestion = None;
-    }
+            }
 
     /// Single entry point for every paste pathway (Ctrl+V, bracketed paste,
     /// rapid-key burst). Runs file-path extraction first so drag-and-drop of

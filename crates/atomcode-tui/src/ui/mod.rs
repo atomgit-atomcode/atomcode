@@ -83,14 +83,14 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         if let Some((ref sessions, selected)) = app.session_selector {
             session_selector::render(frame, chunks[1], sessions, selected, &app.session_selector_query, app.session_selector_cursor);
         }
-        input_box::render(frame, chunks[2], &app.input, false, None, &app.attached_files, &app.pasted_blocks);
+        input_box::render(frame, chunks[2], &app.input, false, &app.attached_files, &app.pasted_blocks);
         return;
     }
 
     // Issue input mode: render issue form in chat area
     if let crate::app::AppMode::IssueInput(ref state) = app.mode {
         issue_input::render(frame, chunks[1], state);
-        input_box::render(frame, chunks[2], &app.input, false, None, &app.attached_files, &app.pasted_blocks);
+        input_box::render(frame, chunks[2], &app.input, false, &app.attached_files, &app.pasted_blocks);
         return;
     }
 
@@ -149,7 +149,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         }
     }
 
-    input_box::render(frame, chunks[2], &app.input, app.mode.is_streaming_or_executing(), app.suggestion.as_deref(), &app.attached_files, &app.pasted_blocks);
+    input_box::render(frame, chunks[2], &app.input, app.mode.is_streaming_or_executing(), &app.attached_files, &app.pasted_blocks);
 
     // Render slash menu as overlay above input box
     if app.slash_menu.visible {

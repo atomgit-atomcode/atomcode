@@ -12,25 +12,14 @@ const H_PADDING: u16 = 3;
 
 use crate::file_attach::AttachedFile;
 
-pub fn render(frame: &mut Frame, area: Rect, input: &InputState, is_busy: bool, suggestion: Option<&str>, attached: &[AttachedFile], pasted: &[String]) {
+pub fn render(frame: &mut Frame, area: Rect, input: &InputState, is_busy: bool, attached: &[AttachedFile], pasted: &[String]) {
     let is_empty = input.is_empty() && pasted.is_empty();
     let inner_width = area.width.saturating_sub(2 + H_PADDING * 2) as usize;
     let inner_width = inner_width.max(1);
 
     // Build visual lines by manually wrapping each logical line.
     let (visual_lines, cursor_visual_row, cursor_visual_col) = if is_empty {
-        let placeholder = if let Some(sug) = suggestion {
-            vec![Line::from(vec![
-                Span::styled(sug.to_string(), Style::default().fg(theme::text_secondary())),
-                Span::styled("  Tab", Style::default().fg(theme::text_muted())),
-            ])]
-        } else {
-            vec![Line::from(Span::styled(
-                "Ask anything\u{2026}",
-                Style::default().fg(theme::text_muted()),
-            ))]
-        };
-        (placeholder, 0usize, 0usize)
+        (vec![Line::from(Span::raw(String::new()))], 0usize, 0usize)
     } else {
         let mut vis_lines: Vec<Line<'static>> = Vec::new();
         let mut cursor_vrow = 0usize;
