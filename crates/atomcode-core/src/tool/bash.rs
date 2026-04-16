@@ -124,18 +124,39 @@ async fn bash_execute(args: &str, ctx: &ToolContext) -> Result<ToolResult> {
         let mut child = Command::new("cmd.exe")
             .args(&["/C", &parsed.command])
             .current_dir(&wd)
+            .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()?;
 
         #[cfg(not(target_os = "windows"))]
-        let mut child = Command::new("bash")
-            .arg("-c")
-            .arg(&parsed.command)
-            .current_dir(&wd)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()?;
+        let mut child = {
+            let mut cmd = Command::new("bash");
+            cmd.arg("-c")
+                .arg(&parsed.command)
+                .current_dir(&wd)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+            // Detach child from the controlling terminal so neither it nor any
+            // grandchild (ssh, git credential helpers, server-side hook output
+            // rendered by git) can write directly to /dev/tty.  Without this,
+            // programs that open /dev/tty bypass our piped stdout/stderr and
+            // scribble ANSI escape sequences onto the TUI — producing artifacts
+            // like the [PASSED] box from AtomGit push hooks.
+            unsafe {
+                cmd.pre_exec(|| {
+                    // Create a new session. This makes the child the session
+                    // leader with no controlling terminal, preventing /dev/tty
+                    // access from this process and all its descendants.
+                    // setsid() = POSIX, available on all Unix platforms.
+                    extern "C" { fn setsid() -> i32; }
+                    setsid();
+                    Ok(())
+                });
+            }
+            cmd.spawn()?
+        };
 
         let mut stdout = child.stdout.take().unwrap();
         let mut stderr = child.stderr.take().unwrap();

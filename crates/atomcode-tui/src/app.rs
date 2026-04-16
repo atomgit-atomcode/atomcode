@@ -264,6 +264,10 @@ pub struct App {
     pub session_selector_query: String,
     /// Last sent user input - restored to input box if turn is cancelled.
     pub last_sent_input: Option<String>,
+    /// Force a full terminal redraw on the next frame. Set after bash tool
+    /// completion to overwrite any artifacts left by child processes that
+    /// wrote directly to the terminal (e.g. git push hook output via /dev/tty).
+    pub needs_full_redraw: bool,
 }
 
 impl App {
@@ -401,6 +405,7 @@ impl App {
                 session_selector: None,
                              session_selector_query: String::new(),
                              last_sent_input: None,
+                             needs_full_redraw: false,
                     }
                 }
 
@@ -714,6 +719,12 @@ impl App {
                 let icon = if success { "\u{2713}" } else { "\u{2717}" };
                 let first_line = output.lines().next().unwrap_or("").chars().take(40).collect::<String>();
                 self.last_completed_tool = format!("{} {} {}", icon, name, first_line);
+                // Bash tools may leave terminal artifacts from child processes
+                // writing directly to /dev/tty (e.g. git push hook output).
+                // Force a full redraw to overwrite any such artifacts.
+                if name == "bash" {
+                    self.needs_full_redraw = true;
+                }
                 // Use the same call_id the agent recorded on ToolCallStarted so chat_panel's
                 // "in-flight tool call" detection (call.id ∈ completed_call_ids) matches.
                 self.conversation.add_tool_result(ToolResult {

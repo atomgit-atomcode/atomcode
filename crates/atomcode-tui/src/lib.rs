@@ -410,6 +410,13 @@ pub async fn run(
     event_loop.start();
 
     loop {
+        // Force a full redraw when requested (e.g. after bash tool completion)
+        // to overwrite any artifacts left by child processes that wrote
+        // directly to the terminal via /dev/tty.
+        if app.needs_full_redraw {
+            app.needs_full_redraw = false;
+            terminal.clear()?;
+        }
         terminal.draw(|frame| ui::render(frame, &mut app))?;
 
         if let Some(file_path) = app.pending_editor.take() {
