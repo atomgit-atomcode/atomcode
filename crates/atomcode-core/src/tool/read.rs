@@ -336,9 +336,33 @@ impl Tool for ReadFileTool {
             .join("\n");
 
         if !returned_all {
+            // Append tree-sitter skeleton of the UNSEEN portions.
+            // Model reads 51 lines but file has 600 — skeleton shows
+            // what functions exist in the other 549 lines with line numbers.
+            let mut searcher = ctx.semantic.lock().await;
+            let skeleton = if let Some(symbols) = searcher.list_symbols(path) {
+                let unseen: Vec<String> = symbols.iter()
+                    .filter(|s| s.start_line < offset + 1 || s.start_line > end)
+                    .map(|s| {
+                        let sig = lines.get(s.start_line.saturating_sub(1))
+                            .map(|l| l.trim())
+                            .unwrap_or(&s.name);
+                        let sig_short: String = sig.chars().take(70).collect();
+                        format!("{:>4}| {}  (L{}-{})", s.start_line, sig_short, s.start_line, s.end_line)
+                    })
+                    .collect();
+                if !unseen.is_empty() {
+                    format!("\n{}", unseen.join("\n"))
+                } else {
+                    String::new()
+                }
+            } else {
+                String::new()
+            };
+
             output.push_str(&format!(
-                "\n\n[Showing lines {}-{} of {} total.]",
-                offset + 1, end, total_lines
+                "\n\n[Showing lines {}-{} of {} total. Unseen structure:]{}",
+                offset + 1, end, total_lines, skeleton
             ));
         }
 
