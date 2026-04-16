@@ -13,6 +13,8 @@
 
 use std::io::{BufRead, Write};
 use std::net::TcpListener;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
@@ -117,10 +119,80 @@ fn build_authorize_url_with(authorize_url: &str, state: &str, parent_origin: &st
     )
 }
 
+/// Error returned when the user presses Ctrl+C during the wait.
+#[derive(Debug)]
+pub struct Cancelled;
+
+impl std::fmt::Display for Cancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "login cancelled by user")
+    }
+}
+
+impl std::error::Error for Cancelled {}
+
 fn receive_code(port: u16, expected_state: &str) -> Result<String> {
     let listener = TcpListener::bind(("127.0.0.1", port))
         .with_context(|| format!("Bind 127.0.0.1:{} — port in use?", port))?;
-    let (mut stream, _) = listener.accept().context("Accept OAuth callback")?;
+
+    // Set a short timeout so we can check for cancellation periodically.
+    listener
+        .set_nonblocking(true)
+        .context("set_nonblocking")?;
+
+    let timeout = std::time::Duration::from_secs(300); // 5 minutes max wait
+
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let cancelled_clone = cancelled.clone();
+
+    // Spawn a thread to watch for ESC key press
+    let esc_handle = std::thread::spawn(move || {
+        use std::io::Read;
+        // Use raw stdin to read single keypresses without echo
+        let mut stdin = std::io::stdin();
+        let mut buf = [0u8; 1];
+        loop {
+            if cancelled_clone.load(Ordering::SeqCst) {
+                break;
+            }
+            match stdin.read(&mut buf) {
+                Ok(1) => {
+                    // ESC key is 0x1B
+                    if buf[0] == 0x1B {
+                        cancelled_clone.store(true, Ordering::SeqCst);
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+    });
+
+    let start = std::time::Instant::now();
+    let mut stream = None;
+    while start.elapsed() < timeout {
+        if cancelled.load(Ordering::SeqCst) {
+            esc_handle.join().ok();
+            bail!(Cancelled);
+        }
+        match listener.accept() {
+            Ok((s, _)) => {
+                stream = Some(s);
+                break;
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                // Nothing ready — sleep briefly before polling again.
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            Err(e) => {
+                cancelled.store(true, Ordering::SeqCst);
+                esc_handle.join().ok();
+                return Err(e).context("Accept OAuth callback");
+            }
+        }
+    }
+
+    let mut stream = stream.context("No scan callback received (timed out or cancelled)")?;
 
     let mut reader = std::io::BufReader::new(&mut stream);
     let mut request_line = String::new();
@@ -247,7 +319,7 @@ pub fn login() -> Result<(WecomIdentity, Option<BrokerCreds>)> {
     println!("  If browser doesn't open, visit:\n    {}\n", auth_url);
     open_browser(&auth_url);
 
-    println!("  Waiting for callback on port {}...", REDIRECT_PORT);
+    println!("  Waiting for callback on port {} (press ESC to cancel)...", REDIRECT_PORT);
     let code = receive_code(REDIRECT_PORT, &state)?;
     println!("  Scan received, exchanging with broker...\n");
 
