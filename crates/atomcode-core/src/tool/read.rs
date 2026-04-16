@@ -290,6 +290,16 @@ impl Tool for ReadFileTool {
             .collect::<Vec<_>>()
             .join("\n");
 
+        if returned_all {
+            let fname = path.file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| parsed.file_path.clone());
+            output.push_str(&format!(
+                "\n\n[Full file read: {} ({} lines). Do NOT read this file again unless you edit it first.]",
+                fname, total_lines
+            ));
+        }
+
         if !returned_all {
             // Append tree-sitter skeleton of the UNSEEN portions.
             // Model reads 51 lines but file has 600 — skeleton shows
