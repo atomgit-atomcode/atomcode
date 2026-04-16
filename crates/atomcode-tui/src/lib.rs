@@ -506,6 +506,13 @@ pub async fn run(
         if app.pending_login {
             app.pending_login = false;
 
+            // Stop the input-reading thread before releasing the terminal.
+            // On Windows, if the background thread keeps calling
+            // crossterm::event::read() while we toggle raw mode / leave the
+            // alt screen / spawn the browser via `cmd /C start`, the shared
+            // console state goes inconsistent and the process exits.
+            event_loop.stop();
+
             disable_raw_mode()?;
             execute!(
                 terminal.backend_mut(),
@@ -515,11 +522,19 @@ pub async fn run(
             #[cfg(not(target_os = "windows"))]
             execute!(terminal.backend_mut(), DisableBracketedPaste)?;
             terminal.show_cursor()?;
+            let _ = std::io::stdout().flush();
 
             println!("\n  AtomCode AtomGit Login");
             println!("  =========================\n");
 
-            match run_oauth_login() {
+            // reqwest::blocking owns a tokio runtime; run on a dedicated
+            // blocking thread so its Drop doesn't panic from async context.
+            // (Same pattern as /login-inner below.)
+            let login_result = tokio::task::spawn_blocking(run_oauth_login)
+                .await
+                .unwrap_or_else(|e| Err(anyhow::anyhow!("login task panicked: {}", e)));
+
+            match login_result {
                 Ok(auth) => {
                     println!("\n  Login successful! Logged in as: {}", auth.user.username);
                     let oauth_name = app.pending_oauth_name.take().unwrap_or_else(|| "AtomGit".to_string());
@@ -558,12 +573,16 @@ pub async fn run(
             #[cfg(not(target_os = "windows"))]
             execute!(terminal.backend_mut(), EnableBracketedPaste)?;
             terminal.clear()?;
+            event_loop.start();
             continue;
         }
 
         // Handle pending WeCom login
         if app.pending_wecom_login {
             app.pending_wecom_login = false;
+
+            // See /login above — stop input thread before terminal surgery.
+            event_loop.stop();
 
             disable_raw_mode()?;
             execute!(
@@ -574,6 +593,7 @@ pub async fn run(
             #[cfg(not(target_os = "windows"))]
             execute!(terminal.backend_mut(), DisableBracketedPaste)?;
             terminal.show_cursor()?;
+            let _ = std::io::stdout().flush();
 
             // reqwest::blocking owns a tokio runtime; run on a dedicated
             // blocking thread so its Drop doesn't panic from async context.
@@ -624,6 +644,7 @@ pub async fn run(
             #[cfg(not(target_os = "windows"))]
             execute!(terminal.backend_mut(), EnableBracketedPaste)?;
             terminal.clear()?;
+            event_loop.start();
             continue;
         }
 
