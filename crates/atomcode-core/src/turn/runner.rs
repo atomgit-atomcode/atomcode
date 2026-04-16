@@ -146,6 +146,7 @@ impl TurnRunner {
         let mut tool_calls_buf: Vec<ToolCall> = Vec::new();
         let mut text_buf = String::new();
         let mut total_tokens: usize = 0;
+        let mut got_usage = false;
         let mut got_any_event = false;
         let mut was_truncated = false;
 
@@ -238,6 +239,7 @@ _ = cancel.cancelled() => {
 
                         Some(Ok(StreamEvent::Usage(usage))) => {
                             total_tokens += usage.completion_tokens;
+                            got_usage = true;
                             let _ = event_tx.send(TurnEvent::TokenUsage {
                                 prompt_tokens: usage.prompt_tokens,
                                 completion_tokens: usage.completion_tokens,
@@ -247,6 +249,27 @@ _ = cancel.cancelled() => {
                         }
 
                         Some(Ok(StreamEvent::Done { truncated: is_truncated })) => {
+                            // Fallback: if the provider didn't report usage (many
+                            // OpenAI-compatible APIs ignore stream_options), estimate
+                            // output tokens from the streamed text + tool call args.
+                            if !got_usage {
+                                let mut output_chars = text_buf.len();
+                                for tc in &tool_calls_buf {
+                                    output_chars += tc.arguments.len();
+                                }
+                                // Rough heuristic: ~2 chars per token for mixed
+                                // Chinese/English, ~4 for pure English. Use 3 as a
+                                // middle ground since most users mix both.
+                                let estimated = (output_chars / 3).max(1);
+                                total_tokens += estimated;
+                                let _ = event_tx.send(TurnEvent::TokenUsage {
+                                    prompt_tokens: 0,
+                                    completion_tokens: estimated,
+                                    total_tokens: estimated,
+                                    cached_tokens: 0,
+                                });
+                            }
+
                             // Rescue tool calls embedded as text (GLM-5 sometimes
                             // outputs `<tool_call>name(args)</tool_call>` instead of
                             // using the standard function calling format).
