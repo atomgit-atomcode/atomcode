@@ -12,7 +12,7 @@ pub mod welcome;
 
 use std::path::PathBuf;
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
@@ -183,7 +183,7 @@ fn render_selection_highlight(frame: &mut Frame, sel: &TextSelection, chat_area:
     let area_top = chat_area.y;
     let area_bottom = chat_area.y + chat_area.height;
 
-    let sel_bg = Color::Rgb(40, 80, 160);  // Selection blue - works on both themes
+    let sel_bg = theme::rgb(40, 80, 160);  // Selection blue - works on both themes
     let sel_fg = theme::text_primary();
 
     // Clamp row range to chat area — leave 1-row gap before input box

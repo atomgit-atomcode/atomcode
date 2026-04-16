@@ -747,7 +747,7 @@ fn render_tool_result(lines: &mut Vec<Line<'static>>, result: &ToolResult, expan
                     bar.clone(),
                     Span::styled(
                         format!("    {}", display),
-                        Style::default().fg(theme::TEXT_SECONDARY),
+                        Style::default().fg(theme::text_secondary()),
                     ),
                 ]));
             }
@@ -756,7 +756,7 @@ fn render_tool_result(lines: &mut Vec<Line<'static>>, result: &ToolResult, expan
                     bar.clone(),
                     Span::styled(
                         format!("    ... ({} more lines)", output_lines.len() - 1 - max_expanded),
-                        Style::default().fg(theme::TEXT_MUTED),
+                        Style::default().fg(theme::text_muted()),
                     ),
                 ]));
             }
@@ -911,11 +911,11 @@ pub fn render_approval(lines: &mut Vec<Line<'static>>, call: &ToolCall) {
         Span::raw(format!("{}", TOOL_INDENT)),
         Span::styled(" \u{25b6} ", Style::default().fg(theme::warning()).add_modifier(Modifier::BOLD)),
         Span::styled("Waiting for approval: ", Style::default().fg(theme::warning())),
-        Span::styled(" Y ", Style::default().fg(theme::TEXT_ON_ACCENT).bg(theme::success()).add_modifier(Modifier::BOLD)),
+        Span::styled(" Y ", Style::default().fg(theme::text_on_accent()).bg(theme::success()).add_modifier(Modifier::BOLD)),
         Span::styled(" Allow  ", key_label),
-        Span::styled(" A ", Style::default().fg(theme::TEXT_ON_ACCENT).bg(theme::info()).add_modifier(Modifier::BOLD)),
+        Span::styled(" A ", Style::default().fg(theme::text_on_accent()).bg(theme::info()).add_modifier(Modifier::BOLD)),
         Span::styled(" Always  ", key_label),
-        Span::styled(" N ", Style::default().fg(theme::TEXT_ON_ACCENT).bg(theme::error()).add_modifier(Modifier::BOLD)),
+        Span::styled(" N ", Style::default().fg(theme::text_on_accent()).bg(theme::error()).add_modifier(Modifier::BOLD)),
         Span::styled(" Deny", key_label),
     ]));
     lines.push(Line::default());

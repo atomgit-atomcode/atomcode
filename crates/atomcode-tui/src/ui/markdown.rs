@@ -1,5 +1,5 @@
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd, HeadingLevel};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{Theme, ThemeSet};
@@ -313,7 +313,7 @@ impl MarkdownRenderer {
             // Subtle 2-space indent groups the block visually without borders.
             s.push(Span::raw("  "));
             for (style, text) in regions {
-                let fg = Color::Rgb(style.foreground.r, style.foreground.g, style.foreground.b);
+                let fg = super::theme::rgb(style.foreground.r, style.foreground.g, style.foreground.b);
                 s.push(Span::styled(text.to_string(), Style::default().fg(fg)));
             }
             Line::from(s)

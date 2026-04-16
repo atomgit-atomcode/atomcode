@@ -848,7 +848,7 @@ impl Conversation {
 
         for i in cold_msgs..condense_end.min(msgs.len()) {
             if let MessageContent::ToolResult(ref r) = msgs[i].content {
-                let tool_name = call_id_to_tool.get(&r.call_id)
+                let _tool_name = call_id_to_tool.get(&r.call_id)
                     .map(|s| s.as_str())
                     .unwrap_or("tool");
 
