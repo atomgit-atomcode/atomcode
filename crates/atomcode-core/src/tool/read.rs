@@ -46,9 +46,8 @@ impl Tool for ReadFileTool {
     fn definition(&self) -> ToolDef {
         ToolDef {
             name: "read_file",
-            description: "Read a file. Returns a skeleton (structure + line numbers) for files >50 lines.\n\
-                Use offset and limit to read specific sections shown in the skeleton.\n\
-                Small files (≤50 lines) return full content directly.\n\
+            description: "Read a file. Returns full content with line numbers.\n\
+                Large files return a skeleton (structure overview) — use offset/limit to read sections.\n\
                 NEVER use bash (cat/head/tail) to read files.".to_string(),
             parameters: json!({
                 "type": "object",
@@ -176,13 +175,13 @@ impl Tool for ReadFileTool {
         let lines: Vec<&str> = content.lines().collect();
         let total_lines = lines.len();
 
-        // ── Layer A: skeleton-first for all non-trivial files ──
-        // Default read (no offset/limit) returns skeleton, NOT full content.
-        // Model uses line numbers from skeleton to request specific sections.
-        // This prevents "lost in the middle" on weak models (GLM-5 can't
-        // process 685 lines — it reads full then greps the same file).
-        // Small files (≤50 lines) return full content directly.
-        let auto_skeleton = total_lines > 50
+        // ── Layer A: full content by default, skeleton for large files ──
+        // Skeleton is the FALLBACK, not the default. Most files (≤300 lines)
+        // return full content — model can grep result or use old_string to edit
+        // directly without an extra read step.
+        // >300 lines: skeleton (GLM-5 lost in the middle at ~685 lines).
+        // With offset/limit: always return exact content (model chose a range).
+        let auto_skeleton = total_lines > 300
             && parsed.offset.is_none()
             && parsed.limit.is_none();
 
