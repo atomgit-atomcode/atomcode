@@ -4,10 +4,9 @@ impl AgentLoop {
     /// Graph-driven preread: identify call chain files from user message,
     /// read their key functions, and inject into system prompt.
     ///
-    /// Unlike the old "preread everything" approach (disabled for bloating context),
-    /// this only reads files ON THE CALL CHAIN — typically 3-5 files, ~15K tok max.
-    /// Budget: total preread ≤ 25% of remaining context.
-    pub(crate) async fn build_preread_context(&mut self, _content: &str) -> String {
+    /// Build a per-turn reminder string injected into the conversation.
+    /// Currently returns empty — reserved for future per-turn context injection.
+    pub(crate) fn build_turn_reminder(&self) -> String {
         String::new()
     }
 
@@ -142,11 +141,6 @@ impl AgentLoop {
         prompt.push_str(&format!(
             "\n=== PROJECT STRUCTURE ===\n{project_ctx}\n"
         ));
-
-        // Pre-read files (bulk content — middle of prompt)
-        if !self.preread_context.is_empty() {
-            prompt.push_str(&format!("\n\n{}", self.preread_context));
-        }
 
         // NOTE: Active file full-content injection disabled — it consumes too much
         // context window on weak models (32K), degrading decision quality.
