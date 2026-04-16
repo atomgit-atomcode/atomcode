@@ -30,6 +30,7 @@ pub const BUILTIN_COMMANDS: &[(&str, &str)] = &[
     ("/cd",       "Change working directory"),
     
     // === Utilities ===
+    ("/plan",     "Toggle plan mode (read-only analysis)"),
     ("/undo",     "Undo last turn's edits"),
     ("/diff",     "Show git diff of current changes"),
     ("/cost",     "Show token usage for this session"),

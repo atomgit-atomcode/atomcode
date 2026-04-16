@@ -38,6 +38,13 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         Style::default().fg(theme::text_muted()),
     ));
     left.push(Span::styled("  ", Style::default()));
+    if app.plan_mode {
+        left.push(Span::styled(
+            " PLAN ",
+            Style::default().fg(theme::text_on_accent()).bg(theme::info()).add_modifier(Modifier::BOLD),
+        ));
+        left.push(Span::styled(" ", Style::default()));
+    }
     left.push(Span::styled(&dir, Style::default().fg(theme::status_path())));
 
     // Calculate available space for session name

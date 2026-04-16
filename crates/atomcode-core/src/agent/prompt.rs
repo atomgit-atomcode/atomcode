@@ -97,6 +97,20 @@ impl AgentLoop {
             ));
         }
 
+        // Plan mode: inject planning-only instructions before rules.
+        if self.plan_mode {
+            prompt.push_str(
+                "\n=== PLAN MODE (ACTIVE) ===\n\
+                 You are in PLAN MODE. You can explore, read files, run commands, and analyze the codebase.\n\
+                 You MUST NOT edit, create, or delete any files. Only read-only tools are available.\n\
+                 Your job is to:\n\
+                 1. Analyze the codebase and understand the current state\n\
+                 2. Create a detailed implementation plan with specific files, functions, and changes\n\
+                 3. Present the plan clearly so the user can review before executing\n\
+                 Do NOT attempt to make any changes. Focus on analysis and planning only.\n\n"
+            );
+        }
+
         // RULES GO LAST — recency effect ensures the model remembers these
         // when it starts generating tool calls.
         prompt.push_str(&format!("\n=== RULES (follow these strictly) ===\n{rules}\n"));

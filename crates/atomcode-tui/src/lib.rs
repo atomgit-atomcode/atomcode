@@ -258,29 +258,37 @@ fn run_oauth_login() -> anyhow::Result<AuthInfo> {
         };
     }
 
-    println!("  Waiting for authorization callback on port {}...", oauth::REDIRECT_PORT);
-    println!("  Press Ctrl+C to cancel.\n");
+    println!("  Waiting for authorization callback on port 8765...");
+    println!("  Press Esc or Ctrl+C to cancel.\n");
 
-    // Start local server with non-blocking accept so Ctrl+C can interrupt
+    // Start local server with non-blocking accept so user can cancel
     let listener = TcpListener::bind(("127.0.0.1", oauth::REDIRECT_PORT))?;
     listener.set_nonblocking(true)?;
 
-    // Poll for the OAuth callback connection.
-    // We are inside spawn_blocking and the terminal is NOT in raw mode
-    // (the caller already left the alternate screen / disabled raw mode),
-    // so we must NOT call enable_raw_mode() here — on Windows that panics
-    // with "initial console mode not set" because the saved console state
-    // was cleared when the outer TUI disabled raw mode.
+    // Enable raw mode so Ctrl+C is captured as a key event (not SIGINT)
+    // and Esc is detected character-by-character.
+    crossterm::terminal::enable_raw_mode()?;
+
     let accept_result: anyhow::Result<std::net::TcpStream> = loop {
+        // Poll for keypresses (Esc / Ctrl+C to cancel)
+        if crossterm::event::poll(std::time::Duration::from_millis(200)).unwrap_or(false) {
+            if let Ok(crossterm::event::Event::Key(key)) = crossterm::event::read() {
+                if key.code == crossterm::event::KeyCode::Esc
+                    || (key.code == crossterm::event::KeyCode::Char('c')
+                        && key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL))
+                {
+                    break Err(anyhow::anyhow!("Login cancelled by user"));
+                }
+            }
+        }
         match listener.accept() {
             Ok((stream, _)) => break Ok(stream),
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(std::time::Duration::from_millis(200));
-                continue;
-            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
             Err(e) => break Err(e.into()),
         }
     };
+
+    crossterm::terminal::disable_raw_mode()?;
 
     let mut stream = accept_result?;
 

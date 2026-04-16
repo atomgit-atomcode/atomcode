@@ -264,6 +264,8 @@ pub struct App {
     pub session_selector_cursor: usize,
     /// Last sent user input - restored to input box if turn is cancelled.
     pub last_sent_input: Option<String>,
+    /// Plan mode: read-only exploration, no edits. Toggled via `/plan`.
+    pub plan_mode: bool,
 }
 
 impl App {
@@ -401,6 +403,7 @@ impl App {
                              session_selector_query: String::new(),
                              session_selector_cursor: 0,
                              last_sent_input: None,
+                             plan_mode: false,
                     }
                 }
 
@@ -1688,11 +1691,20 @@ impl App {
             // - Any modifier + Enter (Shift/Ctrl/Alt) = newline
             // - Rapid Enter (<50ms since last key) = newline (paste fallback)
             (KeyModifiers::NONE, KeyCode::Enter) => {
-                self.slash_menu.close();
-                self.send_message(event_tx);
+                // Backslash at end of line = insert newline instead of sending
+                // (fallback for terminals that can't distinguish Shift+Enter)
+                let content = self.input.content();
+                if content.ends_with('\\') {
+                    // Remove the trailing backslash and insert a newline
+                    self.input.backspace();
+                    self.input.insert_newline();
+                } else {
+                    self.slash_menu.close();
+                    self.send_message(event_tx);
+                }
             }
             (_, KeyCode::Enter) => {
-                // Any modifier + Enter = newline
+                // Any modifier + Enter = newline (Shift+Enter, Alt+Enter, etc.)
                 self.input.insert_newline();
             }
             (KeyModifiers::CONTROL, KeyCode::Char('j')) => {
@@ -2136,6 +2148,36 @@ impl App {
                     self.change_working_dir(arg);
                     let _ = self.agent_handle.cmd_tx.send(AgentCommand::ChangeDir(arg.to_string()));
                 }
+            }
+            cmd if cmd == "/plan" || cmd.starts_with("/plan ") => {
+                let arg = cmd.strip_prefix("/plan").unwrap().trim();
+                if arg.is_empty() {
+                    // Toggle plan mode
+                    self.plan_mode = !self.plan_mode;
+                    let _ = self.agent_handle.cmd_tx.send(AgentCommand::SetPlanMode(self.plan_mode));
+                    let status = if self.plan_mode { "**Plan mode ON** — read-only analysis, no edits." } else { "**Plan mode OFF** — full access restored." };
+                    self.conversation.push_delta(status);
+                    self.conversation.finalize_stream();
+                } else {
+                    // One-shot plan mode: enable and send message directly
+                    if !self.plan_mode {
+                        self.plan_mode = true;
+                        let _ = self.agent_handle.cmd_tx.send(AgentCommand::SetPlanMode(true));
+                    }
+                    let msg = arg.to_string();
+                    self.input.clear();
+                    self.conversation.add_user_message(&msg);
+                    self.mode = AppMode::Streaming;
+                    self.turn_start = Some(Instant::now());
+                    self.llm_call_start = Some(Instant::now());
+                    self.current_step_count = 0;
+                    self.current_tool_call_count = 0;
+                    self.turn_tokens = 0;
+                    self.last_turn_duration = None;
+                    self.last_checkpoint = atomcode_core::agent::git_checkpoint::create_checkpoint(&self.working_dir);
+                    let _ = self.agent_handle.cmd_tx.send(AgentCommand::SendMessage(msg));
+                }
+                return true;
             }
             "/undo" => {
                 if let Some(ref checkpoint) = self.last_checkpoint.clone() {

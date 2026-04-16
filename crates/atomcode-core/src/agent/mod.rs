@@ -58,6 +58,8 @@ pub enum AgentCommand {
     ClearConversation,
     /// Set messages from a resumed session.
     SetMessages(Vec<crate::conversation::message::Message>),
+    /// Set plan mode (read-only exploration, no edits).
+    SetPlanMode(bool),
     /// Shutdown the agent.
     Shutdown,
 }
@@ -277,11 +279,26 @@ pub struct AgentLoop {
     /// Remaining read-only turns for diagnosis tasks. When > 0, only read-only tools are available.
     /// Decremented each turn. Forces the model to read code before curl/edit.
     diagnosis_read_only_turns: usize,
+    /// Plan mode: restrict to read-only tools and inject planning instructions.
+    /// Toggled via `/plan` command or `SetPlanMode` agent command.
+    pub plan_mode: bool,
     /// Current task type — drives dynamic prompt selection and planning.
     /// ATLAS-style subtask driver: decomposes plan into per-file subtasks.
     subtask_driver: subtask_driver::SubtaskDriver,
     /// Original plan text from model's first response — used for plan adherence reminders.
     plan_text: Option<String>,
+
+    /// Completion detection: model indicated task is done.
+    /// Set when text contains completion marker AND recent tool results all succeeded.
+    /// Next turn: if model only does read/grep → stop (unnecessary verification).
+    /// If model does edit/write/bash → cancel grace, continue (more substantive work).
+    #[allow(dead_code)]
+    completion_grace: bool,
+
+    /// Track whether all tool results in the last turn were successful.
+    /// Used by completion detection: only trigger grace when tools succeeded.
+    #[allow(dead_code)]
+    last_turn_tools_all_success: bool,
 
     /// Discovered service URLs extracted from tool outputs (e.g., "http://localhost:3002").
     /// Persisted across turns so the model knows which ports are active.
@@ -428,6 +445,9 @@ impl AgentLoop {
             pending_input: None,
             planning_phase: false,
             diagnosis_read_only_turns: 0,
+            plan_mode: false,
+            completion_grace: false,
+            last_turn_tools_all_success: false,
             subtask_driver: subtask_driver::SubtaskDriver::new(),
             plan_text: None,
             session_files: std::collections::HashMap::new(),
@@ -552,6 +572,9 @@ impl AgentLoop {
                 AgentCommand::SetMessages(messages) => {
                     // Set messages from a resumed session.
                     self.conversation.messages = messages;
+                }
+                AgentCommand::SetPlanMode(enabled) => {
+                    self.plan_mode = enabled;
                 }
                 AgentCommand::Shutdown => break,
             }
@@ -843,10 +866,11 @@ impl AgentLoop {
                 // not by blocking tools at the agent loop level.
                 let read_only_tools: &[&str] = &[
                     "read_file", "grep", "glob", "list_directory",
+                    "web_search", "web_fetch",
                     "trace_callees", "trace_callers", "trace_chain",
                     "file_dependencies", "blast_radius",
                 ];
-                let use_read_only = self.diagnosis_read_only_turns > 0;
+                let use_read_only = self.plan_mode || self.diagnosis_read_only_turns > 0;
                 let tool_filter: Option<&[&str]> = if use_read_only {
                     Some(read_only_tools)
                 } else {

@@ -276,7 +276,7 @@ pub fn render_setup(frame: &mut Frame, area: Rect, state: &WelcomeState) {
 
 /// Build a box line with plain text content, padded to box width.
 fn box_line(text: &str, box_w: usize, border_style: Style) -> Line<'static> {
-    let pad = box_w.saturating_sub(display_width(text));
+    let pad = box_w.saturating_sub(display_width(text) + 1); // +1 for leading space
     Line::from(vec![
         Span::styled("  │", border_style),
         Span::styled(format!(" {}", text), Style::default().fg(theme::text_primary())),
