@@ -46,8 +46,9 @@ impl Tool for ReadFileTool {
     fn definition(&self) -> ToolDef {
         ToolDef {
             name: "read_file",
-            description: "Read a file. Returns text with line numbers.\n\
-                Reads the FULL file by default — do NOT use offset/limit unless instructed.\n\
+            description: "Read a file. Returns a skeleton (structure + line numbers) for files >50 lines.\n\
+                Use offset and limit to read specific sections shown in the skeleton.\n\
+                Small files (≤50 lines) return full content directly.\n\
                 NEVER use bash (cat/head/tail) to read files.".to_string(),
             parameters: json!({
                 "type": "object",
@@ -175,14 +176,13 @@ impl Tool for ReadFileTool {
         let lines: Vec<&str> = content.lines().collect();
         let total_lines = lines.len();
 
-        // ── Layer A: per-file decision (the ONLY truncation for read_file) ──
-        // Compares file size against per-file token budget (set by Layer B in
-        // runner.rs). If file fits → full content. If not → tree-sitter skeleton.
-        // No char_limit, no line limit, no post-hoc truncation.
-        // truncation.rs skips read_file entirely — this is the single authority.
-        let file_tokens = total_lines * 12;
-        let per_file_budget = ctx.read_budget_tokens.load(std::sync::atomic::Ordering::Relaxed);
-        let auto_skeleton = file_tokens > per_file_budget
+        // ── Layer A: skeleton-first for all non-trivial files ──
+        // Default read (no offset/limit) returns skeleton, NOT full content.
+        // Model uses line numbers from skeleton to request specific sections.
+        // This prevents "lost in the middle" on weak models (GLM-5 can't
+        // process 685 lines — it reads full then greps the same file).
+        // Small files (≤50 lines) return full content directly.
+        let auto_skeleton = total_lines > 50
             && parsed.offset.is_none()
             && parsed.limit.is_none();
 
@@ -190,7 +190,7 @@ impl Tool for ReadFileTool {
             let mut searcher = ctx.semantic.lock().await;
             let skeleton = if let Some(symbols) = searcher.list_symbols(path) {
                 let fname = path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
-                let mut skel = format!("[File skeleton: {} ({} lines) — to see full content, call read_file again without offset/limit:]\n\n",
+                let mut skel = format!("[File skeleton: {} ({} lines). Use read_file with offset and limit to read specific sections.]\n\n",
                     fname, total_lines);
                 // Skeleton is fully driven by semantic layer's list_symbols().
                 // For Vue/Svelte, list_symbols already includes <template>/<style> sections
@@ -260,16 +260,9 @@ impl Tool for ReadFileTool {
 
         let offset = parsed.offset.unwrap_or(1).max(1) - 1;
 
-        // No hardcoded line limit — Layer A (auto_skeleton) is the only gate.
-        // If auto_skeleton didn't fire, the file fits in budget → return all lines.
-        // Ignore model-supplied limit when reading from start (offset=0): if the
-        // file passed Layer A, the model is just creating fragments by passing
-        // limit=100. GLM-5 does this despite "do NOT use offset/limit" instruction.
-        let limit = match (parsed.offset, parsed.limit) {
-            (None, Some(l)) => total_lines, // offset=0 + limit → ignore limit, give full
-            (Some(_), Some(l)) => l,         // explicit range → respect it
-            _ => total_lines,                // no limit → full
-        };
+        // Model passed offset/limit → return exactly what it asked for.
+        // No override — if it asked for L440-480, give L440-480.
+        let limit = parsed.limit.unwrap_or(total_lines);
 
         // If offset > 0 but auto-expand would give the whole file, reset offset to 0
         let offset = if offset > 0 && limit >= total_lines { 0 } else { offset };
@@ -289,16 +282,6 @@ impl Tool for ReadFileTool {
             .map(|(i, line)| format!("{:>4}| {}", offset + i + 1, line))
             .collect::<Vec<_>>()
             .join("\n");
-
-        if returned_all {
-            let fname = path.file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| parsed.file_path.clone());
-            output.push_str(&format!(
-                "\n\n[Full file read: {} ({} lines). The ENTIRE content is above — do NOT re-read or grep this file. Search the content above directly.]",
-                fname, total_lines
-            ));
-        }
 
         if !returned_all {
             // Append tree-sitter skeleton of the UNSEEN portions.
