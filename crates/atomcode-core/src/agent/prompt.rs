@@ -98,6 +98,12 @@ impl AgentLoop {
             })
             .unwrap_or_default();
 
+        // Model identity — needed both for identity injection and language discipline.
+        let model_id = self.config.providers
+            .get(&self.config.default_provider)
+            .map(|p| p.model.to_lowercase())
+            .unwrap_or_default();
+
         // Assemble prompt: env + project context + pre-read files (bulk) → rules LAST.
         // Models attend most to the START and END of context (primacy + recency).
         // Pre-read files go in the middle (bulk reference material).
@@ -106,6 +112,18 @@ impl AgentLoop {
             "Working directory: {wd}\nALL file paths MUST start with {wd}. NEVER use paths from previous sessions.\n{env_info}\n",
             wd = wd.display(), env_info = env_info,
         );
+
+        // Identity: inject model name so the model can correctly identify itself.
+        // Without this, models fall back to their training-time default identity
+        // (e.g. "I'm Claude on Cursor" or "I'm ChatGPT").
+        let model_display = self.config.providers
+            .get(&self.config.default_provider)
+            .map(|p| p.model.as_str())
+            .unwrap_or("unknown");
+        prompt.push_str(&format!(
+            "You are AtomCode. When asked who you are, say you are AtomCode (an AI coding agent by AtomGit) running the {} model. Never claim to be another product.\n",
+            model_display,
+        ));
 
         if !git_info.is_empty() {
             prompt.push_str(&format!("Git: {}\n", git_info));
@@ -170,10 +188,6 @@ impl AgentLoop {
         // reasoning blocks like "I need to..."/"Let me..." to leak into the
         // visible output. For those, force Chinese reasoning + <think> wrapping.
         // For Claude/GPT/GLM, skip — they don't have this drift problem.
-        let model_id = self.config.providers
-            .get(&self.config.default_provider)
-            .map(|p| p.model.to_lowercase())
-            .unwrap_or_default();
         let needs_cn_lock = model_id.contains("minimax")
             || model_id.contains("qwen")
             || model_id.contains("deepseek")

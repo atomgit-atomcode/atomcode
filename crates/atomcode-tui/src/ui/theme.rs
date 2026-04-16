@@ -14,6 +14,9 @@ static CURRENT_THEME: OnceLock<Theme> = OnceLock::new();
 /// Whether the terminal supports 24-bit true color.
 static TRUECOLOR: OnceLock<bool> = OnceLock::new();
 
+/// Whether we're running inside macOS Terminal.app (needs special handling).
+static APPLE_TERMINAL: OnceLock<bool> = OnceLock::new();
+
 /// Theme type - dark or light background.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Theme {
@@ -39,11 +42,23 @@ impl Theme {
         let theme = Self::detect();
         let _ = CURRENT_THEME.set(theme);
         let _ = TRUECOLOR.set(detect_truecolor());
+        let is_apple = std::env::var("TERM_PROGRAM")
+            .map(|tp| tp.to_lowercase() == "apple_terminal")
+            .unwrap_or(false);
+        let _ = APPLE_TERMINAL.set(is_apple);
     }
 
     /// Get the current theme.
     pub fn current() -> Self {
         *CURRENT_THEME.get().unwrap_or(&Theme::Dark)
+    }
+
+    /// Whether we're running inside macOS Terminal.app.
+    /// Terminal.app doesn't support true color and has issues with external
+    /// processes writing to the terminal via SSH master connections, requiring
+    /// full repaint on every frame.
+    pub fn is_apple_terminal() -> bool {
+        *APPLE_TERMINAL.get().unwrap_or(&false)
     }
 }
 
@@ -91,6 +106,11 @@ fn detect_truecolor() -> bool {
 
     // Default: assume true color (most modern terminals support it)
     true
+}
+
+/// Check if terminal supports true color.
+pub fn is_truecolor() -> bool {
+    *TRUECOLOR.get().unwrap_or(&true)
 }
 
 /// Create a color, falling back to the nearest 256-color index when true color
@@ -278,6 +298,12 @@ pub fn bg_inline_code() -> Color {
 // All three tiers bumped one notch brighter (more contrast vs background) per
 // 2026-04-12 feedback that overall text felt dim.
 pub fn text_primary() -> Color {
+    if !is_truecolor() {
+        return match Theme::current() {
+            Theme::Dark => Color::White,
+            Theme::Light => Color::Black,
+        };
+    }
     match Theme::current() {
         Theme::Dark => rgb(238, 240, 248),
         Theme::Light => rgb(10, 10, 20),
@@ -285,6 +311,12 @@ pub fn text_primary() -> Color {
 }
 
 pub fn text_secondary() -> Color {
+    if !is_truecolor() {
+        return match Theme::current() {
+            Theme::Dark => Color::Gray,
+            Theme::Light => Color::DarkGray,
+        };
+    }
     match Theme::current() {
         Theme::Dark => rgb(185, 188, 202),
         Theme::Light => rgb(55, 58, 73),
@@ -292,6 +324,9 @@ pub fn text_secondary() -> Color {
 }
 
 pub fn text_muted() -> Color {
+    if !is_truecolor() {
+        return Color::DarkGray;
+    }
     match Theme::current() {
         Theme::Dark => rgb(125, 128, 142),
         Theme::Light => rgb(100, 103, 118),
@@ -388,6 +423,9 @@ pub fn selection_bg() -> Color {
 
 // ── Border / Separator ──
 pub fn border() -> Color {
+    if !is_truecolor() {
+        return Color::DarkGray;
+    }
     match Theme::current() {
         Theme::Dark => rgb(75, 78, 95),
         Theme::Light => rgb(160, 163, 180),
@@ -403,6 +441,9 @@ pub fn separator() -> Color {
 
 // ── User Message ──
 pub fn user_chevron() -> Color {
+    if !is_truecolor() {
+        return Color::Cyan;
+    }
     match Theme::current() {
         Theme::Dark => rgb(90, 170, 255),
         Theme::Light => rgb(50, 120, 200),

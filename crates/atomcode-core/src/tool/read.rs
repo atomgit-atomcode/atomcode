@@ -277,7 +277,7 @@ impl Tool for ReadFileTool {
         // file passed Layer A, the model is just creating fragments by passing
         // limit=100. GLM-5 does this despite "do NOT use offset/limit" instruction.
         let limit = match (parsed.offset, parsed.limit) {
-            (None, Some(l)) => total_lines, // offset=0 + limit → ignore limit, give full
+            (None, Some(_)) => total_lines, // offset=0 + limit → ignore limit, give full
             (Some(_), Some(l)) => l,         // explicit range → respect it
             _ => total_lines,                // no limit → full
         };

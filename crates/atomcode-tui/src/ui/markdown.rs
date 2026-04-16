@@ -333,7 +333,18 @@ fn flush(lines: &mut Vec<Line<'static>>, spans: &mut Vec<Span<'static>>) {
 
 fn render_table(lines: &mut Vec<Line<'static>>, header: &[String], rows: &[Vec<String>]) {
     if header.is_empty() { return; }
-    let cols = header.len();
+
+    // Trim trailing empty columns — models sometimes output a trailing `|`
+    // which pulldown-cmark parses as an extra empty cell, producing a
+    // "ghost column" with borders but no content.
+    let mut cols = header.len();
+    while cols > 1
+        && header.get(cols - 1).map(|s| s.is_empty()).unwrap_or(false)
+        && rows.iter().all(|r| r.get(cols - 1).map(|s| s.is_empty()).unwrap_or(true))
+    {
+        cols -= 1;
+    }
+    let header = &header[..cols];
     // Border at text_primary brightness — the box drawing chars read as structural
     // furniture, so they need to be as visible as the cell text itself. Anything dimmer
     // makes the table "recede into the background".
@@ -360,11 +371,12 @@ fn render_table(lines: &mut Vec<Line<'static>>, header: &[String], rows: &[Vec<S
         if dw <= max_w {
             text.to_string()
         } else {
+            let ellipsis_w = char_width('…');
             let mut result = String::new();
             let mut w = 0;
             for c in text.chars() {
-                let cw = if (c as u32) >= 0x4E00 { 2 } else { 1 };
-                if w + cw > max_w.saturating_sub(1) { break; }
+                let cw = char_width(c);
+                if w + cw + ellipsis_w > max_w { break; }
                 result.push(c);
                 w += cw;
             }
@@ -439,13 +451,7 @@ fn render_table(lines: &mut Vec<Line<'static>>, header: &[String], rows: &[Vec<S
 
 /// Display width of a string (CJK = 2 columns).
 fn display_width_str(s: &str) -> usize {
-    s.chars().map(|c| {
-        let cp = c as u32;
-        if (0x4E00..=0x9FFF).contains(&cp) || (0x3400..=0x4DBF).contains(&cp)
-            || (0xFF01..=0xFF60).contains(&cp) || (0x3000..=0x30FF).contains(&cp)
-            || (0xAC00..=0xD7AF).contains(&cp)
-        { 2 } else { 1 }
-    }).sum()
+    s.chars().map(char_width).sum()
 }
 
 /// Wrap lines that exceed `max_width` columns.
@@ -498,11 +504,18 @@ fn span_width(span: &Span) -> usize {
 
 fn char_width(c: char) -> usize {
     let cp = c as u32;
-    if (0x4E00..=0x9FFF).contains(&cp) || (0x3400..=0x4DBF).contains(&cp)
-        || (0x20000..=0x2A6DF).contains(&cp) || (0xF900..=0xFAFF).contains(&cp)
-        || (0xFF01..=0xFF60).contains(&cp) || (0xFFE0..=0xFFE6).contains(&cp)
-        || (0xAC00..=0xD7AF).contains(&cp) || (0x3000..=0x303F).contains(&cp)
-        || (0x3040..=0x309F).contains(&cp) || (0x30A0..=0x30FF).contains(&cp)
+    if (0x4E00..=0x9FFF).contains(&cp)      // CJK Unified Ideographs
+        || (0x3400..=0x4DBF).contains(&cp)   // CJK Extension A
+        || (0x20000..=0x2A6DF).contains(&cp) // CJK Extension B
+        || (0xF900..=0xFAFF).contains(&cp)   // CJK Compatibility Ideographs
+        || (0xFF01..=0xFF60).contains(&cp)   // Fullwidth Latin / symbols
+        || (0xFFE0..=0xFFE6).contains(&cp)   // Fullwidth signs
+        || (0xAC00..=0xD7AF).contains(&cp)   // Hangul Syllables
+        || (0x3000..=0x303F).contains(&cp)   // CJK Symbols and Punctuation
+        || (0x3040..=0x309F).contains(&cp)   // Hiragana
+        || (0x30A0..=0x30FF).contains(&cp)   // Katakana
+        || (0x2E80..=0x2EFF).contains(&cp)   // CJK Radicals
+        || (0xFE30..=0xFE4F).contains(&cp)   // CJK Compatibility Forms
     { 2 } else { 1 }
 }
 

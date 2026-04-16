@@ -463,9 +463,11 @@ pub async fn run(
     // WriteConsole syscall, which is orders of magnitude slower than Unix tty
     // writes — unbuffered stdout caused visible per-keystroke lag. ratatui
     // flushes the backend at the end of every draw, so latency is unaffected.
-    // 64KB capacity: a full-screen frame of ANSI output often exceeds the
-    // default 8KB buffer, which would force multiple flushes per frame.
-    let backend = CrosstermBackend::new(std::io::BufWriter::with_capacity(64 * 1024, stdout));
+    // 512KB capacity: full-repaint mode (underline_color toggle) writes every
+    // cell on every frame — a 200×50 terminal produces ~200KB of ANSI output.
+    // The buffer must hold the entire frame to avoid mid-frame flushes that
+    // expose intermediate cursor positions as visible flicker.
+    let backend = CrosstermBackend::new(std::io::BufWriter::with_capacity(512 * 1024, stdout));
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
     let mut app = App::new(model_name, config, agent_handle, tool_context, working_dir, session_to_continue);
@@ -487,12 +489,37 @@ pub async fn run(
         // front had content.  After the swap the front is blank, so the REAL
         // draw (immediately after) sees every content cell as "changed" and
         // writes it — guaranteed full repaint.
-        if app.redraw_frames > 0 {
-            app.redraw_frames -= 1;
-            terminal.clear()?;
-            terminal.draw(|_| {})?;
-        }
-        terminal.draw(|frame| ui::render(frame, &mut app))?;
+        // Full-repaint trick: toggle an invisible style attribute (underline_color)
+        // on every cell after rendering, alternating each frame.  ratatui's diff
+        // compares Cell fields including underline_color, so every cell appears
+        // "changed" and is written to the terminal — guaranteeing no stale
+        // artifacts from external processes (SSH master, git hooks) survive.
+        // underline_color is invisible without the UNDERLINED modifier, so the
+        // toggle has zero visual effect.  Single draw() = single flush = no flicker.
+        let repaint_parity = app.tick_count;
+        terminal.draw(|frame| {
+            ui::render(frame, &mut app);
+            // Toggle underline_color across the entire buffer
+            let uc = if repaint_parity % 2 == 0 {
+                ratatui::style::Color::Reset
+            } else {
+                ratatui::style::Color::Indexed(0)
+            };
+            let buf = frame.buffer_mut();
+            let area = buf.area;
+            // Skip row 0 (status bar) and last 3 rows (input box) — they
+            // redraw fully on every frame anyway, and the SGR toggle causes
+            // visible flicker on the ◉ logo character in some terminals.
+            let y_start = area.y + 1;
+            let y_end = area.y + area.height.saturating_sub(3);
+            for y in y_start..y_end {
+                for x in area.x..area.x + area.width {
+                    if let Some(cell) = buf.cell_mut(ratatui::layout::Position::new(x, y)) {
+                        cell.set_style(cell.style().underline_color(uc));
+                    }
+                }
+            }
+        })?;
 
         if let Some(file_path) = app.pending_editor.take() {
             // First disable raw mode to release terminal control completely
@@ -780,17 +807,29 @@ app.conversation.add_user_message("/login-with-sso");
                         Err(_) => break,
                     }
                 }
-                // Force full redraw if a bash tool just completed — overwrite
-                // any artifacts from child processes writing to /dev/tty.
-                if app.redraw_frames > 0 {
-                    app.redraw_frames -= 1;
-                    terminal.clear()?;
-                    terminal.draw(|_| {})?;
-                }
                 // Redraw immediately after processing agent events.
                 // Without this, the terminal won't update until the next user
                 // input event, causing the UI to appear "frozen".
-                terminal.draw(|frame| ui::render(frame, &mut app))?;
+                let repaint_parity = app.tick_count;
+                terminal.draw(|frame| {
+                    ui::render(frame, &mut app);
+                    let uc = if repaint_parity % 2 == 0 {
+                        ratatui::style::Color::Reset
+                    } else {
+                        ratatui::style::Color::Indexed(0)
+                    };
+                    let buf = frame.buffer_mut();
+                    let area = buf.area;
+                    let y_start = area.y + 1;
+                    let y_end = area.y + area.height.saturating_sub(3);
+                    for y in y_start..y_end {
+                        for x in area.x..area.x + area.width {
+                            if let Some(cell) = buf.cell_mut(ratatui::layout::Position::new(x, y)) {
+                                cell.set_style(cell.style().underline_color(uc));
+                            }
+                        }
+                    }
+                })?;
             }
         }
 

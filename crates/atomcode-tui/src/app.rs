@@ -265,12 +265,6 @@ pub struct App {
     pub session_selector_cursor: usize,
     /// Last sent user input - restored to input box if turn is cancelled.
     pub last_sent_input: Option<String>,
-    /// Force full terminal redraws for this many remaining frames. Set after
-    /// bash tool completion to overwrite any artifacts left by child processes
-    /// (or their SSH master connections) that write directly to the terminal.
-    /// Multiple frames are needed because SSH multiplexing may relay server-side
-    /// hook output asynchronously, arriving after the initial redraw.
-    pub redraw_frames: u8,
 }
 
 impl App {
@@ -409,7 +403,6 @@ impl App {
                              session_selector_query: String::new(),
                              session_selector_cursor: 0,
                              last_sent_input: None,
-                             redraw_frames: 0,
                     }
                 }
 
@@ -544,25 +537,27 @@ impl App {
             self.render_cache_msg_count = 0;
             self.scroll_offset = 0;
             self.at_bottom = true;
-            // Show new project info
-            let new_dir = self.working_dir.display().to_string();
-            let tree = crate::project_context::build_project_context(&self.working_dir);
-            self.project_context_cache = Some(tree.text.clone());
-            let summary = format!(
-                "Switched to `{}`\n\n```\n{}\n```",
-                new_dir,
-                tree.text.lines().take(20).collect::<Vec<_>>().join("\n"),
-            );
-            self.conversation.push_delta(&summary);
-            self.conversation.finalize_stream();
-            // Update session manager and load latest session for this project
+            // Load session for the new project directory
             self.session_manager = SessionManager::new(&self.working_dir);
             self.current_session = self.session_manager.latest()
                 .ok().flatten()
                 .unwrap_or_else(|| Session::default_session(self.working_dir.clone()));
-            // Restore conversation from loaded session
-            self.conversation = atomcode_core::conversation::Conversation::new();
-            self.conversation.messages = self.current_session.messages.clone();
+            if !self.current_session.messages.is_empty() {
+                // Resume previous session in this directory
+                self.conversation.messages = self.current_session.messages.clone();
+            } else {
+                // No previous session — show project summary
+                let new_dir = self.working_dir.display().to_string();
+                let tree = crate::project_context::build_project_context(&self.working_dir);
+                self.project_context_cache = Some(tree.text.clone());
+                let summary = format!(
+                    "Switched to `{}`\n\n```\n{}\n```",
+                    new_dir,
+                    tree.text.lines().take(20).collect::<Vec<_>>().join("\n"),
+                );
+                self.conversation.push_delta(&summary);
+                self.conversation.finalize_stream();
+            }
         } else {
             // Directory doesn't exist — create it, git init, and add ATOMCODE.md
             let new_path = if path.starts_with('/') || path.starts_with('~') {
@@ -723,12 +718,15 @@ impl App {
                 let icon = if success { "\u{2713}" } else { "\u{2717}" };
                 let first_line = output.lines().next().unwrap_or("").chars().take(40).collect::<String>();
                 self.last_completed_tool = format!("{} {} {}", icon, name, first_line);
-                // Bash tools may leave terminal artifacts from child processes
-                // (or SSH master connections) writing directly to /dev/tty.
-                // Force full redraws for several frames to catch late-arriving
-                // output relayed asynchronously by SSH multiplexing.
                 if name == "bash" {
-                    self.redraw_frames = 10;
+                    // Sync working_dir — bash `cd` updates the shared context
+                    // but not app.working_dir (shown in the status bar).
+                    if let Ok(wd) = self.tool_context.working_dir.try_read() {
+                        if *wd != self.working_dir {
+                            self.working_dir = wd.clone();
+                            self.project_context_cache = None;
+                        }
+                    }
                 }
                 // Use the same call_id the agent recorded on ToolCallStarted so chat_panel's
                 // "in-flight tool call" detection (call.id ∈ completed_call_ids) matches.
@@ -1880,7 +1878,12 @@ impl App {
                 }
             }
             (_, KeyCode::Backspace) => {
-                self.input.backspace();
+                if self.input.is_empty() && !self.pasted_blocks.is_empty() {
+                    // When input is empty, Backspace removes the last pasted block
+                    self.pasted_blocks.pop();
+                } else {
+                    self.input.backspace();
+                }
             }
             (_, KeyCode::Left) => {
                 if self.input.cursor_col > 0 {
@@ -1945,11 +1948,12 @@ impl App {
 
     /// Handle scroll keys (Ctrl+Up/Down, PageUp/PageDown). Returns true if the key was a scroll key.
     fn handle_scroll_keys(&mut self, key: KeyEvent) -> bool {
+        let vh = self.last_viewport_height as usize;
+        let max_scroll = self.last_total_lines.saturating_sub(vh);
         match (key.modifiers, key.code) {
             (KeyModifiers::CONTROL, KeyCode::Up) => {
                 if self.at_bottom {
-                    let total = self.last_total_lines;
-                    self.scroll_offset = total.saturating_sub(3);
+                    self.scroll_offset = max_scroll.saturating_sub(3);
                     self.at_bottom = false;
                 } else {
                     self.scroll_offset = self.scroll_offset.saturating_sub(3);
@@ -1957,8 +1961,6 @@ impl App {
                 true
             }
             (KeyModifiers::CONTROL, KeyCode::Down) => {
-                let vh = self.last_viewport_height as usize;
-                let max_scroll = self.last_total_lines.saturating_sub(vh);
                 self.scroll_offset = (self.scroll_offset + 3).min(max_scroll);
                 if self.scroll_offset >= max_scroll {
                     self.at_bottom = true;
@@ -1967,8 +1969,7 @@ impl App {
             }
             (_, KeyCode::PageUp) => {
                 if self.at_bottom {
-                    let total = self.last_total_lines;
-                    self.scroll_offset = total.saturating_sub(20);
+                    self.scroll_offset = max_scroll.saturating_sub(20);
                     self.at_bottom = false;
                 } else {
                     self.scroll_offset = self.scroll_offset.saturating_sub(20);
@@ -1976,8 +1977,6 @@ impl App {
                 true
             }
             (_, KeyCode::PageDown) => {
-                let vh = self.last_viewport_height as usize;
-                let max_scroll = self.last_total_lines.saturating_sub(vh);
                 self.scroll_offset = (self.scroll_offset + 20).min(max_scroll);
                 if self.scroll_offset >= max_scroll {
                     self.at_bottom = true;
@@ -1994,9 +1993,10 @@ impl App {
         match mouse.kind {
             // ── Scroll wheel ──
             MouseEventKind::ScrollUp => {
+                let vh = self.last_viewport_height as usize;
                 if self.at_bottom {
-                    let total = self.last_total_lines;
-                    self.scroll_offset = total.saturating_sub(3);
+                    let max_scroll = self.last_total_lines.saturating_sub(vh);
+                    self.scroll_offset = max_scroll.saturating_sub(3);
                     self.at_bottom = false;
                 } else {
                     self.scroll_offset = self.scroll_offset.saturating_sub(3);
@@ -2667,6 +2667,46 @@ impl App {
         // Check for slash commands first
         if self.handle_slash_command() {
             return;
+        }
+
+        // Intercept bare `cd <path>` — treat as `/cd <path>` so the working
+        // directory actually changes instead of the LLM just listing files.
+        {
+            let trimmed = content.trim();
+            if trimmed == "cd" || trimmed.starts_with("cd ") {
+                let arg = trimmed.strip_prefix("cd").unwrap().trim();
+                if arg.is_empty() {
+                    if self.recent_dirs.is_empty() {
+                        self.conversation.add_user_message(trimmed);
+                        self.conversation.push_delta(&format!(
+                            "Working directory: `{}`\n\nNo recent projects. Use `cd <path>` to switch.",
+                            self.working_dir.display()
+                        ));
+                        self.conversation.finalize_stream();
+                    } else {
+                        self.dir_selector = Some(0);
+                    }
+                } else if arg == "-" {
+                    if let Some(prev) = self.previous_working_dir.clone() {
+                        self.conversation.add_user_message(trimmed);
+                        let prev_str = prev.to_string_lossy().to_string();
+                        self.change_working_dir(&prev_str);
+                        let _ = self.agent_handle.cmd_tx.send(AgentCommand::ChangeDir(prev_str));
+                    } else {
+                        self.conversation.add_user_message(trimmed);
+                        self.conversation.push_delta("No previous directory");
+                        self.conversation.finalize_stream();
+                    }
+                } else {
+                    self.conversation.add_user_message(trimmed);
+                    self.change_working_dir(arg);
+                    let _ = self.agent_handle.cmd_tx.send(AgentCommand::ChangeDir(arg.to_string()));
+                }
+                self.input.clear();
+                self.pasted_blocks.clear();
+                self.attached_files.clear();
+                return;
+            }
         }
 
         // Add full content to history (typed + pasted)

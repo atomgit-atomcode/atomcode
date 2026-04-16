@@ -133,6 +133,20 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         app.last_rendered_scroll = rendered_scroll;
         app.last_viewport_height = chunks[1].height;
         app.last_total_lines = total_lines;
+
+        // Clamp scroll_offset when content shrinks (e.g. after streaming ends,
+        // dynamic lines disappear). Without this, stale scroll_offset can leave
+        // large blank regions above the actual content.
+        if !app.at_bottom {
+            let vh = chunks[1].height as usize;
+            let max_scroll = total_lines.saturating_sub(vh);
+            if app.scroll_offset > max_scroll {
+                app.scroll_offset = max_scroll;
+                if max_scroll == 0 {
+                    app.at_bottom = true;
+                }
+            }
+        }
     }
 
     input_box::render(frame, chunks[2], &app.input, app.mode.is_streaming_or_executing(), app.suggestion.as_deref(), &app.attached_files, &app.pasted_blocks);

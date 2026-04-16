@@ -101,6 +101,33 @@ impl Tool for BashTool {
 
     async fn execute(&self, args: &str, ctx: &ToolContext) -> Result<ToolResult> {
         let mut result = bash_execute(args, ctx).await?;
+
+        // Detect `cd` commands and update the shared working directory so the
+        // status bar and subsequent bash calls reflect the change.  Without
+        // this, `cd /path` in a child process only affects that process — the
+        // TUI keeps showing the old directory.
+        if result.success {
+            if let Ok(parsed) = serde_json::from_str::<BashArgs>(args) {
+                if let Some(new_dir) = detect_cd_target(&parsed.command) {
+                    let current = ctx.working_dir.read().await.clone();
+                    let resolved = if new_dir.starts_with('/') {
+                        std::path::PathBuf::from(&new_dir)
+                    } else if new_dir.starts_with('~') {
+                        dirs::home_dir()
+                            .map(|h| h.join(new_dir.strip_prefix("~/").unwrap_or(&new_dir[1..])))
+                            .unwrap_or_else(|| std::path::PathBuf::from(&new_dir))
+                    } else {
+                        current.join(&new_dir)
+                    };
+                    let resolved = std::fs::canonicalize(&resolved).unwrap_or(resolved);
+                    if resolved.is_dir() {
+                        let mut wd = ctx.working_dir.write().await;
+                        *wd = resolved;
+                    }
+                }
+            }
+        }
+
         // Append cwd to every bash result so model always knows where it is.
         let wd = ctx.working_dir.read().await;
         result.output.push_str(&format!("\n[cwd: {}]", wd.display()));
@@ -377,6 +404,29 @@ fn check_destructive_command(command: &str) -> Option<String> {
     None
 }
 
+
+/// Detect if a bash command is (or starts with) a `cd` and extract the target
+/// directory.  Handles: `cd /path`, `cd ~/path`, `cd dir && ...`, `cd dir; ...`.
+/// Returns None for non-cd commands or bare `cd` (go home).
+fn detect_cd_target(cmd: &str) -> Option<String> {
+    let trimmed = cmd.trim();
+    if !trimmed.starts_with("cd ") && trimmed != "cd" {
+        return None;
+    }
+    if trimmed == "cd" {
+        // bare `cd` goes to $HOME
+        return dirs::home_dir().map(|h| h.to_string_lossy().to_string());
+    }
+    // Extract the path after `cd `, stopping at `&&`, `;`, `||`, `|`, or end.
+    let after_cd = trimmed[3..].trim_start();
+    let end = after_cd.find(|c: char| c == '&' || c == ';' || c == '|')
+        .unwrap_or(after_cd.len());
+    let path = after_cd[..end].trim().trim_matches('"').trim_matches('\'');
+    if path.is_empty() {
+        return dirs::home_dir().map(|h| h.to_string_lossy().to_string());
+    }
+    Some(path.to_string())
+}
 
 /// Strip model-added `| tail -N` / `| head -N` from the end of bash commands.
 /// The framework's truncation system manages output length — model shouldn't self-truncate.
