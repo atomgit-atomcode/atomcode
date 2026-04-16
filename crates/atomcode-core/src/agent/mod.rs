@@ -260,8 +260,6 @@ pub struct AgentLoop {
     current_task: String,
     /// Name of the tool currently being executed (for smart truncation).
     current_tool_name: String,
-    /// Pre-read file contents injected as system context (not synthetic tool calls).
-    preread_context: String,
 
     /// Files edited in the previous turn — injected into system prompt so the model
     /// knows where to start when the user reports the same issue again.
@@ -432,7 +430,6 @@ impl AgentLoop {
             files_edited_this_turn: Vec::new(),
             current_task: String::new(),
             current_tool_name: String::new(),
-            preread_context: String::new(),
             prev_turn_edited_files: Vec::new(),
             last_checkpoint: None,
             active_file: None,
@@ -606,8 +603,6 @@ impl AgentLoop {
             std::sync::atomic::Ordering::Relaxed,
         );
 
-        self.preread_context = self.build_preread_context(&content).await;
-
         // Auto-diagnose: if user mentions error keywords, scan logs and attach findings.
         // This gives the model the real error from Turn 1, instead of spending 3-5 turns grepping.
         let enriched = self.auto_diagnose_errors(&content).await;
@@ -745,8 +740,6 @@ impl AgentLoop {
     }
 
     // needs_planning replaced by task_classifier::TaskType::needs_planning()
-
-    // build_preread_context → prompt.rs
 
     // auto_diagnose_errors → diagnose.rs
     // find_file_in_project → diagnose.rs

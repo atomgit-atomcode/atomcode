@@ -1,16 +1,6 @@
 use super::*;
 
 impl AgentLoop {
-    /// Graph-driven preread: identify call chain files from user message,
-    /// read their key functions, and inject into system prompt.
-    ///
-    /// Unlike the old "preread everything" approach (disabled for bloating context),
-    /// this only reads files ON THE CALL CHAIN — typically 3-5 files, ~15K tok max.
-    /// Budget: total preread ≤ 25% of remaining context.
-    pub(crate) async fn build_preread_context(&mut self, _content: &str) -> String {
-        String::new()
-    }
-
     /// Build the stable system prompt. This should NOT change between turns
     /// within the same session, enabling prompt caching across all providers.
     ///
@@ -83,11 +73,6 @@ impl AgentLoop {
         prompt.push_str(&format!(
             "\n=== PROJECT STRUCTURE ===\n{project_ctx}\n"
         ));
-
-        // Pre-read files (bulk content — middle of prompt)
-        if !self.preread_context.is_empty() {
-            prompt.push_str(&format!("\n\n{}", self.preread_context));
-        }
 
         // Project instructions (if any)
         if !project_instructions.is_empty() {
