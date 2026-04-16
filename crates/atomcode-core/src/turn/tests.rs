@@ -809,3 +809,96 @@ async fn test_denied_tool_result_in_llm_context() {
         panic!("Expected ToolResult for denied call");
     }
 }
+
+// ===========================================================================
+// Prompt caching tests
+// ===========================================================================
+
+/// Turn reminder should be injected into the last user message (copy only),
+/// not into the conversation history.
+#[tokio::test]
+async fn test_turn_reminder_injected_into_last_user_message() {
+    let mut runner = make_runner(MockProvider::text_only("ok"), ToolRegistry::new(), auto_bypass());
+    let mut conv = Conversation::new();
+    conv.add_user_message("fix the bug");
+    let (tx, _rx) = mpsc::unbounded_channel();
+
+    let reminder = "<system-reminder>\nCurrent task: fix the bug\n</system-reminder>";
+    runner.run_with_filter(&mut conv, "system", reminder, &tx, CancellationToken::new(), None).await;
+
+    // Conversation history should NOT contain the reminder
+    for msg in &conv.messages {
+        if let crate::conversation::message::MessageContent::Text(ref text) = msg.content {
+            assert!(!text.contains("system-reminder"),
+                "Turn reminder leaked into conversation history: {}", text);
+        }
+    }
+}
+
+/// Empty turn reminder should not modify messages.
+#[tokio::test]
+async fn test_empty_turn_reminder_is_noop() {
+    let mut runner = make_runner(MockProvider::text_only("ok"), ToolRegistry::new(), auto_bypass());
+    let mut conv = Conversation::new();
+    conv.add_user_message("hello");
+    let (tx, _rx) = mpsc::unbounded_channel();
+
+    // Empty reminder — should work exactly like run()
+    runner.run_with_filter(&mut conv, "system", "", &tx, CancellationToken::new(), None).await;
+
+    // Should have completed normally
+    assert!(conv.messages.len() >= 2); // user + assistant
+}
+
+/// ToolRegistry should return definitions in stable (sorted) order.
+#[test]
+fn test_tool_registry_stable_order() {
+    let mut registry = ToolRegistry::new();
+    // Register in reverse alphabetical order
+    registry.register(Box::new(EchoTool { name: "write_file" }));
+    registry.register(Box::new(EchoTool { name: "bash" }));
+    registry.register(Box::new(EchoTool { name: "read_file" }));
+    registry.register(Box::new(EchoTool { name: "grep" }));
+    registry.register(Box::new(EchoTool { name: "edit_file" }));
+
+    let defs = registry.get_definitions();
+    let names: Vec<&str> = defs.iter().map(|d| d.name).collect();
+
+    // BTreeMap should give alphabetical order regardless of insertion order
+    assert_eq!(names, vec!["bash", "edit_file", "grep", "read_file", "write_file"]);
+
+    // Call again — order must be identical
+    let defs2 = registry.get_definitions();
+    let names2: Vec<&str> = defs2.iter().map(|d| d.name).collect();
+    assert_eq!(names, names2, "Tool order must be stable across calls");
+}
+
+/// UNIFIED_PROMPT should not contain tool-specific usage descriptions
+/// (those belong in tool definitions, not system prompt).
+#[test]
+fn test_rules_no_tool_descriptions() {
+    let rules = crate::config::prompt_sections::build_rules();
+
+    // Should NOT contain tool usage descriptions (removed for token savings)
+    assert!(!rules.contains("Search code: grep"), "Rules should not describe grep usage");
+    assert!(!rules.contains("Find files: glob"), "Rules should not describe glob usage");
+    assert!(!rules.contains("Read code: read_file"), "Rules should not describe read_file usage");
+    assert!(!rules.contains("Edit files: edit_file"), "Rules should not describe edit_file usage");
+    assert!(!rules.contains("Create files: write_file"), "Rules should not describe write_file usage");
+    assert!(!rules.contains("Run commands: bash"), "Rules should not describe bash usage");
+
+    // SHOULD still contain tool discipline rules
+    assert!(rules.contains("Call multiple tools in ONE turn"),
+        "Rules must contain batch tool call discipline");
+}
+
+/// System prompt should not contain dynamic content (date, git status, etc.)
+/// that would break prompt caching.
+#[test]
+fn test_rules_no_dynamic_content() {
+    let rules = crate::config::prompt_sections::build_rules();
+
+    assert!(!rules.contains("Date:"), "Rules should not contain date");
+    assert!(!rules.contains("Git:"), "Rules should not contain git status");
+    assert!(!rules.contains("Recent activity"), "Rules should not contain recent activity");
+}

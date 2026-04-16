@@ -159,6 +159,62 @@ struct ClaudeDelta {
     partial_json: Option<String>,
 }
 
+// ── Request body construction ────────────────────────────────────────────────
+
+impl ClaudeProvider {
+    /// Build the JSON request body for the Claude API.
+    /// Extracted for testability — the same logic is used by chat_stream.
+    fn build_request_body(
+        model: &str,
+        max_tokens: usize,
+        system: Option<String>,
+        msgs: Vec<serde_json::Value>,
+        tools: Option<&[ToolDef]>,
+    ) -> serde_json::Value {
+        let mut body = json!({
+            "model": model,
+            "messages": msgs,
+            "max_tokens": max_tokens,
+            "stream": true,
+        });
+
+        if let Some(sys) = system {
+            // System prompt as array with cache_control breakpoint.
+            // Claude caches prefix: system → tools → messages.
+            // Marking system as cacheable ensures it's reused across turns
+            // when the content is stable (same session).
+            body["system"] = json!([{
+                "type": "text",
+                "text": sys,
+                "cache_control": {"type": "ephemeral"}
+            }]);
+        }
+
+        if let Some(tool_defs) = tools {
+            if !tool_defs.is_empty() {
+                let mut tools_json: Vec<serde_json::Value> = tool_defs
+                    .iter()
+                    .map(|td| {
+                        json!({
+                            "name": td.name,
+                            "description": td.description,
+                            "input_schema": td.parameters,
+                        })
+                    })
+                    .collect();
+                // Cache breakpoint on last tool: system + all tools form
+                // the stable prefix (tools don't change within a session).
+                if let Some(last) = tools_json.last_mut() {
+                    last["cache_control"] = json!({"type": "ephemeral"});
+                }
+                body["tools"] = json!(tools_json);
+            }
+        }
+
+        body
+    }
+}
+
 // ── LlmProvider impl ─────────────────────────────────────────────────────────
 
 #[async_trait]
@@ -169,33 +225,7 @@ impl LlmProvider for ClaudeProvider {
         tools: Option<&[ToolDef]>,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
         let (system, msgs) = Self::format_messages(messages);
-
-        let mut body = json!({
-            "model": self.model,
-            "messages": msgs,
-            "max_tokens": self.max_tokens,
-            "stream": true,
-        });
-
-        if let Some(sys) = system {
-            body["system"] = json!(sys);
-        }
-
-        if let Some(tool_defs) = tools {
-            if !tool_defs.is_empty() {
-                let tools_json: Vec<serde_json::Value> = tool_defs
-                    .iter()
-                    .map(|td| {
-                        json!({
-                            "name": td.name,
-                            "description": td.description,
-                            "input_schema": td.parameters,
-                        })
-                    })
-                    .collect();
-                body["tools"] = json!(tools_json);
-            }
-        }
+        let body = Self::build_request_body(&self.model, self.max_tokens, system, msgs, tools);
 
         let request = self
             .client
@@ -364,5 +394,94 @@ impl LlmProvider for ClaudeProvider {
 
     fn model_name(&self) -> &str {
         &self.model
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_system_prompt_has_cache_control() {
+        let body = ClaudeProvider::build_request_body(
+            "claude-sonnet-4-20250514",
+            8192,
+            Some("You are a helpful assistant.".to_string()),
+            vec![json!({"role": "user", "content": "hello"})],
+            None,
+        );
+
+        let system = &body["system"];
+        assert!(system.is_array(), "system should be array, got: {}", system);
+        let block = &system[0];
+        assert_eq!(block["type"], "text");
+        assert_eq!(block["text"], "You are a helpful assistant.");
+        assert_eq!(block["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn test_tools_last_has_cache_control() {
+        let tools = vec![
+            ToolDef { name: "grep", description: "Search".into(), parameters: json!({"type": "object"}) },
+            ToolDef { name: "read_file", description: "Read".into(), parameters: json!({"type": "object"}) },
+        ];
+
+        let body = ClaudeProvider::build_request_body(
+            "claude-sonnet-4-20250514",
+            8192,
+            Some("sys".to_string()),
+            vec![],
+            Some(&tools),
+        );
+
+        let tools_json = &body["tools"];
+        assert!(tools_json.is_array());
+        let arr = tools_json.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+
+        // First tool should NOT have cache_control
+        assert!(arr[0].get("cache_control").is_none(),
+            "First tool should not have cache_control");
+
+        // Last tool SHOULD have cache_control
+        assert_eq!(arr[1]["cache_control"]["type"], "ephemeral",
+            "Last tool must have cache_control");
+    }
+
+    #[test]
+    fn test_single_tool_has_cache_control() {
+        let tools = vec![
+            ToolDef { name: "bash", description: "Run".into(), parameters: json!({"type": "object"}) },
+        ];
+
+        let body = ClaudeProvider::build_request_body(
+            "model",
+            8192,
+            None,
+            vec![],
+            Some(&tools),
+        );
+
+        let arr = body["tools"].as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn test_empty_tools_no_tools_field() {
+        let tools: Vec<ToolDef> = vec![];
+        let body = ClaudeProvider::build_request_body(
+            "model", 8192, None, vec![], Some(&tools),
+        );
+        assert!(body.get("tools").is_none(), "Empty tools should not add tools field");
+    }
+
+    #[test]
+    fn test_no_system_no_system_field() {
+        let body = ClaudeProvider::build_request_body(
+            "model", 8192, None, vec![], None,
+        );
+        assert!(body.get("system").is_none(), "No system prompt should not add system field");
     }
 }

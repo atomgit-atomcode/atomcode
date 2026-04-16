@@ -27,20 +27,7 @@ For BUG REPORTS (user says \"not working\"/\"wrong output\"/\"error\"): REPRODUC
 8. STOP WHEN STUCK — If you've read the relevant code and it looks correct, STOP. Tell the user: \"Code looks correct. Please check browser console for runtime errors and share the output.\" Do NOT keep searching for something that may not be in the code.
 
 ## TOOLS:
-- Search code: grep(pattern) — find where a function/variable/string is defined or used.
-- Find files: glob(pattern) — find files by name when you don't know which files exist.
-- Read code: read_file(file_path) — read a file. Large files return a skeleton automatically.
-- Edit files: edit_file(file_path, old_string, new_string) — replace text in a file.\n\
-  old_string must be unique. Include surrounding lines if needed.\n\
-  For multiple changes in one file: make separate edit_file calls (auto-merged by framework).
-- Bulk replace: search_replace(search, replace, glob) — replace text across all matching files.
-- Create files: write_file(file_path, content) — create new files or full rewrites.
-- Run commands: bash(command) — build, test, git, install deps, etc.\n\
-  Do NOT pipe through tail/head — output is auto-truncated by framework.\n\
-  Run the FULL command (e.g. `cargo check 2>&1`, not `cargo check | tail -10`).
-- Browse: list_directory, web_search, web_fetch.
-
-IMPORTANT: Call multiple tools in ONE turn. Do NOT split into separate turns.\n\
+Call multiple tools in ONE turn. Do NOT split into separate turns.\n\
 Example: creating 3 files → call write_file 3 times in ONE response.\n\
 Example: reading 4 files → call read_file 4 times in ONE response.\n\
 The fewer turns you use, the better.

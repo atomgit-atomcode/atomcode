@@ -798,6 +798,7 @@ impl AgentLoop {
             // the prompt guides the model to work efficiently.
 
             let system_prompt = self.build_system_prompt();
+            let turn_reminder = self.build_turn_reminder();
             let cancel = self.cancel_token.clone();
 
             // Context compression: when > 70% budget, pause and compress
@@ -894,7 +895,7 @@ impl AgentLoop {
                     None // Full tool access — model can read, edit, bash, search_replace
                 };
                 let turn_fut = runner.run_with_filter(
-                    &mut conv, &system_prompt, &turn_tx, cancel, tool_filter,
+                    &mut conv, &system_prompt, &turn_reminder, &turn_tx, cancel, tool_filter,
                 );
                 tokio::pin!(turn_fut);
 

@@ -11,6 +11,12 @@ impl AgentLoop {
         String::new()
     }
 
+    /// Build the stable system prompt. This should NOT change between turns
+    /// within the same session, enabling prompt caching across all providers.
+    ///
+    /// Dynamic per-turn content (git status, recent activity, current task, etc.)
+    /// is built separately by `build_turn_reminder()` and injected into the
+    /// last user message as a <system-reminder>.
     pub(crate) fn build_system_prompt(&mut self) -> String {
         // Dynamic rules: select prompt sections based on task type.
         // If user has a custom system_prompt in config, use that instead (override).
@@ -48,9 +54,6 @@ impl AgentLoop {
             }
         };
 
-        // No file suggestions — let the model decide which files to read
-        // based on the project structure and conversation context (let model decide).
-
         // Load project-level instructions (.atomcode.md or ATOMCODE.md)
         let project_instructions = [".atomcode.md", "ATOMCODE.md"]
             .iter()
@@ -60,66 +63,22 @@ impl AgentLoop {
             })
             .unwrap_or_default();
 
-        // Inject environment metadata
+        // Stable environment metadata (no date — model can run `date` if needed)
         let shell = if cfg!(target_os = "windows") {
             std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".into())
         } else {
             std::env::var("SHELL").unwrap_or_else(|_| "bash".into())
         };
-        let date_str = if cfg!(target_os = "windows") {
-            // Windows: use PowerShell for date
-            std::process::Command::new("cmd.exe")
-                .args(&["/C", "echo %date%"])
-                .output()
-                .ok().and_then(|o| String::from_utf8(o.stdout).ok())
-                .map(|s| s.trim().to_string())
-                .unwrap_or_else(|| "unknown".into())
-        } else {
-            std::process::Command::new("date").arg("+%Y-%m-%d").output()
-                .ok().and_then(|o| String::from_utf8(o.stdout).ok())
-                .map(|s| s.trim().to_string())
-                .unwrap_or_else(|| "unknown".into())
-        };
         let env_info = format!(
-            "Platform: {} | Shell: {} | Date: {}",
-            std::env::consts::OS, shell, date_str,
+            "Platform: {} | Shell: {}",
+            std::env::consts::OS, shell,
         );
 
-        // Git context (branch + status summary)
-        let git_info = std::process::Command::new("git")
-            .args(&["status", "--short", "--branch"])
-            .current_dir(&wd)
-            .output()
-            .ok()
-            .and_then(|o| String::from_utf8(o.stdout).ok())
-            .map(|s| {
-                let lines: Vec<&str> = s.lines().take(10).collect();
-                lines.join("\n")
-            })
-            .unwrap_or_default();
-
-        // Assemble prompt: env + project context + pre-read files (bulk) → rules LAST.
-        // Models attend most to the START and END of context (primacy + recency).
-        // Pre-read files go in the middle (bulk reference material).
-        // Rules go LAST so the model remembers them when generating tool calls.
+        // Assemble stable prompt: working dir + env + project context + instructions + rules.
         let mut prompt = format!(
             "Working directory: {wd}\nALL file paths MUST start with {wd}. NEVER use paths from previous sessions.\n{env_info}\n",
             wd = wd.display(), env_info = env_info,
         );
-
-        if !git_info.is_empty() {
-            prompt.push_str(&format!("Git: {}\n", git_info));
-        }
-
-        // Recent activity: extract edited file names from the most recent datalog.
-        // Only file names (not content/user messages) — safe, small, factual.
-        let recent_activity = super::extract_recent_activity_from_datalog(&wd);
-        if !recent_activity.is_empty() {
-            prompt.push_str(&format!("Recent activity: {}\n", recent_activity));
-        }
-
-        // Active services: disabled. Server commands are BLOCKED in Phase 3.5,
-        // so detecting running services is unnecessary noise in the system prompt.
 
         prompt.push_str(&format!(
             "\n=== PROJECT STRUCTURE ===\n{project_ctx}\n"
@@ -129,10 +88,6 @@ impl AgentLoop {
         if !self.preread_context.is_empty() {
             prompt.push_str(&format!("\n\n{}", self.preread_context));
         }
-
-        // NOTE: Active file full-content injection disabled — it consumes too much
-        // context window on weak models (32K), degrading decision quality.
-        // The working-set skeleton mechanism is sufficient.
 
         // Project instructions (if any)
         if !project_instructions.is_empty() {
@@ -148,28 +103,12 @@ impl AgentLoop {
             prompt.push_str(&format!("\n{}\n", project_knowledge));
         }
 
-        // Previous session context: inject the last few completed turns' outcomes
-        // so the model knows what was done before (prevents re-doing the same work).
-        let prev_context = self.build_previous_session_context();
-        if !prev_context.is_empty() {
-            prompt.push_str(&format!(
-                "\n=== PREVIOUS SESSION ===\n{}\n",
-                prev_context
-            ));
-        }
-
-        // Skills section: disabled until skill system is implemented.
-        // Listing unavailable skills wastes context tokens.
-
         // RULES GO LAST — recency effect ensures the model remembers these
         // when it starts generating tool calls.
         prompt.push_str(&format!("\n=== RULES (follow these strictly) ===\n{rules}\n"));
 
         // Language discipline: some models (MiniMax, Qwen, DeepSeek) default to
-        // English chain-of-thought even when the user speaks Chinese, causing
-        // reasoning blocks like "I need to..."/"Let me..." to leak into the
-        // visible output. For those, force Chinese reasoning + <think> wrapping.
-        // For Claude/GPT/GLM, skip — they don't have this drift problem.
+        // English chain-of-thought even when the user speaks Chinese.
         let model_id = self.config.providers
             .get(&self.config.default_provider)
             .map(|p| p.model.to_lowercase())
@@ -184,31 +123,14 @@ impl AgentLoop {
             );
         }
 
-        // File-creation discipline: REMOVED.
-        // Was limiting files to 300 lines, causing model to use incremental
-        // edit_file ×N instead of one write_file rewrite. Conflicted with
-        // batch prompt ("do multiple tools in one turn"). Result: 7T→16T.
-
         // Platform-specific rules — only injected on the target OS.
-        // macOS/Linux get nothing extra; Windows gets cmd.exe syntax rules.
         let platform = crate::config::platform_rules();
         if !platform.is_empty() {
             prompt.push_str(platform);
             prompt.push('\n');
         }
 
-        // Inject previous turn's edited files — helps model avoid re-exploring
-        if !self.prev_turn_edited_files.is_empty() {
-            let files = self.prev_turn_edited_files.join(", ");
-            prompt.push_str(&format!(
-                "\n[Previous turn: you edited {}. If the user reports the same issue, start from these files.]\n",
-                files
-            ));
-        }
-
-        // MiniMax M2 的 thinking 默认极其啰嗦，会大量消耗 output tokens 并拖慢响应。
-        // 模型本身没有 reasoning_effort 档位开关，只能用 prompt 约束。放在接近尾部
-        // 借助 recency 保证每轮都生效，等效于一个轻量 system-reminder。
+        // MiniMax thinking discipline
         if model_id.contains("minimax") {
             prompt.push_str(
                 "\n<system-reminder>\n\
@@ -219,99 +141,17 @@ impl AgentLoop {
             );
         }
 
-        // Inject current task at the very end (recency bias).
-        // The model attends most to the last ~200 tokens of system prompt.
-        // Putting the task here ensures it's the first thing the model "thinks about"
-        // when generating Turn 1 — no more blind glob/grep before reading the task.
-        if !self.current_task.is_empty() {
-            let task_short = if self.current_task.chars().count() > 300 {
-                format!("{}...", self.current_task.chars().take(297).collect::<String>())
-            } else {
-                self.current_task.clone()
-            };
-            prompt.push_str(&format!(
-                "\n=== CURRENT TASK ===\n{}\n\
-                 Act on this task directly. Do NOT search for files you already know about.\n",
-                task_short
-            ));
-        }
-
         prompt
     }
 
-    /// Build a summary of the previous session's completed turns.
-    /// This gives the model context about what was already done, preventing
-    /// it from re-doing work (e.g., re-fixing Java version compatibility).
-    /// Only includes turns that are Completed (not the current Active turn).
-    /// Capped at the last 5 turns and 1500 chars total.
-    pub(crate) fn build_previous_session_context(&self) -> String {
-        let turns = &self.conversation.turn_tracker.turns;
-        if turns.is_empty() {
-            return String::new();
-        }
-
-        // Only include Completed turns (not Active).
-        let completed: Vec<_> = turns.iter()
-            .filter(|t| t.status == crate::conversation::turn::TurnStatus::Completed)
-            .collect();
-
-        if completed.is_empty() {
-            return String::new();
-        }
-
-        // Take the last 5 completed turns.
-        let recent = &completed[completed.len().saturating_sub(5)..];
-        let mut ctx = String::new();
-
-        for turn in recent {
-            let msgs = &self.conversation.messages[turn.start_idx..turn.end_idx()];
-
-            // Extract user question.
-            let user_q = msgs.first()
-                .and_then(|m| m.text())
-                .unwrap_or("(unknown)");
-            let user_short = if user_q.chars().count() > 80 {
-                format!("{}...", user_q.chars().take(77).collect::<String>())
-            } else {
-                user_q.to_string()
-            };
-
-            // Extract assistant outcome (last text message in turn).
-            let mut outcome = String::new();
-            for msg in msgs.iter().rev() {
-                if let Some(text) = msg.text() {
-                    if matches!(msg.role, crate::conversation::message::Role::Assistant) && !text.trim().is_empty() {
-                        outcome = if text.chars().count() > 200 {
-                            format!("{}...", text.chars().take(197).collect::<String>())
-                        } else {
-                            text.to_string()
-                        };
-                        break;
-                    }
-                }
-            }
-
-            if outcome.is_empty() {
-                // Synthesize from tool results
-                outcome = self.conversation.synthesize_turn_outcome(msgs);
-            }
-
-            if !outcome.is_empty() {
-                ctx.push_str(&format!("- User: \"{}\"\n  Result: {}\n", user_short, outcome));
-            }
-
-            if ctx.len() > 1500 {
-                // Truncate at a char boundary to avoid panic on multi-byte UTF-8.
-                let mut end = 1500;
-                while end > 0 && !ctx.is_char_boundary(end) {
-                    end -= 1;
-                }
-                ctx.truncate(end);
-                ctx.push_str("\n...(truncated)");
-                break;
-            }
-        }
-
-        ctx
+    /// Build per-turn dynamic context as a <system-reminder> block.
+    /// This is injected into the last user message before sending to the LLM,
+    /// keeping the system prompt stable for caching.
+    ///
+    /// Currently empty — current_task is already in the user message,
+    /// and other dynamic content (git status, date, etc.) was removed.
+    /// Reserved for future per-turn context injection needs.
+    pub(crate) fn build_turn_reminder(&self) -> String {
+        String::new()
     }
 }
