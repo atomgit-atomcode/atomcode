@@ -91,7 +91,7 @@ Connect to any LLM that supports OpenAI's function-calling API:
 
 - **Persistent sessions** — every conversation is saved; resume or switch with `/resume`
 - **AtomGit OAuth login** — `/login` (or `atomcode login`) pairs your CLI with your AtomGit account
-- **WeCom QR login** — `/login-inner` for GitCode internal users
+- **SSO login** — `/login-with-sso` for GitCode internal users
 - **Headless mode** — `atomcode -p "..."` runs a single prompt non-interactively and streams the reply on stdout (Claude Code `-p` style)
 - **Daemon mode** — `atomcode-daemon` exposes an HTTP API for session history and SSE streaming chat
 

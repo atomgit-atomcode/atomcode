@@ -1,14 +1,14 @@
-# Zouwu — atomcode `/login-inner` 接入文档
+# Zouwu — atomcode `/login-with-sso` 接入文档
 
 **受众：** zouwu 前端 + 后端团队
 **版本：** 2026-04-14
-**对应 atomcode 分支：** `feat/login-inner`（合并到 main 后即生效）
+**对应 atomcode 分支：** `feat/login-with-sso`（合并到 main 后即生效）
 
 ---
 
 ## 背景
 
-atomcode 是终端 AI 编程助手，GitCode 内部员工通过 `/login-inner` 命令登录后，可以用公司内部的 LiteLLM 额度。整个流程遵循 **OAuth 2.0 Authorization Code Flow**，zouwu 作为 "broker" 承担两个角色：
+atomcode 是终端 AI 编程助手，GitCode 内部员工通过 `/login-with-sso` 命令登录后，可以用公司内部的 LiteLLM 额度。整个流程遵循 **OAuth 2.0 Authorization Code Flow**，zouwu 作为 "broker" 承担两个角色：
 
 1. **扫码登录前端**——拿到员工身份
 2. **code ↔ LLM token 交换后端**——给每个员工签发 LiteLLM virtual key
@@ -25,7 +25,7 @@ atomcode 是终端 AI 编程助手，GitCode 内部员工通过 `/login-inner` �
 │  (terminal) │                │   broker    │              │          │
 └──────┬──────┘                └──────┬──────┘              └─────┬────┘
        │                              │                           │
-       │ 1. 用户输入 /login-inner     │                           │
+       │ 1. 用户输入 /login-with-sso     │                           │
        │    atomcode 生成 state       │                           │
        │    开浏览器访问 authorize URL                            │
        │───────────────────────────▶  │                           │
@@ -362,7 +362,7 @@ cargo test --test wecom_login_test -- --nocapture
 - `/login` 页面：固定返回一个 HTML，加 JS 在 3 秒后 302 到 `{parent_origin}?code=fake-code&state=<echoed>`（跳过企微扫码）
 - `/exchange` 接口：看到 `code=fake-code` 就返回固定的 `{user, llm_token}`
 
-客户端用 `ATOMCODE_CONFIG_DIR_OVERRIDE=/tmp/atomcode-test cargo run --bin atomcode` 连 staging 跑一次完整 `/login-inner`，验证端到端打通。
+客户端用 `ATOMCODE_CONFIG_DIR_OVERRIDE=/tmp/atomcode-test cargo run --bin atomcode` 连 staging 跑一次完整 `/login-with-sso`，验证端到端打通。
 
 ### 3. 接入真实企微
 
@@ -383,7 +383,7 @@ Mock 跑通后替换成真企微调用。
 
 ### 看客户端发出去的 URL
 
-atomcode 在 `/login-inner` 启动后会在终端打印完整的 authorize URL：
+atomcode 在 `/login-with-sso` 启动后会在终端打印完整的 authorize URL：
 
 ```
   AtomCode Login (WeCom / GitCode Internal)

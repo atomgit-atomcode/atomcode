@@ -92,10 +92,10 @@ atomcode logout     # 或 TUI 内 /logout</code></pre>
         <p>OAuth 登录后自动添加的 provider 属于 "ephemeral"(短期)条目,不会被写进 <code>~/.atomcode/config.toml</code>,下次重启需要重新登录。这是有意为之,用来保护 token 不落盘。如果你希望持久化,请手动配置 API Key。</p>
       </div>
 
-      <h2>企业微信扫码(内部)</h2>
+<h2>SSO登录(内部)</h2>
       <p>如果你在 GitCode / CSDN 内部环境,可以使用:</p>
-      <pre><code>/login-inner</code></pre>
-      <p>TUI 会打开一个二维码页面,用企业微信扫码即可完成登录。底层基于 AtomCode 的邹悟(Zouwu)broker,会自动映射到对应的 provider。</p>
+      <pre><code>/login-with-sso</code></pre>
+      <p>TUI 会打开浏览器进行 SSO 登录。底层基于 AtomCode 的邹悟(Zouwu)broker,会自动映射到对应的 provider。</p>
 
       <h2>API Key 方式</h2>
       <p>如果你想使用自有的 OpenAI / Claude / DeepSeek / GLM 等密钥,有三种做法:</p>
@@ -118,7 +118,7 @@ atomcode logout     # 或 TUI 内 /logout</code></pre>
       <ul>
         <li>只是想快速体验 &rarr; <strong>AtomGit OAuth</strong>。</li>
         <li>需要在 CI / 脚本里跑 &rarr; <strong>API Key</strong> + 配置文件或环境变量。</li>
-        <li>公司内网 / GitCode 内部 &rarr; <strong>/login-inner</strong>。</li>
+<li>公司内网 / GitCode 内部 &rarr; <strong>/login-with-sso</strong>。</li>
         <li>完全离线 &rarr; 配置一个 <strong>Ollama</strong> provider,不需要任何登录。</li>
       </ul>
 

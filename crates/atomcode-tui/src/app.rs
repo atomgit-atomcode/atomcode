@@ -136,7 +136,7 @@ pub struct App {
     pub pending_editor: Option<String>,
     /// Flag to trigger OAuth login flow.
     pub pending_login: bool,
-    /// Flag to trigger WeCom QR login flow (GitCode internal).
+    /// Flag to trigger SSO login flow.
     pub pending_wecom_login: bool,
     /// Last key event timestamp — for paste detection when bracketed paste isn't available.
     pub last_key_time: Instant,
@@ -2310,9 +2310,9 @@ impl App {
                 self.conversation.push_delta("Opening browser for AtomGit login...");
                 self.conversation.finalize_stream();
             }
-            "/login-inner" => {
+            "/login-with-sso" => {
                 self.pending_wecom_login = true;
-                self.conversation.push_delta("Opening browser for WeCom QR login...");
+                self.conversation.push_delta("Opening browser for SSO login...");
                 self.conversation.finalize_stream();
             }
             "/logout" => {

@@ -91,7 +91,7 @@ AtomCode 是一款住在你终端里的 AI 编码助手。用自然语言给它�
 
 - **持久化会话** —— 每次对话都会保存，用 `/resume` 恢复或切换
 - **AtomGit OAuth 登录** —— `/login`（或 `atomcode login`）将 CLI 与你的 AtomGit 账号绑定
-- **企业微信扫码登录** —— `/login-inner`，GitCode 内部用户使用
+- **SSO 登录** —— `/login-with-sso`，GitCode 内部用户使用
 - **Headless 模式** —— `atomcode -p "..."` 非交互式跑一条 prompt，结果直接输出到 stdout（类似 Claude Code 的 `-p`）
 - **Daemon 模式** —— `atomcode-daemon` 提供 HTTP API，用于查询会话历史和 SSE 流式对话
 

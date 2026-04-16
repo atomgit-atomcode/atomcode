@@ -529,7 +529,7 @@ pub async fn run(
 
             // reqwest::blocking owns a tokio runtime; run on a dedicated
             // blocking thread so its Drop doesn't panic from async context.
-            // (Same pattern as /login-inner below.)
+// (Same pattern as /login-with-sso below.)
             let login_result = tokio::task::spawn_blocking(run_oauth_login)
                 .await
                 .unwrap_or_else(|e| Err(anyhow::anyhow!("login task panicked: {}", e)));
@@ -612,22 +612,22 @@ pub async fn run(
                     app.rebuild_provider();
                     app.sync_config_to_agent();
                     let model_display = app.provider.model_name();
-                    app.conversation.add_user_message("/login-inner");
+app.conversation.add_user_message("/login-with-sso");
                     app.conversation.push_delta(&format!(
-                        "Login successful! WeCom user: **{}** ({}).\n\nProvider `{}` active (in-memory, not saved to config).\nModel: `{}`",
+                        "Login successful! SSO user: **{}** ({}).\n\nProvider `{}` active (in-memory, not saved to config).\nModel: `{}`",
                         display_name, identity.userid, provider_name, model_display
                     ));
                     app.conversation.finalize_stream();
                 }
                 Ok((_identity, None)) => {
                     println!("\n  Broker returned no credentials; provider not registered.");
-                    app.conversation.add_user_message("/login-inner");
+app.conversation.add_user_message("/login-with-sso");
                     app.conversation.push_delta("Login completed, but broker returned no credentials. Contact the GitCode platform team.");
                     app.conversation.finalize_stream();
                 }
                 Err(e) => {
                     println!("\n  WeCom login failed: {}", e);
-                    app.conversation.add_user_message("/login-inner");
+app.conversation.add_user_message("/login-with-sso");
                     app.conversation.push_delta(&format!("Login failed: {}", e));
                     app.conversation.finalize_stream();
                 }

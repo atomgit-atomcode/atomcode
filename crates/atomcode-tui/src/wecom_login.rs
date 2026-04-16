@@ -1,4 +1,4 @@
-//! WeCom (企业微信) QR-code OAuth login for GitCode internal employees.
+//! SSO OAuth login via internal broker for company employees.
 //!
 //! Flow (standard OAuth 2.0 Authorization Code):
 //!   1. Open BROKER_AUTHORIZE_URL in browser with state + parent_origin.
