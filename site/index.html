@@ -521,19 +521,49 @@ cp target/release/atomcode ~/.local/bin/</pre>
     <span class="text-slate-300">Configure manually</span>   <span class="text-slate-500" data-i18n="install.apikey">API Key</span>
     <span class="text-slate-300">Skip for now</span>          <span class="text-slate-500" data-i18n="install.skip">先看看再说</span></pre>
         </div>
+        <!-- 下载预编译二进制 -->
         <div class="code-block rounded-xl p-5">
-          <div class="text-xs text-slate-500 mb-3 font-medium" data-i18n="install.download">或下载预编译二进制文件</div>
-          <div class="grid grid-cols-3 gap-3 text-center">
-            <a href="#" class="px-4 py-3 rounded-lg bg-white/5 hover:bg-white/10 transition text-sm">
-              <div class="text-white font-medium">macOS ARM</div>
+          <div class="text-xs text-slate-500 mb-3 font-medium flex items-center gap-1.5">
+            <span data-i18n="install.download">下载预编译二进制文件</span>
+            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"></path>
+            </svg>
+          </div>
+          <div class="grid grid-cols-2 md:grid-cols-4 gap-3 text-center">
+            <a href="https://atomgit.com/atomgit_atomcode/atomcode-release/releases/download/v4.15.3/atomcode-v4.15.3-darwin-arm64" class="relative px-4 py-3 rounded-lg bg-white/5 hover:bg-white/10 border border-white/10 hover:border-brand-500/50 transition text-sm group">
+              <div class="flex items-center justify-center gap-2">
+                <span class="text-white font-medium group-hover:text-brand-400 transition">macOS ARM</span>
+                <svg class="w-4 h-4 text-brand-400 opacity-0 group-hover:opacity-100 transition" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"></path>
+                </svg>
+              </div>
               <div class="text-xs text-slate-500 mt-0.5" data-i18n="install.apple">Apple Silicon</div>
             </a>
-            <a href="#" class="px-4 py-3 rounded-lg bg-white/5 hover:bg-white/10 transition text-sm">
-              <div class="text-white font-medium">macOS Intel</div>
+            <a href="https://atomgit.com/atomgit_atomcode/atomcode-release/releases/download/v4.15.3/atomcode-v4.15.3-darwin-x64" class="relative px-4 py-3 rounded-lg bg-white/5 hover:bg-white/10 border border-white/10 hover:border-brand-500/50 transition text-sm group">
+              <div class="flex items-center justify-center gap-2">
+                <span class="text-white font-medium group-hover:text-brand-400 transition">macOS Intel</span>
+                <svg class="w-4 h-4 text-brand-400 opacity-0 group-hover:opacity-100 transition" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"></path>
+                </svg>
+              </div>
               <div class="text-xs text-slate-500 mt-0.5">x86_64</div>
             </a>
-            <a href="#" class="px-4 py-3 rounded-lg bg-white/5 hover:bg-white/10 transition text-sm">
-              <div class="text-white font-medium">Windows</div>
+            <a href="https://atomgit.com/atomgit_atomcode/atomcode-release/releases/download/v4.15.3/atomcode-v4.15.3-linux-x64" class="relative px-4 py-3 rounded-lg bg-white/5 hover:bg-white/10 border border-white/10 hover:border-brand-500/50 transition text-sm group">
+              <div class="flex items-center justify-center gap-2">
+                <span class="text-white font-medium group-hover:text-brand-400 transition">Linux</span>
+                <svg class="w-4 h-4 text-brand-400 opacity-0 group-hover:opacity-100 transition" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"></path>
+                </svg>
+              </div>
+              <div class="text-xs text-slate-500 mt-0.5">x64</div>
+            </a>
+            <a href="https://atomgit.com/atomgit_atomcode/atomcode-release/releases/download/v4.15.3/atomcode-v4.15.3-windows-x64.exe" class="relative px-4 py-3 rounded-lg bg-white/5 hover:bg-white/10 border border-white/10 hover:border-brand-500/50 transition text-sm group">
+              <div class="flex items-center justify-center gap-2">
+                <span class="text-white font-medium group-hover:text-brand-400 transition">Windows</span>
+                <svg class="w-4 h-4 text-brand-400 opacity-0 group-hover:opacity-100 transition" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"></path>
+                </svg>
+              </div>
               <div class="text-xs text-slate-500 mt-0.5">x64</div>
             </a>
           </div>
