@@ -163,6 +163,18 @@ enum Commands {
 
 #[tokio::main]
 async fn main() {
+    // Set Windows console to UTF-8 so CJK and other multi-byte characters
+    // render correctly instead of showing garbled output (mojibake).
+    #[cfg(target_os = "windows")]
+    {
+        use windows_sys::Win32::System::Console::{SetConsoleOutputCP, SetConsoleCP};
+        use windows_sys::Win32::Globalization::CP_UTF8;
+        unsafe {
+            SetConsoleOutputCP(CP_UTF8);
+            SetConsoleCP(CP_UTF8);
+        }
+    }
+
     // Set panic hook to show errors cleanly
     std::panic::set_hook(Box::new(|info| {
         restore_terminal_if_tui();

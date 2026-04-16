@@ -26,3 +26,4 @@ dirs = "6"
 # cost enough to make typing feel smooth again on Windows Terminal / ConHost.
 [target.'cfg(target_os = "windows")'.dependencies]
 mimalloc = { version = "0.1", default-features = false }
+windows-sys = { version = "0.61", features = ["Win32_System_Console", "Win32_Globalization"] }
