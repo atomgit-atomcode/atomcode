@@ -69,18 +69,18 @@ impl Tool for ReadFileTool {
         let parsed: ReadFileArgs = serde_json::from_str(args)?;
         let path = std::path::Path::new(&parsed.file_path);
 
-        // ── INVARIANT (2026-04-16): cache hit returns STUB, not full content ──
-        // CC pattern: FILE_UNCHANGED_STUB. When the model re-reads a file that
-        // hasn't changed since last read, return a one-line stub instead of the
-        // full content. This eliminates "读完即忘" loops where the model reads
-        // index.html 9x because each read fills context with duplicate content.
-        // Edit/write tools change mtime → cache invalidates → next read gets
-        // fresh content automatically.
+        // ── INVARIANT (2026-04-16): STUB keyed by PATH ONLY ──
+        // Cache key is path + mtime — NOT offset/limit. A file read once (any
+        // range) means the content is in conversation context. Re-reading with
+        // different offset/limit is still the same file, still unchanged.
+        // Without this: model reads main.ts with limit=100, then offset=100,
+        // then offset=300 — each has a different cache key, STUB never fires,
+        // 4 reads of the same unchanged file.
         // ─────────────────────────────────────────────────────────────────────
         let cache_key: crate::tool::ReadCacheKey = (
             path.to_path_buf(),
-            parsed.offset,
-            parsed.limit,
+            None, // ignore offset — keyed by path only
+            None, // ignore limit — keyed by path only
         );
         let disk_mtime = tokio::fs::metadata(&parsed.file_path).await.ok()
             .and_then(|m| m.modified().ok());
@@ -273,7 +273,14 @@ impl Tool for ReadFileTool {
 
         // No hardcoded line limit — Layer A (auto_skeleton) is the only gate.
         // If auto_skeleton didn't fire, the file fits in budget → return all lines.
-        let limit = parsed.limit.unwrap_or(total_lines);
+        // Ignore model-supplied limit when reading from start (offset=0): if the
+        // file passed Layer A, the model is just creating fragments by passing
+        // limit=100. GLM-5 does this despite "do NOT use offset/limit" instruction.
+        let limit = match (parsed.offset, parsed.limit) {
+            (None, Some(l)) => total_lines, // offset=0 + limit → ignore limit, give full
+            (Some(_), Some(l)) => l,         // explicit range → respect it
+            _ => total_lines,                // no limit → full
+        };
 
         // If offset > 0 but auto-expand would give the whole file, reset offset to 0
         let offset = if offset > 0 && limit >= total_lines { 0 } else { offset };
