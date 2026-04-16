@@ -29,27 +29,6 @@ impl AgentLoop {
             .map(|g| g.clone())
             .unwrap_or_default();
 
-        // Use cached project context if working dir hasn't changed
-        let project_ctx = match &self.project_context_cache {
-            Some((cached_wd, cached_ctx)) if cached_wd == &wd => cached_ctx.clone(),
-            _ => {
-                // Pass graph for cross-file call annotations in file tree
-                let graph_ref = self.turn_runner.context.graph.try_read()
-                    .ok();
-                let pc = if let Some(ref g) = graph_ref {
-                    crate::project_context::build_project_context_with_graph(&wd, Some(g))
-                } else {
-                    crate::project_context::build_project_context(&wd)
-                };
-                self.project_context_cache = Some((wd.clone(), pc.text.clone()));
-                self.context_included_files = pc.included_files;
-                pc.text
-            }
-        };
-
-        // No file suggestions — let the model decide which files to read
-        // based on the project structure and conversation context (let model decide).
-
         // Load project-level instructions (.atomcode.md or ATOMCODE.md)
         let project_instructions = [".atomcode.md", "ATOMCODE.md"]
             .iter()
@@ -103,48 +82,11 @@ impl AgentLoop {
             .map(|p| p.model.to_lowercase())
             .unwrap_or_default();
 
-        // Assemble prompt: env + project context + pre-read files (bulk) → rules LAST.
-        // Models attend most to the START and END of context (primacy + recency).
-        // Pre-read files go in the middle (bulk reference material).
-        // Rules go LAST so the model remembers them when generating tool calls.
+        // Assemble prompt: env → rules LAST (recency effect).
         let mut prompt = format!(
-            "Working directory: {wd}\nALL file paths MUST start with {wd}. NEVER use paths from previous sessions.\n{env_info}\n",
+            "Working directory: {wd}\nAll file paths in tool calls must be absolute, resolved under {wd}. Verify file existence before editing.\n{env_info}\n",
             wd = wd.display(), env_info = env_info,
         );
-
-        // Identity: inject model name so the model can correctly identify itself.
-        // Without this, models fall back to their training-time default identity
-        // (e.g. "I'm Claude on Cursor" or "I'm ChatGPT").
-        let model_display = self.config.providers
-            .get(&self.config.default_provider)
-            .map(|p| p.model.as_str())
-            .unwrap_or("unknown");
-        prompt.push_str(&format!(
-            "You are AtomCode. When asked who you are, say you are AtomCode (an AI coding agent by AtomGit) running the {} model. Never claim to be another product.\n",
-            model_display,
-        ));
-
-        if !git_info.is_empty() {
-            prompt.push_str(&format!("Git: {}\n", git_info));
-        }
-
-        // Recent activity: extract edited file names from the most recent datalog.
-        // Only file names (not content/user messages) — safe, small, factual.
-        let recent_activity = super::extract_recent_activity_from_datalog(&wd);
-        if !recent_activity.is_empty() {
-            prompt.push_str(&format!("Recent activity: {}\n", recent_activity));
-        }
-
-        // Active services: disabled. Server commands are BLOCKED in Phase 3.5,
-        // so detecting running services is unnecessary noise in the system prompt.
-
-        prompt.push_str(&format!(
-            "\n=== PROJECT STRUCTURE ===\n{project_ctx}\n"
-        ));
-
-        // NOTE: Active file full-content injection disabled — it consumes too much
-        // context window on weak models (32K), degrading decision quality.
-        // The working-set skeleton mechanism is sufficient.
 
         // Project instructions (if any)
         if !project_instructions.is_empty() {
@@ -178,10 +120,7 @@ impl AgentLoop {
         prompt.push_str(&format!("\n=== RULES (follow these strictly) ===\n{rules}\n"));
 
         // Language discipline: some models (MiniMax, Qwen, DeepSeek) default to
-        // English chain-of-thought even when the user speaks Chinese, causing
-        // reasoning blocks like "I need to..."/"Let me..." to leak into the
-        // visible output. For those, force Chinese reasoning + <think> wrapping.
-        // For Claude/GPT/GLM, skip — they don't have this drift problem.
+        // English chain-of-thought even when the user speaks Chinese.
         let needs_cn_lock = model_id.contains("minimax")
             || model_id.contains("qwen")
             || model_id.contains("deepseek")
@@ -192,13 +131,7 @@ impl AgentLoop {
             );
         }
 
-        // File-creation discipline: REMOVED.
-        // Was limiting files to 300 lines, causing model to use incremental
-        // edit_file ×N instead of one write_file rewrite. Conflicted with
-        // batch prompt ("do multiple tools in one turn"). Result: 7T→16T.
-
         // Platform-specific rules — only injected on the target OS.
-        // macOS/Linux get nothing extra; Windows gets cmd.exe syntax rules.
         let platform = crate::config::platform_rules();
         if !platform.is_empty() {
             prompt.push_str(platform);
@@ -214,23 +147,16 @@ impl AgentLoop {
             ));
         }
 
-        // MiniMax M2 的 thinking 默认极其啰嗦，会大量消耗 output tokens 并拖慢响应。
-        // 模型本身没有 reasoning_effort 档位开关，只能用 prompt 约束。放在接近尾部
-        // 借助 recency 保证每轮都生效，等效于一个轻量 system-reminder。
+        // MiniMax thinking discipline — inline as a rule, not a <system-reminder>
         if model_id.contains("minimax") {
             prompt.push_str(
-                "\n<system-reminder>\n\
-                 THINKING 简洁纪律：内部思考（<think> 块）必须极简，\
-                 只写必要的决策线索，不要复述工具结果、不要分点展开、不要自问自答。\
-                 目标 ≤ 3 句话。冗长 thinking 视为严重问题。\n\
-                 </system-reminder>\n"
+                "\n## THINKING 纪律:\n\
+                 内部思考（<think> 块）必须极简，只写必要的决策线索，\
+                 不要复述工具结果、不要分点展开、不要自问自答。目标 ≤ 3 句话。\n"
             );
         }
 
         // Inject current task at the very end (recency bias).
-        // The model attends most to the last ~200 tokens of system prompt.
-        // Putting the task here ensures it's the first thing the model "thinks about"
-        // when generating Turn 1 — no more blind glob/grep before reading the task.
         if !self.current_task.is_empty() {
             let task_short = if self.current_task.chars().count() > 300 {
                 format!("{}...", self.current_task.chars().take(297).collect::<String>())

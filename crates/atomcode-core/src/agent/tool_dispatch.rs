@@ -391,24 +391,6 @@ impl AgentLoop {
         }
 
         match tool_name {
-            "read_file" => {
-                // Only intercept reads of descriptor files already in project context.
-                let parsed: serde_json::Value = serde_json::from_str(args).ok()?;
-                let file_path = parsed.get("file_path")?.as_str()?;
-                let path = std::path::Path::new(file_path);
-                let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-                if self.context_included_files.contains(&canonical) {
-                    let filename = path.file_name()
-                        .map(|f| f.to_string_lossy().to_string())
-                        .unwrap_or_else(|| file_path.to_string());
-                    return Some(format!(
-                        "[SKIPPED: {} content is already in your system prompt. \
-                         Use that information. Read the file you need to EDIT instead.]",
-                        filename
-                    ));
-                }
-                None
-            }
             "list_directory" => {
                 // Intercept listing the working directory — tree is already in context.
                 let parsed: serde_json::Value = serde_json::from_str(args).ok()?;

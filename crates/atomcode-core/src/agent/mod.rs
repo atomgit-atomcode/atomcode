@@ -242,11 +242,6 @@ pub struct AgentLoop {
     // Cancellation token for the current turn
     cancel_token: CancellationToken,
 
-    // Cached project context (invalidated on working dir change)
-    project_context_cache: Option<(PathBuf, String)>,
-    /// Absolute paths of descriptor files included in the project context.
-    /// Used to intercept redundant read_file calls.
-    context_included_files: HashSet<PathBuf>,
     /// Discipline tracking — all counters for loop detection, stagnation,
     /// error streaks, and tool usage patterns. Extracted from AgentLoop to
     /// reduce God Object complexity (was 22 fields inline).
@@ -423,8 +418,6 @@ impl AgentLoop {
             approval_resp_tx,
             last_approval_request: None,
             cancel_token: CancellationToken::new(),
-            project_context_cache: None,
-            context_included_files: HashSet::new(),
             discipline_state: DisciplineState::default(),
             files_read_this_turn: Vec::new(),
             files_edited_this_turn: Vec::new(),

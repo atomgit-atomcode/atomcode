@@ -16,7 +16,6 @@ struct ListDirArgs {
 
 fn default_depth() -> usize { 2 }
 
-use super::SKIP_DIRS;
 
 #[async_trait]
 impl Tool for ListDirTool {
@@ -82,7 +81,7 @@ fn scan_dir(lines: &mut Vec<String>, dir: &std::path::Path, depth: usize, max_de
 
     let mut items: Vec<_> = entries
         .filter_map(|e| e.ok())
-        .filter(|e| !SKIP_DIRS.contains(&e.file_name().to_string_lossy().as_ref()))
+        .filter(|e| !super::should_skip_dir(&e.file_name().to_string_lossy()))
         .collect();
     items.sort_by_key(|e| e.file_name());
 

@@ -70,7 +70,6 @@ impl AgentLoop {
                 let mut wd = self.turn_runner.context.working_dir.write().await;
                 *wd = resolved.clone();
             }
-            self.project_context_cache = None; // invalidate on dir change
             self.datalog.set_working_dir(&resolved);
             // Clear conversation history — old paths from previous directory will confuse the model
             self.conversation.messages.clear();

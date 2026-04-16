@@ -20,7 +20,7 @@ const DESCRIPTORS: &[&str] = &[
 /// dependency lists (e.g. [dependencies] in Cargo.toml) not just metadata.
 const DESCRIPTOR_BUDGET_TOKENS: usize = 1200;
 
-use crate::tool::SKIP_DIRS;
+use crate::tool::should_skip_dir;
 
 /// Result of building project context: the context string and the set of included file paths.
 pub struct ProjectContext {
@@ -394,7 +394,7 @@ fn scan_tree(
             let mut out = format!("{}{}/ (deep path collapsed)\n", indent, collapsed_path);
             if let Ok(entries) = std::fs::read_dir(&leaf_dir) {
                 let mut items: Vec<_> = entries.filter_map(|e| e.ok())
-                    .filter(|e| !SKIP_DIRS.contains(&e.file_name().to_string_lossy().as_ref()))
+                    .filter(|e| !should_skip_dir(&e.file_name().to_string_lossy()))
                     .collect();
                 items.sort_by_key(|e| e.file_name());
                 for entry in items.iter().take(15) {
@@ -418,7 +418,7 @@ fn scan_tree(
 
     let mut items: Vec<_> = entries
         .filter_map(|e| e.ok())
-        .filter(|e| !SKIP_DIRS.contains(&e.file_name().to_string_lossy().as_ref()))
+        .filter(|e| !should_skip_dir(&e.file_name().to_string_lossy()))
         .collect();
     items.sort_by_key(|e| e.file_name());
 
@@ -519,7 +519,7 @@ fn scan_config_recursive(
 
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
-        if SKIP_DIRS.contains(&name.as_str()) { continue; }
+        if should_skip_dir(&name) { continue; }
 
         let path = entry.path();
         if path.is_dir() {
@@ -667,7 +667,7 @@ fn collapse_single_child_chain(dir: &Path) -> Option<(String, std::path::PathBuf
     loop {
         let entries: Vec<_> = match std::fs::read_dir(&current) {
             Ok(e) => e.filter_map(|e| e.ok())
-                .filter(|e| !SKIP_DIRS.contains(&e.file_name().to_string_lossy().as_ref()))
+                .filter(|e| !should_skip_dir(&e.file_name().to_string_lossy()))
                 .collect(),
             Err(_) => break,
         };

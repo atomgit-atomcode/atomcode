@@ -31,7 +31,19 @@ pub const SKIP_DIRS: &[&str] = &[
     "dist", "build", ".cache", "vendor", ".venv", "venv",
     ".idea", ".vscode", ".DS_Store", ".env",
     "datalog", "logs", "log", ".atomcode",
+    ".claude", "runs",
 ];
+
+/// Prefixes — any directory whose name starts with one of these is skipped.
+/// Covers `.venv-*` variants (`.venv-test`, `.venv-swebench`, etc.).
+pub const SKIP_DIR_PREFIXES: &[&str] = &[".venv-"];
+
+/// Check if a directory name should be skipped (exact match OR prefix match).
+/// Use this instead of `SKIP_DIRS.contains()` for complete coverage.
+pub fn should_skip_dir(name: &str) -> bool {
+    SKIP_DIRS.contains(&name)
+        || SKIP_DIR_PREFIXES.iter().any(|p| name.starts_with(p))
+}
 use std::path::PathBuf;
 use std::sync::Arc;
 

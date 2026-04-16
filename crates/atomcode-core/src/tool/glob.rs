@@ -126,6 +126,12 @@ impl Tool for GlobTool {
             find_args.push("-path".to_string());
             find_args.push(format!("*/{skip}/*"));
         }
+        // Also skip prefix-matched directories (e.g. .venv-*)
+        for prefix in super::SKIP_DIR_PREFIXES {
+            find_args.push("-not".to_string());
+            find_args.push("-path".to_string());
+            find_args.push(format!("*/{prefix}*/*"));
+        }
         let output = Command::new("find")
             .args(&find_args)
             .current_dir(&wd)

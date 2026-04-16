@@ -239,7 +239,6 @@ impl AgentLoop {
 
     /// Find a file by name in the project directory (searches up to 4 levels deep).
     pub(crate) fn find_file_in_project(wd: &std::path::Path, filename: &str) -> Option<std::path::PathBuf> {
-        use crate::tool::SKIP_DIRS;
         fn walk(dir: &std::path::Path, target: &str, depth: usize) -> Option<std::path::PathBuf> {
             if depth > 4 { return None; }
             let entries = std::fs::read_dir(dir).ok()?;
@@ -250,7 +249,7 @@ impl AgentLoop {
                     return Some(entry.path());
                 }
                 if entry.file_type().map(|t| t.is_dir()).unwrap_or(false)
-                    && !SKIP_DIRS.contains(&name_str.as_ref())
+                    && !crate::tool::should_skip_dir(&name_str)
                 {
                     if let Some(found) = walk(&entry.path(), target, depth + 1) {
                         return Some(found);
