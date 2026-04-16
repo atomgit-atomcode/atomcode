@@ -209,7 +209,7 @@ fn render_add_form(frame: &mut Frame, area: Rect, mgr: &ProviderManager, step: &
     // Show completed fields
     let name_style = if *step == AddStep::Name { active_label } else { label };
     let name_val = if *step == AddStep::Name {
-        format!("{}_", mgr.input_buf)
+        mgr.input_display()
     } else if mgr.new_name.is_empty() {
         "...".to_string()
     } else {
@@ -248,12 +248,11 @@ fn render_add_form(frame: &mut Frame, area: Rect, mgr: &ProviderManager, step: &
     if *step as usize >= AddStep::ApiKey as usize {
         let style = if *step == AddStep::ApiKey { active_label } else { label };
         let val = if *step == AddStep::ApiKey {
-            let display = if mgr.input_buf.is_empty() {
-                "(optional, press Enter to skip)".to_string()
+            if mgr.input_buf.is_empty() {
+                mgr.input_display() + " (optional, press Enter to skip)"
             } else {
-                format!("{}*", mgr.input_buf.chars().take(3).collect::<String>())
-            };
-            display
+                format!("{}***", mgr.input_buf.chars().take(3).collect::<String>())
+            }
         } else if mgr.new_api_key.is_empty() {
             "(none)".to_string()
         } else {
@@ -268,7 +267,7 @@ fn render_add_form(frame: &mut Frame, area: Rect, mgr: &ProviderManager, step: &
     if *step as usize >= AddStep::BaseUrl as usize {
         let style = if *step == AddStep::BaseUrl { active_label } else { label };
         let val = if *step == AddStep::BaseUrl {
-            format!("{}_", mgr.input_buf)
+            mgr.input_display()
         } else if mgr.new_base_url.is_empty() {
             "(default)".to_string()
         } else {
@@ -282,7 +281,7 @@ fn render_add_form(frame: &mut Frame, area: Rect, mgr: &ProviderManager, step: &
 
     if *step as usize >= AddStep::Model as usize {
         let style = if *step == AddStep::Model { active_label } else { label };
-        let val = format!("{}_", mgr.input_buf);
+        let val = mgr.input_display();
         lines.push(Line::from(vec![
             Span::styled("  Model:    ", style),
             Span::styled(val, value),
@@ -373,7 +372,7 @@ fn render_edit_form(
         };
 
         let display_val = if editing_this {
-            format!("{}_", mgr.input_buf)
+            mgr.input_display()
         } else if is_sel && i == 0 {
             // Type field - show current with hint
             format!("{} (Enter to cycle)", v)

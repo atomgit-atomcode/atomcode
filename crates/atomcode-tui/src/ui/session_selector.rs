@@ -50,7 +50,7 @@ fn format_timestamp(ts: u64) -> String {
 /// Render the session selector inline in the chat area.
 /// Returns the number of lines rendered (for scroll calculation).
 /// selected = 0 means search box is focused, 1+ means session item is selected.
-pub fn render(frame: &mut Frame, area: Rect, sessions: &[SessionMeta], selected: usize, query: &str) -> usize {
+pub fn render(frame: &mut Frame, area: Rect, sessions: &[SessionMeta], selected: usize, query: &str, cursor_pos: usize) -> usize {
     // Filter sessions by query
     let filtered: Vec<(usize, &SessionMeta)> = sessions.iter().enumerate()
         .filter(|(_, s)| query.is_empty() 
@@ -71,28 +71,29 @@ pub fn render(frame: &mut Frame, area: Rect, sessions: &[SessionMeta], selected:
     let search_bg = if search_is_selected { theme::brand_bg() } else { theme::bg_surface() };
     let search_fg = if search_is_selected { theme::text_primary() } else { theme::text_secondary() };
     
-    let search_prompt = if query.is_empty() {
-        " Type to search..."
-    } else {
-        query
-    };
-    
     // Search row with box style
     let search_indicator = if search_is_selected { " \u{25b8} " } else { "   " };
-    lines.push(Line::from(vec![
-        Span::styled(search_indicator, Style::default().fg(search_fg).bg(search_bg)),
-        Span::styled("Search: ", Style::default().fg(search_fg).bg(search_bg)),
-        Span::styled(
-            search_prompt,
-            Style::default().fg(if query.is_empty() { 
-                if search_is_selected { theme::text_muted() } else { theme::text_muted() } 
-            } else { 
-                search_fg 
-            }).bg(search_bg)
-        ),
-        Span::styled("\u{2588}", Style::default().fg(search_fg).bg(search_bg)), // cursor
-        Span::styled(" ", Style::default().bg(search_bg)), // padding
-    ]));
+    let text_style = Style::default().fg(search_fg).bg(search_bg);
+    let cursor_style = Style::default().fg(search_fg).bg(search_bg);
+
+    if query.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled(search_indicator, text_style),
+            Span::styled("Search: ", text_style),
+            Span::styled("\u{2588}", cursor_style),
+            Span::styled(" Type to search...", Style::default().fg(theme::text_muted()).bg(search_bg)),
+        ]));
+    } else {
+        let (before, after) = query.split_at(cursor_pos.min(query.len()));
+        lines.push(Line::from(vec![
+            Span::styled(search_indicator, text_style),
+            Span::styled("Search: ", text_style),
+            Span::styled(before.to_string(), text_style),
+            Span::styled("\u{2588}", cursor_style),
+            Span::styled(after.to_string(), text_style),
+            Span::styled(" ", Style::default().bg(search_bg)),
+        ]));
+    }
     
     // Cursor hint when search is selected
     if search_is_selected {

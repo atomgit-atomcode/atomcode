@@ -262,6 +262,7 @@ pub struct App {
     pub session_selector: Option<(Vec<SessionMeta>, usize)>,
     /// Search filter for session selector.
     pub session_selector_query: String,
+    pub session_selector_cursor: usize,
     /// Last sent user input - restored to input box if turn is cancelled.
     pub last_sent_input: Option<String>,
     /// Force full terminal redraws for this many remaining frames. Set after
@@ -406,6 +407,7 @@ impl App {
                 current_session,
                 session_selector: None,
                              session_selector_query: String::new(),
+                             session_selector_cursor: 0,
                              last_sent_input: None,
                              redraw_frames: 0,
                     }
@@ -1285,6 +1287,7 @@ impl App {
                             let session_id = sessions[session_idx].id.clone();
                             self.session_selector = None;
                             self.session_selector_query.clear();
+                            self.session_selector_cursor = 0;
                             if let Ok(session) = self.session_manager.load(&session_id) {
                                 self.current_session = session;
                                 self.conversation.messages = self.current_session.messages.clone();
@@ -1304,24 +1307,42 @@ impl App {
                 KeyCode::Esc => {
                     self.session_selector = None;
                     self.session_selector_query.clear();
+                    self.session_selector_cursor = 0;
                     self.mode = AppMode::Normal;
                 }
                 KeyCode::Backspace => {
-                    // Always allow backspace in search query, regardless of selection
-                    self.session_selector_query.pop();
-                    // Reset selection to first matching session (index 1)
+                    if self.session_selector_cursor > 0 {
+                        let prev = self.session_selector_query[..self.session_selector_cursor]
+                            .char_indices().next_back().map(|(i, _)| i).unwrap_or(0);
+                        self.session_selector_query.remove(prev);
+                        self.session_selector_cursor = prev;
+                    }
                     if !filtered.is_empty() {
-                        *selected = 1; // First session after search row
+                        *selected = 1;
                     }
                 }
                 KeyCode::Char(c) => {
-                    // Typing always goes to search query
-                    self.session_selector_query.push(c);
-                    // Auto-select first matching session (index 1 = first session)
+                    self.session_selector_query.insert(self.session_selector_cursor, c);
+                    self.session_selector_cursor += c.len_utf8();
                     if !filtered.is_empty() {
                         *selected = 1;
                     } else {
-                        *selected = 0; // Stay on search row if no matches
+                        *selected = 0;
+                    }
+                }
+                KeyCode::Left => {
+                    if self.session_selector_cursor > 0 {
+                        let prev = self.session_selector_query[..self.session_selector_cursor]
+                            .char_indices().next_back().map(|(i, _)| i).unwrap_or(0);
+                        self.session_selector_cursor = prev;
+                    }
+                }
+                KeyCode::Right => {
+                    if self.session_selector_cursor < self.session_selector_query.len() {
+                        let next = self.session_selector_query[self.session_selector_cursor..]
+                            .char_indices().nth(1).map(|(i, _)| self.session_selector_cursor + i)
+                            .unwrap_or(self.session_selector_query.len());
+                        self.session_selector_cursor = next;
                     }
                 }
                 _ => {}
@@ -2290,6 +2311,7 @@ impl App {
                             let default_selected = if sessions.is_empty() { 0 } else { 1 };
                             self.session_selector = Some((sessions, default_selected));
                             self.session_selector_query.clear();
+                            self.session_selector_cursor = 0;
                             self.mode = AppMode::SessionSelector;
                             self.conversation.messages.pop(); // Remove the /resume user message
                         }

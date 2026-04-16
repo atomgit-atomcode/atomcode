@@ -81,7 +81,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     // Session selector mode: render inline in chat area
     if matches!(app.mode, crate::app::AppMode::SessionSelector) {
         if let Some((ref sessions, selected)) = app.session_selector {
-            session_selector::render(frame, chunks[1], sessions, selected, &app.session_selector_query);
+            session_selector::render(frame, chunks[1], sessions, selected, &app.session_selector_query, app.session_selector_cursor);
         }
         input_box::render(frame, chunks[2], &app.input, false, None, &app.attached_files, &app.pasted_blocks);
         return;

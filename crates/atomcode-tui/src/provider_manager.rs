@@ -47,6 +47,7 @@ pub struct ProviderManager {
     pub state: ManagerState,
     pub selected: usize,
     pub input_buf: String,
+    pub cursor_pos: usize,
     /// For the add wizard, accumulate fields here.
     pub new_name: String,
     pub new_type: String,
@@ -70,6 +71,7 @@ impl ProviderManager {
             state: ManagerState::List,
             selected: 0,
             input_buf: String::new(),
+            cursor_pos: 0,
             new_name: String::new(),
             new_type: String::new(),
             new_api_key: String::new(),
@@ -79,6 +81,74 @@ impl ProviderManager {
             edit_field_selected: 0,
             message: None,
             provider_names,
+        }
+    }
+
+    /// Set input buffer and place cursor at end.
+    fn set_input(&mut self, s: String) {
+        self.cursor_pos = s.len();
+        self.input_buf = s;
+    }
+
+    /// Clear input buffer and reset cursor.
+    fn clear_input(&mut self) {
+        self.input_buf.clear();
+        self.cursor_pos = 0;
+    }
+
+    /// Insert a character at cursor position.
+    fn insert_at_cursor(&mut self, c: char) {
+        self.input_buf.insert(self.cursor_pos, c);
+        self.cursor_pos += c.len_utf8();
+    }
+
+    /// Delete the character before cursor (backspace).
+    fn backspace_at_cursor(&mut self) {
+        if self.cursor_pos > 0 {
+            // Find the previous char boundary
+            let prev = self.input_buf[..self.cursor_pos]
+                .char_indices()
+                .next_back()
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            self.input_buf.remove(prev);
+            self.cursor_pos = prev;
+        }
+    }
+
+    /// Render the input buffer with cursor marker for UI display.
+    pub fn input_display(&self) -> String {
+        let (before, after) = self.input_buf.split_at(self.cursor_pos);
+        format!("{}│{}", before, after)
+    }
+
+    /// Handle common text-input keys (cursor movement, backspace, delete).
+    /// Returns true if the key was consumed.
+    fn handle_cursor_key(&mut self, key: &KeyEvent) -> bool {
+        match key.code {
+            KeyCode::Left => {
+                if self.cursor_pos > 0 {
+                    let prev = self.input_buf[..self.cursor_pos].char_indices().next_back().map(|(i, _)| i).unwrap_or(0);
+                    self.cursor_pos = prev;
+                }
+                true
+            }
+            KeyCode::Right => {
+                if self.cursor_pos < self.input_buf.len() {
+                    let next = self.input_buf[self.cursor_pos..].char_indices().nth(1).map(|(i, _)| self.cursor_pos + i).unwrap_or(self.input_buf.len());
+                    self.cursor_pos = next;
+                }
+                true
+            }
+            KeyCode::Home => { self.cursor_pos = 0; true }
+            KeyCode::End => { self.cursor_pos = self.input_buf.len(); true }
+            KeyCode::Delete => {
+                if self.cursor_pos < self.input_buf.len() {
+                    self.input_buf.remove(self.cursor_pos);
+                }
+                true
+            }
+            _ => false,
         }
     }
 
@@ -129,7 +199,7 @@ impl ProviderManager {
             KeyCode::Char('a') | KeyCode::Char('A') => {
                 // Start adding
                 self.state = ManagerState::Adding(AddStep::Name);
-                self.input_buf.clear();
+                self.clear_input();
                 self.new_name.clear();
                 self.new_type.clear();
                 self.new_api_key.clear();
@@ -145,7 +215,7 @@ impl ProviderManager {
                 }
                 self.state = ManagerState::Editing(EditField::Type);
                 self.edit_field_selected = 0;
-                self.input_buf.clear();
+                self.clear_input();
                 // Pre-fill type_selected based on current provider
                 if let Some(name) = self.selected_name() {
                     if let Some(p) = config.providers.get(name) {
@@ -207,21 +277,21 @@ impl ProviderManager {
                             return None;
                         }
                         self.new_name = name;
-                        self.input_buf.clear();
+                        self.clear_input();
                         self.state = ManagerState::Adding(AddStep::Type);
                         self.type_selected = 0;
                         self.message = None;
                     }
                     KeyCode::Backspace => {
-                        self.input_buf.pop();
+                        self.backspace_at_cursor();
                     }
                     KeyCode::Char(c) => {
                         // Only allow alphanumeric, dash, underscore
                         if c.is_alphanumeric() || c == '-' || c == '_' {
-                            self.input_buf.push(c);
+                            self.insert_at_cursor(c);
                         }
                     }
-                    _ => {}
+                    _ => { self.handle_cursor_key(&key); }
                 }
                 None
             }
@@ -229,7 +299,7 @@ impl ProviderManager {
                 match key.code {
                     KeyCode::Esc => {
                         self.state = ManagerState::Adding(AddStep::Name);
-                        self.input_buf = self.new_name.clone();
+                        self.set_input(self.new_name.clone());
                         return None;
                     }
                     KeyCode::Up => {
@@ -251,7 +321,7 @@ impl ProviderManager {
                             return Some(ManagerAction::StartAtomGitOAuth(self.new_name.clone()));
                         }
                         self.new_type = selected_type.to_string();
-                        self.input_buf.clear();
+                        self.clear_input();
                         self.state = ManagerState::Adding(AddStep::ApiKey);
                         self.message = None;
                     }
@@ -267,23 +337,23 @@ impl ProviderManager {
                     }
                     KeyCode::Enter => {
                         self.new_api_key = self.input_buf.trim().to_string();
-                        self.input_buf.clear();
+                        self.clear_input();
                         self.state = ManagerState::Adding(AddStep::BaseUrl);
                         self.message = None;
                         // Pre-fill base_url hint
                         if self.new_type == "openai" {
-                            self.input_buf = "https://api.openai.com/v1".to_string();
+                            self.set_input("https://api.openai.com/v1".to_string());
                         } else if self.new_type == "ollama" {
-                            self.input_buf = "http://localhost:11434".to_string();
+                            self.set_input("http://localhost:11434".to_string());
                         }
                     }
                     KeyCode::Backspace => {
-                        self.input_buf.pop();
+                        self.backspace_at_cursor();
                     }
                     KeyCode::Char(c) => {
-                        self.input_buf.push(c);
+                        self.insert_at_cursor(c);
                     }
-                    _ => {}
+                    _ => { self.handle_cursor_key(&key); }
                 }
                 None
             }
@@ -291,22 +361,22 @@ impl ProviderManager {
                 match key.code {
                     KeyCode::Esc => {
                         self.state = ManagerState::Adding(AddStep::ApiKey);
-                        self.input_buf.clear();
+                        self.clear_input();
                         return None;
                     }
                     KeyCode::Enter => {
                         self.new_base_url = self.input_buf.trim().to_string();
-                        self.input_buf.clear();
+                        self.clear_input();
                         self.state = ManagerState::Adding(AddStep::Model);
                         self.message = None;
                     }
                     KeyCode::Backspace => {
-                        self.input_buf.pop();
+                        self.backspace_at_cursor();
                     }
                     KeyCode::Char(c) => {
-                        self.input_buf.push(c);
+                        self.insert_at_cursor(c);
                     }
-                    _ => {}
+                    _ => { self.handle_cursor_key(&key); }
                 }
                 None
             }
@@ -314,7 +384,7 @@ impl ProviderManager {
                 match key.code {
                     KeyCode::Esc => {
                         self.state = ManagerState::Adding(AddStep::BaseUrl);
-                        self.input_buf.clear();
+                        self.clear_input();
                         return None;
                     }
                     KeyCode::Enter => {
@@ -323,7 +393,7 @@ impl ProviderManager {
                             self.message = Some("Model cannot be empty".to_string());
                             return None;
                         }
-                        self.input_buf.clear();
+                        self.clear_input();
                         self.state = ManagerState::List;
                         self.message = Some(format!("Provider '{}' added", self.new_name));
 
@@ -349,12 +419,12 @@ impl ProviderManager {
                         return Some(ManagerAction::Add(self.new_name.clone(), provider));
                     }
                     KeyCode::Backspace => {
-                        self.input_buf.pop();
+                        self.backspace_at_cursor();
                     }
                     KeyCode::Char(c) => {
-                        self.input_buf.push(c);
+                        self.insert_at_cursor(c);
                     }
-                    _ => {}
+                    _ => { self.handle_cursor_key(&key); }
                 }
                 None
             }
@@ -412,7 +482,7 @@ impl ProviderManager {
                     }
                     KeyCode::Enter => {
                         // Start editing the selected field
-                        self.input_buf.clear();
+                        self.clear_input();
                         let edit_field = match self.edit_field_selected {
                             0 => EditField::Type,
                             1 => EditField::ApiKey,
@@ -445,7 +515,7 @@ impl ProviderManager {
                 match key.code {
                     KeyCode::Esc => {
                         self.state = ManagerState::Editing(EditField::Type);
-                        self.input_buf.clear();
+                        self.clear_input();
                         return None;
                     }
                     KeyCode::Enter => {
@@ -459,7 +529,7 @@ impl ProviderManager {
                                 _ => return None,
                             };
                             self.state = ManagerState::Editing(EditField::Type);
-                            self.input_buf.clear();
+                            self.clear_input();
                             self.message = Some(format!("Updated {} for '{}'", field_name, name));
                             return Some(ManagerAction::UpdateField(
                                 name,
@@ -471,14 +541,14 @@ impl ProviderManager {
                         None
                     }
                     KeyCode::Backspace => {
-                        self.input_buf.pop();
+                        self.backspace_at_cursor();
                         None
                     }
                     KeyCode::Char(c) => {
-                        self.input_buf.push(c);
+                        self.insert_at_cursor(c);
                         None
                     }
-                    _ => None,
+                    _ => { self.handle_cursor_key(&key); None }
                 }
             }
         }
