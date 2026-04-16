@@ -146,12 +146,28 @@ async fn bash_execute(args: &str, ctx: &ToolContext) -> Result<ToolResult> {
             // like the [PASSED] box from AtomGit push hooks.
             unsafe {
                 cmd.pre_exec(|| {
-                    // Create a new session. This makes the child the session
-                    // leader with no controlling terminal, preventing /dev/tty
-                    // access from this process and all its descendants.
-                    // setsid() = POSIX, available on all Unix platforms.
-                    extern "C" { fn setsid() -> i32; }
+                    extern "C" {
+                        fn setsid() -> i32;
+                        fn open(path: *const u8, oflag: i32) -> i32;
+                        fn close(fd: i32) -> i32;
+                        fn ioctl(fd: i32, request: u64, ...) -> i32;
+                    }
+                    // Create a new session — detaches from the controlling
+                    // terminal so /dev/tty opens fail.
                     setsid();
+                    // Belt-and-suspenders: also try to explicitly detach using
+                    // TIOCNOTTY, which works even when setsid alone doesn't
+                    // fully sever the connection on some macOS versions.
+                    const O_RDWR: i32 = 2;
+                    #[cfg(target_os = "macos")]
+                    const TIOCNOTTY: u64 = 0x20007471;
+                    #[cfg(not(target_os = "macos"))]
+                    const TIOCNOTTY: u64 = 0x5422;
+                    let tty_fd = open(b"/dev/tty\0".as_ptr(), O_RDWR);
+                    if tty_fd >= 0 {
+                        ioctl(tty_fd, TIOCNOTTY);
+                        close(tty_fd);
+                    }
                     Ok(())
                 });
             }

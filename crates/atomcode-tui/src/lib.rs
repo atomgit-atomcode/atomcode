@@ -412,10 +412,14 @@ pub async fn run(
     loop {
         // Force a full redraw when requested (e.g. after bash tool completion)
         // to overwrite any artifacts left by child processes that wrote
-        // directly to the terminal via /dev/tty.
+        // directly to the terminal via /dev/tty.  terminal.clear() only resets
+        // the back buffer, so the diff engine may skip cells that match the
+        // stale front buffer — leaving artifacts visible.  resize() resets
+        // BOTH buffers, forcing the next draw() to write every cell.
         if app.needs_full_redraw {
             app.needs_full_redraw = false;
-            terminal.clear()?;
+            let sz = terminal.size()?;
+            terminal.resize(ratatui::layout::Rect::new(0, 0, sz.width, sz.height))?;
         }
         terminal.draw(|frame| ui::render(frame, &mut app))?;
 
@@ -689,6 +693,13 @@ app.conversation.add_user_message("/login-with-sso");
                         Ok(e) => app.handle_agent_event(e),
                         Err(_) => break,
                     }
+                }
+                // Force full redraw if a bash tool just completed — overwrite
+                // any artifacts from child processes writing to /dev/tty.
+                if app.needs_full_redraw {
+                    app.needs_full_redraw = false;
+                    let sz = terminal.size()?;
+                    terminal.resize(ratatui::layout::Rect::new(0, 0, sz.width, sz.height))?;
                 }
                 // Redraw immediately after processing agent events.
                 // Without this, the terminal won't update until the next user
