@@ -809,24 +809,32 @@ impl Conversation {
     fn microcompact(msgs: &mut Vec<Message>, _turns: &[turn::Turn], total_msg_count: usize) {
         const OTHER_KEEP: usize = 20;
 
+        // Don't compact until context is getting large.
+        // Small context = keep everything so model can cross-reference freely.
+        // Only start compacting non-read results when context pressure builds.
+        let total_chars: usize = msgs.iter().map(|m| {
+            match &m.content {
+                MessageContent::ToolResult(r) => r.output.len(),
+                MessageContent::Text(t) => t.len(),
+                _ => 100, // rough estimate for other types
+            }
+        }).sum();
+        // Don't compact until > 100K chars (~25K tokens).
+        // Yesterday's best sessions peaked at 22.8K tok (~91K chars) with
+        // zero compaction — all reads stayed in context. Only start compacting
+        // when context pressure is genuinely building toward the 50% LLM
+        // compression threshold (32K tok = 128K chars).
+        if total_chars < 100_000 { return; }
         if total_msg_count <= OTHER_KEEP { return; }
 
         let other_cutoff = total_msg_count.saturating_sub(OTHER_KEEP);
 
-        // Build call_id → tool_name map + call_id → file_path for read_file dedup
+        // Build call_id → tool_name map
         let mut call_id_to_tool: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-        let mut call_id_to_read_file: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         for msg in msgs.iter() {
             if let MessageContent::AssistantWithToolCalls { tool_calls, .. } = &msg.content {
                 for tc in tool_calls {
                     call_id_to_tool.insert(tc.id.clone(), tc.name.clone());
-                    if tc.name == "read_file" {
-                        if let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
-                            if let Some(fp) = args.get("file_path").and_then(|v| v.as_str()) {
-                                call_id_to_read_file.insert(tc.id.clone(), fp.to_string());
-                            }
-                        }
-                    }
                 }
             }
         }
@@ -844,27 +852,9 @@ impl Conversation {
                     .map(|s| s.as_str())
                     .unwrap_or("tool");
 
-                // read_file: only condense if a NEWER read of the same file exists.
-                // Keeps the latest read of each file; clears older reads of the same file.
-                if tool_name == "read_file" {
-                    // Check if there's a newer read of the same file later in msgs
-                    let my_file = call_id_to_read_file.get(&r.call_id);
-                    if let Some(file_path) = my_file {
-                        let has_newer = msgs[i+1..].iter().any(|later_msg| {
-                            if let MessageContent::ToolResult(ref later_r) = later_msg.content {
-                                call_id_to_read_file.get(&later_r.call_id)
-                                    .map(|f| f == file_path)
-                                    .unwrap_or(false)
-                            } else {
-                                false
-                            }
-                        });
-                        if !has_newer { continue; } // newest read of this file — keep it
-                        // else: fall through to condense (older read of same file)
-                    } else {
-                        continue; // can't identify file — keep it safe
-                    }
-                }
+                // read_file: treated same as other tools — condensed when old.
+                // The 8K char cap + 20-message window keeps context manageable.
+                // Exempting read_file caused 78% context bloat in multi-file tasks.
 
                 let msg_idx = i.saturating_sub(cold_msgs);
                 if msg_idx >= other_cutoff { continue; }

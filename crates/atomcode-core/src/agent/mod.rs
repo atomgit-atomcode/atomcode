@@ -1251,14 +1251,11 @@ impl AgentLoop {
                                 "(continuing...)".to_string(),
                             )
                         );
-                        if !self.files_edited_this_turn.is_empty() {
-                            let files = self.files_edited_this_turn.join(", ");
-                            self.conversation.add_user_message(&format!(
-                                "Summarize what you changed: {}", files,
-                            ));
-                        } else {
-                            self.conversation.add_user_message("Continue.");
-                        }
+                        // Empty response retry: one uniform nudge regardless of whether
+                        // edits happened. Removed the edit-specific "Summarize what you
+                        // changed: <files>" branch — it prompted weak models to re-narrate
+                        // work already reflected in tool results.
+                        self.conversation.add_user_message("Continue.");
                         tokio::time::sleep(Duration::from_secs(2)).await;
                         continue;
                     }
@@ -1321,7 +1318,9 @@ impl AgentLoop {
                                             sub_result
                                         ));
                                     } else {
-                                        self.conversation.add_user_message("Sub-agent results are above. Summarize what was changed.");
+                                        // Sub-agent results streamed via TextDelta above;
+                                        // no extra "Summarize" user-turn — it just triggers
+                                        // another round of re-narration. Let the turn stop naturally.
                                         self.finish_turn(TurnStopReason::Natural);
                                         return;
                                     }
@@ -1334,19 +1333,9 @@ impl AgentLoop {
                     // Post-process: truncate large outputs + externalize to disk
                     self.post_process_tool_results(tool_count);
 
-                    // ATLAS auto-verify: DISABLED.
-                    // Phase 4.2 edit success rate 90%+ makes auto-compile mostly overhead
-                    // (10-30s blocking per edit, 0 real errors caught today).
-                    // Model runs build itself when needed. Re-enable via config if needed.
-                    // Feature codename: "Guardian" — see docs/archive/guardian-auto-compile.md
-                    //
-                    // if !self.files_edited_this_turn.is_empty() {
-                    //     let log_sizes = self.snapshot_devserver_log_sizes();
-                    //     self.auto_compile_verify().await;
-                    //     self.syntax_check_edited_files().await;
-                    //     self.check_devserver_logs(&log_sizes).await;
-                    //     self.check_vue_partial_edit().await;
-                    // }
+                    // ATLAS auto-verify: removed along with the verify module.
+                    // Model runs build/lint itself when needed.
+                    // See docs/archive/guardian-auto-compile.md if re-introducing.
 
                     // Apply discipline: inject status reminders (no STOP commands).
                     self.apply_post_turn_discipline();
@@ -1613,10 +1602,7 @@ impl AgentLoop {
         self.conversation.save(&Conversation::history_path());
     }
 
-    // resolve_args → tool_dispatch.rs
-    // intercept_redundant_call → tool_dispatch.rs
     // store_tool_result → tool_dispatch.rs
-    // normalize_bash_cmd → tool_dispatch.rs (standalone fn)
 
     // detect_running_services → services.rs
     // extract_service_urls → services.rs

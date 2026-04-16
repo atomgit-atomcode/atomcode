@@ -102,7 +102,6 @@ impl Tool for BashTool {
     async fn execute(&self, args: &str, ctx: &ToolContext) -> Result<ToolResult> {
         let mut result = bash_execute(args, ctx).await?;
         // Append cwd to every bash result so model always knows where it is.
-        // This prevents "forgot to cd" loops (e.g., 5x "no POM in this directory").
         let wd = ctx.working_dir.read().await;
         result.output.push_str(&format!("\n[cwd: {}]", wd.display()));
         Ok(result)
