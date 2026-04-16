@@ -46,8 +46,8 @@ impl Tool for ReadFileTool {
     fn definition(&self) -> ToolDef {
         ToolDef {
             name: "read_file",
-            description: "Read a file. Returns text with line numbers.\n\
-                Reads the FULL file by default — do NOT use offset/limit unless instructed.\n\
+            description: "Read a file. Returns full content with line numbers.\n\
+                Large files return a skeleton (structure overview) — use offset/limit to read sections.\n\
                 NEVER use bash (cat/head/tail) to read files.".to_string(),
             parameters: json!({
                 "type": "object",
@@ -69,35 +69,25 @@ impl Tool for ReadFileTool {
         let parsed: ReadFileArgs = serde_json::from_str(args)?;
         let path = std::path::Path::new(&parsed.file_path);
 
-        // ── INVARIANT (2026-04-16): STUB keyed by PATH ONLY ──
-        // Cache key is path + mtime — NOT offset/limit. A file read once (any
-        // range) means the content is in conversation context. Re-reading with
-        // different offset/limit is still the same file, still unchanged.
-        // Without this: model reads main.ts with limit=100, then offset=100,
-        // then offset=300 — each has a different cache key, STUB never fires,
-        // 4 reads of the same unchanged file.
-        // ─────────────────────────────────────────────────────────────────────
+        // ── Read cache: performance optimization only, NOT a STUB gate ──
+        // Cache stores (mtime, rendered_output). If mtime matches, skip disk read +
+        // UTF-8 parse + tree-sitter. Returns full content so the model always gets
+        // what it asked for. STUB behavior was tried and reverted — it blocks
+        // legitimate re-reads and doesn't prevent short-distance duplicates
+        // (model ignores STUB text due to lost-at-the-end attention).
         let cache_key: crate::tool::ReadCacheKey = (
             path.to_path_buf(),
-            None, // ignore offset — keyed by path only
-            None, // ignore limit — keyed by path only
+            parsed.offset,
+            parsed.limit,
         );
         let disk_mtime = tokio::fs::metadata(&parsed.file_path).await.ok()
             .and_then(|m| m.modified().ok());
         if let Some(mtime) = disk_mtime {
-            if let Some((cached_mtime, _cached_output)) = ctx.read_cache.read().await.get(&cache_key).cloned() {
+            if let Some((cached_mtime, cached_output)) = ctx.read_cache.read().await.get(&cache_key).cloned() {
                 if cached_mtime == mtime {
-                    let filename = path.file_name()
-                        .map(|n| n.to_string_lossy().to_string())
-                        .unwrap_or_else(|| parsed.file_path.clone());
                     return Ok(ToolResult {
                         call_id: String::new(),
-                        output: format!(
-                            "{}: file unchanged since last read. The content from the earlier \
-                             read_file result in this conversation is still current — refer to \
-                             that instead of re-reading.",
-                            filename
-                        ),
+                        output: cached_output,
                         success: true,
                     });
                 }
@@ -186,14 +176,12 @@ impl Tool for ReadFileTool {
         let lines: Vec<&str> = content.lines().collect();
         let total_lines = lines.len();
 
-        // ── Layer A: per-file decision (the ONLY truncation for read_file) ──
-        // Compares file size against per-file token budget (set by Layer B in
-        // runner.rs). If file fits → full content. If not → tree-sitter skeleton.
-        // No char_limit, no line limit, no post-hoc truncation.
-        // truncation.rs skips read_file entirely — this is the single authority.
-        let file_tokens = total_lines * 12;
-        let per_file_budget = ctx.read_budget_tokens.load(std::sync::atomic::Ordering::Relaxed);
-        let auto_skeleton = file_tokens > per_file_budget
+        // ── Layer A: full content default, skeleton for large files (>300 lines) ──
+        // Skeleton is the FALLBACK, not the default. ≤300 lines return full content
+        // so the model can grep→old_string→edit in 2 steps. >300 lines return
+        // skeleton because GLM-5 gets lost in the middle at ~685 lines.
+        // With offset/limit: always return exact content (model chose a range).
+        let auto_skeleton = total_lines > 300
             && parsed.offset.is_none()
             && parsed.limit.is_none();
 
@@ -201,7 +189,7 @@ impl Tool for ReadFileTool {
             let mut searcher = ctx.semantic.lock().await;
             let skeleton = if let Some(symbols) = searcher.list_symbols(path) {
                 let fname = path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
-                let mut skel = format!("[File skeleton: {} ({} lines) — to see full content, call read_file again without offset/limit:]\n\n",
+                let mut skel = format!("[File skeleton: {} ({} lines). Use read_file with offset and limit to read specific sections.]\n\n",
                     fname, total_lines);
                 // Skeleton is fully driven by semantic layer's list_symbols().
                 // For Vue/Svelte, list_symbols already includes <template>/<style> sections
@@ -344,10 +332,9 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    /// Cache hit on re-read of an unchanged file — second call returns STUB,
-    /// not the full content. This is the FILE_UNCHANGED_STUB pattern from CC.
+    /// Cache hit returns full content (performance cache, not STUB).
     #[tokio::test]
-    async fn read_cache_hits_returns_stub() {
+    async fn read_cache_hits_returns_full_content() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("a.rs");
         std::fs::write(&path, "fn main() {}\n").unwrap();
@@ -362,8 +349,7 @@ mod tests {
 
         let r2 = tool.execute(&args, &ctx).await.unwrap();
         assert!(r2.success);
-        assert!(r2.output.contains("unchanged since last read"), "second read should return stub");
-        assert!(!r2.output.contains("fn main"), "stub should NOT contain file content");
+        assert!(r2.output.contains("fn main"), "cache hit should return same content");
     }
 
     /// Cache miss after file content changes — mtime shifts, cached entry is ignored.
