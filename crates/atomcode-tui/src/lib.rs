@@ -222,10 +222,12 @@ fn run_oauth_login() -> anyhow::Result<AuthInfo> {
     use std::net::TcpListener;
     use std::collections::HashMap;
 
+
     // Generate state for CSRF protection
     let state = format!("atomcode_{}", std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_nanos());
+
 
     // Build authorization URL
     let auth_url = format!(
@@ -247,7 +249,14 @@ fn run_oauth_login() -> anyhow::Result<AuthInfo> {
     #[cfg(target_os = "linux")]
     let _ = std::process::Command::new("xdg-open").arg(&auth_url).spawn();
     #[cfg(target_os = "windows")]
-    let _ = std::process::Command::new("cmd").args(["/C", "start", &auth_url]).spawn();
+    {
+        let _ = {
+            use std::os::windows::process::CommandExt;
+            std::process::Command::new("cmd")
+                .raw_arg(format!("/C start \"\" \"{}\"", auth_url))
+                .spawn()
+        };
+    }
 
     println!("  Waiting for authorization callback on port {}...", oauth::REDIRECT_PORT);
     println!("  Press Ctrl+C to cancel.\n");
@@ -256,32 +265,22 @@ fn run_oauth_login() -> anyhow::Result<AuthInfo> {
     let listener = TcpListener::bind(("127.0.0.1", oauth::REDIRECT_PORT))?;
     listener.set_nonblocking(true)?;
 
-    // Enable raw mode temporarily so we can detect Esc / Ctrl+C keypresses
-    crossterm::terminal::enable_raw_mode()?;
-
-    let accept_result = loop {
+    // Poll for the OAuth callback connection.
+    // We are inside spawn_blocking and the terminal is NOT in raw mode
+    // (the caller already left the alternate screen / disabled raw mode),
+    // so we must NOT call enable_raw_mode() here — on Windows that panics
+    // with "initial console mode not set" because the saved console state
+    // was cleared when the outer TUI disabled raw mode.
+    let accept_result: anyhow::Result<std::net::TcpStream> = loop {
         match listener.accept() {
             Ok((stream, _)) => break Ok(stream),
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                if crossterm::event::poll(std::time::Duration::from_millis(200))
-                    .unwrap_or(false)
-                {
-                    if let Ok(crossterm::event::Event::Key(key)) = crossterm::event::read() {
-                        if key.code == crossterm::event::KeyCode::Esc
-                            || (key.code == crossterm::event::KeyCode::Char('c')
-                                && key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL))
-                        {
-                            break Err(anyhow::anyhow!("Login cancelled by user"));
-                        }
-                    }
-                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
                 continue;
             }
             Err(e) => break Err(e.into()),
         }
     };
-
-    crossterm::terminal::disable_raw_mode()?;
 
     let mut stream = accept_result?;
 
@@ -522,16 +521,17 @@ pub async fn run(
         })?;
 
         if let Some(file_path) = app.pending_editor.take() {
-            // First disable raw mode to release terminal control completely
-            disable_raw_mode()?;
+            // LeaveAlternateScreen before disable_raw_mode — on Windows
+            // crossterm clears saved console mode on disable_raw_mode().
             let _ = execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
-            execute!(
+            let _ = execute!(
                 terminal.backend_mut(),
                 DisableMouseCapture,
                 LeaveAlternateScreen
-            )?;
+            );
             #[cfg(not(target_os = "windows"))]
-            execute!(terminal.backend_mut(), DisableBracketedPaste)?;
+            { let _ = execute!(terminal.backend_mut(), DisableBracketedPaste); }
+            disable_raw_mode()?;
             terminal.show_cursor()?;
 
             event_loop.stop();
@@ -619,6 +619,7 @@ pub async fn run(
         if app.pending_login {
             app.pending_login = false;
 
+
             // Stop the input-reading thread before releasing the terminal.
             // On Windows, if the background thread keeps calling
             // crossterm::event::read() while we toggle raw mode / leave the
@@ -626,15 +627,19 @@ pub async fn run(
             // console state goes inconsistent and the process exits.
             event_loop.stop();
 
-            disable_raw_mode()?;
+            // On Windows, crossterm clears the saved console mode when
+            // disable_raw_mode() is called, so LeaveAlternateScreen must
+            // happen BEFORE disable_raw_mode() — otherwise it fails with
+            // "Initial console modes not set".
             let _ = execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
-            execute!(
+            let _ = execute!(
                 terminal.backend_mut(),
                 DisableMouseCapture,
                 LeaveAlternateScreen
-            )?;
+            );
             #[cfg(not(target_os = "windows"))]
-            execute!(terminal.backend_mut(), DisableBracketedPaste)?;
+            { let _ = execute!(terminal.backend_mut(), DisableBracketedPaste); }
+            disable_raw_mode()?;
             terminal.show_cursor()?;
             let _ = std::io::stdout().flush();
 
@@ -704,15 +709,16 @@ pub async fn run(
             // See /login above — stop input thread before terminal surgery.
             event_loop.stop();
 
-            disable_raw_mode()?;
+            // LeaveAlternateScreen before disable_raw_mode — see /login comment.
             let _ = execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
-            execute!(
+            let _ = execute!(
                 terminal.backend_mut(),
                 DisableMouseCapture,
                 LeaveAlternateScreen
-            )?;
+            );
             #[cfg(not(target_os = "windows"))]
-            execute!(terminal.backend_mut(), DisableBracketedPaste)?;
+            { let _ = execute!(terminal.backend_mut(), DisableBracketedPaste); }
+            disable_raw_mode()?;
             terminal.show_cursor()?;
             let _ = std::io::stdout().flush();
 

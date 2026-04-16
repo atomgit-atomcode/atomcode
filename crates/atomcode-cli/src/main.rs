@@ -491,6 +491,11 @@ AgentEvent::SubAgentProgress { file, status } => {
 
 /// Handle subcommands (login, logout, status)
 async fn handle_command(cmd: Commands) -> Result<()> {
+    // Subcommands never enter TUI, so tell the panic hook to skip terminal
+    // cleanup — otherwise `disable_raw_mode` panics on Windows with
+    // "initial console mode not set" because raw mode was never enabled.
+    HEADLESS_MODE.store(true, Ordering::Relaxed);
+
     match cmd {
         Commands::Login => {
             let auth = auth::login()?;

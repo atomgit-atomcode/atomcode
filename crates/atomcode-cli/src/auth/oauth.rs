@@ -181,8 +181,9 @@ fn open_browser(url: &str) -> Result<()> {
 
 #[cfg(target_os = "windows")]
 fn open_browser(url: &str) -> Result<()> {
+    use std::os::windows::process::CommandExt;
     std::process::Command::new("cmd")
-        .args(["/C", "start", url])
+        .raw_arg(format!("/C start \"\" \"{}\"", url))
         .spawn()
         .context("Failed to open browser")?;
     Ok(())
