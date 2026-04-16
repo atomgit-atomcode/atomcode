@@ -31,16 +31,12 @@ pub struct ProviderConfig {
 }
 
 fn default_context_window() -> usize {
-    64000
+    128000
 }
 
-/// Default context window per provider type.
-/// 64K is the safe default — most models advertise 128K+ but their effective
-/// attention span is much smaller. Oversized context causes "lost in the middle"
-/// and prevents compression from triggering. Users can override in config.
 pub fn default_context_window_for(provider_type: &str) -> usize {
     match provider_type {
         "ollama" => 8000,
-        _ => 64000,
+        _ => 128000,
     }
 }

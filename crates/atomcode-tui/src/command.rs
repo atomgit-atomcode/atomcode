@@ -38,7 +38,7 @@ pub const BUILTIN_COMMANDS: &[(&str, &str)] = &[
     ("/issue",    "Create issue on AtomGit"),
     
     // === Config & Help ===
-    ("/config",   "Edit config file"),
+    ("/config",   "Show config file path"),
     ("/status",   "Show login status and model info"),
     ("/logout",   "Logout from AtomGit"),
     ("/help",     "Show commands & shortcuts"),

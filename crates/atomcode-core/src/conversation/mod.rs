@@ -651,8 +651,16 @@ impl Conversation {
     /// Compress a turn into a one-line mechanical summary.
     /// No LLM call — deterministic, fast, never fails.
     /// Format: "Turn N: user asked X → read file.js, edited file.js (-3 +5 lines)"
+    // ── INVARIANT (2026-04-16): compress_turn MUST preserve assistant thinking ──
+    // The assistant's text (thinking/reasoning) in AssistantWithToolCalls is the
+    // diagnostic conclusion for that turn ("代码逻辑看起来正确", "问题找到了！ID不匹配").
+    // Without it, the compressed summary says only "read main.ts, grep closeSettings"
+    // — the model doesn't know it already confirmed the logic was correct, so it
+    // searches the same files again. 39-turn loop sessions traced to this omission.
+    // ─────────────────────────────────────────────────────────────────────────────
     fn compress_turn(&self, turn_num: usize, turn_msgs: &[Message]) -> String {
         let mut user_text = String::new();
+        let mut assistant_text = String::new();
         let mut tools: Vec<String> = Vec::new();
 
         for msg in turn_msgs {
@@ -666,7 +674,20 @@ impl Conversation {
                         };
                     }
                 }
-                (_, MessageContent::AssistantWithToolCalls { tool_calls, .. }) => {
+                (_, MessageContent::AssistantWithToolCalls { text, tool_calls }) => {
+                    // Preserve assistant's diagnostic conclusion (first 80 chars).
+                    // This is NOT framework judgment — it's the model's own words,
+                    // kept so the model remembers what it already concluded.
+                    if let Some(t) = text {
+                        let trimmed = t.trim();
+                        if !trimmed.is_empty() && assistant_text.is_empty() {
+                            assistant_text = if trimmed.chars().count() > 80 {
+                                format!("{}...", trimmed.chars().take(77).collect::<String>())
+                            } else {
+                                trimmed.to_string()
+                            };
+                        }
+                    }
                     for tc in tool_calls {
                         let short = if let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
                             let fp = args.get("file_path").and_then(|v| v.as_str())
@@ -696,6 +717,20 @@ impl Conversation {
                         }
                     }
                 }
+                // Also capture pure assistant text (no tool calls) — these are
+                // diagnostic summaries like "已修复！" or "代码逻辑正确".
+                (Role::Assistant, MessageContent::Text(s)) => {
+                    if assistant_text.is_empty() {
+                        let trimmed = s.trim();
+                        if !trimmed.is_empty() {
+                            assistant_text = if trimmed.chars().count() > 80 {
+                                format!("{}...", trimmed.chars().take(77).collect::<String>())
+                            } else {
+                                trimmed.to_string()
+                            };
+                        }
+                    }
+                }
                 (_, MessageContent::ToolResult(r)) if !r.success => {
                     tools.push("FAILED".to_string());
                 }
@@ -704,11 +739,21 @@ impl Conversation {
         }
 
         let tools_str = if tools.is_empty() { "no tools".to_string() } else { tools.join(", ") };
-        if user_text.is_empty() {
-            format!("- Turn {}: {}", turn_num, tools_str)
+
+        // Format: "- Turn N: [user text] [assistant conclusion] → tools"
+        // The assistant conclusion is the key addition — it's what prevents
+        // the model from re-searching the same files after compression.
+        let prefix = if !user_text.is_empty() {
+            format!("\"{}\" ", user_text)
         } else {
-            format!("- Turn {}: \"{}\" → {}", turn_num, user_text, tools_str)
-        }
+            String::new()
+        };
+        let conclusion = if !assistant_text.is_empty() {
+            format!("[{}] ", assistant_text)
+        } else {
+            String::new()
+        };
+        format!("- Turn {}: {}{}→ {}", turn_num, prefix, conclusion, tools_str)
     }
 
     /// Synthesize a brief outcome description for a turn that has no assistant text.

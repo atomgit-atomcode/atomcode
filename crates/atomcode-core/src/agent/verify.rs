@@ -1,3 +1,11 @@
+// ── INVARIANT (2026-04-16): DO NOT DELETE THIS FILE ──
+// verify.rs was deleted once (01afc5b, "all dead_code") and had to be
+// restored (4f704cb) after causing 22-49 turn sessions. The functions
+// are called conditionally from mod.rs — #[allow(dead_code)] does NOT
+// mean unused. If you think this file is dead, grep for `should_verify`
+// and `inject_verify_prompt` in mod.rs before touching it.
+// ──────────────────────────────────────────────────────────────────
+
 use super::*;
 
 impl AgentLoop {
@@ -46,6 +54,12 @@ impl AgentLoop {
         false
     }
 
+    // ── INVARIANT (2026-04-16): verify prompt must NOT mention dev server ──
+    // "check if the dev server shows errors" caused models to run `npm run dev`
+    // for verification → 140-168s blocking waits. Always guide toward build/check
+    // commands that exit immediately. Tech-stack neutral: no npm/cargo/mvn.
+    // History: "dev server" wording survived 16 commits unnoticed. Fixed today.
+    // ────────────────────────────────────────────────────────────────────────
     /// Inject a verification prompt into the conversation as a user message,
     /// forcing the model to check its work before declaring success.
     #[allow(dead_code)]
@@ -53,8 +67,8 @@ impl AgentLoop {
         let files = self.files_edited_this_turn.join(", ");
         let verify_msg = format!(
             "[SYSTEM: You edited {}. Before finishing, verify your changes work. \
-             Run a quick check: look for syntax errors, check if the dev server shows errors, \
-             or re-read a key edited file to confirm it's correct. \
+             Run the project's build/check/compile command to catch errors. \
+             Do NOT start any long-running process that does not exit on its own. \
              If you find errors, fix them now.]",
             files
         );

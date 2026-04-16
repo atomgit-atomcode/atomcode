@@ -450,8 +450,6 @@ let _is_read = call_id_to_tool.get(call_id) == Some(&"read_file");
     // would otherwise keep stale buffer state and never overwrite /dev/tty
     // artifacts left by child processes (git push hooks, etc.).
     frame.render_widget(Clear, full_area);
-    let bg = Block::default().style(Style::default().bg(theme::bg_surface()));
-    frame.render_widget(bg, full_area);
     // NO .wrap() — scroll offset is calculated in logical lines, but Paragraph::wrap
     // adds physical lines, causing scroll/render mismatch and "Dow" ghost artifacts.
     // All content lines are pre-wrapped by wrap_lines() or truncated to fit area.width.

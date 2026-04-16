@@ -69,12 +69,14 @@ impl Tool for ReadFileTool {
         let parsed: ReadFileArgs = serde_json::from_str(args)?;
         let path = std::path::Path::new(&parsed.file_path);
 
-        // ── Read cache lookup ──
-        // If we've rendered this exact (path, offset, limit) before AND the file's
-        // on-disk mtime hasn't changed, return the previous output. Saves a disk
-        // read + UTF-8 check + skeleton generation (semantic analysis is the
-        // heaviest cost for large files). Edit/write tools change mtime → cache
-        // invalidates naturally. Tech-neutral: works for any language/file type.
+        // ── INVARIANT (2026-04-16): cache hit returns STUB, not full content ──
+        // CC pattern: FILE_UNCHANGED_STUB. When the model re-reads a file that
+        // hasn't changed since last read, return a one-line stub instead of the
+        // full content. This eliminates "读完即忘" loops where the model reads
+        // index.html 9x because each read fills context with duplicate content.
+        // Edit/write tools change mtime → cache invalidates → next read gets
+        // fresh content automatically.
+        // ─────────────────────────────────────────────────────────────────────
         let cache_key: crate::tool::ReadCacheKey = (
             path.to_path_buf(),
             parsed.offset,
@@ -83,11 +85,19 @@ impl Tool for ReadFileTool {
         let disk_mtime = tokio::fs::metadata(&parsed.file_path).await.ok()
             .and_then(|m| m.modified().ok());
         if let Some(mtime) = disk_mtime {
-            if let Some((cached_mtime, cached_output)) = ctx.read_cache.read().await.get(&cache_key).cloned() {
+            if let Some((cached_mtime, _cached_output)) = ctx.read_cache.read().await.get(&cache_key).cloned() {
                 if cached_mtime == mtime {
+                    let filename = path.file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| parsed.file_path.clone());
                     return Ok(ToolResult {
                         call_id: String::new(),
-                        output: cached_output,
+                        output: format!(
+                            "{}: file unchanged since last read. The content from the earlier \
+                             read_file result in this conversation is still current — refer to \
+                             that instead of re-reading.",
+                            filename
+                        ),
                         success: true,
                     });
                 }
@@ -279,9 +289,17 @@ impl Tool for ReadFileTool {
 
         let end = (offset.saturating_add(limit)).min(total_lines);
 
-        // Smart char limit: if full output would exceed ctx/8, show head + tree-sitter skeleton.
-        // Fixed 8K char limit per read — matches truncation.rs ctx/8 cap.
-        let char_limit: usize = 8_000;
+        // ── INVARIANT (2026-04-16): char_limit must scale with ctx_budget ──
+        // Was hardcoded 8K, which truncated 368-line files even at 128K context.
+        // Formula: 1/5 of remaining budget (in tokens) → convert to chars.
+        // Floor 8K chars (~180 lines), no upper cap — auto_skeleton (Layer 1)
+        // already handles truly huge files. This layer only catches medium files
+        // (200-2000 lines) that slip past auto_skeleton but are too big for
+        // the remaining budget.
+        // ─────────────────────────────────────────────────────────────────
+        let budget_tokens = ctx.ctx_budget_hint.load(std::sync::atomic::Ordering::Relaxed);
+        let single_file_budget = budget_tokens / 5; // 20% of remaining budget in tokens
+        let char_limit: usize = single_file_budget.saturating_mul(4).max(8_000); // tokens→chars, floor 8K
         let full_output_estimate = (end - offset) * 45; // ~45 chars per formatted line
 
         if full_output_estimate > char_limit && parsed.offset.is_none() {
@@ -317,8 +335,8 @@ impl Tool for ReadFileTool {
             };
 
             output.push_str(&format!(
-                "\n\n[Showing {}/{} lines. Remaining structure:]\n{}",
-                head_end - offset, total_lines, skeleton
+                "\n\n[TRUNCATED: showing lines {}-{} of {} total. Use read_file with start_line={} to see the rest. Remaining structure:]\n{}",
+                offset + 1, head_end, total_lines, head_end + 1, skeleton
             ));
 
             if let Some(mtime) = disk_mtime {
@@ -378,10 +396,10 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    /// Cache hit on re-read of an unchanged file — second call should be served
-    /// from ToolContext.read_cache and produce byte-identical output to the first.
+    /// Cache hit on re-read of an unchanged file — second call returns STUB,
+    /// not the full content. This is the FILE_UNCHANGED_STUB pattern from CC.
     #[tokio::test]
-    async fn read_cache_hits_when_file_unchanged() {
+    async fn read_cache_hits_returns_stub() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("a.rs");
         std::fs::write(&path, "fn main() {}\n").unwrap();
@@ -392,17 +410,12 @@ mod tests {
 
         let r1 = tool.execute(&args, &ctx).await.unwrap();
         assert!(r1.success);
-
-        // Modify the cached entry in place so we can prove the 2nd call came from cache.
-        let cache_key: crate::tool::ReadCacheKey = (path.clone(), None, None);
-        {
-            let mut cache = ctx.read_cache.write().await;
-            let (mtime, _) = cache.get(&cache_key).cloned().expect("cache populated on first read");
-            cache.insert(cache_key.clone(), (mtime, "CACHED-SENTINEL".to_string()));
-        }
+        assert!(r1.output.contains("fn main"), "first read should return content");
 
         let r2 = tool.execute(&args, &ctx).await.unwrap();
-        assert_eq!(r2.output, "CACHED-SENTINEL", "2nd read should return cached entry verbatim");
+        assert!(r2.success);
+        assert!(r2.output.contains("unchanged since last read"), "second read should return stub");
+        assert!(!r2.output.contains("fn main"), "stub should NOT contain file content");
     }
 
     /// Cache miss after file content changes — mtime shifts, cached entry is ignored.

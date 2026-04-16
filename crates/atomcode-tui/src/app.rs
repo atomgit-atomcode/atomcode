@@ -2146,17 +2146,13 @@ impl App {
                         "Config file not found at `{}`.\nRun AtomCode without an existing config to create one via the setup wizard.",
                         config_path.display()
                     ));
-                    self.conversation.finalize_stream();
                 } else {
-                    let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vim".to_string());
                     self.conversation.push_delta(&format!(
-                        "Opening config in `{}`...\n\n`{}`",
-                        editor,
+                        "`{}`",
                         config_path.display()
                     ));
-                    self.conversation.finalize_stream();
-                    self.pending_editor = Some(config_path.to_string_lossy().to_string());
                 }
+                self.conversation.finalize_stream();
             }
             "/model" => {
                 // Enter model selector mode

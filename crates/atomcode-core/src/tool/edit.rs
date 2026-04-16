@@ -171,13 +171,22 @@ struct SingleEdit {
 
 #[async_trait]
 impl Tool for EditFileTool {
+    // ── INVARIANT (2026-04-16): edit_file schema MUST expose both modes ──
+    // Line mode (start_line/end_line) and text mode (old_string) must BOTH
+    // be in the tool schema. Removing start_line/end_line forces the model
+    // into old_string-only → match failures → full redo → 14-turn sessions.
+    // History: added Phase 3, removed 5e09b86 ("confuses weak models"),
+    // restored today. If a model can't handle both, fix the description,
+    // don't delete the parameter.
+    // ────────────────────────────────────────────────────────────────────
     fn definition(&self) -> ToolDef {
         ToolDef {
             name: "edit_file",
             description: "Replace text in a file. ALWAYS prefer this over write_file for existing files.\n\
-                Provide old_string (text to find) and new_string (replacement text).\n\
+                Two modes:\n\
+                1. Line mode (PREFERRED): use start_line + end_line + new_string. Line numbers come from read_file output. No text matching needed.\n\
+                2. Text mode: use old_string + new_string. old_string must be unique — include surrounding lines if needed.\n\
                 To delete text, set new_string to empty string.\n\
-                old_string must be unique — include surrounding lines if needed.\n\
                 For multiple changes in one file: make separate edit_file calls, one per region.".to_string(),
             parameters: json!({
                 "type": "object",
@@ -188,18 +197,26 @@ impl Tool for EditFileTool {
                     },
                     "old_string": {
                         "type": "string",
-                        "description": "Exact text to find and replace. Include enough context to be unique."
+                        "description": "Text mode: exact text to find and replace. Include enough context to be unique."
                     },
                     "new_string": {
                         "type": "string",
                         "description": "Replacement text. Use empty string to delete."
                     },
+                    "start_line": {
+                        "type": "integer",
+                        "description": "Line mode: first line to replace (1-indexed, from read_file output)"
+                    },
+                    "end_line": {
+                        "type": "integer",
+                        "description": "Line mode: last line to replace (inclusive)"
+                    },
                     "replace_all": {
                         "type": "boolean",
-                        "description": "Replace ALL occurrences (default: first only)"
+                        "description": "Replace ALL occurrences (default: first only). Only for text mode."
                     }
                 },
-                "required": ["file_path", "old_string", "new_string"]
+                "required": ["file_path", "new_string"]
             }),
         }
     }
