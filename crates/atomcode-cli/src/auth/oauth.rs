@@ -3,7 +3,21 @@ use std::io::{self, BufRead, Write};
 use std::net::TcpListener;
 
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+
+/// Deserialize an ID that may be a string or a number into a String.
+fn deserialize_id_as_string<'de, D: Deserializer<'de>>(deserializer: D) -> std::result::Result<String, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StringOrNum {
+        Str(String),
+        Int(i64),
+    }
+    match StringOrNum::deserialize(deserializer)? {
+        StringOrNum::Str(s) => Ok(s),
+        StringOrNum::Int(n) => Ok(n.to_string()),
+    }
+}
 
 /// URL encode a string
 fn urlencoding_encode(s: &str) -> String {
@@ -31,12 +45,15 @@ pub struct AuthInfo {
     pub refresh_token: Option<String>,
     pub token_type: String,
     pub expires_in: Option<i64>,
+    /// Unix timestamp (seconds) when this token was obtained
+    #[serde(default)]
+    pub created_at: i64,
     pub user: UserInfo,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserInfo {
-    pub id: i64,
+    pub id: String,
     pub username: String,
     pub name: Option<String>,
     pub email: Option<String>,
@@ -53,7 +70,8 @@ struct TokenResponse {
 
 #[derive(Debug, Deserialize)]
 struct UserResponse {
-    id: i64,
+    #[serde(deserialize_with = "deserialize_id_as_string")]
+    id: String,
     login: String,
     name: Option<String>,
     email: Option<String>,
@@ -106,11 +124,17 @@ pub fn login() -> Result<AuthInfo> {
     // Get user info
     let user = get_user_info(&token.access_token)?;
     
+    let created_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+
     let auth_info = AuthInfo {
         access_token: token.access_token,
         refresh_token: token.refresh_token,
         token_type: token.token_type.unwrap_or_else(|| "Bearer".to_string()),
         expires_in: token.expires_in,
+        created_at,
         user: UserInfo {
             id: user.id,
             username: user.login,
@@ -302,6 +326,89 @@ fn get_user_info(access_token: &str) -> Result<UserResponse> {
     
     response.json::<UserResponse>()
         .context("Failed to parse user response")
+}
+
+/// Refresh the access token using the stored refresh_token.
+/// Returns updated AuthInfo with new tokens, and saves it to disk.
+#[allow(dead_code)]
+pub fn refresh_access_token(auth: &AuthInfo) -> Result<AuthInfo> {
+    let refresh_token = auth.refresh_token.as_deref()
+        .context("No refresh_token available — please /login again")?;
+
+    let client = reqwest::blocking::Client::new();
+    let params = [
+        ("client_id", CLIENT_ID),
+        ("client_secret", CLIENT_SECRET),
+        ("refresh_token", refresh_token),
+        ("grant_type", "refresh_token"),
+    ];
+
+    let response = client
+        .post(TOKEN_URL)
+        .form(&params)
+        .send()
+        .context("Failed to send refresh token request")?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().unwrap_or_default();
+        anyhow::bail!("Token refresh failed ({}): {} — please /login again", status, body);
+    }
+
+    let token: TokenResponse = response.json()
+        .context("Failed to parse refresh token response")?;
+
+    let created_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+
+    let new_auth = AuthInfo {
+        access_token: token.access_token,
+        refresh_token: token.refresh_token.or_else(|| auth.refresh_token.clone()),
+        token_type: token.token_type.unwrap_or_else(|| auth.token_type.clone()),
+        expires_in: token.expires_in.or(auth.expires_in),
+        created_at,
+        user: auth.user.clone(),
+    };
+
+    save_auth(&new_auth)?;
+    Ok(new_auth)
+}
+
+/// Get a valid access token, refreshing automatically if expired.
+/// Returns the access token string ready to use.
+#[allow(dead_code)]
+pub fn get_valid_token() -> Result<String> {
+    let auth = get_stored_auth()
+        .context("Not logged in — please use /login first")?;
+
+    // Check if token is expired (with 5-minute safety margin)
+    if let Some(expires_in) = auth.expires_in {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let expires_at = auth.created_at + expires_in;
+
+        if now >= expires_at - 300 {
+            // Token expired or about to expire — try refresh
+            match refresh_access_token(&auth) {
+                Ok(new_auth) => return Ok(new_auth.access_token),
+                Err(e) => anyhow::bail!("Token expired and refresh failed: {}", e),
+            }
+        }
+    } else if auth.created_at == 0 {
+        // Legacy auth.toml without created_at — no way to know if expired,
+        // try refresh if refresh_token is available, otherwise use as-is
+        if auth.refresh_token.is_some() {
+            if let Ok(new_auth) = refresh_access_token(&auth) {
+                return Ok(new_auth.access_token);
+            }
+        }
+    }
+
+    Ok(auth.access_token)
 }
 
 /// Logout - clear stored auth

@@ -20,6 +20,7 @@ base64 = "0.22"
 url = "2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }
 serde = { version = "1", features = ["derive"] }
+toml = "0.8"
 libc = "0.2"
 terminal-link = "0.1"
 

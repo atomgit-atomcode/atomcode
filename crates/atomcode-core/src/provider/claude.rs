@@ -122,6 +122,23 @@ struct ClaudeSSE {
     index: Option<usize>,
     content_block: Option<ContentBlock>,
     delta: Option<ClaudeDelta>,
+    usage: Option<ClaudeUsage>,
+    message: Option<ClaudeMessage>,
+}
+
+#[derive(Deserialize)]
+struct ClaudeMessage {
+    usage: Option<ClaudeUsage>,
+}
+
+#[derive(Deserialize)]
+struct ClaudeUsage {
+    #[serde(default)]
+    input_tokens: usize,
+    #[serde(default)]
+    output_tokens: usize,
+    #[serde(default)]
+    cache_read_input_tokens: usize,
 }
 
 #[derive(Deserialize)]
@@ -302,6 +319,30 @@ impl LlmProvider for ClaudeProvider {
                                 tc_id.clear();
                                 tc_name.clear();
                                 tc_json.clear();
+                            }
+                        }
+                        "message_start" => {
+                            // message_start nests usage under message.usage
+                            if let Some(usage) = evt.message.as_ref().and_then(|m| m.usage.as_ref()) {
+                                let _ = tx.send(Ok(StreamEvent::Usage(
+                                    crate::stream::TokenUsage {
+                                        prompt_tokens: usage.input_tokens,
+                                        completion_tokens: usage.output_tokens,
+                                        cached_tokens: usage.cache_read_input_tokens,
+                                    }
+                                )));
+                            }
+                        }
+                        "message_delta" => {
+                            // message_delta has top-level usage with output_tokens
+                            if let Some(usage) = &evt.usage {
+                                let _ = tx.send(Ok(StreamEvent::Usage(
+                                    crate::stream::TokenUsage {
+                                        prompt_tokens: usage.input_tokens,
+                                        completion_tokens: usage.output_tokens,
+                                        cached_tokens: usage.cache_read_input_tokens,
+                                    }
+                                )));
                             }
                         }
                         "message_stop" => {

@@ -191,6 +191,7 @@ dependencies = [
  "terminal-link",
  "tokio",
  "tokio-util",
+ "toml",
  "url",
 ]
 

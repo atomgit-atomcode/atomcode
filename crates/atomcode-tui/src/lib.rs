@@ -350,16 +350,36 @@ fn run_oauth_login() -> anyhow::Result<AuthInfo> {
         },
     };
 
-    // Save to file
+    // Save auth.toml (credentials only, not written to config.toml)
     let auth_path = atomcode_core::config::Config::config_dir().join("auth.toml");
-
     if let Some(parent) = auth_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
 
-    // Auth token kept in memory only — not written to disk.
-    // Previously saved to auth.toml; removed for security.
-    println!("  Auth active (in-memory only)\n");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let mut auth_content = format!("access_token = \"{}\"\ncreated_at = {}\n",
+        access_token, now);
+    if let Some(ref rt) = token_resp.refresh_token {
+        auth_content.push_str(&format!("refresh_token = \"{}\"\n", rt));
+    }
+    if let Some(exp) = token_resp.expires_in {
+        auth_content.push_str(&format!("expires_in = {}\n", exp));
+    }
+    auth_content.push_str(&format!(
+        "\n[user]\nid = \"{}\"\nusername = \"{}\"\n",
+        auth_info.user.id, auth_info.user.username
+    ));
+    if let Some(ref name) = auth_info.user.name {
+        auth_content.push_str(&format!("name = \"{}\"\n", name));
+    }
+
+    match std::fs::write(&auth_path, &auth_content) {
+        Ok(_) => println!("  Auth saved to: {}\n", auth_path.display()),
+        Err(e) => println!("  Warning: failed to save auth.toml: {}\n", e),
+    }
 
     Ok(auth_info)
 }
@@ -412,14 +432,21 @@ pub async fn run(
     loop {
         // Force a full redraw when requested (e.g. after bash tool completion)
         // to overwrite any artifacts left by child processes that wrote
-        // directly to the terminal via /dev/tty.  terminal.clear() only resets
-        // the back buffer, so the diff engine may skip cells that match the
-        // stale front buffer — leaving artifacts visible.  resize() resets
-        // BOTH buffers, forcing the next draw() to write every cell.
-        if app.needs_full_redraw {
-            app.needs_full_redraw = false;
-            let sz = terminal.size()?;
-            terminal.resize(ratatui::layout::Rect::new(0, 0, sz.width, sz.height))?;
+        // directly to the terminal via /dev/tty.
+        //
+        // terminal.clear() only resets the BACK buffer.  The front buffer
+        // retains stale cell state, so the diff engine skips cells whose new
+        // content happens to match the old front — leaving artifacts visible.
+        //
+        // Fix: clear() + draw-nothing.  The empty draw diffs a blank back
+        // buffer against the stale front, flushing blanks everywhere the
+        // front had content.  After the swap the front is blank, so the REAL
+        // draw (immediately after) sees every content cell as "changed" and
+        // writes it — guaranteed full repaint.
+        if app.redraw_frames > 0 {
+            app.redraw_frames -= 1;
+            terminal.clear()?;
+            terminal.draw(|_| {})?;
         }
         terminal.draw(|frame| ui::render(frame, &mut app))?;
 
@@ -696,10 +723,10 @@ app.conversation.add_user_message("/login-with-sso");
                 }
                 // Force full redraw if a bash tool just completed — overwrite
                 // any artifacts from child processes writing to /dev/tty.
-                if app.needs_full_redraw {
-                    app.needs_full_redraw = false;
-                    let sz = terminal.size()?;
-                    terminal.resize(ratatui::layout::Rect::new(0, 0, sz.width, sz.height))?;
+                if app.redraw_frames > 0 {
+                    app.redraw_frames -= 1;
+                    terminal.clear()?;
+                    terminal.draw(|_| {})?;
                 }
                 // Redraw immediately after processing agent events.
                 // Without this, the terminal won't update until the next user

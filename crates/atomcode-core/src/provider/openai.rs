@@ -128,6 +128,7 @@ impl OpenAiProvider {
 
 #[derive(Deserialize)]
 struct ChatChunk {
+    #[serde(default)]
     choices: Vec<ChunkChoice>,
     usage: Option<ChunkUsage>,
 }

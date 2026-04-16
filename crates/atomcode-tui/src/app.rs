@@ -264,10 +264,12 @@ pub struct App {
     pub session_selector_query: String,
     /// Last sent user input - restored to input box if turn is cancelled.
     pub last_sent_input: Option<String>,
-    /// Force a full terminal redraw on the next frame. Set after bash tool
-    /// completion to overwrite any artifacts left by child processes that
-    /// wrote directly to the terminal (e.g. git push hook output via /dev/tty).
-    pub needs_full_redraw: bool,
+    /// Force full terminal redraws for this many remaining frames. Set after
+    /// bash tool completion to overwrite any artifacts left by child processes
+    /// (or their SSH master connections) that write directly to the terminal.
+    /// Multiple frames are needed because SSH multiplexing may relay server-side
+    /// hook output asynchronously, arriving after the initial redraw.
+    pub redraw_frames: u8,
 }
 
 impl App {
@@ -405,7 +407,7 @@ impl App {
                 session_selector: None,
                              session_selector_query: String::new(),
                              last_sent_input: None,
-                             needs_full_redraw: false,
+                             redraw_frames: 0,
                     }
                 }
 
@@ -720,10 +722,11 @@ impl App {
                 let first_line = output.lines().next().unwrap_or("").chars().take(40).collect::<String>();
                 self.last_completed_tool = format!("{} {} {}", icon, name, first_line);
                 // Bash tools may leave terminal artifacts from child processes
-                // writing directly to /dev/tty (e.g. git push hook output).
-                // Force a full redraw to overwrite any such artifacts.
+                // (or SSH master connections) writing directly to /dev/tty.
+                // Force full redraws for several frames to catch late-arriving
+                // output relayed asynchronously by SSH multiplexing.
                 if name == "bash" {
-                    self.needs_full_redraw = true;
+                    self.redraw_frames = 10;
                 }
                 // Use the same call_id the agent recorded on ToolCallStarted so chat_panel's
                 // "in-flight tool call" detection (call.id ∈ completed_call_ids) matches.
@@ -1379,14 +1382,12 @@ impl App {
                             new_state.error = None;
                             self.mode = AppMode::IssueInput(new_state);
                             
-                            // Get access token
+                            // Get access token from auth.toml
                             let auth_path = atomcode_core::config::Config::config_dir().join("auth.toml");
-                            if let Ok(content) = std::fs::read_to_string(&auth_path) {
-                                let access_token = content.lines()
-                                    .find(|line| line.starts_with("access_token"))
-                                    .and_then(|line| line.split('=').nth(1))
-                                    .map(|s| s.trim().trim_matches('"').to_string());
-                                
+                            let access_token = std::fs::read_to_string(&auth_path).ok()
+                                .and_then(|content| read_auth_field(&content, "access_token"));
+
+                            {
                                 if let Some(token) = access_token {
                                     let title = state.title.clone();
                                     let description = state.description.clone();
@@ -2380,19 +2381,12 @@ impl App {
                 self.conversation.finalize_stream();
             }
             "/issue" => {
-                // Check login status first
+                // Check login status from auth.toml
                 let auth_path = atomcode_core::config::Config::config_dir().join("auth.toml");
-                let mut logged_in = false;
-                
-                if auth_path.exists() {
-                    if let Ok(content) = std::fs::read_to_string(&auth_path) {
-                        // Check if access_token exists
-                        if content.lines().any(|line| line.starts_with("access_token")) {
-                            logged_in = true;
-                        }
-                    }
-                }
-                
+                let logged_in = std::fs::read_to_string(&auth_path).ok()
+                    .and_then(|content| read_auth_field(&content, "access_token"))
+                    .is_some();
+
                 if logged_in {
                     // Switch to issue input mode
                     self.mode = AppMode::IssueInput(IssueInputState::new());
@@ -2995,20 +2989,116 @@ impl InputState {
     }
 }
 
-/// Submit an issue to AtomGit API
-async fn submit_issue_to_gitcode(access_token: &str, title: &str, body: &str) -> Result<String, String> {
-    use reqwest::Client;
-    
-    let client = Client::new();
+/// GitCode OAuth constants (must match atomcode-cli/src/auth/oauth.rs)
+const GITCODE_TOKEN_URL: &str = "https://atomgit.com/oauth/token";
+const GITCODE_CLIENT_ID: &str = "b9956e5327e544578128af8979ba3ccb";
+const GITCODE_CLIENT_SECRET: &str = "756ef00061884c7aa1ac64bd4eae3be7";
 
-    // AtomGit API endpoint for creating issues
-    // Format: https://api.atomgit.com/api/v5/repos/:owner/issues
-    let url = "https://api.atomgit.com/api/v5/repos/bangxu/issues";
-    
+/// Read a value from auth.toml by key (line-based parsing, tolerates malformed TOML).
+fn read_auth_field(content: &str, key: &str) -> Option<String> {
+    content.lines()
+        .find(|line| line.starts_with(key))
+        .and_then(|line| line.split('=').nth(1))
+        .map(|s| s.trim().trim_matches('"').to_string())
+}
+
+/// Try to refresh the access_token using the refresh_token stored in auth.toml.
+/// On success, updates auth.toml and returns the new access_token.
+async fn refresh_gitcode_token() -> Result<String, String> {
+    let auth_path = dirs::home_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join(".atomcode")
+        .join("auth.toml");
+    let content = std::fs::read_to_string(&auth_path)
+        .map_err(|e| format!("Failed to read auth.toml: {}", e))?;
+
+    let refresh_token = read_auth_field(&content, "refresh_token")
+        .ok_or("No refresh_token in auth.toml — please /login again")?;
+
+    let client = reqwest::Client::new();
     let response = client
-        .post(url)
+        .post(GITCODE_TOKEN_URL)
+        .form(&[
+            ("client_id", GITCODE_CLIENT_ID),
+            ("client_secret", GITCODE_CLIENT_SECRET),
+            ("refresh_token", refresh_token.as_str()),
+            ("grant_type", "refresh_token"),
+        ])
+        .send()
+        .await
+        .map_err(|e| format!("Refresh request failed: {}", e))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("Token refresh failed ({}): {} — please /login again", status, body));
+    }
+
+    let token_resp: serde_json::Value = response.json().await
+        .map_err(|e| format!("Failed to parse refresh response: {}", e))?;
+
+    let new_access_token = token_resp["access_token"].as_str()
+        .ok_or("No access_token in refresh response")?
+        .to_string();
+
+    // Rebuild auth.toml with updated tokens, preserving user section
+    let username = read_auth_field(&content, "username").unwrap_or_default();
+    let id = read_auth_field(&content, "id").unwrap_or_default();
+    let new_refresh = token_resp["refresh_token"].as_str()
+        .map(|s| s.to_string())
+        .or(Some(refresh_token));
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    let mut new_content = format!(
+        "access_token = \"{}\"\ncreated_at = {}\n",
+        new_access_token, now
+    );
+    if let Some(rt) = &new_refresh {
+        new_content.push_str(&format!("refresh_token = \"{}\"\n", rt));
+    }
+    if let Some(exp) = token_resp["expires_in"].as_i64() {
+        new_content.push_str(&format!("expires_in = {}\n", exp));
+    }
+    new_content.push_str(&format!(
+        "\n[user]\nid = \"{}\"\nusername = \"{}\"\n",
+        id, username
+    ));
+
+    std::fs::write(&auth_path, new_content)
+        .map_err(|e| format!("Failed to write auth.toml: {}", e))?;
+
+    Ok(new_access_token)
+}
+
+/// Submit an issue to GitCode API. Automatically refreshes token on 401.
+async fn submit_issue_to_gitcode(access_token: &str, title: &str, body: &str) -> Result<String, String> {
+    let result = post_issue(access_token, title, body).await;
+
+    // If 401, try refreshing the token and retry once
+    if let Err(ref e) = result {
+        if e.contains("401") {
+            let new_token = refresh_gitcode_token().await?;
+            return post_issue(&new_token, title, body).await;
+        }
+    }
+
+    result
+}
+
+/// Post an issue to GitCode API with the given access_token.
+async fn post_issue(access_token: &str, title: &str, body: &str) -> Result<String, String> {
+    let client = reqwest::Client::new();
+    let url = format!(
+        "https://api.gitcode.com/api/v5/repos/atomgit_atomcode/issues?access_token={}",
+        access_token
+    );
+
+    let response = client
+        .post(&url)
         .json(&serde_json::json!({
-            "access_token": access_token,
             "repo": "atomcode",
             "title": title,
             "body": body,
@@ -3016,7 +3106,7 @@ async fn submit_issue_to_gitcode(access_token: &str, title: &str, body: &str) ->
         .send()
         .await
         .map_err(|e| format!("Request failed: {}", e))?;
-    
+
     if response.status().is_success() {
         let json: serde_json::Value = response.json().await
             .map_err(|e| format!("Failed to parse response: {}", e))?;

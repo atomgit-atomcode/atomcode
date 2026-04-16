@@ -76,6 +76,10 @@ pub fn render(
     render_cache_msg_count: &mut usize,
 ) -> (usize, usize) {
     let right_margin: u16 = 2;
+    // Keep the full area for background/clear so that the rightmost columns
+    // are explicitly painted — prevents /dev/tty artifacts from persisting
+    // in cells that no widget ever touches.
+    let full_area = area;
     let area = Rect {
         width: area.width.saturating_sub(right_margin),
         ..area
@@ -441,9 +445,13 @@ let _is_read = call_id_to_tool.get(call_id) == Some(&"read_file");
         visible.push(Line::default());
     }
 
-    frame.render_widget(Clear, area);
+    // Clear and paint background on the FULL area (including right margin)
+    // so every column is explicitly written — cells that no widget touches
+    // would otherwise keep stale buffer state and never overwrite /dev/tty
+    // artifacts left by child processes (git push hooks, etc.).
+    frame.render_widget(Clear, full_area);
     let bg = Block::default().style(Style::default().bg(theme::bg_surface()));
-    frame.render_widget(bg, area);
+    frame.render_widget(bg, full_area);
     // NO .wrap() — scroll offset is calculated in logical lines, but Paragraph::wrap
     // adds physical lines, causing scroll/render mismatch and "Dow" ghost artifacts.
     // All content lines are pre-wrapped by wrap_lines() or truncated to fit area.width.

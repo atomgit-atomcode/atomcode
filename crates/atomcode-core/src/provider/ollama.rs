@@ -60,6 +60,10 @@ impl OllamaProvider {
 struct OllamaChunk {
     message: Option<OllamaMessage>,
     done: bool,
+    #[serde(default)]
+    prompt_eval_count: usize,
+    #[serde(default)]
+    eval_count: usize,
 }
 
 #[derive(Deserialize)]
@@ -133,6 +137,15 @@ impl LlmProvider for OllamaProvider {
 
                     if let Ok(chunk) = serde_json::from_str::<OllamaChunk>(&line) {
                         if chunk.done {
+                            if chunk.eval_count > 0 || chunk.prompt_eval_count > 0 {
+                                let _ = tx.send(Ok(StreamEvent::Usage(
+                                    crate::stream::TokenUsage {
+                                        prompt_tokens: chunk.prompt_eval_count,
+                                        completion_tokens: chunk.eval_count,
+                                        cached_tokens: 0,
+                                    }
+                                )));
+                            }
                             let _ = tx.send(Ok(StreamEvent::Done { truncated: false }));
                             return;
                         } else if let Some(msg) = chunk.message {
