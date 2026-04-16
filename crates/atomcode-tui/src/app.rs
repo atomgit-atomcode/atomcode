@@ -1705,6 +1705,9 @@ impl App {
                     // Esc peels off one paste block at a time so users can undo
                     // an accidental extra paste without losing the rest.
                     self.pasted_blocks.pop();
+                } else if !self.attached_files.is_empty() {
+                    // Then peel off attached files one at a time
+                    self.attached_files.pop();
                 } else if !self.input.is_empty() {
                     self.input.clear();
                     self.slash_menu.close();
@@ -1805,6 +1808,9 @@ impl App {
                 if self.input.is_empty() && !self.pasted_blocks.is_empty() {
                     // When input is empty, Backspace removes the last pasted block
                     self.pasted_blocks.pop();
+                } else if self.input.is_empty() && self.pasted_blocks.is_empty() && !self.attached_files.is_empty() {
+                    // When input and pasted blocks are empty, Backspace removes the last attached file
+                    self.attached_files.pop();
                 } else {
                     self.input.backspace();
                 }
