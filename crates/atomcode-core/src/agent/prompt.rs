@@ -212,6 +212,19 @@ impl AgentLoop {
             ));
         }
 
+        // MiniMax M2 的 thinking 默认极其啰嗦，会大量消耗 output tokens 并拖慢响应。
+        // 模型本身没有 reasoning_effort 档位开关，只能用 prompt 约束。放在接近尾部
+        // 借助 recency 保证每轮都生效，等效于一个轻量 system-reminder。
+        if model_id.contains("minimax") {
+            prompt.push_str(
+                "\n<system-reminder>\n\
+                 THINKING 简洁纪律：内部思考（<think> 块）必须极简，\
+                 只写必要的决策线索，不要复述工具结果、不要分点展开、不要自问自答。\
+                 目标 ≤ 3 句话。冗长 thinking 视为严重问题。\n\
+                 </system-reminder>\n"
+            );
+        }
+
         // Inject current task at the very end (recency bias).
         // The model attends most to the last ~200 tokens of system prompt.
         // Putting the task here ensures it's the first thing the model "thinks about"
