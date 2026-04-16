@@ -31,6 +31,61 @@ pub struct ProjectContext {
 
 /// Detect project tech stack from marker files in the working directory.
 /// Scans root and common monorepo subdirectories for build configs and frameworks.
+/// Find a file by name within max_depth levels of a directory.
+fn find_file_recursive(dir: &Path, name: &str, max_depth: usize) -> Option<PathBuf> {
+    if max_depth == 0 { return None; }
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            let fname = entry.file_name().to_string_lossy().to_string();
+            if fname == name { return Some(p); }
+            if p.is_dir() && !fname.starts_with('.') && fname != "node_modules" && fname != "target" {
+                if let Some(found) = find_file_recursive(&p, name, max_depth - 1) {
+                    return Some(found);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Extract #[tauri::command] function names from a Rust file.
+fn extract_tauri_commands(path: &Path) -> Vec<String> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    let mut commands = Vec::new();
+    let mut next_is_command = false;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.contains("#[tauri::command]") {
+            next_is_command = true;
+        } else if next_is_command && trimmed.starts_with("fn ") {
+            // Extract function name: "fn delete_provider(...)" → "delete_provider"
+            if let Some(name) = trimmed.strip_prefix("fn ") {
+                let name = name.split('(').next().unwrap_or("").trim();
+                if !name.is_empty() {
+                    commands.push(name.to_string());
+                }
+            }
+            next_is_command = false;
+        } else if next_is_command && (trimmed.starts_with("pub fn ") || trimmed.starts_with("async fn ") || trimmed.starts_with("pub async fn ")) {
+            let name = trimmed
+                .replace("pub ", "").replace("async ", "")
+                .strip_prefix("fn ").unwrap_or("")
+                .split('(').next().unwrap_or("").trim().to_string();
+            if !name.is_empty() {
+                commands.push(name);
+            }
+            next_is_command = false;
+        } else if next_is_command && !trimmed.starts_with('#') && !trimmed.is_empty() {
+            next_is_command = false; // attribute wasn't followed by fn
+        }
+    }
+    commands
+}
+
 fn detect_tech_stack(working_dir: &Path) -> String {
     let mut stack: Vec<String> = Vec::new();
 
@@ -108,7 +163,27 @@ fn detect_tech_stack(working_dir: &Path) -> String {
                     stack.push("Spring Boot".to_string());
                 }
             }
-            break; // only check the first pom that exists
+            break;
+        }
+    }
+
+    // Detect Tauri desktop app
+    let tauri_conf = find_file_recursive(working_dir, "tauri.conf.json", 3);
+    if let Some(ref tauri_path) = tauri_conf {
+        stack.push("Tauri desktop app".to_string());
+
+        // Extract #[tauri::command] functions from main.rs
+        if let Some(src_dir) = tauri_path.parent() {
+            let main_rs = src_dir.join("src").join("main.rs");
+            if main_rs.exists() {
+                let commands = extract_tauri_commands(&main_rs);
+                if !commands.is_empty() {
+                    stack.push(format!(
+                        "Rust backend commands: [{}]",
+                        commands.join(", ")
+                    ));
+                }
+            }
         }
     }
 
@@ -117,10 +192,20 @@ fn detect_tech_stack(working_dir: &Path) -> String {
     stack.retain(|item| seen.insert(item.clone()));
 
     if stack.is_empty() {
-        String::new()
-    } else {
-        format!("Tech stack: {}\n", stack.join(", "))
+        return String::new();
     }
+
+    let mut result = format!("Tech stack: {}\n", stack.join(", "));
+
+    // Tauri architecture hint
+    if tauri_conf.is_some() {
+        result.push_str(
+            "Architecture: TypeScript frontend ↔ Rust backend via invoke(). \
+             Frontend must call invoke() to persist data through the Rust backend.\n"
+        );
+    }
+
+    result
 }
 
 /// Build project context by scanning the tree and including raw descriptor file contents.
