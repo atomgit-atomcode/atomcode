@@ -69,35 +69,24 @@ impl Tool for ReadFileTool {
         let parsed: ReadFileArgs = serde_json::from_str(args)?;
         let path = std::path::Path::new(&parsed.file_path);
 
-        // ── INVARIANT (2026-04-16): STUB keyed by PATH ONLY ──
-        // Cache key is path + mtime — NOT offset/limit. A file read once (any
-        // range) means the content is in conversation context. Re-reading with
-        // different offset/limit is still the same file, still unchanged.
-        // Without this: model reads main.ts with limit=100, then offset=100,
-        // then offset=300 — each has a different cache key, STUB never fires,
-        // 4 reads of the same unchanged file.
-        // ─────────────────────────────────────────────────────────────────────
+        // ── Read cache: performance optimization only, NOT a STUB gate ──
+        // Cache stores (mtime, rendered_output). If mtime matches, skip disk read +
+        // UTF-8 parse + tree-sitter. Returns full content (not STUB) so the model
+        // always gets what it asked for. STUB behavior is handled upstream in
+        // build_messages (condenses old read results in conversation history).
         let cache_key: crate::tool::ReadCacheKey = (
             path.to_path_buf(),
-            None, // ignore offset — keyed by path only
-            None, // ignore limit — keyed by path only
+            parsed.offset,
+            parsed.limit,
         );
         let disk_mtime = tokio::fs::metadata(&parsed.file_path).await.ok()
             .and_then(|m| m.modified().ok());
         if let Some(mtime) = disk_mtime {
-            if let Some((cached_mtime, _cached_output)) = ctx.read_cache.read().await.get(&cache_key).cloned() {
+            if let Some((cached_mtime, cached_output)) = ctx.read_cache.read().await.get(&cache_key).cloned() {
                 if cached_mtime == mtime {
-                    let filename = path.file_name()
-                        .map(|n| n.to_string_lossy().to_string())
-                        .unwrap_or_else(|| parsed.file_path.clone());
                     return Ok(ToolResult {
                         call_id: String::new(),
-                        output: format!(
-                            "{}: file unchanged since last read. The content from the earlier \
-                             read_file result in this conversation is still current — refer to \
-                             that instead of re-reading.",
-                            filename
-                        ),
+                        output: cached_output,
                         success: true,
                     });
                 }
@@ -344,10 +333,11 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    /// Cache hit on re-read of an unchanged file — second call returns STUB,
-    /// not the full content. This is the FILE_UNCHANGED_STUB pattern from CC.
+    /// Cache hit on re-read of an unchanged file — second call returns full
+    /// content from cache (performance optimization). STUB condensation happens
+    /// upstream in build_messages, not at execute time.
     #[tokio::test]
-    async fn read_cache_hits_returns_stub() {
+    async fn read_cache_hits_returns_full_content() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("a.rs");
         std::fs::write(&path, "fn main() {}\n").unwrap();
@@ -362,8 +352,7 @@ mod tests {
 
         let r2 = tool.execute(&args, &ctx).await.unwrap();
         assert!(r2.success);
-        assert!(r2.output.contains("unchanged since last read"), "second read should return stub");
-        assert!(!r2.output.contains("fn main"), "stub should NOT contain file content");
+        assert!(r2.output.contains("fn main"), "cache hit should return same content");
     }
 
     /// Cache miss after file content changes — mtime shifts, cached entry is ignored.

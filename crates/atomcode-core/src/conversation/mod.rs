@@ -276,6 +276,53 @@ impl Conversation {
         // Add all current messages
         result.extend(self.messages.iter().cloned());
 
+        // ── Condense old read_file results to STUB ──
+        // Prevents the model from seeing full file content from 5+ messages ago,
+        // which causes it to think "I haven't read this file yet" and re-read.
+        // Keep the last 10 messages untouched (recent context). For older messages,
+        // detect read_file output by line-number prefix pattern ("   1| ...") and
+        // replace with a one-line stub. The model sees the stub in history and
+        // won't issue a duplicate read_file call — saving an entire LLM round trip.
+        // Second defense: read.rs execute-time STUB catches any that slip through.
+        {
+            let keep_recent = 10; // last ~2 turns stay full
+            let condense_end = result.len().saturating_sub(keep_recent);
+            // Skip system + cold zone messages at the front
+            let condense_start = if self.cold_summaries.is_empty() { 1 } else { 2 };
+            for i in condense_start..condense_end {
+                if let MessageContent::ToolResult(ref r) = result[i].content {
+                    // Detect read_file output: lines start with line-number prefix "  N| "
+                    let is_read_output = r.output.lines().take(2).any(|l| {
+                        let t = l.trim_start();
+                        t.len() > 3
+                            && t.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false)
+                            && t.contains("| ")
+                    });
+                    // Also detect skeleton output
+                    let is_skeleton = r.output.starts_with("[File skeleton:");
+                    // Don't condense short outputs (stubs, errors, edit results)
+                    let is_large = r.output.len() > 500;
+
+                    if (is_read_output || is_skeleton) && is_large {
+                        // Extract filename from first line if possible
+                        let hint = r.output.lines().next()
+                            .map(|l| l.trim().chars().take(60).collect::<String>())
+                            .unwrap_or_default();
+                        let mut condensed = r.clone();
+                        condensed.output = format!(
+                            "[file content condensed — was read earlier in this conversation. \
+                             First line: {}. Re-read with read_file if needed.]",
+                            hint
+                        );
+                        result[i] = Message {
+                            role: result[i].role.clone(),
+                            content: MessageContent::ToolResult(condensed),
+                        };
+                    }
+                }
+            }
+        }
+
         // Safety: if over 80% (or 60K absolute cap), drop oldest turns.
         // BUT: skip if cold_summaries exist — that means LLM compression just ran
         // and we're looking at the "keep_full=5" survivor set. Dropping those too
