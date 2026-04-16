@@ -295,7 +295,7 @@ impl Tool for ReadFileTool {
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_else(|| parsed.file_path.clone());
             output.push_str(&format!(
-                "\n\n[Full file read: {} ({} lines). Do NOT read this file again unless you edit it first.]",
+                "\n\n[Full file read: {} ({} lines). The ENTIRE content is above — do NOT re-read or grep this file. Search the content above directly.]",
                 fname, total_lines
             ));
         }
