@@ -239,6 +239,7 @@ async fn run() -> Result<i32> {
         let name = pc.model.clone();
         (pc, name)
     };
+
     let provider = create_provider(&provider_config)?;
 
     let working_dir = resolve_working_dir(cli.dir.clone());

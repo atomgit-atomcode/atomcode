@@ -107,7 +107,8 @@ pub fn login() -> Result<AuthInfo> {
     }
     
     // Start local server to receive callback
-    println!("  Waiting for authorization callback on port {}...\n", REDIRECT_PORT);
+    println!("  Waiting for authorization callback on port {}...", REDIRECT_PORT);
+    println!("  Press Ctrl+C to cancel.\n");
     
     let (code, returned_state) = receive_callback(REDIRECT_PORT)?;
     
@@ -192,31 +193,44 @@ fn open_browser(_url: &str) -> Result<()> {
     anyhow::bail!("Unsupported platform for browser auto-open");
 }
 
-/// Receive OAuth callback on local server
+/// Receive OAuth callback on local server.
+/// Uses non-blocking accept so Ctrl+C can interrupt the wait.
 fn receive_callback(port: u16) -> Result<(String, String)> {
     let listener = TcpListener::bind(("127.0.0.1", port))
         .with_context(|| format!("Failed to bind to port {}. Is it already in use?", port))?;
-    
-    // Accept first connection
-    let (mut stream, _) = listener.accept()
-        .context("Failed to accept connection")?;
-    
+    listener.set_nonblocking(true)
+        .context("Failed to set non-blocking mode")?;
+
+    // Poll for connection, checking for Ctrl+C between attempts
+    let mut stream = loop {
+        match listener.accept() {
+            Ok((stream, _)) => break stream,
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                continue;
+            }
+            Err(e) => return Err(e).context("Failed to accept connection"),
+        }
+    };
+
+    stream.set_nonblocking(false)?;
+
     // Read HTTP request
     let mut reader = io::BufReader::new(&mut stream);
     let mut request_line = String::new();
     reader.read_line(&mut request_line)?;
-    
+
     // Parse the request line (GET /callback?code=...&state=... HTTP/1.1)
     let url: String = request_line
         .split_whitespace()
         .nth(1)
         .context("Invalid HTTP request")?
         .to_string();
-    
+
     // Parse query parameters
     let query_start = url.find('?').context("No query parameters in callback")?;
     let query = &url[query_start + 1..];
-    
+
     let params: HashMap<String, String> = query
         .split('&')
         .filter_map(|pair| {
@@ -226,19 +240,21 @@ fn receive_callback(port: u16) -> Result<(String, String)> {
             Some((key.to_string(), value))
         })
         .collect();
-    
-    // Check for error
+
+    // Check for error — redirect browser to AtomGit
     if let Some(error) = params.get("error") {
         let error_desc = params.get("error_description").map(|s| s.as_str()).unwrap_or(error);
+        let response = "HTTP/1.1 302 Found\r\nLocation: https://atomgit.com\r\n\r\n";
+        let _ = stream.write_all(response.as_bytes());
+        let _ = stream.flush();
         anyhow::bail!("OAuth error: {}", error_desc);
     }
-    
+
     let code = params.get("code").context("No code in callback")?.clone();
     let state = params.get("state").cloned().unwrap_or_default();
-    
-    // Send response to browser
-    let response = if params.contains_key("code") {
-        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n\r\n\
+
+    // Send success response to browser
+    let response = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n\r\n\
         <html><head><title>AtomCode Login</title>\
         <style>body{font-family:system-ui;display:flex;justify-content:center;align-items:center;height:100vh;margin:0;background:#1a1a2e;color:#eee}\
         .container{text-align:center;padding:2rem}h1{color:#7c3aed;margin:0}p{color:#888}\
@@ -247,15 +263,11 @@ fn receive_callback(port: u16) -> Result<(String, String)> {
         <div class=\"success\">✓</div>\
         <h1>Authorization Successful</h1>\
         <p>You can close this window and return to AtomCode.</p>\
-        </div></body></html>"
-    } else {
-        "HTTP/1.1 400 Bad Request\r\nContent-Type: text/html\r\n\r\n\
-        <html><body><h1>Bad Request</h1></body></html>"
-    };
-    
+        </div></body></html>";
+
     stream.write_all(response.as_bytes())?;
     stream.flush()?;
-    
+
     Ok((code, state))
 }
 

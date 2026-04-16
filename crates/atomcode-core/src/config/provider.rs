@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 pub struct ProviderConfig {
     #[serde(rename = "type")]
     pub provider_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
     pub model: String,
     pub base_url: Option<String>,

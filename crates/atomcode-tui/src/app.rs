@@ -1206,9 +1206,6 @@ impl App {
                 } else {
                     // All other keys work normally: scroll, type, Ctrl+A/E, etc.
                     self.handle_key_normal(key, event_tx);
-                    // Don't show slash menu during streaming — it overlays the output
-                    // and Esc would need to close menu vs cancel agent (confusing UX)
-                    self.slash_menu.close();
                 }
             }
             AppMode::WaitingApproval(_) => {

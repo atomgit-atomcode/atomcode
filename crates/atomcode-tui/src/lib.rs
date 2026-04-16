@@ -14,7 +14,10 @@ use std::io::Write;
 use anyhow::Result;
 use crossterm::{
     execute,
-    event::DisableMouseCapture,
+    event::{
+        DisableMouseCapture,
+        KeyboardEnhancementFlags, PushKeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    },
     terminal::{
         disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
         SetTitle, Clear, ClearType,
@@ -180,20 +183,20 @@ struct UserResponse {
     name: Option<String>,
 }
 
-/// Add AtomGit provider to config and set as default
-/// Build an in-memory ProviderConfig from OAuth token.
-/// Does NOT write to config file — credentials stay in memory only.
-fn build_oauth_provider(access_token: &str) -> ProviderConfig {
+/// Build an OAuth ProviderConfig for AtomGit.
+/// api_key is NOT included — it is loaded from auth.toml at runtime.
+/// The provider is non-ephemeral so it gets persisted to config.toml.
+fn build_oauth_provider() -> ProviderConfig {
     ProviderConfig {
         provider_type: "openai".to_string(),
-        api_key: Some(access_token.to_string()),
+        api_key: None, // injected from auth.toml at runtime
         model: "MiniMax-M2.7".to_string(),
         base_url: Some("https://api-ai.gitcode.com/v1".to_string()),
         system_prompt: None,
         user_agent: None,
         context_window: 64000,
         max_tokens: None,
-        ephemeral: true,
+        ephemeral: false,
     }
 }
 
@@ -246,13 +249,44 @@ fn run_oauth_login() -> anyhow::Result<AuthInfo> {
     #[cfg(target_os = "windows")]
     let _ = std::process::Command::new("cmd").args(["/C", "start", &auth_url]).spawn();
 
-    println!("  Waiting for authorization callback on port {}...\n", oauth::REDIRECT_PORT);
+    println!("  Waiting for authorization callback on port {}...", oauth::REDIRECT_PORT);
+    println!("  Press Ctrl+C to cancel.\n");
 
-    // Start local server
+    // Start local server with non-blocking accept so Ctrl+C can interrupt
     let listener = TcpListener::bind(("127.0.0.1", oauth::REDIRECT_PORT))?;
-    let (mut stream, _) = listener.accept()?;
+    listener.set_nonblocking(true)?;
+
+    // Enable raw mode temporarily so we can detect Esc / Ctrl+C keypresses
+    crossterm::terminal::enable_raw_mode()?;
+
+    let accept_result = loop {
+        match listener.accept() {
+            Ok((stream, _)) => break Ok(stream),
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if crossterm::event::poll(std::time::Duration::from_millis(200))
+                    .unwrap_or(false)
+                {
+                    if let Ok(crossterm::event::Event::Key(key)) = crossterm::event::read() {
+                        if key.code == crossterm::event::KeyCode::Esc
+                            || (key.code == crossterm::event::KeyCode::Char('c')
+                                && key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL))
+                        {
+                            break Err(anyhow::anyhow!("Login cancelled by user"));
+                        }
+                    }
+                }
+                continue;
+            }
+            Err(e) => break Err(e.into()),
+        }
+    };
+
+    crossterm::terminal::disable_raw_mode()?;
+
+    let mut stream = accept_result?;
 
     // Read HTTP request
+    stream.set_nonblocking(false)?;
     let mut reader = std::io::BufReader::new(&mut stream);
     let mut request_line = String::new();
     reader.read_line(&mut request_line)?;
@@ -273,7 +307,6 @@ fn run_oauth_login() -> anyhow::Result<AuthInfo> {
                     .chars()
                     .fold(String::new(), |mut s, c| {
                         if c == '%' {
-                            // Simple URL decode
                             s
                         } else {
                             s.push(c);
@@ -286,6 +319,10 @@ fn run_oauth_login() -> anyhow::Result<AuthInfo> {
         .collect();
 
     if let Some(error) = params.get("error") {
+        // User denied authorization in browser — redirect to AtomGit
+        let response = "HTTP/1.1 302 Found\r\nLocation: https://atomgit.com\r\n\r\n";
+        let _ = stream.write_all(response.as_bytes());
+        let _ = stream.flush();
         anyhow::bail!("OAuth error: {}", error);
     }
 
@@ -414,6 +451,13 @@ pub async fn run(
     #[cfg(not(target_os = "windows"))]
     execute!(stdout, EnableBracketedPaste)?;
 
+    // Enable Kitty keyboard protocol so the terminal can distinguish
+    // Shift+Enter from plain Enter (needed for multi-line input).
+    // Silently ignored by terminals that don't support it.
+    let _ = execute!(stdout, PushKeyboardEnhancementFlags(
+        KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+    ));
+
     // Wrap stdout in BufWriter: crossterm emits many small writes per frame
     // (cursor moves, style changes, cells). On Windows each write is a
     // WriteConsole syscall, which is orders of magnitude slower than Unix tty
@@ -453,6 +497,7 @@ pub async fn run(
         if let Some(file_path) = app.pending_editor.take() {
             // First disable raw mode to release terminal control completely
             disable_raw_mode()?;
+            let _ = execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
             execute!(
                 terminal.backend_mut(),
                 DisableMouseCapture,
@@ -484,7 +529,7 @@ pub async fn run(
                             let config_path = Config::default_path();
                             if std::path::Path::new(&file_path) == config_path {
                                 if let Ok(mut new_config) = Config::load(&config_path) {
-                                    // Preserve ephemeral providers (e.g. OAuth /login) —
+                                    // Preserve ephemeral providers (e.g. WeCom SSO) —
                                     // they only exist in memory, not on disk.
                                     for (name, provider) in &app.config.providers {
                                         if provider.ephemeral {
@@ -531,6 +576,9 @@ pub async fn run(
             )?;
             #[cfg(not(target_os = "windows"))]
             execute!(terminal.backend_mut(), EnableBracketedPaste)?;
+            let _ = execute!(terminal.backend_mut(), PushKeyboardEnhancementFlags(
+                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+            ));
             terminal.clear()?;
             event_loop.start();
             if let Some(msg) = spawn_error {
@@ -552,6 +600,7 @@ pub async fn run(
             event_loop.stop();
 
             disable_raw_mode()?;
+            let _ = execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
             execute!(
                 terminal.backend_mut(),
                 DisableMouseCapture,
@@ -576,17 +625,20 @@ pub async fn run(
                 Ok(auth) => {
                     println!("\n  Login successful! Logged in as: {}", auth.user.username);
                     let oauth_name = app.pending_oauth_name.take().unwrap_or_else(|| "AtomGit".to_string());
-                    // Add provider to in-memory config only — no disk write.
-                    // Credentials stay in memory for this session.
-                    let oauth_provider = build_oauth_provider(&auth.access_token);
+                    // Save provider config to config.toml (without api_key).
+                    // api_key comes from auth.toml at runtime.
+                    let oauth_provider = build_oauth_provider();
                     app.config.providers.insert(oauth_name.clone(), oauth_provider);
                     app.config.default_provider = oauth_name.clone();
+                    let _ = app.config.save(&Config::default_path());
+                    // api_key stays None in config — create_provider() reads
+                    // it from auth.toml automatically.
                     app.rebuild_provider();
                     app.sync_config_to_agent();
                     let model_display = app.provider.model_name();
                     app.conversation.add_user_message("/login");
                     app.conversation.push_delta(&format!(
-                        "Login successful! Logged in as: **{}** (ID: {})\n\nProvider `{}` active (in-memory, not saved to config).\nModel: `{}`",
+                        "Login successful! Logged in as: **{}** (ID: {})\n\nProvider `{}` saved to config.\nModel: `{}`",
                         auth.user.username, auth.user.id, oauth_name, model_display
                     ));
                     app.conversation.finalize_stream();
@@ -610,6 +662,9 @@ pub async fn run(
             )?;
             #[cfg(not(target_os = "windows"))]
             execute!(terminal.backend_mut(), EnableBracketedPaste)?;
+            let _ = execute!(terminal.backend_mut(), PushKeyboardEnhancementFlags(
+                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+            ));
             terminal.clear()?;
             event_loop.start();
             continue;
@@ -623,6 +678,7 @@ pub async fn run(
             event_loop.stop();
 
             disable_raw_mode()?;
+            let _ = execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
             execute!(
                 terminal.backend_mut(),
                 DisableMouseCapture,
@@ -681,6 +737,9 @@ app.conversation.add_user_message("/login-with-sso");
             )?;
             #[cfg(not(target_os = "windows"))]
             execute!(terminal.backend_mut(), EnableBracketedPaste)?;
+            let _ = execute!(terminal.backend_mut(), PushKeyboardEnhancementFlags(
+                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+            ));
             terminal.clear()?;
             event_loop.start();
             continue;
@@ -746,6 +805,7 @@ app.conversation.add_user_message("/login-with-sso");
     }
 
     disable_raw_mode()?;
+    let _ = execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
     execute!(
         terminal.backend_mut(),
         DisableMouseCapture,
