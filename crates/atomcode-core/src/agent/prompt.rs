@@ -7,7 +7,35 @@ impl AgentLoop {
     /// Build a per-turn reminder string injected into the conversation.
     /// Currently returns empty — reserved for future per-turn context injection.
     pub(crate) fn build_turn_reminder(&self) -> String {
-        String::new()
+        let mut parts = Vec::new();
+
+        // Previous turn's edited files — helps model avoid re-exploring
+        if !self.prev_turn_edited_files.is_empty() {
+            let files = self.prev_turn_edited_files.join(", ");
+            parts.push(format!(
+                "[Previous turn: you edited {}. If the user reports the same issue, start from these files.]",
+                files
+            ));
+        }
+
+        // Current task at the very end (recency bias)
+        if !self.current_task.is_empty() {
+            let task_short = if self.current_task.chars().count() > 300 {
+                format!("{}...", self.current_task.chars().take(297).collect::<String>())
+            } else {
+                self.current_task.clone()
+            };
+            parts.push(format!(
+                "=== CURRENT TASK ===\n{}\nAct on this task directly. Do NOT search for files you already know about.",
+                task_short
+            ));
+        }
+
+        if parts.is_empty() {
+            String::new()
+        } else {
+            parts.join("\n\n")
+        }
     }
 
     pub(crate) fn build_system_prompt(&mut self) -> String {
@@ -38,29 +66,15 @@ impl AgentLoop {
             })
             .unwrap_or_default();
 
-        // Inject environment metadata
+        // Stable environment metadata (no date — changes every day, breaks cache)
         let shell = if cfg!(target_os = "windows") {
             std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".into())
         } else {
             std::env::var("SHELL").unwrap_or_else(|_| "bash".into())
         };
-        let date_str = if cfg!(target_os = "windows") {
-            // Windows: use PowerShell for date
-            std::process::Command::new("cmd.exe")
-                .args(&["/C", "echo %date%"])
-                .output()
-                .ok().and_then(|o| String::from_utf8(o.stdout).ok())
-                .map(|s| s.trim().to_string())
-                .unwrap_or_else(|| "unknown".into())
-        } else {
-            std::process::Command::new("date").arg("+%Y-%m-%d").output()
-                .ok().and_then(|o| String::from_utf8(o.stdout).ok())
-                .map(|s| s.trim().to_string())
-                .unwrap_or_else(|| "unknown".into())
-        };
         let env_info = format!(
-            "Platform: {} | Shell: {} | Date: {}",
-            std::env::consts::OS, shell, date_str,
+            "Platform: {} | Shell: {}",
+            std::env::consts::OS, shell,
         );
 
         // Model identity — needed for language discipline.
@@ -106,15 +120,6 @@ impl AgentLoop {
             prompt.push('\n');
         }
 
-        // Inject previous turn's edited files — helps model avoid re-exploring
-        if !self.prev_turn_edited_files.is_empty() {
-            let files = self.prev_turn_edited_files.join(", ");
-            prompt.push_str(&format!(
-                "\n[Previous turn: you edited {}. If the user reports the same issue, start from these files.]\n",
-                files
-            ));
-        }
-
         // MiniMax thinking discipline — inline as a rule, not a <system-reminder>
         if model_id.contains("minimax") {
             prompt.push_str(
@@ -122,20 +127,6 @@ impl AgentLoop {
                  内部思考（<think> 块）必须极简，只写必要的决策线索，\
                  不要复述工具结果、不要分点展开、不要自问自答。目标 ≤ 3 句话。\n"
             );
-        }
-
-        // Inject current task at the very end (recency bias).
-        if !self.current_task.is_empty() {
-            let task_short = if self.current_task.chars().count() > 300 {
-                format!("{}...", self.current_task.chars().take(297).collect::<String>())
-            } else {
-                self.current_task.clone()
-            };
-            prompt.push_str(&format!(
-                "\n=== CURRENT TASK ===\n{}\n\
-                 Act on this task directly. Do NOT search for files you already know about.\n",
-                task_short
-            ));
         }
 
         prompt
