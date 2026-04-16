@@ -83,10 +83,17 @@ impl AgentLoop {
             .map(|p| p.model.to_lowercase())
             .unwrap_or_default();
 
-        // Assemble prompt: env → rules LAST (recency effect).
+        // Identity: inject model name so the model correctly identifies itself.
+        let model_display = self.config.providers
+            .get(&self.config.default_provider)
+            .map(|p| p.model.as_str())
+            .unwrap_or("unknown");
+
+        // Assemble prompt: identity + env → rules LAST (recency effect).
         let mut prompt = format!(
-            "Working directory: {wd}\nAll file paths in tool calls must be absolute, resolved under {wd}. Verify file existence before editing.\n{env_info}\n",
-            wd = wd.display(), env_info = env_info,
+            "You are AtomCode. When asked who you are, say you are AtomCode (an AI coding agent by AtomGit) running the {} model. Never claim to be another product.\n\
+             Working directory: {wd}\nAll file paths in tool calls must be absolute, resolved under {wd}. Verify file existence before editing.\n{env_info}\n",
+            model_display, wd = wd.display(), env_info = env_info,
         );
 
         // Project instructions (if any)
