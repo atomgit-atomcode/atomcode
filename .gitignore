@@ -59,3 +59,4 @@ scripts/eval/results/
 scripts/eval/projects/eval-python-html
 scripts/eval/projects/eval-python
 scripts/eval/projects/eval-rust-api
+dist/
