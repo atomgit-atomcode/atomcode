@@ -273,20 +273,18 @@ impl Tool for ReadFileTool {
 
         // If offset > 0 but auto-expand would give the whole file, reset offset to 0
         let offset = if offset > 0 && limit >= total_lines { 0 } else { offset };
+        // Clamp offset to file size — caller may pass an offset past EOF
+        // (e.g. cached line count stale, or model hallucinates a line number).
+        let offset = offset.min(total_lines);
 
-        let end = (offset + limit).min(total_lines);
+        let end = (offset.saturating_add(limit)).min(total_lines);
 
         // Smart char limit: if full output would exceed ctx/8, show head + tree-sitter skeleton.
-        // This replaces the brutal head+tail truncation in truncation.rs — the model sees
-        // real code for the beginning + function signatures with line numbers for the rest.
         // Fixed 8K char limit per read — matches truncation.rs ctx/8 cap.
-        // Using a fixed limit instead of dynamic budget ensures the skeleton
-        // ALWAYS triggers for large files, regardless of how much context remains.
         let char_limit: usize = 8_000;
         let full_output_estimate = (end - offset) * 45; // ~45 chars per formatted line
 
         if full_output_estimate > char_limit && parsed.offset.is_none() {
-            // Output would exceed budget — show head lines + tree-sitter skeleton for the rest.
             let head_lines = (char_limit * 2 / 3) / 45; // 2/3 budget for real code
             let head_end = (offset + head_lines).min(end);
 
@@ -297,7 +295,6 @@ impl Tool for ReadFileTool {
                 .collect::<Vec<_>>()
                 .join("\n");
 
-            // Tree-sitter skeleton for the truncated portion
             let mut searcher = ctx.semantic.lock().await;
             let skeleton = if let Some(symbols) = searcher.list_symbols(path) {
                 let beyond: Vec<String> = symbols.iter()
@@ -329,7 +326,6 @@ impl Tool for ReadFileTool {
             }
             return Ok(ToolResult { call_id: String::new(), output, success: true });
         }
-
         let returned_all = offset == 0 && end >= total_lines;
 
         let mut output: String = lines[offset..end]
