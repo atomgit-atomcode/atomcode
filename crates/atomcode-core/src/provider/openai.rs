@@ -37,7 +37,9 @@ impl OpenAiProvider {
                 .base_url
                 .clone()
                 .unwrap_or_else(|| "https://api.openai.com/v1".to_string()),
-            max_tokens: config.max_tokens.unwrap_or((config.context_window / 4).max(16_000)),
+            // Cap at 16K: prevents models from spending 250s on thinking
+            // with zero visible output. CC uses fixed 16-32K, not proportional.
+            max_tokens: config.max_tokens.unwrap_or((config.context_window / 4).clamp(8_000, 16_384)),
         })
     }
 

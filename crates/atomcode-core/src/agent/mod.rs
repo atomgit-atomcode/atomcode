@@ -1231,14 +1231,22 @@ impl AgentLoop {
                     // on internal reasoning — retrying will produce the same result.
                     let is_empty = text.trim().is_empty() || (text.trim().len() < 5 && tokens < 10);
                     let turn_elapsed = self.turn_start.map(|t| t.elapsed().as_secs()).unwrap_or(0);
+                    // Slow empty: model spent all tokens on thinking. Don't retry
+                    // with "Continue" (will just burn tokens again). Instead nudge
+                    // model to summarize what it did and finish.
                     let is_slow_empty = is_empty && turn_elapsed > 60;
-                    if is_slow_empty {
-                        // Don't retry — model burned max_tokens on thinking
-                        let _ = self.event_tx.send(AgentEvent::TextDelta(
-                            "\n[Model produced no visible output after extended thinking. Try rephrasing your request more specifically.]\n".to_string()
-                        ));
-                        self.finish_turn(TurnStopReason::Natural);
-                        return;
+                    if is_slow_empty && self.retry_count < 1 {
+                        self.retry_count += 1;
+                        self.conversation.messages.push(
+                            crate::conversation::message::Message::new(
+                                crate::conversation::message::Role::Assistant,
+                                "(completed)".to_string(),
+                            )
+                        );
+                        self.conversation.add_user_message(
+                            "Summarize what you changed and finish."
+                        );
+                        continue;
                     }
                     if is_empty && self.retry_count < 2 {
                         self.retry_count += 1;
