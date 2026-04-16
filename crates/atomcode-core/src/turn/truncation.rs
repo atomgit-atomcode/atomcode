@@ -19,7 +19,7 @@ use crate::tool::ToolResult;
 pub fn truncate_output(result: &mut ToolResult, tool_name: &str, context_window: usize) {
     match tool_name {
         "bash" => truncate_bash(result),
-        "read_file" => truncate_read_file(result),
+        "read_file" => {}, // Layer A in read.rs is the single authority. No post-hoc truncation.
         "web_fetch" => truncate_generic(result, 150, 20, 40),
         _ => truncate_generic(result, 200, 30, 50),
     }
@@ -292,95 +292,11 @@ fn assemble_important_lines(lines: &[&str], important: &[bool]) -> String {
     output
 }
 
-/// read_file: if output is very long, extract an outline — keep top-level
-/// declarations (lines at indent level 0-1) plus head/tail for orientation.
-/// Tech-stack agnostic: uses indentation depth as a universal proxy for
-/// "important structural line" — works across all languages.
-///
-/// Threshold is 2000 lines. Truncating forces multi-read/multi-edit cycles
-/// that waste far more tokens than keeping the full file.
-/// At 32K context window, 2000 lines ≈ 8000 tokens = 25% of budget.
-/// Files over 2000 lines are extremely rare in practice.
-fn truncate_read_file(result: &mut ToolResult) {
-    let lines: Vec<&str> = result.output.lines().collect();
-    if lines.len() <= 2000 {
-        return;
-    }
-
-    // Always keep first 30 and last 20 lines (file header/imports + end).
-    const HEAD: usize = 30;
-    const TAIL: usize = 20;
-
-    let mut important: Vec<bool> = vec![false; lines.len()];
-
-    // Head and tail.
-    for i in 0..HEAD.min(lines.len()) {
-        important[i] = true;
-    }
-    for i in lines.len().saturating_sub(TAIL)..lines.len() {
-        important[i] = true;
-    }
-
-    // Top-level lines in the middle: detect by indentation depth.
-    // read_file output has line-number prefix: "  123| content"
-    // Extract content after "| " and check its indent level.
-    for (i, line) in lines.iter().enumerate() {
-        // Extract the actual code content after the line-number prefix.
-        let content = if let Some(pos) = line.find("| ") {
-            &line[pos + 2..]
-        } else {
-            line
-        };
-
-        // Skip empty/whitespace-only lines.
-        if content.trim().is_empty() {
-            continue;
-        }
-
-        // Count leading whitespace (spaces or tabs).
-        let indent = content.len() - content.trim_start().len();
-        // Indent 0-1 = top-level declaration (function, class, struct, etc.)
-        // across virtually all languages.
-        if indent <= 1 && content.trim().len() > 2 {
-            important[i] = true;
-            // Include the line below (often opening brace, docstring, or type annotation).
-            if i + 1 < lines.len() {
-                important[i + 1] = true;
-            }
-        }
-    }
-
-    // Assemble with skip markers + usage hint.
-    let total_lines = lines.len();
-    let mut output = format!(
-        "[File has {} lines — showing outline only. Use read_file with offset and limit to read specific sections.]\n\n",
-        total_lines
-    );
-    let mut skipping = false;
-    let mut skip_count = 0usize;
-
-    for (i, line) in lines.iter().enumerate() {
-        if important[i] {
-            if skipping {
-                output.push_str(&format!("\n[... {} lines skipped ...]\n", skip_count));
-                skipping = false;
-                skip_count = 0;
-            }
-            if !output.is_empty() {
-                output.push('\n');
-            }
-            output.push_str(line);
-        } else {
-            skipping = true;
-            skip_count += 1;
-        }
-    }
-    if skipping {
-        output.push_str(&format!("\n[... {} lines skipped ...]", skip_count));
-    }
-
-    result.output = output;
-}
+// truncate_read_file: DELETED.
+// read_file truncation is now handled exclusively by Layer A (auto_skeleton)
+// in read.rs. Having two separate outline-extraction algorithms (tree-sitter
+// in read.rs vs indent-based here) was redundant and caused confusion about
+// which one actually controlled the output.
 
 /// Generic truncation: head + tail, skipping middle.
 pub(crate) fn truncate_generic(result: &mut ToolResult, max_lines: usize, head: usize, tail: usize) {
@@ -517,34 +433,7 @@ mod tests {
         assert!(result.output.contains("error: compilation failed"));
     }
 
-    // --- truncate_read_file tests ---
-
-    #[test]
-    fn truncate_read_file_short_file_unchanged() {
-        let output = (0..100).map(|i| format!("   {}| line content", i)).collect::<Vec<_>>().join("\n");
-        let mut result = make_result(&output);
-        truncate_read_file(&mut result);
-        assert_eq!(result.output, output);
-    }
-
-    #[test]
-    fn truncate_read_file_long_file_extracts_outline() {
-        // Create a 2001-line "file" with line-number prefixes
-        let lines: Vec<String> = (0..2001).map(|i| {
-            if i % 100 == 0 {
-                format!("   {}| fn function_{}", i, i)
-            } else {
-                format!("   {}|     body line {}", i, i)
-            }
-        }).collect();
-        let output = lines.join("\n");
-        let mut result = make_result(&output);
-        truncate_read_file(&mut result);
-        // Should be shorter than original
-        assert!(result.output.len() < output.len());
-        // Should contain skip markers
-        assert!(result.output.contains("lines skipped"));
-    }
+    // truncate_read_file tests: DELETED (function removed, Layer A in read.rs handles it)
 
     // --- truncate_generic tests ---
 

@@ -173,6 +173,10 @@ pub struct ToolContext {
     /// Remaining context tokens budget. Set by TurnRunner before each tool batch.
     /// read_file uses this to decide full content vs skeleton.
     pub ctx_budget_hint: Arc<std::sync::atomic::AtomicUsize>,
+    /// Per-file token budget for read_file. Set by runner.rs Layer B before each
+    /// tool batch: `ctx_budget / (5 * num_reads)`. read.rs compares file_tokens
+    /// against this to decide full vs skeleton. Defaults to ctx_budget/5 (single file).
+    pub read_budget_tokens: Arc<std::sync::atomic::AtomicUsize>,
     /// Per-session read-file output cache. Hit is valid only when on-disk mtime
     /// still matches. Avoids redoing UTF-8 parsing + semantic skeleton generation
     /// when the model re-reads the same file — these are CPU-heavy, not just I/O.
@@ -190,6 +194,7 @@ impl ToolContext {
             semantic: Arc::new(Mutex::new(crate::semantic::SemanticSearcher::new())),
             file_history: Arc::new(Mutex::new(file_history::FileHistory::new(session_id))),
             ctx_budget_hint: Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX)),
+            read_budget_tokens: Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX)),
             graph: Arc::new(RwLock::new(crate::graph::CodeGraph::new())),
             read_cache: Arc::new(RwLock::new(std::collections::HashMap::new())),
         }

@@ -186,13 +186,14 @@ impl Tool for ReadFileTool {
         let lines: Vec<&str> = content.lines().collect();
         let total_lines = lines.len();
 
-        // Dynamic skeleton threshold based on remaining context budget.
-        // Full content when ctx has room, skeleton when filling up.
-        // Single file capped at 20% of remaining budget (÷5).
+        // ── Layer A: per-file decision (the ONLY truncation for read_file) ──
+        // Compares file size against per-file token budget (set by Layer B in
+        // runner.rs). If file fits → full content. If not → tree-sitter skeleton.
+        // No char_limit, no line limit, no post-hoc truncation.
+        // truncation.rs skips read_file entirely — this is the single authority.
         let file_tokens = total_lines * 12;
-        let budget = ctx.ctx_budget_hint.load(std::sync::atomic::Ordering::Relaxed);
-        let single_file_limit = budget / 5;
-        let auto_skeleton = file_tokens > single_file_limit
+        let per_file_budget = ctx.read_budget_tokens.load(std::sync::atomic::Ordering::Relaxed);
+        let auto_skeleton = file_tokens > per_file_budget
             && parsed.offset.is_none()
             && parsed.limit.is_none();
 
@@ -270,16 +271,9 @@ impl Tool for ReadFileTool {
 
         let offset = parsed.offset.unwrap_or(1).max(1) - 1;
 
-        let limit = match parsed.limit {
-            Some(l) => l,
-            None => {
-                if total_lines > 1500 && parsed.offset.is_none() {
-                    1500
-                } else {
-                    2000
-                }
-            }
-        };
+        // No hardcoded line limit — Layer A (auto_skeleton) is the only gate.
+        // If auto_skeleton didn't fire, the file fits in budget → return all lines.
+        let limit = parsed.limit.unwrap_or(total_lines);
 
         // If offset > 0 but auto-expand would give the whole file, reset offset to 0
         let offset = if offset > 0 && limit >= total_lines { 0 } else { offset };
@@ -289,61 +283,8 @@ impl Tool for ReadFileTool {
 
         let end = (offset.saturating_add(limit)).min(total_lines);
 
-        // ── INVARIANT (2026-04-16): char_limit must scale with ctx_budget ──
-        // Was hardcoded 8K, which truncated 368-line files even at 128K context.
-        // Formula: 1/5 of remaining budget (in tokens) → convert to chars.
-        // Floor 8K chars (~180 lines), no upper cap — auto_skeleton (Layer 1)
-        // already handles truly huge files. This layer only catches medium files
-        // (200-2000 lines) that slip past auto_skeleton but are too big for
-        // the remaining budget.
-        // ─────────────────────────────────────────────────────────────────
-        let budget_tokens = ctx.ctx_budget_hint.load(std::sync::atomic::Ordering::Relaxed);
-        let single_file_budget = budget_tokens / 5; // 20% of remaining budget in tokens
-        let char_limit: usize = single_file_budget.saturating_mul(4).max(8_000); // tokens→chars, floor 8K
-        let full_output_estimate = (end - offset) * 45; // ~45 chars per formatted line
-
-        if full_output_estimate > char_limit && parsed.offset.is_none() {
-            let head_lines = (char_limit * 2 / 3) / 45; // 2/3 budget for real code
-            let head_end = (offset + head_lines).min(end);
-
-            let mut output: String = lines[offset..head_end]
-                .iter()
-                .enumerate()
-                .map(|(i, line)| format!("{:>4}| {}", offset + i + 1, line))
-                .collect::<Vec<_>>()
-                .join("\n");
-
-            let mut searcher = ctx.semantic.lock().await;
-            let skeleton = if let Some(symbols) = searcher.list_symbols(path) {
-                let beyond: Vec<String> = symbols.iter()
-                    .filter(|s| s.start_line > head_end)
-                    .map(|s| {
-                        let sig = lines.get(s.start_line.saturating_sub(1))
-                            .map(|l| l.trim())
-                            .unwrap_or(&s.name);
-                        let sig_short: String = sig.chars().take(70).collect();
-                        format!("{:>4}| {}  (L{}-{})", s.start_line, sig_short, s.start_line, s.end_line)
-                    })
-                    .collect();
-                if !beyond.is_empty() {
-                    beyond.join("\n")
-                } else {
-                    String::new()
-                }
-            } else {
-                String::new()
-            };
-
-            output.push_str(&format!(
-                "\n\n[TRUNCATED: showing lines {}-{} of {} total. Use read_file with start_line={} to see the rest. Remaining structure:]\n{}",
-                offset + 1, head_end, total_lines, head_end + 1, skeleton
-            ));
-
-            if let Some(mtime) = disk_mtime {
-                ctx.read_cache.write().await.insert(cache_key, (mtime, output.clone()));
-            }
-            return Ok(ToolResult { call_id: String::new(), output, success: true });
-        }
+        // char_limit branch DELETED — Layer A (auto_skeleton) is the only gate.
+        // If we reach here, the file passed the budget check → return full content.
         let returned_all = offset == 0 && end >= total_lines;
 
         let mut output: String = lines[offset..end]

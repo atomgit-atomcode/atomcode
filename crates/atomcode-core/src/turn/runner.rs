@@ -352,6 +352,24 @@ _ = cancel.cancelled() => {
             });
         }
 
+        // ── Layer B: per-turn read budget allocation ──
+        // Count read_file calls in this batch and set per-file token budget.
+        // Formula: 20% of ctx budget / num_reads. This ensures N reads in one
+        // turn share the budget fairly — 1 read gets 20%, 3 reads get 6.7% each.
+        // read.rs Layer A checks file_tokens against this to decide full vs skeleton.
+        {
+            let num_reads = tool_calls_buf.iter()
+                .filter(|c| c.name == "read_file")
+                .count()
+                .max(1); // avoid division by zero
+            let budget = self.context.ctx_budget_hint.load(std::sync::atomic::Ordering::Relaxed);
+            let per_file = budget / (5 * num_reads);
+            self.context.read_budget_tokens.store(
+                per_file.max(2000), // floor: ~170 lines always get full content
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+
         let tool_count = tool_calls_buf.len();
         let mut seen_calls: std::collections::HashMap<(String, String), usize> = std::collections::HashMap::new();
         let mut is_dup: Vec<bool> = vec![false; tool_calls_buf.len()];
