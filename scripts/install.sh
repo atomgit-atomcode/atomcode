@@ -8,7 +8,7 @@
 #   ATOMCODE_PREFIX    install dir (default: /usr/local/bin, falls back to ~/.local/bin)
 set -eu
 
-VERSION="${ATOMCODE_VERSION:-v4.15.1}"
+VERSION="${ATOMCODE_VERSION:-v4.15.2}"
 REPO_BASE="https://gitcode.com/atomgit_atomcode/atomcode-release/releases/download"
 
 # --- detect platform ---
@@ -95,8 +95,35 @@ echo "Installed: $TARGET"
 case ":$PATH:" in
     *":$PREFIX:"*) ;;
     *)
-        echo ""
-        echo "Note: $PREFIX is not in your PATH. Add this line to your shell rc:"
-        echo "    export PATH=\"$PREFIX:\$PATH\""
+        # Auto-append PATH export to shell rc file
+        LINE="export PATH=\"$PREFIX:\$PATH\""
+        RC=""
+        if [ -n "${ZSH_VERSION:-}" ] || [ "$(basename "${SHELL:-}")" = "zsh" ]; then
+            RC="$HOME/.zshrc"
+        elif [ -n "${BASH_VERSION:-}" ] || [ "$(basename "${SHELL:-}")" = "bash" ]; then
+            RC="$HOME/.bashrc"
+        fi
+
+        if [ -n "$RC" ]; then
+            if [ -f "$RC" ] && grep -qF "$PREFIX" "$RC" 2>/dev/null; then
+                # Already present, skip
+                :
+            else
+                echo "" >> "$RC"
+                echo "# Added by AtomCode installer" >> "$RC"
+                echo "$LINE" >> "$RC"
+                echo ""
+                echo "Added $PREFIX to PATH in $RC"
+            fi
+            echo ""
+            echo "To start using atomcode right now, run:"
+            echo ""
+            echo "    source $RC"
+            echo ""
+        else
+            echo ""
+            echo "Note: $PREFIX is not in your PATH. Add this line to your shell rc:"
+            echo "    $LINE"
+        fi
         ;;
 esac
