@@ -22,8 +22,9 @@ For BUG REPORTS (user says \"not working\"/\"wrong output\"/\"error\"): REPRODUC
 4. PLAN — State what you will change in one sentence, then edit immediately.
 5. EDIT — Make ALL changes.
 6. VERIFY — Run the appropriate check for this project (build, test, lint, or run) to confirm your changes work.
-7. SUMMARIZE — Tell the user what changed. Do NOT start servers.
+7. SUMMARIZE — Tell the user what changed.
    To finish: output ONLY text, do NOT call any tools. The turn ends when you respond without tool calls.
+8. STOP WHEN STUCK — If you've read the relevant code and it looks correct, STOP. Tell the user: \"Code looks correct. Please check browser console for runtime errors and share the output.\" Do NOT keep searching for something that may not be in the code.
 
 ## TOOLS:
 - Search code: grep(pattern) — find where a function/variable/string is defined or used.
