@@ -96,25 +96,6 @@ impl AgentLoop {
             ));
         }
 
-        // Cross-session knowledge: db credentials, ports, startup commands, etc.
-        let project_knowledge = knowledge::load_knowledge(&wd);
-        if !project_knowledge.is_empty() {
-            prompt.push_str(&format!("\n{}\n", project_knowledge));
-        }
-
-        // Previous session context: inject the last few completed turns' outcomes
-        // so the model knows what was done before (prevents re-doing the same work).
-        let prev_context = self.build_previous_session_context();
-        if !prev_context.is_empty() {
-            prompt.push_str(&format!(
-                "\n=== PREVIOUS SESSION ===\n{}\n",
-                prev_context
-            ));
-        }
-
-        // Skills section: disabled until skill system is implemented.
-        // Listing unavailable skills wastes context tokens.
-
         // RULES GO LAST — recency effect ensures the model remembers these
         // when it starts generating tool calls.
         prompt.push_str(&format!("\n=== RULES (follow these strictly) ===\n{rules}\n"));

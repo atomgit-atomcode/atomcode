@@ -3,7 +3,7 @@
 //! via channels. Decoupled from any TUI concerns.
 
 pub mod git_checkpoint;
-pub mod knowledge;
+// pub mod knowledge; // removed: low-value cross-session memory, see git history
 pub mod sub_agent;
 pub mod subtask_driver;
 // task_classifier removed — replaced by state-based decisions in handle_send_message.
@@ -682,33 +682,6 @@ impl AgentLoop {
             let ctx_window = self.config.providers.get(&self.config.default_provider)
                 .map(|p| p.context_window).unwrap_or(128000);
             self.datalog.begin_turn(&content, &model_name, ctx_window);
-        }
-
-        // "记住这个" / "remember this" — save last assistant response as knowledge.
-        let lower_content = content.to_lowercase();
-        let is_remember = lower_content.contains("记住")
-            || lower_content.contains("remember")
-            || lower_content.contains("记录一下")
-            || lower_content.contains("记下来");
-        if is_remember {
-            let wd = self.turn_runner.context.working_dir.try_read()
-                .map(|g| g.clone()).unwrap_or_default();
-            // Find last assistant text
-            let last_assistant = self.conversation.messages.iter().rev()
-                .find(|m| matches!(m.role, crate::conversation::message::Role::Assistant))
-                .and_then(|m| m.text())
-                .unwrap_or("")
-                .to_string();
-            if !last_assistant.is_empty() {
-                // Use first 200 chars as value, timestamp as category
-                let summary = if last_assistant.chars().count() > 200 {
-                    format!("{}...", last_assistant.chars().take(197).collect::<String>())
-                } else {
-                    last_assistant.clone()
-                };
-                let category = format!("user_note_{}", chrono::Local::now().format("%Y%m%d_%H%M"));
-                knowledge::save_user_knowledge(&wd, &category, &summary);
-            }
         }
 
         // State-based decisions (replaces keyword-based task_classifier).
@@ -1566,20 +1539,6 @@ impl AgentLoop {
 
         // Flush datalog with final stats
         self.datalog.end_turn(self.turn_tokens, self.tool_call_count);
-
-        // Record session activity to project knowledge (cross-session memory).
-        if !self.files_edited_this_turn.is_empty() {
-            let wd = self.turn_runner.context.working_dir.try_read()
-                .map(|g| g.clone()).unwrap_or_default();
-            let last_curl = knowledge::find_last_curl(&self.conversation.messages);
-            knowledge::record_session(
-                &wd,
-                &self.current_task,
-                &self.files_edited_this_turn,
-                last_curl.as_deref(),
-                self.discipline_state.build_fail_count == 0,
-            );
-        }
 
         let duration = self.turn_start.map(|t| t.elapsed()).unwrap_or_default();
         self.turn_start = None;
