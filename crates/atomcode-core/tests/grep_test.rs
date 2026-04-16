@@ -78,7 +78,13 @@ async fn test_no_crash_on_chinese() {
 async fn test_excludes_target() {
     let result = run_grep("GrepTool", ".", &wd()).await;
     assert!(result.success);
-    let has_target = result.output.lines().any(|l| l.contains("/target/"));
+    // Check that no result *file path* comes from target/ — only inspect the
+    // path prefix before the first `:`, not the matched source text which may
+    // contain the literal string "target/" (e.g. this very test).
+    let has_target = result.output.lines().any(|l| {
+        let path = l.split(':').next().unwrap_or("");
+        path.contains("/target/") || path.starts_with("target/")
+    });
     assert!(!has_target, "target/ should be excluded. Output: {}", result.output);
 }
 
