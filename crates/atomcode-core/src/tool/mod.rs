@@ -22,7 +22,7 @@ pub mod web_fetch;
 pub mod web_search;
 pub mod write;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// Directories to skip when scanning file trees (build artifacts, caches, VCS).
 /// Used by glob, list_dir, project_context, and collect_project_files.
@@ -218,13 +218,16 @@ pub trait Tool: Send + Sync {
 }
 
 pub struct ToolRegistry {
-    tools: HashMap<String, Arc<dyn Tool>>,
+    // BTreeMap ensures stable iteration order (sorted by name),
+    // which keeps tool definitions in a consistent order across turns.
+    // This is important for OpenAI/DeepSeek auto prefix caching.
+    tools: BTreeMap<String, Arc<dyn Tool>>,
 }
 
 impl ToolRegistry {
     pub fn new() -> Self {
         Self {
-            tools: HashMap::new(),
+            tools: BTreeMap::new(),
         }
     }
 

@@ -184,9 +184,9 @@ impl Tool for EditFileTool {
             name: "edit_file",
             description: "Replace text in a file. ALWAYS prefer this over write_file for existing files.\n\
                 Two modes:\n\
-                1. Line mode (PREFERRED): use start_line + end_line + new_string. Line numbers come from read_file output. No text matching needed.\n\
-                2. Text mode: use old_string + new_string. old_string must be unique — include surrounding lines if needed.\n\
-                To delete text, set new_string to empty string.\n\
+                1. Line mode: use start_line + end_line + new_string. Line numbers from read_file or grep output.\n\
+                2. Text mode: use old_string + new_string. old_string must match exactly.\n\
+                Both modes work. Use whichever is faster — if grep already showed the code, edit directly.\n\
                 For multiple changes in one file: make separate edit_file calls, one per region.".to_string(),
             parameters: json!({
                 "type": "object",

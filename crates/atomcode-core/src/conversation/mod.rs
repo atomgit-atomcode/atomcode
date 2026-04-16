@@ -276,6 +276,11 @@ impl Conversation {
         // Add all current messages
         result.extend(self.messages.iter().cloned());
 
+        // NOTE: read_file result condensation was here (83fc7ff) but reverted.
+        // 问题: 长距离重读是合理需求（旧内容被压缩后模型需要重新看），
+        // 短距离重读在 keep_recent 保护内又压缩不到。两头不讨好。
+        // 正确方案需要更深入设计，不在这里做。
+
         // Safety: if over 80% (or 60K absolute cap), drop oldest turns.
         // BUT: skip if cold_summaries exist — that means LLM compression just ran
         // and we're looking at the "keep_full=5" survivor set. Dropping those too

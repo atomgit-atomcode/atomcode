@@ -44,15 +44,18 @@ impl TurnRunner {
         event_tx: &mpsc::UnboundedSender<TurnEvent>,
         cancel: CancellationToken,
     ) -> TurnResult {
-        self.run_with_filter(conversation, system_prompt, event_tx, cancel, None).await
+        self.run_with_filter(conversation, system_prompt, "", event_tx, cancel, None).await
     }
 
-    /// Run with optional tool filter. If `allowed_tools` is Some, only those tools
-    /// are visible to the LLM. Used by Phase 2 to restrict first turn to read-only.
+    /// Run with optional tool filter and turn reminder.
+    /// `turn_reminder` is dynamic per-turn context (git status, current task, etc.)
+    /// injected as a <system-reminder> into the last user message to keep the
+    /// system prompt stable for caching.
     pub async fn run_with_filter(
         &mut self,
         conversation: &mut Conversation,
         system_prompt: &str,
+        turn_reminder: &str,
         event_tx: &mpsc::UnboundedSender<TurnEvent>,
         cancel: CancellationToken,
         allowed_tools: Option<&[&str]>,
@@ -65,8 +68,23 @@ impl TurnRunner {
             .map(|p| p.context_window)
             .unwrap_or(128000);
 
-        let (messages, ctx_stats) =
+        let (mut messages, ctx_stats) =
             conversation.to_provider_messages_budgeted(system_prompt, context_window);
+
+        // Inject turn reminder into the last user message.
+        // This keeps system prompt stable (cacheable) while providing
+        // per-turn dynamic context (previous session, current task, etc.).
+        if !turn_reminder.is_empty() {
+            // Find the last User message and prepend the reminder
+            for msg in messages.iter_mut().rev() {
+                if matches!(msg.role, crate::conversation::message::Role::User) {
+                    if let crate::conversation::message::MessageContent::Text(ref mut text) = msg.content {
+                        *text = format!("{}\n{}", turn_reminder, text);
+                        break;
+                    }
+                }
+            }
+        }
 
         let actual_tokens: usize = messages.iter().map(|m| m.estimate_tokens()).sum();
 
@@ -500,6 +518,7 @@ _ = cancel.cancelled() => {
         let result = self.run_with_filter(
             &mut mini_conv,
             system_prompt,
+            "",
             event_tx,
             cancel,
             Some(execute_tools),
