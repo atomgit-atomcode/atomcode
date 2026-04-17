@@ -32,23 +32,28 @@ pub const THINKING_LABELS: &[&str] = &[
     "Scheming",
 ];
 
-/// Rotating pool of turn-completion phrases.
+/// Rotating pool of turn-completion phrases — CC-vibe playful verbs.
 pub const DONE_LABELS: &[&str] = &[
     "Done",
+    "Nailed it",
     "Wrapped",
-    "Baked",
     "Shipped",
-    "Nailed",
-    "Sorted",
-    "Sealed",
-    "Delivered",
-    "Stuck the landing",
-    "Locked in",
-    "Buttoned up",
+    "Baked",
+    "Plated",
+    "Served",
+    "Bagged",
+    "Handled",
     "Dialed in",
+    "Locked in",
+    "Sealed",
+    "Stuck the landing",
+    "Buttoned up",
     "Squared away",
     "Cooked",
     "Dusted",
+    "Called it",
+    "Delivered",
+    "Tied off",
 ];
 
 pub struct UiState {

@@ -520,7 +520,7 @@ fn handle_agent_event(
             let done = state.next_done_label();
             let dur = crate::render::fmt_dur(duration);
             let label = format!(
-                "✓ {} · {}轮 · {}工具 · {} · {}tok",
+                "✓ {} · {} rounds · {} tools · {} · {} tok",
                 done, turn_count, tool_call_count, dur, total_tokens
             );
             renderer.render(UiLine::TurnSeparator { label });

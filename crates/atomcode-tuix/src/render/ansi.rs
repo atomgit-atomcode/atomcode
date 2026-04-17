@@ -205,9 +205,9 @@ impl<W: Write + Send> AnsiRenderer<W> {
         self.write_assistant_rendered_line(&line);
     }
 
-    /// Write a complete assistant line: clear any transient, emit bar
-    /// prefix + markdown-rendered content + CRLF. Returns None-rendered
-    /// lines (fence markers) are elided entirely.
+    /// Write a complete assistant line: clear any transient, emit
+    /// markdown-rendered content + CRLF. Returns None-rendered lines
+    /// (fence markers) are elided entirely.
     fn write_assistant_rendered_line(&mut self, content: &str) {
         let Some(rendered) = crate::markdown::render_line(
             content, &mut self.md_state, self.caps,
@@ -216,7 +216,6 @@ impl<W: Write + Send> AnsiRenderer<W> {
             return;
         };
         self.clear_line_if_needed();
-        self.write_bar_prefix();
         let _ = self.out.write_all(rendered.as_bytes());
         let _ = self.out.write_all(b"\r\n");
         self.last_was_permanent = true;
@@ -636,15 +635,17 @@ mod tests {
     }
 
     #[test]
-    fn assistant_text_gets_bar_prefix_on_new_line() {
+    fn assistant_text_emits_both_lines() {
         let mut buf = Vec::new();
         let mut r = AnsiRenderer::with_writer(&mut buf, caps_no_color());
         r.render(UiLine::AssistantText("hello\nworld".into()));
         r.render(UiLine::AssistantLineBreak);
         r.flush();
         let s = String::from_utf8(buf).unwrap();
-        assert!(s.contains("  │ hello"));
-        assert!(s.contains("  │ world"));
+        assert!(s.contains("hello"));
+        assert!(s.contains("world"));
+        // No bar prefix on assistant lines — text is flush-left.
+        assert!(!s.contains("  │ hello"));
     }
 
     #[test]
@@ -678,9 +679,9 @@ mod tests {
         r.render(UiLine::AssistantText("done\n".into()));
         r.flush();
         let s = String::from_utf8(buf).unwrap();
-        assert!(s.contains("  │ done\r\n"));
-        // No dangling bar prefix after the final newline
-        assert!(!s.trim_end().ends_with("│"));
+        assert!(s.contains("done\r\n"));
+        // No dangling bar prefix anywhere — text is flush-left.
+        assert!(!s.contains("│"));
     }
 
     #[test]
