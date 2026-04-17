@@ -15,7 +15,7 @@ const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦
 
 /// Slash commands available for tab completion (without leading `/`).
 const COMMANDS: &[&str] = &[
-    "quit", "help", "config", "clear", "model", "status", "diff", "undo", "cost",
+    "quit", "help", "config", "clear", "model", "status", "diff", "undo", "cost", "cd",
 ];
 
 pub async fn run(
@@ -23,7 +23,7 @@ pub async fn run(
     model_name: String,
     mut agent_handle: AgentHandle,
     _tool_context: ToolContext,
-    working_dir: std::path::PathBuf,
+    mut working_dir: std::path::PathBuf,
     _session_to_continue: Option<atomcode_core::session::Session>,
 ) -> Result<()> {
     // Enable raw mode (no alternate screen)
@@ -50,6 +50,8 @@ pub async fn run(
     let mut streaming = false;
     let mut spinner_frame: usize = 0;
     let mut spinner_label = String::from("Thinking...");
+    let mut total_tokens: usize = 0;
+    let mut previous_dir: Option<std::path::PathBuf> = None;
 
     loop {
         if !streaming {
@@ -74,7 +76,8 @@ pub async fn run(
                                      \x20   /status  - Show session status\r\n\
                                      \x20   /diff    - Show git diff\r\n\
                                      \x20   /undo    - Undo last change\r\n\
-                                     \x20   /cost    - Show token cost\r\n"
+                                     \x20   /cost    - Show token cost\r\n\
+                                     \x20   /cd      - Change directory\r\n"
                                 );
                                 let _ = out.flush();
                                 continue;
@@ -100,6 +103,89 @@ pub async fn run(
                             "/model" => {
                                 let mut out = io::stdout();
                                 let _ = write!(out, "\r\n  Model: {}\r\n", model_name);
+                                let _ = out.flush();
+                                continue;
+                            }
+                            "/status" => {
+                                let mut out = io::stdout();
+                                let _ = write!(
+                                    out,
+                                    "\r\n  Model:  {}\r\n  Dir:    {}\r\n  Config: {}\r\n",
+                                    model_name,
+                                    working_dir.display(),
+                                    Config::default_path().display(),
+                                );
+                                let _ = out.flush();
+                                continue;
+                            }
+                            "/diff" => {
+                                let output = std::process::Command::new("git")
+                                    .args(["diff", "--stat"])
+                                    .current_dir(&working_dir)
+                                    .output();
+                                let mut out = io::stdout();
+                                match output {
+                                    Ok(o) => {
+                                        let text = String::from_utf8_lossy(&o.stdout);
+                                        for line in text.lines() {
+                                            let _ = write!(out, "\r\n  {}", line);
+                                        }
+                                        let _ = write!(out, "\r\n");
+                                    }
+                                    Err(e) => {
+                                        let _ = write!(out, "\r\n  git diff failed: {}\r\n", e);
+                                    }
+                                }
+                                let _ = out.flush();
+                                continue;
+                            }
+                            "/undo" => {
+                                let mut out = io::stdout();
+                                let _ = write!(out, "\r\n  Undo is not yet supported.\r\n");
+                                let _ = out.flush();
+                                continue;
+                            }
+                            "/cost" => {
+                                let mut out = io::stdout();
+                                let _ = write!(out, "\r\n  Session tokens: {}\r\n", total_tokens);
+                                let _ = out.flush();
+                                continue;
+                            }
+                            "/cd" => {
+                                let arg = text.strip_prefix("/cd").unwrap().trim();
+                                let home_dir = std::env::var("HOME").ok().map(std::path::PathBuf::from);
+                                let mut out = io::stdout();
+                                if arg.is_empty() {
+                                    // /cd with no arg: go home
+                                    if let Some(home) = &home_dir {
+                                        previous_dir = Some(working_dir.clone());
+                                        working_dir = home.clone();
+                                        agent_handle.cmd_tx.send(AgentCommand::ChangeDir(working_dir.to_string_lossy().to_string())).ok();
+                                        let _ = write!(out, "\r\n  Changed to: {}\r\n", working_dir.display());
+                                    }
+                                } else {
+                                    let path = if arg == "-" {
+                                        previous_dir.clone().unwrap_or_else(|| working_dir.clone())
+                                    } else if arg.starts_with('~') {
+                                        if let Some(home) = &home_dir {
+                                            let rest = arg.strip_prefix("~/").unwrap_or(&arg[1..]);
+                                            if rest.is_empty() { home.clone() } else { home.join(rest) }
+                                        } else {
+                                            std::path::PathBuf::from(arg)
+                                        }
+                                    } else {
+                                        let p = std::path::PathBuf::from(arg);
+                                        if p.is_absolute() { p } else { working_dir.join(p) }
+                                    };
+                                    if path.is_dir() {
+                                        previous_dir = Some(working_dir.clone());
+                                        working_dir = path;
+                                        agent_handle.cmd_tx.send(AgentCommand::ChangeDir(working_dir.to_string_lossy().to_string())).ok();
+                                        let _ = write!(out, "\r\n  Changed to: {}\r\n", working_dir.display());
+                                    } else {
+                                        let _ = write!(out, "\r\n  Not a directory: {}\r\n", path.display());
+                                    }
+                                }
                                 let _ = out.flush();
                                 continue;
                             }
@@ -211,8 +297,10 @@ pub async fn run(
                             render::print_error(&e);
                             streaming = false;
                         }
-                        Some(AgentEvent::TokenUsage(_)
-                            | AgentEvent::ContextStats { .. }
+                        Some(AgentEvent::TokenUsage(usage)) => {
+                            total_tokens += usage.completion_tokens;
+                        }
+                        Some(AgentEvent::ContextStats { .. }
                             | AgentEvent::SubAgentProgress { .. }
                             | AgentEvent::WorkingDirChanged(_)) => {
                             // Ignored for now
