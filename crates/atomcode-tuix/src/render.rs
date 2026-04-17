@@ -106,7 +106,7 @@ pub fn print_header(model: &str, working_dir: &str) {
     );
     print!("  {}  {}", model, working_dir);
     let _ = execute!(out, ResetColor);
-    println!();
+    let _ = write!(io::stdout(), "\r\n"); let _ = io::stdout().flush();
     let _ = out.flush();
 }
 
@@ -133,7 +133,7 @@ pub fn print_user_message(content: &str) {
         if i > 0 {
             print!("  ");
         }
-        println!("{}", line);
+        let _ = write!(io::stdout(), "{}\r\n", line);
     }
     let _ = out.flush();
 }
@@ -145,7 +145,7 @@ pub fn print_assistant_text(content: &str) {
         let _ = execute!(out, SetForegroundColor(ACCENT_DIM));
         print!("  │ ");
         let _ = execute!(out, ResetColor);
-        println!("{}", line);
+        let _ = write!(io::stdout(), "{}\r\n", line);
     }
     let _ = out.flush();
 }
@@ -162,7 +162,7 @@ pub fn print_tool_call(name: &str, detail: &str) {
         print!("({})", detail);
     }
     let _ = execute!(out, ResetColor);
-    println!();
+    let _ = write!(io::stdout(), "\r\n"); let _ = io::stdout().flush();
     let _ = out.flush();
 }
 
@@ -183,7 +183,7 @@ pub fn print_tool_result(success: bool, summary: &str) {
     let _ = execute!(out, SetForegroundColor(DIM_GRAY));
     print!("{}", summary);
     let _ = execute!(out, ResetColor);
-    println!();
+    let _ = write!(io::stdout(), "\r\n"); let _ = io::stdout().flush();
     let _ = out.flush();
 }
 
@@ -213,7 +213,7 @@ pub fn print_approval_prompt(tool_name: &str, detail: &str) {
     print!("\n  Allow {}({})?", tool_name, detail);
     print!(" [Y]es / [N]o / [A]lways");
     let _ = execute!(out, ResetColor);
-    println!();
+    let _ = write!(io::stdout(), "\r\n"); let _ = io::stdout().flush();
     let _ = out.flush();
 }
 
@@ -221,7 +221,7 @@ pub fn print_approval_prompt(tool_name: &str, detail: &str) {
 pub fn print_error(msg: &str) {
     let mut out = io::stdout();
     let _ = execute!(out, SetForegroundColor(ERROR_RED));
-    println!("\n  [Error: {}]", msg);
+    let _ = write!(io::stdout(), "\r\n  [Error: {}]\r\n", msg);
     let _ = execute!(out, ResetColor);
     let _ = out.flush();
 }
@@ -239,7 +239,7 @@ pub fn print_diff_line(line: &str) {
     }
     print!("{}", line);
     let _ = execute!(out, ResetColor);
-    println!();
+    let _ = write!(io::stdout(), "\r\n"); let _ = io::stdout().flush();
     let _ = out.flush();
 }
 

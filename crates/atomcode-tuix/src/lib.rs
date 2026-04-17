@@ -217,9 +217,10 @@ pub async fn run(
                     match event {
                         Some(AgentEvent::TextDelta(text)) => {
                             render::clear_spinner();
-                            // Print the streaming text chunk directly
+                            // Raw mode: \n must become \r\n
                             let mut out = io::stdout();
-                            let _ = write!(out, "{}", text);
+                            let fixed = text.replace('\n', "\r\n");
+                            let _ = write!(out, "{}", fixed);
                             let _ = out.flush();
                         }
                         Some(AgentEvent::ToolCallStreaming { name, .. }) => {
@@ -336,7 +337,8 @@ pub async fn run(
         let _ = crossterm::execute!(io::stdout(), DisableBracketedPaste);
     }
     terminal::disable_raw_mode()?;
-    println!();
+    let _ = write!(io::stdout(), "\r\n");
+    let _ = io::stdout().flush();
 
     Ok(())
 }
