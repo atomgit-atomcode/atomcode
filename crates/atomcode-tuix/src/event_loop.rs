@@ -465,41 +465,43 @@ pub async fn run_loop(
     loop {
         #[cfg(unix)]
         tokio::select! {
+            // Biased ordering: spinner first so whenever a tick is
+            // pending in spin_rx we draw it before racing with agent
+            // events. Without `biased` tokio picks a ready branch
+            // randomly, so under heavy agent traffic the spinner gets
+            // chosen ~50% of the time its tick is ready, dropping the
+            // effective frame rate to ~5 fps and looking like "frozen
+            // then jumps".
+            biased;
+
+            // ── Spinner tick (from background task) ──
+            Some(()) = spin_rx.recv(), if matches!(state.phase, UiPhase::Streaming) => {
+                draw_spinner_now(&mut state, &buf, renderer);
+                last_spinner_draw = std::time::Instant::now();
+            }
+
             // ── Terminal input ──
             maybe = ctx.input_rx.recv() => {
                 let Some(ev) = maybe else { break };
                 handle_input(
                     ev, &mut state, &mut buf, &mut ctx, renderer, &mut menu, &mut model_picker,
                 )?;
-                // DEVIATION from plan: removed `ctx.input_rx.is_closed()` check —
-                // UnboundedReceiver has no is_closed(); recv()->None already handles closure.
             }
 
             // ── Agent events ──
             maybe = ctx.agent.event_rx.recv(), if matches!(state.phase, UiPhase::Streaming) => {
                 let Some(ev) = maybe else { break };
                 handle_agent_event(ev, &mut state, &mut think, renderer, &mut pending_tools);
-                // Post-event spinner pump: each handler can stall for
-                // tens of ms (large diff rendering, markdown flushing)
-                // which starves the interval branch. Advance the spinner
-                // here if enough time has passed.
                 if matches!(state.phase, UiPhase::Streaming)
                     && last_spinner_draw.elapsed() >= Duration::from_millis(100)
                 {
                     draw_spinner_now(&mut state, &buf, renderer);
                     last_spinner_draw = std::time::Instant::now();
                 }
-                // if back to IDLE, redraw prompt
                 if matches!(state.phase, UiPhase::Idle) {
                     renderer.render(UiLine::InputPrompt { buf: buf.text.clone(), cursor_cols: buf.cursor_cols(), menu: None });
                     renderer.flush();
                 }
-            }
-
-            // ── Spinner tick (from background task) ──
-            Some(()) = spin_rx.recv(), if matches!(state.phase, UiPhase::Streaming) => {
-                draw_spinner_now(&mut state, &buf, renderer);
-                last_spinner_draw = std::time::Instant::now();
             }
 
             // ── Suspend ──
@@ -535,6 +537,14 @@ pub async fn run_loop(
 
         #[cfg(not(unix))]
         tokio::select! {
+            biased;
+
+            // ── Spinner tick (from background task) ──
+            Some(()) = spin_rx.recv(), if matches!(state.phase, UiPhase::Streaming) => {
+                draw_spinner_now(&mut state, &buf, renderer);
+                last_spinner_draw = std::time::Instant::now();
+            }
+
             // ── Terminal input ──
             maybe = ctx.input_rx.recv() => {
                 let Some(ev) = maybe else { break };
@@ -547,9 +557,6 @@ pub async fn run_loop(
             maybe = ctx.agent.event_rx.recv(), if matches!(state.phase, UiPhase::Streaming) => {
                 let Some(ev) = maybe else { break };
                 handle_agent_event(ev, &mut state, &mut think, renderer, &mut pending_tools);
-                // Post-event spinner pump: each handler can stall for
-                // tens of ms which starves the interval branch. Advance
-                // the spinner here if enough time has passed.
                 if matches!(state.phase, UiPhase::Streaming)
                     && last_spinner_draw.elapsed() >= Duration::from_millis(100)
                 {
@@ -560,12 +567,6 @@ pub async fn run_loop(
                     renderer.render(UiLine::InputPrompt { buf: buf.text.clone(), cursor_cols: buf.cursor_cols(), menu: None });
                     renderer.flush();
                 }
-            }
-
-            // ── Spinner tick (from background task) ──
-            Some(()) = spin_rx.recv(), if matches!(state.phase, UiPhase::Streaming) => {
-                draw_spinner_now(&mut state, &buf, renderer);
-                last_spinner_draw = std::time::Instant::now();
             }
         }
 

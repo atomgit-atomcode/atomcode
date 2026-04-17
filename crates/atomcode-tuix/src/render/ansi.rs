@@ -434,13 +434,46 @@ impl<W: Write + Send> AnsiRenderer<W> {
     /// Flush any complete lines (those ending in '\n') from
     /// `assistant_line_buf` to stdout with inline markdown applied.
     /// Partial last line stays buffered.
+    ///
+    /// **Batched render cycle:** a single `TextDelta` event can easily
+    /// carry a whole markdown paragraph with 20+ internal `\n`s. The
+    /// naive per-line approach — erase_footer + emit + redraw_footer
+    /// for each — produces 20× the ANSI traffic and blocks the event
+    /// loop long enough to freeze the spinner task (the task can't
+    /// deliver ticks while event_loop is mid-write). Instead we drain
+    /// *all* complete lines, do one erase, write the bodies, and one
+    /// redraw. Handler time drops from O(N × 4KB) to O(N × 200B).
     fn flush_assistant_lines(&mut self) {
+        if !self.assistant_line_buf.contains('\n') {
+            return;
+        }
+        // Collect complete lines first; render_line can mutate md_state
+        // (table buffering), so we must iterate deterministically.
+        let mut bodies: Vec<String> = Vec::new();
         while let Some(nl) = self.assistant_line_buf.find('\n') {
             let line: String = self.assistant_line_buf.drain(..=nl).collect();
-            // Strip the trailing '\n' for markdown rendering.
             let content = &line[..line.len() - 1];
-            self.write_assistant_rendered_line(content);
+            if let Some(rendered) =
+                crate::markdown::render_line(content, &mut self.md_state, self.caps)
+            {
+                bodies.push(rendered);
+            }
         }
+        if bodies.is_empty() {
+            return;
+        }
+        self.erase_footer();
+        let w = self.content_width();
+        for rendered in bodies {
+            for phys in rendered.split('\n') {
+                for chunk in crate::width::wrap_line_to_width(phys, w) {
+                    self.write_left_pad();
+                    let _ = self.out.write_all(chunk.as_bytes());
+                    let _ = self.out.write_all(b"\r\n");
+                }
+            }
+        }
+        self.redraw_footer_if_any();
     }
 
     /// Flush any remaining partial line as if it were terminated.
