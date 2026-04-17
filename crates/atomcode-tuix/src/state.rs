@@ -65,6 +65,10 @@ pub struct UiState {
     pub prior_phase: Option<UiPhase>,
     /// Round-robin index into THINKING_LABELS; bumped on each on_submit.
     pub thinking_idx: usize,
+    /// When the current turn started. Set by on_submit, cleared on
+    /// turn-complete / turn-cancelled / error. Used by the spinner to
+    /// display live elapsed time.
+    pub turn_started_at: Option<std::time::Instant>,
 }
 
 impl Default for UiState {
@@ -82,7 +86,14 @@ impl UiState {
             total_tokens: 0,
             prior_phase: None,
             thinking_idx: 0,
+            turn_started_at: None,
         }
+    }
+
+    /// Elapsed wall time since the current turn began, if a turn is
+    /// active. Returns None when idle.
+    pub fn turn_elapsed(&self) -> Option<std::time::Duration> {
+        self.turn_started_at.map(|t| t.elapsed())
     }
 
     fn current_thinking(&self) -> &'static str {
@@ -94,29 +105,36 @@ impl UiState {
         self.spinner_label = self.current_thinking().to_string();
         self.spinner_frame = 0;
         self.thinking_idx = self.thinking_idx.wrapping_add(1);
+        self.turn_started_at = Some(std::time::Instant::now());
     }
 
     pub fn on_turn_complete(&mut self) {
         self.phase = UiPhase::Idle;
         self.spinner_label.clear();
+        self.turn_started_at = None;
     }
 
     pub fn on_turn_cancelled(&mut self) {
         self.phase = UiPhase::Idle;
         self.spinner_label.clear();
+        self.turn_started_at = None;
     }
 
     pub fn on_error(&mut self) {
         self.phase = UiPhase::Idle;
         self.spinner_label.clear();
+        self.turn_started_at = None;
     }
 
+    /// Set the spinner label to `"Running {name}"` (no trailing ellipsis —
+    /// the renderer appends `...` uniformly so it looks right even when
+    /// the elapsed-time suffix is appended).
     pub fn on_tool_call_started(&mut self, name: &str) {
-        self.spinner_label = format!("Running {}...", name);
+        self.spinner_label = format!("Running {}", name);
     }
 
     pub fn on_tool_call_streaming(&mut self, name: &str) {
-        self.spinner_label = format!("Preparing {}...", name);
+        self.spinner_label = format!("Preparing {}", name);
     }
 
     pub fn on_thinking(&mut self) {

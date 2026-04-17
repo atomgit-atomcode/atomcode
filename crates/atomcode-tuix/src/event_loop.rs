@@ -268,7 +268,8 @@ pub async fn run_loop(
             // ── Spinner tick ──
             _ = spinner_tick.tick(), if matches!(state.phase, UiPhase::Streaming) => {
                 let frame = state.tick_spinner();
-                renderer.render(UiLine::StreamingBox { buf: buf.text.clone(), cursor_cols: buf.cursor_cols(), frame, label: state.spinner_label.clone() });
+                let label = format_spinner_label(&state);
+                renderer.render(UiLine::StreamingBox { buf: buf.text.clone(), cursor_cols: buf.cursor_cols(), frame, label });
                 renderer.flush();
             }
 
@@ -288,11 +289,13 @@ pub async fn run_loop(
                 state.on_resume();
                 match state.phase {
                     UiPhase::Streaming => {
+                        let frame = state.tick_spinner();
+                        let label = format_spinner_label(&state);
                         renderer.render(UiLine::StreamingBox {
                             buf: buf.text.clone(),
                             cursor_cols: buf.cursor_cols(),
-                            frame: state.tick_spinner(),
-                            label: state.spinner_label.clone(),
+                            frame,
+                            label,
                         });
                     }
                     _ => {
@@ -330,7 +333,8 @@ pub async fn run_loop(
             // ── Spinner tick ──
             _ = spinner_tick.tick(), if matches!(state.phase, UiPhase::Streaming) => {
                 let frame = state.tick_spinner();
-                renderer.render(UiLine::StreamingBox { buf: buf.text.clone(), cursor_cols: buf.cursor_cols(), frame, label: state.spinner_label.clone() });
+                let label = format_spinner_label(&state);
+                renderer.render(UiLine::StreamingBox { buf: buf.text.clone(), cursor_cols: buf.cursor_cols(), frame, label });
                 renderer.flush();
             }
         }
@@ -704,7 +708,7 @@ fn handle_agent_event(
             }
         }
         AgentEvent::ToolCallStreaming { name, .. } => {
-            state.on_tool_call_streaming(&name);
+            state.on_tool_call_streaming(&display_tool_name(&name));
         }
         AgentEvent::ToolCallStarted { id, name, arguments } => {
             // Don't emit the ▸ line yet; hold it in pending_tools until the
@@ -712,16 +716,20 @@ fn handle_agent_event(
             // visual pairing even when the agent runs tools in parallel
             // (all Starts then all Results in the event stream).
             let detail = format_tool_detail(&name, &arguments);
-            pending_tools.insert(id, (name.clone(), detail));
-            state.on_tool_call_started(&name);
+            let display = display_tool_name(&name);
+            pending_tools.insert(id, (display.clone(), detail));
+            state.on_tool_call_started(&display);
         }
         AgentEvent::ToolCallResult { call_id, name, output, success, .. } => {
             // Close any in-flight assistant line before emitting the pair.
             renderer.render(UiLine::AssistantLineBreak);
 
+            // Prefer the display-name we stored at ToolCallStarted time;
+            // fall back to converting the raw name if we missed the Start
+            // (e.g. protocol surfaced a Result without a matching Start).
             let (display_name, detail) = pending_tools
                 .remove(&call_id)
-                .unwrap_or_else(|| (name.clone(), String::new()));
+                .unwrap_or_else(|| (display_tool_name(&name), String::new()));
 
             // Filter empty tool names (model occasionally emits malformed
             // tool calls with "" as the name; agent surfaces the error via
@@ -750,12 +758,17 @@ fn handle_agent_event(
         }
         AgentEvent::ApprovalNeeded { tool_name, call, .. } => {
             let detail = format_tool_detail(&tool_name, &call.arguments);
-            renderer.render(UiLine::ApprovalPrompt { tool: tool_name.clone(), detail });
+            renderer.render(UiLine::ApprovalPrompt {
+                tool: display_tool_name(&tool_name),
+                detail,
+            });
             renderer.flush();
             state.on_approval_needed(&tool_name);
         }
         AgentEvent::PhaseChange(AgentPhase::Thinking) => state.on_thinking(),
-        AgentEvent::PhaseChange(AgentPhase::CallingTool(name)) => state.on_tool_call_streaming(&name),
+        AgentEvent::PhaseChange(AgentPhase::CallingTool(name)) => {
+            state.on_tool_call_streaming(&display_tool_name(&name));
+        }
         AgentEvent::PhaseChange(_) => {}
         AgentEvent::TurnComplete { duration, total_tokens, turn_count, tool_call_count, .. } => {
             renderer.render(UiLine::AssistantLineBreak);
@@ -918,6 +931,34 @@ fn resolve_cd(arg: &str, cwd: &std::path::Path, prev: Option<&std::path::Path>) 
         return Err(format!("Not a directory: {}", canon.display()));
     }
     Ok(canon)
+}
+
+/// Build the spinner line shown in the footer — `"{label}… · {elapsed}"`.
+/// State stores only the bare word (e.g. `Pondering`, `Running ReadFile`);
+/// the ellipsis and turn-elapsed suffix are appended here so the format
+/// is consistent across every label variant.
+fn format_spinner_label(state: &UiState) -> String {
+    let base = &state.spinner_label;
+    match state.turn_elapsed() {
+        Some(d) => format!("{}… · {}", base, crate::render::fmt_dur(d)),
+        None => format!("{}…", base),
+    }
+}
+
+/// Convert a snake_case tool name to PascalCase for display. The agent
+/// protocol uses `read_file`, `edit_file`, `web_fetch` etc.; the UI shows
+/// `ReadFile`, `EditFile`, `WebFetch` — a CC-style convention that reads
+/// more cleanly at a glance.
+pub fn display_tool_name(snake: &str) -> String {
+    let mut out = String::with_capacity(snake.len());
+    for word in snake.split('_') {
+        let mut chars = word.chars();
+        if let Some(c) = chars.next() {
+            out.extend(c.to_uppercase());
+            out.push_str(chars.as_str());
+        }
+    }
+    out
 }
 
 fn format_tool_detail(name: &str, args_json: &str) -> String {
