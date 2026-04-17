@@ -155,7 +155,10 @@ impl UiState {
     }
 
     pub fn tick_spinner(&mut self) -> &'static str {
-        const FRAMES: &[&str] = &["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"];
+        // Half-moon rotation — renders cleanly in almost every terminal font.
+        // Previously used Braille U+28xx, which fonts without that block
+        // fall back to ":" or similar visible garbage.
+        const FRAMES: &[&str] = &["◐", "◓", "◑", "◒"];
         self.spinner_frame = (self.spinner_frame + 1) % FRAMES.len();
         FRAMES[self.spinner_frame]
     }

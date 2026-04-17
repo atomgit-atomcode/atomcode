@@ -259,26 +259,47 @@ impl<W: Write + Send> AnsiRenderer<W> {
     /// Flush any remaining partial line as if it were terminated.
     /// Used by AssistantLineBreak and TurnComplete.
     fn flush_assistant_remainder(&mut self) {
-        if self.assistant_line_buf.is_empty() {
-            return;
+        if !self.assistant_line_buf.is_empty() {
+            let line = std::mem::take(&mut self.assistant_line_buf);
+            self.write_assistant_rendered_line(&line);
         }
-        let line = std::mem::take(&mut self.assistant_line_buf);
-        self.write_assistant_rendered_line(&line);
+        // Also flush any trailing markdown block (table that ended without
+        // a following non-table line).
+        if let Some(block) = crate::markdown::finalize(&mut self.md_state, self.caps) {
+            for (i, phys) in block.split('\n').enumerate() {
+                if i > 0 {
+                    self.move_to_scroll_bottom();
+                } else {
+                    self.clear_line_if_needed();
+                }
+                let _ = self.out.write_all(phys.as_bytes());
+                let _ = self.out.write_all(b"\r\n");
+            }
+            self.last_was_permanent = true;
+        }
     }
 
     /// Write a complete assistant line: clear any transient, emit
     /// markdown-rendered content + CRLF. Returns None-rendered lines
-    /// (fence markers) are elided entirely.
+    /// (fence markers, buffered table rows) are elided entirely. A block
+    /// flush (e.g., table) may contain embedded '\n'; we split and write
+    /// each physical line separately so raw-mode CRLF accounting stays
+    /// correct.
     fn write_assistant_rendered_line(&mut self, content: &str) {
         let Some(rendered) = crate::markdown::render_line(
             content, &mut self.md_state, self.caps,
         ) else {
-            // Fence marker — don't emit a visible line.
             return;
         };
-        self.clear_line_if_needed();
-        let _ = self.out.write_all(rendered.as_bytes());
-        let _ = self.out.write_all(b"\r\n");
+        for (i, phys) in rendered.split('\n').enumerate() {
+            if i > 0 {
+                self.move_to_scroll_bottom();
+            } else {
+                self.clear_line_if_needed();
+            }
+            let _ = self.out.write_all(phys.as_bytes());
+            let _ = self.out.write_all(b"\r\n");
+        }
         self.last_was_permanent = true;
     }
 

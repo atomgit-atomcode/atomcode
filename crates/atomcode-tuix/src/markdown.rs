@@ -14,6 +14,9 @@ use crate::terminal::TerminalCaps;
 #[derive(Default)]
 pub struct MdState {
     pub in_code_block: bool,
+    /// Accumulates consecutive `|…|` rows; flushed as an aligned block
+    /// when a non-table line arrives.
+    pub table_buf: Vec<String>,
 }
 
 impl MdState {
@@ -22,6 +25,7 @@ impl MdState {
     }
     pub fn reset(&mut self) {
         self.in_code_block = false;
+        self.table_buf.clear();
     }
 }
 
@@ -31,60 +35,187 @@ impl MdState {
 pub fn render_line(line: &str, state: &mut MdState, caps: TerminalCaps) -> Option<String> {
     let trimmed = line.trim();
 
+    // Table row: buffer and defer emit until block ends.
+    if !state.in_code_block && trimmed.starts_with('|') {
+        state.table_buf.push(trimmed.to_string());
+        return None;
+    }
+
+    // Non-table line arriving after buffered rows: flush as aligned block.
+    let prefix = if !state.table_buf.is_empty() {
+        let t = flush_aligned_table(&state.table_buf, caps);
+        state.table_buf.clear();
+        Some(t)
+    } else {
+        None
+    };
+    let prepend = |body: String| -> String {
+        match prefix.as_ref() {
+            Some(p) => format!("{}\n{}", p, body),
+            None => body,
+        }
+    };
+    let prefix_only = || -> Option<String> {
+        prefix.as_ref().map(|p| p.clone())
+    };
+
     // Fenced code block fence (``` or ~~~)
     if is_fence(trimmed) {
         state.in_code_block = !state.in_code_block;
-        return None;
+        return prefix_only();
     }
 
     // Inside code block: render in a soft teal with no inline parsing
     if state.in_code_block {
-        if caps.colors {
-            return Some(format!("\x1b[38;2;175;205;190m{}\x1b[39m", line));
-        }
-        return Some(line.to_string());
+        let body = if caps.colors {
+            format!("\x1b[38;2;175;205;190m{}\x1b[39m", line)
+        } else {
+            line.to_string()
+        };
+        return Some(prepend(body));
     }
 
     // Horizontal rule — thin bright gray line
     if is_hrule(trimmed) {
         let rule = "─".repeat(60);
-        if caps.colors {
-            return Some(format!("\x1b[38;2;130;130;140m{}\x1b[39m", rule));
-        }
-        return Some(rule);
-    }
-
-    // Table row (starts with `|`): replace pipes with box chars, thin bright line.
-    if trimmed.starts_with('|') {
-        return Some(render_table_line(trimmed, caps));
+        let body = if caps.colors {
+            format!("\x1b[38;2;130;130;140m{}\x1b[39m", rule)
+        } else {
+            rule
+        };
+        return Some(prepend(body));
     }
 
     // Heading — brightness hierarchy without screaming bold.
     if let Some((level, rest)) = parse_heading(line) {
         let inner = render_inline(rest, caps);
-        if !caps.colors {
-            return Some(format!("{} {}", "#".repeat(level as usize), inner));
-        }
-        return Some(match level {
-            // H1: pure white + bold (strongest hit)
-            1 => format!("\x1b[1;38;2;245;245;250m{}\x1b[0m", inner),
-            // H2: pure white, no bold
-            2 => format!("\x1b[38;2;245;245;250m{}\x1b[39m", inner),
-            // H3: secondary gray
-            3 => format!("\x1b[38;2;170;170;180m{}\x1b[39m", inner),
-            // H4+: muted
-            _ => format!("\x1b[38;2;130;130;140m{}\x1b[39m", inner),
-        });
+        let body = if !caps.colors {
+            format!("{} {}", "#".repeat(level as usize), inner)
+        } else {
+            match level {
+                1 => format!("\x1b[1;38;2;245;245;250m{}\x1b[0m", inner),
+                2 => format!("\x1b[38;2;245;245;250m{}\x1b[39m", inner),
+                3 => format!("\x1b[38;2;170;170;180m{}\x1b[39m", inner),
+                _ => format!("\x1b[38;2;130;130;140m{}\x1b[39m", inner),
+            }
+        };
+        return Some(prepend(body));
     }
 
     // Unordered list: `- text` / `* text`
     if let Some((indent, rest)) = parse_list_item(line) {
         let inner = render_inline(rest, caps);
-        return Some(format!("{}• {}", " ".repeat(indent), inner));
+        return Some(prepend(format!("{}• {}", " ".repeat(indent), inner)));
     }
 
     // Default: inline-only
-    Some(render_inline(line, caps))
+    Some(prepend(render_inline(line, caps)))
+}
+
+/// Emit any still-buffered block (e.g., a table that ended without a
+/// following non-table line). Call at stream end.
+pub fn finalize(state: &mut MdState, caps: TerminalCaps) -> Option<String> {
+    if state.table_buf.is_empty() {
+        return None;
+    }
+    let t = flush_aligned_table(&state.table_buf, caps);
+    state.table_buf.clear();
+    Some(t)
+}
+
+/// Flush a buffered markdown table as a column-aligned block. Computes the
+/// max display width per column, pads every cell accordingly, renders with
+/// `│`/`┼`/`─` box chars in muted gray. Inline markdown inside cells is
+/// honoured.
+pub fn flush_aligned_table(rows: &[String], caps: TerminalCaps) -> String {
+    // Parse each row: strip leading/trailing '|', split by '|', trim cells.
+    let parsed: Vec<Vec<String>> = rows
+        .iter()
+        .map(|r| {
+            let s = r.trim_start_matches('|').trim_end_matches('|');
+            s.split('|').map(|c| c.trim().to_string()).collect()
+        })
+        .collect();
+
+    // Identify separator row(s) — cells match `[-: ]+` only.
+    let is_sep = |row: &[String]| -> bool {
+        row.iter().all(|c| {
+            !c.is_empty()
+                && c.chars().all(|ch| matches!(ch, '-' | ':' | ' '))
+        })
+    };
+
+    let ncols = parsed.iter().map(|r| r.len()).max().unwrap_or(0);
+    if ncols == 0 {
+        return String::new();
+    }
+
+    // Compute col widths from non-separator rows, using display width of
+    // the plaintext (markdown markers stripped for width only).
+    let mut col_widths = vec![0usize; ncols];
+    for row in &parsed {
+        if is_sep(row) {
+            continue;
+        }
+        for (j, cell) in row.iter().enumerate() {
+            if j >= ncols {
+                break;
+            }
+            let plain = strip_md_for_width(cell);
+            let w = crate::width::display_width(&plain);
+            col_widths[j] = col_widths[j].max(w);
+        }
+    }
+
+    let border_on = if caps.colors { "\x1b[38;2;130;130;140m" } else { "" };
+    let border_off = if caps.colors { "\x1b[39m" } else { "" };
+
+    let mut out = String::new();
+    for (idx, row) in parsed.iter().enumerate() {
+        if is_sep(row) {
+            // Separator: ├──┼──┤
+            out.push_str(border_on);
+            out.push('├');
+            for (j, w) in col_widths.iter().enumerate() {
+                for _ in 0..(w + 2) {
+                    out.push('─');
+                }
+                if j + 1 < col_widths.len() {
+                    out.push('┼');
+                }
+            }
+            out.push('┤');
+            out.push_str(border_off);
+        } else {
+            out.push_str(border_on);
+            out.push('│');
+            out.push_str(border_off);
+            for (j, w) in col_widths.iter().enumerate() {
+                let cell = row.get(j).map(|s| s.as_str()).unwrap_or("");
+                let plain_w = crate::width::display_width(&strip_md_for_width(cell));
+                let rendered = render_inline(cell, caps);
+                out.push(' ');
+                out.push_str(&rendered);
+                let pad = w.saturating_sub(plain_w);
+                for _ in 0..pad {
+                    out.push(' ');
+                }
+                out.push(' ');
+                out.push_str(border_on);
+                out.push('│');
+                out.push_str(border_off);
+            }
+        }
+        if idx + 1 < parsed.len() {
+            out.push('\n');
+        }
+    }
+    out
+}
+
+fn strip_md_for_width(s: &str) -> String {
+    // Remove markdown markers that add bytes but no display width.
+    s.replace("**", "").replace('`', "")
 }
 
 /// Render a markdown table line. Separator rows get `┼─` chars; data rows
