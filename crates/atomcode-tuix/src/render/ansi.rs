@@ -399,50 +399,40 @@ impl<W: Write + Send> AnsiRenderer<W> {
             self.write_assistant_rendered_line(&line);
         }
         // Also flush any trailing markdown block (table that ended without
-        // a following non-table line).
+        // a following non-table line). Use the pure-append render cycle:
+        // erase footer once, emit all chunks, redraw footer once.
         if let Some(block) = crate::markdown::finalize(&mut self.md_state, self.caps) {
-            let term_w = self.term_width().max(1);
-            let mut first_emit = true;
+            self.erase_footer();
+            let term_w = self.term_width().saturating_sub(1).max(1);
             for phys in block.split('\n') {
                 for chunk in crate::width::wrap_line_to_width(phys, term_w) {
-                    if first_emit {
-                        self.clear_line_if_needed();
-                        first_emit = false;
-                    } else {
-                        self.move_to_scroll_bottom();
-                    }
                     let _ = self.out.write_all(chunk.as_bytes());
                     let _ = self.out.write_all(b"\r\n");
                 }
             }
+            self.redraw_footer_if_any();
         }
     }
 
-    /// Write a complete assistant line: clear any transient, emit
-    /// markdown-rendered content + CRLF. Every physical line is manually
-    /// wrapped to terminal width before emit — we cannot rely on terminal
-    /// autowrap at scroll-region bottom since different terminals handle
-    /// that boundary case differently (some leak content past the region).
+    /// Write a complete assistant line: erase footer once, emit all
+    /// wrapped chunks + CRLF, redraw footer. Follows the pure-append
+    /// render cycle so every streaming TextDelta leaves the footer in
+    /// a clean, redrawn state.
     fn write_assistant_rendered_line(&mut self, content: &str) {
         let Some(rendered) = crate::markdown::render_line(
             content, &mut self.md_state, self.caps,
         ) else {
             return;
         };
-        let term_w = self.term_width().max(1);
-        let mut first_emit = true;
+        self.erase_footer();
+        let term_w = self.term_width().saturating_sub(1).max(1);
         for phys in rendered.split('\n') {
             for chunk in crate::width::wrap_line_to_width(phys, term_w) {
-                if first_emit {
-                    self.clear_line_if_needed();
-                    first_emit = false;
-                } else {
-                    self.move_to_scroll_bottom();
-                }
                 let _ = self.out.write_all(chunk.as_bytes());
                 let _ = self.out.write_all(b"\r\n");
             }
         }
+        self.redraw_footer_if_any();
     }
 
     fn term_width(&self) -> usize {
