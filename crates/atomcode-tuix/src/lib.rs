@@ -52,6 +52,7 @@ pub async fn run(
     let mut spinner_label = String::from("Thinking...");
     let mut total_tokens: usize = 0;
     let mut previous_dir: Option<std::path::PathBuf> = None;
+    let mut streaming_started = false; // track if we printed the initial bar prefix
 
     loop {
         if !streaming {
@@ -217,9 +218,15 @@ pub async fn run(
                     match event {
                         Some(AgentEvent::TextDelta(text)) => {
                             render::clear_spinner();
-                            // Raw mode: \n must become \r\n
                             let mut out = io::stdout();
-                            let fixed = text.replace('\n', "\r\n");
+                            // First delta: print bar prefix
+                            if !streaming_started {
+                                let _ = write!(out, "\r\n");
+                                streaming_started = true;
+                            }
+                            // Replace \n with \r\n + bar prefix for each new line
+                            let fixed = text.replace('\n', "\r\n  \u{2502} ");
+                            // Print with bar prefix if at start of line
                             let _ = write!(out, "{}", fixed);
                             let _ = out.flush();
                         }
@@ -228,13 +235,16 @@ pub async fn run(
                         }
                         Some(AgentEvent::ToolCallStarted { name, arguments, .. }) => {
                             render::clear_spinner();
-                            // End any streaming text line
                             let mut out = io::stdout();
-                            let _ = write!(out, "\r\n");
+                            // End streaming text line if active
+                            if streaming_started {
+                                let _ = write!(out, "\r\n");
+                            }
                             let _ = out.flush();
                             let detail = render::format_tool_detail(&name, &arguments);
                             render::print_tool_call(&name, &detail);
                             spinner_label = format!("Running {}...", name);
+                            streaming_started = false; // next TextDelta gets fresh bar prefix
                         }
                         Some(AgentEvent::ToolCallResult { output, success, name, .. }) => {
                             render::clear_spinner();
@@ -285,6 +295,7 @@ pub async fn run(
                             let _ = write!(out, "\r\n");
                             let _ = out.flush();
                             streaming = false;
+                            streaming_started = false;
                         }
                         Some(AgentEvent::TurnCancelled { .. }) => {
                             render::clear_spinner();
@@ -292,11 +303,13 @@ pub async fn run(
                             let _ = write!(out, "\r\n  (cancelled)\r\n");
                             let _ = out.flush();
                             streaming = false;
+                            streaming_started = false;
                         }
                         Some(AgentEvent::Error(e)) => {
                             render::clear_spinner();
                             render::print_error(&e);
                             streaming = false;
+                            streaming_started = false;
                         }
                         Some(AgentEvent::TokenUsage(usage)) => {
                             total_tokens += usage.completion_tokens;
