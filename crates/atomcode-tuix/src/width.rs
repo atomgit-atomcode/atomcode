@@ -8,6 +8,52 @@ pub fn display_width(s: &str) -> usize {
         .sum()
 }
 
+/// Split a line (possibly containing SGR escape sequences) into chunks
+/// whose visible display width is at most `max_cols`. SGR bytes pass
+/// through without consuming display columns. Handles CJK/emoji width.
+///
+/// This is the renderer-side replacement for terminal autowrap: we cannot
+/// trust the terminal to wrap consistently at scroll-region boundaries,
+/// so we wrap ourselves before emitting.
+pub fn wrap_line_to_width(line: &str, max_cols: usize) -> Vec<String> {
+    if max_cols == 0 || line.is_empty() {
+        return vec![line.to_string()];
+    }
+    let mut chunks: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut cur_width = 0usize;
+    let mut chars = line.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            // SGR passthrough — doesn't count toward display width.
+            current.push(c);
+            while let Some(&p) = chars.peek() {
+                chars.next();
+                current.push(p);
+                if p.is_ascii_alphabetic() || p == '~' {
+                    break;
+                }
+            }
+            continue;
+        }
+        let w = UnicodeWidthChar::width(c).unwrap_or(0);
+        if cur_width + w > max_cols && !current.is_empty() {
+            chunks.push(std::mem::take(&mut current));
+            cur_width = 0;
+        }
+        current.push(c);
+        cur_width += w;
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    if chunks.is_empty() {
+        chunks.push(String::new());
+    }
+    chunks
+}
+
 /// Truncate `s` so its display width is at most `max_cols`.
 /// Guaranteed to return a valid UTF-8 string that never splits a grapheme.
 pub fn truncate_to_width(s: &str, max_cols: usize) -> String {

@@ -85,8 +85,11 @@ impl<W: Write + Send> AnsiRenderer<W> {
         crossterm::terminal::size().map(|(_, h)| h as usize).unwrap_or(24)
     }
 
-    /// Draw footer optionally with a slash-command menu above the box.
-    /// Reshapes scroll region dynamically to reserve extra rows for menu.
+    /// Draw footer optionally with a slash-command menu BELOW the box.
+    /// Reshapes scroll region dynamically. Layout:
+    ///   - menu inactive: spinner (row h-3) + box (rows h-2..h)
+    ///   - menu active:   box (rows h-M-2..h-M) + menu (rows h-M+1..h)
+    /// When menu active there's no spinner row (only reachable via idle).
     fn draw_footer_with_menu(
         &mut self,
         buf: &str,
@@ -95,36 +98,100 @@ impl<W: Write + Send> AnsiRenderer<W> {
         menu: Option<&super::MenuPayload>,
     ) {
         let h = self.term_rows();
-        // When menu active: reserve menu.len() + 4 bottom rows.
-        // When menu inactive: reserve 4 (spinner + 3-line box).
+        let w = self.term_width();
         let menu_rows = menu.map(|m| m.items.len().min(8)).unwrap_or(0);
-        let reserved = menu_rows + 4;
-        let new_bottom = h.saturating_sub(reserved).max(1);
-        // Update scroll region (DECSTBM). Idempotent when unchanged.
-        let _ = write!(self.out, "\x1b[1;{}r", new_bottom);
 
-        if let Some(menu) = menu {
-            let menu_top = h.saturating_sub(3 + menu_rows);
-            // Clear menu area rows first so leftover content doesn't bleed.
-            for i in 0..menu_rows {
-                let _ = write!(self.out, "\x1b[{};1H\x1b[K", menu_top + i);
+        // Reserved rows at bottom:
+        //   menu inactive: 4 (spinner + 3-line box)
+        //   menu active:   3 + menu_rows (box + menu, no spinner)
+        let reserved = if menu_rows > 0 { 3 + menu_rows } else { 4 };
+        let scroll_bottom = h.saturating_sub(reserved).max(1);
+        let _ = write!(self.out, "\x1b[1;{}r", scroll_bottom);
+
+        // Disable autowrap for the footer paint — restored at end.
+        let _ = self.out.write_all(b"\x1b[?7l");
+
+        // Box vertical position.
+        let box_top = if menu_rows > 0 {
+            h.saturating_sub(menu_rows + 2)
+        } else {
+            h.saturating_sub(2)
+        };
+        let box_mid = box_top + 1;
+        let box_bot = box_top + 2;
+
+        // Spinner row (only without menu): just above box_top.
+        if menu_rows == 0 {
+            let spinner_row = box_top.saturating_sub(1);
+            let _ = write!(self.out, "\x1b[{};1H\x1b[K", spinner_row);
+            if let Some((frame, label)) = spinner {
+                self.set_fg(Role::Brand);
+                let _ = write!(self.out, " {} ", frame);
+                self.reset();
+                if self.caps.colors {
+                    let _ = self.out.write_all(b"\x1b[1m");
+                }
+                self.set_fg(Role::Secondary);
+                let _ = self.out.write_all(scrub_controls(label).as_bytes());
+                self.reset();
+                if self.caps.colors {
+                    let _ = self.out.write_all(b"\x1b[22m");
+                }
             }
-            // Draw each menu item.
-            for (i, (name, desc)) in menu.items.iter().take(menu_rows).enumerate() {
-                let row = menu_top + i;
-                let selected = i == menu.selected;
-                let _ = write!(self.out, "\x1b[{};1H", row);
+        }
+
+        let inner = w.saturating_sub(2);
+
+        // Box top border
+        let _ = write!(self.out, "\x1b[{};1H\x1b[K", box_top);
+        self.set_fg(Role::Border);
+        let _ = self.out.write_all("╭".as_bytes());
+        for _ in 0..inner { let _ = self.out.write_all("─".as_bytes()); }
+        let _ = self.out.write_all("╮".as_bytes());
+        self.reset();
+
+        // Box middle: │ ❯ {buf} │
+        let _ = write!(self.out, "\x1b[{};1H\x1b[K", box_mid);
+        self.set_fg(Role::Border);
+        let _ = self.out.write_all("│ ".as_bytes());
+        self.reset();
+        self.set_fg(Role::Accent);
+        let _ = self.out.write_all("❯ ".as_bytes());
+        self.reset();
+        let text_budget = inner.saturating_sub(4);
+        let safe = scrub_controls(buf);
+        let display_buf = crate::width::truncate_to_width(&safe, text_budget);
+        let buf_w = crate::width::display_width(&display_buf);
+        let pad = text_budget.saturating_sub(buf_w);
+        let _ = self.out.write_all(display_buf.as_bytes());
+        for _ in 0..pad { let _ = self.out.write_all(b" "); }
+        self.set_fg(Role::Border);
+        let _ = self.out.write_all(" │".as_bytes());
+        self.reset();
+
+        // Box bottom border
+        let _ = write!(self.out, "\x1b[{};1H\x1b[K", box_bot);
+        self.set_fg(Role::Border);
+        let _ = self.out.write_all("╰".as_bytes());
+        for _ in 0..inner { let _ = self.out.write_all("─".as_bytes()); }
+        let _ = self.out.write_all("╯".as_bytes());
+        self.reset();
+
+        // Menu rows (below box).
+        if let Some(menu_payload) = menu {
+            for (i, (name, desc)) in menu_payload.items.iter().take(menu_rows).enumerate() {
+                let row = box_bot + 1 + i;
+                let selected = i == menu_payload.selected;
+                let _ = write!(self.out, "\x1b[{};1H\x1b[K", row);
                 if selected {
-                    // Highlighted row: bright bg + white fg
                     if self.caps.colors {
                         let _ = self.out.write_all(b"\x1b[48;2;50;70;90m");
                     }
                     self.set_fg(Role::ToolName);
                     let _ = write!(self.out, "  ▸ /{:<12}  {}", name, desc);
-                    // Pad to end of line for full bg.
-                    let content_w = 5 + name.len() + 2 + desc.chars().count();
-                    let pad = self.term_width().saturating_sub(content_w);
-                    for _ in 0..pad { let _ = self.out.write_all(b" "); }
+                    let content_w = 5 + name.chars().count() + 2 + desc.chars().count();
+                    let right_pad = w.saturating_sub(content_w);
+                    for _ in 0..right_pad { let _ = self.out.write_all(b" "); }
                     if self.caps.colors {
                         let _ = self.out.write_all(b"\x1b[0m");
                     }
@@ -136,7 +203,11 @@ impl<W: Write + Send> AnsiRenderer<W> {
             }
         }
 
-        self.draw_footer(buf, cursor_cols, spinner);
+        // Cursor on middle row at col after "│ ❯ " = 4, plus cursor_cols.
+        let cursor_col = 4 + cursor_cols + 1;
+        let _ = write!(self.out, "\x1b[{};{}H", box_mid, cursor_col);
+
+        let _ = self.out.write_all(b"\x1b[?7h");
     }
 
     /// Redraw the fixed bottom footer (rows h-3..h). Optional `spinner`
@@ -271,39 +342,48 @@ impl<W: Write + Send> AnsiRenderer<W> {
         // Also flush any trailing markdown block (table that ended without
         // a following non-table line).
         if let Some(block) = crate::markdown::finalize(&mut self.md_state, self.caps) {
-            for (i, phys) in block.split('\n').enumerate() {
-                if i > 0 {
-                    self.move_to_scroll_bottom();
-                } else {
-                    self.clear_line_if_needed();
+            let term_w = self.term_width().max(1);
+            let mut first_emit = true;
+            for phys in block.split('\n') {
+                for chunk in crate::width::wrap_line_to_width(phys, term_w) {
+                    if first_emit {
+                        self.clear_line_if_needed();
+                        first_emit = false;
+                    } else {
+                        self.move_to_scroll_bottom();
+                    }
+                    let _ = self.out.write_all(chunk.as_bytes());
+                    let _ = self.out.write_all(b"\r\n");
                 }
-                let _ = self.out.write_all(phys.as_bytes());
-                let _ = self.out.write_all(b"\r\n");
             }
             self.last_was_permanent = true;
         }
     }
 
     /// Write a complete assistant line: clear any transient, emit
-    /// markdown-rendered content + CRLF. Returns None-rendered lines
-    /// (fence markers, buffered table rows) are elided entirely. A block
-    /// flush (e.g., table) may contain embedded '\n'; we split and write
-    /// each physical line separately so raw-mode CRLF accounting stays
-    /// correct.
+    /// markdown-rendered content + CRLF. Every physical line is manually
+    /// wrapped to terminal width before emit — we cannot rely on terminal
+    /// autowrap at scroll-region bottom since different terminals handle
+    /// that boundary case differently (some leak content past the region).
     fn write_assistant_rendered_line(&mut self, content: &str) {
         let Some(rendered) = crate::markdown::render_line(
             content, &mut self.md_state, self.caps,
         ) else {
             return;
         };
-        for (i, phys) in rendered.split('\n').enumerate() {
-            if i > 0 {
-                self.move_to_scroll_bottom();
-            } else {
-                self.clear_line_if_needed();
+        let term_w = self.term_width().max(1);
+        let mut first_emit = true;
+        for phys in rendered.split('\n') {
+            for chunk in crate::width::wrap_line_to_width(phys, term_w) {
+                if first_emit {
+                    self.clear_line_if_needed();
+                    first_emit = false;
+                } else {
+                    self.move_to_scroll_bottom();
+                }
+                let _ = self.out.write_all(chunk.as_bytes());
+                let _ = self.out.write_all(b"\r\n");
             }
-            let _ = self.out.write_all(phys.as_bytes());
-            let _ = self.out.write_all(b"\r\n");
         }
         self.last_was_permanent = true;
     }
