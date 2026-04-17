@@ -2,6 +2,7 @@
 pub mod commands;
 pub mod render;
 pub mod sanitize;
+pub mod state;
 pub mod terminal;
 pub mod think;
 pub mod width;
