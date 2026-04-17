@@ -1,5 +1,5 @@
-mod render;
-mod input;
+pub mod render;
+pub mod input;
 
 use anyhow::Result;
 use atomcode_core::agent::AgentHandle;
