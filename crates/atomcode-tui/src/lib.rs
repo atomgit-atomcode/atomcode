@@ -291,15 +291,15 @@ fn run_oauth_login() -> anyhow::Result<AuthInfo> {
 
     let has_listener = listener.is_some();
 
+    println!("  Press Esc or Ctrl+C to cancel.\n");
     if has_listener {
         println!("  Waiting for callback on port {}...", oauth::REDIRECT_PORT);
-        println!("  If you're on a remote server, paste the callback URL below instead.");
+        println!("  If you're on a remote server, paste the callback URL below instead.\n");
     } else {
         println!("  Cannot listen on port {} (already in use?).", oauth::REDIRECT_PORT);
-        println!("  After authorizing, paste the callback URL from your browser below.");
+        println!("  After authorizing, paste the callback URL from your browser below.\n");
     }
-    println!("  Press Esc or Ctrl+C to cancel.\n");
-    println!("  Callback URL: ");
+    println!("  Paste Callback URL: ");
 
     // Wait for either: (1) local callback, or (2) user pastes callback URL
     // User input is collected character by character in raw mode.
