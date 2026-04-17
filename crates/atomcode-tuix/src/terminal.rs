@@ -81,6 +81,7 @@ mod tests {
         assert!(!caps.colors);
         assert!(!caps.spinner);
         assert!(!caps.bracketed_paste);
+        assert!(!caps.raw_mode);
     }
 
     #[test]
@@ -108,5 +109,6 @@ mod tests {
         assert!(caps.colors);
         assert!(caps.spinner);
         assert!(caps.bracketed_paste);
+        assert!(caps.raw_mode);
     }
 }
