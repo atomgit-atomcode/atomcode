@@ -55,13 +55,16 @@ impl<W: Write + Send> AnsiRenderer<W> {
     }
 
     /// Clear any transient content (spinner, input box) before a permanent
-    /// write. No-op if state says nothing transient is active.
+    /// write. No-op if state says nothing transient is active, or if we are
+    /// in the middle of streaming assistant text on the current line (the
+    /// text itself is "permanent-in-progress"; another AssistantText chunk
+    /// should APPEND to it, not wipe it).
     fn clear_line_if_needed(&mut self) {
         if self.transient_lines > 1 {
             let _ = write!(self.out, "\x1b[{}A", self.transient_lines - 1);
             let _ = self.out.write_all(b"\r\x1b[J");
             self.transient_lines = 0;
-        } else if !self.last_was_permanent {
+        } else if !self.last_was_permanent && !self.assistant_continuing {
             let _ = self.out.write_all(b"\r\x1b[K");
             self.transient_lines = 0;
         }
@@ -320,7 +323,11 @@ impl<W: Write + Send> Renderer for AnsiRenderer<W> {
                 self.assistant_continuing = false;
             }
             UiLine::Spinner { frame, label } => {
-                // Clear any prior transient (spinner 1-line OR input box 3-line).
+                // Don't paint spinner over in-flight assistant text — the
+                // streaming text itself is the progress signal.
+                if self.assistant_continuing {
+                    return;
+                }
                 self.reset_transient();
                 self.set_fg(Role::Brand);
                 let _ = write!(self.out, "  {} ", frame);
