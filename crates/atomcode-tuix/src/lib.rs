@@ -3,6 +3,7 @@
 pub mod commands;
 pub mod event_loop;
 pub mod input;
+pub mod markdown;
 pub mod render;
 pub mod sanitize;
 pub mod state;

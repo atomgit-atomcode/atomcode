@@ -27,6 +27,11 @@ pub struct AnsiRenderer<W: Write + Send> {
     /// (0 = on the top row, 1 = one row below top, etc.). Needed because
     /// the input box leaves the cursor on its middle row, not its bottom.
     transient_cursor_from_top: usize,
+    /// Buffer for the current assistant-text line. Deltas accumulate here
+    /// until a '\n' arrives (or AssistantLineBreak / TurnComplete fires),
+    /// at which point the complete line is rendered through the inline
+    /// markdown renderer and written with the bar prefix.
+    assistant_line_buf: String,
 }
 
 impl AnsiRenderer<BufWriter<Stdout>> {
@@ -44,6 +49,7 @@ impl<W: Write + Send> AnsiRenderer<W> {
             assistant_continuing: false,
             transient_lines: 0,
             transient_cursor_from_top: 0,
+            assistant_line_buf: String::new(),
         }
     }
 
@@ -96,6 +102,40 @@ impl<W: Write + Send> AnsiRenderer<W> {
         self.set_fg(Role::AccentDim);
         let _ = self.out.write_all("  │ ".as_bytes());
         self.reset();
+    }
+
+    /// Flush any complete lines (those ending in '\n') from
+    /// `assistant_line_buf` to stdout with inline markdown applied.
+    /// Partial last line stays buffered.
+    fn flush_assistant_lines(&mut self) {
+        while let Some(nl) = self.assistant_line_buf.find('\n') {
+            let line: String = self.assistant_line_buf.drain(..=nl).collect();
+            // Strip the trailing '\n' for markdown rendering.
+            let content = &line[..line.len() - 1];
+            self.write_assistant_rendered_line(content);
+        }
+    }
+
+    /// Flush any remaining partial line as if it were terminated.
+    /// Used by AssistantLineBreak and TurnComplete.
+    fn flush_assistant_remainder(&mut self) {
+        if self.assistant_line_buf.is_empty() {
+            return;
+        }
+        let line = std::mem::take(&mut self.assistant_line_buf);
+        self.write_assistant_rendered_line(&line);
+    }
+
+    /// Write a complete assistant line: clear any transient, emit bar
+    /// prefix + markdown-rendered content + CRLF.
+    fn write_assistant_rendered_line(&mut self, content: &str) {
+        // Clear spinner/box before emitting this permanent line.
+        self.clear_line_if_needed();
+        self.write_bar_prefix();
+        let rendered = crate::markdown::render_inline_line(content, self.caps);
+        let _ = self.out.write_all(rendered.as_bytes());
+        let _ = self.out.write_all(b"\r\n");
+        self.last_was_permanent = true;
     }
 
     fn term_width(&self) -> usize {
@@ -226,40 +266,20 @@ impl<W: Write + Send> Renderer for AnsiRenderer<W> {
                 self.assistant_continuing = false;
             }
             UiLine::AssistantText(text) => {
-                self.clear_line_if_needed();
+                // Line-buffered: accumulate until \n boundaries, then render
+                // each complete line through inline markdown.
                 let safe = scrub_controls(&text);
-                let ends_with_nl = safe.ends_with('\n');
-                // If input ends with '\n', strip it — we'll emit the final newline ourselves.
-                let body = if ends_with_nl { &safe[..safe.len() - 1] } else { &safe[..] };
-                let mut first_segment = !self.assistant_continuing;
-                for (i, segment) in body.split('\n').enumerate() {
-                    if i > 0 {
-                        let _ = self.out.write_all(b"\r\n");
-                        self.write_bar_prefix();
-                    } else if first_segment {
-                        self.write_bar_prefix();
-                        first_segment = false;
-                    }
-                    let _ = self.out.write_all(segment.as_bytes());
-                }
-                if ends_with_nl {
-                    let _ = self.out.write_all(b"\r\n");
-                    self.last_was_permanent = true;
-                    self.assistant_continuing = false;
-                } else {
-                    self.last_was_permanent = false;
-                    self.assistant_continuing = true;
-                }
+                self.assistant_line_buf.push_str(&safe);
+                self.flush_assistant_lines();
+                self.assistant_continuing = !self.assistant_line_buf.is_empty();
             }
             UiLine::AssistantLineBreak => {
-                let _ = self.out.write_all(b"\r\n");
-                self.last_was_permanent = true;
+                self.flush_assistant_remainder();
                 self.assistant_continuing = false;
             }
             UiLine::ToolCall { name, detail } => {
-                if self.assistant_continuing {
-                    let _ = self.out.write_all(b"\r\n");
-                    self.last_was_permanent = true;
+                if self.assistant_continuing || !self.assistant_line_buf.is_empty() {
+                    self.flush_assistant_remainder();
                     self.assistant_continuing = false;
                 }
                 self.clear_line_if_needed();
@@ -275,9 +295,8 @@ impl<W: Write + Send> Renderer for AnsiRenderer<W> {
                 self.last_was_permanent = true;
             }
             UiLine::ToolResult { success, summary } => {
-                if self.assistant_continuing {
-                    let _ = self.out.write_all(b"\r\n");
-                    self.last_was_permanent = true;
+                if self.assistant_continuing || !self.assistant_line_buf.is_empty() {
+                    self.flush_assistant_remainder();
                     self.assistant_continuing = false;
                 }
                 self.clear_line_if_needed();
@@ -308,6 +327,10 @@ impl<W: Write + Send> Renderer for AnsiRenderer<W> {
                 self.last_was_permanent = true;
             }
             UiLine::Error(msg) => {
+                if self.assistant_continuing || !self.assistant_line_buf.is_empty() {
+                    self.flush_assistant_remainder();
+                    self.assistant_continuing = false;
+                }
                 self.clear_line_if_needed();
                 self.set_fg(Role::Error);
                 let _ = write!(self.out, "  [Error: {}]", scrub_controls(&msg));
@@ -325,6 +348,7 @@ impl<W: Write + Send> Renderer for AnsiRenderer<W> {
                 self.assistant_continuing = false;
             }
             UiLine::TurnComplete => {
+                self.flush_assistant_remainder();
                 self.clear_line_if_needed();
                 let _ = self.out.write_all(b"\r\n");
                 self.last_was_permanent = true;
@@ -543,10 +567,13 @@ mod tests {
         let mut buf = Vec::new();
         let mut r = AnsiRenderer::with_writer(&mut buf, caps_no_color());
         r.render(UiLine::AssistantText("hello\nworld".into()));
+        // Under line-buffered rendering, "hello\n" flushes as a complete
+        // line; "world" stays buffered until an explicit line break arrives.
+        r.render(UiLine::AssistantLineBreak);
         r.flush();
         let s = String::from_utf8(buf).unwrap();
         assert!(s.starts_with("  │ hello"));
-        assert!(s.contains("\n  │ world"));
+        assert!(s.contains("  │ world"));
     }
 
     #[test]
