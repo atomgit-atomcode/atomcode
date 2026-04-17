@@ -618,36 +618,27 @@ impl<W: Write + Send> Renderer for AnsiRenderer<W> {
             UiLine::User(text) => {
                 self.erase_footer();
                 let safe = scrub_controls(&text);
-                // Inner stripe width = term_w - 2*PAD_COL. "❯ " takes 2 cols.
-                let stripe_w = self.term_width().saturating_sub(PAD_COL * 2);
-                let text_w = crate::width::display_width(&safe);
-                let stripe_pad = stripe_w.saturating_sub(2 + text_w);
 
                 // Blank line above
                 let _ = self.out.write_all(b"\r\n");
 
-                // Stripe row: left margin, then the stripe. Use reverse
-                // video so contrast works on any terminal theme; colour
-                // the leading "❯" with the accent role which remains
-                // legible since reverse flips both fg and bg.
+                // CC-style echo: no background stripe — the subtle bg we
+                // used before rendered as a large dark block on light
+                // terminal themes (and a large light block on dark via
+                // reverse video). Just the accent-coloured prompt glyph
+                // plus plain text; the surrounding blank lines provide
+                // enough separation.
                 self.write_left_pad();
-                if self.caps.colors {
-                    let _ = self.out.write_all(b"\x1b[7m");
-                }
                 if self.caps.colors {
                     let _ = self.out.write_all(b"\x1b[1m");
                 }
+                self.set_fg(Role::Accent);
                 let _ = self.out.write_all("❯ ".as_bytes());
+                self.reset();
                 if self.caps.colors {
                     let _ = self.out.write_all(b"\x1b[22m");
                 }
                 let _ = self.out.write_all(safe.as_bytes());
-                for _ in 0..stripe_pad {
-                    let _ = self.out.write_all(b" ");
-                }
-                if self.caps.colors {
-                    let _ = self.out.write_all(b"\x1b[0m");
-                }
                 let _ = self.out.write_all(b"\r\n");
 
                 // Blank line below

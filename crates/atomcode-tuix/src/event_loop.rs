@@ -29,16 +29,103 @@ pub struct LoopCtx {
 }
 
 /// Line-edit buffer for input composition. Byte-indexed cursor.
+///
+/// Large pasted blocks are folded into `[Pasted #N +M lines]` placeholders
+/// stored in `text`; the original contents live in `pastes` and are
+/// spliced back in when the line is submitted. This keeps the visible
+/// input short (matching CC's paste UX) without truncating what the
+/// agent actually sees.
 struct Buffer {
     text: String,
     cursor: usize,
     history_idx: Option<usize>,
     stash: String,
+    /// Placeholder index → original pasted text. Index 0 = paste #1.
+    pastes: Vec<String>,
 }
+
+/// Minimum line count or char count for a paste to fold into a
+/// placeholder. Smaller pastes are inserted inline — no point hiding
+/// 3 lines behind a `[Pasted ...]` token.
+const PASTE_FOLD_LINES: usize = 5;
+const PASTE_FOLD_CHARS: usize = 400;
 
 impl Buffer {
     fn new() -> Self {
-        Self { text: String::new(), cursor: 0, history_idx: None, stash: String::new() }
+        Self {
+            text: String::new(),
+            cursor: 0,
+            history_idx: None,
+            stash: String::new(),
+            pastes: Vec::new(),
+        }
+    }
+
+    /// Insert a pasted block. Folds into `[Pasted #N +M lines]` if the
+    /// block exceeds the fold threshold, keeping the visible input terse.
+    /// Returns the placeholder that was inserted (or the raw text for
+    /// small pastes) so callers can advance the cursor correctly.
+    fn insert_paste(&mut self, text: String) -> String {
+        let line_count = text.lines().count().max(1);
+        let char_count = text.chars().count();
+        if line_count >= PASTE_FOLD_LINES || char_count >= PASTE_FOLD_CHARS {
+            let id = self.pastes.len() + 1;
+            let placeholder = format!("[Pasted #{} +{} lines]", id, line_count);
+            self.pastes.push(text);
+            self.text.insert_str(self.cursor, &placeholder);
+            self.cursor += placeholder.len();
+            placeholder
+        } else {
+            let n = text.len();
+            self.text.insert_str(self.cursor, &text);
+            self.cursor += n;
+            text
+        }
+    }
+
+    /// Expand every `[Pasted #N +M lines]` token in `line` back to the
+    /// original paste contents. Called at submit time — the agent gets
+    /// the full pasted payload, while history/display keeps the compact
+    /// form.
+    fn expand_pastes(&self, line: &str) -> String {
+        if self.pastes.is_empty() {
+            return line.to_string();
+        }
+        let mut out = String::with_capacity(line.len());
+        let mut rest = line;
+        while let Some(start) = rest.find("[Pasted #") {
+            out.push_str(&rest[..start]);
+            let tail = &rest[start..];
+            if let Some(end) = tail.find(']') {
+                // Parse id from "[Pasted #N +M lines]"
+                let header = &tail[..=end];
+                let id_part = header
+                    .strip_prefix("[Pasted #")
+                    .and_then(|s| s.split_whitespace().next());
+                if let Some(id_str) = id_part {
+                    if let Ok(id) = id_str.parse::<usize>() {
+                        if id >= 1 && id <= self.pastes.len() {
+                            out.push_str(&self.pastes[id - 1]);
+                            rest = &tail[end + 1..];
+                            continue;
+                        }
+                    }
+                }
+                // Malformed or out-of-range token — leave as-is.
+                out.push_str(header);
+                rest = &tail[end + 1..];
+            } else {
+                out.push_str(tail);
+                rest = "";
+                break;
+            }
+        }
+        out.push_str(rest);
+        out
+    }
+
+    fn clear_pastes(&mut self) {
+        self.pastes.clear();
     }
 
     fn apply(&mut self, action: Action, history: &[String], commands: &CommandRegistry) -> BufferResult {
@@ -68,12 +155,14 @@ impl Buffer {
                     self.text.clear();
                     self.cursor = 0;
                     self.history_idx = None;
+                    self.pastes.clear();
                     BufferResult::Redraw
                 }
             }
             Action::ClearLine => {
                 self.text.clear();
                 self.cursor = 0;
+                self.pastes.clear();
                 BufferResult::Redraw
             }
             Action::DeleteWordBackward => {
@@ -177,6 +266,59 @@ impl Buffer {
     fn cursor_cols(&self) -> usize {
         // display width of buf[..cursor]
         crate::width::display_width(&self.text[..self.cursor])
+    }
+}
+
+#[cfg(test)]
+mod buffer_tests {
+    use super::*;
+
+    #[test]
+    fn small_paste_inserts_inline() {
+        let mut b = Buffer::new();
+        b.insert_paste("hi\n".to_string());
+        assert_eq!(b.text, "hi\n");
+        assert!(b.pastes.is_empty(), "small paste should not fold");
+    }
+
+    #[test]
+    fn large_paste_folds_into_placeholder() {
+        let mut b = Buffer::new();
+        let big = "line\n".repeat(10);
+        b.insert_paste(big.clone());
+        assert!(b.text.contains("[Pasted #1 +10 lines]"));
+        assert_eq!(b.pastes, vec![big]);
+    }
+
+    #[test]
+    fn expand_pastes_restores_original() {
+        let mut b = Buffer::new();
+        let big = "line\n".repeat(10);
+        b.insert_paste(big.clone());
+        let committed = b.text.clone();
+        let expanded = b.expand_pastes(&committed);
+        assert_eq!(expanded, big);
+    }
+
+    #[test]
+    fn expand_pastes_is_noop_without_placeholders() {
+        let b = Buffer::new();
+        assert_eq!(b.expand_pastes("plain text"), "plain text");
+    }
+
+    #[test]
+    fn expand_handles_multiple_pastes_interleaved() {
+        let mut b = Buffer::new();
+        b.insert_paste("A\n".repeat(6));
+        b.text.insert_str(b.cursor, " then ");
+        b.cursor += 6;
+        b.insert_paste("B\n".repeat(6));
+        let line = b.text.clone();
+        let out = b.expand_pastes(&line);
+        assert!(out.contains("A\n"));
+        assert!(out.contains(" then "));
+        assert!(out.contains("B\n"));
+        assert!(!out.contains("[Pasted"));
     }
 }
 
@@ -360,8 +502,7 @@ fn handle_input(
     match ev {
         InputEvent::Paste(text) => {
             if matches!(state.phase, UiPhase::Idle) && model_picker.is_none() {
-                buf.text.insert_str(buf.cursor, &text);
-                buf.cursor += text.len();
+                buf.insert_paste(text);
                 renderer.render(UiLine::InputPrompt { buf: buf.text.clone(), cursor_cols: buf.cursor_cols(), menu: None });
                 renderer.flush();
             }
@@ -530,10 +671,14 @@ fn handle_idle_key(
             }
         }
         BufferResult::Commit(line) => {
+            // Expand paste placeholders so the agent sees full content
+            // while the echoed user line and history stay compact.
+            let expanded = buf.expand_pastes(&line);
             renderer.render(UiLine::ClearTransient);
             renderer.render(UiLine::User(line.clone()));
             buf.text.clear();
             buf.cursor = 0;
+            buf.clear_pastes();
             menu.selected = 0;
             if let Some((cmd, arg)) = parse_slash_line(&line) {
                 execute_slash_command(cmd, arg, state, ctx, renderer, model_picker)?;
@@ -542,7 +687,7 @@ fn handle_idle_key(
                 }
             } else {
                 ctx.history.push(line.clone());
-                ctx.agent.cmd_tx.send(AgentCommand::SendMessage(line)).ok();
+                ctx.agent.cmd_tx.send(AgentCommand::SendMessage(expanded)).ok();
                 state.on_submit();
             }
         }
