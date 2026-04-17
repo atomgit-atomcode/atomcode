@@ -1,4 +1,5 @@
 // crates/atomcode-tuix/src/lib.rs
+pub mod terminal;
 
 use anyhow::Result;
 use atomcode_core::agent::AgentHandle;
