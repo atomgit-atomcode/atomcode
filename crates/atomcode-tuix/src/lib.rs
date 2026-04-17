@@ -50,24 +50,16 @@ impl TerminalGuard {
             execute!(io::stdout(), EnableBracketedPaste)?;
             g.paste_enabled = true;
         }
-        // Static reservation: bottom 8 rows are footer chrome.
-        //   rows h-7..h-4: menu overlay (4-row slot, blank when inactive)
-        //   row  h-3:      spinner (blank when idle)
-        //   rows h-2..h:   input box (3 rows, always visible)
-        // Scroll region is set ONCE here and never changes at runtime,
-        // which means no row ever transitions between region-interior
-        // and region-exterior — the class of "ghost scrollback" bugs is
-        // eliminated by construction.
+        // PURE APPEND ARCHITECTURE — no scroll region, no DECSTBM.
+        // Footer is drawn at the current cursor position; content writes
+        // erase and redraw the footer; terminal scrolls naturally when
+        // cursor reaches the bottom row. No region boundaries means no
+        // transition bugs.
         if caps.tty {
-            let (_, h) = crossterm::terminal::size().unwrap_or((80, 24));
-            let bottom = (h as usize).saturating_sub(8);
-            if bottom >= 5 {
-                let stdout = io::stdout();
-                let mut out = stdout.lock();
-                let _ = write!(out, "\x1b[2J\x1b[H\x1b[1;{}r", bottom);
-                let _ = out.flush();
-                g.scroll_region_set = true;
-            }
+            let stdout = io::stdout();
+            let mut out = stdout.lock();
+            let _ = write!(out, "\x1b[2J\x1b[H");
+            let _ = out.flush();
         }
         Ok(g)
     }
@@ -76,15 +68,12 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         use std::io::Write as _;
-        if self.scroll_region_set {
-            let stdout = io::stdout();
-            let mut out = stdout.lock();
-            // Reset scroll region + ensure autowrap restored + move cursor
-            // below the footer so the next shell prompt doesn't stomp chrome.
-            let (_, h) = crossterm::terminal::size().unwrap_or((80, 24));
-            let _ = write!(out, "\x1b[?7h\x1b[r\x1b[{};1H\r\n", h);
-            let _ = out.flush();
-        }
+        // Ensure scroll region and autowrap reset defensively in case any
+        // renderer code emitted DECSTBM. Cursor to a fresh row for shell.
+        let stdout = io::stdout();
+        let mut out = stdout.lock();
+        let _ = write!(out, "\x1b[?7h\x1b[r\r\n");
+        let _ = out.flush();
         if self.paste_enabled {
             let _ = execute!(io::stdout(), DisableBracketedPaste);
         }
