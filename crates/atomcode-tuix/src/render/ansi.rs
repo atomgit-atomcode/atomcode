@@ -107,19 +107,20 @@ impl<W: Write + Send> AnsiRenderer<W> {
     fn render_welcome(&mut self, model: &str, working_dir: &str) {
         let model = scrub_controls(model);
         let working_dir = scrub_controls(working_dir);
-        let box_w = self.term_width().saturating_sub(2).min(72).max(40);
+        // Full-width box, flush to the left edge.
+        let box_w = self.term_width().max(30);
         let inner = box_w.saturating_sub(2);
 
         // Top border with inlined title: ╭─ ✻ AtomCode ─────╮
         let title = " ✻ AtomCode ";
         let title_w = crate::width::display_width(title);
-        self.set_fg(Role::AccentDim);
-        let _ = self.out.write_all(" ╭─".as_bytes());
+        self.set_fg(Role::Border);
+        let _ = self.out.write_all("╭─".as_bytes());
         self.reset();
         self.set_fg(Role::Brand);
         let _ = self.out.write_all(title.as_bytes());
         self.reset();
-        self.set_fg(Role::AccentDim);
+        self.set_fg(Role::Border);
         let fill = inner.saturating_sub(1 + title_w);
         for _ in 0..fill {
             let _ = self.out.write_all("─".as_bytes());
@@ -129,8 +130,7 @@ impl<W: Write + Send> AnsiRenderer<W> {
 
         self.draw_blank_row(inner);
 
-        // Tips row
-        let tip = "   Type a message, or /help for commands";
+        let tip = "  Type a message, or /help for commands";
         let tip_w = crate::width::display_width(tip);
         self.draw_box_row(inner, |this| {
             this.set_fg(Role::Muted);
@@ -140,8 +140,7 @@ impl<W: Write + Send> AnsiRenderer<W> {
 
         self.draw_blank_row(inner);
 
-        // cwd + model rows, with secondary labels in dim colour
-        let cwd_label = "   cwd    ";
+        let cwd_label = "  cwd    ";
         let cwd_value = crate::width::truncate_to_width(&working_dir, inner.saturating_sub(crate::width::display_width(cwd_label) + 1));
         let cwd_vw = crate::width::display_width(&cwd_value);
         self.draw_box_row(inner, |this| {
@@ -151,7 +150,7 @@ impl<W: Write + Send> AnsiRenderer<W> {
             let _ = this.out.write_all(cwd_value.as_bytes());
         }, crate::width::display_width(cwd_label) + cwd_vw);
 
-        let m_label = "   model  ";
+        let m_label = "  model  ";
         let m_value = crate::width::truncate_to_width(&model, inner.saturating_sub(crate::width::display_width(m_label) + 1));
         let m_vw = crate::width::display_width(&m_value);
         self.draw_box_row(inner, |this| {
@@ -165,9 +164,8 @@ impl<W: Write + Send> AnsiRenderer<W> {
 
         self.draw_blank_row(inner);
 
-        // Bottom border
-        self.set_fg(Role::AccentDim);
-        let _ = self.out.write_all(" ╰".as_bytes());
+        self.set_fg(Role::Border);
+        let _ = self.out.write_all("╰".as_bytes());
         for _ in 0..inner {
             let _ = self.out.write_all("─".as_bytes());
         }
@@ -175,7 +173,7 @@ impl<W: Write + Send> AnsiRenderer<W> {
         self.reset();
     }
 
-    /// Draw one bordered row: ` │ {content} {pad} │\r\n`.
+    /// Draw one bordered row: `│{content}{pad}│\r\n`.
     /// `content_width` is the display width of what the caller writes.
     fn draw_box_row(
         &mut self,
@@ -183,22 +181,22 @@ impl<W: Write + Send> AnsiRenderer<W> {
         content: impl FnOnce(&mut Self),
         content_width: usize,
     ) {
-        self.set_fg(Role::AccentDim);
-        let _ = self.out.write_all(" │".as_bytes());
+        self.set_fg(Role::Border);
+        let _ = self.out.write_all("│".as_bytes());
         self.reset();
         content(self);
         let pad = inner_width.saturating_sub(content_width);
         for _ in 0..pad {
             let _ = self.out.write_all(b" ");
         }
-        self.set_fg(Role::AccentDim);
+        self.set_fg(Role::Border);
         let _ = self.out.write_all("│\r\n".as_bytes());
         self.reset();
     }
 
     fn draw_blank_row(&mut self, inner_width: usize) {
-        self.set_fg(Role::AccentDim);
-        let _ = self.out.write_all(" │".as_bytes());
+        self.set_fg(Role::Border);
+        let _ = self.out.write_all("│".as_bytes());
         for _ in 0..inner_width {
             let _ = self.out.write_all(b" ");
         }
@@ -340,27 +338,25 @@ impl<W: Write + Send> Renderer for AnsiRenderer<W> {
                 }
                 self.reset_transient();
 
-                let box_w = self.term_width().saturating_sub(2).min(120).max(30);
+                // Full-width box, flush left.
+                let box_w = self.term_width().max(30);
                 let inner = box_w.saturating_sub(2);
                 let safe_label = scrub_controls(&label);
-                // Middle line: " │ {frame} {label} {pad} │"
-                //               1  1   1    wL   pad   1  1
-                // Frame is width 1 (Braille char). " {frame} " = 3 cols.
+                // Middle line: "│ {frame} {label}{pad} │"
+                //  col: 0 (│) 1 (sp) 2 (frame) 3 (sp) 4... text ... (sp) (│)
                 let text_budget = inner.saturating_sub(4);
                 let display_label = crate::width::truncate_to_width(&safe_label, text_budget);
                 let label_w = crate::width::display_width(&display_label);
                 let pad = text_budget.saturating_sub(label_w);
 
-                // Top border
-                self.set_fg(Role::AccentDim);
-                let _ = self.out.write_all(" ╭".as_bytes());
+                self.set_fg(Role::Border);
+                let _ = self.out.write_all("╭".as_bytes());
                 for _ in 0..inner { let _ = self.out.write_all("─".as_bytes()); }
                 let _ = self.out.write_all("╮\r\n".as_bytes());
                 self.reset();
 
-                // Middle: │ {frame} {label}  │
-                self.set_fg(Role::AccentDim);
-                let _ = self.out.write_all(" │ ".as_bytes());
+                self.set_fg(Role::Border);
+                let _ = self.out.write_all("│ ".as_bytes());
                 self.reset();
                 self.set_fg(Role::Brand);
                 let _ = write!(self.out, "{} ", frame);
@@ -369,19 +365,18 @@ impl<W: Write + Send> Renderer for AnsiRenderer<W> {
                 let _ = self.out.write_all(display_label.as_bytes());
                 self.reset();
                 for _ in 0..pad { let _ = self.out.write_all(b" "); }
-                self.set_fg(Role::AccentDim);
+                self.set_fg(Role::Border);
                 let _ = self.out.write_all(" │\r\n".as_bytes());
                 self.reset();
 
-                // Bottom border (no \r\n)
-                self.set_fg(Role::AccentDim);
-                let _ = self.out.write_all(" ╰".as_bytes());
+                self.set_fg(Role::Border);
+                let _ = self.out.write_all("╰".as_bytes());
                 for _ in 0..inner { let _ = self.out.write_all("─".as_bytes()); }
                 let _ = self.out.write_all("╯".as_bytes());
                 self.reset();
 
-                // Position cursor on middle line so transient_cursor_from_top = 1.
-                let _ = write!(self.out, "\x1b[1A\r\x1b[1G");
+                // Position cursor on middle line.
+                let _ = write!(self.out, "\x1b[1A\r");
 
                 self.last_was_permanent = false;
                 self.transient_lines = 3;
@@ -395,27 +390,27 @@ impl<W: Write + Send> Renderer for AnsiRenderer<W> {
                 // Clear any prior transient first.
                 self.reset_transient();
 
-                let box_w = self.term_width().saturating_sub(2).min(120).max(30);
+                // Full-width box, flush left.
+                let box_w = self.term_width().max(30);
                 let inner = box_w.saturating_sub(2);
-                // Inner budget for text = inner - 1 (leading space) - 2 ("❯ ") - 1 (trailing space)
+                // Inner layout: "│ ❯ {buf}{pad} │"
+                //  col 0 (│) 1 (sp) 2 (❯) 3 (sp) 4... text ... (sp) (│)
                 let text_budget = inner.saturating_sub(4);
                 let safe = scrub_controls(&buf);
                 let display_buf = crate::width::truncate_to_width(&safe, text_budget);
                 let buf_w = crate::width::display_width(&display_buf);
                 let pad = text_budget.saturating_sub(buf_w);
 
-                // Top border: ╭───╮
-                self.set_fg(Role::AccentDim);
-                let _ = self.out.write_all(" ╭".as_bytes());
+                self.set_fg(Role::Border);
+                let _ = self.out.write_all("╭".as_bytes());
                 for _ in 0..inner {
                     let _ = self.out.write_all("─".as_bytes());
                 }
                 let _ = self.out.write_all("╮\r\n".as_bytes());
                 self.reset();
 
-                // Middle: │ ❯ {buf} {pad} │
-                self.set_fg(Role::AccentDim);
-                let _ = self.out.write_all(" │ ".as_bytes());
+                self.set_fg(Role::Border);
+                let _ = self.out.write_all("│ ".as_bytes());
                 self.reset();
                 self.set_fg(Role::Accent);
                 let _ = self.out.write_all("❯ ".as_bytes());
@@ -424,28 +419,25 @@ impl<W: Write + Send> Renderer for AnsiRenderer<W> {
                 for _ in 0..pad {
                     let _ = self.out.write_all(b" ");
                 }
-                self.set_fg(Role::AccentDim);
+                self.set_fg(Role::Border);
                 let _ = self.out.write_all(" │\r\n".as_bytes());
                 self.reset();
 
-                // Bottom border: ╰───╯ (no trailing \n so cursor ends on bottom row)
-                self.set_fg(Role::AccentDim);
-                let _ = self.out.write_all(" ╰".as_bytes());
+                self.set_fg(Role::Border);
+                let _ = self.out.write_all("╰".as_bytes());
                 for _ in 0..inner {
                     let _ = self.out.write_all("─".as_bytes());
                 }
                 let _ = self.out.write_all("╯".as_bytes());
                 self.reset();
 
-                // Position cursor on the middle line at col ` │ ❯ ` + cursor_cols.
-                // We're currently at end of bottom border. Move up 1 line, to
-                // absolute column (1-indexed): 1 (space) + 1 (│) + 1 ( ) + 1 (❯) + 1 ( ) + cursor_cols.
-                let cursor_col = 5 + cursor_cols;
+                // Position cursor on middle line at col after "│ ❯ " = 4, plus cursor_cols.
+                // Use \r then forward N via \x1b[{N}C.
+                let cursor_col = 4 + cursor_cols;
                 let _ = write!(self.out, "\x1b[1A\r\x1b[{}C", cursor_col);
 
                 self.last_was_permanent = false;
                 self.transient_lines = 3;
-                // Cursor was positioned on the MIDDLE line (1 below top).
                 self.transient_cursor_from_top = 1;
             }
             UiLine::InputCommit => {

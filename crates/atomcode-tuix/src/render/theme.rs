@@ -12,6 +12,9 @@ impl Palette {
     pub const BLUE: Color = Color::Rgb { r: 100, g: 160, b: 240 };
     pub const ACCENT_DIM: Color = Color::Rgb { r: 40, g: 55, b: 80 };
     pub const SECONDARY: Color = Color::Rgb { r: 140, g: 142, b: 155 };
+    /// Bright-but-muted border colour for boxes (welcome, spinner, input).
+    /// Visible on dark terminals without screaming.
+    pub const BORDER: Color = Color::Rgb { r: 110, g: 140, b: 200 };
     pub const WARNING: Color = Color::Rgb { r: 195, g: 155, b: 45 };
     pub const ERROR: Color = Color::Rgb { r: 210, g: 75, b: 75 };
     pub const GREEN: Color = Color::Rgb { r: 80, g: 200, b: 120 };
@@ -30,6 +33,7 @@ pub fn role(caps: TerminalCaps, role: Role) -> Option<Color> {
         Role::Accent => Palette::BLUE,
         Role::AccentDim => Palette::ACCENT_DIM,
         Role::Secondary => Palette::SECONDARY,
+        Role::Border => Palette::BORDER,
         Role::Warning => Palette::WARNING,
         Role::Error => Palette::ERROR,
         Role::Success => Palette::GREEN,
@@ -45,6 +49,7 @@ pub enum Role {
     Accent,
     AccentDim,
     Secondary,
+    Border,
     Warning,
     Error,
     Success,
