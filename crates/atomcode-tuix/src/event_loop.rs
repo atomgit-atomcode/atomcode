@@ -405,19 +405,41 @@ pub async fn run_loop(
     renderer.render(UiLine::InputPrompt { buf: String::new(), cursor_cols: 0, menu: None });
     renderer.flush();
 
-    let mut spinner_tick = tokio::time::interval(Duration::from_millis(100));
-    // Skip missed ticks instead of bursting them. If a long-running
-    // event handler (e.g. emitting 100 diff lines) delays the interval
-    // for 500ms, we don't want 5 back-to-back frames when control
-    // returns — just the latest frame.
-    spinner_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    spinner_tick.tick().await; // consume immediate tick
+    // Spinner tick channel — a background task fires a tick every 100ms
+    // into a bounded (cap 1) mpsc. The main loop recv's this in the
+    // `tokio::select!` alongside the agent-event channel, so spinner
+    // ticks compete fairly with agent events (both are channel reads
+    // rather than a time-interval future that the runtime can skip
+    // over when other branches are always ready).
+    //
+    // Cap 1 + try_send means if the main loop is mid-event and a tick
+    // can't land in the channel, we silently drop it — no burst of
+    // queued frames when control eventually returns. The post-event
+    // pump (below) complements this by advancing the spinner as soon
+    // as a slow handler finishes, even if the next scheduled tick is
+    // still 50ms away.
+    let (spin_tx, mut spin_rx) = tokio::sync::mpsc::channel::<()>(1);
+    let spin_task = {
+        let spin_tx = spin_tx.clone();
+        tokio::spawn(async move {
+            use tokio::sync::mpsc::error::TrySendError;
+            let mut interval = tokio::time::interval(Duration::from_millis(100));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            interval.tick().await; // discard the immediate tick
+            loop {
+                interval.tick().await;
+                match spin_tx.try_send(()) {
+                    Ok(_) | Err(TrySendError::Full(_)) => {}
+                    Err(TrySendError::Closed(_)) => break,
+                }
+            }
+        })
+    };
+    drop(spin_tx); // only the task needs the sender
 
-    // Tracks when the spinner was last drawn so the opportunistic
-    // post-event pump knows whether to redraw. When the `select!` loop
-    // races between an agent-event branch that is always ready and the
-    // spinner interval, the interval branch can be starved — drawing
-    // again at the end of an event handler closes that gap.
+    // Last-draw timestamp — consulted by the post-event pump so we
+    // don't redraw more often than every 100ms even when handlers
+    // fire back-to-back.
     let mut last_spinner_draw = std::time::Instant::now();
 
     // call_id → (tool_name, detail). Populated on ToolCallStarted, consumed
@@ -474,8 +496,8 @@ pub async fn run_loop(
                 }
             }
 
-            // ── Spinner tick ──
-            _ = spinner_tick.tick(), if matches!(state.phase, UiPhase::Streaming) => {
+            // ── Spinner tick (from background task) ──
+            Some(()) = spin_rx.recv(), if matches!(state.phase, UiPhase::Streaming) => {
                 draw_spinner_now(&mut state, &buf, renderer);
                 last_spinner_draw = std::time::Instant::now();
             }
@@ -540,8 +562,8 @@ pub async fn run_loop(
                 }
             }
 
-            // ── Spinner tick ──
-            _ = spinner_tick.tick(), if matches!(state.phase, UiPhase::Streaming) => {
+            // ── Spinner tick (from background task) ──
+            Some(()) = spin_rx.recv(), if matches!(state.phase, UiPhase::Streaming) => {
                 draw_spinner_now(&mut state, &buf, renderer);
                 last_spinner_draw = std::time::Instant::now();
             }
@@ -552,6 +574,11 @@ pub async fn run_loop(
         }
     }
 
+    // Stop the background spinner task. Dropping `spin_rx` at scope
+    // exit would let it self-terminate on the next try_send, but abort
+    // is immediate and has no downside — the task holds no resources
+    // beyond the interval timer.
+    spin_task.abort();
     let _ = ctx.history.save();
     Ok(())
 }
