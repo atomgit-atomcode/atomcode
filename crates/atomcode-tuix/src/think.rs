@@ -117,6 +117,11 @@ fn find_open_tag(s: &str) -> TagScan {
 
 /// If `s` starts with a complete `<think...>` or `<thinking...>` open tag,
 /// returns byte end position (just after `>`).
+///
+/// NOTE: attribute values are matched by finding the next literal `>`.
+/// A quoted attribute containing a literal `>` (e.g. `<think foo="a>b">`)
+/// would confuse this parser. LLM-generated think tags in practice carry
+/// no meaningful attributes, so this trade-off is intentional.
 fn parse_open_tag(s: &str) -> Option<usize> {
     if !s.starts_with('<') { return None; }
     let lower_head: String = s.chars().take(10).map(|c| c.to_ascii_lowercase()).collect();
