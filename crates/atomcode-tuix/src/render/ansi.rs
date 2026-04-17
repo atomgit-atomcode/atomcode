@@ -23,6 +23,10 @@ pub struct AnsiRenderer<W: Write + Send> {
     /// for the bordered input box). Used by clear_transient to move the
     /// cursor back to the top of the transient before erasing.
     transient_lines: usize,
+    /// Cursor row offset from the top of the current transient area
+    /// (0 = on the top row, 1 = one row below top, etc.). Needed because
+    /// the input box leaves the cursor on its middle row, not its bottom.
+    transient_cursor_from_top: usize,
 }
 
 impl AnsiRenderer<BufWriter<Stdout>> {
@@ -39,6 +43,7 @@ impl<W: Write + Send> AnsiRenderer<W> {
             last_was_permanent: true,
             assistant_continuing: false,
             transient_lines: 0,
+            transient_cursor_from_top: 0,
         }
     }
 
@@ -56,31 +61,35 @@ impl<W: Write + Send> AnsiRenderer<W> {
 
     /// Clear any transient content (spinner, input box) before a permanent
     /// write. No-op if state says nothing transient is active, or if we are
-    /// in the middle of streaming assistant text on the current line (the
-    /// text itself is "permanent-in-progress"; another AssistantText chunk
-    /// should APPEND to it, not wipe it).
+    /// in the middle of streaming assistant text on the current line.
     fn clear_line_if_needed(&mut self) {
         if self.transient_lines > 1 {
-            let _ = write!(self.out, "\x1b[{}A", self.transient_lines - 1);
+            if self.transient_cursor_from_top > 0 {
+                let _ = write!(self.out, "\x1b[{}A", self.transient_cursor_from_top);
+            }
             let _ = self.out.write_all(b"\r\x1b[J");
             self.transient_lines = 0;
+            self.transient_cursor_from_top = 0;
         } else if !self.last_was_permanent && !self.assistant_continuing {
             let _ = self.out.write_all(b"\r\x1b[K");
             self.transient_lines = 0;
+            self.transient_cursor_from_top = 0;
         }
     }
 
     /// Unconditionally reset to start of the transient area, erasing it.
-    /// Used by transient writes (spinner, ClearTransient, InputPrompt) —
-    /// they need idempotent clearing regardless of prior state.
+    /// Used by transient writes (spinner, ClearTransient, InputPrompt).
     fn reset_transient(&mut self) {
         if self.transient_lines > 1 {
-            let _ = write!(self.out, "\x1b[{}A", self.transient_lines - 1);
+            if self.transient_cursor_from_top > 0 {
+                let _ = write!(self.out, "\x1b[{}A", self.transient_cursor_from_top);
+            }
             let _ = self.out.write_all(b"\r\x1b[J");
         } else {
             let _ = self.out.write_all(b"\r\x1b[K");
         }
         self.transient_lines = 0;
+        self.transient_cursor_from_top = 0;
     }
 
     fn write_bar_prefix(&mut self) {
@@ -337,6 +346,7 @@ impl<W: Write + Send> Renderer for AnsiRenderer<W> {
                 self.reset();
                 self.last_was_permanent = false;
                 self.transient_lines = 1;
+                self.transient_cursor_from_top = 0;
             }
             UiLine::ClearTransient => {
                 self.reset_transient();
@@ -396,6 +406,8 @@ impl<W: Write + Send> Renderer for AnsiRenderer<W> {
 
                 self.last_was_permanent = false;
                 self.transient_lines = 3;
+                // Cursor was positioned on the MIDDLE line (1 below top).
+                self.transient_cursor_from_top = 1;
             }
             UiLine::InputCommit => {
                 let _ = self.out.write_all(b"\r\n");
