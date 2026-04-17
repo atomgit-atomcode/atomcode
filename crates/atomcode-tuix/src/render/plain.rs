@@ -62,6 +62,12 @@ impl<W: Write + Send> Renderer for PlainRenderer<W> {
                 let sign = if added { "+" } else { "-" };
                 let _ = writeln!(self.out, "  {} {}", sign, scrub_controls(&text));
             }
+            UiLine::DiffBlock(entries) => {
+                for entry in entries {
+                    let sign = if entry.added { "+" } else { "-" };
+                    let _ = writeln!(self.out, "  {} {}", sign, scrub_controls(&entry.text));
+                }
+            }
             UiLine::ApprovalPrompt { tool, detail } => {
                 let _ = writeln!(
                     self.out,

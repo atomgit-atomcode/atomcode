@@ -18,6 +18,14 @@ pub enum UiLine {
     ToolCall { name: String, detail: String },
     ToolResult { success: bool, summary: String },
     DiffLine { added: bool, text: String },
+    /// A batch of diff lines emitted in a single render call. Use this
+    /// instead of N individual `DiffLine` renders when a tool result
+    /// carries many changed lines — each `DiffLine` triggers a full
+    /// erase_footer + redraw_footer cycle, so 50 diff lines translate
+    /// into 50 footer redraws and tens of KB of ANSI, blocking the
+    /// event loop long enough to freeze the spinner. `DiffBlock` does
+    /// one erase + N writes + one redraw.
+    DiffBlock(Vec<DiffEntry>),
     ApprovalPrompt { tool: String, detail: String },
     Error(String),
     TurnCancelled,
@@ -63,6 +71,13 @@ pub trait Renderer: Send {
 pub struct MenuPayload {
     pub items: Vec<(String, String)>, // (name, desc)
     pub selected: usize,
+}
+
+/// One line in a diff batch. `added = true` renders as `+`, false as `-`.
+#[derive(Debug, Clone)]
+pub struct DiffEntry {
+    pub added: bool,
+    pub text: String,
 }
 
 /// Convert a Duration to a short label like "1.2s" or "340ms".

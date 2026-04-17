@@ -984,12 +984,31 @@ fn handle_agent_event(
             });
             let summary = summarise(&output);
             renderer.render(UiLine::ToolResult { success, summary });
-            for line in output.lines().take(120) {
-                if let Some(rest) = line.strip_prefix("+ ") {
-                    renderer.render(UiLine::DiffLine { added: true, text: rest.to_string() });
-                } else if let Some(rest) = line.strip_prefix("- ") {
-                    renderer.render(UiLine::DiffLine { added: false, text: rest.to_string() });
-                }
+            // Collect diff lines into a single batch — N individual
+            // DiffLine renders each trigger a full footer redraw and
+            // tens of KB of ANSI, which blocks the event loop long
+            // enough to stall the spinner during edit tool results.
+            let diff_entries: Vec<crate::render::DiffEntry> = output
+                .lines()
+                .take(120)
+                .filter_map(|line| {
+                    if let Some(rest) = line.strip_prefix("+ ") {
+                        Some(crate::render::DiffEntry {
+                            added: true,
+                            text: rest.to_string(),
+                        })
+                    } else if let Some(rest) = line.strip_prefix("- ") {
+                        Some(crate::render::DiffEntry {
+                            added: false,
+                            text: rest.to_string(),
+                        })
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            if !diff_entries.is_empty() {
+                renderer.render(UiLine::DiffBlock(diff_entries));
             }
             renderer.flush();
             let _ = name;

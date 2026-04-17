@@ -714,6 +714,35 @@ impl<W: Write + Send> Renderer for AnsiRenderer<W> {
                 push_sgr_fg_reset(&mut line, self.caps);
                 self.emit_wrapped_line(&line);
             }
+            UiLine::DiffBlock(entries) => {
+                // Single erase/redraw cycle for the whole batch — 50
+                // diff lines translate to 2 footer redraws instead of
+                // 50, keeping the event loop unblocked for the
+                // background spinner task.
+                self.erase_footer();
+                let w = self.content_width();
+                for entry in entries {
+                    let mut line = String::new();
+                    push_sgr_fg(
+                        &mut line,
+                        self.caps,
+                        if entry.added { Role::DiffAdd } else { Role::DiffRemove },
+                    );
+                    let sign = if entry.added { '+' } else { '-' };
+                    line.push_str(&format!(
+                        "       {} {}",
+                        sign,
+                        scrub_controls(&entry.text)
+                    ));
+                    push_sgr_fg_reset(&mut line, self.caps);
+                    for chunk in crate::width::wrap_line_to_width(&line, w) {
+                        self.write_left_pad();
+                        let _ = self.out.write_all(chunk.as_bytes());
+                        let _ = self.out.write_all(b"\r\n");
+                    }
+                }
+                self.redraw_footer_if_any();
+            }
             UiLine::ApprovalPrompt { tool, detail } => {
                 let mut line = String::new();
                 push_sgr_fg(&mut line, self.caps, Role::Warning);
