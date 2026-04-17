@@ -289,70 +289,80 @@ impl<W: Write + Send> AnsiRenderer<W> {
     fn render_welcome(&mut self, model: &str, working_dir: &str) {
         let model = scrub_controls(model);
         let working_dir = scrub_controls(working_dir);
-        // Full-width box, flush to the left edge.
-        let box_w = self.term_width().max(30);
-        let inner = box_w.saturating_sub(2);
+        let w = self.term_width();
 
-        // Top border with inlined title: ╭─ ✻ AtomCode ─────╮
-        let title = " ✻ AtomCode ";
-        let title_w = crate::width::display_width(title);
-        self.set_fg(Role::Border);
-        let _ = self.out.write_all("╭─".as_bytes());
-        self.reset();
+        // Leading breath.
+        let _ = self.out.write_all(b"\r\n");
+
+        // Row 1: "  ◆ atomcode" on the left; "v4.15.3  ·  MIT" on the right.
+        let left = "  ◆ atomcode";
+        let right_ver = "v4.15.3";
+        let right_lic = "MIT";
+        let left_w = crate::width::display_width(left);
+        let right_w = right_ver.len() + 5 + right_lic.len(); // "  ·  "
+        let gap = w.saturating_sub(left_w + right_w + 2);
+
         self.set_fg(Role::Brand);
-        let _ = self.out.write_all(title.as_bytes());
-        self.reset();
-        self.set_fg(Role::Border);
-        let fill = inner.saturating_sub(1 + title_w);
-        for _ in 0..fill {
-            let _ = self.out.write_all("─".as_bytes());
+        if self.caps.colors {
+            let _ = self.out.write_all(b"\x1b[1m");
         }
-        let _ = self.out.write_all("╮\r\n".as_bytes());
-        self.reset();
-
-        self.draw_blank_row(inner);
-
-        let tip = "  Type a message, or /help for commands";
-        let tip_w = crate::width::display_width(tip);
-        self.draw_box_row(inner, |this| {
-            this.set_fg(Role::Muted);
-            let _ = this.out.write_all(tip.as_bytes());
-            this.reset();
-        }, tip_w);
-
-        self.draw_blank_row(inner);
-
-        let cwd_label = "  cwd    ";
-        let cwd_value = crate::width::truncate_to_width(&working_dir, inner.saturating_sub(crate::width::display_width(cwd_label) + 1));
-        let cwd_vw = crate::width::display_width(&cwd_value);
-        self.draw_box_row(inner, |this| {
-            this.set_fg(Role::Muted);
-            let _ = this.out.write_all(cwd_label.as_bytes());
-            this.reset();
-            let _ = this.out.write_all(cwd_value.as_bytes());
-        }, crate::width::display_width(cwd_label) + cwd_vw);
-
-        let m_label = "  model  ";
-        let m_value = crate::width::truncate_to_width(&model, inner.saturating_sub(crate::width::display_width(m_label) + 1));
-        let m_vw = crate::width::display_width(&m_value);
-        self.draw_box_row(inner, |this| {
-            this.set_fg(Role::Muted);
-            let _ = this.out.write_all(m_label.as_bytes());
-            this.reset();
-            this.set_fg(Role::Secondary);
-            let _ = this.out.write_all(m_value.as_bytes());
-            this.reset();
-        }, crate::width::display_width(m_label) + m_vw);
-
-        self.draw_blank_row(inner);
-
-        self.set_fg(Role::Border);
-        let _ = self.out.write_all("╰".as_bytes());
-        for _ in 0..inner {
-            let _ = self.out.write_all("─".as_bytes());
+        let _ = self.out.write_all(left.as_bytes());
+        if self.caps.colors {
+            let _ = self.out.write_all(b"\x1b[22m");
         }
-        let _ = self.out.write_all("╯\r\n".as_bytes());
         self.reset();
+        for _ in 0..gap {
+            let _ = self.out.write_all(b" ");
+        }
+        self.set_fg(Role::Secondary);
+        let _ = self.out.write_all(right_ver.as_bytes());
+        self.reset();
+        self.set_fg(Role::Muted);
+        let _ = self.out.write_all("  ·  ".as_bytes());
+        self.reset();
+        self.set_fg(Role::Muted);
+        let _ = self.out.write_all(right_lic.as_bytes());
+        self.reset();
+        let _ = self.out.write_all(b"\r\n\r\n");
+
+        // "     ∙ {working_dir}" and "     ∙ {model}" — soft bullets, muted.
+        let max_path = w.saturating_sub(10);
+        let cwd_disp = crate::width::truncate_to_width(&working_dir, max_path);
+        self.set_fg(Role::AccentDim);
+        let _ = self.out.write_all("     ∙ ".as_bytes());
+        self.reset();
+        self.set_fg(Role::Secondary);
+        let _ = self.out.write_all(cwd_disp.as_bytes());
+        self.reset();
+        let _ = self.out.write_all(b"\r\n");
+
+        let model_disp = crate::width::truncate_to_width(&model, max_path);
+        self.set_fg(Role::AccentDim);
+        let _ = self.out.write_all("     ∙ ".as_bytes());
+        self.reset();
+        self.set_fg(Role::Secondary);
+        let _ = self.out.write_all(model_disp.as_bytes());
+        self.reset();
+        let _ = self.out.write_all(b"\r\n\r\n");
+
+        // Hint row with keyboard glyphs. "     /" command, "⇧⏎" newline,
+        // "⌃C" cancel.
+        self.set_fg(Role::AccentDim);
+        let _ = self.out.write_all("     type something, or press  ".as_bytes());
+        self.reset();
+        if self.caps.colors {
+            let _ = self.out.write_all(b"\x1b[1m");
+        }
+        self.set_fg(Role::Accent);
+        let _ = self.out.write_all("/".as_bytes());
+        self.reset();
+        if self.caps.colors {
+            let _ = self.out.write_all(b"\x1b[22m");
+        }
+        self.set_fg(Role::AccentDim);
+        let _ = self.out.write_all("  to browse commands".as_bytes());
+        self.reset();
+        let _ = self.out.write_all(b"\r\n\r\n");
     }
 
     /// Draw one bordered row: `│{content}{pad}│\r\n`.
