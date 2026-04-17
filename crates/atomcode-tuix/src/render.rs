@@ -90,6 +90,40 @@ fn word_wrap(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
+/// Print welcome screen: clear terminal, show logo + project info.
+pub fn print_welcome(model: &str, working_dir: &str) {
+    let mut out = io::stdout();
+    // Clear screen
+    let _ = crossterm::execute!(
+        out,
+        crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
+        crossterm::cursor::MoveTo(0, 0)
+    );
+
+    // Logo
+    let _ = execute!(out, SetForegroundColor(BRAND), SetAttribute(Attribute::Bold));
+    let _ = write!(out, "  \u{25c9}  AtomCode\r\n");
+    let _ = execute!(out, SetAttribute(Attribute::Reset), ResetColor);
+
+    // Info line
+    let _ = execute!(out, SetForegroundColor(DIM_GRAY));
+    let _ = write!(out, "  {}  {}\r\n", model, working_dir);
+    let _ = execute!(out, ResetColor);
+
+    // Separator
+    let w = term_width();
+    let _ = execute!(out, SetForegroundColor(ACCENT_DIM));
+    let _ = write!(out, "  {}\r\n", "\u{2500}".repeat(w.saturating_sub(4)));
+    let _ = execute!(out, ResetColor);
+
+    // Tips
+    let _ = execute!(out, SetForegroundColor(DIM_GRAY));
+    let _ = write!(out, "  /help for commands \u{00b7} Ctrl+C to cancel \u{00b7} Shift+Enter for newline\r\n");
+    let _ = execute!(out, ResetColor);
+
+    let _ = out.flush();
+}
+
 /// Print header: `AtomCode  model_name  ~/working_dir`
 pub fn print_header(model: &str, working_dir: &str) {
     let mut out = io::stdout();

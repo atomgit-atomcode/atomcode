@@ -37,14 +37,14 @@ pub async fn run(
     // Build commands list for tab completion
     let commands: Vec<String> = COMMANDS.iter().map(|s| s.to_string()).collect();
 
-    // Print header
+    // Welcome screen
     let wd_str = working_dir.to_string_lossy().to_string();
     let dir_display = if let Some(home) = std::env::var("HOME").ok() {
         wd_str.replacen(&home, "~", 1)
     } else {
         wd_str
     };
-    render::print_header(&model_name, &dir_display);
+    render::print_welcome(&model_name, &dir_display);
 
     let mut history: Vec<String> = Vec::new();
     let mut streaming = false;
