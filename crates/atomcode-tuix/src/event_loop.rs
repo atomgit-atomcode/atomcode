@@ -382,9 +382,19 @@ fn handle_idle_key(
     renderer: &mut dyn Renderer,
 ) -> Result<()> {
     let action = classify(code, modifiers);
+    let was_empty = buf.text.is_empty();
     match buf.apply(action, ctx.history.entries(), &ctx.commands) {
         BufferResult::NoOp => {}
         BufferResult::Redraw => {
+            // Typing the first `/` on an empty buffer: echo the slash command
+            // menu into scrollback so the user can see what's available.
+            if was_empty && buf.text == "/" {
+                let mut out = String::from("\n");
+                for c in ctx.commands.all() {
+                    out.push_str(&format!("  /{:<10}  {}\n", c.name, c.desc));
+                }
+                renderer.render(UiLine::CommandOutput(out));
+            }
             renderer.render(UiLine::InputPrompt { buf: buf.text.clone(), cursor_cols: buf.cursor_cols() });
             renderer.flush();
         }
