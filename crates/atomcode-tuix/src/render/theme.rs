@@ -3,48 +3,63 @@ use crossterm::style::Color;
 
 use crate::terminal::TerminalCaps;
 
-/// 24-bit RGB palette. Callers check TerminalCaps::colors before applying.
+/// Basic 16-color palette — SGR 30-37/90-97 only, no truecolor RGB.
+///
+/// **Why 16 colors:** truecolor RGB renders the same pixel regardless of
+/// terminal theme. On Mac Terminal.app's default "Basic" (light) profile,
+/// our old lavender/mint/grays landed on a light background and all but
+/// disappeared. The 16-color SGR palette (30-37, 90-97) is interpreted by
+/// the terminal's own theme engine — each user's colorscheme remaps the
+/// same escape into theme-appropriate RGB, so atomcode adapts to whatever
+/// terminal theme the user runs.
+///
+/// **Compatibility floor:** SGR 30-37/90-97 are part of the 1996 ECMA-48
+/// baseline. Every modern terminal (macOS Terminal, iTerm2, Alacritty,
+/// Kitty, Wezterm, Windows Terminal, Win10 1511+ cmd.exe with VT mode,
+/// tmux, SSH-in-SSH) handles them identically. We specifically avoid
+/// `\x1b[2m` (dim) which isn't reliable on Windows conhost < 1809.
 pub struct Palette;
 
 impl Palette {
-    // Palette: no blue, no yellow. Soft lavender brand, mint accent,
-    // neutral grays for body text and borders, coral for warning.
-    pub const BRAND: Color = Color::Rgb { r: 205, g: 175, b: 215 };
-    pub const DIM_GRAY: Color = Color::Rgb { r: 105, g: 105, b: 115 };
-    pub const ACCENT: Color = Color::Rgb { r: 165, g: 210, b: 180 };
-    pub const ACCENT_DIM: Color = Color::Rgb { r: 90, g: 110, b: 100 };
-    pub const SECONDARY: Color = Color::Rgb { r: 170, g: 170, b: 180 };
-    pub const BORDER: Color = Color::Rgb { r: 130, g: 130, b: 140 };
-    pub const WARNING: Color = Color::Rgb { r: 220, g: 140, b: 140 };
-    pub const ERROR: Color = Color::Rgb { r: 220, g: 95, b: 95 };
-    pub const GREEN: Color = Color::Rgb { r: 140, g: 200, b: 140 };
-    pub const RED: Color = Color::Rgb { r: 220, g: 95, b: 95 };
-    /// Soft teal used for inline code (was yellow).
-    pub const CODE: Color = Color::Rgb { r: 175, g: 205, b: 190 };
-    /// Pure bright white — used for tool names so they stand out.
-    pub const WHITE: Color = Color::Rgb { r: 245, g: 245, b: 250 };
+    pub const BRAND: Color = Color::Magenta;      // bright magenta (95)
+    pub const MUTED: Color = Color::DarkGrey;     // bright black / dark gray (90)
+    pub const ACCENT: Color = Color::Cyan;        // bright cyan (96)
+    pub const BORDER: Color = Color::DarkGrey;    // same grey as muted
+    pub const WARNING: Color = Color::DarkYellow; // yellow (33) — readable on both light/dark
+    pub const ERROR: Color = Color::Red;          // bright red (91)
+    pub const DIFF_ADD: Color = Color::DarkGreen; // green (32) — not neon
+    pub const DIFF_REMOVE: Color = Color::DarkRed; // red (31)
+    pub const CODE: Color = Color::DarkCyan;      // cyan (36) — inline `code`
 }
 
 /// Semantic colour role → concrete Color, honouring NO_COLOR etc.
-/// Returns None when colours are disabled.
+/// Returns None when colours are disabled OR when the role intentionally
+/// uses the terminal's default foreground (so strong/tool-name text just
+/// gets SGR bold without a fixed colour).
 pub fn role(caps: TerminalCaps, role: Role) -> Option<Color> {
     if !caps.colors {
         return None;
     }
-    Some(match role {
-        Role::Brand => Palette::BRAND,
-        Role::Muted => Palette::DIM_GRAY,
-        Role::Accent => Palette::ACCENT,
-        Role::AccentDim => Palette::ACCENT_DIM,
-        Role::Secondary => Palette::SECONDARY,
-        Role::Border => Palette::BORDER,
-        Role::Warning => Palette::WARNING,
-        Role::Error => Palette::ERROR,
-        Role::Success => Palette::GREEN,
-        Role::DiffAdd => Palette::GREEN,
-        Role::DiffRemove => Palette::RED,
-        Role::ToolName => Palette::WHITE,
-    })
+    match role {
+        Role::Brand => Some(Palette::BRAND),
+        Role::Muted => Some(Palette::MUTED),
+        Role::Accent => Some(Palette::ACCENT),
+        Role::AccentDim => Some(Palette::MUTED),
+        // Secondary = default terminal foreground. Using None means
+        // "don't emit a colour SGR"; text shows in whatever colour the
+        // terminal's theme chose for regular output.
+        Role::Secondary => None,
+        Role::Border => Some(Palette::BORDER),
+        Role::Warning => Some(Palette::WARNING),
+        Role::Error => Some(Palette::ERROR),
+        Role::Success => Some(Palette::DIFF_ADD),
+        Role::DiffAdd => Some(Palette::DIFF_ADD),
+        Role::DiffRemove => Some(Palette::DIFF_REMOVE),
+        // Tool names: emphasise with bold only; the caller adds `\x1b[1m`.
+        // No colour means the name picks up the terminal's default fg,
+        // which guarantees readability on any theme.
+        Role::ToolName => None,
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -85,5 +100,13 @@ mod tests {
     #[test]
     fn role_returns_palette_when_colors_enabled() {
         assert_eq!(role(caps(true), Role::Brand), Some(Palette::BRAND));
+    }
+
+    #[test]
+    fn secondary_and_toolname_return_none() {
+        // These roles deliberately fall through to the terminal's default
+        // foreground — they should return None even when colours are on.
+        assert!(role(caps(true), Role::Secondary).is_none());
+        assert!(role(caps(true), Role::ToolName).is_none());
     }
 }

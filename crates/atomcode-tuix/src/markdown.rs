@@ -65,10 +65,12 @@ pub fn render_line(line: &str, state: &mut MdState, caps: TerminalCaps) -> Optio
         return prefix_only();
     }
 
-    // Inside code block: render in a soft teal with no inline parsing
+    // Inside code block: render in cyan (basic-16 SGR 36) with no inline
+    // parsing. Cyan is the conventional "code" tone across themes and
+    // reads on both light and dark backgrounds.
     if state.in_code_block {
         let body = if caps.colors {
-            format!("\x1b[38;2;175;205;190m{}\x1b[39m", line)
+            format!("\x1b[36m{}\x1b[39m", line)
         } else {
             line.to_string()
         };
@@ -82,17 +84,18 @@ pub fn render_line(line: &str, state: &mut MdState, caps: TerminalCaps) -> Optio
         return Some(prepend(String::new()));
     }
 
-    // Heading — brightness hierarchy without screaming bold.
+    // Heading — express hierarchy with SGR weight (bold) rather than
+    // specific colours. Top levels stay in the terminal's default
+    // foreground (always readable); lower levels drop to muted grey.
     if let Some((level, rest)) = parse_heading(line) {
         let inner = render_inline(rest, caps);
         let body = if !caps.colors {
             format!("{} {}", "#".repeat(level as usize), inner)
         } else {
             match level {
-                1 => format!("\x1b[1;38;2;245;245;250m{}\x1b[0m", inner),
-                2 => format!("\x1b[38;2;245;245;250m{}\x1b[39m", inner),
-                3 => format!("\x1b[38;2;170;170;180m{}\x1b[39m", inner),
-                _ => format!("\x1b[38;2;130;130;140m{}\x1b[39m", inner),
+                1 | 2 => format!("\x1b[1m{}\x1b[22m", inner),
+                3 => format!("\x1b[1m{}\x1b[22m", inner),
+                _ => format!("\x1b[90m{}\x1b[39m", inner),
             }
         };
         return Some(prepend(body));
@@ -163,7 +166,7 @@ pub fn flush_aligned_table(rows: &[String], caps: TerminalCaps) -> String {
         }
     }
 
-    let border_on = if caps.colors { "\x1b[38;2;130;130;140m" } else { "" };
+    let border_on = if caps.colors { "\x1b[90m" } else { "" };
     let border_off = if caps.colors { "\x1b[39m" } else { "" };
 
     // Draw a horizontal rule row with given connector characters.
@@ -245,7 +248,7 @@ fn render_table_line(line: &str, caps: TerminalCaps) -> String {
             })
             .collect();
         return if caps.colors {
-            format!("\x1b[38;2;130;130;140m{}\x1b[39m", converted)
+            format!("\x1b[90m{}\x1b[39m", converted)
         } else {
             converted
         };
@@ -253,7 +256,7 @@ fn render_table_line(line: &str, caps: TerminalCaps) -> String {
 
     // Data row: split on '|' (keeping leading/trailing empty cells), apply
     // inline markdown to each cell, then rejoin with coloured `│` separators.
-    let border_on = if caps.colors { "\x1b[38;2;130;130;140m" } else { "" };
+    let border_on = if caps.colors { "\x1b[90m" } else { "" };
     let border_off = if caps.colors { "\x1b[39m" } else { "" };
 
     let parts: Vec<&str> = line.split('|').collect();
@@ -353,7 +356,7 @@ fn render_inline(line: &str, caps: TerminalCaps) -> String {
                     inner.push(p);
                 }
                 if closed && !inner.is_empty() {
-                    out.push_str("\x1b[38;2;175;205;190m"); // soft teal
+                    out.push_str("\x1b[36m"); // cyan (SGR 36) — inline code
                     out.push_str(&inner);
                     out.push_str("\x1b[39m");
                 } else {
@@ -463,7 +466,9 @@ mod tests {
 
     #[test]
     fn inline_code() {
-        assert!(render_inline_line("`x`", caps()).contains("\x1b[38;2;175;205;190mx"));
+        // Inline code uses SGR 36 (cyan) from the basic-16 palette so the
+        // terminal's theme engine picks the actual RGB.
+        assert!(render_inline_line("`x`", caps()).contains("\x1b[36mx"));
     }
 
     #[test]
@@ -476,8 +481,9 @@ mod tests {
         let mut st = MdState::new();
         let out = render_line("## Hello", &mut st, caps()).unwrap();
         assert!(out.contains("Hello"));
-        // Headings now use colour-only (no bold), so SGR starts with 38.
-        assert!(out.contains("\x1b[38;2;"));
+        // Headings now use SGR bold (\x1b[1m) with default foreground —
+        // readable on both light and dark terminal themes.
+        assert!(out.contains("\x1b[1m"));
     }
 
     #[test]

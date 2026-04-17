@@ -19,10 +19,13 @@ const PAD_COL: usize = 2;
 // buffer and emit it through the single wrapping path). ──
 
 fn push_sgr_fg(buf: &mut String, caps: TerminalCaps, r: Role) {
+    use std::fmt::Write as _;
     if let Some(color) = role(caps, r) {
-        if let crossterm::style::Color::Rgb { r, g, b } = color {
-            buf.push_str(&format!("\x1b[38;2;{};{};{}m", r, g, b));
-        }
+        // Delegate to crossterm's SGR encoding — it emits the correct
+        // sequence for basic 16-color variants (e.g. Color::DarkGrey →
+        // `\x1b[90m`), 256-color, and truecolor without us having to
+        // branch per variant.
+        let _ = write!(buf, "{}", crossterm::style::SetForegroundColor(color));
     }
 }
 
@@ -237,10 +240,15 @@ impl<W: Write + Send> AnsiRenderer<W> {
             let selected = state.menu_selected_in_view == Some(i);
             self.write_left_pad();
             if selected {
+                // Reverse video paints the selected row in the terminal's
+                // own fg/bg inverted — guarantees contrast on any theme
+                // (light or dark) without us picking a specific bg colour.
                 if self.caps.colors {
-                    let _ = self.out.write_all(b"\x1b[48;2;50;70;90m");
+                    let _ = self.out.write_all(b"\x1b[7m");
                 }
-                self.set_fg(Role::ToolName);
+                if self.caps.colors {
+                    let _ = self.out.write_all(b"\x1b[1m");
+                }
                 let _ = write!(self.out, "  ▸ /{:<12}  {}", name, desc);
                 // Pad out to the box's right edge so the highlight strip
                 // aligns with the input box width.
@@ -618,15 +626,20 @@ impl<W: Write + Send> Renderer for AnsiRenderer<W> {
                 // Blank line above
                 let _ = self.out.write_all(b"\r\n");
 
-                // Stripe row: left margin, then bg-filled stripe of width stripe_w.
+                // Stripe row: left margin, then the stripe. Use reverse
+                // video so contrast works on any terminal theme; colour
+                // the leading "❯" with the accent role which remains
+                // legible since reverse flips both fg and bg.
                 self.write_left_pad();
                 if self.caps.colors {
-                    let _ = self.out.write_all(b"\x1b[48;2;28;42;62m");
+                    let _ = self.out.write_all(b"\x1b[7m");
                 }
-                self.set_fg(Role::Accent);
+                if self.caps.colors {
+                    let _ = self.out.write_all(b"\x1b[1m");
+                }
                 let _ = self.out.write_all("❯ ".as_bytes());
                 if self.caps.colors {
-                    let _ = self.out.write_all(b"\x1b[39m"); // fg only reset
+                    let _ = self.out.write_all(b"\x1b[22m");
                 }
                 let _ = self.out.write_all(safe.as_bytes());
                 for _ in 0..stripe_pad {
