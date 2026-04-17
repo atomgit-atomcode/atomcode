@@ -217,8 +217,8 @@ pub fn flush_aligned_table(rows: &[String], caps: TerminalCaps) -> String {
         }
         out.push('\n');
 
-        // After the header row (first data row), insert the separator rule.
-        if i == 0 && data_rows.len() > 1 {
+        // Separator between every pair of rows: ├─┼─┤
+        if i + 1 < data_rows.len() {
             out.push_str(&rule('├', '┼', '┤'));
             out.push('\n');
         }
