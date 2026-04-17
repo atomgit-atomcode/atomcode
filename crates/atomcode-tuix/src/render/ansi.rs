@@ -70,13 +70,15 @@ impl<W: Write + Send> AnsiRenderer<W> {
     }
 
     /// Move cursor to the bottom row of the scroll region and erase that
-    /// row. Called at the start of every permanent write so content flows
-    /// into the scroll area without colliding with the fixed footer.
-    /// Assumes terminal scroll region is (1..h-4).
+    /// row. Also re-asserts the scroll region bounds for the current
+    /// terminal height — if the terminal has been resized since setup, the
+    /// stale DECSTBM value would cause content to spill into the fixed
+    /// footer rows.
     fn move_to_scroll_bottom(&mut self) {
-        let (_, h) = crossterm::terminal::size().unwrap_or((80, 24));
-        let bottom = (h as usize).saturating_sub(4).max(1);
-        let _ = write!(self.out, "\x1b[{};1H\x1b[K", bottom);
+        let h = self.term_rows();
+        let bottom = h.saturating_sub(4).max(1);
+        // Re-emit scroll region + absolute position + erase.
+        let _ = write!(self.out, "\x1b[1;{}r\x1b[{};1H\x1b[K", bottom, bottom);
     }
 
     fn term_rows(&self) -> usize {

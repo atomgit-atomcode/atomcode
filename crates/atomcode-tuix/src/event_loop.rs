@@ -207,6 +207,7 @@ pub async fn run_loop(
     let mut buf = Buffer::new();
     let mut think = ThinkStripper::new();
     let mut menu = MenuState::new();
+    let mut model_picker: Option<ModelPicker> = None;
 
     // Draw welcome + initial prompt
     let dir_display = ctx.working_dir.to_string_lossy().to_string();
@@ -247,7 +248,7 @@ pub async fn run_loop(
             maybe = ctx.input_rx.recv() => {
                 let Some(ev) = maybe else { break };
                 handle_input(
-                    ev, &mut state, &mut buf, &mut ctx, renderer, &mut menu,
+                    ev, &mut state, &mut buf, &mut ctx, renderer, &mut menu, &mut model_picker,
                 )?;
                 // DEVIATION from plan: removed `ctx.input_rx.is_closed()` check —
                 // UnboundedReceiver has no is_closed(); recv()->None already handles closure.
@@ -312,7 +313,7 @@ pub async fn run_loop(
             maybe = ctx.input_rx.recv() => {
                 let Some(ev) = maybe else { break };
                 handle_input(
-                    ev, &mut state, &mut buf, &mut ctx, renderer, &mut menu,
+                    ev, &mut state, &mut buf, &mut ctx, renderer, &mut menu, &mut model_picker,
                 )?;
             }
 
@@ -350,26 +351,30 @@ fn handle_input(
     ctx: &mut LoopCtx,
     renderer: &mut dyn Renderer,
     menu: &mut MenuState,
+    model_picker: &mut Option<ModelPicker>,
 ) -> Result<()> {
     match ev {
         InputEvent::Paste(text) => {
-            if matches!(state.phase, UiPhase::Idle) {
+            if matches!(state.phase, UiPhase::Idle) && model_picker.is_none() {
                 buf.text.insert_str(buf.cursor, &text);
                 buf.cursor += text.len();
                 renderer.render(UiLine::InputPrompt { buf: buf.text.clone(), cursor_cols: buf.cursor_cols(), menu: None });
                 renderer.flush();
             }
         }
-        InputEvent::Eof => {
-            // Treat like Ctrl+C on empty buf
-        }
+        InputEvent::Eof => {}
         InputEvent::Key(KeyEvent { kind: KeyEventKind::Release, .. }) => {}
         InputEvent::Key(KeyEvent { code, modifiers, .. }) => {
+            // Model picker is modal — intercept keys first if active.
+            if model_picker.is_some() && matches!(state.phase, UiPhase::Idle) {
+                handle_model_picker_key(code, modifiers, buf, ctx, renderer, model_picker)?;
+                return Ok(());
+            }
             match state.phase {
-                UiPhase::Idle => handle_idle_key(code, modifiers, state, buf, ctx, renderer, menu)?,
+                UiPhase::Idle => handle_idle_key(code, modifiers, state, buf, ctx, renderer, menu, model_picker)?,
                 UiPhase::Streaming => handle_streaming_key(code, modifiers, ctx, renderer)?,
                 UiPhase::Approval => handle_approval_key(code, state, ctx, renderer)?,
-                UiPhase::Suspended => {} // ignored
+                UiPhase::Suspended => {}
             }
         }
     }
@@ -384,6 +389,29 @@ pub struct MenuState {
 impl MenuState {
     pub fn new() -> Self {
         Self { selected: 0 }
+    }
+}
+
+/// Interactive model picker: activated by `/model`. Holds the provider
+/// list sorted alphabetically with the current default first.
+pub struct ModelPicker {
+    pub providers: Vec<String>,
+    pub selected: usize,
+}
+
+impl ModelPicker {
+    pub fn open(config: &Config) -> Self {
+        let mut providers: Vec<String> = config.providers.keys().cloned().collect();
+        providers.sort();
+        // Put the current default at top for quick re-confirmation.
+        let cur = config.default_provider.clone();
+        if let Some(idx) = providers.iter().position(|p| *p == cur) {
+            providers.swap(0, idx);
+        }
+        Self {
+            providers,
+            selected: 0,
+        }
     }
 }
 
@@ -419,6 +447,7 @@ fn handle_idle_key(
     ctx: &mut LoopCtx,
     renderer: &mut dyn Renderer,
     menu: &mut MenuState,
+    model_picker: &mut Option<ModelPicker>,
 ) -> Result<()> {
     // If the menu is active (buf starts with '/'), intercept navigation keys.
     let menu_items = build_menu_items(&buf.text, &ctx.commands);
@@ -451,14 +480,9 @@ fn handle_idle_key(
                 buf.text.clear();
                 buf.cursor = 0;
                 if let Some((cmd, arg)) = parse_slash_line(&committed) {
-                    execute_slash_command(cmd, arg, state, ctx, renderer)?;
+                    execute_slash_command(cmd, arg, state, ctx, renderer, model_picker)?;
                     if matches!(state.phase, UiPhase::Idle) {
-                        renderer.render(UiLine::InputPrompt {
-                            buf: String::new(),
-                            cursor_cols: 0,
-                            menu: None,
-                        });
-                        renderer.flush();
+                        redraw_idle(buf, ctx, model_picker, renderer);
                     }
                 }
                 return Ok(());
@@ -508,14 +532,9 @@ fn handle_idle_key(
             buf.cursor = 0;
             menu.selected = 0;
             if let Some((cmd, arg)) = parse_slash_line(&line) {
-                execute_slash_command(cmd, arg, state, ctx, renderer)?;
+                execute_slash_command(cmd, arg, state, ctx, renderer, model_picker)?;
                 if matches!(state.phase, UiPhase::Idle) {
-                    renderer.render(UiLine::InputPrompt {
-                        buf: String::new(),
-                        cursor_cols: 0,
-                        menu: None,
-                    });
-                    renderer.flush();
+                    redraw_idle(buf, ctx, model_picker, renderer);
                 }
             } else {
                 ctx.history.push(line.clone());
@@ -546,6 +565,98 @@ fn redraw_with_menu(
         menu: Some(payload),
     });
     renderer.flush();
+}
+
+/// Redraw the idle footer, showing the model picker if active.
+fn redraw_idle(
+    buf: &Buffer,
+    ctx: &LoopCtx,
+    model_picker: &Option<ModelPicker>,
+    renderer: &mut dyn Renderer,
+) {
+    let payload = model_picker.as_ref().map(|p| {
+        let items: Vec<(String, String)> = p
+            .providers
+            .iter()
+            .map(|name| {
+                let desc = ctx
+                    .config
+                    .providers
+                    .get(name)
+                    .map(|c| format!("{} · {}", c.provider_type, c.model))
+                    .unwrap_or_default();
+                (name.clone(), desc)
+            })
+            .collect();
+        crate::render::MenuPayload {
+            items,
+            selected: p.selected,
+        }
+    });
+    renderer.render(UiLine::InputPrompt {
+        buf: buf.text.clone(),
+        cursor_cols: buf.cursor_cols(),
+        menu: payload,
+    });
+    renderer.flush();
+}
+
+/// Modal key handler while ModelPicker is active.
+fn handle_model_picker_key(
+    code: KeyCode,
+    _modifiers: crossterm::event::KeyModifiers,
+    buf: &mut Buffer,
+    ctx: &mut LoopCtx,
+    renderer: &mut dyn Renderer,
+    model_picker: &mut Option<ModelPicker>,
+) -> Result<()> {
+    let Some(picker) = model_picker.as_mut() else { return Ok(()); };
+    match code {
+        KeyCode::Up => {
+            picker.selected = picker.selected.saturating_sub(1);
+            redraw_idle(buf, ctx, model_picker, renderer);
+        }
+        KeyCode::Down => {
+            let max = model_picker.as_ref().unwrap().providers.len().saturating_sub(1);
+            let picker = model_picker.as_mut().unwrap();
+            if picker.selected < max {
+                picker.selected += 1;
+            }
+            redraw_idle(buf, ctx, model_picker, renderer);
+        }
+        KeyCode::Enter => {
+            let chosen = model_picker.as_ref().unwrap().providers[model_picker.as_ref().unwrap().selected].clone();
+            // Build new config with updated default_provider.
+            let mut new_config = ctx.config.clone();
+            new_config.default_provider = chosen.clone();
+            // Tell the agent to switch.
+            ctx.agent
+                .cmd_tx
+                .send(AgentCommand::ReloadConfig(new_config.clone()))
+                .ok();
+            // Update local state for the display.
+            let display = new_config
+                .providers
+                .get(&chosen)
+                .map(|p| p.model.clone())
+                .unwrap_or_else(|| chosen.clone());
+            ctx.config = new_config;
+            ctx.model_name = display.clone();
+            *model_picker = None;
+            renderer.render(UiLine::CommandOutput(format!(
+                "  Switched to {} · {}\n",
+                chosen, display
+            )));
+            renderer.flush();
+            redraw_idle(buf, ctx, model_picker, renderer);
+        }
+        KeyCode::Esc => {
+            *model_picker = None;
+            redraw_idle(buf, ctx, model_picker, renderer);
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn handle_streaming_key(
@@ -694,6 +805,7 @@ fn execute_slash_command(
     state: &mut UiState,
     ctx: &mut LoopCtx,
     renderer: &mut dyn Renderer,
+    model_picker: &mut Option<ModelPicker>,
 ) -> Result<()> {
     match cmd {
         "quit" | "exit" => {
@@ -720,8 +832,14 @@ fn execute_slash_command(
             renderer.flush();
         }
         "model" => {
-            renderer.render(UiLine::CommandOutput(format!("  Model: {}\n", ctx.model_name)));
-            renderer.flush();
+            if ctx.config.providers.is_empty() {
+                renderer.render(UiLine::CommandOutput(
+                    "  No providers configured.\n".into(),
+                ));
+                renderer.flush();
+            } else {
+                *model_picker = Some(ModelPicker::open(&ctx.config));
+            }
         }
         "status" => {
             let txt = format!(
