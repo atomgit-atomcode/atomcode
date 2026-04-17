@@ -9,6 +9,35 @@ use super::{Renderer, UiLine};
 use crate::sanitize::scrub_controls;
 use crate::terminal::TerminalCaps;
 
+// ── SGR helpers that append to a String (so arms can build a full line
+// buffer and emit it through the single wrapping path). ──
+
+fn push_sgr_fg(buf: &mut String, caps: TerminalCaps, r: Role) {
+    if let Some(color) = role(caps, r) {
+        if let crossterm::style::Color::Rgb { r, g, b } = color {
+            buf.push_str(&format!("\x1b[38;2;{};{};{}m", r, g, b));
+        }
+    }
+}
+
+fn push_sgr_fg_reset(buf: &mut String, caps: TerminalCaps) {
+    if caps.colors {
+        buf.push_str("\x1b[39m");
+    }
+}
+
+fn push_sgr_bold_on(buf: &mut String, caps: TerminalCaps) {
+    if caps.colors {
+        buf.push_str("\x1b[1m");
+    }
+}
+
+fn push_sgr_bold_off(buf: &mut String, caps: TerminalCaps) {
+    if caps.colors {
+        buf.push_str("\x1b[22m");
+    }
+}
+
 /// ANSI renderer writing to any `Write`.
 pub struct AnsiRenderer<W: Write + Send> {
     out: W,
@@ -35,6 +64,11 @@ pub struct AnsiRenderer<W: Write + Send> {
     /// Markdown parser state carried across lines within a single turn
     /// (tracks fenced-code-block enter/exit).
     md_state: crate::markdown::MdState,
+    /// Last reserved-rows count (footer size). When a later draw uses fewer
+    /// rows, the rows that transitioned from footer to scroll area must be
+    /// erased explicitly — otherwise the old box/menu bytes linger as
+    /// ghost scrollback.
+    prev_reserved: usize,
 }
 
 impl AnsiRenderer<BufWriter<Stdout>> {
@@ -54,6 +88,7 @@ impl<W: Write + Send> AnsiRenderer<W> {
             transient_cursor_from_top: 0,
             assistant_line_buf: String::new(),
             md_state: crate::markdown::MdState::new(),
+            prev_reserved: 4,
         }
     }
 
@@ -105,6 +140,9 @@ impl<W: Write + Send> AnsiRenderer<W> {
         //   menu inactive: 4 (spinner + 3-line box)
         //   menu active:   3 + menu_rows (box + menu, no spinner)
         let reserved = if menu_rows > 0 { 3 + menu_rows } else { 4 };
+        // If footer shrinks, erase rows that are transitioning from footer
+        // to scroll area — otherwise their old content ghosts in scrollback.
+        self.clear_old_footer_rows(reserved);
         let scroll_bottom = h.saturating_sub(reserved).max(1);
         let _ = write!(self.out, "\x1b[1;{}r", scroll_bottom);
 
@@ -223,13 +261,10 @@ impl<W: Write + Send> AnsiRenderer<W> {
         let h = self.term_rows();
         let w = self.term_width();
         let inner = w.saturating_sub(2);
-        // Re-establish the default scroll region every paint — terminal
-        // resizes would otherwise leave stale bounds and the bottom border
-        // could scroll out of place.
+        // Default footer = 4 reserved rows (spinner + 3-line box).
+        self.clear_old_footer_rows(4);
         let default_bottom = h.saturating_sub(4).max(1);
         let _ = write!(self.out, "\x1b[1;{}r", default_bottom);
-        // Disable autowrap for the duration of the box draw so writing ╯
-        // at column w doesn't wrap to the next line. Restored at the end.
         let _ = self.out.write_all(b"\x1b[?7l");
 
         // Row h-3: spinner or blank
@@ -318,6 +353,41 @@ impl<W: Write + Send> AnsiRenderer<W> {
         self.set_fg(Role::AccentDim);
         let _ = self.out.write_all("  │ ".as_bytes());
         self.reset();
+    }
+
+    /// Central path for emitting one logical permanent line. Wraps the
+    /// line to terminal width (SGR-aware) and writes each chunk with a
+    /// move_to_scroll_bottom + \r\n so every line lands at the scroll
+    /// region bottom — never autowraps into the reserved footer rows.
+    fn emit_wrapped_line(&mut self, line: &str) {
+        let w = self.term_width().max(1);
+        for chunk in crate::width::wrap_line_to_width(line, w) {
+            self.move_to_scroll_bottom();
+            let _ = self.out.write_all(chunk.as_bytes());
+            let _ = self.out.write_all(b"\r\n");
+        }
+    }
+
+    fn emit_blank_line(&mut self) {
+        self.move_to_scroll_bottom();
+        let _ = self.out.write_all(b"\r\n");
+    }
+
+    /// When a previous footer occupied more rows than the new one does,
+    /// the rows that transitioned from footer to scroll area still contain
+    /// the old chrome (box borders, menu items). Explicitly erase them
+    /// before the new scroll region takes effect so they don't linger as
+    /// ghost scrollback.
+    fn clear_old_footer_rows(&mut self, new_reserved: usize) {
+        let h = self.term_rows();
+        if self.prev_reserved > new_reserved {
+            let start = h.saturating_sub(self.prev_reserved).saturating_add(1);
+            let end = h.saturating_sub(new_reserved);
+            for row in start..=end {
+                let _ = write!(self.out, "\x1b[{};1H\x1b[K", row);
+            }
+        }
+        self.prev_reserved = new_reserved;
     }
 
     /// Flush any complete lines (those ending in '\n') from
@@ -567,26 +637,23 @@ impl<W: Write + Send> Renderer for AnsiRenderer<W> {
                     self.flush_assistant_remainder();
                     self.assistant_continuing = false;
                 }
-                self.clear_line_if_needed();
-                self.set_fg(Role::Muted);
-                let _ = self.out.write_all("  ▸ ".as_bytes());
-                self.reset();
-                // Tool name: pure white + bold.
-                if self.caps.colors {
-                    let _ = self.out.write_all(b"\x1b[1m");
-                }
-                self.set_fg(Role::ToolName);
-                let _ = self.out.write_all(scrub_controls(&name).as_bytes());
-                self.reset();
-                if self.caps.colors {
-                    let _ = self.out.write_all(b"\x1b[22m");
-                }
+                let mut line = String::new();
+                push_sgr_fg(&mut line, self.caps, Role::Muted);
+                line.push_str("  ▸ ");
+                push_sgr_fg_reset(&mut line, self.caps);
+                push_sgr_bold_on(&mut line, self.caps);
+                push_sgr_fg(&mut line, self.caps, Role::ToolName);
+                line.push_str(&scrub_controls(&name));
+                push_sgr_fg_reset(&mut line, self.caps);
+                push_sgr_bold_off(&mut line, self.caps);
                 if !detail.is_empty() {
-                    self.set_fg(Role::Muted);
-                    let _ = write!(self.out, "({})", scrub_controls(&detail));
-                    self.reset();
+                    push_sgr_fg(&mut line, self.caps, Role::Muted);
+                    line.push('(');
+                    line.push_str(&scrub_controls(&detail));
+                    line.push(')');
+                    push_sgr_fg_reset(&mut line, self.caps);
                 }
-                let _ = self.out.write_all(b"\r\n");
+                self.emit_wrapped_line(&line);
                 self.last_was_permanent = true;
             }
             UiLine::ToolResult { success, summary } => {
@@ -594,41 +661,42 @@ impl<W: Write + Send> Renderer for AnsiRenderer<W> {
                     self.flush_assistant_remainder();
                     self.assistant_continuing = false;
                 }
-                self.clear_line_if_needed();
-                // CC-style indent under call: "    ⎿ {summary}" with optional
-                // error ✗ glyph for visibility on failure.
-                self.set_fg(Role::Muted);
-                let _ = self.out.write_all("    ⎿ ".as_bytes());
-                self.reset();
+                let mut line = String::new();
+                push_sgr_fg(&mut line, self.caps, Role::Muted);
+                line.push_str("    ⎿ ");
+                push_sgr_fg_reset(&mut line, self.caps);
                 if !success {
-                    self.set_fg(Role::Error);
-                    let _ = self.out.write_all("✗ ".as_bytes());
-                    self.reset();
+                    push_sgr_fg(&mut line, self.caps, Role::Error);
+                    line.push_str("✗ ");
+                    push_sgr_fg_reset(&mut line, self.caps);
                 }
-                self.set_fg(Role::Muted);
-                let _ = self.out.write_all(scrub_controls(&summary).as_bytes());
-                self.reset();
-                let _ = self.out.write_all(b"\r\n");
-                // Extra blank line after each tool pair — gives paragraph
-                // spacing so scrollback isn't a wall of text.
-                let _ = self.out.write_all(b"\r\n");
+                push_sgr_fg(&mut line, self.caps, Role::Muted);
+                line.push_str(&scrub_controls(&summary));
+                push_sgr_fg_reset(&mut line, self.caps);
+                self.emit_wrapped_line(&line);
+                // Paragraph spacer.
+                self.emit_blank_line();
                 self.last_was_permanent = true;
             }
             UiLine::DiffLine { added, text } => {
-                self.clear_line_if_needed();
-                self.set_fg(if added { Role::DiffAdd } else { Role::DiffRemove });
+                let mut line = String::new();
+                push_sgr_fg(&mut line, self.caps,
+                    if added { Role::DiffAdd } else { Role::DiffRemove });
                 let sign = if added { '+' } else { '-' };
-                let _ = write!(self.out, "       {} {}", sign, scrub_controls(&text));
-                self.reset();
-                let _ = self.out.write_all(b"\r\n");
+                line.push_str(&format!("       {} {}", sign, scrub_controls(&text)));
+                push_sgr_fg_reset(&mut line, self.caps);
+                self.emit_wrapped_line(&line);
                 self.last_was_permanent = true;
             }
             UiLine::ApprovalPrompt { tool, detail } => {
-                self.clear_line_if_needed();
-                self.set_fg(Role::Warning);
-                let _ = write!(self.out, "  Allow {}({})? [Y]es / [N]o / [A]lways", scrub_controls(&tool), scrub_controls(&detail));
-                self.reset();
-                let _ = self.out.write_all(b"\r\n");
+                let mut line = String::new();
+                push_sgr_fg(&mut line, self.caps, Role::Warning);
+                line.push_str(&format!(
+                    "  Allow {}({})? [Y]es / [N]o / [A]lways",
+                    scrub_controls(&tool), scrub_controls(&detail)
+                ));
+                push_sgr_fg_reset(&mut line, self.caps);
+                self.emit_wrapped_line(&line);
                 self.last_was_permanent = true;
             }
             UiLine::Error(msg) => {
@@ -636,19 +704,20 @@ impl<W: Write + Send> Renderer for AnsiRenderer<W> {
                     self.flush_assistant_remainder();
                     self.assistant_continuing = false;
                 }
-                self.clear_line_if_needed();
-                self.set_fg(Role::Error);
-                let _ = write!(self.out, "  [Error: {}]", scrub_controls(&msg));
-                self.reset();
-                let _ = self.out.write_all(b"\r\n");
+                let mut line = String::new();
+                push_sgr_fg(&mut line, self.caps, Role::Error);
+                line.push_str(&format!("  [Error: {}]", scrub_controls(&msg)));
+                push_sgr_fg_reset(&mut line, self.caps);
+                self.emit_wrapped_line(&line);
                 self.last_was_permanent = true;
                 self.assistant_continuing = false;
             }
             UiLine::TurnCancelled => {
-                self.clear_line_if_needed();
-                self.set_fg(Role::Muted);
-                let _ = self.out.write_all("  (cancelled)\r\n".as_bytes());
-                self.reset();
+                let mut line = String::new();
+                push_sgr_fg(&mut line, self.caps, Role::Muted);
+                line.push_str("  (cancelled)");
+                push_sgr_fg_reset(&mut line, self.caps);
+                self.emit_wrapped_line(&line);
                 self.last_was_permanent = true;
                 self.assistant_continuing = false;
             }
@@ -713,13 +782,9 @@ impl<W: Write + Send> Renderer for AnsiRenderer<W> {
                 self.last_was_permanent = true;
             }
             UiLine::CommandOutput(text) => {
-                self.clear_line_if_needed();
                 let safe = scrub_controls(&text);
-                // Raw mode needs explicit CR; translate any bare \n to \r\n.
-                let crlf = safe.replace('\n', "\r\n");
-                let _ = self.out.write_all(crlf.as_bytes());
-                if !crlf.ends_with('\n') {
-                    let _ = self.out.write_all(b"\r\n");
+                for phys in safe.split('\n') {
+                    self.emit_wrapped_line(phys);
                 }
                 self.last_was_permanent = true;
             }
