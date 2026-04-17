@@ -1,4 +1,5 @@
 // crates/atomcode-tuix/src/lib.rs
+pub mod sanitize;
 pub mod terminal;
 
 use anyhow::Result;
