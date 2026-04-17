@@ -170,46 +170,62 @@ pub fn flush_aligned_table(rows: &[String], caps: TerminalCaps) -> String {
     let border_on = if caps.colors { "\x1b[38;2;130;130;140m" } else { "" };
     let border_off = if caps.colors { "\x1b[39m" } else { "" };
 
-    let mut out = String::new();
-    for (idx, row) in parsed.iter().enumerate() {
-        if is_sep(row) {
-            // Separator: ├──┼──┤
-            out.push_str(border_on);
-            out.push('├');
-            for (j, w) in col_widths.iter().enumerate() {
-                for _ in 0..(w + 2) {
-                    out.push('─');
-                }
-                if j + 1 < col_widths.len() {
-                    out.push('┼');
-                }
+    // Draw a horizontal rule row with given connector characters.
+    let rule = |left: char, mid: char, right: char| -> String {
+        let mut s = String::new();
+        s.push_str(border_on);
+        s.push(left);
+        for (j, w) in col_widths.iter().enumerate() {
+            for _ in 0..(w + 2) {
+                s.push('─');
             }
-            out.push('┤');
-            out.push_str(border_off);
-        } else {
+            if j + 1 < col_widths.len() {
+                s.push(mid);
+            }
+        }
+        s.push(right);
+        s.push_str(border_off);
+        s
+    };
+
+    let data_rows: Vec<&Vec<String>> = parsed.iter().filter(|r| !is_sep(r)).collect();
+
+    let mut out = String::new();
+    // Top border: ┌─┬─┐
+    out.push_str(&rule('┌', '┬', '┐'));
+    out.push('\n');
+
+    for (i, row) in data_rows.iter().enumerate() {
+        // Data row: │ cell │ cell │
+        out.push_str(border_on);
+        out.push('│');
+        out.push_str(border_off);
+        for (j, w) in col_widths.iter().enumerate() {
+            let cell = row.get(j).map(|s| s.as_str()).unwrap_or("");
+            let plain_w = crate::width::display_width(&strip_md_for_width(cell));
+            let rendered = render_inline(cell, caps);
+            out.push(' ');
+            out.push_str(&rendered);
+            let pad = w.saturating_sub(plain_w);
+            for _ in 0..pad {
+                out.push(' ');
+            }
+            out.push(' ');
             out.push_str(border_on);
             out.push('│');
             out.push_str(border_off);
-            for (j, w) in col_widths.iter().enumerate() {
-                let cell = row.get(j).map(|s| s.as_str()).unwrap_or("");
-                let plain_w = crate::width::display_width(&strip_md_for_width(cell));
-                let rendered = render_inline(cell, caps);
-                out.push(' ');
-                out.push_str(&rendered);
-                let pad = w.saturating_sub(plain_w);
-                for _ in 0..pad {
-                    out.push(' ');
-                }
-                out.push(' ');
-                out.push_str(border_on);
-                out.push('│');
-                out.push_str(border_off);
-            }
         }
-        if idx + 1 < parsed.len() {
+        out.push('\n');
+
+        // After the header row (first data row), insert the separator rule.
+        if i == 0 && data_rows.len() > 1 {
+            out.push_str(&rule('├', '┼', '┤'));
             out.push('\n');
         }
     }
+
+    // Bottom border: └─┴─┘
+    out.push_str(&rule('└', '┴', '┘'));
     out
 }
 
