@@ -187,6 +187,22 @@ pub fn read_input(history: &[String], commands: &[String]) -> Option<String> {
                         }
                         buf.insert(cursor, c);
                         cursor += c.len_utf8();
+
+                        // Auto-show command list when user types just "/"
+                        if buf == "/" {
+                            redraw(&buf, cursor);
+                            let mut out = stdout();
+                            let _ = execute!(out, SetForegroundColor(Color::Rgb { r: 85, g: 88, b: 100 }));
+                            for cmd in commands {
+                                let _ = write!(out, "\r\n    /{}", cmd);
+                            }
+                            let _ = execute!(out, ResetColor);
+                            let _ = write!(out, "\r\n");
+                            let _ = out.flush();
+                            // Reprint prompt with current buffer
+                            redraw(&buf, cursor);
+                            continue;
+                        }
                     }
                     _ => continue,
                 }
