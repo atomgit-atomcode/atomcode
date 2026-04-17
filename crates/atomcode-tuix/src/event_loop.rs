@@ -889,6 +889,39 @@ fn execute_slash_command(
             renderer.render(UiLine::CommandOutput(format!("  Session tokens: {}\n", state.total_tokens)));
             renderer.flush();
         }
+        "login" => {
+            run_login_flow(renderer, ctx)?;
+        }
+        "logout" => {
+            match atomcode_core::auth::logout() {
+                Ok(()) => {
+                    renderer.render(UiLine::CommandOutput(
+                        "  Signed out of AtomGit.\n".into(),
+                    ));
+                }
+                Err(e) => {
+                    renderer.render(UiLine::Error(format!("logout failed: {}", e)));
+                }
+            }
+            renderer.flush();
+        }
+        "whoami" => {
+            let txt = if let Some(auth) = atomcode_core::auth::get_stored_auth() {
+                let email = auth.user.email.as_deref().unwrap_or("—");
+                let name = auth.user.name.as_deref().unwrap_or(&auth.user.username);
+                format!(
+                    "  {} ({})\n  {}\n  auth: {}\n",
+                    name,
+                    auth.user.username,
+                    email,
+                    atomcode_core::auth::auth_file_path().display(),
+                )
+            } else {
+                "  Not signed in. Use /login to authenticate.\n".into()
+            };
+            renderer.render(UiLine::CommandOutput(txt));
+            renderer.flush();
+        }
         "cd" => {
             let new_dir = resolve_cd(arg, &ctx.working_dir, ctx.previous_dir.as_deref());
             match new_dir {
@@ -931,6 +964,57 @@ fn resolve_cd(arg: &str, cwd: &std::path::Path, prev: Option<&std::path::Path>) 
         return Err(format!("Not a directory: {}", canon.display()));
     }
     Ok(canon)
+}
+
+/// Drop out of raw mode, run the (blocking) OAuth login flow so the user
+/// can interact with the browser callback in a normal terminal, then
+/// re-enter raw mode and redraw the welcome screen. OAuth uses stdout
+/// prints + opens a browser — mixing that with our footer-managing
+/// raw-mode renderer would collide on stdin/stdout, so we suspend.
+fn run_login_flow(
+    renderer: &mut dyn Renderer,
+    ctx: &mut LoopCtx,
+) -> Result<()> {
+    // Suspend our UI so the OAuth flow owns the terminal.
+    renderer.shutdown();
+    let _ = crossterm::terminal::disable_raw_mode();
+
+    let result = atomcode_core::auth::login()
+        .and_then(|auth| atomcode_core::auth::save_auth(&auth).map(|()| auth));
+
+    // Re-enter raw mode regardless of success/failure.
+    let _ = crossterm::terminal::enable_raw_mode();
+
+    match result {
+        Ok(auth) => {
+            let dir_display = ctx.working_dir.to_string_lossy().to_string();
+            let dir_display = if let Ok(home) = std::env::var("HOME") {
+                dir_display.replacen(&home, "~", 1)
+            } else {
+                dir_display
+            };
+            renderer.render(UiLine::Welcome {
+                model: ctx.model_name.clone(),
+                working_dir: dir_display,
+            });
+            let name = auth
+                .user
+                .name
+                .as_deref()
+                .unwrap_or(&auth.user.username)
+                .to_string();
+            renderer.render(UiLine::CommandOutput(format!(
+                "  Signed in as {} ({}).\n",
+                name, auth.user.username
+            )));
+            renderer.flush();
+        }
+        Err(e) => {
+            renderer.render(UiLine::Error(format!("login failed: {}", e)));
+            renderer.flush();
+        }
+    }
+    Ok(())
 }
 
 /// Build the spinner line shown in the footer — `"{label}… · {elapsed}"`.

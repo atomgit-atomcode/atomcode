@@ -46,16 +46,19 @@ impl CommandRegistry {
 }
 
 const BUILTIN_COMMANDS: &[Command] = &[
-    Command { name: "quit",    desc: "Exit AtomCode" },
-    Command { name: "help",    desc: "Show this help" },
-    Command { name: "config",  desc: "Show config path" },
-    Command { name: "clear",   desc: "Clear screen" },
-    Command { name: "model",   desc: "Show current model" },
+    Command { name: "login",   desc: "Sign in with AtomGit OAuth" },
+    Command { name: "logout",  desc: "Sign out of AtomGit" },
+    Command { name: "whoami",  desc: "Show current logged-in user" },
+    Command { name: "model",   desc: "Switch provider / model" },
     Command { name: "status",  desc: "Show session status" },
-    Command { name: "diff",    desc: "Show git diff" },
-    Command { name: "undo",    desc: "Undo last change (not yet supported)" },
-    Command { name: "cost",    desc: "Show token cost" },
+    Command { name: "config",  desc: "Show config path" },
     Command { name: "cd",      desc: "Change working directory" },
+    Command { name: "diff",    desc: "Show git diff" },
+    Command { name: "clear",   desc: "Clear screen" },
+    Command { name: "cost",    desc: "Show token cost" },
+    Command { name: "undo",    desc: "Undo last change (not yet supported)" },
+    Command { name: "help",    desc: "Show this help" },
+    Command { name: "quit",    desc: "Exit AtomCode" },
 ];
 
 /// Parse "/cmd args..." into (cmd, args). Returns None if not a slash line.

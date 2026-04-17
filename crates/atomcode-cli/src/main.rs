@@ -31,7 +31,7 @@ use atomcode_core::tool::web_search::WebSearchTool;
 use atomcode_core::tool::web_fetch::WebFetchTool;
 use atomcode_core::tool::search_replace::SearchReplaceTool;
 
-mod auth;
+use atomcode_core::auth;
 
 /// Set to `true` at the start of `run_headless` so the panic hook and the
 /// top-level error handler can skip TUI cleanup. In headless mode we never

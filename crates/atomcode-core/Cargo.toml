@@ -16,6 +16,7 @@ tokio-stream = "0.1"
 tokio-util = "0.7"
 toml = "0.8"
 dirs = "6"
+url = "2"
 uuid = { version = "1", features = ["v4"] }
 
 # Semantic analysis
