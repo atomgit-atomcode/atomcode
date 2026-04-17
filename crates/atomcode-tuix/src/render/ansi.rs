@@ -14,11 +14,15 @@ pub struct AnsiRenderer<W: Write + Send> {
     out: W,
     caps: TerminalCaps,
     /// True if the last write was a permanent line (ends with \n).
-    /// Used to decide whether to emit `\r\x1b[K` before writing a transient.
+    /// Used to decide whether to emit clearing before writing a transient.
     last_was_permanent: bool,
     /// Tracks if we're mid-assistant-text block (next text delta should NOT
     /// re-emit the "  │ " prefix for the first line).
     assistant_continuing: bool,
+    /// Number of lines the current transient occupies (0, 1 for spinner, 3
+    /// for the bordered input box). Used by clear_transient to move the
+    /// cursor back to the top of the transient before erasing.
+    transient_lines: usize,
 }
 
 impl AnsiRenderer<BufWriter<Stdout>> {
@@ -34,6 +38,7 @@ impl<W: Write + Send> AnsiRenderer<W> {
             caps,
             last_was_permanent: true,
             assistant_continuing: false,
+            transient_lines: 0,
         }
     }
 
@@ -49,10 +54,30 @@ impl<W: Write + Send> AnsiRenderer<W> {
         }
     }
 
+    /// Clear any transient content (spinner, input box) before a permanent
+    /// write. No-op if state says nothing transient is active.
     fn clear_line_if_needed(&mut self) {
-        if !self.last_was_permanent {
+        if self.transient_lines > 1 {
+            let _ = write!(self.out, "\x1b[{}A", self.transient_lines - 1);
+            let _ = self.out.write_all(b"\r\x1b[J");
+            self.transient_lines = 0;
+        } else if !self.last_was_permanent {
+            let _ = self.out.write_all(b"\r\x1b[K");
+            self.transient_lines = 0;
+        }
+    }
+
+    /// Unconditionally reset to start of the transient area, erasing it.
+    /// Used by transient writes (spinner, ClearTransient, InputPrompt) —
+    /// they need idempotent clearing regardless of prior state.
+    fn reset_transient(&mut self) {
+        if self.transient_lines > 1 {
+            let _ = write!(self.out, "\x1b[{}A", self.transient_lines - 1);
+            let _ = self.out.write_all(b"\r\x1b[J");
+        } else {
             let _ = self.out.write_all(b"\r\x1b[K");
         }
+        self.transient_lines = 0;
     }
 
     fn write_bar_prefix(&mut self) {
@@ -61,24 +86,110 @@ impl<W: Write + Send> AnsiRenderer<W> {
         self.reset();
     }
 
+    fn term_width(&self) -> usize {
+        crossterm::terminal::size()
+            .map(|(w, _)| w as usize)
+            .unwrap_or(80)
+    }
+
     fn render_welcome(&mut self, model: &str, working_dir: &str) {
         let model = scrub_controls(model);
         let working_dir = scrub_controls(working_dir);
-        self.set_fg(Role::Brand);
-        let _ = self.out.write_all("  ◉  AtomCode\r\n".as_bytes());
-        self.reset();
-        self.set_fg(Role::Muted);
-        let _ = write!(self.out, "  {}  {}\r\n", model, working_dir);
-        self.reset();
+        // Box width: terminal width minus 2 margin cols, capped at 76.
+        let box_w = self.term_width().saturating_sub(2).min(76).max(40);
+        let inner = box_w.saturating_sub(2); // 2 border chars
+
+        // Top border: ╭───...───╮
         self.set_fg(Role::AccentDim);
-        let _ = self.out.write_all("  ".as_bytes());
-        for _ in 0..60 {
+        let _ = self.out.write_all(" ╭".as_bytes());
+        for _ in 0..inner {
             let _ = self.out.write_all("─".as_bytes());
         }
-        let _ = self.out.write_all(b"\r\n");
+        let _ = self.out.write_all("╮\r\n".as_bytes());
         self.reset();
-        self.set_fg(Role::Muted);
-        let _ = self.out.write_all("  /help for commands · Ctrl+C to cancel · Shift+Enter for newline\r\n".as_bytes());
+
+        // Row 1: ✦ Welcome to AtomCode!
+        self.draw_box_row(inner, |this| {
+            this.set_fg(Role::Brand);
+            let _ = write!(this.out, " ✦ AtomCode");
+            this.reset();
+        }, 12);
+
+        // Blank spacer
+        self.draw_blank_row(inner);
+
+        // Row: tips
+        let tips = "   /help for commands  ·  /status  ·  Ctrl+C cancel";
+        let tips_w = crate::width::display_width(tips);
+        self.draw_box_row(inner, |this| {
+            this.set_fg(Role::Muted);
+            let _ = this.out.write_all(tips.as_bytes());
+            this.reset();
+        }, tips_w);
+
+        // Blank spacer
+        self.draw_blank_row(inner);
+
+        // Row: cwd
+        let cwd_line = format!("   cwd:   {}", working_dir);
+        let cwd_w = crate::width::display_width(&cwd_line);
+        let cwd_body = crate::width::truncate_to_width(&cwd_line, inner.saturating_sub(1));
+        let cwd_body_w = crate::width::display_width(&cwd_body);
+        self.draw_box_row(inner, |this| {
+            this.set_fg(Role::Muted);
+            let _ = this.out.write_all(cwd_body.as_bytes());
+            this.reset();
+        }, cwd_body_w);
+        let _ = cwd_w;
+
+        // Row: model
+        let model_line = format!("   model: {}", model);
+        let model_body = crate::width::truncate_to_width(&model_line, inner.saturating_sub(1));
+        let model_body_w = crate::width::display_width(&model_body);
+        self.draw_box_row(inner, |this| {
+            this.set_fg(Role::Muted);
+            let _ = this.out.write_all(model_body.as_bytes());
+            this.reset();
+        }, model_body_w);
+
+        // Bottom border: ╰───...───╯
+        self.set_fg(Role::AccentDim);
+        let _ = self.out.write_all(" ╰".as_bytes());
+        for _ in 0..inner {
+            let _ = self.out.write_all("─".as_bytes());
+        }
+        let _ = self.out.write_all("╯\r\n".as_bytes());
+        self.reset();
+    }
+
+    /// Draw one bordered row: ` │ {content} {pad} │\r\n`.
+    /// `content_width` is the display width of what the caller writes.
+    fn draw_box_row(
+        &mut self,
+        inner_width: usize,
+        content: impl FnOnce(&mut Self),
+        content_width: usize,
+    ) {
+        self.set_fg(Role::AccentDim);
+        let _ = self.out.write_all(" │".as_bytes());
+        self.reset();
+        content(self);
+        let pad = inner_width.saturating_sub(content_width);
+        for _ in 0..pad {
+            let _ = self.out.write_all(b" ");
+        }
+        self.set_fg(Role::AccentDim);
+        let _ = self.out.write_all("│\r\n".as_bytes());
+        self.reset();
+    }
+
+    fn draw_blank_row(&mut self, inner_width: usize) {
+        self.set_fg(Role::AccentDim);
+        let _ = self.out.write_all(" │".as_bytes());
+        for _ in 0..inner_width {
+            let _ = self.out.write_all(b" ");
+        }
+        let _ = self.out.write_all("│\r\n".as_bytes());
         self.reset();
     }
 }
@@ -209,7 +320,8 @@ impl<W: Write + Send> Renderer for AnsiRenderer<W> {
                 self.assistant_continuing = false;
             }
             UiLine::Spinner { frame, label } => {
-                let _ = self.out.write_all(b"\r\x1b[K");
+                // Clear any prior transient (spinner 1-line OR input box 3-line).
+                self.reset_transient();
                 self.set_fg(Role::Brand);
                 let _ = write!(self.out, "  {} ", frame);
                 self.reset();
@@ -217,20 +329,66 @@ impl<W: Write + Send> Renderer for AnsiRenderer<W> {
                 let _ = self.out.write_all(scrub_controls(&label).as_bytes());
                 self.reset();
                 self.last_was_permanent = false;
+                self.transient_lines = 1;
             }
             UiLine::ClearTransient => {
-                let _ = self.out.write_all(b"\r\x1b[K");
+                self.reset_transient();
                 self.last_was_permanent = true;
             }
             UiLine::InputPrompt { buf, cursor_cols } => {
-                let _ = self.out.write_all(b"\r\x1b[K");
+                // Clear any prior transient first.
+                self.reset_transient();
+
+                let box_w = self.term_width().saturating_sub(2).min(120).max(30);
+                let inner = box_w.saturating_sub(2);
+                // Inner budget for text = inner - 1 (leading space) - 2 ("❯ ") - 1 (trailing space)
+                let text_budget = inner.saturating_sub(4);
+                let safe = scrub_controls(&buf);
+                let display_buf = crate::width::truncate_to_width(&safe, text_budget);
+                let buf_w = crate::width::display_width(&display_buf);
+                let pad = text_budget.saturating_sub(buf_w);
+
+                // Top border: ╭───╮
+                self.set_fg(Role::AccentDim);
+                let _ = self.out.write_all(" ╭".as_bytes());
+                for _ in 0..inner {
+                    let _ = self.out.write_all("─".as_bytes());
+                }
+                let _ = self.out.write_all("╮\r\n".as_bytes());
+                self.reset();
+
+                // Middle: │ ❯ {buf} {pad} │
+                self.set_fg(Role::AccentDim);
+                let _ = self.out.write_all(" │ ".as_bytes());
+                self.reset();
                 self.set_fg(Role::Accent);
                 let _ = self.out.write_all("❯ ".as_bytes());
                 self.reset();
-                let _ = self.out.write_all(scrub_controls(&buf).as_bytes());
-                let total = 2 + cursor_cols;
-                let _ = write!(self.out, "\r\x1b[{}C", total);
+                let _ = self.out.write_all(display_buf.as_bytes());
+                for _ in 0..pad {
+                    let _ = self.out.write_all(b" ");
+                }
+                self.set_fg(Role::AccentDim);
+                let _ = self.out.write_all(" │\r\n".as_bytes());
+                self.reset();
+
+                // Bottom border: ╰───╯ (no trailing \n so cursor ends on bottom row)
+                self.set_fg(Role::AccentDim);
+                let _ = self.out.write_all(" ╰".as_bytes());
+                for _ in 0..inner {
+                    let _ = self.out.write_all("─".as_bytes());
+                }
+                let _ = self.out.write_all("╯".as_bytes());
+                self.reset();
+
+                // Position cursor on the middle line at col ` │ ❯ ` + cursor_cols.
+                // We're currently at end of bottom border. Move up 1 line, to
+                // absolute column (1-indexed): 1 (space) + 1 (│) + 1 ( ) + 1 (❯) + 1 ( ) + cursor_cols.
+                let cursor_col = 5 + cursor_cols;
+                let _ = write!(self.out, "\x1b[1A\r\x1b[{}C", cursor_col);
+
                 self.last_was_permanent = false;
+                self.transient_lines = 3;
             }
             UiLine::InputCommit => {
                 let _ = self.out.write_all(b"\r\n");
@@ -255,9 +413,8 @@ impl<W: Write + Send> Renderer for AnsiRenderer<W> {
     }
 
     fn shutdown(&mut self) {
-        if !self.last_was_permanent {
-            let _ = self.out.write_all(b"\r\x1b[K");
-        }
+        // Clear any multi-line transient (input box) cleanly.
+        self.clear_line_if_needed();
         let _ = self.out.write_all(b"\r\n");
         let _ = self.out.flush();
     }
