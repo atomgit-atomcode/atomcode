@@ -75,15 +75,11 @@ pub fn render_line(line: &str, state: &mut MdState, caps: TerminalCaps) -> Optio
         return Some(prepend(body));
     }
 
-    // Horizontal rule — thin bright gray line
+    // Horizontal rule — render as a blank separator line, not a visible
+    // rule. A horizontal bar overwhelms the surrounding prose; a blank line
+    // communicates the same thematic break far more gracefully.
     if is_hrule(trimmed) {
-        let rule = "─".repeat(60);
-        let body = if caps.colors {
-            format!("\x1b[38;2;130;130;140m{}\x1b[39m", rule)
-        } else {
-            rule
-        };
-        return Some(prepend(body));
+        return Some(prepend(String::new()));
     }
 
     // Heading — brightness hierarchy without screaming bold.
@@ -506,10 +502,13 @@ mod tests {
     }
 
     #[test]
-    fn hrule_becomes_box_chars() {
+    fn hrule_becomes_blank_line() {
+        // Horizontal rules now render as blank lines (thematic break), not
+        // visible rules — a line of "─" chars is visually noisier than the
+        // blank separator it's supposed to stand in for.
         let mut st = MdState::new();
         let out = render_line("---", &mut st, caps()).unwrap();
-        assert!(out.contains("─"));
+        assert_eq!(out, "");
     }
 
     #[test]

@@ -54,6 +54,32 @@ pub fn wrap_line_to_width(line: &str, max_cols: usize) -> Vec<String> {
     chunks
 }
 
+/// Slice `s` starting at display column `start_col`, taking up to `max_cols`
+/// columns. Characters that straddle the start boundary are skipped. Used to
+/// implement horizontal scroll in the input prompt — keeps the cursor visible
+/// when the buffer exceeds the viewport width.
+pub fn slice_cols(s: &str, start_col: usize, max_cols: usize) -> String {
+    let mut col = 0usize;
+    let mut acc = String::new();
+    let mut acc_w = 0usize;
+    for c in s.chars() {
+        let w = UnicodeWidthChar::width(c).unwrap_or(0);
+        if col + w <= start_col {
+            col += w;
+        } else if col < start_col {
+            col += w;
+        } else {
+            if acc_w + w > max_cols {
+                break;
+            }
+            acc.push(c);
+            acc_w += w;
+            col += w;
+        }
+    }
+    acc
+}
+
 /// Truncate `s` so its display width is at most `max_cols`.
 /// Guaranteed to return a valid UTF-8 string that never splits a grapheme.
 pub fn truncate_to_width(s: &str, max_cols: usize) -> String {
@@ -120,5 +146,28 @@ mod tests {
     #[test]
     fn truncate_to_width_preserves_under_limit() {
         assert_eq!(truncate_to_width("hi", 10), "hi");
+    }
+
+    #[test]
+    fn slice_cols_window_midway() {
+        // "abcdefghij" start 3, width 4 → "defg"
+        assert_eq!(slice_cols("abcdefghij", 3, 4), "defg");
+    }
+
+    #[test]
+    fn slice_cols_cjk_straddle_skipped() {
+        // "你好world" = 2+2+1+1+1+1+1. start_col=1 straddles "你" → skip it.
+        // Then start at col 2 with 4 cols → "好wo".
+        assert_eq!(slice_cols("你好world", 1, 4), "好wo");
+    }
+
+    #[test]
+    fn slice_cols_past_end_empty() {
+        assert_eq!(slice_cols("abc", 10, 5), "");
+    }
+
+    #[test]
+    fn slice_cols_start_zero_matches_truncate() {
+        assert_eq!(slice_cols("hello world", 0, 5), "hello");
     }
 }

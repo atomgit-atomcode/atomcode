@@ -9,6 +9,12 @@ use super::{Renderer, UiLine};
 use crate::sanitize::scrub_controls;
 use crate::terminal::TerminalCaps;
 
+/// Outer margin in columns on both left and right of the whole UI. All
+/// content (prose, tool lines, markdown, footer box, menu) is inset by this
+/// many columns — flush-to-edge text is visually jarring, especially on
+/// wider terminals.
+const PAD_COL: usize = 2;
+
 // ── SGR helpers that append to a String (so arms can build a full line
 // buffer and emit it through the single wrapping path). ──
 
@@ -150,15 +156,19 @@ impl<W: Write + Send> AnsiRenderer<W> {
     fn draw_footer_here(&mut self) {
         let state = self.last_footer.clone();
         let w = self.term_width();
-        let inner = w.saturating_sub(2);
+        // Box occupies (w - 2*PAD_COL) columns; inner width excludes the two
+        // border cells.
+        let box_outer = w.saturating_sub(PAD_COL * 2);
+        let inner = box_outer.saturating_sub(2);
 
         let _ = self.out.write_all(b"\x1b[?7l");
         let _ = self.out.write_all(b"\r");
 
         // Row 0: spinner (if present) or blank margin.
         if let (Some(frame), Some(label)) = (state.spinner_frame.as_ref(), state.spinner_label.as_ref()) {
+            self.write_left_pad();
             self.set_fg(Role::Brand);
-            let _ = write!(self.out, " {} ", frame);
+            let _ = write!(self.out, "{} ", frame);
             self.reset();
             if self.caps.colors {
                 let _ = self.out.write_all(b"\x1b[1m");
@@ -173,6 +183,7 @@ impl<W: Write + Send> AnsiRenderer<W> {
         let _ = self.out.write_all(b"\r\n");
 
         // Row 1: box top border.
+        self.write_left_pad();
         self.set_fg(Role::Border);
         let _ = self.out.write_all("╭".as_bytes());
         for _ in 0..inner { let _ = self.out.write_all("─".as_bytes()); }
@@ -180,13 +191,24 @@ impl<W: Write + Send> AnsiRenderer<W> {
         self.reset();
         let _ = self.out.write_all(b"\r\n");
 
-        // Row 2: box middle.
+        // Row 2: box middle — horizontal scroll when cursor exceeds text budget.
+        // text_budget = inner - (leading " ❯ " = 3) - trailing space before │.
         let text_budget = inner.saturating_sub(4);
         let safe = scrub_controls(&state.buf);
-        let display_buf = crate::width::truncate_to_width(&safe, text_budget);
+        let (display_buf, rendered_cursor_col) = if text_budget == 0 {
+            (String::new(), 0usize)
+        } else if state.cursor_cols < text_budget {
+            (crate::width::truncate_to_width(&safe, text_budget), state.cursor_cols)
+        } else {
+            // Slide window so the cursor sits at the rightmost typing cell.
+            let window_start = state.cursor_cols + 1 - text_budget;
+            let windowed = crate::width::slice_cols(&safe, window_start, text_budget);
+            (windowed, text_budget - 1)
+        };
         let buf_w = crate::width::display_width(&display_buf);
         let pad = text_budget.saturating_sub(buf_w);
 
+        self.write_left_pad();
         self.set_fg(Role::Border);
         let _ = self.out.write_all("│ ".as_bytes());
         self.reset();
@@ -201,6 +223,7 @@ impl<W: Write + Send> AnsiRenderer<W> {
         let _ = self.out.write_all(b"\r\n");
 
         // Row 3: box bottom border.
+        self.write_left_pad();
         self.set_fg(Role::Border);
         let _ = self.out.write_all("╰".as_bytes());
         for _ in 0..inner { let _ = self.out.write_all("─".as_bytes()); }
@@ -212,14 +235,17 @@ impl<W: Write + Send> AnsiRenderer<W> {
         let menu_rows = state.menu_items.len().min(4);
         for (i, (name, desc)) in state.menu_items.iter().take(4).enumerate() {
             let selected = state.menu_selected_in_view == Some(i);
+            self.write_left_pad();
             if selected {
                 if self.caps.colors {
                     let _ = self.out.write_all(b"\x1b[48;2;50;70;90m");
                 }
                 self.set_fg(Role::ToolName);
                 let _ = write!(self.out, "  ▸ /{:<12}  {}", name, desc);
+                // Pad out to the box's right edge so the highlight strip
+                // aligns with the input box width.
                 let content_w = 5 + name.chars().count() + 2 + desc.chars().count();
-                let right_pad = w.saturating_sub(content_w);
+                let right_pad = box_outer.saturating_sub(content_w);
                 for _ in 0..right_pad { let _ = self.out.write_all(b" "); }
                 if self.caps.colors {
                     let _ = self.out.write_all(b"\x1b[0m");
@@ -243,8 +269,9 @@ impl<W: Write + Send> AnsiRenderer<W> {
         if up > 0 {
             let _ = write!(self.out, "\x1b[{}A", up);
         }
-        // Col 5 + cursor_cols (1-indexed; "│ ❯ " = 4 chars, so col 5 is first typing position).
-        let col = 5 + state.cursor_cols;
+        // Col = 1 (1-indexed) + PAD_COL (outer margin) + 4 ("│ ❯ ") +
+        // rendered_cursor_col (cursor offset within the visible window).
+        let col = 1 + PAD_COL + 4 + rendered_cursor_col;
         let _ = write!(self.out, "\r\x1b[{}G", col);
 
         let _ = self.out.write_all(b"\x1b[?7h");
@@ -352,18 +379,35 @@ impl<W: Write + Send> AnsiRenderer<W> {
         self.reset();
     }
 
+    /// Effective content width — terminal width minus left+right padding
+    /// and a 1-col safety margin against autowrap at the absolute rightmost
+    /// column. Always ≥ 1 so wrapping never collapses to zero.
+    fn content_width(&self) -> usize {
+        self.term_width()
+            .saturating_sub(PAD_COL * 2 + 1)
+            .max(1)
+    }
+
+    /// Emit PAD_COL spaces to the stdout at the start of a line.
+    fn write_left_pad(&mut self) {
+        for _ in 0..PAD_COL {
+            let _ = self.out.write_all(b" ");
+        }
+    }
+
     /// Central path for emitting one logical permanent line. Three steps:
     ///   1. erase_footer — remove the box/menu so content writes to a
     ///      clean area.
-    ///   2. wrap & emit content — each chunk + \r\n; terminal scrolls
-    ///      naturally when cursor passes bottom row.
+    ///   2. wrap & emit content — each chunk prefixed with left pad and
+    ///      suffixed with \r\n; terminal scrolls naturally when cursor
+    ///      passes bottom row.
     ///   3. redraw footer — blank margin + box + menu at new cursor
     ///      position (below the content we just wrote).
     fn emit_wrapped_line(&mut self, line: &str) {
         self.erase_footer();
-        // Reserve 1 col as safety margin against autowrap at col w.
-        let w = self.term_width().saturating_sub(1).max(1);
+        let w = self.content_width();
         for chunk in crate::width::wrap_line_to_width(line, w) {
+            self.write_left_pad();
             let _ = self.out.write_all(chunk.as_bytes());
             let _ = self.out.write_all(b"\r\n");
         }
@@ -400,12 +444,13 @@ impl<W: Write + Send> AnsiRenderer<W> {
         }
         // Also flush any trailing markdown block (table that ended without
         // a following non-table line). Use the pure-append render cycle:
-        // erase footer once, emit all chunks, redraw footer once.
+        // erase footer once, emit all padded chunks, redraw footer once.
         if let Some(block) = crate::markdown::finalize(&mut self.md_state, self.caps) {
             self.erase_footer();
-            let term_w = self.term_width().saturating_sub(1).max(1);
+            let w = self.content_width();
             for phys in block.split('\n') {
-                for chunk in crate::width::wrap_line_to_width(phys, term_w) {
+                for chunk in crate::width::wrap_line_to_width(phys, w) {
+                    self.write_left_pad();
                     let _ = self.out.write_all(chunk.as_bytes());
                     let _ = self.out.write_all(b"\r\n");
                 }
@@ -415,7 +460,7 @@ impl<W: Write + Send> AnsiRenderer<W> {
     }
 
     /// Write a complete assistant line: erase footer once, emit all
-    /// wrapped chunks + CRLF, redraw footer. Follows the pure-append
+    /// padded wrapped chunks + CRLF, redraw footer. Follows the pure-append
     /// render cycle so every streaming TextDelta leaves the footer in
     /// a clean, redrawn state.
     fn write_assistant_rendered_line(&mut self, content: &str) {
@@ -425,9 +470,10 @@ impl<W: Write + Send> AnsiRenderer<W> {
             return;
         };
         self.erase_footer();
-        let term_w = self.term_width().saturating_sub(1).max(1);
+        let w = self.content_width();
         for phys in rendered.split('\n') {
-            for chunk in crate::width::wrap_line_to_width(phys, term_w) {
+            for chunk in crate::width::wrap_line_to_width(phys, w) {
+                self.write_left_pad();
                 let _ = self.out.write_all(chunk.as_bytes());
                 let _ = self.out.write_all(b"\r\n");
             }
@@ -556,18 +602,24 @@ impl<W: Write + Send> Renderer for AnsiRenderer<W> {
     fn render(&mut self, line: UiLine) {
         match line {
             UiLine::Welcome { model, working_dir } => {
-                self.clear_line_if_needed();
+                self.erase_footer();
                 self.render_welcome(&model, &working_dir);
                 self.assistant_continuing = false;
+                self.redraw_footer_if_any();
             }
             UiLine::User(text) => {
-                self.clear_line_if_needed();
+                self.erase_footer();
                 let safe = scrub_controls(&text);
+                // Inner stripe width = term_w - 2*PAD_COL. "❯ " takes 2 cols.
+                let stripe_w = self.term_width().saturating_sub(PAD_COL * 2);
+                let text_w = crate::width::display_width(&safe);
+                let stripe_pad = stripe_w.saturating_sub(2 + text_w);
 
                 // Blank line above
                 let _ = self.out.write_all(b"\r\n");
 
-                // Row with subtle background, full-width padded.
+                // Stripe row: left margin, then bg-filled stripe of width stripe_w.
+                self.write_left_pad();
                 if self.caps.colors {
                     let _ = self.out.write_all(b"\x1b[48;2;28;42;62m");
                 }
@@ -577,10 +629,7 @@ impl<W: Write + Send> Renderer for AnsiRenderer<W> {
                     let _ = self.out.write_all(b"\x1b[39m"); // fg only reset
                 }
                 let _ = self.out.write_all(safe.as_bytes());
-                let content_w = 2 + crate::width::display_width(&safe);
-                let tw = self.term_width();
-                let pad = tw.saturating_sub(content_w);
-                for _ in 0..pad {
+                for _ in 0..stripe_pad {
                     let _ = self.out.write_all(b" ");
                 }
                 if self.caps.colors {
@@ -594,6 +643,7 @@ impl<W: Write + Send> Renderer for AnsiRenderer<W> {
                 self.assistant_continuing = false;
                 // New user turn → reset markdown parser state.
                 self.md_state.reset();
+                self.redraw_footer_if_any();
             }
             UiLine::AssistantText(text) => {
                 // Line-buffered: accumulate until \n boundaries, then render
@@ -691,9 +741,13 @@ impl<W: Write + Send> Renderer for AnsiRenderer<W> {
                 self.assistant_continuing = false;
             }
             UiLine::TurnComplete => {
+                // flush_assistant_remainder does erase+emit+redraw, leaving
+                // cursor at box middle. TurnSeparator (emitted right after
+                // this by the event loop) provides the blank line above
+                // itself, so we don't add one here — doing so would drift
+                // the cursor away from box middle and break the next
+                // erase_footer's "up 2" calibration.
                 self.flush_assistant_remainder();
-                self.clear_line_if_needed();
-                let _ = self.out.write_all(b"\r\n");
                 self.assistant_continuing = false;
             }
             UiLine::Spinner { frame, label } => {
@@ -717,20 +771,29 @@ impl<W: Write + Send> Renderer for AnsiRenderer<W> {
                 self.draw_footer_with_menu(&buf, cursor_cols, None, menu.as_ref());
             }
             UiLine::InputCommit => {
-                let _ = self.out.write_all(b"\r\n");
+                // No-op. The event loop now emits ClearTransient → User to
+                // commit a submission, which handles footer erasure and the
+                // user-echo row cleanly. Emitting a bare \r\n here would
+                // drift the cursor off box middle and break the next
+                // erase_footer's relative offset.
             }
             UiLine::TurnSeparator { label } => {
-                self.clear_line_if_needed();
-                let tw = self.term_width();
+                self.erase_footer();
+                let inner_w = self.term_width().saturating_sub(PAD_COL * 2);
                 let safe = scrub_controls(&label);
                 let lw = crate::width::display_width(&safe);
-                // Layout: `{dashes} {label} {dashes}` filled to full width.
-                // Reserve 2 spaces around label. Fallback if too narrow.
-                let padded = 2 + lw + 2; // ── _label_ ──
-                let remaining = tw.saturating_sub(padded);
+                // Layout: `{dashes} {label} {dashes}` filled to inner width.
+                // Reserve 1 space on each side of label. Fallback if too narrow.
+                let padded = 1 + lw + 1;
+                let remaining = inner_w.saturating_sub(padded);
                 let left = remaining / 2;
                 let right = remaining - left;
 
+                // Blank line above so the separator doesn't cling to the
+                // last line of content.
+                let _ = self.out.write_all(b"\r\n");
+
+                self.write_left_pad();
                 self.set_fg(Role::Muted);
                 for _ in 0..left { let _ = self.out.write_all("─".as_bytes()); }
                 let _ = self.out.write_all(b" ");
@@ -743,6 +806,8 @@ impl<W: Write + Send> Renderer for AnsiRenderer<W> {
                 for _ in 0..right { let _ = self.out.write_all("─".as_bytes()); }
                 self.reset();
                 let _ = self.out.write_all(b"\r\n\r\n");
+
+                self.redraw_footer_if_any();
             }
             UiLine::CommandOutput(text) => {
                 let safe = scrub_controls(&text);
