@@ -7,18 +7,22 @@ use crate::terminal::TerminalCaps;
 pub struct Palette;
 
 impl Palette {
-    pub const BRAND: Color = Color::Rgb { r: 140, g: 175, b: 230 };
-    pub const DIM_GRAY: Color = Color::Rgb { r: 85, g: 88, b: 100 };
-    pub const BLUE: Color = Color::Rgb { r: 100, g: 160, b: 240 };
-    pub const ACCENT_DIM: Color = Color::Rgb { r: 40, g: 55, b: 80 };
-    pub const SECONDARY: Color = Color::Rgb { r: 140, g: 142, b: 155 };
-    /// Bright-but-muted border colour for boxes (welcome, spinner, input).
-    /// Visible on dark terminals without screaming.
-    pub const BORDER: Color = Color::Rgb { r: 110, g: 140, b: 200 };
-    pub const WARNING: Color = Color::Rgb { r: 195, g: 155, b: 45 };
-    pub const ERROR: Color = Color::Rgb { r: 210, g: 75, b: 75 };
-    pub const GREEN: Color = Color::Rgb { r: 80, g: 200, b: 120 };
-    pub const RED: Color = Color::Rgb { r: 210, g: 75, b: 75 };
+    // Palette: no blue, no yellow. Soft lavender brand, mint accent,
+    // neutral grays for body text and borders, coral for warning.
+    pub const BRAND: Color = Color::Rgb { r: 205, g: 175, b: 215 };
+    pub const DIM_GRAY: Color = Color::Rgb { r: 105, g: 105, b: 115 };
+    pub const ACCENT: Color = Color::Rgb { r: 165, g: 210, b: 180 };
+    pub const ACCENT_DIM: Color = Color::Rgb { r: 90, g: 110, b: 100 };
+    pub const SECONDARY: Color = Color::Rgb { r: 170, g: 170, b: 180 };
+    pub const BORDER: Color = Color::Rgb { r: 130, g: 130, b: 140 };
+    pub const WARNING: Color = Color::Rgb { r: 220, g: 140, b: 140 };
+    pub const ERROR: Color = Color::Rgb { r: 220, g: 95, b: 95 };
+    pub const GREEN: Color = Color::Rgb { r: 140, g: 200, b: 140 };
+    pub const RED: Color = Color::Rgb { r: 220, g: 95, b: 95 };
+    /// Soft teal used for inline code (was yellow).
+    pub const CODE: Color = Color::Rgb { r: 175, g: 205, b: 190 };
+    /// Pure bright white — used for tool names so they stand out.
+    pub const WHITE: Color = Color::Rgb { r: 245, g: 245, b: 250 };
 }
 
 /// Semantic colour role → concrete Color, honouring NO_COLOR etc.
@@ -30,7 +34,7 @@ pub fn role(caps: TerminalCaps, role: Role) -> Option<Color> {
     Some(match role {
         Role::Brand => Palette::BRAND,
         Role::Muted => Palette::DIM_GRAY,
-        Role::Accent => Palette::BLUE,
+        Role::Accent => Palette::ACCENT,
         Role::AccentDim => Palette::ACCENT_DIM,
         Role::Secondary => Palette::SECONDARY,
         Role::Border => Palette::BORDER,
@@ -39,6 +43,7 @@ pub fn role(caps: TerminalCaps, role: Role) -> Option<Color> {
         Role::Success => Palette::GREEN,
         Role::DiffAdd => Palette::GREEN,
         Role::DiffRemove => Palette::RED,
+        Role::ToolName => Palette::WHITE,
     })
 }
 
@@ -55,6 +60,7 @@ pub enum Role {
     Success,
     DiffAdd,
     DiffRemove,
+    ToolName,
 }
 
 #[cfg(test)]

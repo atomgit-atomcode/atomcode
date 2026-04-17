@@ -317,9 +317,19 @@ impl<W: Write + Send> Renderer for AnsiRenderer<W> {
                     self.assistant_continuing = false;
                 }
                 self.clear_line_if_needed();
-                self.set_fg(Role::Secondary);
-                let _ = write!(self.out, "  ▸ {}", scrub_controls(&name));
+                self.set_fg(Role::Muted);
+                let _ = self.out.write_all("  ▸ ".as_bytes());
                 self.reset();
+                // Tool name: pure white + bold.
+                if self.caps.colors {
+                    let _ = self.out.write_all(b"\x1b[1m");
+                }
+                self.set_fg(Role::ToolName);
+                let _ = self.out.write_all(scrub_controls(&name).as_bytes());
+                self.reset();
+                if self.caps.colors {
+                    let _ = self.out.write_all(b"\x1b[22m");
+                }
                 if !detail.is_empty() {
                     self.set_fg(Role::Muted);
                     let _ = write!(self.out, "({})", scrub_controls(&detail));
@@ -347,6 +357,9 @@ impl<W: Write + Send> Renderer for AnsiRenderer<W> {
                 self.set_fg(Role::Muted);
                 let _ = self.out.write_all(scrub_controls(&summary).as_bytes());
                 self.reset();
+                let _ = self.out.write_all(b"\r\n");
+                // Extra blank line after each tool pair — gives paragraph
+                // spacing so scrollback isn't a wall of text.
                 let _ = self.out.write_all(b"\r\n");
                 self.last_was_permanent = true;
             }

@@ -37,33 +37,38 @@ pub fn render_line(line: &str, state: &mut MdState, caps: TerminalCaps) -> Optio
         return None;
     }
 
-    // Inside code block: render with muted colour, skip inline parsing
+    // Inside code block: render in a soft teal with no inline parsing
     if state.in_code_block {
         if caps.colors {
-            return Some(format!("\x1b[38;2;180;160;120m{}\x1b[39m", line));
+            return Some(format!("\x1b[38;2;175;205;190m{}\x1b[39m", line));
         }
         return Some(line.to_string());
     }
 
-    // Horizontal rule
+    // Horizontal rule — thin bright gray line
     if is_hrule(trimmed) {
         let rule = "─".repeat(60);
         if caps.colors {
-            return Some(format!("\x1b[38;2;110;140;200m{}\x1b[39m", rule));
+            return Some(format!("\x1b[38;2;130;130;140m{}\x1b[39m", rule));
         }
         return Some(rule);
     }
 
-    // Heading
+    // Table row (starts with `|`): replace pipes with box chars, thin bright line.
+    if trimmed.starts_with('|') {
+        return Some(render_table_line(trimmed, caps));
+    }
+
+    // Heading — no bold, pure colour weight by level.
     if let Some((level, rest)) = parse_heading(line) {
         let inner = render_inline(rest, caps);
         if !caps.colors {
             return Some(format!("{} {}", "#".repeat(level as usize), inner));
         }
         return Some(match level {
-            1 => format!("\x1b[1;38;2;140;175;230m▎ {}\x1b[0m", inner),
-            2 => format!("\x1b[1;38;2;100;160;240m{}\x1b[0m", inner),
-            _ => format!("\x1b[1;38;2;140;142;155m{}\x1b[0m", inner),
+            1 => format!("\x1b[38;2;205;175;215m{}\x1b[39m", inner), // brand lavender
+            2 => format!("\x1b[38;2;170;170;180m{}\x1b[39m", inner), // secondary gray
+            _ => format!("\x1b[38;2;130;130;140m{}\x1b[39m", inner), // muted border gray
         });
     }
 
@@ -75,6 +80,35 @@ pub fn render_line(line: &str, state: &mut MdState, caps: TerminalCaps) -> Optio
 
     // Default: inline-only
     Some(render_inline(line, caps))
+}
+
+/// Render a markdown table line. Converts `|` to `│` and `-` to `─`,
+/// separators get `┼` at junctions. Colour: thin bright gray border.
+fn render_table_line(line: &str, caps: TerminalCaps) -> String {
+    let is_separator = line.chars().all(|c| matches!(c, '|' | '-' | ':' | ' '));
+    let converted: String = if is_separator {
+        line.chars()
+            .map(|c| match c {
+                '|' => '┼',
+                '-' => '─',
+                other => other,
+            })
+            .collect()
+    } else {
+        line.chars()
+            .map(|c| match c {
+                '|' => '│',
+                other => other,
+            })
+            .collect()
+    };
+    if !caps.colors {
+        return converted;
+    }
+    // Emit with the border colour applied to borders only. For simplicity,
+    // colour the entire line with the border tone — content reads fine on
+    // the thin gray tint.
+    format!("\x1b[38;2;130;130;140m{}\x1b[39m", converted)
 }
 
 /// Legacy single-line inline renderer — kept for direct callers (tests,
@@ -155,7 +189,7 @@ fn render_inline(line: &str, caps: TerminalCaps) -> String {
                     inner.push(p);
                 }
                 if closed && !inner.is_empty() {
-                    out.push_str("\x1b[38;2;205;170;90m");
+                    out.push_str("\x1b[38;2;175;205;190m"); // soft teal
                     out.push_str(&inner);
                     out.push_str("\x1b[39m");
                 } else {
@@ -265,7 +299,7 @@ mod tests {
 
     #[test]
     fn inline_code() {
-        assert!(render_inline_line("`x`", caps()).contains("\x1b[38;2;205;170;90mx"));
+        assert!(render_inline_line("`x`", caps()).contains("\x1b[38;2;175;205;190mx"));
     }
 
     #[test]
@@ -278,7 +312,8 @@ mod tests {
         let mut st = MdState::new();
         let out = render_line("## Hello", &mut st, caps()).unwrap();
         assert!(out.contains("Hello"));
-        assert!(out.contains("\x1b[1;"));
+        // Headings now use colour-only (no bold), so SGR starts with 38.
+        assert!(out.contains("\x1b[38;2;"));
     }
 
     #[test]
