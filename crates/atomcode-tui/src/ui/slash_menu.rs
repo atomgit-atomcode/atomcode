@@ -13,17 +13,24 @@ pub fn render(frame: &mut Frame, input_area: Rect, menu: &SlashMenu) {
     if !menu.visible || menu.filtered.is_empty() {
         return;
     }
+    let frame_area = frame.area();
     let item_count = menu.filtered.len();
     let max_visible = 12usize;
     let visible_count = item_count.min(max_visible);
     let menu_height = (visible_count as u16 + 2).min(14); // +2 for border, max 14
     let menu_width = 64u16.min(input_area.width.saturating_sub(2));
 
-    // Position: above the input box, aligned to left
+    // Position: above the input box, clamped to frame bounds
     let menu_y = input_area.y.saturating_sub(menu_height);
     let menu_x = input_area.x + 1;
 
-    let area = Rect::new(menu_x, menu_y, menu_width, menu_height);
+    // Clamp height so the menu never exceeds the frame
+    let clamped_height = menu_height.min(frame_area.height.saturating_sub(menu_y));
+    if clamped_height < 3 || menu_width < 10 {
+        return; // Too small to render anything useful
+    }
+
+    let area = Rect::new(menu_x, menu_y, menu_width, clamped_height);
 
     // Build menu items - only visible range
     let scroll_offset = menu.scroll_offset;

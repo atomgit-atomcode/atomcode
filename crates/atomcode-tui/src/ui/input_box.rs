@@ -196,7 +196,7 @@ pub fn height(input: &InputState, terminal_height: u16, terminal_width: u16, has
     let paste_height: u16 = paste_block_count.min(5) as u16;
     let min_height = 3 + tag_height;
     let max_content: u16 = 8;
-    let max_height = (max_content + 2 + tag_height).min(terminal_height / 2);
+    let max_height = (max_content + 2 + tag_height).min(terminal_height / 2).max(min_height);
 
     let inner_width = terminal_width.saturating_sub(2 + H_PADDING * 2) as usize;
     let inner_width = inner_width.max(1);
