@@ -406,7 +406,19 @@ pub async fn run_loop(
     renderer.flush();
 
     let mut spinner_tick = tokio::time::interval(Duration::from_millis(100));
+    // Skip missed ticks instead of bursting them. If a long-running
+    // event handler (e.g. emitting 100 diff lines) delays the interval
+    // for 500ms, we don't want 5 back-to-back frames when control
+    // returns — just the latest frame.
+    spinner_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     spinner_tick.tick().await; // consume immediate tick
+
+    // Tracks when the spinner was last drawn so the opportunistic
+    // post-event pump knows whether to redraw. When the `select!` loop
+    // races between an agent-event branch that is always ready and the
+    // spinner interval, the interval branch can be starved — drawing
+    // again at the end of an event handler closes that gap.
+    let mut last_spinner_draw = std::time::Instant::now();
 
     // call_id → (tool_name, detail). Populated on ToolCallStarted, consumed
     // on ToolCallResult so the result line can show "name(detail) — summary"
@@ -445,6 +457,16 @@ pub async fn run_loop(
             maybe = ctx.agent.event_rx.recv(), if matches!(state.phase, UiPhase::Streaming) => {
                 let Some(ev) = maybe else { break };
                 handle_agent_event(ev, &mut state, &mut think, renderer, &mut pending_tools);
+                // Post-event spinner pump: each handler can stall for
+                // tens of ms (large diff rendering, markdown flushing)
+                // which starves the interval branch. Advance the spinner
+                // here if enough time has passed.
+                if matches!(state.phase, UiPhase::Streaming)
+                    && last_spinner_draw.elapsed() >= Duration::from_millis(100)
+                {
+                    draw_spinner_now(&mut state, &buf, renderer);
+                    last_spinner_draw = std::time::Instant::now();
+                }
                 // if back to IDLE, redraw prompt
                 if matches!(state.phase, UiPhase::Idle) {
                     renderer.render(UiLine::InputPrompt { buf: buf.text.clone(), cursor_cols: buf.cursor_cols(), menu: None });
@@ -454,10 +476,8 @@ pub async fn run_loop(
 
             // ── Spinner tick ──
             _ = spinner_tick.tick(), if matches!(state.phase, UiPhase::Streaming) => {
-                let frame = state.tick_spinner();
-                let label = format_spinner_label(&state);
-                renderer.render(UiLine::StreamingBox { buf: buf.text.clone(), cursor_cols: buf.cursor_cols(), frame, label });
-                renderer.flush();
+                draw_spinner_now(&mut state, &buf, renderer);
+                last_spinner_draw = std::time::Instant::now();
             }
 
             // ── Suspend ──
@@ -476,14 +496,8 @@ pub async fn run_loop(
                 state.on_resume();
                 match state.phase {
                     UiPhase::Streaming => {
-                        let frame = state.tick_spinner();
-                        let label = format_spinner_label(&state);
-                        renderer.render(UiLine::StreamingBox {
-                            buf: buf.text.clone(),
-                            cursor_cols: buf.cursor_cols(),
-                            frame,
-                            label,
-                        });
+                        draw_spinner_now(&mut state, &buf, renderer);
+                        last_spinner_draw = std::time::Instant::now();
                     }
                     _ => {
                         renderer.render(UiLine::InputPrompt {
@@ -491,9 +505,9 @@ pub async fn run_loop(
                             cursor_cols: buf.cursor_cols(),
                             menu: None,
                         });
+                        renderer.flush();
                     }
                 }
-                renderer.flush();
             }
         }
 
@@ -511,6 +525,15 @@ pub async fn run_loop(
             maybe = ctx.agent.event_rx.recv(), if matches!(state.phase, UiPhase::Streaming) => {
                 let Some(ev) = maybe else { break };
                 handle_agent_event(ev, &mut state, &mut think, renderer, &mut pending_tools);
+                // Post-event spinner pump: each handler can stall for
+                // tens of ms which starves the interval branch. Advance
+                // the spinner here if enough time has passed.
+                if matches!(state.phase, UiPhase::Streaming)
+                    && last_spinner_draw.elapsed() >= Duration::from_millis(100)
+                {
+                    draw_spinner_now(&mut state, &buf, renderer);
+                    last_spinner_draw = std::time::Instant::now();
+                }
                 if matches!(state.phase, UiPhase::Idle) {
                     renderer.render(UiLine::InputPrompt { buf: buf.text.clone(), cursor_cols: buf.cursor_cols(), menu: None });
                     renderer.flush();
@@ -519,10 +542,8 @@ pub async fn run_loop(
 
             // ── Spinner tick ──
             _ = spinner_tick.tick(), if matches!(state.phase, UiPhase::Streaming) => {
-                let frame = state.tick_spinner();
-                let label = format_spinner_label(&state);
-                renderer.render(UiLine::StreamingBox { buf: buf.text.clone(), cursor_cols: buf.cursor_cols(), frame, label });
-                renderer.flush();
+                draw_spinner_now(&mut state, &buf, renderer);
+                last_spinner_draw = std::time::Instant::now();
             }
         }
 
@@ -1205,6 +1226,25 @@ fn run_login_flow(
         }
     }
     Ok(())
+}
+
+/// Render one spinner frame. Used from both the interval-driven tick
+/// path and the opportunistic "post-event" pump path that guards
+/// against agent-event floods starving the interval tick.
+fn draw_spinner_now(
+    state: &mut UiState,
+    buf: &Buffer,
+    renderer: &mut dyn Renderer,
+) {
+    let frame = state.tick_spinner();
+    let label = format_spinner_label(state);
+    renderer.render(UiLine::StreamingBox {
+        buf: buf.text.clone(),
+        cursor_cols: buf.cursor_cols(),
+        frame,
+        label,
+    });
+    renderer.flush();
 }
 
 /// Build the spinner line shown in the footer — `"{label}… · {elapsed}"`.
