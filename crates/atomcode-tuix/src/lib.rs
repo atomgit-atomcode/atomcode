@@ -1,6 +1,7 @@
 // crates/atomcode-tuix/src/lib.rs
 pub mod sanitize;
 pub mod terminal;
+pub mod width;
 
 use anyhow::Result;
 use atomcode_core::agent::AgentHandle;
