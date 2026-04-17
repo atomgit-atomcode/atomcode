@@ -1,4 +1,5 @@
 // crates/atomcode-tuix/src/lib.rs
+pub mod commands;
 pub mod render;
 pub mod sanitize;
 pub mod terminal;
