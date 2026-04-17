@@ -29,9 +29,12 @@ pub struct AnsiRenderer<W: Write + Send> {
     transient_cursor_from_top: usize,
     /// Buffer for the current assistant-text line. Deltas accumulate here
     /// until a '\n' arrives (or AssistantLineBreak / TurnComplete fires),
-    /// at which point the complete line is rendered through the inline
+    /// at which point the complete line is rendered through the block-aware
     /// markdown renderer and written with the bar prefix.
     assistant_line_buf: String,
+    /// Markdown parser state carried across lines within a single turn
+    /// (tracks fenced-code-block enter/exit).
+    md_state: crate::markdown::MdState,
 }
 
 impl AnsiRenderer<BufWriter<Stdout>> {
@@ -50,6 +53,7 @@ impl<W: Write + Send> AnsiRenderer<W> {
             transient_lines: 0,
             transient_cursor_from_top: 0,
             assistant_line_buf: String::new(),
+            md_state: crate::markdown::MdState::new(),
         }
     }
 
@@ -127,12 +131,17 @@ impl<W: Write + Send> AnsiRenderer<W> {
     }
 
     /// Write a complete assistant line: clear any transient, emit bar
-    /// prefix + markdown-rendered content + CRLF.
+    /// prefix + markdown-rendered content + CRLF. Returns None-rendered
+    /// lines (fence markers) are elided entirely.
     fn write_assistant_rendered_line(&mut self, content: &str) {
-        // Clear spinner/box before emitting this permanent line.
+        let Some(rendered) = crate::markdown::render_line(
+            content, &mut self.md_state, self.caps,
+        ) else {
+            // Fence marker — don't emit a visible line.
+            return;
+        };
         self.clear_line_if_needed();
         self.write_bar_prefix();
-        let rendered = crate::markdown::render_inline_line(content, self.caps);
         let _ = self.out.write_all(rendered.as_bytes());
         let _ = self.out.write_all(b"\r\n");
         self.last_was_permanent = true;
@@ -257,13 +266,38 @@ impl<W: Write + Send> Renderer for AnsiRenderer<W> {
             UiLine::User(text) => {
                 self.clear_line_if_needed();
                 let safe = scrub_controls(&text);
+
+                // Blank line above
+                let _ = self.out.write_all(b"\r\n");
+
+                // Row with subtle background, full-width padded.
+                if self.caps.colors {
+                    let _ = self.out.write_all(b"\x1b[48;2;28;42;62m");
+                }
                 self.set_fg(Role::Accent);
                 let _ = self.out.write_all("❯ ".as_bytes());
-                self.reset();
+                if self.caps.colors {
+                    let _ = self.out.write_all(b"\x1b[39m"); // fg only reset
+                }
                 let _ = self.out.write_all(safe.as_bytes());
+                let content_w = 2 + crate::width::display_width(&safe);
+                let tw = self.term_width();
+                let pad = tw.saturating_sub(content_w);
+                for _ in 0..pad {
+                    let _ = self.out.write_all(b" ");
+                }
+                if self.caps.colors {
+                    let _ = self.out.write_all(b"\x1b[0m");
+                }
                 let _ = self.out.write_all(b"\r\n");
+
+                // Blank line below
+                let _ = self.out.write_all(b"\r\n");
+
                 self.last_was_permanent = true;
                 self.assistant_continuing = false;
+                // New user turn → reset markdown parser state.
+                self.md_state.reset();
             }
             UiLine::AssistantText(text) => {
                 // Line-buffered: accumulate until \n boundaries, then render
@@ -300,10 +334,16 @@ impl<W: Write + Send> Renderer for AnsiRenderer<W> {
                     self.assistant_continuing = false;
                 }
                 self.clear_line_if_needed();
-                let (icon, r) = if success { ("✓", Role::Success) } else { ("✗", Role::Error) };
-                self.set_fg(r);
-                let _ = write!(self.out, "  {} ", icon);
+                // CC-style indent under call: "    ⎿ {summary}" with optional
+                // error ✗ glyph for visibility on failure.
+                self.set_fg(Role::Muted);
+                let _ = self.out.write_all("    ⎿ ".as_bytes());
                 self.reset();
+                if !success {
+                    self.set_fg(Role::Error);
+                    let _ = self.out.write_all("✗ ".as_bytes());
+                    self.reset();
+                }
                 self.set_fg(Role::Muted);
                 let _ = self.out.write_all(scrub_controls(&summary).as_bytes());
                 self.reset();
@@ -313,7 +353,8 @@ impl<W: Write + Send> Renderer for AnsiRenderer<W> {
             UiLine::DiffLine { added, text } => {
                 self.clear_line_if_needed();
                 self.set_fg(if added { Role::DiffAdd } else { Role::DiffRemove });
-                let _ = write!(self.out, "    {}", scrub_controls(&text));
+                let sign = if added { '+' } else { '-' };
+                let _ = write!(self.out, "       {} {}", sign, scrub_controls(&text));
                 self.reset();
                 let _ = self.out.write_all(b"\r\n");
                 self.last_was_permanent = true;
@@ -584,7 +625,8 @@ mod tests {
         r.flush();
         let s = String::from_utf8(buf).unwrap();
         assert!(s.contains("\x1b["));
-        assert!(s.contains("✓"));
+        // Results now use CC-style ⎿ indent (no ✓ on success)
+        assert!(s.contains("⎿"));
         assert!(s.contains("ok"));
     }
 
