@@ -7,32 +7,48 @@ pub enum UiPhase {
     Suspended,
 }
 
-/// Rotating pool of playful "thinking" labels. Advances once per turn so
-/// consecutive turns don't show the same word.
+/// Rotating pool of "thinking" labels — CC-style playful verbs.
+/// Advances once per turn so consecutive turns vary.
 pub const THINKING_LABELS: &[&str] = &[
-    "思考中",
-    "琢磨中",
-    "推演中",
-    "酝酿中",
-    "捣鼓中",
-    "咀嚼中",
-    "盘算中",
-    "钻研中",
-    "打磨中",
-    "筹划中",
+    "Pondering",
+    "Noodling",
+    "Percolating",
+    "Brewing",
+    "Cogitating",
+    "Churning",
+    "Hatching",
+    "Marinating",
+    "Simmering",
+    "Tinkering",
+    "Mulling",
+    "Musing",
+    "Ruminating",
+    "Puttering",
+    "Fermenting",
+    "Divining",
+    "Concocting",
+    "Germinating",
+    "Whittling",
+    "Scheming",
 ];
 
-/// Rotating pool of turn-completion phrases. Used by the event loop when
-/// building the TurnSeparator that marks the end of each turn.
+/// Rotating pool of turn-completion phrases.
 pub const DONE_LABELS: &[&str] = &[
-    "搞定",
-    "完工",
-    "收工",
-    "齐活",
-    "干完啦",
-    "告一段落",
-    "稳了",
-    "成",
+    "Done",
+    "Wrapped",
+    "Baked",
+    "Shipped",
+    "Nailed",
+    "Sorted",
+    "Sealed",
+    "Delivered",
+    "Stuck the landing",
+    "Locked in",
+    "Buttoned up",
+    "Dialed in",
+    "Squared away",
+    "Cooked",
+    "Dusted",
 ];
 
 pub struct UiState {

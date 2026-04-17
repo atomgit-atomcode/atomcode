@@ -87,33 +87,49 @@ pub fn render_line(line: &str, state: &mut MdState, caps: TerminalCaps) -> Optio
     Some(render_inline(line, caps))
 }
 
-/// Render a markdown table line. Converts `|` to `│` and `-` to `─`,
-/// separators get `┼` at junctions. Colour: thin bright gray border.
+/// Render a markdown table line. Separator rows get `┼─` chars; data rows
+/// get `│` pipes with inline markdown applied inside each cell so **bold**
+/// and `code` formatting work within table content.
 fn render_table_line(line: &str, caps: TerminalCaps) -> String {
     let is_separator = line.chars().all(|c| matches!(c, '|' | '-' | ':' | ' '));
-    let converted: String = if is_separator {
-        line.chars()
+    if is_separator {
+        let converted: String = line
+            .chars()
             .map(|c| match c {
                 '|' => '┼',
                 '-' => '─',
                 other => other,
             })
-            .collect()
-    } else {
-        line.chars()
-            .map(|c| match c {
-                '|' => '│',
-                other => other,
-            })
-            .collect()
-    };
-    if !caps.colors {
-        return converted;
+            .collect();
+        return if caps.colors {
+            format!("\x1b[38;2;130;130;140m{}\x1b[39m", converted)
+        } else {
+            converted
+        };
     }
-    // Emit with the border colour applied to borders only. For simplicity,
-    // colour the entire line with the border tone — content reads fine on
-    // the thin gray tint.
-    format!("\x1b[38;2;130;130;140m{}\x1b[39m", converted)
+
+    // Data row: split on '|' (keeping leading/trailing empty cells), apply
+    // inline markdown to each cell, then rejoin with coloured `│` separators.
+    let border_on = if caps.colors { "\x1b[38;2;130;130;140m" } else { "" };
+    let border_off = if caps.colors { "\x1b[39m" } else { "" };
+
+    let parts: Vec<&str> = line.split('|').collect();
+    let mut out = String::with_capacity(line.len() + 32);
+    for (i, cell) in parts.iter().enumerate() {
+        if i > 0 || line.starts_with('|') {
+            if i == 0 && line.starts_with('|') {
+                out.push_str(border_on);
+                out.push('│');
+                out.push_str(border_off);
+                continue;
+            }
+            out.push_str(border_on);
+            out.push('│');
+            out.push_str(border_off);
+        }
+        out.push_str(&render_inline(cell, caps));
+    }
+    out
 }
 
 /// Legacy single-line inline renderer — kept for direct callers (tests,
