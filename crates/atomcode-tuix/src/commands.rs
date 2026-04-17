@@ -50,6 +50,7 @@ const BUILTIN_COMMANDS: &[Command] = &[
     Command { name: "logout",  desc: "Sign out of AtomGit" },
     Command { name: "whoami",  desc: "Show current logged-in user" },
     Command { name: "model",   desc: "Switch provider / model" },
+    Command { name: "provider", desc: "Manage providers (add / edit / delete)" },
     Command { name: "status",  desc: "Show session status" },
     Command { name: "config",  desc: "Show config path" },
     Command { name: "cd",      desc: "Change working directory" },

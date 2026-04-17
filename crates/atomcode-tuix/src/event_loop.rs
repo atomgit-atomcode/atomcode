@@ -391,6 +391,7 @@ pub async fn run_loop(
     let mut think = ThinkStripper::new();
     let mut menu = MenuState::new();
     let mut model_picker: Option<ModelPicker> = None;
+    let mut provider_wizard: Option<ProviderWizard> = None;
 
     // Draw welcome + initial prompt
     let dir_display = ctx.working_dir.to_string_lossy().to_string();
@@ -485,7 +486,8 @@ pub async fn run_loop(
             maybe = ctx.input_rx.recv() => {
                 let Some(ev) = maybe else { break };
                 handle_input(
-                    ev, &mut state, &mut buf, &mut ctx, renderer, &mut menu, &mut model_picker,
+                    ev, &mut state, &mut buf, &mut ctx, renderer, &mut menu,
+                    &mut model_picker, &mut provider_wizard,
                 )?;
             }
 
@@ -544,7 +546,8 @@ pub async fn run_loop(
             maybe = ctx.input_rx.recv() => {
                 let Some(ev) = maybe else { break };
                 handle_input(
-                    ev, &mut state, &mut buf, &mut ctx, renderer, &mut menu, &mut model_picker,
+                    ev, &mut state, &mut buf, &mut ctx, renderer, &mut menu,
+                    &mut model_picker, &mut provider_wizard,
                 )?;
             }
 
@@ -586,10 +589,14 @@ fn handle_input(
     renderer: &mut dyn Renderer,
     menu: &mut MenuState,
     model_picker: &mut Option<ModelPicker>,
+    provider_wizard: &mut Option<ProviderWizard>,
 ) -> Result<()> {
     match ev {
         InputEvent::Paste(text) => {
-            if matches!(state.phase, UiPhase::Idle) && model_picker.is_none() {
+            if matches!(state.phase, UiPhase::Idle)
+                && model_picker.is_none()
+                && provider_wizard.is_none()
+            {
                 buf.insert_paste(text);
                 redraw_idle_plain(&buf, &state, &ctx, renderer);
             }
@@ -597,13 +604,23 @@ fn handle_input(
         InputEvent::Eof => {}
         InputEvent::Key(KeyEvent { kind: KeyEventKind::Release, .. }) => {}
         InputEvent::Key(KeyEvent { code, modifiers, .. }) => {
-            // Model picker is modal — intercept keys first if active.
+            // Wizard takes priority over model picker, which takes
+            // priority over the normal phase handler.
+            if provider_wizard.is_some() && matches!(state.phase, UiPhase::Idle) {
+                handle_provider_wizard_key(
+                    code, modifiers, buf, state, ctx, renderer, provider_wizard,
+                )?;
+                return Ok(());
+            }
             if model_picker.is_some() && matches!(state.phase, UiPhase::Idle) {
                 handle_model_picker_key(code, modifiers, buf, state, ctx, renderer, model_picker)?;
                 return Ok(());
             }
             match state.phase {
-                UiPhase::Idle => handle_idle_key(code, modifiers, state, buf, ctx, renderer, menu, model_picker)?,
+                UiPhase::Idle => handle_idle_key(
+                    code, modifiers, state, buf, ctx, renderer, menu,
+                    model_picker, provider_wizard,
+                )?,
                 UiPhase::Streaming => handle_streaming_key(code, modifiers, ctx, renderer)?,
                 UiPhase::Approval => handle_approval_key(code, state, ctx, renderer)?,
                 UiPhase::Suspended => {}
@@ -647,6 +664,102 @@ impl ModelPicker {
     }
 }
 
+// ── ProviderWizard: /provider interactive flow ──
+//
+// A multi-step Q&A wizard for managing providers without leaving the
+// scrollback. Driven by `ProviderWizard` state; input goes into the
+// normal buf and Enter advances to the next step (or commits). At any
+// point Esc cancels and returns to Idle.
+//
+// Each step appends a `CommandOutput` prompt to scrollback ("Provider
+// name?"), the user types + Enter, the answer is echoed back as another
+// scrollback line, and the next step's prompt appears. Persistent
+// menus (MainMenu / DeletePick / SetDefaultPick) re-use the existing
+// `MenuPayload` footer palette.
+
+pub enum ProviderWizard {
+    /// Initial picker: Add / Edit / Delete / Set Default.
+    MainMenu { selected: usize },
+    /// Sequential `Add` prompts. `draft` accumulates answered fields.
+    Add { step: WizardStep, draft: DraftProvider },
+    /// Pick which provider to edit.
+    EditPick {
+        providers: Vec<String>,
+        selected: usize,
+    },
+    /// Editing a specific provider; same flow as `Add` but prompts show
+    /// the existing value as a hint and an empty Enter keeps it.
+    Edit {
+        target: String,
+        step: WizardStep,
+        draft: DraftProvider,
+    },
+    /// Pick which provider to delete.
+    DeletePick {
+        providers: Vec<String>,
+        selected: usize,
+    },
+    /// Final y/N confirmation before a delete actually lands.
+    DeleteConfirm { target: String },
+    /// Pick which provider to make default.
+    SetDefaultPick {
+        providers: Vec<String>,
+        selected: usize,
+    },
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum WizardStep {
+    Name,
+    ProviderType,
+    ApiKey,
+    Model,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct DraftProvider {
+    pub name: String,
+    pub provider_type: String,
+    pub api_key: String,
+    pub model: String,
+}
+
+impl DraftProvider {
+    /// Merge this draft onto `base` — empty fields leave `base` untouched.
+    /// Used by Edit so an empty Enter at a prompt keeps the existing value.
+    fn apply_onto(&self, base: &mut atomcode_core::config::provider::ProviderConfig) {
+        if !self.provider_type.is_empty() {
+            base.provider_type = self.provider_type.clone();
+        }
+        if !self.api_key.is_empty() {
+            base.api_key = Some(self.api_key.clone());
+        }
+        if !self.model.is_empty() {
+            base.model = self.model.clone();
+        }
+    }
+
+    fn into_config(self) -> atomcode_core::config::provider::ProviderConfig {
+        use atomcode_core::config::provider::{default_context_window_for, ProviderConfig};
+        let provider_type = self.provider_type.clone();
+        ProviderConfig {
+            provider_type: provider_type.clone(),
+            api_key: if self.api_key.is_empty() {
+                None
+            } else {
+                Some(self.api_key)
+            },
+            model: self.model,
+            base_url: None,
+            system_prompt: None,
+            user_agent: None,
+            context_window: default_context_window_for(&provider_type),
+            max_tokens: None,
+            ephemeral: false,
+        }
+    }
+}
+
 /// Filter the command registry by the buf's prefix after '/'. Returns the
 /// (name, desc) pairs matching, or None if menu shouldn't show (buf doesn't
 /// start with '/' or has whitespace, meaning the user has moved on to args).
@@ -680,6 +793,7 @@ fn handle_idle_key(
     renderer: &mut dyn Renderer,
     menu: &mut MenuState,
     model_picker: &mut Option<ModelPicker>,
+    provider_wizard: &mut Option<ProviderWizard>,
 ) -> Result<()> {
     // If the menu is active (buf starts with '/'), intercept navigation keys.
     let menu_items = build_menu_items(&buf.text, &ctx.commands);
@@ -712,7 +826,7 @@ fn handle_idle_key(
                 buf.text.clear();
                 buf.cursor = 0;
                 if let Some((cmd, arg)) = parse_slash_line(&committed) {
-                    execute_slash_command(cmd, arg, state, ctx, renderer, model_picker)?;
+                    execute_slash_command(cmd, arg, state, ctx, renderer, model_picker, provider_wizard)?;
                     if matches!(state.phase, UiPhase::Idle) {
                         redraw_idle(buf, state, ctx, model_picker, renderer);
                     }
@@ -758,7 +872,7 @@ fn handle_idle_key(
             buf.clear_pastes();
             menu.selected = 0;
             if let Some((cmd, arg)) = parse_slash_line(&line) {
-                execute_slash_command(cmd, arg, state, ctx, renderer, model_picker)?;
+                execute_slash_command(cmd, arg, state, ctx, renderer, model_picker, provider_wizard)?;
                 if matches!(state.phase, UiPhase::Idle) {
                     redraw_idle(buf, state, ctx, model_picker, renderer);
                 }
@@ -848,6 +962,475 @@ fn redraw_idle(
         status: build_status(state, ctx),
     });
     renderer.flush();
+}
+
+/// Redraw the footer with the wizard's current menu/prompt. Text-input
+/// steps show the normal input box; picker steps show an overlay menu
+/// built from wizard state.
+fn redraw_wizard(
+    buf: &Buffer,
+    state: &UiState,
+    ctx: &LoopCtx,
+    wizard: &ProviderWizard,
+    renderer: &mut dyn Renderer,
+) {
+    let menu = match wizard {
+        ProviderWizard::MainMenu { selected } => Some(crate::render::MenuPayload {
+            items: vec![
+                ("add".into(), "Add a new provider".into()),
+                ("edit".into(), "Edit an existing provider".into()),
+                ("delete".into(), "Remove a provider".into()),
+                ("set-default".into(), "Switch the default provider".into()),
+            ],
+            selected: *selected,
+        }),
+        ProviderWizard::EditPick { providers, selected }
+        | ProviderWizard::DeletePick { providers, selected }
+        | ProviderWizard::SetDefaultPick { providers, selected } => {
+            let items: Vec<(String, String)> = providers
+                .iter()
+                .map(|name| {
+                    let desc = ctx
+                        .config
+                        .providers
+                        .get(name)
+                        .map(|c| format!("{} · {}", c.provider_type, c.model))
+                        .unwrap_or_default();
+                    (name.clone(), desc)
+                })
+                .collect();
+            Some(crate::render::MenuPayload {
+                items,
+                selected: *selected,
+            })
+        }
+        // Q&A steps: plain input box, no overlay menu.
+        ProviderWizard::Add { .. }
+        | ProviderWizard::Edit { .. }
+        | ProviderWizard::DeleteConfirm { .. } => None,
+    };
+    renderer.render(UiLine::InputPrompt {
+        buf: buf.text.clone(),
+        cursor_byte: buf.cursor,
+        menu,
+        status: build_status(state, ctx),
+    });
+    renderer.flush();
+}
+
+/// Push a prompt line into scrollback. Steps share the same "tool-line"
+/// styling — a muted line with two-space indent — so the Q&A reads like
+/// the rest of the conversation rather than a modal popup.
+fn wizard_push(renderer: &mut dyn Renderer, text: &str) {
+    renderer.render(UiLine::CommandOutput(format!("  {}\n", text)));
+    renderer.flush();
+}
+
+/// Prompt string for the given wizard step; includes the existing value
+/// as a hint in Edit mode so the user sees what empty-Enter will keep.
+fn wizard_step_prompt(
+    step: WizardStep,
+    existing: Option<&atomcode_core::config::provider::ProviderConfig>,
+) -> String {
+    match (step, existing) {
+        (WizardStep::Name, _) => "Provider name?".into(),
+        (WizardStep::ProviderType, None) => "Type? (openai / claude / ollama)".into(),
+        (WizardStep::ProviderType, Some(p)) => {
+            format!("Type? [{}] (openai / claude / ollama, blank to keep)", p.provider_type)
+        }
+        (WizardStep::ApiKey, None) => "API key? (blank to leave unset)".into(),
+        (WizardStep::ApiKey, Some(p)) => {
+            let hint = if p.api_key.is_some() { "set — blank to keep" } else { "unset" };
+            format!("API key? [{}]", hint)
+        }
+        (WizardStep::Model, None) => "Model?".into(),
+        (WizardStep::Model, Some(p)) => format!("Model? [{}] (blank to keep)", p.model),
+    }
+}
+
+/// Push the prompt for this step into scrollback + redraw footer.
+fn show_step_prompt(
+    step: WizardStep,
+    existing: Option<&atomcode_core::config::provider::ProviderConfig>,
+    buf: &Buffer,
+    state: &UiState,
+    ctx: &LoopCtx,
+    wizard: &ProviderWizard,
+    renderer: &mut dyn Renderer,
+) {
+    wizard_push(renderer, &wizard_step_prompt(step, existing));
+    redraw_wizard(buf, state, ctx, wizard, renderer);
+}
+
+/// Validate and advance the "Add" sub-flow. Returns the next state, or
+/// None when the wizard has committed / cancelled (caller clears).
+fn advance_add(
+    draft: &mut DraftProvider,
+    step: WizardStep,
+    answer: &str,
+    renderer: &mut dyn Renderer,
+) -> Option<WizardStep> {
+    let ans = answer.trim();
+    match step {
+        WizardStep::Name => {
+            if ans.is_empty() {
+                wizard_push(renderer, "Name cannot be empty.");
+                return Some(WizardStep::Name);
+            }
+            draft.name = ans.to_string();
+            Some(WizardStep::ProviderType)
+        }
+        WizardStep::ProviderType => {
+            if !["openai", "claude", "ollama"].contains(&ans) {
+                wizard_push(renderer, "Unknown type. Choose openai / claude / ollama.");
+                return Some(WizardStep::ProviderType);
+            }
+            draft.provider_type = ans.to_string();
+            Some(WizardStep::ApiKey)
+        }
+        WizardStep::ApiKey => {
+            draft.api_key = ans.to_string();
+            Some(WizardStep::Model)
+        }
+        WizardStep::Model => {
+            if ans.is_empty() {
+                wizard_push(renderer, "Model cannot be empty.");
+                return Some(WizardStep::Model);
+            }
+            draft.model = ans.to_string();
+            None // signal: ready to commit
+        }
+    }
+}
+
+/// Validate and advance the "Edit" sub-flow. Empty answers preserve
+/// the existing value, so the caller needs `existing` to know what
+/// that value is.
+fn advance_edit(
+    draft: &mut DraftProvider,
+    step: WizardStep,
+    answer: &str,
+    renderer: &mut dyn Renderer,
+) -> Option<WizardStep> {
+    let ans = answer.trim();
+    match step {
+        WizardStep::Name => {
+            // Name isn't editable (it's the key into the provider map).
+            Some(WizardStep::ProviderType)
+        }
+        WizardStep::ProviderType => {
+            if !ans.is_empty() && !["openai", "claude", "ollama"].contains(&ans) {
+                wizard_push(renderer, "Unknown type. Choose openai / claude / ollama or leave blank.");
+                return Some(WizardStep::ProviderType);
+            }
+            draft.provider_type = ans.to_string();
+            Some(WizardStep::ApiKey)
+        }
+        WizardStep::ApiKey => {
+            draft.api_key = ans.to_string();
+            Some(WizardStep::Model)
+        }
+        WizardStep::Model => {
+            draft.model = ans.to_string();
+            None
+        }
+    }
+}
+
+/// Persist config changes and notify the daemon to pick them up.
+fn save_and_reload(ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
+    let path = Config::default_path();
+    match ctx.config.save(&path) {
+        Ok(()) => {
+            let _ = ctx
+                .agent
+                .cmd_tx
+                .send(AgentCommand::ReloadConfig(ctx.config.clone()));
+        }
+        Err(e) => {
+            renderer.render(UiLine::Error(format!("config save failed: {}", e)));
+            renderer.flush();
+        }
+    }
+}
+
+fn handle_provider_wizard_key(
+    code: KeyCode,
+    _modifiers: crossterm::event::KeyModifiers,
+    buf: &mut Buffer,
+    state: &mut UiState,
+    ctx: &mut LoopCtx,
+    renderer: &mut dyn Renderer,
+    wizard: &mut Option<ProviderWizard>,
+) -> Result<()> {
+    // Esc always cancels at any point.
+    if matches!(code, KeyCode::Esc) {
+        *wizard = None;
+        buf.text.clear();
+        buf.cursor = 0;
+        wizard_push(renderer, "(cancelled)");
+        redraw_idle_plain(buf, state, ctx, renderer);
+        return Ok(());
+    }
+
+    let current = wizard.take().expect("guarded by caller");
+    match current {
+        // ── Menu states: Up / Down / Enter navigate; others ignored. ──
+        ProviderWizard::MainMenu { mut selected } => {
+            const ITEMS: [&str; 4] = ["add", "edit", "delete", "set-default"];
+            match code {
+                KeyCode::Up => {
+                    selected = selected.saturating_sub(1);
+                    *wizard = Some(ProviderWizard::MainMenu { selected });
+                }
+                KeyCode::Down => {
+                    if selected + 1 < ITEMS.len() {
+                        selected += 1;
+                    }
+                    *wizard = Some(ProviderWizard::MainMenu { selected });
+                }
+                KeyCode::Enter => {
+                    let providers: Vec<String> = {
+                        let mut v: Vec<String> = ctx.config.providers.keys().cloned().collect();
+                        v.sort();
+                        v
+                    };
+                    match ITEMS[selected] {
+                        "add" => {
+                            let new = ProviderWizard::Add {
+                                step: WizardStep::Name,
+                                draft: DraftProvider::default(),
+                            };
+                            show_step_prompt(WizardStep::Name, None, buf, state, ctx, &new, renderer);
+                            *wizard = Some(new);
+                        }
+                        "edit" | "delete" | "set-default" if providers.is_empty() => {
+                            wizard_push(renderer, "No providers configured yet.");
+                            redraw_idle_plain(buf, state, ctx, renderer);
+                            // wizard stays None → back to normal Idle.
+                        }
+                        "edit" => {
+                            let new = ProviderWizard::EditPick { providers, selected: 0 };
+                            redraw_wizard(buf, state, ctx, &new, renderer);
+                            *wizard = Some(new);
+                        }
+                        "delete" => {
+                            let new = ProviderWizard::DeletePick { providers, selected: 0 };
+                            redraw_wizard(buf, state, ctx, &new, renderer);
+                            *wizard = Some(new);
+                        }
+                        "set-default" => {
+                            let new = ProviderWizard::SetDefaultPick { providers, selected: 0 };
+                            redraw_wizard(buf, state, ctx, &new, renderer);
+                            *wizard = Some(new);
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {
+                    *wizard = Some(ProviderWizard::MainMenu { selected });
+                }
+            }
+            if let Some(w) = wizard.as_ref() {
+                redraw_wizard(buf, state, ctx, w, renderer);
+            }
+        }
+
+        // ── Picker states share Up/Down/Enter logic. ──
+        ProviderWizard::EditPick { providers, mut selected } => {
+            match code {
+                KeyCode::Up => selected = selected.saturating_sub(1),
+                KeyCode::Down => {
+                    if selected + 1 < providers.len() {
+                        selected += 1;
+                    }
+                }
+                KeyCode::Enter => {
+                    let target = providers[selected].clone();
+                    let existing = ctx.config.providers.get(&target).cloned();
+                    let new = ProviderWizard::Edit {
+                        target: target.clone(),
+                        step: WizardStep::ProviderType, // skip Name (immutable)
+                        draft: DraftProvider::default(),
+                    };
+                    show_step_prompt(
+                        WizardStep::ProviderType,
+                        existing.as_ref(),
+                        buf,
+                        state,
+                        ctx,
+                        &new,
+                        renderer,
+                    );
+                    *wizard = Some(new);
+                    return Ok(());
+                }
+                _ => {}
+            }
+            let new = ProviderWizard::EditPick { providers, selected };
+            redraw_wizard(buf, state, ctx, &new, renderer);
+            *wizard = Some(new);
+        }
+
+        ProviderWizard::DeletePick { providers, mut selected } => {
+            match code {
+                KeyCode::Up => selected = selected.saturating_sub(1),
+                KeyCode::Down => {
+                    if selected + 1 < providers.len() {
+                        selected += 1;
+                    }
+                }
+                KeyCode::Enter => {
+                    let target = providers[selected].clone();
+                    wizard_push(renderer, &format!("Delete \"{}\"? [y/N]", target));
+                    let new = ProviderWizard::DeleteConfirm { target };
+                    redraw_wizard(buf, state, ctx, &new, renderer);
+                    *wizard = Some(new);
+                    return Ok(());
+                }
+                _ => {}
+            }
+            let new = ProviderWizard::DeletePick { providers, selected };
+            redraw_wizard(buf, state, ctx, &new, renderer);
+            *wizard = Some(new);
+        }
+
+        ProviderWizard::SetDefaultPick { providers, mut selected } => {
+            match code {
+                KeyCode::Up => selected = selected.saturating_sub(1),
+                KeyCode::Down => {
+                    if selected + 1 < providers.len() {
+                        selected += 1;
+                    }
+                }
+                KeyCode::Enter => {
+                    let chosen = providers[selected].clone();
+                    ctx.config.default_provider = chosen.clone();
+                    if let Some(p) = ctx.config.providers.get(&chosen) {
+                        ctx.model_name = p.model.clone();
+                    }
+                    save_and_reload(ctx, renderer);
+                    wizard_push(renderer, &format!("Default set to {}.", chosen));
+                    redraw_idle_plain(buf, state, ctx, renderer);
+                    return Ok(());
+                }
+                _ => {}
+            }
+            let new = ProviderWizard::SetDefaultPick { providers, selected };
+            redraw_wizard(buf, state, ctx, &new, renderer);
+            *wizard = Some(new);
+        }
+
+        ProviderWizard::DeleteConfirm { target } => {
+            match code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    ctx.config.providers.remove(&target);
+                    // If we just dropped the default, fall back to any
+                    // remaining provider or blank.
+                    if ctx.config.default_provider == target {
+                        ctx.config.default_provider = ctx
+                            .config
+                            .providers
+                            .keys()
+                            .next()
+                            .cloned()
+                            .unwrap_or_default();
+                    }
+                    save_and_reload(ctx, renderer);
+                    wizard_push(renderer, &format!("Removed \"{}\".", target));
+                }
+                _ => {
+                    wizard_push(renderer, "(kept)");
+                }
+            }
+            redraw_idle_plain(buf, state, ctx, renderer);
+        }
+
+        // ── Text-input states: Enter submits, chars edit buf, others pass through Buffer. ──
+        ProviderWizard::Add { step, mut draft } => {
+            if matches!(code, KeyCode::Enter) {
+                let answer = buf.text.clone();
+                wizard_push(renderer, &format!("  ↳ {}", answer));
+                buf.text.clear();
+                buf.cursor = 0;
+                match advance_add(&mut draft, step, &answer, renderer) {
+                    Some(next) => {
+                        let new = ProviderWizard::Add { step: next, draft };
+                        show_step_prompt(next, None, buf, state, ctx, &new, renderer);
+                        *wizard = Some(new);
+                    }
+                    None => {
+                        // All fields gathered — commit.
+                        let name = draft.name.clone();
+                        let cfg = draft.into_config();
+                        ctx.config.providers.insert(name.clone(), cfg);
+                        // If nothing was default, promote the newcomer.
+                        if ctx.config.default_provider.is_empty() {
+                            ctx.config.default_provider = name.clone();
+                        }
+                        save_and_reload(ctx, renderer);
+                        wizard_push(renderer, &format!("Added provider \"{}\".", name));
+                        redraw_idle_plain(buf, state, ctx, renderer);
+                    }
+                }
+                return Ok(());
+            }
+            // Forward other keys to the buffer so typing / editing works.
+            forward_to_buffer(code, _modifiers, buf, ctx);
+            let restored = ProviderWizard::Add { step, draft };
+            redraw_wizard(buf, state, ctx, &restored, renderer);
+            *wizard = Some(restored);
+        }
+
+        ProviderWizard::Edit { target, step, mut draft } => {
+            if matches!(code, KeyCode::Enter) {
+                let answer = buf.text.clone();
+                wizard_push(renderer, &format!("  ↳ {}", if answer.is_empty() { "(keep)" } else { answer.as_str() }));
+                buf.text.clear();
+                buf.cursor = 0;
+                match advance_edit(&mut draft, step, &answer, renderer) {
+                    Some(next) => {
+                        let existing = ctx.config.providers.get(&target).cloned();
+                        let new = ProviderWizard::Edit {
+                            target: target.clone(),
+                            step: next,
+                            draft,
+                        };
+                        show_step_prompt(next, existing.as_ref(), buf, state, ctx, &new, renderer);
+                        *wizard = Some(new);
+                    }
+                    None => {
+                        // Commit edit: merge draft onto existing provider.
+                        if let Some(existing) = ctx.config.providers.get_mut(&target) {
+                            draft.apply_onto(existing);
+                        }
+                        save_and_reload(ctx, renderer);
+                        wizard_push(renderer, &format!("Updated \"{}\".", target));
+                        redraw_idle_plain(buf, state, ctx, renderer);
+                    }
+                }
+                return Ok(());
+            }
+            forward_to_buffer(code, _modifiers, buf, ctx);
+            let restored = ProviderWizard::Edit { target, step, draft };
+            redraw_wizard(buf, state, ctx, &restored, renderer);
+            *wizard = Some(restored);
+        }
+    }
+
+    Ok(())
+}
+
+/// Route a keystroke into `Buffer::apply` so text-input wizard steps
+/// support the usual editing shortcuts (Backspace / Left / Right / etc).
+fn forward_to_buffer(
+    code: KeyCode,
+    modifiers: crossterm::event::KeyModifiers,
+    buf: &mut Buffer,
+    ctx: &LoopCtx,
+) {
+    let action = classify(code, modifiers);
+    let _ = buf.apply(action, ctx.history.entries(), &ctx.commands);
 }
 
 /// Modal key handler while ModelPicker is active.
@@ -1084,6 +1667,7 @@ fn execute_slash_command(
     ctx: &mut LoopCtx,
     renderer: &mut dyn Renderer,
     model_picker: &mut Option<ModelPicker>,
+    provider_wizard: &mut Option<ProviderWizard>,
 ) -> Result<()> {
     match cmd {
         "quit" | "exit" => {
@@ -1118,6 +1702,14 @@ fn execute_slash_command(
             } else {
                 *model_picker = Some(ModelPicker::open(&ctx.config));
             }
+        }
+        "provider" => {
+            *provider_wizard = Some(ProviderWizard::MainMenu { selected: 0 });
+            renderer.render(UiLine::CommandOutput(
+                "  Provider management — Add / Edit / Delete / Set default. Esc to cancel.\n"
+                    .into(),
+            ));
+            renderer.flush();
         }
         "status" => {
             let txt = format!(
