@@ -13,12 +13,16 @@ $RepoBase = "https://atomgit.com/atomgit_atomcode/atomcode-release/releases/down
 
 # --- detect arch ---
 $Arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture
-if ($Arch -ne "X64") {
-    Write-Host "Unsupported architecture: $Arch (only x64 is released)" -ForegroundColor Red
-    exit 1
+switch ("$Arch") {
+    "X64"   { $ArchTag = "x64" }
+    "Arm64" { $ArchTag = "arm64" }
+    default {
+        Write-Host "Unsupported architecture: $Arch (supported: x64, arm64)" -ForegroundColor Red
+        exit 1
+    }
 }
 
-$BinName = "atomcode-$Version-windows-x64.exe"
+$BinName = "atomcode-$Version-windows-$ArchTag.exe"
 $Url = "$RepoBase/$Version/$BinName"
 
 # --- pick install dir ---
