@@ -69,37 +69,112 @@ impl<W: Write + Send> AnsiRenderer<W> {
         }
     }
 
-    /// Clear any transient content (spinner, input box) before a permanent
-    /// write. No-op if state says nothing transient is active, or if we are
-    /// in the middle of streaming assistant text on the current line.
-    fn clear_line_if_needed(&mut self) {
-        if self.transient_lines > 1 {
-            if self.transient_cursor_from_top > 0 {
-                let _ = write!(self.out, "\x1b[{}A", self.transient_cursor_from_top);
-            }
-            let _ = self.out.write_all(b"\r\x1b[J");
-            self.transient_lines = 0;
-            self.transient_cursor_from_top = 0;
-        } else if !self.last_was_permanent && !self.assistant_continuing {
-            let _ = self.out.write_all(b"\r\x1b[K");
-            self.transient_lines = 0;
-            self.transient_cursor_from_top = 0;
-        }
+    /// Move cursor to the bottom row of the scroll region and erase that
+    /// row. Called at the start of every permanent write so content flows
+    /// into the scroll area without colliding with the fixed footer.
+    /// Assumes terminal scroll region is (1..h-4).
+    fn move_to_scroll_bottom(&mut self) {
+        let (_, h) = crossterm::terminal::size().unwrap_or((80, 24));
+        let bottom = (h as usize).saturating_sub(4).max(1);
+        let _ = write!(self.out, "\x1b[{};1H\x1b[K", bottom);
     }
 
-    /// Unconditionally reset to start of the transient area, erasing it.
-    /// Used by transient writes (spinner, ClearTransient, InputPrompt).
-    fn reset_transient(&mut self) {
-        if self.transient_lines > 1 {
-            if self.transient_cursor_from_top > 0 {
-                let _ = write!(self.out, "\x1b[{}A", self.transient_cursor_from_top);
+    fn term_rows(&self) -> usize {
+        crossterm::terminal::size().map(|(_, h)| h as usize).unwrap_or(24)
+    }
+
+    /// Redraw the fixed bottom footer (rows h-3..h). Optional `spinner`
+    /// shown on row h-3; box on rows h-2, h-1, h. Leaves cursor on the
+    /// middle row at col 4 + cursor_cols so the user can see where they
+    /// are typing.
+    fn draw_footer(
+        &mut self,
+        buf: &str,
+        cursor_cols: usize,
+        spinner: Option<(&str, &str)>,
+    ) {
+        let h = self.term_rows();
+        let w = self.term_width();
+        let inner = w.saturating_sub(2);
+
+        // Row h-3: spinner or blank
+        let _ = write!(self.out, "\x1b[{};1H\x1b[K", h.saturating_sub(3));
+        if let Some((frame, label)) = spinner {
+            self.set_fg(Role::Brand);
+            let _ = write!(self.out, " {} ", frame);
+            self.reset();
+            if self.caps.colors {
+                let _ = self.out.write_all(b"\x1b[1m");
             }
-            let _ = self.out.write_all(b"\r\x1b[J");
-        } else {
-            let _ = self.out.write_all(b"\r\x1b[K");
+            self.set_fg(Role::Secondary);
+            let _ = self.out.write_all(scrub_controls(label).as_bytes());
+            self.reset();
+            if self.caps.colors {
+                let _ = self.out.write_all(b"\x1b[22m");
+            }
         }
-        self.transient_lines = 0;
-        self.transient_cursor_from_top = 0;
+
+        // Row h-2: top border
+        let _ = write!(self.out, "\x1b[{};1H\x1b[K", h.saturating_sub(2));
+        self.set_fg(Role::Border);
+        let _ = self.out.write_all("╭".as_bytes());
+        for _ in 0..inner {
+            let _ = self.out.write_all("─".as_bytes());
+        }
+        let _ = self.out.write_all("╮".as_bytes());
+        self.reset();
+
+        // Row h-1: middle with ❯ + buf
+        let _ = write!(self.out, "\x1b[{};1H\x1b[K", h.saturating_sub(1));
+        self.set_fg(Role::Border);
+        let _ = self.out.write_all("│ ".as_bytes());
+        self.reset();
+        self.set_fg(Role::Accent);
+        let _ = self.out.write_all("❯ ".as_bytes());
+        self.reset();
+        let text_budget = inner.saturating_sub(4);
+        let safe = scrub_controls(buf);
+        let display_buf = crate::width::truncate_to_width(&safe, text_budget);
+        let buf_w = crate::width::display_width(&display_buf);
+        let pad = text_budget.saturating_sub(buf_w);
+        let _ = self.out.write_all(display_buf.as_bytes());
+        for _ in 0..pad {
+            let _ = self.out.write_all(b" ");
+        }
+        self.set_fg(Role::Border);
+        let _ = self.out.write_all(" │".as_bytes());
+        self.reset();
+
+        // Row h: bottom border
+        let _ = write!(self.out, "\x1b[{};1H\x1b[K", h);
+        self.set_fg(Role::Border);
+        let _ = self.out.write_all("╰".as_bytes());
+        for _ in 0..inner {
+            let _ = self.out.write_all("─".as_bytes());
+        }
+        let _ = self.out.write_all("╯".as_bytes());
+        self.reset();
+
+        // Cursor on middle row at col 4 + cursor_cols (1-indexed).
+        let cursor_col = 4 + cursor_cols + 1;
+        let _ = write!(
+            self.out,
+            "\x1b[{};{}H",
+            h.saturating_sub(1),
+            cursor_col
+        );
+    }
+
+    // Shim so existing call sites keep compiling. Scroll-region mode makes
+    // transient clearing largely unnecessary, but permanent arms still call
+    // these before writing — route them to move_to_scroll_bottom.
+    fn clear_line_if_needed(&mut self) {
+        if !self.assistant_continuing {
+            self.move_to_scroll_bottom();
+        }
+    }
+    fn reset_transient(&mut self) {
+        self.move_to_scroll_bottom();
     }
 
     fn write_bar_prefix(&mut self) {
@@ -409,147 +484,27 @@ impl<W: Write + Send> Renderer for AnsiRenderer<W> {
                 self.assistant_continuing = false;
             }
             UiLine::Spinner { frame, label } => {
-                // Legacy single-line spinner. During Streaming the event
-                // loop uses StreamingBox instead.
+                // Legacy path — map to the fixed footer with spinner.
                 if self.assistant_continuing {
                     return;
                 }
-                self.reset_transient();
-                self.set_fg(Role::Brand);
-                let _ = write!(self.out, "  {} ", frame);
-                self.reset();
-                self.set_fg(Role::Muted);
-                let _ = self.out.write_all(scrub_controls(&label).as_bytes());
-                self.reset();
+                self.draw_footer("", 0, Some((frame, &label)));
                 self.last_was_permanent = false;
-                self.transient_lines = 1;
-                self.transient_cursor_from_top = 0;
             }
             UiLine::StreamingBox { buf, cursor_cols, frame, label } => {
-                // Don't paint over in-flight assistant text — the text IS
-                // the progress signal.
                 if self.assistant_continuing {
                     return;
                 }
-                self.reset_transient();
-
-                // Line 0: spinner " ⠋ Thinking..."
-                self.set_fg(Role::Brand);
-                let _ = write!(self.out, " {} ", frame);
-                self.reset();
-                // Label: brighter (Secondary) + bold for slight emphasis.
-                if self.caps.colors {
-                    let _ = self.out.write_all(b"\x1b[1m");
-                }
-                self.set_fg(Role::Secondary);
-                let _ = self.out.write_all(scrub_controls(&label).as_bytes());
-                self.reset();
-                if self.caps.colors {
-                    let _ = self.out.write_all(b"\x1b[22m");
-                }
-                let _ = self.out.write_all(b"\r\n");
-
-                // Lines 1-3: the normal input box showing buf (even though
-                // the user isn't typing, show them what they have queued).
-                let box_w = self.term_width().max(30);
-                let inner = box_w.saturating_sub(2);
-                let text_budget = inner.saturating_sub(4);
-                let safe = scrub_controls(&buf);
-                let display_buf = crate::width::truncate_to_width(&safe, text_budget);
-                let buf_w = crate::width::display_width(&display_buf);
-                let pad = text_budget.saturating_sub(buf_w);
-
-                self.set_fg(Role::Border);
-                let _ = self.out.write_all("╭".as_bytes());
-                for _ in 0..inner { let _ = self.out.write_all("─".as_bytes()); }
-                let _ = self.out.write_all("╮\r\n".as_bytes());
-                self.reset();
-
-                self.set_fg(Role::Border);
-                let _ = self.out.write_all("│ ".as_bytes());
-                self.reset();
-                self.set_fg(Role::Accent);
-                let _ = self.out.write_all("❯ ".as_bytes());
-                self.reset();
-                let _ = self.out.write_all(display_buf.as_bytes());
-                for _ in 0..pad { let _ = self.out.write_all(b" "); }
-                self.set_fg(Role::Border);
-                let _ = self.out.write_all(" │\r\n".as_bytes());
-                self.reset();
-
-                self.set_fg(Role::Border);
-                let _ = self.out.write_all("╰".as_bytes());
-                for _ in 0..inner { let _ = self.out.write_all("─".as_bytes()); }
-                let _ = self.out.write_all("╯".as_bytes());
-                self.reset();
-
-                // Cursor on middle row of the box = row 2 from top of transient
-                // (row 0 = spinner, row 1 = top border, row 2 = middle, row 3 = bottom).
-                let cursor_col = 4 + cursor_cols;
-                let _ = write!(self.out, "\x1b[1A\r\x1b[{}C", cursor_col);
-                let _ = cursor_col;
-
+                self.draw_footer(&buf, cursor_cols, Some((frame, &label)));
                 self.last_was_permanent = false;
-                self.transient_lines = 4;
-                self.transient_cursor_from_top = 2;
             }
             UiLine::ClearTransient => {
-                self.reset_transient();
-                self.last_was_permanent = true;
+                // Footer is fixed at absolute bottom rows — nothing to clear.
+                // Kept as no-op for event_loop compatibility.
             }
             UiLine::InputPrompt { buf, cursor_cols } => {
-                // Clear any prior transient first.
-                self.reset_transient();
-
-                // Full-width box, flush left.
-                let box_w = self.term_width().max(30);
-                let inner = box_w.saturating_sub(2);
-                // Inner layout: "│ ❯ {buf}{pad} │"
-                //  col 0 (│) 1 (sp) 2 (❯) 3 (sp) 4... text ... (sp) (│)
-                let text_budget = inner.saturating_sub(4);
-                let safe = scrub_controls(&buf);
-                let display_buf = crate::width::truncate_to_width(&safe, text_budget);
-                let buf_w = crate::width::display_width(&display_buf);
-                let pad = text_budget.saturating_sub(buf_w);
-
-                self.set_fg(Role::Border);
-                let _ = self.out.write_all("╭".as_bytes());
-                for _ in 0..inner {
-                    let _ = self.out.write_all("─".as_bytes());
-                }
-                let _ = self.out.write_all("╮\r\n".as_bytes());
-                self.reset();
-
-                self.set_fg(Role::Border);
-                let _ = self.out.write_all("│ ".as_bytes());
-                self.reset();
-                self.set_fg(Role::Accent);
-                let _ = self.out.write_all("❯ ".as_bytes());
-                self.reset();
-                let _ = self.out.write_all(display_buf.as_bytes());
-                for _ in 0..pad {
-                    let _ = self.out.write_all(b" ");
-                }
-                self.set_fg(Role::Border);
-                let _ = self.out.write_all(" │\r\n".as_bytes());
-                self.reset();
-
-                self.set_fg(Role::Border);
-                let _ = self.out.write_all("╰".as_bytes());
-                for _ in 0..inner {
-                    let _ = self.out.write_all("─".as_bytes());
-                }
-                let _ = self.out.write_all("╯".as_bytes());
-                self.reset();
-
-                // Position cursor on middle line at col after "│ ❯ " = 4, plus cursor_cols.
-                // Use \r then forward N via \x1b[{N}C.
-                let cursor_col = 4 + cursor_cols;
-                let _ = write!(self.out, "\x1b[1A\r\x1b[{}C", cursor_col);
-
+                self.draw_footer(&buf, cursor_cols, None);
                 self.last_was_permanent = false;
-                self.transient_lines = 3;
-                self.transient_cursor_from_top = 1;
             }
             UiLine::InputCommit => {
                 let _ = self.out.write_all(b"\r\n");
@@ -650,29 +605,34 @@ mod tests {
         let s = String::from_utf8(buf).unwrap();
         assert!(s.contains("▸ read_file(lib.rs)"));
         assert!(s.ends_with('\n'));
-        assert!(!s.contains("\x1b["));
+        // Scroll-region mode uses \x1b[{row};1H positioning, which emits
+        // \x1b[ sequences even in NO_COLOR mode. Verify no SGR fg/bg
+        // escapes leaked in instead.
+        assert!(!s.contains("\x1b[38;"));
+        assert!(!s.contains("\x1b[48;"));
     }
 
     #[test]
-    fn spinner_overwrites_with_cr_and_clear() {
+    fn spinner_draws_footer() {
         let mut buf = Vec::new();
         let mut r = AnsiRenderer::with_writer(&mut buf, caps_no_color());
-        r.render(UiLine::Spinner { frame: "⠋", label: "Thinking...".into() });
+        r.render(UiLine::Spinner { frame: "⠋", label: "Pondering".into() });
         r.flush();
         let s = String::from_utf8(buf).unwrap();
-        assert!(s.starts_with("\r\x1b[K"));
         assert!(s.contains("⠋"));
-        assert!(s.contains("Thinking..."));
-        assert!(!s.ends_with('\n'));
+        assert!(s.contains("Pondering"));
+        // Footer box corners present
+        assert!(s.contains("╭"));
+        assert!(s.contains("╰"));
     }
 
     #[test]
-    fn clear_transient_emits_erase_line() {
+    fn clear_transient_is_noop() {
         let mut buf = Vec::new();
         let mut r = AnsiRenderer::with_writer(&mut buf, caps_no_color());
         r.render(UiLine::ClearTransient);
         r.flush();
-        assert_eq!(buf, b"\r\x1b[K");
+        assert!(buf.is_empty(), "ClearTransient should be a no-op in scroll-region mode");
     }
 
     #[test]
@@ -680,12 +640,10 @@ mod tests {
         let mut buf = Vec::new();
         let mut r = AnsiRenderer::with_writer(&mut buf, caps_no_color());
         r.render(UiLine::AssistantText("hello\nworld".into()));
-        // Under line-buffered rendering, "hello\n" flushes as a complete
-        // line; "world" stays buffered until an explicit line break arrives.
         r.render(UiLine::AssistantLineBreak);
         r.flush();
         let s = String::from_utf8(buf).unwrap();
-        assert!(s.starts_with("  │ hello"));
+        assert!(s.contains("  │ hello"));
         assert!(s.contains("  │ world"));
     }
 
@@ -720,7 +678,7 @@ mod tests {
         r.render(UiLine::AssistantText("done\n".into()));
         r.flush();
         let s = String::from_utf8(buf).unwrap();
-        assert!(s.starts_with("  │ done\r\n"));
+        assert!(s.contains("  │ done\r\n"));
         // No dangling bar prefix after the final newline
         assert!(!s.trim_end().ends_with("│"));
     }

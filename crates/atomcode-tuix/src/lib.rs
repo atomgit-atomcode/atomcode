@@ -26,16 +26,22 @@ use crate::input::reader;
 use crate::render::{ansi::AnsiRenderer, plain::PlainRenderer, Renderer};
 use crate::terminal::TerminalCaps;
 
-/// RAII guard: enables raw mode + bracketed paste on construction,
-/// unconditionally disables both on drop (even during panic).
+/// RAII guard: enables raw mode + bracketed paste + scroll region on
+/// construction, unconditionally restores all three on drop (even during panic).
 struct TerminalGuard {
     raw_enabled: bool,
     paste_enabled: bool,
+    scroll_region_set: bool,
 }
 
 impl TerminalGuard {
     fn activate(caps: TerminalCaps) -> Result<Self> {
-        let mut g = Self { raw_enabled: false, paste_enabled: false };
+        use std::io::Write as _;
+        let mut g = Self {
+            raw_enabled: false,
+            paste_enabled: false,
+            scroll_region_set: false,
+        };
         if caps.raw_mode {
             crossterm::terminal::enable_raw_mode()?;
             g.raw_enabled = true;
@@ -44,12 +50,36 @@ impl TerminalGuard {
             execute!(io::stdout(), EnableBracketedPaste)?;
             g.paste_enabled = true;
         }
+        // Reserve the bottom 4 rows for the input footer (spinner + 3-line
+        // input box). Everything else scrolls within the top region.
+        if caps.tty {
+            let (_, h) = crossterm::terminal::size().unwrap_or((80, 24));
+            let bottom = (h as usize).saturating_sub(4);
+            if bottom >= 5 {
+                let stdout = io::stdout();
+                let mut out = stdout.lock();
+                // Clear screen + home, then set scroll region.
+                let _ = write!(out, "\x1b[2J\x1b[H\x1b[1;{}r", bottom);
+                let _ = out.flush();
+                g.scroll_region_set = true;
+            }
+        }
         Ok(g)
     }
 }
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
+        use std::io::Write as _;
+        if self.scroll_region_set {
+            let stdout = io::stdout();
+            let mut out = stdout.lock();
+            // Reset scroll region + move cursor below the footer area so
+            // the next shell prompt doesn't land inside leftover chrome.
+            let (_, h) = crossterm::terminal::size().unwrap_or((80, 24));
+            let _ = write!(out, "\x1b[r\x1b[{};1H\r\n", h);
+            let _ = out.flush();
+        }
         if self.paste_enabled {
             let _ = execute!(io::stdout(), DisableBracketedPaste);
         }
