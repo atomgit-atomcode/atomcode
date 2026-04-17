@@ -244,58 +244,9 @@ pub fn read_approval() -> char {
 // ─── Internal helpers ───
 
 fn redraw(buf: &str, cursor: usize) {
-    let mut out = stdout();
-    let lines: Vec<&str> = buf.split('\n').collect();
-    let num_lines = lines.len();
-
-    // Figure out which line the cursor is on and the column offset
-    let (cursor_line, cursor_col) = cursor_position(buf, cursor);
-
-    // Move up to the first line if multi-line (we may have printed multiple lines before)
-    // We track how many lines were printed; for simplicity, move up (num_lines - 1) lines
-    // from the last printed position. Since we always end on the last line after printing,
-    // we move up from there.
-    if num_lines > 1 {
-        // Move cursor up to first line
-        let up = num_lines - 1;
-        let _ = execute!(out, cursor::MoveUp(up as u16));
-    }
-
-    // Clear and reprint each line
-    for (i, line) in lines.iter().enumerate() {
-        // Move to start of line and clear it
-        let _ = write!(out, "\r\x1b[K");
-        if i == 0 {
-            let _ = execute!(
-                out,
-                SetForegroundColor(PROMPT_COLOR),
-                Print(PROMPT),
-                ResetColor,
-                Print(line),
-            );
-        } else {
-            let _ = execute!(out, Print(CONTINUATION), Print(line));
-        }
-        // Move to next line if not the last
-        if i < num_lines - 1 {
-            let _ = write!(out, "\n");
-        }
-    }
-
-    // Now position the cursor correctly
-    // We are currently at the end of the last line.
-    // Move up to cursor_line
-    let lines_up = (num_lines - 1) - cursor_line;
-    if lines_up > 0 {
-        let _ = execute!(out, cursor::MoveUp(lines_up as u16));
-    }
-
-    // Move to correct column
-    let prefix_width = if cursor_line == 0 { PROMPT_DISPLAY_WIDTH } else { 2 };
-    let col = prefix_width + display_width(&lines[cursor_line][..cursor_col]);
-    let _ = write!(out, "\r\x1b[{}C", col);
-
-    let _ = out.flush();
+    // For single-line (most common): count chars before cursor for column position
+    let cursor_chars = buf[..cursor].chars().count();
+    crate::render::draw_input_box(buf, cursor_chars);
 }
 
 /// Returns (line_index, byte_offset_within_line) for the given cursor byte offset in buf.

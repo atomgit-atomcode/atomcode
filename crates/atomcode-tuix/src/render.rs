@@ -56,8 +56,94 @@ const RED: Color = Color::Rgb {
     b: 75,
 };
 
+pub fn term_size() -> (usize, usize) {
+    terminal::size().map(|(w, h)| (w as usize, h as usize)).unwrap_or((80, 24))
+}
+
 fn term_width() -> usize {
-    terminal::size().map(|(w, _)| w as usize).unwrap_or(80)
+    term_size().0
+}
+
+/// Set up scroll region: rows 1..=(height-3) scroll, bottom 3 rows are fixed for input.
+pub fn setup_scroll_region() {
+    let (w, h) = term_size();
+    let mut out = io::stdout();
+    let scroll_end = h.saturating_sub(3);
+    // Set scroll region (1-indexed)
+    let _ = write!(out, "\x1b[1;{}r", scroll_end);
+    // Move cursor to end of scroll region
+    let _ = write!(out, "\x1b[{};1H", scroll_end);
+    let _ = out.flush();
+}
+
+/// Reset scroll region to full terminal.
+pub fn reset_scroll_region() {
+    let mut out = io::stdout();
+    let _ = write!(out, "\x1b[r"); // reset to full screen
+    let _ = out.flush();
+}
+
+/// Draw the input box at the fixed bottom area (last 3 rows).
+/// Shows a border + prompt + current input text.
+pub fn draw_input_box(input: &str, cursor_col: usize) {
+    let (w, h) = term_size();
+    let mut out = io::stdout();
+
+    // Save cursor position (in scroll region)
+    let _ = write!(out, "\x1b7");
+
+    let box_y = h.saturating_sub(2); // border on row h-2, input on h-1, status on h
+    let inner_w = w.saturating_sub(4); // 2 border + 2 padding
+
+    // Top border ─
+    let _ = write!(out, "\x1b[{};1H\x1b[K", box_y);
+    let _ = execute!(out, SetForegroundColor(ACCENT_DIM));
+    let _ = write!(out, "  \u{256d}{}\u{256e}", "\u{2500}".repeat(inner_w));
+    let _ = execute!(out, ResetColor);
+
+    // Input line: │ ❯ text │
+    let _ = write!(out, "\x1b[{};1H\x1b[K", box_y + 1);
+    let _ = execute!(out, SetForegroundColor(ACCENT_DIM));
+    let _ = write!(out, "  \u{2502} ");
+    let _ = execute!(out, SetForegroundColor(BLUE));
+    let _ = write!(out, "\u{276f} ");
+    let _ = execute!(out, ResetColor);
+    // Truncate input to fit
+    let display_input = if input.len() > inner_w.saturating_sub(6) {
+        &input[..inner_w.saturating_sub(6)]
+    } else {
+        input
+    };
+    let _ = write!(out, "{}", display_input);
+    // Pad and close border
+    let used = display_input.len() + 4; // "│ ❯ " = 4
+    let pad = inner_w.saturating_sub(used);
+    let _ = write!(out, "{}", " ".repeat(pad));
+    let _ = execute!(out, SetForegroundColor(ACCENT_DIM));
+    let _ = write!(out, "\u{2502}");
+    let _ = execute!(out, ResetColor);
+
+    // Bottom border ─
+    let _ = write!(out, "\x1b[{};1H\x1b[K", box_y + 2);
+    let _ = execute!(out, SetForegroundColor(ACCENT_DIM));
+    let _ = write!(out, "  \u{2570}{}\u{256f}", "\u{2500}".repeat(inner_w));
+    let _ = execute!(out, ResetColor);
+
+    // Position cursor inside the input box
+    let cursor_x = 6 + cursor_col; // "  │ ❯ " = 6 chars
+    let _ = write!(out, "\x1b[{};{}H", box_y + 1, cursor_x + 1); // 1-indexed
+
+    // Restore cursor won't work across scroll region, so we leave cursor in input box
+    let _ = out.flush();
+}
+
+/// Move cursor to end of scroll region (for output).
+pub fn move_to_scroll_end() {
+    let (_, h) = term_size();
+    let scroll_end = h.saturating_sub(3);
+    let mut out = io::stdout();
+    let _ = write!(out, "\x1b[{};1H", scroll_end);
+    let _ = out.flush();
 }
 
 /// Simple word-wrap: splits `text` into lines of at most `width` characters.

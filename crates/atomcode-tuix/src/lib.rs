@@ -46,6 +46,10 @@ pub async fn run(
     };
     render::print_welcome(&model_name, &dir_display);
 
+    // Set up scroll region: output area above, fixed input box below
+    render::setup_scroll_region();
+    render::draw_input_box("", 0);
+
     let mut history: Vec<String> = Vec::new();
     let mut streaming = false;
     let mut spinner_frame: usize = 0;
@@ -198,6 +202,7 @@ pub async fn run(
                     }
 
                     history.push(text.clone());
+                    render::move_to_scroll_end();
                     render::print_user_message(&text);
                     agent_handle
                         .cmd_tx
@@ -220,10 +225,10 @@ pub async fn run(
                         Some(AgentEvent::TextDelta(text)) => {
                             render::clear_spinner();
                             // Strip <think>...</think> blocks in-flight.
-                            // GLM-5/MiniMax/Qwen emit English CoT inside <think> tags.
                             let visible = strip_think_streaming(&text, &mut think_buf);
                             if visible.is_empty() { continue; }
 
+                            render::move_to_scroll_end();
                             let mut out = io::stdout();
                             // First visible delta: print bar prefix
                             if !streaming_started {
@@ -234,6 +239,8 @@ pub async fn run(
                             let fixed = visible.replace('\n', "\r\n  \u{2502} ");
                             let _ = write!(out, "{}", fixed);
                             let _ = out.flush();
+                            // Redraw input box (streaming may have scrolled content)
+                            render::draw_input_box("", 0);
                         }
                         Some(AgentEvent::ToolCallStreaming { name, .. }) => {
                             spinner_label = format!("Preparing {}...", name);
@@ -352,6 +359,7 @@ pub async fn run(
     }
 
     // Cleanup
+    render::reset_scroll_region();
     if !cfg!(target_os = "windows") {
         let _ = crossterm::execute!(io::stdout(), DisableBracketedPaste);
     }
