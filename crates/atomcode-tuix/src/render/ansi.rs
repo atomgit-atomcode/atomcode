@@ -62,6 +62,8 @@ impl<W: Write + Send> AnsiRenderer<W> {
     }
 
     fn render_welcome(&mut self, model: &str, working_dir: &str) {
+        let model = scrub_controls(model);
+        let working_dir = scrub_controls(working_dir);
         self.set_fg(Role::Brand);
         let _ = self.out.write_all("  ◉  AtomCode\n".as_bytes());
         self.reset();
@@ -104,19 +106,28 @@ impl<W: Write + Send> Renderer for AnsiRenderer<W> {
             UiLine::AssistantText(text) => {
                 self.clear_line_if_needed();
                 let safe = scrub_controls(&text);
-                let mut first = !self.assistant_continuing;
-                for (i, segment) in safe.split('\n').enumerate() {
+                let ends_with_nl = safe.ends_with('\n');
+                // If input ends with '\n', strip it — we'll emit the final newline ourselves.
+                let body = if ends_with_nl { &safe[..safe.len() - 1] } else { &safe[..] };
+                let mut first_segment = !self.assistant_continuing;
+                for (i, segment) in body.split('\n').enumerate() {
                     if i > 0 {
                         let _ = self.out.write_all(b"\n");
                         self.write_bar_prefix();
-                    } else if first {
+                    } else if first_segment {
                         self.write_bar_prefix();
-                        first = false;
+                        first_segment = false;
                     }
                     let _ = self.out.write_all(segment.as_bytes());
                 }
-                self.last_was_permanent = false;
-                self.assistant_continuing = true;
+                if ends_with_nl {
+                    let _ = self.out.write_all(b"\n");
+                    self.last_was_permanent = true;
+                    self.assistant_continuing = false;
+                } else {
+                    self.last_was_permanent = false;
+                    self.assistant_continuing = true;
+                }
             }
             UiLine::AssistantLineBreak => {
                 let _ = self.out.write_all(b"\n");
@@ -126,11 +137,12 @@ impl<W: Write + Send> Renderer for AnsiRenderer<W> {
             UiLine::ToolCall { name, detail } => {
                 if self.assistant_continuing {
                     let _ = self.out.write_all(b"\n");
+                    self.last_was_permanent = true;
                     self.assistant_continuing = false;
                 }
                 self.clear_line_if_needed();
                 self.set_fg(Role::Secondary);
-                let _ = write!(self.out, "  ▸ {}", name);
+                let _ = write!(self.out, "  ▸ {}", scrub_controls(&name));
                 self.reset();
                 if !detail.is_empty() {
                     self.set_fg(Role::Muted);
@@ -141,6 +153,11 @@ impl<W: Write + Send> Renderer for AnsiRenderer<W> {
                 self.last_was_permanent = true;
             }
             UiLine::ToolResult { success, summary } => {
+                if self.assistant_continuing {
+                    let _ = self.out.write_all(b"\n");
+                    self.last_was_permanent = true;
+                    self.assistant_continuing = false;
+                }
                 self.clear_line_if_needed();
                 let (icon, r) = if success { ("✓", Role::Success) } else { ("✗", Role::Error) };
                 self.set_fg(r);
@@ -163,7 +180,7 @@ impl<W: Write + Send> Renderer for AnsiRenderer<W> {
             UiLine::ApprovalPrompt { tool, detail } => {
                 self.clear_line_if_needed();
                 self.set_fg(Role::Warning);
-                let _ = write!(self.out, "  Allow {}({})? [Y]es / [N]o / [A]lways", tool, scrub_controls(&detail));
+                let _ = write!(self.out, "  Allow {}({})? [Y]es / [N]o / [A]lways", scrub_controls(&tool), scrub_controls(&detail));
                 self.reset();
                 let _ = self.out.write_all(b"\n");
                 self.last_was_permanent = true;
@@ -203,7 +220,7 @@ impl<W: Write + Send> Renderer for AnsiRenderer<W> {
             }
             UiLine::ClearTransient => {
                 let _ = self.out.write_all(b"\r\x1b[K");
-                self.last_was_permanent = false;
+                self.last_was_permanent = true;
             }
             UiLine::InputPrompt { buf, cursor_cols } => {
                 let _ = self.out.write_all(b"\r\x1b[K");
@@ -344,5 +361,42 @@ mod tests {
         let s = String::from_utf8(buf).unwrap();
         assert!(s.contains("[Error: oops]"));
         assert!(s.ends_with('\n'));
+    }
+
+    #[test]
+    fn assistant_text_with_trailing_newline_closes_line() {
+        let mut buf = Vec::new();
+        let mut r = AnsiRenderer::with_writer(&mut buf, caps_no_color());
+        r.render(UiLine::AssistantText("done\n".into()));
+        r.flush();
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.starts_with("  │ done\n"));
+        // No dangling bar prefix after the final newline
+        assert!(!s.trim_end().ends_with("│"));
+    }
+
+    #[test]
+    fn tool_call_after_assistant_text_closes_cleanly() {
+        let mut buf = Vec::new();
+        let mut r = AnsiRenderer::with_writer(&mut buf, caps_no_color());
+        r.render(UiLine::AssistantText("partial".into()));
+        r.render(UiLine::ToolCall { name: "bash".into(), detail: "ls".into() });
+        r.flush();
+        let s = String::from_utf8(buf).unwrap();
+        // Assistant line closes with \n, then tool line appears
+        assert!(s.contains("partial\n"));
+        assert!(s.contains("▸ bash(ls)"));
+    }
+
+    #[test]
+    fn tool_name_is_sanitised() {
+        let mut buf = Vec::new();
+        let mut r = AnsiRenderer::with_writer(&mut buf, caps_no_color());
+        r.render(UiLine::ToolCall { name: "bash\x1b[2J".into(), detail: "x".into() });
+        r.flush();
+        let s = String::from_utf8(buf).unwrap();
+        // No ANSI escape from the malicious name reaches output
+        assert!(!s.contains("\x1b[2J"));
+        assert!(s.contains("▸ bash(x)"));
     }
 }
