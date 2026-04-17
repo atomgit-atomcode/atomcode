@@ -219,6 +219,12 @@ pub async fn run_loop(
     let mut spinner_tick = tokio::time::interval(Duration::from_millis(100));
     spinner_tick.tick().await; // consume immediate tick
 
+    // call_id → (tool_name, detail). Populated on ToolCallStarted, consumed
+    // on ToolCallResult so the result line can show "name(detail) — summary"
+    // instead of just a bare "✓ summary" detached from its originating call.
+    let mut pending_tools: std::collections::HashMap<String, (String, String)> =
+        std::collections::HashMap::new();
+
     // DEVIATION from plan:
     // 1. plan uses `SignalKind::terminal_stop()` which does not exist in tokio 1.x.
     //    Using `SignalKind::from_raw(libc::SIGTSTP)` instead.
@@ -249,7 +255,7 @@ pub async fn run_loop(
             // ── Agent events ──
             maybe = ctx.agent.event_rx.recv(), if matches!(state.phase, UiPhase::Streaming) => {
                 let Some(ev) = maybe else { break };
-                handle_agent_event(ev, &mut state, &mut think, renderer);
+                handle_agent_event(ev, &mut state, &mut think, renderer, &mut pending_tools);
                 // if back to IDLE, redraw prompt
                 if matches!(state.phase, UiPhase::Idle) {
                     renderer.render(UiLine::InputPrompt { buf: buf.text.clone(), cursor_cols: buf.cursor_cols() });
@@ -309,7 +315,7 @@ pub async fn run_loop(
             // ── Agent events ──
             maybe = ctx.agent.event_rx.recv(), if matches!(state.phase, UiPhase::Streaming) => {
                 let Some(ev) = maybe else { break };
-                handle_agent_event(ev, &mut state, &mut think, renderer);
+                handle_agent_event(ev, &mut state, &mut think, renderer, &mut pending_tools);
                 if matches!(state.phase, UiPhase::Idle) {
                     renderer.render(UiLine::InputPrompt { buf: buf.text.clone(), cursor_cols: buf.cursor_cols() });
                     renderer.flush();
@@ -442,6 +448,7 @@ fn handle_agent_event(
     state: &mut UiState,
     think: &mut ThinkStripper,
     renderer: &mut dyn Renderer,
+    pending_tools: &mut std::collections::HashMap<String, (String, String)>,
 ) {
     match ev {
         AgentEvent::TextDelta(text) => {
@@ -454,18 +461,29 @@ fn handle_agent_event(
         AgentEvent::ToolCallStreaming { name, .. } => {
             state.on_tool_call_streaming(&name);
         }
-        AgentEvent::ToolCallStarted { name, arguments, .. } => {
+        AgentEvent::ToolCallStarted { id, name, arguments } => {
             // Close any in-flight assistant line
             renderer.render(UiLine::AssistantLineBreak);
             let detail = format_tool_detail(&name, &arguments);
+            pending_tools.insert(id.clone(), (name.clone(), detail.clone()));
             renderer.render(UiLine::ToolCall { name: name.clone(), detail });
             renderer.flush();
             state.on_tool_call_started(&name);
         }
-        AgentEvent::ToolCallResult { output, success, .. } => {
+        AgentEvent::ToolCallResult { call_id, name, output, success, .. } => {
+            // Pair the result with its originating call by embedding the
+            // tool name (and cached detail) in the summary. This is needed
+            // because batched parallel calls emit all Starts then all
+            // Results, losing visual pairing in a flat scrollback.
+            let cached = pending_tools.remove(&call_id);
             let summary = summarise(&output);
-            renderer.render(UiLine::ToolResult { success, summary });
-            // Diff lines
+            let labeled = match cached {
+                Some((_cname, detail)) if !detail.is_empty() => {
+                    format!("{}({}) — {}", name, detail, summary)
+                }
+                _ => format!("{} — {}", name, summary),
+            };
+            renderer.render(UiLine::ToolResult { success, summary: labeled });
             for line in output.lines().take(120) {
                 if let Some(rest) = line.strip_prefix("+ ") {
                     renderer.render(UiLine::DiffLine { added: true, text: rest.to_string() });
@@ -627,19 +645,62 @@ fn format_tool_detail(name: &str, args_json: &str) -> String {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(args_json) else {
         return String::new();
     };
+    let get_str = |k: &str| v.get(k).and_then(|x| x.as_str()).map(str::to_string);
+    let basename = |p: &str| p.rsplit('/').next().unwrap_or(p).to_string();
+
     match name {
-        "read_file" | "edit_file" | "write_file" | "create_file" => {
-            v.get("file_path").and_then(|x| x.as_str())
-                .map(|p| p.rsplit('/').next().unwrap_or(p).to_string())
-                .unwrap_or_default()
+        "read_file" | "edit_file" | "write_file" | "create_file" | "list_symbols" => {
+            get_str("file_path").map(|p| basename(&p)).unwrap_or_default()
         }
-        "grep" => v.get("pattern").and_then(|x| x.as_str())
-            .map(|p| crate::width::truncate_to_width(p, 30))
+        "read_symbol" => {
+            let sym = get_str("symbol").unwrap_or_default();
+            let file = get_str("file_path").map(|p| basename(&p)).unwrap_or_default();
+            if sym.is_empty() { file } else if file.is_empty() { sym } else { format!("{} in {}", sym, file) }
+        }
+        "glob" => get_str("pattern")
+            .map(|p| crate::width::truncate_to_width(&p, 40))
             .unwrap_or_default(),
-        "bash" => v.get("command").and_then(|x| x.as_str())
-            .map(|c| crate::width::truncate_to_width(c, 40))
+        "grep" => get_str("pattern")
+            .map(|p| crate::width::truncate_to_width(&p, 40))
             .unwrap_or_default(),
-        _ => String::new(),
+        "bash" => get_str("command")
+            .map(|c| crate::width::truncate_to_width(&c, 60))
+            .unwrap_or_default(),
+        "list_directory" | "change_dir" => {
+            get_str("path").unwrap_or_else(|| ".".into())
+        }
+        "web_fetch" => get_str("url")
+            .map(|u| crate::width::truncate_to_width(&u, 60))
+            .unwrap_or_default(),
+        "web_search" => get_str("query")
+            .map(|q| crate::width::truncate_to_width(&q, 50))
+            .unwrap_or_default(),
+        "find_references" | "trace_callees" | "trace_callers" | "trace_chain" => {
+            get_str("symbol").unwrap_or_default()
+        }
+        "blast_radius" | "file_dependencies" => {
+            get_str("file").map(|p| basename(&p)).unwrap_or_default()
+        }
+        "search_replace" => {
+            let file = get_str("file_path").or_else(|| get_str("file"));
+            let pat = get_str("pattern").or_else(|| get_str("old"));
+            match (file, pat) {
+                (Some(f), Some(p)) => format!("{}: {}", basename(&f), crate::width::truncate_to_width(&p, 25)),
+                (Some(f), None) => basename(&f),
+                (None, Some(p)) => crate::width::truncate_to_width(&p, 40),
+                _ => String::new(),
+            }
+        }
+        "use_skill" => get_str("name").unwrap_or_default(),
+        _ => {
+            // Fallback: try common single-key args that make sense as detail.
+            for key in ["file_path", "path", "file", "pattern", "query", "url", "name", "symbol", "command"] {
+                if let Some(s) = get_str(key) {
+                    return crate::width::truncate_to_width(&s, 40);
+                }
+            }
+            String::new()
+        }
     }
 }
 
