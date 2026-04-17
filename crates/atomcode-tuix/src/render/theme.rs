@@ -21,15 +21,24 @@ use crate::terminal::TerminalCaps;
 pub struct Palette;
 
 impl Palette {
+    // Using the bright (9X) variants for signal colours rather than the
+    // standard (3X) variants. On dark-theme terminals the standard set
+    // (32/33/31/36) renders muddy — "dark green" looks olive-khaki,
+    // "dark cyan" looks desaturated. CC uses bright variants for diff
+    // +/- and inline code for the same reason; aligning here so colours
+    // read consistently across Mac Terminal / iTerm / Alacritty dark
+    // themes. Bright variants also still map to sensible colours on
+    // light themes (most terminals give them enough contrast with the
+    // default background).
     pub const BRAND: Color = Color::Magenta;      // bright magenta (95)
-    pub const MUTED: Color = Color::DarkGrey;     // bright black / dark gray (90)
+    pub const MUTED: Color = Color::DarkGrey;     // bright black / mid-gray (90)
     pub const ACCENT: Color = Color::Cyan;        // bright cyan (96)
     pub const BORDER: Color = Color::DarkGrey;    // same grey as muted
-    pub const WARNING: Color = Color::DarkYellow; // yellow (33) — readable on both light/dark
+    pub const WARNING: Color = Color::Yellow;     // bright yellow (93)
     pub const ERROR: Color = Color::Red;          // bright red (91)
-    pub const DIFF_ADD: Color = Color::DarkGreen; // green (32) — not neon
-    pub const DIFF_REMOVE: Color = Color::DarkRed; // red (31)
-    pub const CODE: Color = Color::DarkCyan;      // cyan (36) — inline `code`
+    pub const DIFF_ADD: Color = Color::Green;     // bright green (92)
+    pub const DIFF_REMOVE: Color = Color::Red;    // bright red (91) — paired with Error
+    pub const CODE: Color = Color::Cyan;          // bright cyan (96)
 }
 
 /// Semantic colour role → concrete Color, honouring NO_COLOR etc.

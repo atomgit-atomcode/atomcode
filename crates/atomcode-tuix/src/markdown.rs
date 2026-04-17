@@ -65,12 +65,12 @@ pub fn render_line(line: &str, state: &mut MdState, caps: TerminalCaps) -> Optio
         return prefix_only();
     }
 
-    // Inside code block: render in cyan (basic-16 SGR 36) with no inline
-    // parsing. Cyan is the conventional "code" tone across themes and
-    // reads on both light and dark backgrounds.
+    // Inside code block: render in bright cyan (SGR 96) with no inline
+    // parsing. Bright cyan is the conventional "code" tone across themes
+    // and reads vividly on both light and dark backgrounds.
     if state.in_code_block {
         let body = if caps.colors {
-            format!("\x1b[36m{}\x1b[39m", line)
+            format!("\x1b[96m{}\x1b[39m", line)
         } else {
             line.to_string()
         };
@@ -356,7 +356,7 @@ fn render_inline(line: &str, caps: TerminalCaps) -> String {
                     inner.push(p);
                 }
                 if closed && !inner.is_empty() {
-                    out.push_str("\x1b[36m"); // cyan (SGR 36) — inline code
+                    out.push_str("\x1b[96m"); // bright cyan (SGR 96) — inline code
                     out.push_str(&inner);
                     out.push_str("\x1b[39m");
                 } else {
@@ -466,9 +466,9 @@ mod tests {
 
     #[test]
     fn inline_code() {
-        // Inline code uses SGR 36 (cyan) from the basic-16 palette so the
-        // terminal's theme engine picks the actual RGB.
-        assert!(render_inline_line("`x`", caps()).contains("\x1b[36mx"));
+        // Inline code uses SGR 96 (bright cyan) — reads vividly on both
+        // light and dark terminal themes.
+        assert!(render_inline_line("`x`", caps()).contains("\x1b[96mx"));
     }
 
     #[test]
