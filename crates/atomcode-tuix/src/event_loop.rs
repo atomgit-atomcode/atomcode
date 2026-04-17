@@ -50,6 +50,14 @@ struct Buffer {
 const PASTE_FOLD_LINES: usize = 5;
 const PASTE_FOLD_CHARS: usize = 400;
 
+/// Fold `\r\n` and lone `\r` line endings to `\n`. Bracketed-paste
+/// payloads from macOS Terminal / iTerm2 / Windows clipboard frequently
+/// carry CR separators; leaving them in place makes `str::lines()` miss
+/// line breaks and can confuse downstream JSON/prompt serialisation.
+fn normalize_newlines(s: &str) -> String {
+    s.replace("\r\n", "\n").replace('\r', "\n")
+}
+
 impl Buffer {
     fn new() -> Self {
         Self {
@@ -61,16 +69,33 @@ impl Buffer {
         }
     }
 
-    /// Insert a pasted block. Folds into `[Pasted #N +M lines]` if the
-    /// block exceeds the fold threshold, keeping the visible input terse.
-    /// Returns the placeholder that was inserted (or the raw text for
-    /// small pastes) so callers can advance the cursor correctly.
+    /// Insert a pasted block. Folds into a `[Pasted …]` placeholder if
+    /// the block exceeds the fold threshold, keeping the visible input
+    /// terse. Returns the placeholder that was inserted (or the raw
+    /// text for small pastes) so callers can advance the cursor.
+    ///
+    /// Single-line long pastes (e.g. a 600-char URL) use a `{N} chars`
+    /// summary — `+1 lines` would be misleading. Multi-line pastes use
+    /// `+{M} lines` which is what people expect for code blocks / diffs.
+    ///
+    /// **Line-ending normalisation:** most terminals in bracketed paste
+    /// mode emit `\r` (or `\r\n`) between lines rather than `\n`. Without
+    /// normalising, a 20-line paste looks like one gigantic line to
+    /// `str::lines()` (returning count 1), and downstream agents may
+    /// mis-handle payloads that mix CR-only separators. We fold `\r\n`
+    /// and lone `\r` to `\n` at ingress so both the placeholder summary
+    /// and the expanded agent payload are in canonical form.
     fn insert_paste(&mut self, text: String) -> String {
+        let text = normalize_newlines(&text);
         let line_count = text.lines().count().max(1);
         let char_count = text.chars().count();
         if line_count >= PASTE_FOLD_LINES || char_count >= PASTE_FOLD_CHARS {
             let id = self.pastes.len() + 1;
-            let placeholder = format!("[Pasted #{} +{} lines]", id, line_count);
+            let placeholder = if line_count <= 1 {
+                format!("[Pasted #{} {} chars]", id, char_count)
+            } else {
+                format!("[Pasted #{} +{} lines]", id, line_count)
+            };
             self.pastes.push(text);
             self.text.insert_str(self.cursor, &placeholder);
             self.cursor += placeholder.len();
@@ -304,6 +329,26 @@ mod buffer_tests {
     fn expand_pastes_is_noop_without_placeholders() {
         let b = Buffer::new();
         assert_eq!(b.expand_pastes("plain text"), "plain text");
+    }
+
+    #[test]
+    fn paste_with_cr_separators_folds_correctly() {
+        // Bracketed-paste often uses \r between lines (esp. macOS
+        // Terminal.app). Without normalising, str::lines() sees one
+        // gigantic line and the placeholder misreports "+1 lines".
+        let mut b = Buffer::new();
+        let cr_paste: String = (1..=20).map(|i| format!("line{}\r", i)).collect();
+        b.insert_paste(cr_paste.clone());
+        assert!(
+            b.text.contains("+20 lines"),
+            "expected 20-line placeholder, got: {}",
+            b.text
+        );
+        // Original stored in pastes[0] is normalised (no \r).
+        assert!(!b.pastes[0].contains('\r'));
+        // Expanded body round-trips with \n separators.
+        let expanded = b.expand_pastes(&b.text);
+        assert_eq!(expanded.lines().count(), 20);
     }
 
     #[test]
