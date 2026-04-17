@@ -173,6 +173,7 @@ fn test_config() -> Config {
         default_provider: "test".to_string(),
         default_workdir: None,
         providers,
+        datalog: Default::default(),
     }
 }
 

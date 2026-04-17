@@ -232,6 +232,7 @@ async fn run() -> Result<i32> {
                 default_provider: String::new(),
                 default_workdir: None,
                 providers: HashMap::new(),
+                datalog: Default::default(),
             }
         })
     } else {
@@ -240,6 +241,7 @@ async fn run() -> Result<i32> {
             default_provider: String::new(),
             default_workdir: None,
             providers: HashMap::new(),
+            datalog: Default::default(),
         }
     };
 
