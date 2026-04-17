@@ -337,9 +337,15 @@ impl<W: Write + Send> AnsiRenderer<W> {
         let cursor_row_from_top = 2 + cursor_row_in_middle;
         self.last_footer.cursor_row_from_top = cursor_row_from_top;
 
-        // After drawing, cursor is just after the last menu row (or box
-        // bottom if no menu). Walk up to land on the cursor's middle row.
-        let up = total_rows.saturating_sub(cursor_row_from_top + 1);
+        // After drawing, cursor is at row (R + total_rows) — the line
+        // after the last emitted \r\n. Target cursor row is footer_top
+        // + cursor_row_from_top = R + cursor_row_from_top. Distance up
+        // is `total_rows - cursor_row_from_top` (NOT minus an extra
+        // one — the earlier off-by-one parked the cursor on the row
+        // below the intended middle row, which both mis-located the
+        // visible cursor and shifted `erase_footer`'s anchor, causing
+        // the footer to inch downward one row per keystroke).
+        let up = total_rows.saturating_sub(cursor_row_from_top);
         if up > 0 {
             let _ = write!(self.out, "\x1b[{}A", up);
         }
