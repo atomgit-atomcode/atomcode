@@ -50,18 +50,20 @@ impl TerminalGuard {
             execute!(io::stdout(), EnableBracketedPaste)?;
             g.paste_enabled = true;
         }
-        // Reserve the bottom 4 rows for the input footer (spinner + 3-line
-        // input box). Everything else scrolls within the top region.
+        // Static reservation: bottom 8 rows are footer chrome.
+        //   rows h-7..h-4: menu overlay (4-row slot, blank when inactive)
+        //   row  h-3:      spinner (blank when idle)
+        //   rows h-2..h:   input box (3 rows, always visible)
+        // Scroll region is set ONCE here and never changes at runtime,
+        // which means no row ever transitions between region-interior
+        // and region-exterior — the class of "ghost scrollback" bugs is
+        // eliminated by construction.
         if caps.tty {
             let (_, h) = crossterm::terminal::size().unwrap_or((80, 24));
-            let bottom = (h as usize).saturating_sub(4);
+            let bottom = (h as usize).saturating_sub(8);
             if bottom >= 5 {
                 let stdout = io::stdout();
                 let mut out = stdout.lock();
-                // Clear screen + home + set scroll region. Autowrap stays
-                // ON globally so long markdown lines flow into the next
-                // scroll row instead of being truncated; footer draws
-                // disable autowrap locally for the duration of their paint.
                 let _ = write!(out, "\x1b[2J\x1b[H\x1b[1;{}r", bottom);
                 let _ = out.flush();
                 g.scroll_region_set = true;
