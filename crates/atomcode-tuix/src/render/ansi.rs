@@ -107,64 +107,65 @@ impl<W: Write + Send> AnsiRenderer<W> {
     fn render_welcome(&mut self, model: &str, working_dir: &str) {
         let model = scrub_controls(model);
         let working_dir = scrub_controls(working_dir);
-        // Box width: terminal width minus 2 margin cols, capped at 76.
-        let box_w = self.term_width().saturating_sub(2).min(76).max(40);
-        let inner = box_w.saturating_sub(2); // 2 border chars
+        let box_w = self.term_width().saturating_sub(2).min(72).max(40);
+        let inner = box_w.saturating_sub(2);
 
-        // Top border: ╭───...───╮
+        // Top border with inlined title: ╭─ ✻ AtomCode ─────╮
+        let title = " ✻ AtomCode ";
+        let title_w = crate::width::display_width(title);
         self.set_fg(Role::AccentDim);
-        let _ = self.out.write_all(" ╭".as_bytes());
-        for _ in 0..inner {
+        let _ = self.out.write_all(" ╭─".as_bytes());
+        self.reset();
+        self.set_fg(Role::Brand);
+        let _ = self.out.write_all(title.as_bytes());
+        self.reset();
+        self.set_fg(Role::AccentDim);
+        let fill = inner.saturating_sub(1 + title_w);
+        for _ in 0..fill {
             let _ = self.out.write_all("─".as_bytes());
         }
         let _ = self.out.write_all("╮\r\n".as_bytes());
         self.reset();
 
-        // Row 1: ✦ Welcome to AtomCode!
-        self.draw_box_row(inner, |this| {
-            this.set_fg(Role::Brand);
-            let _ = write!(this.out, " ✦ AtomCode");
-            this.reset();
-        }, 12);
-
-        // Blank spacer
         self.draw_blank_row(inner);
 
-        // Row: tips
-        let tips = "   /help for commands  ·  /status  ·  Ctrl+C cancel";
-        let tips_w = crate::width::display_width(tips);
+        // Tips row
+        let tip = "   Type a message, or /help for commands";
+        let tip_w = crate::width::display_width(tip);
         self.draw_box_row(inner, |this| {
             this.set_fg(Role::Muted);
-            let _ = this.out.write_all(tips.as_bytes());
+            let _ = this.out.write_all(tip.as_bytes());
             this.reset();
-        }, tips_w);
+        }, tip_w);
 
-        // Blank spacer
         self.draw_blank_row(inner);
 
-        // Row: cwd
-        let cwd_line = format!("   cwd:   {}", working_dir);
-        let cwd_w = crate::width::display_width(&cwd_line);
-        let cwd_body = crate::width::truncate_to_width(&cwd_line, inner.saturating_sub(1));
-        let cwd_body_w = crate::width::display_width(&cwd_body);
+        // cwd + model rows, with secondary labels in dim colour
+        let cwd_label = "   cwd    ";
+        let cwd_value = crate::width::truncate_to_width(&working_dir, inner.saturating_sub(crate::width::display_width(cwd_label) + 1));
+        let cwd_vw = crate::width::display_width(&cwd_value);
         self.draw_box_row(inner, |this| {
             this.set_fg(Role::Muted);
-            let _ = this.out.write_all(cwd_body.as_bytes());
+            let _ = this.out.write_all(cwd_label.as_bytes());
             this.reset();
-        }, cwd_body_w);
-        let _ = cwd_w;
+            let _ = this.out.write_all(cwd_value.as_bytes());
+        }, crate::width::display_width(cwd_label) + cwd_vw);
 
-        // Row: model
-        let model_line = format!("   model: {}", model);
-        let model_body = crate::width::truncate_to_width(&model_line, inner.saturating_sub(1));
-        let model_body_w = crate::width::display_width(&model_body);
+        let m_label = "   model  ";
+        let m_value = crate::width::truncate_to_width(&model, inner.saturating_sub(crate::width::display_width(m_label) + 1));
+        let m_vw = crate::width::display_width(&m_value);
         self.draw_box_row(inner, |this| {
             this.set_fg(Role::Muted);
-            let _ = this.out.write_all(model_body.as_bytes());
+            let _ = this.out.write_all(m_label.as_bytes());
             this.reset();
-        }, model_body_w);
+            this.set_fg(Role::Secondary);
+            let _ = this.out.write_all(m_value.as_bytes());
+            this.reset();
+        }, crate::width::display_width(m_label) + m_vw);
 
-        // Bottom border: ╰───...───╯
+        self.draw_blank_row(inner);
+
+        // Bottom border
         self.set_fg(Role::AccentDim);
         let _ = self.out.write_all(" ╰".as_bytes());
         for _ in 0..inner {
@@ -338,15 +339,53 @@ impl<W: Write + Send> Renderer for AnsiRenderer<W> {
                     return;
                 }
                 self.reset_transient();
+
+                let box_w = self.term_width().saturating_sub(2).min(120).max(30);
+                let inner = box_w.saturating_sub(2);
+                let safe_label = scrub_controls(&label);
+                // Middle line: " │ {frame} {label} {pad} │"
+                //               1  1   1    wL   pad   1  1
+                // Frame is width 1 (Braille char). " {frame} " = 3 cols.
+                let text_budget = inner.saturating_sub(4);
+                let display_label = crate::width::truncate_to_width(&safe_label, text_budget);
+                let label_w = crate::width::display_width(&display_label);
+                let pad = text_budget.saturating_sub(label_w);
+
+                // Top border
+                self.set_fg(Role::AccentDim);
+                let _ = self.out.write_all(" ╭".as_bytes());
+                for _ in 0..inner { let _ = self.out.write_all("─".as_bytes()); }
+                let _ = self.out.write_all("╮\r\n".as_bytes());
+                self.reset();
+
+                // Middle: │ {frame} {label}  │
+                self.set_fg(Role::AccentDim);
+                let _ = self.out.write_all(" │ ".as_bytes());
+                self.reset();
                 self.set_fg(Role::Brand);
-                let _ = write!(self.out, "  {} ", frame);
+                let _ = write!(self.out, "{} ", frame);
                 self.reset();
                 self.set_fg(Role::Muted);
-                let _ = self.out.write_all(scrub_controls(&label).as_bytes());
+                let _ = self.out.write_all(display_label.as_bytes());
                 self.reset();
+                for _ in 0..pad { let _ = self.out.write_all(b" "); }
+                self.set_fg(Role::AccentDim);
+                let _ = self.out.write_all(" │\r\n".as_bytes());
+                self.reset();
+
+                // Bottom border (no \r\n)
+                self.set_fg(Role::AccentDim);
+                let _ = self.out.write_all(" ╰".as_bytes());
+                for _ in 0..inner { let _ = self.out.write_all("─".as_bytes()); }
+                let _ = self.out.write_all("╯".as_bytes());
+                self.reset();
+
+                // Position cursor on middle line so transient_cursor_from_top = 1.
+                let _ = write!(self.out, "\x1b[1A\r\x1b[1G");
+
                 self.last_was_permanent = false;
-                self.transient_lines = 1;
-                self.transient_cursor_from_top = 0;
+                self.transient_lines = 3;
+                self.transient_cursor_from_top = 1;
             }
             UiLine::ClearTransient => {
                 self.reset_transient();
