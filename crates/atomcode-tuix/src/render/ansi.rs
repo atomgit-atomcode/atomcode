@@ -68,7 +68,7 @@ impl<W: Write + Send> AnsiRenderer<W> {
         let _ = self.out.write_all("  ◉  AtomCode\n".as_bytes());
         self.reset();
         self.set_fg(Role::Muted);
-        let _ = write!(self.out, "  {}  {}\n", model, working_dir);
+        let _ = writeln!(self.out, "  {}  {}", model, working_dir);
         self.reset();
         self.set_fg(Role::AccentDim);
         let _ = self.out.write_all("  ".as_bytes());

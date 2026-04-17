@@ -580,7 +580,7 @@ fn execute_slash_command(
             renderer.flush();
         }
         "cd" => {
-            let new_dir = resolve_cd(arg, &ctx.working_dir, ctx.previous_dir.as_ref());
+            let new_dir = resolve_cd(arg, &ctx.working_dir, ctx.previous_dir.as_deref());
             match new_dir {
                 Ok(path) => {
                     ctx.previous_dir = Some(ctx.working_dir.clone());
@@ -602,12 +602,12 @@ fn execute_slash_command(
     Ok(())
 }
 
-fn resolve_cd(arg: &str, cwd: &PathBuf, prev: Option<&PathBuf>) -> std::result::Result<PathBuf, String> {
+fn resolve_cd(arg: &str, cwd: &std::path::Path, prev: Option<&std::path::Path>) -> std::result::Result<PathBuf, String> {
     let home = std::env::var("HOME").ok().map(PathBuf::from);
     let target = if arg.is_empty() {
         home.ok_or_else(|| "HOME not set".to_string())?
     } else if arg == "-" {
-        prev.cloned().ok_or_else(|| "No previous directory".to_string())?
+        prev.map(|p| p.to_path_buf()).ok_or_else(|| "No previous directory".to_string())?
     } else if let Some(rest) = arg.strip_prefix('~') {
         let home = home.ok_or_else(|| "HOME not set".to_string())?;
         let rest = rest.strip_prefix('/').unwrap_or(rest);

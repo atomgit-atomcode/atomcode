@@ -16,6 +16,12 @@ pub struct UiState {
     pub prior_phase: Option<UiPhase>,
 }
 
+impl Default for UiState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl UiState {
     pub fn new() -> Self {
         Self {

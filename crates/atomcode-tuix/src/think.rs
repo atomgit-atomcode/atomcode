@@ -12,6 +12,12 @@ pub struct ThinkStripper {
     inside: bool,
 }
 
+impl Default for ThinkStripper {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ThinkStripper {
     pub fn new() -> Self {
         Self { carry: String::new(), inside: false }

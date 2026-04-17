@@ -18,6 +18,12 @@ impl PlainRenderer<BufWriter<Stdout>> {
     }
 }
 
+impl Default for PlainRenderer<BufWriter<Stdout>> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<W: Write + Send> PlainRenderer<W> {
     pub fn with_writer(out: W) -> Self {
         Self { out, last_prompt_written: false }

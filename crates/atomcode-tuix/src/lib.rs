@@ -85,7 +85,7 @@ pub async fn run(
             use std::io::BufRead;
             let stdin = std::io::stdin();
             let lock = stdin.lock();
-            for line in lock.lines().flatten() {
+            for line in lock.lines().map_while(Result::ok) {
                 // Synthesize a key-by-key paste so the loop handles it uniformly.
                 if input_tx.send(input::InputEvent::Paste(line)).is_err() {
                     return;
