@@ -51,13 +51,18 @@ fn push_sgr_bold_off(buf: &mut String, caps: TerminalCaps) {
 #[derive(Clone, Default)]
 struct FooterState {
     buf: String,
-    cursor_cols: usize,
+    cursor_byte: usize,
     /// Rendered menu items (already paged to at most 4).
     menu_items: Vec<(String, String)>,
     /// Index into menu_items that should display selected. 0-indexed.
     menu_selected_in_view: Option<usize>,
     spinner_frame: Option<String>,
     spinner_label: Option<String>,
+    /// Rows to walk up from the cursor resting position (box middle at
+    /// row K) to reach the footer's top row. Populated by
+    /// `draw_footer_here` so `erase_footer` knows exactly how far to
+    /// `\x1b[?A` regardless of whether the box is 1 row or N rows tall.
+    cursor_row_from_top: usize,
 }
 
 /// ANSI renderer — PURE APPEND architecture (no scroll region).
@@ -132,30 +137,34 @@ impl<W: Write + Send> AnsiRenderer<W> {
         crossterm::terminal::size().map(|(_, h)| h as usize).unwrap_or(24)
     }
 
-    /// Erase the currently-drawn footer. Cursor is assumed to be on the
-    /// box middle row (which is row index 2 from the footer top: row 0 =
-    /// blank margin, row 1 = box top, row 2 = box middle). Moves cursor
-    /// up to the footer top then clears to end of screen.
+    /// Erase the currently-drawn footer. Cursor is on the box middle row
+    /// at the K-th middle line (0-based); distance from there up to the
+    /// footer top is `2 + K` (row 0 = spinner/blank, row 1 = ╭─╮ border,
+    /// rows 2..2+N-1 = middle). `draw_footer_here` populates
+    /// `last_footer.cursor_row_from_top` so we know the exact number
+    /// regardless of how tall the box is.
     fn erase_footer(&mut self) {
         if self.footer_rows == 0 {
             return;
         }
-        // Move up 2 rows (box middle → footer top blank row), go to col 1,
-        // erase everything from there to end of screen.
-        let _ = self.out.write_all(b"\x1b[2A\r\x1b[J");
+        let up = self.last_footer.cursor_row_from_top.max(1);
+        let _ = write!(self.out, "\x1b[{}A\r\x1b[J", up);
         self.footer_rows = 0;
     }
 
     /// Draw the footer starting at the current cursor position. Layout:
     ///
-    ///   row 0: spinner line ("⠋ Pondering") — or blank margin
-    ///   row 1: ╭───────╮   box top
-    ///   row 2: │ ❯ buf │   box middle  ← cursor lands here at end
-    ///   row 3: ╰───────╯   box bottom
-    ///   row 4..4+N: menu items (N ≤ 4)
+    ///   row 0:         spinner line ("⠋ Pondering") — or blank margin
+    ///   row 1:         ╭─────────────╮   box top
+    ///   row 2..2+N-1:  │ ❯ line 1   │   middle row (cursor lands on row 2+K)
+    ///                  │   line 2   │   extra middle rows when buf wraps
+    ///   row 2+N:       ╰─────────────╯   box bottom
+    ///   row 3+N..3+N+M: menu items (M ≤ 4)
     ///
-    /// Every row emitted with \r\n. Total rows = 4 + N. Cursor positioning
-    /// at the end: up (total - 2) to reach box middle, then col 5 + cursor_cols.
+    /// The first middle row carries the "❯ " prompt glyph; wrapped
+    /// continuation rows use "  " (two spaces) in that position so text
+    /// keeps its indent. Box auto-grows in height as the user types past
+    /// the right border — no horizontal scroll.
     fn draw_footer_here(&mut self) {
         let state = self.last_footer.clone();
         let w = self.term_width();
@@ -163,9 +172,25 @@ impl<W: Write + Send> AnsiRenderer<W> {
         // border cells.
         let box_outer = w.saturating_sub(PAD_COL * 2);
         let inner = box_outer.saturating_sub(2);
+        // Text budget = inner minus the leading "❯ " (2 cols) and a 1-col
+        // gap on each side of the prompt glyph: "│ ❯ text │" uses 4
+        // border-adjacent cols (│ + space + ❯ + space ... trailing space + │).
+        let text_budget = inner.saturating_sub(4);
 
         let _ = self.out.write_all(b"\x1b[?7l");
         let _ = self.out.write_all(b"\r");
+
+        // Wrap the buffer and locate the cursor in the wrapped layout.
+        let safe = scrub_controls(&state.buf);
+        let (mut lines, cursor_row_in_middle, cursor_col_in_row) = if text_budget == 0 {
+            (vec![String::new()], 0usize, 0usize)
+        } else {
+            crate::width::wrap_with_cursor(&safe, text_budget, state.cursor_byte)
+        };
+        if lines.is_empty() {
+            lines.push(String::new());
+        }
+        let middle_rows = lines.len();
 
         // Row 0: spinner (if present) or blank margin.
         if let (Some(frame), Some(label)) = (state.spinner_frame.as_ref(), state.spinner_label.as_ref()) {
@@ -194,38 +219,31 @@ impl<W: Write + Send> AnsiRenderer<W> {
         self.reset();
         let _ = self.out.write_all(b"\r\n");
 
-        // Row 2: box middle — horizontal scroll when cursor exceeds text budget.
-        // text_budget = inner - (leading " ❯ " = 3) - trailing space before │.
-        let text_budget = inner.saturating_sub(4);
-        let safe = scrub_controls(&state.buf);
-        let (display_buf, rendered_cursor_col) = if text_budget == 0 {
-            (String::new(), 0usize)
-        } else if state.cursor_cols < text_budget {
-            (crate::width::truncate_to_width(&safe, text_budget), state.cursor_cols)
-        } else {
-            // Slide window so the cursor sits at the rightmost typing cell.
-            let window_start = state.cursor_cols + 1 - text_budget;
-            let windowed = crate::width::slice_cols(&safe, window_start, text_budget);
-            (windowed, text_budget - 1)
-        };
-        let buf_w = crate::width::display_width(&display_buf);
-        let pad = text_budget.saturating_sub(buf_w);
+        // Rows 2..2+N-1: middle. First row gets "❯ ", continuations get "  ".
+        for (i, line) in lines.iter().enumerate() {
+            let line_w = crate::width::display_width(line);
+            let pad = text_budget.saturating_sub(line_w);
 
-        self.write_left_pad();
-        self.set_fg(Role::Border);
-        let _ = self.out.write_all("│ ".as_bytes());
-        self.reset();
-        self.set_fg(Role::Accent);
-        let _ = self.out.write_all("❯ ".as_bytes());
-        self.reset();
-        let _ = self.out.write_all(display_buf.as_bytes());
-        for _ in 0..pad { let _ = self.out.write_all(b" "); }
-        self.set_fg(Role::Border);
-        let _ = self.out.write_all(" │".as_bytes());
-        self.reset();
-        let _ = self.out.write_all(b"\r\n");
+            self.write_left_pad();
+            self.set_fg(Role::Border);
+            let _ = self.out.write_all("│ ".as_bytes());
+            self.reset();
+            if i == 0 {
+                self.set_fg(Role::Accent);
+                let _ = self.out.write_all("❯ ".as_bytes());
+                self.reset();
+            } else {
+                let _ = self.out.write_all(b"  ");
+            }
+            let _ = self.out.write_all(line.as_bytes());
+            for _ in 0..pad { let _ = self.out.write_all(b" "); }
+            self.set_fg(Role::Border);
+            let _ = self.out.write_all(" │".as_bytes());
+            self.reset();
+            let _ = self.out.write_all(b"\r\n");
+        }
 
-        // Row 3: box bottom border.
+        // Row 2+N: box bottom border.
         self.write_left_pad();
         self.set_fg(Role::Border);
         let _ = self.out.write_all("╰".as_bytes());
@@ -267,19 +285,24 @@ impl<W: Write + Send> AnsiRenderer<W> {
             let _ = i;
         }
 
-        // Total rows = 4 (spinner/blank + 3 box) + menu_rows.
-        let total_rows = 4 + menu_rows;
+        // Total rows = 1 (spinner/blank) + 1 (top) + N middle + 1 (bottom) + M menu.
+        let total_rows = 1 + 1 + middle_rows + 1 + menu_rows;
         self.footer_rows = total_rows;
 
-        // Cursor now at (footer_start + total_rows, 0). Box middle is at
-        // row index 2 from footer top. Move up (total_rows - 2).
-        let up = total_rows.saturating_sub(2);
+        // Cursor lands on middle row K. Offset from footer top = 2 + K
+        // (spinner row + top border + K middle rows above the cursor row).
+        let cursor_row_from_top = 2 + cursor_row_in_middle;
+        self.last_footer.cursor_row_from_top = cursor_row_from_top;
+
+        // After drawing, cursor is just after the last menu row (or box
+        // bottom if no menu). Walk up to land on the cursor's middle row.
+        let up = total_rows.saturating_sub(cursor_row_from_top + 1);
         if up > 0 {
             let _ = write!(self.out, "\x1b[{}A", up);
         }
-        // Col = 1 (1-indexed) + PAD_COL (outer margin) + 4 ("│ ❯ ") +
-        // rendered_cursor_col (cursor offset within the visible window).
-        let col = 1 + PAD_COL + 4 + rendered_cursor_col;
+        // Col = 1 (1-indexed) + PAD_COL + 4 ("│ ❯ " or "│   ")
+        //       + cursor_col_in_row.
+        let col = 1 + PAD_COL + 4 + cursor_col_in_row;
         let _ = write!(self.out, "\r\x1b[{}G", col);
 
         let _ = self.out.write_all(b"\x1b[?7h");
@@ -309,7 +332,7 @@ impl<W: Write + Send> AnsiRenderer<W> {
     fn draw_footer_with_menu(
         &mut self,
         buf: &str,
-        cursor_cols: usize,
+        cursor_byte: usize,
         spinner: Option<(&str, &str)>,
         menu: Option<&super::MenuPayload>,
     ) {
@@ -348,11 +371,13 @@ impl<W: Write + Send> AnsiRenderer<W> {
 
         self.last_footer = FooterState {
             buf: buf.to_string(),
-            cursor_cols,
+            cursor_byte,
             menu_items,
             menu_selected_in_view: selected_in_view,
             spinner_frame: sp_frame,
             spinner_label: sp_label,
+            // cursor_row_from_top populated by draw_footer_here.
+            cursor_row_from_top: 0,
         };
 
         self.erase_footer();
@@ -363,10 +388,10 @@ impl<W: Write + Send> AnsiRenderer<W> {
     fn draw_footer(
         &mut self,
         buf: &str,
-        cursor_cols: usize,
+        cursor_byte: usize,
         spinner: Option<(&str, &str)>,
     ) {
-        self.draw_footer_with_menu(buf, cursor_cols, spinner, None);
+        self.draw_footer_with_menu(buf, cursor_byte, spinner, None);
     }
 
     // Shim so existing call sites keep compiling. Scroll-region mode makes
@@ -823,18 +848,18 @@ impl<W: Write + Send> Renderer for AnsiRenderer<W> {
                 }
                 self.draw_footer("", 0, Some((frame, &label)));
             }
-            UiLine::StreamingBox { buf, cursor_cols, frame, label } => {
+            UiLine::StreamingBox { buf, cursor_byte, frame, label } => {
                 if self.assistant_continuing {
                     return;
                 }
-                self.draw_footer(&buf, cursor_cols, Some((frame, &label)));
+                self.draw_footer(&buf, cursor_byte, Some((frame, &label)));
             }
             UiLine::ClearTransient => {
                 // Footer is fixed at absolute bottom rows — nothing to clear.
                 // Kept as no-op for event_loop compatibility.
             }
-            UiLine::InputPrompt { buf, cursor_cols, menu } => {
-                self.draw_footer_with_menu(&buf, cursor_cols, None, menu.as_ref());
+            UiLine::InputPrompt { buf, cursor_byte, menu } => {
+                self.draw_footer_with_menu(&buf, cursor_byte, None, menu.as_ref());
             }
             UiLine::InputCommit => {
                 // No-op. The event loop now emits ClearTransient → User to

@@ -54,6 +54,65 @@ pub fn wrap_line_to_width(line: &str, max_cols: usize) -> Vec<String> {
     chunks
 }
 
+/// Wrap `text` to `max_cols` columns AND locate the cursor's 2D position
+/// within the wrapped layout. Honours explicit `\n` as a hard line break
+/// (Shift+Enter in the input buffer). Returns `(lines, cursor_row, cursor_col)`
+/// where `cursor_row` is 0-based within `lines` and `cursor_col` is the
+/// display column within that row.
+///
+/// `cursor_byte` is a byte offset into `text`; `text.len()` (end-of-buffer)
+/// is the expected maximum.
+pub fn wrap_with_cursor(
+    text: &str,
+    max_cols: usize,
+    cursor_byte: usize,
+) -> (Vec<String>, usize, usize) {
+    if max_cols == 0 {
+        return (vec![String::new()], 0, 0);
+    }
+    let mut lines: Vec<String> = vec![String::new()];
+    let mut col = 0usize;
+    let mut byte = 0usize;
+    let mut cursor_row = 0usize;
+    let mut cursor_col = 0usize;
+    let mut cursor_set = false;
+
+    for c in text.chars() {
+        // Wrap check BEFORE writing the char, so a cursor that lands
+        // at byte==boundary appears on the new row at col 0 rather
+        // than pinned to col `max_cols` on the old row (which would
+        // overlap the right border).
+        if c != '\n' {
+            let w = UnicodeWidthChar::width(c).unwrap_or(0);
+            if col + w > max_cols && !lines.last().unwrap().is_empty() {
+                lines.push(String::new());
+                col = 0;
+            }
+        }
+        if !cursor_set && byte == cursor_byte {
+            cursor_row = lines.len() - 1;
+            cursor_col = col;
+            cursor_set = true;
+        }
+        if c == '\n' {
+            lines.push(String::new());
+            col = 0;
+        } else {
+            let w = UnicodeWidthChar::width(c).unwrap_or(0);
+            lines.last_mut().unwrap().push(c);
+            col += w;
+        }
+        byte += c.len_utf8();
+    }
+
+    // Cursor at end-of-buffer falls through.
+    if !cursor_set {
+        cursor_row = lines.len() - 1;
+        cursor_col = col;
+    }
+    (lines, cursor_row, cursor_col)
+}
+
 /// Slice `s` starting at display column `start_col`, taking up to `max_cols`
 /// columns. Characters that straddle the start boundary are skipped. Used to
 /// implement horizontal scroll in the input prompt — keeps the cursor visible
@@ -169,5 +228,42 @@ mod tests {
     #[test]
     fn slice_cols_start_zero_matches_truncate() {
         assert_eq!(slice_cols("hello world", 0, 5), "hello");
+    }
+
+    #[test]
+    fn wrap_with_cursor_short_text_single_row() {
+        let (lines, r, c) = wrap_with_cursor("hi", 10, 2);
+        assert_eq!(lines, vec!["hi".to_string()]);
+        assert_eq!((r, c), (0, 2));
+    }
+
+    #[test]
+    fn wrap_with_cursor_overflow_moves_to_next_row() {
+        let (lines, r, c) = wrap_with_cursor("abcdef", 3, 3);
+        assert_eq!(lines, vec!["abc".to_string(), "def".to_string()]);
+        // cursor at byte 3 (between abc and def) → start of row 1
+        assert_eq!((r, c), (1, 0));
+    }
+
+    #[test]
+    fn wrap_with_cursor_honours_explicit_newline() {
+        let (lines, r, c) = wrap_with_cursor("ab\ncd", 10, 4);
+        assert_eq!(lines, vec!["ab".to_string(), "cd".to_string()]);
+        assert_eq!((r, c), (1, 1));
+    }
+
+    #[test]
+    fn wrap_with_cursor_end_of_buffer() {
+        let (lines, r, c) = wrap_with_cursor("hello", 10, 5);
+        assert_eq!(lines, vec!["hello".to_string()]);
+        assert_eq!((r, c), (0, 5));
+    }
+
+    #[test]
+    fn wrap_with_cursor_cjk_widths() {
+        // "你好" = 4 cols. max=3 → wraps after "你" (width 2 fits, next
+        // char 好 (w=2) would overflow 2+2=4>3, so wrap).
+        let (lines, _, _) = wrap_with_cursor("你好", 3, 0);
+        assert_eq!(lines, vec!["你".to_string(), "好".to_string()]);
     }
 }

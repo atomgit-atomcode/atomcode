@@ -38,15 +38,20 @@ pub enum UiLine {
     ClearTransient,
     /// Draw the input prompt "❯ " + current buffer (transient, idle).
     /// When `menu` is Some, a command palette is drawn above the box.
+    /// `cursor_byte` is a byte offset into `buf` — the renderer wraps
+    /// `buf` to the available input width and derives the 2D cursor
+    /// position (row, col) itself so the input box can grow multi-line
+    /// when the user exceeds a single row.
     InputPrompt {
         buf: String,
-        cursor_cols: usize,
+        cursor_byte: usize,
         menu: Option<MenuPayload>,
     },
-    /// Streaming chrome: one spinner line above the 3-line input box.
+    /// Streaming chrome: spinner line above a (possibly multi-line)
+    /// input box. Same `cursor_byte` semantics as `InputPrompt`.
     StreamingBox {
         buf: String,
-        cursor_cols: usize,
+        cursor_byte: usize,
         frame: &'static str,
         label: String,
     },

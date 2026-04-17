@@ -288,10 +288,6 @@ impl Buffer {
         }
     }
 
-    fn cursor_cols(&self) -> usize {
-        // display width of buf[..cursor]
-        crate::width::display_width(&self.text[..self.cursor])
-    }
 }
 
 #[cfg(test)]
@@ -402,7 +398,7 @@ pub async fn run_loop(
         dir_display.replacen(&home, "~", 1)
     } else { dir_display };
     renderer.render(UiLine::Welcome { model: ctx.model_name.clone(), working_dir: dir_display.clone() });
-    renderer.render(UiLine::InputPrompt { buf: String::new(), cursor_cols: 0, menu: None });
+    renderer.render(UiLine::InputPrompt { buf: String::new(), cursor_byte: 0, menu: None });
     renderer.flush();
 
     // Spinner tick channel — a background task fires a tick every 100ms
@@ -499,7 +495,7 @@ pub async fn run_loop(
                     last_spinner_draw = std::time::Instant::now();
                 }
                 if matches!(state.phase, UiPhase::Idle) {
-                    renderer.render(UiLine::InputPrompt { buf: buf.text.clone(), cursor_cols: buf.cursor_cols(), menu: None });
+                    renderer.render(UiLine::InputPrompt { buf: buf.text.clone(), cursor_byte: buf.cursor, menu: None });
                     renderer.flush();
                 }
             }
@@ -526,7 +522,7 @@ pub async fn run_loop(
                     _ => {
                         renderer.render(UiLine::InputPrompt {
                             buf: buf.text.clone(),
-                            cursor_cols: buf.cursor_cols(),
+                            cursor_byte: buf.cursor,
                             menu: None,
                         });
                         renderer.flush();
@@ -564,7 +560,7 @@ pub async fn run_loop(
                     last_spinner_draw = std::time::Instant::now();
                 }
                 if matches!(state.phase, UiPhase::Idle) {
-                    renderer.render(UiLine::InputPrompt { buf: buf.text.clone(), cursor_cols: buf.cursor_cols(), menu: None });
+                    renderer.render(UiLine::InputPrompt { buf: buf.text.clone(), cursor_byte: buf.cursor, menu: None });
                     renderer.flush();
                 }
             }
@@ -597,7 +593,7 @@ fn handle_input(
         InputEvent::Paste(text) => {
             if matches!(state.phase, UiPhase::Idle) && model_picker.is_none() {
                 buf.insert_paste(text);
-                renderer.render(UiLine::InputPrompt { buf: buf.text.clone(), cursor_cols: buf.cursor_cols(), menu: None });
+                renderer.render(UiLine::InputPrompt { buf: buf.text.clone(), cursor_byte: buf.cursor, menu: None });
                 renderer.flush();
             }
         }
@@ -733,7 +729,7 @@ fn handle_idle_key(
                 menu.selected = 0;
                 renderer.render(UiLine::InputPrompt {
                     buf: String::new(),
-                    cursor_cols: 0,
+                    cursor_byte: 0,
                     menu: None,
                 });
                 renderer.flush();
@@ -758,7 +754,7 @@ fn handle_idle_key(
                 menu.selected = 0;
                 renderer.render(UiLine::InputPrompt {
                     buf: buf.text.clone(),
-                    cursor_cols: buf.cursor_cols(),
+                    cursor_byte: buf.cursor,
                     menu: None,
                 });
                 renderer.flush();
@@ -804,7 +800,7 @@ fn redraw_with_menu(
     };
     renderer.render(UiLine::InputPrompt {
         buf: buf.text.clone(),
-        cursor_cols: buf.cursor_cols(),
+        cursor_byte: buf.cursor,
         menu: Some(payload),
     });
     renderer.flush();
@@ -838,7 +834,7 @@ fn redraw_idle(
     });
     renderer.render(UiLine::InputPrompt {
         buf: buf.text.clone(),
-        cursor_cols: buf.cursor_cols(),
+        cursor_byte: buf.cursor,
         menu: payload,
     });
     renderer.flush();
@@ -1287,7 +1283,7 @@ fn draw_spinner_now(
     let label = format_spinner_label(state);
     renderer.render(UiLine::StreamingBox {
         buf: buf.text.clone(),
-        cursor_cols: buf.cursor_cols(),
+        cursor_byte: buf.cursor,
         frame,
         label,
     });

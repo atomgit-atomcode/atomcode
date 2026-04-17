@@ -152,7 +152,7 @@ mod tests {
     fn input_prompt_uses_plain_chevron() {
         let mut buf = Vec::new();
         let mut r = PlainRenderer::with_writer(&mut buf);
-        r.render(UiLine::InputPrompt { buf: "hi".into(), cursor_cols: 2, menu: None });
+        r.render(UiLine::InputPrompt { buf: "hi".into(), cursor_byte: 2, menu: None });
         r.flush();
         let s = String::from_utf8(buf).unwrap();
         assert!(s.contains("> "));
