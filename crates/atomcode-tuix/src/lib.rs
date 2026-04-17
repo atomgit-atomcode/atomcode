@@ -58,10 +58,11 @@ impl TerminalGuard {
             if bottom >= 5 {
                 let stdout = io::stdout();
                 let mut out = stdout.lock();
-                // Clear screen + home, set scroll region, disable autowrap.
-                // Autowrap off prevents exact-fit box borders (width-w last
-                // char) from triggering a scroll at the bottom-right cell.
-                let _ = write!(out, "\x1b[2J\x1b[H\x1b[1;{}r\x1b[?7l", bottom);
+                // Clear screen + home + set scroll region. Autowrap stays
+                // ON globally so long markdown lines flow into the next
+                // scroll row instead of being truncated; footer draws
+                // disable autowrap locally for the duration of their paint.
+                let _ = write!(out, "\x1b[2J\x1b[H\x1b[1;{}r", bottom);
                 let _ = out.flush();
                 g.scroll_region_set = true;
             }
@@ -76,8 +77,8 @@ impl Drop for TerminalGuard {
         if self.scroll_region_set {
             let stdout = io::stdout();
             let mut out = stdout.lock();
-            // Reset scroll region + re-enable autowrap + move cursor below
-            // the footer so the next shell prompt doesn't stomp leftover chrome.
+            // Reset scroll region + ensure autowrap restored + move cursor
+            // below the footer so the next shell prompt doesn't stomp chrome.
             let (_, h) = crossterm::terminal::size().unwrap_or((80, 24));
             let _ = write!(out, "\x1b[?7h\x1b[r\x1b[{};1H\r\n", h);
             let _ = out.flush();

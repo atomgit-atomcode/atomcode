@@ -157,6 +157,9 @@ impl<W: Write + Send> AnsiRenderer<W> {
         // could scroll out of place.
         let default_bottom = h.saturating_sub(4).max(1);
         let _ = write!(self.out, "\x1b[1;{}r", default_bottom);
+        // Disable autowrap for the duration of the box draw so writing ╯
+        // at column w doesn't wrap to the next line. Restored at the end.
+        let _ = self.out.write_all(b"\x1b[?7l");
 
         // Row h-3: spinner or blank
         let _ = write!(self.out, "\x1b[{};1H\x1b[K", h.saturating_sub(3));
@@ -224,6 +227,8 @@ impl<W: Write + Send> AnsiRenderer<W> {
             h.saturating_sub(1),
             cursor_col
         );
+        // Restore autowrap for scrolling content.
+        let _ = self.out.write_all(b"\x1b[?7h");
     }
 
     // Shim so existing call sites keep compiling. Scroll-region mode makes
