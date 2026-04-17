@@ -106,6 +106,7 @@ dependencies = [
  "anyhow",
  "atomcode-core",
  "atomcode-tui",
+ "atomcode-tuix",
  "clap",
  "crossterm",
  "dirs 6.0.0",
@@ -194,6 +195,17 @@ dependencies = [
  "tokio-util",
  "toml",
  "url",
+]
+
+[[package]]
+name = "atomcode-tuix"
+version = "4.15.3"
+dependencies = [
+ "anyhow",
+ "atomcode-core",
+ "crossterm",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
