@@ -41,6 +41,8 @@ pub enum UiLine {
     InputCommit,
     /// Slash-command output (arbitrary text, already sanitised by caller).
     CommandOutput(String),
+    /// A visible separator between turns: `────── {label} ──────`.
+    TurnSeparator { label: String },
 }
 
 pub trait Renderer: Send {

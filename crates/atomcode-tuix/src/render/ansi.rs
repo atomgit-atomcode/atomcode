@@ -437,9 +437,16 @@ impl<W: Write + Send> Renderer for AnsiRenderer<W> {
                 self.set_fg(Role::Brand);
                 let _ = write!(self.out, " {} ", frame);
                 self.reset();
-                self.set_fg(Role::Muted);
+                // Label: brighter (Secondary) + bold for slight emphasis.
+                if self.caps.colors {
+                    let _ = self.out.write_all(b"\x1b[1m");
+                }
+                self.set_fg(Role::Secondary);
                 let _ = self.out.write_all(scrub_controls(&label).as_bytes());
                 self.reset();
+                if self.caps.colors {
+                    let _ = self.out.write_all(b"\x1b[22m");
+                }
                 let _ = self.out.write_all(b"\r\n");
 
                 // Lines 1-3: the normal input box showing buf (even though
@@ -546,6 +553,32 @@ impl<W: Write + Send> Renderer for AnsiRenderer<W> {
             }
             UiLine::InputCommit => {
                 let _ = self.out.write_all(b"\r\n");
+                self.last_was_permanent = true;
+            }
+            UiLine::TurnSeparator { label } => {
+                self.clear_line_if_needed();
+                let tw = self.term_width();
+                let safe = scrub_controls(&label);
+                let lw = crate::width::display_width(&safe);
+                // Layout: `{dashes} {label} {dashes}` filled to full width.
+                // Reserve 2 spaces around label. Fallback if too narrow.
+                let padded = 2 + lw + 2; // ── _label_ ──
+                let remaining = tw.saturating_sub(padded);
+                let left = remaining / 2;
+                let right = remaining - left;
+
+                self.set_fg(Role::Muted);
+                for _ in 0..left { let _ = self.out.write_all("─".as_bytes()); }
+                let _ = self.out.write_all(b" ");
+                self.reset();
+                self.set_fg(Role::Secondary);
+                let _ = self.out.write_all(safe.as_bytes());
+                self.reset();
+                self.set_fg(Role::Muted);
+                let _ = self.out.write_all(b" ");
+                for _ in 0..right { let _ = self.out.write_all("─".as_bytes()); }
+                self.reset();
+                let _ = self.out.write_all(b"\r\n\r\n");
                 self.last_was_permanent = true;
             }
             UiLine::CommandOutput(text) => {

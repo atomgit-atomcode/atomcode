@@ -514,13 +514,16 @@ fn handle_agent_event(
         AgentEvent::PhaseChange(AgentPhase::Thinking) => state.on_thinking(),
         AgentEvent::PhaseChange(AgentPhase::CallingTool(name)) => state.on_tool_call_streaming(&name),
         AgentEvent::PhaseChange(_) => {}
-        AgentEvent::TurnComplete { .. } => {
+        AgentEvent::TurnComplete { duration, total_tokens, turn_count, tool_call_count, .. } => {
             renderer.render(UiLine::AssistantLineBreak);
-            // Drop any orphaned pending calls (shouldn't happen if agent is
-            // well-behaved; clear defensively so they don't leak into the
-            // next turn).
             pending_tools.clear();
-            renderer.render(UiLine::TurnComplete);
+            let done = state.next_done_label();
+            let dur = crate::render::fmt_dur(duration);
+            let label = format!(
+                "✓ {} · {}轮 · {}工具 · {} · {}tok",
+                done, turn_count, tool_call_count, dur, total_tokens
+            );
+            renderer.render(UiLine::TurnSeparator { label });
             renderer.flush();
             state.on_turn_complete();
         }

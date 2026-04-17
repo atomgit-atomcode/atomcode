@@ -7,6 +7,34 @@ pub enum UiPhase {
     Suspended,
 }
 
+/// Rotating pool of playful "thinking" labels. Advances once per turn so
+/// consecutive turns don't show the same word.
+pub const THINKING_LABELS: &[&str] = &[
+    "思考中",
+    "琢磨中",
+    "推演中",
+    "酝酿中",
+    "捣鼓中",
+    "咀嚼中",
+    "盘算中",
+    "钻研中",
+    "打磨中",
+    "筹划中",
+];
+
+/// Rotating pool of turn-completion phrases. Used by the event loop when
+/// building the TurnSeparator that marks the end of each turn.
+pub const DONE_LABELS: &[&str] = &[
+    "搞定",
+    "完工",
+    "收工",
+    "齐活",
+    "干完啦",
+    "告一段落",
+    "稳了",
+    "成",
+];
+
 pub struct UiState {
     pub phase: UiPhase,
     pub spinner_label: String,
@@ -14,6 +42,8 @@ pub struct UiState {
     pub total_tokens: usize,
     /// When Suspended, holds the phase to restore on resume.
     pub prior_phase: Option<UiPhase>,
+    /// Round-robin index into THINKING_LABELS; bumped on each on_submit.
+    pub thinking_idx: usize,
 }
 
 impl Default for UiState {
@@ -30,13 +60,19 @@ impl UiState {
             spinner_frame: 0,
             total_tokens: 0,
             prior_phase: None,
+            thinking_idx: 0,
         }
+    }
+
+    fn current_thinking(&self) -> &'static str {
+        THINKING_LABELS[self.thinking_idx % THINKING_LABELS.len()]
     }
 
     pub fn on_submit(&mut self) {
         self.phase = UiPhase::Streaming;
-        self.spinner_label = "Thinking...".into();
+        self.spinner_label = self.current_thinking().to_string();
         self.spinner_frame = 0;
+        self.thinking_idx = self.thinking_idx.wrapping_add(1);
     }
 
     pub fn on_turn_complete(&mut self) {
@@ -63,7 +99,10 @@ impl UiState {
     }
 
     pub fn on_thinking(&mut self) {
-        self.spinner_label = "Thinking...".into();
+        // Reuse the current pool label (don't bump the index — that's done
+        // on submit, one rotation per turn not per state transition).
+        let idx = self.thinking_idx.saturating_sub(1) % THINKING_LABELS.len();
+        self.spinner_label = THINKING_LABELS[idx].to_string();
     }
 
     pub fn on_approval_needed(&mut self, _tool: &str) {
@@ -85,6 +124,13 @@ impl UiState {
         } else {
             self.phase = UiPhase::Idle;
         }
+    }
+
+    /// Pick (and advance) a playful "done" phrase for the turn separator.
+    pub fn next_done_label(&mut self) -> &'static str {
+        // Reuse thinking_idx rotation so done/think move together.
+        let idx = self.thinking_idx.wrapping_sub(1) % DONE_LABELS.len();
+        DONE_LABELS[idx]
     }
 
     pub fn tick_spinner(&mut self) -> &'static str {
@@ -109,7 +155,19 @@ mod tests {
         let mut s = UiState::new();
         s.on_submit();
         assert_eq!(s.phase, UiPhase::Streaming);
-        assert_eq!(s.spinner_label, "Thinking...");
+        // Label is one of the rotating pool entries.
+        assert!(THINKING_LABELS.contains(&s.spinner_label.as_str()));
+    }
+
+    #[test]
+    fn consecutive_submits_rotate_labels() {
+        let mut s = UiState::new();
+        s.on_submit();
+        let first = s.spinner_label.clone();
+        s.on_turn_complete();
+        s.on_submit();
+        let second = s.spinner_label.clone();
+        assert_ne!(first, second);
     }
 
     #[test]

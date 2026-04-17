@@ -59,16 +59,21 @@ pub fn render_line(line: &str, state: &mut MdState, caps: TerminalCaps) -> Optio
         return Some(render_table_line(trimmed, caps));
     }
 
-    // Heading — no bold, pure colour weight by level.
+    // Heading — brightness hierarchy without screaming bold.
     if let Some((level, rest)) = parse_heading(line) {
         let inner = render_inline(rest, caps);
         if !caps.colors {
             return Some(format!("{} {}", "#".repeat(level as usize), inner));
         }
         return Some(match level {
-            1 => format!("\x1b[38;2;205;175;215m{}\x1b[39m", inner), // brand lavender
-            2 => format!("\x1b[38;2;170;170;180m{}\x1b[39m", inner), // secondary gray
-            _ => format!("\x1b[38;2;130;130;140m{}\x1b[39m", inner), // muted border gray
+            // H1: pure white + bold (strongest hit)
+            1 => format!("\x1b[1;38;2;245;245;250m{}\x1b[0m", inner),
+            // H2: pure white, no bold
+            2 => format!("\x1b[38;2;245;245;250m{}\x1b[39m", inner),
+            // H3: secondary gray
+            3 => format!("\x1b[38;2;170;170;180m{}\x1b[39m", inner),
+            // H4+: muted
+            _ => format!("\x1b[38;2;130;130;140m{}\x1b[39m", inner),
         });
     }
 

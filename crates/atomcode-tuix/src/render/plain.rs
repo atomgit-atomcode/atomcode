@@ -83,6 +83,9 @@ impl<W: Write + Send> Renderer for PlainRenderer<W> {
             | UiLine::ClearTransient => {
                 // no-op in plain mode
             }
+            UiLine::TurnSeparator { label } => {
+                let _ = writeln!(self.out, "--- {} ---", scrub_controls(&label));
+            }
             UiLine::InputPrompt { buf, .. } => {
                 if !self.last_prompt_written {
                     let _ = write!(self.out, "> {}", scrub_controls(&buf));
