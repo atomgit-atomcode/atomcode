@@ -55,7 +55,18 @@ pub fn scrub_controls(input: &str) -> String {
                 // other C0: drop
             }
             '\u{0080}'..='\u{009F}' => {
-                // C1 controls — drop the control char only; do not consume following bytes
+                // C1 controls — some terminals interpret these as CSI alternatives.
+                // For U+009B (alt CSI introducer), consume the full sequence up to
+                // its final byte so the payload cannot reach the terminal as literal
+                // text. Other C1 controls are dropped as-is.
+                if c == '\u{009B}' {
+                    while let Some(&p) = chars.peek() {
+                        chars.next();
+                        if ('\x40'..='\x7E').contains(&p) {
+                            break;
+                        }
+                    }
+                }
             }
             _ => out.push(c),
         }
@@ -102,8 +113,8 @@ mod tests {
 
     #[test]
     fn c1_controls_removed() {
-        // \x9b = CSI alternate form
-        assert_eq!(scrub_controls("a\u{009b}2Jb"), "a2Jb");
+        // \x9b = CSI alternate form — introducer AND payload must be stripped
+        assert_eq!(scrub_controls("a\u{009b}2Jb"), "ab");
     }
 
     #[test]
