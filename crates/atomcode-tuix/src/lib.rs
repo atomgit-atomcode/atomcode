@@ -53,6 +53,7 @@ pub async fn run(
     let mut total_tokens: usize = 0;
     let mut previous_dir: Option<std::path::PathBuf> = None;
     let mut streaming_started = false; // track if we printed the initial bar prefix
+    let mut think_buf = String::new(); // accumulator for in-flight <think> stripping
 
     loop {
         if !streaming {
@@ -218,15 +219,19 @@ pub async fn run(
                     match event {
                         Some(AgentEvent::TextDelta(text)) => {
                             render::clear_spinner();
+                            // Strip <think>...</think> blocks in-flight.
+                            // GLM-5/MiniMax/Qwen emit English CoT inside <think> tags.
+                            let visible = strip_think_streaming(&text, &mut think_buf);
+                            if visible.is_empty() { continue; }
+
                             let mut out = io::stdout();
-                            // First delta: print bar prefix
+                            // First visible delta: print bar prefix
                             if !streaming_started {
-                                let _ = write!(out, "\r\n");
+                                let _ = write!(out, "\r\n  \u{2502} ");
                                 streaming_started = true;
                             }
                             // Replace \n with \r\n + bar prefix for each new line
-                            let fixed = text.replace('\n', "\r\n  \u{2502} ");
-                            // Print with bar prefix if at start of line
+                            let fixed = visible.replace('\n', "\r\n  \u{2502} ");
                             let _ = write!(out, "{}", fixed);
                             let _ = out.flush();
                         }
@@ -296,6 +301,7 @@ pub async fn run(
                             let _ = out.flush();
                             streaming = false;
                             streaming_started = false;
+                            think_buf.clear();
                         }
                         Some(AgentEvent::TurnCancelled { .. }) => {
                             render::clear_spinner();
@@ -354,4 +360,48 @@ pub async fn run(
     let _ = io::stdout().flush();
 
     Ok(())
+}
+
+/// Strip `<think>...</think>` blocks from streaming text.
+/// `buf` accumulates partial tags across delta boundaries.
+/// Returns the visible text (everything outside think blocks).
+fn strip_think_streaming(delta: &str, buf: &mut String) -> String {
+    buf.push_str(delta);
+    let mut visible = String::new();
+    let mut rest = buf.as_str();
+
+    loop {
+        match rest.find("<think>") {
+            None => {
+                // Check if rest ends with a partial "<thi..." that might be start of tag
+                let maybe_partial = rest.len().min(7);
+                let tail = &rest[rest.len() - maybe_partial..];
+                if "<think>".starts_with(tail) && !tail.is_empty() && tail != rest {
+                    // Might be partial tag — hold it in buffer
+                    visible.push_str(&rest[..rest.len() - maybe_partial]);
+                    *buf = tail.to_string();
+                } else {
+                    visible.push_str(rest);
+                    buf.clear();
+                }
+                break;
+            }
+            Some(open) => {
+                visible.push_str(&rest[..open]);
+                let after = &rest[open + 7..]; // skip "<think>"
+                match after.find("</think>") {
+                    Some(close) => {
+                        // Complete block — skip it, continue scanning
+                        rest = &after[close + 8..]; // skip "</think>"
+                    }
+                    None => {
+                        // Block still open — swallow everything, hold in buffer
+                        *buf = rest[open..].to_string();
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    visible
 }
