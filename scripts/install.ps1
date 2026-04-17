@@ -12,12 +12,20 @@ $Version = if ($env:ATOMCODE_VERSION) { $env:ATOMCODE_VERSION } else { "v4.15.3"
 $RepoBase = "https://atomgit.com/atomgit_atomcode/atomcode-release/releases/download"
 
 # --- detect arch ---
-$Arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture
-switch ("$Arch") {
-    "X64"   { $ArchTag = "x64" }
-    "Arm64" { $ArchTag = "arm64" }
+# Prefer PROCESSOR_ARCHITEW6432 (set only when a 32-bit process runs on a 64-bit
+# OS — it holds the real OS arch). Fall back to PROCESSOR_ARCHITECTURE.
+# Avoids RuntimeInformation::OSArchitecture which is empty on older PS 5.1/.NET.
+$RealArch = if ($env:PROCESSOR_ARCHITEW6432) {
+    $env:PROCESSOR_ARCHITEW6432
+} else {
+    $env:PROCESSOR_ARCHITECTURE
+}
+
+switch ($RealArch) {
+    "AMD64" { $ArchTag = "x64" }
+    "ARM64" { $ArchTag = "arm64" }
     default {
-        Write-Host "Unsupported architecture: $Arch (supported: x64, arm64)" -ForegroundColor Red
+        Write-Host "Unsupported architecture: $RealArch (supported: AMD64, ARM64)" -ForegroundColor Red
         exit 1
     }
 }
