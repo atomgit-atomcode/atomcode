@@ -83,6 +83,60 @@ impl<W: Write + Send> AnsiRenderer<W> {
         crossterm::terminal::size().map(|(_, h)| h as usize).unwrap_or(24)
     }
 
+    /// Draw footer optionally with a slash-command menu above the box.
+    /// Reshapes scroll region dynamically to reserve extra rows for menu.
+    fn draw_footer_with_menu(
+        &mut self,
+        buf: &str,
+        cursor_cols: usize,
+        spinner: Option<(&str, &str)>,
+        menu: Option<&super::MenuPayload>,
+    ) {
+        let h = self.term_rows();
+        // When menu active: reserve menu.len() + 4 bottom rows.
+        // When menu inactive: reserve 4 (spinner + 3-line box).
+        let menu_rows = menu.map(|m| m.items.len().min(8)).unwrap_or(0);
+        let reserved = menu_rows + 4;
+        let new_bottom = h.saturating_sub(reserved).max(1);
+        // Update scroll region (DECSTBM). Idempotent when unchanged.
+        let _ = write!(self.out, "\x1b[1;{}r", new_bottom);
+
+        if let Some(menu) = menu {
+            let menu_top = h.saturating_sub(3 + menu_rows);
+            // Clear menu area rows first so leftover content doesn't bleed.
+            for i in 0..menu_rows {
+                let _ = write!(self.out, "\x1b[{};1H\x1b[K", menu_top + i);
+            }
+            // Draw each menu item.
+            for (i, (name, desc)) in menu.items.iter().take(menu_rows).enumerate() {
+                let row = menu_top + i;
+                let selected = i == menu.selected;
+                let _ = write!(self.out, "\x1b[{};1H", row);
+                if selected {
+                    // Highlighted row: bright bg + white fg
+                    if self.caps.colors {
+                        let _ = self.out.write_all(b"\x1b[48;2;50;70;90m");
+                    }
+                    self.set_fg(Role::ToolName);
+                    let _ = write!(self.out, "  ▸ /{:<12}  {}", name, desc);
+                    // Pad to end of line for full bg.
+                    let content_w = 5 + name.len() + 2 + desc.chars().count();
+                    let pad = self.term_width().saturating_sub(content_w);
+                    for _ in 0..pad { let _ = self.out.write_all(b" "); }
+                    if self.caps.colors {
+                        let _ = self.out.write_all(b"\x1b[0m");
+                    }
+                } else {
+                    self.set_fg(Role::Muted);
+                    let _ = write!(self.out, "    /{:<12}  {}", name, desc);
+                    self.reset();
+                }
+            }
+        }
+
+        self.draw_footer(buf, cursor_cols, spinner);
+    }
+
     /// Redraw the fixed bottom footer (rows h-3..h). Optional `spinner`
     /// shown on row h-3; box on rows h-2, h-1, h. Leaves cursor on the
     /// middle row at col 4 + cursor_cols so the user can see where they
@@ -501,8 +555,8 @@ impl<W: Write + Send> Renderer for AnsiRenderer<W> {
                 // Footer is fixed at absolute bottom rows — nothing to clear.
                 // Kept as no-op for event_loop compatibility.
             }
-            UiLine::InputPrompt { buf, cursor_cols } => {
-                self.draw_footer(&buf, cursor_cols, None);
+            UiLine::InputPrompt { buf, cursor_cols, menu } => {
+                self.draw_footer_with_menu(&buf, cursor_cols, None, menu.as_ref());
                 self.last_was_permanent = false;
             }
             UiLine::InputCommit => {

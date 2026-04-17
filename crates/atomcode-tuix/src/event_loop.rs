@@ -206,6 +206,7 @@ pub async fn run_loop(
     let mut state = UiState::new();
     let mut buf = Buffer::new();
     let mut think = ThinkStripper::new();
+    let mut menu = MenuState::new();
 
     // Draw welcome + initial prompt
     let dir_display = ctx.working_dir.to_string_lossy().to_string();
@@ -213,7 +214,7 @@ pub async fn run_loop(
         dir_display.replacen(&home, "~", 1)
     } else { dir_display };
     renderer.render(UiLine::Welcome { model: ctx.model_name.clone(), working_dir: dir_display.clone() });
-    renderer.render(UiLine::InputPrompt { buf: String::new(), cursor_cols: 0 });
+    renderer.render(UiLine::InputPrompt { buf: String::new(), cursor_cols: 0, menu: None });
     renderer.flush();
 
     let mut spinner_tick = tokio::time::interval(Duration::from_millis(100));
@@ -246,7 +247,7 @@ pub async fn run_loop(
             maybe = ctx.input_rx.recv() => {
                 let Some(ev) = maybe else { break };
                 handle_input(
-                    ev, &mut state, &mut buf, &mut ctx, renderer,
+                    ev, &mut state, &mut buf, &mut ctx, renderer, &mut menu,
                 )?;
                 // DEVIATION from plan: removed `ctx.input_rx.is_closed()` check —
                 // UnboundedReceiver has no is_closed(); recv()->None already handles closure.
@@ -258,7 +259,7 @@ pub async fn run_loop(
                 handle_agent_event(ev, &mut state, &mut think, renderer, &mut pending_tools);
                 // if back to IDLE, redraw prompt
                 if matches!(state.phase, UiPhase::Idle) {
-                    renderer.render(UiLine::InputPrompt { buf: buf.text.clone(), cursor_cols: buf.cursor_cols() });
+                    renderer.render(UiLine::InputPrompt { buf: buf.text.clone(), cursor_cols: buf.cursor_cols(), menu: None });
                     renderer.flush();
                 }
             }
@@ -297,6 +298,7 @@ pub async fn run_loop(
                         renderer.render(UiLine::InputPrompt {
                             buf: buf.text.clone(),
                             cursor_cols: buf.cursor_cols(),
+                            menu: None,
                         });
                     }
                 }
@@ -310,7 +312,7 @@ pub async fn run_loop(
             maybe = ctx.input_rx.recv() => {
                 let Some(ev) = maybe else { break };
                 handle_input(
-                    ev, &mut state, &mut buf, &mut ctx, renderer,
+                    ev, &mut state, &mut buf, &mut ctx, renderer, &mut menu,
                 )?;
             }
 
@@ -319,7 +321,7 @@ pub async fn run_loop(
                 let Some(ev) = maybe else { break };
                 handle_agent_event(ev, &mut state, &mut think, renderer, &mut pending_tools);
                 if matches!(state.phase, UiPhase::Idle) {
-                    renderer.render(UiLine::InputPrompt { buf: buf.text.clone(), cursor_cols: buf.cursor_cols() });
+                    renderer.render(UiLine::InputPrompt { buf: buf.text.clone(), cursor_cols: buf.cursor_cols(), menu: None });
                     renderer.flush();
                 }
             }
@@ -347,13 +349,14 @@ fn handle_input(
     buf: &mut Buffer,
     ctx: &mut LoopCtx,
     renderer: &mut dyn Renderer,
+    menu: &mut MenuState,
 ) -> Result<()> {
     match ev {
         InputEvent::Paste(text) => {
             if matches!(state.phase, UiPhase::Idle) {
                 buf.text.insert_str(buf.cursor, &text);
                 buf.cursor += text.len();
-                renderer.render(UiLine::InputPrompt { buf: buf.text.clone(), cursor_cols: buf.cursor_cols() });
+                renderer.render(UiLine::InputPrompt { buf: buf.text.clone(), cursor_cols: buf.cursor_cols(), menu: None });
                 renderer.flush();
             }
         }
@@ -363,7 +366,7 @@ fn handle_input(
         InputEvent::Key(KeyEvent { kind: KeyEventKind::Release, .. }) => {}
         InputEvent::Key(KeyEvent { code, modifiers, .. }) => {
             match state.phase {
-                UiPhase::Idle => handle_idle_key(code, modifiers, state, buf, ctx, renderer)?,
+                UiPhase::Idle => handle_idle_key(code, modifiers, state, buf, ctx, renderer, menu)?,
                 UiPhase::Streaming => handle_streaming_key(code, modifiers, ctx, renderer)?,
                 UiPhase::Approval => handle_approval_key(code, state, ctx, renderer)?,
                 UiPhase::Suspended => {} // ignored
@@ -373,6 +376,41 @@ fn handle_input(
     Ok(())
 }
 
+/// Slash-command palette state. Active whenever buf starts with '/'.
+pub struct MenuState {
+    pub selected: usize,
+}
+
+impl MenuState {
+    pub fn new() -> Self {
+        Self { selected: 0 }
+    }
+}
+
+/// Filter the command registry by the buf's prefix after '/'. Returns the
+/// (name, desc) pairs matching, or None if menu shouldn't show (buf doesn't
+/// start with '/' or has whitespace, meaning the user has moved on to args).
+fn build_menu_items(buf: &str, commands: &CommandRegistry) -> Option<Vec<(String, String)>> {
+    if !buf.starts_with('/') {
+        return None;
+    }
+    let rest = &buf[1..];
+    // Once a space appears (user is typing args), stop showing menu.
+    if rest.contains(char::is_whitespace) {
+        return None;
+    }
+    let matches: Vec<(String, String)> = commands
+        .matching_prefix(rest)
+        .into_iter()
+        .map(|c| (c.name.to_string(), c.desc.to_string()))
+        .collect();
+    if matches.is_empty() {
+        None
+    } else {
+        Some(matches)
+    }
+}
+
 fn handle_idle_key(
     code: KeyCode,
     modifiers: crossterm::event::KeyModifiers,
@@ -380,36 +418,103 @@ fn handle_idle_key(
     buf: &mut Buffer,
     ctx: &mut LoopCtx,
     renderer: &mut dyn Renderer,
+    menu: &mut MenuState,
 ) -> Result<()> {
+    // If the menu is active (buf starts with '/'), intercept navigation keys.
+    let menu_items = build_menu_items(&buf.text, &ctx.commands);
+    if let Some(items) = &menu_items {
+        // Clamp selection in range.
+        if menu.selected >= items.len() {
+            menu.selected = items.len() - 1;
+        }
+        match (code, modifiers) {
+            (KeyCode::Up, _) => {
+                menu.selected = menu.selected.saturating_sub(1);
+                redraw_with_menu(buf, items, menu.selected, renderer);
+                return Ok(());
+            }
+            (KeyCode::Down, _) => {
+                if menu.selected + 1 < items.len() {
+                    menu.selected += 1;
+                }
+                redraw_with_menu(buf, items, menu.selected, renderer);
+                return Ok(());
+            }
+            (KeyCode::Enter, m) if !m.contains(crossterm::event::KeyModifiers::SHIFT) => {
+                // Accept the highlighted command as the committed line.
+                let name = items[menu.selected].0.clone();
+                let committed = format!("/{}", name);
+                menu.selected = 0;
+                // Simulate a commit path.
+                renderer.render(UiLine::ClearTransient);
+                renderer.render(UiLine::User(committed.clone()));
+                buf.text.clear();
+                buf.cursor = 0;
+                if let Some((cmd, arg)) = parse_slash_line(&committed) {
+                    execute_slash_command(cmd, arg, state, ctx, renderer)?;
+                    if matches!(state.phase, UiPhase::Idle) {
+                        renderer.render(UiLine::InputPrompt {
+                            buf: String::new(),
+                            cursor_cols: 0,
+                            menu: None,
+                        });
+                        renderer.flush();
+                    }
+                }
+                return Ok(());
+            }
+            (KeyCode::Esc, _) => {
+                // Close menu by clearing buffer.
+                buf.text.clear();
+                buf.cursor = 0;
+                menu.selected = 0;
+                renderer.render(UiLine::InputPrompt {
+                    buf: String::new(),
+                    cursor_cols: 0,
+                    menu: None,
+                });
+                renderer.flush();
+                return Ok(());
+            }
+            _ => {} // fall through to buffer edits
+        }
+    }
+
     let action = classify(code, modifiers);
-    let was_empty = buf.text.is_empty();
     match buf.apply(action, ctx.history.entries(), &ctx.commands) {
         BufferResult::NoOp => {}
         BufferResult::Redraw => {
-            // Typing the first `/` on an empty buffer: echo the slash command
-            // menu into scrollback so the user can see what's available.
-            if was_empty && buf.text == "/" {
-                let mut out = String::from("\n");
-                for c in ctx.commands.all() {
-                    out.push_str(&format!("  /{:<10}  {}\n", c.name, c.desc));
+            // Rebuild menu after buf change.
+            let items = build_menu_items(&buf.text, &ctx.commands);
+            if let Some(items) = items {
+                if menu.selected >= items.len() {
+                    menu.selected = 0;
                 }
-                renderer.render(UiLine::CommandOutput(out));
+                redraw_with_menu(buf, &items, menu.selected, renderer);
+            } else {
+                menu.selected = 0;
+                renderer.render(UiLine::InputPrompt {
+                    buf: buf.text.clone(),
+                    cursor_cols: buf.cursor_cols(),
+                    menu: None,
+                });
+                renderer.flush();
             }
-            renderer.render(UiLine::InputPrompt { buf: buf.text.clone(), cursor_cols: buf.cursor_cols() });
-            renderer.flush();
         }
         BufferResult::Commit(line) => {
-            // Clear the transient prompt, then echo the committed input
-            // as a permanent scrollback line (clean, single-source echo).
             renderer.render(UiLine::ClearTransient);
             renderer.render(UiLine::User(line.clone()));
             buf.text.clear();
             buf.cursor = 0;
-            // Slash command?
+            menu.selected = 0;
             if let Some((cmd, arg)) = parse_slash_line(&line) {
                 execute_slash_command(cmd, arg, state, ctx, renderer)?;
                 if matches!(state.phase, UiPhase::Idle) {
-                    renderer.render(UiLine::InputPrompt { buf: String::new(), cursor_cols: 0 });
+                    renderer.render(UiLine::InputPrompt {
+                        buf: String::new(),
+                        cursor_cols: 0,
+                        menu: None,
+                    });
                     renderer.flush();
                 }
             } else {
@@ -420,10 +525,27 @@ fn handle_idle_key(
         }
         BufferResult::Exit => {
             ctx.agent.cmd_tx.send(AgentCommand::Shutdown).ok();
-            // trigger break on next loop via closed channel
         }
     }
     Ok(())
+}
+
+fn redraw_with_menu(
+    buf: &Buffer,
+    items: &[(String, String)],
+    selected: usize,
+    renderer: &mut dyn Renderer,
+) {
+    let payload = crate::render::MenuPayload {
+        items: items.to_vec(),
+        selected,
+    };
+    renderer.render(UiLine::InputPrompt {
+        buf: buf.text.clone(),
+        cursor_cols: buf.cursor_cols(),
+        menu: Some(payload),
+    });
+    renderer.flush();
 }
 
 fn handle_streaming_key(

@@ -29,7 +29,12 @@ pub enum UiLine {
     /// Clear the current transient line (prepares for a permanent write).
     ClearTransient,
     /// Draw the input prompt "❯ " + current buffer (transient, idle).
-    InputPrompt { buf: String, cursor_cols: usize },
+    /// When `menu` is Some, a command palette is drawn above the box.
+    InputPrompt {
+        buf: String,
+        cursor_cols: usize,
+        menu: Option<MenuPayload>,
+    },
     /// Streaming chrome: one spinner line above the 3-line input box.
     StreamingBox {
         buf: String,
@@ -51,6 +56,13 @@ pub trait Renderer: Send {
     fn flush(&mut self);
     /// Shutdown: disable bracketed paste, disable raw mode, etc.
     fn shutdown(&mut self);
+}
+
+/// Slash-command palette payload: filtered entries + which one is selected.
+#[derive(Debug, Clone)]
+pub struct MenuPayload {
+    pub items: Vec<(String, String)>, // (name, desc)
+    pub selected: usize,
 }
 
 /// Convert a Duration to a short label like "1.2s" or "340ms".
