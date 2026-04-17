@@ -61,12 +61,31 @@ const BUILTIN_COMMANDS: &[Command] = &[
     Command { name: "quit",    desc: "Exit AtomCode" },
 ];
 
-/// Parse "/cmd args..." into (cmd, args). Returns None if not a slash line.
+/// Parse `"/cmd args..."` into `(cmd, args)` when the leading `/` is a
+/// command invocation. Returns `None` when the `/` is actually part of a
+/// filesystem path, URL, or any other text the user wants sent to the
+/// agent verbatim.
+///
+/// A valid command name is ASCII alphanumeric + `_`/`-`, followed by
+/// whitespace or end-of-input. `/Users/me`, `/tmp`, `/https://...`,
+/// `/path/with/mixed/字符` all fail the shape test and fall through to
+/// agent dispatch.
 pub fn parse_slash_line(s: &str) -> Option<(&str, &str)> {
-    let s = s.strip_prefix('/')?;
-    match s.find(char::is_whitespace) {
-        Some(i) => Some((&s[..i], s[i..].trim_start())),
-        None => Some((s, "")),
+    let rest = s.strip_prefix('/')?;
+    let name_end = rest
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-'))
+        .unwrap_or(rest.len());
+    if name_end == 0 {
+        return None;
+    }
+    let name = &rest[..name_end];
+    let after = &rest[name_end..];
+    match after.chars().next() {
+        None => Some((name, "")),
+        Some(c) if c.is_whitespace() => Some((name, after.trim_start())),
+        // Non-space follow-on (`/`, `.`, `:`, etc.) means the `/` was
+        // a literal character in a path / URL — not a command.
+        _ => None,
     }
 }
 
@@ -112,6 +131,29 @@ mod tests {
     #[test]
     fn parse_non_slash_returns_none() {
         assert!(parse_slash_line("hello").is_none());
+    }
+
+    #[test]
+    fn parse_rejects_path_starting_with_slash() {
+        // A filesystem path the user pastes must reach the agent
+        // untouched, not trigger "Unknown command: /Users/...".
+        assert!(parse_slash_line("/Users/me/file.txt").is_none());
+        assert!(parse_slash_line("/tmp/x").is_none());
+        assert!(parse_slash_line("/path/with/中文/pic.png").is_none());
+    }
+
+    #[test]
+    fn parse_rejects_url_starting_with_slash() {
+        assert!(parse_slash_line("/https://example.com/x").is_none());
+    }
+
+    #[test]
+    fn parse_command_with_slash_argument_ok() {
+        // `/cd /path` is a command with a path argument — the second
+        // slash sits in args, not the command name.
+        let (cmd, arg) = parse_slash_line("/cd /tmp/x").unwrap();
+        assert_eq!(cmd, "cd");
+        assert_eq!(arg, "/tmp/x");
     }
 
     #[test]
