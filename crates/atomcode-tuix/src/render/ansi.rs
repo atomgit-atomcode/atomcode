@@ -150,6 +150,11 @@ impl<W: Write + Send> AnsiRenderer<W> {
         let h = self.term_rows();
         let w = self.term_width();
         let inner = w.saturating_sub(2);
+        // Re-establish the default scroll region every paint — terminal
+        // resizes would otherwise leave stale bounds and the bottom border
+        // could scroll out of place.
+        let default_bottom = h.saturating_sub(4).max(1);
+        let _ = write!(self.out, "\x1b[1;{}r", default_bottom);
 
         // Row h-3: spinner or blank
         let _ = write!(self.out, "\x1b[{};1H\x1b[K", h.saturating_sub(3));
