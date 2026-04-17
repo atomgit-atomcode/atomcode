@@ -462,28 +462,37 @@ fn handle_agent_event(
             state.on_tool_call_streaming(&name);
         }
         AgentEvent::ToolCallStarted { id, name, arguments } => {
-            // Close any in-flight assistant line
-            renderer.render(UiLine::AssistantLineBreak);
+            // Don't emit the ▸ line yet; hold it in pending_tools until the
+            // matching ToolCallResult arrives. This preserves CC-style
+            // visual pairing even when the agent runs tools in parallel
+            // (all Starts then all Results in the event stream).
             let detail = format_tool_detail(&name, &arguments);
-            pending_tools.insert(id.clone(), (name.clone(), detail.clone()));
-            renderer.render(UiLine::ToolCall { name: name.clone(), detail });
-            renderer.flush();
+            pending_tools.insert(id, (name.clone(), detail));
             state.on_tool_call_started(&name);
         }
         AgentEvent::ToolCallResult { call_id, name, output, success, .. } => {
-            // Pair the result with its originating call by embedding the
-            // tool name (and cached detail) in the summary. This is needed
-            // because batched parallel calls emit all Starts then all
-            // Results, losing visual pairing in a flat scrollback.
-            let cached = pending_tools.remove(&call_id);
-            let summary = summarise(&output);
-            let labeled = match cached {
-                Some((_cname, detail)) if !detail.is_empty() => {
-                    format!("{}({}) — {}", name, detail, summary)
-                }
-                _ => format!("{} — {}", name, summary),
+            // Close any in-flight assistant line before emitting the pair.
+            renderer.render(UiLine::AssistantLineBreak);
+
+            let (display_name, detail) = pending_tools
+                .remove(&call_id)
+                .unwrap_or_else(|| (name.clone(), String::new()));
+
+            // Filter empty tool names (model occasionally emits malformed
+            // tool calls with "" as the name; agent surfaces the error via
+            // a ToolCallResult but there's no useful ▸ line to render).
+            let safe_name = if display_name.is_empty() {
+                "(invalid)".to_string()
+            } else {
+                display_name
             };
-            renderer.render(UiLine::ToolResult { success, summary: labeled });
+
+            renderer.render(UiLine::ToolCall {
+                name: safe_name.clone(),
+                detail: detail.clone(),
+            });
+            let summary = summarise(&output);
+            renderer.render(UiLine::ToolResult { success, summary });
             for line in output.lines().take(120) {
                 if let Some(rest) = line.strip_prefix("+ ") {
                     renderer.render(UiLine::DiffLine { added: true, text: rest.to_string() });
@@ -492,6 +501,7 @@ fn handle_agent_event(
                 }
             }
             renderer.flush();
+            let _ = name;
         }
         AgentEvent::ApprovalNeeded { tool_name, call, .. } => {
             let detail = format_tool_detail(&tool_name, &call.arguments);
@@ -504,11 +514,25 @@ fn handle_agent_event(
         AgentEvent::PhaseChange(_) => {}
         AgentEvent::TurnComplete { .. } => {
             renderer.render(UiLine::AssistantLineBreak);
+            // Drop any orphaned pending calls (shouldn't happen if agent is
+            // well-behaved; clear defensively so they don't leak into the
+            // next turn).
+            pending_tools.clear();
             renderer.render(UiLine::TurnComplete);
             renderer.flush();
             state.on_turn_complete();
         }
         AgentEvent::TurnCancelled { .. } => {
+            // Render any in-flight tool calls that never got a result
+            // as "(cancelled)" so the user sees what was mid-flight.
+            for (_id, (name, detail)) in pending_tools.drain() {
+                let safe_name = if name.is_empty() { "(invalid)".into() } else { name };
+                renderer.render(UiLine::ToolCall { name: safe_name, detail });
+                renderer.render(UiLine::ToolResult {
+                    success: false,
+                    summary: "(cancelled)".into(),
+                });
+            }
             renderer.render(UiLine::TurnCancelled);
             renderer.flush();
             state.on_turn_cancelled();
