@@ -5,6 +5,7 @@ pub mod sanitize;
 pub mod terminal;
 pub mod think;
 pub mod width;
+pub mod input;
 
 use anyhow::Result;
 use atomcode_core::agent::AgentHandle;
