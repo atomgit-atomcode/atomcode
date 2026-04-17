@@ -381,21 +381,21 @@ fn handle_idle_key(
             renderer.flush();
         }
         BufferResult::Commit(line) => {
-            renderer.render(UiLine::InputCommit);
+            // Clear the transient prompt, then echo the committed input
+            // as a permanent scrollback line (clean, single-source echo).
+            renderer.render(UiLine::ClearTransient);
+            renderer.render(UiLine::User(line.clone()));
+            buf.text.clear();
+            buf.cursor = 0;
             // Slash command?
             if let Some((cmd, arg)) = parse_slash_line(&line) {
                 execute_slash_command(cmd, arg, state, ctx, renderer)?;
-                buf.text.clear();
-                buf.cursor = 0;
                 if matches!(state.phase, UiPhase::Idle) {
                     renderer.render(UiLine::InputPrompt { buf: String::new(), cursor_cols: 0 });
                     renderer.flush();
                 }
             } else {
                 ctx.history.push(line.clone());
-                buf.text.clear();
-                buf.cursor = 0;
-                renderer.render(UiLine::User(line.clone()));
                 ctx.agent.cmd_tx.send(AgentCommand::SendMessage(line)).ok();
                 state.on_submit();
             }

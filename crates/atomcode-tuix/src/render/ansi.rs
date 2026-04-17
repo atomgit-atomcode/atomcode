@@ -65,20 +65,20 @@ impl<W: Write + Send> AnsiRenderer<W> {
         let model = scrub_controls(model);
         let working_dir = scrub_controls(working_dir);
         self.set_fg(Role::Brand);
-        let _ = self.out.write_all("  ◉  AtomCode\n".as_bytes());
+        let _ = self.out.write_all("  ◉  AtomCode\r\n".as_bytes());
         self.reset();
         self.set_fg(Role::Muted);
-        let _ = writeln!(self.out, "  {}  {}", model, working_dir);
+        let _ = write!(self.out, "  {}  {}\r\n", model, working_dir);
         self.reset();
         self.set_fg(Role::AccentDim);
         let _ = self.out.write_all("  ".as_bytes());
         for _ in 0..60 {
             let _ = self.out.write_all("─".as_bytes());
         }
-        let _ = self.out.write_all(b"\n");
+        let _ = self.out.write_all(b"\r\n");
         self.reset();
         self.set_fg(Role::Muted);
-        let _ = self.out.write_all("  /help for commands · Ctrl+C to cancel · Shift+Enter for newline\n".as_bytes());
+        let _ = self.out.write_all("  /help for commands · Ctrl+C to cancel · Shift+Enter for newline\r\n".as_bytes());
         self.reset();
     }
 }
@@ -99,7 +99,7 @@ impl<W: Write + Send> Renderer for AnsiRenderer<W> {
                 let _ = self.out.write_all("❯ ".as_bytes());
                 self.reset();
                 let _ = self.out.write_all(safe.as_bytes());
-                let _ = self.out.write_all(b"\n");
+                let _ = self.out.write_all(b"\r\n");
                 self.last_was_permanent = true;
                 self.assistant_continuing = false;
             }
@@ -112,7 +112,7 @@ impl<W: Write + Send> Renderer for AnsiRenderer<W> {
                 let mut first_segment = !self.assistant_continuing;
                 for (i, segment) in body.split('\n').enumerate() {
                     if i > 0 {
-                        let _ = self.out.write_all(b"\n");
+                        let _ = self.out.write_all(b"\r\n");
                         self.write_bar_prefix();
                     } else if first_segment {
                         self.write_bar_prefix();
@@ -121,7 +121,7 @@ impl<W: Write + Send> Renderer for AnsiRenderer<W> {
                     let _ = self.out.write_all(segment.as_bytes());
                 }
                 if ends_with_nl {
-                    let _ = self.out.write_all(b"\n");
+                    let _ = self.out.write_all(b"\r\n");
                     self.last_was_permanent = true;
                     self.assistant_continuing = false;
                 } else {
@@ -130,13 +130,13 @@ impl<W: Write + Send> Renderer for AnsiRenderer<W> {
                 }
             }
             UiLine::AssistantLineBreak => {
-                let _ = self.out.write_all(b"\n");
+                let _ = self.out.write_all(b"\r\n");
                 self.last_was_permanent = true;
                 self.assistant_continuing = false;
             }
             UiLine::ToolCall { name, detail } => {
                 if self.assistant_continuing {
-                    let _ = self.out.write_all(b"\n");
+                    let _ = self.out.write_all(b"\r\n");
                     self.last_was_permanent = true;
                     self.assistant_continuing = false;
                 }
@@ -149,12 +149,12 @@ impl<W: Write + Send> Renderer for AnsiRenderer<W> {
                     let _ = write!(self.out, "({})", scrub_controls(&detail));
                     self.reset();
                 }
-                let _ = self.out.write_all(b"\n");
+                let _ = self.out.write_all(b"\r\n");
                 self.last_was_permanent = true;
             }
             UiLine::ToolResult { success, summary } => {
                 if self.assistant_continuing {
-                    let _ = self.out.write_all(b"\n");
+                    let _ = self.out.write_all(b"\r\n");
                     self.last_was_permanent = true;
                     self.assistant_continuing = false;
                 }
@@ -166,7 +166,7 @@ impl<W: Write + Send> Renderer for AnsiRenderer<W> {
                 self.set_fg(Role::Muted);
                 let _ = self.out.write_all(scrub_controls(&summary).as_bytes());
                 self.reset();
-                let _ = self.out.write_all(b"\n");
+                let _ = self.out.write_all(b"\r\n");
                 self.last_was_permanent = true;
             }
             UiLine::DiffLine { added, text } => {
@@ -174,7 +174,7 @@ impl<W: Write + Send> Renderer for AnsiRenderer<W> {
                 self.set_fg(if added { Role::DiffAdd } else { Role::DiffRemove });
                 let _ = write!(self.out, "    {}", scrub_controls(&text));
                 self.reset();
-                let _ = self.out.write_all(b"\n");
+                let _ = self.out.write_all(b"\r\n");
                 self.last_was_permanent = true;
             }
             UiLine::ApprovalPrompt { tool, detail } => {
@@ -182,7 +182,7 @@ impl<W: Write + Send> Renderer for AnsiRenderer<W> {
                 self.set_fg(Role::Warning);
                 let _ = write!(self.out, "  Allow {}({})? [Y]es / [N]o / [A]lways", scrub_controls(&tool), scrub_controls(&detail));
                 self.reset();
-                let _ = self.out.write_all(b"\n");
+                let _ = self.out.write_all(b"\r\n");
                 self.last_was_permanent = true;
             }
             UiLine::Error(msg) => {
@@ -190,21 +190,21 @@ impl<W: Write + Send> Renderer for AnsiRenderer<W> {
                 self.set_fg(Role::Error);
                 let _ = write!(self.out, "  [Error: {}]", scrub_controls(&msg));
                 self.reset();
-                let _ = self.out.write_all(b"\n");
+                let _ = self.out.write_all(b"\r\n");
                 self.last_was_permanent = true;
                 self.assistant_continuing = false;
             }
             UiLine::TurnCancelled => {
                 self.clear_line_if_needed();
                 self.set_fg(Role::Muted);
-                let _ = self.out.write_all("  (cancelled)\n".as_bytes());
+                let _ = self.out.write_all("  (cancelled)\r\n".as_bytes());
                 self.reset();
                 self.last_was_permanent = true;
                 self.assistant_continuing = false;
             }
             UiLine::TurnComplete => {
                 self.clear_line_if_needed();
-                let _ = self.out.write_all(b"\n");
+                let _ = self.out.write_all(b"\r\n");
                 self.last_was_permanent = true;
                 self.assistant_continuing = false;
             }
@@ -233,15 +233,17 @@ impl<W: Write + Send> Renderer for AnsiRenderer<W> {
                 self.last_was_permanent = false;
             }
             UiLine::InputCommit => {
-                let _ = self.out.write_all(b"\n");
+                let _ = self.out.write_all(b"\r\n");
                 self.last_was_permanent = true;
             }
             UiLine::CommandOutput(text) => {
                 self.clear_line_if_needed();
                 let safe = scrub_controls(&text);
-                let _ = self.out.write_all(safe.as_bytes());
-                if !safe.ends_with('\n') {
-                    let _ = self.out.write_all(b"\n");
+                // Raw mode needs explicit CR; translate any bare \n to \r\n.
+                let crlf = safe.replace('\n', "\r\n");
+                let _ = self.out.write_all(crlf.as_bytes());
+                if !crlf.ends_with('\n') {
+                    let _ = self.out.write_all(b"\r\n");
                 }
                 self.last_was_permanent = true;
             }
@@ -256,7 +258,7 @@ impl<W: Write + Send> Renderer for AnsiRenderer<W> {
         if !self.last_was_permanent {
             let _ = self.out.write_all(b"\r\x1b[K");
         }
-        let _ = self.out.write_all(b"\n");
+        let _ = self.out.write_all(b"\r\n");
         let _ = self.out.flush();
     }
 }
@@ -370,7 +372,7 @@ mod tests {
         r.render(UiLine::AssistantText("done\n".into()));
         r.flush();
         let s = String::from_utf8(buf).unwrap();
-        assert!(s.starts_with("  │ done\n"));
+        assert!(s.starts_with("  │ done\r\n"));
         // No dangling bar prefix after the final newline
         assert!(!s.trim_end().ends_with("│"));
     }
@@ -384,7 +386,7 @@ mod tests {
         r.flush();
         let s = String::from_utf8(buf).unwrap();
         // Assistant line closes with \n, then tool line appears
-        assert!(s.contains("partial\n"));
+        assert!(s.contains("partial\r\n"));
         assert!(s.contains("▸ bash(ls)"));
     }
 
