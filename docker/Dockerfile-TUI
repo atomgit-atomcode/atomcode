@@ -1,0 +1,45 @@
+# AtomCode TUI Docker 镜像
+# 用于在 macOS/Windows 上体验 Linux 版本的 AtomCode
+#
+# 构建步骤:
+#   1. ./scripts/release.sh  # 生成 Linux 二进制到 dist/ 目录
+#   2. docker build -t atomcode-tui -f docker/Dockerfile-TUI .
+#
+# 运行方式:
+#   docker run --rm -it \
+#     -v ~/.atomcode:/root/.atomcode \
+#     -v $(pwd):/workspace \
+#     atomcode-tui
+
+FROM debian:bookworm-slim
+
+# 使用国内镜像加速
+RUN sed -i 's|http://deb.debian.org|http://mirrors.aliyun.com|g' /etc/apt/sources.list.d/debian.sources 2>/dev/null || \
+    sed -i 's|http://deb.debian.org|http://mirrors.aliyun.com|g' /etc/apt/sources.list 2>/dev/null || true
+
+# 安装必要的工具和库
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    ca-certificates \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+# 从 dist 目录复制预编译的 Linux 二进制
+COPY dist/atomcode-v*/atomcode-*-linux-x64.tar.gz /tmp/atomcode.tar.gz
+
+# 解压并安装
+RUN cd /tmp && \
+    tar xzf atomcode.tar.gz && \
+    mv /tmp/atomcode-atomcode-v*-linux-x64 /usr/local/bin/atomcode && \
+    chmod +x /usr/local/bin/atomcode && \
+    rm -f /tmp/*.tar.gz
+
+# 设置工作目录
+WORKDIR /workspace
+
+# 设置终端环境变量
+ENV TERM=xterm-256color
+ENV COLORTERM=truecolor
+
+# 入口点
+ENTRYPOINT ["atomcode"]

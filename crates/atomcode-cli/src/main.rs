@@ -200,7 +200,20 @@ async fn run() -> Result<i32> {
 
     // Handle subcommands
     if let Some(cmd) = cli.command {
-        return handle_command(cmd).await.map(|_| 0);
+        match &cmd {
+            Commands::Login => {
+                // Login, then fall through to start TUI
+                HEADLESS_MODE.store(true, Ordering::Relaxed);
+                let auth = auth::login()?;
+                auth::save_auth(&auth)?;
+                println!("  Login successful! Starting AtomCode...\n");
+                HEADLESS_MODE.store(false, Ordering::Relaxed);
+                // Fall through to TUI startup below
+            }
+            _ => {
+                return handle_command(cmd).await.map(|_| 0);
+            }
+        }
     }
 
     // Default: start TUI

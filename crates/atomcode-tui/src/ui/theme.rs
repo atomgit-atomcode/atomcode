@@ -104,8 +104,11 @@ fn detect_truecolor() -> bool {
         }
     }
 
-    // Default: assume true color (most modern terminals support it)
-    true
+    // SSH sessions: COLORTERM and TERM_PROGRAM are typically not forwarded,
+    // so we land here. Default to false (256-color) — safe on all terminals.
+    // Users on true-color-capable SSH clients can set COLORTERM=truecolor
+    // in their remote shell profile to opt in.
+    false
 }
 
 /// Check if terminal supports true color.

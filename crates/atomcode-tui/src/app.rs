@@ -939,7 +939,14 @@ impl App {
                         } else {
                             self.stage_paste(&text);
                         }
-                                            }
+                    } else if cfg!(target_os = "linux") {
+                        // On Linux, Ctrl+V requires xclip/xsel/wl-paste.
+                        // Show a hint if none are available.
+                        self.conversation.push_delta(
+                            "**Paste failed.** Install a clipboard tool: `sudo apt install xclip` (X11) or `sudo apt install wl-clipboard` (Wayland). Alternatively, use your terminal's paste (Ctrl+Shift+V)."
+                        );
+                        self.conversation.finalize_stream();
+                    }
                     return;
                 }
 
@@ -992,8 +999,13 @@ impl App {
         }
     }
 
-    fn handle_key(&mut self, key: KeyEvent, event_tx: &mpsc::UnboundedSender<AppEvent>) {
-        // nothing here — key timing handled in handle_key_normal
+    fn handle_key(&mut self, mut key: KeyEvent, event_tx: &mpsc::UnboundedSender<AppEvent>) {
+        // Ctrl+H → Backspace: some Linux terminals send \x08 (Ctrl+H) for Backspace.
+        // crossterm decodes it as Char('h') + CONTROL instead of KeyCode::Backspace.
+        if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('h') {
+            key.code = KeyCode::Backspace;
+            key.modifiers = KeyModifiers::NONE;
+        }
 
         // Ctrl+Shift+C: copy selection to clipboard (like Ctrl+C in Claude Code with selection)
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.modifiers.contains(KeyModifiers::SHIFT)
@@ -2760,26 +2772,30 @@ fn copy_to_clipboard(text: &str) -> std::io::Result<()> {
     use std::io::Write;
     use std::process::{Command, Stdio};
 
-    if cfg!(target_os = "windows") {
-        // Windows: use clip.exe
-        let mut child = Command::new("clip.exe")
-            .stdin(Stdio::piped())
-            .spawn()?;
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(text.as_bytes())?;
-        }
-        child.wait()?;
-    } else {
-        let cmd = if cfg!(target_os = "macos") { "pbcopy" } else { "xclip" };
+    let spawn_and_write = |cmd: &str, args: &[&str], input: &str| -> std::io::Result<()> {
         let mut child = Command::new(cmd)
+            .args(args)
             .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .spawn()?;
         if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(text.as_bytes())?;
+            stdin.write_all(input.as_bytes())?;
         }
         child.wait()?;
+        Ok(())
+    };
+
+    if cfg!(target_os = "windows") {
+        spawn_and_write("clip.exe", &[], text)
+    } else if cfg!(target_os = "macos") {
+        spawn_and_write("pbcopy", &[], text)
+    } else {
+        // Linux: try wl-copy (Wayland), xclip, xsel in order
+        spawn_and_write("wl-copy", &[], text)
+            .or_else(|_| spawn_and_write("xclip", &["-selection", "clipboard"], text))
+            .or_else(|_| spawn_and_write("xsel", &["--clipboard", "--input"], text))
     }
-    Ok(())
 }
 
 /// Read text from system clipboard.
@@ -2818,10 +2834,17 @@ fn read_clipboard() -> Option<String> {
         let output = if cfg!(target_os = "macos") {
             Command::new("pbpaste").output().ok()
         } else {
-            Command::new("xclip")
-                .args(&["-selection", "clipboard", "-o"])
-                .output().ok()
-                .or_else(|| Command::new("xsel").args(&["--clipboard", "--output"]).output().ok())
+            // Try wl-paste (Wayland), xclip, xsel in order
+            Command::new("wl-paste").args(&["--no-newline"]).output().ok()
+                .filter(|o| o.status.success())
+                .or_else(|| Command::new("xclip")
+                    .args(&["-selection", "clipboard", "-o"])
+                    .output().ok()
+                    .filter(|o| o.status.success()))
+                .or_else(|| Command::new("xsel")
+                    .args(&["--clipboard", "--output"])
+                    .output().ok()
+                    .filter(|o| o.status.success()))
         };
 
         output

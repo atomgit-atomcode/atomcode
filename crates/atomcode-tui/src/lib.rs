@@ -216,11 +216,30 @@ fn build_wecom_provider(creds: &wecom_login::BrokerCreds) -> ProviderConfig {
     }
 }
 
+/// Parse query parameters from a callback URL (handles both full URL and path-only).
+fn parse_callback_params(url: &str) -> anyhow::Result<std::collections::HashMap<String, String>> {
+    // Find the query string — works for both "/callback?code=..." and "http://...?code=..."
+    let query_start = url.find('?').ok_or_else(|| anyhow::anyhow!("No query parameters in URL"))?;
+    let query = &url[query_start + 1..];
+
+    Ok(query.split('&')
+        .filter_map(|pair| {
+            let mut parts = pair.splitn(2, '=');
+            let key = parts.next()?;
+            let value = parts.next().unwrap_or_default();
+            // Basic URL decode
+            let decoded = value.replace('+', " ")
+                .replace("%3A", ":").replace("%2F", "/")
+                .replace("%3D", "=").replace("%26", "&");
+            Some((key.to_string(), decoded))
+        })
+        .collect())
+}
+
 /// Run OAuth login flow (blocking)
 fn run_oauth_login() -> anyhow::Result<AuthInfo> {
     use std::io::{BufRead, Write};
     use std::net::TcpListener;
-    use std::collections::HashMap;
 
 
     // Generate state for CSRF protection
@@ -239,115 +258,173 @@ fn run_oauth_login() -> anyhow::Result<AuthInfo> {
         url::form_urlencoded::byte_serialize(oauth::SCOPES.as_bytes()).collect::<String>(),
     );
 
-    println!("  Opening browser for authorization...");
-    println!("  If browser doesn't open, visit:\n");
-    println!("  {}\n", auth_url);
-
-    // Open browser
-    #[cfg(target_os = "macos")]
-    let _ = std::process::Command::new("open").arg(&auth_url).spawn();
-    #[cfg(target_os = "linux")]
-    let _ = std::process::Command::new("xdg-open").arg(&auth_url).spawn();
-    #[cfg(target_os = "windows")]
-    {
-        let _ = {
+    // Try to open browser
+    let browser_opened = {
+        #[cfg(target_os = "macos")]
+        { std::process::Command::new("open").arg(&auth_url).spawn().is_ok() }
+        #[cfg(target_os = "linux")]
+        { std::process::Command::new("xdg-open").arg(&auth_url).spawn().is_ok() }
+        #[cfg(target_os = "windows")]
+        {
             use std::os::windows::process::CommandExt;
             std::process::Command::new("cmd")
                 .raw_arg(format!("/C start \"\" \"{}\"", auth_url))
-                .spawn()
-        };
+                .spawn().is_ok()
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+        { false }
+    };
+
+    if browser_opened {
+        println!("  Opening browser for authorization...");
+        println!("  If browser doesn't open, visit the URL below.\n");
+    } else {
+        println!("  Could not open browser automatically.\n");
+    }
+    println!("  {}\n", auth_url);
+
+    // Try to bind local callback server
+    let listener = TcpListener::bind(("127.0.0.1", oauth::REDIRECT_PORT)).ok();
+    if let Some(ref l) = listener {
+        let _ = l.set_nonblocking(true);
     }
 
-    println!("  Waiting for authorization callback on port 8765...");
+    let has_listener = listener.is_some();
+
+    if has_listener {
+        println!("  Waiting for callback on port {}...", oauth::REDIRECT_PORT);
+        println!("  If you're on a remote server, paste the callback URL below instead.");
+    } else {
+        println!("  Cannot listen on port {} (already in use?).", oauth::REDIRECT_PORT);
+        println!("  After authorizing, paste the callback URL from your browser below.");
+    }
     println!("  Press Esc or Ctrl+C to cancel.\n");
+    println!("  Callback URL: ");
 
-    // Start local server with non-blocking accept so user can cancel
-    let listener = TcpListener::bind(("127.0.0.1", oauth::REDIRECT_PORT))?;
-    listener.set_nonblocking(true)?;
-
-    // Enable raw mode so Ctrl+C is captured as a key event (not SIGINT)
-    // and Esc is detected character-by-character.
+    // Wait for either: (1) local callback, or (2) user pastes callback URL
+    // User input is collected character by character in raw mode.
     crossterm::terminal::enable_raw_mode()?;
 
-    let accept_result: anyhow::Result<std::net::TcpStream> = loop {
-        // Poll for keypresses (Esc / Ctrl+C to cancel)
+    let mut url_input = String::new();
+
+    enum CallbackResult {
+        FromServer(std::net::TcpStream),
+        FromPaste(String), // the full callback URL
+    }
+
+    let callback_result: anyhow::Result<CallbackResult> = loop {
+        // Poll for keypresses or paste events
         if crossterm::event::poll(std::time::Duration::from_millis(200)).unwrap_or(false) {
-            if let Ok(crossterm::event::Event::Key(key)) = crossterm::event::read() {
-                if key.code == crossterm::event::KeyCode::Esc
-                    || (key.code == crossterm::event::KeyCode::Char('c')
-                        && key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL))
-                {
-                    break Err(anyhow::anyhow!("Login cancelled by user"));
+            match crossterm::event::read() {
+                Ok(crossterm::event::Event::Key(key)) => {
+                    // Ctrl+H → Backspace (Linux terminal compat)
+                    let code = if key.modifiers == crossterm::event::KeyModifiers::CONTROL
+                        && key.code == crossterm::event::KeyCode::Char('h')
+                    { crossterm::event::KeyCode::Backspace } else { key.code };
+
+                    match code {
+                        crossterm::event::KeyCode::Esc => {
+                            break Err(anyhow::anyhow!("Login cancelled by user"));
+                        }
+                        crossterm::event::KeyCode::Char('c')
+                            if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) =>
+                        {
+                            break Err(anyhow::anyhow!("Login cancelled by user"));
+                        }
+                        crossterm::event::KeyCode::Enter => {
+                            if url_input.contains("code=") {
+                                break Ok(CallbackResult::FromPaste(url_input.clone()));
+                            }
+                        }
+                        crossterm::event::KeyCode::Char(c) => {
+                            url_input.push(c);
+                            let mut buf = [0u8; 4];
+                            let s = c.encode_utf8(&mut buf);
+                            let _ = std::io::stdout().write_all(s.as_bytes());
+                            let _ = std::io::stdout().flush();
+                        }
+                        crossterm::event::KeyCode::Backspace => {
+                            if !url_input.is_empty() {
+                                url_input.pop();
+                                let _ = std::io::stdout().write_all(b"\x08 \x08");
+                                let _ = std::io::stdout().flush();
+                            }
+                        }
+                        _ => {}
+                    }
                 }
+                Ok(crossterm::event::Event::Paste(text)) => {
+                    url_input.push_str(&text);
+                    let _ = std::io::stdout().write_all(text.as_bytes());
+                    let _ = std::io::stdout().flush();
+                    if url_input.contains("code=") {
+                        break Ok(CallbackResult::FromPaste(url_input.clone()));
+                    }
+                }
+                _ => {}
             }
         }
-        match listener.accept() {
-            Ok((stream, _)) => break Ok(stream),
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
-            Err(e) => break Err(e.into()),
+        // Also check local server
+        if let Some(ref listener) = listener {
+            match listener.accept() {
+                Ok((stream, _)) => break Ok(CallbackResult::FromServer(stream)),
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) => break Err(e.into()),
+            }
         }
     };
 
     crossterm::terminal::disable_raw_mode()?;
+    println!(); // newline after input
 
-    let mut stream = accept_result?;
+    // Parse the callback — either from HTTP request or pasted URL
+    let (code, returned_state) = match callback_result? {
+        CallbackResult::FromServer(mut stream) => {
+            stream.set_nonblocking(false)?;
+            let mut reader = std::io::BufReader::new(&mut stream);
+            let mut request_line = String::new();
+            reader.read_line(&mut request_line)?;
 
-    // Read HTTP request
-    stream.set_nonblocking(false)?;
-    let mut reader = std::io::BufReader::new(&mut stream);
-    let mut request_line = String::new();
-    reader.read_line(&mut request_line)?;
+            let url: String = request_line.split_whitespace().nth(1)
+                .ok_or_else(|| anyhow::anyhow!("Invalid HTTP request"))?
+                .to_string();
 
-    let url: String = request_line.split_whitespace().nth(1)
-        .ok_or_else(|| anyhow::anyhow!("Invalid HTTP request"))?
-        .to_string();
+            let params = parse_callback_params(&url)?;
 
-    let query_start = url.find('?').ok_or_else(|| anyhow::anyhow!("No query in callback"))?;
-    let query = &url[query_start + 1..];
+            if let Some(error) = params.get("error") {
+                let response = "HTTP/1.1 302 Found\r\nLocation: https://atomgit.com\r\n\r\n";
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+                anyhow::bail!("OAuth error: {}", error);
+            }
 
-    let params: HashMap<String, String> = query.split('&')
-        .filter_map(|pair| {
-            let mut parts = pair.splitn(2, '=');
-            let key = parts.next()?;
-            let value = parts.next().map(|v| {
-                v.replace('+', " ")
-                    .chars()
-                    .fold(String::new(), |mut s, c| {
-                        if c == '%' {
-                            s
-                        } else {
-                            s.push(c);
-                            s
-                        }
-                    })
-            }).unwrap_or_default();
-            Some((key.to_string(), value))
-        })
-        .collect();
+            // Send success page
+            let response = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n\r\n\
+                <html><head><style>body{font-family:system-ui;display:flex;justify-content:center;align-items:center;height:100vh;margin:0;background:#1a1a2e;color:#eee}\
+                .container{text-align:center}h1{color:#7c3aed}.success{color:#22c55e;font-size:4rem}</style></head>\
+                <body><div class=\"container\"><div class=\"success\">✓</div><h1>Authorization Successful</h1>\
+                <p>You can close this window and return to AtomCode.</p></div></body></html>";
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
 
-    if let Some(error) = params.get("error") {
-        // User denied authorization in browser — redirect to AtomGit
-        let response = "HTTP/1.1 302 Found\r\nLocation: https://atomgit.com\r\n\r\n";
-        let _ = stream.write_all(response.as_bytes());
-        let _ = stream.flush();
-        anyhow::bail!("OAuth error: {}", error);
-    }
-
-    let code = params.get("code").ok_or_else(|| anyhow::anyhow!("No code in callback"))?;
-    let returned_state = params.get("state").cloned().unwrap_or_default();
+            let code = params.get("code").ok_or_else(|| anyhow::anyhow!("No code in callback"))?.clone();
+            let st = params.get("state").cloned().unwrap_or_default();
+            (code, st)
+        }
+        CallbackResult::FromPaste(url) => {
+            let params = parse_callback_params(&url)?;
+            if let Some(error) = params.get("error") {
+                anyhow::bail!("OAuth error: {}", error);
+            }
+            let code = params.get("code").ok_or_else(|| anyhow::anyhow!("No code in pasted URL"))?.clone();
+            let st = params.get("state").cloned().unwrap_or_default();
+            (code, st)
+        }
+    };
 
     if returned_state != state {
         anyhow::bail!("OAuth state mismatch");
     }
-
-    // Send success response
-    let response = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n\r\n\
-        <html><head><style>body{font-family:system-ui;display:flex;justify-content:center;align-items:center;height:100vh;margin:0;background:#1a1a2e;color:#eee}\
-        .container{text-align:center}h1{color:#7c3aed}.success{color:#22c55e;font-size:4rem}</style></head>\
-        <body><div class=\"container\"><div class=\"success\">✓</div><h1>Authorization Successful</h1>\
-        <p>You can close this window and return to AtomCode.</p></div></body></html>";
-    stream.write_all(response.as_bytes())?;
-    stream.flush()?;
 
     println!("  Authorization received, exchanging token...\n");
 
@@ -358,7 +435,7 @@ fn run_oauth_login() -> anyhow::Result<AuthInfo> {
         .form(&[
             ("client_id", oauth::CLIENT_ID),
             ("client_secret", oauth::CLIENT_SECRET),
-            ("code", code),
+            ("code", &code),
             ("redirect_uri", oauth::REDIRECT_URI),
             ("grant_type", "authorization_code"),
         ])

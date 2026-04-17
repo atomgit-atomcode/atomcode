@@ -1,6 +1,57 @@
-# AtomCode Daemon Docker 镜像
+# AtomCode Docker 镜像
 
-用于部署 AtomCode Daemon 后台服务的 Docker 镜像。
+本目录包含两种 Docker 镜像：
+
+- **Dockerfile-Daemon** - 用于部署 AtomCode Daemon 后台服务
+- **Dockerfile-TUI** - 用于在 macOS/Windows 上体验 Linux 版本的 AtomCode TUI
+
+---
+
+## AtomCode TUI 镜像
+
+用于在 macOS 或 Windows 上体验 Linux 版本的 AtomCode 终端界面。
+
+### 构建镜像
+
+```bash
+# 1. 先编译 Linux 版本（需要 musl 交叉编译工具）
+brew install FiloSottile/musl-cross/musl-cross
+./scripts/release.sh
+
+# 2. 构建 Docker 镜像
+docker build -t atomcode-tui -f docker/Dockerfile-TUI .
+```
+
+### 运行容器
+
+```bash
+# 基本运行
+docker run --rm -it atomcode-tui
+
+# 挂载配置和项目目录
+docker run --rm -it \
+  -v ~/.atomcode:/root/.atomcode \
+  -v $(pwd):/workspace \
+  atomcode-tui
+
+# 指定工作目录
+docker run --rm -it \
+  -v ~/.atomcode:/root/.atomcode \
+  -v /path/to/project:/workspace \
+  atomcode-tui
+
+# 传递环境变量（API Key）
+docker run --rm -it \
+  -e ANTHROPIC_API_KEY=your-api-key \
+  -v ~/.atomcode:/root/.atomcode \
+  atomcode-tui
+```
+
+> **注意**: TUI 模式需要 `-it` 参数来启用交互式终端。
+
+---
+
+## AtomCode Daemon 镜像
 
 ## 构建镜像
 
