@@ -38,31 +38,53 @@ fn push_sgr_bold_off(buf: &mut String, caps: TerminalCaps) {
     }
 }
 
-/// ANSI renderer writing to any `Write`.
+/// Footer-state snapshot used to redraw the bottom chrome after content writes.
+#[derive(Clone, Default)]
+struct FooterState {
+    buf: String,
+    cursor_cols: usize,
+    /// Rendered menu items (already paged to at most 4).
+    menu_items: Vec<(String, String)>,
+    /// Index into menu_items that should display selected. 0-indexed.
+    menu_selected_in_view: Option<usize>,
+    spinner_frame: Option<String>,
+    spinner_label: Option<String>,
+}
+
+/// ANSI renderer — PURE APPEND architecture (no scroll region).
+///
+/// Layout (relative to current cursor position, not absolute rows):
+///   ┌──────────────────────────────┐
+///   │ content (scrollback)         │  ← everything flows here
+///   │ ...                          │
+///   │ [blank margin row]           │  ← 1 row between content and box
+///   │ ╭──────────────────╮         │  ← box top
+///   │ │ ❯ {user input}   │         │  ← box middle (cursor here)
+///   │ ╰──────────────────╯         │  ← box bottom
+///   │ menu row 1 (if active)       │
+///   │ menu row 2 (if active)       │
+///   │ menu row 3 (if active)       │
+///   │ menu row 4 (if active)       │
+///   └──────────────────────────────┘
+///
+/// Render cycle: erase_footer → emit content \r\n → draw_footer_here.
+/// Terminal scrolls naturally when cursor hits the bottom row.
 pub struct AnsiRenderer<W: Write + Send> {
     out: W,
     caps: TerminalCaps,
-    /// True if the last write was a permanent line (ends with \n).
-    /// Used to decide whether to emit clearing before writing a transient.
-    last_was_permanent: bool,
+    /// Number of rows the currently-drawn footer occupies. 0 if footer
+    /// not yet drawn (pre-welcome) or already erased.
+    footer_rows: usize,
+    /// Last footer state passed to draw_footer_here. Permanent content
+    /// emits redraw the footer using this snapshot.
+    last_footer: FooterState,
     /// Tracks if we're mid-assistant-text block (next text delta should NOT
     /// re-emit the "  │ " prefix for the first line).
     assistant_continuing: bool,
-    /// Number of lines the current transient occupies (0, 1 for spinner, 3
-    /// for the bordered input box). Used by clear_transient to move the
-    /// cursor back to the top of the transient before erasing.
-    transient_lines: usize,
-    /// Cursor row offset from the top of the current transient area
-    /// (0 = on the top row, 1 = one row below top, etc.). Needed because
-    /// the input box leaves the cursor on its middle row, not its bottom.
-    transient_cursor_from_top: usize,
     /// Buffer for the current assistant-text line. Deltas accumulate here
-    /// until a '\n' arrives (or AssistantLineBreak / TurnComplete fires),
-    /// at which point the complete line is rendered through the block-aware
-    /// markdown renderer and written with the bar prefix.
+    /// until a '\n' arrives.
     assistant_line_buf: String,
-    /// Markdown parser state carried across lines within a single turn
-    /// (tracks fenced-code-block enter/exit).
+    /// Markdown parser state (code-block tracking, table row buffering).
     md_state: crate::markdown::MdState,
 }
 
@@ -77,10 +99,9 @@ impl<W: Write + Send> AnsiRenderer<W> {
         Self {
             out,
             caps,
-            last_was_permanent: true,
+            footer_rows: 0,
+            last_footer: FooterState::default(),
             assistant_continuing: false,
-            transient_lines: 0,
-            transient_cursor_from_top: 0,
             assistant_line_buf: String::new(),
             md_state: crate::markdown::MdState::new(),
         }
@@ -98,168 +119,44 @@ impl<W: Write + Send> AnsiRenderer<W> {
         }
     }
 
-    /// Move cursor to the bottom row of the scroll region and erase that
-    /// row. Scroll region is set once at startup (by TerminalGuard) and
-    /// NEVER changes at runtime — no dynamic resize. Menu overlays live
-    /// inside the scroll region via absolute positioning + per-row erase,
-    /// so no row ever transitions between region-interior and region-exterior.
-    fn move_to_scroll_bottom(&mut self) {
-        let h = self.term_rows();
-        let bottom = h.saturating_sub(8).max(1);
-        let _ = write!(self.out, "\x1b[{};1H\x1b[K", bottom);
-    }
-
     fn term_rows(&self) -> usize {
         crossterm::terminal::size().map(|(_, h)| h as usize).unwrap_or(24)
     }
 
-    /// Draw footer with optional menu overlay.
-    ///
-    /// STATIC LAYOUT — scroll region set once at startup, NEVER changed:
-    ///   scroll region:  1..h-8        (content only)
-    ///   rows h-7..h-4:  menu chrome   (4 reserved rows; blank when inactive)
-    ///   row  h-3:       spinner       (blank when idle)
-    ///   rows h-2..h:    input box     (3 rows, always visible)
-    ///
-    /// Menu NEVER lives in the content area. Up to 4 items shown at once;
-    /// if more commands match, the current selection stays in view via
-    /// the menu_scroll offset the caller maintains.
-    fn draw_footer_with_menu(
-        &mut self,
-        buf: &str,
-        cursor_cols: usize,
-        spinner: Option<(&str, &str)>,
-        menu: Option<&super::MenuPayload>,
-    ) {
-        const MENU_SLOT_ROWS: usize = 4;
-        let h = self.term_rows();
-        let w = self.term_width();
-        let inner = w.saturating_sub(2);
-
-        let _ = self.out.write_all(b"\x1b[?7l");
-
-        // Always erase all 4 menu chrome rows (h-7..h-4) before redraw —
-        // fixed slot, no transitions to manage.
-        for i in 0..MENU_SLOT_ROWS {
-            let row = h.saturating_sub(7 - i); // h-7, h-6, h-5, h-4
-            if row >= 1 {
-                let _ = write!(self.out, "\x1b[{};1H\x1b[K", row);
-            }
+    /// Erase the currently-drawn footer. Cursor is assumed to be on the
+    /// box middle row (which is row index 2 from the footer top: row 0 =
+    /// blank margin, row 1 = box top, row 2 = box middle). Moves cursor
+    /// up to the footer top then clears to end of screen.
+    fn erase_footer(&mut self) {
+        if self.footer_rows == 0 {
+            return;
         }
-
-        // Paint menu items (if active). Top-align within the 4-row slot.
-        if let Some(m) = menu {
-            let visible = m.items.iter().take(MENU_SLOT_ROWS).enumerate();
-            for (i, (name, desc)) in visible {
-                let row = h.saturating_sub(7 - i); // h-7, h-6, h-5, h-4
-                let selected = i == m.selected;
-                let _ = write!(self.out, "\x1b[{};1H", row);
-                if selected {
-                    if self.caps.colors {
-                        let _ = self.out.write_all(b"\x1b[48;2;50;70;90m");
-                    }
-                    self.set_fg(Role::ToolName);
-                    let _ = write!(self.out, "  ▸ /{:<12}  {}", name, desc);
-                    let content_w = 5 + name.chars().count() + 2 + desc.chars().count();
-                    let right_pad = w.saturating_sub(content_w);
-                    for _ in 0..right_pad {
-                        let _ = self.out.write_all(b" ");
-                    }
-                    if self.caps.colors {
-                        let _ = self.out.write_all(b"\x1b[0m");
-                    }
-                } else {
-                    self.set_fg(Role::Muted);
-                    let _ = write!(self.out, "    /{:<12}  {}", name, desc);
-                    self.reset();
-                }
-            }
-        }
-
-        // Spinner row (h-3): always erased, optionally painted. Spinner
-        // suppressed when menu is active (avoid visual competition).
-        let spinner_row = h.saturating_sub(3);
-        let _ = write!(self.out, "\x1b[{};1H\x1b[K", spinner_row);
-        if menu.is_none() {
-            if let Some((frame, label)) = spinner {
-                self.set_fg(Role::Brand);
-                let _ = write!(self.out, " {} ", frame);
-                self.reset();
-                if self.caps.colors {
-                    let _ = self.out.write_all(b"\x1b[1m");
-                }
-                self.set_fg(Role::Secondary);
-                let _ = self.out.write_all(scrub_controls(label).as_bytes());
-                self.reset();
-                if self.caps.colors {
-                    let _ = self.out.write_all(b"\x1b[22m");
-                }
-            }
-        }
-
-        // Fixed box at rows h-2..h.
-        let box_top = h.saturating_sub(2);
-        let box_mid = h.saturating_sub(1);
-        let box_bot = h;
-
-        let _ = write!(self.out, "\x1b[{};1H\x1b[K", box_top);
-        self.set_fg(Role::Border);
-        let _ = self.out.write_all("╭".as_bytes());
-        for _ in 0..inner { let _ = self.out.write_all("─".as_bytes()); }
-        let _ = self.out.write_all("╮".as_bytes());
-        self.reset();
-
-        let _ = write!(self.out, "\x1b[{};1H\x1b[K", box_mid);
-        self.set_fg(Role::Border);
-        let _ = self.out.write_all("│ ".as_bytes());
-        self.reset();
-        self.set_fg(Role::Accent);
-        let _ = self.out.write_all("❯ ".as_bytes());
-        self.reset();
-        let text_budget = inner.saturating_sub(4);
-        let safe = scrub_controls(buf);
-        let display_buf = crate::width::truncate_to_width(&safe, text_budget);
-        let buf_w = crate::width::display_width(&display_buf);
-        let pad = text_budget.saturating_sub(buf_w);
-        let _ = self.out.write_all(display_buf.as_bytes());
-        for _ in 0..pad { let _ = self.out.write_all(b" "); }
-        self.set_fg(Role::Border);
-        let _ = self.out.write_all(" │".as_bytes());
-        self.reset();
-
-        let _ = write!(self.out, "\x1b[{};1H\x1b[K", box_bot);
-        self.set_fg(Role::Border);
-        let _ = self.out.write_all("╰".as_bytes());
-        for _ in 0..inner { let _ = self.out.write_all("─".as_bytes()); }
-        let _ = self.out.write_all("╯".as_bytes());
-        self.reset();
-
-        // Cursor on box middle.
-        let cursor_col = 4 + cursor_cols + 1;
-        let _ = write!(self.out, "\x1b[{};{}H", box_mid, cursor_col);
-
-        let _ = self.out.write_all(b"\x1b[?7h");
+        // Move up 2 rows (box middle → footer top blank row), go to col 1,
+        // erase everything from there to end of screen.
+        let _ = self.out.write_all(b"\x1b[2A\r\x1b[J");
+        self.footer_rows = 0;
     }
 
-    /// Redraw the fixed bottom footer (rows h-3..h). Optional `spinner`
-    /// shown on row h-3; box on rows h-2, h-1, h. Leaves cursor on the
-    /// middle row at col 4 + cursor_cols so the user can see where they
-    /// are typing.
-    fn draw_footer(
-        &mut self,
-        buf: &str,
-        cursor_cols: usize,
-        spinner: Option<(&str, &str)>,
-    ) {
-        let h = self.term_rows();
+    /// Draw the footer starting at the current cursor position. Layout:
+    ///
+    ///   row 0: spinner line ("⠋ Pondering") — or blank margin
+    ///   row 1: ╭───────╮   box top
+    ///   row 2: │ ❯ buf │   box middle  ← cursor lands here at end
+    ///   row 3: ╰───────╯   box bottom
+    ///   row 4..4+N: menu items (N ≤ 4)
+    ///
+    /// Every row emitted with \r\n. Total rows = 4 + N. Cursor positioning
+    /// at the end: up (total - 2) to reach box middle, then col 5 + cursor_cols.
+    fn draw_footer_here(&mut self) {
+        let state = self.last_footer.clone();
         let w = self.term_width();
         let inner = w.saturating_sub(2);
-        // Scroll region is fixed at startup (1..h-8). No runtime changes.
-        let _ = self.out.write_all(b"\x1b[?7l");
 
-        // Row h-3: spinner or blank
-        let _ = write!(self.out, "\x1b[{};1H\x1b[K", h.saturating_sub(3));
-        if let Some((frame, label)) = spinner {
+        let _ = self.out.write_all(b"\x1b[?7l");
+        let _ = self.out.write_all(b"\r");
+
+        // Row 0: spinner (if present) or blank margin.
+        if let (Some(frame), Some(label)) = (state.spinner_frame.as_ref(), state.spinner_label.as_ref()) {
             self.set_fg(Role::Brand);
             let _ = write!(self.out, " {} ", frame);
             self.reset();
@@ -273,58 +170,168 @@ impl<W: Write + Send> AnsiRenderer<W> {
                 let _ = self.out.write_all(b"\x1b[22m");
             }
         }
+        let _ = self.out.write_all(b"\r\n");
 
-        // Row h-2: top border
-        let _ = write!(self.out, "\x1b[{};1H\x1b[K", h.saturating_sub(2));
+        // Row 1: box top border.
         self.set_fg(Role::Border);
         let _ = self.out.write_all("╭".as_bytes());
-        for _ in 0..inner {
-            let _ = self.out.write_all("─".as_bytes());
-        }
+        for _ in 0..inner { let _ = self.out.write_all("─".as_bytes()); }
         let _ = self.out.write_all("╮".as_bytes());
         self.reset();
+        let _ = self.out.write_all(b"\r\n");
 
-        // Row h-1: middle with ❯ + buf
-        let _ = write!(self.out, "\x1b[{};1H\x1b[K", h.saturating_sub(1));
+        // Row 2: box middle.
+        let text_budget = inner.saturating_sub(4);
+        let safe = scrub_controls(&state.buf);
+        let display_buf = crate::width::truncate_to_width(&safe, text_budget);
+        let buf_w = crate::width::display_width(&display_buf);
+        let pad = text_budget.saturating_sub(buf_w);
+
         self.set_fg(Role::Border);
         let _ = self.out.write_all("│ ".as_bytes());
         self.reset();
         self.set_fg(Role::Accent);
         let _ = self.out.write_all("❯ ".as_bytes());
         self.reset();
-        let text_budget = inner.saturating_sub(4);
-        let safe = scrub_controls(buf);
-        let display_buf = crate::width::truncate_to_width(&safe, text_budget);
-        let buf_w = crate::width::display_width(&display_buf);
-        let pad = text_budget.saturating_sub(buf_w);
         let _ = self.out.write_all(display_buf.as_bytes());
-        for _ in 0..pad {
-            let _ = self.out.write_all(b" ");
-        }
+        for _ in 0..pad { let _ = self.out.write_all(b" "); }
         self.set_fg(Role::Border);
         let _ = self.out.write_all(" │".as_bytes());
         self.reset();
+        let _ = self.out.write_all(b"\r\n");
 
-        // Row h: bottom border
-        let _ = write!(self.out, "\x1b[{};1H\x1b[K", h);
+        // Row 3: box bottom border.
         self.set_fg(Role::Border);
         let _ = self.out.write_all("╰".as_bytes());
-        for _ in 0..inner {
-            let _ = self.out.write_all("─".as_bytes());
-        }
+        for _ in 0..inner { let _ = self.out.write_all("─".as_bytes()); }
         let _ = self.out.write_all("╯".as_bytes());
         self.reset();
+        let _ = self.out.write_all(b"\r\n");
 
-        // Cursor on middle row at col 4 + cursor_cols (1-indexed).
-        let cursor_col = 4 + cursor_cols + 1;
-        let _ = write!(
-            self.out,
-            "\x1b[{};{}H",
-            h.saturating_sub(1),
-            cursor_col
-        );
-        // Restore autowrap for scrolling content.
+        // Rows 4..4+N: menu items.
+        let menu_rows = state.menu_items.len().min(4);
+        for (i, (name, desc)) in state.menu_items.iter().take(4).enumerate() {
+            let selected = state.menu_selected_in_view == Some(i);
+            if selected {
+                if self.caps.colors {
+                    let _ = self.out.write_all(b"\x1b[48;2;50;70;90m");
+                }
+                self.set_fg(Role::ToolName);
+                let _ = write!(self.out, "  ▸ /{:<12}  {}", name, desc);
+                let content_w = 5 + name.chars().count() + 2 + desc.chars().count();
+                let right_pad = w.saturating_sub(content_w);
+                for _ in 0..right_pad { let _ = self.out.write_all(b" "); }
+                if self.caps.colors {
+                    let _ = self.out.write_all(b"\x1b[0m");
+                }
+            } else {
+                self.set_fg(Role::Muted);
+                let _ = write!(self.out, "    /{:<12}  {}", name, desc);
+                self.reset();
+            }
+            let _ = self.out.write_all(b"\r\n");
+            let _ = i;
+        }
+
+        // Total rows = 4 (spinner/blank + 3 box) + menu_rows.
+        let total_rows = 4 + menu_rows;
+        self.footer_rows = total_rows;
+
+        // Cursor now at (footer_start + total_rows, 0). Box middle is at
+        // row index 2 from footer top. Move up (total_rows - 2).
+        let up = total_rows.saturating_sub(2);
+        if up > 0 {
+            let _ = write!(self.out, "\x1b[{}A", up);
+        }
+        // Col 5 + cursor_cols (1-indexed; "│ ❯ " = 4 chars, so col 5 is first typing position).
+        let col = 5 + state.cursor_cols;
+        let _ = write!(self.out, "\r\x1b[{}G", col);
+
         let _ = self.out.write_all(b"\x1b[?7h");
+    }
+
+    /// Redraw footer if it was previously drawn — used after permanent
+    /// content writes to put the box back.
+    fn redraw_footer_if_any(&mut self) {
+        if !self.last_footer.buf.is_empty()
+            || !self.last_footer.menu_items.is_empty()
+            || self.last_footer.spinner_frame.is_some()
+            || self.footer_rows > 0
+        {
+            self.draw_footer_here();
+        }
+    }
+
+    /// Back-compat shim for arms that used to call this name. In the
+    /// pure-append model, "moving to scroll bottom" = erasing the footer
+    /// and leaving cursor at the content-emit position.
+    fn move_to_scroll_bottom(&mut self) {
+        self.erase_footer();
+    }
+
+    /// Update last_footer state and redraw at current cursor. Everything
+    /// about layout lives in draw_footer_here — this is just a dispatcher.
+    fn draw_footer_with_menu(
+        &mut self,
+        buf: &str,
+        cursor_cols: usize,
+        spinner: Option<(&str, &str)>,
+        menu: Option<&super::MenuPayload>,
+    ) {
+        // Paginate menu to the currently-visible 4 items.
+        let (menu_items, selected_in_view) = if let Some(m) = menu {
+            let len = m.items.len();
+            if len == 0 {
+                (Vec::new(), None)
+            } else {
+                // Keep selected in view: compute offset such that selected
+                // sits somewhere in [offset, offset+4).
+                let offset = if len <= 4 {
+                    0
+                } else if m.selected < 4 {
+                    0
+                } else {
+                    (m.selected + 1).saturating_sub(4).min(len.saturating_sub(4))
+                };
+                let end = (offset + 4).min(len);
+                let items: Vec<(String, String)> = m.items[offset..end].to_vec();
+                let sel = if m.selected >= offset && m.selected < end {
+                    Some(m.selected - offset)
+                } else {
+                    None
+                };
+                (items, sel)
+            }
+        } else {
+            (Vec::new(), None)
+        };
+
+        let (sp_frame, sp_label) = match spinner {
+            Some((f, l)) if menu.is_none() => (Some(f.to_string()), Some(l.to_string())),
+            _ => (None, None),
+        };
+
+        self.last_footer = FooterState {
+            buf: buf.to_string(),
+            cursor_cols,
+            menu_items,
+            menu_selected_in_view: selected_in_view,
+            spinner_frame: sp_frame,
+            spinner_label: sp_label,
+        };
+
+        self.erase_footer();
+        self.draw_footer_here();
+    }
+
+    /// Back-compat wrapper — routes to draw_footer_with_menu(menu=None).
+    fn draw_footer(
+        &mut self,
+        buf: &str,
+        cursor_cols: usize,
+        spinner: Option<(&str, &str)>,
+    ) {
+        self.draw_footer_with_menu(buf, cursor_cols, spinner, None);
     }
 
     // Shim so existing call sites keep compiling. Scroll-region mode makes
@@ -345,22 +352,28 @@ impl<W: Write + Send> AnsiRenderer<W> {
         self.reset();
     }
 
-    /// Central path for emitting one logical permanent line. Wraps the
-    /// line to terminal width (SGR-aware) and writes each chunk with a
-    /// move_to_scroll_bottom + \r\n so every line lands at the scroll
-    /// region bottom — never autowraps into the reserved footer rows.
+    /// Central path for emitting one logical permanent line. Three steps:
+    ///   1. erase_footer — remove the box/menu so content writes to a
+    ///      clean area.
+    ///   2. wrap & emit content — each chunk + \r\n; terminal scrolls
+    ///      naturally when cursor passes bottom row.
+    ///   3. redraw footer — blank margin + box + menu at new cursor
+    ///      position (below the content we just wrote).
     fn emit_wrapped_line(&mut self, line: &str) {
-        let w = self.term_width().max(1);
+        self.erase_footer();
+        // Reserve 1 col as safety margin against autowrap at col w.
+        let w = self.term_width().saturating_sub(1).max(1);
         for chunk in crate::width::wrap_line_to_width(line, w) {
-            self.move_to_scroll_bottom();
             let _ = self.out.write_all(chunk.as_bytes());
             let _ = self.out.write_all(b"\r\n");
         }
+        self.redraw_footer_if_any();
     }
 
     fn emit_blank_line(&mut self) {
-        self.move_to_scroll_bottom();
+        self.erase_footer();
         let _ = self.out.write_all(b"\r\n");
+        self.redraw_footer_if_any();
     }
 
     // clear_old_footer_rows removed — static footer layout means no
@@ -402,7 +415,6 @@ impl<W: Write + Send> AnsiRenderer<W> {
                     let _ = self.out.write_all(b"\r\n");
                 }
             }
-            self.last_was_permanent = true;
         }
     }
 
@@ -431,7 +443,6 @@ impl<W: Write + Send> AnsiRenderer<W> {
                 let _ = self.out.write_all(b"\r\n");
             }
         }
-        self.last_was_permanent = true;
     }
 
     fn term_width(&self) -> usize {
@@ -557,7 +568,6 @@ impl<W: Write + Send> Renderer for AnsiRenderer<W> {
             UiLine::Welcome { model, working_dir } => {
                 self.clear_line_if_needed();
                 self.render_welcome(&model, &working_dir);
-                self.last_was_permanent = true;
                 self.assistant_continuing = false;
             }
             UiLine::User(text) => {
@@ -591,7 +601,6 @@ impl<W: Write + Send> Renderer for AnsiRenderer<W> {
                 // Blank line below
                 let _ = self.out.write_all(b"\r\n");
 
-                self.last_was_permanent = true;
                 self.assistant_continuing = false;
                 // New user turn → reset markdown parser state.
                 self.md_state.reset();
@@ -630,7 +639,6 @@ impl<W: Write + Send> Renderer for AnsiRenderer<W> {
                     push_sgr_fg_reset(&mut line, self.caps);
                 }
                 self.emit_wrapped_line(&line);
-                self.last_was_permanent = true;
             }
             UiLine::ToolResult { success, summary } => {
                 if self.assistant_continuing || !self.assistant_line_buf.is_empty() {
@@ -652,7 +660,6 @@ impl<W: Write + Send> Renderer for AnsiRenderer<W> {
                 self.emit_wrapped_line(&line);
                 // Paragraph spacer.
                 self.emit_blank_line();
-                self.last_was_permanent = true;
             }
             UiLine::DiffLine { added, text } => {
                 let mut line = String::new();
@@ -662,7 +669,6 @@ impl<W: Write + Send> Renderer for AnsiRenderer<W> {
                 line.push_str(&format!("       {} {}", sign, scrub_controls(&text)));
                 push_sgr_fg_reset(&mut line, self.caps);
                 self.emit_wrapped_line(&line);
-                self.last_was_permanent = true;
             }
             UiLine::ApprovalPrompt { tool, detail } => {
                 let mut line = String::new();
@@ -673,7 +679,6 @@ impl<W: Write + Send> Renderer for AnsiRenderer<W> {
                 ));
                 push_sgr_fg_reset(&mut line, self.caps);
                 self.emit_wrapped_line(&line);
-                self.last_was_permanent = true;
             }
             UiLine::Error(msg) => {
                 if self.assistant_continuing || !self.assistant_line_buf.is_empty() {
@@ -685,7 +690,6 @@ impl<W: Write + Send> Renderer for AnsiRenderer<W> {
                 line.push_str(&format!("  [Error: {}]", scrub_controls(&msg)));
                 push_sgr_fg_reset(&mut line, self.caps);
                 self.emit_wrapped_line(&line);
-                self.last_was_permanent = true;
                 self.assistant_continuing = false;
             }
             UiLine::TurnCancelled => {
@@ -694,14 +698,12 @@ impl<W: Write + Send> Renderer for AnsiRenderer<W> {
                 line.push_str("  (cancelled)");
                 push_sgr_fg_reset(&mut line, self.caps);
                 self.emit_wrapped_line(&line);
-                self.last_was_permanent = true;
                 self.assistant_continuing = false;
             }
             UiLine::TurnComplete => {
                 self.flush_assistant_remainder();
                 self.clear_line_if_needed();
                 let _ = self.out.write_all(b"\r\n");
-                self.last_was_permanent = true;
                 self.assistant_continuing = false;
             }
             UiLine::Spinner { frame, label } => {
@@ -710,14 +712,12 @@ impl<W: Write + Send> Renderer for AnsiRenderer<W> {
                     return;
                 }
                 self.draw_footer("", 0, Some((frame, &label)));
-                self.last_was_permanent = false;
             }
             UiLine::StreamingBox { buf, cursor_cols, frame, label } => {
                 if self.assistant_continuing {
                     return;
                 }
                 self.draw_footer(&buf, cursor_cols, Some((frame, &label)));
-                self.last_was_permanent = false;
             }
             UiLine::ClearTransient => {
                 // Footer is fixed at absolute bottom rows — nothing to clear.
@@ -725,11 +725,9 @@ impl<W: Write + Send> Renderer for AnsiRenderer<W> {
             }
             UiLine::InputPrompt { buf, cursor_cols, menu } => {
                 self.draw_footer_with_menu(&buf, cursor_cols, None, menu.as_ref());
-                self.last_was_permanent = false;
             }
             UiLine::InputCommit => {
                 let _ = self.out.write_all(b"\r\n");
-                self.last_was_permanent = true;
             }
             UiLine::TurnSeparator { label } => {
                 self.clear_line_if_needed();
@@ -755,14 +753,12 @@ impl<W: Write + Send> Renderer for AnsiRenderer<W> {
                 for _ in 0..right { let _ = self.out.write_all("─".as_bytes()); }
                 self.reset();
                 let _ = self.out.write_all(b"\r\n\r\n");
-                self.last_was_permanent = true;
             }
             UiLine::CommandOutput(text) => {
                 let safe = scrub_controls(&text);
                 for phys in safe.split('\n') {
                     self.emit_wrapped_line(phys);
                 }
-                self.last_was_permanent = true;
             }
         }
     }
