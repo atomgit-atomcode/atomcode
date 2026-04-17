@@ -276,5 +276,99 @@ nav.docs-nav { background: rgba(2,6,23,0.85); backdrop-filter: blur(16px); trans
 ::-webkit-scrollbar-thumb { background: #334155; border-radius: 3px; }
 [data-theme="light"] ::-webkit-scrollbar-thumb { background: #cbd5e1; }
 
+/* ── Docs search ── */
+.docs-search-wrap { position: relative; margin-bottom: 1rem; }
+#searchInput {
+  width: 100%;
+  padding: 0.5rem 0.75rem;
+  padding-right: 3rem;
+  border-radius: 0.5rem;
+  border: 1px solid var(--border-color);
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+  font-size: 0.8125rem;
+  font-family: 'Inter', system-ui, sans-serif;
+  outline: none;
+  transition: border-color 0.15s ease;
+}
+#searchInput::placeholder { color: var(--text-secondary); opacity: 0.6; }
+#searchInput:focus { border-color: #8b5cf6; }
+.docs-search-wrap::after {
+  content: '⌘K';
+  position: absolute;
+  right: 0.5rem;
+  top: 50%;
+  transform: translateY(-50%);
+  font-size: 0.625rem;
+  color: var(--text-secondary);
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  padding: 0.1rem 0.35rem;
+  border-radius: 0.25rem;
+  pointer-events: none;
+  opacity: 0.6;
+}
+.docs-search-results {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  right: 0;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 0.75rem;
+  max-height: 24rem;
+  overflow-y: auto;
+  z-index: 100;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.3);
+}
+[data-theme="light"] .docs-search-results { box-shadow: 0 8px 24px rgba(0,0,0,0.1); }
+.search-item {
+  display: block;
+  padding: 0.625rem 0.875rem;
+  text-decoration: none !important;
+  border-bottom: 1px solid var(--border-color);
+  transition: background 0.1s ease;
+}
+.search-item:last-child { border-bottom: none; }
+.search-item:hover { background: rgba(139,92,246,0.08); }
+.search-page {
+  display: inline-block;
+  font-size: 0.625rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #8b5cf6;
+  margin-bottom: 0.125rem;
+}
+.search-heading {
+  display: block;
+  font-size: 0.8125rem;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin-bottom: 0.125rem;
+}
+.search-snippet {
+  display: block;
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+  line-height: 1.5;
+}
+.search-snippet mark {
+  background: rgba(139,92,246,0.25);
+  color: #c4b5fd;
+  border-radius: 2px;
+  padding: 0 2px;
+}
+[data-theme="light"] .search-snippet mark {
+  background: rgba(124,58,237,0.15);
+  color: #5b21b6;
+}
+.search-empty {
+  padding: 1rem;
+  text-align: center;
+  font-size: 0.8125rem;
+  color: var(--text-secondary);
+}
+
 /* Tailwind utility overrides in light theme (nav only) */
 [data-theme="light"] .hover\:text-brand-400:hover { color: #7c3aed !important; }

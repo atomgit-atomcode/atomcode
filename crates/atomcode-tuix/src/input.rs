@@ -1,17 +1,19 @@
 use crossterm::event::{poll, read, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::style::{Color, Print, SetForegroundColor, ResetColor};
-use crossterm::cursor;
 use crossterm::execute;
 use std::io::{stdout, Write};
 use std::time::Duration;
 
+#[allow(dead_code)]
 const PROMPT: &str = "❯ ";
+#[allow(dead_code)]
 const PROMPT_DISPLAY_WIDTH: usize = 2; // "❯ " is 1 wide char + 1 space = 2 columns
+#[allow(dead_code)]
 const CONTINUATION: &str = "  ";
 const POLL_TIMEOUT: Duration = Duration::from_millis(100);
+#[allow(dead_code)]
 const PROMPT_COLOR: Color = Color::Rgb { r: 100, g: 160, b: 240 };
 
-/// Read user input line-by-line in raw mode.
 /// Returns `Some(text)` on Enter, `None` on Ctrl+C when buffer is empty (exit signal).
 pub fn read_input(history: &[String], commands: &[String]) -> Option<String> {
     let mut buf = String::new();
@@ -250,6 +252,7 @@ fn redraw(buf: &str, cursor: usize) {
 }
 
 /// Returns (line_index, byte_offset_within_line) for the given cursor byte offset in buf.
+#[allow(dead_code)]
 fn cursor_position(buf: &str, cursor: usize) -> (usize, usize) {
     let before = &buf[..cursor];
     let line = before.matches('\n').count();
@@ -259,6 +262,7 @@ fn cursor_position(buf: &str, cursor: usize) -> (usize, usize) {
 
 /// Compute the display width of a string (simple: count chars, treating each as width 1).
 /// For a more accurate CJK-aware width, a unicode-width crate would be needed.
+#[allow(dead_code)]
 fn display_width(s: &str) -> usize {
     s.chars().count()
 }

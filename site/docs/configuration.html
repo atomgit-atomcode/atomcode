@@ -30,6 +30,7 @@
   <div class="max-w-7xl mx-auto px-4 md:px-6 pt-20 md:pt-24 pb-24 md:grid md:grid-cols-[220px_1fr] md:gap-10">
     <aside id="docsSidebar" class="docs-sidebar md:sticky md:top-24 md:self-start mb-8 md:mb-0">
       <div class="text-xs uppercase text-slate-500 font-semibold mb-3 tracking-wider">使用指南</div>
+      <div id="docsSearch"></div>
       <nav class="flex flex-col gap-0.5">
         <a href="./index.html">概览</a>
         <a href="./getting-started.html">快速开始</a>
@@ -90,7 +91,7 @@ context_window = 64000</code></pre>
         </thead>
         <tbody>
           <tr><td><code>type</code></td><td>string</td><td>是</td><td>provider 协议类型,目前支持 <code>openai</code>、<code>claude</code>、<code>ollama</code></td></tr>
-          <tr><td><code>api_key</code></td><td>string</td><td>视情况</td><td>API Key。<code>ollama</code> 可不填</td></tr>
+          <tr><td><code>api_key</code></td><td>string?</td><td>视情况</td><td>API Key。<code>ollama</code> 可不填。OAuth 登录的 provider 不含此字段,token 从 <code>~/.atomcode/auth.toml</code> 自动读取</td></tr>
           <tr><td><code>model</code></td><td>string</td><td>是</td><td>模型名,比如 <code>deepseek-chat</code>、<code>gpt-4o</code>、<code>claude-sonnet-4-6</code></td></tr>
           <tr><td><code>base_url</code></td><td>string?</td><td>否</td><td>API 基地址。<code>openai</code> 类型需要指向实际接口,留空使用 OpenAI 官方</td></tr>
           <tr><td><code>context_window</code></td><td>integer</td><td>否</td><td>模型上下文窗口(tokens),默认 64000。<code>ollama</code> 默认 8000</td></tr>

@@ -30,6 +30,7 @@
   <div class="max-w-7xl mx-auto px-4 md:px-6 pt-20 md:pt-24 pb-24 md:grid md:grid-cols-[220px_1fr] md:gap-10">
     <aside id="docsSidebar" class="docs-sidebar md:sticky md:top-24 md:self-start mb-8 md:mb-0">
       <div class="text-xs uppercase text-slate-500 font-semibold mb-3 tracking-wider">使用指南</div>
+      <div id="docsSearch"></div>
       <nav class="flex flex-col gap-0.5">
         <a href="./index.html">概览</a>
         <a href="./getting-started.html">快速开始</a>
@@ -135,7 +136,7 @@ atomcode --config ./custom.toml</code></pre>
       <ul>
         <li><code>/resume</code> —— 在不同会话之间切换或恢复</li>
         <li><code>/session</code> —— 新建一个干净会话</li>
-        <li><code>/cd</code> —— 运行时切换工作目录(会改变 <code>default_workdir</code>)</li>
+        <li><code>/cd</code> 或直接输入 <code>cd /path</code> —— 切换工作目录(状态栏实时更新)</li>
         <li><code>/clear</code> —— 清空当前会话的消息</li>
         <li><code>/compact</code> —— 压缩历史消息以腾出上下文预算</li>
       </ul>
@@ -143,7 +144,7 @@ atomcode --config ./custom.toml</code></pre>
 
       <h2>查看成本和 diff</h2>
       <ul>
-        <li><code>/cost</code> —— 本次会话累计消耗的输入 / 输出 tokens</li>
+        <li><code>/cost</code> —— 本次会话输出 token 数和上下文用量(不支持 usage 的 API 会自动估算)</li>
         <li><code>/diff</code> —— 当前工作目录未提交改动的 git diff</li>
         <li><code>/undo</code> —— 回滚上一轮的所有文件编辑</li>
       </ul>

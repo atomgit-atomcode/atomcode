@@ -66,7 +66,7 @@ fn term_width() -> usize {
 
 /// Set up scroll region: rows 1..=(height-3) scroll, bottom 3 rows are fixed for input.
 pub fn setup_scroll_region() {
-    let (w, h) = term_size();
+    let (_w, h) = term_size();
     let mut out = io::stdout();
     let scroll_end = h.saturating_sub(3);
     // Set scroll region (1-indexed)

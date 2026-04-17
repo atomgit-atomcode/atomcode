@@ -30,6 +30,7 @@
   <div class="max-w-7xl mx-auto px-4 md:px-6 pt-20 md:pt-24 pb-24 md:grid md:grid-cols-[220px_1fr] md:gap-10">
     <aside id="docsSidebar" class="docs-sidebar md:sticky md:top-24 md:self-start mb-8 md:mb-0">
       <div class="text-xs uppercase text-slate-500 font-semibold mb-3 tracking-wider">使用指南</div>
+      <div id="docsSearch"></div>
       <nav class="flex flex-col gap-0.5">
         <a href="./index.html" aria-current="page">概览</a>
         <a href="./getting-started.html">快速开始</a>
@@ -41,7 +42,7 @@
         <a href="./tools.html">内置工具</a>
         <a href="./sessions.html">会话与撤销</a>
         <a href="./project-instructions.html">项目指令文件</a>
-        <a href="./headless-daemon.html">Headless 与 Daemon</a>
+        <!-- <a href="./headless-daemon.html">Headless 与 Daemon</a> -->
         <a href="./skills.html">Skills 扩展</a>
         <a href="./faq.html">常见问题</a>
       </nav>
@@ -75,7 +76,7 @@
         </a>
         <a class="doc-card" href="./login.html">
           <h3>登录方式</h3>
-          <p>AtomGit OAuth、企业微信扫码、API Key 三种登录路径对比。</p>
+          <p>AtomGit OAuth 一键登录(自动持久化)与 API Key 配置对比。</p>
         </a>
         <a class="doc-card" href="./basic-usage.html">
           <h3>基本使用</h3>
@@ -101,10 +102,10 @@
           <h3>项目指令文件</h3>
           <p>用 <code>.atomcode.md</code> 给 AtomCode 定制项目级规范。</p>
         </a>
-        <a class="doc-card" href="./headless-daemon.html">
+        <!-- <a class="doc-card" href="./headless-daemon.html">
           <h3>Headless 与 Daemon</h3>
           <p>CLI 非交互模式、<code>atomcode-daemon</code> HTTP/SSE API。</p>
-        </a>
+        </a> -->
         <a class="doc-card" href="./skills.html">
           <h3>Skills 扩展</h3>
           <p>编写用户自定义 skill,扩展斜杠命令生态。</p>
@@ -118,7 +119,7 @@
       <h2>反馈与参与</h2>
       <p>AtomCode 是开源项目,欢迎提交 issue 或 PR:</p>
       <ul>
-        <li>仓库:<a href="https://atomgit.com/atomgit_atomcode/atomcode" target="_blank">atomgit.com/atomgit_atomcode/atomcode</a></li>
+        <li>开源仓库:<a href="https://atomgit.com/atomgit_atomcode/atomcode" target="_blank">https://atomgit.com/atomgit_atomcode/atomcode</a></li>
         <li>Issue:终端内直接运行 <code>/issue</code> 即可快速创建</li>
         <li>许可证:MIT</li>
       </ul>

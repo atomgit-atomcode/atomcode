@@ -265,8 +265,19 @@ async fn run() -> Result<i32> {
                 p.model = model.clone();
             }
         }
+        // Provide a dummy api_key to prevent create_provider from attempting
+        // auth-token loading (which would fail if not logged in).  The real
+        // provider is rebuilt later via rebuild_provider() once the user has
+        // configured credentials.
         let pc = config.active_provider(cli.provider.as_deref())?.clone();
         let name = pc.model.clone();
+        let pc = if pc.api_key.is_none() && pc.provider_type != "ollama" {
+            let mut c = pc.clone();
+            c.api_key = Some("not-configured".to_string());
+            c
+        } else {
+            pc
+        };
         (pc, name)
     };
 
