@@ -46,6 +46,7 @@ pub enum UiLine {
         buf: String,
         cursor_byte: usize,
         menu: Option<MenuPayload>,
+        status: StatusLine,
     },
     /// Streaming chrome: spinner line above a (possibly multi-line)
     /// input box. Same `cursor_byte` semantics as `InputPrompt`.
@@ -54,6 +55,7 @@ pub enum UiLine {
         cursor_byte: usize,
         frame: &'static str,
         label: String,
+        status: StatusLine,
     },
     /// User pressed Enter: commit the current InputPrompt to scrollback.
     InputCommit,
@@ -76,6 +78,16 @@ pub trait Renderer: Send {
 pub struct MenuPayload {
     pub items: Vec<(String, String)>, // (name, desc)
     pub selected: usize,
+}
+
+/// Persistent status line drawn directly below the input box — CC-style
+/// "model · cwd · tokens" chrome. Visible in both Idle and Streaming
+/// phases so the user always sees what provider is active.
+#[derive(Debug, Clone, Default)]
+pub struct StatusLine {
+    pub model: String,
+    pub cwd: String,      // HOME replaced with "~"
+    pub total_tokens: usize,
 }
 
 /// One line in a diff batch. `added = true` renders as `+`, false as `-`.

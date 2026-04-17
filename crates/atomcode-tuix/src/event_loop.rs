@@ -398,7 +398,12 @@ pub async fn run_loop(
         dir_display.replacen(&home, "~", 1)
     } else { dir_display };
     renderer.render(UiLine::Welcome { model: ctx.model_name.clone(), working_dir: dir_display.clone() });
-    renderer.render(UiLine::InputPrompt { buf: String::new(), cursor_byte: 0, menu: None });
+    renderer.render(UiLine::InputPrompt {
+        buf: String::new(),
+        cursor_byte: 0,
+        menu: None,
+        status: build_status(&state, &ctx),
+    });
     renderer.flush();
 
     // Spinner tick channel — a background task fires a tick every 100ms
@@ -472,7 +477,7 @@ pub async fn run_loop(
 
             // ── Spinner tick (from background task) ──
             Some(()) = spin_rx.recv(), if matches!(state.phase, UiPhase::Streaming) => {
-                draw_spinner_now(&mut state, &buf, renderer);
+                draw_spinner_now(&mut state, &buf, &ctx, renderer);
                 last_spinner_draw = std::time::Instant::now();
             }
 
@@ -491,12 +496,11 @@ pub async fn run_loop(
                 if matches!(state.phase, UiPhase::Streaming)
                     && last_spinner_draw.elapsed() >= Duration::from_millis(100)
                 {
-                    draw_spinner_now(&mut state, &buf, renderer);
+                    draw_spinner_now(&mut state, &buf, &ctx, renderer);
                     last_spinner_draw = std::time::Instant::now();
                 }
                 if matches!(state.phase, UiPhase::Idle) {
-                    renderer.render(UiLine::InputPrompt { buf: buf.text.clone(), cursor_byte: buf.cursor, menu: None });
-                    renderer.flush();
+                    redraw_idle_plain(&buf, &state, &ctx, renderer);
                 }
             }
 
@@ -516,16 +520,11 @@ pub async fn run_loop(
                 state.on_resume();
                 match state.phase {
                     UiPhase::Streaming => {
-                        draw_spinner_now(&mut state, &buf, renderer);
+                        draw_spinner_now(&mut state, &buf, &ctx, renderer);
                         last_spinner_draw = std::time::Instant::now();
                     }
                     _ => {
-                        renderer.render(UiLine::InputPrompt {
-                            buf: buf.text.clone(),
-                            cursor_byte: buf.cursor,
-                            menu: None,
-                        });
-                        renderer.flush();
+                        redraw_idle_plain(&buf, &state, &ctx, renderer);
                     }
                 }
             }
@@ -537,7 +536,7 @@ pub async fn run_loop(
 
             // ── Spinner tick (from background task) ──
             Some(()) = spin_rx.recv(), if matches!(state.phase, UiPhase::Streaming) => {
-                draw_spinner_now(&mut state, &buf, renderer);
+                draw_spinner_now(&mut state, &buf, &ctx, renderer);
                 last_spinner_draw = std::time::Instant::now();
             }
 
@@ -556,12 +555,11 @@ pub async fn run_loop(
                 if matches!(state.phase, UiPhase::Streaming)
                     && last_spinner_draw.elapsed() >= Duration::from_millis(100)
                 {
-                    draw_spinner_now(&mut state, &buf, renderer);
+                    draw_spinner_now(&mut state, &buf, &ctx, renderer);
                     last_spinner_draw = std::time::Instant::now();
                 }
                 if matches!(state.phase, UiPhase::Idle) {
-                    renderer.render(UiLine::InputPrompt { buf: buf.text.clone(), cursor_byte: buf.cursor, menu: None });
-                    renderer.flush();
+                    redraw_idle_plain(&buf, &state, &ctx, renderer);
                 }
             }
         }
@@ -593,8 +591,7 @@ fn handle_input(
         InputEvent::Paste(text) => {
             if matches!(state.phase, UiPhase::Idle) && model_picker.is_none() {
                 buf.insert_paste(text);
-                renderer.render(UiLine::InputPrompt { buf: buf.text.clone(), cursor_byte: buf.cursor, menu: None });
-                renderer.flush();
+                redraw_idle_plain(&buf, &state, &ctx, renderer);
             }
         }
         InputEvent::Eof => {}
@@ -602,7 +599,7 @@ fn handle_input(
         InputEvent::Key(KeyEvent { code, modifiers, .. }) => {
             // Model picker is modal — intercept keys first if active.
             if model_picker.is_some() && matches!(state.phase, UiPhase::Idle) {
-                handle_model_picker_key(code, modifiers, buf, ctx, renderer, model_picker)?;
+                handle_model_picker_key(code, modifiers, buf, state, ctx, renderer, model_picker)?;
                 return Ok(());
             }
             match state.phase {
@@ -694,14 +691,14 @@ fn handle_idle_key(
         match (code, modifiers) {
             (KeyCode::Up, _) => {
                 menu.selected = menu.selected.saturating_sub(1);
-                redraw_with_menu(buf, items, menu.selected, renderer);
+                redraw_with_menu(buf, items, menu.selected, state, ctx, renderer);
                 return Ok(());
             }
             (KeyCode::Down, _) => {
                 if menu.selected + 1 < items.len() {
                     menu.selected += 1;
                 }
-                redraw_with_menu(buf, items, menu.selected, renderer);
+                redraw_with_menu(buf, items, menu.selected, state, ctx, renderer);
                 return Ok(());
             }
             (KeyCode::Enter, m) if !m.contains(crossterm::event::KeyModifiers::SHIFT) => {
@@ -717,7 +714,7 @@ fn handle_idle_key(
                 if let Some((cmd, arg)) = parse_slash_line(&committed) {
                     execute_slash_command(cmd, arg, state, ctx, renderer, model_picker)?;
                     if matches!(state.phase, UiPhase::Idle) {
-                        redraw_idle(buf, ctx, model_picker, renderer);
+                        redraw_idle(buf, state, ctx, model_picker, renderer);
                     }
                 }
                 return Ok(());
@@ -727,12 +724,7 @@ fn handle_idle_key(
                 buf.text.clear();
                 buf.cursor = 0;
                 menu.selected = 0;
-                renderer.render(UiLine::InputPrompt {
-                    buf: String::new(),
-                    cursor_byte: 0,
-                    menu: None,
-                });
-                renderer.flush();
+                redraw_idle_plain(buf, state, ctx, renderer);
                 return Ok(());
             }
             _ => {} // fall through to buffer edits
@@ -749,15 +741,10 @@ fn handle_idle_key(
                 if menu.selected >= items.len() {
                     menu.selected = 0;
                 }
-                redraw_with_menu(buf, &items, menu.selected, renderer);
+                redraw_with_menu(buf, &items, menu.selected, state, ctx, renderer);
             } else {
                 menu.selected = 0;
-                renderer.render(UiLine::InputPrompt {
-                    buf: buf.text.clone(),
-                    cursor_byte: buf.cursor,
-                    menu: None,
-                });
-                renderer.flush();
+                redraw_idle_plain(buf, state, ctx, renderer);
             }
         }
         BufferResult::Commit(line) => {
@@ -773,7 +760,7 @@ fn handle_idle_key(
             if let Some((cmd, arg)) = parse_slash_line(&line) {
                 execute_slash_command(cmd, arg, state, ctx, renderer, model_picker)?;
                 if matches!(state.phase, UiPhase::Idle) {
-                    redraw_idle(buf, ctx, model_picker, renderer);
+                    redraw_idle(buf, state, ctx, model_picker, renderer);
                 }
             } else {
                 ctx.history.push(line.clone());
@@ -792,6 +779,8 @@ fn redraw_with_menu(
     buf: &Buffer,
     items: &[(String, String)],
     selected: usize,
+    state: &UiState,
+    ctx: &LoopCtx,
     renderer: &mut dyn Renderer,
 ) {
     let payload = crate::render::MenuPayload {
@@ -802,6 +791,25 @@ fn redraw_with_menu(
         buf: buf.text.clone(),
         cursor_byte: buf.cursor,
         menu: Some(payload),
+        status: build_status(state, ctx),
+    });
+    renderer.flush();
+}
+
+/// Idle prompt without any menu/picker — used by the common
+/// "Redraw" path and the post-event-loop fallback after an agent
+/// event returns the UI to Idle.
+fn redraw_idle_plain(
+    buf: &Buffer,
+    state: &UiState,
+    ctx: &LoopCtx,
+    renderer: &mut dyn Renderer,
+) {
+    renderer.render(UiLine::InputPrompt {
+        buf: buf.text.clone(),
+        cursor_byte: buf.cursor,
+        menu: None,
+        status: build_status(state, ctx),
     });
     renderer.flush();
 }
@@ -809,6 +817,7 @@ fn redraw_with_menu(
 /// Redraw the idle footer, showing the model picker if active.
 fn redraw_idle(
     buf: &Buffer,
+    state: &UiState,
     ctx: &LoopCtx,
     model_picker: &Option<ModelPicker>,
     renderer: &mut dyn Renderer,
@@ -836,6 +845,7 @@ fn redraw_idle(
         buf: buf.text.clone(),
         cursor_byte: buf.cursor,
         menu: payload,
+        status: build_status(state, ctx),
     });
     renderer.flush();
 }
@@ -845,6 +855,7 @@ fn handle_model_picker_key(
     code: KeyCode,
     _modifiers: crossterm::event::KeyModifiers,
     buf: &mut Buffer,
+    state: &UiState,
     ctx: &mut LoopCtx,
     renderer: &mut dyn Renderer,
     model_picker: &mut Option<ModelPicker>,
@@ -853,7 +864,7 @@ fn handle_model_picker_key(
     match code {
         KeyCode::Up => {
             picker.selected = picker.selected.saturating_sub(1);
-            redraw_idle(buf, ctx, model_picker, renderer);
+            redraw_idle(buf, state, ctx, model_picker, renderer);
         }
         KeyCode::Down => {
             let max = model_picker.as_ref().unwrap().providers.len().saturating_sub(1);
@@ -861,7 +872,7 @@ fn handle_model_picker_key(
             if picker.selected < max {
                 picker.selected += 1;
             }
-            redraw_idle(buf, ctx, model_picker, renderer);
+            redraw_idle(buf, state, ctx, model_picker, renderer);
         }
         KeyCode::Enter => {
             let chosen = model_picker.as_ref().unwrap().providers[model_picker.as_ref().unwrap().selected].clone();
@@ -887,11 +898,11 @@ fn handle_model_picker_key(
                 chosen, display
             )));
             renderer.flush();
-            redraw_idle(buf, ctx, model_picker, renderer);
+            redraw_idle(buf, state, ctx, model_picker, renderer);
         }
         KeyCode::Esc => {
             *model_picker = None;
-            redraw_idle(buf, ctx, model_picker, renderer);
+            redraw_idle(buf, state, ctx, model_picker, renderer);
         }
         _ => {}
     }
@@ -1271,21 +1282,41 @@ fn run_login_flow(
     Ok(())
 }
 
+/// Build the persistent status line shown directly below the input box.
+/// Pulls model name from ctx, cwd from ctx.working_dir (with $HOME
+/// collapsed to `~`), and running token count from state.
+fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::StatusLine {
+    let cwd = ctx.working_dir.to_string_lossy().to_string();
+    let cwd = if let Ok(home) = std::env::var("HOME") {
+        cwd.replacen(&home, "~", 1)
+    } else {
+        cwd
+    };
+    crate::render::StatusLine {
+        model: ctx.model_name.clone(),
+        cwd,
+        total_tokens: state.total_tokens,
+    }
+}
+
 /// Render one spinner frame. Used from both the interval-driven tick
 /// path and the opportunistic "post-event" pump path that guards
 /// against agent-event floods starving the interval tick.
 fn draw_spinner_now(
     state: &mut UiState,
     buf: &Buffer,
+    ctx: &LoopCtx,
     renderer: &mut dyn Renderer,
 ) {
     let frame = state.tick_spinner();
     let label = format_spinner_label(state);
+    let status = build_status(state, ctx);
     renderer.render(UiLine::StreamingBox {
         buf: buf.text.clone(),
         cursor_byte: buf.cursor,
         frame,
         label,
+        status,
     });
     renderer.flush();
 }

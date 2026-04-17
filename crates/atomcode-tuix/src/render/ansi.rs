@@ -15,6 +15,17 @@ use crate::terminal::TerminalCaps;
 /// wider terminals.
 const PAD_COL: usize = 2;
 
+/// Format a running token count as a compact human label — "842 tokens",
+/// "1.2k tokens", "12.3k tokens". Status bar is width-constrained so we
+/// avoid long raw numbers.
+fn format_token_count(n: usize) -> String {
+    if n < 1000 {
+        format!("{} tokens", n)
+    } else {
+        format!("{:.1}k tokens", (n as f64) / 1000.0)
+    }
+}
+
 // ── SGR helpers that append to a String (so arms can build a full line
 // buffer and emit it through the single wrapping path). ──
 
@@ -58,6 +69,8 @@ struct FooterState {
     menu_selected_in_view: Option<usize>,
     spinner_frame: Option<String>,
     spinner_label: Option<String>,
+    /// Persistent status line under the box.
+    status: super::StatusLine,
     /// Rows to walk up from the cursor resting position (box middle at
     /// row K) to reach the footer's top row. Populated by
     /// `draw_footer_here` so `erase_footer` knows exactly how far to
@@ -285,8 +298,38 @@ impl<W: Write + Send> AnsiRenderer<W> {
             let _ = i;
         }
 
-        // Total rows = 1 (spinner/blank) + 1 (top) + N middle + 1 (bottom) + M menu.
-        let total_rows = 1 + 1 + middle_rows + 1 + menu_rows;
+        // Status row: "  model · cwd · N tokens" in muted grey. Drawn
+        // below any menu rows so it's the last line of the footer.
+        // Only suppressed when the status line is totally empty (very
+        // early startup before welcome has run).
+        let has_status = !state.status.model.is_empty() || !state.status.cwd.is_empty();
+        if has_status {
+            self.write_left_pad();
+            self.set_fg(Role::Muted);
+            let mut parts: Vec<String> = Vec::with_capacity(3);
+            if !state.status.model.is_empty() {
+                parts.push(scrub_controls(&state.status.model));
+            }
+            if !state.status.cwd.is_empty() {
+                parts.push(scrub_controls(&state.status.cwd));
+            }
+            if state.status.total_tokens > 0 {
+                parts.push(format_token_count(state.status.total_tokens));
+            }
+            let joined = parts.join(" · ");
+            // Truncate to the box's outer width so over-long paths
+            // don't wrap and throw off cursor_row_from_top bookkeeping.
+            let max = box_outer.max(1);
+            let truncated = crate::width::truncate_to_width(&joined, max);
+            let _ = self.out.write_all(truncated.as_bytes());
+            self.reset();
+            let _ = self.out.write_all(b"\r\n");
+        }
+        let status_rows = if has_status { 1 } else { 0 };
+
+        // Total rows = 1 (spinner/blank) + 1 (top) + N middle + 1 (bottom)
+        //              + M menu + S status.
+        let total_rows = 1 + 1 + middle_rows + 1 + menu_rows + status_rows;
         self.footer_rows = total_rows;
 
         // Cursor lands on middle row K. Offset from footer top = 2 + K
@@ -314,6 +357,7 @@ impl<W: Write + Send> AnsiRenderer<W> {
         if !self.last_footer.buf.is_empty()
             || !self.last_footer.menu_items.is_empty()
             || self.last_footer.spinner_frame.is_some()
+            || !self.last_footer.status.model.is_empty()
             || self.footer_rows > 0
         {
             self.draw_footer_here();
@@ -335,6 +379,7 @@ impl<W: Write + Send> AnsiRenderer<W> {
         cursor_byte: usize,
         spinner: Option<(&str, &str)>,
         menu: Option<&super::MenuPayload>,
+        status: super::StatusLine,
     ) {
         // Paginate menu to the currently-visible 4 items.
         let (menu_items, selected_in_view) = if let Some(m) = menu {
@@ -376,6 +421,7 @@ impl<W: Write + Send> AnsiRenderer<W> {
             menu_selected_in_view: selected_in_view,
             spinner_frame: sp_frame,
             spinner_label: sp_label,
+            status,
             // cursor_row_from_top populated by draw_footer_here.
             cursor_row_from_top: 0,
         };
@@ -390,8 +436,9 @@ impl<W: Write + Send> AnsiRenderer<W> {
         buf: &str,
         cursor_byte: usize,
         spinner: Option<(&str, &str)>,
+        status: super::StatusLine,
     ) {
-        self.draw_footer_with_menu(buf, cursor_byte, spinner, None);
+        self.draw_footer_with_menu(buf, cursor_byte, spinner, None, status);
     }
 
     // Shim so existing call sites keep compiling. Scroll-region mode makes
@@ -846,20 +893,20 @@ impl<W: Write + Send> Renderer for AnsiRenderer<W> {
                 if self.assistant_continuing {
                     return;
                 }
-                self.draw_footer("", 0, Some((frame, &label)));
+                self.draw_footer("", 0, Some((frame, &label)), self.last_footer.status.clone());
             }
-            UiLine::StreamingBox { buf, cursor_byte, frame, label } => {
+            UiLine::StreamingBox { buf, cursor_byte, frame, label, status } => {
                 if self.assistant_continuing {
                     return;
                 }
-                self.draw_footer(&buf, cursor_byte, Some((frame, &label)));
+                self.draw_footer(&buf, cursor_byte, Some((frame, &label)), status);
             }
             UiLine::ClearTransient => {
                 // Footer is fixed at absolute bottom rows — nothing to clear.
                 // Kept as no-op for event_loop compatibility.
             }
-            UiLine::InputPrompt { buf, cursor_byte, menu } => {
-                self.draw_footer_with_menu(&buf, cursor_byte, None, menu.as_ref());
+            UiLine::InputPrompt { buf, cursor_byte, menu, status } => {
+                self.draw_footer_with_menu(&buf, cursor_byte, None, menu.as_ref(), status);
             }
             UiLine::InputCommit => {
                 // No-op. The event loop now emits ClearTransient → User to
