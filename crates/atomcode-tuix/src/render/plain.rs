@@ -78,7 +78,9 @@ impl<W: Write + Send> Renderer for PlainRenderer<W> {
             UiLine::TurnComplete => {
                 let _ = self.out.write_all(b"\n");
             }
-            UiLine::Spinner { .. } | UiLine::ClearTransient => {
+            UiLine::Spinner { .. }
+            | UiLine::StreamingBox { .. }
+            | UiLine::ClearTransient => {
                 // no-op in plain mode
             }
             UiLine::InputPrompt { buf, .. } => {

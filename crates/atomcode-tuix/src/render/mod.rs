@@ -22,12 +22,21 @@ pub enum UiLine {
     Error(String),
     TurnCancelled,
     TurnComplete,
-    /// Render a transient spinner (overwrites current transient line).
+    /// Legacy single-line spinner (kept for tests / PlainRenderer fallback).
+    /// During Streaming the event loop emits `StreamingBox` instead so the
+    /// spinner sits ABOVE the input box rather than inside it.
     Spinner { frame: &'static str, label: String },
     /// Clear the current transient line (prepares for a permanent write).
     ClearTransient,
-    /// Draw the input prompt "❯ " + current buffer (transient).
+    /// Draw the input prompt "❯ " + current buffer (transient, idle).
     InputPrompt { buf: String, cursor_cols: usize },
+    /// Streaming chrome: one spinner line above the 3-line input box.
+    StreamingBox {
+        buf: String,
+        cursor_cols: usize,
+        frame: &'static str,
+        label: String,
+    },
     /// User pressed Enter: commit the current InputPrompt to scrollback.
     InputCommit,
     /// Slash-command output (arbitrary text, already sanitised by caller).

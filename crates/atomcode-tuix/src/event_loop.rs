@@ -266,7 +266,7 @@ pub async fn run_loop(
             // ── Spinner tick ──
             _ = spinner_tick.tick(), if matches!(state.phase, UiPhase::Streaming) => {
                 let frame = state.tick_spinner();
-                renderer.render(UiLine::Spinner { frame, label: state.spinner_label.clone() });
+                renderer.render(UiLine::StreamingBox { buf: buf.text.clone(), cursor_cols: buf.cursor_cols(), frame, label: state.spinner_label.clone() });
                 renderer.flush();
             }
 
@@ -286,7 +286,9 @@ pub async fn run_loop(
                 state.on_resume();
                 match state.phase {
                     UiPhase::Streaming => {
-                        renderer.render(UiLine::Spinner {
+                        renderer.render(UiLine::StreamingBox {
+                            buf: buf.text.clone(),
+                            cursor_cols: buf.cursor_cols(),
                             frame: state.tick_spinner(),
                             label: state.spinner_label.clone(),
                         });
@@ -325,7 +327,7 @@ pub async fn run_loop(
             // ── Spinner tick ──
             _ = spinner_tick.tick(), if matches!(state.phase, UiPhase::Streaming) => {
                 let frame = state.tick_spinner();
-                renderer.render(UiLine::Spinner { frame, label: state.spinner_label.clone() });
+                renderer.render(UiLine::StreamingBox { buf: buf.text.clone(), cursor_cols: buf.cursor_cols(), frame, label: state.spinner_label.clone() });
                 renderer.flush();
             }
         }

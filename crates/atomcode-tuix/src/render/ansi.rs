@@ -396,23 +396,48 @@ impl<W: Write + Send> Renderer for AnsiRenderer<W> {
                 self.assistant_continuing = false;
             }
             UiLine::Spinner { frame, label } => {
-                // Don't paint spinner over in-flight assistant text — the
-                // streaming text itself is the progress signal.
+                // Legacy single-line spinner. During Streaming the event
+                // loop uses StreamingBox instead.
+                if self.assistant_continuing {
+                    return;
+                }
+                self.reset_transient();
+                self.set_fg(Role::Brand);
+                let _ = write!(self.out, "  {} ", frame);
+                self.reset();
+                self.set_fg(Role::Muted);
+                let _ = self.out.write_all(scrub_controls(&label).as_bytes());
+                self.reset();
+                self.last_was_permanent = false;
+                self.transient_lines = 1;
+                self.transient_cursor_from_top = 0;
+            }
+            UiLine::StreamingBox { buf, cursor_cols, frame, label } => {
+                // Don't paint over in-flight assistant text — the text IS
+                // the progress signal.
                 if self.assistant_continuing {
                     return;
                 }
                 self.reset_transient();
 
-                // Full-width box, flush left.
+                // Line 0: spinner " ⠋ Thinking..."
+                self.set_fg(Role::Brand);
+                let _ = write!(self.out, " {} ", frame);
+                self.reset();
+                self.set_fg(Role::Muted);
+                let _ = self.out.write_all(scrub_controls(&label).as_bytes());
+                self.reset();
+                let _ = self.out.write_all(b"\r\n");
+
+                // Lines 1-3: the normal input box showing buf (even though
+                // the user isn't typing, show them what they have queued).
                 let box_w = self.term_width().max(30);
                 let inner = box_w.saturating_sub(2);
-                let safe_label = scrub_controls(&label);
-                // Middle line: "│ {frame} {label}{pad} │"
-                //  col: 0 (│) 1 (sp) 2 (frame) 3 (sp) 4... text ... (sp) (│)
                 let text_budget = inner.saturating_sub(4);
-                let display_label = crate::width::truncate_to_width(&safe_label, text_budget);
-                let label_w = crate::width::display_width(&display_label);
-                let pad = text_budget.saturating_sub(label_w);
+                let safe = scrub_controls(&buf);
+                let display_buf = crate::width::truncate_to_width(&safe, text_budget);
+                let buf_w = crate::width::display_width(&display_buf);
+                let pad = text_budget.saturating_sub(buf_w);
 
                 self.set_fg(Role::Border);
                 let _ = self.out.write_all("╭".as_bytes());
@@ -423,12 +448,10 @@ impl<W: Write + Send> Renderer for AnsiRenderer<W> {
                 self.set_fg(Role::Border);
                 let _ = self.out.write_all("│ ".as_bytes());
                 self.reset();
-                self.set_fg(Role::Brand);
-                let _ = write!(self.out, "{} ", frame);
+                self.set_fg(Role::Accent);
+                let _ = self.out.write_all("❯ ".as_bytes());
                 self.reset();
-                self.set_fg(Role::Muted);
-                let _ = self.out.write_all(display_label.as_bytes());
-                self.reset();
+                let _ = self.out.write_all(display_buf.as_bytes());
                 for _ in 0..pad { let _ = self.out.write_all(b" "); }
                 self.set_fg(Role::Border);
                 let _ = self.out.write_all(" │\r\n".as_bytes());
@@ -440,12 +463,15 @@ impl<W: Write + Send> Renderer for AnsiRenderer<W> {
                 let _ = self.out.write_all("╯".as_bytes());
                 self.reset();
 
-                // Position cursor on middle line.
-                let _ = write!(self.out, "\x1b[1A\r");
+                // Cursor on middle row of the box = row 2 from top of transient
+                // (row 0 = spinner, row 1 = top border, row 2 = middle, row 3 = bottom).
+                let cursor_col = 4 + cursor_cols;
+                let _ = write!(self.out, "\x1b[1A\r\x1b[{}C", cursor_col);
+                let _ = cursor_col;
 
                 self.last_was_permanent = false;
-                self.transient_lines = 3;
-                self.transient_cursor_from_top = 1;
+                self.transient_lines = 4;
+                self.transient_cursor_from_top = 2;
             }
             UiLine::ClearTransient => {
                 self.reset_transient();
