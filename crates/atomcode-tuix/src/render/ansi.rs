@@ -414,6 +414,15 @@ impl<W: Write + Send> AnsiRenderer<W> {
             _ => (None, None),
         };
 
+        // Critical ordering: erase BEFORE overwriting `last_footer`, so
+        // `erase_footer` walks the cursor up using the _previous_ frame's
+        // `cursor_row_from_top`. Reversing this (erase after overwrite)
+        // means erase would read the fresh `cursor_row_from_top: 0`,
+        // fall back to `max(1) = 1` row up, clear only a sliver, and
+        // leave the prior footer's middle/bottom/menu rows as visible
+        // ghosts on the screen.
+        self.erase_footer();
+
         self.last_footer = FooterState {
             buf: buf.to_string(),
             cursor_byte,
@@ -422,11 +431,10 @@ impl<W: Write + Send> AnsiRenderer<W> {
             spinner_frame: sp_frame,
             spinner_label: sp_label,
             status,
-            // cursor_row_from_top populated by draw_footer_here.
+            // cursor_row_from_top populated by draw_footer_here below.
             cursor_row_from_top: 0,
         };
 
-        self.erase_footer();
         self.draw_footer_here();
     }
 
