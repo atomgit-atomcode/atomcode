@@ -88,7 +88,7 @@ struct RefreshResponse {
 /// Read a valid access token from `~/.atomcode/auth.toml`.
 /// Automatically refreshes expired tokens via the OAuth refresh_token flow.
 fn load_auth_token() -> Result<String> {
-    let auth_path = crate::config::Config::config_dir().join("auth.toml");
+    let auth_path = crate::auth::auth_file_path();
     let content = std::fs::read_to_string(&auth_path)
         .map_err(|_| anyhow::anyhow!("Not logged in — please use /login"))?;
     let auth: StoredAuth = toml::from_str(&content)
@@ -152,4 +152,29 @@ fn refresh_and_save(refresh_token: &str, auth_path: &std::path::Path) -> Result<
     let _ = std::fs::write(auth_path, content);
 
     Ok(access_token)
+}
+
+#[cfg(test)]
+mod tests {
+    /// Test that auth token is loaded from the correct unified path.
+    /// This prevents regressions where OAuth login token persistence breaks
+    /// after program restart due to path mismatch.
+    #[test]
+    fn test_auth_token_path_consistency() {
+        // Both paths should resolve to the same location: ~/.atomcode/auth.toml
+        let auth_module_path = crate::auth::auth_file_path();
+        let expected_path = dirs::home_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join(".atomcode")
+            .join("auth.toml");
+
+        assert_eq!(auth_module_path, expected_path,
+            "auth_file_path() should always return ~/.atomcode/auth.toml");
+
+        // Verify the path ends with the expected directory structure
+        assert!(auth_module_path.ends_with(".atomcode/auth.toml") ||
+                auth_module_path.ends_with(".atomcode\\auth.toml"), // Windows compatibility
+                "Path should end with .atomcode/auth.toml, got: {}",
+                auth_module_path.display());
+    }
 }

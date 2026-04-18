@@ -273,13 +273,10 @@ async fn run() -> Result<i32> {
         // configured credentials.
         let pc = config.active_provider(cli.provider.as_deref())?.clone();
         let name = pc.model.clone();
-        let pc = if pc.api_key.is_none() && pc.provider_type != "ollama" {
-            let mut c = pc.clone();
-            c.api_key = Some("not-configured".to_string());
-            c
-        } else {
-            pc
-        };
+        // 注意：如果api_key为None，保持为None不要设置"not-configured"。
+        // 这样可以让create_provider()检测到None并从auth.toml自动加载token。
+        // 设置"not-configured"会绕过create_provider()中的自动加载逻辑，导致OAuth登录后
+        // 重启程序时无法获取token而报404错误。
         (pc, name)
     };
 
