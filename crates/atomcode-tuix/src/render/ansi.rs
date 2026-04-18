@@ -673,8 +673,11 @@ impl<W: Write + Send> AnsiRenderer<W> {
         self.reset();
         let _ = self.out.write_all(b"\r\n\r\n");
 
-        // Hint row with keyboard glyphs. "     /" command, "⇧⏎" newline,
-        // "⌃C" cancel.
+        // Two hint rows:
+        //   row 1: "     type something, or press  /  to browse commands"
+        //   row 2: "     /provider  to add a custom model"
+        // `/provider` gets bold+accent so new users discover how to wire
+        // up their own API key without digging through config.toml.
         self.set_fg(Role::AccentDim);
         let _ = self.out.write_all("     type something, or press  ".as_bytes());
         self.reset();
@@ -689,6 +692,23 @@ impl<W: Write + Send> AnsiRenderer<W> {
         }
         self.set_fg(Role::AccentDim);
         let _ = self.out.write_all("  to browse commands".as_bytes());
+        self.reset();
+        let _ = self.out.write_all(b"\r\n");
+
+        self.set_fg(Role::AccentDim);
+        let _ = self.out.write_all("     ".as_bytes());
+        self.reset();
+        if self.caps.colors {
+            let _ = self.out.write_all(b"\x1b[1m");
+        }
+        self.set_fg(Role::Accent);
+        let _ = self.out.write_all("/provider".as_bytes());
+        self.reset();
+        if self.caps.colors {
+            let _ = self.out.write_all(b"\x1b[22m");
+        }
+        self.set_fg(Role::AccentDim);
+        let _ = self.out.write_all("  to add a custom model".as_bytes());
         self.reset();
         let _ = self.out.write_all(b"\r\n\r\n");
     }
