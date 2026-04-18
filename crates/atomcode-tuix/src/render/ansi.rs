@@ -1,6 +1,8 @@
 // crates/atomcode-tuix/src/render/ansi.rs
 use std::io::{BufWriter, Stdout, Write};
 
+use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
+use crossterm::execute;
 use crossterm::style::{SetForegroundColor, ResetColor};
 use crossterm::QueueableCommand;
 
@@ -1003,6 +1005,43 @@ impl<W: Write + Send> Renderer for AnsiRenderer<W> {
         self.assistant_line_buf.clear();
         self.md_state.reset();
         let _ = self.out.flush();
+    }
+
+    fn clear_screen(&mut self) {
+        // Physical-only: wipe the terminal without invalidating the
+        // cached footer/stream state. The very next render call will
+        // re-erase (no-op on a blank screen) + re-draw the footer, so
+        // the cache stays coherent with what we emit.
+        let _ = self.out.write_all(b"\x1b[2J\x1b[H");
+        let _ = self.out.flush();
+    }
+
+    fn suspend_for_external(&mut self) {
+        // Gate on caps so tests / pipe mode / dumb terminals don't try
+        // to toggle modes they never entered. `shutdown` handles the
+        // final `\r\n` + flush so the external child starts on a clean
+        // line.
+        if self.caps.bracketed_paste {
+            let _ = execute!(self.out, DisableBracketedPaste);
+        }
+        if self.caps.raw_mode {
+            let _ = crossterm::terminal::disable_raw_mode();
+        }
+        self.shutdown();
+    }
+
+    fn resume_from_external(&mut self) {
+        if self.caps.raw_mode {
+            let _ = crossterm::terminal::enable_raw_mode();
+        }
+        if self.caps.bracketed_paste {
+            let _ = execute!(self.out, EnableBracketedPaste);
+        }
+        // The child wrote to stdout in cooked mode — our footer_rows /
+        // last_footer / cursor tracking is now lying about terminal
+        // state. Wipe the screen + forget all caches so the next render
+        // rebuilds against a known (row 1, col 1) anchor.
+        self.reset();
     }
 }
 

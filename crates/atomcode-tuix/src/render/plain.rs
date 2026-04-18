@@ -124,6 +124,21 @@ impl<W: Write + Send> Renderer for PlainRenderer<W> {
         // Plain renderer has no cached footer state; just flush.
         let _ = self.out.flush();
     }
+
+    fn clear_screen(&mut self) {
+        // Pipe / non-TTY sink — a hardware "clear screen" is meaningless.
+        // Just flush so whatever's queued is visible before the caller
+        // (e.g. the `/clear` command) moves on.
+        let _ = self.out.flush();
+    }
+
+    fn suspend_for_external(&mut self) {
+        let _ = self.out.flush();
+    }
+
+    fn resume_from_external(&mut self) {
+        let _ = self.out.flush();
+    }
 }
 
 #[cfg(test)]

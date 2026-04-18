@@ -7,8 +7,7 @@ use anyhow::Result;
 use atomcode_core::agent::{AgentCommand, AgentEvent, AgentHandle, AgentPhase};
 use atomcode_core::config::Config;
 use atomcode_core::session::SessionManager;
-use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste, KeyCode, KeyEvent, KeyEventKind};
-use crossterm::execute;
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 use tokio::sync::mpsc;
 
 use crate::commands::{parse_slash_line, CommandRegistry};
@@ -2146,10 +2145,11 @@ fn execute_slash_command(
             renderer.flush();
         }
         "clear" => {
-            // Pure-append clear: use terminal's own clear sequence. OK because
-            // scrollback is preserved by most terminals with \x1b[3J being optional.
-            let _ = std::io::Write::write_all(&mut std::io::stdout(), b"\x1b[2J\x1b[H");
-            let _ = std::io::Write::flush(&mut std::io::stdout());
+            // Physical clear via the renderer (keeps cached footer state
+            // coherent with the terminal). Scrollback is preserved by
+            // most terminals — \x1b[3J would nuke it, which we don't
+            // want; `clear_screen` emits \x1b[2J\x1b[H.
+            renderer.clear_screen();
             let dir_display = ctx.working_dir.to_string_lossy().to_string();
             renderer.render(UiLine::Welcome { model: ctx.model_name.clone(), working_dir: dir_display });
             renderer.flush();
@@ -2163,9 +2163,11 @@ fn execute_slash_command(
             state.total_tokens = 0;
             state.thinking_idx = 0;
             state.on_turn_complete();
-            // Wipe screen + reset scrollback view, like a fresh launch.
-            let _ = std::io::Write::write_all(&mut std::io::stdout(), b"\x1b[2J\x1b[H");
-            let _ = std::io::Write::flush(&mut std::io::stdout());
+            // `reset()` wipes the terminal AND the renderer's cached
+            // footer/stream state, so the next Welcome renders against
+            // a known (row 1, col 1) anchor. This is what makes
+            // /session behave like a fresh launch.
+            renderer.reset();
             let dir_display = ctx.working_dir.to_string_lossy().to_string();
             let dir_display = if let Ok(home) = std::env::var("HOME") {
                 dir_display.replacen(&home, "~", 1)
@@ -2359,25 +2361,19 @@ fn run_login_flow(
     renderer: &mut dyn Renderer,
     ctx: &mut LoopCtx,
 ) -> Result<()> {
-    // Suspend our UI so the OAuth flow owns the terminal. The guard enabled
-    // bracketed-paste (DECSET 2004); if we leave it on, any pasted callback
-    // URL arrives wrapped in `\x1b[200~ ... \x1b[201~`, which corrupts the
-    // state parameter and trips the CSRF check.
-    renderer.shutdown();
-    let _ = execute!(std::io::stdout(), DisableBracketedPaste);
-    let _ = crossterm::terminal::disable_raw_mode();
+    // Suspend: disables bracketed paste (otherwise the callback URL
+    // paste would arrive wrapped in `\x1b[200~ ... \x1b[201~` and
+    // corrupt the CSRF state parameter) and raw mode, then flushes.
+    // The OAuth flow owns the terminal until it returns.
+    renderer.suspend_for_external();
 
     let result = atomcode_core::auth::login()
         .and_then(|auth| atomcode_core::auth::save_auth(&auth).map(|()| auth));
 
-    // Re-enter raw mode + bracketed paste regardless of success/failure.
-    let _ = crossterm::terminal::enable_raw_mode();
-    let _ = execute!(std::io::stdout(), EnableBracketedPaste);
-    // The OAuth flow wrote to stdout in cooked mode, so the renderer's
-    // cached footer_rows / last_footer are now lying about the terminal
-    // cursor position. Forget everything and wipe the screen so the
-    // welcome + status line that follow render against a known anchor.
-    renderer.reset();
+    // Resume: re-enable raw + bracketed-paste AND reset cached state
+    // (the cooked-mode child wrote to stdout, so our cursor tracking
+    // is lying — next render must anchor against a fresh screen).
+    renderer.resume_from_external();
 
     match result {
         Ok(auth) => {

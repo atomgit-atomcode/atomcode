@@ -83,6 +83,26 @@ pub trait Renderer: Send {
     /// tries to `erase_footer` at a position the terminal cursor is no
     /// longer at, corrupting every subsequent ANSI cursor move.
     fn reset(&mut self);
+
+    /// Wipe the physical terminal with `\x1b[2J\x1b[H` and flush.
+    /// **Does not** touch cached footer/stream state — callers that want a
+    /// full state wipe should call `reset()` instead. Use this when only
+    /// the visible scrollback should be cleared (e.g. the `/clear`
+    /// command after which the footer immediately redraws).
+    fn clear_screen(&mut self);
+
+    /// Hand the terminal off to a non-TUI child process (blocking OAuth
+    /// flow, `/shell`, etc.): disable raw mode + bracketed paste, finish
+    /// any pending writes. After this returns, the child is free to use
+    /// the terminal in cooked mode; `resume_from_external()` must be
+    /// called before any further `render()` calls.
+    fn suspend_for_external(&mut self);
+
+    /// Take the terminal back after `suspend_for_external()`: re-enable
+    /// raw mode + bracketed paste AND call `reset()` to wipe the cached
+    /// state (the child wrote to stdout in cooked mode, so our cursor
+    /// tracking is now lying).
+    fn resume_from_external(&mut self);
 }
 
 /// Slash-command palette payload: filtered entries + which one is selected.
