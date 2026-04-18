@@ -253,8 +253,12 @@ impl AgentLoop {
     }
 
     /// Intercept tool calls that are provably redundant — returns a short message
-    /// instead of executing the tool. Only intercepts cases where the data is
-    /// already available in the system prompt (descriptor files, working dir tree).
+    /// instead of executing the tool. Historically this also intercepted
+    /// `list_directory(".")` because the system prompt used to carry the full
+    /// working-directory tree; that tree injection was removed in commit
+    /// 1e9936f8 ("refactor: 移除 system prompt 中的 PROJECT STRUCTURE 段") so
+    /// the `list_directory` interception below is now a no-op — the model needs
+    /// to actually be able to see the top-level layout when it asks.
     /// Does NOT intercept duplicate reads (the model may re-read with different params).
     #[allow(dead_code)]
     pub(crate) fn intercept_redundant_call(&mut self, tool_name: &str, args: &str) -> Option<String> {
@@ -390,23 +394,13 @@ impl AgentLoop {
             }
         }
 
-        match tool_name {
-            "list_directory" => {
-                // Intercept listing the working directory — tree is already in context.
-                let parsed: serde_json::Value = serde_json::from_str(args).ok()?;
-                let list_path = parsed.get("path").and_then(|v| v.as_str()).unwrap_or(".");
-                let wd = self.turn_runner.context.working_dir.try_read().ok()?;
-                let wd_str = wd.to_string_lossy();
-                if list_path == "." || list_path == wd_str.as_ref() {
-                    return Some(
-                        "[SKIPPED: Working directory file tree is already in your system prompt. \
-                         Read the file you need to EDIT instead.]".to_string()
-                    );
-                }
-                None
-            }
-            _ => None,
-        }
+        // `list_directory` used to be intercepted here (see doc comment above).
+        // After 1e9936f8 removed the prompt-level tree injection, blocking the
+        // model's `list_directory(".")` call is actively harmful — it reports
+        // "tree already in your system prompt" (false) and forces the model to
+        // guess sibling paths. Let every tool through.
+        let _ = (tool_name, args);
+        None
     }
 
 }
