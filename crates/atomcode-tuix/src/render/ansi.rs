@@ -726,257 +726,302 @@ impl<W: Write + Send> AnsiRenderer<W> {
         let _ = self.out.write_all(b"\r\n\r\n");
     }
 
+    // ── UiLine variant handlers ──
+    // One method per UiLine variant. Each is the body of the old match
+    // arm, unchanged. Renderer::render is now pure dispatch.
+
+    fn render_welcome_line(&mut self, model: &str, working_dir: &str) {
+        self.erase_footer();
+        self.render_welcome(model, working_dir);
+        self.assistant_continuing = false;
+        self.redraw_footer_if_any();
+    }
+
+    fn render_user_line(&mut self, text: &str) {
+        self.erase_footer();
+        let safe = scrub_controls(text);
+
+        // Blank line above
+        let _ = self.out.write_all(b"\r\n");
+
+        // CC-style echo: no background stripe — the subtle bg we used
+        // before rendered as a large dark block on light terminal
+        // themes (and a large light block on dark via reverse video).
+        // Just the accent-coloured prompt glyph plus plain text; the
+        // surrounding blank lines provide enough separation.
+        self.write_left_pad();
+        if self.caps.colors {
+            let _ = self.out.write_all(b"\x1b[1m");
+        }
+        self.set_fg(Role::Accent);
+        let _ = self.out.write_all("❯ ".as_bytes());
+        self.reset();
+        if self.caps.colors {
+            let _ = self.out.write_all(b"\x1b[22m");
+        }
+        let _ = self.out.write_all(safe.as_bytes());
+        let _ = self.out.write_all(b"\r\n");
+
+        // Blank line below
+        let _ = self.out.write_all(b"\r\n");
+
+        self.assistant_continuing = false;
+        // New user turn → reset markdown parser state.
+        self.md_state.reset();
+        self.redraw_footer_if_any();
+    }
+
+    fn render_assistant_text(&mut self, text: &str) {
+        // Line-buffered: accumulate until \n boundaries, then render
+        // each complete line through inline markdown.
+        let safe = scrub_controls(text);
+        self.assistant_line_buf.push_str(&safe);
+        self.flush_assistant_lines();
+        self.assistant_continuing = !self.assistant_line_buf.is_empty();
+    }
+
+    fn render_assistant_line_break(&mut self) {
+        self.flush_assistant_remainder();
+        self.assistant_continuing = false;
+    }
+
+    fn render_tool_call(&mut self, name: &str, detail: &str) {
+        if self.assistant_continuing || !self.assistant_line_buf.is_empty() {
+            self.flush_assistant_remainder();
+            self.assistant_continuing = false;
+        }
+        let mut line = String::new();
+        push_sgr_fg(&mut line, self.caps, Role::Muted);
+        line.push_str("  ▸ ");
+        push_sgr_fg_reset(&mut line, self.caps);
+        push_sgr_bold_on(&mut line, self.caps);
+        push_sgr_fg(&mut line, self.caps, Role::ToolName);
+        line.push_str(&scrub_controls(name));
+        push_sgr_fg_reset(&mut line, self.caps);
+        push_sgr_bold_off(&mut line, self.caps);
+        if !detail.is_empty() {
+            push_sgr_fg(&mut line, self.caps, Role::Muted);
+            line.push('(');
+            line.push_str(&scrub_controls(detail));
+            line.push(')');
+            push_sgr_fg_reset(&mut line, self.caps);
+        }
+        self.emit_wrapped_line(&line);
+    }
+
+    fn render_tool_result(&mut self, success: bool, summary: &str) {
+        if self.assistant_continuing || !self.assistant_line_buf.is_empty() {
+            self.flush_assistant_remainder();
+            self.assistant_continuing = false;
+        }
+        let mut line = String::new();
+        push_sgr_fg(&mut line, self.caps, Role::Muted);
+        line.push_str("    ⎿ ");
+        push_sgr_fg_reset(&mut line, self.caps);
+        if !success {
+            push_sgr_fg(&mut line, self.caps, Role::Error);
+            line.push_str("✗ ");
+            push_sgr_fg_reset(&mut line, self.caps);
+        }
+        push_sgr_fg(&mut line, self.caps, Role::Muted);
+        line.push_str(&scrub_controls(summary));
+        push_sgr_fg_reset(&mut line, self.caps);
+        self.emit_wrapped_line(&line);
+        // Paragraph spacer.
+        self.emit_blank_line();
+    }
+
+    fn render_diff_line(&mut self, added: bool, text: &str) {
+        let mut line = String::new();
+        push_sgr_fg(&mut line, self.caps,
+            if added { Role::DiffAdd } else { Role::DiffRemove });
+        let sign = if added { '+' } else { '-' };
+        line.push_str(&format!("       {} {}", sign, scrub_controls(text)));
+        push_sgr_fg_reset(&mut line, self.caps);
+        self.emit_wrapped_line(&line);
+    }
+
+    fn render_diff_block(&mut self, entries: &[super::DiffEntry]) {
+        // Single erase/redraw cycle for the whole batch — 50 diff lines
+        // translate to 2 footer redraws instead of 50, keeping the
+        // event loop unblocked for the background spinner task.
+        self.erase_footer();
+        let w = self.content_width();
+        for entry in entries {
+            let mut line = String::new();
+            push_sgr_fg(
+                &mut line,
+                self.caps,
+                if entry.added { Role::DiffAdd } else { Role::DiffRemove },
+            );
+            let sign = if entry.added { '+' } else { '-' };
+            line.push_str(&format!(
+                "       {} {}",
+                sign,
+                scrub_controls(&entry.text)
+            ));
+            push_sgr_fg_reset(&mut line, self.caps);
+            for chunk in crate::width::wrap_line_to_width(&line, w) {
+                self.write_left_pad();
+                let _ = self.out.write_all(chunk.as_bytes());
+                let _ = self.out.write_all(b"\r\n");
+            }
+        }
+        self.redraw_footer_if_any();
+    }
+
+    fn render_approval_prompt(&mut self, tool: &str, detail: &str) {
+        let mut line = String::new();
+        push_sgr_fg(&mut line, self.caps, Role::Warning);
+        line.push_str(&format!(
+            "  Allow {}({})? [Y]es / [N]o / [A]lways",
+            scrub_controls(tool), scrub_controls(detail)
+        ));
+        push_sgr_fg_reset(&mut line, self.caps);
+        self.emit_wrapped_line(&line);
+    }
+
+    fn render_error_line(&mut self, msg: &str) {
+        if self.assistant_continuing || !self.assistant_line_buf.is_empty() {
+            self.flush_assistant_remainder();
+            self.assistant_continuing = false;
+        }
+        let mut line = String::new();
+        push_sgr_fg(&mut line, self.caps, Role::Error);
+        line.push_str(&format!("  [Error: {}]", scrub_controls(msg)));
+        push_sgr_fg_reset(&mut line, self.caps);
+        self.emit_wrapped_line(&line);
+        self.assistant_continuing = false;
+    }
+
+    fn render_turn_cancelled(&mut self) {
+        let mut line = String::new();
+        push_sgr_fg(&mut line, self.caps, Role::Muted);
+        line.push_str("  (cancelled)");
+        push_sgr_fg_reset(&mut line, self.caps);
+        self.emit_wrapped_line(&line);
+        self.assistant_continuing = false;
+    }
+
+    fn render_turn_complete(&mut self) {
+        // flush_assistant_remainder does erase+emit+redraw, leaving
+        // cursor at box middle. TurnSeparator (emitted right after
+        // this by the event loop) provides the blank line above itself,
+        // so we don't add one here — doing so would drift the cursor
+        // away from box middle and break the next erase_footer's
+        // "up 2" calibration.
+        self.flush_assistant_remainder();
+        self.assistant_continuing = false;
+    }
+
+    fn render_spinner(&mut self, frame: &'static str, label: &str) {
+        // Legacy path — map to the fixed footer with spinner.
+        if self.assistant_continuing {
+            return;
+        }
+        self.draw_footer("", 0, Some((frame, label)), self.last_footer.status.clone());
+    }
+
+    fn render_streaming_box(
+        &mut self,
+        buf: &str,
+        cursor_byte: usize,
+        frame: &'static str,
+        label: &str,
+        status: super::StatusLine,
+        menu: Option<super::MenuPayload>,
+    ) {
+        if self.assistant_continuing {
+            return;
+        }
+        // When the user is typing `/` mid-stream, show the command
+        // palette in place of the spinner — otherwise keep the legacy
+        // spinner-only path.
+        if menu.is_some() {
+            self.draw_footer_with_menu(buf, cursor_byte, Some((frame, label)), menu.as_ref(), status);
+        } else {
+            self.draw_footer(buf, cursor_byte, Some((frame, label)), status);
+        }
+    }
+
+    fn render_input_prompt(
+        &mut self,
+        buf: &str,
+        cursor_byte: usize,
+        menu: Option<super::MenuPayload>,
+        status: super::StatusLine,
+    ) {
+        self.draw_footer_with_menu(buf, cursor_byte, None, menu.as_ref(), status);
+    }
+
+    fn render_turn_separator(&mut self, label: &str) {
+        self.erase_footer();
+        let inner_w = self.term_width().saturating_sub(PAD_COL * 2);
+        let safe = scrub_controls(label);
+        let lw = crate::width::display_width(&safe);
+        // Layout: `{dashes} {label} {dashes}` filled to inner width.
+        // Reserve 1 space on each side of label. Fallback if too narrow.
+        let padded = 1 + lw + 1;
+        let remaining = inner_w.saturating_sub(padded);
+        let left = remaining / 2;
+        let right = remaining - left;
+
+        // Blank line above so the separator doesn't cling to the last
+        // line of content.
+        let _ = self.out.write_all(b"\r\n");
+
+        self.write_left_pad();
+        self.set_fg(Role::Muted);
+        for _ in 0..left { let _ = self.out.write_all("─".as_bytes()); }
+        let _ = self.out.write_all(b" ");
+        self.reset();
+        self.set_fg(Role::Secondary);
+        let _ = self.out.write_all(safe.as_bytes());
+        self.reset();
+        self.set_fg(Role::Muted);
+        let _ = self.out.write_all(b" ");
+        for _ in 0..right { let _ = self.out.write_all("─".as_bytes()); }
+        self.reset();
+        let _ = self.out.write_all(b"\r\n\r\n");
+
+        self.redraw_footer_if_any();
+    }
+
+    fn render_command_output(&mut self, text: &str) {
+        let safe = scrub_controls(text);
+        for phys in safe.split('\n') {
+            self.emit_wrapped_line(phys);
+        }
+    }
 }
 
 impl<W: Write + Send> Renderer for AnsiRenderer<W> {
     fn render(&mut self, line: UiLine) {
+        // Pure dispatch. Every variant has its own method below; adding
+        // a new UiLine means "add a method + one arm here", not "grow
+        // an already-1000-line match".
         match line {
-            UiLine::Welcome { model, working_dir } => {
-                self.erase_footer();
-                self.render_welcome(&model, &working_dir);
-                self.assistant_continuing = false;
-                self.redraw_footer_if_any();
-            }
-            UiLine::User(text) => {
-                self.erase_footer();
-                let safe = scrub_controls(&text);
-
-                // Blank line above
-                let _ = self.out.write_all(b"\r\n");
-
-                // CC-style echo: no background stripe — the subtle bg we
-                // used before rendered as a large dark block on light
-                // terminal themes (and a large light block on dark via
-                // reverse video). Just the accent-coloured prompt glyph
-                // plus plain text; the surrounding blank lines provide
-                // enough separation.
-                self.write_left_pad();
-                if self.caps.colors {
-                    let _ = self.out.write_all(b"\x1b[1m");
-                }
-                self.set_fg(Role::Accent);
-                let _ = self.out.write_all("❯ ".as_bytes());
-                self.reset();
-                if self.caps.colors {
-                    let _ = self.out.write_all(b"\x1b[22m");
-                }
-                let _ = self.out.write_all(safe.as_bytes());
-                let _ = self.out.write_all(b"\r\n");
-
-                // Blank line below
-                let _ = self.out.write_all(b"\r\n");
-
-                self.assistant_continuing = false;
-                // New user turn → reset markdown parser state.
-                self.md_state.reset();
-                self.redraw_footer_if_any();
-            }
-            UiLine::AssistantText(text) => {
-                // Line-buffered: accumulate until \n boundaries, then render
-                // each complete line through inline markdown.
-                let safe = scrub_controls(&text);
-                self.assistant_line_buf.push_str(&safe);
-                self.flush_assistant_lines();
-                self.assistant_continuing = !self.assistant_line_buf.is_empty();
-            }
-            UiLine::AssistantLineBreak => {
-                self.flush_assistant_remainder();
-                self.assistant_continuing = false;
-            }
-            UiLine::ToolCall { name, detail } => {
-                if self.assistant_continuing || !self.assistant_line_buf.is_empty() {
-                    self.flush_assistant_remainder();
-                    self.assistant_continuing = false;
-                }
-                let mut line = String::new();
-                push_sgr_fg(&mut line, self.caps, Role::Muted);
-                line.push_str("  ▸ ");
-                push_sgr_fg_reset(&mut line, self.caps);
-                push_sgr_bold_on(&mut line, self.caps);
-                push_sgr_fg(&mut line, self.caps, Role::ToolName);
-                line.push_str(&scrub_controls(&name));
-                push_sgr_fg_reset(&mut line, self.caps);
-                push_sgr_bold_off(&mut line, self.caps);
-                if !detail.is_empty() {
-                    push_sgr_fg(&mut line, self.caps, Role::Muted);
-                    line.push('(');
-                    line.push_str(&scrub_controls(&detail));
-                    line.push(')');
-                    push_sgr_fg_reset(&mut line, self.caps);
-                }
-                self.emit_wrapped_line(&line);
-            }
-            UiLine::ToolResult { success, summary } => {
-                if self.assistant_continuing || !self.assistant_line_buf.is_empty() {
-                    self.flush_assistant_remainder();
-                    self.assistant_continuing = false;
-                }
-                let mut line = String::new();
-                push_sgr_fg(&mut line, self.caps, Role::Muted);
-                line.push_str("    ⎿ ");
-                push_sgr_fg_reset(&mut line, self.caps);
-                if !success {
-                    push_sgr_fg(&mut line, self.caps, Role::Error);
-                    line.push_str("✗ ");
-                    push_sgr_fg_reset(&mut line, self.caps);
-                }
-                push_sgr_fg(&mut line, self.caps, Role::Muted);
-                line.push_str(&scrub_controls(&summary));
-                push_sgr_fg_reset(&mut line, self.caps);
-                self.emit_wrapped_line(&line);
-                // Paragraph spacer.
-                self.emit_blank_line();
-            }
-            UiLine::DiffLine { added, text } => {
-                let mut line = String::new();
-                push_sgr_fg(&mut line, self.caps,
-                    if added { Role::DiffAdd } else { Role::DiffRemove });
-                let sign = if added { '+' } else { '-' };
-                line.push_str(&format!("       {} {}", sign, scrub_controls(&text)));
-                push_sgr_fg_reset(&mut line, self.caps);
-                self.emit_wrapped_line(&line);
-            }
-            UiLine::DiffBlock(entries) => {
-                // Single erase/redraw cycle for the whole batch — 50
-                // diff lines translate to 2 footer redraws instead of
-                // 50, keeping the event loop unblocked for the
-                // background spinner task.
-                self.erase_footer();
-                let w = self.content_width();
-                for entry in entries {
-                    let mut line = String::new();
-                    push_sgr_fg(
-                        &mut line,
-                        self.caps,
-                        if entry.added { Role::DiffAdd } else { Role::DiffRemove },
-                    );
-                    let sign = if entry.added { '+' } else { '-' };
-                    line.push_str(&format!(
-                        "       {} {}",
-                        sign,
-                        scrub_controls(&entry.text)
-                    ));
-                    push_sgr_fg_reset(&mut line, self.caps);
-                    for chunk in crate::width::wrap_line_to_width(&line, w) {
-                        self.write_left_pad();
-                        let _ = self.out.write_all(chunk.as_bytes());
-                        let _ = self.out.write_all(b"\r\n");
-                    }
-                }
-                self.redraw_footer_if_any();
-            }
-            UiLine::ApprovalPrompt { tool, detail } => {
-                let mut line = String::new();
-                push_sgr_fg(&mut line, self.caps, Role::Warning);
-                line.push_str(&format!(
-                    "  Allow {}({})? [Y]es / [N]o / [A]lways",
-                    scrub_controls(&tool), scrub_controls(&detail)
-                ));
-                push_sgr_fg_reset(&mut line, self.caps);
-                self.emit_wrapped_line(&line);
-            }
-            UiLine::Error(msg) => {
-                if self.assistant_continuing || !self.assistant_line_buf.is_empty() {
-                    self.flush_assistant_remainder();
-                    self.assistant_continuing = false;
-                }
-                let mut line = String::new();
-                push_sgr_fg(&mut line, self.caps, Role::Error);
-                line.push_str(&format!("  [Error: {}]", scrub_controls(&msg)));
-                push_sgr_fg_reset(&mut line, self.caps);
-                self.emit_wrapped_line(&line);
-                self.assistant_continuing = false;
-            }
-            UiLine::TurnCancelled => {
-                let mut line = String::new();
-                push_sgr_fg(&mut line, self.caps, Role::Muted);
-                line.push_str("  (cancelled)");
-                push_sgr_fg_reset(&mut line, self.caps);
-                self.emit_wrapped_line(&line);
-                self.assistant_continuing = false;
-            }
-            UiLine::TurnComplete => {
-                // flush_assistant_remainder does erase+emit+redraw, leaving
-                // cursor at box middle. TurnSeparator (emitted right after
-                // this by the event loop) provides the blank line above
-                // itself, so we don't add one here — doing so would drift
-                // the cursor away from box middle and break the next
-                // erase_footer's "up 2" calibration.
-                self.flush_assistant_remainder();
-                self.assistant_continuing = false;
-            }
-            UiLine::Spinner { frame, label } => {
-                // Legacy path — map to the fixed footer with spinner.
-                if self.assistant_continuing {
-                    return;
-                }
-                self.draw_footer("", 0, Some((frame, &label)), self.last_footer.status.clone());
-            }
-            UiLine::StreamingBox { buf, cursor_byte, frame, label, status, menu } => {
-                if self.assistant_continuing {
-                    return;
-                }
-                // When the user is typing `/` mid-stream, show the command
-                // palette in place of the spinner — otherwise keep the
-                // legacy spinner-only path.
-                if menu.is_some() {
-                    self.draw_footer_with_menu(&buf, cursor_byte, Some((frame, &label)), menu.as_ref(), status);
-                } else {
-                    self.draw_footer(&buf, cursor_byte, Some((frame, &label)), status);
-                }
-            }
-            UiLine::ClearTransient => {
-                // Footer is fixed at absolute bottom rows — nothing to clear.
-                // Kept as no-op for event_loop compatibility.
-            }
-            UiLine::InputPrompt { buf, cursor_byte, menu, status } => {
-                self.draw_footer_with_menu(&buf, cursor_byte, None, menu.as_ref(), status);
-            }
-            UiLine::InputCommit => {
-                // No-op. The event loop now emits ClearTransient → User to
-                // commit a submission, which handles footer erasure and the
-                // user-echo row cleanly. Emitting a bare \r\n here would
-                // drift the cursor off box middle and break the next
-                // erase_footer's relative offset.
-            }
-            UiLine::TurnSeparator { label } => {
-                self.erase_footer();
-                let inner_w = self.term_width().saturating_sub(PAD_COL * 2);
-                let safe = scrub_controls(&label);
-                let lw = crate::width::display_width(&safe);
-                // Layout: `{dashes} {label} {dashes}` filled to inner width.
-                // Reserve 1 space on each side of label. Fallback if too narrow.
-                let padded = 1 + lw + 1;
-                let remaining = inner_w.saturating_sub(padded);
-                let left = remaining / 2;
-                let right = remaining - left;
-
-                // Blank line above so the separator doesn't cling to the
-                // last line of content.
-                let _ = self.out.write_all(b"\r\n");
-
-                self.write_left_pad();
-                self.set_fg(Role::Muted);
-                for _ in 0..left { let _ = self.out.write_all("─".as_bytes()); }
-                let _ = self.out.write_all(b" ");
-                self.reset();
-                self.set_fg(Role::Secondary);
-                let _ = self.out.write_all(safe.as_bytes());
-                self.reset();
-                self.set_fg(Role::Muted);
-                let _ = self.out.write_all(b" ");
-                for _ in 0..right { let _ = self.out.write_all("─".as_bytes()); }
-                self.reset();
-                let _ = self.out.write_all(b"\r\n\r\n");
-
-                self.redraw_footer_if_any();
-            }
-            UiLine::CommandOutput(text) => {
-                let safe = scrub_controls(&text);
-                for phys in safe.split('\n') {
-                    self.emit_wrapped_line(phys);
-                }
-            }
+            UiLine::Welcome { model, working_dir } => self.render_welcome_line(&model, &working_dir),
+            UiLine::User(text) => self.render_user_line(&text),
+            UiLine::AssistantText(text) => self.render_assistant_text(&text),
+            UiLine::AssistantLineBreak => self.render_assistant_line_break(),
+            UiLine::ToolCall { name, detail } => self.render_tool_call(&name, &detail),
+            UiLine::ToolResult { success, summary } => self.render_tool_result(success, &summary),
+            UiLine::DiffLine { added, text } => self.render_diff_line(added, &text),
+            UiLine::DiffBlock(entries) => self.render_diff_block(&entries),
+            UiLine::ApprovalPrompt { tool, detail } => self.render_approval_prompt(&tool, &detail),
+            UiLine::Error(msg) => self.render_error_line(&msg),
+            UiLine::TurnCancelled => self.render_turn_cancelled(),
+            UiLine::TurnComplete => self.render_turn_complete(),
+            UiLine::Spinner { frame, label } => self.render_spinner(frame, &label),
+            UiLine::StreamingBox { buf, cursor_byte, frame, label, status, menu } =>
+                self.render_streaming_box(&buf, cursor_byte, frame, &label, status, menu),
+            UiLine::ClearTransient => { /* no-op: footer is fixed-at-bottom */ }
+            UiLine::InputPrompt { buf, cursor_byte, menu, status } =>
+                self.render_input_prompt(&buf, cursor_byte, menu, status),
+            UiLine::InputCommit => { /* no-op: ClearTransient + User handles commit */ }
+            UiLine::TurnSeparator { label } => self.render_turn_separator(&label),
+            UiLine::CommandOutput(text) => self.render_command_output(&text),
         }
     }
 
