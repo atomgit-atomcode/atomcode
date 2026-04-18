@@ -1,4 +1,5 @@
 // crates/atomcode-tuix/src/event_loop.rs
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -392,6 +393,12 @@ pub async fn run_loop(
     let mut menu = MenuState::new();
     let mut model_picker: Option<ModelPicker> = None;
     let mut provider_wizard: Option<ProviderWizard> = None;
+    // Messages the user submitted while a turn was already running.
+    // Drained one-at-a-time from the head whenever the current turn
+    // finishes (TurnComplete / TurnCancelled / error → Idle). Matches
+    // CC's "type-ahead" behavior — you can queue the next prompt while
+    // the model is still thinking and it fires automatically.
+    let mut message_queue: VecDeque<String> = VecDeque::new();
 
     // Draw welcome + initial prompt
     let dir_display = ctx.working_dir.to_string_lossy().to_string();
@@ -478,7 +485,7 @@ pub async fn run_loop(
 
             // ── Spinner tick (from background task) ──
             Some(()) = spin_rx.recv(), if matches!(state.phase, UiPhase::Streaming) => {
-                draw_spinner_now(&mut state, &buf, &ctx, renderer);
+                draw_spinner_now(&mut state, &buf, &ctx, renderer, message_queue.len());
                 last_spinner_draw = std::time::Instant::now();
             }
 
@@ -487,7 +494,7 @@ pub async fn run_loop(
                 let Some(ev) = maybe else { break };
                 handle_input(
                     ev, &mut state, &mut buf, &mut ctx, renderer, &mut menu,
-                    &mut model_picker, &mut provider_wizard,
+                    &mut model_picker, &mut provider_wizard, &mut message_queue,
                 )?;
             }
 
@@ -498,11 +505,24 @@ pub async fn run_loop(
                 if matches!(state.phase, UiPhase::Streaming)
                     && last_spinner_draw.elapsed() >= Duration::from_millis(100)
                 {
-                    draw_spinner_now(&mut state, &buf, &ctx, renderer);
+                    draw_spinner_now(&mut state, &buf, &ctx, renderer, message_queue.len());
                     last_spinner_draw = std::time::Instant::now();
                 }
                 if matches!(state.phase, UiPhase::Idle) {
-                    redraw_idle_plain(&buf, &state, &ctx, renderer);
+                    // Turn just ended — drain the type-ahead queue.
+                    // Pop the oldest queued message, echo as a User
+                    // line, dispatch to the agent, and transition
+                    // back to Streaming. Remaining queue entries
+                    // fire in order on subsequent completions.
+                    if let Some(queued) = message_queue.pop_front() {
+                        renderer.render(UiLine::User(queued.clone()));
+                        renderer.flush();
+                        ctx.agent.cmd_tx.send(AgentCommand::SendMessage(queued)).ok();
+                        state.on_submit();
+                        draw_spinner_now(&mut state, &buf, &ctx, renderer, message_queue.len());
+                    } else {
+                        redraw_idle_plain(&buf, &state, &ctx, renderer);
+                    }
                 }
             }
 
@@ -522,7 +542,7 @@ pub async fn run_loop(
                 state.on_resume();
                 match state.phase {
                     UiPhase::Streaming => {
-                        draw_spinner_now(&mut state, &buf, &ctx, renderer);
+                        draw_spinner_now(&mut state, &buf, &ctx, renderer, message_queue.len());
                         last_spinner_draw = std::time::Instant::now();
                     }
                     _ => {
@@ -538,7 +558,7 @@ pub async fn run_loop(
 
             // ── Spinner tick (from background task) ──
             Some(()) = spin_rx.recv(), if matches!(state.phase, UiPhase::Streaming) => {
-                draw_spinner_now(&mut state, &buf, &ctx, renderer);
+                draw_spinner_now(&mut state, &buf, &ctx, renderer, message_queue.len());
                 last_spinner_draw = std::time::Instant::now();
             }
 
@@ -547,7 +567,7 @@ pub async fn run_loop(
                 let Some(ev) = maybe else { break };
                 handle_input(
                     ev, &mut state, &mut buf, &mut ctx, renderer, &mut menu,
-                    &mut model_picker, &mut provider_wizard,
+                    &mut model_picker, &mut provider_wizard, &mut message_queue,
                 )?;
             }
 
@@ -558,11 +578,24 @@ pub async fn run_loop(
                 if matches!(state.phase, UiPhase::Streaming)
                     && last_spinner_draw.elapsed() >= Duration::from_millis(100)
                 {
-                    draw_spinner_now(&mut state, &buf, &ctx, renderer);
+                    draw_spinner_now(&mut state, &buf, &ctx, renderer, message_queue.len());
                     last_spinner_draw = std::time::Instant::now();
                 }
                 if matches!(state.phase, UiPhase::Idle) {
-                    redraw_idle_plain(&buf, &state, &ctx, renderer);
+                    // Turn just ended — drain the type-ahead queue.
+                    // Pop the oldest queued message, echo as a User
+                    // line, dispatch to the agent, and transition
+                    // back to Streaming. Remaining queue entries
+                    // fire in order on subsequent completions.
+                    if let Some(queued) = message_queue.pop_front() {
+                        renderer.render(UiLine::User(queued.clone()));
+                        renderer.flush();
+                        ctx.agent.cmd_tx.send(AgentCommand::SendMessage(queued)).ok();
+                        state.on_submit();
+                        draw_spinner_now(&mut state, &buf, &ctx, renderer, message_queue.len());
+                    } else {
+                        redraw_idle_plain(&buf, &state, &ctx, renderer);
+                    }
                 }
             }
         }
@@ -590,15 +623,22 @@ fn handle_input(
     menu: &mut MenuState,
     model_picker: &mut Option<ModelPicker>,
     provider_wizard: &mut Option<ProviderWizard>,
+    message_queue: &mut VecDeque<String>,
 ) -> Result<()> {
     match ev {
         InputEvent::Paste(text) => {
-            if matches!(state.phase, UiPhase::Idle)
+            // Allow pasting during Streaming too — it goes into the
+            // type-ahead buffer just like keyboard input.
+            if matches!(state.phase, UiPhase::Idle | UiPhase::Streaming)
                 && model_picker.is_none()
                 && provider_wizard.is_none()
             {
                 buf.insert_paste(text);
-                redraw_idle_plain(&buf, &state, &ctx, renderer);
+                if matches!(state.phase, UiPhase::Streaming) {
+                    draw_spinner_now(state, buf, ctx, renderer, message_queue.len());
+                } else {
+                    redraw_idle_plain(&buf, &state, &ctx, renderer);
+                }
             }
         }
         InputEvent::Eof => {}
@@ -621,7 +661,9 @@ fn handle_input(
                     code, modifiers, state, buf, ctx, renderer, menu,
                     model_picker, provider_wizard,
                 )?,
-                UiPhase::Streaming => handle_streaming_key(code, modifiers, ctx, renderer)?,
+                UiPhase::Streaming => handle_streaming_key(
+                    code, modifiers, state, buf, ctx, renderer, message_queue,
+                )?,
                 UiPhase::Approval => handle_approval_key(code, state, ctx, renderer)?,
                 UiPhase::Suspended => {}
             }
@@ -1495,11 +1537,57 @@ fn handle_model_picker_key(
 fn handle_streaming_key(
     code: KeyCode,
     modifiers: crossterm::event::KeyModifiers,
+    state: &mut UiState,
+    buf: &mut Buffer,
     ctx: &mut LoopCtx,
-    _renderer: &mut dyn Renderer,
+    renderer: &mut dyn Renderer,
+    message_queue: &mut VecDeque<String>,
 ) -> Result<()> {
+    // Ctrl+C always cancels the running turn — highest priority so
+    // users have a reliable escape hatch even mid-edit.
     if code == KeyCode::Char('c') && modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
         ctx.agent.cmd_tx.send(AgentCommand::Cancel).ok();
+        return Ok(());
+    }
+
+    let action = classify(code, modifiers);
+    match buf.apply(action, ctx.history.entries(), &ctx.commands) {
+        BufferResult::NoOp => {}
+        BufferResult::Redraw => {
+            draw_spinner_now(state, buf, ctx, renderer, message_queue.len());
+        }
+        BufferResult::Commit(line) => {
+            // Slash commands are not queued — they need ctx access
+            // that only makes sense between turns. Show a hint and
+            // leave the buf alone.
+            if line.starts_with('/') {
+                renderer.render(UiLine::CommandOutput(
+                    "  (slash commands are disabled while a turn is running)\n".into(),
+                ));
+                renderer.flush();
+                buf.text.clear();
+                buf.cursor = 0;
+                draw_spinner_now(state, buf, ctx, renderer, message_queue.len());
+                return Ok(());
+            }
+            // Expand any paste placeholders — agent sees full payload,
+            // scrollback echo stays compact.
+            let expanded = buf.expand_pastes(&line);
+            ctx.history.push(line.clone());
+            message_queue.push_back(expanded);
+            buf.text.clear();
+            buf.cursor = 0;
+            buf.clear_pastes();
+            // Echo as a queued entry so the user sees it landed.
+            renderer.render(UiLine::CommandOutput(format!("  ↳ queued: {}\n", line)));
+            renderer.flush();
+            draw_spinner_now(state, buf, ctx, renderer, message_queue.len());
+        }
+        BufferResult::Exit => {
+            // Ctrl+C on empty buf during streaming — treat as cancel
+            // (consistent with the explicit Ctrl+C branch above).
+            ctx.agent.cmd_tx.send(AgentCommand::Cancel).ok();
+        }
     }
     Ok(())
 }
@@ -1899,9 +1987,10 @@ fn draw_spinner_now(
     buf: &Buffer,
     ctx: &LoopCtx,
     renderer: &mut dyn Renderer,
+    queue_len: usize,
 ) {
     let frame = state.tick_spinner();
-    let label = format_spinner_label(state);
+    let label = format_spinner_label(state, queue_len);
     let status = build_status(state, ctx);
     renderer.render(UiLine::StreamingBox {
         buf: buf.text.clone(),
@@ -1913,16 +2002,21 @@ fn draw_spinner_now(
     renderer.flush();
 }
 
-/// Build the spinner line shown in the footer — `"{label}… · {elapsed}"`.
-/// State stores only the bare word (e.g. `Pondering`, `Running ReadFile`);
-/// the ellipsis and turn-elapsed suffix are appended here so the format
-/// is consistent across every label variant.
-fn format_spinner_label(state: &UiState) -> String {
+/// Build the spinner line shown in the footer —
+/// `"{label}… · {elapsed} · {N} queued"`. State stores only the bare
+/// word (e.g. `Pondering`, `Running ReadFile`); ellipsis + elapsed +
+/// queued suffixes are appended here so format is consistent across
+/// every call site.
+fn format_spinner_label(state: &UiState, queue_len: usize) -> String {
     let base = &state.spinner_label;
-    match state.turn_elapsed() {
-        Some(d) => format!("{}… · {}", base, crate::render::fmt_dur(d)),
-        None => format!("{}…", base),
+    let mut out = format!("{}…", base);
+    if let Some(d) = state.turn_elapsed() {
+        out.push_str(&format!(" · {}", crate::render::fmt_dur(d)));
     }
+    if queue_len > 0 {
+        out.push_str(&format!(" · {} queued", queue_len));
+    }
+    out
 }
 
 /// Convert a snake_case tool name to PascalCase for display. The agent
