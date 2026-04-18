@@ -6,7 +6,8 @@ use std::time::Duration;
 use anyhow::Result;
 use atomcode_core::agent::{AgentCommand, AgentEvent, AgentHandle, AgentPhase};
 use atomcode_core::config::Config;
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
+use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste, KeyCode, KeyEvent, KeyEventKind};
+use crossterm::execute;
 use tokio::sync::mpsc;
 
 use crate::commands::{parse_slash_line, CommandRegistry};
@@ -1936,6 +1937,25 @@ fn resolve_cd(arg: &str, cwd: &std::path::Path, prev: Option<&std::path::Path>) 
     Ok(canon)
 }
 
+/// Provider name used for the AtomGit OAuth provider entry in config.
+const OAUTH_PROVIDER_NAME: &str = "AtomGit";
+
+/// Build the AtomGit OAuth ProviderConfig. api_key is intentionally None —
+/// it's loaded from auth.toml at runtime by `create_provider()`.
+fn build_oauth_provider() -> atomcode_core::config::provider::ProviderConfig {
+    atomcode_core::config::provider::ProviderConfig {
+        provider_type: "openai".to_string(),
+        api_key: None,
+        model: "MiniMax-M2.7".to_string(),
+        base_url: Some("https://api-ai.gitcode.com/v1".to_string()),
+        system_prompt: None,
+        user_agent: None,
+        context_window: 64000,
+        max_tokens: None,
+        ephemeral: false,
+    }
+}
+
 /// Drop out of raw mode, run the (blocking) OAuth login flow so the user
 /// can interact with the browser callback in a normal terminal, then
 /// re-enter raw mode and redraw the welcome screen. OAuth uses stdout
@@ -1945,18 +1965,36 @@ fn run_login_flow(
     renderer: &mut dyn Renderer,
     ctx: &mut LoopCtx,
 ) -> Result<()> {
-    // Suspend our UI so the OAuth flow owns the terminal.
+    // Suspend our UI so the OAuth flow owns the terminal. The guard enabled
+    // bracketed-paste (DECSET 2004); if we leave it on, any pasted callback
+    // URL arrives wrapped in `\x1b[200~ ... \x1b[201~`, which corrupts the
+    // state parameter and trips the CSRF check.
     renderer.shutdown();
+    let _ = execute!(std::io::stdout(), DisableBracketedPaste);
     let _ = crossterm::terminal::disable_raw_mode();
 
     let result = atomcode_core::auth::login()
         .and_then(|auth| atomcode_core::auth::save_auth(&auth).map(|()| auth));
 
-    // Re-enter raw mode regardless of success/failure.
+    // Re-enter raw mode + bracketed paste regardless of success/failure.
     let _ = crossterm::terminal::enable_raw_mode();
+    let _ = execute!(std::io::stdout(), EnableBracketedPaste);
 
     match result {
         Ok(auth) => {
+            // Register the AtomGit OAuth provider and switch to it so the
+            // freshly logged-in token is actually used. Without this the
+            // status bar / next turn would keep using whatever provider was
+            // active before login.
+            let provider = build_oauth_provider();
+            let model = provider.model.clone();
+            ctx.config
+                .providers
+                .insert(OAUTH_PROVIDER_NAME.to_string(), provider);
+            ctx.config.default_provider = OAUTH_PROVIDER_NAME.to_string();
+            ctx.model_name = model.clone();
+            save_and_reload(ctx, renderer);
+
             let dir_display = ctx.working_dir.to_string_lossy().to_string();
             let dir_display = if let Ok(home) = std::env::var("HOME") {
                 dir_display.replacen(&home, "~", 1)
@@ -1974,8 +2012,8 @@ fn run_login_flow(
                 .unwrap_or(&auth.user.username)
                 .to_string();
             renderer.render(UiLine::CommandOutput(format!(
-                "  Signed in as {} ({}).\n",
-                name, auth.user.username
+                "  Signed in as {} ({}). Model switched to {}.\n",
+                name, auth.user.username, model
             )));
             renderer.flush();
         }

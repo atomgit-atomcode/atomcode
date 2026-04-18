@@ -26,12 +26,11 @@ use crate::input::reader;
 use crate::render::{ansi::AnsiRenderer, plain::PlainRenderer, Renderer};
 use crate::terminal::TerminalCaps;
 
-/// RAII guard: enables raw mode + bracketed paste + scroll region on
-/// construction, unconditionally restores all three on drop (even during panic).
+/// RAII guard: enables raw mode + bracketed paste on construction,
+/// unconditionally restores both on drop (even during panic).
 struct TerminalGuard {
     raw_enabled: bool,
     paste_enabled: bool,
-    scroll_region_set: bool,
 }
 
 impl TerminalGuard {
@@ -40,7 +39,6 @@ impl TerminalGuard {
         let mut g = Self {
             raw_enabled: false,
             paste_enabled: false,
-            scroll_region_set: false,
         };
         if caps.raw_mode {
             crossterm::terminal::enable_raw_mode()?;

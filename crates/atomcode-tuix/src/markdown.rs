@@ -233,51 +233,6 @@ fn strip_md_for_width(s: &str) -> String {
     s.replace("**", "").replace('`', "")
 }
 
-/// Render a markdown table line. Separator rows get `┼─` chars; data rows
-/// get `│` pipes with inline markdown applied inside each cell so **bold**
-/// and `code` formatting work within table content.
-fn render_table_line(line: &str, caps: TerminalCaps) -> String {
-    let is_separator = line.chars().all(|c| matches!(c, '|' | '-' | ':' | ' '));
-    if is_separator {
-        let converted: String = line
-            .chars()
-            .map(|c| match c {
-                '|' => '┼',
-                '-' => '─',
-                other => other,
-            })
-            .collect();
-        return if caps.colors {
-            format!("\x1b[90m{}\x1b[39m", converted)
-        } else {
-            converted
-        };
-    }
-
-    // Data row: split on '|' (keeping leading/trailing empty cells), apply
-    // inline markdown to each cell, then rejoin with coloured `│` separators.
-    let border_on = if caps.colors { "\x1b[90m" } else { "" };
-    let border_off = if caps.colors { "\x1b[39m" } else { "" };
-
-    let parts: Vec<&str> = line.split('|').collect();
-    let mut out = String::with_capacity(line.len() + 32);
-    for (i, cell) in parts.iter().enumerate() {
-        if i > 0 || line.starts_with('|') {
-            if i == 0 && line.starts_with('|') {
-                out.push_str(border_on);
-                out.push('│');
-                out.push_str(border_off);
-                continue;
-            }
-            out.push_str(border_on);
-            out.push('│');
-            out.push_str(border_off);
-        }
-        out.push_str(&render_inline(cell, caps));
-    }
-    out
-}
-
 /// Legacy single-line inline renderer — kept for direct callers (tests,
 /// simple assistant lines). Does not track block state.
 pub fn render_inline_line(line: &str, caps: TerminalCaps) -> String {

@@ -146,10 +146,6 @@ impl<W: Write + Send> AnsiRenderer<W> {
         }
     }
 
-    fn term_rows(&self) -> usize {
-        crossterm::terminal::size().map(|(_, h)| h as usize).unwrap_or(24)
-    }
-
     /// Erase the currently-drawn footer. Cursor is on the box middle row
     /// at the K-th middle line (0-based); distance from there up to the
     /// footer top is `2 + K` (row 0 = spinner/blank, row 1 = ╭─╮ border,
@@ -463,16 +459,6 @@ impl<W: Write + Send> AnsiRenderer<W> {
             self.move_to_scroll_bottom();
         }
     }
-    fn reset_transient(&mut self) {
-        self.move_to_scroll_bottom();
-    }
-
-    fn write_bar_prefix(&mut self) {
-        self.set_fg(Role::AccentDim);
-        let _ = self.out.write_all("  │ ".as_bytes());
-        self.reset();
-    }
-
     /// Effective content width — terminal width minus left+right padding
     /// and a 1-col safety margin against autowrap at the absolute rightmost
     /// column. Always ≥ 1 so wrapping never collapses to zero.
@@ -713,36 +699,6 @@ impl<W: Write + Send> AnsiRenderer<W> {
         let _ = self.out.write_all(b"\r\n\r\n");
     }
 
-    /// Draw one bordered row: `│{content}{pad}│\r\n`.
-    /// `content_width` is the display width of what the caller writes.
-    fn draw_box_row(
-        &mut self,
-        inner_width: usize,
-        content: impl FnOnce(&mut Self),
-        content_width: usize,
-    ) {
-        self.set_fg(Role::Border);
-        let _ = self.out.write_all("│".as_bytes());
-        self.reset();
-        content(self);
-        let pad = inner_width.saturating_sub(content_width);
-        for _ in 0..pad {
-            let _ = self.out.write_all(b" ");
-        }
-        self.set_fg(Role::Border);
-        let _ = self.out.write_all("│\r\n".as_bytes());
-        self.reset();
-    }
-
-    fn draw_blank_row(&mut self, inner_width: usize) {
-        self.set_fg(Role::Border);
-        let _ = self.out.write_all("│".as_bytes());
-        for _ in 0..inner_width {
-            let _ = self.out.write_all(b" ");
-        }
-        let _ = self.out.write_all("│\r\n".as_bytes());
-        self.reset();
-    }
 }
 
 impl<W: Write + Send> Renderer for AnsiRenderer<W> {

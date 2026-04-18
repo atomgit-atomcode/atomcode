@@ -1,6 +1,10 @@
 use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
 use std::net::TcpListener;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
+use std::thread;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -99,22 +103,23 @@ pub fn login() -> Result<AuthInfo> {
     println!("  Opening browser for authorization...");
     println!("  If browser doesn't open, visit this URL:\n");
     println!("  {}\n", auth_url);
-    
-    // Open browser
+
+    // Open browser (best-effort — paste path below covers headless / WSL).
     if let Err(e) = open_browser(&auth_url) {
         println!("  Failed to open browser: {}", e);
-        println!("  Please visit the URL above manually.\n");
+        println!("  (paste path below will still work)\n");
     }
+
+    let (code, returned_state) = await_callback(REDIRECT_PORT)?;
     
-    // Start local server to receive callback
-    println!("  Waiting for authorization callback on port {}...", REDIRECT_PORT);
-    println!("  Press Ctrl+C to cancel.\n");
-    
-    let (code, returned_state) = receive_callback(REDIRECT_PORT)?;
-    
-    // Verify state
+    // Verify state. Most common cause of mismatch in practice is the user
+    // pasting a callback URL left over from an earlier /login attempt;
+    // re-running /login regenerates state and fixes it.
     if returned_state != state {
-        anyhow::bail!("OAuth state mismatch - possible CSRF attack");
+        anyhow::bail!(
+            "OAuth state mismatch — the pasted URL likely came from an earlier \
+             /login attempt. Re-run /login and paste the newly-authorized URL."
+        );
     }
     
     println!("  Authorization received, exchanging token...\n");
@@ -194,20 +199,80 @@ fn open_browser(_url: &str) -> Result<()> {
     anyhow::bail!("Unsupported platform for browser auto-open");
 }
 
-/// Receive OAuth callback on local server.
-/// Uses non-blocking accept so Ctrl+C can interrupt the wait.
-fn receive_callback(port: u16) -> Result<(String, String)> {
-    let listener = TcpListener::bind(("127.0.0.1", port))
-        .with_context(|| format!("Failed to bind to port {}. Is it already in use?", port))?;
-    listener.set_nonblocking(true)
+/// Race a local TCP listener against stdin paste; return the first
+/// `(code, state)` that arrives. Listener handles the normal desktop path
+/// where the browser hits `127.0.0.1:8765`; stdin path handles WSL /
+/// headless Linux where the user copies the callback URL from their
+/// browser's address bar and pastes it in.
+fn await_callback(port: u16) -> Result<(String, String)> {
+    let listener = match TcpListener::bind(("127.0.0.1", port)) {
+        Ok(l) => Some(l),
+        Err(e) => {
+            println!(
+                "  Could not bind port {} ({}). Paste path only.",
+                port, e
+            );
+            None
+        }
+    };
+
+    println!(
+        "  Waiting for callback on http://127.0.0.1:{}/callback",
+        port
+    );
+    println!("  Or paste the full callback URL here and press Enter:");
+    println!("  (Ctrl+C to cancel)\n");
+
+    let (tx, rx) = mpsc::channel::<Result<(String, String)>>();
+    let stop = Arc::new(AtomicBool::new(false));
+
+    if let Some(listener) = listener {
+        let tx_l = tx.clone();
+        let stop_l = Arc::clone(&stop);
+        thread::spawn(move || {
+            let r = accept_callback_until_stopped(listener, &stop_l);
+            let _ = tx_l.send(r);
+        });
+    }
+
+    // Stdin reader. `read_line` is blocking and cannot be cancelled
+    // cross-platform, so we spawn and let it die with the process if the
+    // listener wins. Send on a closed channel is silently dropped.
+    thread::spawn(move || {
+        let stdin = io::stdin();
+        let mut line = String::new();
+        let r = match stdin.lock().read_line(&mut line) {
+            Ok(0) => Err(anyhow::anyhow!("stdin closed")),
+            Ok(_) => parse_pasted_callback(&line),
+            Err(e) => Err(anyhow::Error::new(e).context("Failed to read from stdin")),
+        };
+        let _ = tx.send(r);
+    });
+
+    let result = rx.recv().context("login cancelled")?;
+    stop.store(true, Ordering::Relaxed);
+    result
+}
+
+/// Accept a single OAuth callback on an already-bound listener, polling a
+/// `stop` flag every 200ms so the caller can cancel (e.g. when the paste
+/// path won the race).
+fn accept_callback_until_stopped(
+    listener: TcpListener,
+    stop: &AtomicBool,
+) -> Result<(String, String)> {
+    listener
+        .set_nonblocking(true)
         .context("Failed to set non-blocking mode")?;
 
-    // Poll for connection, checking for Ctrl+C between attempts
     let mut stream = loop {
+        if stop.load(Ordering::Relaxed) {
+            anyhow::bail!("listener cancelled");
+        }
         match listener.accept() {
             Ok((stream, _)) => break stream,
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(std::time::Duration::from_millis(200));
+                thread::sleep(Duration::from_millis(200));
                 continue;
             }
             Err(e) => return Err(e).context("Failed to accept connection"),
@@ -487,4 +552,139 @@ pub fn is_logged_in() -> bool {
 #[allow(dead_code)]
 pub fn current_user() -> Option<UserInfo> {
     get_stored_auth().map(|auth| auth.user)
+}
+
+/// Parse a user-pasted OAuth callback URL into (code, state).
+///
+/// Accepts any URL with a query string containing `code` and `state`.
+/// Rejects raw `code` without URL context — state validation is CSRF
+/// protection and we want the full round-trip, not a manually typed code.
+fn parse_pasted_callback(input: &str) -> Result<(String, String)> {
+    // Defensively strip bracketed-paste markers. The TUI disables DECSET
+    // 2004 before calling us, but a user pasting into a terminal we didn't
+    // configure (or with a stray prior session) can still deliver these.
+    let cleaned = input
+        .trim()
+        .trim_start_matches("\x1b[200~")
+        .trim_end_matches("\x1b[201~")
+        .trim();
+
+    let query_start = cleaned.find('?').context(
+        "Could not parse callback URL — paste the full http://127.0.0.1:8765/callback?... URL",
+    )?;
+    let query = &cleaned[query_start + 1..];
+
+    let params: HashMap<String, String> = query
+        .split('&')
+        .filter_map(|pair| {
+            let mut parts = pair.splitn(2, '=');
+            let key = parts.next()?;
+            let value = parts
+                .next()
+                .map(|v| urlencoding_decode(v))
+                .unwrap_or_default();
+            Some((key.to_string(), value))
+        })
+        .collect();
+
+    if let Some(error) = params.get("error") {
+        let desc = params
+            .get("error_description")
+            .map(|s| s.as_str())
+            .unwrap_or(error);
+        anyhow::bail!("OAuth error: {}", desc);
+    }
+
+    let code = params
+        .get("code")
+        .context("Callback URL missing 'code' parameter")?
+        .clone();
+    let state = params.get("state").context(
+        "Callback URL missing 'state' parameter (paste the full URL, not just the code)",
+    )?.clone();
+
+    Ok((code, state))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_happy_path_loopback_url() {
+        let (code, state) =
+            parse_pasted_callback("http://127.0.0.1:8765/callback?code=abc&state=xyz").unwrap();
+        assert_eq!(code, "abc");
+        assert_eq!(state, "xyz");
+    }
+
+    #[test]
+    fn parse_any_host_with_extra_params() {
+        let (code, state) =
+            parse_pasted_callback("https://example.com/x?foo=1&code=abc&state=xyz&bar=2").unwrap();
+        assert_eq!(code, "abc");
+        assert_eq!(state, "xyz");
+    }
+
+    #[test]
+    fn parse_missing_state_errors_with_full_url_hint() {
+        let err = parse_pasted_callback("http://127.0.0.1:8765/callback?code=abc")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("state"), "got: {err}");
+        assert!(err.contains("full URL"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_missing_code_errors() {
+        let err = parse_pasted_callback("http://127.0.0.1:8765/callback?state=xyz")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("code"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_error_response_includes_description() {
+        let err = parse_pasted_callback(
+            "http://127.0.0.1:8765/callback?error=access_denied&error_description=User+denied",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("User denied"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_not_a_url_errors() {
+        let err = parse_pasted_callback("this is not a url")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("full"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_url_encoded_state_is_decoded() {
+        let (_, state) = parse_pasted_callback(
+            "http://127.0.0.1:8765/callback?code=c&state=atomcode_%3Atest",
+        )
+        .unwrap();
+        assert_eq!(state, "atomcode_:test");
+    }
+
+    #[test]
+    fn parse_strips_bracketed_paste_markers() {
+        let input = "\x1b[200~http://127.0.0.1:8765/callback?code=abc&state=xyz\x1b[201~";
+        let (code, state) = parse_pasted_callback(input).unwrap();
+        assert_eq!(code, "abc");
+        assert_eq!(state, "xyz");
+    }
+
+    #[test]
+    fn parse_trims_surrounding_whitespace() {
+        let (code, state) = parse_pasted_callback(
+            "   http://127.0.0.1:8765/callback?code=abc&state=xyz\n",
+        )
+        .unwrap();
+        assert_eq!(code, "abc");
+        assert_eq!(state, "xyz");
+    }
 }
