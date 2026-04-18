@@ -24,11 +24,18 @@ use std::time::{Duration, Instant};
 
 use super::UiLine;
 
-/// Minimum gap between two InputPrompt / StreamingBox redraws. ~50fps —
-/// visually fluid on any terminal, no noticeable leading-edge latency,
-/// and well within Terminal.app's ANSI-processing budget for a single
-/// footer payload.
-pub const INPUT_REDRAW_THROTTLE_MS: u64 = 20;
+/// Minimum gap between two InputPrompt / StreamingBox redraws.
+///
+/// Lowered from 20ms to 5ms after Step 9 (render worker on dedicated
+/// OS thread). The old 20ms + 20ms deferred-tick added up to ~40ms
+/// visible lag for IME commit bursts (e.g. macOS Pinyin "达到的地方"
+/// arriving as 5 Char events in <100µs), which fast typists
+/// perceived as "I pressed space, the chars didn't show, I need to
+/// type again". With the render worker now absorbing terminal I/O
+/// asynchronously, the throttle's only remaining job is to coalesce
+/// sub-5ms bursts — normal human typing (>50ms inter-key) never hits
+/// it now.
+pub const INPUT_REDRAW_THROTTLE_MS: u64 = 5;
 
 #[derive(Default)]
 pub struct InputThrottle {

@@ -662,7 +662,12 @@ pub async fn run_loop(
     // choke on back-to-back full footer payloads, but the trailing
     // edge of a burst needs someone to paint it — that someone is this
     // tick. No-op when nothing is pending.
-    let mut deferred_render_tick = tokio::time::interval(Duration::from_millis(20));
+    // 5ms matches the InputThrottle window (see render::throttle) —
+    // tick == window means the max visible lag from "burst ended" to
+    // "parked paint landed" is ~10ms, imperceptible. Previously 20ms
+    // which compounded with the 20ms throttle window to ~40ms lag,
+    // visible for IME commit bursts.
+    let mut deferred_render_tick = tokio::time::interval(Duration::from_millis(5));
     deferred_render_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     deferred_render_tick.tick().await; // consume the immediate fire
 
