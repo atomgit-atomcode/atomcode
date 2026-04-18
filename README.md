@@ -50,7 +50,7 @@ Think of it as an open-source alternative to Claude Code / Cursor Agent, but run
 - **Verification loop** — automatically verifies edits via syntax checks before declaring success
 - **Dynamic step budget** — scales with the number of edited files, capped per turn to bound cost
 - **Loop detection** — detects and breaks out of repetitive tool-call patterns
-- **3-layer JSON repair** — recovers malformed tool-call arguments from weaker models
+- **3-layer JSON repair** — recovers malformed tool-call arguments
 - **Turn-level datalog** — structured per-turn logs for replay, debugging, and eval harnesses
 
 ### Built-in Tools
@@ -113,17 +113,6 @@ Connect to any LLM that supports OpenAI's function-calling API:
 - **Per-session permission grants** — approve once per tool pattern, or always-allow
 - **Source file deletion requires approval** — `rm` on code files is never auto-approved
 - **Undo** — `/undo` rolls back the last turn's file edits via file-history snapshots
-
-### Weak Model Optimization
-
-AtomCode is specifically engineered to work well with weaker/cheaper models (DeepSeek V3, GLM-5, Qwen-Plus):
-
-- **Compact system prompt** (~1.5K tokens) with rules at the END (recency effect)
-- **No source file pre-reading** — the model reads what it needs, avoiding attention dilution
-- **Token-budget-aware conversation windowing** — hot/cold zones with tool-result condensation
-- **System reminders** every few steps to keep the model on track
-- **Specialized JSON repair** for models that produce malformed function-call arguments
-- **Edit surrounding context** — returns lines around each edit to help the model stay oriented
 
 ## Installation
 
