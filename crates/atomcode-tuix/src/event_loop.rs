@@ -2373,6 +2373,11 @@ fn run_login_flow(
     // Re-enter raw mode + bracketed paste regardless of success/failure.
     let _ = crossterm::terminal::enable_raw_mode();
     let _ = execute!(std::io::stdout(), EnableBracketedPaste);
+    // The OAuth flow wrote to stdout in cooked mode, so the renderer's
+    // cached footer_rows / last_footer are now lying about the terminal
+    // cursor position. Forget everything and wipe the screen so the
+    // welcome + status line that follow render against a known anchor.
+    renderer.reset();
 
     match result {
         Ok(auth) => {

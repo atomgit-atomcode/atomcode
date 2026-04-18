@@ -119,6 +119,11 @@ impl<W: Write + Send> Renderer for PlainRenderer<W> {
     fn shutdown(&mut self) {
         let _ = self.out.flush();
     }
+
+    fn reset(&mut self) {
+        // Plain renderer has no cached footer state; just flush.
+        let _ = self.out.flush();
+    }
 }
 
 #[cfg(test)]

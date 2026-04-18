@@ -75,6 +75,14 @@ pub trait Renderer: Send {
     fn flush(&mut self);
     /// Shutdown: disable bracketed paste, disable raw mode, etc.
     fn shutdown(&mut self);
+    /// Forget all cached rendering state (footer rows, last footer snapshot,
+    /// assistant-text mid-line buffer, markdown parser) AND clear the
+    /// physical terminal screen. Used by callers that hand control back
+    /// to a non-TUI process (e.g. the blocking OAuth flow in /login)
+    /// and then want a clean slate — without this, the next render
+    /// tries to `erase_footer` at a position the terminal cursor is no
+    /// longer at, corrupting every subsequent ANSI cursor move.
+    fn reset(&mut self);
 }
 
 /// Slash-command palette payload: filtered entries + which one is selected.

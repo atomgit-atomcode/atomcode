@@ -988,6 +988,22 @@ impl<W: Write + Send> Renderer for AnsiRenderer<W> {
         let _ = self.out.write_all(b"\r\n");
         let _ = self.out.flush();
     }
+
+    fn reset(&mut self) {
+        // Wipe the physical terminal + cursor home so the next render
+        // starts from a known (row 1, col 1) position.
+        let _ = self.out.write_all(b"\x1b[2J\x1b[H");
+        // Forget everything we cached about the prior footer — a stale
+        // cursor_row_from_top here is what makes erase_footer walk the
+        // cursor to the wrong row after /login or any other external
+        // terminal hijack.
+        self.footer_rows = 0;
+        self.last_footer = FooterState::default();
+        self.assistant_continuing = false;
+        self.assistant_line_buf.clear();
+        self.md_state.reset();
+        let _ = self.out.flush();
+    }
 }
 
 #[cfg(test)]
