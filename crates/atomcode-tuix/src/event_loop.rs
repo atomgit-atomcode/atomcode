@@ -48,9 +48,9 @@ pub struct LoopCtx {
 /// spliced back in when the line is submitted. This keeps the visible
 /// input short (matching CC's paste UX) without truncating what the
 /// agent actually sees.
-struct Buffer {
-    text: String,
-    cursor: usize,
+pub struct Buffer {
+    pub text: String,
+    pub cursor: usize,
     history_idx: Option<usize>,
     stash: String,
     /// Placeholder index → original pasted text. Index 0 = paste #1.
@@ -403,9 +403,11 @@ pub async fn run_loop(
     let mut buf = Buffer::new();
     let mut think = ThinkStripper::new();
     let mut menu = MenuState::new();
-    let mut model_picker: Option<ModelPicker> = None;
-    let mut provider_wizard: Option<ProviderWizard> = None;
-    let mut session_picker: Option<SessionPicker> = None;
+    // Exactly one overlay at a time — /model, /provider, /resume all
+    // push into the same slot. The Modal trait owns draw + key handling
+    // so adding a fourth overlay is just another `Box<dyn Modal>`, not
+    // another field + another dispatch branch.
+    let mut active_modal: Option<Box<dyn crate::modals::Modal>> = None;
     // Messages the user submitted while a turn was already running.
     // Drained one-at-a-time from the head whenever the current turn
     // finishes (TurnComplete / TurnCancelled / error → Idle). Matches
@@ -523,7 +525,7 @@ pub async fn run_loop(
                 let Some(ev) = maybe else { break };
                 handle_input(
                     ev, &mut state, &mut buf, &mut ctx, renderer, &mut menu,
-                    &mut model_picker, &mut provider_wizard, &mut session_picker, &mut message_queue,
+                    &mut active_modal, &mut message_queue,
                 )?;
             }
 
@@ -612,7 +614,7 @@ pub async fn run_loop(
                 let Some(ev) = maybe else { break };
                 handle_input(
                     ev, &mut state, &mut buf, &mut ctx, renderer, &mut menu,
-                    &mut model_picker, &mut provider_wizard, &mut session_picker, &mut message_queue,
+                    &mut active_modal, &mut message_queue,
                 )?;
             }
 
@@ -671,19 +673,18 @@ fn handle_input(
     ctx: &mut LoopCtx,
     renderer: &mut dyn Renderer,
     menu: &mut MenuState,
-    model_picker: &mut Option<ModelPicker>,
-    provider_wizard: &mut Option<ProviderWizard>,
-    session_picker: &mut Option<SessionPicker>,
+    active_modal: &mut Option<Box<dyn crate::modals::Modal>>,
     message_queue: &mut VecDeque<String>,
 ) -> Result<()> {
+    use crate::modals::ModalAction;
+
     match ev {
         InputEvent::Paste(text) => {
             // Allow pasting during Streaming too — it goes into the
-            // type-ahead buffer just like keyboard input.
+            // type-ahead buffer just like keyboard input. Modals have
+            // their own key handling and ignore paste events.
             if matches!(state.phase, UiPhase::Idle | UiPhase::Streaming)
-                && model_picker.is_none()
-                && provider_wizard.is_none()
-                && session_picker.is_none()
+                && active_modal.is_none()
             {
                 buf.insert_paste(text);
                 if matches!(state.phase, UiPhase::Streaming) {
@@ -702,27 +703,22 @@ fn handle_input(
         // Repeat tick, producing "ghost characters" / runaway backspace
         // the moment the OS autorepeat kicked in.
         InputEvent::Key(KeyEvent { kind: KeyEventKind::Press, code, modifiers, .. }) => {
-            // Wizard > session picker > model picker > normal phase handler.
-            // Exactly one modal can be active at a time — the command
-            // dispatcher opens them mutually exclusive.
-            if provider_wizard.is_some() && matches!(state.phase, UiPhase::Idle) {
-                handle_provider_wizard_key(
-                    code, modifiers, buf, state, ctx, renderer, provider_wizard,
-                )?;
-                return Ok(());
-            }
-            if session_picker.is_some() && matches!(state.phase, UiPhase::Idle) {
-                handle_session_picker_key(code, modifiers, buf, state, ctx, renderer, session_picker)?;
-                return Ok(());
-            }
-            if model_picker.is_some() && matches!(state.phase, UiPhase::Idle) {
-                handle_model_picker_key(code, modifiers, buf, state, ctx, renderer, model_picker)?;
-                return Ok(());
+            // Modal trumps phase handlers when it's installed — /model,
+            // /provider, /resume all install a modal and the event loop
+            // funnels every keystroke through it until it reports Close.
+            if matches!(state.phase, UiPhase::Idle) {
+                if let Some(modal) = active_modal.as_mut() {
+                    let action = modal.handle_key(code, modifiers, buf, state, ctx, renderer)?;
+                    if matches!(action, ModalAction::Close) {
+                        *active_modal = None;
+                        redraw_idle_plain(buf, state, ctx, renderer);
+                    }
+                    return Ok(());
+                }
             }
             match state.phase {
                 UiPhase::Idle => handle_idle_key(
-                    code, modifiers, state, buf, ctx, renderer, menu,
-                    model_picker, provider_wizard, session_picker,
+                    code, modifiers, state, buf, ctx, renderer, menu, active_modal,
                 )?,
                 UiPhase::Streaming => handle_streaming_key(
                     code, modifiers, state, buf, ctx, renderer, menu, message_queue,
@@ -775,10 +771,9 @@ impl ModelPicker {
 // ── SessionPicker: /resume modal ──
 //
 // Lists prior sessions for the current project, with type-to-filter search.
-// Mirrors the ModelPicker pattern: an Option<SessionPicker> lives in the
-// event loop; when Some, `redraw_idle` renders it as a MenuPayload above
-// the input box. Up/Down navigates, Enter loads, Esc cancels, typing
-// edits the query.
+// Implements `Modal` (see `impl Modal for SessionPicker` below) so the event
+// loop treats it uniformly with ModelPicker / ProviderWizard. Up/Down
+// navigates, Enter loads, Esc cancels, typing edits the query.
 
 pub struct SessionPicker {
     /// All sessions for the project, pre-filtered to message_count > 0.
@@ -958,9 +953,7 @@ fn handle_idle_key(
     ctx: &mut LoopCtx,
     renderer: &mut dyn Renderer,
     menu: &mut MenuState,
-    model_picker: &mut Option<ModelPicker>,
-    provider_wizard: &mut Option<ProviderWizard>,
-    session_picker: &mut Option<SessionPicker>,
+    active_modal: &mut Option<Box<dyn crate::modals::Modal>>,
 ) -> Result<()> {
     // If the menu is active (buf starts with '/'), intercept navigation keys.
     let menu_items = build_menu_items(&buf.text, &ctx.commands);
@@ -993,9 +986,9 @@ fn handle_idle_key(
                 buf.text.clear();
                 buf.cursor = 0;
                 if let Some((cmd, arg)) = parse_slash_line(&committed) {
-                    execute_slash_command(cmd, arg, state, ctx, renderer, model_picker, provider_wizard, session_picker)?;
+                    execute_slash_command(cmd, arg, state, ctx, renderer, active_modal)?;
                     if matches!(state.phase, UiPhase::Idle) {
-                        redraw_idle(buf, state, ctx, model_picker, session_picker, renderer);
+                        redraw_after_slash(buf, state, ctx, active_modal, renderer);
                     }
                 }
                 return Ok(());
@@ -1039,9 +1032,9 @@ fn handle_idle_key(
             buf.clear_pastes();
             menu.selected = 0;
             if let Some((cmd, arg)) = parse_slash_line(&line) {
-                execute_slash_command(cmd, arg, state, ctx, renderer, model_picker, provider_wizard, session_picker)?;
+                execute_slash_command(cmd, arg, state, ctx, renderer, active_modal)?;
                 if matches!(state.phase, UiPhase::Idle) {
-                    redraw_idle(buf, state, ctx, model_picker, session_picker, renderer);
+                    redraw_after_slash(buf, state, ctx, active_modal, renderer);
                 }
             } else {
                 ctx.history.push(line.clone());
@@ -1095,48 +1088,24 @@ fn redraw_idle_plain(
     renderer.flush();
 }
 
-/// Redraw the idle footer, showing the model picker or session picker if active.
-/// At most one picker is active at a time (the input handler enforces this),
-/// but the signature accepts both so call sites in picker-specific key handlers
-/// can pass `&None` for the inactive one.
-fn redraw_idle(
+/// Redraw after running a slash command. If the command installed a
+/// modal, delegate the draw to it so the modal's menu appears; otherwise
+/// fall through to the plain idle prompt.
+///
+/// Replaces the old per-picker `redraw_idle` that hard-coded payload
+/// construction for model/session. New modals just implement `draw`.
+fn redraw_after_slash(
     buf: &Buffer,
     state: &UiState,
     ctx: &LoopCtx,
-    model_picker: &Option<ModelPicker>,
-    session_picker: &Option<SessionPicker>,
+    active_modal: &Option<Box<dyn crate::modals::Modal>>,
     renderer: &mut dyn Renderer,
 ) {
-    let payload = if let Some(p) = session_picker.as_ref() {
-        Some(build_session_menu_payload(p))
-    } else if let Some(p) = model_picker.as_ref() {
-        let items: Vec<(String, String)> = p
-            .providers
-            .iter()
-            .map(|name| {
-                let desc = ctx
-                    .config
-                    .providers
-                    .get(name)
-                    .map(|c| format!("{} · {}", c.provider_type, c.model))
-                    .unwrap_or_default();
-                (name.clone(), desc)
-            })
-            .collect();
-        Some(crate::render::MenuPayload {
-            items,
-            selected: p.selected,
-        })
+    if let Some(modal) = active_modal.as_ref() {
+        modal.draw(buf, state, ctx, renderer);
     } else {
-        None
-    };
-    renderer.render(UiLine::InputPrompt {
-        buf: buf.text.clone(),
-        cursor_byte: buf.cursor,
-        menu: payload,
-        status: build_status(state, ctx),
-    });
-    renderer.flush();
+        redraw_idle_plain(buf, state, ctx, renderer);
+    }
 }
 
 fn build_session_menu_payload(p: &SessionPicker) -> crate::render::MenuPayload {
@@ -1367,6 +1336,10 @@ fn save_and_reload(ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
     }
 }
 
+/// Process one key for the wizard. Returns `Continue` if the wizard
+/// stays active, `Close` when the wizard is done (cancelled, committed,
+/// or transitioned to Idle after a terminal operation). The caller
+/// drops the modal on `Close` and redraws the plain idle prompt.
 fn handle_provider_wizard_key(
     code: KeyCode,
     _modifiers: crossterm::event::KeyModifiers,
@@ -1374,19 +1347,21 @@ fn handle_provider_wizard_key(
     state: &mut UiState,
     ctx: &mut LoopCtx,
     renderer: &mut dyn Renderer,
-    wizard: &mut Option<ProviderWizard>,
-) -> Result<()> {
+    wizard: &mut ProviderWizard,
+) -> Result<crate::modals::ModalAction> {
+    use crate::modals::ModalAction;
+
     // Esc always cancels at any point.
     if matches!(code, KeyCode::Esc) {
-        *wizard = None;
         buf.text.clear();
         buf.cursor = 0;
         wizard_push(renderer, "(cancelled)");
-        redraw_idle_plain(buf, state, ctx, renderer);
-        return Ok(());
+        return Ok(ModalAction::Close);
     }
 
-    let current = wizard.take().expect("guarded by caller");
+    // Take the current state out so we can move fields; put it back
+    // (or replace it) before returning Continue.
+    let current = std::mem::replace(wizard, ProviderWizard::MainMenu { selected: 0 });
     match current {
         // ── Menu states: Up / Down / Enter navigate; others ignored. ──
         ProviderWizard::MainMenu { mut selected } => {
@@ -1394,13 +1369,13 @@ fn handle_provider_wizard_key(
             match code {
                 KeyCode::Up => {
                     selected = selected.saturating_sub(1);
-                    *wizard = Some(ProviderWizard::MainMenu { selected });
+                    *wizard = ProviderWizard::MainMenu { selected };
                 }
                 KeyCode::Down => {
                     if selected + 1 < ITEMS.len() {
                         selected += 1;
                     }
-                    *wizard = Some(ProviderWizard::MainMenu { selected });
+                    *wizard = ProviderWizard::MainMenu { selected };
                 }
                 KeyCode::Enter => {
                     let providers: Vec<String> = {
@@ -1415,38 +1390,38 @@ fn handle_provider_wizard_key(
                                 draft: DraftProvider::default(),
                             };
                             show_step_prompt(WizardStep::Name, None, buf, state, ctx, &new, renderer);
-                            *wizard = Some(new);
+                            *wizard = new;
                         }
                         "edit" | "delete" | "set-default" if providers.is_empty() => {
                             wizard_push(renderer, "No providers configured yet.");
-                            redraw_idle_plain(buf, state, ctx, renderer);
-                            // wizard stays None → back to normal Idle.
+                            return Ok(ModalAction::Close);
                         }
                         "edit" => {
                             let new = ProviderWizard::EditPick { providers, selected: 0 };
                             redraw_wizard(buf, state, ctx, &new, renderer);
-                            *wizard = Some(new);
+                            *wizard = new;
                         }
                         "delete" => {
                             let new = ProviderWizard::DeletePick { providers, selected: 0 };
                             redraw_wizard(buf, state, ctx, &new, renderer);
-                            *wizard = Some(new);
+                            *wizard = new;
                         }
                         "set-default" => {
                             let new = ProviderWizard::SetDefaultPick { providers, selected: 0 };
                             redraw_wizard(buf, state, ctx, &new, renderer);
-                            *wizard = Some(new);
+                            *wizard = new;
                         }
-                        _ => {}
+                        _ => {
+                            *wizard = ProviderWizard::MainMenu { selected };
+                        }
                     }
                 }
                 _ => {
-                    *wizard = Some(ProviderWizard::MainMenu { selected });
+                    *wizard = ProviderWizard::MainMenu { selected };
                 }
             }
-            if let Some(w) = wizard.as_ref() {
-                redraw_wizard(buf, state, ctx, w, renderer);
-            }
+            redraw_wizard(buf, state, ctx, wizard, renderer);
+            Ok(ModalAction::Continue)
         }
 
         // ── Picker states share Up/Down/Enter logic. ──
@@ -1475,14 +1450,14 @@ fn handle_provider_wizard_key(
                         &new,
                         renderer,
                     );
-                    *wizard = Some(new);
-                    return Ok(());
+                    *wizard = new;
+                    return Ok(ModalAction::Continue);
                 }
                 _ => {}
             }
-            let new = ProviderWizard::EditPick { providers, selected };
-            redraw_wizard(buf, state, ctx, &new, renderer);
-            *wizard = Some(new);
+            *wizard = ProviderWizard::EditPick { providers, selected };
+            redraw_wizard(buf, state, ctx, wizard, renderer);
+            Ok(ModalAction::Continue)
         }
 
         ProviderWizard::DeletePick { providers, mut selected } => {
@@ -1496,16 +1471,15 @@ fn handle_provider_wizard_key(
                 KeyCode::Enter => {
                     let target = providers[selected].clone();
                     wizard_push(renderer, &format!("Delete \"{}\"? [y/N]", target));
-                    let new = ProviderWizard::DeleteConfirm { target };
-                    redraw_wizard(buf, state, ctx, &new, renderer);
-                    *wizard = Some(new);
-                    return Ok(());
+                    *wizard = ProviderWizard::DeleteConfirm { target };
+                    redraw_wizard(buf, state, ctx, wizard, renderer);
+                    return Ok(ModalAction::Continue);
                 }
                 _ => {}
             }
-            let new = ProviderWizard::DeletePick { providers, selected };
-            redraw_wizard(buf, state, ctx, &new, renderer);
-            *wizard = Some(new);
+            *wizard = ProviderWizard::DeletePick { providers, selected };
+            redraw_wizard(buf, state, ctx, wizard, renderer);
+            Ok(ModalAction::Continue)
         }
 
         ProviderWizard::SetDefaultPick { providers, mut selected } => {
@@ -1524,14 +1498,13 @@ fn handle_provider_wizard_key(
                     }
                     save_and_reload(ctx, renderer);
                     wizard_push(renderer, &format!("Default set to {}.", chosen));
-                    redraw_idle_plain(buf, state, ctx, renderer);
-                    return Ok(());
+                    return Ok(ModalAction::Close);
                 }
                 _ => {}
             }
-            let new = ProviderWizard::SetDefaultPick { providers, selected };
-            redraw_wizard(buf, state, ctx, &new, renderer);
-            *wizard = Some(new);
+            *wizard = ProviderWizard::SetDefaultPick { providers, selected };
+            redraw_wizard(buf, state, ctx, wizard, renderer);
+            Ok(ModalAction::Continue)
         }
 
         ProviderWizard::DeleteConfirm { target } => {
@@ -1556,7 +1529,7 @@ fn handle_provider_wizard_key(
                     wizard_push(renderer, "(kept)");
                 }
             }
-            redraw_idle_plain(buf, state, ctx, renderer);
+            Ok(ModalAction::Close)
         }
 
         // ── Text-input states: Enter submits, chars edit buf, others pass through Buffer. ──
@@ -1570,7 +1543,8 @@ fn handle_provider_wizard_key(
                     Some(next) => {
                         let new = ProviderWizard::Add { step: next, draft };
                         show_step_prompt(next, None, buf, state, ctx, &new, renderer);
-                        *wizard = Some(new);
+                        *wizard = new;
+                        return Ok(ModalAction::Continue);
                     }
                     None => {
                         // All fields gathered — commit.
@@ -1583,16 +1557,15 @@ fn handle_provider_wizard_key(
                         }
                         save_and_reload(ctx, renderer);
                         wizard_push(renderer, &format!("Added provider \"{}\".", name));
-                        redraw_idle_plain(buf, state, ctx, renderer);
+                        return Ok(ModalAction::Close);
                     }
                 }
-                return Ok(());
             }
             // Forward other keys to the buffer so typing / editing works.
             forward_to_buffer(code, _modifiers, buf, ctx);
-            let restored = ProviderWizard::Add { step, draft };
-            redraw_wizard(buf, state, ctx, &restored, renderer);
-            *wizard = Some(restored);
+            *wizard = ProviderWizard::Add { step, draft };
+            redraw_wizard(buf, state, ctx, wizard, renderer);
+            Ok(ModalAction::Continue)
         }
 
         ProviderWizard::Edit { target, step, mut draft } => {
@@ -1610,7 +1583,8 @@ fn handle_provider_wizard_key(
                             draft,
                         };
                         show_step_prompt(next, existing.as_ref(), buf, state, ctx, &new, renderer);
-                        *wizard = Some(new);
+                        *wizard = new;
+                        return Ok(ModalAction::Continue);
                     }
                     None => {
                         // Commit edit: merge draft onto existing provider.
@@ -1619,19 +1593,40 @@ fn handle_provider_wizard_key(
                         }
                         save_and_reload(ctx, renderer);
                         wizard_push(renderer, &format!("Updated \"{}\".", target));
-                        redraw_idle_plain(buf, state, ctx, renderer);
+                        return Ok(ModalAction::Close);
                     }
                 }
-                return Ok(());
             }
             forward_to_buffer(code, _modifiers, buf, ctx);
-            let restored = ProviderWizard::Edit { target, step, draft };
-            redraw_wizard(buf, state, ctx, &restored, renderer);
-            *wizard = Some(restored);
+            *wizard = ProviderWizard::Edit { target, step, draft };
+            redraw_wizard(buf, state, ctx, wizard, renderer);
+            Ok(ModalAction::Continue)
         }
     }
+}
 
-    Ok(())
+impl crate::modals::Modal for ProviderWizard {
+    fn handle_key(
+        &mut self,
+        code: KeyCode,
+        mods: crossterm::event::KeyModifiers,
+        buf: &mut Buffer,
+        state: &mut UiState,
+        ctx: &mut LoopCtx,
+        renderer: &mut dyn Renderer,
+    ) -> Result<crate::modals::ModalAction> {
+        handle_provider_wizard_key(code, mods, buf, state, ctx, renderer, self)
+    }
+
+    fn draw(
+        &self,
+        buf: &Buffer,
+        state: &UiState,
+        ctx: &LoopCtx,
+        renderer: &mut dyn Renderer,
+    ) {
+        redraw_wizard(buf, state, ctx, self, renderer);
+    }
 }
 
 /// Route a keystroke into `Buffer::apply` so text-input wizard steps
@@ -1646,59 +1641,89 @@ fn forward_to_buffer(
     let _ = buf.apply(action, ctx.history.entries(), &ctx.commands);
 }
 
-/// Modal key handler while ModelPicker is active.
-fn handle_model_picker_key(
-    code: KeyCode,
-    _modifiers: crossterm::event::KeyModifiers,
-    buf: &mut Buffer,
-    state: &UiState,
-    ctx: &mut LoopCtx,
-    renderer: &mut dyn Renderer,
-    model_picker: &mut Option<ModelPicker>,
-) -> Result<()> {
-    let Some(picker) = model_picker.as_mut() else { return Ok(()); };
-    match code {
-        KeyCode::Up => {
-            picker.selected = picker.selected.saturating_sub(1);
-            redraw_idle(buf, state, ctx, model_picker, &None, renderer);
-        }
-        KeyCode::Down => {
-            let max = model_picker.as_ref().unwrap().providers.len().saturating_sub(1);
-            let picker = model_picker.as_mut().unwrap();
-            if picker.selected < max {
-                picker.selected += 1;
+impl crate::modals::Modal for ModelPicker {
+    fn handle_key(
+        &mut self,
+        code: KeyCode,
+        _mods: crossterm::event::KeyModifiers,
+        buf: &mut Buffer,
+        state: &mut UiState,
+        ctx: &mut LoopCtx,
+        renderer: &mut dyn Renderer,
+    ) -> Result<crate::modals::ModalAction> {
+        use crate::modals::ModalAction;
+        match code {
+            KeyCode::Up => {
+                self.selected = self.selected.saturating_sub(1);
+                self.draw(buf, state, ctx, renderer);
+                Ok(ModalAction::Continue)
             }
-            redraw_idle(buf, state, ctx, model_picker, &None, renderer);
+            KeyCode::Down => {
+                let max = self.providers.len().saturating_sub(1);
+                if self.selected < max {
+                    self.selected += 1;
+                }
+                self.draw(buf, state, ctx, renderer);
+                Ok(ModalAction::Continue)
+            }
+            KeyCode::Enter => {
+                let chosen = self.providers[self.selected].clone();
+                let display = ctx
+                    .config
+                    .providers
+                    .get(&chosen)
+                    .map(|p| p.model.clone())
+                    .unwrap_or_else(|| chosen.clone());
+                ctx.config.default_provider = chosen.clone();
+                ctx.model_name = display.clone();
+                // Persist to config.toml + notify agent. Without this, the
+                // switch lives only in memory and the next startup reverts
+                // to whatever was last saved.
+                save_and_reload(ctx, renderer);
+                renderer.render(UiLine::CommandOutput(format!(
+                    "  Switched to {} · {}\n",
+                    chosen, display
+                )));
+                renderer.flush();
+                Ok(ModalAction::Close)
+            }
+            KeyCode::Esc => Ok(ModalAction::Close),
+            _ => Ok(ModalAction::Continue),
         }
-        KeyCode::Enter => {
-            let chosen = model_picker.as_ref().unwrap().providers[model_picker.as_ref().unwrap().selected].clone();
-            let display = ctx
-                .config
-                .providers
-                .get(&chosen)
-                .map(|p| p.model.clone())
-                .unwrap_or_else(|| chosen.clone());
-            ctx.config.default_provider = chosen.clone();
-            ctx.model_name = display.clone();
-            // Persist to config.toml + notify agent. Without this, the
-            // switch lives only in memory and the next startup reverts to
-            // whatever was last saved.
-            save_and_reload(ctx, renderer);
-            *model_picker = None;
-            renderer.render(UiLine::CommandOutput(format!(
-                "  Switched to {} · {}\n",
-                chosen, display
-            )));
-            renderer.flush();
-            redraw_idle(buf, state, ctx, model_picker, &None, renderer);
-        }
-        KeyCode::Esc => {
-            *model_picker = None;
-            redraw_idle(buf, state, ctx, model_picker, &None, renderer);
-        }
-        _ => {}
     }
-    Ok(())
+
+    fn draw(
+        &self,
+        buf: &Buffer,
+        state: &UiState,
+        ctx: &LoopCtx,
+        renderer: &mut dyn Renderer,
+    ) {
+        let items: Vec<(String, String)> = self
+            .providers
+            .iter()
+            .map(|name| {
+                let desc = ctx
+                    .config
+                    .providers
+                    .get(name)
+                    .map(|c| format!("{} · {}", c.provider_type, c.model))
+                    .unwrap_or_default();
+                (name.clone(), desc)
+            })
+            .collect();
+        let payload = crate::render::MenuPayload {
+            items,
+            selected: self.selected,
+        };
+        renderer.render(UiLine::InputPrompt {
+            buf: buf.text.clone(),
+            cursor_byte: buf.cursor,
+            menu: Some(payload),
+            status: build_status(state, ctx),
+        });
+        renderer.flush();
+    }
 }
 
 /// Modal key handler while SessionPicker is active.
@@ -1708,71 +1733,83 @@ fn handle_model_picker_key(
 /// `update_filter()`. On Enter, the session is loaded via
 /// `SessionManager::load`, its messages are replayed into scrollback as
 /// semantic UiLines, and `AgentCommand::SetMessages` syncs the agent.
-fn handle_session_picker_key(
-    code: KeyCode,
-    modifiers: crossterm::event::KeyModifiers,
-    buf: &mut Buffer,
-    state: &mut UiState,
-    ctx: &mut LoopCtx,
-    renderer: &mut dyn Renderer,
-    session_picker: &mut Option<SessionPicker>,
-) -> Result<()> {
-    if session_picker.is_none() {
-        return Ok(());
-    }
-    match code {
-        KeyCode::Up => {
-            session_picker.as_mut().unwrap().up();
-            redraw_idle(buf, state, ctx, &None, session_picker, renderer);
-        }
-        KeyCode::Down => {
-            session_picker.as_mut().unwrap().down();
-            redraw_idle(buf, state, ctx, &None, session_picker, renderer);
-        }
-        KeyCode::Backspace => {
-            let p = session_picker.as_mut().unwrap();
-            p.query.pop();
-            p.update_filter();
-            redraw_idle(buf, state, ctx, &None, session_picker, renderer);
-        }
-        KeyCode::Char(c) if !modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => {
-            let p = session_picker.as_mut().unwrap();
-            p.query.push(c);
-            p.update_filter();
-            redraw_idle(buf, state, ctx, &None, session_picker, renderer);
-        }
-        KeyCode::Enter => {
-            let chosen = session_picker.as_ref().unwrap().chosen_id();
-            let Some(id) = chosen else {
-                // Filter matched nothing — ignore Enter.
-                return Ok(());
-            };
-            match ctx.session_manager.load(&id) {
-                Ok(session) => {
-                    *session_picker = None;
-                    replay_session(renderer, &session);
-                    ctx.agent
-                        .cmd_tx
-                        .send(AgentCommand::SetMessages(session.messages.clone()))
-                        .ok();
-                    state.on_turn_complete();
-                    redraw_idle(buf, state, ctx, &None, session_picker, renderer);
-                }
-                Err(e) => {
-                    renderer.render(UiLine::Error(format!("load session failed: {}", e)));
-                    renderer.flush();
-                    *session_picker = None;
-                    redraw_idle(buf, state, ctx, &None, session_picker, renderer);
+impl crate::modals::Modal for SessionPicker {
+    fn handle_key(
+        &mut self,
+        code: KeyCode,
+        mods: crossterm::event::KeyModifiers,
+        buf: &mut Buffer,
+        state: &mut UiState,
+        ctx: &mut LoopCtx,
+        renderer: &mut dyn Renderer,
+    ) -> Result<crate::modals::ModalAction> {
+        use crate::modals::ModalAction;
+        match code {
+            KeyCode::Up => {
+                self.up();
+                self.draw(buf, state, ctx, renderer);
+                Ok(ModalAction::Continue)
+            }
+            KeyCode::Down => {
+                self.down();
+                self.draw(buf, state, ctx, renderer);
+                Ok(ModalAction::Continue)
+            }
+            KeyCode::Backspace => {
+                self.query.pop();
+                self.update_filter();
+                self.draw(buf, state, ctx, renderer);
+                Ok(ModalAction::Continue)
+            }
+            KeyCode::Char(c) if !mods.contains(crossterm::event::KeyModifiers::CONTROL) => {
+                self.query.push(c);
+                self.update_filter();
+                self.draw(buf, state, ctx, renderer);
+                Ok(ModalAction::Continue)
+            }
+            KeyCode::Enter => {
+                let Some(id) = self.chosen_id() else {
+                    // Filter matched nothing — ignore Enter, stay open.
+                    return Ok(ModalAction::Continue);
+                };
+                match ctx.session_manager.load(&id) {
+                    Ok(session) => {
+                        replay_session(renderer, &session);
+                        ctx.agent
+                            .cmd_tx
+                            .send(AgentCommand::SetMessages(session.messages.clone()))
+                            .ok();
+                        state.on_turn_complete();
+                        Ok(ModalAction::Close)
+                    }
+                    Err(e) => {
+                        renderer.render(UiLine::Error(format!("load session failed: {}", e)));
+                        renderer.flush();
+                        Ok(ModalAction::Close)
+                    }
                 }
             }
+            KeyCode::Esc => Ok(ModalAction::Close),
+            _ => Ok(ModalAction::Continue),
         }
-        KeyCode::Esc => {
-            *session_picker = None;
-            redraw_idle(buf, state, ctx, &None, session_picker, renderer);
-        }
-        _ => {}
     }
-    Ok(())
+
+    fn draw(
+        &self,
+        buf: &Buffer,
+        state: &UiState,
+        ctx: &LoopCtx,
+        renderer: &mut dyn Renderer,
+    ) {
+        let payload = build_session_menu_payload(self);
+        renderer.render(UiLine::InputPrompt {
+            buf: buf.text.clone(),
+            cursor_byte: buf.cursor,
+            menu: Some(payload),
+            status: build_status(state, ctx),
+        });
+        renderer.flush();
+    }
 }
 
 /// Emit historical session messages into scrollback as semantic UiLines,
@@ -2090,9 +2127,7 @@ fn execute_slash_command(
     state: &mut UiState,
     ctx: &mut LoopCtx,
     renderer: &mut dyn Renderer,
-    model_picker: &mut Option<ModelPicker>,
-    provider_wizard: &mut Option<ProviderWizard>,
-    session_picker: &mut Option<SessionPicker>,
+    active_modal: &mut Option<Box<dyn crate::modals::Modal>>,
 ) -> Result<()> {
     match cmd {
         "quit" | "exit" => {
@@ -2209,7 +2244,7 @@ fn execute_slash_command(
                 ));
                 renderer.flush();
             } else {
-                *model_picker = Some(ModelPicker::open(&ctx.config));
+                *active_modal = Some(Box::new(ModelPicker::open(&ctx.config)));
             }
         }
         "resume" => {
@@ -2225,7 +2260,7 @@ fn execute_slash_command(
                         ));
                         renderer.flush();
                     } else {
-                        *session_picker = Some(SessionPicker::open(sessions));
+                        *active_modal = Some(Box::new(SessionPicker::open(sessions)));
                     }
                 }
                 Err(e) => {
@@ -2235,7 +2270,7 @@ fn execute_slash_command(
             }
         }
         "provider" => {
-            *provider_wizard = Some(ProviderWizard::MainMenu { selected: 0 });
+            *active_modal = Some(Box::new(ProviderWizard::MainMenu { selected: 0 }));
             renderer.render(UiLine::CommandOutput(
                 "  Provider management — Add / Edit / Delete / Set default. Esc to cancel.\n"
                     .into(),
