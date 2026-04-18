@@ -1781,6 +1781,31 @@ fn execute_slash_command(
             renderer.render(UiLine::Welcome { model: ctx.model_name.clone(), working_dir: dir_display });
             renderer.flush();
         }
+        "session" => {
+            // Start fresh: tell the agent to drop conversation history,
+            // clear the scrollback + type-ahead queue + UI state, and
+            // redraw the welcome screen so the user sees they're in a
+            // brand-new session. Ports `/session` from the legacy TUI.
+            ctx.agent.cmd_tx.send(AgentCommand::ClearConversation).ok();
+            state.total_tokens = 0;
+            state.thinking_idx = 0;
+            state.on_turn_complete();
+            // Wipe screen + reset scrollback view, like a fresh launch.
+            let _ = std::io::Write::write_all(&mut std::io::stdout(), b"\x1b[2J\x1b[H");
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+            let dir_display = ctx.working_dir.to_string_lossy().to_string();
+            let dir_display = if let Ok(home) = std::env::var("HOME") {
+                dir_display.replacen(&home, "~", 1)
+            } else {
+                dir_display
+            };
+            renderer.render(UiLine::Welcome {
+                model: ctx.model_name.clone(),
+                working_dir: dir_display,
+            });
+            renderer.render(UiLine::CommandOutput("  New session started.\n".into()));
+            renderer.flush();
+        }
         "model" => {
             if ctx.config.providers.is_empty() {
                 renderer.render(UiLine::CommandOutput(

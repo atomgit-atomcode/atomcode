@@ -56,6 +56,7 @@ const BUILTIN_COMMANDS: &[Command] = &[
     Command { name: "cd",      desc: "Change working directory" },
     Command { name: "diff",    desc: "Show git diff" },
     Command { name: "clear",   desc: "Clear screen" },
+    Command { name: "session", desc: "Start a new session (clears conversation)" },
     Command { name: "cost",    desc: "Show token cost" },
     Command { name: "undo",    desc: "Undo last change (not yet supported)" },
     Command { name: "help",    desc: "Show this help" },
