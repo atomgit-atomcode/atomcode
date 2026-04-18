@@ -53,6 +53,7 @@ const BUILTIN_COMMANDS: &[Command] = &[
     Command { name: "provider", desc: "Manage providers (add / edit / delete)" },
     Command { name: "status",  desc: "Show session status" },
     Command { name: "config",  desc: "Show config path" },
+    Command { name: "reload",  desc: "Reload ~/.atomcode/config.toml from disk" },
     Command { name: "cd",      desc: "Change working directory" },
     Command { name: "diff",    desc: "Show git diff" },
     Command { name: "clear",   desc: "Clear screen" },

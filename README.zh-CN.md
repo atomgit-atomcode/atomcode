@@ -171,20 +171,26 @@ Select provider:
 
 ### 2. 配置
 
-配置文件位于 `~/.atomcode/config.toml`：
+配置文件位于 `~/.atomcode/config.toml`，最小单 provider 样例：
 
 ```toml
 default_provider = "deepseek"
 
 [providers.deepseek]
-provider_type = "openai"
-api_key = "sk-..."
-model = "deepseek-chat"
-base_url = "https://api.deepseek.com/v1"
+type           = "openai"
+api_key        = "sk-..."
+model          = "deepseek-chat"
+base_url       = "https://api.deepseek.com/v1"
 context_window = 64000
 ```
 
-可以配置多个 provider，用 `/model` 或 `/provider` 切换。
+可以配置多个 provider，用 `/model` 或 `/provider` 切换。完整示例
+（涵盖 Claude / OpenAI / OpenAI-兼容 endpoint 如 DeepSeek / GLM /
+SiliconFlow / OpenRouter / Ollama，以及 `[datalog]` 段）见
+[`docs/config.example.toml`](docs/config.example.toml)——拷出来按需改。
+
+手动改完 `config.toml` 后，在 atomcode 里执行 `/reload` 重新加载配置，
+不用重启。
 
 ### 3. 开始编码
 

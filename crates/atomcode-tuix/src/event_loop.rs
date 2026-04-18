@@ -1772,6 +1772,41 @@ fn execute_slash_command(
             renderer.render(UiLine::CommandOutput(txt));
             renderer.flush();
         }
+        "reload" => {
+            // Re-read ~/.atomcode/config.toml from disk and push it to the
+            // running daemon. Streaming-safe: the agent picks the new config
+            // up on the *next* turn; anything already in-flight finishes on
+            // the old config (ReloadConfig is queued behind the current
+            // AgentCommand stream, not a hot swap).
+            let path = Config::default_path();
+            match Config::load(&path) {
+                Ok(new_cfg) => {
+                    let new_default = new_cfg.default_provider.clone();
+                    let new_model = new_cfg
+                        .providers
+                        .get(&new_default)
+                        .map(|p| p.model.clone())
+                        .unwrap_or_else(|| new_default.clone());
+                    ctx.config = new_cfg.clone();
+                    ctx.model_name = new_model.clone();
+                    ctx.agent
+                        .cmd_tx
+                        .send(AgentCommand::ReloadConfig(new_cfg))
+                        .ok();
+                    renderer.render(UiLine::CommandOutput(format!(
+                        "  Config reloaded. Active: {} · {}\n",
+                        new_default, new_model,
+                    )));
+                }
+                Err(e) => {
+                    renderer.render(UiLine::Error(format!(
+                        "reload failed: {} (kept previous config)",
+                        e
+                    )));
+                }
+            }
+            renderer.flush();
+        }
         "clear" => {
             // Pure-append clear: use terminal's own clear sequence. OK because
             // scrollback is preserved by most terminals with \x1b[3J being optional.

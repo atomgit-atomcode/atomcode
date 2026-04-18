@@ -171,20 +171,29 @@ Select provider:
 
 ### 2. Configuration
 
-Config is stored at `~/.atomcode/config.toml`:
+Config is stored at `~/.atomcode/config.toml`. A minimal single-provider
+setup looks like this:
 
 ```toml
 default_provider = "deepseek"
 
 [providers.deepseek]
-provider_type = "openai"
-api_key = "sk-..."
-model = "deepseek-chat"
-base_url = "https://api.deepseek.com/v1"
+type           = "openai"
+api_key        = "sk-..."
+model          = "deepseek-chat"
+base_url       = "https://api.deepseek.com/v1"
 context_window = 64000
 ```
 
-You can configure multiple providers and switch between them with `/model` or `/provider`.
+You can declare multiple providers and switch between them with `/model`
+or `/provider`. A **complete reference** covering Claude / OpenAI /
+OpenAI-compatible endpoints (DeepSeek, GLM, SiliconFlow, OpenRouter...) /
+Ollama, plus the `[datalog]` section, lives at
+[`docs/config.example.toml`](docs/config.example.toml) — copy and edit the
+bits you need.
+
+After editing `config.toml` by hand, run `/reload` inside atomcode to pick
+up the changes without restarting.
 
 ### 3. Start Coding
 

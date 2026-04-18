@@ -1,0 +1,109 @@
+# AtomCode configuration (~/.atomcode/config.toml)
+#
+# Copy this file to ~/.atomcode/config.toml, fill in your API keys, and set
+# `default_provider` to the entry you want to use at startup. You can also
+# add providers interactively with `/provider` inside atomcode and switch
+# between them with `/model`.
+#
+# All fields except `type` and `model` are optional; sensible defaults kick
+# in for the rest (context_window, max_tokens, base_url, etc.).
+
+# ── Which provider is active at startup ──────────────────────────────
+# Must match one of the [providers.X] table names below.
+default_provider = "claude"
+
+
+# ── Claude (Anthropic) ───────────────────────────────────────────────
+[providers.claude]
+type           = "claude"
+api_key        = "sk-ant-..."
+model          = "claude-sonnet-4-5"
+# base_url     = "https://api.anthropic.com"      # override only if routing
+context_window = 200000
+# max_tokens   = 8192                             # defaults to context_window / 4
+
+
+# ── OpenAI ───────────────────────────────────────────────────────────
+[providers.openai]
+type           = "openai"
+api_key        = "sk-..."
+model          = "gpt-4o"
+context_window = 128000
+
+
+# ── OpenAI-compatible: DeepSeek ──────────────────────────────────────
+# Works for any provider that speaks the OpenAI chat-completions API
+# (DeepSeek, Moonshot, Qwen, Zhipu, Together, SiliconFlow, OpenRouter...).
+# The only thing that changes is `base_url` + `model` + `api_key`.
+[providers.deepseek]
+type           = "openai"
+api_key        = "sk-..."
+model          = "deepseek-chat"
+base_url       = "https://api.deepseek.com/v1"
+context_window = 64000
+
+
+# ── OpenAI-compatible: Zhipu GLM (multimodal-capable) ────────────────
+[providers.glm]
+type           = "openai"
+api_key        = "..."
+model          = "glm-4-plus"
+base_url       = "https://open.bigmodel.cn/api/paas/v4"
+context_window = 128000
+
+
+# ── OpenAI-compatible: SiliconFlow (Pro endpoint) ────────────────────
+[providers.siliconflow]
+type           = "openai"
+api_key        = "sk-..."
+model          = "Pro/zai-org/GLM-5"
+base_url       = "https://api.siliconflow.cn/v1"
+context_window = 128000
+
+
+# ── OpenAI-compatible: OpenRouter ────────────────────────────────────
+[providers.openrouter]
+type           = "openai"
+api_key        = "sk-or-v1-..."
+model          = "anthropic/claude-sonnet-4"
+base_url       = "https://openrouter.ai/api/v1"
+context_window = 200000
+
+
+# ── Ollama (local) ───────────────────────────────────────────────────
+# No api_key needed. Make sure `ollama serve` is running and the model
+# is pulled (`ollama pull qwen2.5-coder`).
+[providers.ollama]
+type           = "ollama"
+model          = "qwen2.5-coder:14b"
+base_url       = "http://localhost:11434"
+context_window = 32768
+
+
+# ── AtomGit (OAuth) ──────────────────────────────────────────────────
+# Populated automatically after `/login` — you don't normally hand-edit
+# this section. `/logout` removes it.
+# [providers.atomgit]
+# type    = "openai"
+# model   = "glm-4.5"
+# base_url = "https://api.atomgit.com/v1"
+# (api_key lives in ~/.atomcode/auth.toml, not here.)
+
+
+# ── Per-turn datalog settings ────────────────────────────────────────
+# Each turn writes a markdown file (plus a .jsonl of raw LLM requests)
+# so you can inspect what the agent actually saw.
+# - enabled = false        -> disable logging entirely
+# - dir unset (default)    -> writes to <working_dir>/datalog/ (follows /cd)
+# - dir = "/abs/path"      -> absolute, fixed (unaffected by /cd)
+# - dir = "~/sub"          -> expanded from $HOME, fixed
+# - dir = "rel/path"       -> joined with current working_dir, follows /cd
+[datalog]
+enabled = true
+# dir = "~/.atomcode/datalog"
+
+
+# ── Optional: remember the last /cd directory ────────────────────────
+# Populated on `/cd`; atomcode restores it on startup. Hand-edit only
+# if you want to pin a default working directory.
+# default_workdir = "~/project/myrepo"
