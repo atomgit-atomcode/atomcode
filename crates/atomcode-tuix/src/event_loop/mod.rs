@@ -398,6 +398,139 @@ mod buffer_tests {
     }
 }
 
+#[cfg(test)]
+mod menu_tests {
+    use super::*;
+
+    #[test]
+    fn non_slash_input_returns_no_menu() {
+        let reg = CommandRegistry::builtin();
+        assert!(build_menu_items("hello world", &reg).is_none());
+    }
+
+    #[test]
+    fn slash_prefix_returns_all_commands() {
+        let reg = CommandRegistry::builtin();
+        let items = build_menu_items("/", &reg).expect("menu should show for '/'");
+        assert!(!items.is_empty(), "builtin registry should have commands");
+    }
+
+    #[test]
+    fn slash_with_filter_narrows_list() {
+        let reg = CommandRegistry::builtin();
+        let all = build_menu_items("/", &reg).unwrap();
+        let filtered = build_menu_items("/he", &reg).unwrap_or_default();
+        assert!(
+            filtered.len() < all.len(),
+            "prefix '/he' should filter builtin commands"
+        );
+        // Every filtered entry must start with "he".
+        for (name, _) in &filtered {
+            assert!(
+                name.starts_with("he"),
+                "prefix filter leaked non-matching '{}'",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn whitespace_after_slash_closes_menu() {
+        // Once the user types args, menu goes away so arrow keys don't
+        // start navigating a stale palette.
+        let reg = CommandRegistry::builtin();
+        assert!(build_menu_items("/cd ", &reg).is_none());
+        assert!(build_menu_items("/cd /tmp", &reg).is_none());
+    }
+
+    #[test]
+    fn slash_with_no_matches_returns_none() {
+        let reg = CommandRegistry::builtin();
+        assert!(build_menu_items("/zzznomatch", &reg).is_none());
+    }
+}
+
+#[cfg(test)]
+mod tool_format_tests {
+    use super::*;
+
+    #[test]
+    fn display_tool_name_snake_to_pascal() {
+        assert_eq!(display_tool_name("read_file"), "ReadFile");
+        assert_eq!(display_tool_name("search_replace"), "SearchReplace");
+        assert_eq!(display_tool_name("bash"), "Bash");
+    }
+
+    #[test]
+    fn display_tool_name_handles_edge_cases() {
+        assert_eq!(display_tool_name(""), "");
+        assert_eq!(display_tool_name("x"), "X");
+        assert_eq!(display_tool_name("x_"), "X");
+        assert_eq!(display_tool_name("_x"), "X");
+    }
+
+    #[test]
+    fn format_tool_detail_read_file_basename() {
+        let args = r#"{"file_path":"/abs/path/to/foo.rs"}"#;
+        assert_eq!(format_tool_detail("read_file", args), "foo.rs");
+    }
+
+    #[test]
+    fn format_tool_detail_read_symbol_combines_symbol_and_file() {
+        let args = r#"{"symbol":"parse","file_path":"src/lexer.rs"}"#;
+        assert_eq!(format_tool_detail("read_symbol", args), "parse in lexer.rs");
+    }
+
+    #[test]
+    fn format_tool_detail_bash_truncates_long_commands() {
+        let args = format!(
+            r#"{{"command":"{}"}}"#,
+            "a".repeat(200)
+        );
+        let out = format_tool_detail("bash", &args);
+        assert!(
+            out.len() <= 63, // 60-cell budget + possible trailing ellipsis bytes
+            "bash detail should truncate: len={} `{}`",
+            out.len(),
+            out
+        );
+    }
+
+    #[test]
+    fn format_tool_detail_unknown_tool_falls_back_to_common_keys() {
+        // Unknown tool but args carry `file_path` — fallback uses it.
+        let args = r#"{"file_path":"/tmp/a.txt","extra":"x"}"#;
+        let out = format_tool_detail("my_custom_tool", args);
+        assert!(!out.is_empty(), "fallback should find file_path");
+    }
+
+    #[test]
+    fn format_tool_detail_invalid_json_returns_empty() {
+        let out = format_tool_detail("read_file", "not json");
+        assert_eq!(out, "");
+    }
+
+    #[test]
+    fn summarise_single_line_returned_as_is() {
+        assert_eq!(summarise("ok"), "ok");
+    }
+
+    #[test]
+    fn summarise_multi_line_adds_line_count() {
+        let out = summarise("first line\nsecond line\nthird line");
+        assert!(out.starts_with("first line"));
+        assert!(out.contains("(3 lines)"));
+    }
+
+    #[test]
+    fn summarise_empty_string_has_fallback() {
+        let out = summarise("");
+        // Empty input: `lines()` yields nothing, so first falls back
+        // to "(no output)" and n==0 means no " (N lines)" suffix.
+        assert!(out.contains("(no output)"), "got: {}", out);
+    }
+}
+
 pub(crate) enum BufferResult {
     NoOp,
     Redraw,

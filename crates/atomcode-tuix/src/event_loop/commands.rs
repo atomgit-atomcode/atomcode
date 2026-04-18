@@ -416,3 +416,95 @@ fn run_login_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx) -> Result<()> 
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Create a subdir inside a tempdir and return both. Paths are
+    /// canonicalized because `resolve_cd` canonicalizes its output, and
+    /// on macOS `/var/folders/...` → `/private/var/folders/...`.
+    fn make_dirs() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cwd = tmp.path().canonicalize().expect("canon cwd");
+        let sub = cwd.join("sub");
+        std::fs::create_dir(&sub).expect("mkdir sub");
+        let sub = sub.canonicalize().expect("canon sub");
+        (tmp, cwd, sub)
+    }
+
+    #[test]
+    fn relative_path_resolves_against_cwd() {
+        let (_tmp, cwd, sub) = make_dirs();
+        let got = resolve_cd("sub", &cwd, None).expect("relative resolves");
+        assert_eq!(got, sub);
+    }
+
+    #[test]
+    fn absolute_path_ignores_cwd() {
+        let (_tmp, _cwd, sub) = make_dirs();
+        let alt_cwd = PathBuf::from("/"); // unrelated cwd
+        let got = resolve_cd(sub.to_str().unwrap(), &alt_cwd, None)
+            .expect("absolute resolves");
+        assert_eq!(got, sub);
+    }
+
+    #[test]
+    fn dash_uses_previous_dir() {
+        let (_tmp, cwd, sub) = make_dirs();
+        let got = resolve_cd("-", &sub, Some(&cwd)).expect("dash uses prev");
+        assert_eq!(got, cwd);
+    }
+
+    #[test]
+    fn dash_without_previous_errors() {
+        let (_tmp, cwd, _sub) = make_dirs();
+        let err = resolve_cd("-", &cwd, None).expect_err("dash w/o prev");
+        assert!(err.contains("No previous directory"), "got: {}", err);
+    }
+
+    #[test]
+    fn nonexistent_path_errors() {
+        let (_tmp, cwd, _sub) = make_dirs();
+        let err = resolve_cd("nope-does-not-exist", &cwd, None)
+            .expect_err("nonexistent errors");
+        assert!(err.contains("nope-does-not-exist"), "got: {}", err);
+    }
+
+    #[test]
+    fn file_path_rejected_with_not_a_directory() {
+        let (_tmp, cwd, _sub) = make_dirs();
+        let file = cwd.join("a.txt");
+        std::fs::write(&file, "hi").expect("write");
+        let err = resolve_cd(file.to_str().unwrap(), &cwd, None)
+            .expect_err("file is not a dir");
+        assert!(err.contains("Not a directory"), "got: {}", err);
+    }
+
+    #[test]
+    fn tilde_expands_to_home() {
+        // Only run when HOME is actually resolvable; skip quietly on
+        // hosts where it isn't (some CI sandboxes).
+        let Some(home) = crate::platform::home_dir() else {
+            return;
+        };
+        let Ok(canon_home) = home.canonicalize() else {
+            return;
+        };
+        let (_tmp, cwd, _sub) = make_dirs();
+        let got = resolve_cd("~", &cwd, None).expect("~ resolves");
+        assert_eq!(got, canon_home);
+    }
+
+    #[test]
+    fn build_oauth_provider_has_expected_defaults() {
+        // Guardrail against accidental edits to the OAuth-provider
+        // seed values (api_key must be None; base_url must point to
+        // the AtomGit gateway).
+        let p = build_oauth_provider();
+        assert_eq!(p.provider_type, "openai");
+        assert!(p.api_key.is_none(), "api_key must be None — loaded from auth.toml");
+        assert_eq!(p.base_url.as_deref(), Some("https://api-ai.gitcode.com/v1"));
+        assert!(p.context_window > 0);
+    }
+}
