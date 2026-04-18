@@ -145,10 +145,21 @@ impl<W: Write + Send> AnsiRenderer<W> {
     /// `flush_deferred` (on the event-loop's 20ms timer) and by any
     /// immediate render that needs to preserve paint order (footer
     /// must redraw below the content write).
+    ///
+    /// **Must flush after dispatch.** The event loop's `renderer.render()
+    /// + renderer.flush()` pair is how bytes normally reach the terminal;
+    /// a parked paint drained by the 5ms deferred tick has no matching
+    /// `renderer.flush()` from the caller, so without this explicit flush
+    /// the ANSI bytes sit in BufWriter's 8KB buffer and don't show up on
+    /// screen until the *next* user-triggered render forces a flush.
+    /// Symptom: type "你好好" via IME, see only "你" until pressing any
+    /// subsequent key — that key's own render.flush() finally pushes the
+    /// parked "你好好" bytes out.
     fn paint_pending_input(&mut self) {
         if let Some(line) = self.throttle.take_pending() {
             self.dispatch_unthrottled(line);
             self.throttle.mark_painted();
+            let _ = self.out.flush();
         }
     }
 
