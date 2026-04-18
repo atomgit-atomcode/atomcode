@@ -1,5 +1,5 @@
-use crate::tool::{ToolCall, ToolResult};
 use crate::tool::result_store::ToolResultRef;
+use crate::tool::{ToolCall, ToolResult};
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Role {
@@ -52,7 +52,8 @@ impl Message {
             MessageContent::Text(s) => s.len(),
             MessageContent::AssistantWithToolCalls { text, tool_calls } => {
                 let text_len = text.as_ref().map_or(0, |t| t.len());
-                let calls_len: usize = tool_calls.iter()
+                let calls_len: usize = tool_calls
+                    .iter()
                     .map(|tc| tc.name.len() + tc.arguments.len() + 20)
                     .sum();
                 text_len + calls_len
@@ -89,11 +90,14 @@ impl Message {
                     }
                 } else {
                     let first_line = r.output.lines().next().unwrap_or("Error");
-                    format!("FAILED: {}", if first_line.chars().count() > 80 {
-                        format!("{}...", first_line.chars().take(77).collect::<String>())
-                    } else {
-                        first_line.to_string()
-                    })
+                    format!(
+                        "FAILED: {}",
+                        if first_line.chars().count() > 80 {
+                            format!("{}...", first_line.chars().take(77).collect::<String>())
+                        } else {
+                            first_line.to_string()
+                        }
+                    )
                 };
                 Message {
                     role: self.role.clone(),
@@ -112,7 +116,10 @@ impl Message {
 
     /// Returns true if this message is a tool result (either inline or ref).
     pub fn is_tool_result(&self) -> bool {
-        matches!(self.content, MessageContent::ToolResult(_) | MessageContent::ToolResultRef(_))
+        matches!(
+            self.content,
+            MessageContent::ToolResult(_) | MessageContent::ToolResultRef(_)
+        )
     }
 
     /// Extract call_id from tool result variants.
@@ -147,12 +154,12 @@ impl Message {
 fn is_file_read_output(output: &str) -> bool {
     // read_file outputs lines like "   1| package com.devpress..."
     let first_lines: Vec<&str> = output.lines().take(3).collect();
-    first_lines.len() >= 2 && first_lines.iter().any(|l| {
-        let trimmed = l.trim_start();
-        // Match pattern: digits followed by "| "
-        trimmed.chars().take_while(|c| c.is_ascii_digit()).count() > 0
-            && trimmed.contains("| ")
-    })
+    first_lines.len() >= 2
+        && first_lines.iter().any(|l| {
+            let trimmed = l.trim_start();
+            // Match pattern: digits followed by "| "
+            trimmed.chars().take_while(|c| c.is_ascii_digit()).count() > 0 && trimmed.contains("| ")
+        })
 }
 
 /// Compress a read_file result to a skeleton: keep import lines, function/class
@@ -165,13 +172,36 @@ fn compress_file_to_skeleton(output: &str) -> String {
 
     // Function/class/struct signature keywords
     let sig_keywords = [
-        "fn ", "pub fn ", "async fn ", "pub async fn ",
-        "def ", "class ", "function ", "func ",
-        "export ", "import ", "const ", "let ",
-        "public ", "private ", "protected ",
-        "interface ", "type ", "struct ", "enum ", "impl ",
-        "<template", "</template", "<script", "</script", "<style", "</style",
-        "package ", "use ", "from ", "#include",
+        "fn ",
+        "pub fn ",
+        "async fn ",
+        "pub async fn ",
+        "def ",
+        "class ",
+        "function ",
+        "func ",
+        "export ",
+        "import ",
+        "const ",
+        "let ",
+        "public ",
+        "private ",
+        "protected ",
+        "interface ",
+        "type ",
+        "struct ",
+        "enum ",
+        "impl ",
+        "<template",
+        "</template",
+        "<script",
+        "</script",
+        "<style",
+        "</style",
+        "package ",
+        "use ",
+        "from ",
+        "#include",
     ];
 
     for line in &lines {
@@ -185,7 +215,7 @@ fn compress_file_to_skeleton(output: &str) -> String {
 
         // Keep empty lines between sections (but not consecutive)
         if trimmed.is_empty() {
-            if skeleton.last().map_or(true, |l: &&str| !l.trim().is_empty()) {
+            if skeleton.last().is_none_or(|l: &&str| !l.trim().is_empty()) {
                 // Don't add empty lines to skeleton
             }
             continue;
@@ -195,7 +225,7 @@ fn compress_file_to_skeleton(output: &str) -> String {
         let indent = content.len() - content.trim_start().len();
         let is_signature = indent <= 4 && sig_keywords.iter().any(|kw| trimmed.starts_with(kw));
         let is_decorator = trimmed.starts_with('@') || trimmed.starts_with("#[");
-        let _is_close = trimmed == "}" || trimmed == "}" || trimmed.starts_with("})");
+        // let _is_close = trimmed == "}" || trimmed == "}" || trimmed.starts_with("})");
 
         if is_signature || is_decorator {
             skeleton.push(*line);
@@ -208,7 +238,10 @@ fn compress_file_to_skeleton(output: &str) -> String {
         return format!("{} ({} lines total)", first, total);
     }
 
-    let mut result = format!("[File skeleton — {} lines total, use edit_file with start_line/end_line to edit:]\n", total);
+    let mut result = format!(
+        "[File skeleton — {} lines total, use edit_file with start_line/end_line to edit:]\n",
+        total
+    );
     for line in &skeleton {
         result.push_str(line);
         result.push('\n');
