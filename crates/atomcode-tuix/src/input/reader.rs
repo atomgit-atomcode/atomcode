@@ -152,9 +152,19 @@ fn run(
             Err(_) => return,
         };
         let msg = match ev {
-            Event::Key(k) => InputEvent::Key(k),
-            Event::Paste(p) => InputEvent::Paste(p),
-            Event::Resize(_, _) | Event::Mouse(_) | Event::FocusGained | Event::FocusLost => {
+            Event::Key(k) => {
+                crate::tuix_trace!("RD", "key {:?} {:?}", k.kind, k.code);
+                InputEvent::Key(k)
+            }
+            Event::Paste(p) => {
+                crate::tuix_trace!("RD", "paste len={}", p.len());
+                InputEvent::Paste(p)
+            }
+            Event::Resize(w, h) => {
+                crate::tuix_trace!("RD", "resize {}x{}", w, h);
+                continue;
+            }
+            Event::Mouse(_) | Event::FocusGained | Event::FocusLost => {
                 continue;
             }
         };

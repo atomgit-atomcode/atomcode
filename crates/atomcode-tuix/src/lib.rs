@@ -11,6 +11,7 @@ pub mod sanitize;
 pub mod state;
 pub mod terminal;
 pub mod think;
+pub mod trace;
 pub mod width;
 
 use anyhow::Result;

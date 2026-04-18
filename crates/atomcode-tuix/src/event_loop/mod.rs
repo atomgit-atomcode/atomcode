@@ -605,6 +605,13 @@ pub async fn run_loop(
 ) -> Result<()> {
     let mut app = App::new();
 
+    crate::tuix_trace!(
+        "SES",
+        "run_loop start model={} cwd={}",
+        ctx.model_name,
+        ctx.working_dir.display()
+    );
+
     // Draw welcome + initial prompt
     let dir_display = crate::platform::collapse_home(
         &ctx.working_dir.to_string_lossy(),
@@ -721,7 +728,11 @@ pub async fn run_loop(
             // ── Agent events ──
             maybe = ctx.agent.event_rx.recv(), if matches!(app.state.phase, UiPhase::Streaming) => {
                 let Some(ev) = maybe else { break };
+                let pre_phase = app.state.phase;
                 handle_agent_event(ev, &mut app.state, &mut app.think, renderer, &mut app.pending_tools);
+                if pre_phase != app.state.phase {
+                    crate::tuix_trace!("PH", "{:?} -> {:?}", pre_phase, app.state.phase);
+                }
                 if matches!(app.state.phase, UiPhase::Streaming)
                     && last_spinner_draw.elapsed() >= Duration::from_millis(100)
                 {
@@ -735,12 +746,14 @@ pub async fn run_loop(
                     // back to Streaming. Remaining queue entries
                     // fire in order on subsequent completions.
                     if let Some(queued) = app.message_queue.pop_front() {
+                        crate::tuix_trace!("QUE", "pop_front remaining={}", app.message_queue.len());
                         renderer.render(UiLine::User(queued.clone()));
                         renderer.flush();
                         ctx.agent.cmd_tx.send(AgentCommand::SendMessage(queued)).ok();
                         app.state.on_submit();
                         draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
                     } else {
+                        crate::tuix_trace!("PH", "turn_end -> Idle, queue empty, redraw_idle");
                         redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
                     }
                 }
@@ -804,7 +817,11 @@ pub async fn run_loop(
             // ── Agent events ──
             maybe = ctx.agent.event_rx.recv(), if matches!(app.state.phase, UiPhase::Streaming) => {
                 let Some(ev) = maybe else { break };
+                let pre_phase = app.state.phase;
                 handle_agent_event(ev, &mut app.state, &mut app.think, renderer, &mut app.pending_tools);
+                if pre_phase != app.state.phase {
+                    crate::tuix_trace!("PH", "{:?} -> {:?}", pre_phase, app.state.phase);
+                }
                 if matches!(app.state.phase, UiPhase::Streaming)
                     && last_spinner_draw.elapsed() >= Duration::from_millis(100)
                 {
@@ -813,12 +830,14 @@ pub async fn run_loop(
                 }
                 if matches!(app.state.phase, UiPhase::Idle) {
                     if let Some(queued) = app.message_queue.pop_front() {
+                        crate::tuix_trace!("QUE", "pop_front remaining={}", app.message_queue.len());
                         renderer.render(UiLine::User(queued.clone()));
                         renderer.flush();
                         ctx.agent.cmd_tx.send(AgentCommand::SendMessage(queued)).ok();
                         app.state.on_submit();
                         draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
                     } else {
+                        crate::tuix_trace!("PH", "turn_end -> Idle, queue empty, redraw_idle");
                         redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
                     }
                 }
@@ -846,6 +865,19 @@ fn handle_input(
     ev: InputEvent,
 ) -> Result<()> {
     use crate::modals::ModalAction;
+
+    crate::tuix_trace!(
+        "IN",
+        "phase={:?} modal={} qlen={} ev={}",
+        app.state.phase,
+        app.active_modal.is_some(),
+        app.message_queue.len(),
+        match &ev {
+            InputEvent::Paste(t) => format!("paste({})", t.len()),
+            InputEvent::Eof => "eof".into(),
+            InputEvent::Key(k) => format!("key({:?},{:?})", k.kind, k.code),
+        }
+    );
 
     match ev {
         InputEvent::Paste(text) => {
@@ -1007,7 +1039,20 @@ fn handle_idle_key(
     }
 
     let action = classify(code, modifiers);
-    match app.buf.apply(action, ctx.history.entries(), &ctx.commands) {
+    let result = app.buf.apply(action, ctx.history.entries(), &ctx.commands);
+    crate::tuix_trace!(
+        "KEY",
+        "idle result={} buf_len={} cursor={}",
+        match &result {
+            BufferResult::NoOp => "NoOp",
+            BufferResult::Redraw => "Redraw",
+            BufferResult::Commit(_) => "Commit",
+            BufferResult::Exit => "Exit",
+        },
+        app.buf.text.len(),
+        app.buf.cursor
+    );
+    match result {
         BufferResult::NoOp => {}
         BufferResult::Redraw => {
             // Rebuild menu after buf change.
@@ -1208,6 +1253,7 @@ fn handle_streaming_key(
             let expanded = app.buf.expand_pastes(&line);
             ctx.history.push(line.clone());
             app.message_queue.push_back(expanded);
+            crate::tuix_trace!("QUE", "push_back len={}", app.message_queue.len());
             app.buf.text.clear();
             app.buf.cursor = 0;
             app.buf.clear_pastes();

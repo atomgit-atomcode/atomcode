@@ -50,10 +50,17 @@ impl InputThrottle {
     /// Has enough time elapsed since the last input-driven paint to let
     /// a new one through? Leading edge (`None`) always returns true.
     pub fn window_elapsed(&self) -> bool {
-        match self.last_paint {
+        let elapsed = match self.last_paint {
             None => true,
             Some(t) => t.elapsed() >= Duration::from_millis(INPUT_REDRAW_THROTTLE_MS),
-        }
+        };
+        crate::tuix_trace!(
+            "THR",
+            "window_elapsed={} since_last={:?}",
+            elapsed,
+            self.last_paint.map(|t| t.elapsed())
+        );
+        elapsed
     }
 
     /// Record that we just painted an input-driven render. Also drops
@@ -61,13 +68,16 @@ impl InputThrottle {
     pub fn mark_painted(&mut self) {
         self.last_paint = Some(Instant::now());
         self.pending = None;
+        crate::tuix_trace!("THR", "mark_painted");
     }
 
     /// Park an input-driven render for the trailing-edge paint. If one
     /// was already parked it's replaced (the latest state wins — the
     /// user doesn't want to see an intermediate buffer).
     pub fn park_pending(&mut self, line: UiLine) {
+        let had_prior = self.pending.is_some();
         self.pending = Some(line);
+        crate::tuix_trace!("THR", "park_pending replaced_prior={}", had_prior);
     }
 
     /// Take the parked payload (if any) and return it for painting.
@@ -87,6 +97,7 @@ impl InputThrottle {
     pub fn clear(&mut self) {
         self.last_paint = None;
         self.pending = None;
+        crate::tuix_trace!("THR", "clear");
     }
 }
 

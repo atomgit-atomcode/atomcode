@@ -160,10 +160,22 @@ impl Drop for TaskRenderer {
 fn run_worker(mut inner: Box<dyn Renderer>, cmd_rx: mpsc::Receiver<RenderCmd>) {
     while let Ok(cmd) = cmd_rx.recv() {
         match cmd {
-            RenderCmd::Line(line) => inner.render(line),
-            RenderCmd::Flush => inner.flush(),
-            RenderCmd::FlushDeferred => inner.flush_deferred(),
+            RenderCmd::Line(line) => {
+                crate::tuix_trace!("REN", "Line {}", ui_line_tag(&line));
+                inner.render(line);
+            }
+            RenderCmd::Flush => {
+                crate::tuix_trace!("REN", "Flush");
+                inner.flush();
+            }
+            RenderCmd::FlushDeferred => {
+                // Skip logging this to avoid flooding — the 20ms tick
+                // fires 50 times/sec even when nothing is pending, and
+                // throttle.rs already logs when it decides to paint.
+                inner.flush_deferred();
+            }
             RenderCmd::Ack { op, ack } => {
+                crate::tuix_trace!("REN", "Ack {:?}", op);
                 match op {
                     AckOp::Reset => inner.reset(),
                     AckOp::ClearScreen => inner.clear_screen(),
@@ -186,6 +198,32 @@ fn run_worker(mut inner: Box<dyn Renderer>, cmd_rx: mpsc::Receiver<RenderCmd>) {
     // Sender dropped without explicit Shutdown — still run shutdown so
     // the terminal isn't left in raw mode on abrupt exit paths.
     inner.shutdown();
+}
+
+/// Short tag for logging which UiLine variant the worker is processing.
+/// Keeps trace lines column-aligned so `grep Line` output is readable.
+fn ui_line_tag(l: &UiLine) -> &'static str {
+    match l {
+        UiLine::Welcome { .. } => "Welcome",
+        UiLine::User(_) => "User",
+        UiLine::AssistantText(_) => "AssistantText",
+        UiLine::AssistantLineBreak => "AssistantLineBreak",
+        UiLine::ToolCall { .. } => "ToolCall",
+        UiLine::ToolResult { .. } => "ToolResult",
+        UiLine::DiffLine { .. } => "DiffLine",
+        UiLine::DiffBlock(_) => "DiffBlock",
+        UiLine::ApprovalPrompt { .. } => "ApprovalPrompt",
+        UiLine::Error(_) => "Error",
+        UiLine::TurnCancelled => "TurnCancelled",
+        UiLine::TurnComplete => "TurnComplete",
+        UiLine::Spinner { .. } => "Spinner",
+        UiLine::StreamingBox { .. } => "StreamingBox",
+        UiLine::ClearTransient => "ClearTransient",
+        UiLine::InputPrompt { .. } => "InputPrompt",
+        UiLine::InputCommit => "InputCommit",
+        UiLine::CommandOutput(_) => "CommandOutput",
+        UiLine::TurnSeparator { .. } => "TurnSeparator",
+    }
 }
 
 #[cfg(test)]
