@@ -1766,9 +1766,33 @@ fn execute_slash_command(
             renderer.flush();
         }
         "config" => {
-            let txt = format!("  Provider: {}\n  Config: {}\n",
+            // Head: current active provider + config path so users know
+            // which provider is talking and where to edit.
+            let mut txt = format!(
+                "  Provider: {}\n  Config: {}\n\n",
                 ctx.config.default_provider,
-                Config::default_path().display());
+                Config::default_path().display(),
+            );
+            // Body: one minimal runnable example + pointer to the full
+            // reference so users know where to get Claude / OpenAI /
+            // Ollama variants without flooding the terminal here.
+            txt.push_str(
+                "  Example:\n\
+                 \n\
+                 ```toml\n\
+                 default_provider = \"deepseek\"\n\
+                 \n\
+                 [providers.deepseek]\n\
+                 type           = \"openai\"\n\
+                 api_key        = \"sk-...\"\n\
+                 model          = \"deepseek-chat\"\n\
+                 base_url       = \"https://api.deepseek.com/v1\"\n\
+                 context_window = 64000\n\
+                 ```\n\
+                 \n\
+                 Full reference: docs/config.example.toml (every field, every provider flavour).\n\
+                 Edit the file, then run /reload — no restart needed.\n",
+            );
             renderer.render(UiLine::CommandOutput(txt));
             renderer.flush();
         }
