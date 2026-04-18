@@ -6,6 +6,7 @@ use std::time::Duration;
 use anyhow::Result;
 use atomcode_core::agent::{AgentCommand, AgentEvent, AgentHandle, AgentPhase};
 use atomcode_core::config::Config;
+use atomcode_core::session::SessionManager;
 use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste, KeyCode, KeyEvent, KeyEventKind};
 use crossterm::execute;
 use tokio::sync::mpsc;
@@ -28,6 +29,17 @@ pub struct LoopCtx {
     pub history: History,
     pub input_rx: mpsc::UnboundedReceiver<InputEvent>,
     pub commands: CommandRegistry,
+    pub session_manager: SessionManager,
+    /// Shared "new version available" hint. Populated by the detached
+    /// version-check task spawned from `run()`; read by `build_status`
+    /// on each redraw. `None` = no hint (either check still pending,
+    /// network failed silently, or already up to date).
+    pub update_hint: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    /// Wake signal from the version-check task — one `()` sent when the
+    /// task resolves with a positive result. The event loop selects on
+    /// `wake_rx` and triggers an idle redraw so the hint appears without
+    /// waiting for the user's next keystroke.
+    pub wake_rx: mpsc::Receiver<()>,
 }
 
 /// Line-edit buffer for input composition. Byte-indexed cursor.
@@ -394,6 +406,7 @@ pub async fn run_loop(
     let mut menu = MenuState::new();
     let mut model_picker: Option<ModelPicker> = None;
     let mut provider_wizard: Option<ProviderWizard> = None;
+    let mut session_picker: Option<SessionPicker> = None;
     // Messages the user submitted while a turn was already running.
     // Drained one-at-a-time from the head whenever the current turn
     // finishes (TurnComplete / TurnCancelled / error → Idle). Matches
@@ -486,7 +499,7 @@ pub async fn run_loop(
 
             // ── Spinner tick (from background task) ──
             Some(()) = spin_rx.recv(), if matches!(state.phase, UiPhase::Streaming) => {
-                draw_spinner_now(&mut state, &buf, &ctx, renderer, message_queue.len());
+                draw_spinner_now(&mut state, &buf, &ctx, renderer, message_queue.len(), menu.selected);
                 last_spinner_draw = std::time::Instant::now();
             }
 
@@ -495,8 +508,16 @@ pub async fn run_loop(
                 let Some(ev) = maybe else { break };
                 handle_input(
                     ev, &mut state, &mut buf, &mut ctx, renderer, &mut menu,
-                    &mut model_picker, &mut provider_wizard, &mut message_queue,
+                    &mut model_picker, &mut provider_wizard, &mut session_picker, &mut message_queue,
                 )?;
+            }
+
+            // ── Version-check wake ──
+            // Fires once when the detached startup check resolves with a
+            // positive result. Idle-only: in Streaming the spinner tick
+            // redraws frequently enough that the hint picks up naturally.
+            Some(()) = ctx.wake_rx.recv(), if matches!(state.phase, UiPhase::Idle) => {
+                redraw_idle_plain(&buf, &state, &ctx, renderer);
             }
 
             // ── Agent events ──
@@ -506,7 +527,7 @@ pub async fn run_loop(
                 if matches!(state.phase, UiPhase::Streaming)
                     && last_spinner_draw.elapsed() >= Duration::from_millis(100)
                 {
-                    draw_spinner_now(&mut state, &buf, &ctx, renderer, message_queue.len());
+                    draw_spinner_now(&mut state, &buf, &ctx, renderer, message_queue.len(), menu.selected);
                     last_spinner_draw = std::time::Instant::now();
                 }
                 if matches!(state.phase, UiPhase::Idle) {
@@ -520,7 +541,7 @@ pub async fn run_loop(
                         renderer.flush();
                         ctx.agent.cmd_tx.send(AgentCommand::SendMessage(queued)).ok();
                         state.on_submit();
-                        draw_spinner_now(&mut state, &buf, &ctx, renderer, message_queue.len());
+                        draw_spinner_now(&mut state, &buf, &ctx, renderer, message_queue.len(), menu.selected);
                     } else {
                         redraw_idle_plain(&buf, &state, &ctx, renderer);
                     }
@@ -543,7 +564,7 @@ pub async fn run_loop(
                 state.on_resume();
                 match state.phase {
                     UiPhase::Streaming => {
-                        draw_spinner_now(&mut state, &buf, &ctx, renderer, message_queue.len());
+                        draw_spinner_now(&mut state, &buf, &ctx, renderer, message_queue.len(), menu.selected);
                         last_spinner_draw = std::time::Instant::now();
                     }
                     _ => {
@@ -559,7 +580,7 @@ pub async fn run_loop(
 
             // ── Spinner tick (from background task) ──
             Some(()) = spin_rx.recv(), if matches!(state.phase, UiPhase::Streaming) => {
-                draw_spinner_now(&mut state, &buf, &ctx, renderer, message_queue.len());
+                draw_spinner_now(&mut state, &buf, &ctx, renderer, message_queue.len(), menu.selected);
                 last_spinner_draw = std::time::Instant::now();
             }
 
@@ -568,8 +589,13 @@ pub async fn run_loop(
                 let Some(ev) = maybe else { break };
                 handle_input(
                     ev, &mut state, &mut buf, &mut ctx, renderer, &mut menu,
-                    &mut model_picker, &mut provider_wizard, &mut message_queue,
+                    &mut model_picker, &mut provider_wizard, &mut session_picker, &mut message_queue,
                 )?;
+            }
+
+            // ── Version-check wake ──
+            Some(()) = ctx.wake_rx.recv(), if matches!(state.phase, UiPhase::Idle) => {
+                redraw_idle_plain(&buf, &state, &ctx, renderer);
             }
 
             // ── Agent events ──
@@ -579,7 +605,7 @@ pub async fn run_loop(
                 if matches!(state.phase, UiPhase::Streaming)
                     && last_spinner_draw.elapsed() >= Duration::from_millis(100)
                 {
-                    draw_spinner_now(&mut state, &buf, &ctx, renderer, message_queue.len());
+                    draw_spinner_now(&mut state, &buf, &ctx, renderer, message_queue.len(), menu.selected);
                     last_spinner_draw = std::time::Instant::now();
                 }
                 if matches!(state.phase, UiPhase::Idle) {
@@ -593,7 +619,7 @@ pub async fn run_loop(
                         renderer.flush();
                         ctx.agent.cmd_tx.send(AgentCommand::SendMessage(queued)).ok();
                         state.on_submit();
-                        draw_spinner_now(&mut state, &buf, &ctx, renderer, message_queue.len());
+                        draw_spinner_now(&mut state, &buf, &ctx, renderer, message_queue.len(), menu.selected);
                     } else {
                         redraw_idle_plain(&buf, &state, &ctx, renderer);
                     }
@@ -624,6 +650,7 @@ fn handle_input(
     menu: &mut MenuState,
     model_picker: &mut Option<ModelPicker>,
     provider_wizard: &mut Option<ProviderWizard>,
+    session_picker: &mut Option<SessionPicker>,
     message_queue: &mut VecDeque<String>,
 ) -> Result<()> {
     match ev {
@@ -633,10 +660,11 @@ fn handle_input(
             if matches!(state.phase, UiPhase::Idle | UiPhase::Streaming)
                 && model_picker.is_none()
                 && provider_wizard.is_none()
+                && session_picker.is_none()
             {
                 buf.insert_paste(text);
                 if matches!(state.phase, UiPhase::Streaming) {
-                    draw_spinner_now(state, buf, ctx, renderer, message_queue.len());
+                    draw_spinner_now(state, buf, ctx, renderer, message_queue.len(), menu.selected);
                 } else {
                     redraw_idle_plain(&buf, &state, &ctx, renderer);
                 }
@@ -645,12 +673,17 @@ fn handle_input(
         InputEvent::Eof => {}
         InputEvent::Key(KeyEvent { kind: KeyEventKind::Release, .. }) => {}
         InputEvent::Key(KeyEvent { code, modifiers, .. }) => {
-            // Wizard takes priority over model picker, which takes
-            // priority over the normal phase handler.
+            // Wizard > session picker > model picker > normal phase handler.
+            // Exactly one modal can be active at a time — the command
+            // dispatcher opens them mutually exclusive.
             if provider_wizard.is_some() && matches!(state.phase, UiPhase::Idle) {
                 handle_provider_wizard_key(
                     code, modifiers, buf, state, ctx, renderer, provider_wizard,
                 )?;
+                return Ok(());
+            }
+            if session_picker.is_some() && matches!(state.phase, UiPhase::Idle) {
+                handle_session_picker_key(code, modifiers, buf, state, ctx, renderer, session_picker)?;
                 return Ok(());
             }
             if model_picker.is_some() && matches!(state.phase, UiPhase::Idle) {
@@ -660,10 +693,10 @@ fn handle_input(
             match state.phase {
                 UiPhase::Idle => handle_idle_key(
                     code, modifiers, state, buf, ctx, renderer, menu,
-                    model_picker, provider_wizard,
+                    model_picker, provider_wizard, session_picker,
                 )?,
                 UiPhase::Streaming => handle_streaming_key(
-                    code, modifiers, state, buf, ctx, renderer, message_queue,
+                    code, modifiers, state, buf, ctx, renderer, menu, message_queue,
                 )?,
                 UiPhase::Approval => handle_approval_key(code, state, ctx, renderer)?,
                 UiPhase::Suspended => {}
@@ -704,6 +737,64 @@ impl ModelPicker {
             providers,
             selected: 0,
         }
+    }
+}
+
+// ── SessionPicker: /resume modal ──
+//
+// Lists prior sessions for the current project, with type-to-filter search.
+// Mirrors the ModelPicker pattern: an Option<SessionPicker> lives in the
+// event loop; when Some, `redraw_idle` renders it as a MenuPayload above
+// the input box. Up/Down navigates, Enter loads, Esc cancels, typing
+// edits the query.
+
+pub struct SessionPicker {
+    /// All sessions for the project, pre-filtered to message_count > 0.
+    pub sessions: Vec<atomcode_core::session::SessionMeta>,
+    /// User-typed filter text. Empty string = show all.
+    pub query: String,
+    /// Indices into `sessions` that match `query` (case-insensitive substring).
+    pub filtered: Vec<usize>,
+    /// Index into `filtered`.
+    pub selected: usize,
+}
+
+impl SessionPicker {
+    pub fn open(sessions: Vec<atomcode_core::session::SessionMeta>) -> Self {
+        let filtered: Vec<usize> = (0..sessions.len()).collect();
+        Self { sessions, query: String::new(), filtered, selected: 0 }
+    }
+
+    pub fn update_filter(&mut self) {
+        let q = self.query.to_lowercase();
+        self.filtered = self
+            .sessions
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| q.is_empty() || s.name.to_lowercase().contains(&q))
+            .map(|(i, _)| i)
+            .collect();
+        self.selected = 0;
+    }
+
+    pub fn up(&mut self) {
+        self.selected = self.selected.saturating_sub(1);
+    }
+
+    pub fn down(&mut self) {
+        if self.filtered.is_empty() {
+            self.selected = 0;
+            return;
+        }
+        let max = self.filtered.len() - 1;
+        if self.selected < max {
+            self.selected += 1;
+        }
+    }
+
+    pub fn chosen_id(&self) -> Option<atomcode_core::session::SessionId> {
+        let i = *self.filtered.get(self.selected)?;
+        self.sessions.get(i).map(|s| s.id.clone())
     }
 }
 
@@ -837,6 +928,7 @@ fn handle_idle_key(
     menu: &mut MenuState,
     model_picker: &mut Option<ModelPicker>,
     provider_wizard: &mut Option<ProviderWizard>,
+    session_picker: &mut Option<SessionPicker>,
 ) -> Result<()> {
     // If the menu is active (buf starts with '/'), intercept navigation keys.
     let menu_items = build_menu_items(&buf.text, &ctx.commands);
@@ -869,9 +961,9 @@ fn handle_idle_key(
                 buf.text.clear();
                 buf.cursor = 0;
                 if let Some((cmd, arg)) = parse_slash_line(&committed) {
-                    execute_slash_command(cmd, arg, state, ctx, renderer, model_picker, provider_wizard)?;
+                    execute_slash_command(cmd, arg, state, ctx, renderer, model_picker, provider_wizard, session_picker)?;
                     if matches!(state.phase, UiPhase::Idle) {
-                        redraw_idle(buf, state, ctx, model_picker, renderer);
+                        redraw_idle(buf, state, ctx, model_picker, session_picker, renderer);
                     }
                 }
                 return Ok(());
@@ -915,9 +1007,9 @@ fn handle_idle_key(
             buf.clear_pastes();
             menu.selected = 0;
             if let Some((cmd, arg)) = parse_slash_line(&line) {
-                execute_slash_command(cmd, arg, state, ctx, renderer, model_picker, provider_wizard)?;
+                execute_slash_command(cmd, arg, state, ctx, renderer, model_picker, provider_wizard, session_picker)?;
                 if matches!(state.phase, UiPhase::Idle) {
-                    redraw_idle(buf, state, ctx, model_picker, renderer);
+                    redraw_idle(buf, state, ctx, model_picker, session_picker, renderer);
                 }
             } else {
                 ctx.history.push(line.clone());
@@ -971,15 +1063,21 @@ fn redraw_idle_plain(
     renderer.flush();
 }
 
-/// Redraw the idle footer, showing the model picker if active.
+/// Redraw the idle footer, showing the model picker or session picker if active.
+/// At most one picker is active at a time (the input handler enforces this),
+/// but the signature accepts both so call sites in picker-specific key handlers
+/// can pass `&None` for the inactive one.
 fn redraw_idle(
     buf: &Buffer,
     state: &UiState,
     ctx: &LoopCtx,
     model_picker: &Option<ModelPicker>,
+    session_picker: &Option<SessionPicker>,
     renderer: &mut dyn Renderer,
 ) {
-    let payload = model_picker.as_ref().map(|p| {
+    let payload = if let Some(p) = session_picker.as_ref() {
+        Some(build_session_menu_payload(p))
+    } else if let Some(p) = model_picker.as_ref() {
         let items: Vec<(String, String)> = p
             .providers
             .iter()
@@ -993,11 +1091,13 @@ fn redraw_idle(
                 (name.clone(), desc)
             })
             .collect();
-        crate::render::MenuPayload {
+        Some(crate::render::MenuPayload {
             items,
             selected: p.selected,
-        }
-    });
+        })
+    } else {
+        None
+    };
     renderer.render(UiLine::InputPrompt {
         buf: buf.text.clone(),
         cursor_byte: buf.cursor,
@@ -1005,6 +1105,44 @@ fn redraw_idle(
         status: build_status(state, ctx),
     });
     renderer.flush();
+}
+
+fn build_session_menu_payload(p: &SessionPicker) -> crate::render::MenuPayload {
+    let items: Vec<(String, String)> = p
+        .filtered
+        .iter()
+        .map(|&i| {
+            let s = &p.sessions[i];
+            let desc = format!(
+                "{} msgs · {}",
+                s.message_count,
+                humanize_age(s.updated_at),
+            );
+            (s.name.clone(), desc)
+        })
+        .collect();
+    crate::render::MenuPayload {
+        items,
+        selected: p.selected,
+    }
+}
+
+fn humanize_age(ts: u64) -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(ts);
+    let d = now.saturating_sub(ts);
+    if d < 60 {
+        "just now".into()
+    } else if d < 3600 {
+        format!("{}m ago", d / 60)
+    } else if d < 86400 {
+        format!("{}h ago", d / 3600)
+    } else {
+        format!("{}d ago", d / 86400)
+    }
 }
 
 /// Redraw the footer with the wizard's current menu/prompt. Text-input
@@ -1490,7 +1628,7 @@ fn handle_model_picker_key(
     match code {
         KeyCode::Up => {
             picker.selected = picker.selected.saturating_sub(1);
-            redraw_idle(buf, state, ctx, model_picker, renderer);
+            redraw_idle(buf, state, ctx, model_picker, &None, renderer);
         }
         KeyCode::Down => {
             let max = model_picker.as_ref().unwrap().providers.len().saturating_sub(1);
@@ -1498,41 +1636,162 @@ fn handle_model_picker_key(
             if picker.selected < max {
                 picker.selected += 1;
             }
-            redraw_idle(buf, state, ctx, model_picker, renderer);
+            redraw_idle(buf, state, ctx, model_picker, &None, renderer);
         }
         KeyCode::Enter => {
             let chosen = model_picker.as_ref().unwrap().providers[model_picker.as_ref().unwrap().selected].clone();
-            // Build new config with updated default_provider.
-            let mut new_config = ctx.config.clone();
-            new_config.default_provider = chosen.clone();
-            // Tell the agent to switch.
-            ctx.agent
-                .cmd_tx
-                .send(AgentCommand::ReloadConfig(new_config.clone()))
-                .ok();
-            // Update local state for the display.
-            let display = new_config
+            let display = ctx
+                .config
                 .providers
                 .get(&chosen)
                 .map(|p| p.model.clone())
                 .unwrap_or_else(|| chosen.clone());
-            ctx.config = new_config;
+            ctx.config.default_provider = chosen.clone();
             ctx.model_name = display.clone();
+            // Persist to config.toml + notify agent. Without this, the
+            // switch lives only in memory and the next startup reverts to
+            // whatever was last saved.
+            save_and_reload(ctx, renderer);
             *model_picker = None;
             renderer.render(UiLine::CommandOutput(format!(
                 "  Switched to {} · {}\n",
                 chosen, display
             )));
             renderer.flush();
-            redraw_idle(buf, state, ctx, model_picker, renderer);
+            redraw_idle(buf, state, ctx, model_picker, &None, renderer);
         }
         KeyCode::Esc => {
             *model_picker = None;
-            redraw_idle(buf, state, ctx, model_picker, renderer);
+            redraw_idle(buf, state, ctx, model_picker, &None, renderer);
         }
         _ => {}
     }
     Ok(())
+}
+
+/// Modal key handler while SessionPicker is active.
+///
+/// Up/Down navigates, Enter loads the selected session, Esc cancels.
+/// Printable chars + Backspace edit the filter query and re-run
+/// `update_filter()`. On Enter, the session is loaded via
+/// `SessionManager::load`, its messages are replayed into scrollback as
+/// semantic UiLines, and `AgentCommand::SetMessages` syncs the agent.
+fn handle_session_picker_key(
+    code: KeyCode,
+    modifiers: crossterm::event::KeyModifiers,
+    buf: &mut Buffer,
+    state: &mut UiState,
+    ctx: &mut LoopCtx,
+    renderer: &mut dyn Renderer,
+    session_picker: &mut Option<SessionPicker>,
+) -> Result<()> {
+    if session_picker.is_none() {
+        return Ok(());
+    }
+    match code {
+        KeyCode::Up => {
+            session_picker.as_mut().unwrap().up();
+            redraw_idle(buf, state, ctx, &None, session_picker, renderer);
+        }
+        KeyCode::Down => {
+            session_picker.as_mut().unwrap().down();
+            redraw_idle(buf, state, ctx, &None, session_picker, renderer);
+        }
+        KeyCode::Backspace => {
+            let p = session_picker.as_mut().unwrap();
+            p.query.pop();
+            p.update_filter();
+            redraw_idle(buf, state, ctx, &None, session_picker, renderer);
+        }
+        KeyCode::Char(c) if !modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => {
+            let p = session_picker.as_mut().unwrap();
+            p.query.push(c);
+            p.update_filter();
+            redraw_idle(buf, state, ctx, &None, session_picker, renderer);
+        }
+        KeyCode::Enter => {
+            let chosen = session_picker.as_ref().unwrap().chosen_id();
+            let Some(id) = chosen else {
+                // Filter matched nothing — ignore Enter.
+                return Ok(());
+            };
+            match ctx.session_manager.load(&id) {
+                Ok(session) => {
+                    *session_picker = None;
+                    replay_session(renderer, &session);
+                    ctx.agent
+                        .cmd_tx
+                        .send(AgentCommand::SetMessages(session.messages.clone()))
+                        .ok();
+                    state.on_turn_complete();
+                    redraw_idle(buf, state, ctx, &None, session_picker, renderer);
+                }
+                Err(e) => {
+                    renderer.render(UiLine::Error(format!("load session failed: {}", e)));
+                    renderer.flush();
+                    *session_picker = None;
+                    redraw_idle(buf, state, ctx, &None, session_picker, renderer);
+                }
+            }
+        }
+        KeyCode::Esc => {
+            *session_picker = None;
+            redraw_idle(buf, state, ctx, &None, session_picker, renderer);
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Emit historical session messages into scrollback as semantic UiLines,
+/// so the user sees the prior conversation before continuing.
+fn replay_session(renderer: &mut dyn Renderer, session: &atomcode_core::session::Session) {
+    use atomcode_core::conversation::message::{MessageContent, Role};
+    renderer.render(UiLine::TurnSeparator {
+        label: format!("resumed: {}", session.name),
+    });
+    for m in &session.messages {
+        match (&m.role, &m.content) {
+            (Role::User, MessageContent::Text(s)) => {
+                renderer.render(UiLine::User(s.clone()));
+            }
+            (Role::Assistant, MessageContent::Text(s)) => {
+                if !s.is_empty() {
+                    renderer.render(UiLine::AssistantText(s.clone()));
+                    renderer.render(UiLine::AssistantLineBreak);
+                }
+            }
+            (Role::Assistant, MessageContent::AssistantWithToolCalls { text, tool_calls }) => {
+                if let Some(t) = text {
+                    if !t.is_empty() {
+                        renderer.render(UiLine::AssistantText(t.clone()));
+                        renderer.render(UiLine::AssistantLineBreak);
+                    }
+                }
+                for tc in tool_calls {
+                    renderer.render(UiLine::ToolCall {
+                        name: tc.name.clone(),
+                        detail: format_tool_detail(&tc.name, &tc.arguments),
+                    });
+                }
+            }
+            (Role::Tool, MessageContent::ToolResult(r)) => {
+                renderer.render(UiLine::ToolResult {
+                    success: r.success,
+                    summary: summarise(&r.output),
+                });
+            }
+            (Role::Tool, MessageContent::ToolResultRef(r)) => {
+                renderer.render(UiLine::ToolResult {
+                    success: true,
+                    summary: summarise(&r.summary),
+                });
+            }
+            _ => {}
+        }
+    }
+    renderer.render(UiLine::TurnComplete);
+    renderer.flush();
 }
 
 fn handle_streaming_key(
@@ -1542,6 +1801,7 @@ fn handle_streaming_key(
     buf: &mut Buffer,
     ctx: &mut LoopCtx,
     renderer: &mut dyn Renderer,
+    menu: &mut MenuState,
     message_queue: &mut VecDeque<String>,
 ) -> Result<()> {
     // Ctrl+C always cancels the running turn — highest priority so
@@ -1551,11 +1811,53 @@ fn handle_streaming_key(
         return Ok(());
     }
 
+    // When the menu is active (buf starts with `/`), intercept nav keys
+    // so the user can browse candidate commands mid-stream. Execution
+    // is still blocked below — Enter falls through to the commit arm,
+    // which emits the "disabled while a turn is running" hint.
+    let menu_items = build_menu_items(&buf.text, &ctx.commands);
+    if let Some(items) = &menu_items {
+        if menu.selected >= items.len() {
+            menu.selected = items.len() - 1;
+        }
+        match code {
+            KeyCode::Up => {
+                menu.selected = menu.selected.saturating_sub(1);
+                draw_spinner_now(state, buf, ctx, renderer, message_queue.len(), menu.selected);
+                return Ok(());
+            }
+            KeyCode::Down => {
+                if menu.selected + 1 < items.len() {
+                    menu.selected += 1;
+                }
+                draw_spinner_now(state, buf, ctx, renderer, message_queue.len(), menu.selected);
+                return Ok(());
+            }
+            KeyCode::Esc => {
+                buf.text.clear();
+                buf.cursor = 0;
+                menu.selected = 0;
+                draw_spinner_now(state, buf, ctx, renderer, message_queue.len(), menu.selected);
+                return Ok(());
+            }
+            _ => {} // fall through to buffer edits
+        }
+    }
+
     let action = classify(code, modifiers);
     match buf.apply(action, ctx.history.entries(), &ctx.commands) {
         BufferResult::NoOp => {}
         BufferResult::Redraw => {
-            draw_spinner_now(state, buf, ctx, renderer, message_queue.len());
+            // Menu shape may have changed — reset selection if it
+            // now points past the (possibly shorter) list.
+            if let Some(items) = build_menu_items(&buf.text, &ctx.commands) {
+                if menu.selected >= items.len() {
+                    menu.selected = 0;
+                }
+            } else {
+                menu.selected = 0;
+            }
+            draw_spinner_now(state, buf, ctx, renderer, message_queue.len(), menu.selected);
         }
         BufferResult::Commit(line) => {
             // Slash commands are not queued — they need ctx access
@@ -1568,7 +1870,8 @@ fn handle_streaming_key(
                 renderer.flush();
                 buf.text.clear();
                 buf.cursor = 0;
-                draw_spinner_now(state, buf, ctx, renderer, message_queue.len());
+                menu.selected = 0;
+                draw_spinner_now(state, buf, ctx, renderer, message_queue.len(), menu.selected);
                 return Ok(());
             }
             // Expand any paste placeholders — agent sees full payload,
@@ -1582,7 +1885,7 @@ fn handle_streaming_key(
             // Echo as a queued entry so the user sees it landed.
             renderer.render(UiLine::CommandOutput(format!("  ↳ queued: {}\n", line)));
             renderer.flush();
-            draw_spinner_now(state, buf, ctx, renderer, message_queue.len());
+            draw_spinner_now(state, buf, ctx, renderer, message_queue.len(), menu.selected);
         }
         BufferResult::Exit => {
             // Ctrl+C on empty buf during streaming — treat as cancel
@@ -1757,6 +2060,7 @@ fn execute_slash_command(
     renderer: &mut dyn Renderer,
     model_picker: &mut Option<ModelPicker>,
     provider_wizard: &mut Option<ProviderWizard>,
+    session_picker: &mut Option<SessionPicker>,
 ) -> Result<()> {
     match cmd {
         "quit" | "exit" => {
@@ -1815,6 +2119,28 @@ fn execute_slash_command(
                 renderer.flush();
             } else {
                 *model_picker = Some(ModelPicker::open(&ctx.config));
+            }
+        }
+        "resume" => {
+            match ctx.session_manager.list() {
+                Ok(all) => {
+                    let sessions: Vec<_> = all
+                        .into_iter()
+                        .filter(|s| s.message_count > 0)
+                        .collect();
+                    if sessions.is_empty() {
+                        renderer.render(UiLine::CommandOutput(
+                            "  No previous sessions found. Start a conversation first.\n".into(),
+                        ));
+                        renderer.flush();
+                    } else {
+                        *session_picker = Some(SessionPicker::open(sessions));
+                    }
+                }
+                Err(e) => {
+                    renderer.render(UiLine::Error(format!("list sessions failed: {}", e)));
+                    renderer.flush();
+                }
             }
         }
         "provider" => {
@@ -2035,32 +2361,49 @@ fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::StatusLine {
     } else {
         cwd
     };
+    let hint = ctx
+        .update_hint
+        .lock()
+        .ok()
+        .and_then(|g| g.clone())
+        .map(|v| format!("↑ {} 可官网升级", v));
     crate::render::StatusLine {
         model: ctx.model_name.clone(),
         cwd,
         total_tokens: state.total_tokens,
+        hint,
     }
 }
 
 /// Render one spinner frame. Used from both the interval-driven tick
 /// path and the opportunistic "post-event" pump path that guards
 /// against agent-event floods starving the interval tick.
+///
+/// When the type-ahead buffer starts with `/`, the slash-command palette
+/// is attached so the user can see candidate commands mid-stream (the
+/// renderer then shows the menu in place of the spinner).
 fn draw_spinner_now(
     state: &mut UiState,
     buf: &Buffer,
     ctx: &LoopCtx,
     renderer: &mut dyn Renderer,
     queue_len: usize,
+    menu_selected: usize,
 ) {
     let frame = state.tick_spinner();
     let label = format_spinner_label(state, queue_len);
     let status = build_status(state, ctx);
+    let menu = build_menu_items(&buf.text, &ctx.commands).map(|items| {
+        let selected = menu_selected.min(items.len().saturating_sub(1));
+        crate::render::MenuPayload { items, selected }
+    });
     renderer.render(UiLine::StreamingBox {
         buf: buf.text.clone(),
         cursor_byte: buf.cursor,
         frame,
         label,
         status,
+        menu,
     });
     renderer.flush();
 }
@@ -2169,5 +2512,97 @@ fn summarise(output: &str) -> String {
         format!("{} ({} lines)", trimmed, n)
     } else {
         trimmed
+    }
+}
+
+#[cfg(test)]
+mod session_picker_tests {
+    use super::*;
+    use atomcode_core::session::{SessionId, SessionMeta};
+    use std::path::PathBuf;
+
+    fn meta(name: &str, msgs: usize) -> SessionMeta {
+        SessionMeta {
+            id: SessionId::from_string(format!("id-{name}")),
+            name: name.to_string(),
+            working_dir: PathBuf::from("/tmp/x"),
+            created_at: 0,
+            updated_at: 0,
+            message_count: msgs,
+            file_size: 0,
+        }
+    }
+
+    #[test]
+    fn open_shows_all_sessions_initially() {
+        let p = SessionPicker::open(vec![meta("alpha", 3), meta("beta", 5)]);
+        assert_eq!(p.filtered.len(), 2);
+        assert_eq!(p.selected, 0);
+        assert!(p.query.is_empty());
+    }
+
+    #[test]
+    fn update_filter_matches_by_substring_case_insensitive() {
+        let mut p = SessionPicker::open(vec![
+            meta("Fix auth bug", 4),
+            meta("Refactor renderer", 7),
+            meta("authentication flow", 2),
+        ]);
+        p.query = "auth".to_string();
+        p.update_filter();
+        assert_eq!(p.filtered.len(), 2);
+        let names: Vec<&str> = p.filtered.iter().map(|i| p.sessions[*i].name.as_str()).collect();
+        assert!(names.contains(&"Fix auth bug"));
+        assert!(names.contains(&"authentication flow"));
+    }
+
+    #[test]
+    fn update_filter_empty_query_shows_all() {
+        let mut p = SessionPicker::open(vec![meta("x", 1), meta("y", 1)]);
+        p.query = "zz".to_string();
+        p.update_filter();
+        assert_eq!(p.filtered.len(), 0);
+        p.query.clear();
+        p.update_filter();
+        assert_eq!(p.filtered.len(), 2);
+    }
+
+    #[test]
+    fn update_filter_resets_selection_to_zero() {
+        let mut p = SessionPicker::open(vec![meta("one", 1), meta("two", 1), meta("three", 1)]);
+        p.selected = 2;
+        p.query = "on".to_string();
+        p.update_filter();
+        assert_eq!(p.selected, 0, "selection must reset when filter changes");
+    }
+
+    #[test]
+    fn down_and_up_stay_within_filtered_bounds() {
+        let mut p = SessionPicker::open(vec![meta("a", 1), meta("b", 1)]);
+        p.down();
+        assert_eq!(p.selected, 1);
+        p.down();
+        assert_eq!(p.selected, 1, "down at end stays put");
+        p.up();
+        assert_eq!(p.selected, 0);
+        p.up();
+        assert_eq!(p.selected, 0, "up at top stays put");
+    }
+
+    #[test]
+    fn chosen_returns_session_at_selected() {
+        let sessions = vec![meta("first", 1), meta("second", 1)];
+        let mut p = SessionPicker::open(sessions);
+        p.down();
+        let id = p.chosen_id().expect("selection should exist");
+        assert_eq!(id.as_str(), "id-second");
+    }
+
+    #[test]
+    fn chosen_returns_none_when_filter_empty() {
+        let mut p = SessionPicker::open(vec![meta("alpha", 1)]);
+        p.query = "xyz".to_string();
+        p.update_filter();
+        assert!(p.chosen_id().is_none());
     }
 }

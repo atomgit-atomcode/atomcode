@@ -132,6 +132,28 @@ pub async fn run(
         .map(History::load)
         .unwrap_or_else(|| History::load(std::path::PathBuf::from("/tmp/atomcode-history")));
 
+    let session_manager = atomcode_core::session::SessionManager::new(&working_dir);
+
+    // Passive "new version available" check. Detached — never blocks
+    // startup; on any error returns None silently. On a positive hit
+    // the task (a) stores the version in the shared mutex and (b) sends
+    // a wake pulse so the event loop redraws the status row immediately
+    // instead of waiting for the user's next keystroke.
+    let update_hint = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+    let (wake_tx, wake_rx) = tokio::sync::mpsc::channel::<()>(1);
+    {
+        let slot = update_hint.clone();
+        tokio::spawn(async move {
+            let current = format!("v{}", env!("CARGO_PKG_VERSION"));
+            if let Some(latest) = atomcode_core::version_check::check_latest(&current).await {
+                if let Ok(mut g) = slot.lock() {
+                    *g = Some(latest);
+                }
+                let _ = wake_tx.try_send(());
+            }
+        });
+    }
+
     let ctx = LoopCtx {
         config,
         model_name,
@@ -141,6 +163,9 @@ pub async fn run(
         history,
         input_rx,
         commands: CommandRegistry::builtin(),
+        session_manager,
+        update_hint,
+        wake_rx,
     };
 
     let result = run_loop(ctx, renderer.as_mut()).await;

@@ -341,6 +341,7 @@ _ = cancel.cancelled() => {
             self.provider.model_name(),
             0, // step is set by caller
             response_duration,
+            self.config.datalog.enabled,
         );
 
         // 5. If no tool calls, we're done — LLM produced text only
