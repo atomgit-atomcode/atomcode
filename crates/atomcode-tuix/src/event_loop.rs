@@ -1813,9 +1813,12 @@ fn handle_streaming_key(
     menu: &mut MenuState,
     message_queue: &mut VecDeque<String>,
 ) -> Result<()> {
-    // Ctrl+C always cancels the running turn — highest priority so
-    // users have a reliable escape hatch even mid-edit.
-    if code == KeyCode::Char('c') && modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
+    // Ctrl+C and Esc both cancel the running turn — highest priority so
+    // users have a reliable escape hatch even mid-edit, and ESC matches
+    // the muscle-memory from Claude Code / other TUIs.
+    let is_ctrl_c = code == KeyCode::Char('c')
+        && modifiers.contains(crossterm::event::KeyModifiers::CONTROL);
+    if is_ctrl_c || code == KeyCode::Esc {
         ctx.agent.cmd_tx.send(AgentCommand::Cancel).ok();
         return Ok(());
     }
@@ -1839,13 +1842,6 @@ fn handle_streaming_key(
                 if menu.selected + 1 < items.len() {
                     menu.selected += 1;
                 }
-                draw_spinner_now(state, buf, ctx, renderer, message_queue.len(), menu.selected);
-                return Ok(());
-            }
-            KeyCode::Esc => {
-                buf.text.clear();
-                buf.cursor = 0;
-                menu.selected = 0;
                 draw_spinner_now(state, buf, ctx, renderer, message_queue.len(), menu.selected);
                 return Ok(());
             }

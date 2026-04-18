@@ -1404,7 +1404,17 @@ impl AgentLoop {
                     // Send TurnCancelled event for TUI to sync
                     let messages = self.conversation.messages.clone();
                     let _ = self.event_tx.send(AgentEvent::TurnCancelled { messages });
-                    self.finish_turn(TurnStopReason::Cancelled);
+                    // Do finish_turn's bookkeeping WITHOUT emitting TurnComplete.
+                    // TurnCancelled already tells the TUI the turn ended; emitting
+                    // TurnComplete on top buffers a stale "✓ done · N rounds" line
+                    // that fires the next time the TUI's phase becomes Streaming —
+                    // i.e. right after the user's next submission.
+                    self.conversation.turn_tracker.complete_current();
+                    self.datalog.end_turn(self.turn_tokens, self.tool_call_count);
+                    self.turn_start = None;
+                    self.phase = AgentPhase::Idle;
+                    let _ = self.event_tx.send(AgentEvent::PhaseChange(AgentPhase::Idle));
+                    self.conversation.save(&Conversation::history_path());
                     return;
                 }
             }
