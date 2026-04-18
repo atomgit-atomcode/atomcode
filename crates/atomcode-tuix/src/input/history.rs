@@ -26,11 +26,11 @@ impl History {
         Self { path, entries }
     }
 
-    /// Default history path: ~/.atomcode/history
+    /// Default history path: `~/.atomcode/history` on Unix,
+    /// `%USERPROFILE%\.atomcode\history` on Windows (or a tempdir
+    /// fallback if home is unknown).
     pub fn default_path() -> Option<PathBuf> {
-        std::env::var("HOME").ok().map(|h| {
-            PathBuf::from(h).join(".atomcode").join("history")
-        })
+        Some(crate::platform::history_path())
     }
 
     pub fn entries(&self) -> &Vec<String> {

@@ -4,6 +4,7 @@ pub mod commands;
 pub mod event_loop;
 pub mod input;
 pub mod markdown;
+pub mod platform;
 pub mod render;
 pub mod sanitize;
 pub mod state;
@@ -128,9 +129,13 @@ pub async fn run(
         }))
     };
 
+    // `default_path()` now always returns Some (tempdir fallback lives
+    // inside `platform::history_path`), so the explicit else-branch
+    // with a hardcoded Unix path is gone — Windows used to fall here
+    // and then fail to write to `/tmp`.
     let history = History::default_path()
         .map(History::load)
-        .unwrap_or_else(|| History::load(std::path::PathBuf::from("/tmp/atomcode-history")));
+        .unwrap_or_else(|| History::load(crate::platform::history_path()));
 
     let session_manager = atomcode_core::session::SessionManager::new(&working_dir);
 

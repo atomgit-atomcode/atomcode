@@ -414,10 +414,9 @@ pub async fn run_loop(
     let mut message_queue: VecDeque<String> = VecDeque::new();
 
     // Draw welcome + initial prompt
-    let dir_display = ctx.working_dir.to_string_lossy().to_string();
-    let dir_display = if let Ok(home) = std::env::var("HOME") {
-        dir_display.replacen(&home, "~", 1)
-    } else { dir_display };
+    let dir_display = crate::platform::collapse_home(
+        &ctx.working_dir.to_string_lossy(),
+    );
     renderer.render(UiLine::Welcome { model: ctx.model_name.clone(), working_dir: dir_display.clone() });
     renderer.render(UiLine::InputPrompt {
         buf: String::new(),
@@ -2168,12 +2167,9 @@ fn execute_slash_command(
             // a known (row 1, col 1) anchor. This is what makes
             // /session behave like a fresh launch.
             renderer.reset();
-            let dir_display = ctx.working_dir.to_string_lossy().to_string();
-            let dir_display = if let Ok(home) = std::env::var("HOME") {
-                dir_display.replacen(&home, "~", 1)
-            } else {
-                dir_display
-            };
+            let dir_display = crate::platform::collapse_home(
+                &ctx.working_dir.to_string_lossy(),
+            );
             renderer.render(UiLine::Welcome {
                 model: ctx.model_name.clone(),
                 working_dir: dir_display,
@@ -2313,13 +2309,13 @@ fn execute_slash_command(
 }
 
 fn resolve_cd(arg: &str, cwd: &std::path::Path, prev: Option<&std::path::Path>) -> std::result::Result<PathBuf, String> {
-    let home = std::env::var("HOME").ok().map(PathBuf::from);
+    let home = crate::platform::home_dir();
     let target = if arg.is_empty() {
-        home.ok_or_else(|| "HOME not set".to_string())?
+        home.ok_or_else(|| "home directory not known".to_string())?
     } else if arg == "-" {
         prev.map(|p| p.to_path_buf()).ok_or_else(|| "No previous directory".to_string())?
     } else if let Some(rest) = arg.strip_prefix('~') {
-        let home = home.ok_or_else(|| "HOME not set".to_string())?;
+        let home = home.ok_or_else(|| "home directory not known".to_string())?;
         let rest = rest.strip_prefix('/').unwrap_or(rest);
         if rest.is_empty() { home } else { home.join(rest) }
     } else {
@@ -2390,12 +2386,9 @@ fn run_login_flow(
             ctx.model_name = model.clone();
             save_and_reload(ctx, renderer);
 
-            let dir_display = ctx.working_dir.to_string_lossy().to_string();
-            let dir_display = if let Ok(home) = std::env::var("HOME") {
-                dir_display.replacen(&home, "~", 1)
-            } else {
-                dir_display
-            };
+            let dir_display = crate::platform::collapse_home(
+                &ctx.working_dir.to_string_lossy(),
+            );
             renderer.render(UiLine::Welcome {
                 model: ctx.model_name.clone(),
                 working_dir: dir_display,
@@ -2424,12 +2417,7 @@ fn run_login_flow(
 /// Pulls model name from ctx, cwd from ctx.working_dir (with $HOME
 /// collapsed to `~`), and running token count from state.
 fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::StatusLine {
-    let cwd = ctx.working_dir.to_string_lossy().to_string();
-    let cwd = if let Ok(home) = std::env::var("HOME") {
-        cwd.replacen(&home, "~", 1)
-    } else {
-        cwd
-    };
+    let cwd = crate::platform::collapse_home(&ctx.working_dir.to_string_lossy());
     let hint = ctx
         .update_hint
         .lock()
