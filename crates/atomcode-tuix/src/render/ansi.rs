@@ -633,9 +633,9 @@ impl<W: Write + Send> AnsiRenderer<W> {
         // Leading breath.
         let _ = self.out.write_all(b"\r\n");
 
-        // Row 1: "  ◆ AtomCode" on the left; "v4.18.0  ·  MIT" on the right.
+        // Row 1: "  ◆ AtomCode" on the left; "v4.18.1  ·  MIT" on the right.
         let left = "  ◆ AtomCode";
-        let right_ver = "v4.18.0";
+        let right_ver = "v4.18.1";
         let right_lic = "MIT";
         let left_w = crate::width::display_width(left);
         let right_w = right_ver.len() + 5 + right_lic.len(); // "  ·  "
