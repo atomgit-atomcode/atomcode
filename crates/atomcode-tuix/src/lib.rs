@@ -100,13 +100,20 @@ pub async fn run(
         Box::new(PlainRenderer::new())
     };
 
-    // Input thread (only spawn when raw-mode/TTY available; pipe mode reads stdin directly)
+    // Input thread (only spawn when raw-mode/TTY available; pipe mode
+    // reads stdin directly). `reader_handle` exposes Pause / Resume so
+    // the OAuth login flow (and any future child-process handoff) can
+    // stop us from racing the child for stdin bytes. Pipe mode doesn't
+    // need that — no browser handoff there — so it stays as a plain
+    // JoinHandle held separately.
     let (input_tx, input_rx) = mpsc::unbounded_channel();
-    let reader_handle = if caps.raw_mode {
-        Some(reader::spawn(input_tx.clone()))
+    let mut reader_handle: Option<reader::ReaderHandle> = None;
+    let mut pipe_reader: Option<std::thread::JoinHandle<()>> = None;
+    if caps.raw_mode {
+        reader_handle = Some(reader::spawn(input_tx.clone()));
     } else {
         // For pipe mode, spawn a line-based reader on a blocking thread.
-        Some(std::thread::spawn(move || {
+        pipe_reader = Some(std::thread::spawn(move || {
             use std::io::BufRead;
             let stdin = std::io::stdin();
             let lock = stdin.lock();
@@ -127,7 +134,7 @@ pub async fn run(
                 }
             }
             let _ = input_tx.send(input::InputEvent::Eof);
-        }))
+        }));
     };
 
     // `default_path()` now always returns Some (tempdir fallback lives
@@ -172,12 +179,13 @@ pub async fn run(
         session_manager,
         update_hint,
         wake_rx,
+        reader: reader_handle,
     };
 
     let result = run_loop(ctx, renderer.as_mut()).await;
 
     renderer.shutdown();
-    drop(reader_handle); // thread exits on next channel send failure
+    drop(pipe_reader); // pipe-mode thread exits on next channel send failure
 
     result
 }

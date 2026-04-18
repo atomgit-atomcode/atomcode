@@ -39,6 +39,11 @@ pub struct LoopCtx {
     /// `wake_rx` and triggers an idle redraw so the hint appears without
     /// waiting for the user's next keystroke.
     pub wake_rx: mpsc::Receiver<()>,
+    /// Control handle for the crossterm reader thread — `Some` in raw-mode
+    /// TTY sessions, `None` in pipe mode. Used by child-process handoffs
+    /// (OAuth login, future `/shell`) to pause+resume event consumption
+    /// so our reader doesn't race the child for stdin bytes.
+    pub reader: Option<crate::input::reader::ReaderHandle>,
 }
 
 /// Line-edit buffer for input composition. Byte-indexed cursor.
@@ -2423,6 +2428,20 @@ fn run_login_flow(
     renderer: &mut dyn Renderer,
     ctx: &mut LoopCtx,
 ) -> Result<()> {
+    // Pause the reader thread BEFORE disabling raw mode so it stops
+    // calling `event::poll` / `event::read`. Without this, the reader
+    // would keep consuming bytes from stdin in cooked mode (keystrokes
+    // the user made after the browser handoff, stray bytes from the
+    // callback handshake, FocusGained/Lost) and those events would
+    // either starve the OAuth child or land in `input_rx` as stale
+    // events that eat the first real keystroke after login.
+    //
+    // `pause_blocking` waits for ack so the reader is guaranteed idle
+    // before `suspend_for_external` flips raw mode.
+    if let Some(reader) = ctx.reader.as_ref() {
+        let _ = reader.pause_blocking();
+    }
+
     // Suspend: disables bracketed paste (otherwise the callback URL
     // paste would arrive wrapped in `\x1b[200~ ... \x1b[201~` and
     // corrupt the CSRF state parameter) and raw mode, then flushes.
@@ -2437,15 +2456,13 @@ fn run_login_flow(
     // is lying — next render must anchor against a fresh screen).
     renderer.resume_from_external();
 
-    // Drain any InputEvents the crossterm reader thread queued while
-    // the OAuth flow owned the terminal. The reader never stops — in
-    // cooked mode it still forwards parsed events (keystrokes the user
-    // made after the browser handoff, stray bytes from the callback
-    // handshake, even spurious FocusGained/Lost) into `input_rx`.
-    // Without this drain the first keystroke after login is actually
-    // consumed by these stale events, producing the "have to press a
-    // key twice before it registers" symptom.
-    while ctx.input_rx.try_recv().is_ok() {}
+    // Unpause the reader AFTER raw mode is back on. The reader skipped
+    // the entire OAuth window so `input_rx` has no stale events to
+    // drain — the first keystroke the user presses after login lands
+    // cleanly.
+    if let Some(reader) = ctx.reader.as_ref() {
+        reader.resume();
+    }
 
     match result {
         Ok(auth) => {
