@@ -139,6 +139,11 @@ impl<W: Write + Send> Renderer for PlainRenderer<W> {
     fn resume_from_external(&mut self) {
         let _ = self.out.flush();
     }
+
+    fn flush_deferred(&mut self) {
+        // PlainRenderer has no throttling — deferred queue is empty.
+        let _ = self.out.flush();
+    }
 }
 
 #[cfg(test)]

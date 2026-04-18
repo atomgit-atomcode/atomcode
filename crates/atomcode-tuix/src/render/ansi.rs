@@ -115,7 +115,25 @@ pub struct AnsiRenderer<W: Write + Send> {
     assistant_line_buf: String,
     /// Markdown parser state (code-block tracking, table row buffering).
     md_state: crate::markdown::MdState,
+    /// When the InputPrompt / StreamingBox footer was last actually
+    /// painted. Used to throttle high-frequency input-driven redraws:
+    /// Mac Terminal.app takes ~30-60ms to process a full footer ANSI
+    /// payload, and a fast typist (8 chars/sec) submits renders twice
+    /// as fast as Terminal.app can drain — producing the "cursor blinks
+    /// but no chars, then they catch up in a burst" symptom.
+    last_input_render: Option<std::time::Instant>,
+    /// If a render(InputPrompt|StreamingBox) came in during the 20ms
+    /// throttle window, the most recent payload lives here until the
+    /// window closes and `flush_deferred` or an out-of-band render
+    /// drains it.
+    pending_input: Option<UiLine>,
 }
+
+/// Minimum gap between two InputPrompt/StreamingBox redraws. ~50fps —
+/// visually fluid on any terminal, no noticeable leading-edge latency,
+/// and well within Terminal.app's ANSI-processing budget for a single
+/// footer payload.
+const INPUT_REDRAW_THROTTLE_MS: u64 = 20;
 
 impl AnsiRenderer<BufWriter<Stdout>> {
     pub fn new(caps: TerminalCaps) -> Self {
@@ -133,6 +151,78 @@ impl<W: Write + Send> AnsiRenderer<W> {
             assistant_continuing: false,
             assistant_line_buf: String::new(),
             md_state: crate::markdown::MdState::new(),
+            last_input_render: None,
+            pending_input: None,
+        }
+    }
+
+    /// Is the payload worth throttling? True for the two high-frequency
+    /// input-driven renders (InputPrompt / StreamingBox) — everything
+    /// else (ToolCall / Welcome / diff / ...) bypasses and paints
+    /// immediately.
+    fn is_throttled_line(line: &UiLine) -> bool {
+        matches!(line, UiLine::InputPrompt { .. } | UiLine::StreamingBox { .. })
+    }
+
+    /// Is enough time gone since the last input-driven paint to let a
+    /// new one through? Leading edge returns true when no prior paint
+    /// has happened.
+    fn input_render_window_elapsed(&self) -> bool {
+        match self.last_input_render {
+            None => true,
+            Some(t) => {
+                t.elapsed() >= std::time::Duration::from_millis(INPUT_REDRAW_THROTTLE_MS)
+            }
+        }
+    }
+
+    /// Drop any deferred input-render request — used when an immediate
+    /// out-of-band paint (e.g. ToolCall) would superseed it, and when
+    /// reset() forgets all cached state.
+    fn clear_deferred_input(&mut self) {
+        self.pending_input = None;
+        self.last_input_render = None;
+    }
+
+    /// Paint the currently-pending deferred InputPrompt / StreamingBox
+    /// if any. Called by `flush_deferred` (on the event-loop's 20ms
+    /// timer) and by any immediate render that needs to fix render order.
+    fn paint_pending_input(&mut self) {
+        if let Some(line) = self.pending_input.take() {
+            self.dispatch_unthrottled(line);
+            self.last_input_render = Some(std::time::Instant::now());
+        }
+    }
+
+    /// Render a UiLine bypassing the throttle. Used internally by
+    /// `render` after it decides a line is not throttled (or the
+    /// throttle window has elapsed), and by `paint_pending_input`.
+    fn dispatch_unthrottled(&mut self, line: UiLine) {
+        // Pure dispatch. Every variant has its own method; adding a new
+        // UiLine means "add a method + one arm here", not "grow an
+        // already-1000-line match".
+        match line {
+            UiLine::Welcome { model, working_dir } => self.render_welcome_line(&model, &working_dir),
+            UiLine::User(text) => self.render_user_line(&text),
+            UiLine::AssistantText(text) => self.render_assistant_text(&text),
+            UiLine::AssistantLineBreak => self.render_assistant_line_break(),
+            UiLine::ToolCall { name, detail } => self.render_tool_call(&name, &detail),
+            UiLine::ToolResult { success, summary } => self.render_tool_result(success, &summary),
+            UiLine::DiffLine { added, text } => self.render_diff_line(added, &text),
+            UiLine::DiffBlock(entries) => self.render_diff_block(&entries),
+            UiLine::ApprovalPrompt { tool, detail } => self.render_approval_prompt(&tool, &detail),
+            UiLine::Error(msg) => self.render_error_line(&msg),
+            UiLine::TurnCancelled => self.render_turn_cancelled(),
+            UiLine::TurnComplete => self.render_turn_complete(),
+            UiLine::Spinner { frame, label } => self.render_spinner(frame, &label),
+            UiLine::StreamingBox { buf, cursor_byte, frame, label, status, menu } =>
+                self.render_streaming_box(&buf, cursor_byte, frame, &label, status, menu),
+            UiLine::ClearTransient => { /* no-op: footer is fixed-at-bottom */ }
+            UiLine::InputPrompt { buf, cursor_byte, menu, status } =>
+                self.render_input_prompt(&buf, cursor_byte, menu, status),
+            UiLine::InputCommit => { /* no-op: ClearTransient + User handles commit */ }
+            UiLine::TurnSeparator { label } => self.render_turn_separator(&label),
+            UiLine::CommandOutput(text) => self.render_command_output(&text),
         }
     }
 
@@ -997,32 +1087,27 @@ impl<W: Write + Send> AnsiRenderer<W> {
 
 impl<W: Write + Send> Renderer for AnsiRenderer<W> {
     fn render(&mut self, line: UiLine) {
-        // Pure dispatch. Every variant has its own method below; adding
-        // a new UiLine means "add a method + one arm here", not "grow
-        // an already-1000-line match".
-        match line {
-            UiLine::Welcome { model, working_dir } => self.render_welcome_line(&model, &working_dir),
-            UiLine::User(text) => self.render_user_line(&text),
-            UiLine::AssistantText(text) => self.render_assistant_text(&text),
-            UiLine::AssistantLineBreak => self.render_assistant_line_break(),
-            UiLine::ToolCall { name, detail } => self.render_tool_call(&name, &detail),
-            UiLine::ToolResult { success, summary } => self.render_tool_result(success, &summary),
-            UiLine::DiffLine { added, text } => self.render_diff_line(added, &text),
-            UiLine::DiffBlock(entries) => self.render_diff_block(&entries),
-            UiLine::ApprovalPrompt { tool, detail } => self.render_approval_prompt(&tool, &detail),
-            UiLine::Error(msg) => self.render_error_line(&msg),
-            UiLine::TurnCancelled => self.render_turn_cancelled(),
-            UiLine::TurnComplete => self.render_turn_complete(),
-            UiLine::Spinner { frame, label } => self.render_spinner(frame, &label),
-            UiLine::StreamingBox { buf, cursor_byte, frame, label, status, menu } =>
-                self.render_streaming_box(&buf, cursor_byte, frame, &label, status, menu),
-            UiLine::ClearTransient => { /* no-op: footer is fixed-at-bottom */ }
-            UiLine::InputPrompt { buf, cursor_byte, menu, status } =>
-                self.render_input_prompt(&buf, cursor_byte, menu, status),
-            UiLine::InputCommit => { /* no-op: ClearTransient + User handles commit */ }
-            UiLine::TurnSeparator { label } => self.render_turn_separator(&label),
-            UiLine::CommandOutput(text) => self.render_command_output(&text),
+        if Self::is_throttled_line(&line) {
+            if self.input_render_window_elapsed() {
+                // Leading edge: paint immediately and open a new window.
+                self.dispatch_unthrottled(line);
+                self.last_input_render = Some(std::time::Instant::now());
+                self.pending_input = None;
+            } else {
+                // Within the throttle window: keep only the most
+                // recent payload; an older pending render would paint
+                // stale state (e.g. buf: "abc" after the user is
+                // already at "abcde").
+                self.pending_input = Some(line);
+            }
+            return;
         }
+        // Non-throttled render — must flush any deferred input paint
+        // FIRST so emission order matches the caller's intent (ToolCall
+        // arriving after a pending InputPrompt should still see its
+        // footer sitting below the tool line, not the other way round).
+        self.paint_pending_input();
+        self.dispatch_unthrottled(line);
     }
 
     fn flush(&mut self) {
@@ -1049,7 +1134,20 @@ impl<W: Write + Send> Renderer for AnsiRenderer<W> {
         self.assistant_continuing = false;
         self.assistant_line_buf.clear();
         self.md_state.reset();
+        // Drop any throttled payload too — it references a state that
+        // the reset just obliterated.
+        self.clear_deferred_input();
         let _ = self.out.flush();
+    }
+
+    fn flush_deferred(&mut self) {
+        // Called by the event loop on a 20ms tick. Only actually paints
+        // if (a) there's a pending InputPrompt/StreamingBox and (b) the
+        // throttle window has elapsed — otherwise it's a no-op so the
+        // 50fps timer doesn't blast stale payloads.
+        if self.pending_input.is_some() && self.input_render_window_elapsed() {
+            self.paint_pending_input();
+        }
     }
 
     fn clear_screen(&mut self) {

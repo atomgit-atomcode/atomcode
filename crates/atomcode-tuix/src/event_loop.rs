@@ -458,6 +458,15 @@ pub async fn run_loop(
     };
     drop(spin_tx); // only the task needs the sender
 
+    // Deferred-render tick: 50fps. The renderer throttles InputPrompt /
+    // StreamingBox redraws to 20ms windows so Mac Terminal.app doesn't
+    // choke on back-to-back full footer payloads, but the trailing
+    // edge of a burst needs someone to paint it — that someone is this
+    // tick. No-op when nothing is pending.
+    let mut deferred_render_tick = tokio::time::interval(Duration::from_millis(20));
+    deferred_render_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    deferred_render_tick.tick().await; // consume the immediate fire
+
     // Last-draw timestamp — consulted by the post-event pump so we
     // don't redraw more often than every 100ms even when handlers
     // fire back-to-back.
@@ -494,6 +503,14 @@ pub async fn run_loop(
             // effective frame rate to ~5 fps and looking like "frozen
             // then jumps".
             biased;
+
+            // ── Deferred-render trailing edge ──
+            // Drains any InputPrompt / StreamingBox payload the
+            // renderer parked during its 20ms throttle window. No-op
+            // when nothing is pending.
+            _ = deferred_render_tick.tick() => {
+                renderer.flush_deferred();
+            }
 
             // ── Spinner tick (from background task) ──
             Some(()) = spin_rx.recv(), if matches!(state.phase, UiPhase::Streaming) => {
@@ -575,6 +592,14 @@ pub async fn run_loop(
         #[cfg(not(unix))]
         tokio::select! {
             biased;
+
+            // ── Deferred-render trailing edge ──
+            // Drains any InputPrompt / StreamingBox payload the
+            // renderer parked during its 20ms throttle window. No-op
+            // when nothing is pending.
+            _ = deferred_render_tick.tick() => {
+                renderer.flush_deferred();
+            }
 
             // ── Spinner tick (from background task) ──
             Some(()) = spin_rx.recv(), if matches!(state.phase, UiPhase::Streaming) => {
@@ -2370,6 +2395,16 @@ fn run_login_flow(
     // (the cooked-mode child wrote to stdout, so our cursor tracking
     // is lying — next render must anchor against a fresh screen).
     renderer.resume_from_external();
+
+    // Drain any InputEvents the crossterm reader thread queued while
+    // the OAuth flow owned the terminal. The reader never stops — in
+    // cooked mode it still forwards parsed events (keystrokes the user
+    // made after the browser handoff, stray bytes from the callback
+    // handshake, even spurious FocusGained/Lost) into `input_rx`.
+    // Without this drain the first keystroke after login is actually
+    // consumed by these stale events, producing the "have to press a
+    // key twice before it registers" symptom.
+    while ctx.input_rx.try_recv().is_ok() {}
 
     match result {
         Ok(auth) => {

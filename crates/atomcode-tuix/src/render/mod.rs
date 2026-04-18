@@ -103,6 +103,16 @@ pub trait Renderer: Send {
     /// state (the child wrote to stdout in cooked mode, so our cursor
     /// tracking is now lying).
     fn resume_from_external(&mut self);
+
+    /// Paint any throttled payload that's been sitting in the deferred
+    /// queue past its throttle window. Called from the event loop on a
+    /// ~50fps timer so the "trailing edge" of a burst of input renders
+    /// actually lands — without this tick a lone stale payload would
+    /// stay invisible until the next unrelated render arrived.
+    ///
+    /// Implementations without throttling (e.g. PlainRenderer) can
+    /// treat this as a flush.
+    fn flush_deferred(&mut self);
 }
 
 /// Slash-command palette payload: filtered entries + which one is selected.
