@@ -25,7 +25,7 @@ use crate::commands::CommandRegistry;
 use crate::event_loop::{run_loop, LoopCtx};
 use crate::input::history::History;
 use crate::input::reader;
-use crate::render::{ansi::AnsiRenderer, plain::PlainRenderer, Renderer};
+use crate::render::{ansi::AnsiRenderer, plain::PlainRenderer, worker::TaskRenderer, Renderer};
 use crate::terminal::TerminalCaps;
 
 /// RAII guard: enables raw mode + bracketed paste on construction,
@@ -94,11 +94,17 @@ pub async fn run(
     let caps = TerminalCaps::probe();
     let _guard = TerminalGuard::activate(caps)?;
 
-    let mut renderer: Box<dyn Renderer> = if caps.tty {
+    // Pick the inner renderer by terminal capability, then wrap it in
+    // a `TaskRenderer` so all ANSI I/O happens on a dedicated OS thread.
+    // Slow terminals (Mac Terminal.app processing a 4KB footer payload)
+    // no longer block the event loop — the event loop sends `UiLine`s
+    // through a channel and moves on.
+    let inner: Box<dyn Renderer> = if caps.tty {
         Box::new(AnsiRenderer::new(caps))
     } else {
         Box::new(PlainRenderer::new())
     };
+    let mut renderer: Box<dyn Renderer> = Box::new(TaskRenderer::new(inner));
 
     // Input thread (only spawn when raw-mode/TTY available; pipe mode
     // reads stdin directly). `reader_handle` exposes Pause / Resume so
