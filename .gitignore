@@ -54,9 +54,9 @@ backend.log
 # diverge between contributors, and shouldn't imply official project rules).
 /CLAUDE.md
 
-# Eval results (generated, not committed)
-scripts/eval/results/
-scripts/eval/projects/eval-python-html
-scripts/eval/projects/eval-python
-scripts/eval/projects/eval-rust-api
+# Local eval harness — kept off version control. Includes scripts,
+# baseline/config TOML (may hold API keys), case inputs, run outputs,
+# and sample projects. The whole directory lives on disk for reruns
+# but never ships.
+scripts/eval/
 dist/
