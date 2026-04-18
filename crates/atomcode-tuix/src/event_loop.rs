@@ -671,8 +671,14 @@ fn handle_input(
             }
         }
         InputEvent::Eof => {}
-        InputEvent::Key(KeyEvent { kind: KeyEventKind::Release, .. }) => {}
-        InputEvent::Key(KeyEvent { code, modifiers, .. }) => {
+        // Only act on Press events. On Unix tty crossterm only emits Press
+        // so this guard is a no-op there; on Windows crossterm emits all
+        // three kinds (Press / Repeat / Release). Without filtering to
+        // Press we double-fired on every keystroke (Press + Release both
+        // ran the handler) and a held-down key fired again on every
+        // Repeat tick, producing "ghost characters" / runaway backspace
+        // the moment the OS autorepeat kicked in.
+        InputEvent::Key(KeyEvent { kind: KeyEventKind::Press, code, modifiers, .. }) => {
             // Wizard > session picker > model picker > normal phase handler.
             // Exactly one modal can be active at a time — the command
             // dispatcher opens them mutually exclusive.
@@ -702,6 +708,9 @@ fn handle_input(
                 UiPhase::Suspended => {}
             }
         }
+        // Release / Repeat key events: drop on the floor. Press is handled
+        // above; everything else is noise on Windows.
+        InputEvent::Key(_) => {}
     }
     Ok(())
 }
