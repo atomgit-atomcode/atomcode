@@ -395,25 +395,60 @@ fn next_boundary(s: &str, mut p: usize) -> usize {
     p
 }
 
+/// All the per-session UI state that flows through key/event handlers.
+///
+/// Before this aggregation, handlers took 7–9 `&mut` parameters each
+/// and the call sites filled a paragraph. Now the handlers take
+/// `(&mut App, &mut LoopCtx, &mut dyn Renderer, …event)` — the LoopCtx
+/// stays separate because the tokio `select!` in `run_loop` needs to
+/// borrow `ctx.input_rx`, `ctx.agent.event_rx`, `ctx.wake_rx`
+/// independently, and bundling them into App would fight the borrow
+/// checker on every arm.
+pub struct App {
+    pub state: UiState,
+    pub buf: Buffer,
+    pub menu: MenuState,
+    /// Exactly one overlay at a time — /model, /provider, /resume all
+    /// push into the same slot. The Modal trait owns draw + key handling
+    /// so adding a fourth overlay is `Some(Box::new(X))`, not a new
+    /// field + new dispatch branch.
+    pub active_modal: Option<Box<dyn crate::modals::Modal>>,
+    /// Messages the user submitted while a turn was already running.
+    /// Drained one-at-a-time from the head whenever the current turn
+    /// finishes. Matches CC's "type-ahead" UX — queue the next prompt
+    /// while the model is still thinking and it fires automatically.
+    pub message_queue: VecDeque<String>,
+    /// Streaming-state `<think>…</think>` stripper. Kept on App (not
+    /// a local in the streaming arm) because it carries state across
+    /// agent events — a tag straddling two chunks would break if the
+    /// stripper were re-constructed each event.
+    pub think: ThinkStripper,
+    /// call_id → (tool_name, detail). Populated on ToolCallStarted,
+    /// consumed on ToolCallResult so the result line reads
+    /// "name(detail) — summary" instead of a bare "✓ summary" detached
+    /// from its originating call.
+    pub pending_tools: std::collections::HashMap<String, (String, String)>,
+}
+
+impl App {
+    fn new() -> Self {
+        Self {
+            state: UiState::new(),
+            buf: Buffer::new(),
+            menu: MenuState::new(),
+            active_modal: None,
+            message_queue: VecDeque::new(),
+            think: ThinkStripper::new(),
+            pending_tools: std::collections::HashMap::new(),
+        }
+    }
+}
+
 pub async fn run_loop(
     mut ctx: LoopCtx,
     renderer: &mut dyn Renderer,
 ) -> Result<()> {
-    let mut state = UiState::new();
-    let mut buf = Buffer::new();
-    let mut think = ThinkStripper::new();
-    let mut menu = MenuState::new();
-    // Exactly one overlay at a time — /model, /provider, /resume all
-    // push into the same slot. The Modal trait owns draw + key handling
-    // so adding a fourth overlay is just another `Box<dyn Modal>`, not
-    // another field + another dispatch branch.
-    let mut active_modal: Option<Box<dyn crate::modals::Modal>> = None;
-    // Messages the user submitted while a turn was already running.
-    // Drained one-at-a-time from the head whenever the current turn
-    // finishes (TurnComplete / TurnCancelled / error → Idle). Matches
-    // CC's "type-ahead" behavior — you can queue the next prompt while
-    // the model is still thinking and it fires automatically.
-    let mut message_queue: VecDeque<String> = VecDeque::new();
+    let mut app = App::new();
 
     // Draw welcome + initial prompt
     let dir_display = crate::platform::collapse_home(
@@ -424,7 +459,7 @@ pub async fn run_loop(
         buf: String::new(),
         cursor_byte: 0,
         menu: None,
-        status: build_status(&state, &ctx),
+        status: build_status(&app.state, &ctx),
     });
     renderer.flush();
 
@@ -474,12 +509,6 @@ pub async fn run_loop(
     // fire back-to-back.
     let mut last_spinner_draw = std::time::Instant::now();
 
-    // call_id → (tool_name, detail). Populated on ToolCallStarted, consumed
-    // on ToolCallResult so the result line can show "name(detail) — summary"
-    // instead of just a bare "✓ summary" detached from its originating call.
-    let mut pending_tools: std::collections::HashMap<String, (String, String)> =
-        std::collections::HashMap::new();
-
     // DEVIATION from plan:
     // 1. plan uses `SignalKind::terminal_stop()` which does not exist in tokio 1.x.
     //    Using `SignalKind::from_raw(libc::SIGTSTP)` instead.
@@ -515,52 +544,49 @@ pub async fn run_loop(
             }
 
             // ── Spinner tick (from background task) ──
-            Some(()) = spin_rx.recv(), if matches!(state.phase, UiPhase::Streaming) => {
-                draw_spinner_now(&mut state, &buf, &ctx, renderer, message_queue.len(), menu.selected);
+            Some(()) = spin_rx.recv(), if matches!(app.state.phase, UiPhase::Streaming) => {
+                draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
                 last_spinner_draw = std::time::Instant::now();
             }
 
             // ── Terminal input ──
             maybe = ctx.input_rx.recv() => {
                 let Some(ev) = maybe else { break };
-                handle_input(
-                    ev, &mut state, &mut buf, &mut ctx, renderer, &mut menu,
-                    &mut active_modal, &mut message_queue,
-                )?;
+                handle_input(&mut app, &mut ctx, renderer, ev)?;
             }
 
             // ── Version-check wake ──
             // Fires once when the detached startup check resolves with a
             // positive result. Idle-only: in Streaming the spinner tick
             // redraws frequently enough that the hint picks up naturally.
-            Some(()) = ctx.wake_rx.recv(), if matches!(state.phase, UiPhase::Idle) => {
-                redraw_idle_plain(&buf, &state, &ctx, renderer);
+            Some(()) = ctx.wake_rx.recv(), if matches!(app.state.phase, UiPhase::Idle) => {
+                redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
             }
 
             // ── Agent events ──
-            maybe = ctx.agent.event_rx.recv(), if matches!(state.phase, UiPhase::Streaming) => {
+            maybe = ctx.agent.event_rx.recv(), if matches!(app.state.phase, UiPhase::Streaming) => {
                 let Some(ev) = maybe else { break };
-                handle_agent_event(ev, &mut state, &mut think, renderer, &mut pending_tools);
-                if matches!(state.phase, UiPhase::Streaming)
+                handle_agent_event(ev, &mut app.state, &mut app.think, renderer, &mut app.pending_tools);
+                if matches!(app.state.phase, UiPhase::Streaming)
                     && last_spinner_draw.elapsed() >= Duration::from_millis(100)
                 {
-                    draw_spinner_now(&mut state, &buf, &ctx, renderer, message_queue.len(), menu.selected);
+                    draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
                     last_spinner_draw = std::time::Instant::now();
                 }
-                if matches!(state.phase, UiPhase::Idle) {
+                if matches!(app.state.phase, UiPhase::Idle) {
                     // Turn just ended — drain the type-ahead queue.
                     // Pop the oldest queued message, echo as a User
                     // line, dispatch to the agent, and transition
                     // back to Streaming. Remaining queue entries
                     // fire in order on subsequent completions.
-                    if let Some(queued) = message_queue.pop_front() {
+                    if let Some(queued) = app.message_queue.pop_front() {
                         renderer.render(UiLine::User(queued.clone()));
                         renderer.flush();
                         ctx.agent.cmd_tx.send(AgentCommand::SendMessage(queued)).ok();
-                        state.on_submit();
-                        draw_spinner_now(&mut state, &buf, &ctx, renderer, message_queue.len(), menu.selected);
+                        app.state.on_submit();
+                        draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
                     } else {
-                        redraw_idle_plain(&buf, &state, &ctx, renderer);
+                        redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
                     }
                 }
             }
@@ -569,7 +595,7 @@ pub async fn run_loop(
             _ = sigtstp.recv() => {
                 renderer.render(UiLine::ClearTransient);
                 renderer.shutdown();
-                state.on_suspend();
+                app.state.on_suspend();
                 // Disable raw mode before SIGSTOP so shell gets a sane terminal.
                 let _ = crossterm::terminal::disable_raw_mode();
                 unsafe { libc::raise(libc::SIGSTOP); }
@@ -578,14 +604,14 @@ pub async fn run_loop(
             // ── Resume ──
             _ = sigcont.recv() => {
                 let _ = crossterm::terminal::enable_raw_mode();
-                state.on_resume();
-                match state.phase {
+                app.state.on_resume();
+                match app.state.phase {
                     UiPhase::Streaming => {
-                        draw_spinner_now(&mut state, &buf, &ctx, renderer, message_queue.len(), menu.selected);
+                        draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
                         last_spinner_draw = std::time::Instant::now();
                     }
                     _ => {
-                        redraw_idle_plain(&buf, &state, &ctx, renderer);
+                        redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
                     }
                 }
             }
@@ -604,55 +630,47 @@ pub async fn run_loop(
             }
 
             // ── Spinner tick (from background task) ──
-            Some(()) = spin_rx.recv(), if matches!(state.phase, UiPhase::Streaming) => {
-                draw_spinner_now(&mut state, &buf, &ctx, renderer, message_queue.len(), menu.selected);
+            Some(()) = spin_rx.recv(), if matches!(app.state.phase, UiPhase::Streaming) => {
+                draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
                 last_spinner_draw = std::time::Instant::now();
             }
 
             // ── Terminal input ──
             maybe = ctx.input_rx.recv() => {
                 let Some(ev) = maybe else { break };
-                handle_input(
-                    ev, &mut state, &mut buf, &mut ctx, renderer, &mut menu,
-                    &mut active_modal, &mut message_queue,
-                )?;
+                handle_input(&mut app, &mut ctx, renderer, ev)?;
             }
 
             // ── Version-check wake ──
-            Some(()) = ctx.wake_rx.recv(), if matches!(state.phase, UiPhase::Idle) => {
-                redraw_idle_plain(&buf, &state, &ctx, renderer);
+            Some(()) = ctx.wake_rx.recv(), if matches!(app.state.phase, UiPhase::Idle) => {
+                redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
             }
 
             // ── Agent events ──
-            maybe = ctx.agent.event_rx.recv(), if matches!(state.phase, UiPhase::Streaming) => {
+            maybe = ctx.agent.event_rx.recv(), if matches!(app.state.phase, UiPhase::Streaming) => {
                 let Some(ev) = maybe else { break };
-                handle_agent_event(ev, &mut state, &mut think, renderer, &mut pending_tools);
-                if matches!(state.phase, UiPhase::Streaming)
+                handle_agent_event(ev, &mut app.state, &mut app.think, renderer, &mut app.pending_tools);
+                if matches!(app.state.phase, UiPhase::Streaming)
                     && last_spinner_draw.elapsed() >= Duration::from_millis(100)
                 {
-                    draw_spinner_now(&mut state, &buf, &ctx, renderer, message_queue.len(), menu.selected);
+                    draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
                     last_spinner_draw = std::time::Instant::now();
                 }
-                if matches!(state.phase, UiPhase::Idle) {
-                    // Turn just ended — drain the type-ahead queue.
-                    // Pop the oldest queued message, echo as a User
-                    // line, dispatch to the agent, and transition
-                    // back to Streaming. Remaining queue entries
-                    // fire in order on subsequent completions.
-                    if let Some(queued) = message_queue.pop_front() {
+                if matches!(app.state.phase, UiPhase::Idle) {
+                    if let Some(queued) = app.message_queue.pop_front() {
                         renderer.render(UiLine::User(queued.clone()));
                         renderer.flush();
                         ctx.agent.cmd_tx.send(AgentCommand::SendMessage(queued)).ok();
-                        state.on_submit();
-                        draw_spinner_now(&mut state, &buf, &ctx, renderer, message_queue.len(), menu.selected);
+                        app.state.on_submit();
+                        draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
                     } else {
-                        redraw_idle_plain(&buf, &state, &ctx, renderer);
+                        redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
                     }
                 }
             }
         }
 
-        if matches!(state.phase, UiPhase::Idle) && ctx.agent.cmd_tx.is_closed() {
+        if matches!(app.state.phase, UiPhase::Idle) && ctx.agent.cmd_tx.is_closed() {
             break;
         }
     }
@@ -667,14 +685,10 @@ pub async fn run_loop(
 }
 
 fn handle_input(
-    ev: InputEvent,
-    state: &mut UiState,
-    buf: &mut Buffer,
+    app: &mut App,
     ctx: &mut LoopCtx,
     renderer: &mut dyn Renderer,
-    menu: &mut MenuState,
-    active_modal: &mut Option<Box<dyn crate::modals::Modal>>,
-    message_queue: &mut VecDeque<String>,
+    ev: InputEvent,
 ) -> Result<()> {
     use crate::modals::ModalAction;
 
@@ -683,14 +697,14 @@ fn handle_input(
             // Allow pasting during Streaming too — it goes into the
             // type-ahead buffer just like keyboard input. Modals have
             // their own key handling and ignore paste events.
-            if matches!(state.phase, UiPhase::Idle | UiPhase::Streaming)
-                && active_modal.is_none()
+            if matches!(app.state.phase, UiPhase::Idle | UiPhase::Streaming)
+                && app.active_modal.is_none()
             {
-                buf.insert_paste(text);
-                if matches!(state.phase, UiPhase::Streaming) {
-                    draw_spinner_now(state, buf, ctx, renderer, message_queue.len(), menu.selected);
+                app.buf.insert_paste(text);
+                if matches!(app.state.phase, UiPhase::Streaming) {
+                    draw_spinner_now(&mut app.state, &app.buf, ctx, renderer, app.message_queue.len(), app.menu.selected);
                 } else {
-                    redraw_idle_plain(&buf, &state, &ctx, renderer);
+                    redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
                 }
             }
         }
@@ -706,24 +720,22 @@ fn handle_input(
             // Modal trumps phase handlers when it's installed — /model,
             // /provider, /resume all install a modal and the event loop
             // funnels every keystroke through it until it reports Close.
-            if matches!(state.phase, UiPhase::Idle) {
-                if let Some(modal) = active_modal.as_mut() {
-                    let action = modal.handle_key(code, modifiers, buf, state, ctx, renderer)?;
+            if matches!(app.state.phase, UiPhase::Idle) {
+                if let Some(modal) = app.active_modal.as_mut() {
+                    let action = modal.handle_key(
+                        code, modifiers, &mut app.buf, &mut app.state, ctx, renderer,
+                    )?;
                     if matches!(action, ModalAction::Close) {
-                        *active_modal = None;
-                        redraw_idle_plain(buf, state, ctx, renderer);
+                        app.active_modal = None;
+                        redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
                     }
                     return Ok(());
                 }
             }
-            match state.phase {
-                UiPhase::Idle => handle_idle_key(
-                    code, modifiers, state, buf, ctx, renderer, menu, active_modal,
-                )?,
-                UiPhase::Streaming => handle_streaming_key(
-                    code, modifiers, state, buf, ctx, renderer, menu, message_queue,
-                )?,
-                UiPhase::Approval => handle_approval_key(code, state, ctx, renderer)?,
+            match app.state.phase {
+                UiPhase::Idle => handle_idle_key(app, ctx, renderer, code, modifiers)?,
+                UiPhase::Streaming => handle_streaming_key(app, ctx, renderer, code, modifiers)?,
+                UiPhase::Approval => handle_approval_key(code, &mut app.state, ctx, renderer)?,
                 UiPhase::Suspended => {}
             }
         }
@@ -946,59 +958,56 @@ fn build_menu_items(buf: &str, commands: &CommandRegistry) -> Option<Vec<(String
 }
 
 fn handle_idle_key(
-    code: KeyCode,
-    modifiers: crossterm::event::KeyModifiers,
-    state: &mut UiState,
-    buf: &mut Buffer,
+    app: &mut App,
     ctx: &mut LoopCtx,
     renderer: &mut dyn Renderer,
-    menu: &mut MenuState,
-    active_modal: &mut Option<Box<dyn crate::modals::Modal>>,
+    code: KeyCode,
+    modifiers: crossterm::event::KeyModifiers,
 ) -> Result<()> {
     // If the menu is active (buf starts with '/'), intercept navigation keys.
-    let menu_items = build_menu_items(&buf.text, &ctx.commands);
+    let menu_items = build_menu_items(&app.buf.text, &ctx.commands);
     if let Some(items) = &menu_items {
         // Clamp selection in range.
-        if menu.selected >= items.len() {
-            menu.selected = items.len() - 1;
+        if app.menu.selected >= items.len() {
+            app.menu.selected = items.len() - 1;
         }
         match (code, modifiers) {
             (KeyCode::Up, _) => {
-                menu.selected = menu.selected.saturating_sub(1);
-                redraw_with_menu(buf, items, menu.selected, state, ctx, renderer);
+                app.menu.selected = app.menu.selected.saturating_sub(1);
+                redraw_with_menu(&app.buf, items, app.menu.selected, &app.state, ctx, renderer);
                 return Ok(());
             }
             (KeyCode::Down, _) => {
-                if menu.selected + 1 < items.len() {
-                    menu.selected += 1;
+                if app.menu.selected + 1 < items.len() {
+                    app.menu.selected += 1;
                 }
-                redraw_with_menu(buf, items, menu.selected, state, ctx, renderer);
+                redraw_with_menu(&app.buf, items, app.menu.selected, &app.state, ctx, renderer);
                 return Ok(());
             }
             (KeyCode::Enter, m) if !m.contains(crossterm::event::KeyModifiers::SHIFT) => {
                 // Accept the highlighted command as the committed line.
-                let name = items[menu.selected].0.clone();
+                let name = items[app.menu.selected].0.clone();
                 let committed = format!("/{}", name);
-                menu.selected = 0;
+                app.menu.selected = 0;
                 // Simulate a commit path.
                 renderer.render(UiLine::ClearTransient);
                 renderer.render(UiLine::User(committed.clone()));
-                buf.text.clear();
-                buf.cursor = 0;
+                app.buf.text.clear();
+                app.buf.cursor = 0;
                 if let Some((cmd, arg)) = parse_slash_line(&committed) {
-                    execute_slash_command(cmd, arg, state, ctx, renderer, active_modal)?;
-                    if matches!(state.phase, UiPhase::Idle) {
-                        redraw_after_slash(buf, state, ctx, active_modal, renderer);
+                    execute_slash_command(cmd, arg, &mut app.state, ctx, renderer, &mut app.active_modal)?;
+                    if matches!(app.state.phase, UiPhase::Idle) {
+                        redraw_after_slash(&app.buf, &app.state, ctx, &app.active_modal, renderer);
                     }
                 }
                 return Ok(());
             }
             (KeyCode::Esc, _) => {
                 // Close menu by clearing buffer.
-                buf.text.clear();
-                buf.cursor = 0;
-                menu.selected = 0;
-                redraw_idle_plain(buf, state, ctx, renderer);
+                app.buf.text.clear();
+                app.buf.cursor = 0;
+                app.menu.selected = 0;
+                redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
                 return Ok(());
             }
             _ => {} // fall through to buffer edits
@@ -1006,40 +1015,40 @@ fn handle_idle_key(
     }
 
     let action = classify(code, modifiers);
-    match buf.apply(action, ctx.history.entries(), &ctx.commands) {
+    match app.buf.apply(action, ctx.history.entries(), &ctx.commands) {
         BufferResult::NoOp => {}
         BufferResult::Redraw => {
             // Rebuild menu after buf change.
-            let items = build_menu_items(&buf.text, &ctx.commands);
+            let items = build_menu_items(&app.buf.text, &ctx.commands);
             if let Some(items) = items {
-                if menu.selected >= items.len() {
-                    menu.selected = 0;
+                if app.menu.selected >= items.len() {
+                    app.menu.selected = 0;
                 }
-                redraw_with_menu(buf, &items, menu.selected, state, ctx, renderer);
+                redraw_with_menu(&app.buf, &items, app.menu.selected, &app.state, ctx, renderer);
             } else {
-                menu.selected = 0;
-                redraw_idle_plain(buf, state, ctx, renderer);
+                app.menu.selected = 0;
+                redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
             }
         }
         BufferResult::Commit(line) => {
             // Expand paste placeholders so the agent sees full content
             // while the echoed user line and history stay compact.
-            let expanded = buf.expand_pastes(&line);
+            let expanded = app.buf.expand_pastes(&line);
             renderer.render(UiLine::ClearTransient);
             renderer.render(UiLine::User(line.clone()));
-            buf.text.clear();
-            buf.cursor = 0;
-            buf.clear_pastes();
-            menu.selected = 0;
+            app.buf.text.clear();
+            app.buf.cursor = 0;
+            app.buf.clear_pastes();
+            app.menu.selected = 0;
             if let Some((cmd, arg)) = parse_slash_line(&line) {
-                execute_slash_command(cmd, arg, state, ctx, renderer, active_modal)?;
-                if matches!(state.phase, UiPhase::Idle) {
-                    redraw_after_slash(buf, state, ctx, active_modal, renderer);
+                execute_slash_command(cmd, arg, &mut app.state, ctx, renderer, &mut app.active_modal)?;
+                if matches!(app.state.phase, UiPhase::Idle) {
+                    redraw_after_slash(&app.buf, &app.state, ctx, &app.active_modal, renderer);
                 }
             } else {
                 ctx.history.push(line.clone());
                 ctx.agent.cmd_tx.send(AgentCommand::SendMessage(expanded)).ok();
-                state.on_submit();
+                app.state.on_submit();
             }
         }
         BufferResult::Exit => {
@@ -1864,14 +1873,11 @@ fn replay_session(renderer: &mut dyn Renderer, session: &atomcode_core::session:
 }
 
 fn handle_streaming_key(
-    code: KeyCode,
-    modifiers: crossterm::event::KeyModifiers,
-    state: &mut UiState,
-    buf: &mut Buffer,
+    app: &mut App,
     ctx: &mut LoopCtx,
     renderer: &mut dyn Renderer,
-    menu: &mut MenuState,
-    message_queue: &mut VecDeque<String>,
+    code: KeyCode,
+    modifiers: crossterm::event::KeyModifiers,
 ) -> Result<()> {
     // Ctrl+C always cancels the running turn — highest priority so
     // users have a reliable escape hatch even mid-edit.
@@ -1884,29 +1890,29 @@ fn handle_streaming_key(
     // so the user can browse candidate commands mid-stream. Execution
     // is still blocked below — Enter falls through to the commit arm,
     // which emits the "disabled while a turn is running" hint.
-    let menu_items = build_menu_items(&buf.text, &ctx.commands);
+    let menu_items = build_menu_items(&app.buf.text, &ctx.commands);
     if let Some(items) = &menu_items {
-        if menu.selected >= items.len() {
-            menu.selected = items.len() - 1;
+        if app.menu.selected >= items.len() {
+            app.menu.selected = items.len() - 1;
         }
         match code {
             KeyCode::Up => {
-                menu.selected = menu.selected.saturating_sub(1);
-                draw_spinner_now(state, buf, ctx, renderer, message_queue.len(), menu.selected);
+                app.menu.selected = app.menu.selected.saturating_sub(1);
+                draw_spinner_now(&mut app.state, &app.buf, ctx, renderer, app.message_queue.len(), app.menu.selected);
                 return Ok(());
             }
             KeyCode::Down => {
-                if menu.selected + 1 < items.len() {
-                    menu.selected += 1;
+                if app.menu.selected + 1 < items.len() {
+                    app.menu.selected += 1;
                 }
-                draw_spinner_now(state, buf, ctx, renderer, message_queue.len(), menu.selected);
+                draw_spinner_now(&mut app.state, &app.buf, ctx, renderer, app.message_queue.len(), app.menu.selected);
                 return Ok(());
             }
             KeyCode::Esc => {
-                buf.text.clear();
-                buf.cursor = 0;
-                menu.selected = 0;
-                draw_spinner_now(state, buf, ctx, renderer, message_queue.len(), menu.selected);
+                app.buf.text.clear();
+                app.buf.cursor = 0;
+                app.menu.selected = 0;
+                draw_spinner_now(&mut app.state, &app.buf, ctx, renderer, app.message_queue.len(), app.menu.selected);
                 return Ok(());
             }
             _ => {} // fall through to buffer edits
@@ -1914,19 +1920,19 @@ fn handle_streaming_key(
     }
 
     let action = classify(code, modifiers);
-    match buf.apply(action, ctx.history.entries(), &ctx.commands) {
+    match app.buf.apply(action, ctx.history.entries(), &ctx.commands) {
         BufferResult::NoOp => {}
         BufferResult::Redraw => {
             // Menu shape may have changed — reset selection if it
             // now points past the (possibly shorter) list.
-            if let Some(items) = build_menu_items(&buf.text, &ctx.commands) {
-                if menu.selected >= items.len() {
-                    menu.selected = 0;
+            if let Some(items) = build_menu_items(&app.buf.text, &ctx.commands) {
+                if app.menu.selected >= items.len() {
+                    app.menu.selected = 0;
                 }
             } else {
-                menu.selected = 0;
+                app.menu.selected = 0;
             }
-            draw_spinner_now(state, buf, ctx, renderer, message_queue.len(), menu.selected);
+            draw_spinner_now(&mut app.state, &app.buf, ctx, renderer, app.message_queue.len(), app.menu.selected);
         }
         BufferResult::Commit(line) => {
             // Slash commands are not queued — they need ctx access
@@ -1937,24 +1943,24 @@ fn handle_streaming_key(
                     "  (slash commands are disabled while a turn is running)\n".into(),
                 ));
                 renderer.flush();
-                buf.text.clear();
-                buf.cursor = 0;
-                menu.selected = 0;
-                draw_spinner_now(state, buf, ctx, renderer, message_queue.len(), menu.selected);
+                app.buf.text.clear();
+                app.buf.cursor = 0;
+                app.menu.selected = 0;
+                draw_spinner_now(&mut app.state, &app.buf, ctx, renderer, app.message_queue.len(), app.menu.selected);
                 return Ok(());
             }
             // Expand any paste placeholders — agent sees full payload,
             // scrollback echo stays compact.
-            let expanded = buf.expand_pastes(&line);
+            let expanded = app.buf.expand_pastes(&line);
             ctx.history.push(line.clone());
-            message_queue.push_back(expanded);
-            buf.text.clear();
-            buf.cursor = 0;
-            buf.clear_pastes();
+            app.message_queue.push_back(expanded);
+            app.buf.text.clear();
+            app.buf.cursor = 0;
+            app.buf.clear_pastes();
             // Echo as a queued entry so the user sees it landed.
             renderer.render(UiLine::CommandOutput(format!("  ↳ queued: {}\n", line)));
             renderer.flush();
-            draw_spinner_now(state, buf, ctx, renderer, message_queue.len(), menu.selected);
+            draw_spinner_now(&mut app.state, &app.buf, ctx, renderer, app.message_queue.len(), app.menu.selected);
         }
         BufferResult::Exit => {
             // Ctrl+C on empty buf during streaming — treat as cancel
