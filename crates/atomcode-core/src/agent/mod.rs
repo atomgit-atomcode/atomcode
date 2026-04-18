@@ -1833,8 +1833,6 @@ fn extract_contract(plan_text: &str) -> String {
 }
 
 /// LEGACY: Hardcoded build marker detection. Used only by sub-agent merge verification.
-/// Phase 5 replaces this with LLM-inferred project config (codename: "ProjectSense").
-/// See docs/phase5-the-final-five.md
 fn find_build_command(wd: &std::path::Path) -> Option<(String, std::path::PathBuf)> {
     let markers: &[(&str, &str)] = &[
         ("package.json", "npm run build 2>&1 | head -30"),

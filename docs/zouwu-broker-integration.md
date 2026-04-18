@@ -425,7 +425,6 @@ curl -X POST https://test-zouwu.gitcode.com/exchange \
 ## 联系人
 
 - atomcode 客户端代码：`/crates/atomcode-tui/src/auth/wecom.rs`
-- Spec：`/docs/superpowers/specs/2026-04-14-wecom-login-design.md`
 - 问题反馈：GitCode Issue / 内部 IM
 
 zouwu 后端有任何协议字段需要调整，直接告诉 atomcode 团队，在 `BrokerResponse` / `parse_broker_response` 那一层适配即可，成本很低。
