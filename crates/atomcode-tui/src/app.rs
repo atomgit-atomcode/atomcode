@@ -7,6 +7,7 @@ use tokio::sync::mpsc;
 use atomcode_core::agent::{AgentCommand, AgentEvent, AgentHandle};
 use atomcode_core::config::Config;
 use atomcode_core::conversation::Conversation;
+use atomcode_core::input_history::InputHistory;
 use atomcode_core::provider::LlmProvider;
 use atomcode_core::session::{Session, SessionManager, SessionMeta};
 use atomcode_core::tool::{ToolCall, ToolContext, ToolResult};
@@ -277,20 +278,10 @@ impl App {
        working_dir: PathBuf,
        session_to_continue: Option<Session>,
    ) -> Self {
-       // Load history ONLY for input history (up/down arrow), NOT for conversation context.
-       // Each session starts fresh — prevents corrupted messages from causing API errors.
-       let old_history = Conversation::load(&Conversation::history_path());
-       let input_history: Vec<String> = old_history.messages.iter()
-           .filter_map(|m| {
-               use atomcode_core::conversation::message::{MessageContent, Role};
-               if matches!(m.role, Role::User) {
-                   if let MessageContent::Text(s) = &m.content {
-                       if !s.starts_with('/') { return Some(s.clone()); }
-                   }
-               }
-               None
-           })
-           .collect();
+       // Input history (↑/↓ recall) is persisted separately from conversation
+       // messages in ~/.atomcode/input_history.txt — append-only across sessions,
+       // independent of session state. Oldest first, newest last.
+       let input_history: Vec<String> = InputHistory::load();
 
        // Initialize session manager and load or create default session
        let session_manager = SessionManager::new(&working_dir);
@@ -1786,11 +1777,9 @@ impl App {
                         self.history_stash = Some(self.input.content());
                         self.history_index = Some(self.input_history.len().saturating_sub(1));
                     } else if let Some(idx) = self.history_index {
+                        // Stop at oldest — no wrap-around.
                         if idx > 0 {
                             self.history_index = Some(idx - 1);
-                        } else {
-                            // Wrap around: oldest -> newest
-                            self.history_index = Some(self.input_history.len().saturating_sub(1));
                         }
                     }
                     if let Some(idx) = self.history_index {
@@ -1818,15 +1807,9 @@ impl App {
                             for c in stash.chars() { self.input.insert_char(c); }
                         }
                     }
-                } else if !self.input_history.is_empty() {
-                    // Enter history from newest
-                    self.history_stash = Some(self.input.content());
-                    self.history_index = Some(0);
-                    if let Some(hist) = self.input_history.first().cloned() {
-                                                self.pasted_blocks.clear();
-                        self.load_history_entry(&hist);
-                    }
                 }
+                // ↓ without an active history index is a no-op —
+                // history is only entered via ↑ (from newest upward).
             }
             (_, KeyCode::Backspace) => {
                 if self.input.is_empty() && !self.pasted_blocks.is_empty() {
@@ -2676,10 +2659,11 @@ impl App {
             }
         }
 
-        // Add full content to history (typed + pasted)
+        // Add full content to in-memory recall list and persist across sessions.
         self.input_history.push(content.clone());
-        if self.input_history.len() > 100 {
-            self.input_history.drain(..self.input_history.len() - 100);
+        InputHistory::append(&content);
+        if self.input_history.len() > 1000 {
+            self.input_history.drain(..self.input_history.len() - 1000);
         }
         self.history_index = None;
         self.history_stash = None;

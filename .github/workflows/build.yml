@@ -181,3 +181,59 @@ jobs:
             --file-name=${TAG_NAME}-linux-arm64 \
             --file-path=dist/${TAG_NAME}-linux-arm64 \
             --access-token=${{ secrets.ACCESS_TOKEN }}
+
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      # 1️⃣ 拉代码
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Add hosts
+        run: |
+          Add-Content -Path C:\Windows\System32\drivers\etc\hosts -Value "159.138.147.37 api.atomgit.com"
+          Add-Content -Path C:\Windows\System32\drivers\etc\hosts -Value "159.138.147.37 file.atomgit.com"
+          Add-Content -Path C:\Windows\System32\drivers\etc\hosts -Value "159.138.147.37 api.gitcode.com"
+          Add-Content -Path C:\Windows\System32\drivers\etc\hosts -Value "159.138.147.37 file.gitcode.com"
+
+      # 2️⃣ 安装 Rust
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # 3️⃣ 添加 Windows ARM64 target
+      - name: Add Windows ARM64 target
+        run: rustup target add aarch64-pc-windows-msvc
+
+      # 4️⃣ 编译 ARM64
+      - name: Build ARM64
+        run: cargo build --release --target aarch64-pc-windows-msvc
+
+      # 5️⃣ 生成带版本号的二进制
+      - name: Prepare binaries
+        shell: bash
+        run: |
+          TAG_NAME=${GITHUB_REF#refs/tags/}
+
+          mkdir -p dist
+
+          cp target/aarch64-pc-windows-msvc/release/atomcode.exe dist/${TAG_NAME}-windows-arm64.exe
+
+      # 6️⃣ 安装 Python
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      # 7️⃣ 上传 ARM64
+      - name: Upload ARM64
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          TAG_NAME=${GITHUB_REF#refs/tags/}
+
+          python3 .github/workflows/create_tag_release.py \
+            --tag-name=${TAG_NAME} \
+            --file-name=${TAG_NAME}-windows-arm64.exe \
+            --file-path=dist/${TAG_NAME}-windows-arm64.exe \
+            --access-token=${{ secrets.ACCESS_TOKEN }}

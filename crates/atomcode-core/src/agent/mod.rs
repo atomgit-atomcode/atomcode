@@ -407,6 +407,9 @@ impl AgentLoop {
         // Convert Box → Arc so provider can be shared with sub-agents.
         let provider: std::sync::Arc<dyn LlmProvider> = std::sync::Arc::from(provider);
 
+        // Build the datalog writer before `config` is moved into the agent below.
+        let datalog = crate::turn::datalog::DatalogWriter::new(&working_dir, &config.datalog);
+
         let turn_runner = TurnRunner {
             provider,
             tools: shared_tools.clone(),
@@ -454,7 +457,7 @@ impl AgentLoop {
             active_services: std::collections::HashMap::new(),
             skill_registry,
             reindex_tx: None,
-            datalog: crate::turn::datalog::DatalogWriter::new(&working_dir),
+            datalog,
             cmd_rx,
             event_tx,
         };

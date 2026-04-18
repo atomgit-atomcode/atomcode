@@ -14,7 +14,7 @@
   <nav class="docs-nav fixed top-0 w-full z-50 border-b border-white/5">
     <div class="max-w-7xl mx-auto px-4 md:px-6 h-14 md:h-16 flex items-center justify-between">
       <a href="../index.html" class="flex items-center gap-2 md:gap-3">
-        <img src="https://cdn-news.gitcode.com/news/atomcode.png" alt="AtomCode" class="w-7 h-7 md:w-8 md:h-8 rounded-lg">
+        <img src="https://cdn-news.gitcode.com/news/atomcode-icon.png" alt="AtomCode" class="w-7 h-7 md:w-8 md:h-8 rounded-lg">
         <span class="text-base md:text-lg font-semibold tracking-tight">AtomCode</span>
         <span class="text-xs text-slate-500 hidden sm:inline">· 使用指南</span>
       </a>
@@ -30,6 +30,7 @@
   <div class="max-w-7xl mx-auto px-4 md:px-6 pt-20 md:pt-24 pb-24 md:grid md:grid-cols-[220px_1fr] md:gap-10">
     <aside id="docsSidebar" class="docs-sidebar md:sticky md:top-24 md:self-start mb-8 md:mb-0">
       <div class="text-xs uppercase text-slate-500 font-semibold mb-3 tracking-wider">使用指南</div>
+      <div id="docsSearch"></div>
       <nav class="flex flex-col gap-0.5">
         <a href="./index.html">概览</a>
         <a href="./getting-started.html">快速开始</a>
@@ -49,7 +50,7 @@
 
     <main class="prose-docs min-w-0">
       <h1>登录方式</h1>
-      <p class="lede">AtomCode 支持三种方式接入 LLM:AtomGit OAuth 一键登录、企业微信扫码登录,以及传统 API Key。本页帮你选对方式,并完成绑定。</p>
+      <p class="lede">AtomCode 支持两种方式接入 LLM:AtomGit OAuth 一键登录和传统 API Key。本页帮你选对方式,并完成绑定。</p>
 
       <h2>三种方式速览</h2>
       <table>
@@ -58,7 +59,6 @@
         </thead>
         <tbody>
           <tr><td>AtomGit OAuth</td><td><code>/login</code></td><td>任何有 AtomGit 账号的开发者,最省事</td></tr>
-          <tr><td>企业微信扫码</td><td><code>/login-inner</code></td><td>GitCode / CSDN 内部用户</td></tr>
           <tr><td>API Key</td><td><code>/provider</code> 或手动编辑配置</td><td>使用自有 OpenAI / Claude / DeepSeek Key 的用户</td></tr>
         </tbody>
       </table>
@@ -87,16 +87,6 @@
       <pre><code>atomcode status     # 或 TUI 内 /status
 atomcode logout     # 或 TUI 内 /logout</code></pre>
 
-      <div class="callout callout-info">
-        <strong>OAuth 的 provider 是临时的</strong>
-        <p>OAuth 登录后自动添加的 provider 属于 "ephemeral"(短期)条目,不会被写进 <code>~/.atomcode/config.toml</code>,下次重启需要重新登录。这是有意为之,用来保护 token 不落盘。如果你希望持久化,请手动配置 API Key。</p>
-      </div>
-
-<h2>SSO登录(内部)</h2>
-      <p>如果你在 GitCode / CSDN 内部环境,可以使用:</p>
-      <pre><code>/login-with-sso</code></pre>
-      <p>TUI 会打开浏览器进行 SSO 登录。底层基于 AtomCode 的邹悟(Zouwu)broker,会自动映射到对应的 provider。</p>
-
       <h2>API Key 方式</h2>
       <p>如果你想使用自有的 OpenAI / Claude / DeepSeek / GLM 等密钥,有三种做法:</p>
 
@@ -116,9 +106,8 @@ atomcode logout     # 或 TUI 内 /logout</code></pre>
 
       <h2>选哪个?</h2>
       <ul>
-        <li>只是想快速体验 &rarr; <strong>AtomGit OAuth</strong>。</li>
+        <li>只是想快速体验 &rarr; <strong>AtomGit OAuth</strong>,登录一次后自动持久化。</li>
         <li>需要在 CI / 脚本里跑 &rarr; <strong>API Key</strong> + 配置文件或环境变量。</li>
-<li>公司内网 / GitCode 内部 &rarr; <strong>/login-with-sso</strong>。</li>
         <li>完全离线 &rarr; 配置一个 <strong>Ollama</strong> provider,不需要任何登录。</li>
       </ul>
 

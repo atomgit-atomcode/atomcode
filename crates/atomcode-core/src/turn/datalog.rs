@@ -1,18 +1,29 @@
 //! Per-turn logging: writes each user request and agent response to a markdown
-//! file in the `datalog/` directory under the working directory.
+//! file in a configurable directory (default: `<working_dir>/datalog/`).
 //!
-//! File naming: `datalog/YYYY-MM-DD_HH-MM-SS.md`
+//! File naming: `<dir>/YYYY-MM-DD_HH-MM-SS.md`
 //! Content mirrors what the user sees on screen.
 //! Every write operation flushes immediately so logs survive crashes.
+//!
+//! Configured via `[datalog]` in `~/.atomcode/config.toml`:
+//! - `enabled = false` — disables logging entirely (writer becomes a no-op)
+//! - `dir = "<path>"` — redirects output; supports absolute, `~/…`, or relative paths
 
 use std::fmt::Write as FmtWrite;
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime};
 
+use crate::config::DatalogConfig;
+
 /// Accumulates log entries for a single turn, flushing to disk after each operation.
 pub struct DatalogWriter {
-    /// Working directory (datalog/ created under this)
+    /// Current working directory — used when `configured_dir` is None or relative.
     base_dir: PathBuf,
+    /// Raw user-configured dir (pre-resolution). `None` → default to
+    /// `<base_dir>/datalog`. Otherwise can be absolute, `~/…`, or relative.
+    configured_dir: Option<String>,
+    /// When false, all methods are no-ops and no files are created.
+    enabled: bool,
     /// Content buffer
     buf: String,
     /// Whether we have an active turn
@@ -28,9 +39,11 @@ pub struct DatalogWriter {
 }
 
 impl DatalogWriter {
-    pub fn new(working_dir: &Path) -> Self {
+    pub fn new(working_dir: &Path, config: &DatalogConfig) -> Self {
         Self {
             base_dir: working_dir.to_path_buf(),
+            configured_dir: config.dir.clone(),
+            enabled: config.enabled,
             buf: String::new(),
             active: false,
             start: None,
@@ -40,9 +53,30 @@ impl DatalogWriter {
         }
     }
 
-    /// Update the base directory (e.g. after `/cd`).
+    /// Update the working directory (e.g. after `/cd`). Absolute / `~/`
+    /// configured paths are unaffected — only the default and relative cases
+    /// follow cwd changes.
     pub fn set_working_dir(&mut self, dir: &Path) {
         self.base_dir = dir.to_path_buf();
+    }
+
+    /// Resolve the actual directory to write datalog files into, given the
+    /// current `base_dir` and `configured_dir`. Pure function — used by
+    /// `begin_turn` and covered by unit tests.
+    fn resolve_log_dir(base_dir: &Path, configured: Option<&str>) -> PathBuf {
+        match configured {
+            None => base_dir.join("datalog"),
+            Some(s) if s.starts_with("~/") || s == "~" => {
+                let rest = s.strip_prefix("~/").unwrap_or("");
+                dirs::home_dir()
+                    .unwrap_or_else(|| PathBuf::from("."))
+                    .join(rest)
+            }
+            Some(s) => {
+                let p = PathBuf::from(s);
+                if p.is_absolute() { p } else { base_dir.join(p) }
+            }
+        }
     }
 
     /// Clear the current turn log state and delete the log file if it exists.
@@ -69,6 +103,7 @@ impl DatalogWriter {
 
     /// Start a new turn: create log file, write env info + user message.
     pub fn begin_turn(&mut self, user_message: &str, model_name: &str, context_window: usize) {
+        if !self.enabled { return; }
         self.buf.clear();
         self.step = 0;
         self.active = true;
@@ -76,7 +111,7 @@ impl DatalogWriter {
 
         let timestamp = format_timestamp();
         let filename = format!("{}.md", timestamp.replace(' ', "_").replace(':', "-"));
-        let log_dir = self.base_dir.join("datalog");
+        let log_dir = Self::resolve_log_dir(&self.base_dir, self.configured_dir.as_deref());
         let _ = std::fs::create_dir_all(&log_dir);
         self.file_path = Some(log_dir.join(filename));
 
@@ -396,10 +431,53 @@ mod tests {
     use super::*;
 
     fn make_log(dir: &Path) -> DatalogWriter {
-        let mut log = DatalogWriter::new(dir);
+        let mut log = DatalogWriter::new(dir, &DatalogConfig::default());
         log.begin_turn("test", "test-model", 16000);
         log.log_llm_call();
         log
+    }
+
+    #[test]
+    fn resolve_log_dir_default_uses_working_dir() {
+        let base = PathBuf::from("/tmp/work");
+        let p = DatalogWriter::resolve_log_dir(&base, None);
+        assert_eq!(p, PathBuf::from("/tmp/work/datalog"));
+    }
+
+    #[test]
+    fn resolve_log_dir_absolute_ignores_working_dir() {
+        let base = PathBuf::from("/tmp/work");
+        let p = DatalogWriter::resolve_log_dir(&base, Some("/var/logs/atomcode"));
+        assert_eq!(p, PathBuf::from("/var/logs/atomcode"));
+    }
+
+    #[test]
+    fn resolve_log_dir_relative_joins_working_dir() {
+        let base = PathBuf::from("/tmp/work");
+        let p = DatalogWriter::resolve_log_dir(&base, Some("logs/ac"));
+        assert_eq!(p, PathBuf::from("/tmp/work/logs/ac"));
+    }
+
+    #[test]
+    fn resolve_log_dir_tilde_expands_home() {
+        let base = PathBuf::from("/tmp/work");
+        let p = DatalogWriter::resolve_log_dir(&base, Some("~/.atomcode/logs"));
+        let expected = dirs::home_dir().unwrap().join(".atomcode/logs");
+        assert_eq!(p, expected);
+    }
+
+    #[test]
+    fn disabled_writer_never_creates_files() {
+        let dir = std::env::temp_dir().join("atomcode_test_datalog_disabled");
+        let _ = std::fs::remove_dir_all(&dir);
+        let cfg = DatalogConfig { enabled: false, dir: None };
+        let mut log = DatalogWriter::new(&dir, &cfg);
+        log.begin_turn("hello", "m", 1000);
+        log.log_llm_call();
+        log.log_text("response");
+        log.end_turn(0, 0);
+        assert!(log.file_path.is_none());
+        assert!(!dir.join("datalog").exists());
     }
 
     #[test]

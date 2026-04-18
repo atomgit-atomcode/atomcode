@@ -14,7 +14,7 @@
   <nav class="docs-nav fixed top-0 w-full z-50 border-b border-white/5">
     <div class="max-w-7xl mx-auto px-4 md:px-6 h-14 md:h-16 flex items-center justify-between">
       <a href="../index.html" class="flex items-center gap-2 md:gap-3">
-        <img src="https://cdn-news.gitcode.com/news/atomcode.png" alt="AtomCode" class="w-7 h-7 md:w-8 md:h-8 rounded-lg">
+        <img src="https://cdn-news.gitcode.com/news/atomcode-icon.png" alt="AtomCode" class="w-7 h-7 md:w-8 md:h-8 rounded-lg">
         <span class="text-base md:text-lg font-semibold tracking-tight">AtomCode</span>
         <span class="text-xs text-slate-500 hidden sm:inline">· 使用指南</span>
       </a>
@@ -30,6 +30,7 @@
   <div class="max-w-7xl mx-auto px-4 md:px-6 pt-20 md:pt-24 pb-24 md:grid md:grid-cols-[220px_1fr] md:gap-10">
     <aside id="docsSidebar" class="docs-sidebar md:sticky md:top-24 md:self-start mb-8 md:mb-0">
       <div class="text-xs uppercase text-slate-500 font-semibold mb-3 tracking-wider">使用指南</div>
+      <div id="docsSearch"></div>
       <nav class="flex flex-col gap-0.5">
         <a href="./index.html">概览</a>
         <a href="./getting-started.html">快速开始</a>
@@ -61,9 +62,8 @@
           <tr><td><code>/session</code></td><td>创建一个全新的、干净的会话</td></tr>
           <tr><td><code>/provider</code></td><td>打开 provider 管理界面,增删改切换</td></tr>
           <tr><td><code>/model</code></td><td>在当前 provider 下切换模型,或跨 provider 切换</td></tr>
-          <tr><td><code>/login</code></td><td>通过 AtomGit OAuth 登录</td></tr>
-          <tr><td><code>/login-with-sso</code></td><td>通过SSO登录(GitCode 内部用户)</td></tr>
-          <tr><td><code>/cd</code></td><td>切换工作目录,并写回 <code>default_workdir</code></td></tr>
+          <tr><td><code>/login</code></td><td>通过 AtomGit OAuth 登录,配置自动持久化到 config.toml</td></tr>
+          <tr><td><code>/cd</code></td><td>切换工作目录,并写回 <code>default_workdir</code>。也可以直接输入 <code>cd /path</code>(无需斜杠前缀)</td></tr>
         </tbody>
       </table>
 
@@ -73,9 +73,10 @@
           <tr><th>命令</th><th>作用</th></tr>
         </thead>
         <tbody>
+          <tr><td><code>/plan</code></td><td>进入 Plan 模式(只读分析,不修改代码)。AI 会先调研、制定方案,确认后再执行</td></tr>
           <tr><td><code>/undo</code></td><td>回滚上一轮 AI 对本地文件的所有编辑,基于 file-history 快照</td></tr>
           <tr><td><code>/diff</code></td><td>显示当前工作目录未提交改动的 git diff</td></tr>
-          <tr><td><code>/cost</code></td><td>展示当前会话累计消耗的输入 / 输出 token 数</td></tr>
+          <tr><td><code>/cost</code></td><td>展示当前会话输出 token 数和上下文用量。不支持 usage 报告的 API 会自动估算</td></tr>
           <tr><td><code>/copy</code></td><td>将 AI 最后一条回复复制到系统剪贴板</td></tr>
           <tr><td><code>/clear</code></td><td>清空当前会话的消息(保留工作目录和模型)</td></tr>
           <tr><td><code>/compact</code></td><td>压缩历史消息,把早期对话压缩成摘要以腾出上下文预算</td></tr>
@@ -111,9 +112,10 @@
       <pre><code>&gt; 重构 src/db 使用连接池
 ... (AI 执行)
 &gt; /cost
-Input:  42.1K tokens
-Output: 8.3K tokens
-Total:  ≈ $0.21</code></pre>
+Session token usage
+- Total output tokens: 8342
+- Current turn tokens: 2156
+- Context: 42K / 128K</code></pre>
 
       <h3>改完不满意就回滚</h3>
       <pre><code>&gt; 给所有函数加 JSDoc

@@ -50,6 +50,67 @@ pub struct Config {
     /// Default working directory. Saved on /cd, restored on startup.
     pub default_workdir: Option<String>,
     pub providers: HashMap<String, ProviderConfig>,
+    /// Per-turn datalog settings. Missing from older configs → defaults to
+    /// enabled=true, dir=None (writes to `<cwd>/datalog/`).
+    ///
+    /// `skip_serializing` intentionally suppresses serde's automatic output;
+    /// `save()` writes this section manually with explanatory comments and
+    /// the default `dir` line commented-out so users can edit the file
+    /// without needing to know the field names in advance.
+    #[serde(default, skip_serializing)]
+    pub datalog: DatalogConfig,
+}
+
+/// Controls the per-turn markdown datalog writer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DatalogConfig {
+    /// When false, `DatalogWriter` becomes a no-op and no files are created.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Where to write datalog files. Accepted forms:
+    /// - `None` (or omitted) → `<working_dir>/datalog/` (default, current behavior)
+    /// - Absolute path → used as-is, not affected by /cd
+    /// - `~/...` → expanded relative to home, not affected by /cd
+    /// - Relative path → resolved against working_dir, follows /cd
+    #[serde(default)]
+    pub dir: Option<String>,
+}
+
+fn default_true() -> bool { true }
+
+impl Default for DatalogConfig {
+    fn default() -> Self {
+        Self { enabled: true, dir: None }
+    }
+}
+
+/// Serialize the `[datalog]` section with help comments so users editing
+/// config.toml by hand can discover the options without reading the source.
+/// When `dir` is unset, emit a commented-out example; when set, emit it as
+/// a real TOML string.
+fn render_datalog_section(cfg: &DatalogConfig) -> String {
+    let mut out = String::new();
+    out.push_str("\n# Per-turn datalog settings. Each turn writes a markdown file\n");
+    out.push_str("# (plus a .jsonl of raw LLM requests) into `dir`.\n");
+    out.push_str("# - enabled = false        -> disable logging entirely\n");
+    out.push_str("# - dir unset (default)    -> writes to <working_dir>/datalog/ (follows /cd)\n");
+    out.push_str("# - dir = \"/abs/path\"      -> absolute, fixed (unaffected by /cd)\n");
+    out.push_str("# - dir = \"~/sub\"          -> expanded from $HOME, fixed\n");
+    out.push_str("# - dir = \"rel/path\"       -> joined with current working_dir, follows /cd\n");
+    out.push_str("[datalog]\n");
+    out.push_str(&format!("enabled = {}\n", cfg.enabled));
+    match &cfg.dir {
+        Some(d) => {
+            let escaped = d.replace('\\', "\\\\").replace('"', "\\\"");
+            out.push_str(&format!("dir = \"{}\"\n", escaped));
+        }
+        None => {
+            // Leave dir unset so behavior stays <cwd>/datalog/. The line below is
+            // ONLY an example of the string form — not the actual default.
+            out.push_str("# dir = \"~/.atomcode/datalog\"  # example: uncomment to redirect\n");
+        }
+    }
+    out
 }
 
 impl Config {
@@ -75,7 +136,8 @@ impl Config {
                 persistent.default_provider = disk.default_provider;
             }
         }
-        let content = toml::to_string_pretty(&persistent)?;
+        let mut content = toml::to_string_pretty(&persistent)?;
+        content.push_str(&render_datalog_section(&self.datalog));
         std::fs::write(path, content)?;
         Ok(())
     }
@@ -200,6 +262,54 @@ mod tests {
         let config: Config = toml::from_str(toml_str).unwrap();
         let provider = config.active_provider(None).unwrap();
         assert_eq!(provider.model, "claude-opus-4-6");
+    }
+
+    #[test]
+    fn render_datalog_section_default_has_commented_dir() {
+        let rendered = render_datalog_section(&DatalogConfig::default());
+        assert!(rendered.contains("[datalog]"));
+        assert!(rendered.contains("enabled = true"));
+        assert!(rendered.contains("# dir = "));
+        assert!(!rendered.contains("\ndir = "), "default must not emit active dir line");
+    }
+
+    #[test]
+    fn render_datalog_section_with_dir_emits_real_value() {
+        let cfg = DatalogConfig { enabled: false, dir: Some("~/.atomcode/logs".to_string()) };
+        let rendered = render_datalog_section(&cfg);
+        assert!(rendered.contains("enabled = false"));
+        assert!(rendered.contains("dir = \"~/.atomcode/logs\""));
+    }
+
+    #[test]
+    fn saved_config_roundtrips_datalog() {
+        let tmp = std::env::temp_dir().join(format!("atomcode_cfg_rt_{}.toml", std::process::id()));
+        let mut cfg = Config {
+            default_provider: "p".to_string(),
+            default_workdir: None,
+            providers: HashMap::new(),
+            datalog: DatalogConfig { enabled: false, dir: Some("/var/log/ac".to_string()) },
+        };
+        cfg.providers.insert("p".to_string(), ProviderConfig {
+            provider_type: "openai".to_string(),
+            api_key: Some("k".to_string()),
+            model: "m".to_string(),
+            base_url: None,
+            system_prompt: None,
+            user_agent: None,
+            context_window: 16000,
+            max_tokens: None,
+            ephemeral: false,
+        });
+        cfg.save(&tmp).unwrap();
+        let text = std::fs::read_to_string(&tmp).unwrap();
+        assert!(text.contains("[datalog]"));
+        assert!(text.contains("enabled = false"));
+        assert!(text.contains("dir = \"/var/log/ac\""));
+        let reloaded = Config::load(&tmp).unwrap();
+        assert!(!reloaded.datalog.enabled);
+        assert_eq!(reloaded.datalog.dir.as_deref(), Some("/var/log/ac"));
+        let _ = std::fs::remove_file(&tmp);
     }
 
     #[test]

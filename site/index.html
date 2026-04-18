@@ -140,7 +140,7 @@
     <div class="max-w-6xl mx-auto px-4 md:px-6 h-14 md:h-16 flex items-center justify-between">
       <!-- Left: Logo -->
       <div class="flex items-center gap-2 md:gap-3 flex-shrink-0">
-        <img src="https://cdn-news.gitcode.com/news/atomcode.png" alt="AtomCode" class="w-7 h-7 md:w-8 md:h-8 rounded-lg">
+        <img src="https://cdn-news.gitcode.com/news/atomcode-icon.png" alt="AtomCode" class="w-7 h-7 md:w-8 md:h-8 rounded-lg">
         <span class="text-base md:text-lg font-semibold tracking-tight">AtomCode</span>
         <span class="text-xs px-1.5 md:px-2 py-0.5 rounded-full bg-brand-600/20 text-brand-400 font-medium">v4.15.3</span>
       </div>
@@ -505,6 +505,10 @@
           <pre class="font-mono text-sm text-emerald-400 whitespace-pre-wrap break-all">curl -fsSL https://atomgit.com/atomgit_atomcode/atomcode-release/releases/download/v4.15.3/install.sh | sh</pre>
         </div>
         <div class="code-block rounded-xl p-5">
+          <div class="text-xs text-slate-500 mb-3 font-medium" data-i18n="install.oneclick.win">一键安装（Windows · PowerShell）</div>
+          <pre class="font-mono text-sm text-emerald-400 whitespace-pre-wrap break-all">irm https://atomgit.com/atomgit_atomcode/atomcode-release/releases/download/v4.15.3/install.ps1 | iex</pre>
+        </div>
+        <div class="code-block rounded-xl p-5">
           <div class="text-xs text-slate-500 mb-3 font-medium" data-i18n="install.build">从源码构建</div>
           <pre class="font-mono text-sm text-emerald-400">git clone https://atomgit.com/atomgit_atomcode/atomcode.git
 cd atomcode
@@ -557,7 +561,7 @@ cp target/release/atomcode ~/.local/bin/</pre>
               </div>
               <div class="text-xs text-slate-500 mt-0.5">x64</div>
             </a>
-            <a href="https://atomgit.com/atomgit_atomcode/atomcode-release/releases/download/v4.15.3/atomcode-v4.15.3-windows-x64.exe" class="relative px-4 py-3 rounded-lg bg-white/5 hover:bg-white/10 border border-white/10 hover:border-brand-500/50 transition text-sm group">
+            <a href="https://gitcode.com/atomgit_atomcode/atomcode-release/releases/download/v4.15.3/atomcode-v4.15.3-windows-x64-signed.exe" class="relative px-4 py-3 rounded-lg bg-white/5 hover:bg-white/10 border border-white/10 hover:border-brand-500/50 transition text-sm group">
               <div class="flex items-center justify-center gap-2">
                 <span class="text-white font-medium group-hover:text-brand-400 transition">Windows</span>
                 <svg class="w-4 h-4 text-brand-400 opacity-0 group-hover:opacity-100 transition" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -576,7 +580,7 @@ cp target/release/atomcode ~/.local/bin/</pre>
   <footer class="py-12 border-t border-white/5">
     <div class="max-w-5xl mx-auto px-6 flex flex-col md:flex-row items-center justify-between gap-4">
       <div class="flex items-center gap-3">
-        <img src="https://cdn-news.gitcode.com/news/atomcode.png" alt="AtomCode" class="w-6 h-6 rounded">
+        <img src="https://cdn-news.gitcode.com/news/atomcode-icon.png" alt="AtomCode" class="w-6 h-6 rounded">
         <span class="text-sm text-slate-500" data-i18n="footer.tagline">AtomCode · 开源终端 AI 编码助手</span>
       </div>
       <div class="flex items-center gap-6 text-sm text-slate-500">
@@ -624,6 +628,7 @@ cp target/release/atomcode ~/.local/bin/</pre>
         'comp.planned': '计划中', 'comp.yourcost': '仅 API 费用', 'comp.sub': '订阅 + API',
         'install.title': '30 秒快速开始', 'install.desc': '一条命令完成安装，就是这么简单！',
         'install.oneclick': '一键安装（macOS / Linux）',
+        'install.oneclick.win': '一键安装（Windows · PowerShell）',
         'install.build': '从源码构建', 'install.wizard': '首次运行 — 欢迎界面', 'install.welcome': '欢迎使用 AtomCode · 开始使用：',
         'install.oauth': 'OAuth · 推荐', 'install.apikey': 'API Key', 'install.skip': '先看看再说',
         'install.download': '或下载预编译二进制文件', 'install.apple': 'Apple Silicon',
@@ -663,6 +668,7 @@ cp target/release/atomcode ~/.local/bin/</pre>
         'comp.planned': 'Planned', 'comp.yourcost': 'Your API costs only', 'comp.sub': 'Subscription + API',
         'install.title': 'Get Started in 30 Seconds', 'install.desc': "One command to install. That's it.",
         'install.oneclick': 'One-click install (macOS / Linux)',
+        'install.oneclick.win': 'One-click install (Windows · PowerShell)',
         'install.build': 'Build from source', 'install.wizard': 'First run — welcome screen', 'install.welcome': 'Welcome to AtomCode · Get started:',
         'install.oauth': 'OAuth · recommended', 'install.apikey': 'API Key', 'install.skip': 'explore first',
         'install.download': 'Or download a pre-built binary', 'install.apple': 'Apple Silicon',

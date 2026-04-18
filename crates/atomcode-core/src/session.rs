@@ -139,13 +139,89 @@ pub struct SessionManager {
 }
 
 impl SessionManager {
+    /// Get the root directory for all sessions (~/.atomcode/sessions/).
+    pub fn sessions_root_dir() -> PathBuf {
+        dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".atomcode")
+            .join("sessions")
+    }
+    
+    /// Get the legacy sessions directory (used on macOS before v4.16).
+    /// Returns None on non-macOS platforms.
+    fn legacy_sessions_dir() -> Option<PathBuf> {
+        if cfg!(target_os = "macos") {
+            dirs::data_local_dir().map(|p| p.join("atomcode").join("sessions"))
+        } else {
+            None
+        }
+    }
+    
+    /// Migrate sessions from legacy location to new location.
+    /// This is a no-op if:
+    /// - Not on macOS
+    /// - Legacy directory doesn't exist
+    /// - New directory already has sessions
+    fn migrate_from_legacy() {
+        let Some(legacy_dir) = Self::legacy_sessions_dir() else {
+            return; // Not macOS, no migration needed
+        };
+        
+        if !legacy_dir.exists() {
+            return; // No legacy data
+        }
+        
+        let new_dir = Self::sessions_root_dir();
+        if new_dir.exists() && std::fs::read_dir(&new_dir).map_or(false, |mut d| d.next().is_some()) {
+            return; // New location already has data, skip migration
+        }
+        
+        // Perform migration
+        if let Err(e) = std::fs::create_dir_all(&new_dir) {
+            eprintln!("[session] Failed to create sessions dir: {}", e);
+            return;
+        }
+        
+        match std::fs::read_dir(&legacy_dir) {
+            Ok(entries) => {
+                let mut migrated = 0;
+                for entry in entries.flatten() {
+                    let src = entry.path();
+                    let dst = new_dir.join(entry.file_name());
+                    if src.is_dir() {
+                        if let Err(e) = std::fs::create_dir_all(&dst) {
+                            eprintln!("[session] Failed to create {:?}: {}", dst, e);
+                            continue;
+                        }
+                        if let Ok(files) = std::fs::read_dir(&src) {
+                            for file in files.flatten() {
+                                let src_file = file.path();
+                                let dst_file = dst.join(file.file_name());
+                                if let Err(e) = std::fs::copy(&src_file, &dst_file) {
+                                    eprintln!("[session] Failed to copy {:?}: {}", src_file, e);
+                                } else {
+                                    migrated += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+                if migrated > 0 {
+                    eprintln!("[session] Migrated {} session(s) from legacy location", migrated);
+                }
+            }
+            Err(e) => {
+                eprintln!("[session] Failed to read legacy sessions dir: {}", e);
+            }
+        }
+    }
+    
     /// Create a new session manager for the given working directory.
     pub fn new(working_dir: &Path) -> Self {
-        let sessions_dir = dirs::config_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("atomcode")
-            .join("sessions");
+        // Auto-migrate from legacy location on first use
+        Self::migrate_from_legacy();
         
+        let sessions_dir = Self::sessions_root_dir();
         let project_hash = hash_path(working_dir);
         
         Self {
