@@ -115,25 +115,11 @@ pub struct AnsiRenderer<W: Write + Send> {
     assistant_line_buf: String,
     /// Markdown parser state (code-block tracking, table row buffering).
     md_state: crate::markdown::MdState,
-    /// When the InputPrompt / StreamingBox footer was last actually
-    /// painted. Used to throttle high-frequency input-driven redraws:
-    /// Mac Terminal.app takes ~30-60ms to process a full footer ANSI
-    /// payload, and a fast typist (8 chars/sec) submits renders twice
-    /// as fast as Terminal.app can drain — producing the "cursor blinks
-    /// but no chars, then they catch up in a burst" symptom.
-    last_input_render: Option<std::time::Instant>,
-    /// If a render(InputPrompt|StreamingBox) came in during the 20ms
-    /// throttle window, the most recent payload lives here until the
-    /// window closes and `flush_deferred` or an out-of-band render
-    /// drains it.
-    pending_input: Option<UiLine>,
+    /// Per-frame throttle for InputPrompt / StreamingBox. Smooths
+    /// keystroke storms that outrun Terminal.app's ANSI-processing
+    /// budget — see `render::throttle` for the full rationale.
+    throttle: super::throttle::InputThrottle,
 }
-
-/// Minimum gap between two InputPrompt/StreamingBox redraws. ~50fps —
-/// visually fluid on any terminal, no noticeable leading-edge latency,
-/// and well within Terminal.app's ANSI-processing budget for a single
-/// footer payload.
-const INPUT_REDRAW_THROTTLE_MS: u64 = 20;
 
 impl AnsiRenderer<BufWriter<Stdout>> {
     pub fn new(caps: TerminalCaps) -> Self {
@@ -151,46 +137,18 @@ impl<W: Write + Send> AnsiRenderer<W> {
             assistant_continuing: false,
             assistant_line_buf: String::new(),
             md_state: crate::markdown::MdState::new(),
-            last_input_render: None,
-            pending_input: None,
+            throttle: super::throttle::InputThrottle::new(),
         }
     }
 
-    /// Is the payload worth throttling? True for the two high-frequency
-    /// input-driven renders (InputPrompt / StreamingBox) — everything
-    /// else (ToolCall / Welcome / diff / ...) bypasses and paints
-    /// immediately.
-    fn is_throttled_line(line: &UiLine) -> bool {
-        matches!(line, UiLine::InputPrompt { .. } | UiLine::StreamingBox { .. })
-    }
-
-    /// Is enough time gone since the last input-driven paint to let a
-    /// new one through? Leading edge returns true when no prior paint
-    /// has happened.
-    fn input_render_window_elapsed(&self) -> bool {
-        match self.last_input_render {
-            None => true,
-            Some(t) => {
-                t.elapsed() >= std::time::Duration::from_millis(INPUT_REDRAW_THROTTLE_MS)
-            }
-        }
-    }
-
-    /// Drop any deferred input-render request — used when an immediate
-    /// out-of-band paint (e.g. ToolCall) would superseed it, and when
-    /// reset() forgets all cached state.
-    fn clear_deferred_input(&mut self) {
-        self.pending_input = None;
-        self.last_input_render = None;
-    }
-
-    /// Paint the currently-pending deferred InputPrompt / StreamingBox
-    /// if any. Called by `flush_deferred` (on the event-loop's 20ms
-    /// timer) and by any immediate render that needs to fix render order.
+    /// Paint any deferred InputPrompt / StreamingBox. Called by
+    /// `flush_deferred` (on the event-loop's 20ms timer) and by any
+    /// immediate render that needs to preserve paint order (footer
+    /// must redraw below the content write).
     fn paint_pending_input(&mut self) {
-        if let Some(line) = self.pending_input.take() {
+        if let Some(line) = self.throttle.take_pending() {
             self.dispatch_unthrottled(line);
-            self.last_input_render = Some(std::time::Instant::now());
+            self.throttle.mark_painted();
         }
     }
 
@@ -1087,18 +1045,18 @@ impl<W: Write + Send> AnsiRenderer<W> {
 
 impl<W: Write + Send> Renderer for AnsiRenderer<W> {
     fn render(&mut self, line: UiLine) {
-        if Self::is_throttled_line(&line) {
-            if self.input_render_window_elapsed() {
+        use super::throttle::InputThrottle;
+        if InputThrottle::is_throttled(&line) {
+            if self.throttle.window_elapsed() {
                 // Leading edge: paint immediately and open a new window.
                 self.dispatch_unthrottled(line);
-                self.last_input_render = Some(std::time::Instant::now());
-                self.pending_input = None;
+                self.throttle.mark_painted();
             } else {
-                // Within the throttle window: keep only the most
-                // recent payload; an older pending render would paint
-                // stale state (e.g. buf: "abc" after the user is
-                // already at "abcde").
-                self.pending_input = Some(line);
+                // Within the throttle window: keep only the most recent
+                // payload; an older parked render would paint stale
+                // state (e.g. buf: "abc" after the user is already at
+                // "abcde").
+                self.throttle.park_pending(line);
             }
             return;
         }
@@ -1136,7 +1094,7 @@ impl<W: Write + Send> Renderer for AnsiRenderer<W> {
         self.md_state.reset();
         // Drop any throttled payload too — it references a state that
         // the reset just obliterated.
-        self.clear_deferred_input();
+        self.throttle.clear();
         let _ = self.out.flush();
     }
 
@@ -1145,7 +1103,7 @@ impl<W: Write + Send> Renderer for AnsiRenderer<W> {
         // if (a) there's a pending InputPrompt/StreamingBox and (b) the
         // throttle window has elapsed — otherwise it's a no-op so the
         // 50fps timer doesn't blast stale payloads.
-        if self.pending_input.is_some() && self.input_render_window_elapsed() {
+        if self.throttle.has_pending() && self.throttle.window_elapsed() {
             self.paint_pending_input();
         }
     }
