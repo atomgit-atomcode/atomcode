@@ -3,12 +3,12 @@
 #   irm https://atomgit.com/atomgit_atomcode/atomcode-release/raw/main/install.ps1 | iex
 #
 # Env overrides:
-#   $env:ATOMCODE_VERSION   release tag to install (default: v4.15.3)
+#   $env:ATOMCODE_VERSION   release tag to install (default: v4.18.0)
 #   $env:ATOMCODE_PREFIX    install dir (default: %LOCALAPPDATA%\AtomCode)
 
 $ErrorActionPreference = "Stop"
 
-$Version = if ($env:ATOMCODE_VERSION) { $env:ATOMCODE_VERSION } else { "v4.15.3" }
+$Version = if ($env:ATOMCODE_VERSION) { $env:ATOMCODE_VERSION } else { "v4.18.0" }
 $RepoBase = "https://atomgit.com/atomgit_atomcode/atomcode-release/releases/download"
 
 # --- detect arch ---

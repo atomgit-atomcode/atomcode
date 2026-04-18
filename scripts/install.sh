@@ -8,7 +8,7 @@
 #   ATOMCODE_PREFIX    install dir (default: /usr/local/bin, falls back to ~/.local/bin)
 set -eu
 
-VERSION="${ATOMCODE_VERSION:-v4.15.3}"
+VERSION="${ATOMCODE_VERSION:-v4.18.0}"
 REPO_BASE="https://atomgit.com/atomgit_atomcode/atomcode-release/releases/download"
 
 # --- detect platform ---
