@@ -19,6 +19,13 @@ use crate::event_loop::{Buffer, LoopCtx};
 use crate::render::Renderer;
 use crate::state::UiState;
 
+pub mod model_picker;
+pub mod provider_wizard;
+pub mod session_picker;
+pub use model_picker::ModelPicker;
+pub use provider_wizard::ProviderWizard;
+pub use session_picker::SessionPicker;
+
 /// Result of a modal consuming one key event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModalAction {
