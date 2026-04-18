@@ -821,6 +821,7 @@ impl AgentLoop {
                     self.turn_runner.provider.model_name(),
                     context_window,
                     self.tool_call_count,
+                    self.config.datalog.enabled,
                 );
                 // Dump request to datalog for inline debugging
                 self.datalog.log_llm_dump(

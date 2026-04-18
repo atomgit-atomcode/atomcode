@@ -50,12 +50,16 @@ pub enum UiLine {
     },
     /// Streaming chrome: spinner line above a (possibly multi-line)
     /// input box. Same `cursor_byte` semantics as `InputPrompt`.
+    /// When `menu` is Some (user typed `/` into the type-ahead buffer
+    /// mid-stream), the slash-command palette is drawn above the box
+    /// in place of the spinner — same rendering path as `InputPrompt`.
     StreamingBox {
         buf: String,
         cursor_byte: usize,
         frame: &'static str,
         label: String,
         status: StatusLine,
+        menu: Option<MenuPayload>,
     },
     /// User pressed Enter: commit the current InputPrompt to scrollback.
     InputCommit,
@@ -88,6 +92,9 @@ pub struct StatusLine {
     pub model: String,
     pub cwd: String,      // HOME replaced with "~"
     pub total_tokens: usize,
+    /// Right-aligned passive hint. Currently used for "new version available"
+    /// at startup. None = render status row as left-only, same as before.
+    pub hint: Option<String>,
 }
 
 /// One line in a diff batch. `added = true` renders as `+`, false as `-`.

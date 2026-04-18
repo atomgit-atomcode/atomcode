@@ -146,10 +146,6 @@ impl<W: Write + Send> AnsiRenderer<W> {
         }
     }
 
-    fn term_rows(&self) -> usize {
-        crossterm::terminal::size().map(|(_, h)| h as usize).unwrap_or(24)
-    }
-
     /// Erase the currently-drawn footer. Cursor is on the box middle row
     /// at the K-th middle line (0-based); distance from there up to the
     /// footer top is `2 + K` (row 0 = spinner/blank, row 1 = ╭─╮ border,
@@ -298,11 +294,14 @@ impl<W: Write + Send> AnsiRenderer<W> {
             let _ = i;
         }
 
-        // Status row: "  model · cwd · N tokens" in muted grey. Drawn
-        // below any menu rows so it's the last line of the footer.
-        // Only suppressed when the status line is totally empty (very
-        // early startup before welcome has run).
-        let has_status = !state.status.model.is_empty() || !state.status.cwd.is_empty();
+        // Status row: "  model · cwd · N tokens" in muted grey, optionally
+        // with a right-aligned hint (e.g. "↑ v4.16.0" for a passive update
+        // reminder). Drawn below any menu rows so it's the last line of
+        // the footer. Only suppressed when the status line is totally
+        // empty (very early startup before welcome has run).
+        let has_status = !state.status.model.is_empty()
+            || !state.status.cwd.is_empty()
+            || state.status.hint.is_some();
         if has_status {
             self.write_left_pad();
             self.set_fg(Role::Muted);
@@ -316,12 +315,34 @@ impl<W: Write + Send> AnsiRenderer<W> {
             if state.status.total_tokens > 0 {
                 parts.push(format_token_count(state.status.total_tokens));
             }
-            let joined = parts.join(" · ");
-            // Truncate to the box's outer width so over-long paths
-            // don't wrap and throw off cursor_row_from_top bookkeeping.
+            let left = parts.join(" · ");
             let max = box_outer.max(1);
-            let truncated = crate::width::truncate_to_width(&joined, max);
-            let _ = self.out.write_all(truncated.as_bytes());
+
+            if let Some(raw_hint) = state.status.hint.as_deref() {
+                let hint = scrub_controls(raw_hint);
+                let hint_w = crate::width::display_width(&hint);
+                // If hint alone exceeds the row, drop it — never truncate
+                // the model/cwd chrome users care about most.
+                if hint_w + 1 < max {
+                    let left_budget = max - hint_w - 1;
+                    let left_truncated = crate::width::truncate_to_width(&left, left_budget);
+                    let left_w = crate::width::display_width(&left_truncated);
+                    let pad = max - left_w - hint_w;
+                    let _ = self.out.write_all(left_truncated.as_bytes());
+                    for _ in 0..pad {
+                        let _ = self.out.write_all(b" ");
+                    }
+                    self.reset();
+                    self.set_fg(Role::Error);
+                    let _ = self.out.write_all(hint.as_bytes());
+                } else {
+                    let truncated = crate::width::truncate_to_width(&left, max);
+                    let _ = self.out.write_all(truncated.as_bytes());
+                }
+            } else {
+                let truncated = crate::width::truncate_to_width(&left, max);
+                let _ = self.out.write_all(truncated.as_bytes());
+            }
             self.reset();
             let _ = self.out.write_all(b"\r\n");
         }
@@ -463,16 +484,6 @@ impl<W: Write + Send> AnsiRenderer<W> {
             self.move_to_scroll_bottom();
         }
     }
-    fn reset_transient(&mut self) {
-        self.move_to_scroll_bottom();
-    }
-
-    fn write_bar_prefix(&mut self) {
-        self.set_fg(Role::AccentDim);
-        let _ = self.out.write_all("  │ ".as_bytes());
-        self.reset();
-    }
-
     /// Effective content width — terminal width minus left+right padding
     /// and a 1-col safety margin against autowrap at the absolute rightmost
     /// column. Always ≥ 1 so wrapping never collapses to zero.
@@ -713,36 +724,6 @@ impl<W: Write + Send> AnsiRenderer<W> {
         let _ = self.out.write_all(b"\r\n\r\n");
     }
 
-    /// Draw one bordered row: `│{content}{pad}│\r\n`.
-    /// `content_width` is the display width of what the caller writes.
-    fn draw_box_row(
-        &mut self,
-        inner_width: usize,
-        content: impl FnOnce(&mut Self),
-        content_width: usize,
-    ) {
-        self.set_fg(Role::Border);
-        let _ = self.out.write_all("│".as_bytes());
-        self.reset();
-        content(self);
-        let pad = inner_width.saturating_sub(content_width);
-        for _ in 0..pad {
-            let _ = self.out.write_all(b" ");
-        }
-        self.set_fg(Role::Border);
-        let _ = self.out.write_all("│\r\n".as_bytes());
-        self.reset();
-    }
-
-    fn draw_blank_row(&mut self, inner_width: usize) {
-        self.set_fg(Role::Border);
-        let _ = self.out.write_all("│".as_bytes());
-        for _ in 0..inner_width {
-            let _ = self.out.write_all(b" ");
-        }
-        let _ = self.out.write_all("│\r\n".as_bytes());
-        self.reset();
-    }
 }
 
 impl<W: Write + Send> Renderer for AnsiRenderer<W> {
@@ -929,11 +910,18 @@ impl<W: Write + Send> Renderer for AnsiRenderer<W> {
                 }
                 self.draw_footer("", 0, Some((frame, &label)), self.last_footer.status.clone());
             }
-            UiLine::StreamingBox { buf, cursor_byte, frame, label, status } => {
+            UiLine::StreamingBox { buf, cursor_byte, frame, label, status, menu } => {
                 if self.assistant_continuing {
                     return;
                 }
-                self.draw_footer(&buf, cursor_byte, Some((frame, &label)), status);
+                // When the user is typing `/` mid-stream, show the command
+                // palette in place of the spinner — otherwise keep the
+                // legacy spinner-only path.
+                if menu.is_some() {
+                    self.draw_footer_with_menu(&buf, cursor_byte, Some((frame, &label)), menu.as_ref(), status);
+                } else {
+                    self.draw_footer(&buf, cursor_byte, Some((frame, &label)), status);
+                }
             }
             UiLine::ClearTransient => {
                 // Footer is fixed at absolute bottom rows — nothing to clear.

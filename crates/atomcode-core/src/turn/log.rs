@@ -27,6 +27,8 @@ fn pending_request_path() -> &'static Mutex<Option<PathBuf>> {
 /// Log the LLM request. Writes a JSON file containing the `request` section
 /// under `<working_dir>/datalog/llm/<timestamp>.json` and stashes the path
 /// for the subsequent `log_llm_response` call to append to.
+///
+/// If `enabled` is false, this function is a no-op.
 pub fn log_llm_request(
     working_dir: &Path,
     messages: &[Message],
@@ -34,7 +36,9 @@ pub fn log_llm_request(
     model: &str,
     context_window: usize,
     step: usize,
+    enabled: bool,
 ) {
+    if !enabled { return; }
     use std::io::Write;
 
     let log_dir = working_dir.join("datalog").join("llm");
@@ -83,6 +87,8 @@ pub fn log_llm_request(
 /// Log the LLM response by reading the pending request file, adding a
 /// `response` section, and writing the merged JSON back. Also appends a
 /// one-line summary to `calls.log`.
+///
+/// If `enabled` is false, this function is a no-op.
 pub fn log_llm_response(
     working_dir: &Path,
     text: &str,
@@ -90,7 +96,9 @@ pub fn log_llm_response(
     model: &str,
     step: usize,
     duration_ms: u64,
+    enabled: bool,
 ) {
+    if !enabled { return; }
     use std::io::Write;
 
     let log_dir = working_dir.join("datalog").join("llm");
@@ -216,7 +224,7 @@ mod tests {
             parameters: serde_json::json!({"type": "object"}),
         }];
 
-        log_llm_request(tmp.path(), &messages, &tools, "test-model", 16000, 3);
+        log_llm_request(tmp.path(), &messages, &tools, "test-model", 16000, 3, true);
         log_llm_response(
             tmp.path(),
             "hi back",
@@ -228,6 +236,7 @@ mod tests {
             "test-model",
             3,
             123,
+            true,
         );
 
         let log_dir = tmp.path().join("datalog").join("llm");
@@ -259,7 +268,7 @@ mod tests {
         // Wipe any stashed pending path from previous tests (single static).
         if let Ok(mut g) = pending_request_path().lock() { *g = None; }
 
-        log_llm_response(tmp.path(), "bare text", &[], "solo-model", 7, 50);
+        log_llm_response(tmp.path(), "bare text", &[], "solo-model", 7, 50, true);
 
         let log_dir = tmp.path().join("datalog").join("llm");
         let orphans: Vec<_> = std::fs::read_dir(&log_dir).unwrap()
