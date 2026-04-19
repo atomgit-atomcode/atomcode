@@ -45,12 +45,19 @@ pub struct RetainedRenderer<W: Write + Send> {
     // ── widget state ──
     input_buf: String,
     input_cursor_byte: usize,
-    #[allow(dead_code)] // Phase 3 paints spinner
     spinner: Option<(String, String)>,
-    #[allow(dead_code)] // Phase 3 paints menu
     menu: Option<MenuPayload>,
-    #[allow(dead_code)] // Phase 3 paints status
     status: StatusLine,
+    // ── body history ──
+    /// Pre-wrapped body rows, oldest first. Trimmed when exceeds
+    /// 2× screen height. Each row already carries its PAD_COL
+    /// prefix + styled cells, so `paint_body` just `draw_row`s
+    /// the last N directly.
+    body_lines: Vec<Vec<Cell>>,
+    /// Line-buffer for streaming assistant text — chunks accumulate
+    /// here until a `\n` boundary, at which point the completed
+    /// physical line is appended to `body_lines`.
+    assistant_line_buf: String,
 }
 
 impl RetainedRenderer<BufWriter<Stdout>> {
@@ -71,6 +78,8 @@ impl<W: Write + Send> RetainedRenderer<W> {
             spinner: None,
             menu: None,
             status: StatusLine::default(),
+            body_lines: Vec::new(),
+            assistant_line_buf: String::new(),
         }
     }
 
@@ -354,27 +363,243 @@ impl<W: Write + Send> RetainedRenderer<W> {
         self.screen.set_cursor(cursor_abs_row, cursor_abs_col);
     }
 
+    /// Footer total height — mirrors the computation inside
+    /// `paint_footer` so `paint_body` knows where body_bottom lands.
+    fn current_footer_rows(&self) -> usize {
+        let rule_width = (self.screen.width() as usize).saturating_sub(PAD_COL * 2);
+        let text_budget = rule_width.saturating_sub(2);
+        let safe = scrub_controls(&self.input_buf);
+        let middle_rows = if text_budget == 0 {
+            1
+        } else {
+            crate::width::wrap_with_cursor(&safe, text_budget, self.input_cursor_byte)
+                .0
+                .len()
+                .max(1)
+        };
+        let menu_rows = self
+            .menu
+            .as_ref()
+            .map(|m| m.items.len().min(4))
+            .unwrap_or(0);
+        let has_status = !self.status.model.is_empty()
+            || !self.status.cwd.is_empty()
+            || self.status.hint.is_some();
+        let status_rows = if has_status { 1 } else { 0 };
+        // 1 spinner + 1 top rule + middle + 1 bot rule + menu + status
+        1 + 1 + middle_rows + 1 + menu_rows + status_rows
+    }
+
+    /// Paint the tail of `body_lines` into the screen rows above
+    /// the footer. Older lines that don't fit are simply not drawn
+    /// (they survive in `body_lines` memory if within the
+    /// retention cap, otherwise were already trimmed in
+    /// `push_body_row`).
+    fn paint_body(&mut self) {
+        let h = self.screen.height() as usize;
+        let footer_rows = self.current_footer_rows();
+        let body_bottom = h.saturating_sub(footer_rows);
+        if body_bottom == 0 || self.body_lines.is_empty() {
+            return;
+        }
+        let n = self.body_lines.len().min(body_bottom);
+        let start = self.body_lines.len() - n;
+        let first_screen_row = body_bottom - n;
+        // Collect rows first (immutable borrow of self.body_lines)
+        // so we can mutably borrow self.screen afterwards.
+        let rows: Vec<Vec<Cell>> = self.body_lines[start..].to_vec();
+        for (i, row) in rows.iter().enumerate() {
+            self.screen.draw_row(first_screen_row + i, 0, row);
+        }
+    }
+
+    /// Single-entry-point for painting a full frame: body above,
+    /// footer below. Caller flushes after.
+    fn paint_frame(&mut self) {
+        self.paint_body();
+        self.paint_footer();
+    }
+
+    /// Append a fully-cell-formatted body row to history, trim
+    /// oldest when over the retention cap.
+    fn push_body_row(&mut self, row: Vec<Cell>) {
+        self.body_lines.push(row);
+        let max_keep = (self.screen.height() as usize).saturating_mul(2).max(64);
+        if self.body_lines.len() > max_keep {
+            let drain = self.body_lines.len() - max_keep;
+            self.body_lines.drain(0..drain);
+        }
+    }
+
+    /// Wrap `text` to content width and push each wrapped chunk as
+    /// its own body row with a PAD_COL prefix. Used by variants
+    /// whose content is plain (assistant text, command output).
+    fn push_body_text(&mut self, text: &str, style: &CellStyle) {
+        let w = (self.screen.width() as usize).saturating_sub(PAD_COL * 2);
+        if w == 0 {
+            return;
+        }
+        for phys in text.split('\n') {
+            for chunk in crate::width::wrap_line_to_width(phys, w) {
+                let mut row = Vec::new();
+                let pad = CellStyle::default();
+                push_str_cells(&mut row, &" ".repeat(PAD_COL), &pad);
+                push_str_cells(&mut row, &chunk, style);
+                self.push_body_row(row);
+            }
+        }
+    }
+
+    /// Build one row with a leading `prefix` (often an accent
+    /// glyph with its own style) and a plain-styled body. Used by
+    /// User echo ("❯ …"), ToolCall ("▸ name(detail)"), etc.
+    fn push_body_prefixed(
+        &mut self,
+        prefix: &str,
+        prefix_style: &CellStyle,
+        body: &str,
+        body_style: &CellStyle,
+    ) {
+        let w = (self.screen.width() as usize).saturating_sub(PAD_COL * 2);
+        if w == 0 {
+            return;
+        }
+        // First row carries the prefix; wrapped continuation rows
+        // use an indent of the same visible width so the body text
+        // column stays aligned.
+        let prefix_w = crate::width::display_width(prefix);
+        let first_budget = w.saturating_sub(prefix_w);
+        let cont_pad: String = " ".repeat(prefix_w);
+        let chunks: Vec<String> = crate::width::wrap_line_to_width(body, first_budget.max(1))
+            .into_iter()
+            .map(|c| c.to_string())
+            .collect();
+        for (i, chunk) in chunks.iter().enumerate() {
+            let mut row = Vec::new();
+            let pad = CellStyle::default();
+            push_str_cells(&mut row, &" ".repeat(PAD_COL), &pad);
+            if i == 0 {
+                push_str_cells(&mut row, prefix, prefix_style);
+            } else {
+                push_str_cells(&mut row, &cont_pad, &pad);
+            }
+            push_str_cells(&mut row, chunk.as_str(), body_style);
+            self.push_body_row(row);
+        }
+    }
+
+    /// Flush complete lines (those terminated by `\n`) from the
+    /// streaming assistant buffer into `body_lines`. Partial
+    /// tail stays in the buffer for the next delta.
+    fn flush_assistant_lines(&mut self) {
+        while let Some(nl) = self.assistant_line_buf.find('\n') {
+            let line: String = self.assistant_line_buf.drain(..=nl).collect();
+            // Drop the trailing '\n'.
+            let content = &line[..line.len() - 1];
+            // Markdown rendering deferred — Phase 4 emits plain
+            // text; Phase 5+ adds inline markdown.
+            let safe = scrub_controls(content);
+            self.push_body_text(&safe, &CellStyle::default());
+        }
+    }
+
+    /// Turn the partial buffer into a body row (as if `\n`
+    /// terminated). Called on AssistantLineBreak / TurnComplete.
+    fn flush_assistant_remainder(&mut self) {
+        if !self.assistant_line_buf.is_empty() {
+            let line = std::mem::take(&mut self.assistant_line_buf);
+            let safe = scrub_controls(&line);
+            self.push_body_text(&safe, &CellStyle::default());
+        }
+    }
+
     fn flush_frame(&mut self) {
         let bytes = self.screen.render_diff();
         let _ = self.out.write_all(&bytes);
+    }
+
+    fn push_welcome(&mut self, model: &str, working_dir: &str) {
+        // Mirror AnsiRenderer::render_welcome — compact 6-row greet.
+        let caps = self.caps;
+        let w = self.screen.width() as usize;
+        let content_w = w.saturating_sub(PAD_COL * 2);
+        // Row 1: brand left + version · license right
+        let left_txt = "◆ AtomCode";
+        let right_ver = "v4.18.1";
+        let right_lic = "MIT";
+        let left_w = crate::width::display_width(left_txt);
+        let right_w = right_ver.len() + 5 + right_lic.len();
+        let gap = content_w.saturating_sub(left_w + right_w);
+        let mut row1 = Vec::new();
+        let pad = CellStyle::default();
+        push_str_cells(&mut row1, &" ".repeat(PAD_COL), &pad);
+        push_str_cells(&mut row1, left_txt, &self.style_bold(Role::Brand));
+        for _ in 0..gap {
+            row1.push(Cell::blank());
+        }
+        push_str_cells(&mut row1, right_ver, &self.style_for(Role::Secondary));
+        push_str_cells(&mut row1, "  ·  ", &self.style_for(Role::Muted));
+        push_str_cells(&mut row1, right_lic, &self.style_for(Role::Muted));
+        self.push_body_row(row1);
+
+        let max_path = w.saturating_sub(6);
+        let cwd_disp = crate::width::truncate_to_width(working_dir, max_path);
+        let mut row2 = Vec::new();
+        push_str_cells(&mut row2, &" ".repeat(PAD_COL), &pad);
+        push_str_cells(&mut row2, "∙ ", &self.style_for(Role::AccentDim));
+        push_str_cells(&mut row2, &cwd_disp, &self.style_for(Role::Secondary));
+        self.push_body_row(row2);
+
+        let model_disp = crate::width::truncate_to_width(model, max_path);
+        let mut row3 = Vec::new();
+        push_str_cells(&mut row3, &" ".repeat(PAD_COL), &pad);
+        push_str_cells(&mut row3, "∙ ", &self.style_for(Role::AccentDim));
+        push_str_cells(&mut row3, &model_disp, &self.style_for(Role::Secondary));
+        self.push_body_row(row3);
+
+        // Blank separator.
+        self.push_body_row(Vec::new());
+
+        // Hint rows.
+        let mut row5 = Vec::new();
+        push_str_cells(&mut row5, &" ".repeat(PAD_COL), &pad);
+        push_str_cells(
+            &mut row5,
+            "type something, or press  ",
+            &self.style_for(Role::AccentDim),
+        );
+        push_str_cells(&mut row5, "/", &self.style_bold(Role::Accent));
+        push_str_cells(
+            &mut row5,
+            "  to browse commands",
+            &self.style_for(Role::AccentDim),
+        );
+        self.push_body_row(row5);
+
+        let mut row6 = Vec::new();
+        push_str_cells(&mut row6, &" ".repeat(PAD_COL), &pad);
+        push_str_cells(&mut row6, "/provider", &self.style_bold(Role::Accent));
+        push_str_cells(
+            &mut row6,
+            "  to add a custom model",
+            &self.style_for(Role::AccentDim),
+        );
+        self.push_body_row(row6);
+
+        let _ = caps; // style helpers already captured
     }
 }
 
 impl<W: Write + Send> Renderer for RetainedRenderer<W> {
     fn render(&mut self, line: UiLine) {
-        // Phase 3 owns the footer path (InputPrompt / StreamingBox /
-        // Spinner). Body / streaming content variants keep no-op
-        // until Phase 4 — this keeps the dual-track smoke-safe,
-        // just with no body history.
         match line {
+            // ── footer-only variants ──
             UiLine::InputPrompt { buf, cursor_byte, menu, status } => {
                 self.spinner = None;
                 self.input_buf = buf;
                 self.input_cursor_byte = cursor_byte;
                 self.menu = menu;
                 self.status = status;
-                self.paint_footer();
-                self.flush_frame();
             }
             UiLine::StreamingBox { buf, cursor_byte, frame, label, status, menu } => {
                 self.spinner = Some((frame.to_string(), label));
@@ -382,21 +607,175 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 self.input_cursor_byte = cursor_byte;
                 self.menu = menu;
                 self.status = status;
-                self.paint_footer();
-                self.flush_frame();
             }
             UiLine::Spinner { frame, label } => {
                 self.spinner = Some((frame.to_string(), label));
-                self.paint_footer();
-                self.flush_frame();
             }
             UiLine::ClearTransient | UiLine::InputCommit => {
-                // No-op: retained buffer replaces the transient-clearing
-                // dance the immediate-mode path needed.
+                // No-op in retained mode.
+                return;
             }
-            // Phase 4 wires body-emitting variants into append_body_lines.
-            _ => {}
+
+            // ── body: welcome / turn events ──
+            UiLine::Welcome { model, working_dir } => {
+                let model_scrubbed = scrub_controls(&model);
+                let wd_scrubbed = scrub_controls(&working_dir);
+                self.push_welcome(&model_scrubbed, &wd_scrubbed);
+            }
+            UiLine::User(text) => {
+                let safe = scrub_controls(&text);
+                let accent = self.style_bold(Role::Accent);
+                let plain = CellStyle::default();
+                self.push_body_prefixed("❯ ", &accent, &safe, &plain);
+                // Blank spacer row.
+                self.push_body_row(Vec::new());
+            }
+            UiLine::TurnSeparator { label } => {
+                let w = (self.screen.width() as usize).saturating_sub(PAD_COL * 2);
+                let safe = scrub_controls(&label);
+                let lw = crate::width::display_width(&safe);
+                let padded = 1 + lw + 1;
+                let remaining = w.saturating_sub(padded);
+                let left = remaining / 2;
+                let right = remaining - left;
+                let mut row = Vec::new();
+                let pad = CellStyle::default();
+                push_str_cells(&mut row, &" ".repeat(PAD_COL), &pad);
+                let muted = self.style_for(Role::Muted);
+                for _ in 0..left {
+                    row.push(Cell {
+                        ch: '─',
+                        style: muted.clone(),
+                        width: 1,
+                    });
+                }
+                push_str_cells(&mut row, " ", &pad);
+                push_str_cells(&mut row, &safe, &self.style_for(Role::Secondary));
+                push_str_cells(&mut row, " ", &pad);
+                for _ in 0..right {
+                    row.push(Cell {
+                        ch: '─',
+                        style: muted.clone(),
+                        width: 1,
+                    });
+                }
+                self.push_body_row(Vec::new());
+                self.push_body_row(row);
+                self.push_body_row(Vec::new());
+            }
+
+            // ── body: streaming assistant ──
+            UiLine::AssistantText(text) => {
+                self.assistant_line_buf.push_str(&scrub_controls(&text));
+                self.flush_assistant_lines();
+            }
+            UiLine::AssistantLineBreak => {
+                self.flush_assistant_remainder();
+            }
+            UiLine::TurnComplete => {
+                self.flush_assistant_remainder();
+            }
+            UiLine::TurnCancelled => {
+                self.flush_assistant_remainder();
+                let muted = self.style_for(Role::Muted);
+                self.push_body_text("(cancelled)", &muted);
+            }
+
+            // ── body: tools & diffs ──
+            UiLine::ToolCall { name, detail } => {
+                self.flush_assistant_remainder();
+                let muted = self.style_for(Role::Muted);
+                let tool_name_style = self.style_bold(Role::ToolName);
+                let safe_name = scrub_controls(&name);
+                let safe_detail = scrub_controls(&detail);
+                let body_str = if safe_detail.is_empty() {
+                    safe_name.clone()
+                } else {
+                    format!("{}({})", safe_name, safe_detail)
+                };
+                // Approximate AnsiRenderer's "▸ NAME(detail)" where
+                // only NAME is bolded; retained uses a uniform style
+                // for the tool-call line (acceptable in Phase 4,
+                // tightens in Phase 5/6).
+                let _ = muted;
+                self.push_body_prefixed("▸ ", &self.style_for(Role::Muted), &body_str, &tool_name_style);
+            }
+            UiLine::ToolResult { success, summary } => {
+                self.flush_assistant_remainder();
+                let muted = self.style_for(Role::Muted);
+                let error = self.style_for(Role::Error);
+                let safe = scrub_controls(&summary);
+                let body_str = if success {
+                    safe
+                } else {
+                    format!("✗ {}", safe)
+                };
+                let body_style = if success { muted.clone() } else { error };
+                let mut leading = String::from("    ⎿ ");
+                let _ = leading.len();
+                // Indent result lines 4 cols past the tool-call row.
+                let row_w =
+                    (self.screen.width() as usize).saturating_sub(PAD_COL * 2 + 6);
+                for phys in body_str.split('\n') {
+                    for chunk in crate::width::wrap_line_to_width(phys, row_w.max(1)) {
+                        let mut row = Vec::new();
+                        let pad = CellStyle::default();
+                        push_str_cells(&mut row, &" ".repeat(PAD_COL), &pad);
+                        push_str_cells(&mut row, "    ⎿ ", &muted);
+                        push_str_cells(&mut row, &chunk, &body_style);
+                        self.push_body_row(row);
+                    }
+                }
+                self.push_body_row(Vec::new()); // paragraph spacer
+            }
+            UiLine::DiffLine { added, text } => {
+                let style = self.style_for(if added {
+                    Role::DiffAdd
+                } else {
+                    Role::DiffRemove
+                });
+                let sign = if added { '+' } else { '-' };
+                let body = format!("       {} {}", sign, scrub_controls(&text));
+                self.push_body_text(&body, &style);
+            }
+            UiLine::DiffBlock(entries) => {
+                for entry in &entries {
+                    let style = self.style_for(if entry.added {
+                        Role::DiffAdd
+                    } else {
+                        Role::DiffRemove
+                    });
+                    let sign = if entry.added { '+' } else { '-' };
+                    let body = format!("       {} {}", sign, scrub_controls(&entry.text));
+                    self.push_body_text(&body, &style);
+                }
+            }
+
+            // ── body: approval / errors / command output ──
+            UiLine::ApprovalPrompt { tool, detail } => {
+                let warn = self.style_for(Role::Warning);
+                let body = format!(
+                    "Allow {}({})? [Y]es / [N]o / [A]lways",
+                    scrub_controls(&tool),
+                    scrub_controls(&detail)
+                );
+                self.push_body_text(&body, &warn);
+            }
+            UiLine::Error(msg) => {
+                let err_style = self.style_for(Role::Error);
+                let body = format!("[Error: {}]", scrub_controls(&msg));
+                self.push_body_text(&body, &err_style);
+            }
+            UiLine::CommandOutput(text) => {
+                let safe = scrub_controls(&text);
+                self.push_body_text(&safe, &CellStyle::default());
+            }
         }
+        // Every UiLine that reaches here paints + flushes a full
+        // frame. Phase 5 replaces the direct flush with a dirty
+        // flag coalesced on the 16ms tick.
+        self.paint_frame();
+        self.flush_frame();
     }
 
     fn flush(&mut self) {
@@ -413,11 +792,13 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
     }
 
     fn reset(&mut self) {
-        // Terminal-side reset: full screen wipe. Screen-side reset:
-        // rebuild both frames blank so the next render_diff does
-        // a cold-start on a blank terminal.
+        // Terminal-side wipe + full state reset. `body_lines` is
+        // also dropped so post-reset the screen truly starts clean
+        // (old transcript stays in the terminal's own scrollback).
         let _ = self.out.write_all(b"\x1b[2J\x1b[H");
         self.screen = Screen::new(self.screen.width(), self.screen.height());
+        self.body_lines.clear();
+        self.assistant_line_buf.clear();
         let _ = self.out.flush();
     }
 
@@ -466,8 +847,13 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
     }
 
     fn on_resize(&mut self, cols: u16, rows: u16) {
+        // Body cells are pre-wrapped to the old width — drop them
+        // rather than mis-render. Terminal-side scrollback still
+        // holds the history for the user to scroll back to.
         self.screen.resize(cols, rows);
-        self.paint_footer();
+        self.body_lines.clear();
+        self.assistant_line_buf.clear();
+        self.paint_frame();
         self.flush_frame();
     }
 }
@@ -664,6 +1050,51 @@ mod tests {
         assert!(open_cost < 1000, "retained open: {} B", open_cost);
         assert!(close_cost < 1000, "retained close: {} B", close_cost);
         assert!(nav_avg < 300, "retained nav: {} B", nav_avg);
+    }
+
+    /// Streaming delta byte cost: scenario mirrors agent_events
+    /// emitting `AssistantText` + `StreamingBox` repeatedly. Each
+    /// iteration appends a short line to the body + re-paints the
+    /// footer spinner. Budget: < 200 B/iteration (AnsiRenderer was
+    /// 41 B for streaming-only, but retained pays an extra
+    /// full-frame cost for the trailing StreamingBox re-paint).
+    #[test]
+    fn retained_streaming_delta_byte_cost() {
+        let (mut r, counter) = new_counting(80, 24);
+        let status = status_basic();
+        // Initial spinner footer.
+        r.render(UiLine::StreamingBox {
+            buf: String::new(),
+            cursor_byte: 0,
+            frame: "⠋",
+            label: "Thinking".into(),
+            status: status.clone(),
+            menu: None,
+        });
+        r.flush();
+        let before_burst = sample(&counter);
+        for i in 0..20 {
+            r.render(UiLine::AssistantText(format!("line {}\n", i)));
+            r.render(UiLine::StreamingBox {
+                buf: String::new(),
+                cursor_byte: 0,
+                frame: "⠹",
+                label: "Thinking".into(),
+                status: status.clone(),
+                menu: None,
+            });
+        }
+        r.flush();
+        let avg_per_delta = (sample(&counter) - before_burst) / 20;
+        eprintln!(
+            "[RETAINED BYTE] streaming avg per (delta + box redraw) = {} B",
+            avg_per_delta
+        );
+        assert!(
+            avg_per_delta < 250,
+            "retained streaming regressed: {} B/iter (budget < 250)",
+            avg_per_delta
+        );
     }
 
     /// Wide CJK input end-to-end: render "你是谁" from empty, assert
