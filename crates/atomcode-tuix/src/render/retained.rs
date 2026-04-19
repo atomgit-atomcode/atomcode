@@ -1217,6 +1217,71 @@ mod tests {
         assert_eq!(idle_bytes, 0, "idle tick should emit 0 bytes");
     }
 
+    /// Regression: user reports bot_rule row visibly shortens when
+    /// the input wraps from 1 line to 2 lines. Hypothesis: diff
+    /// spurious-skips the bot_rule row, or paint_body/footer
+    /// miscomputes bot_rule_row and overwrites it.
+    ///
+    /// Direct assertion: after wrapping, inspect Screen.prev_cells
+    /// (which is "what we just emitted") — every column in the
+    /// bot_rule row must contain either a PAD_COL blank or a '─'.
+    #[test]
+    fn retained_bot_rule_full_width_after_wrap() {
+        let (mut r, _buf) = new_capturing(40, 24);
+        let status = status_basic();
+        // Short input → 1-row middle.
+        r.render(UiLine::InputPrompt {
+            buf: "hi".into(),
+            cursor_byte: 2,
+            menu: None,
+            status: status.clone(),
+        });
+        r.flush_deferred();
+
+        // Long input → 2-row middle.
+        let long: String = std::iter::repeat('中').take(40).collect();
+        r.render(UiLine::InputPrompt {
+            buf: long.clone(),
+            cursor_byte: long.len(),
+            menu: None,
+            status: status.clone(),
+        });
+        r.flush_deferred();
+
+        // Inspect the newly-emitted frame (prev_cells after swap).
+        let h = r.screen.height() as usize;
+        let footer_rows = r.current_footer_rows();
+        let footer_top = h - footer_rows;
+        // Layout: spinner + top_rule + middle×N + bot_rule + status.
+        // With 2-row middle: bot_rule at footer_top + 2 + 2 = footer_top + 4
+        let (lines, _, _) =
+            crate::width::wrap_with_cursor(&long, 40 - 6, long.len());
+        assert!(lines.len() >= 2, "test setup: expected wrap");
+        let bot_rule_row = footer_top + 2 + lines.len();
+        let prev_cells = r.screen.prev_cells_for_test();
+        let row_cells = &prev_cells[bot_rule_row];
+
+        // Rule structure: PAD_COL(2) blank + rule_width('─') + tail_pad blank.
+        let rule_width = 40 - PAD_COL * 2; // 36
+        let rule_start = PAD_COL;
+        let rule_end = PAD_COL + rule_width;
+        for (col, cell) in row_cells.iter().enumerate() {
+            if col >= rule_start && col < rule_end {
+                assert_eq!(
+                    cell.ch, '─',
+                    "col {} expected '─', got {:?} (rule short!)",
+                    col, cell
+                );
+            } else {
+                assert_eq!(
+                    cell.ch, ' ',
+                    "col {} expected pad blank, got {:?}",
+                    col, cell
+                );
+            }
+        }
+    }
+
     /// Regression for "login 后 输入内容过长不自动换行" report.
     /// User observed a single long-line input not wrapping — turned
     /// out the buffer was 202 display cols vs the 203-col budget, so

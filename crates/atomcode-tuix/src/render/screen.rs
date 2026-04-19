@@ -189,6 +189,14 @@ impl Screen {
     pub fn resize(&mut self, width: u16, height: u16) {
         *self = Self::new(width, height);
     }
+
+    /// Debug-only accessor: peek at the last-emitted frame. Lets
+    /// tests assert "the terminal shows X cell at (row, col)"
+    /// without reconstructing state from the ANSI byte stream.
+    #[cfg(test)]
+    pub fn prev_cells_for_test(&self) -> &[Vec<Cell>] {
+        &self.prev_cells
+    }
 }
 
 #[cfg(test)]
