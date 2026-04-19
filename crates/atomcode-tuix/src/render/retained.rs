@@ -58,6 +58,15 @@ pub struct RetainedRenderer<W: Write + Send> {
     /// here until a `\n` boundary, at which point the completed
     /// physical line is appended to `body_lines`.
     assistant_line_buf: String,
+    // ── Phase 5: frame coalescing ──
+    /// True when widget state has changed since the last frame
+    /// emit. `render()` flips this to true instead of painting
+    /// immediately; `flush_deferred()` (called every 5ms by the
+    /// event loop tick) checks this and does the paint+emit at
+    /// most once per tick. An IME burst of 40 keystrokes in 1ms
+    /// thus produces ONE frame instead of 40 — the difference
+    /// between 40 Mac Terminal repaints and 1.
+    dirty: bool,
 }
 
 impl RetainedRenderer<BufWriter<Stdout>> {
@@ -80,6 +89,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             status: StatusLine::default(),
             body_lines: Vec::new(),
             assistant_line_buf: String::new(),
+            dirty: false,
         }
     }
 
@@ -771,11 +781,12 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 self.push_body_text(&safe, &CellStyle::default());
             }
         }
-        // Every UiLine that reaches here paints + flushes a full
-        // frame. Phase 5 replaces the direct flush with a dirty
-        // flag coalesced on the 16ms tick.
-        self.paint_frame();
-        self.flush_frame();
+        // Phase 5: widget state updated → mark frame dirty. No
+        // paint, no emit. The event loop's 5ms tick (via
+        // flush_deferred) will coalesce any further state
+        // changes that arrive in the same window into a single
+        // paint+emit pass.
+        self.dirty = true;
     }
 
     fn flush(&mut self) {
@@ -783,6 +794,15 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
     }
 
     fn shutdown(&mut self) {
+        // Drain any pending frame before exit so the user sees the
+        // latest widget state (typically a final prompt or an error
+        // line) rather than a frame that dirty-flagged too late.
+        if self.dirty {
+            self.paint_frame();
+            let bytes = self.screen.render_diff();
+            let _ = self.out.write_all(&bytes);
+            self.dirty = false;
+        }
         // Be defensive: clear any DECSTBM that the old AnsiRenderer
         // might have set before we took over (if flag was toggled
         // mid-session), re-enable autowrap, park cursor on a fresh
@@ -840,9 +860,18 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
     }
 
     fn flush_deferred(&mut self) {
-        // Phase 2: no frame coalescing yet. Phase 5 wires this up to
-        // the 16ms tick to drain any dirty frame that hasn't been
-        // painted yet.
+        // The coalesce point. Called every 5ms by the event loop
+        // tick. If widget state has changed since the last tick,
+        // paint one full frame, diff it against the previous
+        // frame, and emit the patch stream. Multiple `render()`
+        // calls in the same 5ms window are absorbed into a single
+        // paint here.
+        if self.dirty {
+            self.paint_frame();
+            let bytes = self.screen.render_diff();
+            let _ = self.out.write_all(&bytes);
+            self.dirty = false;
+        }
         let _ = self.out.flush();
     }
 
@@ -952,7 +981,7 @@ mod tests {
             menu: None,
             status: status.clone(),
         });
-        r.flush();
+        r.flush_deferred();
         let before = sample(&counter);
         for i in 1..=10 {
             let s = "h".repeat(i + 1);
@@ -963,7 +992,7 @@ mod tests {
                 status: status.clone(),
             });
         }
-        r.flush();
+        r.flush_deferred();
         let avg = (sample(&counter) - before) / 10;
         eprintln!("[RETAINED BYTE] keystroke avg = {} B", avg);
         assert!(
@@ -992,7 +1021,7 @@ mod tests {
             menu: None,
             status: status.clone(),
         });
-        r.flush();
+        r.flush_deferred();
 
         let before_open = sample(&counter);
         r.render(UiLine::InputPrompt {
@@ -1004,7 +1033,7 @@ mod tests {
             }),
             status: status.clone(),
         });
-        r.flush();
+        r.flush_deferred();
         let open_cost = sample(&counter) - before_open;
 
         let before_close = sample(&counter);
@@ -1014,7 +1043,7 @@ mod tests {
             menu: None,
             status: status.clone(),
         });
-        r.flush();
+        r.flush_deferred();
         let close_cost = sample(&counter) - before_close;
 
         // Nav: 3 Up/Down changes.
@@ -1027,7 +1056,7 @@ mod tests {
             }),
             status: status.clone(),
         });
-        r.flush();
+        r.flush_deferred();
         let before_nav = sample(&counter);
         for sel in 1..=3 {
             r.render(UiLine::InputPrompt {
@@ -1040,7 +1069,7 @@ mod tests {
                 status: status.clone(),
             });
         }
-        r.flush();
+        r.flush_deferred();
         let nav_avg = (sample(&counter) - before_nav) / 3;
 
         eprintln!(
@@ -1071,7 +1100,7 @@ mod tests {
             status: status.clone(),
             menu: None,
         });
-        r.flush();
+        r.flush_deferred();
         let before_burst = sample(&counter);
         for i in 0..20 {
             r.render(UiLine::AssistantText(format!("line {}\n", i)));
@@ -1084,7 +1113,7 @@ mod tests {
                 menu: None,
             });
         }
-        r.flush();
+        r.flush_deferred();
         let avg_per_delta = (sample(&counter) - before_burst) / 20;
         eprintln!(
             "[RETAINED BYTE] streaming avg per (delta + box redraw) = {} B",
@@ -1095,6 +1124,67 @@ mod tests {
             "retained streaming regressed: {} B/iter (budget < 250)",
             avg_per_delta
         );
+    }
+
+    /// Phase 5 coalesce contract: N render() calls followed by a
+    /// single flush_deferred() must produce exactly ONE emit (or
+    /// zero, if nothing visibly changed since the last frame).
+    /// Without coalesce, Phase 4 would emit N times. Regression
+    /// target: IME burst of 40 chars = 1 terminal repaint, not 40.
+    #[test]
+    fn retained_coalesce_many_renders_one_emit() {
+        let (mut r, counter) = new_counting(80, 24);
+        let status = status_basic();
+        // Establish initial frame so subsequent diffs are small.
+        r.render(UiLine::InputPrompt {
+            buf: "".into(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+        });
+        r.flush_deferred();
+
+        let before_burst = sample(&counter);
+        // Simulate IME burst: 40 keystrokes in zero time.
+        let mut buf = String::new();
+        for ch in "你是谁你是谁你是谁你是谁你是谁你是谁你是谁你是谁你是谁你是谁你是谁你是谁你是谁".chars() {
+            buf.push(ch);
+            r.render(UiLine::InputPrompt {
+                buf: buf.clone(),
+                cursor_byte: buf.len(),
+                menu: None,
+                status: status.clone(),
+            });
+        }
+        // Zero byte count so far — coalesce should hold every
+        // render() as dirty-flag updates only.
+        assert_eq!(
+            sample(&counter) - before_burst,
+            0,
+            "render() must not emit bytes before flush_deferred fires"
+        );
+
+        // The tick fires → ONE paint+emit covering all 40 state
+        // changes at once.
+        r.flush_deferred();
+        let burst_bytes = sample(&counter) - before_burst;
+        eprintln!(
+            "[RETAINED BYTE] coalesce: 40 renders + 1 tick = {} B total",
+            burst_bytes
+        );
+        // Upper bound: full middle-row re-emit (≈80 chars × 3 bytes
+        // for UTF-8 CJK = ~240 B + cursor moves). Budget 500 B.
+        assert!(
+            burst_bytes > 0 && burst_bytes < 500,
+            "coalesce should produce exactly one modest emit: {} B",
+            burst_bytes
+        );
+
+        // Second tick with no state change → truly zero emit.
+        let before_idle = sample(&counter);
+        r.flush_deferred();
+        let idle_bytes = sample(&counter) - before_idle;
+        assert_eq!(idle_bytes, 0, "idle tick should emit 0 bytes");
     }
 
     /// Wide CJK input end-to-end: render "你是谁" from empty, assert
@@ -1110,7 +1200,7 @@ mod tests {
             menu: None,
             status: status.clone(),
         });
-        r.flush();
+        r.flush_deferred();
         buf.lock().unwrap().clear();
 
         r.render(UiLine::InputPrompt {
@@ -1119,7 +1209,7 @@ mod tests {
             menu: None,
             status: status.clone(),
         });
-        r.flush();
+        r.flush_deferred();
         let stream_bytes = std::mem::take(&mut *buf.lock().unwrap());
         let stream = String::from_utf8_lossy(&stream_bytes).to_string();
         assert!(
