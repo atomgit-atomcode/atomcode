@@ -107,6 +107,12 @@ pub struct AnsiRenderer<W: Write + Send> {
     /// Last footer state passed to draw_footer_here. Permanent content
     /// emits redraw the footer using this snapshot.
     last_footer: FooterState,
+    /// Pre-encoded byte slice for each row of the last painted footer.
+    /// `draw_footer_here` compares each new row against this and only
+    /// emits `\x1b[2K` + new content for rows that actually changed,
+    /// letting unchanged rules / status / menu rows sit on screen with
+    /// zero bytes sent. Empty vec = no prior footer (cold start).
+    last_footer_rows: Vec<Vec<u8>>,
     /// Tracks if we're mid-assistant-text block (next text delta should NOT
     /// re-emit the "  │ " prefix for the first line).
     assistant_continuing: bool,
@@ -134,6 +140,7 @@ impl<W: Write + Send> AnsiRenderer<W> {
             caps,
             footer_rows: 0,
             last_footer: FooterState::default(),
+            last_footer_rows: Vec::new(),
             assistant_continuing: false,
             assistant_line_buf: String::new(),
             md_state: crate::markdown::MdState::new(),
@@ -222,6 +229,11 @@ impl<W: Write + Send> AnsiRenderer<W> {
         let was_rows = self.footer_rows;
         let _ = write!(self.out, "\x1b[{}A\r\x1b[J", up);
         self.footer_rows = 0;
+        // Next footer paint starts from a blank slate — any cached row
+        // contents would now "diff same" against rows that were just
+        // wiped off screen, causing the emit path to skip rows it should
+        // be redrawing. Clear the cache so the next paint is a cold start.
+        self.last_footer_rows.clear();
         crate::tuix_trace!(
             "FOOT",
             "erase up={} rows={} dur={}µs",
@@ -245,27 +257,15 @@ impl<W: Write + Send> AnsiRenderer<W> {
     /// keeps its indent. Box auto-grows in height as the user types past
     /// the right border — no horizontal scroll.
     fn draw_footer_here(&mut self) {
-        let _t0 = std::time::Instant::now();
+        let t0 = std::time::Instant::now();
         let state = self.last_footer.clone();
         let w = self.term_width();
         // CC-style footer: the input area is framed by a horizontal rule
-        // above and below (like an <hr>), with no vertical sides. Previously
-        // we drew a full `╭─╮│…│╰─╯` box, which forced every middle row to
-        // include the right-side `│` border and pad-to-width spaces —
-        // ~60-80 extra bytes per keystroke that Mac Terminal.app processes
-        // slowly (visible lag after a long streaming turn).
-        //
-        // Rules span full available width — the visual integrity
-        // matters more than per-keystroke bytes now that the virtual-
-        // footer diff path (TODO next phase) won't re-emit unchanged
-        // rows anyway.
+        // above and below (like an <hr>), with no vertical sides.
         let rule_width = w.saturating_sub(PAD_COL * 2);
         // Text budget = rule width minus the "❯ " prompt prefix (or the
         // equivalent "  " on wrapped continuation rows).
         let text_budget = rule_width.saturating_sub(2);
-
-        let _ = self.out.write_all(b"\x1b[?7l");
-        let _ = self.out.write_all(b"\r");
 
         // Wrap the buffer and locate the cursor in the wrapped layout.
         let safe = scrub_controls(&state.buf);
@@ -279,192 +279,265 @@ impl<W: Write + Send> AnsiRenderer<W> {
         }
         let middle_rows = lines.len();
 
+        // ── Build every row into its own pre-encoded byte buffer ──
+        // These are compared against `last_footer_rows` so unchanged
+        // rows don't produce any terminal output. Rows are built
+        // deterministically from state so byte-equality == visual-
+        // equality (no stale SGR state leaking between rows because
+        // every builder ends with an explicit reset).
+        let mut new_rows: Vec<Vec<u8>> = Vec::with_capacity(8);
+
         // Row 0: spinner (if present) or blank margin.
-        if let (Some(frame), Some(label)) = (state.spinner_frame.as_ref(), state.spinner_label.as_ref()) {
-            self.write_left_pad();
-            self.set_fg(Role::Brand);
-            let _ = write!(self.out, "{} ", frame);
-            self.reset();
-            if self.caps.colors {
-                let _ = self.out.write_all(b"\x1b[1m");
-            }
-            self.set_fg(Role::Secondary);
-            let _ = self.out.write_all(scrub_controls(label).as_bytes());
-            self.reset();
-            if self.caps.colors {
-                let _ = self.out.write_all(b"\x1b[22m");
-            }
-        }
-        let _ = self.out.write_all(b"\r\n");
-
-        // Row 1: top horizontal rule (replaces `╭─────╮`).
-        self.write_left_pad();
-        self.set_fg(Role::Border);
-        for _ in 0..rule_width { let _ = self.out.write_all("─".as_bytes()); }
-        self.reset();
-        let _ = self.out.write_all(b"\r\n");
-
-        // Rows 2..2+N-1: middle. First row gets "❯ ", continuations get "  ".
-        // No right-side border or pad-to-width — text simply ends at its
-        // natural length, as in CC.
+        new_rows.push(self.build_spinner_row(&state));
+        // Row 1: top horizontal rule.
+        new_rows.push(self.build_rule_row(rule_width));
+        // Rows 2..2+N-1: middle input lines.
         for (i, line) in lines.iter().enumerate() {
-            self.write_left_pad();
-            if i == 0 {
-                self.set_fg(Role::Accent);
-                let _ = self.out.write_all("❯ ".as_bytes());
-                self.reset();
-            } else {
-                let _ = self.out.write_all(b"  ");
-            }
-            let _ = self.out.write_all(line.as_bytes());
-            let _ = self.out.write_all(b"\r\n");
+            new_rows.push(self.build_middle_row(line, i == 0));
         }
-
-        // Row 2+N: bottom horizontal rule (replaces `╰─────╯`).
-        self.write_left_pad();
-        self.set_fg(Role::Border);
-        for _ in 0..rule_width { let _ = self.out.write_all("─".as_bytes()); }
-        self.reset();
-        let _ = self.out.write_all(b"\r\n");
-
-        // Rows 4..4+N: menu items.
+        // Row 2+N: bottom horizontal rule.
+        new_rows.push(self.build_rule_row(rule_width));
+        // Rows 3+N..: menu items (0-4).
         let menu_rows = state.menu_items.len().min(4);
         for (i, (name, desc)) in state.menu_items.iter().take(4).enumerate() {
             let selected = state.menu_selected_in_view == Some(i);
-            self.write_left_pad();
-            if selected {
-                // Reverse video paints the selected row in the terminal's
-                // own fg/bg inverted — guarantees contrast on any theme
-                // (light or dark) without us picking a specific bg colour.
-                if self.caps.colors {
-                    let _ = self.out.write_all(b"\x1b[7m");
-                }
-                if self.caps.colors {
-                    let _ = self.out.write_all(b"\x1b[1m");
-                }
-                let _ = write!(self.out, "  ▸ /{:<12}  {}", name, desc);
-                // Pad out to the rule width so the highlight strip
-                // aligns with the horizontal rules above/below.
-                let content_w = 5 + name.chars().count() + 2 + desc.chars().count();
-                let right_pad = rule_width.saturating_sub(content_w);
-                for _ in 0..right_pad { let _ = self.out.write_all(b" "); }
-                if self.caps.colors {
-                    let _ = self.out.write_all(b"\x1b[0m");
-                }
-            } else {
-                self.set_fg(Role::Muted);
-                let _ = write!(self.out, "    /{:<12}  {}", name, desc);
-                self.reset();
-            }
-            let _ = self.out.write_all(b"\r\n");
-            let _ = i;
+            new_rows.push(self.build_menu_row(name, desc, selected, rule_width));
         }
-
-        // Status row: "  model · cwd · N tokens" in muted grey, optionally
-        // with a right-aligned hint (e.g. "↑ v4.16.0" for a passive update
-        // reminder). Drawn below any menu rows so it's the last line of
-        // the footer. Only suppressed when the status line is totally
-        // empty (very early startup before welcome has run).
+        // Status row (if any chrome to show).
         let has_status = !state.status.model.is_empty()
             || !state.status.cwd.is_empty()
             || state.status.hint.is_some();
-        if has_status {
-            self.write_left_pad();
-            self.set_fg(Role::Muted);
-            let mut parts: Vec<String> = Vec::with_capacity(3);
-            if !state.status.model.is_empty() {
-                parts.push(scrub_controls(&state.status.model));
-            }
-            if !state.status.cwd.is_empty() {
-                parts.push(scrub_controls(&state.status.cwd));
-            }
-            if state.status.total_tokens > 0 {
-                parts.push(format_token_count(state.status.total_tokens));
-            }
-            let left = parts.join(" · ");
-            let max = rule_width.max(1);
-
-            if let Some(raw_hint) = state.status.hint.as_deref() {
-                let hint = scrub_controls(raw_hint);
-                let hint_w = crate::width::display_width(&hint);
-                // If hint alone exceeds the row, drop it — never truncate
-                // the model/cwd chrome users care about most.
-                if hint_w + 1 < max {
-                    let left_budget = max - hint_w - 1;
-                    let left_truncated = crate::width::truncate_to_width(&left, left_budget);
-                    let left_w = crate::width::display_width(&left_truncated);
-                    let pad = max - left_w - hint_w;
-                    let _ = self.out.write_all(left_truncated.as_bytes());
-                    for _ in 0..pad {
-                        let _ = self.out.write_all(b" ");
-                    }
-                    self.reset();
-                    self.set_fg(Role::Error);
-                    let _ = self.out.write_all(hint.as_bytes());
-                } else {
-                    let truncated = crate::width::truncate_to_width(&left, max);
-                    let _ = self.out.write_all(truncated.as_bytes());
-                }
-            } else {
-                let truncated = crate::width::truncate_to_width(&left, max);
-                let _ = self.out.write_all(truncated.as_bytes());
-            }
-            self.reset();
-            let _ = self.out.write_all(b"\r\n");
-        }
         let status_rows = if has_status { 1 } else { 0 };
-
-        // Total rows = 1 (spinner/blank) + 1 (top) + N middle + 1 (bottom)
-        //              + M menu + S status.
-        let total_rows = 1 + 1 + middle_rows + 1 + menu_rows + status_rows;
-        self.footer_rows = total_rows;
-
-        // Cursor lands on middle row K. Offset from footer top = 2 + K
-        // (spinner row + top border + K middle rows above the cursor row).
-        let cursor_row_from_top = 2 + cursor_row_in_middle;
-        self.last_footer.cursor_row_from_top = cursor_row_from_top;
-
-        // After drawing, cursor is at row (R + total_rows) — the line
-        // after the last emitted \r\n. Target cursor row is footer_top
-        // + cursor_row_from_top = R + cursor_row_from_top. Distance up
-        // is `total_rows - cursor_row_from_top` (NOT minus an extra
-        // one — the earlier off-by-one parked the cursor on the row
-        // below the intended middle row, which both mis-located the
-        // visible cursor and shifted `erase_footer`'s anchor, causing
-        // the footer to inch downward one row per keystroke).
-        let up = total_rows.saturating_sub(cursor_row_from_top);
-        if up > 0 {
-            let _ = write!(self.out, "\x1b[{}A", up);
+        if has_status {
+            new_rows.push(self.build_status_row(&state.status, rule_width));
         }
-        // Col = 1 (1-indexed) + PAD_COL + 2 ("❯ " or "  " continuation)
-        //       + cursor_col_in_row. CC-style footer has no left `│ ` so
-        //       the prompt glyph is the very first cell after PAD_COL.
-        let col = 1 + PAD_COL + 2 + cursor_col_in_row;
-        let _ = write!(self.out, "\r\x1b[{}G", col);
 
-        let _ = self.out.write_all(b"\x1b[?7h");
+        let total_rows = new_rows.len();
+        let cursor_row_from_top = 2 + cursor_row_in_middle;
 
-        // Rough byte estimate: rule (width × 3 bytes UTF-8 `─`) × 2 rules +
-        // middle rows (text budget × avg 1.5 bytes + SGR overhead) +
-        // menu rows (~80 bytes × M) + status (~80 bytes) + cursor
-        // positioning (~15 bytes). Big numbers (>1KB) are the target of
-        // the upcoming virtual-footer diff layer.
-        let est_bytes =
-            rule_width * 3 * 2 // top + bottom rule
-                + middle_rows * (text_budget + 10)
-                + menu_rows * 80
-                + status_rows * 80
-                + 30; // overhead + cursor positioning
+        // Emit changed rows only, reposition cursor. Zero bytes for any
+        // row whose bytes match the previous paint.
+        let changed_rows = self.emit_footer_diff(
+            &new_rows,
+            cursor_row_from_top,
+            PAD_COL + 2 + cursor_col_in_row,
+        );
+
+        // Save state for next diff.
+        self.footer_rows = total_rows;
+        self.last_footer.cursor_row_from_top = cursor_row_from_top;
+        self.last_footer_rows = new_rows;
+
+        // est_bytes = sum of emitted row byte counts (plus a small
+        // positioning overhead). Shows how much the diff saved: a full
+        // paint of a 200-col terminal used to be ~1500 bytes every
+        // keystroke; now the typical incremental paint is ~30-80 bytes
+        // (only the middle row differs).
         crate::tuix_trace!(
             "FOOT",
-            "draw rule_w={} mid={} menu={} status={} est_bytes={} dur={}µs",
+            "draw rule_w={} mid={} menu={} status={} total={} changed={} dur={}µs",
             rule_width,
             middle_rows,
             menu_rows,
             status_rows,
-            est_bytes,
-            _t0.elapsed().as_micros()
+            total_rows,
+            changed_rows,
+            t0.elapsed().as_micros()
         );
+    }
+
+    // ── Per-row builders ──
+    //
+    // Each returns the exact byte sequence that, when emitted at column 0
+    // of the target row (after an erase-line), paints the row identically
+    // to the old imperative code. Rows are self-contained: every colour
+    // change is paired with a reset so SGR state doesn't bleed across
+    // row boundaries when the diff skips intermediate rows.
+
+    fn build_spinner_row(&self, state: &FooterState) -> Vec<u8> {
+        let mut s = String::new();
+        if let (Some(frame), Some(label)) = (state.spinner_frame.as_ref(), state.spinner_label.as_ref()) {
+            for _ in 0..PAD_COL { s.push(' '); }
+            push_sgr_fg(&mut s, self.caps, Role::Brand);
+            s.push_str(frame);
+            s.push(' ');
+            push_sgr_fg_reset(&mut s, self.caps);
+            push_sgr_bold_on(&mut s, self.caps);
+            push_sgr_fg(&mut s, self.caps, Role::Secondary);
+            s.push_str(&scrub_controls(label));
+            push_sgr_fg_reset(&mut s, self.caps);
+            push_sgr_bold_off(&mut s, self.caps);
+        }
+        s.into_bytes()
+    }
+
+    fn build_rule_row(&self, rule_width: usize) -> Vec<u8> {
+        let mut s = String::new();
+        for _ in 0..PAD_COL { s.push(' '); }
+        push_sgr_fg(&mut s, self.caps, Role::Border);
+        for _ in 0..rule_width { s.push('─'); }
+        push_sgr_fg_reset(&mut s, self.caps);
+        s.into_bytes()
+    }
+
+    fn build_middle_row(&self, line: &str, is_first: bool) -> Vec<u8> {
+        let mut s = String::new();
+        for _ in 0..PAD_COL { s.push(' '); }
+        if is_first {
+            push_sgr_fg(&mut s, self.caps, Role::Accent);
+            s.push_str("❯ ");
+            push_sgr_fg_reset(&mut s, self.caps);
+        } else {
+            s.push_str("  ");
+        }
+        s.push_str(line);
+        s.into_bytes()
+    }
+
+    fn build_menu_row(&self, name: &str, desc: &str, selected: bool, rule_width: usize) -> Vec<u8> {
+        use std::fmt::Write as _;
+        let mut s = String::new();
+        for _ in 0..PAD_COL { s.push(' '); }
+        if selected {
+            // Reverse video so contrast works on any terminal theme.
+            if self.caps.colors {
+                s.push_str("\x1b[7m");
+                s.push_str("\x1b[1m");
+            }
+            let _ = write!(s, "  ▸ /{:<12}  {}", name, desc);
+            // Pad to rule_width so highlight strip visually reaches the
+            // rule's right edge above/below.
+            let content_w = 5 + name.chars().count() + 2 + desc.chars().count();
+            let right_pad = rule_width.saturating_sub(content_w);
+            for _ in 0..right_pad { s.push(' '); }
+            if self.caps.colors {
+                s.push_str("\x1b[0m");
+            }
+        } else {
+            push_sgr_fg(&mut s, self.caps, Role::Muted);
+            let _ = write!(s, "    /{:<12}  {}", name, desc);
+            push_sgr_fg_reset(&mut s, self.caps);
+        }
+        s.into_bytes()
+    }
+
+    fn build_status_row(&self, status: &super::StatusLine, rule_width: usize) -> Vec<u8> {
+        let mut s = String::new();
+        for _ in 0..PAD_COL { s.push(' '); }
+        push_sgr_fg(&mut s, self.caps, Role::Muted);
+        let mut parts: Vec<String> = Vec::with_capacity(3);
+        if !status.model.is_empty() {
+            parts.push(scrub_controls(&status.model));
+        }
+        if !status.cwd.is_empty() {
+            parts.push(scrub_controls(&status.cwd));
+        }
+        if status.total_tokens > 0 {
+            parts.push(format_token_count(status.total_tokens));
+        }
+        let left = parts.join(" · ");
+        let max = rule_width.max(1);
+
+        if let Some(raw_hint) = status.hint.as_deref() {
+            let hint = scrub_controls(raw_hint);
+            let hint_w = crate::width::display_width(&hint);
+            // If hint alone exceeds the row, drop it — don't truncate
+            // model/cwd chrome which is the primary info.
+            if hint_w + 1 < max {
+                let left_budget = max - hint_w - 1;
+                let left_truncated = crate::width::truncate_to_width(&left, left_budget);
+                let left_w = crate::width::display_width(&left_truncated);
+                let pad = max - left_w - hint_w;
+                s.push_str(&left_truncated);
+                for _ in 0..pad { s.push(' '); }
+                push_sgr_fg_reset(&mut s, self.caps);
+                push_sgr_fg(&mut s, self.caps, Role::Error);
+                s.push_str(&hint);
+            } else {
+                let truncated = crate::width::truncate_to_width(&left, max);
+                s.push_str(&truncated);
+            }
+        } else {
+            let truncated = crate::width::truncate_to_width(&left, max);
+            s.push_str(&truncated);
+        }
+        push_sgr_fg_reset(&mut s, self.caps);
+        s.into_bytes()
+    }
+
+    /// Diff the newly built rows against `last_footer_rows` and emit
+    /// `\x1b[2K` + content only for rows whose bytes changed. Returns
+    /// the number of rows actually emitted (for trace). Cursor is
+    /// assumed to be at `(self.last_footer.cursor_row_from_top, ?)`
+    /// when prev exists, or at `(0, 0)` of the footer when prev is
+    /// empty (post `erase_footer`).
+    fn emit_footer_diff(
+        &mut self,
+        new_rows: &[Vec<u8>],
+        target_cursor_row: usize,
+        target_cursor_col: usize,
+    ) -> usize {
+        let prev = std::mem::take(&mut self.last_footer_rows);
+        let total_rows = new_rows.len();
+        let max_rows = total_rows.max(prev.len());
+
+        // Disable autowrap for the whole paint — stray wrap at the
+        // right edge would shift cursor down and desynchronise our
+        // row tracking.
+        let _ = self.out.write_all(b"\x1b[?7l");
+
+        // Position cursor at (row 0, col 0) of the footer area.
+        // If we had a previous paint, cursor is at (prev_cursor_row, ?);
+        // move up + CR. Otherwise (post-erase), cursor already at (0, 0)
+        // — just CR to be safe.
+        if !prev.is_empty() {
+            let up = self.last_footer.cursor_row_from_top;
+            if up > 0 {
+                let _ = write!(self.out, "\x1b[{}A", up);
+            }
+        }
+        let _ = self.out.write_all(b"\r");
+
+        let mut changed = 0usize;
+        for i in 0..max_rows {
+            let new_row = new_rows.get(i);
+            let prev_row = prev.get(i);
+            let emit = match (new_row, prev_row) {
+                (Some(n), Some(p)) => n != p,
+                (Some(_), None) => true,   // new row beyond prev footer
+                (None, Some(_)) => true,   // prev had row, new doesn't — erase
+                (None, None) => false,
+            };
+            if emit {
+                // Erase the whole line first (clears whatever was
+                // there in the prev paint), then lay down new bytes.
+                // For `None` new_row (row disappearing), just erase.
+                let _ = self.out.write_all(b"\x1b[2K");
+                if let Some(n) = new_row {
+                    let _ = self.out.write_all(n);
+                }
+                changed += 1;
+            }
+            // Advance to next row if any rows remain.
+            if i + 1 < max_rows {
+                let _ = self.out.write_all(b"\r\n");
+            }
+        }
+
+        // Cursor now at row (max_rows - 1), arbitrary col. Move back up
+        // to target row, then set col.
+        let last_row = max_rows.saturating_sub(1);
+        if last_row > target_cursor_row {
+            let _ = write!(self.out, "\x1b[{}A", last_row - target_cursor_row);
+        }
+        let _ = self.out.write_all(b"\r");
+        if target_cursor_col > 0 {
+            // \x1b[NG is 1-indexed column positioning.
+            let _ = write!(self.out, "\x1b[{}G", target_cursor_col + 1);
+        }
+
+        let _ = self.out.write_all(b"\x1b[?7h");
+        changed
     }
 
     /// Redraw footer if it was previously drawn — used after permanent
@@ -1126,6 +1199,7 @@ impl<W: Write + Send> Renderer for AnsiRenderer<W> {
         // terminal hijack.
         self.footer_rows = 0;
         self.last_footer = FooterState::default();
+        self.last_footer_rows.clear();
         self.assistant_continuing = false;
         self.assistant_line_buf.clear();
         self.md_state.reset();
