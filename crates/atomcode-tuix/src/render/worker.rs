@@ -50,6 +50,9 @@ enum RenderCmd {
     Line(UiLine),
     Flush,
     FlushDeferred,
+    /// Terminal resize — fire-and-forget, the worker updates its
+    /// internal DECSTBM region and repaints the footer.
+    Resize(u16, u16),
     /// Lifecycle operation requiring an ACK — the worker performs the
     /// op then sends `()` back so the caller can proceed.
     Ack {
@@ -143,6 +146,10 @@ impl Renderer for TaskRenderer {
     fn flush_deferred(&mut self) {
         let _ = self.cmd_tx.send(RenderCmd::FlushDeferred);
     }
+
+    fn on_resize(&mut self, cols: u16, rows: u16) {
+        let _ = self.cmd_tx.send(RenderCmd::Resize(cols, rows));
+    }
 }
 
 impl Drop for TaskRenderer {
@@ -191,6 +198,17 @@ fn run_worker(mut inner: Box<dyn Renderer>, cmd_rx: mpsc::Receiver<RenderCmd>) {
                         d.as_micros()
                     );
                 }
+            }
+            RenderCmd::Resize(cols, rows) => {
+                let t0 = Instant::now();
+                inner.on_resize(cols, rows);
+                crate::tuix_trace!(
+                    "REN",
+                    "Resize {}x{} dur={}µs",
+                    cols,
+                    rows,
+                    t0.elapsed().as_micros()
+                );
             }
             RenderCmd::Ack { op, ack } => {
                 let t0 = Instant::now();

@@ -115,6 +115,15 @@ pub trait Renderer: Send {
     /// Implementations without throttling (e.g. PlainRenderer) can
     /// treat this as a flush.
     fn flush_deferred(&mut self);
+
+    /// Terminal window was resized to `(cols, rows)`. DECSTBM-based
+    /// renderers must re-issue the scroll region (`\x1b[1;H-N r`) so
+    /// the fixed footer stays pinned to the new bottom. Non-DECSTBM
+    /// renderers can treat this as a redraw hint or a no-op.
+    ///
+    /// Default is no-op — backends that don't care about geometry
+    /// (Plain, tests) don't need to override.
+    fn on_resize(&mut self, _cols: u16, _rows: u16) {}
 }
 
 /// Slash-command palette payload: filtered entries + which one is selected.

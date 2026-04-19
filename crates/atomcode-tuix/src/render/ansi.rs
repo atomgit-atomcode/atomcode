@@ -3,8 +3,6 @@ use std::io::{BufWriter, Stdout, Write};
 
 use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
 use crossterm::execute;
-use crossterm::style::{SetForegroundColor, ResetColor};
-use crossterm::QueueableCommand;
 
 use super::theme::{role, Role};
 use super::{Renderer, UiLine};
@@ -125,6 +123,14 @@ pub struct AnsiRenderer<W: Write + Send> {
     /// keystroke storms that outrun Terminal.app's ANSI-processing
     /// budget — see `render::throttle` for the full rationale.
     throttle: super::throttle::InputThrottle,
+    /// Active DECSTBM scroll region `(top, bottom)`, 1-indexed. `None`
+    /// means no region is set (initial state, or cleared for external
+    /// hijack). Fixed-footer architecture: we keep the region as
+    /// `[1, H - footer_rows]` so body content scrolls in the upper area
+    /// and the footer at `[H - footer_rows + 1, H]` is untouched by
+    /// body writes — streaming TextDelta no longer cold-starts the
+    /// footer, killing the 700B-per-delta Mac Terminal.app saturation.
+    scroll_region: Option<(u16, u16)>,
 }
 
 impl AnsiRenderer<BufWriter<Stdout>> {
@@ -145,7 +151,152 @@ impl<W: Write + Send> AnsiRenderer<W> {
             assistant_line_buf: String::new(),
             md_state: crate::markdown::MdState::new(),
             throttle: super::throttle::InputThrottle::new(),
+            scroll_region: None,
         }
+    }
+
+    /// Current terminal dimensions (`(width, height)`), falling back
+    /// to 80×24 if crossterm can't probe (pipe, dumb, test env).
+    fn term_size(&self) -> (u16, u16) {
+        crossterm::terminal::size().unwrap_or((80, 24))
+    }
+
+    /// Last row of the scroll region (= first row outside the footer,
+    /// inclusive on the top side). 1-indexed. Content writes stream
+    /// here; `\r\n` at this row triggers SU inside the region.
+    fn scroll_bottom(&self) -> u16 {
+        let (_, h) = self.term_size();
+        h.saturating_sub(self.footer_rows as u16).max(1)
+    }
+
+    /// Absolute 1-indexed row of the footer's top. Footer occupies
+    /// `[footer_top(), H]`. Invalid when `footer_rows == 0`.
+    fn footer_top(&self) -> u16 {
+        let (_, h) = self.term_size();
+        h.saturating_sub(self.footer_rows as u16).saturating_add(1)
+    }
+
+    /// True when the DECSTBM fixed-footer path is active for this
+    /// render call. Requires a terminal that supports scroll regions
+    /// AND a footer that has been drawn at least once.
+    fn decstbm_active(&self) -> bool {
+        self.caps.scroll_region && self.footer_rows > 0
+    }
+
+    /// Ensure the terminal's scroll region matches `[1, scroll_bottom]`.
+    /// Idempotent — skips the DECSTBM write if already current.
+    /// Called at every footer redraw so footer-height changes (menu
+    /// open/close, multi-line input) transparently re-flow.
+    fn sync_scroll_region(&mut self) {
+        if !self.caps.scroll_region || self.footer_rows == 0 {
+            return;
+        }
+        let bottom = self.scroll_bottom();
+        let want = (1u16, bottom);
+        if self.scroll_region == Some(want) {
+            return;
+        }
+        let _ = write!(self.out, "\x1b[{};{}r", want.0, want.1);
+        self.scroll_region = Some(want);
+        crate::tuix_trace!("DECSTBM", "set 1..{} (footer_rows={})", bottom, self.footer_rows);
+    }
+
+    /// Release any active scroll region (`\x1b[r`). Call before any
+    /// path that hands the terminal off — suspend_for_external,
+    /// shutdown, panic cleanup. Leaving DECSTBM set after exit means
+    /// the user's shell inherits a truncated scroll area and behaves
+    /// weirdly (scrolling breaks below former footer row).
+    fn clear_scroll_region(&mut self) {
+        if self.scroll_region.is_none() {
+            return;
+        }
+        let _ = self.out.write_all(b"\x1b[r");
+        self.scroll_region = None;
+        crate::tuix_trace!("DECSTBM", "clear");
+    }
+
+    /// Recompute the input cursor's absolute (row, col) from
+    /// `last_footer` and reposition. Called at the end of every body
+    /// write in DECSTBM mode so the blinking cursor visibly returns
+    /// to the input box after streaming text lands. Without this the
+    /// cursor would sit in the scroll region below the last body line.
+    fn reposition_cursor_to_input(&mut self) {
+        if !self.decstbm_active() {
+            return;
+        }
+        let top = self.footer_top();
+        let w = self.term_width();
+        let rule_width = w.saturating_sub(PAD_COL * 2);
+        let text_budget = rule_width.saturating_sub(2);
+        let safe = scrub_controls(&self.last_footer.buf);
+        let (_, cursor_row_in_middle, cursor_col_in_row) = if text_budget == 0 {
+            (vec![String::new()], 0usize, 0usize)
+        } else {
+            crate::width::wrap_with_cursor(&safe, text_budget, self.last_footer.cursor_byte)
+        };
+        // Row 0 = spinner, Row 1 = top rule, Row 2 = first middle line.
+        let abs_row = top + 2 + cursor_row_in_middle as u16;
+        let abs_col = (PAD_COL + 2 + cursor_col_in_row + 1) as u16;
+        let _ = write!(self.out, "\x1b[{};{}H", abs_row, abs_col);
+    }
+
+    /// Emit a block of body lines into the scroll region. Pure-append
+    /// semantics preserved: each line pushes older content up, footer
+    /// at `[footer_top(), H]` is untouched. Used by every
+    /// content-write path (ToolCall, ToolResult, streaming text,
+    /// DiffBlock, TurnSeparator, etc.) when DECSTBM is active.
+    ///
+    /// Each logical line may wrap into multiple visible rows — we
+    /// scroll once per visible row, so wrapping is transparent.
+    /// Caller is responsible for the eventual cursor reposition
+    /// (or a draw_footer redraw) — this method leaves the cursor at
+    /// the bottom of the scroll region, column matching the last
+    /// wrapped chunk length.
+    fn emit_body_lines_decstbm(&mut self, lines: &[String]) {
+        let bottom = self.scroll_bottom();
+        let w = self.content_width();
+        // Park cursor at bottom of scroll region. Each `\r\n` at this
+        // row triggers SU inside `[1, bottom]` — content moves up,
+        // bottom becomes empty-ready for the next chunk.
+        let _ = write!(self.out, "\x1b[{};1H", bottom);
+        for line in lines {
+            // A logical line may itself contain `\n` (markdown renderer
+            // returns multi-row bodies for code blocks / tables). Split
+            // and wrap each physical row independently.
+            for phys in line.split('\n') {
+                for chunk in crate::width::wrap_line_to_width(phys, w) {
+                    // Always scroll first so we never overwrite the
+                    // bottom row's previous contents.
+                    let _ = self.out.write_all(b"\r\n");
+                    self.write_left_pad();
+                    let _ = self.out.write_all(chunk.as_bytes());
+                }
+            }
+        }
+    }
+
+    /// Unified body-emit helper used by every content-write path
+    /// (ToolCall, ToolResult, DiffLine/Block, streaming markdown, etc.).
+    /// Branches on DECSTBM availability: fixed-footer ⇒ scroll-region
+    /// emit + cursor-only repost; legacy ⇒ erase + emit + redraw.
+    fn emit_body_block(&mut self, lines: &[String]) {
+        if self.decstbm_active() {
+            self.emit_body_lines_decstbm(lines);
+            self.reposition_cursor_to_input();
+            return;
+        }
+        self.erase_footer();
+        let w = self.content_width();
+        for line in lines {
+            for phys in line.split('\n') {
+                for chunk in crate::width::wrap_line_to_width(phys, w) {
+                    self.write_left_pad();
+                    let _ = self.out.write_all(chunk.as_bytes());
+                    let _ = self.out.write_all(b"\r\n");
+                }
+            }
+        }
+        self.redraw_footer_if_any();
     }
 
     /// Paint any deferred InputPrompt / StreamingBox. Called by
@@ -202,18 +353,6 @@ impl<W: Write + Send> AnsiRenderer<W> {
         }
     }
 
-    fn set_fg(&mut self, r: Role) {
-        if let Some(c) = role(self.caps, r) {
-            let _ = self.out.queue(SetForegroundColor(c));
-        }
-    }
-
-    fn reset(&mut self) {
-        if self.caps.colors {
-            let _ = self.out.queue(ResetColor);
-        }
-    }
-
     /// Erase the currently-drawn footer. Cursor is on the box middle row
     /// at the K-th middle line (0-based); distance from there up to the
     /// footer top is `2 + K` (row 0 = spinner/blank, row 1 = ╭─╮ border,
@@ -224,6 +363,18 @@ impl<W: Write + Send> AnsiRenderer<W> {
         if self.footer_rows == 0 {
             return 0;
         }
+        // DECSTBM mode: footer is pinned at absolute rows via the
+        // scroll region. Body writes stream INTO the scroll region
+        // above and never touch the footer, so "erase the footer
+        // before writing content" is a no-op here. Critically, we
+        // also preserve `last_footer_rows` — in DECSTBM mode the
+        // footer stays on screen byte-for-byte across content writes,
+        // so the next redraw can legitimately diff-skip unchanged rows.
+        // This is the core mechanism that brings streaming TextDelta
+        // from ~700 B/delta down to body-only bytes.
+        if self.caps.scroll_region {
+            return 0;
+        }
         let t0 = std::time::Instant::now();
         let up = self.last_footer.cursor_row_from_top.max(1);
         let was_rows = self.footer_rows;
@@ -231,10 +382,9 @@ impl<W: Write + Send> AnsiRenderer<W> {
         let bytes = seq.len();
         let _ = self.out.write_all(seq.as_bytes());
         self.footer_rows = 0;
-        // Next footer paint starts from a blank slate — any cached row
-        // contents would now "diff same" against rows that were just
-        // wiped off screen, causing the emit path to skip rows it should
-        // be redrawing. Clear the cache so the next paint is a cold start.
+        // Legacy (non-DECSTBM) path: next paint starts from a blank
+        // slate, so caches that would "diff same" against wiped-off
+        // rows must be invalidated.
         self.last_footer_rows.clear();
         crate::tuix_trace!(
             "FOOT",
@@ -331,17 +481,38 @@ impl<W: Write + Send> AnsiRenderer<W> {
         let total_rows = new_rows.len();
         let cursor_row_from_top = 2 + cursor_row_in_middle;
 
-        // Emit changed rows only, reposition cursor. Zero bytes for any
-        // row whose bytes match the previous paint.
-        let (changed_rows, bytes) = self.emit_footer_diff(
-            &new_rows,
-            prev_cursor_row,
-            cursor_row_from_top,
-            PAD_COL + 2 + cursor_col_in_row,
-        );
+        let prev_total_rows = self.footer_rows;
+        // Commit the new footer height up-front so `sync_scroll_region`,
+        // `scroll_bottom`, and `footer_top` see the new layout when they
+        // compute absolute row numbers.
+        self.footer_rows = total_rows;
+
+        // DECSTBM: update scroll region boundary BEFORE painting so any
+        // stale cursor positioning inside the region honours the new
+        // lower bound. Also wipes cache rows if footer just shrank —
+        // handled inside `emit_footer_absolute`.
+        if self.caps.scroll_region {
+            self.sync_scroll_region();
+        }
+
+        let (changed_rows, bytes) = if self.caps.scroll_region {
+            self.emit_footer_absolute(
+                &new_rows,
+                prev_total_rows,
+                total_rows,
+                cursor_row_from_top,
+                PAD_COL + 2 + cursor_col_in_row,
+            )
+        } else {
+            self.emit_footer_diff(
+                &new_rows,
+                prev_cursor_row,
+                cursor_row_from_top,
+                PAD_COL + 2 + cursor_col_in_row,
+            )
+        };
 
         // Save state for next diff.
-        self.footer_rows = total_rows;
         self.last_footer.cursor_row_from_top = cursor_row_from_top;
         self.last_footer_rows = new_rows;
 
@@ -481,6 +652,93 @@ impl<W: Write + Send> AnsiRenderer<W> {
         }
         push_sgr_fg_reset(&mut s, self.caps);
         s.into_bytes()
+    }
+
+    /// DECSTBM fixed-footer paint: each row drawn at its absolute
+    /// screen row `\x1b[{row};1H`, row-level diff against
+    /// `last_footer_rows` preserved so unchanged rows stay at 0 bytes
+    /// even across content-write events (cache is no longer invalidated
+    /// by `erase_footer` because body writes never erase — they stream
+    /// into the scroll region above).
+    ///
+    /// Footer occupies `[footer_top, H]`, 1-indexed. If footer just
+    /// shrank (`prev_total_rows > new_total_rows`), the rows formerly
+    /// occupied by footer but now in scroll territory are explicitly
+    /// wiped so stale characters don't ghost under freshly scrolling
+    /// body text.
+    fn emit_footer_absolute(
+        &mut self,
+        new_rows: &[Vec<u8>],
+        prev_total_rows: usize,
+        new_total_rows: usize,
+        target_cursor_row_in_footer: usize,
+        target_cursor_col_from_edge: usize,
+    ) -> (usize, usize) {
+        let (_, h) = self.term_size();
+        let new_top = h.saturating_sub(new_total_rows as u16).saturating_add(1);
+        let mut bytes = 0usize;
+
+        // If footer just shrank, the old top rows that are now in
+        // scroll territory still hold stale footer glyphs. Wipe them
+        // one by one so body content doesn't render atop ghost rules.
+        if prev_total_rows > new_total_rows {
+            let prev_top = h
+                .saturating_sub(prev_total_rows as u16)
+                .saturating_add(1);
+            for row in prev_top..new_top {
+                let s = format!("\x1b[{};1H\x1b[2K", row);
+                let _ = self.out.write_all(s.as_bytes());
+                bytes += s.len();
+            }
+        }
+
+        // Disable autowrap for the paint — rule rows emit exactly
+        // `rule_width` cells and we don't want a UTF-8 terminal's
+        // autowrap to shift the next row down.
+        let _ = self.out.write_all(b"\x1b[?7l");
+        bytes += 4;
+
+        let prev = std::mem::take(&mut self.last_footer_rows);
+        let mut changed = 0usize;
+        // When the footer grew (prev_total_rows < new_total_rows), the
+        // new top rows have no cache entry → emit unconditionally.
+        // When rows match in bytes, skip.
+        let growth = new_total_rows.saturating_sub(prev_total_rows);
+        for (i, new_row) in new_rows.iter().enumerate() {
+            // Old cache index: since footer grew at the top (newer rows
+            // get prepended when menu opens / input multi-lines), the
+            // prev[i] for i < growth doesn't correspond to the same
+            // visual row. Simpler invariant: treat all prev cache as
+            // stale when total_rows changed — cache only trusted when
+            // sizes match. Over-emit in that one frame, then stable.
+            let prev_row = if prev_total_rows == new_total_rows && growth == 0 {
+                prev.get(i)
+            } else {
+                None
+            };
+            if prev_row != Some(new_row) {
+                let abs_row = new_top + i as u16;
+                let s = format!("\x1b[{};1H\x1b[2K", abs_row);
+                let _ = self.out.write_all(s.as_bytes());
+                bytes += s.len();
+                let _ = self.out.write_all(new_row);
+                bytes += new_row.len();
+                changed += 1;
+            }
+        }
+
+        let _ = self.out.write_all(b"\x1b[?7h");
+        bytes += 4;
+
+        // Park cursor at the input cell (row = footer_top + offset,
+        // col = left pad + "❯ " + col in wrapped input).
+        let cursor_abs_row = new_top + target_cursor_row_in_footer as u16;
+        let cursor_abs_col = target_cursor_col_from_edge as u16 + 1; // 1-indexed
+        let s = format!("\x1b[{};{}H", cursor_abs_row, cursor_abs_col);
+        let _ = self.out.write_all(s.as_bytes());
+        bytes += s.len();
+
+        (changed, bytes)
     }
 
     /// Diff the newly built rows against `last_footer_rows` and emit
@@ -707,20 +965,11 @@ impl<W: Write + Send> AnsiRenderer<W> {
     ///   3. redraw footer — blank margin + box + menu at new cursor
     ///      position (below the content we just wrote).
     fn emit_wrapped_line(&mut self, line: &str) {
-        self.erase_footer();
-        let w = self.content_width();
-        for chunk in crate::width::wrap_line_to_width(line, w) {
-            self.write_left_pad();
-            let _ = self.out.write_all(chunk.as_bytes());
-            let _ = self.out.write_all(b"\r\n");
-        }
-        self.redraw_footer_if_any();
+        self.emit_body_block(&[line.to_string()]);
     }
 
     fn emit_blank_line(&mut self) {
-        self.erase_footer();
-        let _ = self.out.write_all(b"\r\n");
-        self.redraw_footer_if_any();
+        self.emit_body_block(&[String::new()]);
     }
 
     // clear_old_footer_rows removed — static footer layout means no
@@ -757,18 +1006,7 @@ impl<W: Write + Send> AnsiRenderer<W> {
         if bodies.is_empty() {
             return;
         }
-        self.erase_footer();
-        let w = self.content_width();
-        for rendered in bodies {
-            for phys in rendered.split('\n') {
-                for chunk in crate::width::wrap_line_to_width(phys, w) {
-                    self.write_left_pad();
-                    let _ = self.out.write_all(chunk.as_bytes());
-                    let _ = self.out.write_all(b"\r\n");
-                }
-            }
-        }
-        self.redraw_footer_if_any();
+        self.emit_body_block(&bodies);
     }
 
     /// Flush any remaining partial line as if it were terminated.
@@ -779,42 +1017,22 @@ impl<W: Write + Send> AnsiRenderer<W> {
             self.write_assistant_rendered_line(&line);
         }
         // Also flush any trailing markdown block (table that ended without
-        // a following non-table line). Use the pure-append render cycle:
-        // erase footer once, emit all padded chunks, redraw footer once.
+        // a following non-table line).
         if let Some(block) = crate::markdown::finalize(&mut self.md_state, self.caps) {
-            self.erase_footer();
-            let w = self.content_width();
-            for phys in block.split('\n') {
-                for chunk in crate::width::wrap_line_to_width(phys, w) {
-                    self.write_left_pad();
-                    let _ = self.out.write_all(chunk.as_bytes());
-                    let _ = self.out.write_all(b"\r\n");
-                }
-            }
-            self.redraw_footer_if_any();
+            self.emit_body_block(&[block]);
         }
     }
 
-    /// Write a complete assistant line: erase footer once, emit all
-    /// padded wrapped chunks + CRLF, redraw footer. Follows the pure-append
-    /// render cycle so every streaming TextDelta leaves the footer in
-    /// a clean, redrawn state.
+    /// Write a complete assistant line through the inline markdown
+    /// renderer, then push the rendered body through the unified
+    /// `emit_body_block` helper.
     fn write_assistant_rendered_line(&mut self, content: &str) {
         let Some(rendered) = crate::markdown::render_line(
             content, &mut self.md_state, self.caps,
         ) else {
             return;
         };
-        self.erase_footer();
-        let w = self.content_width();
-        for phys in rendered.split('\n') {
-            for chunk in crate::width::wrap_line_to_width(phys, w) {
-                self.write_left_pad();
-                let _ = self.out.write_all(chunk.as_bytes());
-                let _ = self.out.write_all(b"\r\n");
-            }
-        }
-        self.redraw_footer_if_any();
+        self.emit_body_block(&[rendered]);
     }
 
     fn term_width(&self) -> usize {
@@ -824,102 +1042,100 @@ impl<W: Write + Send> AnsiRenderer<W> {
     }
 
     fn render_welcome(&mut self, model: &str, working_dir: &str) {
-        // Compact layout (档位 1): was 8 rows with double-blank separators
-        // and 5-space bullet indents; now 6 rows with single-blank separators
-        // and 2-space indents so screen density matches CC's feel.
+        // Compact layout: 6 rows, 2-space indent, single-blank separator
+        // to match CC's density. Builds each row as a pre-formatted string
+        // (with its own SGR bracketing) and pushes the batch through
+        // `emit_body_block`, which handles the left pad so in DECSTBM
+        // mode these rows stream into the scroll region and leave the
+        // fixed footer untouched.
         let model = scrub_controls(model);
         let working_dir = scrub_controls(working_dir);
         let w = self.term_width();
+        let caps = self.caps;
+        let mut lines: Vec<String> = Vec::with_capacity(6);
 
-        // Row 1: "  ◆ AtomCode" on the left; "v4.18.1  ·  MIT" on the right.
-        // (No leading blank — the footer that was above us already left one.)
-        let left = "  ◆ AtomCode";
+        // Row 1: brand on the left, "v{ver}  ·  MIT" right-aligned.
+        // `content_w` = width inside the left + right pad; `write_left_pad`
+        // contributes PAD_COL spaces when emit_body_block fires.
+        let content_w = w.saturating_sub(PAD_COL * 2);
+        let left_txt = "◆ AtomCode";
         let right_ver = "v4.18.1";
         let right_lic = "MIT";
-        let left_w = crate::width::display_width(left);
+        let left_w = crate::width::display_width(left_txt);
         let right_w = right_ver.len() + 5 + right_lic.len(); // "  ·  "
-        let gap = w.saturating_sub(left_w + right_w + 2);
-
-        self.set_fg(Role::Brand);
-        if self.caps.colors {
-            let _ = self.out.write_all(b"\x1b[1m");
-        }
-        let _ = self.out.write_all(left.as_bytes());
-        if self.caps.colors {
-            let _ = self.out.write_all(b"\x1b[22m");
-        }
-        self.reset();
+        let gap = content_w.saturating_sub(left_w + right_w);
+        let mut row = String::new();
+        push_sgr_bold_on(&mut row, caps);
+        push_sgr_fg(&mut row, caps, Role::Brand);
+        row.push_str(left_txt);
+        push_sgr_fg_reset(&mut row, caps);
+        push_sgr_bold_off(&mut row, caps);
         for _ in 0..gap {
-            let _ = self.out.write_all(b" ");
+            row.push(' ');
         }
-        self.set_fg(Role::Secondary);
-        let _ = self.out.write_all(right_ver.as_bytes());
-        self.reset();
-        self.set_fg(Role::Muted);
-        let _ = self.out.write_all("  ·  ".as_bytes());
-        self.reset();
-        self.set_fg(Role::Muted);
-        let _ = self.out.write_all(right_lic.as_bytes());
-        self.reset();
-        let _ = self.out.write_all(b"\r\n");
+        push_sgr_fg(&mut row, caps, Role::Secondary);
+        row.push_str(right_ver);
+        push_sgr_fg_reset(&mut row, caps);
+        push_sgr_fg(&mut row, caps, Role::Muted);
+        row.push_str("  ·  ");
+        row.push_str(right_lic);
+        push_sgr_fg_reset(&mut row, caps);
+        lines.push(row);
 
-        // "  ∙ {working_dir}" and "  ∙ {model}" — soft bullets, muted.
-        // Bullet indent dropped from 5 spaces to 2 to match PAD_COL.
+        // Row 2: ∙ cwd
         let max_path = w.saturating_sub(6);
         let cwd_disp = crate::width::truncate_to_width(&working_dir, max_path);
-        self.set_fg(Role::AccentDim);
-        let _ = self.out.write_all("  ∙ ".as_bytes());
-        self.reset();
-        self.set_fg(Role::Secondary);
-        let _ = self.out.write_all(cwd_disp.as_bytes());
-        self.reset();
-        let _ = self.out.write_all(b"\r\n");
+        let mut row = String::new();
+        push_sgr_fg(&mut row, caps, Role::AccentDim);
+        row.push_str("∙ ");
+        push_sgr_fg_reset(&mut row, caps);
+        push_sgr_fg(&mut row, caps, Role::Secondary);
+        row.push_str(&cwd_disp);
+        push_sgr_fg_reset(&mut row, caps);
+        lines.push(row);
 
+        // Row 3: ∙ model
         let model_disp = crate::width::truncate_to_width(&model, max_path);
-        self.set_fg(Role::AccentDim);
-        let _ = self.out.write_all("  ∙ ".as_bytes());
-        self.reset();
-        self.set_fg(Role::Secondary);
-        let _ = self.out.write_all(model_disp.as_bytes());
-        self.reset();
-        let _ = self.out.write_all(b"\r\n\r\n");
+        let mut row = String::new();
+        push_sgr_fg(&mut row, caps, Role::AccentDim);
+        row.push_str("∙ ");
+        push_sgr_fg_reset(&mut row, caps);
+        push_sgr_fg(&mut row, caps, Role::Secondary);
+        row.push_str(&model_disp);
+        push_sgr_fg_reset(&mut row, caps);
+        lines.push(row);
 
-        // Two hint rows, same 2-space indent as everything else.
-        // `/provider` gets bold+accent so new users discover how to wire
-        // up their own API key without digging through config.toml.
-        self.set_fg(Role::AccentDim);
-        let _ = self.out.write_all("  type something, or press  ".as_bytes());
-        self.reset();
-        if self.caps.colors {
-            let _ = self.out.write_all(b"\x1b[1m");
-        }
-        self.set_fg(Role::Accent);
-        let _ = self.out.write_all("/".as_bytes());
-        self.reset();
-        if self.caps.colors {
-            let _ = self.out.write_all(b"\x1b[22m");
-        }
-        self.set_fg(Role::AccentDim);
-        let _ = self.out.write_all("  to browse commands".as_bytes());
-        self.reset();
-        let _ = self.out.write_all(b"\r\n");
+        // Row 4: blank separator
+        lines.push(String::new());
 
-        self.set_fg(Role::AccentDim);
-        let _ = self.out.write_all("  ".as_bytes());
-        self.reset();
-        if self.caps.colors {
-            let _ = self.out.write_all(b"\x1b[1m");
-        }
-        self.set_fg(Role::Accent);
-        let _ = self.out.write_all("/provider".as_bytes());
-        self.reset();
-        if self.caps.colors {
-            let _ = self.out.write_all(b"\x1b[22m");
-        }
-        self.set_fg(Role::AccentDim);
-        let _ = self.out.write_all("  to add a custom model".as_bytes());
-        self.reset();
-        let _ = self.out.write_all(b"\r\n");
+        // Row 5: "type something, or press / to browse commands"
+        let mut row = String::new();
+        push_sgr_fg(&mut row, caps, Role::AccentDim);
+        row.push_str("type something, or press  ");
+        push_sgr_fg_reset(&mut row, caps);
+        push_sgr_bold_on(&mut row, caps);
+        push_sgr_fg(&mut row, caps, Role::Accent);
+        row.push('/');
+        push_sgr_fg_reset(&mut row, caps);
+        push_sgr_bold_off(&mut row, caps);
+        push_sgr_fg(&mut row, caps, Role::AccentDim);
+        row.push_str("  to browse commands");
+        push_sgr_fg_reset(&mut row, caps);
+        lines.push(row);
+
+        // Row 6: "/provider to add a custom model"
+        let mut row = String::new();
+        push_sgr_bold_on(&mut row, caps);
+        push_sgr_fg(&mut row, caps, Role::Accent);
+        row.push_str("/provider");
+        push_sgr_fg_reset(&mut row, caps);
+        push_sgr_bold_off(&mut row, caps);
+        push_sgr_fg(&mut row, caps, Role::AccentDim);
+        row.push_str("  to add a custom model");
+        push_sgr_fg_reset(&mut row, caps);
+        lines.push(row);
+
+        self.emit_body_block(&lines);
     }
 
     // ── UiLine variant handlers ──
@@ -927,42 +1143,26 @@ impl<W: Write + Send> AnsiRenderer<W> {
     // arm, unchanged. Renderer::render is now pure dispatch.
 
     fn render_welcome_line(&mut self, model: &str, working_dir: &str) {
-        self.erase_footer();
         self.render_welcome(model, working_dir);
         self.assistant_continuing = false;
-        self.redraw_footer_if_any();
     }
 
     fn render_user_line(&mut self, text: &str) {
-        self.erase_footer();
         let safe = scrub_controls(text);
-
+        let caps = self.caps;
         // CC-style echo: accent prompt glyph + plain text, one trailing
-        // blank line for separation from the assistant response. Previously
-        // wrapped the message with blank lines on BOTH sides (3 rows per
-        // user turn), which compounded into CC-feeling-smaller on screen
-        // when many turns stacked. One blank below is enough: the footer's
-        // own "blank margin row" already provides breathing room above.
-        self.write_left_pad();
-        if self.caps.colors {
-            let _ = self.out.write_all(b"\x1b[1m");
-        }
-        self.set_fg(Role::Accent);
-        let _ = self.out.write_all("❯ ".as_bytes());
-        self.reset();
-        if self.caps.colors {
-            let _ = self.out.write_all(b"\x1b[22m");
-        }
-        let _ = self.out.write_all(safe.as_bytes());
-        let _ = self.out.write_all(b"\r\n");
-
-        // Blank line below only
-        let _ = self.out.write_all(b"\r\n");
-
+        // blank row for separation from the assistant response.
+        let mut row = String::new();
+        push_sgr_bold_on(&mut row, caps);
+        push_sgr_fg(&mut row, caps, Role::Accent);
+        row.push_str("❯ ");
+        push_sgr_fg_reset(&mut row, caps);
+        push_sgr_bold_off(&mut row, caps);
+        row.push_str(&safe);
+        self.emit_body_block(&[row, String::new()]);
         self.assistant_continuing = false;
         // New user turn → reset markdown parser state.
         self.md_state.reset();
-        self.redraw_footer_if_any();
     }
 
     fn render_assistant_text(&mut self, text: &str) {
@@ -1036,11 +1236,11 @@ impl<W: Write + Send> AnsiRenderer<W> {
     }
 
     fn render_diff_block(&mut self, entries: &[super::DiffEntry]) {
-        // Single erase/redraw cycle for the whole batch — 50 diff lines
-        // translate to 2 footer redraws instead of 50, keeping the
-        // event loop unblocked for the background spinner task.
-        self.erase_footer();
-        let w = self.content_width();
+        // Build one String per entry, then push the batch through the
+        // unified body emitter. 50 entries still result in a single
+        // erase/redraw cycle (legacy) or a single scroll-region sweep
+        // (DECSTBM) — the event loop stays unblocked for the spinner.
+        let mut bodies: Vec<String> = Vec::with_capacity(entries.len());
         for entry in entries {
             let mut line = String::new();
             push_sgr_fg(
@@ -1055,13 +1255,9 @@ impl<W: Write + Send> AnsiRenderer<W> {
                 scrub_controls(&entry.text)
             ));
             push_sgr_fg_reset(&mut line, self.caps);
-            for chunk in crate::width::wrap_line_to_width(&line, w) {
-                self.write_left_pad();
-                let _ = self.out.write_all(chunk.as_bytes());
-                let _ = self.out.write_all(b"\r\n");
-            }
+            bodies.push(line);
         }
-        self.redraw_footer_if_any();
+        self.emit_body_block(&bodies);
     }
 
     fn render_approval_prompt(&mut self, tool: &str, detail: &str) {
@@ -1149,36 +1345,32 @@ impl<W: Write + Send> AnsiRenderer<W> {
     }
 
     fn render_turn_separator(&mut self, label: &str) {
-        self.erase_footer();
         let inner_w = self.term_width().saturating_sub(PAD_COL * 2);
         let safe = scrub_controls(label);
         let lw = crate::width::display_width(&safe);
-        // Layout: `{dashes} {label} {dashes}` filled to inner width.
-        // Reserve 1 space on each side of label. Fallback if too narrow.
         let padded = 1 + lw + 1;
         let remaining = inner_w.saturating_sub(padded);
         let left = remaining / 2;
         let right = remaining - left;
+        let caps = self.caps;
 
-        // Blank line above so the separator doesn't cling to the last
-        // line of content.
-        let _ = self.out.write_all(b"\r\n");
+        let mut row = String::new();
+        push_sgr_fg(&mut row, caps, Role::Muted);
+        for _ in 0..left { row.push('─'); }
+        row.push(' ');
+        push_sgr_fg_reset(&mut row, caps);
+        push_sgr_fg(&mut row, caps, Role::Secondary);
+        row.push_str(&safe);
+        push_sgr_fg_reset(&mut row, caps);
+        push_sgr_fg(&mut row, caps, Role::Muted);
+        row.push(' ');
+        for _ in 0..right { row.push('─'); }
+        push_sgr_fg_reset(&mut row, caps);
 
-        self.write_left_pad();
-        self.set_fg(Role::Muted);
-        for _ in 0..left { let _ = self.out.write_all("─".as_bytes()); }
-        let _ = self.out.write_all(b" ");
-        self.reset();
-        self.set_fg(Role::Secondary);
-        let _ = self.out.write_all(safe.as_bytes());
-        self.reset();
-        self.set_fg(Role::Muted);
-        let _ = self.out.write_all(b" ");
-        for _ in 0..right { let _ = self.out.write_all("─".as_bytes()); }
-        self.reset();
-        let _ = self.out.write_all(b"\r\n\r\n");
-
-        self.redraw_footer_if_any();
+        // Blank row above + separator + blank row below so the rule
+        // breathes between the tool output it closes and the prompt
+        // that follows.
+        self.emit_body_block(&[String::new(), row, String::new()]);
     }
 
     fn render_command_output(&mut self, text: &str) {
@@ -1212,11 +1404,22 @@ impl<W: Write + Send> Renderer for AnsiRenderer<W> {
     fn shutdown(&mut self) {
         // Clear any multi-line transient (input box) cleanly.
         self.clear_line_if_needed();
+        // Release the DECSTBM fixed-footer scroll region. If we exit
+        // with a restricted region still active, the user's shell
+        // inherits the truncated scroll area and everything below the
+        // former footer row silently fails to scroll — a very confusing
+        // "my terminal is broken" experience.
+        self.clear_scroll_region();
         let _ = self.out.write_all(b"\r\n");
         let _ = self.out.flush();
     }
 
     fn reset(&mut self) {
+        // Release DECSTBM BEFORE the screen wipe — clearing a scroll
+        // region after a `\x1b[2J` is harmless, but some emulators
+        // misbehave if we leave a region set while the cursor is being
+        // moved to (1,1).
+        self.clear_scroll_region();
         // Wipe the physical terminal + cursor home so the next render
         // starts from a known (row 1, col 1) position.
         let _ = self.out.write_all(b"\x1b[2J\x1b[H");
@@ -1246,6 +1449,29 @@ impl<W: Write + Send> Renderer for AnsiRenderer<W> {
         }
     }
 
+    fn on_resize(&mut self, _cols: u16, _rows: u16) {
+        // DECSTBM region boundary depends on `H - footer_rows`. After
+        // a resize `H` changed but our cached scroll_region still
+        // targets the old bottom, so subsequent body writes would
+        // scroll in the wrong region (or fall outside it entirely).
+        // Force a re-sync + full footer repaint. `last_footer_rows`
+        // cache gets invalidated implicitly by size_mismatch detection
+        // inside `emit_footer_absolute`.
+        if !self.caps.scroll_region {
+            return;
+        }
+        // Drop the old region so `sync_scroll_region` re-issues.
+        self.scroll_region = None;
+        // Force a full footer repaint against the new dimensions.
+        // The cache clear ensures every row is re-emitted even if its
+        // bytes happen to match (row positions shift with new H).
+        self.last_footer_rows.clear();
+        if self.footer_rows > 0 {
+            self.draw_footer_here();
+            let _ = self.out.flush();
+        }
+    }
+
     fn clear_screen(&mut self) {
         // Physical-only: wipe the terminal without invalidating the
         // cached footer/stream state. The very next render call will
@@ -1259,7 +1485,9 @@ impl<W: Write + Send> Renderer for AnsiRenderer<W> {
         // Gate on caps so tests / pipe mode / dumb terminals don't try
         // to toggle modes they never entered. `shutdown` handles the
         // final `\r\n` + flush so the external child starts on a clean
-        // line.
+        // line. `shutdown` also clears the DECSTBM region, which is
+        // critical — OAuth/browser/etc. sub-processes inherit the
+        // terminal and must see a full-height scroll area.
         if self.caps.bracketed_paste {
             let _ = execute!(self.out, DisableBracketedPaste);
         }

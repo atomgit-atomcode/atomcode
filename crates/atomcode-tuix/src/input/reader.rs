@@ -162,7 +162,7 @@ fn run(
             }
             Event::Resize(w, h) => {
                 crate::tuix_trace!("RD", "resize {}x{}", w, h);
-                continue;
+                InputEvent::Resize(w, h)
             }
             Event::Mouse(_) | Event::FocusGained | Event::FocusLost => {
                 continue;

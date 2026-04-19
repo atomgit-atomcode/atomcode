@@ -51,11 +51,14 @@ impl TerminalGuard {
             execute!(io::stdout(), EnableBracketedPaste)?;
             g.paste_enabled = true;
         }
-        // PURE APPEND ARCHITECTURE — no scroll region, no DECSTBM.
-        // Footer is drawn at the current cursor position; content writes
-        // erase and redraw the footer; terminal scrolls naturally when
-        // cursor reaches the bottom row. No region boundaries means no
-        // transition bugs.
+        // FIXED-FOOTER via DECSTBM. Scroll region `[1, H - footer_rows]`
+        // is set by `AnsiRenderer` the first time it paints the footer;
+        // body writes stream into that region while the footer stays
+        // pinned at `[H - footer_rows + 1, H]`. This guard only clears
+        // the screen on entry — the renderer owns scroll-region lifecycle
+        // during normal operation, and this guard's Drop is the
+        // belt-and-suspenders reset for panic / abrupt-exit paths where
+        // the renderer worker didn't get to run `shutdown()`.
         if caps.tty {
             let stdout = io::stdout();
             let mut out = stdout.lock();
@@ -69,8 +72,14 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         use std::io::Write as _;
-        // Ensure scroll region and autowrap reset defensively in case any
-        // renderer code emitted DECSTBM. Cursor to a fresh row for shell.
+        // Panic-safe final reset: `\x1b[?7h` re-enables autowrap (in
+        // case a footer paint was interrupted mid-`\x1b[?7l/h` bracket),
+        // `\x1b[r` releases any DECSTBM scroll region we set during
+        // normal operation, then a CRLF parks the cursor on a fresh
+        // line for the user's shell prompt. This runs even when the
+        // renderer worker crashed before `shutdown` could clean up,
+        // which is why it exists alongside the renderer's own
+        // `clear_scroll_region` in `shutdown`.
         let stdout = io::stdout();
         let mut out = stdout.lock();
         let _ = write!(out, "\x1b[?7h\x1b[r\r\n");

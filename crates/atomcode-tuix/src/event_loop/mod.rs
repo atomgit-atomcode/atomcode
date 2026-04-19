@@ -881,10 +881,18 @@ fn handle_input(
             InputEvent::Paste(t) => format!("paste({})", t.len()),
             InputEvent::Eof => "eof".into(),
             InputEvent::Key(k) => format!("key({:?},{:?})", k.kind, k.code),
+            InputEvent::Resize(w, h) => format!("resize({}x{})", w, h),
         }
     );
 
     match ev {
+        InputEvent::Resize(cols, rows) => {
+            // Forward to the renderer so DECSTBM-based backends can
+            // re-issue their scroll region and repaint the footer at
+            // the new geometry. Fire-and-forget; the render worker
+            // serialises this against in-flight content writes.
+            renderer.on_resize(cols, rows);
+        }
         InputEvent::Paste(text) => {
             // Allow pasting during Streaming too — it goes into the
             // type-ahead buffer just like keyboard input. Modals have
