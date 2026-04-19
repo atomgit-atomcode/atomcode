@@ -92,11 +92,19 @@ impl TurnTracker {
 
     /// Notify that a new user message was added at `msg_idx`.
     /// Closes the previous turn and opens a new Active turn.
+    ///
+    /// ── SAFETY INVARIANT ──
+    /// This method assumes msg_idx >= prev.start_idx (always true when messages are
+    /// added sequentially). However, after compression, this invariant could be violated
+    /// if Turn indices are corrupted. We now defend against this by clamping the result.
     pub fn on_user_message(&mut self, msg_idx: usize) {
         // Close previous active turn
         if let Some(prev) = self.turns.last_mut() {
             if prev.status == TurnStatus::Active {
-                prev.msg_count = msg_idx - prev.start_idx;
+                // DEFENSIVE: Guard against underflow from compression bugs.
+                // Use saturating_sub to safely clamp msg_count to 0 if msg_idx < prev.start_idx.
+                // This prevents panic and maintains internal consistency.
+                prev.msg_count = msg_idx.saturating_sub(prev.start_idx);
                 prev.status = TurnStatus::Completed;
             }
         }
@@ -134,7 +142,10 @@ impl TurnTracker {
 
     /// Number of completed turns (available for summarization).
     pub fn completed_count(&self) -> usize {
-        self.turns.iter().filter(|t| t.status == TurnStatus::Completed).count()
+        self.turns
+            .iter()
+            .filter(|t| t.status == TurnStatus::Completed)
+            .count()
     }
 }
 

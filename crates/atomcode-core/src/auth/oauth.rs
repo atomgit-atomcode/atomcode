@@ -10,7 +10,9 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Deserializer, Serialize};
 
 /// Deserialize an ID that may be a string or a number into a String.
-fn deserialize_id_as_string<'de, D: Deserializer<'de>>(deserializer: D) -> std::result::Result<String, D::Error> {
+fn deserialize_id_as_string<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<String, D::Error> {
     #[derive(Deserialize)]
     #[serde(untagged)]
     enum StringOrNum {
@@ -86,10 +88,10 @@ struct UserResponse {
 pub fn login() -> Result<AuthInfo> {
     println!("\n  AtomCode Login");
     println!("  ==============\n");
-    
+
     // Generate random state for CSRF protection
     let state = generate_state();
-    
+
     // Build authorization URL
     let auth_url = format!(
         "{}?client_id={}&redirect_uri={}&response_type=code&state={}&scope={}",
@@ -99,7 +101,7 @@ pub fn login() -> Result<AuthInfo> {
         state,
         urlencoding_encode(SCOPES),
     );
-    
+
     println!("  Opening browser for authorization...");
     println!("  If browser doesn't open, visit this URL:\n");
     println!("  {}\n", auth_url);
@@ -111,25 +113,25 @@ pub fn login() -> Result<AuthInfo> {
     }
 
     let (code, returned_state) = await_callback(REDIRECT_PORT)?;
-    
+
     // Verify state. Most common cause of mismatch in practice is the user
     // pasting a callback URL left over from an earlier /login attempt;
     // re-running /login regenerates state and fixes it.
     if returned_state != state {
         anyhow::bail!(
             "OAuth state mismatch — the pasted URL likely came from an earlier \
-             /login attempt. Re-run /login and paste the newly-authorized URL."
+            /login attempt. Re-run /login and paste the newly-authorized URL."
         );
     }
-    
+
     println!("  Authorization received, exchanging token...\n");
-    
+
     // Exchange code for token
     let token = exchange_code_for_token(&code)?;
-    
+
     // Get user info
     let user = get_user_info(&token.access_token)?;
-    
+
     let created_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -149,9 +151,12 @@ pub fn login() -> Result<AuthInfo> {
             avatar_url: user.avatar_url,
         },
     };
-    
-    println!("  Logged in as: {} ({})\n", auth_info.user.username, auth_info.user.id);
-    
+
+    println!(
+        "  Logged in as: {} ({})\n",
+        auth_info.user.username, auth_info.user.id
+    );
+
     Ok(auth_info)
 }
 
@@ -208,10 +213,7 @@ fn await_callback(port: u16) -> Result<(String, String)> {
     let listener = match TcpListener::bind(("127.0.0.1", port)) {
         Ok(l) => Some(l),
         Err(e) => {
-            println!(
-                "  Could not bind port {} ({}). Paste path only.",
-                port, e
-            );
+            println!("  Could not bind port {} ({}). Paste path only.", port, e);
             None
         }
     };
@@ -302,14 +304,20 @@ fn accept_callback_until_stopped(
         .filter_map(|pair| {
             let mut parts = pair.splitn(2, '=');
             let key = parts.next()?;
-            let value = parts.next().map(|v| urlencoding_decode(v)).unwrap_or_default();
+            let value = parts
+                .next()
+                .map(|v| urlencoding_decode(v))
+                .unwrap_or_default();
             Some((key.to_string(), value))
         })
         .collect();
 
     // Check for error — redirect browser to AtomGit
     if let Some(error) = params.get("error") {
-        let error_desc = params.get("error_description").map(|s| s.as_str()).unwrap_or(error);
+        let error_desc = params
+            .get("error_description")
+            .map(|s| s.as_str())
+            .unwrap_or(error);
         let response = "HTTP/1.1 302 Found\r\nLocation: https://atomgit.com\r\n\r\n";
         let _ = stream.write_all(response.as_bytes());
         let _ = stream.flush();
@@ -341,7 +349,7 @@ fn accept_callback_until_stopped(
 fn urlencoding_decode(s: &str) -> String {
     let mut result = String::new();
     let mut chars = s.chars().peekable();
-    
+
     while let Some(c) = chars.next() {
         if c == '%' {
             let hex: String = chars.by_ref().take(2).collect();
@@ -354,14 +362,14 @@ fn urlencoding_decode(s: &str) -> String {
             result.push(c);
         }
     }
-    
+
     result
 }
 
 /// Exchange authorization code for access token
 fn exchange_code_for_token(code: &str) -> Result<TokenResponse> {
     let client = reqwest::blocking::Client::new();
-    
+
     let params = [
         ("client_id", CLIENT_ID),
         ("client_secret", CLIENT_SECRET),
@@ -369,40 +377,42 @@ fn exchange_code_for_token(code: &str) -> Result<TokenResponse> {
         ("redirect_uri", REDIRECT_URI),
         ("grant_type", "authorization_code"),
     ];
-    
+
     let response = client
         .post(TOKEN_URL)
         .form(&params)
         .send()
         .context("Failed to send token request")?;
-    
+
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().unwrap_or_default();
         anyhow::bail!("Token request failed ({}): {}", status, body);
     }
-    
-    response.json::<TokenResponse>()
+
+    response
+        .json::<TokenResponse>()
         .context("Failed to parse token response")
 }
 
 /// Get user information using access token
 fn get_user_info(access_token: &str) -> Result<UserResponse> {
     let client = reqwest::blocking::Client::new();
-    
+
     let response = client
         .get(USER_URL)
         .bearer_auth(access_token)
         .send()
         .context("Failed to get user info")?;
-    
+
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().unwrap_or_default();
         anyhow::bail!("User info request failed ({}): {}", status, body);
     }
-    
-    response.json::<UserResponse>()
+
+    response
+        .json::<UserResponse>()
         .context("Failed to parse user response")
 }
 
@@ -410,7 +420,9 @@ fn get_user_info(access_token: &str) -> Result<UserResponse> {
 /// Returns updated AuthInfo with new tokens, and saves it to disk.
 #[allow(dead_code)]
 pub fn refresh_access_token(auth: &AuthInfo) -> Result<AuthInfo> {
-    let refresh_token = auth.refresh_token.as_deref()
+    let refresh_token = auth
+        .refresh_token
+        .as_deref()
         .context("No refresh_token available — please /login again")?;
 
     let client = reqwest::blocking::Client::new();
@@ -430,10 +442,15 @@ pub fn refresh_access_token(auth: &AuthInfo) -> Result<AuthInfo> {
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().unwrap_or_default();
-        anyhow::bail!("Token refresh failed ({}): {} — please /login again", status, body);
+        anyhow::bail!(
+            "Token refresh failed ({}): {} — please /login again",
+            status,
+            body
+        );
     }
 
-    let token: TokenResponse = response.json()
+    let token: TokenResponse = response
+        .json()
         .context("Failed to parse refresh token response")?;
 
     let created_at = std::time::SystemTime::now()
@@ -458,8 +475,7 @@ pub fn refresh_access_token(auth: &AuthInfo) -> Result<AuthInfo> {
 /// Returns the access token string ready to use.
 #[allow(dead_code)]
 pub fn get_valid_token() -> Result<String> {
-    let auth = get_stored_auth()
-        .context("Not logged in — please use /login first")?;
+    let auth = get_stored_auth().context("Not logged in — please use /login first")?;
 
     // Check if token is expired (with 5-minute safety margin)
     if let Some(expires_in) = auth.expires_in {
@@ -493,8 +509,7 @@ pub fn get_valid_token() -> Result<String> {
 pub fn logout() -> Result<()> {
     let auth_path = auth_file_path();
     if auth_path.exists() {
-        std::fs::remove_file(&auth_path)
-            .context("Failed to remove auth file")?;
+        std::fs::remove_file(&auth_path).context("Failed to remove auth file")?;
         println!("  Logged out successfully.\n");
     } else {
         println!("  No active session found.\n");
@@ -508,7 +523,7 @@ pub fn get_stored_auth() -> Option<AuthInfo> {
     if !auth_path.exists() {
         return None;
     }
-    
+
     let content = std::fs::read_to_string(&auth_path).ok()?;
     toml::from_str(&content).ok()
 }
@@ -516,21 +531,18 @@ pub fn get_stored_auth() -> Option<AuthInfo> {
 /// Save auth info to file
 pub fn save_auth(auth: &AuthInfo) -> Result<()> {
     let auth_path = auth_file_path();
-    
+
     // Ensure parent directory exists
     if let Some(parent) = auth_path.parent() {
-        std::fs::create_dir_all(parent)
-            .context("Failed to create auth directory")?;
+        std::fs::create_dir_all(parent).context("Failed to create auth directory")?;
     }
-    
-    let content = toml::to_string_pretty(auth)
-        .context("Failed to serialize auth info")?;
-    
-    std::fs::write(&auth_path, content)
-        .context("Failed to write auth file")?;
-    
+
+    let content = toml::to_string_pretty(auth).context("Failed to serialize auth info")?;
+
+    std::fs::write(&auth_path, content).context("Failed to write auth file")?;
+
     println!("  Auth saved to: {}\n", auth_path.display());
-    
+
     Ok(())
 }
 
@@ -599,9 +611,10 @@ fn parse_pasted_callback(input: &str) -> Result<(String, String)> {
         .get("code")
         .context("Callback URL missing 'code' parameter")?
         .clone();
-    let state = params.get("state").context(
-        "Callback URL missing 'state' parameter (paste the full URL, not just the code)",
-    )?.clone();
+    let state = params
+        .get("state")
+        .context("Callback URL missing 'state' parameter (paste the full URL, not just the code)")?
+        .clone();
 
     Ok((code, state))
 }
@@ -663,10 +676,9 @@ mod tests {
 
     #[test]
     fn parse_url_encoded_state_is_decoded() {
-        let (_, state) = parse_pasted_callback(
-            "http://127.0.0.1:8765/callback?code=c&state=atomcode_%3Atest",
-        )
-        .unwrap();
+        let (_, state) =
+            parse_pasted_callback("http://127.0.0.1:8765/callback?code=c&state=atomcode_%3Atest")
+                .unwrap();
         assert_eq!(state, "atomcode_:test");
     }
 
@@ -680,10 +692,9 @@ mod tests {
 
     #[test]
     fn parse_trims_surrounding_whitespace() {
-        let (code, state) = parse_pasted_callback(
-            "   http://127.0.0.1:8765/callback?code=abc&state=xyz\n",
-        )
-        .unwrap();
+        let (code, state) =
+            parse_pasted_callback("   http://127.0.0.1:8765/callback?code=abc&state=xyz\n")
+                .unwrap();
         assert_eq!(code, "abc");
         assert_eq!(state, "xyz");
     }
