@@ -297,35 +297,19 @@ impl<W: Write + Send> AnsiRenderer<W> {
         // deterministically from state so byte-equality == visual-
         // equality (no stale SGR state leaking between rows because
         // every builder ends with an explicit reset).
-        //
-        // STREAMING COMPACT MODE: when the spinner is active (agent is
-        // streaming), skip both horizontal rules. Each rule is `─` ×
-        // rule_width × 3 bytes UTF-8 ≈ 630 bytes on a 209-col terminal.
-        // Stream-time `flush_assistant_lines` calls `erase_footer`
-        // which clears the diff cache, so every subsequent footer
-        // redraw is a COLD start (changed == total). Dropping both
-        // rules cuts cold-start bytes from ~1500 to ~250, which is
-        // Mac Terminal's backlog-avoidance budget.
-        //
-        // Rules come back the moment the turn ends (spinner cleared).
-        let is_streaming = state.spinner_frame.is_some();
         let mut new_rows: Vec<Vec<u8>> = Vec::with_capacity(8);
 
         // Row 0: spinner (if present) or blank margin.
         new_rows.push(self.build_spinner_row(&state));
-        // Row 1: top horizontal rule (skipped during streaming).
-        if !is_streaming {
-            new_rows.push(self.build_rule_row(rule_width));
-        }
-        // Middle input lines.
+        // Row 1: top horizontal rule.
+        new_rows.push(self.build_rule_row(rule_width));
+        // Rows 2..2+N-1: middle input lines.
         for (i, line) in lines.iter().enumerate() {
             new_rows.push(self.build_middle_row(line, i == 0));
         }
-        // Bottom horizontal rule (skipped during streaming).
-        if !is_streaming {
-            new_rows.push(self.build_rule_row(rule_width));
-        }
-        // Menu items (0-4).
+        // Row 2+N: bottom horizontal rule.
+        new_rows.push(self.build_rule_row(rule_width));
+        // Rows 3+N..: menu items (0-4).
         let menu_rows = state.menu_items.len().min(4);
         for (i, (name, desc)) in state.menu_items.iter().take(4).enumerate() {
             let selected = state.menu_selected_in_view == Some(i);
@@ -341,11 +325,7 @@ impl<W: Write + Send> AnsiRenderer<W> {
         }
 
         let total_rows = new_rows.len();
-        // Cursor sits on the middle row. Row offsets:
-        //   streaming: spinner(0) + middle(1..) → cursor at 1 + K
-        //   idle:      spinner(0) + top_rule(1) + middle(2..) → cursor at 2 + K
-        let middle_row_offset = if is_streaming { 1 } else { 2 };
-        let cursor_row_from_top = middle_row_offset + cursor_row_in_middle;
+        let cursor_row_from_top = 2 + cursor_row_in_middle;
 
         // Emit changed rows only, reposition cursor. Zero bytes for any
         // row whose bytes match the previous paint.
@@ -1343,34 +1323,15 @@ mod tests {
         let s = String::from_utf8(buf).unwrap();
         assert!(s.contains("⠋"));
         assert!(s.contains("Pondering"));
-        // STREAMING COMPACT MODE: when the spinner is set, the top/bottom
-        // horizontal rules are intentionally dropped — they're decorative
-        // and their 1.2KB per redraw was the main streaming-time backlog
-        // for Mac Terminal.app. The rules return on the idle footer
-        // (see `idle_footer_has_rules`).
-        assert!(!s.contains("────"), "streaming spinner footer must NOT include rules");
-        // Legacy full-box chrome still banned.
+        // CC-style footer: top/bottom horizontal rules (no corners or sides).
+        // Minimum 4 consecutive ─ characters confirms a rule was drawn,
+        // distinguishing it from ─ that might appear inside content.
+        assert!(s.contains("────"));
+        // Corners `╭╰╮╯` and side `│` must NOT appear — regression guard
+        // against the old full-box rendering coming back.
         assert!(!s.contains("╭"));
         assert!(!s.contains("╰"));
         assert!(!s.contains("│"));
-    }
-
-    #[test]
-    fn idle_footer_has_rules() {
-        // InputPrompt (no spinner) renders the full 5-row footer with
-        // horizontal rules. Regression guard so a future "drop rules
-        // everywhere" refactor doesn't silently remove the idle chrome.
-        let mut buf = Vec::new();
-        let mut r = AnsiRenderer::with_writer(&mut buf, caps_no_color());
-        r.render(UiLine::InputPrompt {
-            buf: "hello".into(),
-            cursor_byte: 5,
-            menu: None,
-            status: crate::render::StatusLine::default(),
-        });
-        r.flush();
-        let s = String::from_utf8(buf).unwrap();
-        assert!(s.contains("────"), "idle footer must include horizontal rules");
     }
 
     #[test]
