@@ -121,17 +121,21 @@ Connect to any LLM that supports OpenAI's function-calling API:
 ```bash
 git clone https://atomgit.com/atomgit_atomcode/atomcode.git
 cd atomcode
+cargo install --path crates/atomcode-cli --locked
+```
+
+The binary will be generated at `target/release/atomcode` and installed to
+`~/.cargo/bin/atomcode` for macOS / Linux and `$env:USERPROFILE/.cargo/bin/atomcode.exe`
+for Windows. Make sure that `~/.cargo/bin` (or `%USERPROFILE%\.cargo\bin` on Windows) is
+in your `PATH`.
+
+To compile without installing, run:
+
+```bash
 cargo build --release
 ```
 
-The binary will be at `target/release/atomcode`. Add it to your PATH:
-
-```bash
-# macOS / Linux
-cp target/release/atomcode ~/.local/bin/
-# or
-sudo cp target/release/atomcode /usr/local/bin/
-```
+and the binary will be generated at `target/release/atomcode`.
 
 ### Requirements
 
