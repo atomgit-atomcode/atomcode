@@ -21,13 +21,22 @@ use std::io::{BufWriter, Stdout, Write};
 use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
 use crossterm::execute;
 
-use super::cell::{push_str_cells, CellStyle};
+use super::cell::{push_str_cells, Cell, CellStyle};
 use super::screen::Screen;
+use super::theme::{role, Role};
 use super::{MenuPayload, Renderer, StatusLine, UiLine};
 use crate::sanitize::scrub_controls;
 use crate::terminal::TerminalCaps;
 
 const PAD_COL: usize = 2;
+
+fn format_token_count(n: usize) -> String {
+    if n < 1000 {
+        format!("{} tokens", n)
+    } else {
+        format!("{:.1}k tokens", (n as f64) / 1000.0)
+    }
+}
 
 pub struct RetainedRenderer<W: Write + Send> {
     out: W,
@@ -65,34 +74,284 @@ impl<W: Write + Send> RetainedRenderer<W> {
         }
     }
 
-    /// Phase 2: footer is exactly one row = "  ❯ <buf>". No rule,
-    /// no menu, no status. Phase 3 replaces this with the full
-    /// `spinner + top rule + middle(wrap) + bottom rule + (menu rows)
-    /// + status` layout matching AnsiRenderer output.
-    fn paint_footer_stub(&mut self) {
+    // ── Widget row builders (Cell-valued, no direct I/O) ──
+    //
+    // These are structurally identical to the ones in
+    // `render/ansi.rs` — when Phase 6 deletes AnsiRenderer, the
+    // duplication collapses (retained becomes the only owner).
+    // Keeping them verbatim here for Phase 3 means we don't have
+    // to refactor two renderers at once: the visual output is
+    // byte-exact against what AnsiRenderer produced in the same
+    // situation, giving the dual-track byte-cost tests a fair
+    // comparison.
+
+    fn style_for(&self, r: Role) -> CellStyle {
+        CellStyle {
+            fg: role(self.caps, r),
+            bold: false,
+            reverse: false,
+        }
+    }
+
+    fn style_bold(&self, r: Role) -> CellStyle {
+        CellStyle {
+            fg: role(self.caps, r),
+            bold: true,
+            reverse: false,
+        }
+    }
+
+    fn build_spinner_row(&self) -> Vec<Cell> {
+        let mut row = Vec::new();
+        let pad = CellStyle::default();
+        push_str_cells(&mut row, &" ".repeat(PAD_COL), &pad);
+        if let Some((frame, label)) = self.spinner.as_ref() {
+            let brand = self.style_for(Role::Brand);
+            push_str_cells(&mut row, frame, &brand);
+            push_str_cells(&mut row, " ", &pad);
+            let label_style = self.style_bold(Role::Secondary);
+            push_str_cells(&mut row, &scrub_controls(label), &label_style);
+        }
+        row
+    }
+
+    fn build_rule_row(&self, rule_width: usize) -> Vec<Cell> {
+        let mut row = Vec::with_capacity(PAD_COL + rule_width);
+        let pad = CellStyle::default();
+        push_str_cells(&mut row, &" ".repeat(PAD_COL), &pad);
+        let border = self.style_for(Role::Border);
+        for _ in 0..rule_width {
+            row.push(Cell {
+                ch: '─',
+                style: border.clone(),
+                width: 1,
+            });
+        }
+        row
+    }
+
+    fn build_middle_row(&self, line: &str, is_first: bool) -> Vec<Cell> {
+        let mut row = Vec::new();
+        let pad = CellStyle::default();
+        push_str_cells(&mut row, &" ".repeat(PAD_COL), &pad);
+        if is_first {
+            let accent = self.style_for(Role::Accent);
+            push_str_cells(&mut row, "❯ ", &accent);
+        } else {
+            push_str_cells(&mut row, "  ", &pad);
+        }
+        push_str_cells(&mut row, line, &pad);
+        row
+    }
+
+    fn build_menu_row(
+        &self,
+        name: &str,
+        desc: &str,
+        selected: bool,
+        rule_width: usize,
+    ) -> Vec<Cell> {
+        let mut row = Vec::new();
+        let pad = CellStyle::default();
+        push_str_cells(&mut row, &" ".repeat(PAD_COL), &pad);
+
+        let content = if selected {
+            format!("  ▸ /{:<12}  {}", name, desc)
+        } else {
+            format!("    /{:<12}  {}", name, desc)
+        };
+
+        let style = if selected {
+            CellStyle {
+                fg: None,
+                bold: true,
+                reverse: true,
+            }
+        } else {
+            self.style_for(Role::Muted)
+        };
+        push_str_cells(&mut row, &content, &style);
+
+        if selected {
+            let content_w = crate::width::display_width(&content);
+            let right_pad = rule_width.saturating_sub(content_w);
+            for _ in 0..right_pad {
+                row.push(Cell {
+                    ch: ' ',
+                    style: style.clone(),
+                    width: 1,
+                });
+            }
+        }
+        row
+    }
+
+    fn build_status_row(&self, status: &StatusLine, rule_width: usize) -> Vec<Cell> {
+        let mut row = Vec::new();
+        let pad = CellStyle::default();
+        push_str_cells(&mut row, &" ".repeat(PAD_COL), &pad);
+
+        let muted = self.style_for(Role::Muted);
+        let error = self.style_for(Role::Error);
+
+        let mut parts: Vec<String> = Vec::with_capacity(3);
+        if !status.model.is_empty() {
+            parts.push(scrub_controls(&status.model));
+        }
+        if !status.cwd.is_empty() {
+            parts.push(scrub_controls(&status.cwd));
+        }
+        if status.total_tokens > 0 {
+            parts.push(format_token_count(status.total_tokens));
+        }
+        let left = parts.join(" · ");
+        let max = rule_width.max(1);
+
+        if let Some(raw_hint) = status.hint.as_deref() {
+            let hint = scrub_controls(raw_hint);
+            let hint_w = crate::width::display_width(&hint);
+            if hint_w + 1 < max {
+                let left_budget = max - hint_w - 1;
+                let left_truncated = crate::width::truncate_to_width(&left, left_budget);
+                let left_w = crate::width::display_width(&left_truncated);
+                let pad_w = max - left_w - hint_w;
+                push_str_cells(&mut row, &left_truncated, &muted);
+                push_str_cells(&mut row, &" ".repeat(pad_w), &pad);
+                push_str_cells(&mut row, &hint, &error);
+            } else {
+                let truncated = crate::width::truncate_to_width(&left, max);
+                push_str_cells(&mut row, &truncated, &muted);
+            }
+        } else {
+            let truncated = crate::width::truncate_to_width(&left, max);
+            push_str_cells(&mut row, &truncated, &muted);
+        }
+        row
+    }
+
+    /// Paint the full footer into `self.screen`. Layout mirrors
+    /// `AnsiRenderer::draw_footer_here_with_prev_cursor`:
+    ///
+    ///   row 0: spinner (or blank margin)
+    ///   row 1: top rule
+    ///   rows 2..2+N: middle input lines (N = wrap_with_cursor line count)
+    ///   row 2+N: bottom rule
+    ///   rows 3+N..3+N+M: menu items (M = 0..4)
+    ///   row 3+N+M: status line (if any chrome)
+    ///
+    /// Total rows = 1 + 1 + N + 1 + M + status_rows (where status is
+    /// 0 or 1). `footer_top = screen.height - total_rows`. Cursor
+    /// parks at `(footer_top + 2 + cursor_row_in_middle,
+    /// PAD_COL + 2 + cursor_col_in_row)` — 1-indexed at emit.
+    fn paint_footer(&mut self) {
+        let w = self.screen.width() as usize;
         let h = self.screen.height() as usize;
-        if h == 0 {
+        if h == 0 || w == 0 {
             return;
         }
-        let footer_row = h.saturating_sub(1);
-        let mut row = Vec::new();
-        push_str_cells(
-            &mut row,
-            &" ".repeat(PAD_COL),
-            &CellStyle::default(),
-        );
-        push_str_cells(&mut row, "❯ ", &CellStyle::default());
-        push_str_cells(
-            &mut row,
-            &scrub_controls(&self.input_buf),
-            &CellStyle::default(),
-        );
-        self.screen.draw_row(footer_row, 0, &row);
-        // Cursor right after the last typed char (display-width
-        // aware in Phase 3; Phase 2 approximates with char count).
-        let cursor_col = PAD_COL + 2 + self.input_buf.chars().count();
-        self.screen
-            .set_cursor((footer_row + 1) as u16, (cursor_col + 1) as u16);
+        let rule_width = w.saturating_sub(PAD_COL * 2);
+        let text_budget = rule_width.saturating_sub(2);
+
+        // Wrap input + locate cursor in wrapped layout.
+        let safe = scrub_controls(&self.input_buf);
+        let (mut lines, cursor_row_in_middle, cursor_col_in_row) = if text_budget == 0 {
+            (vec![String::new()], 0usize, 0usize)
+        } else {
+            crate::width::wrap_with_cursor(&safe, text_budget, self.input_cursor_byte)
+        };
+        if lines.is_empty() {
+            lines.push(String::new());
+        }
+        let middle_rows = lines.len();
+
+        // Paginate menu to 4 items in view around `selected`.
+        let (menu_items, selected_in_view) = if let Some(m) = self.menu.as_ref() {
+            let len = m.items.len();
+            if len == 0 {
+                (Vec::<(String, String)>::new(), None)
+            } else {
+                let offset = if len <= 4 {
+                    0
+                } else if m.selected < 4 {
+                    0
+                } else {
+                    (m.selected + 1)
+                        .saturating_sub(4)
+                        .min(len.saturating_sub(4))
+                };
+                let end = (offset + 4).min(len);
+                let items: Vec<(String, String)> = m.items[offset..end].to_vec();
+                let sel = if m.selected >= offset && m.selected < end {
+                    Some(m.selected - offset)
+                } else {
+                    None
+                };
+                (items, sel)
+            }
+        } else {
+            (Vec::new(), None)
+        };
+
+        // Spinner only when menu not open (same rule as AnsiRenderer).
+        let show_spinner = self.spinner.is_some() && self.menu.is_none();
+        let menu_rows = menu_items.len().min(4);
+        let has_status = !self.status.model.is_empty()
+            || !self.status.cwd.is_empty()
+            || self.status.hint.is_some();
+        let status_rows = if has_status { 1 } else { 0 };
+        let total_rows = 1 + 1 + middle_rows + 1 + menu_rows + status_rows;
+        let footer_top = h.saturating_sub(total_rows);
+
+        // Pre-build every row vector (immutable borrows of self).
+        let spin_row = if show_spinner {
+            Some(self.build_spinner_row())
+        } else {
+            None
+        };
+        let top_rule = self.build_rule_row(rule_width);
+        let middle_cells: Vec<Vec<Cell>> = lines
+            .iter()
+            .enumerate()
+            .map(|(i, line)| self.build_middle_row(line, i == 0))
+            .collect();
+        let bot_rule = self.build_rule_row(rule_width);
+        let status_clone = self.status.clone();
+        let status_cells = if has_status {
+            Some(self.build_status_row(&status_clone, rule_width))
+        } else {
+            None
+        };
+        let menu_cells: Vec<Vec<Cell>> = menu_items
+            .iter()
+            .enumerate()
+            .map(|(i, (name, desc))| {
+                let selected = selected_in_view == Some(i);
+                self.build_menu_row(name, desc, selected, rule_width)
+            })
+            .collect();
+
+        // Mutate screen (now &mut self).
+        if let Some(sr) = spin_row {
+            self.screen.draw_row(footer_top, 0, &sr);
+        }
+        self.screen.draw_row(footer_top + 1, 0, &top_rule);
+        for (i, r) in middle_cells.iter().enumerate() {
+            self.screen.draw_row(footer_top + 2 + i, 0, r);
+        }
+        let bot_rule_row = footer_top + 2 + middle_rows;
+        self.screen.draw_row(bot_rule_row, 0, &bot_rule);
+        for (i, r) in menu_cells.iter().enumerate() {
+            self.screen.draw_row(bot_rule_row + 1 + i, 0, r);
+        }
+        if let Some(st) = status_cells {
+            self.screen
+                .draw_row(bot_rule_row + 1 + menu_rows, 0, &st);
+        }
+
+        // Cursor park — 1-indexed, inside middle row at the input cell.
+        let cursor_abs_row = (footer_top + 2 + cursor_row_in_middle + 1) as u16;
+        let cursor_abs_col = (PAD_COL + 2 + cursor_col_in_row + 1) as u16;
+        self.screen.set_cursor(cursor_abs_row, cursor_abs_col);
     }
 
     fn flush_frame(&mut self) {
@@ -103,30 +362,39 @@ impl<W: Write + Send> RetainedRenderer<W> {
 
 impl<W: Write + Send> Renderer for RetainedRenderer<W> {
     fn render(&mut self, line: UiLine) {
-        // Phase 2: only InputPrompt actually paints. Every other
-        // variant updates internal state silently (or no-ops) so
-        // hot-swapping to RetainedRenderer doesn't crash on first
-        // streaming / tool event.
+        // Phase 3 owns the footer path (InputPrompt / StreamingBox /
+        // Spinner). Body / streaming content variants keep no-op
+        // until Phase 4 — this keeps the dual-track smoke-safe,
+        // just with no body history.
         match line {
             UiLine::InputPrompt { buf, cursor_byte, menu, status } => {
+                self.spinner = None;
                 self.input_buf = buf;
                 self.input_cursor_byte = cursor_byte;
                 self.menu = menu;
                 self.status = status;
-                self.paint_footer_stub();
+                self.paint_footer();
                 self.flush_frame();
             }
-            UiLine::StreamingBox { buf, cursor_byte, status, menu, .. } => {
+            UiLine::StreamingBox { buf, cursor_byte, frame, label, status, menu } => {
+                self.spinner = Some((frame.to_string(), label));
                 self.input_buf = buf;
                 self.input_cursor_byte = cursor_byte;
                 self.menu = menu;
                 self.status = status;
-                self.paint_footer_stub();
+                self.paint_footer();
                 self.flush_frame();
             }
-            // Phase 3/4 will implement these. For Phase 2 smoke they
-            // mutate state but don't emit so the pipeline doesn't
-            // crash on first run.
+            UiLine::Spinner { frame, label } => {
+                self.spinner = Some((frame.to_string(), label));
+                self.paint_footer();
+                self.flush_frame();
+            }
+            UiLine::ClearTransient | UiLine::InputCommit => {
+                // No-op: retained buffer replaces the transient-clearing
+                // dance the immediate-mode path needed.
+            }
+            // Phase 4 wires body-emitting variants into append_body_lines.
             _ => {}
         }
     }
@@ -199,7 +467,234 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
 
     fn on_resize(&mut self, cols: u16, rows: u16) {
         self.screen.resize(cols, rows);
-        self.paint_footer_stub();
+        self.paint_footer();
         self.flush_frame();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::terminal::{EnvView, TerminalCaps};
+    use std::sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    };
+
+    fn caps_with_color() -> TerminalCaps {
+        TerminalCaps::from_env(EnvView {
+            is_stdout_tty: true,
+            no_color: false,
+            term: Some("xterm-256color".into()),
+            colorterm: Some("truecolor".into()),
+        })
+    }
+
+    /// Writer that tallies byte count — for assert-byte-budget tests.
+    struct CountingSink(Arc<AtomicU64>);
+    impl Write for CountingSink {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.fetch_add(b.len() as u64, Ordering::Relaxed);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Writer that captures the ANSI byte stream — lets us inspect
+    /// structure (e.g. "all three wide chars emitted consecutively").
+    #[derive(Clone)]
+    struct CapturingSink(Arc<Mutex<Vec<u8>>>);
+    impl Write for CapturingSink {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn new_counting(
+        w: u16,
+        h: u16,
+    ) -> (RetainedRenderer<CountingSink>, Arc<AtomicU64>) {
+        let counter = Arc::new(AtomicU64::new(0));
+        let sink = CountingSink(counter.clone());
+        let r = RetainedRenderer::with_writer(sink, caps_with_color(), w, h);
+        (r, counter)
+    }
+
+    fn new_capturing(
+        w: u16,
+        h: u16,
+    ) -> (
+        RetainedRenderer<CapturingSink>,
+        Arc<Mutex<Vec<u8>>>,
+    ) {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let sink = CapturingSink(buf.clone());
+        let r = RetainedRenderer::with_writer(sink, caps_with_color(), w, h);
+        (r, buf)
+    }
+
+    fn sample(c: &Arc<AtomicU64>) -> u64 {
+        c.load(Ordering::Relaxed)
+    }
+
+    fn status_basic() -> StatusLine {
+        StatusLine {
+            model: "glm-5".into(),
+            cwd: "~/project/atomcode".into(),
+            total_tokens: 0,
+            hint: None,
+        }
+    }
+
+    /// Keystroke steady-state: only the middle row's last cell
+    /// changes between frames. AnsiRenderer hit 26 B; retained
+    /// should be in the same ballpark. Budget: < 60 B.
+    #[test]
+    fn retained_keystroke_byte_cost_steady_state() {
+        let (mut r, counter) = new_counting(80, 24);
+        let status = status_basic();
+        // Warm: render one frame so prev_cells matches terminal.
+        r.render(UiLine::InputPrompt {
+            buf: "h".into(),
+            cursor_byte: 1,
+            menu: None,
+            status: status.clone(),
+        });
+        r.flush();
+        let before = sample(&counter);
+        for i in 1..=10 {
+            let s = "h".repeat(i + 1);
+            r.render(UiLine::InputPrompt {
+                buf: s.clone(),
+                cursor_byte: s.len(),
+                menu: None,
+                status: status.clone(),
+            });
+        }
+        r.flush();
+        let avg = (sample(&counter) - before) / 10;
+        eprintln!("[RETAINED BYTE] keystroke avg = {} B", avg);
+        assert!(
+            avg < 60,
+            "retained keystroke regressed: avg={} B (budget < 60)",
+            avg
+        );
+    }
+
+    /// Menu open/close: footer height changes 5↔9 → cell-diff must
+    /// emit only changed positions. AnsiRenderer hit 880 B at 80
+    /// col; retained should match. Budget: < 1000 B.
+    #[test]
+    fn retained_menu_toggle_byte_cost() {
+        let (mut r, counter) = new_counting(80, 24);
+        let status = status_basic();
+        let items: Vec<(String, String)> = vec![
+            ("model".into(), "Switch model".into()),
+            ("provider".into(), "Add provider".into()),
+            ("session".into(), "New session".into()),
+            ("resume".into(), "Resume session".into()),
+        ];
+        r.render(UiLine::InputPrompt {
+            buf: "".into(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+        });
+        r.flush();
+
+        let before_open = sample(&counter);
+        r.render(UiLine::InputPrompt {
+            buf: "/".into(),
+            cursor_byte: 1,
+            menu: Some(MenuPayload {
+                items: items.clone(),
+                selected: 0,
+            }),
+            status: status.clone(),
+        });
+        r.flush();
+        let open_cost = sample(&counter) - before_open;
+
+        let before_close = sample(&counter);
+        r.render(UiLine::InputPrompt {
+            buf: "".into(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+        });
+        r.flush();
+        let close_cost = sample(&counter) - before_close;
+
+        // Nav: 3 Up/Down changes.
+        r.render(UiLine::InputPrompt {
+            buf: "/".into(),
+            cursor_byte: 1,
+            menu: Some(MenuPayload {
+                items: items.clone(),
+                selected: 0,
+            }),
+            status: status.clone(),
+        });
+        r.flush();
+        let before_nav = sample(&counter);
+        for sel in 1..=3 {
+            r.render(UiLine::InputPrompt {
+                buf: "/".into(),
+                cursor_byte: 1,
+                menu: Some(MenuPayload {
+                    items: items.clone(),
+                    selected: sel,
+                }),
+                status: status.clone(),
+            });
+        }
+        r.flush();
+        let nav_avg = (sample(&counter) - before_nav) / 3;
+
+        eprintln!(
+            "[RETAINED BYTE] menu open={} B, close={} B, nav avg={} B",
+            open_cost, close_cost, nav_avg
+        );
+        assert!(open_cost < 1000, "retained open: {} B", open_cost);
+        assert!(close_cost < 1000, "retained close: {} B", close_cost);
+        assert!(nav_avg < 300, "retained nav: {} B", nav_avg);
+    }
+
+    /// Wide CJK input end-to-end: render "你是谁" from empty, assert
+    /// emit stream contains the three glyphs consecutively (no
+    /// cursor-drift desync between them).
+    #[test]
+    fn retained_wide_char_input_keeps_all() {
+        let (mut r, buf) = new_capturing(80, 24);
+        let status = status_basic();
+        r.render(UiLine::InputPrompt {
+            buf: "".into(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+        });
+        r.flush();
+        buf.lock().unwrap().clear();
+
+        r.render(UiLine::InputPrompt {
+            buf: "你是谁".into(),
+            cursor_byte: 9,
+            menu: None,
+            status: status.clone(),
+        });
+        r.flush();
+        let stream_bytes = std::mem::take(&mut *buf.lock().unwrap());
+        let stream = String::from_utf8_lossy(&stream_bytes).to_string();
+        assert!(
+            stream.contains("你是谁"),
+            "wide chars not consecutive in retained emit stream:\n{}",
+            stream
+        );
     }
 }
