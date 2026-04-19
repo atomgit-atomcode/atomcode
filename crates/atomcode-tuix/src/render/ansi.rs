@@ -687,14 +687,15 @@ impl<W: Write + Send> AnsiRenderer<W> {
     }
 
     fn render_welcome(&mut self, model: &str, working_dir: &str) {
+        // Compact layout (档位 1): was 8 rows with double-blank separators
+        // and 5-space bullet indents; now 6 rows with single-blank separators
+        // and 2-space indents so screen density matches CC's feel.
         let model = scrub_controls(model);
         let working_dir = scrub_controls(working_dir);
         let w = self.term_width();
 
-        // Leading breath.
-        let _ = self.out.write_all(b"\r\n");
-
         // Row 1: "  ◆ AtomCode" on the left; "v4.18.1  ·  MIT" on the right.
+        // (No leading blank — the footer that was above us already left one.)
         let left = "  ◆ AtomCode";
         let right_ver = "v4.18.1";
         let right_lic = "MIT";
@@ -723,13 +724,14 @@ impl<W: Write + Send> AnsiRenderer<W> {
         self.set_fg(Role::Muted);
         let _ = self.out.write_all(right_lic.as_bytes());
         self.reset();
-        let _ = self.out.write_all(b"\r\n\r\n");
+        let _ = self.out.write_all(b"\r\n");
 
-        // "     ∙ {working_dir}" and "     ∙ {model}" — soft bullets, muted.
-        let max_path = w.saturating_sub(10);
+        // "  ∙ {working_dir}" and "  ∙ {model}" — soft bullets, muted.
+        // Bullet indent dropped from 5 spaces to 2 to match PAD_COL.
+        let max_path = w.saturating_sub(6);
         let cwd_disp = crate::width::truncate_to_width(&working_dir, max_path);
         self.set_fg(Role::AccentDim);
-        let _ = self.out.write_all("     ∙ ".as_bytes());
+        let _ = self.out.write_all("  ∙ ".as_bytes());
         self.reset();
         self.set_fg(Role::Secondary);
         let _ = self.out.write_all(cwd_disp.as_bytes());
@@ -738,20 +740,18 @@ impl<W: Write + Send> AnsiRenderer<W> {
 
         let model_disp = crate::width::truncate_to_width(&model, max_path);
         self.set_fg(Role::AccentDim);
-        let _ = self.out.write_all("     ∙ ".as_bytes());
+        let _ = self.out.write_all("  ∙ ".as_bytes());
         self.reset();
         self.set_fg(Role::Secondary);
         let _ = self.out.write_all(model_disp.as_bytes());
         self.reset();
         let _ = self.out.write_all(b"\r\n\r\n");
 
-        // Two hint rows:
-        //   row 1: "     type something, or press  /  to browse commands"
-        //   row 2: "     /provider  to add a custom model"
+        // Two hint rows, same 2-space indent as everything else.
         // `/provider` gets bold+accent so new users discover how to wire
         // up their own API key without digging through config.toml.
         self.set_fg(Role::AccentDim);
-        let _ = self.out.write_all("     type something, or press  ".as_bytes());
+        let _ = self.out.write_all("  type something, or press  ".as_bytes());
         self.reset();
         if self.caps.colors {
             let _ = self.out.write_all(b"\x1b[1m");
@@ -768,7 +768,7 @@ impl<W: Write + Send> AnsiRenderer<W> {
         let _ = self.out.write_all(b"\r\n");
 
         self.set_fg(Role::AccentDim);
-        let _ = self.out.write_all("     ".as_bytes());
+        let _ = self.out.write_all("  ".as_bytes());
         self.reset();
         if self.caps.colors {
             let _ = self.out.write_all(b"\x1b[1m");
@@ -782,7 +782,7 @@ impl<W: Write + Send> AnsiRenderer<W> {
         self.set_fg(Role::AccentDim);
         let _ = self.out.write_all("  to add a custom model".as_bytes());
         self.reset();
-        let _ = self.out.write_all(b"\r\n\r\n");
+        let _ = self.out.write_all(b"\r\n");
     }
 
     // ── UiLine variant handlers ──
@@ -800,14 +800,12 @@ impl<W: Write + Send> AnsiRenderer<W> {
         self.erase_footer();
         let safe = scrub_controls(text);
 
-        // Blank line above
-        let _ = self.out.write_all(b"\r\n");
-
-        // CC-style echo: no background stripe — the subtle bg we used
-        // before rendered as a large dark block on light terminal
-        // themes (and a large light block on dark via reverse video).
-        // Just the accent-coloured prompt glyph plus plain text; the
-        // surrounding blank lines provide enough separation.
+        // CC-style echo: accent prompt glyph + plain text, one trailing
+        // blank line for separation from the assistant response. Previously
+        // wrapped the message with blank lines on BOTH sides (3 rows per
+        // user turn), which compounded into CC-feeling-smaller on screen
+        // when many turns stacked. One blank below is enough: the footer's
+        // own "blank margin row" already provides breathing room above.
         self.write_left_pad();
         if self.caps.colors {
             let _ = self.out.write_all(b"\x1b[1m");
@@ -821,7 +819,7 @@ impl<W: Write + Send> AnsiRenderer<W> {
         let _ = self.out.write_all(safe.as_bytes());
         let _ = self.out.write_all(b"\r\n");
 
-        // Blank line below
+        // Blank line below only
         let _ = self.out.write_all(b"\r\n");
 
         self.assistant_continuing = false;
