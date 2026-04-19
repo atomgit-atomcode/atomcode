@@ -401,10 +401,19 @@ impl<W: Write + Send> RetainedRenderer<W> {
     }
 
     /// Paint the tail of `body_lines` into the screen rows above
-    /// the footer. Older lines that don't fit are simply not drawn
-    /// (they survive in `body_lines` memory if within the
-    /// retention cap, otherwise were already trimmed in
-    /// `push_body_row`).
+    /// the footer. Older lines that don't fit are trimmed by the
+    /// retention cap on push; here we draw whatever is left.
+    ///
+    /// Layout choice: body content starts at **row 0** (top of
+    /// screen), same as Ink / most conversational TUIs. Short
+    /// transcripts (e.g. fresh session with just the 6-row
+    /// welcome) sit at the top; long transcripts keep rolling the
+    /// oldest lines off the top so the newest row lands at
+    /// `body_bottom - 1`, immediately above the footer. This
+    /// eliminates the 40+ row gap we had when `first_screen_row`
+    /// was anchored to `body_bottom - n` — a 6-line welcome on a
+    /// 60-row terminal was painting to rows 48-53 with 48 blank
+    /// rows above it.
     fn paint_body(&mut self) {
         let h = self.screen.height() as usize;
         let footer_rows = self.current_footer_rows();
@@ -414,12 +423,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
         }
         let n = self.body_lines.len().min(body_bottom);
         let start = self.body_lines.len() - n;
-        let first_screen_row = body_bottom - n;
-        // Collect rows first (immutable borrow of self.body_lines)
-        // so we can mutably borrow self.screen afterwards.
+        // Anchor at the top of the screen.
         let rows: Vec<Vec<Cell>> = self.body_lines[start..].to_vec();
         for (i, row) in rows.iter().enumerate() {
-            self.screen.draw_row(first_screen_row + i, 0, row);
+            self.screen.draw_row(i, 0, row);
         }
     }
 
