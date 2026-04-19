@@ -238,14 +238,18 @@ impl<W: Write + Send> AnsiRenderer<W> {
     fn draw_footer_here(&mut self) {
         let state = self.last_footer.clone();
         let w = self.term_width();
-        // Box occupies (w - 2*PAD_COL) columns; inner width excludes the two
-        // border cells.
-        let box_outer = w.saturating_sub(PAD_COL * 2);
-        let inner = box_outer.saturating_sub(2);
-        // Text budget = inner minus the leading "❯ " (2 cols) and a 1-col
-        // gap on each side of the prompt glyph: "│ ❯ text │" uses 4
-        // border-adjacent cols (│ + space + ❯ + space ... trailing space + │).
-        let text_budget = inner.saturating_sub(4);
+        // CC-style footer: the input area is framed by a horizontal rule
+        // above and below (like an <hr>), with no vertical sides. Previously
+        // we drew a full `╭─╮│…│╰─╯` box, which forced every middle row to
+        // include the right-side `│` border and pad-to-width spaces —
+        // ~60-80 extra bytes per keystroke that Mac Terminal.app processes
+        // slowly (visible lag after a long streaming turn). Top/bottom rules
+        // span (w - 2*PAD_COL) cols so they align with the 2-space left
+        // indent used everywhere else.
+        let rule_width = w.saturating_sub(PAD_COL * 2);
+        // Text budget = rule width minus the "❯ " prompt prefix (or the
+        // equivalent "  " on wrapped continuation rows).
+        let text_budget = rule_width.saturating_sub(2);
 
         let _ = self.out.write_all(b"\x1b[?7l");
         let _ = self.out.write_all(b"\r");
@@ -280,24 +284,18 @@ impl<W: Write + Send> AnsiRenderer<W> {
         }
         let _ = self.out.write_all(b"\r\n");
 
-        // Row 1: box top border.
+        // Row 1: top horizontal rule (replaces `╭─────╮`).
         self.write_left_pad();
         self.set_fg(Role::Border);
-        let _ = self.out.write_all("╭".as_bytes());
-        for _ in 0..inner { let _ = self.out.write_all("─".as_bytes()); }
-        let _ = self.out.write_all("╮".as_bytes());
+        for _ in 0..rule_width { let _ = self.out.write_all("─".as_bytes()); }
         self.reset();
         let _ = self.out.write_all(b"\r\n");
 
         // Rows 2..2+N-1: middle. First row gets "❯ ", continuations get "  ".
+        // No right-side border or pad-to-width — text simply ends at its
+        // natural length, as in CC.
         for (i, line) in lines.iter().enumerate() {
-            let line_w = crate::width::display_width(line);
-            let pad = text_budget.saturating_sub(line_w);
-
             self.write_left_pad();
-            self.set_fg(Role::Border);
-            let _ = self.out.write_all("│ ".as_bytes());
-            self.reset();
             if i == 0 {
                 self.set_fg(Role::Accent);
                 let _ = self.out.write_all("❯ ".as_bytes());
@@ -306,19 +304,13 @@ impl<W: Write + Send> AnsiRenderer<W> {
                 let _ = self.out.write_all(b"  ");
             }
             let _ = self.out.write_all(line.as_bytes());
-            for _ in 0..pad { let _ = self.out.write_all(b" "); }
-            self.set_fg(Role::Border);
-            let _ = self.out.write_all(" │".as_bytes());
-            self.reset();
             let _ = self.out.write_all(b"\r\n");
         }
 
-        // Row 2+N: box bottom border.
+        // Row 2+N: bottom horizontal rule (replaces `╰─────╯`).
         self.write_left_pad();
         self.set_fg(Role::Border);
-        let _ = self.out.write_all("╰".as_bytes());
-        for _ in 0..inner { let _ = self.out.write_all("─".as_bytes()); }
-        let _ = self.out.write_all("╯".as_bytes());
+        for _ in 0..rule_width { let _ = self.out.write_all("─".as_bytes()); }
         self.reset();
         let _ = self.out.write_all(b"\r\n");
 
@@ -338,10 +330,10 @@ impl<W: Write + Send> AnsiRenderer<W> {
                     let _ = self.out.write_all(b"\x1b[1m");
                 }
                 let _ = write!(self.out, "  ▸ /{:<12}  {}", name, desc);
-                // Pad out to the box's right edge so the highlight strip
-                // aligns with the input box width.
+                // Pad out to the rule width so the highlight strip
+                // aligns with the horizontal rules above/below.
                 let content_w = 5 + name.chars().count() + 2 + desc.chars().count();
-                let right_pad = box_outer.saturating_sub(content_w);
+                let right_pad = rule_width.saturating_sub(content_w);
                 for _ in 0..right_pad { let _ = self.out.write_all(b" "); }
                 if self.caps.colors {
                     let _ = self.out.write_all(b"\x1b[0m");
@@ -377,7 +369,7 @@ impl<W: Write + Send> AnsiRenderer<W> {
                 parts.push(format_token_count(state.status.total_tokens));
             }
             let left = parts.join(" · ");
-            let max = box_outer.max(1);
+            let max = rule_width.max(1);
 
             if let Some(raw_hint) = state.status.hint.as_deref() {
                 let hint = scrub_controls(raw_hint);
@@ -431,9 +423,10 @@ impl<W: Write + Send> AnsiRenderer<W> {
         if up > 0 {
             let _ = write!(self.out, "\x1b[{}A", up);
         }
-        // Col = 1 (1-indexed) + PAD_COL + 4 ("│ ❯ " or "│   ")
-        //       + cursor_col_in_row.
-        let col = 1 + PAD_COL + 4 + cursor_col_in_row;
+        // Col = 1 (1-indexed) + PAD_COL + 2 ("❯ " or "  " continuation)
+        //       + cursor_col_in_row. CC-style footer has no left `│ ` so
+        //       the prompt glyph is the very first cell after PAD_COL.
+        let col = 1 + PAD_COL + 2 + cursor_col_in_row;
         let _ = write!(self.out, "\r\x1b[{}G", col);
 
         let _ = self.out.write_all(b"\x1b[?7h");
@@ -1214,9 +1207,15 @@ mod tests {
         let s = String::from_utf8(buf).unwrap();
         assert!(s.contains("⠋"));
         assert!(s.contains("Pondering"));
-        // Footer box corners present
-        assert!(s.contains("╭"));
-        assert!(s.contains("╰"));
+        // CC-style footer: top/bottom horizontal rules (no corners or sides).
+        // Minimum 4 consecutive ─ characters confirms the rule was drawn,
+        // distinguishing it from the ─ that might appear inside content.
+        assert!(s.contains("────"));
+        // Corners `╭╰╮╯` and side `│` must NOT appear — regression guard
+        // against the old full-box rendering coming back.
+        assert!(!s.contains("╭"));
+        assert!(!s.contains("╰"));
+        assert!(!s.contains("│"));
     }
 
     #[test]
