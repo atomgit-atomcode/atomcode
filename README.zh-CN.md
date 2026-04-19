@@ -89,10 +89,10 @@ AtomCode 是一款住在你终端里的 AI 编码助手。用自然语言给它�
 
 ### 会话与登录
 
-- **持久化会话** —— 每次对话都会保存，用 `/resume` 恢复或切换
+- **持久化会话** —— 每次对话都会保存；命令行可用 `atomcode --continue` 或 `-c` 继续上一次会话，在 TUI 内可用 `/resume` 恢复或切换
 - **AtomGit OAuth 登录** —— `/login`（或 `atomcode login`）将 CLI 与你的 AtomGit 账号绑定
 - **SSO 登录** —— `/login-with-sso`，GitCode 内部用户使用
-- **Headless 模式** —— `atomcode -p "..."` 非交互式跑一条 prompt，结果直接输出到 stdout（类似 Claude Code 的 `-p`）
+- **Headless 模式** —— `atomcode -p "..."` 非交互式跑一条 prompt，结果直接输出到 stdout（类似 Claude Code 的 `-p`）；需要确认的 `bash` 会自动批准，其他需要确认的工具会被拒绝
 - **Daemon 模式** —— `atomcode-daemon` 提供 HTTP API，用于查询会话历史和 SSE 流式对话
 
 ### 终端 UI
@@ -200,6 +200,8 @@ atomcode -p "简要说明这个仓库的 agent loop"
 # 从文件读取 prompt
 atomcode --prompt-file task.md
 ```
+
+在 headless 模式下，需要确认的 `bash` 会自动批准并写到 stderr；其他需要确认的工具会被拒绝。
 
 然后直接用自然语言描述你想做的事：
 

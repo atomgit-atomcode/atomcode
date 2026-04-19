@@ -89,10 +89,10 @@ Connect to any LLM that supports OpenAI's function-calling API:
 
 ### Sessions & Login
 
-- **Persistent sessions** — every conversation is saved; resume or switch with `/resume`
+- **Persistent sessions** — every conversation is saved; continue the last session with `atomcode --continue` / `-c`, or resume/switch inside the TUI with `/resume`
 - **AtomGit OAuth login** — `/login` (or `atomcode login`) pairs your CLI with your AtomGit account
 - **SSO login** — `/login-with-sso` for GitCode internal users
-- **Headless mode** — `atomcode -p "..."` runs a single prompt non-interactively and streams the reply on stdout (Claude Code `-p` style)
+- **Headless mode** — `atomcode -p "..."` runs a single prompt non-interactively and streams the reply on stdout (Claude Code `-p` style); approval-required `bash` calls are auto-approved, while other approval-required tools are denied
 - **Daemon mode** — `atomcode-daemon` exposes an HTTP API for session history and SSE streaming chat
 
 ### Terminal UI
@@ -203,6 +203,8 @@ atomcode -p "Explain the agent loop in this repo"
 # Read prompt from file
 atomcode --prompt-file task.md
 ```
+
+In headless mode, approval-required `bash` calls are auto-approved and logged to stderr; other approval-required tools are denied.
 
 Then just type what you want:
 

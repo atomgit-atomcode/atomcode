@@ -95,7 +95,7 @@ atomcode -p "解释这段代码" --provider local --model qwen2.5:14b</code></pr
 
       <div class="callout callout-warn">
         <strong>注意</strong>
-        <p>Headless 模式下没有交互式的权限确认对话框。破坏性命令默认会被拒绝,而不是弹出对话框。如果你需要让它在 CI 里跑某些 "危险但必要" 的操作,最好通过 <code>.atomcode.md</code> 明确授权,或者通过 <code>--disable-tools bash</code> 彻底关闭相关工具。</p>
+        <p>Headless 模式下没有交互式的权限确认对话框。当前实现中,需要确认的 <code>bash</code> 调用会自动批准并把原因写到 stderr;其他需要确认的工具会被拒绝。如果你不希望 CI 中执行 shell,可以显式加上 <code>--disable-tools bash</code>。</p>
       </div>
 
       <h2>atomcode-daemon</h2>
