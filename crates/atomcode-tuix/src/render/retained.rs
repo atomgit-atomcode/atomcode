@@ -1187,6 +1187,56 @@ mod tests {
         assert_eq!(idle_bytes, 0, "idle tick should emit 0 bytes");
     }
 
+    /// Regression for "login 后 输入内容过长不自动换行" report.
+    /// User observed a single long-line input not wrapping — turned
+    /// out the buffer was 202 display cols vs the 203-col budget, so
+    /// legit 1-row. This test pins down that an input CLEARLY past
+    /// the budget produces a multi-row footer, and the cursor
+    /// lives in the LAST middle row (not the first).
+    #[test]
+    fn retained_long_input_wraps_to_multi_row_footer() {
+        // Small screen so wrap happens without massive test data.
+        // text_budget = width - 6 = 34, so any input > 34 cols wraps.
+        let (mut r, _buf) = new_capturing(40, 24);
+        // 40 CJK characters = 80 display cols → wraps to 3 rows (cols
+        // 0..33, 34..67, 68..79). Each row has ~17 Chinese chars.
+        let long: String = std::iter::repeat('中').take(40).collect();
+        // cursor_byte = full UTF-8 length of the input (3 bytes per char × 40).
+        r.render(UiLine::InputPrompt {
+            buf: long.clone(),
+            cursor_byte: long.len(),
+            menu: None,
+            status: status_basic(),
+        });
+        r.flush_deferred();
+
+        // Directly query wrap result to verify wrap happened.
+        let (lines, cursor_row, _cursor_col) =
+            crate::width::wrap_with_cursor(&long, 40 - 6, long.len());
+        assert!(
+            lines.len() >= 2,
+            "expected 2+ wrapped rows, got {} line(s): {:?}",
+            lines.len(),
+            lines
+        );
+        // Cursor should be in the LAST wrapped row (end of buffer).
+        assert_eq!(
+            cursor_row,
+            lines.len() - 1,
+            "cursor should be in last middle row"
+        );
+
+        // Now the integration check: the internal footer-rows count
+        // must match wrap output. If paint_footer miscomputes, the
+        // body area overlaps the multi-row middle.
+        assert_eq!(
+            r.current_footer_rows(),
+            // 1 spinner + 1 top rule + lines.len() + 1 bot rule + 0 menu + status(1)
+            1 + 1 + lines.len() + 1 + 1,
+            "footer_rows must account for wrapped middle row count"
+        );
+    }
+
     /// Wide CJK input end-to-end: render "你是谁" from empty, assert
     /// emit stream contains the three glyphs consecutively (no
     /// cursor-drift desync between them).
