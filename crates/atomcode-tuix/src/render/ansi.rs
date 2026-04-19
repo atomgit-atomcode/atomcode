@@ -256,7 +256,19 @@ impl<W: Write + Send> AnsiRenderer<W> {
     /// continuation rows use "  " (two spaces) in that position so text
     /// keeps its indent. Box auto-grows in height as the user types past
     /// the right border — no horizontal scroll.
+    /// Cold-start wrapper: called after `erase_footer` has moved the cursor
+    /// to the footer top and cleared `last_footer_rows`. Passes 0 as the
+    /// "previous cursor row" because the previous row cache is empty and
+    /// the cursor is already at footer row 0.
     fn draw_footer_here(&mut self) {
+        self.draw_footer_here_with_prev_cursor(0);
+    }
+
+    /// Paint the footer at the current cursor position, diffing against
+    /// `last_footer_rows`. `prev_cursor_row` is the row offset (within the
+    /// previously-drawn footer) the cursor is currently at — emit_footer_diff
+    /// uses it to walk the cursor up to the footer top before diffing.
+    fn draw_footer_here_with_prev_cursor(&mut self, prev_cursor_row: usize) {
         let t0 = std::time::Instant::now();
         let state = self.last_footer.clone();
         let w = self.term_width();
@@ -319,6 +331,7 @@ impl<W: Write + Send> AnsiRenderer<W> {
         // row whose bytes match the previous paint.
         let changed_rows = self.emit_footer_diff(
             &new_rows,
+            prev_cursor_row,
             cursor_row_from_top,
             PAD_COL + 2 + cursor_col_in_row,
         );
@@ -467,13 +480,17 @@ impl<W: Write + Send> AnsiRenderer<W> {
 
     /// Diff the newly built rows against `last_footer_rows` and emit
     /// `\x1b[2K` + content only for rows whose bytes changed. Returns
-    /// the number of rows actually emitted (for trace). Cursor is
-    /// assumed to be at `(self.last_footer.cursor_row_from_top, ?)`
-    /// when prev exists, or at `(0, 0)` of the footer when prev is
-    /// empty (post `erase_footer`).
+    /// the number of rows actually emitted (for trace).
+    ///
+    /// `prev_cursor_row` is where the cursor currently sits relative to
+    /// the footer top (from the previous paint). Used to walk up before
+    /// diffing. Pass 0 when `erase_footer` has already put the cursor
+    /// at the footer top AND cleared `last_footer_rows` — in that case
+    /// prev is empty and no walk-up is needed.
     fn emit_footer_diff(
         &mut self,
         new_rows: &[Vec<u8>],
+        prev_cursor_row: usize,
         target_cursor_row: usize,
         target_cursor_col: usize,
     ) -> usize {
@@ -487,14 +504,12 @@ impl<W: Write + Send> AnsiRenderer<W> {
         let _ = self.out.write_all(b"\x1b[?7l");
 
         // Position cursor at (row 0, col 0) of the footer area.
-        // If we had a previous paint, cursor is at (prev_cursor_row, ?);
-        // move up + CR. Otherwise (post-erase), cursor already at (0, 0)
-        // — just CR to be safe.
-        if !prev.is_empty() {
-            let up = self.last_footer.cursor_row_from_top;
-            if up > 0 {
-                let _ = write!(self.out, "\x1b[{}A", up);
-            }
+        // When `prev` is non-empty, cursor was left at `prev_cursor_row`
+        // within the previous footer — walk it up to row 0.
+        // When `prev` is empty (cold start post-erase_footer), cursor
+        // is already at row 0; just CR to guarantee col 0.
+        if !prev.is_empty() && prev_cursor_row > 0 {
+            let _ = write!(self.out, "\x1b[{}A", prev_cursor_row);
         }
         let _ = self.out.write_all(b"\r");
 
@@ -603,14 +618,15 @@ impl<W: Write + Send> AnsiRenderer<W> {
             _ => (None, None),
         };
 
-        // Critical ordering: erase BEFORE overwriting `last_footer`, so
-        // `erase_footer` walks the cursor up using the _previous_ frame's
-        // `cursor_row_from_top`. Reversing this (erase after overwrite)
-        // means erase would read the fresh `cursor_row_from_top: 0`,
-        // fall back to `max(1) = 1` row up, clear only a sliver, and
-        // leave the prior footer's middle/bottom/menu rows as visible
-        // ghosts on the screen.
-        self.erase_footer();
+        // IN-PLACE footer update (keystroke, spinner tick, menu nav):
+        // do NOT call `erase_footer`. Erasing would wipe the screen
+        // AND clear `last_footer_rows` — defeating the diff that lets
+        // unchanged rules / menu / status rows stay at zero bytes.
+        //
+        // Instead, capture the previous frame's cursor_row_from_top so
+        // `emit_footer_diff` can move the cursor back to the footer top
+        // from wherever the last paint left it.
+        let prev_cursor_row = self.last_footer.cursor_row_from_top;
 
         self.last_footer = FooterState {
             buf: buf.to_string(),
@@ -624,7 +640,7 @@ impl<W: Write + Send> AnsiRenderer<W> {
             cursor_row_from_top: 0,
         };
 
-        self.draw_footer_here();
+        self.draw_footer_here_with_prev_cursor(prev_cursor_row);
     }
 
     /// Back-compat wrapper — routes to draw_footer_with_menu(menu=None).
