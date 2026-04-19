@@ -163,6 +163,13 @@ impl TurnRunner {
         // 4. Process stream events
         let mut tool_calls_buf: Vec<ToolCall> = Vec::new();
         let mut text_buf = String::new();
+        // Reasoning-model thinking content collected separately — not emitted
+        // to scrollback by default (users don't want to read the thinking).
+        // If `text_buf` ends up empty at `Done` but this is non-empty, we
+        // promote reasoning to the final answer: some gateways route entire
+        // responses through `reasoning_content` for MiniMax-M2.7 / DeepSeek-R1,
+        // and without the fallback we'd return a silent 0-token "Nailed it".
+        let mut reasoning_buf = String::new();
         let mut total_tokens: usize = 0;
         let mut got_usage = false;
         let mut got_any_event = false;
@@ -213,6 +220,14 @@ _ = cancel.cancelled() => {
                                 text_buf.push_str(&text);
                                 let _ = event_tx.send(TurnEvent::TextDelta(text));
                             }
+                        }
+                        Some(Ok(StreamEvent::Reasoning(text))) => {
+                            got_any_event = true;
+                            // Accumulate only. Don't push into conversation / emit
+                            // TextDelta here — default UX is to hide reasoning.
+                            // If `content` ends up empty, the `Done` arm below
+                            // promotes `reasoning_buf` to the answer.
+                            reasoning_buf.push_str(&text);
                         }
                         Some(Ok(StreamEvent::ToolCallStart { id, name })) => {
                             got_any_event = true;
@@ -267,6 +282,41 @@ _ = cancel.cancelled() => {
                         }
 
                         Some(Ok(StreamEvent::Done { truncated: is_truncated })) => {
+                            // Reasoning-only fallback: some gateways route the
+                            // entire response through `reasoning_content` for
+                            // reasoning models (MiniMax-M2.7, DeepSeek-R1). If
+                            // we end up here with empty `content`, empty
+                            // tool_calls, but a non-empty reasoning buffer, treat
+                            // the reasoning as the answer — otherwise the agent's
+                            // empty-response retry loop fires twice, sleeps 4s,
+                            // and finally reports a silent "Nailed it · 0 tok".
+                            //
+                            // Rescue runs before this so real tool-call-in-text
+                            // escapes still take priority.
+                            let rescued_tools = if tool_calls_buf.is_empty() {
+                                let rescued = rescue_text_tool_calls(&text_buf);
+                                if !rescued.is_empty() {
+                                    conversation.clear_stream_buffer();
+                                    tool_calls_buf.extend(rescued);
+                                    true
+                                } else {
+                                    false
+                                }
+                            } else {
+                                false
+                            };
+
+                            if text_buf.trim().is_empty()
+                                && tool_calls_buf.is_empty()
+                                && !rescued_tools
+                                && !reasoning_buf.trim().is_empty()
+                            {
+                                let promoted = std::mem::take(&mut reasoning_buf);
+                                conversation.push_delta(&promoted);
+                                text_buf.push_str(&promoted);
+                                let _ = event_tx.send(TurnEvent::TextDelta(promoted));
+                            }
+
                             // Fallback: if the provider didn't report usage (many
                             // OpenAI-compatible APIs ignore stream_options), estimate
                             // output tokens from the streamed text + tool call args.
@@ -286,18 +336,6 @@ _ = cancel.cancelled() => {
                                     total_tokens: estimated,
                                     cached_tokens: 0,
                                 });
-                            }
-
-                            // Rescue tool calls embedded as text (GLM-5 sometimes
-                            // outputs `<tool_call>name(args)</tool_call>` instead of
-                            // using the standard function calling format).
-                            if tool_calls_buf.is_empty() {
-                                let rescued = rescue_text_tool_calls(&text_buf);
-                                if !rescued.is_empty() {
-                                    // Clear the text delta (it was a tool call, not text)
-                                    conversation.clear_stream_buffer();
-                                    tool_calls_buf.extend(rescued);
-                                }
                             }
 
                             // Finalize conversation state

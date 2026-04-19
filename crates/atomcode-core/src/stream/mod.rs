@@ -11,6 +11,12 @@ pub struct TokenUsage {
 #[derive(Debug, Clone)]
 pub enum StreamEvent {
     Delta(String),
+    /// Reasoning-model thinking content (e.g. MiniMax-M2.7, DeepSeek-R1,
+    /// o1-series). Some OpenAI-compatible gateways route the full response
+    /// here when `content` is empty — `TurnRunner` promotes it to the
+    /// final text on `Done` if `content` ends up empty, which keeps us from
+    /// silently returning 0-token "Nailed it" responses for reasoning models.
+    Reasoning(String),
     ToolCallStart { id: String, name: String },
     ToolCallDelta(String),
     ToolCallDone(ToolCall),
