@@ -1,6 +1,7 @@
 // crates/atomcode-tuix/src/render/mod.rs
 pub mod theme;
 pub mod cell;
+pub mod screen;
 pub mod ansi;
 pub mod plain;
 pub mod throttle;
