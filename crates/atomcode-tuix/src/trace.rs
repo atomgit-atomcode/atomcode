@@ -32,25 +32,27 @@ pub fn enabled() -> bool {
 }
 
 fn sink() -> Option<&'static Mutex<File>> {
-    // Skip under `cargo test` — otherwise every test run truncates
-    // the user's reproduction log at `/tmp/tuix.log`. Tests opt in
-    // explicitly via `ATOMCODE_TUIX_LOG=/path` when they need it.
-    #[cfg(test)]
-    {
-        let Some(_) = std::env::var("ATOMCODE_TUIX_LOG").ok() else {
-            return None;
-        };
-    }
-
+    // STRICTLY opt-in. Earlier versions defaulted to writing
+    // `/tmp/tuix.log` unconditionally so users didn't have to set an
+    // env var to produce diagnostic logs. That turned the trace
+    // infrastructure into a production bottleneck:
+    //   - every `tuix_trace!` call on the main thread AND on the
+    //     `tuix-render` worker thread contends the same `Mutex<File>`
+    //   - main thread emits RD+IN+KEY per keystroke (~3 traces),
+    //     worker emits FOOT+REN+THR per paint (~3 traces)
+    //   - under IME burst (8 chars in 100µs), that's 50+ mutex ops
+    //     from two threads. Lock queueing added 1-3ms of main-thread
+    //     stall per burst, which the user perceives as "吞字" —
+    //     characters logically accepted but visually delayed.
+    //
+    // Now: opt-in only. Default build ships no trace overhead at all
+    // (the macro's `if enabled()` short-circuits to a single atomic
+    // load). Set ATOMCODE_TUIX_LOG=/path to enable diagnosis.
     SINK.get_or_init(|| {
-        // Default on — writes to /tmp/tuix.log every run. Set
-        // ATOMCODE_TUIX_LOG=/other/path to redirect; set it to an
-        // empty string to disable entirely.
-        let path = match std::env::var("ATOMCODE_TUIX_LOG") {
-            Ok(p) if p.is_empty() => return None,
-            Ok(p) => p,
-            Err(_) => default_log_path(),
-        };
+        let path = std::env::var("ATOMCODE_TUIX_LOG").ok()?;
+        if path.is_empty() {
+            return None;
+        }
         // Truncate on each run so stale events from prior sessions
         // don't confuse diagnosis.
         let file = OpenOptions::new()
@@ -62,19 +64,6 @@ fn sink() -> Option<&'static Mutex<File>> {
         Some(Mutex::new(file))
     })
     .as_ref()
-}
-
-#[cfg(unix)]
-fn default_log_path() -> String {
-    "/tmp/tuix.log".into()
-}
-
-#[cfg(not(unix))]
-fn default_log_path() -> String {
-    std::env::temp_dir()
-        .join("tuix.log")
-        .to_string_lossy()
-        .into_owned()
 }
 
 fn origin() -> Instant {
