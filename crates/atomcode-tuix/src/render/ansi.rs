@@ -220,14 +220,16 @@ impl<W: Write + Send> AnsiRenderer<W> {
     /// rows 2..2+N-1 = middle). `draw_footer_here` populates
     /// `last_footer.cursor_row_from_top` so we know the exact number
     /// regardless of how tall the box is.
-    fn erase_footer(&mut self) {
+    fn erase_footer(&mut self) -> usize {
         if self.footer_rows == 0 {
-            return;
+            return 0;
         }
         let t0 = std::time::Instant::now();
         let up = self.last_footer.cursor_row_from_top.max(1);
         let was_rows = self.footer_rows;
-        let _ = write!(self.out, "\x1b[{}A\r\x1b[J", up);
+        let seq = format!("\x1b[{}A\r\x1b[J", up);
+        let bytes = seq.len();
+        let _ = self.out.write_all(seq.as_bytes());
         self.footer_rows = 0;
         // Next footer paint starts from a blank slate — any cached row
         // contents would now "diff same" against rows that were just
@@ -236,11 +238,13 @@ impl<W: Write + Send> AnsiRenderer<W> {
         self.last_footer_rows.clear();
         crate::tuix_trace!(
             "FOOT",
-            "erase up={} rows={} dur={}µs",
+            "erase up={} rows={} bytes={} dur={}µs",
             up,
             was_rows,
+            bytes,
             t0.elapsed().as_micros()
         );
+        bytes
     }
 
     /// Draw the footer starting at the current cursor position. Layout:
@@ -329,7 +333,7 @@ impl<W: Write + Send> AnsiRenderer<W> {
 
         // Emit changed rows only, reposition cursor. Zero bytes for any
         // row whose bytes match the previous paint.
-        let changed_rows = self.emit_footer_diff(
+        let (changed_rows, bytes) = self.emit_footer_diff(
             &new_rows,
             prev_cursor_row,
             cursor_row_from_top,
@@ -341,20 +345,21 @@ impl<W: Write + Send> AnsiRenderer<W> {
         self.last_footer.cursor_row_from_top = cursor_row_from_top;
         self.last_footer_rows = new_rows;
 
-        // est_bytes = sum of emitted row byte counts (plus a small
-        // positioning overhead). Shows how much the diff saved: a full
-        // paint of a 200-col terminal used to be ~1500 bytes every
-        // keystroke; now the typical incremental paint is ~30-80 bytes
-        // (only the middle row differs).
+        // bytes = sum of emitted row byte counts + positioning overhead.
+        // Typical incremental paint ~30-80 bytes (middle row only). A
+        // cold-start paint (post-erase_footer) sits at ~600+ bytes since
+        // every row is "new" vs empty cache — watch for these during
+        // streaming TextDelta bursts.
         crate::tuix_trace!(
             "FOOT",
-            "draw rule_w={} mid={} menu={} status={} total={} changed={} dur={}µs",
+            "draw rule_w={} mid={} menu={} status={} total={} changed={} bytes={} dur={}µs",
             rule_width,
             middle_rows,
             menu_rows,
             status_rows,
             total_rows,
             changed_rows,
+            bytes,
             t0.elapsed().as_micros()
         );
     }
@@ -493,15 +498,18 @@ impl<W: Write + Send> AnsiRenderer<W> {
         prev_cursor_row: usize,
         target_cursor_row: usize,
         target_cursor_col: usize,
-    ) -> usize {
+    ) -> (usize, usize) {
         let prev = std::mem::take(&mut self.last_footer_rows);
         let total_rows = new_rows.len();
         let max_rows = total_rows.max(prev.len());
+
+        let mut bytes = 0usize;
 
         // Disable autowrap for the whole paint — stray wrap at the
         // right edge would shift cursor down and desynchronise our
         // row tracking.
         let _ = self.out.write_all(b"\x1b[?7l");
+        bytes += 4;
 
         // Position cursor at (row 0, col 0) of the footer area.
         // When `prev` is non-empty, cursor was left at `prev_cursor_row`
@@ -509,9 +517,12 @@ impl<W: Write + Send> AnsiRenderer<W> {
         // When `prev` is empty (cold start post-erase_footer), cursor
         // is already at row 0; just CR to guarantee col 0.
         if !prev.is_empty() && prev_cursor_row > 0 {
-            let _ = write!(self.out, "\x1b[{}A", prev_cursor_row);
+            let s = format!("\x1b[{}A", prev_cursor_row);
+            bytes += s.len();
+            let _ = self.out.write_all(s.as_bytes());
         }
         let _ = self.out.write_all(b"\r");
+        bytes += 1;
 
         let mut changed = 0usize;
         for i in 0..max_rows {
@@ -528,14 +539,17 @@ impl<W: Write + Send> AnsiRenderer<W> {
                 // there in the prev paint), then lay down new bytes.
                 // For `None` new_row (row disappearing), just erase.
                 let _ = self.out.write_all(b"\x1b[2K");
+                bytes += 4;
                 if let Some(n) = new_row {
                     let _ = self.out.write_all(n);
+                    bytes += n.len();
                 }
                 changed += 1;
             }
             // Advance to next row if any rows remain.
             if i + 1 < max_rows {
                 let _ = self.out.write_all(b"\r\n");
+                bytes += 2;
             }
         }
 
@@ -543,16 +557,22 @@ impl<W: Write + Send> AnsiRenderer<W> {
         // to target row, then set col.
         let last_row = max_rows.saturating_sub(1);
         if last_row > target_cursor_row {
-            let _ = write!(self.out, "\x1b[{}A", last_row - target_cursor_row);
+            let s = format!("\x1b[{}A", last_row - target_cursor_row);
+            bytes += s.len();
+            let _ = self.out.write_all(s.as_bytes());
         }
         let _ = self.out.write_all(b"\r");
+        bytes += 1;
         if target_cursor_col > 0 {
             // \x1b[NG is 1-indexed column positioning.
-            let _ = write!(self.out, "\x1b[{}G", target_cursor_col + 1);
+            let s = format!("\x1b[{}G", target_cursor_col + 1);
+            bytes += s.len();
+            let _ = self.out.write_all(s.as_bytes());
         }
 
         let _ = self.out.write_all(b"\x1b[?7h");
-        changed
+        bytes += 4;
+        (changed, bytes)
     }
 
     /// Redraw footer if it was previously drawn — used after permanent
@@ -1404,6 +1424,135 @@ mod tests {
         // Assistant line closes with \n, then tool line appears
         assert!(s.contains("partial\r\n"));
         assert!(s.contains("▸ bash(ls)"));
+    }
+
+    /// Writer that just tallies byte counts — lets us sample
+    /// `bytes_written` mid-session without borrowing conflicts.
+    struct CountingSink {
+        bytes: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    }
+    impl std::io::Write for CountingSink {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.bytes.fetch_add(b.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn new_counting_renderer() -> (AnsiRenderer<CountingSink>, std::sync::Arc<std::sync::atomic::AtomicU64>) {
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let sink = CountingSink { bytes: counter.clone() };
+        (AnsiRenderer::with_writer(sink, caps_with_color()), counter)
+    }
+
+    fn sample(counter: &std::sync::Arc<std::sync::atomic::AtomicU64>) -> u64 {
+        counter.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Quantify how many bytes a typical streaming TextDelta costs.
+    /// Mirrors the real event-loop pattern: footer is established by a
+    /// StreamingBox, then TextDelta arrives and is followed by a
+    /// StreamingBox redraw (spinner + box below). Each such cycle is
+    /// what Mac Terminal.app's GUI pipeline has to eat per ~20ms during
+    /// streaming — if it's >500 bytes per delta, we're saturating the
+    /// terminal's render queue and user perceives post-stream input lag.
+    #[test]
+    fn streaming_text_delta_byte_cost() {
+        let (mut r, counter) = new_counting_renderer();
+        let status = super::super::StatusLine {
+            model: "glm-4.5".into(),
+            cwd: "~/project/atomcode".into(),
+            total_tokens: 0,
+            hint: None,
+        };
+
+        // Establish initial streaming footer.
+        r.render(UiLine::StreamingBox {
+            buf: String::new(),
+            cursor_byte: 0,
+            frame: "⠋",
+            label: "Thinking".into(),
+            status: status.clone(),
+            menu: None,
+        });
+        r.flush();
+        let baseline = sample(&counter);
+
+        // Simulate a single TextDelta + its follow-up StreamingBox redraw.
+        r.render(UiLine::AssistantText("这是一段 streaming 的文字。\n".into()));
+        r.render(UiLine::StreamingBox {
+            buf: String::new(),
+            cursor_byte: 0,
+            frame: "⠙",
+            label: "Thinking".into(),
+            status: status.clone(),
+            menu: None,
+        });
+        r.flush();
+        let per_delta = sample(&counter) - baseline;
+
+        // 20 more deltas for steady-state average.
+        let before_burst = sample(&counter);
+        for i in 0..20 {
+            r.render(UiLine::AssistantText(format!("行 {}\n", i)));
+            r.render(UiLine::StreamingBox {
+                buf: String::new(),
+                cursor_byte: 0,
+                frame: "⠹",
+                label: "Thinking".into(),
+                status: status.clone(),
+                menu: None,
+            });
+        }
+        r.flush();
+        let avg_per_delta = (sample(&counter) - before_burst) / 20;
+
+        eprintln!(
+            "[BYTE TEST] streaming: first delta = {} B, avg over 20 = {} B",
+            per_delta, avg_per_delta
+        );
+        // Diagnostic only — no assertion. We're measuring current behaviour
+        // to decide whether a batch-redraw optimisation is warranted.
+    }
+
+    #[test]
+    fn keystroke_byte_cost_steady_state() {
+        let (mut r, counter) = new_counting_renderer();
+        let status = super::super::StatusLine {
+            model: "glm-4.5".into(),
+            cwd: "~/project/atomcode".into(),
+            total_tokens: 42,
+            hint: None,
+        };
+
+        // Warm the footer cache with one InputPrompt.
+        r.render(UiLine::InputPrompt {
+            buf: "h".into(),
+            cursor_byte: 1,
+            menu: None,
+            status: status.clone(),
+        });
+        r.flush();
+        let before = sample(&counter);
+
+        // 10 keystrokes — only the input buf grows.
+        for i in 1..=10 {
+            let s: String = "h".repeat(i + 1);
+            r.render(UiLine::InputPrompt {
+                buf: s.clone(),
+                cursor_byte: s.len(),
+                menu: None,
+                status: status.clone(),
+            });
+        }
+        r.flush();
+        let avg_per_keystroke = (sample(&counter) - before) / 10;
+        eprintln!(
+            "[BYTE TEST] keystroke steady-state avg = {} B",
+            avg_per_keystroke
+        );
     }
 
     #[test]
