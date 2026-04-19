@@ -2,6 +2,7 @@
 pub mod theme;
 pub mod ansi;
 pub mod plain;
+pub mod probe;
 pub mod throttle;
 pub mod worker;
 

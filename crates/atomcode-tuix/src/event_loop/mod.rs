@@ -676,6 +676,22 @@ pub async fn run_loop(
     // fire back-to-back.
     let mut last_spinner_draw = std::time::Instant::now();
 
+    // Terminal round-trip probe (opt-in via ATOMCODE_TUIX_PROBE_MS=500).
+    // Periodically sends a CPR query and measures how long it takes for
+    // the terminal to respond — directly measures GUI-pipeline backlog
+    // (Mac Terminal.app in particular renders bytes asynchronously
+    // after accepting them from the pipe, so `flush()` duration alone
+    // can't see sluggish pixel updates).
+    let probe_interval_ms = std::env::var("ATOMCODE_TUIX_PROBE_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&ms| ms >= 100);
+    let mut probe_tick_opt: Option<tokio::time::Interval> = probe_interval_ms.map(|ms| {
+        let mut i = tokio::time::interval(Duration::from_millis(ms));
+        i.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        i
+    });
+
     // DEVIATION from plan:
     // 1. plan uses `SignalKind::terminal_stop()` which does not exist in tokio 1.x.
     //    Using `SignalKind::from_raw(libc::SIGTSTP)` instead.
@@ -708,6 +724,36 @@ pub async fn run_loop(
             // when nothing is pending.
             _ = deferred_render_tick.tick() => {
                 renderer.flush_deferred();
+            }
+
+            // ── Terminal DSR round-trip probe (opt-in) ──
+            // Fires only when ATOMCODE_TUIX_PROBE_MS env var is set.
+            // Measures real GUI-pipeline latency by round-tripping a
+            // `\x1b[6n` query through the terminal and timing the reply.
+            _ = async {
+                match probe_tick_opt.as_mut() {
+                    Some(t) => { t.tick().await; }
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
+                let timeout = Duration::from_millis(500);
+                match crate::render::probe::probe(ctx.reader.as_ref(), timeout) {
+                    Some(rtt) => {
+                        crate::tuix_trace!(
+                            "PROBE",
+                            "terminal_rtt={}µs phase={:?}",
+                            rtt.as_micros(),
+                            app.state.phase
+                        );
+                    }
+                    None => {
+                        crate::tuix_trace!(
+                            "PROBE",
+                            "terminal_rtt=TIMEOUT phase={:?}",
+                            app.state.phase
+                        );
+                    }
+                }
             }
 
             // ── Spinner tick (from background task) ──
@@ -800,6 +846,36 @@ pub async fn run_loop(
             // when nothing is pending.
             _ = deferred_render_tick.tick() => {
                 renderer.flush_deferred();
+            }
+
+            // ── Terminal DSR round-trip probe (opt-in) ──
+            // Fires only when ATOMCODE_TUIX_PROBE_MS env var is set.
+            // Measures real GUI-pipeline latency by round-tripping a
+            // `\x1b[6n` query through the terminal and timing the reply.
+            _ = async {
+                match probe_tick_opt.as_mut() {
+                    Some(t) => { t.tick().await; }
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
+                let timeout = Duration::from_millis(500);
+                match crate::render::probe::probe(ctx.reader.as_ref(), timeout) {
+                    Some(rtt) => {
+                        crate::tuix_trace!(
+                            "PROBE",
+                            "terminal_rtt={}µs phase={:?}",
+                            rtt.as_micros(),
+                            app.state.phase
+                        );
+                    }
+                    None => {
+                        crate::tuix_trace!(
+                            "PROBE",
+                            "terminal_rtt=TIMEOUT phase={:?}",
+                            app.state.phase
+                        );
+                    }
+                }
             }
 
             // ── Spinner tick (from background task) ──
