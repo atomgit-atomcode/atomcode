@@ -67,6 +67,18 @@ pub struct RetainedRenderer<W: Write + Send> {
     /// thus produces ONE frame instead of 40 — the difference
     /// between 40 Mac Terminal repaints and 1.
     dirty: bool,
+    /// Footer row count at the last successful emit. When footer
+    /// geometry changes (wrap, menu open/close), absolute row
+    /// positions of the internal layout stay the same for some
+    /// rows but shift for others — and on Mac Terminal.app we've
+    /// observed the "rule" rows occasionally rendering as
+    /// half-width after such a transition, even though
+    /// `cells[row_57]` holds the full 209 dashes. Rather than
+    /// chase the terminal-side glitch, we invalidate prev_cells
+    /// on geometry change so the next paint emits every row
+    /// full-frame, guaranteeing the terminal re-processes the
+    /// rule regardless of diff skip.
+    last_painted_footer_rows: usize,
 }
 
 impl RetainedRenderer<BufWriter<Stdout>> {
@@ -90,6 +102,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             body_lines: Vec::new(),
             assistant_line_buf: String::new(),
             dirty: false,
+            last_painted_footer_rows: 0,
         }
     }
 
@@ -877,6 +890,17 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         if self.dirty {
             let t0 = std::time::Instant::now();
             let footer_rows = self.current_footer_rows();
+            // Geometry-change guard: when the footer grows/shrinks
+            // (wrap, menu open/close, spinner toggle), invalidate
+            // the diff cache so every row — including ones whose
+            // bytes happen to match the previous frame — gets
+            // re-emitted. This paves over any terminal-side
+            // render glitches that accumulated under the
+            // cell-diff skip path.
+            if footer_rows != self.last_painted_footer_rows {
+                self.screen.invalidate();
+                self.last_painted_footer_rows = footer_rows;
+            }
             let has_status = !self.status.model.is_empty()
                 || !self.status.cwd.is_empty()
                 || self.status.hint.is_some();
@@ -1228,10 +1252,11 @@ mod tests {
             "[RETAINED BYTE] coalesce: 40 renders + 1 tick = {} B total",
             burst_bytes
         );
-        // Upper bound: full middle-row re-emit (≈80 chars × 3 bytes
-        // for UTF-8 CJK = ~240 B + cursor moves). Budget 500 B.
+        // Upper bound: cold start (first paint after session init)
+        // re-emits every non-blank cell + UTF-8 CJK + rule + cursor
+        // moves. Budget 1200 B; typical observed ~700 B.
         assert!(
-            burst_bytes > 0 && burst_bytes < 500,
+            burst_bytes > 0 && burst_bytes < 1200,
             "coalesce should produce exactly one modest emit: {} B",
             burst_bytes
         );
