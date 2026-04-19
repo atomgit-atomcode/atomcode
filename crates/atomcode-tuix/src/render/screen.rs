@@ -190,10 +190,11 @@ impl Screen {
         *self = Self::new(width, height);
     }
 
-    /// Debug-only accessor: peek at the last-emitted frame. Lets
-    /// tests assert "the terminal shows X cell at (row, col)"
-    /// without reconstructing state from the ANSI byte stream.
-    #[cfg(test)]
+    /// Peek at the last-emitted frame. Used by tests and the
+    /// diagnostic trace path (`tuix_trace!("FOOT", ...)`) to
+    /// inspect "what is actually on screen right now" without
+    /// reconstructing state from the ANSI byte stream. Not meant
+    /// for normal rendering — that goes through `render_diff`.
     pub fn prev_cells_for_test(&self) -> &[Vec<Cell>] {
         &self.prev_cells
     }

@@ -890,15 +890,33 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
             let emit_len = bytes.len();
             let _ = self.out.write_all(&bytes);
             self.dirty = false;
+            // Diagnostic: count how many cells on the bot_rule row
+            // (screen_h - 2, 0-indexed) actually hold '─'. bot_rule
+            // sits at a constant absolute row regardless of middle
+            // row count — if this goes to zero while middle_rows > 1,
+            // some path (body overwrite, diff skip, draw_row truncate)
+            // is blanking out the rule.
+            let screen_h = self.screen.height() as usize;
+            let bot_rule_row = screen_h.saturating_sub(2);
+            let bot_rule_dashes = self
+                .screen
+                .prev_cells_for_test()
+                .get(bot_rule_row)
+                .map(|r| r.iter().filter(|c| c.ch == '─').count())
+                .unwrap_or(0);
             crate::tuix_trace!(
                 "FOOT",
-                "paint rows=footer{}(mid={} menu={}) body={} buf_w={} emit={}B dur={}µs",
+                "paint screen={}x{} rows=footer{}(mid={} menu={}) body={} buf_w={} emit={}B botrule_row={} botrule_dashes={} dur={}µs",
+                self.screen.width(),
+                self.screen.height(),
                 footer_rows,
                 middle_rows,
                 menu_rows,
                 self.body_lines.len(),
                 buf_display_w,
                 emit_len,
+                bot_rule_row,
+                bot_rule_dashes,
                 t0.elapsed().as_micros()
             );
         }
