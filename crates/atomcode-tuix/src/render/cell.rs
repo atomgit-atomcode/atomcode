@@ -45,46 +45,78 @@ pub struct CellStyle {
 /// One screen cell: glyph + its visual attributes. Cell equality is
 /// byte-perfect — two cells are equal iff their serialised bytes
 /// would be identical, which is the invariant the diff relies on.
+///
+/// `width` is the **display width** in terminal columns: 1 for ASCII
+/// and other narrow glyphs, 2 for CJK / emoji / other wide glyphs,
+/// and 0 for **continuation cells** — placeholder cells that follow a
+/// wide glyph to keep the invariant `cell_index == terminal_column`.
+/// Without continuation cells, typing "你是谁" (3 wide chars = 6 cols)
+/// into a row model that tracked only char count (3 cells) would emit
+/// patches at model cols 5/6/7 while the terminal had just advanced
+/// to actual col 11 after the first `你`, overwriting each preceding
+/// glyph's right half with the next glyph — the "you3-type-shows-only-
+/// last-char" bug.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cell {
     pub ch: char,
     pub style: CellStyle,
+    pub width: u8,
 }
 
 impl Default for Cell {
-    /// Default blank cell = ASCII space with default style. Rust's
-    /// own default for `char` is `'\0'` (NUL), which serialises as a
-    /// zero byte — terminals **ignore** NUL writes (or render as an
-    /// invisible glyph), so a frame built on top of `Cell::default()`
-    /// would fail to erase leftover content when the diff patches in
-    /// "blank" cells. Using `' '` makes erasure actually erase.
+    /// Default blank cell = ASCII space, width 1, default style.
     fn default() -> Self {
         Self {
             ch: ' ',
             style: CellStyle::default(),
+            width: 1,
         }
     }
 }
 
 impl Cell {
-    /// Blank cell with default style. Padding cells and "erased" cells
-    /// both use this — so a diff that finds a `blank` where a `'─'` used
-    /// to be emits an actual ASCII space that overwrites the glyph.
+    /// Blank narrow cell — space, width 1. Used for padding and as
+    /// the diff's "erase" glyph.
     pub fn blank() -> Self {
         Self::default()
     }
+
+    /// Continuation cell — placeholder for the 2nd (or 3rd, if any)
+    /// terminal column occupied by a wide glyph. `width = 0` tells
+    /// `serialize_patches` to skip emit for this cell: the wide
+    /// glyph emitted in the cell immediately before has already
+    /// advanced the terminal cursor past this column.
+    pub fn continuation() -> Self {
+        Self {
+            ch: ' ',
+            style: CellStyle::default(),
+            width: 0,
+        }
+    }
 }
 
-/// Append each char of `s` as its own cell, all sharing `style`. Lets
-/// row builders write `push_str_cells(&mut row, "  ", default)` instead
-/// of a manual char-by-char loop — the most common pattern in
-/// `build_*_row`.
+/// Append each char of `s` as cells, all sharing `style`. Wide chars
+/// (CJK, emoji, etc.) expand to one real cell carrying the glyph +
+/// `(display_width - 1)` continuation cells so `cell_index ==
+/// terminal_column` holds across the row — critical for the cell-diff
+/// to produce correct patches.
 pub fn push_str_cells(row: &mut Vec<Cell>, s: &str, style: &CellStyle) {
     for ch in s.chars() {
+        let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(1);
+        if w == 0 {
+            // Zero-width (combining marks, control chars). Caller has
+            // already scrubbed real controls; skip here rather than
+            // emit a phantom cell that diff can't align.
+            continue;
+        }
         row.push(Cell {
             ch,
             style: style.clone(),
+            width: w as u8,
         });
+        for _ in 1..w {
+            row.push(Cell::continuation());
+        }
     }
 }
 
@@ -171,6 +203,14 @@ pub fn serialize_patches(patches: &[Patch]) -> Vec<u8> {
     let mut emitted_any_sgr = false;
 
     for patch in patches {
+        // Continuation cell: the wide glyph in the previous cell has
+        // already advanced the terminal cursor past this column. Emit
+        // nothing — writing here would clobber the wide glyph's right
+        // half *and* scramble our cursor model.
+        if patch.cell.width == 0 {
+            continue;
+        }
+
         if expected_cursor != Some((patch.row, patch.col)) {
             let _ = write!(out, "\x1b[{};{}H", patch.row, patch.col);
             expected_cursor = Some((patch.row, patch.col));
@@ -189,8 +229,12 @@ pub fn serialize_patches(patches: &[Patch]) -> Vec<u8> {
         let encoded = patch.cell.ch.encode_utf8(&mut buf);
         out.extend_from_slice(encoded.as_bytes());
 
+        // Cursor advances by the glyph's display width. For narrow
+        // cells this is +1 (the common case), for wide cells (CJK,
+        // emoji) it's +2 — matching what the terminal actually does
+        // so the next patch's `expected_cursor` comparison is sound.
         if let Some((r, c)) = expected_cursor {
-            expected_cursor = Some((r, c + 1));
+            expected_cursor = Some((r, c + patch.cell.width as u16));
         }
     }
 
@@ -278,6 +322,10 @@ pub fn row_to_bytes(cells: &[Cell]) -> Vec<u8> {
     let mut current_style: Option<CellStyle> = None;
     let mut emitted_any_sgr = false;
     for cell in cells {
+        // Continuation cell: see `serialize_patches` for rationale.
+        if cell.width == 0 {
+            continue;
+        }
         if current_style.as_ref() != Some(&cell.style) {
             let before = out.len();
             emit_sgr_transition(&mut out, current_style.as_ref(), &cell.style);
@@ -317,15 +365,18 @@ mod tests {
         let a = Cell {
             ch: 'x',
             style: style_bold_cyan(),
+            width: 1,
         };
         let b = Cell {
             ch: 'x',
             style: style_bold_cyan(),
+            width: 1,
         };
         assert_eq!(a, b);
         let c = Cell {
             ch: 'y',
             style: style_bold_cyan(),
+            width: 1,
         };
         assert_ne!(a, c);
     }
@@ -343,7 +394,7 @@ mod tests {
     fn diff_emits_only_changed_cells() {
         // Two frames differing in one cell (col 3 of row 5).
         let mut prev = HashMap::new();
-        let mut prev_row: Vec<Cell> = "hello".chars().map(|ch| Cell { ch, style: Default::default() }).collect();
+        let mut prev_row: Vec<Cell> = "hello".chars().map(|ch| Cell { ch, style: Default::default(), width: 1 }).collect();
         prev.insert(5u16, prev_row.clone());
 
         let mut next = HashMap::new();
@@ -361,7 +412,7 @@ mod tests {
     fn diff_skips_identical_frames() {
         let row: Vec<Cell> = "same"
             .chars()
-            .map(|ch| Cell { ch, style: Default::default() })
+            .map(|ch| Cell { ch, style: Default::default(), width: 1 })
             .collect();
         let mut prev = HashMap::new();
         prev.insert(1u16, row.clone());
@@ -376,11 +427,11 @@ mod tests {
         // blanking patches so leftover glyphs get overwritten.
         let prev_row: Vec<Cell> = "hello"
             .chars()
-            .map(|ch| Cell { ch, style: Default::default() })
+            .map(|ch| Cell { ch, style: Default::default(), width: 1 })
             .collect();
         let next_row: Vec<Cell> = "he"
             .chars()
-            .map(|ch| Cell { ch, style: Default::default() })
+            .map(|ch| Cell { ch, style: Default::default(), width: 1 })
             .collect();
         let mut prev = HashMap::new();
         prev.insert(1u16, prev_row);
@@ -406,6 +457,7 @@ mod tests {
             cell: Cell {
                 ch: 'x',
                 style: Default::default(),
+                width: 1,
             },
         };
         let bytes = serialize_patches(std::slice::from_ref(&p));
@@ -427,6 +479,7 @@ mod tests {
             cell: Cell {
                 ch: 'x',
                 style: style_bold_cyan(),
+                width: 1,
             },
         };
         let bytes = serialize_patches(std::slice::from_ref(&p));
@@ -442,12 +495,12 @@ mod tests {
         let p1 = Patch {
             row: 5,
             col: 1,
-            cell: Cell { ch: 'a', style: Default::default() },
+            cell: Cell { ch: 'a', style: Default::default(), width: 1 },
         };
         let p2 = Patch {
             row: 5,
             col: 2,
-            cell: Cell { ch: 'b', style: Default::default() },
+            cell: Cell { ch: 'b', style: Default::default(), width: 1 },
         };
         let bytes = serialize_patches(&[p1, p2]);
         let s = String::from_utf8(bytes).unwrap();
@@ -462,7 +515,7 @@ mod tests {
         let p1 = Patch {
             row: 5,
             col: 1,
-            cell: Cell { ch: 'a', style: Default::default() },
+            cell: Cell { ch: 'a', style: Default::default(), width: 1 },
         };
         let p2 = Patch {
             row: 5,
@@ -470,6 +523,7 @@ mod tests {
             cell: Cell {
                 ch: 'b',
                 style: CellStyle { fg: None, bold: true, reverse: false },
+                width: 1,
             },
         };
         let bytes = serialize_patches(&[p1, p2]);
@@ -480,7 +534,7 @@ mod tests {
     #[test]
     fn row_to_bytes_collapses_runs() {
         let row: Vec<Cell> = (0..5)
-            .map(|_| Cell { ch: '─', style: Default::default() })
+            .map(|_| Cell { ch: '─', style: Default::default(), width: 1 })
             .collect();
         let bytes = row_to_bytes(&row);
         let s = String::from_utf8(bytes).unwrap();

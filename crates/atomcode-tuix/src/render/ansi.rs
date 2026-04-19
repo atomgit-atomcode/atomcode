@@ -600,6 +600,7 @@ impl<W: Write + Send> AnsiRenderer<W> {
             row.push(Cell {
                 ch: '─',
                 style: border.clone(),
+                width: 1,
             });
         }
         row
@@ -664,6 +665,7 @@ impl<W: Write + Send> AnsiRenderer<W> {
                 row.push(Cell {
                     ch: ' ',
                     style: style.clone(),
+                    width: 1,
                 });
             }
         }
@@ -1739,6 +1741,57 @@ mod tests {
 
     fn take_buf(buf: &std::sync::Arc<std::sync::Mutex<Vec<u8>>>) -> Vec<u8> {
         std::mem::take(&mut *buf.lock().unwrap())
+    }
+
+    /// Regression test for the "你是谁 shows only 谁" bug: typing
+    /// 3 wide CJK chars incrementally must leave all 3 on screen,
+    /// not overwrite each other's halves. Each `你` / `是` / `谁`
+    /// occupies 2 terminal columns; if our cell model tracked them
+    /// as 1-cell-per-char, the diff would emit patches at model
+    /// cols 5/6/7 while the terminal cursor had already advanced
+    /// to actual col 7/9/11, every glyph clobbering the previous
+    /// one's right half. With `width: 2` cells + continuation cells
+    /// maintaining `cell_index == terminal_column`, the emit
+    /// targets (col 5 / 7 / 9) line up with actual terminal state.
+    #[test]
+    fn wide_char_input_keeps_all_chars() {
+        let (mut r, buf) = new_capturing_renderer();
+        let status = super::super::StatusLine {
+            model: "glm-5".into(),
+            cwd: "~/p".into(),
+            total_tokens: 0,
+            hint: None,
+        };
+        // Establish footer with empty input.
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+        });
+        r.flush();
+        take_buf(&buf);
+
+        // One-shot render with all 3 wide chars — diff generates
+        // three wide-char + three continuation patches back-to-back,
+        // serialize should pack them into one cursor move + 3 glyphs.
+        r.render(UiLine::InputPrompt {
+            buf: "你是谁".into(),
+            cursor_byte: 9,
+            menu: None,
+            status: status.clone(),
+        });
+        r.flush();
+        let stream = String::from_utf8_lossy(&take_buf(&buf)).to_string();
+        // The three glyphs must land consecutively in the emit stream;
+        // a spurious cursor move between them would mean our
+        // expected_cursor model drifted out of sync with the terminal's
+        // wide-char advance.
+        assert!(
+            stream.contains("你是谁"),
+            "wide chars not emitted consecutively (cursor model drift?): stream:\n{}",
+            stream
+        );
     }
 
     /// Regression test for the /model → shrink → input-row residue
