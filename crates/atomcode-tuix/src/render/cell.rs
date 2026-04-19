@@ -183,6 +183,42 @@ pub fn diff_cells(
     patches
 }
 
+/// Slice-based cell-diff for the retained-mode `Screen` buffer.
+/// Both frames are `[Vec<Cell>]` indexed by **screen row** (0..H-1),
+/// with each inner `Vec<Cell>` indexed by **screen col** (0..W-1).
+/// Unlike `diff_cells`, this variant doesn't allocate a hashmap per
+/// frame — Screen always knows all its rows upfront, so a contiguous
+/// slice is both faster and maps 1:1 onto the 2D `cells[row][col]`
+/// access pattern.
+///
+/// Emits patches with **1-indexed** (row, col) matching ANSI cursor
+/// addressing. When one frame is shorter than the other (shouldn't
+/// happen in practice if both come from the same `Screen`, but keep
+/// the robustness for safety), missing rows / columns are treated as
+/// blank so the "other" frame's content generates explicit patches.
+pub fn diff_cell_frames(prev: &[Vec<Cell>], next: &[Vec<Cell>]) -> Vec<Patch> {
+    let mut patches = Vec::new();
+    let max_rows = prev.len().max(next.len());
+    let blank = Cell::blank();
+    for r in 0..max_rows {
+        let p = prev.get(r).map(Vec::as_slice).unwrap_or(&[]);
+        let n = next.get(r).map(Vec::as_slice).unwrap_or(&[]);
+        let max_cols = p.len().max(n.len());
+        for c in 0..max_cols {
+            let pc = p.get(c).unwrap_or(&blank);
+            let nc = n.get(c).unwrap_or(&blank);
+            if pc != nc {
+                patches.push(Patch {
+                    row: (r + 1) as u16,
+                    col: (c + 1) as u16,
+                    cell: nc.clone(),
+                });
+            }
+        }
+    }
+    patches
+}
+
 /// Serialise patches into ANSI bytes with an SGR state machine: emit
 /// cursor-position only when we're jumping, emit SGR only when the
 /// outgoing cell's style differs from the last one we set, and run-pack
@@ -419,6 +455,67 @@ mod tests {
         let mut next = HashMap::new();
         next.insert(1u16, row);
         assert!(diff_cells(&prev, &next).is_empty());
+    }
+
+    /// diff_cell_frames (slice version) emits the same patches as
+    /// diff_cells (HashMap version) for the same content — a sanity
+    /// check that the two API shapes agree on semantics.
+    #[test]
+    fn diff_cell_frames_agrees_with_hashmap_version() {
+        // Two rows, second one changes one cell.
+        let row_a: Vec<Cell> = "hello"
+            .chars()
+            .map(|ch| Cell { ch, style: Default::default(), width: 1 })
+            .collect();
+        let row_b_prev: Vec<Cell> = "world"
+            .chars()
+            .map(|ch| Cell { ch, style: Default::default(), width: 1 })
+            .collect();
+        let mut row_b_next = row_b_prev.clone();
+        row_b_next[2].ch = 'X';
+
+        let prev_slice = vec![row_a.clone(), row_b_prev.clone()];
+        let next_slice = vec![row_a.clone(), row_b_next.clone()];
+
+        let mut prev_hm: HashMap<u16, Vec<Cell>> = HashMap::new();
+        prev_hm.insert(1, row_a.clone());
+        prev_hm.insert(2, row_b_prev);
+        let mut next_hm: HashMap<u16, Vec<Cell>> = HashMap::new();
+        next_hm.insert(1, row_a);
+        next_hm.insert(2, row_b_next);
+
+        let slice_patches = diff_cell_frames(&prev_slice, &next_slice);
+        let hm_patches = diff_cells(&prev_hm, &next_hm);
+        assert_eq!(
+            slice_patches, hm_patches,
+            "slice and hashmap diffs must produce identical patch streams"
+        );
+    }
+
+    /// Uses 0-indexed slice input, produces 1-indexed (row, col)
+    /// patches matching ANSI cursor addressing convention.
+    #[test]
+    fn diff_cell_frames_produces_one_indexed_coords() {
+        let row: Vec<Cell> = "ab"
+            .chars()
+            .map(|ch| Cell { ch, style: Default::default(), width: 1 })
+            .collect();
+        let mut changed = row.clone();
+        changed[0].ch = 'X';
+        let prev = vec![row.clone()];
+        let next = vec![changed];
+        let patches = diff_cell_frames(&prev, &next);
+        assert_eq!(patches.len(), 1);
+        assert_eq!(patches[0].row, 1, "slice row 0 -> ANSI row 1");
+        assert_eq!(patches[0].col, 1, "slice col 0 -> ANSI col 1");
+        assert_eq!(patches[0].cell.ch, 'X');
+    }
+
+    /// Empty frames produce zero patches.
+    #[test]
+    fn diff_cell_frames_empty_frames() {
+        let patches = diff_cell_frames(&[], &[]);
+        assert!(patches.is_empty());
     }
 
     #[test]
