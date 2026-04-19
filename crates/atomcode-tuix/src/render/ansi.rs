@@ -1713,8 +1713,128 @@ mod tests {
         assert!(s.contains("▸ bash(ls)"));
     }
 
-    /// Writer that just tallies byte counts — lets us sample
-    /// `bytes_written` mid-session without borrowing conflicts.
+    /// Writer that also captures every byte so tests can inspect
+    /// the ANSI stream produced across a sequence of renders without
+    /// fighting the borrow checker over `&mut Vec<u8>` held by the
+    /// renderer.
+    #[derive(Clone)]
+    struct CapturingSink {
+        buf: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    }
+    impl std::io::Write for CapturingSink {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.buf.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn new_capturing_renderer() -> (AnsiRenderer<CapturingSink>, std::sync::Arc<std::sync::Mutex<Vec<u8>>>) {
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = CapturingSink { buf: buf.clone() };
+        (AnsiRenderer::with_writer(sink, caps_with_color()), buf)
+    }
+
+    fn take_buf(buf: &std::sync::Arc<std::sync::Mutex<Vec<u8>>>) -> Vec<u8> {
+        std::mem::take(&mut *buf.lock().unwrap())
+    }
+
+    /// Regression test for the /model → shrink → input-row residue
+    /// (image #7 / #8 in dev chat). Symptom: after closing the palette,
+    /// the middle row shows "❯ ddd<old_menu_tail>" — new middle cells
+    /// only cover the first few columns, the prior frame's menu row
+    /// tail lingers.
+    ///
+    /// What the diff SHOULD emit: for the absolute row where the input
+    /// box lands, blank-cell patches covering every column beyond the
+    /// new middle row's length (because the prior frame had a long menu
+    /// row there). Here we run the sequence and assert the emit stream
+    /// contains enough blank-space writes past the input text to erase
+    /// tail content.
+    #[test]
+    fn footer_shrink_erases_menu_tail() {
+        let (mut r, buf) = new_capturing_renderer();
+        let status = super::super::StatusLine {
+            model: "glm-5".into(),
+            cwd: "~/project".into(),
+            total_tokens: 0,
+            hint: None,
+        };
+        let items: Vec<(String, String)> = vec![
+            ("AtomGit".into(), "openai · MiniMax-M2.7".into()),
+            ("deepseekv32".into(), "openai · Pro/deepseek-ai/DeepSeek-V3.2".into()),
+            ("glm47".into(), "openai · Pro/zai-org/GLM-4.7".into()),
+            ("glm5".into(), "openai · Pro/zai-org/GLM-5".into()),
+        ];
+
+        // Frame 1: menu open (footer = 9 rows with 4 menu items).
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: Some(super::super::MenuPayload {
+                items: items.clone(),
+                selected: 3, // /glm5 highlighted
+            }),
+            status: status.clone(),
+        });
+        r.flush();
+        let _open_bytes = take_buf(&buf);
+
+        // Frame 2: menu closes, user has typed 3 chars. Footer shrinks
+        // back to 5 rows. The old menu rows at absolute rows [H-4..H-1]
+        // must be overwritten by the new 5-row footer's spinner/rules/
+        // middle — and critically, the new middle row (at absolute row
+        // H-2, bearing "  ❯ ddd") must have blank patches covering the
+        // OLD menu-row cells past col 5, otherwise the screen shows
+        // "❯ ddd<old menu text>".
+        r.render(UiLine::InputPrompt {
+            buf: "ddd".into(),
+            cursor_byte: 3,
+            menu: None,
+            status: status.clone(),
+        });
+        r.flush();
+        let shrink_bytes = take_buf(&buf);
+        let s = String::from_utf8_lossy(&shrink_bytes);
+
+        // The new middle row should emit "❯ ddd" — check that.
+        assert!(
+            s.contains("ddd"),
+            "middle row missing 'ddd': bytes dump:\n{:?}",
+            s
+        );
+
+        // Stricter: the new middle row has only 5 visible cells
+        // ("  ❯ ddd" = 7 incl pad). Old menu row 3 (selected) had
+        // reverse-video cells running to `rule_width` (~PAD_COL + 205).
+        // For the cell-diff path to have erased the tail, the emit
+        // stream must contain blank-space patches PAST the new middle
+        // row's content. Count emitted spaces in the sequence AFTER
+        // the "ddd" occurrence — if there are fewer than ~150, the
+        // tail wasn't erased.
+        let ddd_pos = s.find("ddd").expect("ddd should be in stream");
+        let after = &s[ddd_pos + 3..];
+        let space_run: usize = after.chars().take_while(|c| *c == ' ').count();
+        // Not strictly a tight check — blank cells may be interleaved
+        // with cursor moves across rows. Count total ASCII spaces in
+        // the whole shrink frame instead.
+        let total_spaces = shrink_bytes.iter().filter(|b| **b == b' ').count();
+        eprintln!(
+            "[SHRINK DIAG] total bytes={}, total_spaces={}, adjacent spaces after ddd={}, raw={:?}",
+            shrink_bytes.len(),
+            total_spaces,
+            space_run,
+            s
+        );
+        assert!(
+            total_spaces >= 150,
+            "footer-shrink frame emitted only {} spaces — menu tail not erased",
+            total_spaces
+        );
+    }
+
     struct CountingSink {
         bytes: std::sync::Arc<std::sync::atomic::AtomicU64>,
     }

@@ -45,16 +45,31 @@ pub struct CellStyle {
 /// One screen cell: glyph + its visual attributes. Cell equality is
 /// byte-perfect — two cells are equal iff their serialised bytes
 /// would be identical, which is the invariant the diff relies on.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cell {
     pub ch: char,
     pub style: CellStyle,
 }
 
+impl Default for Cell {
+    /// Default blank cell = ASCII space with default style. Rust's
+    /// own default for `char` is `'\0'` (NUL), which serialises as a
+    /// zero byte — terminals **ignore** NUL writes (or render as an
+    /// invisible glyph), so a frame built on top of `Cell::default()`
+    /// would fail to erase leftover content when the diff patches in
+    /// "blank" cells. Using `' '` makes erasure actually erase.
+    fn default() -> Self {
+        Self {
+            ch: ' ',
+            style: CellStyle::default(),
+        }
+    }
+}
+
 impl Cell {
     /// Blank cell with default style. Padding cells and "erased" cells
     /// both use this — so a diff that finds a `blank` where a `'─'` used
-    /// to be will legitimately emit a space overwrite.
+    /// to be emits an actual ASCII space that overwrites the glyph.
     pub fn blank() -> Self {
         Self::default()
     }
