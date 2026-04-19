@@ -541,4 +541,278 @@ mod tests {
         // Five UTF-8 ─ (3 bytes each) + nothing else (default style = no SGR).
         assert_eq!(s, "─────");
     }
+
+    // ── Unicode edge-case regression tests ─────────────────────────
+    //
+    // These pin down how `push_str_cells` / `diff_cells` / `serialize_patches`
+    // treat "tricky" Unicode input. For each scenario we either:
+    //   (a) assert the behaviour we DO support, or
+    //   (b) document a known limitation with `#[ignore]` + a doc
+    //       comment explaining what actually happens + why we accept
+    //       it for now.
+    //
+    // Run only this group: `cargo test -p atomcode-tuix --lib unicode_`
+    // ──────────────────────────────────────────────────────────────
+
+    /// Baseline: CJK ideographs expand correctly (1 real cell + 1
+    /// continuation per char). Covers "你是谁" → 6 cells total,
+    /// model col matching terminal col exactly.
+    #[test]
+    fn unicode_cjk_ideograph_expands_to_two_cells() {
+        let mut row = Vec::new();
+        push_str_cells(&mut row, "你是谁", &CellStyle::default());
+        assert_eq!(row.len(), 6, "3 CJK chars × (1 real + 1 cont) = 6 cells");
+
+        // Real cells carry the glyph + width 2.
+        assert_eq!(row[0].ch, '你');
+        assert_eq!(row[0].width, 2);
+        assert_eq!(row[2].ch, '是');
+        assert_eq!(row[2].width, 2);
+        assert_eq!(row[4].ch, '谁');
+        assert_eq!(row[4].width, 2);
+
+        // Continuation cells: width 0, glyph = space (harmless if
+        // something ever did try to serialise them).
+        for i in [1, 3, 5] {
+            assert_eq!(row[i].width, 0, "cell {} should be continuation", i);
+        }
+    }
+
+    /// Emoji like 😀 are Unicode "wide" (East Asian Width Wide/Full).
+    /// Single code-point emoji should behave like CJK — 1 real + 1
+    /// continuation.
+    #[test]
+    fn unicode_single_codepoint_emoji_expands_to_two_cells() {
+        let mut row = Vec::new();
+        push_str_cells(&mut row, "😀", &CellStyle::default());
+        assert_eq!(row.len(), 2);
+        assert_eq!(row[0].ch, '😀');
+        assert_eq!(row[0].width, 2);
+        assert_eq!(row[1].width, 0);
+    }
+
+    /// **Known limitation**: ZWJ-sequence emoji (family, profession,
+    /// flag-of-england-style tag sequences, skin-tone modifiers) are
+    /// composed of multiple Unicode code points joined by U+200D (ZWJ)
+    /// or other joiners. Each code point gets its own `unicode_width`
+    /// lookup and our model treats them independently.
+    ///
+    /// Example: "👨‍👩‍👧" (man + ZWJ + woman + ZWJ + girl)
+    ///   - Terminal displays: 1 glyph occupying 2 columns
+    ///   - `unicode_width` per codepoint: 2 + 0 + 2 + 0 + 2 = 6
+    ///   - Our model: 3 real cells (w=2 each) + 2 skipped (w=0 ZWJ) = 3 real wide glyph cells
+    ///   - Total real cells: 3 with width 2 = 6 terminal cols claimed
+    ///
+    /// If the terminal actually renders the ZWJ sequence as a single
+    /// 2-col glyph, our cursor advances 6 while terminal advances 2,
+    /// drift = 4. Next character lands 4 cols too far right.
+    ///
+    /// This test pins down the **current** behaviour so we notice if
+    /// we ever silently change it; it doesn't prescribe what's "right"
+    /// because the fix requires a grapheme segmenter (unicode-segmentation
+    /// crate) that we're not bringing in yet.
+    #[test]
+    fn unicode_zwj_sequence_is_not_grapheme_aware_known_limitation() {
+        let mut row = Vec::new();
+        // family emoji: man + ZWJ + woman + ZWJ + girl
+        push_str_cells(&mut row, "👨\u{200D}👩\u{200D}👧", &CellStyle::default());
+        // 3 wide base chars → 3 real + 3 continuation = 6
+        // 2 ZWJ (w=0) → skipped
+        // Real cells + continuations only.
+        let real_cells = row.iter().filter(|c| c.width > 0).count();
+        let cont_cells = row.iter().filter(|c| c.width == 0).count();
+        eprintln!(
+            "[UNICODE DIAG] ZWJ family: real={} cont={} total={} (terminal would show 1 glyph = 2 cols)",
+            real_cells, cont_cells, row.len()
+        );
+        // Exact counts: 3 real + 3 continuation (ZWJ are width-0, skipped
+        // by push_str_cells' early `continue`).
+        assert_eq!(real_cells, 3);
+        assert_eq!(cont_cells, 3);
+        assert_eq!(row.len(), 6);
+        // → Known drift: model says 6 cols occupied, terminal shows 2.
+    }
+
+    /// **Known limitation**: skin-tone modifiers (👍🏽) — base emoji
+    /// U+1F44D followed by Fitzpatrick modifier U+1F3FD. Terminal
+    /// typically renders as one 2-col glyph.
+    ///
+    /// Our model:
+    ///   - base: width 2 → 1 real + 1 cont
+    ///   - modifier: `unicode_width` returns 2 (wide) → 1 real + 1 cont
+    ///   - total: 4 cells, model claims 4 cols; terminal uses 2.
+    ///
+    /// Drift 2 per skin-toned emoji. Same grapheme-segmenter fix.
+    #[test]
+    fn unicode_skin_tone_modifier_not_segmented_known_limitation() {
+        let mut row = Vec::new();
+        push_str_cells(&mut row, "👍🏽", &CellStyle::default());
+        let real_cells = row.iter().filter(|c| c.width > 0).count();
+        eprintln!(
+            "[UNICODE DIAG] skin-tone emoji: real={} cells total={}",
+            real_cells, row.len()
+        );
+        // 2 real cells, each advancing cursor by 2 = 4 cols model.
+        // Terminal advances 2. Drift = 2.
+        assert_eq!(real_cells, 2);
+    }
+
+    /// Ambiguous-width chars (East Asian Ambiguous class): `§`, `±`,
+    /// `¶`, Greek letters, box-drawing. `unicode-width` crate defaults
+    /// these to **1** (narrow); CJK-locale terminals may render them
+    /// at **2**. Our model → 1-col advance.
+    ///
+    /// If your Mac Terminal is set to a CJK language, these chars
+    /// will drift left by 1 col per occurrence. Changing `unicode-width`
+    /// to ambiguous-as-wide mode is a per-locale decision we don't
+    /// attempt; we pin the default behaviour here.
+    #[test]
+    fn unicode_ambiguous_width_defaults_narrow() {
+        let mut row = Vec::new();
+        push_str_cells(&mut row, "§±¶", &CellStyle::default());
+        // Each char → 1 cell with width 1 (no continuation).
+        assert_eq!(row.len(), 3);
+        for (i, ch) in "§±¶".chars().enumerate() {
+            assert_eq!(row[i].ch, ch);
+            assert_eq!(row[i].width, 1);
+        }
+    }
+
+    /// Combining marks (NFD form): "e + combining acute" = "e\u{301}"
+    /// displays as "é" (1 col total), but is **2 code points**. Our
+    /// current impl: the combining char has `unicode_width = 0` and
+    /// gets dropped by `push_str_cells`' early-continue — the base 'e'
+    /// survives unadorned.
+    ///
+    /// Effect: an NFD-form string in input loses its accent on screen.
+    /// NFC-form ("é" U+00E9, single codepoint) renders fine.
+    ///
+    /// For CJK-dominant usage this is acceptable. Fixing requires
+    /// either (a) NFC-normalising input before push, or (b) attaching
+    /// combining marks to the preceding cell's char. Neither is in
+    /// scope for Ink Phase 1.
+    #[test]
+    fn unicode_nfd_combining_mark_is_dropped_known_limitation() {
+        let mut row = Vec::new();
+        push_str_cells(&mut row, "e\u{301}", &CellStyle::default());
+        // 'e' kept, combining acute dropped.
+        assert_eq!(row.len(), 1, "combining mark dropped by width=0 guard");
+        assert_eq!(row[0].ch, 'e');
+        assert_eq!(row[0].width, 1);
+    }
+
+    /// NFC precomposed accented chars render correctly as narrow cells.
+    /// Contrast with `unicode_nfd_combining_mark_is_dropped` above.
+    #[test]
+    fn unicode_nfc_precomposed_accent_narrow_cell() {
+        let mut row = Vec::new();
+        push_str_cells(&mut row, "café", &CellStyle::default());
+        assert_eq!(row.len(), 4);
+        for (i, ch) in "café".chars().enumerate() {
+            assert_eq!(row[i].ch, ch);
+            assert_eq!(row[i].width, 1);
+        }
+    }
+
+    /// Zero-width space (U+200B) and BOM (U+FEFF) are width-0 and
+    /// legitimately get dropped — they carry no glyph. This verifies
+    /// the width=0 guard does the right thing rather than accidentally
+    /// inserting a phantom cell that would misalign diff col numbers.
+    #[test]
+    fn unicode_zero_width_invisibles_dropped() {
+        let mut row = Vec::new();
+        push_str_cells(&mut row, "a\u{200B}b\u{FEFF}c", &CellStyle::default());
+        // a, b, c — invisibles silently dropped.
+        assert_eq!(row.len(), 3);
+        assert_eq!(row[0].ch, 'a');
+        assert_eq!(row[1].ch, 'b');
+        assert_eq!(row[2].ch, 'c');
+    }
+
+    /// Mixed-width input: the `cell_index == terminal_column`
+    /// invariant holds across narrow + wide alternation.
+    #[test]
+    fn unicode_mixed_width_cell_indices_match_terminal_cols() {
+        let mut row = Vec::new();
+        push_str_cells(&mut row, "a你b", &CellStyle::default());
+        // Expect: 'a'(w=1) + '你'(w=2) + cont(w=0) + 'b'(w=1) = 4 cells
+        assert_eq!(row.len(), 4);
+        // Verify terminal-col calculation: cell i represents col i+1.
+        // If cursor_advance = cell.width summed, total = 1+2+0+1 = 4,
+        // matching terminal "a你b" = 1+2+1 = 4 cols.
+        let total_advance: u16 = row.iter().map(|c| c.width as u16).sum();
+        assert_eq!(total_advance, 4);
+    }
+
+    /// Diff + serialize round-trip with wide chars — a narrow→wide
+    /// transition at the same cell position must emit the wide glyph
+    /// AND leave the continuation position "covered" so subsequent
+    /// writes don't overwrite the glyph's right half.
+    #[test]
+    fn unicode_diff_narrow_to_wide_at_same_position() {
+        let prev_row: Vec<Cell> = vec![
+            Cell { ch: 'a', style: CellStyle::default(), width: 1 },
+            Cell { ch: 'b', style: CellStyle::default(), width: 1 },
+        ];
+        let next_row: Vec<Cell> = vec![
+            Cell { ch: '你', style: CellStyle::default(), width: 2 },
+            Cell::continuation(),
+        ];
+        let mut prev = HashMap::new();
+        prev.insert(10u16, prev_row);
+        let mut next = HashMap::new();
+        next.insert(10u16, next_row);
+
+        let patches = diff_cells(&prev, &next);
+        assert_eq!(patches.len(), 2, "both cols changed");
+
+        let bytes = serialize_patches(&patches);
+        let s = String::from_utf8(bytes).unwrap();
+        // Emit: cursor to (10, 1), write '你'. Continuation patch at
+        // col 2 skipped (width 0). No cursor move between them because
+        // width=2 advance from col 1 → col 3; continuation patch would
+        // hit col 2 but is skipped entirely.
+        assert!(s.contains('你'));
+        // Exactly one cursor-position CSI (the initial move).
+        assert_eq!(
+            s.matches("\x1b[10;").count(),
+            1,
+            "continuation must not trigger a cursor move: {:?}",
+            s
+        );
+    }
+
+    /// Reverse: wide→narrow at same cell index. The wide char's
+    /// right-half column needs an explicit blank patch to erase the
+    /// stale glyph half left over after overwriting the left half.
+    #[test]
+    fn unicode_diff_wide_to_narrow_erases_right_half() {
+        let prev_row: Vec<Cell> = vec![
+            Cell { ch: '你', style: CellStyle::default(), width: 2 },
+            Cell::continuation(),
+        ];
+        let next_row: Vec<Cell> = vec![
+            Cell { ch: 'a', style: CellStyle::default(), width: 1 },
+            Cell { ch: 'b', style: CellStyle::default(), width: 1 },
+        ];
+        let mut prev = HashMap::new();
+        prev.insert(5u16, prev_row);
+        let mut next = HashMap::new();
+        next.insert(5u16, next_row);
+
+        let patches = diff_cells(&prev, &next);
+        assert_eq!(patches.len(), 2);
+        // Patch 1: col 1 = 'a' (width 1). Patch 2: col 2 = 'b'.
+        assert_eq!(patches[0].col, 1);
+        assert_eq!(patches[0].cell.ch, 'a');
+        assert_eq!(patches[1].col, 2);
+        assert_eq!(patches[1].cell.ch, 'b');
+
+        let bytes = serialize_patches(&patches);
+        let s = String::from_utf8(bytes).unwrap();
+        // Terminal behaviour: writing 'a' at col 1 erases '你' entirely
+        // (both halves). Then writing 'b' at col 2 lands cleanly.
+        assert!(s.contains('a'));
+        assert!(s.contains('b'));
+    }
 }
