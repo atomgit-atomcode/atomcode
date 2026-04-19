@@ -1515,11 +1515,24 @@ impl<W: Write + Send> Renderer for AnsiRenderer<W> {
     }
 
     fn clear_screen(&mut self) {
-        // Physical-only: wipe the terminal without invalidating the
-        // cached footer/stream state. The very next render call will
-        // re-erase (no-op on a blank screen) + re-draw the footer, so
-        // the cache stays coherent with what we emit.
+        // Wipe the terminal AND invalidate the cell-diff cache. The
+        // old comment here promised "cache stays coherent with what we
+        // emit" by keeping the cache intact — that was wrong under
+        // Ink-style cell-diff: after `\x1b[2J` the screen has zero
+        // footer cells, but the cache still says "those cells are
+        // there", so the next `draw_footer_here` diffs "cache == new"
+        // and emits nothing. The footer visibly disappears. User
+        // perceives this as "输入框没有" / "幽灵线" once they start
+        // typing, because only the single changed cell emits and the
+        // rest of the footer (rules, status) stays gone.
         let _ = self.out.write_all(b"\x1b[2J\x1b[H");
+        // Cache must match the screen state we just forced to empty.
+        self.last_footer_rows.clear();
+        self.footer_rows = 0;
+        // Scroll region is terminal-side state; `\x1b[2J` doesn't
+        // touch DECSTBM so we don't need to clear `scroll_region`
+        // here. Next footer paint's `sync_scroll_region` will see
+        // `footer_rows == 0 → footer_rows == N` and re-issue.
         let _ = self.out.flush();
     }
 
