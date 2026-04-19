@@ -217,9 +217,18 @@ impl<W: Write + Send> AnsiRenderer<W> {
         if self.footer_rows == 0 {
             return;
         }
+        let t0 = std::time::Instant::now();
         let up = self.last_footer.cursor_row_from_top.max(1);
+        let was_rows = self.footer_rows;
         let _ = write!(self.out, "\x1b[{}A\r\x1b[J", up);
         self.footer_rows = 0;
+        crate::tuix_trace!(
+            "FOOT",
+            "erase up={} rows={} dur={}µs",
+            up,
+            was_rows,
+            t0.elapsed().as_micros()
+        );
     }
 
     /// Draw the footer starting at the current cursor position. Layout:
@@ -236,6 +245,7 @@ impl<W: Write + Send> AnsiRenderer<W> {
     /// keeps its indent. Box auto-grows in height as the user types past
     /// the right border — no horizontal scroll.
     fn draw_footer_here(&mut self) {
+        let _t0 = std::time::Instant::now();
         let state = self.last_footer.clone();
         let w = self.term_width();
         // CC-style footer: the input area is framed by a horizontal rule
@@ -430,6 +440,28 @@ impl<W: Write + Send> AnsiRenderer<W> {
         let _ = write!(self.out, "\r\x1b[{}G", col);
 
         let _ = self.out.write_all(b"\x1b[?7h");
+
+        // Rough byte estimate: rule (width × 3 bytes UTF-8) × 2 rules +
+        // middle rows (text budget × avg 1.5 bytes + SGR overhead) +
+        // menu rows (~80 bytes × M) + status (~80 bytes) + cursor
+        // positioning (~15 bytes). Tells us which renders are cheap
+        // (50 bytes) vs expensive (2KB).
+        let est_bytes =
+            rule_width * 3 * 2 // top + bottom rule
+                + middle_rows * (text_budget + 10)
+                + menu_rows * 80
+                + status_rows * 80
+                + 30; // overhead + cursor positioning
+        crate::tuix_trace!(
+            "FOOT",
+            "draw rule_w={} mid={} menu={} status={} est_bytes={} dur={}µs",
+            rule_width,
+            middle_rows,
+            menu_rows,
+            status_rows,
+            est_bytes,
+            _t0.elapsed().as_micros()
+        );
     }
 
     /// Redraw footer if it was previously drawn — used after permanent

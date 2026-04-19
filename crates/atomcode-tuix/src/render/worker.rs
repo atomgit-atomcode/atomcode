@@ -158,24 +158,42 @@ impl Drop for TaskRenderer {
 }
 
 fn run_worker(mut inner: Box<dyn Renderer>, cmd_rx: mpsc::Receiver<RenderCmd>) {
+    use std::time::Instant;
     while let Ok(cmd) = cmd_rx.recv() {
+        // Measure the wall-clock time each terminal I/O takes so the log
+        // shows where Mac Terminal.app / iTerm2 / etc. actually spend time.
+        // Big `flush` durations = kernel pipe backpressure from a slow
+        // terminal emulator; big `render` durations = our own bytes taking
+        // forever to serialize or intermediate `write_all` blocking.
         match cmd {
             RenderCmd::Line(line) => {
-                crate::tuix_trace!("REN", "Line {}", ui_line_tag(&line));
+                let tag = ui_line_tag(&line);
+                let t0 = Instant::now();
                 inner.render(line);
+                crate::tuix_trace!("REN", "Line {} render={}µs", tag, t0.elapsed().as_micros());
             }
             RenderCmd::Flush => {
-                crate::tuix_trace!("REN", "Flush");
+                let t0 = Instant::now();
                 inner.flush();
+                crate::tuix_trace!("REN", "Flush flush={}µs", t0.elapsed().as_micros());
             }
             RenderCmd::FlushDeferred => {
-                // Skip logging this to avoid flooding — the 20ms tick
-                // fires 50 times/sec even when nothing is pending, and
-                // throttle.rs already logs when it decides to paint.
+                // Skip logging when it's a true no-op (no pending payload
+                // and window not elapsed). throttle.rs already logs when
+                // this path actually paints.
+                let t0 = Instant::now();
                 inner.flush_deferred();
+                let d = t0.elapsed();
+                if d.as_micros() > 100 {
+                    crate::tuix_trace!(
+                        "REN",
+                        "FlushDeferred deferred={}µs",
+                        d.as_micros()
+                    );
+                }
             }
             RenderCmd::Ack { op, ack } => {
-                crate::tuix_trace!("REN", "Ack {:?}", op);
+                let t0 = Instant::now();
                 match op {
                     AckOp::Reset => inner.reset(),
                     AckOp::ClearScreen => inner.clear_screen(),
@@ -183,6 +201,11 @@ fn run_worker(mut inner: Box<dyn Renderer>, cmd_rx: mpsc::Receiver<RenderCmd>) {
                     AckOp::ResumeFromExternal => inner.resume_from_external(),
                     AckOp::Shutdown => {
                         inner.shutdown();
+                        crate::tuix_trace!(
+                            "REN",
+                            "Ack Shutdown dur={}µs",
+                            t0.elapsed().as_micros()
+                        );
                         let _ = ack.send(());
                         // Exit the loop — drop `inner` + `cmd_rx`.
                         // Any queued commands after this point are
@@ -191,6 +214,7 @@ fn run_worker(mut inner: Box<dyn Renderer>, cmd_rx: mpsc::Receiver<RenderCmd>) {
                         return;
                     }
                 }
+                crate::tuix_trace!("REN", "Ack {:?} dur={}µs", op, t0.elapsed().as_micros());
                 let _ = ack.send(());
             }
         }
