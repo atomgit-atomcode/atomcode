@@ -9,13 +9,12 @@ use crate::app::InputState;
 use crate::ui::theme;
 
 const H_PADDING: u16 = 3;
-const PROMPT_GUTTER: u16 = 3;
 
 use crate::file_attach::AttachedFile;
 
 pub fn render(frame: &mut Frame, area: Rect, input: &InputState, is_busy: bool, attached: &[AttachedFile], pasted: &[String]) {
     let is_empty = input.is_empty() && pasted.is_empty();
-    let inner_width = area.width.saturating_sub(2 + H_PADDING * 2 + PROMPT_GUTTER) as usize;
+    let inner_width = area.width.saturating_sub(2 + H_PADDING * 2) as usize;
     let inner_width = inner_width.max(1);
 
     // Build visual lines by manually wrapping each logical line.
@@ -123,10 +122,6 @@ pub fn render(frame: &mut Frame, area: Rect, input: &InputState, is_busy: bool, 
         let end = (start + max_visible).min(visual_lines.len());
         (visual_lines[start..end].to_vec(), start)
     };
-    let display_lines: Vec<Line<'static>> = display_lines
-        .into_iter()
-        .map(with_prompt_gutter)
-        .collect();
     // Focus state: idle (ready) = bright bold border to signal "you can type here";
     // busy (agent working) = dim muted border to signal "input is locked right now".
     let (border_color, border_bold) = if is_busy {
@@ -143,6 +138,7 @@ pub fn render(frame: &mut Frame, area: Rect, input: &InputState, is_busy: bool, 
         .borders(Borders::ALL)
         .border_set(border::ROUNDED)
         .border_style(border_style)
+        .title(prompt)
         .padding(Padding::horizontal(H_PADDING));
 
     // Attached file tags
@@ -162,27 +158,13 @@ pub fn render(frame: &mut Frame, area: Rect, input: &InputState, is_busy: bool, 
     // No Wrap — we already split lines manually
     let widget = Paragraph::new(display_lines).block(block).style(Style::default().fg(theme::text_primary()));
     frame.render_widget(widget, input_area);
-    let prompt_area = Rect::new(
-        input_area.x + 1 + H_PADDING,
-        input_area.y + 1,
-        PROMPT_GUTTER,
-        1,
-    );
-    frame.render_widget(Paragraph::new(Line::from(prompt)), prompt_area);
 
     // Cursor position — exact because we track visual rows ourselves
     let cursor_row_in_view = cursor_visual_row.saturating_sub(scroll_offset);
-    let cursor_x = input_area.x + 1 + H_PADDING + PROMPT_GUTTER + cursor_visual_col as u16;
+    let cursor_x = input_area.x + 1 + H_PADDING + cursor_visual_col as u16;
     let cursor_y = input_area.y + 1 + cursor_row_in_view as u16;
     let max_y = input_area.y + input_area.height.saturating_sub(2);
     frame.set_cursor_position((cursor_x, cursor_y.min(max_y)));
-}
-
-fn with_prompt_gutter(line: Line<'static>) -> Line<'static> {
-    let mut spans = Vec::with_capacity(line.spans.len() + 1);
-    spans.push(Span::raw(" ".repeat(PROMPT_GUTTER as usize)));
-    spans.extend(line.spans);
-    Line::from(spans)
 }
 
 /// Convert byte offset to char index
@@ -216,7 +198,7 @@ pub fn height(input: &InputState, terminal_height: u16, terminal_width: u16, has
     let max_content: u16 = 8;
     let max_height = (max_content + 2 + tag_height).min(terminal_height / 2).max(min_height);
 
-    let inner_width = terminal_width.saturating_sub(2 + H_PADDING * 2 + PROMPT_GUTTER) as usize;
+    let inner_width = terminal_width.saturating_sub(2 + H_PADDING * 2) as usize;
     let inner_width = inner_width.max(1);
 
     let visual_lines: u16 = input.lines.iter().map(|line| {
