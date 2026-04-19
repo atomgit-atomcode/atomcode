@@ -400,20 +400,21 @@ impl<W: Write + Send> RetainedRenderer<W> {
         1 + 1 + middle_rows + 1 + menu_rows + status_rows
     }
 
-    /// Paint the tail of `body_lines` into the screen rows above
-    /// the footer. Older lines that don't fit are trimmed by the
-    /// retention cap on push; here we draw whatever is left.
+    /// Paint the tail of `body_lines` above the footer, **bottom-
+    /// anchored**: the newest body line lands at `body_bottom - 1`
+    /// (immediately above the footer), older lines stack upward.
+    /// When body_lines is shorter than `body_bottom` (e.g. fresh
+    /// session with just the 6-line welcome), the top rows of the
+    /// screen stay blank — this is intentional so the interactive
+    /// region (body tail + footer) always clusters at the bottom
+    /// of the terminal viewport where the user's gaze already is.
     ///
-    /// Layout choice: body content starts at **row 0** (top of
-    /// screen), same as Ink / most conversational TUIs. Short
-    /// transcripts (e.g. fresh session with just the 6-row
-    /// welcome) sit at the top; long transcripts keep rolling the
-    /// oldest lines off the top so the newest row lands at
-    /// `body_bottom - 1`, immediately above the footer. This
-    /// eliminates the 40+ row gap we had when `first_screen_row`
-    /// was anchored to `body_bottom - n` — a 6-line welcome on a
-    /// 60-row terminal was painting to rows 48-53 with 48 blank
-    /// rows above it.
+    /// Top-anchoring (body from row 0) seemed tidier in theory but
+    /// fails on terminals whose visible viewport is smaller than
+    /// `screen.height()` (scroll buffers / smaller window than the
+    /// reported size): top-anchored welcome ends up scrolled above
+    /// viewport and the user only sees an empty screen with a
+    /// footer. Bottom-anchoring keeps everything visible.
     fn paint_body(&mut self) {
         let h = self.screen.height() as usize;
         let footer_rows = self.current_footer_rows();
@@ -423,10 +424,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
         }
         let n = self.body_lines.len().min(body_bottom);
         let start = self.body_lines.len() - n;
-        // Anchor at the top of the screen.
+        let first_screen_row = body_bottom - n;
         let rows: Vec<Vec<Cell>> = self.body_lines[start..].to_vec();
         for (i, row) in rows.iter().enumerate() {
-            self.screen.draw_row(i, 0, row);
+            self.screen.draw_row(first_screen_row + i, 0, row);
         }
     }
 
