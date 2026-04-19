@@ -109,8 +109,20 @@ pub async fn run(
     // Slow terminals (Mac Terminal.app processing a 4KB footer payload)
     // no longer block the event loop — the event loop sends `UiLine`s
     // through a channel and moves on.
+    // Feature-flag dual track: ATOMCODE_TUIX_RETAINED=1 uses the
+    // retained-mode RetainedRenderer (Ink-style screen buffer).
+    // Default stays on the legacy AnsiRenderer until Phase 6 when
+    // we've validated the new path end-to-end.
+    let use_retained = std::env::var("ATOMCODE_TUIX_RETAINED")
+        .ok()
+        .as_deref()
+        == Some("1");
     let inner: Box<dyn Renderer> = if caps.tty {
-        Box::new(AnsiRenderer::new(caps))
+        if use_retained {
+            Box::new(render::retained::RetainedRenderer::new(caps))
+        } else {
+            Box::new(AnsiRenderer::new(caps))
+        }
     } else {
         Box::new(PlainRenderer::new())
     };
