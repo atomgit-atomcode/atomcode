@@ -121,17 +121,20 @@ AtomCode 是一款住在你终端里的 AI 编码助手。用自然语言给它�
 ```bash
 git clone https://atomgit.com/atomgit_atomcode/atomcode.git
 cd atomcode
+cargo install --path crates/atomcode-cli --locked
+```
+
+编译产物位于 `target/release/atomcode`。在 macOS / Linux 其被安装到 `~/.cargo/bin/atomcode`，
+在 Windows 系统上其被安装到 `$env:USERPROFILE/.cargo/bin/atomcode.exe`。请确保 `~/.cargo/bin`
+（或 `%USERPROFILE%\.cargo\bin`）已经被添加到 `PATH` 环境变量中。
+
+如果只想要编译，不要安装，运行：
+
+```bash
 cargo build --release
 ```
 
-产物位于 `target/release/atomcode`，将其加入 PATH：
-
-```bash
-# macOS / Linux
-cp target/release/atomcode ~/.local/bin/
-# 或
-sudo cp target/release/atomcode /usr/local/bin/
-```
+编译产物会在 `target/release/atomcode` 生成。
 
 ### 依赖
 
