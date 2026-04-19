@@ -4,6 +4,7 @@ use std::io::{BufWriter, Stdout, Write};
 use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
 use crossterm::execute;
 
+use super::cell::{push_str_cells, Cell, CellStyle};
 use super::theme::{role, Role};
 use super::{Renderer, UiLine};
 use crate::sanitize::scrub_controls;
@@ -110,7 +111,7 @@ pub struct AnsiRenderer<W: Write + Send> {
     /// emits `\x1b[2K` + new content for rows that actually changed,
     /// letting unchanged rules / status / menu rows sit on screen with
     /// zero bytes sent. Empty vec = no prior footer (cold start).
-    last_footer_rows: Vec<Vec<u8>>,
+    last_footer_rows: Vec<Vec<Cell>>,
     /// Tracks if we're mid-assistant-text block (next text delta should NOT
     /// re-emit the "  │ " prefix for the first line).
     assistant_continuing: bool,
@@ -445,13 +446,13 @@ impl<W: Write + Send> AnsiRenderer<W> {
         }
         let middle_rows = lines.len();
 
-        // ── Build every row into its own pre-encoded byte buffer ──
-        // These are compared against `last_footer_rows` so unchanged
-        // rows don't produce any terminal output. Rows are built
-        // deterministically from state so byte-equality == visual-
-        // equality (no stale SGR state leaking between rows because
-        // every builder ends with an explicit reset).
-        let mut new_rows: Vec<Vec<u8>> = Vec::with_capacity(8);
+        // ── Build every row as a Vec<Cell> (one cell = char + style) ──
+        // Cells are compared element-by-element inside `emit_footer_*`.
+        // DECSTBM path does cell-level diff and emits only changed
+        // positions; legacy path serialises each row to bytes and does
+        // row-level diff (same behaviour as before the Ink-ification,
+        // just with cells as the source of truth).
+        let mut new_rows: Vec<Vec<Cell>> = Vec::with_capacity(8);
 
         // Row 0: spinner (if present) or blank margin.
         new_rows.push(self.build_spinner_row(&state));
@@ -535,85 +536,148 @@ impl<W: Write + Send> AnsiRenderer<W> {
         );
     }
 
-    // ── Per-row builders ──
+    // ── Cell-based row builders ──
     //
-    // Each returns the exact byte sequence that, when emitted at column 0
-    // of the target row (after an erase-line), paints the row identically
-    // to the old imperative code. Rows are self-contained: every colour
-    // change is paired with a reset so SGR state doesn't bleed across
-    // row boundaries when the diff skips intermediate rows.
+    // Each returns a `Vec<Cell>` — one cell per visible column, carrying
+    // the glyph + its SGR style. The old `Vec<u8>` byte-builder paths are
+    // gone; serialisation is a separate concern handled by `row_to_bytes`
+    // (legacy / non-DECSTBM) or `serialize_patches` after a cell-diff
+    // (the DECSTBM fast path). Building once at cell granularity lets
+    // Ink-style diff skip cells whose (char, style) pair is unchanged.
+    //
+    // Left padding (PAD_COL cells of blank default-style space) is part
+    // of each row by design: the diff comparison runs left-to-right from
+    // column 1, and a row starting with "  " matches another "  "
+    // prefix identically, avoiding spurious leading-column patches when
+    // an intermediate PAD_COL were added externally.
+    //
+    // Every row ends with SGR-neutral blank cells — serialise never leaks
+    // styled trailing space because the diff only patches cells that
+    // actually differ; but rows that fill to `rule_width` still have
+    // their full-width emitted at cold-start. Trailing blanks stay
+    // cheap (`Cell::blank()` compares eq → skipped on redraw).
 
-    fn build_spinner_row(&self, state: &FooterState) -> Vec<u8> {
-        let mut s = String::new();
-        if let (Some(frame), Some(label)) = (state.spinner_frame.as_ref(), state.spinner_label.as_ref()) {
-            for _ in 0..PAD_COL { s.push(' '); }
-            push_sgr_fg(&mut s, self.caps, Role::Brand);
-            s.push_str(frame);
-            s.push(' ');
-            push_sgr_fg_reset(&mut s, self.caps);
-            push_sgr_bold_on(&mut s, self.caps);
-            push_sgr_fg(&mut s, self.caps, Role::Secondary);
-            s.push_str(&scrub_controls(label));
-            push_sgr_fg_reset(&mut s, self.caps);
-            push_sgr_bold_off(&mut s, self.caps);
+    fn style_for(&self, r: Role) -> CellStyle {
+        CellStyle {
+            fg: role(self.caps, r),
+            bold: false,
+            reverse: false,
         }
-        s.into_bytes()
     }
 
-    fn build_rule_row(&self, rule_width: usize) -> Vec<u8> {
-        let mut s = String::new();
-        for _ in 0..PAD_COL { s.push(' '); }
-        push_sgr_fg(&mut s, self.caps, Role::Border);
-        for _ in 0..rule_width { s.push('─'); }
-        push_sgr_fg_reset(&mut s, self.caps);
-        s.into_bytes()
+    fn style_bold(&self, r: Role) -> CellStyle {
+        CellStyle {
+            fg: role(self.caps, r),
+            bold: true,
+            reverse: false,
+        }
     }
 
-    fn build_middle_row(&self, line: &str, is_first: bool) -> Vec<u8> {
-        let mut s = String::new();
-        for _ in 0..PAD_COL { s.push(' '); }
+    fn build_spinner_row(&self, state: &FooterState) -> Vec<Cell> {
+        let mut row = Vec::new();
+        let pad = CellStyle::default();
+        push_str_cells(&mut row, &" ".repeat(PAD_COL), &pad);
+        if let (Some(frame), Some(label)) =
+            (state.spinner_frame.as_ref(), state.spinner_label.as_ref())
+        {
+            let brand = self.style_for(Role::Brand);
+            push_str_cells(&mut row, frame, &brand);
+            push_str_cells(&mut row, " ", &pad);
+            // Label: bold + secondary (which is `None` = default fg on
+            // our theme, so just bold).
+            let label_style = self.style_bold(Role::Secondary);
+            push_str_cells(&mut row, &scrub_controls(label), &label_style);
+        }
+        row
+    }
+
+    fn build_rule_row(&self, rule_width: usize) -> Vec<Cell> {
+        let mut row = Vec::with_capacity(PAD_COL + rule_width);
+        let pad = CellStyle::default();
+        push_str_cells(&mut row, &" ".repeat(PAD_COL), &pad);
+        let border = self.style_for(Role::Border);
+        for _ in 0..rule_width {
+            row.push(Cell {
+                ch: '─',
+                style: border.clone(),
+            });
+        }
+        row
+    }
+
+    fn build_middle_row(&self, line: &str, is_first: bool) -> Vec<Cell> {
+        let mut row = Vec::new();
+        let pad = CellStyle::default();
+        push_str_cells(&mut row, &" ".repeat(PAD_COL), &pad);
         if is_first {
-            push_sgr_fg(&mut s, self.caps, Role::Accent);
-            s.push_str("❯ ");
-            push_sgr_fg_reset(&mut s, self.caps);
+            let accent = self.style_for(Role::Accent);
+            push_str_cells(&mut row, "❯ ", &accent);
         } else {
-            s.push_str("  ");
+            push_str_cells(&mut row, "  ", &pad);
         }
-        s.push_str(line);
-        s.into_bytes()
+        // Body of the middle row is rendered already-wrapped upstream and
+        // carries no SGR of its own — it inherits terminal-default fg,
+        // which matches the old path.
+        push_str_cells(&mut row, line, &pad);
+        row
     }
 
-    fn build_menu_row(&self, name: &str, desc: &str, selected: bool, rule_width: usize) -> Vec<u8> {
-        use std::fmt::Write as _;
-        let mut s = String::new();
-        for _ in 0..PAD_COL { s.push(' '); }
+    fn build_menu_row(
+        &self,
+        name: &str,
+        desc: &str,
+        selected: bool,
+        rule_width: usize,
+    ) -> Vec<Cell> {
+        let mut row = Vec::new();
+        let pad = CellStyle::default();
+        push_str_cells(&mut row, &" ".repeat(PAD_COL), &pad);
+
+        let content = if selected {
+            format!("  ▸ /{:<12}  {}", name, desc)
+        } else {
+            format!("    /{:<12}  {}", name, desc)
+        };
+
+        let style = if selected {
+            // Reverse-video + bold: works on every terminal theme since
+            // it flips the existing fg/bg without depending on a specific
+            // colour match.
+            CellStyle {
+                fg: None,
+                bold: true,
+                reverse: true,
+            }
+        } else {
+            self.style_for(Role::Muted)
+        };
+        push_str_cells(&mut row, &content, &style);
+
         if selected {
-            // Reverse video so contrast works on any terminal theme.
-            if self.caps.colors {
-                s.push_str("\x1b[7m");
-                s.push_str("\x1b[1m");
-            }
-            let _ = write!(s, "  ▸ /{:<12}  {}", name, desc);
-            // Pad to rule_width so highlight strip visually reaches the
-            // rule's right edge above/below.
-            let content_w = 5 + name.chars().count() + 2 + desc.chars().count();
+            // Pad the highlight strip to `rule_width` so reverse-video
+            // visually reaches the rule's right edge, matching the old
+            // appearance. Padding cells carry the reverse-video style so
+            // diff-skips can't fragment the highlight.
+            let content_w = crate::width::display_width(&content);
             let right_pad = rule_width.saturating_sub(content_w);
-            for _ in 0..right_pad { s.push(' '); }
-            if self.caps.colors {
-                s.push_str("\x1b[0m");
+            for _ in 0..right_pad {
+                row.push(Cell {
+                    ch: ' ',
+                    style: style.clone(),
+                });
             }
-        } else {
-            push_sgr_fg(&mut s, self.caps, Role::Muted);
-            let _ = write!(s, "    /{:<12}  {}", name, desc);
-            push_sgr_fg_reset(&mut s, self.caps);
         }
-        s.into_bytes()
+        row
     }
 
-    fn build_status_row(&self, status: &super::StatusLine, rule_width: usize) -> Vec<u8> {
-        let mut s = String::new();
-        for _ in 0..PAD_COL { s.push(' '); }
-        push_sgr_fg(&mut s, self.caps, Role::Muted);
+    fn build_status_row(&self, status: &super::StatusLine, rule_width: usize) -> Vec<Cell> {
+        let mut row = Vec::new();
+        let pad = CellStyle::default();
+        push_str_cells(&mut row, &" ".repeat(PAD_COL), &pad);
+
+        let muted = self.style_for(Role::Muted);
+        let error = self.style_for(Role::Error);
+
         let mut parts: Vec<String> = Vec::with_capacity(3);
         if !status.model.is_empty() {
             parts.push(scrub_controls(&status.model));
@@ -630,28 +694,23 @@ impl<W: Write + Send> AnsiRenderer<W> {
         if let Some(raw_hint) = status.hint.as_deref() {
             let hint = scrub_controls(raw_hint);
             let hint_w = crate::width::display_width(&hint);
-            // If hint alone exceeds the row, drop it — don't truncate
-            // model/cwd chrome which is the primary info.
             if hint_w + 1 < max {
                 let left_budget = max - hint_w - 1;
                 let left_truncated = crate::width::truncate_to_width(&left, left_budget);
                 let left_w = crate::width::display_width(&left_truncated);
-                let pad = max - left_w - hint_w;
-                s.push_str(&left_truncated);
-                for _ in 0..pad { s.push(' '); }
-                push_sgr_fg_reset(&mut s, self.caps);
-                push_sgr_fg(&mut s, self.caps, Role::Error);
-                s.push_str(&hint);
+                let pad_w = max - left_w - hint_w;
+                push_str_cells(&mut row, &left_truncated, &muted);
+                push_str_cells(&mut row, &" ".repeat(pad_w), &pad);
+                push_str_cells(&mut row, &hint, &error);
             } else {
                 let truncated = crate::width::truncate_to_width(&left, max);
-                s.push_str(&truncated);
+                push_str_cells(&mut row, &truncated, &muted);
             }
         } else {
             let truncated = crate::width::truncate_to_width(&left, max);
-            s.push_str(&truncated);
+            push_str_cells(&mut row, &truncated, &muted);
         }
-        push_sgr_fg_reset(&mut s, self.caps);
-        s.into_bytes()
+        row
     }
 
     /// DECSTBM fixed-footer paint: each row drawn at its absolute
@@ -668,7 +727,7 @@ impl<W: Write + Send> AnsiRenderer<W> {
     /// body text.
     fn emit_footer_absolute(
         &mut self,
-        new_rows: &[Vec<u8>],
+        new_rows: &[Vec<Cell>],
         prev_total_rows: usize,
         new_total_rows: usize,
         target_cursor_row_in_footer: usize,
@@ -678,9 +737,8 @@ impl<W: Write + Send> AnsiRenderer<W> {
         let new_top = h.saturating_sub(new_total_rows as u16).saturating_add(1);
         let mut bytes = 0usize;
 
-        // If footer just shrank, the old top rows that are now in
-        // scroll territory still hold stale footer glyphs. Wipe them
-        // one by one so body content doesn't render atop ghost rules.
+        // Footer shrank: old rows now in scroll territory need explicit
+        // wipe (cell-diff can't erase rows outside its frame window).
         if prev_total_rows > new_total_rows {
             let prev_top = h
                 .saturating_sub(prev_total_rows as u16)
@@ -692,40 +750,32 @@ impl<W: Write + Send> AnsiRenderer<W> {
             }
         }
 
-        // Disable autowrap for the paint — rule rows emit exactly
-        // `rule_width` cells and we don't want a UTF-8 terminal's
-        // autowrap to shift the next row down.
+        // Build prev + next frames keyed by absolute terminal row. This
+        // is the leap from row-level diff: footer growing from 5 to 9
+        // rows means rows at new positions (new_top..new_top+growth)
+        // have no prev entry → all-new cells emitted; rows in the
+        // overlap keep their previous cache so cell-diff skips any
+        // position whose (char, style) hasn't moved.
+        use super::cell::{diff_cells, rows_to_frame, serialize_patches};
+        let prev_cells = std::mem::take(&mut self.last_footer_rows);
+        let prev_top = h
+            .saturating_sub(prev_total_rows as u16)
+            .saturating_add(1);
+        let prev_frame = rows_to_frame(&prev_cells, prev_top);
+        let next_frame = rows_to_frame(new_rows, new_top);
+
+        // Disable autowrap so a full-width rule (exactly `rule_width`
+        // cells emitted at the rightmost column) doesn't trigger a
+        // terminal auto-linefeed and desynchronise subsequent
+        // row targets.
         let _ = self.out.write_all(b"\x1b[?7l");
         bytes += 4;
 
-        let prev = std::mem::take(&mut self.last_footer_rows);
-        let mut changed = 0usize;
-        // When the footer grew (prev_total_rows < new_total_rows), the
-        // new top rows have no cache entry → emit unconditionally.
-        // When rows match in bytes, skip.
-        let growth = new_total_rows.saturating_sub(prev_total_rows);
-        for (i, new_row) in new_rows.iter().enumerate() {
-            // Old cache index: since footer grew at the top (newer rows
-            // get prepended when menu opens / input multi-lines), the
-            // prev[i] for i < growth doesn't correspond to the same
-            // visual row. Simpler invariant: treat all prev cache as
-            // stale when total_rows changed — cache only trusted when
-            // sizes match. Over-emit in that one frame, then stable.
-            let prev_row = if prev_total_rows == new_total_rows && growth == 0 {
-                prev.get(i)
-            } else {
-                None
-            };
-            if prev_row != Some(new_row) {
-                let abs_row = new_top + i as u16;
-                let s = format!("\x1b[{};1H\x1b[2K", abs_row);
-                let _ = self.out.write_all(s.as_bytes());
-                bytes += s.len();
-                let _ = self.out.write_all(new_row);
-                bytes += new_row.len();
-                changed += 1;
-            }
-        }
+        let patches = diff_cells(&prev_frame, &next_frame);
+        let changed = patches.len();
+        let patch_bytes = serialize_patches(&patches);
+        let _ = self.out.write_all(&patch_bytes);
+        bytes += patch_bytes.len();
 
         let _ = self.out.write_all(b"\x1b[?7h");
         bytes += 4;
@@ -752,11 +802,12 @@ impl<W: Write + Send> AnsiRenderer<W> {
     /// prev is empty and no walk-up is needed.
     fn emit_footer_diff(
         &mut self,
-        new_rows: &[Vec<u8>],
+        new_rows: &[Vec<Cell>],
         prev_cursor_row: usize,
         target_cursor_row: usize,
         target_cursor_col: usize,
     ) -> (usize, usize) {
+        use super::cell::row_to_bytes;
         let prev = std::mem::take(&mut self.last_footer_rows);
         let total_rows = new_rows.len();
         let max_rows = total_rows.max(prev.len());
@@ -769,11 +820,6 @@ impl<W: Write + Send> AnsiRenderer<W> {
         let _ = self.out.write_all(b"\x1b[?7l");
         bytes += 4;
 
-        // Position cursor at (row 0, col 0) of the footer area.
-        // When `prev` is non-empty, cursor was left at `prev_cursor_row`
-        // within the previous footer — walk it up to row 0.
-        // When `prev` is empty (cold start post-erase_footer), cursor
-        // is already at row 0; just CR to guarantee col 0.
         if !prev.is_empty() && prev_cursor_row > 0 {
             let s = format!("\x1b[{}A", prev_cursor_row);
             bytes += s.len();
@@ -788,31 +834,26 @@ impl<W: Write + Send> AnsiRenderer<W> {
             let prev_row = prev.get(i);
             let emit = match (new_row, prev_row) {
                 (Some(n), Some(p)) => n != p,
-                (Some(_), None) => true,   // new row beyond prev footer
-                (None, Some(_)) => true,   // prev had row, new doesn't — erase
+                (Some(_), None) => true,
+                (None, Some(_)) => true,
                 (None, None) => false,
             };
             if emit {
-                // Erase the whole line first (clears whatever was
-                // there in the prev paint), then lay down new bytes.
-                // For `None` new_row (row disappearing), just erase.
                 let _ = self.out.write_all(b"\x1b[2K");
                 bytes += 4;
                 if let Some(n) = new_row {
-                    let _ = self.out.write_all(n);
-                    bytes += n.len();
+                    let row_bytes = row_to_bytes(n);
+                    let _ = self.out.write_all(&row_bytes);
+                    bytes += row_bytes.len();
                 }
                 changed += 1;
             }
-            // Advance to next row if any rows remain.
             if i + 1 < max_rows {
                 let _ = self.out.write_all(b"\r\n");
                 bytes += 2;
             }
         }
 
-        // Cursor now at row (max_rows - 1), arbitrary col. Move back up
-        // to target row, then set col.
         let last_row = max_rows.saturating_sub(1);
         if last_row > target_cursor_row {
             let s = format!("\x1b[{}A", last_row - target_cursor_row);
@@ -822,7 +863,6 @@ impl<W: Write + Send> AnsiRenderer<W> {
         let _ = self.out.write_all(b"\r");
         bytes += 1;
         if target_cursor_col > 0 {
-            // \x1b[NG is 1-indexed column positioning.
             let s = format!("\x1b[{}G", target_cursor_col + 1);
             bytes += s.len();
             let _ = self.out.write_all(s.as_bytes());
@@ -1696,6 +1736,123 @@ mod tests {
 
     fn sample(counter: &std::sync::Arc<std::sync::atomic::AtomicU64>) -> u64 {
         counter.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Measure footer height oscillation cost: 5-row footer → 9-row
+    /// footer (menu opens) → 5-row footer (menu closes). Each toggle
+    /// was ~1900 B before Ink-ification (row-level diff had to re-emit
+    /// the whole footer because old cache was indexed by footer-relative
+    /// row number and all those indices shifted). After cell-diff against
+    /// absolute-screen-row frames, the status row (absolute row H stays
+    /// put and bytes stay put) should diff-skip; the rule cells (many
+    /// identical `─` runs) should also skip where they overlap; only
+    /// truly new content emits.
+    #[test]
+    fn menu_toggle_byte_cost() {
+        let (mut r, counter) = new_counting_renderer();
+        let status = super::super::StatusLine {
+            model: "glm-5".into(),
+            cwd: "~/project/atomcode".into(),
+            total_tokens: 0,
+            hint: None,
+        };
+        let items: Vec<(String, String)> = vec![
+            ("resume".into(), "Resume a previous session".into()),
+            ("login".into(), "Sign in with AtomGit OAuth".into()),
+            ("logout".into(), "Sign out of AtomGit".into()),
+            ("whoami".into(), "Show current logged-in user".into()),
+        ];
+
+        // Steady 5-row footer.
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+        });
+        r.flush();
+        let before_open = sample(&counter);
+
+        // Open menu → footer grows to 9 rows.
+        r.render(UiLine::InputPrompt {
+            buf: "/".into(),
+            cursor_byte: 1,
+            menu: Some(super::super::MenuPayload {
+                items: items.clone(),
+                selected: 0,
+            }),
+            status: status.clone(),
+        });
+        r.flush();
+        let open_cost = sample(&counter) - before_open;
+
+        // Close menu → back to 5 rows.
+        let before_close = sample(&counter);
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+        });
+        r.flush();
+        let close_cost = sample(&counter) - before_close;
+
+        // Up/Down navigation inside an open menu: only the highlight row
+        // cycles between reverse-on / reverse-off per cell → must be the
+        // cheapest case (< 300 B ideally).
+        r.render(UiLine::InputPrompt {
+            buf: "/".into(),
+            cursor_byte: 1,
+            menu: Some(super::super::MenuPayload {
+                items: items.clone(),
+                selected: 0,
+            }),
+            status: status.clone(),
+        });
+        r.flush();
+        let before_nav = sample(&counter);
+        for sel in 1..=3 {
+            r.render(UiLine::InputPrompt {
+                buf: "/".into(),
+                cursor_byte: 1,
+                menu: Some(super::super::MenuPayload {
+                    items: items.clone(),
+                    selected: sel,
+                }),
+                status: status.clone(),
+            });
+        }
+        r.flush();
+        let nav_avg = (sample(&counter) - before_nav) / 3;
+
+        eprintln!(
+            "[BYTE TEST] menu open={} B; close={} B; nav avg={} B",
+            open_cost, close_cost, nav_avg
+        );
+        // Pre-Ink baseline: open ~1899 B, close ~1556 B, nav ~1885 B.
+        // Post-Ink observed: open ~899 B, close ~895 B, nav ~210 B.
+        //
+        // 899 B is near the physical floor for 5→9 — the two full-width
+        // UTF-8 rules live at different absolute rows in the two
+        // footer heights, so cell-diff can't cross-match them;
+        // ~627 B × 2 rules of new rule-row cells is unavoidable.
+        // Nav drops 9× because Up/Down only flips reverse-video on
+        // 4 menu rows while rule/status cells stay identical.
+        assert!(
+            open_cost < 1000,
+            "menu open regressed: {} B (physical floor ~900 B)",
+            open_cost
+        );
+        assert!(
+            close_cost < 1000,
+            "menu close regressed: {} B",
+            close_cost
+        );
+        assert!(
+            nav_avg < 300,
+            "menu nav regressed: {} B avg (should be ~200 B)",
+            nav_avg
+        );
     }
 
     /// Quantify how many bytes a typical streaming TextDelta costs.
