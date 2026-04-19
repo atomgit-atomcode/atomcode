@@ -1,0 +1,18 @@
+default_provider = "AtomGit"
+
+[providers.AtomGit]
+type = "openai"
+model = "MiniMax-M2.7"
+base_url = "https://api-ai.gitcode.com/v1"
+context_window = 64000
+
+# Per-turn datalog settings. Each turn writes a markdown file
+# (plus a .jsonl of raw LLM requests) into `dir`.
+# - enabled = false        -> disable logging entirely
+# - dir unset (default)    -> writes to <working_dir>/datalog/ (follows /cd)
+# - dir = "/abs/path"      -> absolute, fixed (unaffected by /cd)
+# - dir = "~/sub"          -> expanded from $HOME, fixed
+# - dir = "rel/path"       -> joined with current working_dir, follows /cd
+[datalog]
+enabled = true
+# dir = "~/.atomcode/datalog"  # example: uncomment to redirect

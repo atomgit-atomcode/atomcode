@@ -26,7 +26,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-4.15.0-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-4.18.1-blue" alt="version">
   <img src="https://img.shields.io/badge/rust-1.75%2B-orange" alt="rust">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="license">
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey" alt="platform">
@@ -166,13 +166,12 @@ Select provider:
 配置文件位于 `~/.atomcode/config.toml`，最小单 provider 样例：
 
 ```toml
-default_provider = "deepseek"
+default_provider = "AtomGit"
 
-[providers.deepseek]
+[providers.AtomGit]
 type           = "openai"
-api_key        = "sk-..."
-model          = "deepseek-chat"
-base_url       = "https://api.deepseek.com/v1"
+model          = "MiniMax-M2.7"
+base_url       = "https://api-ai.gitcode.com/v1"
 context_window = 64000
 ```
 
