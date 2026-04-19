@@ -1171,25 +1171,16 @@ impl<W: Write + Send> AnsiRenderer<W> {
 
 impl<W: Write + Send> Renderer for AnsiRenderer<W> {
     fn render(&mut self, line: UiLine) {
-        use super::throttle::InputThrottle;
-        if InputThrottle::is_throttled(&line) {
-            if self.throttle.window_elapsed() {
-                // Leading edge: paint immediately and open a new window.
-                self.dispatch_unthrottled(line);
-                self.throttle.mark_painted();
-            } else {
-                // Within the throttle window: keep only the most recent
-                // payload; an older parked render would paint stale
-                // state (e.g. buf: "abc" after the user is already at
-                // "abcde").
-                self.throttle.park_pending(line);
-            }
-            return;
-        }
-        // Non-throttled render — must flush any deferred input paint
-        // FIRST so emission order matches the caller's intent (ToolCall
-        // arriving after a pending InputPrompt should still see its
-        // footer sitting below the tool line, not the other way round).
+        // InputThrottle removed: it was protecting Mac Terminal from
+        // the old 1500-byte full-redraw bursts. Phase 2's row-diff
+        // cuts per-keystroke paints to ~80 bytes, which Mac Terminal
+        // ingests in under a millisecond — so parking the 2nd of 3
+        // rapid IME chars for 5-10ms now shows up as visible stutter
+        // instead of smoothing a storm that no longer exists.
+        //
+        // `paint_pending_input` is still called below to drain any
+        // payload parked by code that pre-dates this change (e.g.
+        // `flush_deferred` tick), keeping the upgrade backward-safe.
         self.paint_pending_input();
         self.dispatch_unthrottled(line);
     }
