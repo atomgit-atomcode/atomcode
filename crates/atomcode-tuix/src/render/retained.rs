@@ -867,10 +867,40 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         // calls in the same 5ms window are absorbed into a single
         // paint here.
         if self.dirty {
+            let t0 = std::time::Instant::now();
+            let footer_rows = self.current_footer_rows();
+            let has_status = !self.status.model.is_empty()
+                || !self.status.cwd.is_empty()
+                || self.status.hint.is_some();
+            let middle_rows = footer_rows.saturating_sub(
+                1 /* spinner */
+                + 1 /* top rule */
+                + 1 /* bot rule */
+                + self.menu.as_ref().map(|m| m.items.len().min(4)).unwrap_or(0)
+                + if has_status { 1 } else { 0 },
+            );
+            let menu_rows = self
+                .menu
+                .as_ref()
+                .map(|m| m.items.len().min(4))
+                .unwrap_or(0);
+            let buf_display_w = crate::width::display_width(&self.input_buf);
             self.paint_frame();
             let bytes = self.screen.render_diff();
+            let emit_len = bytes.len();
             let _ = self.out.write_all(&bytes);
             self.dirty = false;
+            crate::tuix_trace!(
+                "FOOT",
+                "paint rows=footer{}(mid={} menu={}) body={} buf_w={} emit={}B dur={}µs",
+                footer_rows,
+                middle_rows,
+                menu_rows,
+                self.body_lines.len(),
+                buf_display_w,
+                emit_len,
+                t0.elapsed().as_micros()
+            );
         }
         let _ = self.out.flush();
     }
