@@ -1504,10 +1504,29 @@ impl<W: Write + Send> Renderer for AnsiRenderer<W> {
         if self.caps.bracketed_paste {
             let _ = execute!(self.out, EnableBracketedPaste);
         }
-        // The child wrote to stdout in cooked mode — our footer_rows /
-        // last_footer / cursor tracking is now lying about terminal
-        // state. Wipe the screen + forget all caches so the next render
-        // rebuilds against a known (row 1, col 1) anchor.
+        // Force-clear terminal-side DECSTBM + autowrap state BEFORE
+        // calling `reset()`. Rationale: `shutdown()` (called during
+        // suspend_for_external) already set `self.scroll_region = None`,
+        // so the `clear_scroll_region` inside `reset()` short-circuits
+        // and does NOT re-emit `\x1b[r`. If the OAuth child process
+        // touched the scroll region itself (browser CLIs, shell rc
+        // files that run tput, scripts that set margins), the terminal
+        // is now in a scroll region we don't know about. The next body
+        // write would scroll inside that unknown region and leave
+        // ghost rule characters where they shouldn't be.
+        //
+        // Unconditionally emitting `\x1b[r\x1b[?7h` is a cheap (8 bytes,
+        // no side effects if already clear) way to pin the terminal to
+        // a known state — scroll region fully cleared, autowrap on —
+        // before `reset()` moves the cursor and redraws.
+        if self.caps.scroll_region {
+            let _ = self.out.write_all(b"\x1b[r\x1b[?7h");
+            let _ = self.out.flush();
+            // Sync our own tracker with what we just told the terminal.
+            self.scroll_region = None;
+        }
+        // Wipe the screen + forget all caches so the next render rebuilds
+        // against a known (row 1, col 1) anchor.
         self.reset();
     }
 }
