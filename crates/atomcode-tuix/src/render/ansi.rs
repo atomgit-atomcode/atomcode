@@ -17,6 +17,21 @@ use crate::terminal::TerminalCaps;
 /// wider terminals.
 const PAD_COL: usize = 2;
 
+/// Maximum width for the footer's top/bottom horizontal rules. Beyond
+/// this width, the rules stay capped — on a 209-col Mac Terminal the
+/// cap cuts ~750 bytes per keystroke redraw (each UTF-8 `─` is 3 bytes
+/// × 2 rules), which is the dominant contributor to `Flush` stalls
+/// after heavy streaming. Classic 80-col terminals are unaffected.
+const RULE_MAX_WIDTH: usize = 80;
+
+/// Pre-allocated ASCII dash buffer for emitting horizontal rules with a
+/// single `write_all`. ASCII `-` is 1 byte vs Unicode `─` 3 bytes, so on
+/// a capped 80-wide rule we emit 80 bytes × 2 rules = 160 bytes per
+/// keystroke redraw (vs the old 209-col UTF-8 box-drawing path that
+/// emitted 627 × 2 = 1254 bytes). Same visual width (1 col each); the
+/// ASCII version is thinner but imperceptibly so on most fonts.
+static RULE_DASHES: [u8; RULE_MAX_WIDTH] = [b'-'; RULE_MAX_WIDTH];
+
 /// Format a running token count as a compact human label — "842 tokens",
 /// "1.2k tokens", "12.3k tokens". Status bar is width-constrained so we
 /// avoid long raw numbers.
@@ -253,13 +268,19 @@ impl<W: Write + Send> AnsiRenderer<W> {
         // we drew a full `╭─╮│…│╰─╯` box, which forced every middle row to
         // include the right-side `│` border and pad-to-width spaces —
         // ~60-80 extra bytes per keystroke that Mac Terminal.app processes
-        // slowly (visible lag after a long streaming turn). Top/bottom rules
-        // span (w - 2*PAD_COL) cols so they align with the 2-space left
-        // indent used everywhere else.
-        let rule_width = w.saturating_sub(PAD_COL * 2);
-        // Text budget = rule width minus the "❯ " prompt prefix (or the
-        // equivalent "  " on wrapped continuation rows).
-        let text_budget = rule_width.saturating_sub(2);
+        // slowly (visible lag after a long streaming turn).
+        //
+        // Rule width is capped at `RULE_MAX_WIDTH` so wide terminals
+        // (209 cols × 3 bytes × 2 rules = 1254 bytes on every keystroke)
+        // don't drown Mac Terminal's pipe buffer. Text budget still uses
+        // the full available width — only the decorative horizontal rules
+        // are capped.
+        let avail_width = w.saturating_sub(PAD_COL * 2);
+        let rule_width = avail_width.min(RULE_MAX_WIDTH);
+        // Text budget spans the whole available width — caps are visual
+        // only (rules), not functional (input can still wrap to terminal
+        // edge just like the assistant text above).
+        let text_budget = avail_width.saturating_sub(2);
 
         let _ = self.out.write_all(b"\x1b[?7l");
         let _ = self.out.write_all(b"\r");
@@ -294,10 +315,12 @@ impl<W: Write + Send> AnsiRenderer<W> {
         }
         let _ = self.out.write_all(b"\r\n");
 
-        // Row 1: top horizontal rule (replaces `╭─────╮`).
+        // Row 1: top horizontal rule (replaces `╭─────╮`). Single
+        // write_all of ASCII dashes — see `RULE_DASHES` for the
+        // byte-count rationale.
         self.write_left_pad();
         self.set_fg(Role::Border);
-        for _ in 0..rule_width { let _ = self.out.write_all("─".as_bytes()); }
+        let _ = self.out.write_all(&RULE_DASHES[..rule_width]);
         self.reset();
         let _ = self.out.write_all(b"\r\n");
 
@@ -320,7 +343,7 @@ impl<W: Write + Send> AnsiRenderer<W> {
         // Row 2+N: bottom horizontal rule (replaces `╰─────╯`).
         self.write_left_pad();
         self.set_fg(Role::Border);
-        for _ in 0..rule_width { let _ = self.out.write_all("─".as_bytes()); }
+        let _ = self.out.write_all(&RULE_DASHES[..rule_width]);
         self.reset();
         let _ = self.out.write_all(b"\r\n");
 
@@ -441,13 +464,13 @@ impl<W: Write + Send> AnsiRenderer<W> {
 
         let _ = self.out.write_all(b"\x1b[?7h");
 
-        // Rough byte estimate: rule (width × 3 bytes UTF-8) × 2 rules +
+        // Rough byte estimate: rule (width × 1 byte ASCII `-`) × 2 rules +
         // middle rows (text budget × avg 1.5 bytes + SGR overhead) +
         // menu rows (~80 bytes × M) + status (~80 bytes) + cursor
         // positioning (~15 bytes). Tells us which renders are cheap
-        // (50 bytes) vs expensive (2KB).
+        // (~300 bytes) vs expensive (>1KB with lots of menu items).
         let est_bytes =
-            rule_width * 3 * 2 // top + bottom rule
+            rule_width * 2 // top + bottom rule (ASCII dashes, capped at 80)
                 + middle_rows * (text_budget + 10)
                 + menu_rows * 80
                 + status_rows * 80
@@ -1239,15 +1262,18 @@ mod tests {
         let s = String::from_utf8(buf).unwrap();
         assert!(s.contains("⠋"));
         assert!(s.contains("Pondering"));
-        // CC-style footer: top/bottom horizontal rules (no corners or sides).
-        // Minimum 4 consecutive ─ characters confirms the rule was drawn,
-        // distinguishing it from the ─ that might appear inside content.
-        assert!(s.contains("────"));
-        // Corners `╭╰╮╯` and side `│` must NOT appear — regression guard
-        // against the old full-box rendering coming back.
+        // CC-style footer: top/bottom horizontal rules drawn with ASCII
+        // dashes (cheaper than `─` which is 3-byte UTF-8). At least 4
+        // consecutive `-` confirms a rule was drawn, distinguishing it
+        // from incidental dashes in content.
+        assert!(s.contains("----"));
+        // Corners `╭╰╮╯`, sides `│`, and Unicode box-drawing dashes `─`
+        // must NOT appear — regression guard against the old full-box
+        // rendering OR the earlier Unicode-rule variant coming back.
         assert!(!s.contains("╭"));
         assert!(!s.contains("╰"));
         assert!(!s.contains("│"));
+        assert!(!s.contains("─"));
     }
 
     #[test]
