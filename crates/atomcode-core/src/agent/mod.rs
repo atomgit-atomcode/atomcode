@@ -1527,62 +1527,6 @@ impl AgentLoop {
         }
     }
 
-    #[allow(dead_code)]
-    async fn maybe_summarize_old_turns(&mut self, system_prompt: &str) {
-        let context_window = self.config
-            .providers
-            .get(&self.config.default_provider)
-            .map(|p| p.context_window)
-            .unwrap_or(128000);
-
-        let sys_tokens = system_prompt.len() / 4 + 4;
-        let n_turns = self.conversation.turns_needing_summary(sys_tokens, context_window);
-        if n_turns == 0 { return; }
-
-        // Build the content to summarize
-        let content = self.conversation.build_summary_content(n_turns);
-        if content.is_empty() { return; }
-
-        // Make a lightweight LLM call for summarization
-        let summarize_prompt = format!(
-            "Summarize the following conversation turns in 2-4 concise sentences. \
-             Focus on: what the user asked, what files were read/edited, what was the outcome. \
-             Keep file names and key decisions. Be brief.\n\n{}",
-            content
-        );
-
-        let mut mini_conv = crate::conversation::Conversation::new();
-        mini_conv.add_user_message(&summarize_prompt);
-
-        let msgs = mini_conv.to_provider_messages(
-            "You are a conversation summarizer. Output only the summary, nothing else."
-        );
-
-        // Stream the summary (non-streaming would be simpler but we only have chat_stream)
-        match self.turn_runner.provider.chat_stream(&msgs, None) {
-            Ok(mut stream) => {
-                let mut summary = String::new();
-                use futures::StreamExt;
-                let timeout = std::time::Duration::from_secs(30);
-                loop {
-                    match tokio::time::timeout(timeout, stream.next()).await {
-                        Ok(Some(Ok(crate::stream::StreamEvent::Delta(text)))) => {
-                            summary.push_str(&text);
-                        }
-                        Ok(Some(Ok(crate::stream::StreamEvent::Done { .. }))) => break,
-                        Ok(Some(Ok(_))) => continue,
-                        _ => break, // timeout, error, or stream ended
-                    }
-                }
-
-                if !summary.is_empty() {
-                    self.conversation.apply_summary(n_turns, summary);
-                }
-            }
-            Err(_) => {} // Summarization failed — proceed without it
-        }
-    }
-
     fn finish_turn(&mut self, stop_reason: TurnStopReason) {
         // Error exits must not leave the user's message in the history
         // as an "orphan turn" (user message with no assistant reply).
