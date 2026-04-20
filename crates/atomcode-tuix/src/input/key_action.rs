@@ -25,9 +25,10 @@ pub enum Action {
 pub fn classify(code: KeyCode, modifiers: KeyModifiers) -> Action {
     let ctrl = modifiers.contains(KeyModifiers::CONTROL);
     let shift = modifiers.contains(KeyModifiers::SHIFT);
+    let alt = modifiers.contains(KeyModifiers::ALT);
 
     match (code, ctrl) {
-        (KeyCode::Enter, false) if shift => Action::InsertNewline,
+        (KeyCode::Enter, false) if shift || alt => Action::InsertNewline,
         (KeyCode::Enter, false) => Action::Submit,
         (KeyCode::Char('c'), true) => Action::Cancel,
         (KeyCode::Char('u'), true) => Action::ClearLine,
@@ -64,6 +65,19 @@ mod tests {
     #[test]
     fn shift_enter_inserts_newline() {
         assert_eq!(k(KeyCode::Enter, KeyModifiers::SHIFT), Action::InsertNewline);
+    }
+
+    #[test]
+    fn alt_enter_inserts_newline() {
+        assert_eq!(k(KeyCode::Enter, KeyModifiers::ALT), Action::InsertNewline);
+    }
+
+    #[test]
+    fn alt_shift_enter_inserts_newline() {
+        assert_eq!(
+            k(KeyCode::Enter, KeyModifiers::ALT | KeyModifiers::SHIFT),
+            Action::InsertNewline
+        );
     }
 
     #[test]

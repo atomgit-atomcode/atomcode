@@ -94,6 +94,12 @@ pub struct VirtualTerminal {
     /// `\x1b[?25h/l` cursor visibility flag.
     cursor_visible: bool,
     style: Style,
+    /// 0-indexed DECSTBM scroll region (inclusive). Defaults to the
+    /// full screen; `\x1b[top;bottom r` updates it so LF at the
+    /// bottom row scrolls only this strip (used by retained's body
+    /// scrollback-push path).
+    scroll_top: u16,
+    scroll_bottom: u16,
 }
 
 impl VirtualTerminal {
@@ -108,7 +114,27 @@ impl VirtualTerminal {
             cursor_col: 0,
             cursor_visible: true,
             style: Style::default(),
+            scroll_top: 0,
+            scroll_bottom: height.saturating_sub(1),
         }
+    }
+
+    /// Scroll the current DECSTBM region up by one line: the row at
+    /// `scroll_top` is discarded (its contents would normally enter
+    /// the terminal's scrollback buffer; we don't model that), the
+    /// rows below shift up one position, and `scroll_bottom` becomes
+    /// blank. Cursor stays put.
+    fn scroll_region_up(&mut self) {
+        let top = self.scroll_top as usize;
+        let bot = self.scroll_bottom as usize;
+        if top >= bot || bot >= self.grid.len() {
+            return;
+        }
+        for r in top..bot {
+            self.grid[r] = self.grid[r + 1].clone();
+        }
+        let blank = vec![GridCell::default(); self.width as usize];
+        self.grid[bot] = blank;
     }
 
     pub fn width(&self) -> u16 {
@@ -157,6 +183,14 @@ impl VirtualTerminal {
             .get(row)
             .map(|r| r.iter().map(|c| c.ch).collect())
             .unwrap_or_default()
+    }
+
+    /// Scan every row and return true iff any row's text satisfies the
+    /// predicate. Used by retained body tests where the exact row
+    /// depends on the push ordering (scrollback-push model) but the
+    /// body content should be present on-screen somewhere.
+    pub fn any_row<F: FnMut(&str) -> bool>(&self, mut f: F) -> bool {
+        (0..self.height as usize).any(|r| f(&self.row_text(r)))
     }
 
     /// Handy multi-line dump of the whole grid — useful inside
@@ -285,11 +319,14 @@ impl Perform for VirtualTerminal {
     fn execute(&mut self, byte: u8) {
         match byte {
             b'\n' => {
-                // LF: advance row; terminal auto-scroll is off for
-                // our retained paths, so a LF past the bottom just
-                // clamps (no scroll — retained controls row
-                // placement via CUP).
-                if self.cursor_row + 1 < self.height {
+                // LF at the scroll-region bottom triggers a region
+                // scroll-up; otherwise advance the cursor. This is
+                // what DECSTBM does in a real terminal — our body
+                // emit path relies on it to push rows into what
+                // would be scrollback.
+                if self.cursor_row == self.scroll_bottom {
+                    self.scroll_region_up();
+                } else if self.cursor_row + 1 < self.height {
                     self.cursor_row += 1;
                 }
             }
@@ -360,6 +397,22 @@ impl Perform for VirtualTerminal {
                         }
                         _ => {}
                     }
+                }
+            }
+            // DECSTBM: `\x1b[top;bottom r` — inclusive, 1-indexed.
+            // `\x1b[r` with no params resets to full screen.
+            'r' => {
+                let mut it = params.iter();
+                let top = it.next().and_then(|p| p.first().copied()).unwrap_or(1);
+                let bot = it
+                    .next()
+                    .and_then(|p| p.first().copied())
+                    .unwrap_or(self.height as u16);
+                let top0 = top.saturating_sub(1).min(self.height.saturating_sub(1));
+                let bot0 = bot.saturating_sub(1).min(self.height.saturating_sub(1));
+                if top0 < bot0 {
+                    self.scroll_top = top0;
+                    self.scroll_bottom = bot0;
                 }
             }
             // SGR: `\x1b[...m`

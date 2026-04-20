@@ -493,7 +493,7 @@ _ = cancel.cancelled() => {
                 });
                 conversation.add_tool_result(result);
             } else {
-                let result = self.execute_single_tool(call, event_tx).await;
+                let result = self.execute_single_tool(call, event_tx, &cancel).await;
 
                 // Track files edited for read interception (batch + cross-turn)
                 // Use full file path as key to avoid basename collisions
@@ -578,10 +578,16 @@ _ = cancel.cancelled() => {
     }
 
     /// Execute a single tool call with permission checking.
+    ///
+    /// `cancel` is polled while the tool future runs so Ctrl+C interrupts
+    /// mid-execution — without this, long-running tools (deep `glob`, slow
+    /// `grep`, network calls) complete before the turn-level cancel check
+    /// runs on the next iteration, and the user sees an unresponsive UI.
     async fn execute_single_tool(
         &mut self,
         call: &ToolCall,
         event_tx: &mpsc::UnboundedSender<TurnEvent>,
+        cancel: &CancellationToken,
     ) -> ToolResult {
         // Auto-fix common tool name aliases (models trained on other agents use different names)
         // Case-insensitive matching: models may output "Run", "Bash", "Edit_File", etc.
@@ -705,9 +711,32 @@ _ = cancel.cancelled() => {
             }
         }
 
-        // Execute the tool
+        // Execute the tool. Race against `cancel` so Ctrl+C aborts a
+        // long-running tool future instead of waiting for it to finish.
+        // Dropping the tool future is safe for read-only tools (glob /
+        // grep / read_file); mutating tools (write_file / edit_file /
+        // bash) finish fast enough that interrupting them mid-execution
+        // is acceptable — user pressed Ctrl+C knowing they want to stop.
         let start = Instant::now();
-        let result = tool.execute(&call.arguments, &self.context).await;
+        let result = tokio::select! {
+            r = tool.execute(&call.arguments, &self.context) => r,
+            _ = cancel.cancelled() => {
+                let duration = start.elapsed();
+                let output = "[Cancelled by user]".to_string();
+                let _ = event_tx.send(TurnEvent::ToolCallResult {
+                    call_id: call.id.clone(),
+                    name: call.name.clone(),
+                    output: output.clone(),
+                    success: false,
+                    duration,
+                });
+                return ToolResult {
+                    call_id: call.id.clone(),
+                    output,
+                    success: false,
+                };
+            }
+        };
         let duration = start.elapsed();
 
         let tool_result = match result {

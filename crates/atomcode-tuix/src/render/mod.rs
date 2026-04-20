@@ -117,6 +117,13 @@ pub trait Renderer: Send {
     /// treat this as a flush.
     fn flush_deferred(&mut self);
 
+    /// Remove the most recent `ApprovalPrompt` body row, if the tail
+    /// row is one. Called by the event loop after the user responds
+    /// Y/A/N so the prompt stops sitting in the body above the footer.
+    /// Default: no-op — implementations that stream body lines to
+    /// stdout (plain/pipe mode) can't retract them.
+    fn pop_approval_prompt(&mut self) {}
+
     /// Terminal window was resized to `(cols, rows)`. DECSTBM-based
     /// renderers must re-issue the scroll region (`\x1b[1;H-N r`) so
     /// the fixed footer stays pinned to the new bottom. Non-DECSTBM

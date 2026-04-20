@@ -493,13 +493,19 @@ mod tool_format_tests {
     fn format_tool_detail_bash_truncates_long_commands() {
         let args = format!(
             r#"{{"command":"{}"}}"#,
-            "a".repeat(200)
+            "a".repeat(500)
         );
         let out = format_tool_detail("bash", &args);
+        // 200-col budget with a 1-col trailing '…' (3 UTF-8 bytes).
         assert!(
-            out.len() <= 63, // 60-cell budget + possible trailing ellipsis bytes
-            "bash detail should truncate: len={} `{}`",
-            out.len(),
+            crate::width::display_width(&out) <= 200,
+            "bash detail should truncate to <=200 cols, got {} cols `{}`",
+            crate::width::display_width(&out),
+            out
+        );
+        assert!(
+            out.ends_with('…'),
+            "truncated bash detail should end with ellipsis: `{}`",
             out
         );
     }
@@ -1333,7 +1339,7 @@ fn handle_approval_key(
     code: KeyCode,
     state: &mut UiState,
     ctx: &mut LoopCtx,
-    _renderer: &mut dyn Renderer,
+    renderer: &mut dyn Renderer,
 ) -> Result<()> {
     let cmd = match code {
         KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => AgentCommand::ApproveTool,
@@ -1341,6 +1347,10 @@ fn handle_approval_key(
         KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => AgentCommand::DenyTool,
         _ => return Ok(()),
     };
+    // Retract the "Waiting for approval" body row now that the user
+    // responded — without this, the prompt stays in scrollback next to
+    // the tool result, creating visual noise.
+    renderer.pop_approval_prompt();
     ctx.agent.cmd_tx.send(cmd).ok();
     state.on_approval_resolved();
     Ok(())
@@ -1573,7 +1583,7 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
         .lock()
         .ok()
         .and_then(|g| g.clone())
-        .map(|v| format!("↑ {} 可官网升级", v));
+        .map(|v| format!("↑ {} 使用/upgrade升级", v));
     crate::render::StatusLine {
         model: ctx.model_name.clone(),
         cwd,
@@ -1665,22 +1675,22 @@ pub(crate) fn format_tool_detail(name: &str, args_json: &str) -> String {
             if sym.is_empty() { file } else if file.is_empty() { sym } else { format!("{} in {}", sym, file) }
         }
         "glob" => get_str("pattern")
-            .map(|p| crate::width::truncate_to_width(&p, 40))
+            .map(|p| crate::width::truncate_with_ellipsis(&p, 100))
             .unwrap_or_default(),
         "grep" => get_str("pattern")
-            .map(|p| crate::width::truncate_to_width(&p, 40))
+            .map(|p| crate::width::truncate_with_ellipsis(&p, 100))
             .unwrap_or_default(),
         "bash" => get_str("command")
-            .map(|c| crate::width::truncate_to_width(&c, 60))
+            .map(|c| crate::width::truncate_with_ellipsis(&c, 200))
             .unwrap_or_default(),
         "list_directory" | "change_dir" => {
             get_str("path").unwrap_or_else(|| ".".into())
         }
         "web_fetch" => get_str("url")
-            .map(|u| crate::width::truncate_to_width(&u, 60))
+            .map(|u| crate::width::truncate_with_ellipsis(&u, 150))
             .unwrap_or_default(),
         "web_search" => get_str("query")
-            .map(|q| crate::width::truncate_to_width(&q, 50))
+            .map(|q| crate::width::truncate_with_ellipsis(&q, 100))
             .unwrap_or_default(),
         "find_references" | "trace_callees" | "trace_callers" | "trace_chain" => {
             get_str("symbol").unwrap_or_default()
@@ -1692,9 +1702,9 @@ pub(crate) fn format_tool_detail(name: &str, args_json: &str) -> String {
             let file = get_str("file_path").or_else(|| get_str("file"));
             let pat = get_str("pattern").or_else(|| get_str("old"));
             match (file, pat) {
-                (Some(f), Some(p)) => format!("{}: {}", basename(&f), crate::width::truncate_to_width(&p, 25)),
+                (Some(f), Some(p)) => format!("{}: {}", basename(&f), crate::width::truncate_with_ellipsis(&p, 60)),
                 (Some(f), None) => basename(&f),
-                (None, Some(p)) => crate::width::truncate_to_width(&p, 40),
+                (None, Some(p)) => crate::width::truncate_with_ellipsis(&p, 100),
                 _ => String::new(),
             }
         }
@@ -1703,7 +1713,7 @@ pub(crate) fn format_tool_detail(name: &str, args_json: &str) -> String {
             // Fallback: try common single-key args that make sense as detail.
             for key in ["file_path", "path", "file", "pattern", "query", "url", "name", "symbol", "command"] {
                 if let Some(s) = get_str(key) {
-                    return crate::width::truncate_to_width(&s, 40);
+                    return crate::width::truncate_with_ellipsis(&s, 100);
                 }
             }
             String::new()

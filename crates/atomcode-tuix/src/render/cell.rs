@@ -233,6 +233,37 @@ pub fn serialize_patches(patches: &[Patch]) -> Vec<u8> {
     out
 }
 
+/// Serialise a single row of cells into ANSI bytes **without any cursor
+/// positioning**. Used by the scrollback-push path (write row to stdout
+/// at the current cursor, then let `\n` advance). Skips continuation
+/// cells; closes with `\x1b[0m` iff any SGR was emitted so subsequent
+/// writes start from a clean state.
+pub fn serialize_row(row: &[Cell]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(row.len() * 4);
+    let mut current_style: Option<CellStyle> = None;
+    let mut emitted_any_sgr = false;
+    for cell in row {
+        if cell.width == 0 {
+            continue;
+        }
+        if current_style.as_ref() != Some(&cell.style) {
+            let before = out.len();
+            emit_sgr_transition(&mut out, current_style.as_ref(), &cell.style);
+            if out.len() > before {
+                emitted_any_sgr = true;
+            }
+            current_style = Some(cell.style.clone());
+        }
+        let mut buf = [0u8; 4];
+        let encoded = cell.ch.encode_utf8(&mut buf);
+        out.extend_from_slice(encoded.as_bytes());
+    }
+    if emitted_any_sgr {
+        out.extend_from_slice(b"\x1b[0m");
+    }
+    out
+}
+
 /// Emit the minimal SGR sequence to move from `from` style to `to` style.
 /// Uses reset-and-reapply whenever a "sticky" attribute (bold/reverse)
 /// needs clearing; per-attr toggles (`\x1b[22m` for bold off, `\x1b[27m`

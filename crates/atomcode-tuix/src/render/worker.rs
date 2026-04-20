@@ -53,6 +53,8 @@ enum RenderCmd {
     /// Terminal resize — fire-and-forget, the worker updates its
     /// internal DECSTBM region and repaints the footer.
     Resize(u16, u16),
+    /// Remove the tail ApprovalPrompt body row (fire-and-forget).
+    PopApprovalPrompt,
     /// Lifecycle operation requiring an ACK — the worker performs the
     /// op then sends `()` back so the caller can proceed.
     Ack {
@@ -159,6 +161,10 @@ impl Renderer for TaskRenderer {
     fn on_resize(&mut self, cols: u16, rows: u16) {
         let _ = self.cmd_tx.send(RenderCmd::Resize(cols, rows));
     }
+
+    fn pop_approval_prompt(&mut self) {
+        let _ = self.cmd_tx.send(RenderCmd::PopApprovalPrompt);
+    }
 }
 
 impl Drop for TaskRenderer {
@@ -218,6 +224,9 @@ fn run_worker(mut inner: Box<dyn Renderer>, cmd_rx: mpsc::Receiver<RenderCmd>) {
                     rows,
                     t0.elapsed().as_micros()
                 );
+            }
+            RenderCmd::PopApprovalPrompt => {
+                inner.pop_approval_prompt();
             }
             RenderCmd::Ack { op, ack } => {
                 let t0 = Instant::now();

@@ -449,11 +449,6 @@ fn run_login_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx) -> Result<()> 
             ctx.model_name = model.clone();
             save_and_reload(ctx, renderer);
 
-            let dir_display = crate::platform::collapse_home(&ctx.working_dir.to_string_lossy());
-            renderer.render(UiLine::Welcome {
-                model: ctx.model_name.clone(),
-                working_dir: dir_display,
-            });
             let name = auth
                 .user
                 .name

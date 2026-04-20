@@ -27,7 +27,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 
 pub const MANIFEST_URL: &str =
-    "https://raw.gitcode.com/atomgit_atomcode/atomcode/raw/main/latest.json";
+    "https://raw.atomgit.com/atomgit_atomcode/atomcode/raw/main/latest.json";
 pub const DOWNLOAD_BASE: &str =
     "https://atomgit.com/atomgit_atomcode/atomcode-release/releases/download";
 
