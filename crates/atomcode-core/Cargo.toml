@@ -36,6 +36,7 @@ bincode = "1"
 # Decode Chinese Windows text files (GBK/GB18030) that fail UTF-8 validation.
 # Used by read_file's fallback path.
 encoding_rs = "0.8"
+sha2 = "0.10"
 
 [dev-dependencies]
 tempfile = "3"

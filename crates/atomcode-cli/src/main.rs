@@ -164,6 +164,14 @@ enum Commands {
     Logout,
     /// Show current login status
     Status,
+    /// Upgrade atomcode in-place to the latest released version
+    Upgrade {
+        /// Reinstall even when already on the latest version
+        #[arg(long)]
+        force: bool,
+    },
+    /// Roll back to the previous version (swap with .bak on disk)
+    Rollback,
 }
 
 #[tokio::main]
@@ -556,7 +564,100 @@ async fn handle_command(cmd: Commands) -> Result<()> {
             }
             Ok(())
         }
+        Commands::Upgrade { force } => run_upgrade_cli(force).await,
+        Commands::Rollback => run_rollback_cli(),
     }
+}
+
+/// CLI (non-TUI) upgrade driver — prints progress to stdout and
+/// success/error messages the same way `install.sh` does.
+async fn run_upgrade_cli(force: bool) -> Result<()> {
+    use atomcode_core::self_update::{self, UpgradeEvent, ALREADY_LATEST};
+
+    let current = format!("v{}", env!("CARGO_PKG_VERSION"));
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<UpgradeEvent>();
+
+    // Spawn the driver; consume events on the main task so stdout
+    // writes don't interleave unpredictably with the upgrade work.
+    let driver = tokio::spawn(self_update::run_upgrade(current.clone(), force, tx));
+
+    let mut last_pct: i32 = -1;
+    while let Some(ev) = rx.recv().await {
+        match ev {
+            UpgradeEvent::ManifestFetched { version } => {
+                println!("==> Latest: {}", version);
+            }
+            UpgradeEvent::Downloading { bytes, total } => {
+                // Debounce to whole percents so we don't spam stdout —
+                // piping the CLI through `tee` with 10k updates is no
+                // fun for anyone.
+                let pct = if total == 0 {
+                    0
+                } else {
+                    ((bytes * 100) / total) as i32
+                };
+                if pct != last_pct {
+                    print!("\r    downloading {}% ({} / {} bytes)   ", pct, bytes, total);
+                    io::stdout().flush().ok();
+                    last_pct = pct;
+                }
+            }
+            UpgradeEvent::Verifying => {
+                println!("\n==> Verifying SHA256");
+            }
+            UpgradeEvent::Replacing => {
+                println!("==> Replacing binary");
+            }
+            UpgradeEvent::Done { version, backup } => {
+                println!(
+                    "\n✓ Upgraded to {} (previous version kept at {})",
+                    version,
+                    backup.display()
+                );
+                println!("  Run `atomcode` to start the new version.");
+            }
+            // CLI path never spawns a rollback via this channel and the
+            // driver below translates errors into the returned Result
+            // (not a Failed event) — these arms exist only to keep the
+            // match exhaustive if the TUI path ever reuses this code.
+            UpgradeEvent::Failed(msg) => {
+                eprintln!("\nupgrade failed: {}", msg);
+            }
+            UpgradeEvent::RolledBack { exe, backup } => {
+                println!(
+                    "\n✓ Rolled back. exe={}, backup={}",
+                    exe.display(),
+                    backup.display()
+                );
+            }
+        }
+    }
+
+    match driver.await {
+        Ok(Ok(_summary)) => Ok(()),
+        Ok(Err(e)) => {
+            let msg = format!("{:#}", e);
+            if msg.contains(ALREADY_LATEST) {
+                // Friendly path — not an error, just "nothing to do".
+                println!("  {}", msg.replace(&format!("{}: ", ALREADY_LATEST), ""));
+                Ok(())
+            } else {
+                Err(e)
+            }
+        }
+        Err(e) => Err(anyhow::anyhow!("upgrade task panicked: {}", e)),
+    }
+}
+
+fn run_rollback_cli() -> Result<()> {
+    let summary = atomcode_core::self_update::run_rollback()?;
+    println!(
+        "✓ Rolled back. Previous binary is now at {}, other version saved at {}",
+        summary.exe.display(),
+        summary.backup.display()
+    );
+    println!("  Run `atomcode` to start the rolled-back version.");
+    Ok(())
 }
 
 #[cfg(test)]

@@ -387,7 +387,7 @@ fn replace_binary(new_bin: &Path, exe: &Path) -> Result<()> {
 
 /// Top-level upgrade driver.
 ///
-/// `current_version` is what we're running right now (e.g. `"v4.18.1"`
+/// `current_version` is what we're running right now (e.g. `"v4.19.0"`
 /// — callers typically pass `format!("v{}", env!("CARGO_PKG_VERSION"))`).
 /// When `force` is false and the manifest version is `<=` current, this
 /// returns an error carrying `ALREADY_LATEST` so callers can distinguish
@@ -539,32 +539,32 @@ mod tests {
     #[test]
     fn binary_filename_adds_exe_on_windows_targets() {
         assert_eq!(
-            binary_filename("v4.18.1", "windows-x64"),
-            "atomcode-v4.18.1-windows-x64.exe"
+            binary_filename("v4.19.0", "windows-x64"),
+            "atomcode-v4.19.0-windows-x64.exe"
         );
         assert_eq!(
-            binary_filename("v4.18.1", "windows-arm64"),
-            "atomcode-v4.18.1-windows-arm64.exe"
+            binary_filename("v4.19.0", "windows-arm64"),
+            "atomcode-v4.19.0-windows-arm64.exe"
         );
     }
 
     #[test]
     fn binary_filename_plain_on_unix_targets() {
         assert_eq!(
-            binary_filename("v4.18.1", "darwin-arm64"),
-            "atomcode-v4.18.1-darwin-arm64"
+            binary_filename("v4.19.0", "darwin-arm64"),
+            "atomcode-v4.19.0-darwin-arm64"
         );
         assert_eq!(
-            binary_filename("v4.18.1", "linux-x64"),
-            "atomcode-v4.18.1-linux-x64"
+            binary_filename("v4.19.0", "linux-x64"),
+            "atomcode-v4.19.0-linux-x64"
         );
     }
 
     #[test]
     fn binary_url_shape() {
         assert_eq!(
-            binary_url("v4.18.1", "darwin-arm64"),
-            "https://atomgit.com/atomgit_atomcode/atomcode-release/releases/download/v4.18.1/atomcode-v4.18.1-darwin-arm64"
+            binary_url("v4.19.0", "darwin-arm64"),
+            "https://atomgit.com/atomgit_atomcode/atomcode-release/releases/download/v4.19.0/atomcode-v4.19.0-darwin-arm64"
         );
     }
 
@@ -600,11 +600,11 @@ mod tests {
 
     #[test]
     fn is_newer_semver() {
-        assert!(is_newer("v4.18.2", "v4.18.1"));
+        assert!(is_newer("v4.18.2", "v4.19.0"));
         assert!(is_newer("v4.19.0", "v4.18.9"));
         assert!(is_newer("v5.0.0", "v4.99.99"));
-        assert!(!is_newer("v4.18.1", "v4.18.1"));
-        assert!(!is_newer("v4.18.0", "v4.18.1"));
+        assert!(!is_newer("v4.19.0", "v4.19.0"));
+        assert!(!is_newer("v4.18.0", "v4.19.0"));
     }
 
     #[test]

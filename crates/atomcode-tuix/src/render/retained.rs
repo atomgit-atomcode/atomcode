@@ -279,9 +279,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
     }
 
     fn build_rule_row(&self, rule_width: usize) -> Vec<Cell> {
-        let mut row = Vec::with_capacity(PAD_COL + rule_width);
-        let pad = CellStyle::default();
-        push_str_cells(&mut row, &" ".repeat(PAD_COL), &pad);
+        let mut row = Vec::with_capacity(rule_width);
         let border = self.style_for(Role::Border);
         for _ in 0..rule_width {
             row.push(Cell {
@@ -296,7 +294,6 @@ impl<W: Write + Send> RetainedRenderer<W> {
     fn build_middle_row(&self, line: &str, is_first: bool) -> Vec<Cell> {
         let mut row = Vec::new();
         let pad = CellStyle::default();
-        push_str_cells(&mut row, &" ".repeat(PAD_COL), &pad);
         if is_first {
             let accent = self.style_for(Role::Accent);
             push_str_cells(&mut row, "❯ ", &accent);
@@ -412,8 +409,14 @@ impl<W: Write + Send> RetainedRenderer<W> {
         if h == 0 || w == 0 {
             return;
         }
+        // menu/status keep the PAD_COL margin for visual balance; only
+        // the input-box rules and middle row go full-width so the box
+        // hugs the screen edges (per user request: remove left/right
+        // padding for the input box only).
         let rule_width = w.saturating_sub(PAD_COL * 2);
-        let text_budget = rule_width.saturating_sub(2);
+        let input_rule_width = w;
+        // "❯ " prompt prefix is 2 display cols; text fills the rest.
+        let text_budget = input_rule_width.saturating_sub(2);
 
         // Wrap input + locate cursor in wrapped layout.
         let safe = scrub_controls(&self.input_buf);
@@ -471,13 +474,13 @@ impl<W: Write + Send> RetainedRenderer<W> {
         } else {
             None
         };
-        let top_rule = self.build_rule_row(rule_width);
+        let top_rule = self.build_rule_row(input_rule_width);
         let middle_cells: Vec<Vec<Cell>> = lines
             .iter()
             .enumerate()
             .map(|(i, line)| self.build_middle_row(line, i == 0))
             .collect();
-        let bot_rule = self.build_rule_row(rule_width);
+        let bot_rule = self.build_rule_row(input_rule_width);
         let status_clone = self.status.clone();
         let status_cells = if has_status {
             Some(self.build_status_row(&status_clone, rule_width))
@@ -512,16 +515,17 @@ impl<W: Write + Send> RetainedRenderer<W> {
         }
 
         // Cursor park — 1-indexed, inside middle row at the input cell.
+        // Input row is now flush-left (no PAD_COL); "❯ " prefix is 2 cols.
         let cursor_abs_row = (footer_top + 2 + cursor_row_in_middle + 1) as u16;
-        let cursor_abs_col = (PAD_COL + 2 + cursor_col_in_row + 1) as u16;
+        let cursor_abs_col = (2 + cursor_col_in_row + 1) as u16;
         self.screen.set_cursor(cursor_abs_row, cursor_abs_col);
     }
 
     /// Footer total height — mirrors the computation inside
     /// `paint_footer` so `paint_body` knows where body_bottom lands.
     fn current_footer_rows(&self) -> usize {
-        let rule_width = (self.screen.width() as usize).saturating_sub(PAD_COL * 2);
-        let text_budget = rule_width.saturating_sub(2);
+        // Mirror paint_footer: input box is full-width (only "❯ " prefix).
+        let text_budget = (self.screen.width() as usize).saturating_sub(2);
         let safe = scrub_controls(&self.input_buf);
         let middle_rows = if text_budget == 0 {
             1
@@ -725,7 +729,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let content_w = w.saturating_sub(PAD_COL * 2);
         // Row 1: brand left + version · license right
         let left_txt = "◆ AtomCode";
-        let right_ver = "v4.18.1";
+        let right_ver = "v4.19.0";
         let right_lic = "MIT";
         let left_w = crate::width::display_width(left_txt);
         let right_w = right_ver.len() + 5 + right_lic.len();
@@ -996,9 +1000,13 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         }
         // Be defensive: clear any DECSTBM that the old AnsiRenderer
         // might have set before we took over (if flag was toggled
-        // mid-session), re-enable autowrap, park cursor on a fresh
-        // line for the shell.
-        let _ = self.out.write_all(b"\x1b[?7h\x1b[r\r\n");
+        // mid-session), re-enable autowrap, then wipe the visible
+        // viewport and home the cursor. Without the 2J, the welcome
+        // banner + input box survive as garbage that the shell's new
+        // prompt overwrites from the top — leaving the bottom half
+        // visible. Scrollback is preserved (2J clears only the
+        // visible area, not the scroll buffer).
+        let _ = self.out.write_all(b"\x1b[?7h\x1b[r\x1b[2J\x1b[H");
         let _ = self.out.flush();
     }
 
@@ -1623,25 +1631,17 @@ mod tests {
         drain_into_vterm(&buf, &mut vterm);
 
         // bot_rule is always at absolute row H-2 = 22 (0-indexed).
-        // PAD_COL(2) + rule_width(40-4=36) — so cols 2..=37 should
-        // be '─' on the screen. Cols 0..2 and 38..40 are blank.
+        // Input box is now flush-left/right (no PAD_COL) — every col
+        // 0..w should be '─' on the screen.
         let bot_rule_row = 22;
         for col in 0..40usize {
             let cell = vterm.cell_at(bot_rule_row, col);
-            if (2..38).contains(&col) {
-                assert_eq!(
-                    cell.ch, '─',
-                    "bot_rule col {} (expected '─') shows {:?}\n\
-                     full grid dump:\n{}",
-                    col, cell, vterm.dump()
-                );
-            } else {
-                assert_eq!(
-                    cell.ch, ' ',
-                    "padding col {} (expected blank) shows {:?}",
-                    col, cell
-                );
-            }
+            assert_eq!(
+                cell.ch, '─',
+                "bot_rule col {} (expected '─') shows {:?}\n\
+                 full grid dump:\n{}",
+                col, cell, vterm.dump()
+            );
         }
     }
 
@@ -1678,20 +1678,20 @@ mod tests {
         // Screen h=24, footer 5 rows = [19, 23]:
         //   row 19: spinner blank, row 20: top rule,
         //   row 21: middle, row 22: bot rule, row 23: status.
-        // "  ❯ 你是谁" in middle row (col 0-indexed):
-        //   col 0-1 pad, col 2 '❯', col 3 ' ',
-        //   col 4 '你' (cols 4-5, right half blank), col 6 '是',
-        //   col 8 '谁'.
+        // "❯ 你是谁" in middle row (col 0-indexed, flush-left now):
+        //   col 0 '❯', col 1 ' ',
+        //   col 2 '你' (cols 2-3, right half blank), col 4 '是',
+        //   col 6 '谁'.
         let middle_row = 21;
-        assert_eq!(vterm.cell_at(middle_row, 2).ch, '❯');
-        assert_eq!(vterm.cell_at(middle_row, 3).ch, ' ');
+        assert_eq!(vterm.cell_at(middle_row, 0).ch, '❯');
+        assert_eq!(vterm.cell_at(middle_row, 1).ch, ' ');
         assert_eq!(
-            vterm.cell_at(middle_row, 4).ch, '你',
+            vterm.cell_at(middle_row, 2).ch, '你',
             "dump:\n{}",
             vterm.dump()
         );
-        assert_eq!(vterm.cell_at(middle_row, 6).ch, '是');
-        assert_eq!(vterm.cell_at(middle_row, 8).ch, '谁');
+        assert_eq!(vterm.cell_at(middle_row, 4).ch, '是');
+        assert_eq!(vterm.cell_at(middle_row, 6).ch, '谁');
     }
 
     /// Menu open via vterm: the slash-command palette (4 rows)
@@ -2195,31 +2195,21 @@ mod tests {
         let footer_top = h - footer_rows;
         // Layout: spinner + top_rule + middle×N + bot_rule + status.
         // With 2-row middle: bot_rule at footer_top + 2 + 2 = footer_top + 4
+        // text_budget = w - 2 ("❯ " prefix) = 38 for w=40.
         let (lines, _, _) =
-            crate::width::wrap_with_cursor(&long, 40 - 6, long.len());
+            crate::width::wrap_with_cursor(&long, 40 - 2, long.len());
         assert!(lines.len() >= 2, "test setup: expected wrap");
         let bot_rule_row = footer_top + 2 + lines.len();
         let prev_cells = r.screen.prev_cells_for_test();
         let row_cells = &prev_cells[bot_rule_row];
 
-        // Rule structure: PAD_COL(2) blank + rule_width('─') + tail_pad blank.
-        let rule_width = 40 - PAD_COL * 2; // 36
-        let rule_start = PAD_COL;
-        let rule_end = PAD_COL + rule_width;
+        // Rule is flush-left/right now — every col 0..w is '─'.
         for (col, cell) in row_cells.iter().enumerate() {
-            if col >= rule_start && col < rule_end {
-                assert_eq!(
-                    cell.ch, '─',
-                    "col {} expected '─', got {:?} (rule short!)",
-                    col, cell
-                );
-            } else {
-                assert_eq!(
-                    cell.ch, ' ',
-                    "col {} expected pad blank, got {:?}",
-                    col, cell
-                );
-            }
+            assert_eq!(
+                cell.ch, '─',
+                "col {} expected '─', got {:?} (rule short!)",
+                col, cell
+            );
         }
     }
 

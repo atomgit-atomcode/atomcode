@@ -12,4 +12,5 @@ pub mod skill;
 pub mod stream;
 pub mod tool;
 pub mod turn;
+pub mod self_update;
 pub mod version_check;

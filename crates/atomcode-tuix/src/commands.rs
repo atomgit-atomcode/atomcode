@@ -61,6 +61,7 @@ const BUILTIN_COMMANDS: &[Command] = &[
     Command { name: "session", desc: "Start a new session (clears conversation)" },
     Command { name: "cost",    desc: "Show token cost" },
     Command { name: "undo",    desc: "Undo last change (not yet supported)" },
+    Command { name: "upgrade", desc: "Upgrade atomcode to latest (subcommand: rollback)" },
     Command { name: "help",    desc: "Show this help" },
     Command { name: "quit",    desc: "Exit AtomCode" },
 ];

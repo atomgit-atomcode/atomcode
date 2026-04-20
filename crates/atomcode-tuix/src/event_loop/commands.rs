@@ -254,6 +254,63 @@ pub(super) fn execute_slash_command(
             renderer.render(UiLine::CommandOutput(txt));
             renderer.flush();
         }
+        "upgrade" => {
+            // Sub-dispatch: `/upgrade`, `/upgrade rollback`, `/upgrade --force`.
+            // Keep parsing deliberately tolerant — users type these things
+            // with assorted capitalization and whitespace; a command that
+            // refuses `/upgrade Rollback` is user-hostile.
+            let arg_norm = arg.trim().to_ascii_lowercase();
+            if arg_norm == "rollback" {
+                // Rollback is sync and fast (three renames). Run inline
+                // so the user sees the result immediately without waiting
+                // for an async task to schedule.
+                match atomcode_core::self_update::run_rollback() {
+                    Ok(sum) => {
+                        // Route through the event channel so rendering
+                        // and "set done → exit" logic stays in one place.
+                        let _ = ctx.upgrade_tx.send(
+                            atomcode_core::self_update::UpgradeEvent::RolledBack {
+                                exe: sum.exe,
+                                backup: sum.backup,
+                            },
+                        );
+                    }
+                    Err(e) => {
+                        let _ = ctx.upgrade_tx.send(
+                            atomcode_core::self_update::UpgradeEvent::Failed(format!("{:#}", e)),
+                        );
+                    }
+                }
+            } else {
+                let force = arg_norm == "--force" || arg_norm == "-f";
+                if !force && !arg_norm.is_empty() {
+                    renderer.render(UiLine::Error(format!(
+                        "unknown /upgrade argument: {}\n  usage: /upgrade [rollback|--force]",
+                        arg
+                    )));
+                    renderer.flush();
+                    return Ok(());
+                }
+                renderer.render(UiLine::CommandOutput(
+                    "  正在检查更新...\n".into(),
+                ));
+                renderer.flush();
+                let current = format!("v{}", env!("CARGO_PKG_VERSION"));
+                let tx = ctx.upgrade_tx.clone();
+                tokio::spawn(async move {
+                    // The driver emits Done via `tx` on success; on error
+                    // we translate to a Failed event so the TUI layer
+                    // only has to handle one event stream.
+                    if let Err(e) =
+                        atomcode_core::self_update::run_upgrade(current, force, tx.clone()).await
+                    {
+                        let _ = tx.send(atomcode_core::self_update::UpgradeEvent::Failed(
+                            format!("{:#}", e),
+                        ));
+                    }
+                });
+            }
+        }
         "cd" => {
             let new_dir = resolve_cd(arg, &ctx.working_dir, ctx.previous_dir.as_deref());
             match new_dir {
