@@ -911,6 +911,29 @@ impl App {
                     self.rapid_streak = 0;
                 }
 
+                // PASTE FALLBACK for Enter: when the terminal delivered a paste
+                // as a raw key burst (bracketed paste unsupported, or stripped
+                // by tmux/screen/SSH), the first Enter arrives before the
+                // streak reaches RAPID_PASTE_THRESHOLD and would submit the
+                // prompt prematurely. No human types two keys inside 50ms, so
+                // treat a hot-Enter as a newline and keep the streak alive so
+                // the remainder of the burst enters buffer mode.
+                if paste_eligible
+                    && matches!(key.code, KeyCode::Enter)
+                    && key.modifiers == KeyModifiers::NONE
+                    && interval_ms < 50
+                {
+                    if self.rapid_streak >= RAPID_PASTE_THRESHOLD {
+                        self.rapid_buf.push('\n');
+                    } else {
+                        self.input.insert_newline();
+                        // Force the next key into buffer mode regardless of
+                        // its timing — we already know this is a paste burst.
+                        self.rapid_streak = RAPID_PASTE_THRESHOLD;
+                    }
+                    return;
+                }
+
                 // Once the streak crosses the threshold, divert the current key
                 // into the paste buffer instead of the input box.
                 if paste_eligible && self.rapid_streak >= RAPID_PASTE_THRESHOLD {
@@ -1699,7 +1722,8 @@ impl App {
             // Enter handling:
             // - Plain Enter (no modifiers) = send message
             // - Any modifier + Enter (Shift/Ctrl/Alt) = newline
-            // - Rapid Enter (<50ms since last key) = newline (paste fallback)
+            // - Rapid Enter (<50ms since last key) = newline (paste fallback,
+            //   handled earlier in `handle_input_event` before reaching here).
             (KeyModifiers::NONE, KeyCode::Enter) => {
                 // Backslash at end of line = insert newline instead of sending
                 // (fallback for terminals that can't distinguish Shift+Enter)

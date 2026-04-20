@@ -1,0 +1,718 @@
+//! In-place binary upgrade for atomcode.
+//!
+//! Flow:
+//! 1. Fetch `latest.json` manifest (version + per-target sha256/size).
+//! 2. Detect current platform and pick the matching binary entry.
+//! 3. Verify we can write to `current_exe()`'s directory — if not, fail
+//!    with a precise message telling the user to re-run with `sudo`.
+//! 4. Download the binary to a sibling temp file, streaming progress.
+//! 5. Verify SHA256 against the manifest. Bail (and delete temp) on
+//!    mismatch — we never touch the live binary until verification
+//!    passes.
+//! 6. Rename the live binary to `atomcode.bak` (Windows:
+//!    `atomcode.exe.bak`), then rename the downloaded file into place.
+//!    Same-directory rename is atomic on POSIX; on Windows, renaming
+//!    the currently-running exe is allowed (deleting it is not).
+//!
+//! Rollback swaps the live binary with `.bak` in place, so one backup
+//! always points to "the other version" — the user can toggle by
+//! alternating `/upgrade` and `/upgrade rollback`.
+
+use std::path::{Path, PathBuf};
+
+use anyhow::{anyhow, Context, Result};
+use serde::Deserialize;
+use sha2::{Digest, Sha256};
+use tokio::io::AsyncWriteExt;
+use tokio::sync::mpsc;
+
+pub const MANIFEST_URL: &str =
+    "https://raw.gitcode.com/atomgit_atomcode/atomcode/raw/main/latest.json";
+pub const DOWNLOAD_BASE: &str =
+    "https://atomgit.com/atomgit_atomcode/atomcode-release/releases/download";
+
+/// Streamed progress events from the upgrade/rollback machinery.
+///
+/// Sender is always async-owned (the upgrade task); receivers are the
+/// TUI event loop or the CLI `stdout` logger. Events are advisory —
+/// dropping the receiver must never block the upgrade.
+#[derive(Debug, Clone)]
+pub enum UpgradeEvent {
+    ManifestFetched { version: String },
+    Downloading { bytes: u64, total: u64 },
+    Verifying,
+    Replacing,
+    Done { version: String, backup: PathBuf },
+    /// Terminal failure. Carries the display-formatted error so the UI
+    /// layer doesn't need `anyhow` to render it.
+    Failed(String),
+    /// Rollback finished. Reported through the same channel so the TUI
+    /// can drive both flows with a single select arm.
+    RolledBack { exe: PathBuf, backup: PathBuf },
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Manifest {
+    pub version: String,
+    #[serde(default)]
+    pub released_at: Option<String>,
+    pub binaries: std::collections::BTreeMap<String, BinaryEntry>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct BinaryEntry {
+    pub sha256: String,
+    pub size: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpgradeSummary {
+    pub version: String,
+    pub backup: PathBuf,
+    pub exe: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+pub struct RollbackSummary {
+    pub exe: PathBuf,
+    pub backup: PathBuf,
+}
+
+/// Return the target tag used in release artifact names
+/// (`darwin-arm64`, `linux-x64`, `windows-x64`, …).
+///
+/// `None` means the current platform has no published release — the
+/// caller must surface a clean "unsupported platform" message rather
+/// than fall through to a 404 download.
+pub fn detect_target() -> Option<&'static str> {
+    if cfg!(target_os = "macos") {
+        if cfg!(target_arch = "aarch64") {
+            Some("darwin-arm64")
+        } else if cfg!(target_arch = "x86_64") {
+            Some("darwin-x64")
+        } else {
+            None
+        }
+    } else if cfg!(target_os = "linux") {
+        if cfg!(target_arch = "x86_64") {
+            Some("linux-x64")
+        } else {
+            None
+        }
+    } else if cfg!(target_os = "windows") {
+        if cfg!(target_arch = "x86_64") {
+            Some("windows-x64")
+        } else if cfg!(target_arch = "aarch64") {
+            Some("windows-arm64")
+        } else {
+            None
+        }
+    } else {
+        None
+    }
+}
+
+/// Release artifact filename for a given version + target, matching
+/// what `scripts/release.sh` publishes to `dist/<version>/`.
+pub fn binary_filename(version: &str, target: &str) -> String {
+    if target.starts_with("windows") {
+        format!("atomcode-{}-{}.exe", version, target)
+    } else {
+        format!("atomcode-{}-{}", version, target)
+    }
+}
+
+pub fn binary_url(version: &str, target: &str) -> String {
+    format!(
+        "{}/{}/{}",
+        DOWNLOAD_BASE,
+        version,
+        binary_filename(version, target)
+    )
+}
+
+/// Path of the running `atomcode` executable. Resolved once at the
+/// start of an upgrade so we know what to replace.
+pub fn current_exe_path() -> Result<PathBuf> {
+    std::env::current_exe().context("could not resolve current executable path")
+}
+
+/// Sibling path used to stash the previous binary.
+///
+/// Unix: `atomcode` → `atomcode.bak`.
+/// Windows: `atomcode.exe` → `atomcode.exe.bak`.
+pub fn backup_path(exe: &Path) -> PathBuf {
+    let mut os = exe.as_os_str().to_os_string();
+    os.push(".bak");
+    PathBuf::from(os)
+}
+
+/// Temp file where an in-flight download is written before atomic
+/// rename. Dotted prefix so it doesn't show up in a casual `ls`, and
+/// also so it's easy to identify-and-clean if a crash orphans it.
+fn download_path(exe: &Path) -> PathBuf {
+    let dir = exe.parent().unwrap_or_else(|| Path::new("."));
+    dir.join(".atomcode.download")
+}
+
+/// Same-dir temp used during a three-way rollback swap.
+fn rolling_path(exe: &Path) -> PathBuf {
+    let dir = exe.parent().unwrap_or_else(|| Path::new("."));
+    dir.join(".atomcode.rolling")
+}
+
+/// Return `Ok(())` iff we can create a file alongside `exe`.
+///
+/// Testing the *directory* (not the file itself) is what matters:
+/// `rename(2)` needs write permission on the containing dir to atomic
+/// replace. Probing creates a real empty file and deletes it to avoid
+/// false positives from filesystems that claim metadata writability
+/// but reject opens.
+pub fn ensure_writable(exe: &Path) -> Result<()> {
+    let dir = exe
+        .parent()
+        .ok_or_else(|| anyhow!("executable has no parent directory: {}", exe.display()))?;
+    let probe = dir.join(".atomcode.writable-probe");
+    match std::fs::File::create(&probe) {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&probe);
+            Ok(())
+        }
+        Err(e) => Err(anyhow!(
+            "{} is not writable by the current user ({}).\n\
+             Re-run with elevated privileges:  sudo atomcode upgrade\n\
+             Or reinstall into a user-writable location (e.g. ~/.local/bin).",
+            dir.display(),
+            e
+        )),
+    }
+}
+
+/// Fetch and parse `latest.json`.
+///
+/// Longer timeout than the passive `version_check` (which must fail
+/// fast at startup); here the user explicitly asked for an upgrade, so
+/// waiting 30s for a slow mirror is acceptable.
+pub async fn fetch_manifest() -> Result<Manifest> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .user_agent(format!(
+            "atomcode-self-update/{}",
+            env!("CARGO_PKG_VERSION")
+        ))
+        .build()?;
+    let resp = client
+        .get(MANIFEST_URL)
+        .send()
+        .await
+        .context("failed to fetch latest.json")?;
+    if !resp.status().is_success() {
+        return Err(anyhow!(
+            "fetching latest.json returned HTTP {}",
+            resp.status()
+        ));
+    }
+    let body = resp.text().await.context("reading latest.json body")?;
+    serde_json::from_str(&body)
+        .with_context(|| format!("parsing latest.json (body: {:?})", truncate(&body, 200)))
+}
+
+fn truncate(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        s.to_string()
+    } else {
+        let head: String = s.chars().take(max_chars).collect();
+        format!("{}…", head)
+    }
+}
+
+/// Download `url` to `dest`, streaming SHA256 as bytes arrive.
+///
+/// `progress` fires every chunk with (bytes_so_far, total). Callers
+/// should debounce before redrawing the UI; we emit eagerly because
+/// the upgrade UI wants smooth progress for a ~10 MB file.
+///
+/// Verifies size AND sha256 before returning. On any failure the
+/// partial file is removed so a retry starts clean.
+async fn download_and_verify(
+    url: &str,
+    expected_sha256: &str,
+    expected_size: u64,
+    dest: &Path,
+    progress: &mpsc::UnboundedSender<UpgradeEvent>,
+) -> Result<()> {
+    use futures::StreamExt;
+
+    if dest.exists() {
+        let _ = std::fs::remove_file(dest);
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(600))
+        .user_agent(format!(
+            "atomcode-self-update/{}",
+            env!("CARGO_PKG_VERSION")
+        ))
+        .build()?;
+    let resp = client
+        .get(url)
+        .send()
+        .await
+        .with_context(|| format!("GET {}", url))?;
+    if !resp.status().is_success() {
+        return Err(anyhow!(
+            "downloading {} returned HTTP {} — release may not exist for this platform",
+            url,
+            resp.status()
+        ));
+    }
+
+    // Prefer the manifest's size (authoritative) over Content-Length,
+    // which mirrors may gzip or mis-report. But if Content-Length is
+    // present and differs, that's a likely wrong-file red flag — bail.
+    let reported = resp.content_length();
+    if let Some(n) = reported {
+        if n != expected_size {
+            return Err(anyhow!(
+                "size mismatch: manifest says {} bytes, server says {} bytes — aborting",
+                expected_size,
+                n
+            ));
+        }
+    }
+
+    let mut file = tokio::fs::File::create(dest)
+        .await
+        .with_context(|| format!("creating {}", dest.display()))?;
+    let mut hasher = Sha256::new();
+    let mut written: u64 = 0;
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.context("reading response chunk")?;
+        hasher.update(&chunk);
+        file.write_all(&chunk)
+            .await
+            .context("writing download to disk")?;
+        written += chunk.len() as u64;
+        // Ignore send errors — receiver may have been dropped.
+        let _ = progress.send(UpgradeEvent::Downloading {
+            bytes: written,
+            total: expected_size,
+        });
+    }
+    file.flush().await.context("flushing download to disk")?;
+    drop(file);
+
+    if written != expected_size {
+        let _ = std::fs::remove_file(dest);
+        return Err(anyhow!(
+            "short download: got {} bytes, expected {}",
+            written,
+            expected_size
+        ));
+    }
+
+    let _ = progress.send(UpgradeEvent::Verifying);
+    let got = hex_encode(&hasher.finalize());
+    if !got.eq_ignore_ascii_case(expected_sha256) {
+        let _ = std::fs::remove_file(dest);
+        return Err(anyhow!(
+            "checksum mismatch — possible corruption or tampering.\n  expected: {}\n  got:      {}",
+            expected_sha256,
+            got
+        ));
+    }
+
+    Ok(())
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push_str(&format!("{:02x}", b));
+    }
+    out
+}
+
+/// Put `new_bin` in place of `exe`, keeping the previous `exe` as `.bak`.
+///
+/// On Unix, `rename(2)` within a directory is atomic; on Windows, an
+/// exe currently being executed can be renamed (but not deleted), so
+/// the same sequence works. If a stale `.bak` exists we remove it
+/// first — if that removal fails on Windows because the user hasn't
+/// restarted since a prior upgrade (the `.bak` is the running
+/// process), we surface a clear message.
+fn replace_binary(new_bin: &Path, exe: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perm = std::fs::metadata(new_bin)
+            .with_context(|| format!("stat {}", new_bin.display()))?
+            .permissions();
+        perm.set_mode(0o755);
+        std::fs::set_permissions(new_bin, perm)
+            .with_context(|| format!("chmod {}", new_bin.display()))?;
+    }
+
+    let backup = backup_path(exe);
+    if backup.exists() {
+        std::fs::remove_file(&backup).map_err(|e| {
+            anyhow!(
+                "could not remove previous backup {}: {}.\n\
+                 If you upgraded without restarting, exit atomcode and retry.",
+                backup.display(),
+                e
+            )
+        })?;
+    }
+
+    std::fs::rename(exe, &backup).with_context(|| {
+        format!(
+            "renaming current binary {} -> {}",
+            exe.display(),
+            backup.display()
+        )
+    })?;
+
+    if let Err(e) = std::fs::rename(new_bin, exe) {
+        let _ = std::fs::rename(&backup, exe);
+        return Err(anyhow!(
+            "moving new binary into place failed ({}). Previous version restored.",
+            e
+        ));
+    }
+
+    Ok(())
+}
+
+/// Top-level upgrade driver.
+///
+/// `current_version` is what we're running right now (e.g. `"v4.18.1"`
+/// — callers typically pass `format!("v{}", env!("CARGO_PKG_VERSION"))`).
+/// When `force` is false and the manifest version is `<=` current, this
+/// returns an error carrying `ALREADY_LATEST` so callers can distinguish
+/// "already up to date" from a real failure.
+pub async fn run_upgrade(
+    current_version: String,
+    force: bool,
+    tx: mpsc::UnboundedSender<UpgradeEvent>,
+) -> Result<UpgradeSummary> {
+    let current_version = current_version.as_str();
+    let target = detect_target().ok_or_else(|| {
+        anyhow!(
+            "this platform has no published atomcode release ({}/{})",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        )
+    })?;
+    let exe = current_exe_path()?;
+    ensure_writable(&exe)?;
+
+    let manifest = fetch_manifest().await?;
+    let _ = tx.send(UpgradeEvent::ManifestFetched {
+        version: manifest.version.clone(),
+    });
+
+    if !force && !is_newer(&manifest.version, current_version) {
+        return Err(anyhow!(
+            "{}: already on {} (latest is {}). Pass --force to reinstall.",
+            ALREADY_LATEST,
+            current_version,
+            manifest.version
+        ));
+    }
+
+    let entry = manifest.binaries.get(target).ok_or_else(|| {
+        anyhow!(
+            "manifest has no entry for target {} — this platform may not be in this release",
+            target
+        )
+    })?;
+
+    let url = binary_url(&manifest.version, target);
+    let download = download_path(&exe);
+    download_and_verify(&url, &entry.sha256, entry.size, &download, &tx).await?;
+
+    let _ = tx.send(UpgradeEvent::Replacing);
+    replace_binary(&download, &exe)?;
+
+    let backup = backup_path(&exe);
+    let _ = tx.send(UpgradeEvent::Done {
+        version: manifest.version.clone(),
+        backup: backup.clone(),
+    });
+
+    Ok(UpgradeSummary {
+        version: manifest.version,
+        backup,
+        exe,
+    })
+}
+
+/// Sentinel substring in the "already latest" error so the CLI/TUI
+/// layer can render a calm informational message instead of a scary
+/// red error. Kept as a plain string to avoid an error-type refactor.
+pub const ALREADY_LATEST: &str = "ALREADY_LATEST";
+
+/// Parse and compare two `vMAJOR.MINOR.PATCH` strings. Returns true
+/// when `latest > current`. Malformed inputs fall back to a byte-wise
+/// `!=` so we *do* proceed with reinstall when version strings are
+/// shaped unexpectedly — safer than silently refusing to upgrade.
+fn is_newer(latest: &str, current: &str) -> bool {
+    match (parse_version(latest), parse_version(current)) {
+        (Some(a), Some(b)) => a > b,
+        _ => latest.trim() != current.trim(),
+    }
+}
+
+fn parse_version(s: &str) -> Option<(u64, u64, u64)> {
+    let s = s.trim();
+    let rest = s.strip_prefix('v')?;
+    let mut parts = rest.split('.');
+    let a = parts.next()?.parse().ok()?;
+    let b = parts.next()?.parse().ok()?;
+    let c = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((a, b, c))
+}
+
+/// Three-way swap between the live binary and `.bak`, leaving `.bak`
+/// pointing at what was previously live. Calling rollback twice in a
+/// row returns you to the original state — intentional, so users can
+/// toggle between last-two versions without redownloading.
+pub fn run_rollback() -> Result<RollbackSummary> {
+    let exe = current_exe_path()?;
+    let backup = backup_path(&exe);
+    if !backup.exists() {
+        return Err(anyhow!(
+            "no backup found at {} — nothing to roll back to",
+            backup.display()
+        ));
+    }
+    ensure_writable(&exe)?;
+
+    let rolling = rolling_path(&exe);
+    if rolling.exists() {
+        std::fs::remove_file(&rolling).ok();
+    }
+
+    // Step 1: live -> rolling
+    std::fs::rename(&exe, &rolling).with_context(|| {
+        format!(
+            "renaming {} -> {} (swap step 1)",
+            exe.display(),
+            rolling.display()
+        )
+    })?;
+    // Step 2: backup -> live
+    if let Err(e) = std::fs::rename(&backup, &exe) {
+        // Best-effort unwind of step 1.
+        let _ = std::fs::rename(&rolling, &exe);
+        return Err(anyhow!(
+            "rollback failed at step 2 ({}); state restored",
+            e
+        ));
+    }
+    // Step 3: rolling -> backup
+    if let Err(e) = std::fs::rename(&rolling, &backup) {
+        // Can't cleanly unwind — the live file is already the old
+        // version, which is the user-visible outcome they asked for.
+        // Surface the orphan so they can clean up manually.
+        return Err(anyhow!(
+            "rollback succeeded but tmp file {} could not be moved to {} ({}).\n\
+             Delete it manually; next /upgrade will overwrite it.",
+            rolling.display(),
+            backup.display(),
+            e
+        ));
+    }
+
+    Ok(RollbackSummary { exe, backup })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn binary_filename_adds_exe_on_windows_targets() {
+        assert_eq!(
+            binary_filename("v4.18.1", "windows-x64"),
+            "atomcode-v4.18.1-windows-x64.exe"
+        );
+        assert_eq!(
+            binary_filename("v4.18.1", "windows-arm64"),
+            "atomcode-v4.18.1-windows-arm64.exe"
+        );
+    }
+
+    #[test]
+    fn binary_filename_plain_on_unix_targets() {
+        assert_eq!(
+            binary_filename("v4.18.1", "darwin-arm64"),
+            "atomcode-v4.18.1-darwin-arm64"
+        );
+        assert_eq!(
+            binary_filename("v4.18.1", "linux-x64"),
+            "atomcode-v4.18.1-linux-x64"
+        );
+    }
+
+    #[test]
+    fn binary_url_shape() {
+        assert_eq!(
+            binary_url("v4.18.1", "darwin-arm64"),
+            "https://atomgit.com/atomgit_atomcode/atomcode-release/releases/download/v4.18.1/atomcode-v4.18.1-darwin-arm64"
+        );
+    }
+
+    #[test]
+    fn detect_target_returns_something_on_tier1_hosts() {
+        // We can't assert an exact value (depends on host), but every
+        // supported dev platform should resolve to Some.
+        let t = detect_target();
+        if cfg!(any(target_os = "macos", target_os = "linux", target_os = "windows")) {
+            if cfg!(any(target_arch = "x86_64", target_arch = "aarch64")) {
+                assert!(t.is_some(), "expected target tag on this host");
+            }
+        }
+    }
+
+    #[test]
+    fn backup_path_appends_bak() {
+        let p = Path::new("/usr/local/bin/atomcode");
+        assert_eq!(
+            backup_path(p),
+            PathBuf::from("/usr/local/bin/atomcode.bak")
+        );
+    }
+
+    #[test]
+    fn backup_path_preserves_exe_suffix_on_windows_style() {
+        let p = Path::new("C:/Tools/atomcode.exe");
+        assert_eq!(
+            backup_path(p),
+            PathBuf::from("C:/Tools/atomcode.exe.bak")
+        );
+    }
+
+    #[test]
+    fn is_newer_semver() {
+        assert!(is_newer("v4.18.2", "v4.18.1"));
+        assert!(is_newer("v4.19.0", "v4.18.9"));
+        assert!(is_newer("v5.0.0", "v4.99.99"));
+        assert!(!is_newer("v4.18.1", "v4.18.1"));
+        assert!(!is_newer("v4.18.0", "v4.18.1"));
+    }
+
+    #[test]
+    fn is_newer_falls_back_to_string_diff_on_garbage() {
+        // If we can't parse, err on the side of allowing reinstall
+        // when strings differ (user may have a custom channel).
+        assert!(is_newer("build-abc", "build-xyz"));
+        assert!(!is_newer("build-abc", "build-abc"));
+    }
+
+    #[test]
+    fn manifest_parses_minimal_shape() {
+        let json = r#"{
+            "version": "v4.19.0",
+            "binaries": {
+                "darwin-arm64": { "sha256": "abcd", "size": 1024 }
+            }
+        }"#;
+        let m: Manifest = serde_json::from_str(json).unwrap();
+        assert_eq!(m.version, "v4.19.0");
+        assert_eq!(m.binaries["darwin-arm64"].size, 1024);
+    }
+
+    #[test]
+    fn manifest_ignores_unknown_fields() {
+        let json = r#"{
+            "version": "v4.19.0",
+            "released_at": "2026-04-19T00:00:00Z",
+            "signature": "future-field",
+            "binaries": {
+                "linux-x64": { "sha256": "ffff", "size": 42, "notes": "x" }
+            }
+        }"#;
+        let m: Manifest = serde_json::from_str(json).unwrap();
+        assert_eq!(m.released_at.as_deref(), Some("2026-04-19T00:00:00Z"));
+        assert_eq!(m.binaries["linux-x64"].sha256, "ffff");
+    }
+
+    #[test]
+    fn hex_encode_matches_known_vectors() {
+        assert_eq!(hex_encode(&[0x00, 0xff, 0x10]), "00ff10");
+        assert_eq!(hex_encode(&[]), "");
+    }
+
+    #[test]
+    fn ensure_writable_probes_containing_dir() {
+        // A path inside tempdir must pass; a path whose parent doesn't
+        // exist must fail with a clear message.
+        let tmp = tempfile::tempdir().unwrap();
+        let ok = tmp.path().join("atomcode");
+        assert!(ensure_writable(&ok).is_ok());
+
+        let bogus = Path::new("/nonexistent-dir-xyzzy-9999/atomcode");
+        let err = ensure_writable(bogus).unwrap_err().to_string();
+        assert!(err.contains("sudo atomcode upgrade"), "got: {}", err);
+    }
+
+    #[test]
+    fn replace_binary_renames_live_to_bak() {
+        let tmp = tempfile::tempdir().unwrap();
+        let exe = tmp.path().join("atomcode");
+        let new = tmp.path().join(".atomcode.download");
+        std::fs::write(&exe, b"OLD").unwrap();
+        std::fs::write(&new, b"NEW").unwrap();
+
+        replace_binary(&new, &exe).unwrap();
+
+        assert_eq!(std::fs::read(&exe).unwrap(), b"NEW");
+        let bak = backup_path(&exe);
+        assert_eq!(std::fs::read(&bak).unwrap(), b"OLD");
+        assert!(!new.exists());
+    }
+
+    #[test]
+    fn replace_binary_overwrites_stale_bak() {
+        let tmp = tempfile::tempdir().unwrap();
+        let exe = tmp.path().join("atomcode");
+        let new = tmp.path().join(".atomcode.download");
+        let bak = backup_path(&exe);
+        std::fs::write(&exe, b"V2").unwrap();
+        std::fs::write(&new, b"V3").unwrap();
+        std::fs::write(&bak, b"V1").unwrap();
+
+        replace_binary(&new, &exe).unwrap();
+
+        assert_eq!(std::fs::read(&exe).unwrap(), b"V3");
+        assert_eq!(std::fs::read(&bak).unwrap(), b"V2");
+    }
+
+    #[test]
+    fn rollback_swaps_live_and_bak() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Use a fake exe name that won't collide with the real test
+        // binary. run_rollback uses current_exe() which we cannot
+        // redirect, so we test the primitive by calling replace_binary
+        // first then rename logic directly — model the three-way swap.
+        let exe = tmp.path().join("atomcode");
+        let bak = backup_path(&exe);
+        std::fs::write(&exe, b"NEW").unwrap();
+        std::fs::write(&bak, b"OLD").unwrap();
+
+        // Manual three-way swap mirroring run_rollback's body.
+        let rolling = tmp.path().join(".atomcode.rolling");
+        std::fs::rename(&exe, &rolling).unwrap();
+        std::fs::rename(&bak, &exe).unwrap();
+        std::fs::rename(&rolling, &bak).unwrap();
+
+        assert_eq!(std::fs::read(&exe).unwrap(), b"OLD");
+        assert_eq!(std::fs::read(&bak).unwrap(), b"NEW");
+    }
+}

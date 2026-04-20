@@ -100,6 +100,27 @@ async fn test_write_overwrite_no_warn_on_growth() {
 }
 
 #[tokio::test]
+async fn test_write_empty_args_returns_friendly_error() {
+    // Reproduces the user-reported bug: provider emits `{}` on max_tokens cutoff,
+    // and WriteFileTool used to propagate the raw serde error
+    // ("missing field `file_path` at line 1 column 2") which told the model
+    // nothing. Expected: success=false with actionable recovery hint.
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = make_ctx(dir.path());
+    let tool = WriteFileTool;
+
+    let result = tool.execute("{}", &ctx).await.unwrap();
+    assert!(!result.success, "empty args should fail gracefully");
+    assert!(result.output.contains("missing field"), "keep serde detail: {}", result.output);
+    assert!(
+        result.output.contains("truncated") || result.output.contains("max_tokens"),
+        "should hint at root cause: {}",
+        result.output,
+    );
+    assert!(result.output.contains("edit_file"), "should suggest edit_file: {}", result.output);
+}
+
+#[tokio::test]
 async fn test_write_creates_parent_dirs() {
     let dir = tempfile::tempdir().unwrap();
     let ctx = make_ctx(dir.path());

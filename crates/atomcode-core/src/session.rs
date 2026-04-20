@@ -162,7 +162,7 @@ impl SessionManager {
     /// - Not on macOS
     /// - Legacy directory doesn't exist
     /// - New directory already has sessions
-    fn migrate_from_legacy() {
+    pub fn migrate_from_legacy() {
         let Some(legacy_dir) = Self::legacy_sessions_dir() else {
             return; // Not macOS, no migration needed
         };

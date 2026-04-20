@@ -417,6 +417,8 @@ impl AgentLoop {
             config: config.clone(),
             permission: interactive_permission,
             recently_edited_files: Vec::new(),
+            recent_calls: Vec::new(),
+            file_read_counts: std::collections::HashMap::new(),
         };
 
         let agent = Self {
