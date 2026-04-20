@@ -33,6 +33,17 @@ pub struct TurnRunner {
     pub permission: Box<dyn PermissionDecider>,
     /// Files edited during the current session (tracked for context awareness).
     pub recently_edited_files: Vec<String>,
+    /// Rolling history of `(tool_name, args_hash)` pairs — used to detect tool
+    /// call loops (same tool + same args repeated without any edit in between).
+    /// Bounded to 20 entries to keep memory flat. For `read_file`, only the
+    /// file_path is hashed so paginated re-reads of the same file are treated
+    /// as repeats.
+    pub recent_calls: Vec<(String, u64)>,
+    /// Per-basename read counter. 5+ consecutive reads of the same file without
+    /// an edit is an infinite loop (common when a file can't be parsed as text
+    /// — e.g. Office binaries — and the model keeps retrying with different
+    /// offset/limit values instead of giving up).
+    pub file_read_counts: std::collections::HashMap<String, u32>,
 }
 
 impl TurnRunner {
@@ -530,7 +541,7 @@ _ = cancel.cancelled() => {
 
     /// Execute a single tool call with permission checking.
     async fn execute_single_tool(
-        &self,
+        &mut self,
         call: &ToolCall,
         event_tx: &mpsc::UnboundedSender<TurnEvent>,
     ) -> ToolResult {
@@ -561,7 +572,9 @@ _ = cancel.cancelled() => {
         } else {
             corrected_name
         };
-        let tool = match self.tools.get(corrected_name) {
+        // Clone the Arc so the borrow of `self.tools` ends here — we need to
+        // call `self.detect_call_loop(..)` mutably below.
+        let tool = match self.tools.get_arc(corrected_name) {
             Some(t) => t,
             None => {
                 let available: String = self.tools.iter()
@@ -592,16 +605,44 @@ _ = cancel.cancelled() => {
             }
         };
 
-        // Use corrected name for all subsequent checks
-        let call = if corrected_name != call.name.as_str() {
-            &ToolCall {
+        // Repair malformed JSON args before approval and execution.
+        // Providers sometimes emit truncated / unescaped / fenced JSON (especially
+        // on max_tokens cutoff mid-arguments). Running the repair chain here means
+        // tool implementations see valid JSON whenever we can salvage anything,
+        // and surface deterministic errors when we can't.
+        let repaired_args = super::json_repair::repair_tool_args(corrected_name, &call.arguments);
+
+        // Use corrected name and repaired args for all subsequent checks
+        let owned_call;
+        let call = if corrected_name != call.name.as_str() || repaired_args != call.arguments {
+            owned_call = ToolCall {
                 id: call.id.clone(),
                 name: corrected_name.to_string(),
-                arguments: call.arguments.clone(),
-            }
+                arguments: repaired_args,
+            };
+            &owned_call
         } else {
             call
         };
+
+        // Loop detection: block before we even ask for approval. Without this,
+        // models that get stuck (e.g. re-reading a binary Office file with
+        // different offset/limit values) can burn 30+ turns on the same call.
+        // Returns a user-facing message when blocked; the tool never runs.
+        if let Some(msg) = self.detect_call_loop(&call.name, &call.arguments) {
+            let _ = event_tx.send(TurnEvent::ToolCallResult {
+                call_id: call.id.clone(),
+                name: call.name.clone(),
+                output: msg.clone(),
+                success: false,
+                duration: std::time::Duration::ZERO,
+            });
+            return ToolResult {
+                call_id: call.id.clone(),
+                output: msg,
+                success: false,
+            };
+        }
 
         // Check permission via the injected PermissionDecider.
         // AutoApprove tools execute immediately; RequireApproval tools go through
@@ -652,6 +693,121 @@ _ = cancel.cancelled() => {
         });
 
         tool_result
+    }
+
+    /// Detect tool-call loops and return a recovery message when one should be
+    /// blocked. Also updates the rolling call history as a side effect.
+    ///
+    /// Two patterns are caught:
+    ///
+    /// 1. **Paginated re-reads of the same file** (`read_file` specific):
+    ///    5 unbroken `read_file` calls against the same basename — typically
+    ///    the model panicking on an unreadable file (Office binary, missing
+    ///    GBK decode, etc.) and cycling through offset/limit combinations.
+    ///    Reset by a successful `edit_file` / `write_file` targeting the
+    ///    same file (that counts as real progress).
+    ///
+    /// 2. **Exact repeats** (any tool): 3 calls with identical `(tool_name,
+    ///    args_hash)` and no intervening `edit_file` / `write_file`. Means
+    ///    the model re-issued the same command without reacting to the
+    ///    previous failure.
+    ///
+    /// For `read_file`, only `file_path` is hashed so `offset`/`limit`
+    /// variations still count as "same call".
+    fn detect_call_loop(&mut self, tool_name: &str, args: &str) -> Option<String> {
+        use std::hash::{Hash, Hasher};
+
+        // --- Pattern 1: per-file read saturation ------------------------------
+        if tool_name == "read_file" {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(args) {
+                if let Some(fp) = v.get("file_path").and_then(|v| v.as_str()) {
+                    let short = std::path::Path::new(fp)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| fp.to_string());
+                    let count = self.file_read_counts.entry(short.clone()).or_insert(0);
+                    *count += 1;
+                    if *count >= 5 {
+                        return Some(format!(
+                            "BLOCKED: read_file '{}' was called {} times without an edit. \
+                             You already have everything this file can give you via read_file. \
+                             If it's unreadable (Office binary, PDF, encoding mismatch), stop \
+                             retrying and either use a bash converter (pandoc / pdftotext / \
+                             antiword / unzip for .docx) or tell the user the format isn't \
+                             supported. If you have enough content, act on it now.",
+                            short, count
+                        ));
+                    }
+                }
+            }
+        }
+
+        // A successful edit on the same file should reset its read counter so
+        // post-edit verification reads aren't blocked. `edit_file` / `write_file`
+        // also clear the global recent-repeat list further down.
+        if matches!(tool_name, "edit_file" | "write_file" | "create_file") {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(args) {
+                if let Some(fp) = v.get("file_path").and_then(|v| v.as_str()) {
+                    let short = std::path::Path::new(fp)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| fp.to_string());
+                    self.file_read_counts.remove(&short);
+                }
+            }
+        }
+
+        // --- Pattern 2: exact-repeat across any tool --------------------------
+        let args_hash = {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            if tool_name == "read_file" {
+                // offset/limit variations are still "same file" for loop purposes.
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(args) {
+                    if let Some(fp) = v.get("file_path").and_then(|v| v.as_str()) {
+                        fp.hash(&mut h);
+                    } else {
+                        args.hash(&mut h);
+                    }
+                } else {
+                    args.hash(&mut h);
+                }
+            } else {
+                args.hash(&mut h);
+            }
+            h.finish()
+        };
+
+        let sig = (tool_name.to_string(), args_hash);
+
+        // Count repeats of this exact signature *since the last edit*. An edit
+        // breaks the streak — re-issuing the same read/grep after fixing the
+        // file is legitimate and must not be blocked.
+        let mut repeats = 1usize; // including the current call
+        for prev in self.recent_calls.iter().rev() {
+            if matches!(prev.0.as_str(), "edit_file" | "write_file" | "create_file") {
+                break;
+            }
+            if *prev == sig {
+                repeats += 1;
+            }
+        }
+
+        self.recent_calls.push(sig);
+        if self.recent_calls.len() > 20 {
+            self.recent_calls.remove(0);
+        }
+
+        if repeats >= 3 {
+            return Some(format!(
+                "BLOCKED: {} was called with identical arguments {} times in a row \
+                 without any intervening edit. This is a loop. Read the previous error \
+                 message — it explains why the call is failing. Fix the underlying \
+                 problem (wrong path, wrong format, missing dependency) before retrying, \
+                 or tell the user the step can't proceed.",
+                tool_name, repeats
+            ));
+        }
+        None
     }
 }
 

@@ -569,13 +569,6 @@ fn short_path(path: &str) -> String {
     }
 }
 
-fn sessions_dir() -> PathBuf {
-    dirs::data_local_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("atomcode")
-        .join("sessions")
-}
-
 fn hash_path(path: &std::path::Path) -> String {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
@@ -587,7 +580,7 @@ fn hash_path(path: &std::path::Path) -> String {
 
 /// List all projects (scans sessions directory)
 fn list_projects() -> std::io::Result<Vec<ProjectInfo>> {
-    let sessions_root = sessions_dir();
+    let sessions_root = SessionManager::sessions_root_dir();
     let mut projects = Vec::new();
     
     if !sessions_root.exists() {
@@ -662,7 +655,7 @@ pub struct SessionMetaWithProject {
 
 /// List sessions for a project
 fn list_sessions(project_hash: &str) -> std::io::Result<Vec<SessionMeta>> {
-    let project_dir = sessions_dir().join(project_hash);
+    let project_dir = SessionManager::sessions_root_dir().join(project_hash);
     if !project_dir.exists() {
         return Ok(Vec::new());
     }
@@ -696,7 +689,7 @@ fn list_sessions(project_hash: &str) -> std::io::Result<Vec<SessionMeta>> {
 
 /// List all sessions across all projects
 fn list_all_sessions() -> std::io::Result<Vec<SessionMetaWithProject>> {
-    let sessions_root = sessions_dir();
+    let sessions_root = SessionManager::sessions_root_dir();
     if !sessions_root.exists() {
         return Ok(Vec::new());
     }
@@ -744,7 +737,7 @@ fn list_all_sessions() -> std::io::Result<Vec<SessionMetaWithProject>> {
 
 /// Load a specific session
 fn load_session(project_hash: &str, session_id: &str) -> std::io::Result<Session> {
-    let path = sessions_dir()
+    let path = SessionManager::sessions_root_dir()
         .join(project_hash)
         .join(format!("{}.json", session_id));
     
@@ -994,7 +987,7 @@ async fn create_session(
 
 /// Search sessions by name across all projects
 fn search_sessions_by_name(keyword: &str) -> std::io::Result<Vec<SessionMetaWithProject>> {
-    let sessions_root = sessions_dir();
+    let sessions_root = SessionManager::sessions_root_dir();
     if !sessions_root.exists() {
         return Ok(Vec::new());
     }
@@ -1059,7 +1052,7 @@ async fn search_sessions(Query(query): Query<SearchQuery>) -> impl IntoResponse 
 
 /// Delete a session file
 fn delete_session_file(project_hash: &str, session_id: &str) -> std::io::Result<()> {
-    let path = sessions_dir()
+    let path = SessionManager::sessions_root_dir()
         .join(project_hash)
         .join(format!("{}.json", session_id));
     
@@ -1097,7 +1090,7 @@ pub struct RenameRequest {
 
 /// Rename a session
 fn rename_session_file(project_hash: &str, session_id: &str, new_name: &str) -> std::io::Result<()> {
-    let path = sessions_dir()
+    let path = SessionManager::sessions_root_dir()
         .join(project_hash)
         .join(format!("{}.json", session_id));
     
@@ -1604,6 +1597,8 @@ let session_manager = SessionManager::new(&working_dir);
         config: config.clone(),
         permission,
         recently_edited_files: Vec::new(),
+        recent_calls: Vec::new(),
+        file_read_counts: std::collections::HashMap::new(),
     };
     
     // Build system prompt (minimal for API)
@@ -1830,7 +1825,11 @@ async fn stop_chat(
 #[tokio::main]
 async fn main() {
     use axum::routing::patch;
-    
+
+    // Ensure legacy sessions (macOS pre-v4.16 ~/Library/Application Support/atomcode/sessions)
+    // are migrated to the canonical location (~/.atomcode/sessions) before any handler reads it.
+    SessionManager::migrate_from_legacy();
+
     let state = AppState {
         sessions: Arc::new(RwLock::new(std::collections::HashMap::new())),
         project: Arc::new(RwLock::new(init_project_state())),

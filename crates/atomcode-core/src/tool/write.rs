@@ -92,7 +92,30 @@ impl Tool for WriteFileTool {
     }
 
     async fn execute(&self, args: &str, ctx: &ToolContext) -> Result<ToolResult> {
-        let parsed: WriteFileArgs = serde_json::from_str(args)?;
+        // Parse args defensively. Providers occasionally emit empty ({}) or
+        // truncated tool-call arguments on max_tokens cutoff; surfacing the raw
+        // serde error ("missing field `file_path` at line 1 column 2") tells
+        // the model nothing actionable. Return a success=false result with a
+        // recovery hint instead, so the next turn can re-issue the call properly.
+        let parsed: WriteFileArgs = match serde_json::from_str(args) {
+            Ok(p) => p,
+            Err(e) => {
+                let hint = if args.trim().is_empty() || args.trim() == "{}" {
+                    "tool call arrived with no arguments — likely truncated by max_tokens. \
+                     Re-issue write_file with both `file_path` (absolute) and `content`, \
+                     or switch to edit_file for targeted changes."
+                } else {
+                    "could not parse write_file arguments. Re-issue with a valid JSON object \
+                     containing `file_path` (absolute) and `content`. For large files, \
+                     prefer edit_file to avoid hitting the output token limit."
+                };
+                return Ok(ToolResult {
+                    call_id: String::new(),
+                    output: format!("Error: {}. {}", e, hint),
+                    success: false,
+                });
+            }
+        };
         let path = std::path::Path::new(&parsed.file_path);
 
         // Backup before write (git checkpoint + file-level backup)

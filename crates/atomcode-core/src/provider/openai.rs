@@ -220,12 +220,12 @@ impl LlmProvider for OpenAiProvider {
             .header("Content-Type", "application/json")
             .json(&body);
 
-        let response_future = request.send();
+        let policy = crate::provider::retry::RetryPolicy::default_policy();
 
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
         tokio::spawn(async move {
-            let response = match response_future.await {
+            let response = match crate::provider::retry::send_with_retry(request, &policy).await {
                 Ok(resp) => resp,
                 Err(e) => {
                     let _ = tx.send(Ok(StreamEvent::Error(format!("Connection failed: {}", e))));
@@ -360,7 +360,23 @@ impl LlmProvider for OpenAiProvider {
                                             return;
                                         }
                                         "length" | "max_tokens" => {
-                                            // Model hit token limit — response was truncated
+                                            // Model hit token limit — response was truncated.
+                                            // Flush any accumulated tool calls so the upper layer
+                                            // sees what the model was attempting (args may be
+                                            // partial/malformed; repair_tool_args + write.rs friendly
+                                            // error handle that downstream). Without this, partial
+                                            // tool calls are silently dropped and the retry sees an
+                                            // empty assistant turn with no context.
+                                            for (id, name, args) in &tool_calls {
+                                                let _ = tx.send(Ok(StreamEvent::ToolCallDone(
+                                                    crate::tool::ToolCall {
+                                                        id: id.clone(),
+                                                        name: name.clone(),
+                                                        arguments: args.clone(),
+                                                    }
+                                                )));
+                                            }
+                                            tool_calls.clear();
                                             let _ = tx.send(Ok(StreamEvent::Done { truncated: true }));
                                             return;
                                         }

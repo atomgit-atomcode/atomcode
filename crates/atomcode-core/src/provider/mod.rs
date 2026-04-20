@@ -1,6 +1,7 @@
 pub mod claude;
 pub mod ollama;
 pub mod openai;
+pub mod retry;
 
 use std::pin::Pin;
 
@@ -115,15 +116,16 @@ fn load_auth_token() -> Result<String> {
 /// Exchange refresh_token for a new access_token, save updated auth.toml.
 fn refresh_and_save(refresh_token: &str, auth_path: &std::path::Path) -> Result<String> {
     let client = reqwest::blocking::Client::new();
-    let resp = client
+    let builder = client
         .post(OAUTH_TOKEN_URL)
         .form(&[
             ("client_id", OAUTH_CLIENT_ID),
             ("client_secret", OAUTH_CLIENT_SECRET),
             ("refresh_token", refresh_token),
             ("grant_type", "refresh_token"),
-        ])
-        .send()
+        ]);
+    let policy = crate::provider::retry::RetryPolicy::default_policy();
+    let resp = crate::provider::retry::send_with_retry_blocking(builder, &policy)
         .map_err(|e| anyhow::anyhow!("Token refresh failed: {} — please /login", e))?;
 
     if !resp.status().is_success() {

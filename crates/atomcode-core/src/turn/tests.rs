@@ -189,6 +189,8 @@ fn make_runner(provider: MockProvider, tools: ToolRegistry, permission: Box<dyn 
         config: test_config(),
         permission,
         recently_edited_files: Vec::new(),
+        recent_calls: Vec::new(),
+        file_read_counts: std::collections::HashMap::new(),
     }
 }
 

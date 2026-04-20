@@ -5,6 +5,45 @@
 /// These functions attempt to repair such output before falling back to
 /// last-resort key-value extraction.
 
+/// Normalize tool-call arguments into valid JSON before execution.
+///
+/// Runs the repair chain: direct parse → repair_json → tool-specific extractor →
+/// generic key-value extraction. Returns the original string unchanged if all
+/// strategies fail (caller can then surface a parse error to the model).
+///
+/// `tool_name` selects a specialized extractor when available (e.g. `edit_file`
+/// which may contain unescaped source code in `old_string`/`new_string`).
+pub fn repair_tool_args(tool_name: &str, args: &str) -> String {
+    // Fast path: already valid JSON.
+    if serde_json::from_str::<serde_json::Value>(args).is_ok() {
+        return args.to_string();
+    }
+    // Generic JSON repair (trailing commas, unquoted keys, fence strip, etc.).
+    let repaired = repair_json(args);
+    if serde_json::from_str::<serde_json::Value>(&repaired).is_ok() {
+        return repaired;
+    }
+    // Specialized: edit_file often ships source code with unescaped quotes/newlines.
+    if tool_name == "edit_file" {
+        if let Some(v) = extract_edit_file_args(args) {
+            if let Ok(s) = serde_json::to_string(&v) {
+                return s;
+            }
+        }
+    }
+    // Last resort: key-value field extraction. Only return this if it actually
+    // recovered something — an empty object is no better than the original garbage.
+    let extracted = extract_json_fields(args);
+    if let Some(obj) = extracted.as_object() {
+        if !obj.is_empty() {
+            if let Ok(s) = serde_json::to_string(&extracted) {
+                return s;
+            }
+        }
+    }
+    args.to_string()
+}
+
 /// Attempt to repair common JSON issues from LLM output:
 /// - Trailing commas before } or ]
 /// - Single quotes instead of double quotes (outside of string values)
@@ -435,5 +474,36 @@ mod tests {
         let input = r#"{"file_path": "/src/lib.rs", "old_string": "foo", "new_string": "bar", "replace_all": true}"#;
         let result = extract_edit_file_args(input).expect("should parse");
         assert_eq!(result["replace_all"], true);
+    }
+
+    // --- repair_tool_args tests ---
+
+    #[test]
+    fn repair_tool_args_passes_valid_json_through() {
+        let input = r#"{"file_path":"/tmp/a.rs","content":"x"}"#;
+        assert_eq!(repair_tool_args("write_file", input), input);
+    }
+
+    #[test]
+    fn repair_tool_args_fixes_fence_wrapped_json() {
+        let input = "```json\n{\"file_path\":\"/tmp/a.rs\",\"content\":\"x\"}\n```";
+        let out = repair_tool_args("write_file", input);
+        let v: serde_json::Value = serde_json::from_str(&out).expect("should parse");
+        assert_eq!(v["file_path"], "/tmp/a.rs");
+    }
+
+    #[test]
+    fn repair_tool_args_keeps_empty_object_untouched() {
+        // Empty `{}` is valid JSON — we must not paper over it by inventing fields.
+        // Callers surface it as a user-visible error instead.
+        assert_eq!(repair_tool_args("write_file", "{}"), "{}");
+    }
+
+    #[test]
+    fn repair_tool_args_returns_original_when_unsalvageable() {
+        // Pure garbage with no extractable key=value pairs → return as-is so
+        // the tool emits the real parse error (not a misleading repaired stub).
+        let input = "!!!";
+        assert_eq!(repair_tool_args("write_file", input), "!!!");
     }
 }
