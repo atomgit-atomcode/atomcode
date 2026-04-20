@@ -755,10 +755,6 @@ impl App {
                 self.last_turn_duration = Some(duration);
                 self.turn_start = None;
                 self.render_cache_msg_count = 0; // Invalidate cache
-                // Drop queued append previews — the next turn (if any) will pick
-                // these up from the agent's pending_input and render them as real
-                // user messages, so the previews would duplicate otherwise.
-                self.pending_appends.clear();
                 self.at_bottom = true;
                 // Auto-save session after each turn
                 self.current_session.messages = self.conversation.messages.clone();
@@ -786,6 +782,13 @@ impl App {
                 // Only save if session has messages (don't save empty default sessions)
                 if !self.current_session.messages.is_empty() {
                     let _ = self.session_manager.save(&self.current_session);
+                }
+                // Type-ahead drain: if the user queued messages during this turn,
+                // pop the oldest and fire it as a fresh turn. Remaining queued
+                // entries drain one-at-a-time on subsequent TurnComplete events.
+                if !self.pending_appends.is_empty() {
+                    let queued = self.pending_appends.remove(0);
+                    self.submit_queued(queued);
                 }
             }
             AgentEvent::TurnCancelled { messages } => {
@@ -1121,18 +1124,22 @@ impl App {
                     }
                 } else if (key.code == KeyCode::Enter && key.modifiers == KeyModifiers::NONE)
                     || (key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('j')) {
-                    // During streaming: queue user input for AFTER the current turn ends.
-                    // Do NOT inject into assistant stream — that mixes roles and causes
-                    // the model to treat user input as its own reasoning (e.g., auto-selecting
-                    // options without waiting for confirmation).
+                    // During streaming: queue user input locally for AFTER the current
+                    // turn ends. Drained one-at-a-time on TurnComplete into a fresh
+                    // SendMessage — each queued entry becomes its own new turn, matching
+                    // CC's type-ahead behavior and what the "will send after this turn"
+                    // UI hint promises.
+                    //
+                    // Prior impl sent AgentCommand::AppendInput, which stuffed the text
+                    // into agent.pending_input. But pending_input is only consumed at
+                    // the start of a run_turn_loop iteration — a clean finish_turn
+                    // (Natural stop) returns before pending_input is checked again,
+                    // leaving Q2 stuck. The next user SendMessage (Q3) then starts a
+                    // new run_turn_loop, which picks up stale Q2 as "[Additional
+                    // context]" inside Q3's turn — so Q2 effectively fired together
+                    // with Q3 instead of auto-triggering after Q1.
                     let content = self.input.content();
                     if !content.trim().is_empty() {
-                        let _ = self.agent_handle.cmd_tx.send(
-                            atomcode_core::agent::AgentCommand::AppendInput(content.clone())
-                        );
-                        // Mirror the queue locally so the chat panel can show a
-                        // "queued" preview — without this, Enter during streaming
-                        // gives zero visual feedback and looks broken.
                         self.pending_appends.push(content);
                         self.input.clear();
                         self.render_cache_msg_count = 0;
@@ -2715,6 +2722,37 @@ impl App {
 
         // Delegate to the AgentLoop via channel.
         let _ = self.agent_handle.cmd_tx.send(AgentCommand::SendMessage(full_content));
+    }
+
+    /// Submit a pre-resolved queued message as a fresh turn. Called by the
+    /// TurnComplete drain — the content was already finalized when the user
+    /// queued it mid-stream, so we bypass the input/paste/attachment merging
+    /// that send_message does (those belong to whatever the user is typing
+    /// NOW, not to the queued message).
+    fn submit_queued(&mut self, content: String) {
+        self.input_history.push(content.clone());
+        InputHistory::append(&content);
+        if self.input_history.len() > 1000 {
+            self.input_history.drain(..self.input_history.len() - 1000);
+        }
+        self.history_index = None;
+        self.history_stash = None;
+        self.turn_tokens = 0;
+        self.last_sent_input = Some(content.clone());
+        self.conversation.add_user_message(&content);
+        self.at_bottom = true;
+        self.current_step_count = 0;
+        self.current_tool_call_count = 0;
+        self.turn_start = Some(Instant::now());
+        self.first_token_ms = None;
+        self.llm_call_start = Some(Instant::now());
+        self.last_completed_tool = String::new();
+        self.last_turn_duration = None;
+        self.last_checkpoint = atomcode_core::agent::git_checkpoint::create_checkpoint(
+            &self.working_dir,
+        );
+        self.mode = AppMode::Streaming;
+        let _ = self.agent_handle.cmd_tx.send(AgentCommand::SendMessage(content));
     }
 
 }
