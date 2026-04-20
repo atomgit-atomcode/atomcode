@@ -111,6 +111,11 @@ fn expand_home_path(path: &str, home_dir: Option<&Path>) -> PathBuf {
     PathBuf::from(path)
 }
 
+fn expand_user_path(path: &str) -> PathBuf {
+    let home_dir = dirs::home_dir();
+    expand_home_path(path, home_dir.as_deref())
+}
+
 fn lexical_normalize(path: &Path) -> PathBuf {
     let mut prefix: Option<OsString> = None;
     let mut has_root = false;
@@ -191,10 +196,7 @@ fn strip_windows_drive_prefix(path: &str) -> Option<&str> {
 }
 
 /// Count of leading characters shared between two paths. Used by read_file
-/// and glob 404 recovery to rank candidate suggestions: the match with the
-/// longest shared prefix with what the agent actually asked for is almost
-/// always the one it wanted. Pure character count, tech-neutral — no path
-/// segment parsing (avoids per-OS separator logic).
+/// and glob 404 recovery to rank candidate suggestions.
 pub fn shared_prefix_len(a: &str, b: &str) -> usize {
     a.chars().zip(b.chars()).take_while(|(x, y)| x == y).count()
 }
@@ -202,20 +204,6 @@ pub fn shared_prefix_len(a: &str, b: &str) -> usize {
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use tokio::sync::{Mutex, RwLock};
-
-fn expand_user_path(path: &str) -> PathBuf {
-    if path == "~" {
-        return dirs::home_dir().unwrap_or_else(|| PathBuf::from(path));
-    }
-
-    if let Some(rest) = path.strip_prefix("~/") {
-        return dirs::home_dir()
-            .map(|home| home.join(rest))
-            .unwrap_or_else(|| PathBuf::from(path));
-    }
-
-    PathBuf::from(path)
-}
 
 fn normalize_path(path: &Path) -> PathBuf {
     let mut normalized = PathBuf::new();
@@ -397,7 +385,6 @@ fn is_sensitive_path(path: &Path) -> bool {
     {
         return true;
     }
-
     path.extension()
         .and_then(|ext| ext.to_str())
         .is_some_and(|ext| {
@@ -872,6 +859,58 @@ mod tests {
         let defs = reg.get_definitions().await;
         assert_eq!(defs.len(), 1);
         assert_eq!(defs[0].name, "dummy");
+    }
+
+    #[test]
+    fn sensitive_path_detects_relative_traversal_to_unix_root() {
+        assert!(is_sensitive_input_path_with_context(
+            "../../../etc/passwd",
+            Some(Path::new("/home/alice/project")),
+            Some(Path::new("/home/alice")),
+        ));
+    }
+
+    #[test]
+    fn sensitive_path_detects_windows_system_roots() {
+        assert!(is_sensitive_input_path_with_context(
+            r"C:\Windows\System32\drivers\etc\hosts",
+            None,
+            None,
+        ));
+        assert!(is_sensitive_input_path_with_context(
+            r"D:\Windows\System32\drivers\etc\hosts",
+            None,
+            None,
+        ));
+        assert!(is_sensitive_input_path_with_context(
+            r"C:\Program Files\AtomCode\config.toml",
+            None,
+            None,
+        ));
+        assert!(is_sensitive_input_path_with_context(
+            r"C:\ProgramData\AtomCode\config.toml",
+            None,
+            None,
+        ));
+    }
+
+    #[test]
+    fn sensitive_path_uses_path_boundaries() {
+        assert!(!is_sensitive_input_path_with_context(
+            "/etc-old/passwd",
+            None,
+            None,
+        ));
+        assert!(!is_sensitive_input_path_with_context(
+            r"C:\Windows.old\system.ini",
+            None,
+            None,
+        ));
+        assert!(!is_sensitive_input_path_with_context(
+            r"D:\Windows.old\system.ini",
+            None,
+            None,
+        ));
     }
 
     #[tokio::test]
