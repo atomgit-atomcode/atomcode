@@ -201,15 +201,23 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      # 3️⃣ 添加 Windows ARM64 target
-      - name: Add Windows ARM64 target
-        run: rustup target add aarch64-pc-windows-msvc
+      # 3️⃣ 添加 Windows targets
+      - name: Add Windows targets
+        run: |
+          rustup target add aarch64-pc-windows-msvc
+          # x86_64 is usually available by default on windows-latest, but keep
+          # it explicit so the release matrix is self-documenting and stable.
+          rustup target add x86_64-pc-windows-msvc
 
       # 4️⃣ 编译 ARM64
       - name: Build ARM64
         run: cargo build --release --target aarch64-pc-windows-msvc
 
-      # 5️⃣ 生成带版本号的二进制
+      # 5️⃣ 编译 x86_64
+      - name: Build x86_64
+        run: cargo build --release --target x86_64-pc-windows-msvc
+
+      # 6️⃣ 生成带版本号的二进制
       - name: Prepare binaries
         shell: bash
         run: |
@@ -218,14 +226,15 @@ jobs:
           mkdir -p dist
 
           cp target/aarch64-pc-windows-msvc/release/atomcode.exe dist/${TAG_NAME}-windows-arm64.exe
+          cp target/x86_64-pc-windows-msvc/release/atomcode.exe dist/${TAG_NAME}-windows-x86_64.exe
 
-      # 6️⃣ 安装 Python
+      # 7️⃣ 安装 Python
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.x"
 
-      # 7️⃣ 上传 ARM64
+      # 8️⃣ 上传 ARM64
       - name: Upload ARM64
         if: startsWith(github.ref, 'refs/tags/')
         shell: bash
@@ -236,4 +245,17 @@ jobs:
             --tag-name=${TAG_NAME} \
             --file-name=${TAG_NAME}-windows-arm64.exe \
             --file-path=dist/${TAG_NAME}-windows-arm64.exe \
+            --access-token=${{ secrets.ACCESS_TOKEN }}
+
+      # 9️⃣ 上传 x86_64
+      - name: Upload x86_64
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          TAG_NAME=${GITHUB_REF#refs/tags/}
+
+          python3 .github/workflows/create_tag_release.py \
+            --tag-name=${TAG_NAME} \
+            --file-name=${TAG_NAME}-windows-x86_64.exe \
+            --file-path=dist/${TAG_NAME}-windows-x86_64.exe \
             --access-token=${{ secrets.ACCESS_TOKEN }}

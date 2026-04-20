@@ -503,6 +503,13 @@ impl Conversation {
     /// `remove_count` = number of messages from the front to remove.
     /// (Changed from turn-based to message-based to support single-user-message
     /// sessions where turn_tracker has only 1-2 turns but 30+ messages.)
+    ///
+    /// ── CRITICAL INVARIANT ──
+    /// After compression:
+    /// - All surviving turns must have: start_idx < new_messages.len()
+    /// - All surviving turns must have: end_idx() <= new_messages.len()
+    /// - All surviving turns must have: msg_count > 0
+    /// These invariants prevent underflow in on_user_message(msg_idx).
     pub fn apply_compression(&mut self, remove_count: usize, summary: String) {
         if remove_count == 0 || summary.is_empty() { return; }
 
@@ -516,19 +523,54 @@ impl Conversation {
         let remove_end = remove_count.min(self.messages.len());
         self.messages.drain(..remove_end);
 
-        // Re-index turn tracker: remove turns that are fully within the drained range,
-        // adjust surviving turns' start_idx.
-        self.turn_tracker.turns.retain(|t| t.start_idx >= remove_end || t.end_idx() > remove_end);
-        for turn in &mut self.turn_tracker.turns {
-            if turn.start_idx >= remove_end {
-                turn.start_idx -= remove_end;
+        let new_msg_len = self.messages.len();
+
+        // Re-index turn tracker: rebuild with strict validation and invariant enforcement.
+        // This replaces the previous retain logic which had edge cases causing underflow.
+        let mut surviving_turns = Vec::new();
+
+        for turn in self.turn_tracker.turns.drain(..) {
+            let turn_end = turn.end_idx();
+
+            // Skip turns entirely within the drained range (before remove_end)
+            if turn_end <= remove_end {
+                continue;
+            }
+
+            // Calculate new indices for surviving turns
+            let new_start = if turn.start_idx < remove_end {
+                // Turn partially overlaps the drain: restart at index 0
+                0
             } else {
-                // Turn partially overlaps the drain — adjust both start and count
-                let overlap = remove_end - turn.start_idx;
-                turn.start_idx = 0;
-                turn.msg_count = turn.msg_count.saturating_sub(overlap);
+                // Turn is entirely after remove_end: shift backwards
+                turn.start_idx - remove_end
+            };
+
+            // Calculate new message count
+            let new_count = if turn.start_idx < remove_end {
+                // Partial overlap: count only messages after remove_end
+                turn_end - remove_end
+            } else {
+                // No overlap: count unchanged
+                turn.msg_count
+            };
+
+            // INVARIANT ENFORCEMENT:
+            // Clamp indices to valid range in case of edge cases or corrupted state
+            let new_count = new_count.min(new_msg_len.saturating_sub(new_start));
+
+            // Only include turns with at least one message
+            if new_count > 0 && new_start < new_msg_len {
+                surviving_turns.push(turn::Turn {
+                    start_idx: new_start,
+                    msg_count: new_count,
+                    status: turn.status,
+                    summary: turn.summary,
+                });
             }
         }
+
+        self.turn_tracker.turns = surviving_turns;
     }
 
     /// Check if conversation needs summarization (context > 70% of budget).
@@ -1742,5 +1784,169 @@ mod tests {
         Conversation::sanitize_messages(&mut msgs);
         // All 4 messages should be preserved (valid pair)
         assert_eq!(msgs.len(), 4);
+    }
+
+    /// Test that compression followed by adding a user message doesn't cause underflow.
+    /// This is the regression test for the integer underflow bug in turn.rs:99.
+    /// Scenario: Build a conversation with multiple turns, compress the old ones,
+    /// then add a new user message. The Turn indices should remain consistent.
+    #[test]
+    fn test_compression_then_add_user_message_no_underflow() {
+        let mut conv = Conversation::new();
+
+        // Build 2 turns (4 messages total)
+        // Turn 1: User + Assistant response
+        conv.add_user_message("task 1");
+        assert_eq!(conv.turn_tracker.turns.len(), 1);
+        conv.push_delta("response 1");
+        conv.finalize_stream();
+        conv.turn_tracker.complete_current(); // Mark as completed
+
+        // Turn 2: User + Assistant response
+        conv.add_user_message("task 2");
+        assert_eq!(conv.turn_tracker.turns.len(), 2);
+        conv.push_delta("response 2");
+        conv.finalize_stream();
+        conv.turn_tracker.complete_current(); // Mark as completed
+
+        // Verify state before compression
+        assert_eq!(conv.messages.len(), 4);
+        assert_eq!(conv.turn_tracker.turns[0].status, turn::TurnStatus::Completed);
+        assert_eq!(conv.turn_tracker.turns[1].status, turn::TurnStatus::Completed);
+        assert_eq!(conv.turn_tracker.turns[0].msg_count, 2);
+        assert_eq!(conv.turn_tracker.turns[1].msg_count, 2);
+
+        // Compress: remove first 2 messages (covers first complete turn)
+        conv.apply_compression(2, "Turn 1 summary".to_string());
+
+        // Verify compression result
+        assert_eq!(conv.messages.len(), 2);
+        assert_eq!(conv.turn_tracker.turns.len(), 1);
+        assert_eq!(conv.turn_tracker.turns[0].start_idx, 0);
+        assert_eq!(conv.turn_tracker.turns[0].msg_count, 2);
+
+        // CRITICAL: Add a new user message. This should NOT panic with underflow.
+        // Before the fix, this could panic if Turn indices were corrupted.
+        conv.add_user_message("task 3");
+
+        // Verify final state
+        assert_eq!(conv.messages.len(), 3);
+        assert_eq!(conv.turn_tracker.turns.len(), 2);
+        assert_eq!(conv.turn_tracker.turns[0].status, turn::TurnStatus::Completed);
+        assert_eq!(conv.turn_tracker.turns[0].msg_count, 2);
+        assert_eq!(conv.turn_tracker.turns[1].status, turn::TurnStatus::Active);
+        assert_eq!(conv.turn_tracker.turns[1].start_idx, 2);
+    }
+
+    /// Test partial turn compression (a turn spans the compression boundary).
+    /// This is more complex: when a turn is partially within the removed range,
+    /// its indices must be recalculated correctly.
+    #[test]
+    fn test_compression_partial_turn_overlap() {
+        let mut conv = Conversation::new();
+
+        // Build 2 turns:
+        // Turn 1: msg 0 (user), msg 1 (assistant)
+        // Turn 2: msg 2 (user), msg 3 (assistant), msg 4 (tool result)
+        conv.add_user_message("task 1");
+        conv.push_delta("response 1");
+        conv.finalize_stream();
+        conv.turn_tracker.complete_current();
+
+        conv.add_user_message("task 2");
+        conv.push_delta("response 2");
+        conv.finalize_stream();
+        use crate::tool::ToolResult;
+        conv.add_tool_result(ToolResult {
+            call_id: "call_1".to_string(),
+            output: "result".to_string(),
+            success: true,
+        });
+        conv.turn_tracker.complete_current();
+
+        assert_eq!(conv.messages.len(), 5);
+        assert_eq!(conv.turn_tracker.turns.len(), 2);
+        assert_eq!(conv.turn_tracker.turns[0].msg_count, 2);
+        assert_eq!(conv.turn_tracker.turns[1].msg_count, 3);
+
+        // Compress: remove first 3 messages
+        // This removes Turn 1 entirely and partially overlaps Turn 2
+        // (Turn 2 starts at 2, ends at 5, so 1 message survives at index 0)
+        conv.apply_compression(3, "Old history".to_string());
+
+        // Verify compression result
+        assert_eq!(conv.messages.len(), 2);
+        assert_eq!(conv.turn_tracker.turns.len(), 1);
+        let surviving_turn = &conv.turn_tracker.turns[0];
+        assert_eq!(surviving_turn.start_idx, 0);
+        assert_eq!(surviving_turn.msg_count, 2); // (5 - 3) messages remain
+        assert_eq!(surviving_turn.end_idx(), 2);
+
+        // Add a new user message: should not panic
+        conv.add_user_message("task 3");
+
+        // Verify invariants hold
+        assert_eq!(conv.messages.len(), 3);
+        assert_eq!(conv.turn_tracker.turns.len(), 2);
+        assert_eq!(conv.turn_tracker.turns[0].msg_count, 2);
+        assert_eq!(conv.turn_tracker.turns[1].start_idx, 2);
+    }
+
+    /// Test aggressive compression that removes almost everything.
+    /// Ensure Turns are corrected and no crashes occur.
+    #[test]
+    fn test_compression_removes_most_messages() {
+        let mut conv = Conversation::new();
+
+        // Build 3 turns (6 messages): 2 + 2 + 2
+        for i in 1..=3 {
+            conv.add_user_message(&format!("task {}", i));
+            conv.push_delta(&format!("response {}", i));
+            conv.finalize_stream();
+            conv.turn_tracker.complete_current();
+        }
+        assert_eq!(conv.messages.len(), 6);
+        assert_eq!(conv.turn_tracker.turns.len(), 3);
+
+        // Aggressively compress: keep only the last message
+        conv.apply_compression(5, "Entire history summarized".to_string());
+
+        // Only the last assistant message (msg 5) should remain
+        assert_eq!(conv.messages.len(), 1);
+        assert_eq!(conv.turn_tracker.turns.len(), 1);
+        assert_eq!(conv.turn_tracker.turns[0].start_idx, 0);
+        assert_eq!(conv.turn_tracker.turns[0].msg_count, 1);
+
+        // Add a new user message: should not crash
+        conv.add_user_message("new task");
+
+        assert_eq!(conv.messages.len(), 2);
+        assert_eq!(conv.turn_tracker.turns.len(), 2);
+        assert_eq!(conv.turn_tracker.turns[1].start_idx, 1);
+    }
+
+    /// Test edge case: compression amount exceeds total messages.
+    /// apply_compression should clamp safely.
+    #[test]
+    fn test_compression_exceeds_message_count() {
+        let mut conv = Conversation::new();
+
+        conv.add_user_message("hello");
+        conv.push_delta("response");
+        conv.finalize_stream();
+
+        assert_eq!(conv.messages.len(), 2);
+
+        // Try to remove 100 messages (more than exist)
+        conv.apply_compression(100, "Summary".to_string());
+
+        // Should remove all messages
+        assert_eq!(conv.messages.is_empty(), true);
+        assert_eq!(conv.turn_tracker.turns.is_empty(), true);
+
+        // Add a new user message after clearing: should work
+        conv.add_user_message("new message");
+        assert_eq!(conv.messages.len(), 1);
+        assert_eq!(conv.turn_tracker.turns.len(), 1);
     }
 }

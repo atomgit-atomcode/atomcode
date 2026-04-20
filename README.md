@@ -26,7 +26,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-4.15.0-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-4.18.1-blue" alt="version">
   <img src="https://img.shields.io/badge/rust-1.75%2B-orange" alt="rust">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="license">
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey" alt="platform">
@@ -89,10 +89,10 @@ Connect to any LLM that supports OpenAI's function-calling API:
 
 ### Sessions & Login
 
-- **Persistent sessions** — every conversation is saved; resume or switch with `/resume`
+- **Persistent sessions** — every conversation is saved; continue the last session with `atomcode --continue` / `-c`, or resume/switch inside the TUI with `/resume`
 - **AtomGit OAuth login** — `/login` (or `atomcode login`) pairs your CLI with your AtomGit account
 - **SSO login** — `/login-with-sso` for GitCode internal users
-- **Headless mode** — `atomcode -p "..."` runs a single prompt non-interactively and streams the reply on stdout (Claude Code `-p` style)
+- **Headless mode** — `atomcode -p "..."` runs a single prompt non-interactively and streams the reply on stdout (Claude Code `-p` style); approval-required `bash` calls are auto-approved, while other approval-required tools are denied
 - **Daemon mode** — `atomcode-daemon` exposes an HTTP API for session history and SSE streaming chat
 
 ### Terminal UI
@@ -121,17 +121,21 @@ Connect to any LLM that supports OpenAI's function-calling API:
 ```bash
 git clone https://atomgit.com/atomgit_atomcode/atomcode.git
 cd atomcode
+cargo install --path crates/atomcode-cli --locked
+```
+
+The binary will be generated at `target/release/atomcode` and installed to
+`~/.cargo/bin/atomcode` for macOS / Linux and `$env:USERPROFILE/.cargo/bin/atomcode.exe`
+for Windows. Make sure that `~/.cargo/bin` (or `%USERPROFILE%\.cargo\bin` on Windows) is
+in your `PATH`.
+
+To compile without installing, run:
+
+```bash
 cargo build --release
 ```
 
-The binary will be at `target/release/atomcode`. Add it to your PATH:
-
-```bash
-# macOS / Linux
-cp target/release/atomcode ~/.local/bin/
-# or
-sudo cp target/release/atomcode /usr/local/bin/
-```
+and the binary will be generated at `target/release/atomcode`.
 
 ### Requirements
 
@@ -203,6 +207,8 @@ atomcode -p "Explain the agent loop in this repo"
 # Read prompt from file
 atomcode --prompt-file task.md
 ```
+
+In headless mode, approval-required `bash` calls are auto-approved and logged to stderr; other approval-required tools are denied.
 
 Then just type what you want:
 

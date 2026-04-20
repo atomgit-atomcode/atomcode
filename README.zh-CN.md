@@ -26,7 +26,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-4.15.0-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-4.18.1-blue" alt="version">
   <img src="https://img.shields.io/badge/rust-1.75%2B-orange" alt="rust">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="license">
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey" alt="platform">
@@ -89,10 +89,10 @@ AtomCode 是一款住在你终端里的 AI 编码助手。用自然语言给它�
 
 ### 会话与登录
 
-- **持久化会话** —— 每次对话都会保存，用 `/resume` 恢复或切换
+- **持久化会话** —— 每次对话都会保存；命令行可用 `atomcode --continue` 或 `-c` 继续上一次会话，在 TUI 内可用 `/resume` 恢复或切换
 - **AtomGit OAuth 登录** —— `/login`（或 `atomcode login`）将 CLI 与你的 AtomGit 账号绑定
 - **SSO 登录** —— `/login-with-sso`，GitCode 内部用户使用
-- **Headless 模式** —— `atomcode -p "..."` 非交互式跑一条 prompt，结果直接输出到 stdout（类似 Claude Code 的 `-p`）
+- **Headless 模式** —— `atomcode -p "..."` 非交互式跑一条 prompt，结果直接输出到 stdout（类似 Claude Code 的 `-p`）；需要确认的 `bash` 会自动批准，其他需要确认的工具会被拒绝
 - **Daemon 模式** —— `atomcode-daemon` 提供 HTTP API，用于查询会话历史和 SSE 流式对话
 
 ### 终端 UI
@@ -121,17 +121,20 @@ AtomCode 是一款住在你终端里的 AI 编码助手。用自然语言给它�
 ```bash
 git clone https://atomgit.com/atomgit_atomcode/atomcode.git
 cd atomcode
+cargo install --path crates/atomcode-cli --locked
+```
+
+编译产物位于 `target/release/atomcode`。在 macOS / Linux 其被安装到 `~/.cargo/bin/atomcode`，
+在 Windows 系统上其被安装到 `$env:USERPROFILE/.cargo/bin/atomcode.exe`。请确保 `~/.cargo/bin`
+（或 `%USERPROFILE%\.cargo\bin`）已经被添加到 `PATH` 环境变量中。
+
+如果只想要编译，不要安装，运行：
+
+```bash
 cargo build --release
 ```
 
-产物位于 `target/release/atomcode`，将其加入 PATH：
-
-```bash
-# macOS / Linux
-cp target/release/atomcode ~/.local/bin/
-# 或
-sudo cp target/release/atomcode /usr/local/bin/
-```
+编译产物会在 `target/release/atomcode` 生成。
 
 ### 依赖
 
@@ -200,6 +203,8 @@ atomcode -p "简要说明这个仓库的 agent loop"
 # 从文件读取 prompt
 atomcode --prompt-file task.md
 ```
+
+在 headless 模式下，需要确认的 `bash` 会自动批准并写到 stderr；其他需要确认的工具会被拒绝。
 
 然后直接用自然语言描述你想做的事：
 
