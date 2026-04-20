@@ -28,6 +28,7 @@
 
 pub mod default;
 pub mod ollama;
+pub mod render;
 pub mod resolver;
 pub mod truncate;
 

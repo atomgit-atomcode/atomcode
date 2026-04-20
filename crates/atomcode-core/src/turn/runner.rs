@@ -75,7 +75,7 @@ impl TurnRunner {
         let context_window = self.config.default_context_window();
 
         let (mut messages, ctx_stats) =
-            conversation.to_provider_messages_budgeted(system_prompt, context_window);
+            crate::ctx::render::build_messages(conversation, system_prompt, context_window);
 
         // Inject turn reminder into the last user message.
         // This keeps system prompt stable (cacheable) while providing

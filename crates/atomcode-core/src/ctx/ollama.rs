@@ -60,7 +60,7 @@ impl CtxBuilder for OllamaCtx {
     ) -> (Vec<Message>, ContextStats) {
         // 渲染路径透传到 legacy。窗口是 `self.ctx_window` 决定的,
         // Conversation 自己在裁切时使用它。
-        conv.to_provider_messages_budgeted(system_prompt, self.ctx_window)
+        super::render::build_messages(conv, system_prompt, self.ctx_window)
     }
 
     /// 更早触发压缩:35% 阈值,而非 Default 的 50%。
@@ -82,7 +82,7 @@ impl CtxBuilder for OllamaCtx {
         // 决策用的是 self.needs_compression(更早触发),
         // 但 plan 内容生成逻辑不需要差异化——沿用 Conversation 的
         // one-line-per-round 机械摘要。
-        let (content, n) = conv.build_compression_content();
+        let (content, n) = super::render::build_compression_content(conv);
         if content.is_empty() || n == 0 {
             None
         } else {

@@ -35,15 +35,15 @@ impl CtxBuilder for DefaultCtx {
         conv: &Conversation,
         system_prompt: &str,
     ) -> (Vec<Message>, ContextStats) {
-        conv.to_provider_messages_budgeted(system_prompt, self.ctx_window)
+        crate::ctx::render::build_messages(conv, system_prompt, self.ctx_window)
     }
 
     fn needs_compression(&self, conv: &Conversation, system_tokens: usize) -> bool {
-        conv.needs_compression(system_tokens, self.ctx_window)
+        crate::ctx::render::needs_compression(conv, system_tokens, self.ctx_window)
     }
 
     fn compression_plan(&self, conv: &Conversation) -> Option<(String, usize)> {
-        let (content, n) = conv.build_compression_content();
+        let (content, n) = crate::ctx::render::build_compression_content(conv);
         if content.is_empty() || n == 0 {
             None
         } else {
@@ -171,7 +171,7 @@ mod tests {
         let sys = "System prompt for test";
         let ctx_window = 128_000;
 
-        let (legacy_msgs, legacy_stats) = conv.to_provider_messages_budgeted(sys, ctx_window);
+        let (legacy_msgs, legacy_stats) = crate::ctx::render::build_messages(&conv, sys, ctx_window);
         let d = DefaultCtx::new(&test_provider(ctx_window));
         let (new_msgs, new_stats) = d.build_messages(&conv, sys);
 
@@ -199,7 +199,7 @@ mod tests {
             );
         }
 
-        let legacy = conv.build_compression_content();
+        let legacy = crate::ctx::render::build_compression_content(&conv);
         let d = DefaultCtx::new(&test_provider(128_000));
         let new = d.compression_plan(&conv);
 

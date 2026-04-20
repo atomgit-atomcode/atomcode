@@ -243,268 +243,8 @@ impl Conversation {
         msgs
     }
 
-    /// Context management with cold zone compression.
-    ///
-    /// Structure: [System] [Cold Zone (max 3 summaries)] [Last 5 turns full]
-    ///
-    /// The cold zone is populated by `apply_compression()` when ctx > 70%.
-    /// If still over 80% after cold zone, drop oldest cold summaries.
-    pub fn to_provider_messages_budgeted(
-        &self,
-        system_prompt: &str,
-        token_budget: usize,
-    ) -> (Vec<Message>, ContextStats) {
-        if self.messages.is_empty() {
-            return (vec![Message::new(Role::System, system_prompt)], ContextStats::default());
-        }
 
-        let system_msg = Message::new(Role::System, system_prompt);
-        let system_tokens = system_msg.estimate_tokens();
-
-        let turns = &self.turn_tracker.turns;
-
-        if turns.is_empty() {
-            let remaining = token_budget.saturating_sub(system_tokens);
-            return (self.to_provider_messages_budgeted_fallback(system_msg, remaining), ContextStats::default());
-        }
-
-        let mut result = Vec::with_capacity(self.messages.len() + 3);
-        result.push(system_msg);
-
-        // Inject cold zone summaries (if any)
-        if !self.cold_summaries.is_empty() {
-            let cold_text = format!(
-                "[Earlier conversation history ({} compression{})]\n{}",
-                self.cold_summaries.len(),
-                if self.cold_summaries.len() > 1 { "s" } else { "" },
-                self.cold_summaries.join("\n---\n")
-            );
-            result.push(Message::new(Role::System, cold_text));
-        }
-
-        // Add all current messages
-        result.extend(self.messages.iter().cloned());
-
-        // NOTE: read_file result condensation was here (83fc7ff) but reverted.
-        // 问题: 长距离重读是合理需求（旧内容被压缩后模型需要重新看），
-        // 短距离重读在 keep_recent 保护内又压缩不到。两头不讨好。
-        // 正确方案需要更深入设计，不在这里做。
-
-        // Safety: if over 80% (or 60K absolute cap), drop oldest turns.
-        // BUT: skip if cold_summaries exist — that means LLM compression just ran
-        // and we're looking at the "keep_full=5" survivor set. Dropping those too
-        // would wipe ALL context (the bug that caused sent=0 in audit sessions).
-        let budget_80pct = (token_budget * 80 / 100).min(60000);
-        let total_tokens: usize = result.iter().map(|m| m.estimate_tokens()).sum();
-        let mut dropped_tokens = 0usize;
-
-        if total_tokens > budget_80pct && self.cold_summaries.is_empty() {
-            let tokens_to_drop = total_tokens - budget_80pct;
-
-            // ── HARD FLOOR: the last turn is sacred and NEVER dropped ──
-            // Without this floor, a single oversized tool_result could make `tokens_to_drop`
-            // exceed the sum of all earlier turns, and the `survived_start` calculation below
-            // would settle on `self.messages.len()` → NO messages survive → sent=0 → agent
-            // goes blind and repeats searches forever (2026-04-12 21:25 session pathology).
-            let last_turn_idx = turns.len().saturating_sub(1);
-            let last_turn_start = turns.get(last_turn_idx)
-                .map(|t| t.start_idx)
-                .unwrap_or(0)
-                .min(self.messages.len());
-
-            // First pass: identify which turns to drop and extract their reasoning.
-            // Loop bound `turns.len()-1` ensures we never touch the last turn.
-            let mut drop_summaries: Vec<String> = Vec::new();
-            let mut drop_count = 0usize;
-
-            for ti in 0..turns.len().saturating_sub(1) {
-                if dropped_tokens >= tokens_to_drop { break; }
-                let turn = &turns[ti];
-                let end = turn.end_idx().min(self.messages.len());
-                if turn.start_idx >= self.messages.len() { continue; }
-
-                // Extract model reasoning and tool calls before dropping
-                let turn_msgs = &self.messages[turn.start_idx..end];
-                let mut parts: Vec<String> = Vec::new();
-                for msg in turn_msgs {
-                    match &msg.content {
-                        MessageContent::Text(t) if msg.role == Role::Assistant => {
-                            let short: String = t.chars().take(150).collect();
-                            if !short.trim().is_empty() {
-                                parts.push(short);
-                            }
-                        }
-                        MessageContent::AssistantWithToolCalls { text, tool_calls, .. } => {
-                            if let Some(t) = text {
-                                let short: String = t.chars().take(150).collect();
-                                if !short.trim().is_empty() {
-                                    parts.push(short);
-                                }
-                            }
-                            let tools: Vec<&str> = tool_calls.iter()
-                                .map(|tc| tc.name.as_str()).collect();
-                            if !tools.is_empty() {
-                                parts.push(format!("tools: {}", tools.join(", ")));
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                if !parts.is_empty() {
-                    drop_summaries.push(parts.join(" | "));
-                }
-
-                dropped_tokens += turn_msgs.iter()
-                    .map(|m| m.estimate_tokens()).sum::<usize>();
-                drop_count += 1;
-            }
-
-            // Rebuild: system + cold zone + drop digest + surviving messages
-            let cold_msgs = if self.cold_summaries.is_empty() { 1 } else { 2 };
-            result.truncate(cold_msgs);
-
-            // Inject mechanical digest of dropped turns so model retains reasoning chain
-            if !drop_summaries.is_empty() {
-                let digest = format!(
-                    "[Context overflow: {} earlier turns compressed]\n{}",
-                    drop_count,
-                    drop_summaries.iter().enumerate()
-                        .map(|(i, s)| format!("{}. {}", i + 1, s))
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                );
-                result.push(Message::new(Role::System, digest));
-            }
-
-            // Find first surviving message, clamped to last_turn_start so the last turn always survives.
-            let mut survived_start = 0;
-            let mut skipped = 0usize;
-            for ti in 0..turns.len() {
-                let turn = &turns[ti];
-                let end = turn.end_idx().min(self.messages.len());
-                if turn.start_idx >= self.messages.len() { continue; }
-                let t: usize = self.messages[turn.start_idx..end]
-                    .iter().map(|m| m.estimate_tokens()).sum();
-                skipped += t;
-                if skipped >= dropped_tokens {
-                    survived_start = if ti + 1 < turns.len() {
-                        turns[ti + 1].start_idx
-                    } else {
-                        // Old code set this to self.messages.len() → no survivors.
-                        // Clamp to last_turn_start to preserve at least the last turn.
-                        last_turn_start
-                    };
-                    break;
-                }
-            }
-            // Final clamp: survived_start must not skip past the last turn.
-            survived_start = survived_start.min(last_turn_start);
-            result.extend(self.messages[survived_start..].iter().cloned());
-        }
-
-        // Microcompact: condense old turn ToolResults to one-liners.
-        // Recent 5 turns keep full fidelity. Older turns' large tool results
-        // (read_file full content, bash output) are replaced with compact summaries.
-        // This reduces context growth without LLM calls.
-        // View replacement runs AFTER microcompact — edited files stay fresh.
-        Self::microcompact(&mut result, &self.turn_tracker.turns, self.messages.len());
-
-        Self::replace_stale_reads(&mut result);
-        Self::clean_message_pipeline(&mut result);
-
-        // ── ABSOLUTE FLOOR (runs AFTER all cleanup, right before sent_tokens calc) ──
-        // If compaction + cleanup somehow left us with only system messages, graft back
-        // the last user message so the LLM has *something* to respond to. This is the
-        // strictest possible invariant: whenever self.messages is non-empty, the result
-        // must contain at least one non-system message.
-        //
-        // Placement matters: previously this ran BEFORE clean_message_pipeline, which
-        // could theoretically strip the graft (step 1 removes empty assistants, but not
-        // user text — still, defense in depth says put the floor last).
-        let non_system_count = result.iter().filter(|m| !matches!(m.role, Role::System)).count();
-        if non_system_count == 0 {
-            if let Some(last_user) = self.messages.iter().rev()
-                .find(|m| matches!(m.role, Role::User) && matches!(m.content, MessageContent::Text(..)))
-            {
-                result.push(Message::new(
-                    Role::System,
-                    "[Emergency: prior conversation was dropped during compaction. Only the latest user message is preserved.]"
-                ));
-                result.push(last_user.clone());
-            }
-        }
-
-        let sent_tokens: usize = result.iter().map(|m| m.estimate_tokens()).sum::<usize>()
-            .saturating_sub(system_tokens);
-        let msg_count = result.len();
-        (result, ContextStats {
-            system_tokens,
-            sent_tokens,
-            dropped_tokens,
-            total_messages: msg_count,
-        })
-    }
-
-    /// Check if context needs compression.
-    /// Threshold: min(70% of window, 50K tokens). This value has been stable
-    /// across many real sessions. Do NOT lower without validating on long
-    /// write-heavy sessions (agentarena) — 55% caused total context wipeout.
-    pub fn needs_compression(&self, system_prompt_tokens: usize, token_budget: usize) -> bool {
-        // Guard: need enough messages to make compression worthwhile.
-        // Uses message count instead of turn count because turn_tracker counts
-        // USER MESSAGES (1 user msg = 1 turn), but a single user message can
-        // produce 15+ LLM calls with 35+ messages. The old `turns.len() < 6`
-        // guard caused compression to NEVER trigger in agent-loop scenarios.
-        if self.messages.len() < 12 { return false; }
-        let total: usize = system_prompt_tokens + self.messages.iter()
-            .map(|m| m.estimate_tokens()).sum::<usize>();
-        let threshold = (token_budget * 50 / 100).min(50000);
-        total > threshold
-    }
-
-    /// Build content for LLM compression.
-    ///
-    /// Strategy: keep the last `KEEP_MESSAGES` messages at full fidelity,
     /// compress everything before that into one-line-per-round summaries.
-    /// Returns (compressed_text, number_of_messages_to_remove).
-    ///
-    /// This operates at MESSAGE level, not turn level, because turn_tracker
-    /// counts user messages (1 user msg = 1 turn) but a single user message
-    /// can produce 15+ LLM calls with 35+ messages.
-    pub fn build_compression_content(&self) -> (String, usize) {
-        if self.messages.len() <= KEEP_MESSAGES {
-            return (String::new(), 0);
-        }
-
-        let compress_end_idx = self.messages.len() - KEEP_MESSAGES;
-
-        // Group messages into logical rounds (assistant + tool_calls + tool_results)
-        // and compress each round into a one-liner.
-        let mut content = String::new();
-        let mut round = 0usize;
-        let compress_msgs = &self.messages[..compress_end_idx];
-        let mut i = 0;
-        while i < compress_msgs.len() {
-            // Collect messages for this round
-            let round_start = i;
-            // A round starts at a User or Assistant message and includes
-            // all subsequent tool results until the next User/Assistant.
-            i += 1;
-            while i < compress_msgs.len() {
-                match compress_msgs[i].role {
-                    message::Role::User | message::Role::Assistant => break,
-                    _ => i += 1,
-                }
-            }
-            round += 1;
-            let round_msgs = &compress_msgs[round_start..i];
-            content.push_str(&self.compress_turn(round, round_msgs));
-            content.push('\n');
-        }
-
-        // Return message count (not turn count) for apply_compression
-        (content, compress_end_idx)
-    }
 
     /// Apply compression: store summary in cold zone, remove old messages.
     /// `remove_count` = number of messages from the front to remove.
@@ -580,141 +320,7 @@ impl Conversation {
         self.turn_tracker.turns = surviving_turns;
     }
 
-    /// Compress a turn into a one-line mechanical summary.
-    /// No LLM call — deterministic, fast, never fails.
-    /// Format: "Turn N: user asked X → read file.js, edited file.js (-3 +5 lines)"
-    // ── INVARIANT (2026-04-16): compress_turn MUST preserve assistant thinking ──
-    // The assistant's text (thinking/reasoning) in AssistantWithToolCalls is the
-    // diagnostic conclusion for that turn ("代码逻辑看起来正确", "问题找到了！ID不匹配").
-    // Without it, the compressed summary says only "read main.ts, grep closeSettings"
-    // — the model doesn't know it already confirmed the logic was correct, so it
-    // searches the same files again. 39-turn loop sessions traced to this omission.
-    // ─────────────────────────────────────────────────────────────────────────────
-    fn compress_turn(&self, turn_num: usize, turn_msgs: &[Message]) -> String {
-        let mut user_text = String::new();
-        let mut assistant_text = String::new();
-        let mut tools: Vec<String> = Vec::new();
 
-        for msg in turn_msgs {
-            match (&msg.role, &msg.content) {
-                (Role::User, MessageContent::Text(s)) => {
-                    if !s.starts_with('[') { // skip system-injected messages
-                        user_text = if s.chars().count() > 60 {
-                            format!("{}...", s.chars().take(57).collect::<String>())
-                        } else {
-                            s.clone()
-                        };
-                    }
-                }
-                (_, MessageContent::AssistantWithToolCalls { text, tool_calls }) => {
-                    // Preserve assistant's diagnostic conclusion (first 80 chars).
-                    // This is NOT framework judgment — it's the model's own words,
-                    // kept so the model remembers what it already concluded.
-                    if let Some(t) = text {
-                        let trimmed = t.trim();
-                        if !trimmed.is_empty() && assistant_text.is_empty() {
-                            assistant_text = if trimmed.chars().count() > 80 {
-                                format!("{}...", trimmed.chars().take(77).collect::<String>())
-                            } else {
-                                trimmed.to_string()
-                            };
-                        }
-                    }
-                    for tc in tool_calls {
-                        let short = if let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
-                            let fp = args.get("file_path").and_then(|v| v.as_str())
-                                .map(|p| std::path::Path::new(p).file_name()
-                                    .map(|n| n.to_string_lossy().to_string())
-                                    .unwrap_or_else(|| p.to_string()));
-                            match (tc.name.as_str(), fp) {
-                                ("read_file", Some(f)) => format!("read {}", f),
-                                ("edit_file", Some(f)) => format!("edit {}", f),
-                                ("write_file", Some(f)) => format!("write {}", f),
-                                ("grep", _) => {
-                                    let pat = args.get("pattern").and_then(|v| v.as_str()).unwrap_or("?");
-                                    format!("grep({})", pat)
-                                }
-                                ("bash", _) => {
-                                    let cmd = args.get("command").and_then(|v| v.as_str()).unwrap_or("?");
-                                    let short_cmd: String = cmd.chars().take(30).collect();
-                                    format!("bash({})", short_cmd)
-                                }
-                                (name, _) => name.to_string(),
-                            }
-                        } else {
-                            tc.name.clone()
-                        };
-                        if !tools.contains(&short) {
-                            tools.push(short);
-                        }
-                    }
-                }
-                // Also capture pure assistant text (no tool calls) — these are
-                // diagnostic summaries like "已修复！" or "代码逻辑正确".
-                (Role::Assistant, MessageContent::Text(s)) => {
-                    if assistant_text.is_empty() {
-                        let trimmed = s.trim();
-                        if !trimmed.is_empty() {
-                            assistant_text = if trimmed.chars().count() > 80 {
-                                format!("{}...", trimmed.chars().take(77).collect::<String>())
-                            } else {
-                                trimmed.to_string()
-                            };
-                        }
-                    }
-                }
-                (_, MessageContent::ToolResult(r)) if !r.success => {
-                    tools.push("FAILED".to_string());
-                }
-                _ => {}
-            }
-        }
-
-        let tools_str = if tools.is_empty() { "no tools".to_string() } else { tools.join(", ") };
-
-        // Format: "- Turn N: [user text] [assistant conclusion] → tools"
-        // The assistant conclusion is the key addition — it's what prevents
-        // the model from re-searching the same files after compression.
-        let prefix = if !user_text.is_empty() {
-            format!("\"{}\" ", user_text)
-        } else {
-            String::new()
-        };
-        let conclusion = if !assistant_text.is_empty() {
-            format!("[{}] ", assistant_text)
-        } else {
-            String::new()
-        };
-        format!("- Turn {}: {}{}→ {}", turn_num, prefix, conclusion, tools_str)
-    }
-
-    /// Fallback windowing when no turns are tracked.
-    /// Keeps as many recent messages as fit within 60% of remaining budget.
-    fn to_provider_messages_budgeted_fallback(
-        &self,
-        system_msg: Message,
-        remaining_budget: usize,
-    ) -> Vec<Message> {
-        let budget = remaining_budget * 60 / 100;
-        let mut used = 0usize;
-        let mut start = self.messages.len();
-
-        for i in (0..self.messages.len()).rev() {
-            let msg_tokens = self.messages[i].estimate_tokens();
-            if used + msg_tokens > budget {
-                break;
-            }
-            used += msg_tokens;
-            start = i;
-        }
-        start = self.snap_to_valid_boundary(start);
-
-        let mut result = Vec::with_capacity(self.messages.len() - start + 1);
-        result.push(system_msg);
-        result.extend(self.messages[start..].iter().cloned());
-        Self::sanitize_messages(&mut result);
-        result
-    }
 
     /// Microcompact: condense old ToolResult messages to one-line summaries.
     /// Zero LLM calls — purely mechanical compression.
@@ -727,7 +333,7 @@ impl Conversation {
     ///
     /// Other tool results (bash, grep, edit, etc.) are condensed after
     /// 20 messages to keep context growth in check.
-    fn microcompact(msgs: &mut Vec<Message>, _turns: &[turn::Turn], total_msg_count: usize) {
+    pub(crate) fn microcompact(msgs: &mut Vec<Message>, _turns: &[turn::Turn], total_msg_count: usize) {
         const OTHER_KEEP: usize = 20;
 
         // Don't compact until context is getting large.
@@ -833,7 +439,7 @@ impl Conversation {
     /// Replace stale read_file results with current disk content.
     /// When a file was read then later edited, the old read result is outdated.
     /// This replaces it so the model always sees the latest version.
-    fn replace_stale_reads(msgs: &mut Vec<Message>) {
+    pub(crate) fn replace_stale_reads(msgs: &mut Vec<Message>) {
         // Step 1: Scan tool calls to build call_id → (tool_name, file_path, offset, limit)
         struct ReadInfo {
             file_path: String,
@@ -921,7 +527,7 @@ impl Conversation {
 
     /// Uses a simple state-machine approach: walk forward, track expected sequence.
     /// Valid sequences: System → (User → Assistant/AssistantWithToolCalls → [ToolResult]* → ...)*
-    fn sanitize_messages(msgs: &mut Vec<Message>) {
+    pub(crate) fn sanitize_messages(msgs: &mut Vec<Message>) {
         let mut to_remove: Vec<usize> = Vec::new();
         let mut expecting_tool_results = 0usize; // how many ToolResults we expect next
 
@@ -975,38 +581,13 @@ impl Conversation {
         }
     }
 
-    /// Snap an index to a valid message boundary for the API.
-    fn snap_to_valid_boundary(&self, idx: usize) -> usize {
-        let mut start = idx.min(self.messages.len());
-
-        // Skip orphan ToolResult/ToolResultRef messages
-        while start < self.messages.len() {
-            match &self.messages[start].content {
-                MessageContent::ToolResult(_) | MessageContent::ToolResultRef(_) => start += 1,
-                _ => break,
-            }
-        }
-
-        // Prefer starting at a User message
-        let original = start;
-        while start < self.messages.len() {
-            if matches!(self.messages[start].role, Role::User | Role::System) {
-                break;
-            }
-            start += 1;
-            if start > original + 5 {
-                return original;
-            }
-        }
-        start
-    }
 
     /// Clean message pipeline before sending to API.
     /// Removes noise that degrades model decision quality:
     /// - Empty/whitespace-only assistant messages
     /// - Orphaned tool results (no matching tool_use)
     /// - Consecutive same-role user messages (merge into one)
-    fn clean_message_pipeline(msgs: &mut Vec<Message>) {
+    pub(crate) fn clean_message_pipeline(msgs: &mut Vec<Message>) {
         // 1. Remove empty assistant messages (e.g., after <think> stripping)
         msgs.retain(|m| {
             if m.role == Role::Assistant {
@@ -1269,7 +850,7 @@ mod tests {
     #[test]
     fn test_budgeted_empty_conversation() {
         let conv = Conversation::new();
-        let (msgs, _stats) = conv.to_provider_messages_budgeted("system prompt", 8000);
+        let (msgs, _stats) = crate::ctx::render::build_messages(&conv, "system prompt", 8000);
         assert_eq!(msgs.len(), 1);
         assert!(matches!(msgs[0].role, Role::System));
     }
@@ -1281,7 +862,7 @@ mod tests {
         conv.messages.push(Message::new(Role::Assistant, "hi there"));
         conv.add_user_message("do something");
 
-        let (msgs, _stats) = conv.to_provider_messages_budgeted("sys", 8000);
+        let (msgs, _stats) = crate::ctx::render::build_messages(&conv, "sys", 8000);
         assert_eq!(msgs.len(), 4); // system + 3 messages
         assert!(matches!(msgs[0].role, Role::System));
     }
@@ -1309,7 +890,7 @@ mod tests {
         conv.add_user_message("now what?");
 
         // Large budget — everything fits
-        let (msgs, stats) = conv.to_provider_messages_budgeted("sys", 100000);
+        let (msgs, stats) = crate::ctx::render::build_messages(&conv, "sys", 100000);
         // system + 7 messages (2 turns * 3 msgs each + final user)
         assert_eq!(msgs.len(), 8);
         assert!(matches!(msgs[0].role, Role::System));
@@ -1343,7 +924,7 @@ mod tests {
         }
         conv.add_user_message("now what?");
 
-        let (msgs, stats) = conv.to_provider_messages_budgeted("sys", 4000);
+        let (msgs, stats) = crate::ctx::render::build_messages(&conv, "sys", 4000);
         // Oldest turns should be dropped
         assert!(stats.dropped_tokens > 0, "Some turns should have been dropped");
         // Most recent user message must survive
@@ -1372,7 +953,7 @@ mod tests {
         });
 
         // Very small budget — system prompt is always kept
-        let (msgs, _stats) = conv.to_provider_messages_budgeted("sys", 1000);
+        let (msgs, _stats) = crate::ctx::render::build_messages(&conv, "sys", 1000);
         assert!(!msgs.is_empty(), "Must at least have system prompt");
         assert!(matches!(msgs[0].role, Role::System));
     }
@@ -1420,7 +1001,7 @@ mod tests {
 
         // Budget too small to fit the huge output — compaction MUST still leave
         // at least one non-system message.
-        let (msgs, _stats) = conv.to_provider_messages_budgeted("sys", 10_000);
+        let (msgs, _stats) = crate::ctx::render::build_messages(&conv, "sys", 10_000);
         let non_system = msgs.iter().filter(|m| !matches!(m.role, Role::System)).count();
         assert!(
             non_system > 0,
@@ -1451,7 +1032,7 @@ mod tests {
             });
         }
 
-        let (msgs, _stats) = conv.to_provider_messages_budgeted("sys", 5_000);
+        let (msgs, _stats) = crate::ctx::render::build_messages(&conv, "sys", 5_000);
         let has_user = msgs.iter().any(|m| matches!(m.role, Role::User));
         assert!(has_user, "last user message must always survive, got {} msgs", msgs.len());
     }
@@ -1486,7 +1067,7 @@ mod tests {
         assert_eq!(conv.turn_tracker.turns.len(), 5); // 8 - 3
 
         // Budget check: cold zone should appear in output
-        let (msgs, _stats) = conv.to_provider_messages_budgeted("sys", 100000);
+        let (msgs, _stats) = crate::ctx::render::build_messages(&conv, "sys", 100000);
         let has_cold = msgs.iter().any(|m| {
             m.text().map_or(false, |t| t.contains("Earlier conversation history"))
         });
@@ -1537,7 +1118,7 @@ mod tests {
         }
 
         // Small budget — force dropping
-        let (msgs, stats) = conv.to_provider_messages_budgeted("sys", 2000);
+        let (msgs, stats) = crate::ctx::render::build_messages(&conv, "sys", 2000);
         assert!(stats.dropped_tokens > 0, "Should drop turns when over budget");
         assert!(matches!(msgs[0].role, Role::System));
     }
@@ -1551,7 +1132,7 @@ mod tests {
         conv.messages.push(Message::new(Role::Assistant, "response 2"));
         conv.add_user_message("third");
 
-        let (msgs, _stats) = conv.to_provider_messages_budgeted("sys", 100000);
+        let (msgs, _stats) = crate::ctx::render::build_messages(&conv, "sys", 100000);
         // system + 5 messages
         assert_eq!(msgs.len(), 6);
         assert_eq!(msgs[1].text(), Some("first"));
