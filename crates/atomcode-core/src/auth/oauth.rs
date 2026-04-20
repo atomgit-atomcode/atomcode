@@ -228,6 +228,7 @@ fn await_callback(port: u16) -> Result<(String, String)> {
     let (tx, rx) = mpsc::channel::<Result<(String, String)>>();
     let stop = Arc::new(AtomicBool::new(false));
 
+    let has_listener = listener.is_some();
     if let Some(listener) = listener {
         let tx_l = tx.clone();
         let stop_l = Arc::clone(&stop);
@@ -237,19 +238,30 @@ fn await_callback(port: u16) -> Result<(String, String)> {
         });
     }
 
-    // Stdin reader. `read_line` is blocking and cannot be cancelled
-    // cross-platform, so we spawn and let it die with the process if the
-    // listener wins. Send on a closed channel is silently dropped.
-    thread::spawn(move || {
-        let stdin = io::stdin();
-        let mut line = String::new();
-        let r = match stdin.lock().read_line(&mut line) {
-            Ok(0) => Err(anyhow::anyhow!("stdin closed")),
-            Ok(_) => parse_pasted_callback(&line),
-            Err(e) => Err(anyhow::Error::new(e).context("Failed to read from stdin")),
-        };
-        let _ = tx.send(r);
-    });
+    // Stdin reader (fallback) — only when the listener couldn't bind, i.e.
+    // WSL / headless Linux where the browser can't reach 127.0.0.1. On
+    // Windows with a bound listener this thread is poison: `read_line`
+    // blocks uncancellably on the console handle, and when the listener
+    // wins the race and the TUI resumes raw mode, the orphan keeps
+    // consuming console input — every keystroke the user types after
+    // login is swallowed by this zombie. Skip spawning it when the
+    // listener is handling the callback path.
+    if !has_listener {
+        thread::spawn(move || {
+            let stdin = io::stdin();
+            let mut line = String::new();
+            let r = match stdin.lock().read_line(&mut line) {
+                Ok(0) => Err(anyhow::anyhow!("stdin closed")),
+                Ok(_) => parse_pasted_callback(&line),
+                Err(e) => Err(anyhow::Error::new(e).context("Failed to read from stdin")),
+            };
+            let _ = tx.send(r);
+        });
+    } else {
+        // Keep `tx` alive long enough for the listener thread; dropping it
+        // immediately would close the channel before the callback arrives.
+        drop(tx);
+    }
 
     let result = rx.recv().context("login cancelled")?;
     stop.store(true, Ordering::Relaxed);
