@@ -1147,14 +1147,36 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
     }
 
     fn on_resize(&mut self, cols: u16, rows: u16) {
+        // Terminal-side state wipe: resize leaves the terminal's own
+        // display with characters at absolute positions from BEFORE
+        // the resize. The new Screen we're about to build has both
+        // frames blank, so the diff won't emit any "erase" patches
+        // for the stale content — it would just paint the new
+        // frame on top, leaving ghost copies of the old footer /
+        // body at whatever rows they occupied pre-resize.
+        //
+        // Force `\x1b[2J\x1b[H` to clear the terminal's whole
+        // display first, then rebuild Screen at the new dimensions.
+        // prev_cells is now blank (which matches terminal reality),
+        // cells is blank (about to be repainted by paint_frame).
+        let _ = self.out.write_all(b"\x1b[2J\x1b[H");
+        self.screen.resize(cols, rows);
         // Body cells are pre-wrapped to the old width — drop them
         // rather than mis-render. Terminal-side scrollback still
         // holds the history for the user to scroll back to.
-        self.screen.resize(cols, rows);
         self.body_lines.clear();
         self.assistant_line_buf.clear();
         self.paint_frame();
         self.flush_frame();
+        let _ = self.out.flush();
+        // After this emit `prev_cells` holds exactly what the terminal
+        // shows and the footer occupies `current_footer_rows` rows.
+        // Sync our geometry tracker so the next `flush_deferred`'s
+        // "geometry changed → invalidate" guard does NOT fire (which
+        // would blank prev_cells and leave stale terminal chars
+        // without erase patches).
+        self.last_painted_footer_rows = self.current_footer_rows();
+        self.dirty = false;
     }
 }
 
@@ -1470,6 +1492,66 @@ mod tests {
         r.flush_deferred();
         let idle_bytes = sample(&counter) - before_idle;
         assert_eq!(idle_bytes, 0, "idle tick should emit 0 bytes");
+    }
+
+    /// Regression: user reported that after a terminal resize two
+    /// footers appeared stacked on screen — old footer at pre-resize
+    /// absolute rows kept its chars, new footer painted at new rows,
+    /// both visible. Root cause: `Screen::resize` rebuilds both
+    /// frames blank, so the next diff vs all-blank prev has nothing
+    /// to erase — but the terminal still holds pre-resize glyphs at
+    /// the old absolute positions.
+    ///
+    /// Fix: `on_resize` emits `\x1b[2J\x1b[H` before repainting, so
+    /// the terminal's own display clears and the new frame owns
+    /// every visible column.
+    #[test]
+    fn retained_resize_clears_old_footer_via_vterm() {
+        let (mut r, buf) = new_capturing(80, 24);
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+        let status = status_basic();
+
+        // Frame 1: paint initial footer at 80x24 with distinctive
+        // string "originaltag". After drain, the sink is empty.
+        r.render(UiLine::InputPrompt {
+            buf: "originaltag".into(),
+            cursor_byte: 11,
+            menu: None,
+            status: status.clone(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+        assert!(vterm.row_text(21).contains("originaltag"));
+
+        // Resize + then push a frame with EMPTY input so the new
+        // layout has no legitimate reason to contain "originaltag".
+        // Any occurrence post-resize is ghost content from before.
+        r.on_resize(60, 16);
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+        });
+        r.flush_deferred();
+
+        // New vterm matching post-resize dimensions, feed only the
+        // bytes emitted AFTER the resize (drain was called above
+        // at line "assert row_text 21").
+        let mut vterm = crate::test_term::VirtualTerminal::new(60, 16);
+        drain_into_vterm(&buf, &mut vterm);
+
+        for r_idx in 0..16 {
+            let row = vterm.row_text(r_idx);
+            assert!(
+                !row.contains("originaltag"),
+                "stale pre-resize content leaked to row {}: {:?}\n\
+                 dump:\n{}",
+                r_idx,
+                row,
+                vterm.dump()
+            );
+        }
     }
 
     /// Phase 7 exemplar: end-to-end render through VirtualTerminal.

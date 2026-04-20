@@ -145,11 +145,25 @@ fn run(
                 continue;
             }
             Ok(true) => {}
-            Err(_) => return,
+            Err(_) => {
+                // Transient poll error. Windows crossterm has been
+                // observed to fail `event::poll` / `event::read`
+                // during terminal resize; returning here would kill
+                // the reader thread and collapse the event loop
+                // (input_rx channel closes, `maybe = None` → break).
+                // Users report "atomcode exits when I resize on
+                // Windows". Small sleep + continue absorbs the
+                // glitch while staying responsive.
+                std::thread::sleep(Duration::from_millis(50));
+                continue;
+            }
         }
         let ev = match event::read() {
             Ok(e) => e,
-            Err(_) => return,
+            Err(_) => {
+                std::thread::sleep(Duration::from_millis(50));
+                continue;
+            }
         };
         let msg = match ev {
             Event::Key(k) => {
