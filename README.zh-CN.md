@@ -166,14 +166,15 @@ Select provider:
 配置文件位于 `~/.atomcode/config.toml`，最小单 provider 样例：
 
 ```toml
-default_provider = "AtomGit"
-
-[providers.AtomGit]
-type           = "openai"
-api_key        = "your api key"
-model          = "MiniMax-M2.7"
-base_url       = "https://api-ai.gitcode.com/v1"
-context_window = 64000
+ default_provider = "deepseek"	 
+ 
+ 
+ [providers.deepseek]	 
+ type           = "openai"	 
+ api_key        = "sk-..."	 
+ model          = "deepseek-chat"	 
+ base_url       = "https://api.deepseek.com/v1"	 
+ context_window = 64000
 ```
 
 可以配置多个 provider，用 `/model` 或 `/provider` 切换。完整示例
