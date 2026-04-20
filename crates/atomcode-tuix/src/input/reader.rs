@@ -94,6 +94,37 @@ pub fn spawn(tx: mpsc::UnboundedSender<InputEvent>) -> ReaderHandle {
     }
 }
 
+/// Decide what the reader loop should do next, given the `event::poll`
+/// result and whether the input channel is still alive. Extracted from
+/// `run` so the four-way classification can be unit-tested without
+/// spinning up a real TTY.
+#[derive(Debug, PartialEq, Eq)]
+enum PollAction {
+    /// `poll` said "event available" — proceed to `event::read`.
+    Read,
+    /// No event in this tick and channel still open — loop again.
+    Continue,
+    /// No event and the input channel was dropped — exit the thread.
+    Exit,
+    /// `poll` returned `Err` — treat as a transient glitch (Windows
+    /// crossterm has been seen to fail `poll`/`read` during terminal
+    /// resize). Sleep briefly and loop. Critically, this is NOT
+    /// `Exit` — returning here would kill the reader thread and
+    /// collapse the event loop (`input_rx` closes → `maybe = None`
+    /// → break), which is the "atomcode exits when I resize on
+    /// Windows" bug.
+    Sleep,
+}
+
+fn classify_poll(res: std::io::Result<bool>, tx_closed: bool) -> PollAction {
+    match res {
+        Ok(true) => PollAction::Read,
+        Ok(false) if tx_closed => PollAction::Exit,
+        Ok(false) => PollAction::Continue,
+        Err(_) => PollAction::Sleep,
+    }
+}
+
 fn run(
     tx: mpsc::UnboundedSender<InputEvent>,
     cmd_rx: stdmpsc::Receiver<(ReaderCommand, Option<stdmpsc::Sender<()>>)>,
@@ -137,23 +168,11 @@ fn run(
             Err(TryRecvError::Empty) => {}
         }
 
-        match event::poll(Duration::from_millis(100)) {
-            Ok(false) => {
-                if tx.is_closed() {
-                    return;
-                }
-                continue;
-            }
-            Ok(true) => {}
-            Err(_) => {
-                // Transient poll error. Windows crossterm has been
-                // observed to fail `event::poll` / `event::read`
-                // during terminal resize; returning here would kill
-                // the reader thread and collapse the event loop
-                // (input_rx channel closes, `maybe = None` → break).
-                // Users report "atomcode exits when I resize on
-                // Windows". Small sleep + continue absorbs the
-                // glitch while staying responsive.
+        match classify_poll(event::poll(Duration::from_millis(100)), tx.is_closed()) {
+            PollAction::Read => {}
+            PollAction::Continue => continue,
+            PollAction::Exit => return,
+            PollAction::Sleep => {
                 std::thread::sleep(Duration::from_millis(50));
                 continue;
             }
@@ -231,6 +250,39 @@ mod tests {
             .send((ReaderCommand::Shutdown, None))
             .expect("send shutdown");
         worker.join().expect("worker thread joins cleanly");
+    }
+
+    /// Regression for the Windows-resize crash. `crossterm::event::poll`
+    /// has been observed to return `Err` during terminal resize on
+    /// Windows; the original loop `return`'d on Err, which killed the
+    /// reader thread and collapsed the event loop ("atomcode exits
+    /// when I resize on Windows"). `classify_poll` must classify
+    /// `Err` as `Sleep` (loop again after a short delay), never `Exit`.
+    #[test]
+    fn classify_poll_err_is_sleep_not_exit() {
+        // Real error construction — ErrorKind doesn't matter, the
+        // classifier treats all Err the same.
+        let boom = std::io::Error::new(std::io::ErrorKind::Other, "resize glitch");
+        assert_eq!(classify_poll(Err(boom), false), PollAction::Sleep);
+        let boom = std::io::Error::new(std::io::ErrorKind::Other, "another glitch");
+        assert_eq!(
+            classify_poll(Err(boom), true),
+            PollAction::Sleep,
+            "Err must NOT be Exit even when tx is closed — exit path \
+             is only for clean shutdown via Ok(false) + closed tx"
+        );
+    }
+
+    /// The three `Ok` branches must classify exactly one action each,
+    /// and `Ok(false)` splits on `tx_closed` (the only place the
+    /// reader self-terminates in the happy path).
+    #[test]
+    fn classify_poll_ok_branches() {
+        assert_eq!(classify_poll(Ok(true), false), PollAction::Read);
+        assert_eq!(classify_poll(Ok(true), true), PollAction::Read,
+            "Ok(true) always reads — caller will notice tx closed on send");
+        assert_eq!(classify_poll(Ok(false), false), PollAction::Continue);
+        assert_eq!(classify_poll(Ok(false), true), PollAction::Exit);
     }
 
     /// Dropping the sender side must terminate the worker even while paused.

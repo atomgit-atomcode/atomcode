@@ -1212,6 +1212,35 @@ mod tests {
         }
     }
 
+    /// Writer that tracks every individual `write` call — for tests
+    /// that assert emit is split into N chunks (Mac Terminal byte-drop
+    /// workaround).
+    #[derive(Clone)]
+    struct ChunkCountingSink {
+        chunks: Arc<Mutex<Vec<usize>>>,
+    }
+    impl Write for ChunkCountingSink {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.chunks.lock().unwrap().push(b.len());
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn new_chunk_counting(
+        w: u16,
+        h: u16,
+    ) -> (RetainedRenderer<ChunkCountingSink>, Arc<Mutex<Vec<usize>>>) {
+        let chunks = Arc::new(Mutex::new(Vec::<usize>::new()));
+        let sink = ChunkCountingSink {
+            chunks: chunks.clone(),
+        };
+        let r = RetainedRenderer::with_writer(sink, caps_with_color(), w, h);
+        (r, chunks)
+    }
+
     /// Writer that captures the ANSI byte stream — lets us inspect
     /// structure (e.g. "all three wide chars emitted consecutively").
     #[derive(Clone)]
@@ -2273,6 +2302,257 @@ mod tests {
             stream.contains("你是谁"),
             "wide chars not consecutive in retained emit stream:\n{}",
             stream
+        );
+    }
+
+    /// Mac Terminal.app drops bytes mid-sequence when a single
+    /// `write_all` carries ~1KB+ of mixed CSI/SGR/UTF-8 — observed as
+    /// "bot_rule row shortens" after a big cold-start paint. The
+    /// workaround in `flush_deferred` splits emits into 512 B chunks.
+    /// Regression: a cold-start full frame (welcome + footer +
+    /// menu open) must produce > 1 write call, with every chunk
+    /// except the last sized exactly 512 bytes.
+    #[test]
+    fn retained_large_frame_splits_into_512b_chunks() {
+        let (mut r, chunks) = new_chunk_counting(80, 24);
+        let status = status_basic();
+
+        // Build up a painted frame with welcome + open menu so the
+        // cold-start emit is comfortably over 512 B.
+        r.render(UiLine::Welcome {
+            model: "glm-5".into(),
+            working_dir: "~/project/atomcode".into(),
+        });
+        let items: Vec<(String, String)> = vec![
+            ("model".into(), "Switch model".into()),
+            ("provider".into(), "Add provider".into()),
+            ("session".into(), "New session".into()),
+            ("resume".into(), "Resume session".into()),
+        ];
+        r.render(UiLine::InputPrompt {
+            buf: "/".into(),
+            cursor_byte: 1,
+            menu: Some(MenuPayload {
+                items,
+                selected: 0,
+            }),
+            status,
+        });
+        r.flush_deferred();
+
+        let sizes = chunks.lock().unwrap().clone();
+        let total: usize = sizes.iter().sum();
+        assert!(
+            total > 512,
+            "test needs a > 512 B frame to exercise chunking; got {} B (sizes: {:?})",
+            total,
+            sizes
+        );
+        assert!(
+            sizes.len() > 1,
+            "large frame must split into >1 write ({} B in one call)\nsizes: {:?}",
+            total,
+            sizes
+        );
+        // Every chunk except the last must be exactly 512 bytes — that
+        // guarantees the split is driven by the chunking loop and not
+        // by the caller pre-fragmenting.
+        for (i, sz) in sizes.iter().enumerate().take(sizes.len() - 1) {
+            assert_eq!(
+                *sz, 512,
+                "chunk {} should be 512 B, got {} (sizes: {:?})",
+                i, sz, sizes
+            );
+        }
+        assert!(
+            *sizes.last().unwrap() <= 512,
+            "last chunk must be ≤ 512 B (sizes: {:?})",
+            sizes
+        );
+    }
+
+    /// Small frames must NOT chunk — single `write` per flush keeps
+    /// syscall count minimal on the steady-state keystroke path.
+    #[test]
+    fn retained_small_frame_single_write() {
+        let (mut r, chunks) = new_chunk_counting(80, 24);
+        let status = status_basic();
+        // Warm up so prev_cells matches.
+        r.render(UiLine::InputPrompt {
+            buf: "h".into(),
+            cursor_byte: 1,
+            menu: None,
+            status: status.clone(),
+        });
+        r.flush_deferred();
+        chunks.lock().unwrap().clear();
+
+        // Single keystroke — delta ≪ 512 B.
+        r.render(UiLine::InputPrompt {
+            buf: "hi".into(),
+            cursor_byte: 2,
+            menu: None,
+            status,
+        });
+        r.flush_deferred();
+        let sizes = chunks.lock().unwrap().clone();
+        assert_eq!(
+            sizes.len(),
+            1,
+            "steady-state keystroke should be one write (sizes: {:?})",
+            sizes
+        );
+        assert!(
+            sizes[0] < 512,
+            "keystroke delta should be well under 512 B (got {} B)",
+            sizes[0]
+        );
+    }
+
+    /// After `/clear` (renderer.clear_screen + re-render Welcome),
+    /// the welcome must reappear on the grid. Previous bug: the
+    /// immediate-mode renderer's diff cache was left intact by
+    /// `clear_screen`, so the next welcome paint saw prev=welcome
+    /// (stale), emitted no diff, and the terminal stayed blank.
+    /// Retained mode closes this hole by blowing away the whole
+    /// Screen model inside `clear_screen` — this test pins that
+    /// behaviour.
+    #[test]
+    fn retained_clear_screen_then_welcome_renders_via_vterm() {
+        let (mut r, buf) = new_capturing(80, 24);
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+        let status = status_basic();
+
+        // Initial welcome.
+        r.render(UiLine::Welcome {
+            model: "glm-5".into(),
+            working_dir: "~/project/atomcode".into(),
+        });
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+        assert!(
+            (0..24).any(|row| vterm.row_text(row).contains("AtomCode")),
+            "baseline welcome missing:\n{}",
+            vterm.dump()
+        );
+
+        // /clear — wipe terminal + re-render welcome. Note the
+        // `clear_screen` call wipes state but doesn't repaint; the
+        // next Welcome + flush does.
+        r.clear_screen();
+        r.render(UiLine::Welcome {
+            model: "glm-5".into(),
+            working_dir: "~/project/atomcode".into(),
+        });
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status,
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // Welcome must be back.
+        let still_has = (0..24)
+            .filter(|row| vterm.row_text(*row).contains("AtomCode"))
+            .count();
+        assert_eq!(
+            still_has, 1,
+            "after /clear the welcome must appear exactly once (not 0, not 2+):\n{}",
+            vterm.dump()
+        );
+    }
+
+    /// `resume_from_external` (OAuth browser return, `/shell` exit)
+    /// must (1) emit `\x1b[2J\x1b[H` to clear whatever the child
+    /// process left on screen, and (2) invalidate the Screen cache
+    /// so the next paint is a cold-start full repaint — otherwise
+    /// the diff would skip every cell that happens to match
+    /// prev_cells and the terminal would stay blank with a stale
+    /// cache believing everything is fine.
+    #[test]
+    fn retained_resume_from_external_clears_and_forces_repaint() {
+        let (mut r, buf) = new_capturing(80, 24);
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+        let status = status_basic();
+
+        // Paint welcome first, drain so vterm + terminal state agree.
+        r.render(UiLine::Welcome {
+            model: "glm-5".into(),
+            working_dir: "~/project/atomcode".into(),
+        });
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+        assert!(
+            (0..24).any(|row| vterm.row_text(row).contains("AtomCode")),
+            "baseline welcome missing:\n{}",
+            vterm.dump()
+        );
+
+        // Simulate the child process scribbling garbage on the
+        // terminal — vterm feeds bytes only from the renderer's
+        // sink, so we feed the "garbage" directly to vterm to
+        // mimic a post-child state where on-screen content no
+        // longer matches renderer's prev_cells.
+        vterm.feed(b"\x1b[1;1H*** child process noise ***\r\n");
+        assert!(
+            vterm.row_text(0).contains("child process noise"),
+            "setup: child-noise didn't land on vterm:\n{}",
+            vterm.dump()
+        );
+
+        // Clear capture buffer so we can observe ONLY the bytes
+        // emitted by resume_from_external + the next flush.
+        buf.lock().unwrap().clear();
+        r.resume_from_external();
+        let resume_bytes = buf.lock().unwrap().clone();
+        let resume_str = String::from_utf8_lossy(&resume_bytes);
+        assert!(
+            resume_str.contains("\x1b[2J") && resume_str.contains("\x1b[H"),
+            "resume must emit clear-screen + home: {:?}",
+            resume_str
+        );
+        drain_into_vterm(&buf, &mut vterm);
+
+        // After resume the next render must fully repaint against
+        // blank prev_cells — verify by rendering the SAME welcome
+        // content as before (so a naive cache would emit zero
+        // bytes) and asserting it still produces a non-trivial
+        // emit that restores AtomCode on the grid.
+        r.render(UiLine::Welcome {
+            model: "glm-5".into(),
+            working_dir: "~/project/atomcode".into(),
+        });
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status,
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+        assert!(
+            (0..24).any(|row| vterm.row_text(row).contains("AtomCode")),
+            "after resume_from_external the next paint must restore welcome (full repaint, not diff-skip):\n{}",
+            vterm.dump()
+        );
+        assert!(
+            !vterm.row_text(0).contains("child process noise"),
+            "resume must erase child-process garbage at row 0:\n{}",
+            vterm.dump()
         );
     }
 
