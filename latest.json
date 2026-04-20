@@ -1,5 +1,5 @@
 {
-  "version": "v4.19.0",
+  "version": "v4.19.1",
   "released_at": "2026-04-20T13:41:47Z",
   "binaries": {
     "darwin-arm64": { "sha256": "84660fac68456639828c55ee17e6609c6ad6bfe25f5f71ba27fa31fbaff42057", "size": 14543024 },
