@@ -207,7 +207,17 @@ pub trait ContextStrategy: ContextRenderer + CompactionPolicy + ToolOutputTrunca
 pub struct RenderedContext {
     pub messages: Vec<Message>,
     pub stats: ContextStats,        // system/sent/dropped tokens, msg_count
-    pub cache_breakpoints: Vec<usize>, // Claude only for now; other strategies empty
+    pub cache_plan: CachePlan,      // See below; non-Claude strategies use None
+}
+
+/// Cache hint returned by renderer, consumed by provider layer.
+/// Shipping only two variants this round; `AutomaticPrefix` (OpenAI)
+/// and `ImplicitMinTokens(usize)` (Gemini) land additively with the
+/// prompt-cache wiring PR — adding enum variants is non-breaking
+/// unlike swapping `Vec<usize>` field shape.
+pub enum CachePlan {
+    None,
+    Breakpoints(Vec<usize>),
 }
 
 pub struct CompressionPlan {
@@ -255,15 +265,15 @@ Design rules:
 `ClaudeStrategy` composition, using the trait split:
 
 ```rust
-pub struct ClaudeStrategy<Inner: ContextStrategy> {
-    inner: Inner,
+pub struct ClaudeStrategy {
+    inner: Box<dyn ContextStrategy>, // concrete is Medium or Large at resolve time
     caps: Capabilities, // prompt_cache=true, preserve_thinking_blocks=true
 }
 
-impl<Inner: ContextStrategy> ContextRenderer for ClaudeStrategy<Inner> {
+impl ContextRenderer for ClaudeStrategy {
     fn render(&self, conv: ConversationView<'_>, sys: &str) -> RenderedContext {
         let mut r = self.inner.render(conv, sys);
-        r.cache_breakpoints = compute_cache_breakpoints(&r.messages);
+        r.cache_plan = CachePlan::Breakpoints(compute_cache_breakpoints(&r.messages));
         r
     }
 }
@@ -272,7 +282,7 @@ impl<Inner: ContextStrategy> ContextRenderer for ClaudeStrategy<Inner> {
 // and ToolOutputTruncator forward explicitly. Four small delegate
 // methods total, which is acceptable — the whole point of the trait
 // split was to keep this delegation count bounded.
-impl<Inner: ContextStrategy> CompactionPolicy for ClaudeStrategy<Inner> {
+impl CompactionPolicy for ClaudeStrategy {
     fn should_compress(&self, conv: ConversationView<'_>, sys_tok: usize) -> bool {
         self.inner.should_compress(conv, sys_tok)
     }
@@ -280,7 +290,7 @@ impl<Inner: ContextStrategy> CompactionPolicy for ClaudeStrategy<Inner> {
         self.inner.compression_plan(conv)
     }
 }
-impl<Inner: ContextStrategy> ToolOutputTruncator for ClaudeStrategy<Inner> {
+impl ToolOutputTruncator for ClaudeStrategy {
     fn truncate_result(&self, r: &mut ToolResult, name: &str) {
         self.inner.truncate_result(r, name)
     }
@@ -289,7 +299,7 @@ impl<Inner: ContextStrategy> ToolOutputTruncator for ClaudeStrategy<Inner> {
     }
 }
 
-impl<Inner: ContextStrategy> ContextStrategy for ClaudeStrategy<Inner> {
+impl ContextStrategy for ClaudeStrategy {
     fn capabilities(&self) -> &Capabilities { &self.caps }
     fn name(&self) -> &'static str { "claude" }
 }
@@ -332,7 +342,7 @@ AgentLoop::new(config)
 agent.run_turn()
   ├─ rendered = self.context.render(self.conversation.view(), &system_prompt)
   ├─ turn_runner.run_with_filter(rendered, ...)   ← accepts RenderedContext
-  │      // cache_breakpoints empty → provider ignores
+  │      // cache_plan == None → provider ignores; Breakpoints → Claude emits cache_control
   └─ on tool result:
         self.context.truncate_result(&mut result, tool_name)
         // end of turn, before results fed back to LLM:
@@ -392,37 +402,76 @@ The existing `CRITICAL INVARIANT` block in
 `start_idx < new_len`, `end_idx <= new_len`, `msg_count > 0`) is
 preserved verbatim. Data-layer concern.
 
-## 9. Runtime feature flag for rollback
+## 9. Rollback via `LegacyStrategy` trait object
 
-The refactor touches ≥6 call sites across `agent/mod.rs`,
+The refactor touches 9 call sites across `agent/mod.rs`,
 `turn/runner.rs`, and `agent/tool_dispatch.rs`. A `#[cfg(test)]`-only
-`_legacy` snapshot is insufficient rollback: if the Medium-equivalent
-assertion fails in production under an untested fixture, reverting
-means undoing every call-site rewrite.
+`_legacy` snapshot is insufficient rollback. Branching every call site
+on `if config.use_context_strategy { new } else { legacy }` is also
+wrong — it spreads the flag to 9 places and creates a real drift bug
+if the flag is toggled mid-session between paired operations (e.g.,
+`build_compression_content` and `apply_compression` at
+`agent/mod.rs:648`).
 
-Instead: wire a runtime flag for one release.
+Instead: make "legacy" itself a `ContextStrategy` implementation.
 
 ```rust
-// config/mod.rs
+/// Thin adapter: wraps the still-intact legacy methods on Conversation
+/// and turn/truncation.rs and exposes them through the ContextStrategy
+/// facade. Exists for exactly one release as the rollback gate.
+pub struct LegacyStrategy { ctx_window: usize, caps: Capabilities }
+
+impl ContextRenderer for LegacyStrategy {
+    fn render(&self, conv: ConversationView<'_>, sys: &str) -> RenderedContext {
+        // Delegates to Conversation::to_provider_messages_budgeted_impl
+        // (renamed, kept `pub(crate)` for this release).
+    }
+}
+// CompactionPolicy / ToolOutputTruncator: same pattern — delegate to
+// the legacy Conversation / turn::truncation functions.
+impl ContextStrategy for LegacyStrategy { /* caps default, name "legacy" */ }
+```
+
+Then `resolve_strategy` is the single gate:
+
+```rust
+pub fn resolve_strategy(
+    model_id: &str,
+    ctx_window: usize,
+    use_new: bool,  // read ONCE at AgentLoop construction, never re-read
+) -> Box<dyn ContextStrategy> {
+    if !use_new { return Box::new(LegacyStrategy::new(ctx_window)); }
+    // ... normal resolution ...
+}
+```
+
+Config flag:
+
+```rust
 pub struct Config {
-    // ...
-    /// Enable the new context strategy layer. Default true after this
-    /// refactor; set to false to reinstate the legacy render path.
-    /// Remove this flag and the legacy path one release later.
+    /// Enable the new strategy layer. Read once when AgentLoop is
+    /// constructed; runtime changes to this flag are ignored for the
+    /// duration of the session. Default true after this refactor.
+    /// Remove this flag, LegacyStrategy, and the preserved legacy
+    /// functions one release later.
     #[serde(default = "default_true")]
     pub use_context_strategy: bool,
 }
 ```
 
-During the refactor:
-- Legacy methods on `Conversation` (`to_provider_messages_budgeted`,
-  `needs_compression`, `build_compression_content`) remain `pub` and
-  functional, not `#[cfg(test)]`.
-- `AgentLoop` branches once at the render and compression sites:
-  `if self.config.use_context_strategy { new path } else { legacy }`.
-- One release later, after production data confirms equivalence, the
-  flag, the legacy methods, and the branches are all deleted in a
-  follow-up PR.
+Consequences:
+
+- All 9 call sites become flag-blind — they always call
+  `self.context.xxx()`. No `if` branches outside `resolve_strategy`.
+- No mid-session toggle drift: `AgentLoop` stores the resolved
+  `Box<dyn ContextStrategy>` at construction and never re-reads config.
+- Legacy methods on `Conversation` and `turn/truncation.rs` stay `pub(crate)`
+  and functional (NOT `#[cfg(test)]`), feeding `LegacyStrategy`.
+- Cleanup PR one release later = delete `LegacyStrategy`, delete flag,
+  delete preserved legacy functions. No call-site changes needed.
+- Flag default flip from `false` → `true` lives in **its own commit**,
+  gated on: stagewise tests green + fixture replay green + **telemetry
+  parity observed in production** (not just CI green).
 
 ## 10. Capabilities — populated but not read this iteration
 
@@ -438,11 +487,12 @@ surface minimal.
 | Layer | File(s) | What |
 |---|---|---|
 | Shared invariants | `context/tests/mod.rs` — `strategy_contract_suite!` macro | The 4 invariants in § 8.3, once per strategy |
-| Strategy-specific | `small.rs`, `medium.rs`, `large.rs`, `claude.rs` `#[cfg(test)]` | Threshold-specific behavior: Small's 50% compress, Large's `keep_recent=8`, Claude cache-breakpoint positions |
-| Resolver | `resolver.rs` | Normalization, rule hits, size-tier boundaries, unknown-model fallback, edge cases (empty, mixed case, `provider/` prefix) |
-| Tool truncation | `context/truncate.rs` | Existing `turn/truncation.rs` tests moved verbatim + new per-strategy budget tests |
-| Stagewise equivalence | `context/tests/stagewise.rs` | Legacy vs new compared after **each** in-place mutation (microcompact, replace_stale_reads, clean_pipeline), not just final output |
-| Fixture replay | `context/tests/fixtures/*.json` | 5–10 real serialized `Conversation` snapshots replayed through legacy + new, asserted byte-equal under Medium |
+| Strategy-specific | `small.rs`, `medium.rs`, `large.rs`, `claude.rs` `#[cfg(test)]` | Threshold-specific behavior: Small's 50% compress, Large's `keep_recent=8`. Claude decorator test asserts `cache_plan == Breakpoints(_)` with non-empty vector on a known-large render — no golden positions (consumer deferred) |
+| Resolver | `resolver.rs` | Normalization, rule hits, size-tier boundaries, unknown-model fallback, edge cases (empty, mixed case, `provider/` prefix), `resolver_conflict_claude_small` locks `claude-3-haiku + ctx=8000 → ClaudeStrategy(SmallWindow)` |
+| Tool truncation | `context/truncate.rs` | Existing `turn/truncation.rs` tests moved verbatim + `enforce_turn_budget_per_strategy` table test (Small `ctx/5`, Medium `ctx/4`, Large `ctx/4` with differing clamp bands, identical input) |
+| Stagewise equivalence | `context/tests/stagewise.rs` | Legacy vs new compared after **each** in-place mutation (microcompact, replace_stale_reads, clean_pipeline), not just final output; includes `after_clean_pipeline == final_output` self-consistency assertion on both sides |
+| Fixture replay | `context/tests/fixtures/*.json` | 5–10 serialized `Conversation` snapshots replayed through legacy + new, asserted byte-equal under Medium |
+| Legacy path regression | `context/tests/legacy_path.rs` | End-to-end agent test run under `use_context_strategy=false` — catches LegacyStrategy rot once default flips |
 | Integration regression | `agent/mod.rs` tests | End-to-end behavior unchanged |
 | Long-session stress | `context/tests/long_session.rs` | 100-turn synthetic loop under SmallWindow(8K) — no panic, bounded growth, invariants per turn |
 | Telemetry emission | `context/tests/telemetry.rs` | Structured tracing event fires on each compression with `strategy/ctx/removed/kept` |
@@ -492,23 +542,46 @@ fn medium_stagewise_matches_legacy() {
 }
 ```
 
-`render_with_stage_snapshots` is a test-only method that returns
-intermediate message vectors alongside the final. Both paths expose it
-for the duration of the refactor.
+`render_with_stage_snapshots` is an **inherent** `#[cfg(test)]` method
+on each concrete strategy type (not on the `ContextStrategy` trait) and
+on `Conversation` (for the legacy side). Both sides call into the same
+`render.rs` helper functions the production path calls — the snapshots
+are captured inline, not by a parallel reimplementation. The
+`after_clean_pipeline == final_output` self-consistency assertion runs
+on both sides, catching instrumentation drift if one side snapshots
+before cleanup and the other after.
 
 ### 11.3 Fixture corpus
 
 5–10 serialized `Conversation` snapshots under
-`crates/atomcode-core/src/context/tests/fixtures/`. Source:
-- Real session replays from agentarena or swebench predict logs, if
-  available in the repo.
-- Otherwise hand-constructed covering these shapes: short (<5 msgs),
-  at compression threshold (~50% of 128K), tool-heavy (20+
-  `tool_result` messages), thinking-block-heavy, stale-read-heavy,
-  oversized (>80% of 128K forcing hard cut).
+`crates/atomcode-core/src/context/tests/fixtures/`, each JSON file
+with a schema version header AND a `source: "replay" | "synthetic"`
+tag.
 
-Each fixture is JSON with a schema version header so format evolution
-is detectable.
+**CI guard (mandatory):**
+```rust
+#[test]
+fn fixture_corpus_has_real_replay() {
+    let fixtures = load_fixtures();
+    assert!(fixtures.len() >= 5, "fixture corpus below minimum");
+    assert!(
+        fixtures.iter().any(|f| f.source == "replay"),
+        "at least one replayed fixture required — synthetic-only corpus is self-consistency theater"
+    );
+}
+```
+
+Sourcing the first replay (one-time work at implementation start):
+grep the repo for any existing agentarena / swebench / datalog
+artifact that serializes a `Conversation`. If none exists, capture one
+by running `atomcode` against a real repo for a 10+ turn session with
+datalog enabled and extracting the `Conversation` state at session
+end.
+
+Remaining 4+ fixtures can be synthetic, covering shapes: short
+(<5 msgs), at compression threshold (~50% of 128K), tool-heavy
+(20+ `tool_result` messages), thinking-block-heavy, stale-read-heavy,
+oversized (>80% of 128K forcing hard cut).
 
 ### 11.4 Resolver edge-case tests
 
@@ -618,23 +691,39 @@ Confirm with a single grep pass that no production caller remains.
 ### 13.5 Commit sequence (suggested, not mandatory)
 
 1. Delete dead summary surface (§ 13.4). One commit.
-2. Widen visibility of `microcompact` / `replace_stale_reads` /
-   `clean_message_pipeline` to `pub(crate)`. Add `Conversation::view()`.
-3. Create `context/` skeleton: traits, Capabilities, RenderedContext,
-   CompressionPlan, empty Small/Medium/Large impls. No call-site changes.
+2. Create `context/` skeleton: role traits (`ContextRenderer`,
+   `CompactionPolicy`, `ToolOutputTruncator`), facade trait
+   `ContextStrategy`, `Capabilities`, `RenderedContext`, `CachePlan`,
+   `CompressionPlan`, `ConversationView<'a>`. Empty Small/Medium/Large
+   impls. No call-site changes.
+3. Widen visibility of `microcompact` / `replace_stale_reads` /
+   `clean_message_pipeline` to `pub(crate)`. Add `Conversation::view()`
+   implementation (uses `ConversationView` from step 2).
 4. Move `turn/truncation.rs` → `context/truncate.rs`. Move tests with it.
 5. Implement `MediumWindowStrategy::render` + `CompactionPolicy` +
    `ToolOutputTruncator` as thin wrappers over the migrated helpers.
-6. Add `use_context_strategy` config flag + runtime branches at the
-   enumerated call sites. Flag defaults to `false` initially.
-7. Add stagewise + fixture replay tests for Medium. Flip flag default
-   to `true` only after those pass.
-8. Fill in `SmallWindowStrategy` and `LargeWindowStrategy` thresholds
-   + differentiated truncation budgets.
-9. Add `ClaudeStrategy` (renderer-only decorator) and wire into
-   resolver rule table.
-10. Add telemetry emissions at compression and hard-cut sites.
-11. Add long-session stress test and resolver edge-case tests.
+6. Implement `LegacyStrategy` wrapping preserved legacy functions on
+   `Conversation` and `turn/truncation.rs` (renamed helpers). Add
+   `use_context_strategy` config flag (default `false` initially).
+   Change `resolve_strategy` to return `LegacyStrategy` when flag is
+   false, read flag once at `AgentLoop::new`. Rewrite all 9 call sites
+   to call `self.context.xxx()` (flag-blind).
+7. Add stagewise equivalence + fixture replay tests for Medium,
+   including `fixture_corpus_has_real_replay` CI guard. All other
+   Medium tests (contract suite, resolver edge cases, enforce_turn_budget).
+8. **Flip flag default `false` → `true` in its own commit.** Gate:
+   stagewise + fixture replay green on CI, **telemetry parity
+   confirmed** (compression counts / dropped tokens between legacy
+   and new within agreed tolerance on a canary session). Do not
+   bundle this flip with any code change.
+9. Fill in `SmallWindowStrategy` and `LargeWindowStrategy` thresholds
+   + differentiated truncation budgets + per-strategy tests.
+10. Add `ClaudeStrategy` (renderer-only decorator, `cache_plan =
+    Breakpoints(...)`) and wire into resolver rule table. Add
+    `resolver_conflict_claude_small` test.
+11. Add telemetry emissions at compression and hard-cut sites.
+12. Add long-session stress test, legacy_path regression test,
+    telemetry emission test.
 
 ## 14. Non-goals (deferred to follow-up PRs)
 
@@ -648,10 +737,11 @@ the scope line:
   thinking block stripping, encrypted reasoning item handling).
   `preserve_thinking_blocks` capability flag is populated but has no
   consumer.
-- **`CachePlan` enum** replacing `Vec<usize> cache_breakpoints`. Lands
-  with the prompt-cache wiring PR, which reshapes how the provider
-  layer consumes cache signals (OpenAI auto-prefix, Gemini implicit
-  min-tokens, Claude explicit breakpoints).
+- **Additional `CachePlan` variants.** `None` and `Breakpoints(Vec<usize>)`
+  ship in this refactor on `RenderedContext.cache_plan`. `AutomaticPrefix`
+  (OpenAI auto-cache) and `ImplicitMinTokens(usize)` (Gemini implicit)
+  are additive enum variants landing with the prompt-cache wiring PR.
+  The provider layer does not read `cache_plan` yet this round.
 - **Stable-prefix invariant** (rendering twice produces byte-identical
   prefix) — required for OpenAI / Gemini cache hits, lands with
   `CachePlan`.
