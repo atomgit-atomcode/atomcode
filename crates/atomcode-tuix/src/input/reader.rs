@@ -29,7 +29,8 @@ pub fn spawn(tx: mpsc::UnboundedSender<InputEvent>) -> std::thread::JoinHandle<(
             let msg = match ev {
                 Event::Key(k) => InputEvent::Key(k),
                 Event::Paste(p) => InputEvent::Paste(p),
-                Event::Resize(_, _) | Event::Mouse(_) | Event::FocusGained | Event::FocusLost => {
+                Event::Resize(_, _) => InputEvent::Resize,
+                Event::Mouse(_) | Event::FocusGained | Event::FocusLost => {
                     continue;
                 }
             };

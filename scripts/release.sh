@@ -11,11 +11,29 @@ if [ -x "$HOME/.cargo/bin/rustc" ]; then
     export PATH="$HOME/.cargo/bin:$PATH"
 fi
 
-VERSION=$(git describe --tags --abbrev=0 2>/dev/null)
+# Allow override via env (CI / one-off rebuilds without re-tagging).
+# Otherwise pick the most recent v*.*.* tag — `git describe --tags`
+# alone returns *any* recent tag, including internal deploy tags like
+# "快速发布-atomcode-atomgit-4181" which produce non-ASCII binary
+# filenames and break the /upgrade download URL.
+VERSION="${ATOMCODE_VERSION:-}"
 if [ -z "$VERSION" ]; then
-    echo "No git tag found. Create one first: git tag -a v1.0.0 -m 'v1.0.0'"
+    VERSION=$(git tag -l 'v[0-9]*' --sort=-v:refname | head -n1)
+fi
+if [ -z "$VERSION" ]; then
+    echo "No v*.*.* git tag found. Create one first:  git tag -a v1.0.0 -m 'v1.0.0'"
+    echo "Or set ATOMCODE_VERSION=v1.0.0 to override."
     exit 1
 fi
+case "$VERSION" in
+    v[0-9]*) ;;
+    *)
+        echo "Refusing to release with non-vX.Y.Z version: '$VERSION'"
+        echo "Set ATOMCODE_VERSION=v1.2.3 if you really mean to."
+        exit 1
+        ;;
+esac
+echo "Using VERSION=${VERSION}"
 
 DIST="dist/${VERSION}"
 mkdir -p "$DIST"
@@ -102,6 +120,69 @@ echo ""
 echo "=== SHA256 ==="
 cd "$DIST"
 shasum -a 256 atomcode-* 2>/dev/null | tee checksums.txt
+
+# --- latest.json (manifest for /upgrade self-update) ---
+#
+# Emits the manifest the TUI's `/upgrade` command reads from
+# latest.json in the docs repo root. Shape:
+#   { version, released_at, binaries: { "<target>": { sha256, size } } }
+# Only entries for binaries that actually built are included — if a
+# cross-compile was skipped (musl / mingw missing), that target simply
+# doesn't appear and /upgrade will report "no binary for target …"
+# rather than pointing at a 404.
+echo ""
+echo "=== Generating latest.json ==="
+MANIFEST="latest.json"
+RELEASED_AT=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+emit_entry() {
+    # $1 = target tag (darwin-arm64 / linux-x64 / windows-x64.exe etc.)
+    # $2 = filename in DIST
+    local target="$1"
+    local file="$2"
+    if [ ! -f "$file" ]; then
+        return 1
+    fi
+    local sha
+    sha=$(shasum -a 256 "$file" | awk '{print $1}')
+    local size
+    if stat -f%z "$file" >/dev/null 2>&1; then
+        size=$(stat -f%z "$file")        # macOS / BSD
+    else
+        size=$(stat -c%s "$file")        # GNU coreutils
+    fi
+    printf '    "%s": { "sha256": "%s", "size": %s }' "$target" "$sha" "$size"
+}
+
+{
+    printf '{\n'
+    printf '  "version": "%s",\n' "$VERSION"
+    printf '  "released_at": "%s",\n' "$RELEASED_AT"
+    printf '  "binaries": {\n'
+    first=1
+    for pair in \
+        "darwin-arm64:atomcode-${VERSION}-darwin-arm64" \
+        "darwin-x64:atomcode-${VERSION}-darwin-x64" \
+        "linux-x64:atomcode-${VERSION}-linux-x64" \
+        "windows-x64:atomcode-${VERSION}-windows-x64.exe" \
+        "windows-arm64:atomcode-${VERSION}-windows-arm64.exe"
+    do
+        target="${pair%%:*}"
+        file="${pair#*:}"
+        if [ -f "$file" ]; then
+            if [ "$first" -eq 0 ]; then printf ',\n'; fi
+            emit_entry "$target" "$file"
+            first=0
+        fi
+    done
+    printf '\n  }\n'
+    printf '}\n'
+} > "$MANIFEST"
+
+echo "  -> ${DIST}/${MANIFEST}"
+cat "$MANIFEST"
+
 echo ""
 echo "Done. Release artifacts in ${DIST}/"
+echo "  * Copy ${MANIFEST} to the docs repo root (next to latest.txt) so /upgrade can find it."
 ls -lh atomcode-* 2>/dev/null

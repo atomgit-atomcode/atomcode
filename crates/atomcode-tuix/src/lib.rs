@@ -154,6 +154,13 @@ pub async fn run(
         });
     }
 
+    // Long-lived progress channel for /upgrade. The sender is cloned
+    // into each spawned upgrade task; the receiver stays in the event
+    // loop's select!. Unbounded because progress events are tiny and
+    // we never want the upgrade task to block on UI backpressure.
+    let (upgrade_tx, upgrade_rx) =
+        tokio::sync::mpsc::unbounded_channel::<atomcode_core::self_update::UpgradeEvent>();
+
     let ctx = LoopCtx {
         config,
         model_name,
@@ -166,6 +173,8 @@ pub async fn run(
         session_manager,
         update_hint,
         wake_rx,
+        upgrade_tx,
+        upgrade_rx,
     };
 
     let result = run_loop(ctx, renderer.as_mut()).await;

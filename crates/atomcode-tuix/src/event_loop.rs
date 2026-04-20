@@ -40,6 +40,14 @@ pub struct LoopCtx {
     /// `wake_rx` and triggers an idle redraw so the hint appears without
     /// waiting for the user's next keystroke.
     pub wake_rx: mpsc::Receiver<()>,
+    /// Sender used by `/upgrade` to report streaming progress/failure
+    /// events from the detached upgrade task. Cloned into the task at
+    /// spawn time; kept here so the receiver in the loop outlives any
+    /// number of upgrades (no reconstructing on each invocation).
+    pub upgrade_tx: mpsc::UnboundedSender<atomcode_core::self_update::UpgradeEvent>,
+    /// Consumed in the main `select!` so upgrade progress is rendered
+    /// alongside agent events.
+    pub upgrade_rx: mpsc::UnboundedReceiver<atomcode_core::self_update::UpgradeEvent>,
 }
 
 /// Line-edit buffer for input composition. Byte-indexed cursor.
@@ -465,6 +473,16 @@ pub async fn run_loop(
     // fire back-to-back.
     let mut last_spinner_draw = std::time::Instant::now();
 
+    // Last emitted integer percent for the /upgrade download line.
+    // Gate on change so we don't spam the renderer with a progress
+    // line for every chunk (a 10 MB binary at 64 KiB chunks would be
+    // 160 redraws). `-1` means "no download active yet".
+    let mut upgrade_last_pct: i32 = -1;
+    // True once Done fired successfully — the loop exits after the
+    // current pending message finishes so the user sees the success
+    // line before the TUI shuts down.
+    let mut upgrade_done = false;
+
     // call_id → (tool_name, detail). Populated on ToolCallStarted, consumed
     // on ToolCallResult so the result line can show "name(detail) — summary"
     // instead of just a bare "✓ summary" detached from its originating call.
@@ -518,6 +536,15 @@ pub async fn run_loop(
             // redraws frequently enough that the hint picks up naturally.
             Some(()) = ctx.wake_rx.recv(), if matches!(state.phase, UiPhase::Idle) => {
                 redraw_idle_plain(&buf, &state, &ctx, renderer);
+            }
+
+            // ── /upgrade progress ──
+            Some(ev) = ctx.upgrade_rx.recv() => {
+                handle_upgrade_event(ev, &mut upgrade_last_pct, &mut upgrade_done, &mut ctx, renderer);
+                if upgrade_done { break; }
+                if matches!(state.phase, UiPhase::Idle) {
+                    redraw_idle_plain(&buf, &state, &ctx, renderer);
+                }
             }
 
             // ── Agent events ──
@@ -598,6 +625,15 @@ pub async fn run_loop(
                 redraw_idle_plain(&buf, &state, &ctx, renderer);
             }
 
+            // ── /upgrade progress ──
+            Some(ev) = ctx.upgrade_rx.recv() => {
+                handle_upgrade_event(ev, &mut upgrade_last_pct, &mut upgrade_done, &mut ctx, renderer);
+                if upgrade_done { break; }
+                if matches!(state.phase, UiPhase::Idle) {
+                    redraw_idle_plain(&buf, &state, &ctx, renderer);
+                }
+            }
+
             // ── Agent events ──
             maybe = ctx.agent.event_rx.recv(), if matches!(state.phase, UiPhase::Streaming) => {
                 let Some(ev) = maybe else { break };
@@ -668,6 +704,38 @@ fn handle_input(
                 } else {
                     redraw_idle_plain(&buf, &state, &ctx, renderer);
                 }
+            }
+        }
+        InputEvent::Resize => {
+            // Terminal was resized. The renderer's cached `cursor_row_from_top`
+            // and the just-drawn footer rows were laid out for the old width;
+            // after a shrink→maximize→shrink sequence the old borders often
+            // survive at columns past the new width, giving a "nested boxes"
+            // look. A partial erase can't reliably wipe that because the
+            // cursor may have been reflowed by the terminal.
+            //
+            // Fix: do a full screen reset, then repaint from scratch —
+            // welcome banner at the top, footer below. Streamed chat
+            // content goes to the scrollback (user can scroll up), same
+            // shape the screen had at startup. Predictable and cheap.
+            if matches!(state.phase, UiPhase::Suspended) {
+                return Ok(());
+            }
+            renderer.reset();
+            let dir_display = ctx.working_dir.to_string_lossy().to_string();
+            let dir_display = if let Ok(home) = std::env::var("HOME") {
+                dir_display.replacen(&home, "~", 1)
+            } else {
+                dir_display
+            };
+            renderer.render(UiLine::Welcome {
+                model: ctx.model_name.clone(),
+                working_dir: dir_display,
+            });
+            if matches!(state.phase, UiPhase::Streaming) {
+                draw_spinner_now(state, buf, ctx, renderer, message_queue.len(), menu.selected);
+            } else {
+                redraw_idle_plain(buf, state, ctx, renderer);
             }
         }
         InputEvent::Eof => {}
@@ -2057,6 +2125,83 @@ fn handle_agent_event(
     }
 }
 
+/// Render one streamed upgrade event. Mutates the percent tracker so
+/// Downloading lines only redraw on whole-percent changes (see caller's
+/// `upgrade_last_pct` reasoning). Sets `done = true` when the upgrade
+/// succeeds, so the main loop can break after rendering the success
+/// line — the user must restart to load the new binary.
+fn handle_upgrade_event(
+    ev: atomcode_core::self_update::UpgradeEvent,
+    last_pct: &mut i32,
+    done: &mut bool,
+    ctx: &mut LoopCtx,
+    renderer: &mut dyn Renderer,
+) {
+    use atomcode_core::self_update::UpgradeEvent;
+    match ev {
+        UpgradeEvent::ManifestFetched { version } => {
+            *last_pct = -1;
+            renderer.render(UiLine::CommandOutput(format!(
+                "  最新版本: {}\n",
+                version
+            )));
+        }
+        UpgradeEvent::Downloading { bytes, total } => {
+            let pct = if total == 0 {
+                0
+            } else {
+                ((bytes * 100) / total) as i32
+            };
+            if pct != *last_pct {
+                *last_pct = pct;
+                // Emit at 25/50/75/100 to keep output tidy. Finer-grained
+                // progress would flood the append-only renderer with lines
+                // since there's no in-place update here.
+                if pct == 25 || pct == 50 || pct == 75 || pct == 100 {
+                    renderer.render(UiLine::CommandOutput(format!(
+                        "  下载中 {}% ({} / {} bytes)\n",
+                        pct, bytes, total
+                    )));
+                }
+            }
+        }
+        UpgradeEvent::Verifying => {
+            renderer.render(UiLine::CommandOutput("  正在校验 SHA256\n".into()));
+        }
+        UpgradeEvent::Replacing => {
+            renderer.render(UiLine::CommandOutput("  正在替换二进制文件\n".into()));
+        }
+        UpgradeEvent::Done { version, backup } => {
+            renderer.render(UiLine::CommandOutput(format!(
+                "\n✓ 已升级到 {}（旧版本保留为 {}）\n  请退出后重新运行 `atomcode` 以加载新版本。\n",
+                version,
+                backup.display()
+            )));
+            // Push the hint in the status bar to match the new reality —
+            // the little "↑ vX" arrow goes away for this session.
+            if let Ok(mut g) = ctx.update_hint.lock() {
+                *g = None;
+            }
+            *done = true;
+            // Tell the agent to shut down so the loop exits cleanly.
+            ctx.agent.cmd_tx.send(AgentCommand::Shutdown).ok();
+        }
+        UpgradeEvent::Failed(msg) => {
+            renderer.render(UiLine::Error(format!("升级失败: {}", msg)));
+        }
+        UpgradeEvent::RolledBack { exe, backup } => {
+            renderer.render(UiLine::CommandOutput(format!(
+                "\n✓ 已回滚。当前二进制: {}；另一版本保存在 {}\n  请退出后重新运行 `atomcode` 加载回滚版本。\n",
+                exe.display(),
+                backup.display()
+            )));
+            *done = true;
+            ctx.agent.cmd_tx.send(AgentCommand::Shutdown).ok();
+        }
+    }
+    renderer.flush();
+}
+
 fn execute_slash_command(
     cmd: &str,
     arg: &str,
@@ -2282,6 +2427,63 @@ fn execute_slash_command(
             };
             renderer.render(UiLine::CommandOutput(txt));
             renderer.flush();
+        }
+        "upgrade" => {
+            // Sub-dispatch: `/upgrade`, `/upgrade rollback`, `/upgrade --force`.
+            // Keep parsing deliberately tolerant — users type these things
+            // with assorted capitalization and whitespace; a command that
+            // refuses `/upgrade Rollback` is user-hostile.
+            let arg_norm = arg.trim().to_ascii_lowercase();
+            if arg_norm == "rollback" {
+                // Rollback is sync and fast (three renames). Run inline
+                // so the user sees the result immediately without waiting
+                // for an async task to schedule.
+                match atomcode_core::self_update::run_rollback() {
+                    Ok(sum) => {
+                        // Route through the event channel so rendering
+                        // and "set done → exit" logic stays in one place.
+                        let _ = ctx.upgrade_tx.send(
+                            atomcode_core::self_update::UpgradeEvent::RolledBack {
+                                exe: sum.exe,
+                                backup: sum.backup,
+                            },
+                        );
+                    }
+                    Err(e) => {
+                        let _ = ctx.upgrade_tx.send(
+                            atomcode_core::self_update::UpgradeEvent::Failed(format!("{:#}", e)),
+                        );
+                    }
+                }
+            } else {
+                let force = arg_norm == "--force" || arg_norm == "-f";
+                if !force && !arg_norm.is_empty() {
+                    renderer.render(UiLine::Error(format!(
+                        "unknown /upgrade argument: {}\n  usage: /upgrade [rollback|--force]",
+                        arg
+                    )));
+                    renderer.flush();
+                    return Ok(());
+                }
+                renderer.render(UiLine::CommandOutput(
+                    "  正在检查更新...\n".into(),
+                ));
+                renderer.flush();
+                let current = format!("v{}", env!("CARGO_PKG_VERSION"));
+                let tx = ctx.upgrade_tx.clone();
+                tokio::spawn(async move {
+                    // The driver emits Done via `tx` on success; on error
+                    // we translate to a Failed event so the TUI layer
+                    // only has to handle one event stream.
+                    if let Err(e) =
+                        atomcode_core::self_update::run_upgrade(current, force, tx.clone()).await
+                    {
+                        let _ = tx.send(atomcode_core::self_update::UpgradeEvent::Failed(
+                            format!("{:#}", e),
+                        ));
+                    }
+                });
+            }
         }
         "cd" => {
             let new_dir = resolve_cd(arg, &ctx.working_dir, ctx.previous_dir.as_deref());

@@ -983,9 +983,19 @@ impl<W: Write + Send> Renderer for AnsiRenderer<W> {
     }
 
     fn shutdown(&mut self) {
-        // Clear any multi-line transient (input box) cleanly.
+        // Wipe the visible viewport and home the cursor before handing
+        // control back to the parent shell. Without this, the partial
+        // erase_footer leaves welcome + chat content on screen, and the
+        // `\x1b[r` DECSTBM reset in TerminalGuard::drop then homes the
+        // cursor onto row 1, so the shell's new prompt overwrites the
+        // left half of the welcome banner (the right half survives as
+        // visible garbage — that "v4.18.1 · MIT" leftover).
+        //
+        // Scrollback is preserved (\x1b[2J clears only the visible area,
+        // not the scroll buffer), so users can scroll up to review chat
+        // history after quitting.
         self.clear_line_if_needed();
-        let _ = self.out.write_all(b"\r\n");
+        let _ = self.out.write_all(b"\x1b[2J\x1b[H");
         let _ = self.out.flush();
     }
 
