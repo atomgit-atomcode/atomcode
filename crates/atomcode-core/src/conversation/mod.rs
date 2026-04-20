@@ -244,8 +244,6 @@ impl Conversation {
     }
 
 
-    /// compress everything before that into one-line-per-round summaries.
-
     /// Apply compression: store summary in cold zone, remove old messages.
     /// `remove_count` = number of messages from the front to remove.
     /// (Changed from turn-based to message-based to support single-user-message

@@ -1,16 +1,17 @@
 //! Context construction strategies — one entry point per model/provider.
 //!
-//! This module owns the [`CtxBuilder`] trait and the registry function
-//! [`for_provider`] (defined in [`resolver`]). Each concrete builder
-//! lives in its own file to keep [`mod.rs`](self) thin:
+//! This module owns the [`CtxBuilder`] trait (defined below) and the
+//! registry function [`for_provider`] (in [`resolver`]). Each concrete
+//! builder lives in its own file to keep [`mod.rs`](self) thin:
 //!
-//! | File               | Role                                              |
-//! |--------------------|---------------------------------------------------|
-//! | `strategy` (here)  | `CtxBuilder` trait definition                     |
-//! | `resolver.rs`      | `for_provider` dispatch (add new models here)     |
-//! | `default.rs`       | `DefaultCtx` — legacy-equivalent fallback         |
-//! | `ollama.rs`        | `OllamaCtx` — small-window local models           |
-//! | `truncate.rs`      | Shared per-tool truncation helpers                |
+//! | File          | Role                                                  |
+//! |---------------|-------------------------------------------------------|
+//! | `mod.rs`      | `CtxBuilder` trait definition + re-exports            |
+//! | `resolver.rs` | `for_provider` dispatch (add new models here)         |
+//! | `render.rs`   | Default render / compression-plan policy              |
+//! | `default.rs`  | `DefaultCtx` — thin wrapper over `render`             |
+//! | `ollama.rs`   | `OllamaCtx` — small-window local models               |
+//! | `truncate.rs` | Shared per-tool truncation helpers                    |
 //!
 //! Adding a new per-model ctx strategy:
 //!
@@ -23,8 +24,8 @@
 //! The trait is narrow on purpose: `build_messages` owns the full
 //! render path for its model, including any system-prompt variation,
 //! cold-zone handling, or tool-schema trimming. The shared
-//! [`truncate`] module offers building blocks that impls may call or
-//! ignore at will.
+//! [`render`] and [`truncate`] modules offer building blocks that
+//! impls may call or ignore at will.
 
 pub mod default;
 pub mod ollama;
@@ -48,9 +49,8 @@ pub trait CtxBuilder: Send + Sync {
     /// Implementations are free to transform `system_prompt` (strip
     /// tool schemas for small models, add cache-friendly markers for
     /// Claude, replace entirely for fine-tuned models) and to choose
-    /// any render pipeline (delegate to
-    /// `Conversation::to_provider_messages_budgeted`, call shared
-    /// helpers directly, or roll their own).
+    /// any render pipeline (delegate to [`crate::ctx::render::build_messages`],
+    /// call shared helpers directly, or roll their own).
     fn build_messages(
         &self,
         conv: &Conversation,

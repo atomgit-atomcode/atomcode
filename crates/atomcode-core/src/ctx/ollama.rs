@@ -17,9 +17,11 @@
 //!   [`crate::agent::prompt`] 层面做。
 //! - **不改工具集筛选**：哪些工具暴露给模型是 [`crate::tool::ToolRegistry`]
 //!   的职责,与 ctx 无关。
-//! - **不自定义 microcompact / replace_stale_reads**：那些是
-//!   [`Conversation`] 的内部管道，改它们需要拆 `to_provider_messages_budgeted`
-//!   (超出本模块范围)。
+//! - **不重写 render/microcompact/replace_stale_reads**：`build_messages`
+//!   直接透传给 [`crate::ctx::render::build_messages`] —— 与默认行为同
+//!   pipeline,只是 ctx_window 更小、配合更紧的 tool-output 截断。
+//!   想要 render pipeline 级别的定制,完全重写自己的 `build_messages`
+//!   即可,不必受这里影响。
 //!
 //! 需要以上行为时,在上层扩展相应模块,不在 ctx 里做。
 
@@ -58,14 +60,15 @@ impl CtxBuilder for OllamaCtx {
         conv: &Conversation,
         system_prompt: &str,
     ) -> (Vec<Message>, ContextStats) {
-        // 渲染路径透传到 legacy。窗口是 `self.ctx_window` 决定的,
-        // Conversation 自己在裁切时使用它。
-        super::render::build_messages(conv, system_prompt, self.ctx_window)
+        // 渲染透传给默认 render 管道,仅把 ctx_window 传下去决定
+        // token 预算; cold zone / microcompact / hard-cut 的具体
+        // 策略由 ctx::render 统一执行。
+        crate::ctx::render::build_messages(conv, system_prompt, self.ctx_window)
     }
 
     /// 更早触发压缩:35% 阈值,而非 Default 的 50%。
     fn needs_compression(&self, conv: &Conversation, system_tokens: usize) -> bool {
-        // 消息少于 12 条不压,和 Conversation::needs_compression 保持一致
+        // 消息少于 12 条不压,和 ctx::render::needs_compression 保持一致
         if conv.messages.len() < 12 {
             return false;
         }
@@ -79,10 +82,9 @@ impl CtxBuilder for OllamaCtx {
     }
 
     fn compression_plan(&self, conv: &Conversation) -> Option<(String, usize)> {
-        // 决策用的是 self.needs_compression(更早触发),
-        // 但 plan 内容生成逻辑不需要差异化——沿用 Conversation 的
-        // one-line-per-round 机械摘要。
-        let (content, n) = super::render::build_compression_content(conv);
+        // 决策用的是 self.needs_compression(35% 早触发),
+        // plan 内容生成沿用 ctx::render 的 one-line-per-round 机械摘要。
+        let (content, n) = crate::ctx::render::build_compression_content(conv);
         if content.is_empty() || n == 0 {
             None
         } else {
@@ -231,13 +233,12 @@ mod tests {
         assert!(!o.needs_compression(&conv, 50));
 
         // 再填大量长消息让总 tokens 超过 2800
-        for i in 0..20 {
+        for _ in 0..20 {
             conv.add_user_message(&"lorem ipsum ".repeat(50).repeat(2)); // 每条 ~250 tokens
             conv.add_assistant_tool_calls(
                 Some(&"dolor sit amet ".repeat(50)),
                 vec![],
             );
-            let _ = i;
         }
         // 此时总 tokens 远超 2800
         assert!(o.needs_compression(&conv, 50),

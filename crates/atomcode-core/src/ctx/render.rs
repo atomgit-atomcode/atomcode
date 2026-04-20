@@ -1,20 +1,21 @@
-//! Render & compression-plan logic that used to live on `Conversation`.
+//! Default render & compression-plan policy for atomcode ctx.
 //!
-//! These are the **default policies** atomcode ships with — `DefaultCtx`
-//! and `OllamaCtx` delegate directly to them via [`build_messages`],
-//! [`needs_compression`], and [`build_compression_content`].
+//! [`build_messages`], [`needs_compression`], and
+//! [`build_compression_content`] implement the out-of-the-box context
+//! behavior. `DefaultCtx` is a thin wrapper over them; `OllamaCtx`
+//! reuses `build_messages` / `build_compression_content` and overrides
+//! only the compression threshold (early trigger).
 //!
 //! Implementations wanting different behavior (different thresholds,
 //! different compression content format, different cold-zone layout)
-//! reimplement the relevant function in their own
-//! `impl CtxBuilder` without touching this module.
+//! write their own `impl CtxBuilder` without touching this module.
 //!
-//! All helpers here are free functions taking `&Conversation`, keeping
-//! `Conversation` itself as a pure data container.
+//! All functions here are free functions taking `&Conversation`,
+//! keeping `Conversation` as a pure data container — no render logic
+//! leaks back into the data layer.
 
 use crate::conversation::{Conversation, ContextStats, KEEP_MESSAGES};
 use crate::conversation::message::{self, Message, MessageContent, Role};
-use crate::conversation::turn;
 
 /// Context management with cold zone compression.
 ///
@@ -181,7 +182,7 @@ pub fn build_messages(
     // (read_file full content, bash output) are replaced with compact summaries.
     // This reduces context growth without LLM calls.
     // View replacement runs AFTER microcompact — edited files stay fresh.
-    microcompact(&mut result, &conv.turn_tracker.turns, conv.messages.len());
+    microcompact(&mut result, conv.messages.len());
 
     replace_stale_reads(&mut result);
     clean_message_pipeline(&mut result);
@@ -437,9 +438,10 @@ fn snap_to_valid_boundary(messages: &[Message], idx: usize) -> usize {
     start
 }
 
-// ─── Message-list manipulation helpers (moved from Conversation) ────
-// These operate on `&mut Vec<Message>` and are called during render
-// to apply rolling condensation / freshness replacement / sanity cleanup.
+// ─── Message-list manipulation helpers used during render ───────────
+// These operate on `&mut Vec<Message>` and are called by
+// `build_messages` to apply rolling condensation / freshness
+// replacement / sanity cleanup.
 
 /// Microcompact: condense old ToolResult messages to one-line summaries.
 /// Zero LLM calls — purely mechanical compression.
@@ -452,7 +454,7 @@ fn snap_to_valid_boundary(messages: &[Message], idx: usize) -> usize {
 ///
 /// Other tool results (bash, grep, edit, etc.) are condensed after
 /// 20 messages to keep context growth in check.
-pub(crate) fn microcompact(msgs: &mut Vec<Message>, _turns: &[turn::Turn], total_msg_count: usize) {
+fn microcompact(msgs: &mut Vec<Message>, total_msg_count: usize) {
     const OTHER_KEEP: usize = 20;
 
     let total_chars: usize = msgs.iter().map(|m| {
@@ -541,7 +543,7 @@ pub(crate) fn microcompact(msgs: &mut Vec<Message>, _turns: &[turn::Turn], total
 /// Replace stale read_file results with current disk content.
 /// When a file was read then later edited, the old read result is outdated.
 /// This replaces it so the model always sees the latest version.
-pub(crate) fn replace_stale_reads(msgs: &mut Vec<Message>) {
+fn replace_stale_reads(msgs: &mut Vec<Message>) {
     struct ReadInfo {
         file_path: String,
         offset: Option<usize>,
@@ -615,7 +617,7 @@ pub(crate) fn replace_stale_reads(msgs: &mut Vec<Message>) {
 
 /// Walk forward tracking tool_call/tool_result pairing; remove orphans.
 /// Valid sequences: System → (User → Assistant/AssistantWithToolCalls → [ToolResult]* → ...)*
-pub(crate) fn sanitize_messages(msgs: &mut Vec<Message>) {
+fn sanitize_messages(msgs: &mut Vec<Message>) {
     let mut to_remove: Vec<usize> = Vec::new();
     let mut expecting_tool_results = 0usize;
 
@@ -664,7 +666,7 @@ pub(crate) fn sanitize_messages(msgs: &mut Vec<Message>) {
 /// - Empty/whitespace-only assistant messages
 /// - Orphaned tool results (no matching tool_use)
 /// - Consecutive same-role user messages (merge into one)
-pub(crate) fn clean_message_pipeline(msgs: &mut Vec<Message>) {
+fn clean_message_pipeline(msgs: &mut Vec<Message>) {
     // 1. Remove empty assistant messages (e.g., after <think> stripping)
     msgs.retain(|m| {
         if m.role == Role::Assistant {
@@ -723,7 +725,7 @@ mod tests {
     #[test]
     fn test_budgeted_empty_conversation() {
         let conv = Conversation::new();
-        let (msgs, _stats) = crate::ctx::render::build_messages(&conv, "system prompt", 8000);
+        let (msgs, _stats) = build_messages(&conv, "system prompt", 8000);
         assert_eq!(msgs.len(), 1);
         assert!(matches!(msgs[0].role, Role::System));
     }
@@ -736,7 +738,7 @@ mod tests {
         conv.messages.push(Message::new(Role::Assistant, "hi there"));
         conv.add_user_message("do something");
 
-        let (msgs, _stats) = crate::ctx::render::build_messages(&conv, "sys", 8000);
+        let (msgs, _stats) = build_messages(&conv, "sys", 8000);
         assert_eq!(msgs.len(), 4); // system + 3 messages
         assert!(matches!(msgs[0].role, Role::System));
     }
@@ -765,7 +767,7 @@ mod tests {
         conv.add_user_message("now what?");
 
         // Large budget — everything fits
-        let (msgs, stats) = crate::ctx::render::build_messages(&conv, "sys", 100000);
+        let (msgs, stats) = build_messages(&conv, "sys", 100000);
         // system + 7 messages (2 turns * 3 msgs each + final user)
         assert_eq!(msgs.len(), 8);
         assert!(matches!(msgs[0].role, Role::System));
@@ -800,7 +802,7 @@ mod tests {
         }
         conv.add_user_message("now what?");
 
-        let (msgs, stats) = crate::ctx::render::build_messages(&conv, "sys", 4000);
+        let (msgs, stats) = build_messages(&conv, "sys", 4000);
         // Oldest turns should be dropped
         assert!(stats.dropped_tokens > 0, "Some turns should have been dropped");
         // Most recent user message must survive
@@ -830,7 +832,7 @@ mod tests {
         });
 
         // Very small budget — system prompt is always kept
-        let (msgs, _stats) = crate::ctx::render::build_messages(&conv, "sys", 1000);
+        let (msgs, _stats) = build_messages(&conv, "sys", 1000);
         assert!(!msgs.is_empty(), "Must at least have system prompt");
         assert!(matches!(msgs[0].role, Role::System));
     }
@@ -879,7 +881,7 @@ mod tests {
 
         // Budget too small to fit the huge output — compaction MUST still leave
         // at least one non-system message.
-        let (msgs, _stats) = crate::ctx::render::build_messages(&conv, "sys", 10_000);
+        let (msgs, _stats) = build_messages(&conv, "sys", 10_000);
         let non_system = msgs.iter().filter(|m| !matches!(m.role, Role::System)).count();
         assert!(
             non_system > 0,
@@ -911,7 +913,7 @@ mod tests {
             });
         }
 
-        let (msgs, _stats) = crate::ctx::render::build_messages(&conv, "sys", 5_000);
+        let (msgs, _stats) = build_messages(&conv, "sys", 5_000);
         let has_user = msgs.iter().any(|m| matches!(m.role, Role::User));
         assert!(has_user, "last user message must always survive, got {} msgs", msgs.len());
     }
@@ -947,7 +949,7 @@ mod tests {
         assert_eq!(conv.turn_tracker.turns.len(), 5); // 8 - 3
 
         // Budget check: cold zone should appear in output
-        let (msgs, _stats) = crate::ctx::render::build_messages(&conv, "sys", 100000);
+        let (msgs, _stats) = build_messages(&conv, "sys", 100000);
         let has_cold = msgs.iter().any(|m| {
             m.text().map_or(false, |t| t.contains("Earlier conversation history"))
         });
@@ -977,7 +979,7 @@ mod tests {
         }
 
         // Small budget — force dropping
-        let (msgs, stats) = crate::ctx::render::build_messages(&conv, "sys", 2000);
+        let (msgs, stats) = build_messages(&conv, "sys", 2000);
         assert!(stats.dropped_tokens > 0, "Should drop turns when over budget");
         assert!(matches!(msgs[0].role, Role::System));
     }
@@ -992,7 +994,7 @@ mod tests {
         conv.messages.push(Message::new(Role::Assistant, "response 2"));
         conv.add_user_message("third");
 
-        let (msgs, _stats) = crate::ctx::render::build_messages(&conv, "sys", 100000);
+        let (msgs, _stats) = build_messages(&conv, "sys", 100000);
         // system + 5 messages
         assert_eq!(msgs.len(), 6);
         assert_eq!(msgs[1].text(), Some("first"));
@@ -1019,7 +1021,7 @@ mod tests {
             },
             Message::new(Role::User, "hello"),
         ];
-        crate::ctx::render::sanitize_messages(&mut msgs);
+        sanitize_messages(&mut msgs);
         // Orphan should be removed, leaving System + User
         assert_eq!(msgs.len(), 2);
         assert!(matches!(msgs[0].role, Role::System));
@@ -1053,7 +1055,7 @@ mod tests {
                 }),
             },
         ];
-        crate::ctx::render::sanitize_messages(&mut msgs);
+        sanitize_messages(&mut msgs);
         // All 4 messages should be preserved (valid pair)
         assert_eq!(msgs.len(), 4);
     }
