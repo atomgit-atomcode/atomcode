@@ -21,7 +21,6 @@
 // never need a diff cycle.
 
 use crossterm::style::{Color, SetForegroundColor};
-use std::collections::HashMap;
 use std::io::Write as _;
 
 /// Visual attributes that can vary per cell in our footer. Kept minimal
@@ -129,58 +128,6 @@ pub struct Patch {
     pub row: u16,
     pub col: u16,
     pub cell: Cell,
-}
-
-/// Diff two frames expressed as `{absolute_row -> row_cells}`. Returns
-/// every cell position where the glyph or style changed. Callers map
-/// footer rows to absolute terminal rows (`footer_top + offset`) before
-/// calling this so height changes — footer growing from 5 to 9 — are
-/// naturally absorbed: a row number that only appears in `next` is all
-/// new cells; a row number in both is cell-by-cell diffed; a row only
-/// in `prev` is implicitly wiped by the following footer paint that
-/// covers its absolute position (or by explicit scroll-region clears).
-///
-/// Column width mismatches (prev row is shorter than next) get
-/// padded: treat missing prev cells as `Cell::blank()`, so the extra
-/// tail in `next` emits naturally. When `next` is shorter than `prev`,
-/// the trailing `prev` cells become patches to blank (erasing those
-/// glyphs). This is important when a menu row shrinks — we need to
-/// emit spaces to overwrite leftover characters from the previous
-/// paint.
-pub fn diff_cells(
-    prev: &HashMap<u16, Vec<Cell>>,
-    next: &HashMap<u16, Vec<Cell>>,
-) -> Vec<Patch> {
-    let mut patches = Vec::new();
-
-    // Union of row numbers — every row appearing in either frame needs
-    // at least one pass. Sort so output is deterministic (and cursor
-    // moves go top-to-bottom, which is cheaper on most terminals'
-    // scroll-detection heuristics).
-    let mut rows: Vec<u16> = prev.keys().chain(next.keys()).copied().collect();
-    rows.sort_unstable();
-    rows.dedup();
-
-    for row in rows {
-        let empty = Vec::new();
-        let p = prev.get(&row).unwrap_or(&empty);
-        let n = next.get(&row).unwrap_or(&empty);
-        let max_cols = p.len().max(n.len());
-        let blank = Cell::blank();
-        for col_idx in 0..max_cols {
-            let pc = p.get(col_idx).unwrap_or(&blank);
-            let nc = n.get(col_idx).unwrap_or(&blank);
-            if pc != nc {
-                patches.push(Patch {
-                    row,
-                    col: (col_idx + 1) as u16, // 1-indexed
-                    cell: nc.clone(),
-                });
-            }
-        }
-    }
-
-    patches
 }
 
 /// Slice-based cell-diff for the retained-mode `Screen` buffer.
@@ -336,50 +283,6 @@ fn emit_sgr_transition(out: &mut Vec<u8>, from: Option<&CellStyle>, to: &CellSty
     }
 }
 
-/// Turn `rows: Vec<Vec<Cell>>` (indexed by footer-relative offset) into
-/// `{absolute_row -> cells}` for diffing against a prior frame. Rows
-/// get placed starting at `base_row` (the footer's top row in absolute
-/// screen coordinates, 1-indexed).
-pub fn rows_to_frame(rows: &[Vec<Cell>], base_row: u16) -> HashMap<u16, Vec<Cell>> {
-    rows.iter()
-        .enumerate()
-        .map(|(i, r)| (base_row + i as u16, r.clone()))
-        .collect()
-}
-
-/// Serialise a single row of cells to ANSI bytes — used by legacy
-/// (non-DECSTBM) paths that still emit rows whole rather than diffing.
-/// Equivalent to the old `build_*_row -> Vec<u8>` output.
-pub fn row_to_bytes(cells: &[Cell]) -> Vec<u8> {
-    if cells.is_empty() {
-        return Vec::new();
-    }
-    let mut out = Vec::with_capacity(cells.len() * 2);
-    let mut current_style: Option<CellStyle> = None;
-    let mut emitted_any_sgr = false;
-    for cell in cells {
-        // Continuation cell: see `serialize_patches` for rationale.
-        if cell.width == 0 {
-            continue;
-        }
-        if current_style.as_ref() != Some(&cell.style) {
-            let before = out.len();
-            emit_sgr_transition(&mut out, current_style.as_ref(), &cell.style);
-            if out.len() > before {
-                emitted_any_sgr = true;
-            }
-            current_style = Some(cell.style.clone());
-        }
-        let mut buf = [0u8; 4];
-        let encoded = cell.ch.encode_utf8(&mut buf);
-        out.extend_from_slice(encoded.as_bytes());
-    }
-    if emitted_any_sgr {
-        out.extend_from_slice(b"\x1b[0m");
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -426,72 +329,6 @@ mod tests {
         assert_eq!(row[1].ch, 'b');
     }
 
-    #[test]
-    fn diff_emits_only_changed_cells() {
-        // Two frames differing in one cell (col 3 of row 5).
-        let mut prev = HashMap::new();
-        let mut prev_row: Vec<Cell> = "hello".chars().map(|ch| Cell { ch, style: Default::default(), width: 1 }).collect();
-        prev.insert(5u16, prev_row.clone());
-
-        let mut next = HashMap::new();
-        prev_row[2].ch = 'X'; // change middle char
-        next.insert(5u16, prev_row);
-
-        let patches = diff_cells(&prev, &next);
-        assert_eq!(patches.len(), 1);
-        assert_eq!(patches[0].row, 5);
-        assert_eq!(patches[0].col, 3); // 1-indexed
-        assert_eq!(patches[0].cell.ch, 'X');
-    }
-
-    #[test]
-    fn diff_skips_identical_frames() {
-        let row: Vec<Cell> = "same"
-            .chars()
-            .map(|ch| Cell { ch, style: Default::default(), width: 1 })
-            .collect();
-        let mut prev = HashMap::new();
-        prev.insert(1u16, row.clone());
-        let mut next = HashMap::new();
-        next.insert(1u16, row);
-        assert!(diff_cells(&prev, &next).is_empty());
-    }
-
-    /// diff_cell_frames (slice version) emits the same patches as
-    /// diff_cells (HashMap version) for the same content — a sanity
-    /// check that the two API shapes agree on semantics.
-    #[test]
-    fn diff_cell_frames_agrees_with_hashmap_version() {
-        // Two rows, second one changes one cell.
-        let row_a: Vec<Cell> = "hello"
-            .chars()
-            .map(|ch| Cell { ch, style: Default::default(), width: 1 })
-            .collect();
-        let row_b_prev: Vec<Cell> = "world"
-            .chars()
-            .map(|ch| Cell { ch, style: Default::default(), width: 1 })
-            .collect();
-        let mut row_b_next = row_b_prev.clone();
-        row_b_next[2].ch = 'X';
-
-        let prev_slice = vec![row_a.clone(), row_b_prev.clone()];
-        let next_slice = vec![row_a.clone(), row_b_next.clone()];
-
-        let mut prev_hm: HashMap<u16, Vec<Cell>> = HashMap::new();
-        prev_hm.insert(1, row_a.clone());
-        prev_hm.insert(2, row_b_prev);
-        let mut next_hm: HashMap<u16, Vec<Cell>> = HashMap::new();
-        next_hm.insert(1, row_a);
-        next_hm.insert(2, row_b_next);
-
-        let slice_patches = diff_cell_frames(&prev_slice, &next_slice);
-        let hm_patches = diff_cells(&prev_hm, &next_hm);
-        assert_eq!(
-            slice_patches, hm_patches,
-            "slice and hashmap diffs must produce identical patch streams"
-        );
-    }
-
     /// Uses 0-indexed slice input, produces 1-indexed (row, col)
     /// patches matching ANSI cursor addressing convention.
     #[test]
@@ -530,11 +367,9 @@ mod tests {
             .chars()
             .map(|ch| Cell { ch, style: Default::default(), width: 1 })
             .collect();
-        let mut prev = HashMap::new();
-        prev.insert(1u16, prev_row);
-        let mut next = HashMap::new();
-        next.insert(1u16, next_row);
-        let patches = diff_cells(&prev, &next);
+        let prev = vec![prev_row];
+        let next = vec![next_row];
+        let patches = diff_cell_frames(&prev, &next);
         assert_eq!(patches.len(), 3);
         for p in &patches {
             assert_eq!(p.cell, Cell::blank());
@@ -626,17 +461,6 @@ mod tests {
         let bytes = serialize_patches(&[p1, p2]);
         let s = String::from_utf8(bytes).unwrap();
         assert!(s.contains("\x1b[1m"), "expected bold SGR, got: {:?}", s);
-    }
-
-    #[test]
-    fn row_to_bytes_collapses_runs() {
-        let row: Vec<Cell> = (0..5)
-            .map(|_| Cell { ch: '─', style: Default::default(), width: 1 })
-            .collect();
-        let bytes = row_to_bytes(&row);
-        let s = String::from_utf8(bytes).unwrap();
-        // Five UTF-8 ─ (3 bytes each) + nothing else (default style = no SGR).
-        assert_eq!(s, "─────");
     }
 
     // ── Unicode edge-case regression tests ─────────────────────────
@@ -855,20 +679,15 @@ mod tests {
             Cell { ch: '你', style: CellStyle::default(), width: 2 },
             Cell::continuation(),
         ];
-        let mut prev = HashMap::new();
-        prev.insert(10u16, prev_row);
-        let mut next = HashMap::new();
-        next.insert(10u16, next_row);
+        // Row 9 in the slice (index) → ANSI row 10 in the patch.
+        let prev: Vec<Vec<Cell>> = (0..9).map(|_| Vec::new()).chain(std::iter::once(prev_row)).collect();
+        let next: Vec<Vec<Cell>> = (0..9).map(|_| Vec::new()).chain(std::iter::once(next_row)).collect();
 
-        let patches = diff_cells(&prev, &next);
+        let patches = diff_cell_frames(&prev, &next);
         assert_eq!(patches.len(), 2, "both cols changed");
 
         let bytes = serialize_patches(&patches);
         let s = String::from_utf8(bytes).unwrap();
-        // Emit: cursor to (10, 1), write '你'. Continuation patch at
-        // col 2 skipped (width 0). No cursor move between them because
-        // width=2 advance from col 1 → col 3; continuation patch would
-        // hit col 2 but is skipped entirely.
         assert!(s.contains('你'));
         // Exactly one cursor-position CSI (the initial move).
         assert_eq!(
@@ -892,14 +711,11 @@ mod tests {
             Cell { ch: 'a', style: CellStyle::default(), width: 1 },
             Cell { ch: 'b', style: CellStyle::default(), width: 1 },
         ];
-        let mut prev = HashMap::new();
-        prev.insert(5u16, prev_row);
-        let mut next = HashMap::new();
-        next.insert(5u16, next_row);
+        let prev: Vec<Vec<Cell>> = (0..4).map(|_| Vec::new()).chain(std::iter::once(prev_row)).collect();
+        let next: Vec<Vec<Cell>> = (0..4).map(|_| Vec::new()).chain(std::iter::once(next_row)).collect();
 
-        let patches = diff_cells(&prev, &next);
+        let patches = diff_cell_frames(&prev, &next);
         assert_eq!(patches.len(), 2);
-        // Patch 1: col 1 = 'a' (width 1). Patch 2: col 2 = 'b'.
         assert_eq!(patches[0].col, 1);
         assert_eq!(patches[0].cell.ch, 'a');
         assert_eq!(patches[1].col, 2);
@@ -907,8 +723,6 @@ mod tests {
 
         let bytes = serialize_patches(&patches);
         let s = String::from_utf8(bytes).unwrap();
-        // Terminal behaviour: writing 'a' at col 1 erases '你' entirely
-        // (both halves). Then writing 'b' at col 2 lands cleanly.
         assert!(s.contains('a'));
         assert!(s.contains('b'));
     }

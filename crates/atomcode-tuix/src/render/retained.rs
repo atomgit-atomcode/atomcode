@@ -914,8 +914,6 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                     format!("✗ {}", safe)
                 };
                 let body_style = if success { muted.clone() } else { error };
-                let mut leading = String::from("    ⎿ ");
-                let _ = leading.len();
                 // Indent result lines 4 cols past the tool-call row.
                 let row_w =
                     (self.screen.width() as usize).saturating_sub(PAD_COL * 2 + 6);

@@ -26,7 +26,7 @@ use crate::commands::CommandRegistry;
 use crate::event_loop::{run_loop, LoopCtx};
 use crate::input::history::History;
 use crate::input::reader;
-use crate::render::{ansi::AnsiRenderer, plain::PlainRenderer, worker::TaskRenderer, Renderer};
+use crate::render::{plain::PlainRenderer, retained::RetainedRenderer, worker::TaskRenderer, Renderer};
 use crate::terminal::TerminalCaps;
 
 /// RAII guard: enables raw mode + bracketed paste on construction,
@@ -109,21 +109,11 @@ pub async fn run(
     // Slow terminals (Mac Terminal.app processing a 4KB footer payload)
     // no longer block the event loop — the event loop sends `UiLine`s
     // through a channel and moves on.
-    // Phase 6: RetainedRenderer is now the default TTY path.
-    // AnsiRenderer remains as an escape hatch for regression
-    // debugging — set `ATOMCODE_TUIX_RETAINED=0` to force the
-    // legacy immediate-mode renderer. Any other value (unset,
-    // "1", "true", etc.) uses retained.
-    let use_retained = std::env::var("ATOMCODE_TUIX_RETAINED")
-        .ok()
-        .as_deref()
-        != Some("0");
+    // TTY → retained-mode Ink-style cell-diff renderer.
+    // Non-TTY (pipe, CI, dumb terminal) → PlainRenderer, which
+    // just writes plain text without ANSI cursor positioning.
     let inner: Box<dyn Renderer> = if caps.tty {
-        if use_retained {
-            Box::new(render::retained::RetainedRenderer::new(caps))
-        } else {
-            Box::new(AnsiRenderer::new(caps))
-        }
+        Box::new(RetainedRenderer::new(caps))
     } else {
         Box::new(PlainRenderer::new())
     };
