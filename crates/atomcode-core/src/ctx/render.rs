@@ -14,6 +14,7 @@
 
 use crate::conversation::{Conversation, ContextStats, KEEP_MESSAGES};
 use crate::conversation::message::{self, Message, MessageContent, Role};
+use crate::conversation::turn;
 
 /// Context management with cold zone compression.
 ///
@@ -180,10 +181,10 @@ pub fn build_messages(
     // (read_file full content, bash output) are replaced with compact summaries.
     // This reduces context growth without LLM calls.
     // View replacement runs AFTER microcompact — edited files stay fresh.
-    Conversation::microcompact(&mut result, &conv.turn_tracker.turns, conv.messages.len());
+    microcompact(&mut result, &conv.turn_tracker.turns, conv.messages.len());
 
-    Conversation::replace_stale_reads(&mut result);
-    Conversation::clean_message_pipeline(&mut result);
+    replace_stale_reads(&mut result);
+    clean_message_pipeline(&mut result);
 
     // ── ABSOLUTE FLOOR (runs AFTER all cleanup, right before sent_tokens calc) ──
     // If compaction + cleanup somehow left us with only system messages, graft back
@@ -406,7 +407,7 @@ fn build_messages_fallback(
     let mut result = Vec::with_capacity(conv.messages.len() - start + 1);
     result.push(system_msg);
     result.extend(conv.messages[start..].iter().cloned());
-    Conversation::sanitize_messages(&mut result);
+    sanitize_messages(&mut result);
     result
 }
 
@@ -434,4 +435,626 @@ fn snap_to_valid_boundary(messages: &[Message], idx: usize) -> usize {
         }
     }
     start
+}
+
+// ─── Message-list manipulation helpers (moved from Conversation) ────
+// These operate on `&mut Vec<Message>` and are called during render
+// to apply rolling condensation / freshness replacement / sanity cleanup.
+
+/// Microcompact: condense old ToolResult messages to one-line summaries.
+/// Zero LLM calls — purely mechanical compression.
+///
+/// `read_file` results are NEVER condensed by microcompact. They stay in
+/// context for the entire task so the model can cross-reference files
+/// freely. Cleanup happens at two higher levels:
+/// 1. Task boundary compression (new user message → old task compressed)
+/// 2. 50% LLM compression threshold (context > 32K → oldest turns compressed)
+///
+/// Other tool results (bash, grep, edit, etc.) are condensed after
+/// 20 messages to keep context growth in check.
+pub(crate) fn microcompact(msgs: &mut Vec<Message>, _turns: &[turn::Turn], total_msg_count: usize) {
+    const OTHER_KEEP: usize = 20;
+
+    let total_chars: usize = msgs.iter().map(|m| {
+        match &m.content {
+            MessageContent::ToolResult(r) => r.output.len(),
+            MessageContent::Text(t) => t.len(),
+            _ => 100,
+        }
+    }).sum();
+    if total_chars < 100_000 { return; }
+    if total_msg_count <= OTHER_KEEP { return; }
+
+    let other_cutoff = total_msg_count.saturating_sub(OTHER_KEEP);
+
+    let mut call_id_to_tool: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for msg in msgs.iter() {
+        if let MessageContent::AssistantWithToolCalls { tool_calls, .. } = &msg.content {
+            for tc in tool_calls {
+                call_id_to_tool.insert(tc.id.clone(), tc.name.clone());
+            }
+        }
+    }
+
+    let cold_msgs = msgs.iter()
+        .position(|m| !matches!(m.role, Role::System))
+        .unwrap_or(0);
+
+    let condense_end = cold_msgs + other_cutoff;
+
+    for i in cold_msgs..condense_end.min(msgs.len()) {
+        if let MessageContent::ToolResult(ref r) = msgs[i].content {
+            let _tool_name = call_id_to_tool.get(&r.call_id)
+                .map(|s| s.as_str())
+                .unwrap_or("tool");
+
+            let msg_idx = i.saturating_sub(cold_msgs);
+            if msg_idx >= other_cutoff { continue; }
+
+            if r.output.len() <= 500 { continue; }
+
+            let tool_name = call_id_to_tool.get(&r.call_id)
+                .map(|s| s.as_str())
+                .unwrap_or("tool");
+
+            let summary = match tool_name {
+                "read_file" => {
+                    let line_count = r.output.lines().count();
+                    let first_line = r.output.lines().next().unwrap_or("");
+                    let hint: String = first_line.chars().take(60).collect();
+                    format!("[Read file ({} lines): {}]", line_count, hint)
+                }
+                "bash" => {
+                    let first_line = r.output.lines().next().unwrap_or("(empty)");
+                    let line_count = r.output.lines().count();
+                    let short: String = first_line.chars().take(80).collect();
+                    if r.success {
+                        format!("[bash ({} lines): {}]", line_count, short)
+                    } else {
+                        format!("[bash FAILED ({} lines): {}]", line_count, short)
+                    }
+                }
+                "grep" => {
+                    let match_count = r.output.lines().filter(|l| l.contains(':')).count();
+                    format!("[grep: {} matches]", match_count)
+                }
+                "glob" => {
+                    let file_count = r.output.lines().count();
+                    format!("[glob: {} files]", file_count)
+                }
+                _ => {
+                    let first_line = r.output.lines().next().unwrap_or("");
+                    let short: String = first_line.chars().take(80).collect();
+                    format!("[{}: {}]", tool_name, short)
+                }
+            };
+
+            msgs[i].content = MessageContent::ToolResult(crate::tool::ToolResult {
+                call_id: r.call_id.clone(),
+                output: summary,
+                success: r.success,
+            });
+        }
+    }
+}
+
+/// Replace stale read_file results with current disk content.
+/// When a file was read then later edited, the old read result is outdated.
+/// This replaces it so the model always sees the latest version.
+pub(crate) fn replace_stale_reads(msgs: &mut Vec<Message>) {
+    struct ReadInfo {
+        file_path: String,
+        offset: Option<usize>,
+        limit: Option<usize>,
+    }
+    let mut call_id_to_read: std::collections::HashMap<String, ReadInfo> = std::collections::HashMap::new();
+    let mut edit_call_to_file: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut edited_files: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for msg in msgs.iter() {
+        if let MessageContent::AssistantWithToolCalls { tool_calls, .. } = &msg.content {
+            for tc in tool_calls {
+                if let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
+                    let file_path = args.get("file_path")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if tc.name == "read_file" && !file_path.is_empty() {
+                        let offset = args.get("offset").and_then(|v| v.as_u64()).map(|v| v as usize);
+                        let limit = args.get("limit").and_then(|v| v.as_u64()).map(|v| v as usize);
+                        call_id_to_read.insert(tc.id.clone(), ReadInfo { file_path: file_path.clone(), offset, limit });
+                    }
+                    if matches!(tc.name.as_str(), "edit_file" | "write_file" | "create_file") && !file_path.is_empty() {
+                        edit_call_to_file.insert(tc.id.clone(), file_path);
+                    }
+                }
+            }
+        }
+        if let MessageContent::ToolResult(ref r) = msg.content {
+            if let Some(file_path) = edit_call_to_file.get(&r.call_id) {
+                if !r.output.starts_with("Error") {
+                    edited_files.insert(file_path.clone());
+                }
+            }
+        }
+    }
+
+    if edited_files.is_empty() {
+        return;
+    }
+
+    for msg in msgs.iter_mut() {
+        if let MessageContent::ToolResult(ref mut r) = msg.content {
+            if let Some(info) = call_id_to_read.get(&r.call_id) {
+                if !edited_files.contains(&info.file_path) { continue; }
+                if let Ok(content) = std::fs::read_to_string(&info.file_path) {
+                    let all_lines: Vec<&str> = content.lines().collect();
+                    let total = all_lines.len();
+
+                    if info.offset.is_some() || info.limit.is_some() {
+                        let start = info.offset.unwrap_or(1).max(1) - 1;
+                        let start = start.min(total);
+                        let end = info.limit.map(|l| (start + l).min(total)).unwrap_or(total);
+                        let display: String = all_lines[start..end].iter().enumerate()
+                            .map(|(i, l)| format!("{:>4}| {}", start + i + 1, l))
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        r.output = display;
+                    } else if total <= 300 {
+                        r.output = all_lines.iter().enumerate()
+                            .map(|(i, l)| format!("{:>4}| {}", i + 1, l))
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                    }
+                    // else: large-file full-read, keep existing skeleton as-is.
+                }
+            }
+        }
+    }
+}
+
+/// Walk forward tracking tool_call/tool_result pairing; remove orphans.
+/// Valid sequences: System → (User → Assistant/AssistantWithToolCalls → [ToolResult]* → ...)*
+pub(crate) fn sanitize_messages(msgs: &mut Vec<Message>) {
+    let mut to_remove: Vec<usize> = Vec::new();
+    let mut expecting_tool_results = 0usize;
+
+    for i in 0..msgs.len() {
+        match &msgs[i].content {
+            MessageContent::ToolResult(_) | MessageContent::ToolResultRef(_) => {
+                if expecting_tool_results > 0 {
+                    expecting_tool_results -= 1;
+                } else {
+                    to_remove.push(i);
+                }
+            }
+            MessageContent::AssistantWithToolCalls { tool_calls, .. } => {
+                expecting_tool_results = tool_calls.len();
+            }
+            MessageContent::Text(_) => {
+                expecting_tool_results = 0;
+            }
+        }
+    }
+
+    if expecting_tool_results > 0 {
+        for i in (0..msgs.len()).rev() {
+            match &msgs[i].content {
+                MessageContent::AssistantWithToolCalls { .. } => {
+                    to_remove.push(i);
+                    break;
+                }
+                MessageContent::ToolResult(_) | MessageContent::ToolResultRef(_) => {
+                    to_remove.push(i);
+                }
+                _ => break,
+            }
+        }
+    }
+
+    to_remove.sort_unstable();
+    to_remove.dedup();
+    for &idx in to_remove.iter().rev() {
+        msgs.remove(idx);
+    }
+}
+
+/// Clean message pipeline before sending to API.
+/// Removes noise that degrades model decision quality:
+/// - Empty/whitespace-only assistant messages
+/// - Orphaned tool results (no matching tool_use)
+/// - Consecutive same-role user messages (merge into one)
+pub(crate) fn clean_message_pipeline(msgs: &mut Vec<Message>) {
+    // 1. Remove empty assistant messages (e.g., after <think> stripping)
+    msgs.retain(|m| {
+        if m.role == Role::Assistant {
+            match &m.content {
+                MessageContent::Text(t) => !t.trim().is_empty(),
+                _ => true,
+            }
+        } else {
+            true
+        }
+    });
+
+    // 2. Collect valid tool_use IDs from assistant messages
+    let mut valid_call_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for msg in msgs.iter() {
+        if let MessageContent::AssistantWithToolCalls { tool_calls, .. } = &msg.content {
+            for tc in tool_calls {
+                valid_call_ids.insert(tc.id.clone());
+            }
+        }
+    }
+
+    // 3. Remove orphaned tool results (no matching tool_use)
+    msgs.retain(|m| {
+        if let MessageContent::ToolResult(ref r) = m.content {
+            valid_call_ids.contains(&r.call_id)
+        } else if let MessageContent::ToolResultRef(ref r) = m.content {
+            valid_call_ids.contains(&r.call_id)
+        } else {
+            true
+        }
+    });
+
+    // 4. Merge consecutive user messages into one
+    let mut i = 1;
+    while i < msgs.len() {
+        if msgs[i].role == Role::User && msgs[i - 1].role == Role::User {
+            if let (MessageContent::Text(prev), MessageContent::Text(curr)) =
+                (&msgs[i - 1].content, &msgs[i].content)
+            {
+                let merged = format!("{}\n{}", prev, curr);
+                msgs[i - 1].content = MessageContent::Text(merged);
+                msgs.remove(i);
+                continue;
+            }
+        }
+        i += 1;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::conversation::Conversation;
+    use crate::conversation::message::{Message, Role};
+    #[test]
+    fn test_budgeted_empty_conversation() {
+        let conv = Conversation::new();
+        let (msgs, _stats) = crate::ctx::render::build_messages(&conv, "system prompt", 8000);
+        assert_eq!(msgs.len(), 1);
+        assert!(matches!(msgs[0].role, Role::System));
+    }
+
+
+    #[test]
+    fn test_budgeted_includes_recent_messages() {
+        let mut conv = Conversation::new();
+        conv.add_user_message("hello");
+        conv.messages.push(Message::new(Role::Assistant, "hi there"));
+        conv.add_user_message("do something");
+
+        let (msgs, _stats) = crate::ctx::render::build_messages(&conv, "sys", 8000);
+        assert_eq!(msgs.len(), 4); // system + 3 messages
+        assert!(matches!(msgs[0].role, Role::System));
+    }
+
+
+    #[test]
+    fn test_budgeted_sends_all_when_under_80pct() {
+        use crate::tool::{ToolCall, ToolResult};
+        let mut conv = Conversation::new();
+
+        // Create 2 turns with small tool results — should all fit
+        for turn in 0..2 {
+            conv.add_user_message(&format!("task {}", turn));
+            let call = ToolCall {
+                id: format!("call_{}", turn),
+                name: "read_file".to_string(),
+                arguments: format!(r#"{{"file_path":"/tmp/file_{}.rs"}}"#, turn),
+            };
+            conv.add_assistant_tool_calls(None, vec![call]);
+            conv.add_tool_result(ToolResult {
+                call_id: format!("call_{}", turn),
+                output: "short result".to_string(),
+                success: true,
+            });
+        }
+        conv.add_user_message("now what?");
+
+        // Large budget — everything fits
+        let (msgs, stats) = crate::ctx::render::build_messages(&conv, "sys", 100000);
+        // system + 7 messages (2 turns * 3 msgs each + final user)
+        assert_eq!(msgs.len(), 8);
+        assert!(matches!(msgs[0].role, Role::System));
+        assert_eq!(msgs.last().unwrap().text(), Some("now what?"));
+        assert_eq!(stats.dropped_tokens, 0, "Nothing should be dropped");
+    }
+
+
+    #[test]
+    fn test_budgeted_drops_oldest_turns_when_over_budget() {
+        use crate::tool::{ToolCall, ToolResult};
+        let mut conv = Conversation::new();
+
+        // Create 5 turns with large tool results (2000 chars each ≈ 500 tokens)
+        // Total ≈ 5 * 4 * 500 = 10000 tokens + overhead, budget 80% of 4000 = 3200
+        for turn in 0..5 {
+            conv.add_user_message(&format!("task {}", turn));
+            for i in 0..4 {
+                let idx = turn * 4 + i;
+                let call = ToolCall {
+                    id: format!("call_{}", idx),
+                    name: "read_file".to_string(),
+                    arguments: format!(r#"{{"file_path":"/tmp/file_{}.rs"}}"#, idx),
+                };
+                conv.add_assistant_tool_calls(None, vec![call]);
+                conv.add_tool_result(ToolResult {
+                    call_id: format!("call_{}", idx),
+                    output: "x".repeat(2000),
+                    success: true,
+                });
+            }
+        }
+        conv.add_user_message("now what?");
+
+        let (msgs, stats) = crate::ctx::render::build_messages(&conv, "sys", 4000);
+        // Oldest turns should be dropped
+        assert!(stats.dropped_tokens > 0, "Some turns should have been dropped");
+        // Most recent user message must survive
+        assert_eq!(msgs.last().unwrap().text(), Some("now what?"));
+        // System prompt must be first
+        assert!(matches!(msgs[0].role, Role::System));
+    }
+
+
+    #[test]
+    fn test_budgeted_always_keeps_latest_turn() {
+        use crate::tool::{ToolCall, ToolResult};
+        let mut conv = Conversation::new();
+
+        // Create a single turn with very large output
+        conv.add_user_message("big task");
+        let call = ToolCall {
+            id: "c0".to_string(),
+            name: "bash".to_string(),
+            arguments: "{}".to_string(),
+        };
+        conv.add_assistant_tool_calls(Some("running..."), vec![call]);
+        conv.add_tool_result(ToolResult {
+            call_id: "c0".to_string(),
+            output: "z".repeat(50000),
+            success: true,
+        });
+
+        // Very small budget — system prompt is always kept
+        let (msgs, _stats) = crate::ctx::render::build_messages(&conv, "sys", 1000);
+        assert!(!msgs.is_empty(), "Must at least have system prompt");
+        assert!(matches!(msgs[0].role, Role::System));
+    }
+
+
+    #[test]
+    fn test_budgeted_never_returns_system_only_when_messages_exist() {
+        // Regression for 2026-04-13 bug: a single oversized tool_result caused
+        // `survived_start = self.messages.len()` → no non-system messages in result
+        // → sent=0 → agent blind.
+        //
+        // Invariant: if self.messages is non-empty, to_provider_messages_budgeted
+        // must always include at least one non-system message.
+        use crate::tool::{ToolCall, ToolResult};
+        let mut conv = Conversation::new();
+
+        // 5 normal turns
+        for i in 0..5 {
+            conv.add_user_message(&format!("task {}", i));
+            let call = ToolCall {
+                id: format!("c{}", i),
+                name: "bash".to_string(),
+                arguments: "{}".to_string(),
+            };
+            conv.add_assistant_tool_calls(Some("ok"), vec![call]);
+            conv.add_tool_result(ToolResult {
+                call_id: format!("c{}", i),
+                output: "x".repeat(500),
+                success: true,
+            });
+        }
+
+        // 6th turn with a pathologically oversized output (50K tokens worth of 'z')
+        conv.add_user_message("find everything");
+        let call = ToolCall {
+            id: "c5".to_string(),
+            name: "bash".to_string(),
+            arguments: "{}".to_string(),
+        };
+        conv.add_assistant_tool_calls(Some("finding..."), vec![call]);
+        conv.add_tool_result(ToolResult {
+            call_id: "c5".to_string(),
+            output: "z".repeat(200_000), // huge
+            success: true,
+        });
+
+        // Budget too small to fit the huge output — compaction MUST still leave
+        // at least one non-system message.
+        let (msgs, _stats) = crate::ctx::render::build_messages(&conv, "sys", 10_000);
+        let non_system = msgs.iter().filter(|m| !matches!(m.role, Role::System)).count();
+        assert!(
+            non_system > 0,
+            "never return system-only result when messages exist — got msgs.len()={}",
+            msgs.len()
+        );
+    }
+
+
+    #[test]
+    fn test_budgeted_emergency_restores_last_user_when_all_else_dropped() {
+        // Even if every turn gets dropped by some path, the emergency fallback at
+        // the bottom of to_provider_messages_budgeted should graft back the last
+        // user message rather than return system-only.
+        let mut conv = Conversation::new();
+        conv.add_user_message("original question");
+        // Add 20 turns of huge assistant+tool content to force aggressive drop
+        for i in 0..20 {
+            use crate::tool::{ToolCall, ToolResult};
+            conv.add_assistant_tool_calls(Some(&format!("reasoning {}", i)), vec![ToolCall {
+                id: format!("c{}", i),
+                name: "bash".to_string(),
+                arguments: "{}".to_string(),
+            }]);
+            conv.add_tool_result(ToolResult {
+                call_id: format!("c{}", i),
+                output: "y".repeat(10_000),
+                success: true,
+            });
+        }
+
+        let (msgs, _stats) = crate::ctx::render::build_messages(&conv, "sys", 5_000);
+        let has_user = msgs.iter().any(|m| matches!(m.role, Role::User));
+        assert!(has_user, "last user message must always survive, got {} msgs", msgs.len());
+    }
+
+
+    #[test]
+    fn test_cold_zone_compression() {
+        use crate::tool::{ToolCall, ToolResult};
+        let mut conv = Conversation::new();
+
+        // Create 8 turns
+        for turn in 0..8 {
+            conv.add_user_message(&format!("task {}", turn));
+            let call = ToolCall {
+                id: format!("c{}", turn),
+                name: "bash".to_string(),
+                arguments: "{}".to_string(),
+            };
+            conv.add_assistant_tool_calls(Some("ok"), vec![call]);
+            conv.add_tool_result(ToolResult {
+                call_id: format!("c{}", turn),
+                output: "x".repeat(100),
+                success: true,
+            });
+        }
+
+        // Apply compression: remove first 9 messages (3 turns × 3 msgs each)
+        conv.apply_compression(9, "User ran tasks 0, 1, 2 with bash.".to_string());
+
+        // Cold zone should have 1 entry
+        assert_eq!(conv.cold_summaries.len(), 1);
+        // Messages should be reduced (first 3 turns removed)
+        assert_eq!(conv.turn_tracker.turns.len(), 5); // 8 - 3
+
+        // Budget check: cold zone should appear in output
+        let (msgs, _stats) = crate::ctx::render::build_messages(&conv, "sys", 100000);
+        let has_cold = msgs.iter().any(|m| {
+            m.text().map_or(false, |t| t.contains("Earlier conversation history"))
+        });
+        assert!(has_cold, "Cold zone summary should appear in output");
+    }
+
+
+    #[test]
+    fn test_budgeted_drops_when_no_summary_and_over_budget() {
+        use crate::tool::{ToolCall, ToolResult};
+        let mut conv = Conversation::new();
+
+        // Create 3 turns with large content (no summaries)
+        for turn in 0..3 {
+            conv.add_user_message(&format!("task {}", turn));
+            let call = ToolCall {
+                id: format!("c{}", turn),
+                name: "bash".to_string(),
+                arguments: "{}".to_string(),
+            };
+            conv.add_assistant_tool_calls(Some("ok"), vec![call]);
+            conv.add_tool_result(ToolResult {
+                call_id: format!("c{}", turn),
+                output: "x".repeat(4000),
+                success: true,
+            });
+        }
+
+        // Small budget — force dropping
+        let (msgs, stats) = crate::ctx::render::build_messages(&conv, "sys", 2000);
+        assert!(stats.dropped_tokens > 0, "Should drop turns when over budget");
+        assert!(matches!(msgs[0].role, Role::System));
+    }
+
+
+    #[test]
+    fn test_budgeted_preserves_message_order() {
+        let mut conv = Conversation::new();
+        conv.add_user_message("first");
+        conv.messages.push(Message::new(Role::Assistant, "response 1"));
+        conv.add_user_message("second");
+        conv.messages.push(Message::new(Role::Assistant, "response 2"));
+        conv.add_user_message("third");
+
+        let (msgs, _stats) = crate::ctx::render::build_messages(&conv, "sys", 100000);
+        // system + 5 messages
+        assert_eq!(msgs.len(), 6);
+        assert_eq!(msgs[1].text(), Some("first"));
+        assert_eq!(msgs[2].text(), Some("response 1"));
+        assert_eq!(msgs[3].text(), Some("second"));
+        assert_eq!(msgs[4].text(), Some("response 2"));
+        assert_eq!(msgs[5].text(), Some("third"));
+    }
+
+
+    #[test]
+    fn test_sanitize_removes_orphan_tool_results() {
+        use crate::tool::ToolResult;
+        let mut msgs = vec![
+            Message::new(Role::System, "sys"),
+            // Orphan tool result (no matching AssistantWithToolCalls)
+            Message {
+                role: Role::Tool,
+                content: MessageContent::ToolResult(ToolResult {
+                    call_id: "orphan_1".to_string(),
+                    output: "some output".to_string(),
+                    success: true,
+                }),
+            },
+            Message::new(Role::User, "hello"),
+        ];
+        crate::ctx::render::sanitize_messages(&mut msgs);
+        // Orphan should be removed, leaving System + User
+        assert_eq!(msgs.len(), 2);
+        assert!(matches!(msgs[0].role, Role::System));
+        assert!(matches!(msgs[1].role, Role::User));
+    }
+
+
+    #[test]
+    fn test_sanitize_preserves_valid_pairs() {
+        use crate::tool::{ToolCall, ToolResult};
+        let mut msgs = vec![
+            Message::new(Role::System, "sys"),
+            Message::new(Role::User, "do it"),
+            Message {
+                role: Role::Assistant,
+                content: MessageContent::AssistantWithToolCalls {
+                    text: None,
+                    tool_calls: vec![ToolCall {
+                        id: "c1".to_string(),
+                        name: "bash".to_string(),
+                        arguments: "{}".to_string(),
+                    }],
+                },
+            },
+            Message {
+                role: Role::Tool,
+                content: MessageContent::ToolResult(ToolResult {
+                    call_id: "c1".to_string(),
+                    output: "ok".to_string(),
+                    success: true,
+                }),
+            },
+        ];
+        crate::ctx::render::sanitize_messages(&mut msgs);
+        // All 4 messages should be preserved (valid pair)
+        assert_eq!(msgs.len(), 4);
+    }
 }
