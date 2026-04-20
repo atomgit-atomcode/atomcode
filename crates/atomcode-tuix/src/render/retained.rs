@@ -1147,34 +1147,33 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
     }
 
     fn on_resize(&mut self, cols: u16, rows: u16) {
-        // Terminal-side state wipe: resize leaves the terminal's own
-        // display with characters at absolute positions from BEFORE
-        // the resize. The new Screen we're about to build has both
-        // frames blank, so the diff won't emit any "erase" patches
-        // for the stale content — it would just paint the new
-        // frame on top, leaving ghost copies of the old footer /
-        // body at whatever rows they occupied pre-resize.
-        //
-        // Force `\x1b[2J\x1b[H` to clear the terminal's whole
-        // display first, then rebuild Screen at the new dimensions.
-        // prev_cells is now blank (which matches terminal reality),
-        // cells is blank (about to be repainted by paint_frame).
+        // Terminal-side wipe: resize leaves pre-resize chars at old
+        // absolute positions. Both our new Screen frames are blank,
+        // so a pure diff wouldn't emit erase patches for those ghosts
+        // — they'd linger stacked next to the new footer. Force
+        // `\x1b[2J\x1b[H` to zero the terminal first; the new Screen
+        // then aligns with terminal reality (both blank).
         let _ = self.out.write_all(b"\x1b[2J\x1b[H");
         self.screen.resize(cols, rows);
-        // Body cells are pre-wrapped to the old width — drop them
-        // rather than mis-render. Terminal-side scrollback still
-        // holds the history for the user to scroll back to.
-        self.body_lines.clear();
-        self.assistant_line_buf.clear();
+        // IMPORTANT: keep `body_lines` intact.
+        //
+        // Prior behaviour cleared body on resize on the theory that
+        // rows pre-wrapped to the old width would "mis-render". In
+        // practice `draw_row` silently truncates cells past the new
+        // screen width, so body rows wider than the new terminal
+        // just clip their right edge — the welcome / chat history
+        // stays visible (with a trailing clip when resizing smaller
+        // or a trailing blank when resizing larger) instead of
+        // silently vanishing. Every user who ever dragged their
+        // terminal smaller experienced the old behaviour as "my
+        // welcome / chat disappeared for no reason". Clipping is
+        // the acceptable trade.
+        //
+        // assistant_line_buf preserved likewise — it's a streaming
+        // partial that may still be being appended.
         self.paint_frame();
         self.flush_frame();
         let _ = self.out.flush();
-        // After this emit `prev_cells` holds exactly what the terminal
-        // shows and the footer occupies `current_footer_rows` rows.
-        // Sync our geometry tracker so the next `flush_deferred`'s
-        // "geometry changed → invalidate" guard does NOT fire (which
-        // would blank prev_cells and leave stale terminal chars
-        // without erase patches).
         self.last_painted_footer_rows = self.current_footer_rows();
         self.dirty = false;
     }
@@ -1787,6 +1786,53 @@ mod tests {
             found_brand && found_cwd && found_model && found_hint,
             "welcome rows missing (brand={} cwd={} model={} hint={})\ndump:\n{}",
             found_brand, found_cwd, found_model, found_hint, vterm.dump()
+        );
+    }
+
+    /// Regression for user report: "Mac resize 后欢迎页的内容丢了".
+    /// Before this fix, on_resize cleared body_lines so the welcome
+    /// transcript disappeared. Now body is preserved — resizing
+    /// smaller may clip content on the right (draw_row truncates
+    /// at screen.width), but "AtomCode" / cwd / model lines still
+    /// read. User keeps their chat history across resize.
+    ///
+    /// Same issue applies on Windows identically (same code path),
+    /// so the fix covers both platforms.
+    #[test]
+    fn retained_resize_preserves_welcome_via_vterm() {
+        let (mut r, buf) = new_capturing(80, 24);
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+        let status = status_basic();
+
+        r.render(UiLine::Welcome {
+            model: "glm-5".into(),
+            working_dir: "~/p/a".into(),
+        });
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // Sanity: welcome is visible pre-resize (above footer).
+        let pre_has = (0..24).any(|r| vterm.row_text(r).contains("AtomCode"));
+        assert!(pre_has, "welcome missing before resize\ndump:\n{}", vterm.dump());
+
+        // Resize smaller — welcome must still be on the new grid.
+        r.on_resize(50, 16);
+        r.flush_deferred();
+        let mut vterm = crate::test_term::VirtualTerminal::new(50, 16);
+        drain_into_vterm(&buf, &mut vterm);
+
+        let post_has = (0..16).any(|r| vterm.row_text(r).contains("AtomCode"));
+        assert!(
+            post_has,
+            "welcome disappeared after resize (regression of pre-fix behaviour)\n\
+             dump:\n{}",
+            vterm.dump()
         );
     }
 
