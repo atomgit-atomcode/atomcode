@@ -570,10 +570,7 @@ fn short_path(path: &str) -> String {
 }
 
 fn sessions_dir() -> PathBuf {
-    dirs::data_local_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("atomcode")
-        .join("sessions")
+    SessionManager::sessions_root_dir()
 }
 
 fn hash_path(path: &std::path::Path) -> String {
