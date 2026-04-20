@@ -1062,15 +1062,18 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         if self.dirty {
             let t0 = std::time::Instant::now();
             let footer_rows = self.current_footer_rows();
-            // Geometry-change guard: when the footer grows/shrinks
-            // (wrap, menu open/close, spinner toggle), invalidate
-            // the diff cache so every row — including ones whose
-            // bytes happen to match the previous frame — gets
-            // re-emitted. This paves over any terminal-side
-            // render glitches that accumulated under the
-            // cell-diff skip path.
+            // Track footer_rows for diagnostic / resize code paths.
+            // We DON'T call `screen.invalidate()` here — invalidate
+            // blanks prev_cells, so the diff sees "blank → blank"
+            // for every row whose new cells happen to be blank and
+            // skips the emit. That's wrong whenever the previous
+            // frame had non-blank content at those rows (e.g. menu
+            // close: welcome moves down a few rows, leaving the
+            // top rows of the old welcome position with no erase
+            // patch against them → ghost text on screen). Letting
+            // the real prev→current diff run produces the correct
+            // erase patches naturally.
             if footer_rows != self.last_painted_footer_rows {
-                self.screen.invalidate();
                 self.last_painted_footer_rows = footer_rows;
             }
             let has_status = !self.status.model.is_empty()
@@ -2270,6 +2273,97 @@ mod tests {
             stream.contains("你是谁"),
             "wide chars not consecutive in retained emit stream:\n{}",
             stream
+        );
+    }
+
+    /// Regression for the "/ then Esc" ghost. With menu open the
+    /// footer is taller so the bottom-anchored welcome paints at
+    /// rows A..B. When the menu closes the footer shrinks and the
+    /// welcome paints at rows A+k..B+k (further down). If the
+    /// geometry-change path invalidates prev_cells without also
+    /// erasing the terminal, the diff against blank-prev skips
+    /// blank cells in the new frame — so the old welcome at rows
+    /// A..A+k-1 stays on screen as a ghost underneath the fresh
+    /// paint.
+    #[test]
+    fn retained_menu_close_leaves_no_welcome_ghost() {
+        let (mut r, buf) = new_capturing(80, 24);
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+        let status = status_basic();
+
+        // Initial welcome (no menu). Welcome 6 rows bottom-anchored
+        // above a 5-row footer → rows 13..=18.
+        r.render(UiLine::Welcome {
+            model: "glm-5".into(),
+            working_dir: "~/project/atomcode".into(),
+        });
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // Open menu ("/" pressed). Footer grows by 4 rows (menu) so
+        // welcome now paints at rows 9..=14.
+        let items: Vec<(String, String)> = vec![
+            ("model".into(), "Switch model".into()),
+            ("provider".into(), "Add provider".into()),
+            ("session".into(), "New session".into()),
+            ("resume".into(), "Resume session".into()),
+        ];
+        r.render(UiLine::InputPrompt {
+            buf: "/".into(),
+            cursor_byte: 1,
+            menu: Some(MenuPayload {
+                items: items.clone(),
+                selected: 0,
+            }),
+            status: status.clone(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // Sanity: welcome brand now at row 9 (higher up because
+        // footer is 9 rows).
+        assert!(
+            vterm.row_text(9).contains("AtomCode"),
+            "menu-open welcome brand not at row 9:\n{}",
+            vterm.dump()
+        );
+
+        // Close menu (Esc). Footer shrinks back to 5 rows, welcome
+        // paints at rows 13..=18.
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // Welcome brand must now live at row 13 AND must no longer
+        // appear at row 9 — that row went back into the blank
+        // above-body region. If row 9 still shows "AtomCode" the
+        // diff failed to erase the pre-close paint.
+        assert!(
+            vterm.row_text(13).contains("AtomCode"),
+            "menu-close: welcome brand missing at row 13:\n{}",
+            vterm.dump()
+        );
+        assert!(
+            !vterm.row_text(9).contains("AtomCode"),
+            "menu-close: row 9 still shows ghost welcome brand:\n{}",
+            vterm.dump()
+        );
+        // Same for cwd row (was row 10, moves to row 14).
+        assert!(
+            !vterm.row_text(10).contains("project"),
+            "menu-close: row 10 still shows ghost cwd:\n{}",
+            vterm.dump()
         );
     }
 }
