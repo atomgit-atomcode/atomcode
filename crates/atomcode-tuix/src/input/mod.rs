@@ -14,4 +14,9 @@ pub enum InputEvent {
     Paste(String),
     /// Stdin closed (reader thread exiting).
     Eof,
+    /// Terminal window resized; carries the new `(cols, rows)`.
+    /// The event loop forwards this to the renderer so the DECSTBM
+    /// scroll region can re-flow to the new height (footer stays
+    /// pinned at `[H - footer_rows + 1, H]`).
+    Resize(u16, u16),
 }

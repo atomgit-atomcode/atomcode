@@ -14,7 +14,7 @@ atomcode-tui = { path = "../atomcode-tui" }
 atomcode-tuix = { path = "../atomcode-tuix" }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
-crossterm = "0.28"
+crossterm = "0.29"
 tokio = { version = "1", features = ["full"] }
 url = "2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }

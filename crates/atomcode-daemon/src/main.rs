@@ -569,6 +569,11 @@ fn short_path(path: &str) -> String {
     }
 }
 
+fn sessions_dir() -> PathBuf {
+    SessionManager::sessions_root_dir()
+}
+
+
 fn hash_path(path: &std::path::Path) -> String {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};

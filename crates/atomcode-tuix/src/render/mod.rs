@@ -1,7 +1,10 @@
 // crates/atomcode-tuix/src/render/mod.rs
 pub mod theme;
-pub mod ansi;
+pub mod cell;
+pub mod screen;
 pub mod plain;
+pub mod retained;
+pub mod worker;
 
 use std::time::Duration;
 
@@ -83,6 +86,45 @@ pub trait Renderer: Send {
     /// tries to `erase_footer` at a position the terminal cursor is no
     /// longer at, corrupting every subsequent ANSI cursor move.
     fn reset(&mut self);
+
+    /// Wipe the physical terminal with `\x1b[2J\x1b[H` and flush.
+    /// **Does not** touch cached footer/stream state — callers that want a
+    /// full state wipe should call `reset()` instead. Use this when only
+    /// the visible scrollback should be cleared (e.g. the `/clear`
+    /// command after which the footer immediately redraws).
+    fn clear_screen(&mut self);
+
+    /// Hand the terminal off to a non-TUI child process (blocking OAuth
+    /// flow, `/shell`, etc.): disable raw mode + bracketed paste, finish
+    /// any pending writes. After this returns, the child is free to use
+    /// the terminal in cooked mode; `resume_from_external()` must be
+    /// called before any further `render()` calls.
+    fn suspend_for_external(&mut self);
+
+    /// Take the terminal back after `suspend_for_external()`: re-enable
+    /// raw mode + bracketed paste AND call `reset()` to wipe the cached
+    /// state (the child wrote to stdout in cooked mode, so our cursor
+    /// tracking is now lying).
+    fn resume_from_external(&mut self);
+
+    /// Paint any throttled payload that's been sitting in the deferred
+    /// queue past its throttle window. Called from the event loop on a
+    /// ~50fps timer so the "trailing edge" of a burst of input renders
+    /// actually lands — without this tick a lone stale payload would
+    /// stay invisible until the next unrelated render arrived.
+    ///
+    /// Implementations without throttling (e.g. PlainRenderer) can
+    /// treat this as a flush.
+    fn flush_deferred(&mut self);
+
+    /// Terminal window was resized to `(cols, rows)`. DECSTBM-based
+    /// renderers must re-issue the scroll region (`\x1b[1;H-N r`) so
+    /// the fixed footer stays pinned to the new bottom. Non-DECSTBM
+    /// renderers can treat this as a redraw hint or a no-op.
+    ///
+    /// Default is no-op — backends that don't care about geometry
+    /// (Plain, tests) don't need to override.
+    fn on_resize(&mut self, _cols: u16, _rows: u16) {}
 }
 
 /// Slash-command palette payload: filtered entries + which one is selected.

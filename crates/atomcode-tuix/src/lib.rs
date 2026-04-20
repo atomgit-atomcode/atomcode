@@ -4,11 +4,16 @@ pub mod commands;
 pub mod event_loop;
 pub mod input;
 pub mod markdown;
+pub mod modals;
+pub mod platform;
 pub mod render;
 pub mod sanitize;
 pub mod state;
 pub mod terminal;
+#[cfg(test)]
+pub mod test_term;
 pub mod think;
+pub mod trace;
 pub mod width;
 
 use anyhow::Result;
@@ -23,7 +28,7 @@ use crate::commands::CommandRegistry;
 use crate::event_loop::{run_loop, LoopCtx};
 use crate::input::history::History;
 use crate::input::reader;
-use crate::render::{ansi::AnsiRenderer, plain::PlainRenderer, Renderer};
+use crate::render::{plain::PlainRenderer, retained::RetainedRenderer, worker::TaskRenderer, Renderer};
 use crate::terminal::TerminalCaps;
 
 /// RAII guard: enables raw mode + bracketed paste on construction,
@@ -48,11 +53,14 @@ impl TerminalGuard {
             execute!(io::stdout(), EnableBracketedPaste)?;
             g.paste_enabled = true;
         }
-        // PURE APPEND ARCHITECTURE — no scroll region, no DECSTBM.
-        // Footer is drawn at the current cursor position; content writes
-        // erase and redraw the footer; terminal scrolls naturally when
-        // cursor reaches the bottom row. No region boundaries means no
-        // transition bugs.
+        // FIXED-FOOTER via DECSTBM. Scroll region `[1, H - footer_rows]`
+        // is set by `AnsiRenderer` the first time it paints the footer;
+        // body writes stream into that region while the footer stays
+        // pinned at `[H - footer_rows + 1, H]`. This guard only clears
+        // the screen on entry — the renderer owns scroll-region lifecycle
+        // during normal operation, and this guard's Drop is the
+        // belt-and-suspenders reset for panic / abrupt-exit paths where
+        // the renderer worker didn't get to run `shutdown()`.
         if caps.tty {
             let stdout = io::stdout();
             let mut out = stdout.lock();
@@ -66,8 +74,14 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         use std::io::Write as _;
-        // Ensure scroll region and autowrap reset defensively in case any
-        // renderer code emitted DECSTBM. Cursor to a fresh row for shell.
+        // Panic-safe final reset: `\x1b[?7h` re-enables autowrap (in
+        // case a footer paint was interrupted mid-`\x1b[?7l/h` bracket),
+        // `\x1b[r` releases any DECSTBM scroll region we set during
+        // normal operation, then a CRLF parks the cursor on a fresh
+        // line for the user's shell prompt. This runs even when the
+        // renderer worker crashed before `shutdown` could clean up,
+        // which is why it exists alongside the renderer's own
+        // `clear_scroll_region` in `shutdown`.
         let stdout = io::stdout();
         let mut out = stdout.lock();
         let _ = write!(out, "\x1b[?7h\x1b[r\r\n");
@@ -92,19 +106,35 @@ pub async fn run(
     let caps = TerminalCaps::probe();
     let _guard = TerminalGuard::activate(caps)?;
 
-    let mut renderer: Box<dyn Renderer> = if caps.tty {
-        Box::new(AnsiRenderer::new(caps))
+    // Pick the inner renderer by terminal capability, then wrap it in
+    // a `TaskRenderer` so all ANSI I/O happens on a dedicated OS thread.
+    // Slow terminals (Mac Terminal.app processing a 4KB footer payload)
+    // no longer block the event loop — the event loop sends `UiLine`s
+    // through a channel and moves on.
+    // TTY → retained-mode Ink-style cell-diff renderer.
+    // Non-TTY (pipe, CI, dumb terminal) → PlainRenderer, which
+    // just writes plain text without ANSI cursor positioning.
+    let inner: Box<dyn Renderer> = if caps.tty {
+        Box::new(RetainedRenderer::new(caps))
     } else {
         Box::new(PlainRenderer::new())
     };
+    let mut renderer: Box<dyn Renderer> = Box::new(TaskRenderer::new(inner));
 
-    // Input thread (only spawn when raw-mode/TTY available; pipe mode reads stdin directly)
+    // Input thread (only spawn when raw-mode/TTY available; pipe mode
+    // reads stdin directly). `reader_handle` exposes Pause / Resume so
+    // the OAuth login flow (and any future child-process handoff) can
+    // stop us from racing the child for stdin bytes. Pipe mode doesn't
+    // need that — no browser handoff there — so it stays as a plain
+    // JoinHandle held separately.
     let (input_tx, input_rx) = mpsc::unbounded_channel();
-    let reader_handle = if caps.raw_mode {
-        Some(reader::spawn(input_tx.clone()))
+    let mut reader_handle: Option<reader::ReaderHandle> = None;
+    let mut pipe_reader: Option<std::thread::JoinHandle<()>> = None;
+    if caps.raw_mode {
+        reader_handle = Some(reader::spawn(input_tx.clone()));
     } else {
         // For pipe mode, spawn a line-based reader on a blocking thread.
-        Some(std::thread::spawn(move || {
+        pipe_reader = Some(std::thread::spawn(move || {
             use std::io::BufRead;
             let stdin = std::io::stdin();
             let lock = stdin.lock();
@@ -125,12 +155,16 @@ pub async fn run(
                 }
             }
             let _ = input_tx.send(input::InputEvent::Eof);
-        }))
+        }));
     };
 
+    // `default_path()` now always returns Some (tempdir fallback lives
+    // inside `platform::history_path`), so the explicit else-branch
+    // with a hardcoded Unix path is gone — Windows used to fall here
+    // and then fail to write to `/tmp`.
     let history = History::default_path()
         .map(History::load)
-        .unwrap_or_else(|| History::load(std::path::PathBuf::from("/tmp/atomcode-history")));
+        .unwrap_or_else(|| History::load(crate::platform::history_path()));
 
     let session_manager = atomcode_core::session::SessionManager::new(&working_dir);
 
@@ -166,12 +200,13 @@ pub async fn run(
         session_manager,
         update_hint,
         wake_rx,
+        reader: reader_handle,
     };
 
     let result = run_loop(ctx, renderer.as_mut()).await;
 
     renderer.shutdown();
-    drop(reader_handle); // thread exits on next channel send failure
+    drop(pipe_reader); // pipe-mode thread exits on next channel send failure
 
     result
 }

@@ -32,6 +32,12 @@ pub struct TerminalCaps {
     pub bracketed_paste: bool,
     /// Raw mode for key-by-key input.
     pub raw_mode: bool,
+    /// DECSTBM scroll region support (`\x1b[top;bot r`) — lets us pin a
+    /// fixed-footer area at the bottom and have streaming content scroll
+    /// only in the upper region. VT100+ standard; supported by every
+    /// modern emulator (Terminal.app, iTerm2, Alacritty, WezTerm, Windows
+    /// Terminal, tmux). Disabled on dumb terminals and non-TTY contexts.
+    pub scroll_region: bool,
 }
 
 impl TerminalCaps {
@@ -44,6 +50,7 @@ impl TerminalCaps {
             spinner: tty && !is_dumb,
             bracketed_paste: tty && !is_dumb,
             raw_mode: tty && !is_dumb,
+            scroll_region: tty && !is_dumb,
         }
     }
 

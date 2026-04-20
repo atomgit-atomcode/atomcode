@@ -160,11 +160,11 @@ struct ChunkChoice {
 #[derive(Deserialize)]
 struct ChunkDelta {
     content: Option<String>,
-    /// MiniMax M2.7 / DeepSeek R1 send thinking via this field.
-    /// We parse it to prevent it from leaking into `content` (some providers
-    /// fall back to stuffing reasoning into content when this field is absent
-    /// from the request schema). Parsed but intentionally not forwarded to UI.
-    #[allow(dead_code)]
+    /// MiniMax M2.7 / DeepSeek R1 send thinking via this field. We forward
+    /// it as `StreamEvent::Reasoning` so `TurnRunner` can promote it to
+    /// the final text if `content` ends up empty — some gateways route
+    /// *entire* responses to `reasoning_content` for these models, which
+    /// previously showed up as a silent 0-token "Nailed it" turn.
     reasoning_content: Option<String>,
     tool_calls: Option<Vec<DeltaToolCall>>,
 }
@@ -310,6 +310,11 @@ impl LlmProvider for OpenAiProvider {
                                 if let Some(content) = choice.delta.content {
                                     if !content.is_empty() {
                                         let _ = tx.send(Ok(StreamEvent::Delta(content)));
+                                    }
+                                }
+                                if let Some(reasoning) = choice.delta.reasoning_content {
+                                    if !reasoning.is_empty() {
+                                        let _ = tx.send(Ok(StreamEvent::Reasoning(reasoning)));
                                     }
                                 }
                                 if let Some(delta_tcs) = &choice.delta.tool_calls {

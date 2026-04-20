@@ -6,12 +6,14 @@ edition.workspace = true
 [dependencies]
 atomcode-core = { path = "../atomcode-core" }
 anyhow = "1"
-crossterm = "0.28"
+crossterm = "0.29"
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
 serde_json = "1"
 unicode-width = "0.2"
 unicode-segmentation = "1"
 libc = "0.2"
+dirs = "6"
 
 [dev-dependencies]
 tempfile = "3"
+vte = "0.15.0"

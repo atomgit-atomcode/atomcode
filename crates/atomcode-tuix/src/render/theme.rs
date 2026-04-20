@@ -33,7 +33,7 @@ impl Palette {
     pub const BRAND: Color = Color::Magenta;      // bright magenta (95)
     pub const MUTED: Color = Color::DarkGrey;     // bright black / mid-gray (90)
     pub const ACCENT: Color = Color::Cyan;        // bright cyan (96)
-    pub const BORDER: Color = Color::DarkGrey;    // same grey as muted
+    pub const BORDER: Color = Color::Cyan;        // bright cyan (96) — 蓝绿色边框，和 Accent/prompt glyph 视觉呼应，对比度高于 DarkGrey 不易被背景吞掉
     pub const WARNING: Color = Color::Yellow;     // bright yellow (93)
     pub const ERROR: Color = Color::Red;          // bright red (91)
     pub const DIFF_ADD: Color = Color::Green;     // bright green (92)
