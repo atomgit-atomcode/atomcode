@@ -1225,6 +1225,19 @@ mod tests {
         (r, buf)
     }
 
+    /// Phase 7 harness: drain the capture sink's accumulated
+    /// ANSI bytes into the virtual terminal so `vterm.cell_at` /
+    /// `row_text` / `dump` reflect the post-paint on-screen state.
+    /// The sink is left empty afterwards so subsequent renders
+    /// accumulate their own bytes for another feed cycle.
+    fn drain_into_vterm(
+        buf: &Arc<Mutex<Vec<u8>>>,
+        vterm: &mut crate::test_term::VirtualTerminal,
+    ) {
+        let bytes: Vec<u8> = std::mem::take(&mut *buf.lock().unwrap());
+        vterm.feed(&bytes);
+    }
+
     fn sample(c: &Arc<AtomicU64>) -> u64 {
         c.load(Ordering::Relaxed)
     }
@@ -1457,6 +1470,66 @@ mod tests {
         r.flush_deferred();
         let idle_bytes = sample(&counter) - before_idle;
         assert_eq!(idle_bytes, 0, "idle tick should emit 0 bytes");
+    }
+
+    /// Phase 7 exemplar: end-to-end render through VirtualTerminal.
+    /// Verifies the same bot_rule invariant as the sibling test
+    /// below — but asserts on the grid the terminal would actually
+    /// paint (derived from our ANSI byte stream), not on the cell
+    /// buffer we emitted from. This is the shape of test that
+    /// catches "cells right, screen wrong" bugs like the Mac
+    /// Terminal byte-drop issue.
+    #[test]
+    fn retained_bot_rule_full_width_after_wrap_via_vterm() {
+        let (mut r, buf) = new_capturing(40, 24);
+        let mut vterm = crate::test_term::VirtualTerminal::new(40, 24);
+        let status = status_basic();
+
+        // Frame 1: short input → 1-row middle.
+        r.render(UiLine::InputPrompt {
+            buf: "hi".into(),
+            cursor_byte: 2,
+            menu: None,
+            status: status.clone(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // Frame 2: long input → 2-row middle. Footer grows from 5
+        // to 6, bot_rule moves from row H-2 to row H-2 (same), but
+        // top_rule's emit path passes through rows that previously
+        // held body content.
+        let long: String = std::iter::repeat('中').take(40).collect();
+        r.render(UiLine::InputPrompt {
+            buf: long.clone(),
+            cursor_byte: long.len(),
+            menu: None,
+            status: status.clone(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // bot_rule is always at absolute row H-2 = 22 (0-indexed).
+        // PAD_COL(2) + rule_width(40-4=36) — so cols 2..=37 should
+        // be '─' on the screen. Cols 0..2 and 38..40 are blank.
+        let bot_rule_row = 22;
+        for col in 0..40usize {
+            let cell = vterm.cell_at(bot_rule_row, col);
+            if (2..38).contains(&col) {
+                assert_eq!(
+                    cell.ch, '─',
+                    "bot_rule col {} (expected '─') shows {:?}\n\
+                     full grid dump:\n{}",
+                    col, cell, vterm.dump()
+                );
+            } else {
+                assert_eq!(
+                    cell.ch, ' ',
+                    "padding col {} (expected blank) shows {:?}",
+                    col, cell
+                );
+            }
+        }
     }
 
     /// Regression: user reports bot_rule row visibly shortens when

@@ -10,6 +10,8 @@ pub mod render;
 pub mod sanitize;
 pub mod state;
 pub mod terminal;
+#[cfg(test)]
+pub mod test_term;
 pub mod think;
 pub mod trace;
 pub mod width;
