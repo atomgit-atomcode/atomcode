@@ -354,8 +354,7 @@ impl App {
            total_tokens: 0,
            turn_tokens: 0,
            ctx_used_tokens: 0,
-           context_window: config.providers.get(&config.default_provider)
-               .map(|p| p.context_window).unwrap_or(128000),
+           context_window: config.default_context_window(),
            render_cache: Vec::new(),
            render_cache_msg_count: 0,
            selection: TextSelection::new(),

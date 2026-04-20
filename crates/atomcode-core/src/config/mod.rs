@@ -121,6 +121,17 @@ fn render_datalog_section(cfg: &DatalogConfig) -> String {
 }
 
 impl Config {
+    /// Context window of the currently-selected default provider.
+    /// Falls back to 128_000 when the default_provider is missing or
+    /// has no provider entry — matches pre-existing behavior at the
+    /// ~5 sites that previously open-coded this lookup.
+    pub fn default_context_window(&self) -> usize {
+        self.providers
+            .get(&self.default_provider)
+            .map(|p| p.context_window)
+            .unwrap_or(128_000)
+    }
+
     pub fn load(path: &Path) -> Result<Self> {
         let content = std::fs::read_to_string(path)
             .with_context(|| format!("Failed to read config: {}", path.display()))?;

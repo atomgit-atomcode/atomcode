@@ -72,12 +72,7 @@ impl TurnRunner {
         allowed_tools: Option<&[&str]>,
     ) -> TurnResult {
         // 1. Build messages within token budget
-        let context_window = self
-            .config
-            .providers
-            .get(&self.config.default_provider)
-            .map(|p| p.context_window)
-            .unwrap_or(128000);
+        let context_window = self.config.default_context_window();
 
         let (mut messages, ctx_stats) =
             conversation.to_provider_messages_budgeted(system_prompt, context_window);

@@ -138,11 +138,7 @@ impl AgentLoop {
     /// Post-process tool results added by TurnRunner: truncate large outputs,
     /// then extract file paths from error output and pre-read them.
     pub(crate) fn post_process_tool_results(&mut self, tool_count: usize) {
-        let context_window = self.config
-            .providers
-            .get(&self.config.default_provider)
-            .map(|p| p.context_window)
-            .unwrap_or(128000);
+        let context_window = self.config.default_context_window();
         crate::ctx::truncate::post_process_tool_results(
             &mut self.conversation.messages,
             tool_count,

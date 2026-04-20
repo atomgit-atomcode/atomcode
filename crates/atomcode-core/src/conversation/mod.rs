@@ -1,6 +1,15 @@
 pub mod message;
 pub mod turn;
 
+/// Number of recent messages kept at full fidelity during compression.
+/// The compression path condenses everything BEFORE the last
+/// `KEEP_MESSAGES` messages into a one-line-per-round summary.
+///
+/// Consumed by `build_compression_content` (producer) and by any
+/// `CtxBuilder` impl that needs to preserve the same "keep recent"
+/// semantics when formulating its compression plan.
+pub(crate) const KEEP_MESSAGES: usize = 20;
+
 use crate::tool::{ToolCall, ToolCallBuffer, ToolResult};
 use message::{Message, MessageContent, Role};
 use turn::TurnTracker;
@@ -463,8 +472,6 @@ impl Conversation {
     /// counts user messages (1 user msg = 1 turn) but a single user message
     /// can produce 15+ LLM calls with 35+ messages.
     pub fn build_compression_content(&self) -> (String, usize) {
-        const KEEP_MESSAGES: usize = 20;
-
         if self.messages.len() <= KEEP_MESSAGES {
             return (String::new(), 0);
         }

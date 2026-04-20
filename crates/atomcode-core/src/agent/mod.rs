@@ -614,10 +614,7 @@ impl AgentLoop {
         // Without this, the first tool call in a new turn reads the stale budget
         // from the previous turn's last LLM call (when ctx was full), causing
         // 670-line files to skeleton when there's plenty of room.
-        let ctx_window = self.config.providers
-            .get(&self.config.default_provider)
-            .map(|p| p.context_window)
-            .unwrap_or(128000);
+        let ctx_window = self.config.default_context_window();
         self.turn_runner.context.ctx_budget_hint.store(
             ctx_window,
             std::sync::atomic::Ordering::Relaxed,
@@ -706,8 +703,7 @@ impl AgentLoop {
         // Initialize datalog for this turn
         {
             let model_name = self.turn_runner.provider.model_name().to_string();
-            let ctx_window = self.config.providers.get(&self.config.default_provider)
-                .map(|p| p.context_window).unwrap_or(128000);
+            let ctx_window = self.config.default_context_window();
             self.datalog.begin_turn(&content, &model_name, ctx_window);
         }
 
@@ -807,11 +803,7 @@ impl AgentLoop {
 
             // Log LLM request to <working_dir>/datalog/llm/ — colocated with turn .md files.
             {
-                let context_window = self.config
-                    .providers
-                    .get(&self.config.default_provider)
-                    .map(|p| p.context_window)
-                    .unwrap_or(128000);
+                let context_window = self.config.default_context_window();
                 let (msgs, _) = conv.to_provider_messages_budgeted(&system_prompt, context_window);
                 let tool_defs = self.turn_runner.tools.get_definitions();
                 let wd = self.turn_runner.context.working_dir
@@ -1444,11 +1436,7 @@ impl AgentLoop {
     /// Pauses the task, calls LLM to summarize, stores in cold zone.
     /// Falls back to mechanical compression if LLM fails.
     async fn maybe_compress_history(&mut self, system_prompt: &str) {
-        let context_window = self.config
-            .providers
-            .get(&self.config.default_provider)
-            .map(|p| p.context_window)
-            .unwrap_or(128000);
+        let context_window = self.config.default_context_window();
 
         let sys_tokens = system_prompt.len() / 4 + 4;
         if !self.conversation.needs_compression(sys_tokens, context_window) {
