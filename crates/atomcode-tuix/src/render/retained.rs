@@ -27,6 +27,7 @@ use super::theme::{role, Role};
 use super::{MenuPayload, Renderer, StatusLine, UiLine};
 use crate::sanitize::scrub_controls;
 use crate::terminal::TerminalCaps;
+use crossterm::style::Color;
 
 const PAD_COL: usize = 2;
 
@@ -35,6 +36,131 @@ fn format_token_count(n: usize) -> String {
         format!("{} tokens", n)
     } else {
         format!("{:.1}k tokens", (n as f64) / 1000.0)
+    }
+}
+
+// ── Markdown → Cell parser ─────────────────────────────────────────
+//
+// `crate::markdown::render_line` returns an ANSI-tinted string: the
+// markdown text with SGR escapes embedded (e.g. `**bold**` →
+// `\x1b[1mbold\x1b[22m`, `` `code` `` → `\x1b[96mcode\x1b[39m`).
+// AnsiRenderer wrote those bytes straight to stdout. Retained mode
+// works on `Cell`s, so we parse the ANSI string back into a stream
+// of cells carrying their computed style. Minimal parser — handles
+// only the SGR vocabulary our markdown crate emits:
+//
+//   1     bold on
+//   22    bold off
+//   3     italic on   (folded — CellStyle has no italic bit, so
+//                      italic text renders plain. Same visual loss
+//                      we'd have without markdown support at all;
+//                      acceptable for Phase 6.)
+//   23    italic off
+//   7     reverse on
+//   27    reverse off
+//   39    fg default
+//   90    fg DarkGrey (borders / soft headings)
+//   96    fg Cyan (inline code / code blocks)
+//   0     reset everything
+//
+// Other SGR params (RGB, 256-color, italic, underline) are silently
+// ignored — the glyph still renders with the current accumulated
+// style. CSI sequences with a non-`m` final byte are skipped whole.
+
+/// Parse an ANSI-tinted markdown string into one or more cell
+/// lines, split on `\n`. Wide glyphs get one real cell + N-1
+/// `Cell::continuation()` cells so `cell_index == terminal_column`
+/// stays true.
+fn parse_markdown_to_cells(s: &str) -> Vec<Vec<Cell>> {
+    let mut lines: Vec<Vec<Cell>> = vec![Vec::new()];
+    let mut style = CellStyle::default();
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            if chars.peek() == Some(&'[') {
+                chars.next(); // consume '['
+                let mut params = String::new();
+                while let Some(&p) = chars.peek() {
+                    chars.next();
+                    if p.is_ascii_alphabetic() || p == '~' {
+                        if p == 'm' {
+                            apply_sgr(&params, &mut style);
+                        }
+                        break;
+                    }
+                    params.push(p);
+                }
+            }
+            continue;
+        }
+        if c == '\n' {
+            lines.push(Vec::new());
+            continue;
+        }
+        let w = unicode_width::UnicodeWidthChar::width(c).unwrap_or(1);
+        if w == 0 {
+            continue;
+        }
+        lines.last_mut().unwrap().push(Cell {
+            ch: c,
+            style: style.clone(),
+            width: w as u8,
+        });
+        for _ in 1..w {
+            lines.last_mut().unwrap().push(Cell::continuation());
+        }
+    }
+    lines
+}
+
+/// Cell-based wrap: splits a cell sequence into chunks whose sum
+/// of `cell.width` stays ≤ `max_cols`. Continuation cells (width 0)
+/// travel with their preceding real cell — the combined "grapheme"
+/// never splits mid-wide-glyph.
+fn wrap_cells_to_width(cells: &[Cell], max_cols: usize) -> Vec<Vec<Cell>> {
+    if max_cols == 0 || cells.is_empty() {
+        return vec![cells.to_vec()];
+    }
+    let mut chunks: Vec<Vec<Cell>> = vec![Vec::new()];
+    let mut cur_width = 0usize;
+    for cell in cells {
+        let w = cell.width as usize;
+        if w > 0 && cur_width + w > max_cols && !chunks.last().unwrap().is_empty() {
+            chunks.push(Vec::new());
+            cur_width = 0;
+        }
+        chunks.last_mut().unwrap().push(cell.clone());
+        cur_width += w;
+    }
+    chunks
+}
+
+fn apply_sgr(params: &str, style: &mut CellStyle) {
+    // `\x1b[m` (empty params) is treated as SGR 0 per ECMA-48.
+    let parts: Vec<&str> = if params.is_empty() {
+        vec!["0"]
+    } else {
+        params.split(';').collect()
+    };
+    for part in parts {
+        match part.parse::<u32>().ok() {
+            Some(0) => *style = CellStyle::default(),
+            Some(1) => style.bold = true,
+            Some(22) => style.bold = false,
+            // Italic (3/23) — no CellStyle bit; text renders plain.
+            Some(3) | Some(23) => {}
+            Some(7) => style.reverse = true,
+            Some(27) => style.reverse = false,
+            Some(39) => style.fg = None,
+            Some(90) => style.fg = Some(Color::DarkGrey),
+            Some(96) => style.fg = Some(Color::Cyan),
+            _ => {
+                // Other colors (30-37, 91-97, 38;5;N, 38;2;R;G;B, bg,
+                // underline) silently ignored — our markdown crate
+                // doesn't emit them, and expanding CellStyle to cover
+                // them is out of scope for Phase 6.
+            }
+        }
     }
 }
 
@@ -58,6 +184,10 @@ pub struct RetainedRenderer<W: Write + Send> {
     /// here until a `\n` boundary, at which point the completed
     /// physical line is appended to `body_lines`.
     assistant_line_buf: String,
+    /// Markdown parser state (code-block tracking, table row
+    /// buffering) passed to `crate::markdown::render_line` on each
+    /// completed assistant line.
+    md_state: crate::markdown::MdState,
     // ── Phase 5: frame coalescing ──
     /// True when widget state has changed since the last frame
     /// emit. `render()` flips this to true instead of painting
@@ -101,6 +231,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             status: StatusLine::default(),
             body_lines: Vec::new(),
             assistant_line_buf: String::new(),
+            md_state: crate::markdown::MdState::new(),
             dirty: false,
             last_painted_footer_rows: 0,
         }
@@ -520,27 +651,65 @@ impl<W: Write + Send> RetainedRenderer<W> {
     }
 
     /// Flush complete lines (those terminated by `\n`) from the
-    /// streaming assistant buffer into `body_lines`. Partial
-    /// tail stays in the buffer for the next delta.
+    /// streaming assistant buffer into `body_lines`, rendering
+    /// each through the markdown inline renderer so bold / inline
+    /// code / lists / headings get their styled cells.
     fn flush_assistant_lines(&mut self) {
+        if !self.assistant_line_buf.contains('\n') {
+            return;
+        }
+        let mut completed: Vec<String> = Vec::new();
         while let Some(nl) = self.assistant_line_buf.find('\n') {
             let line: String = self.assistant_line_buf.drain(..=nl).collect();
-            // Drop the trailing '\n'.
-            let content = &line[..line.len() - 1];
-            // Markdown rendering deferred — Phase 4 emits plain
-            // text; Phase 5+ adds inline markdown.
-            let safe = scrub_controls(content);
-            self.push_body_text(&safe, &CellStyle::default());
+            let content = line[..line.len() - 1].to_string();
+            if let Some(rendered) =
+                crate::markdown::render_line(&content, &mut self.md_state, self.caps)
+            {
+                completed.push(rendered);
+            }
+        }
+        for rendered in completed {
+            self.push_markdown_body(&rendered);
         }
     }
 
     /// Turn the partial buffer into a body row (as if `\n`
     /// terminated). Called on AssistantLineBreak / TurnComplete.
+    /// Also drains any trailing markdown block buffer (tables that
+    /// ended without a following non-table line).
     fn flush_assistant_remainder(&mut self) {
         if !self.assistant_line_buf.is_empty() {
             let line = std::mem::take(&mut self.assistant_line_buf);
-            let safe = scrub_controls(&line);
-            self.push_body_text(&safe, &CellStyle::default());
+            if let Some(rendered) =
+                crate::markdown::render_line(&line, &mut self.md_state, self.caps)
+            {
+                self.push_markdown_body(&rendered);
+            }
+        }
+        if let Some(block) = crate::markdown::finalize(&mut self.md_state, self.caps) {
+            self.push_markdown_body(&block);
+        }
+    }
+
+    /// Parse a markdown-rendered string (ANSI-tinted) into cells
+    /// and push each wrapped line to body history. Wrap is done
+    /// at cell level (not byte level) so wide glyphs and SGR
+    /// state survive the split.
+    fn push_markdown_body(&mut self, rendered: &str) {
+        let w = (self.screen.width() as usize).saturating_sub(PAD_COL * 2);
+        if w == 0 {
+            return;
+        }
+        let lines_of_cells = parse_markdown_to_cells(rendered);
+        for line_cells in lines_of_cells {
+            let chunks = wrap_cells_to_width(&line_cells, w);
+            for chunk in chunks {
+                let mut row = Vec::new();
+                let pad = CellStyle::default();
+                push_str_cells(&mut row, &" ".repeat(PAD_COL), &pad);
+                row.extend(chunk);
+                self.push_body_row(row);
+            }
         }
     }
 
@@ -660,6 +829,9 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 self.push_body_prefixed("❯ ", &accent, &safe, &plain);
                 // Blank spacer row.
                 self.push_body_row(Vec::new());
+                // New user turn — reset markdown parser so code-block
+                // / table state from previous turn doesn't bleed.
+                self.md_state.reset();
             }
             UiLine::TurnSeparator { label } => {
                 let w = (self.screen.width() as usize).saturating_sub(PAD_COL * 2);
@@ -840,6 +1012,8 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         self.screen = Screen::new(self.screen.width(), self.screen.height());
         self.body_lines.clear();
         self.assistant_line_buf.clear();
+        self.md_state.reset();
+        self.last_painted_footer_rows = 0;
         let _ = self.out.flush();
     }
 
@@ -920,7 +1094,26 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
             self.paint_frame();
             let bytes = self.screen.render_diff();
             let emit_len = bytes.len();
-            let _ = self.out.write_all(&bytes);
+            // Chunked emit: Mac Terminal.app has been observed to drop
+            // bytes mid-sequence when a single write carries ~1KB+ of
+            // mixed CSI+SGR+UTF-8 — the bot_rule "shortens" bug. Split
+            // into 512-byte chunks with a flush in between so each
+            // chunk reaches the terminal as its own parse cycle.
+            // Trade-off: +N syscalls per frame. Typical frame 50-200B
+            // fits in one chunk; only wrap / menu / cold-start frames
+            // (~1-2KB) incur 2-4 chunks. Still single-digit ms.
+            const CHUNK: usize = 512;
+            let mut offset = 0;
+            while offset < bytes.len() {
+                let end = (offset + CHUNK).min(bytes.len());
+                let _ = self.out.write_all(&bytes[offset..end]);
+                if end < bytes.len() {
+                    // Inter-chunk flush; the final-chunk flush is at
+                    // the end of this method.
+                    let _ = self.out.flush();
+                }
+                offset = end;
+            }
             self.dirty = false;
             // Diagnostic: count how many cells on the bot_rule row
             // (screen_h - 2, 0-indexed) actually hold '─'. bot_rule
