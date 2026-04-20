@@ -1,32 +1,43 @@
 //! Context construction strategies — one entry point per model/provider.
 //!
-//! The top of the module exposes a single [`CtxBuilder`] trait. Each
-//! concrete impl (e.g. [`DefaultCtx`]) decides how to assemble the
-//! messages array sent to the LLM for a given session.
+//! This module owns the [`CtxBuilder`] trait and the registry function
+//! [`for_provider`] (defined in [`resolver`]). Each concrete builder
+//! lives in its own file to keep [`mod.rs`](self) thin:
 //!
-//! When no per-model logic is needed, [`DefaultCtx`] preserves the
-//! legacy behavior of `Conversation::to_provider_messages_budgeted`.
-//! Users wanting to customize context for a specific model:
+//! | File               | Role                                              |
+//! |--------------------|---------------------------------------------------|
+//! | `strategy` (here)  | `CtxBuilder` trait definition                     |
+//! | `resolver.rs`      | `for_provider` dispatch (add new models here)     |
+//! | `default.rs`       | `DefaultCtx` — legacy-equivalent fallback         |
+//! | `ollama.rs`        | `OllamaCtx` — small-window local models           |
+//! | `truncate.rs`      | Shared per-tool truncation helpers                |
 //!
-//! 1. Add a new file `ctx/foo.rs` with a struct implementing
-//!    [`CtxBuilder`].
-//! 2. Register it in [`for_provider`] with a prefix / provider match.
+//! Adding a new per-model ctx strategy:
+//!
+//! 1. Create `ctx/<name>.rs` with a `pub struct XxxCtx` and
+//!    `impl CtxBuilder for XxxCtx`. Keep all ctor + tests + impl
+//!    methods in that single file.
+//! 2. Declare `pub mod <name>;` below.
+//! 3. Register in `resolver::for_provider`.
 //!
 //! The trait is narrow on purpose: `build_messages` owns the full
 //! render path for its model, including any system-prompt variation,
 //! cold-zone handling, or tool-schema trimming. The shared
-//! [`crate::ctx::truncate`] module offers building blocks that impls
-//! may call or ignore at will.
+//! [`truncate`] module offers building blocks that impls may call or
+//! ignore at will.
 
 pub mod default;
+pub mod ollama;
+pub mod resolver;
 pub mod truncate;
 
-use crate::config::provider::ProviderConfig;
 use crate::conversation::{ContextStats, Conversation};
 use crate::conversation::message::Message;
 use crate::tool::ToolResult;
 
 pub use default::DefaultCtx;
+pub use ollama::OllamaCtx;
+pub use resolver::for_provider;
 
 /// Per-session context construction strategy. Selected once at
 /// `AgentLoop::new` via [`for_provider`] and rebuilt on `ReloadConfig`.
@@ -61,25 +72,4 @@ pub trait CtxBuilder: Send + Sync {
 
     /// Human-readable name for logging / debugging.
     fn name(&self) -> &'static str;
-}
-
-/// Resolve the [`CtxBuilder`] for a given provider configuration.
-///
-/// Add new per-model implementations by inserting a match arm BEFORE
-/// the final `DefaultCtx` fallback. Example:
-///
-/// ```text
-/// if provider.provider_type == "ollama" {
-///     return Box::new(OllamaCtx::new(provider));
-/// }
-/// if provider.model.starts_with("claude-") {
-///     return Box::new(ClaudeCtx::new(provider));
-/// }
-/// ```
-///
-/// Unmatched models always fall through to [`DefaultCtx`], which
-/// preserves the current behavior unchanged.
-pub fn for_provider(provider: &ProviderConfig) -> Box<dyn CtxBuilder> {
-    // 未命中任何具体模型规则 → 默认策略
-    Box::new(DefaultCtx::new(provider))
 }
