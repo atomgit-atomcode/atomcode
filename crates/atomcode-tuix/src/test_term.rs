@@ -204,13 +204,19 @@ impl VirtualTerminal {
             self.style = Style::default();
             return;
         }
-        for param in params.iter() {
-            // Most SGR codes live in a single-element sub-param;
-            // compound codes like `38;5;N` would need multi-element
-            // handling but retained doesn't emit those yet.
-            let Some(&code) = param.first() else {
-                continue;
-            };
+        // Flatten to a linear code stream — SGR 38/48 are
+        // compound (38;5;N or 38;2;R;G;B) and need a sliding
+        // window read. Each param in vte's `Params` is a
+        // sub-group (semicolon-separated in CSI), and we only
+        // ever use its first element (crossterm never emits
+        // colon-separated sub-params).
+        let codes: Vec<u16> = params
+            .iter()
+            .filter_map(|p| p.first().copied())
+            .collect();
+        let mut i = 0;
+        while i < codes.len() {
+            let code = codes[i];
             match code {
                 0 => self.style = Style::default(),
                 1 => self.style.bold = true,
@@ -218,28 +224,56 @@ impl VirtualTerminal {
                 7 => self.style.reverse = true,
                 27 => self.style.reverse = false,
                 39 => self.style.fg = None,
-                30 => self.style.fg = Some(Color::Black),
-                31 => self.style.fg = Some(Color::DarkRed),
-                32 => self.style.fg = Some(Color::DarkGreen),
-                33 => self.style.fg = Some(Color::DarkYellow),
-                34 => self.style.fg = Some(Color::DarkBlue),
-                35 => self.style.fg = Some(Color::DarkMagenta),
-                36 => self.style.fg = Some(Color::DarkCyan),
-                37 => self.style.fg = Some(Color::Grey),
-                90 => self.style.fg = Some(Color::DarkGrey),
-                91 => self.style.fg = Some(Color::Red),
-                92 => self.style.fg = Some(Color::Green),
-                93 => self.style.fg = Some(Color::Yellow),
-                94 => self.style.fg = Some(Color::Blue),
-                95 => self.style.fg = Some(Color::Magenta),
-                96 => self.style.fg = Some(Color::Cyan),
-                97 => self.style.fg = Some(Color::White),
-                // Italic (3/23), underline (4/24), bg (40-47, 100-107),
-                // 256-color (38;5;N), truecolor (38;2;R;G;B) — retained
-                // doesn't emit any of these yet; no-op is fine.
+                30..=37 => self.style.fg = Some(ansi16_color(code - 30)),
+                90..=97 => self.style.fg = Some(ansi16_color((code - 90) + 8)),
+                38 => {
+                    // Extended fg. `38;5;N` = 256-color indexed,
+                    // `38;2;R;G;B` = truecolor. crossterm emits
+                    // 38;5;N for basic Color variants (Red, Cyan,
+                    // etc.) rather than the short 91/96 form.
+                    if i + 2 < codes.len() && codes[i + 1] == 5 {
+                        self.style.fg =
+                            Some(ansi16_color(codes[i + 2]));
+                        i += 2;
+                    } else if i + 4 < codes.len() && codes[i + 1] == 2 {
+                        let r = codes[i + 2] as u8;
+                        let g = codes[i + 3] as u8;
+                        let b = codes[i + 4] as u8;
+                        self.style.fg = Some(Color::Rgb { r, g, b });
+                        i += 4;
+                    }
+                }
+                // Italic (3/23), underline (4/24), bg (40-47, 100-107)
+                // and other SGR codes retained doesn't emit — no-op.
                 _ => {}
             }
+            i += 1;
         }
+    }
+}
+
+/// 0..=15 → crossterm basic Color enum. Values beyond 15 become
+/// `Color::AnsiValue(n)` so the caller can still distinguish them
+/// in assertions without us dragging in a 256-color palette.
+fn ansi16_color(idx: u16) -> Color {
+    match idx {
+        0 => Color::Black,
+        1 => Color::DarkRed,
+        2 => Color::DarkGreen,
+        3 => Color::DarkYellow,
+        4 => Color::DarkBlue,
+        5 => Color::DarkMagenta,
+        6 => Color::DarkCyan,
+        7 => Color::Grey,
+        8 => Color::DarkGrey,
+        9 => Color::Red,
+        10 => Color::Green,
+        11 => Color::Yellow,
+        12 => Color::Blue,
+        13 => Color::Magenta,
+        14 => Color::Cyan,
+        15 => Color::White,
+        n => Color::AnsiValue(n as u8),
     }
 }
 

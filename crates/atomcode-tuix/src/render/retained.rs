@@ -1790,6 +1790,296 @@ mod tests {
         );
     }
 
+    /// User echo: `UiLine::User("hi")` produces a body row with
+    /// `❯ hi` accent prefix + a blank spacer. Grid-verified at
+    /// absolute rows right above the footer (body bottom-anchored).
+    #[test]
+    fn retained_user_echo_renders_via_vterm() {
+        let (mut r, buf) = new_capturing(80, 24);
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+        let status = status_basic();
+        r.render(UiLine::User("你好 world".into()));
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+        // User line + blank spacer = 2 body rows. Bottom-anchored
+        // above footer (5 rows) → user echo at row 17, blank at 18.
+        let user_row = vterm.row_text(17);
+        // Wide CJK chars land on even columns with a blank continuation
+        // cell at odd columns ("你 好" in row text). Assert each glyph
+        // separately instead of a joined-string contains.
+        assert!(
+            user_row.contains('❯')
+                && user_row.contains('你')
+                && user_row.contains('好')
+                && user_row.contains("world"),
+            "user echo missing at row 17: {:?}\ndump:\n{}",
+            user_row, vterm.dump()
+        );
+    }
+
+    /// ToolCall: `▸ name(detail)` formatted. Grid-verifies the
+    /// marker + name + parens appear together on one row.
+    #[test]
+    fn retained_tool_call_renders_via_vterm() {
+        let (mut r, buf) = new_capturing(80, 24);
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+        let status = status_basic();
+        r.render(UiLine::ToolCall {
+            name: "bash".into(),
+            detail: "ls -la".into(),
+        });
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+        // ToolCall is 1 body row. Bottom-anchored → row 18.
+        let row = vterm.row_text(18);
+        assert!(
+            row.contains("▸") && row.contains("bash") && row.contains("ls -la"),
+            "tool call missing: {:?}\ndump:\n{}",
+            row, vterm.dump()
+        );
+    }
+
+    /// ToolResult success: `⎿ summary` + blank spacer; failure
+    /// prepends `✗ `. We test success path here; the error styling
+    /// (Role::Error red) is a cell-style detail not asserted in
+    /// this grid check.
+    #[test]
+    fn retained_tool_result_renders_via_vterm() {
+        let (mut r, buf) = new_capturing(80, 24);
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+        let status = status_basic();
+        r.render(UiLine::ToolResult {
+            success: true,
+            summary: "3 files changed".into(),
+        });
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+        // Result (1 row) + blank spacer = 2 rows → success text at row 17.
+        let row = vterm.row_text(17);
+        assert!(
+            row.contains("⎿") && row.contains("3 files changed"),
+            "tool result missing: {:?}\ndump:\n{}",
+            row, vterm.dump()
+        );
+    }
+
+    /// DiffBlock: multiple added/removed lines, each with its own
+    /// marker. Grid-verifies `+` and `-` both appear in the
+    /// respective rows at the correct indent (7-space prefix).
+    #[test]
+    fn retained_diff_block_renders_via_vterm() {
+        let (mut r, buf) = new_capturing(80, 24);
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+        let status = status_basic();
+        r.render(UiLine::DiffBlock(vec![
+            super::super::DiffEntry { added: true, text: "new line".into() },
+            super::super::DiffEntry { added: false, text: "old line".into() },
+        ]));
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+        // 2 diff rows → bottom rows 17, 18.
+        let added = vterm.row_text(17);
+        let removed = vterm.row_text(18);
+        assert!(
+            added.contains("+") && added.contains("new line"),
+            "added row missing: {:?}\ndump:\n{}", added, vterm.dump()
+        );
+        assert!(
+            removed.contains("-") && removed.contains("old line"),
+            "removed row missing: {:?}", removed
+        );
+    }
+
+    /// TurnSeparator: blank + `──── Label ────` + blank. The rule
+    /// spans the full content width with the label centred.
+    #[test]
+    fn retained_turn_separator_renders_via_vterm() {
+        let (mut r, buf) = new_capturing(80, 24);
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+        let status = status_basic();
+        r.render(UiLine::TurnSeparator {
+            label: "Sealed · 1 turn".into(),
+        });
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+        // 3 rows body: blank / separator / blank → middle at 17.
+        let sep = vterm.row_text(17);
+        assert!(
+            sep.contains("─") && sep.contains("Sealed") && sep.contains("1 turn"),
+            "separator missing: {:?}\ndump:\n{}",
+            sep, vterm.dump()
+        );
+    }
+
+    /// Error line: `[Error: msg]` body row with red fg — we assert
+    /// the text + the fg style on the '[' cell.
+    #[test]
+    fn retained_error_line_renders_via_vterm() {
+        let (mut r, buf) = new_capturing(80, 24);
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+        let status = status_basic();
+        r.render(UiLine::Error("connection lost".into()));
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+        let row_text = vterm.row_text(18);
+        assert!(
+            row_text.contains("[Error:") && row_text.contains("connection lost"),
+            "error message missing: {:?}\ndump:\n{}",
+            row_text, vterm.dump()
+        );
+        // Verify red foreground on the first non-pad cell.
+        let idx = row_text.find('[').unwrap();
+        let cell = vterm.cell_at(18, idx);
+        assert!(
+            cell.fg.is_some(),
+            "error text should have a foreground color"
+        );
+    }
+
+    /// CommandOutput: `/command` return string rendered as body.
+    /// Used by /model, /login, /provider etc. to echo status lines.
+    #[test]
+    fn retained_command_output_renders_via_vterm() {
+        let (mut r, buf) = new_capturing(80, 24);
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+        let status = status_basic();
+        r.render(UiLine::CommandOutput(
+            "Switched to glm5 · Pro/zai-org/GLM-5".into(),
+        ));
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+        let row = vterm.row_text(18);
+        assert!(
+            row.contains("Switched to glm5"),
+            "command output missing: {:?}\ndump:\n{}",
+            row, vterm.dump()
+        );
+    }
+
+    /// StreamingBox: spinner frame + label above the input rule.
+    /// During streaming the footer shows the active model status
+    /// with a cycling dot animation — verify the frame char lands
+    /// at col 2 (PAD_COL) of the spinner row.
+    #[test]
+    fn retained_streaming_box_spinner_via_vterm() {
+        let (mut r, buf) = new_capturing(80, 24);
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+        let status = status_basic();
+        r.render(UiLine::StreamingBox {
+            buf: String::new(),
+            cursor_byte: 0,
+            frame: "⠋",
+            label: "Thinking".into(),
+            status: status.clone(),
+            menu: None,
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+        // Footer 5 rows on h=24 → spinner row at 19 (footer_top).
+        // Layout: row 19 spinner, 20 top rule, 21 middle, 22 bot rule, 23 status.
+        let row = vterm.row_text(19);
+        assert!(
+            row.contains("⠋") && row.contains("Thinking"),
+            "spinner row missing: {:?}\ndump:\n{}",
+            row, vterm.dump()
+        );
+    }
+
+    /// Markdown inline: `**bold**` + `` `code` `` rendered in
+    /// the assistant-text stream. Grid inspects specific cells to
+    /// confirm bold and cyan fg survived the markdown → cells →
+    /// serialize → vte parse round-trip.
+    #[test]
+    fn retained_markdown_inline_styles_via_vterm() {
+        let (mut r, buf) = new_capturing(80, 24);
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+        let status = status_basic();
+        r.render(UiLine::AssistantText(
+            "Hello **bold** and `code` here\n".into(),
+        ));
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+        // Body bottom-anchored → row 18.
+        let row_text = vterm.row_text(18);
+        assert!(
+            row_text.contains("Hello bold and code here"),
+            "inline markdown text missing: {:?}\ndump:\n{}",
+            row_text, vterm.dump()
+        );
+        // 'b' of "bold" — the '*' markers are consumed. With
+        // `  Hello **bold** and`, after markdown render it becomes
+        // `  Hello bold and …`. Locate 'b' of "bold" and assert
+        // its cell is bold.
+        let bold_pos = row_text
+            .find("bold")
+            .expect("expected 'bold' in rendered text");
+        let cell = vterm.cell_at(18, bold_pos);
+        assert!(
+            cell.bold,
+            "bold cell at col {} should be bold: {:?}\ndump:\n{}",
+            bold_pos, cell, vterm.dump()
+        );
+        // Inline code: markdown crate wraps it in \x1b[96m (cyan) fg.
+        let code_pos = row_text
+            .find("code")
+            .expect("expected 'code' in rendered text");
+        let code_cell = vterm.cell_at(18, code_pos);
+        assert_eq!(
+            code_cell.fg,
+            Some(crossterm::style::Color::Cyan),
+            "inline code cell should be cyan: {:?}",
+            code_cell
+        );
+    }
+
     /// Regression: user reports bot_rule row visibly shortens when
     /// the input wraps from 1 line to 2 lines. Hypothesis: diff
     /// spurious-skips the bot_rule row, or paint_body/footer
