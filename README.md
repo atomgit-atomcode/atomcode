@@ -172,6 +172,7 @@ default_provider = "AtomGit"
 
 [providers.AtomGit]
 type           = "openai"
+api_key        = "your api key"
 model          = "MiniMax-M2.7"
 base_url       = "https://api-ai.gitcode.com/v1"
 context_window = 64000
