@@ -2,6 +2,7 @@ pub mod agent;
 pub mod auth;
 pub mod config;
 pub mod conversation;
+pub mod ctx;
 pub mod graph;
 pub mod input_history;
 pub mod project_context;
