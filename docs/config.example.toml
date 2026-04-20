@@ -1,10 +1,10 @@
-default_provider = "deepseek"	 
+default_provider = "deepseek"
  
-[providers.deepseek]	 
-type           = "openai"	 
-api_key        = "sk-..."	 
-model          = "deepseek-chat"	 
-base_url       = "https://api.deepseek.com/v1"	 
+[providers.deepseek]
+type           = "openai"
+api_key        = "sk-..."
+model          = "deepseek-chat"
+base_url       = "https://api.deepseek.com/v1"
 context_window = 64000
 
 # Per-turn datalog settings. Each turn writes a markdown file
