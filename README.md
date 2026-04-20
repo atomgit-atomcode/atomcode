@@ -168,15 +168,14 @@ Config is stored at `~/.atomcode/config.toml`. A minimal single-provider
 setup looks like this:
 
 ```toml
- default_provider = "deepseek"	 
- 
- 
- [providers.deepseek]	 
- type           = "openai"	 
- api_key        = "sk-..."	 
- model          = "deepseek-chat"	 
- base_url       = "https://api.deepseek.com/v1"	 
- context_window = 64000
+default_provider = "deepseek"
+
+[providers.deepseek]
+type           = "openai"
+api_key        = "sk-..."
+model          = "deepseek-chat"
+base_url       = "https://api.deepseek.com/v1"
+context_window = 64000
 ```
 
 You can declare multiple providers and switch between them with `/model`
