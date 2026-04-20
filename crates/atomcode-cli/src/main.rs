@@ -128,10 +128,10 @@ struct Cli {
     #[arg(long, value_name = "PATH", conflicts_with = "prompt")]
     prompt_file: Option<std::path::PathBuf>,
 
-    /// Use the CC-style normal-mode TUI (atomcode-tuix).
-    /// Default is the ratatui alternate-screen TUI (atomcode-tui).
+    /// Fall back to the legacy ratatui alternate-screen TUI (atomcode-tui).
+    /// Default is the CC-style normal-mode TUI (atomcode-tuix).
     #[arg(long)]
-    tuix: bool,
+    tui: bool,
 
     /// Show tool calls, token usage, and turn summary on stderr (headless mode only).
     /// Without this flag, headless output is the assistant reply only — Claude Code -p style.
@@ -365,10 +365,10 @@ async fn run() -> Result<i32> {
     }
 
     tokio::spawn(agent_loop.run());
-    if cli.tuix {
-        atomcode_tuix::run(config, model_name, agent_handle, tool_context, working_dir, session_to_continue).await?;
-    } else {
+    if cli.tui {
         atomcode_tui::run(config, model_name, agent_handle, tool_context, working_dir, session_to_continue).await?;
+    } else {
+        atomcode_tuix::run(config, model_name, agent_handle, tool_context, working_dir, session_to_continue).await?;
     }
     Ok(0)
 }
