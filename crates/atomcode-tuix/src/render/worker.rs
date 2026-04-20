@@ -97,9 +97,18 @@ impl TaskRenderer {
         }
     }
 
-    /// Send an ACK op and block until the worker reports done. 2s bound
-    /// keeps us from hanging forever if the worker ever wedges (it
-    /// shouldn't — but a bounded wait beats an infinite one for UX).
+    /// Send an ACK op and block until the worker reports done. 10s
+    /// bound keeps us from hanging forever if the worker ever wedges,
+    /// while giving slow CI machines / thermal-throttled laptops /
+    /// debug builds enough headroom that routine lifecycle ops don't
+    /// spuriously timeout.
+    ///
+    /// 2s was the original budget — a worker processing `Shutdown`
+    /// normally takes < 1ms, so 2s felt like plenty. But on a loaded
+    /// CI runner mid-cargo-test, a few tests would sporadically fail
+    /// on the timeout line because the OS hadn't scheduled the worker
+    /// thread fast enough. CC-style TUI harnesses use ~10s for the
+    /// same reason.
     fn ack(&self, op: AckOp) {
         let (ack_tx, ack_rx) = mpsc::channel();
         if self
@@ -110,7 +119,7 @@ impl TaskRenderer {
             // Worker is gone (already shut down) — nothing to do.
             return;
         }
-        let _ = ack_rx.recv_timeout(Duration::from_secs(2));
+        let _ = ack_rx.recv_timeout(Duration::from_secs(10));
     }
 }
 
