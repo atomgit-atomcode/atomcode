@@ -212,6 +212,10 @@ pub struct AgentLoop {
     pub turn_runner: TurnRunner,
     pub permission_store: std::sync::Arc<std::sync::RwLock<PermissionStore>>,
     pub config: Config,
+    /// Context construction strategy for the active provider. Selected
+    /// at construction via `ctx::for_provider` and rebuilt on
+    /// `AgentCommand::ReloadConfig` when the provider changes.
+    pub ctx: Box<dyn crate::ctx::CtxBuilder>,
 
     // Execution state
     pub phase: AgentPhase,
@@ -421,12 +425,35 @@ impl AgentLoop {
             file_read_counts: std::collections::HashMap::new(),
         };
 
+        // Select the context-construction strategy once for this session.
+        // Rebuilds on ReloadConfig when the provider changes.
+        let ctx: Box<dyn crate::ctx::CtxBuilder> = match config.providers.get(&config.default_provider) {
+            Some(pc) => crate::ctx::for_provider(pc),
+            // Fallback for first-run / broken-config path: synthesize a
+            // minimal provider so `for_provider` still gets its hands on
+            // a context_window. Matches Config::default_context_window()
+            // behavior (128_000) so sessions without a provider don't
+            // panic before the user runs /login or /model.
+            None => crate::ctx::for_provider(&crate::config::provider::ProviderConfig {
+                provider_type: String::new(),
+                api_key: None,
+                model: String::new(),
+                base_url: None,
+                system_prompt: None,
+                user_agent: None,
+                context_window: 128_000,
+                max_tokens: None,
+                ephemeral: true,
+            }),
+        };
+
         let agent = Self {
             conversation,
             tool_registry: shared_tools,
             turn_runner,
             permission_store,
             config,
+            ctx,
             phase: AgentPhase::Idle,
             turn_tokens: 0,
             total_tokens: 0,
@@ -544,6 +571,11 @@ impl AgentLoop {
                     }
 
                     if let Some(provider_config) = self.config.providers.get(&new_provider_name) {
+                        // Rebuild the context strategy for the new provider.
+                        // Selected once per provider; per-model customizations
+                        // (e.g. Ollama schema trimming, Claude cache markers)
+                        // take effect from the next turn.
+                        self.ctx = crate::ctx::for_provider(provider_config);
                         match crate::provider::create_provider(provider_config) {
                             Ok(new_provider) => {
                                 self.turn_runner.provider = std::sync::Arc::from(new_provider);
@@ -645,11 +677,11 @@ impl AgentLoop {
         // Unlike maybe_compress_history (which checks the 50% threshold),
         // this fires at every task boundary regardless of token count.
         if self.conversation.messages.len() > 12 {
-            let (content, n_msgs) = self.conversation.build_compression_content();
-            if !content.is_empty() && n_msgs > 0 {
-                // Mechanical compression — no LLM call needed at task boundary.
-                // The compressed content from build_compression_content is already
-                // one-line-per-round summaries, compact enough for cold zone.
+            // Task-boundary compression goes through the active ctx strategy.
+            // No LLM call — the compressed content is already
+            // one-line-per-round summaries (DefaultCtx) compact enough
+            // for cold zone.
+            if let Some((content, n_msgs)) = self.ctx.compression_plan(&self.conversation) {
                 self.conversation.apply_compression(n_msgs, content);
             }
         }
@@ -804,7 +836,7 @@ impl AgentLoop {
             // Log LLM request to <working_dir>/datalog/llm/ — colocated with turn .md files.
             {
                 let context_window = self.config.default_context_window();
-                let (msgs, _) = conv.to_provider_messages_budgeted(&system_prompt, context_window);
+                let (msgs, _) = self.ctx.build_messages(&conv, &system_prompt);
                 let tool_defs = self.turn_runner.tools.get_definitions();
                 let wd = self.turn_runner.context.working_dir
                     .try_read().map(|g| g.clone()).unwrap_or_default();
@@ -1436,15 +1468,15 @@ impl AgentLoop {
     /// Pauses the task, calls LLM to summarize, stores in cold zone.
     /// Falls back to mechanical compression if LLM fails.
     async fn maybe_compress_history(&mut self, system_prompt: &str) {
-        let context_window = self.config.default_context_window();
-
         let sys_tokens = system_prompt.len() / 4 + 4;
-        if !self.conversation.needs_compression(sys_tokens, context_window) {
+        if !self.ctx.needs_compression(&self.conversation, sys_tokens) {
             return;
         }
 
-        let (content, n_turns) = self.conversation.build_compression_content();
-        if content.is_empty() || n_turns == 0 { return; }
+        let (content, n_turns) = match self.ctx.compression_plan(&self.conversation) {
+            Some(plan) => plan,
+            None => return,
+        };
 
         // Try LLM compression
         let summarize_prompt = format!(
