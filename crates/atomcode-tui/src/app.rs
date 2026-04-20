@@ -1130,11 +1130,8 @@ impl App {
                     if self.slash_menu.visible {
                         // Slash menu is open — close it instead of cancelling the agent
                         self.slash_menu.close();
-                    } else if !self.input.is_empty() {
-                        // Clear input instead of cancelling
-                        self.input.clear();
                     } else {
-                        // Esc cancels the operation
+                        // Esc cancels the operation, preserving user input
                         let _ = self.agent_handle.cmd_tx.send(AgentCommand::Cancel);
                         self.cancel_token.cancel();
                         self.conversation.stream_buffer = None;
@@ -1747,17 +1744,8 @@ impl App {
                 self.send_message(event_tx);
             }
             (_, KeyCode::Esc) => {
-                if !self.pasted_blocks.is_empty() {
-                    // Esc peels off one paste block at a time so users can undo
-                    // an accidental extra paste without losing the rest.
-                    self.pasted_blocks.pop();
-                } else if !self.attached_files.is_empty() {
-                    // Then peel off attached files one at a time
-                    self.attached_files.pop();
-                } else if !self.input.is_empty() {
-                    self.input.clear();
-                    self.slash_menu.close();
-                }
+                // In Normal mode, Esc does not clear input or attachments
+                // Users can continue typing without losing their work
             }
             // Ctrl+L: clear conversation (like Claude Code)
             (KeyModifiers::CONTROL, KeyCode::Char('l')) => {

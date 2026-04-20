@@ -1234,6 +1234,15 @@ fn handle_streaming_key(
         return Ok(());
     }
 
+    // Esc also cancels a running turn (CC-style). Placed before the
+    // menu-nav block so Streaming + menu-open Esc still cancels the
+    // stream — mid-stream the higher-value action is "stop the agent",
+    // not "clear an unsubmitted slash token" (users can Ctrl+U for that).
+    if code == KeyCode::Esc {
+        ctx.agent.cmd_tx.send(AgentCommand::Cancel).ok();
+        return Ok(());
+    }
+
     // When the menu is active (buf starts with `/`), intercept nav keys
     // so the user can browse candidate commands mid-stream. Execution
     // is still blocked below — Enter falls through to the commit arm,
