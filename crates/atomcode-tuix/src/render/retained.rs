@@ -1532,6 +1532,182 @@ mod tests {
         }
     }
 
+    /// Wide CJK input via vterm: render "你是谁" from empty, then
+    /// walk the grid and confirm all three wide glyphs landed on
+    /// their expected absolute columns. This is the bug class
+    /// where the cell model and the byte stream disagree — here
+    /// we assert the terminal's view (post-parse grid) is right.
+    #[test]
+    fn retained_wide_char_lands_on_screen_via_vterm() {
+        let (mut r, buf) = new_capturing(80, 24);
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+        let status = status_basic();
+        // Start with empty input (frame baseline).
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // Type "你是谁" in one shot.
+        r.render(UiLine::InputPrompt {
+            buf: "你是谁".into(),
+            cursor_byte: 9,
+            menu: None,
+            status: status.clone(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // Screen h=24, footer 5 rows = [19, 23]:
+        //   row 19: spinner blank, row 20: top rule,
+        //   row 21: middle, row 22: bot rule, row 23: status.
+        // "  ❯ 你是谁" in middle row (col 0-indexed):
+        //   col 0-1 pad, col 2 '❯', col 3 ' ',
+        //   col 4 '你' (cols 4-5, right half blank), col 6 '是',
+        //   col 8 '谁'.
+        let middle_row = 21;
+        assert_eq!(vterm.cell_at(middle_row, 2).ch, '❯');
+        assert_eq!(vterm.cell_at(middle_row, 3).ch, ' ');
+        assert_eq!(
+            vterm.cell_at(middle_row, 4).ch, '你',
+            "dump:\n{}",
+            vterm.dump()
+        );
+        assert_eq!(vterm.cell_at(middle_row, 6).ch, '是');
+        assert_eq!(vterm.cell_at(middle_row, 8).ch, '谁');
+    }
+
+    /// Menu open via vterm: the slash-command palette (4 rows)
+    /// must appear on its own rows with the selected item visibly
+    /// distinct (reverse video). This catches "menu item didn't
+    /// paint" / "selected highlight is on wrong row" bugs on the
+    /// actual screen, not just in our cell buffer.
+    #[test]
+    fn retained_menu_open_renders_via_vterm() {
+        let (mut r, buf) = new_capturing(80, 24);
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+        let status = status_basic();
+        let items: Vec<(String, String)> = vec![
+            ("model".into(), "Switch model".into()),
+            ("provider".into(), "Add provider".into()),
+            ("session".into(), "New session".into()),
+            ("resume".into(), "Resume session".into()),
+        ];
+
+        // Baseline: no menu.
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // Open menu with selection on row 0 ('/model').
+        r.render(UiLine::InputPrompt {
+            buf: "/".into(),
+            cursor_byte: 1,
+            menu: Some(MenuPayload {
+                items: items.clone(),
+                selected: 0,
+            }),
+            status: status.clone(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // Footer with menu = 1 spinner + 2 rules + 1 middle + 4 menu
+        // + 1 status = 9 rows. Layout from screen_h=24:
+        //   row 15: spinner blank
+        //   row 16: top rule
+        //   row 17: middle ("  ❯ /")
+        //   row 18: bot rule
+        //   rows 19-22: menu rows (selected @ 19)
+        //   row 23: status
+        //
+        // Inspect menu row 0 (row 19): reverse-video strip starting
+        // from PAD_COL, with "▸" marker present.
+        let menu0_row = 19;
+        let row_text = vterm.row_text(menu0_row);
+        assert!(
+            row_text.contains("▸"),
+            "selected marker missing on menu row 0: {:?}\ndump:\n{}",
+            row_text,
+            vterm.dump()
+        );
+        assert!(
+            row_text.contains("/model"),
+            "menu entry text missing: {:?}",
+            row_text
+        );
+        // The marker cell itself should carry reverse-video.
+        let arrow_col = row_text.find('▸').unwrap();
+        let cell = vterm.cell_at(menu0_row, arrow_col);
+        assert!(
+            cell.reverse,
+            "selected menu row should be reverse-video at col {} (cell={:?})",
+            arrow_col, cell
+        );
+
+        // Non-selected row (menu row 1 = screen row 20) must NOT be
+        // reverse-video.
+        let row1_text = vterm.row_text(20);
+        assert!(
+            row1_text.contains("/provider"),
+            "menu row 1 missing: {:?}",
+            row1_text
+        );
+        let provider_col = row1_text.find('/').unwrap();
+        assert!(
+            !vterm.cell_at(20, provider_col).reverse,
+            "non-selected menu row should not be reverse-video"
+        );
+    }
+
+    /// Welcome via vterm: after receiving UiLine::Welcome, the
+    /// six welcome lines (brand / cwd / model / blank / type hint
+    /// / provider hint) must all appear on the screen above the
+    /// footer.
+    #[test]
+    fn retained_welcome_lines_render_via_vterm() {
+        let (mut r, buf) = new_capturing(80, 24);
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+        let status = status_basic();
+
+        r.render(UiLine::Welcome {
+            model: "glm-5".into(),
+            working_dir: "~/p/a".into(),
+        });
+        // Empty input prompt so the footer has something to paint.
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // Body bottom-anchored: 6 body lines + footer 5 rows on a
+        // 24-row screen → body occupies rows 13-18, footer 19-23.
+        // Verify the row containing "AtomCode" exists somewhere in
+        // the body region (exact row depends on layout math).
+        let found_brand = (13..=18).any(|r| vterm.row_text(r).contains("AtomCode"));
+        let found_cwd = (13..=18).any(|r| vterm.row_text(r).contains("~/p/a"));
+        let found_model = (13..=18).any(|r| vterm.row_text(r).contains("glm-5"));
+        let found_hint = (13..=18).any(|r| vterm.row_text(r).contains("browse commands"));
+        assert!(
+            found_brand && found_cwd && found_model && found_hint,
+            "welcome rows missing (brand={} cwd={} model={} hint={})\ndump:\n{}",
+            found_brand, found_cwd, found_model, found_hint, vterm.dump()
+        );
+    }
+
     /// Regression: user reports bot_rule row visibly shortens when
     /// the input wraps from 1 line to 2 lines. Hypothesis: diff
     /// spurious-skips the bot_rule row, or paint_body/footer
