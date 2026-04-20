@@ -2,10 +2,35 @@
 use std::sync::mpsc::{self as stdmpsc, TryRecvError};
 use std::time::Duration;
 
-use crossterm::event::{self, Event};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use tokio::sync::mpsc;
 
 use super::InputEvent;
+
+/// If a Key event could plausibly be part of a paste burst, return the
+/// character it contributes. Enter maps to `\n`, Tab to `\t`, Char(c) to
+/// itself. Modifier-carrying keys (Ctrl/Alt) and non-Press kinds are
+/// excluded — those are commands, not pasted content.
+fn paste_candidate_char(ev: &Event) -> Option<char> {
+    let Event::Key(KeyEvent { kind, code, modifiers, .. }) = ev else {
+        return None;
+    };
+    if *kind != KeyEventKind::Press {
+        return None;
+    }
+    // Shift is fine (Shift+letter on paste of uppercase). Anything else
+    // means the user is issuing a command.
+    let allowed = KeyModifiers::SHIFT | KeyModifiers::NONE;
+    if !(modifiers.difference(allowed).is_empty()) {
+        return None;
+    }
+    match code {
+        KeyCode::Char(c) => Some(*c),
+        KeyCode::Enter => Some('\n'),
+        KeyCode::Tab => Some('\t'),
+        _ => None,
+    }
+}
 
 /// Lifecycle commands for the reader thread. Sent from the event loop
 /// whenever an external process (OAuth browser flow, `/shell`, etc.)
@@ -184,6 +209,120 @@ fn run(
                 continue;
             }
         };
+
+        // Paste-burst detection for terminals without bracketed paste
+        // (Windows conhost, some PowerShell setups). When a user pastes
+        // multi-line text there, crossterm emits each character as an
+        // individual `Event::Key` — including embedded Enters, which
+        // individually trigger submit and produced "many queued
+        // submits". Real bracketed paste lands here as `Event::Paste`
+        // and this block is a no-op.
+        //
+        // Heuristic: if this event is a printable char / Enter / Tab
+        // AND more events are ALREADY queued (peek with 0-timeout
+        // poll), we're almost certainly inside a paste burst — real
+        // typing has human-scale gaps so the queue is empty on peek.
+        // Aggregate consecutive paste-candidate events and emit one
+        // synthetic `InputEvent::Paste`. Only triggers when the burst
+        // contains an Enter (the unambiguous "this is multi-line
+        // pasted text, not typing" signal); burst of chars without
+        // Enter falls through to the normal per-key path — it looks
+        // the same to the user either way and keeps the heuristic
+        // conservative.
+        if let Some(c0) = paste_candidate_char(&ev) {
+            let mut chars = vec![c0];
+            let mut has_enter = c0 == '\n';
+            let mut trailing: Option<Event> = None;
+            const BATCH_CAP: usize = 8192;
+            while chars.len() < BATCH_CAP {
+                // 2ms timeout is way under any human typing cadence
+                // (fastest typists are ~60ms/char) but bridges the
+                // transient gap Windows crossterm takes to translate
+                // each console record into an Event — without it, a
+                // paste arriving as 8 records in the console buffer
+                // can emit events with 100µs-1ms inter-event gaps that
+                // a strict `poll(0)` misses, and every line gets
+                // treated as an independent keystroke sequence.
+                match event::poll(Duration::from_millis(2)) {
+                    Ok(true) => {}
+                    _ => break,
+                }
+                let nxt = match event::read() {
+                    Ok(e) => e,
+                    Err(_) => break,
+                };
+                // Windows crossterm in raw mode emits Press + Release
+                // (and Repeat on autorepeat). Release/Repeat interleaved
+                // with the paste burst used to kill aggregation — the
+                // very next event after 'A' Press is 'A' Release, which
+                // `paste_candidate_char` rejects, so we'd break out with
+                // chars=[A] and never see the rest of the burst. Skip
+                // non-Press Key events silently so the burst detector
+                // walks through to the next printable-char Press.
+                if let Event::Key(k) = &nxt {
+                    if k.kind != KeyEventKind::Press {
+                        continue;
+                    }
+                }
+                match paste_candidate_char(&nxt) {
+                    Some(c) => {
+                        chars.push(c);
+                        if c == '\n' {
+                            has_enter = true;
+                        }
+                    }
+                    None => {
+                        trailing = Some(nxt);
+                        break;
+                    }
+                }
+            }
+            if chars.len() >= 2 && has_enter {
+                let text: String = chars.into_iter().collect();
+                crate::tuix_trace!("RD", "paste-burst synth len={}", text.len());
+                if tx.send(InputEvent::Paste(text)).is_err() {
+                    return;
+                }
+            } else {
+                // Not a clear paste signature — emit originals per-key.
+                // We only kept chars, so reconstruct KeyEvents. The
+                // first event we read is `ev`; subsequent ones we
+                // discarded in favour of `chars`. Rebuild from chars
+                // using a minimal KeyEvent (no modifiers) — this path
+                // fires in the rare case where events piled up but
+                // there was no Enter, i.e. fast typing or single-line
+                // paste. Both look the same on screen, so a synthetic
+                // reconstruction is faithful to user intent.
+                for c in chars {
+                    let code = match c {
+                        '\n' => KeyCode::Enter,
+                        '\t' => KeyCode::Tab,
+                        other => KeyCode::Char(other),
+                    };
+                    let k = KeyEvent::new(code, KeyModifiers::NONE);
+                    if tx.send(InputEvent::Key(k)).is_err() {
+                        return;
+                    }
+                }
+            }
+            // Dispatch whatever non-paste event broke the burst.
+            if let Some(ev) = trailing {
+                let msg = match ev {
+                    Event::Key(k) => {
+                        crate::tuix_trace!("RD", "key {:?} {:?}", k.kind, k.code);
+                        InputEvent::Key(k)
+                    }
+                    Event::Paste(p) => InputEvent::Paste(p),
+                    Event::Resize(w, h) => InputEvent::Resize(w, h),
+                    Event::Mouse(_) | Event::FocusGained | Event::FocusLost => continue,
+                };
+                if tx.send(msg).is_err() {
+                    return;
+                }
+            }
+            continue;
+        }
+
         let msg = match ev {
             Event::Key(k) => {
                 crate::tuix_trace!("RD", "key {:?} {:?}", k.kind, k.code);
