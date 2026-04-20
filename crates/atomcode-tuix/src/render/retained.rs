@@ -767,6 +767,14 @@ impl<W: Write + Send> RetainedRenderer<W> {
     /// Build one row with a leading `prefix` (often an accent
     /// glyph with its own style) and a plain-styled body. Used by
     /// User echo ("❯ …"), ToolCall ("▸ name(detail)"), etc.
+    ///
+    /// Multi-line `body` (Shift+Enter in the input, or a tool detail
+    /// that happens to contain `\n`) is split on '\n' BEFORE width
+    /// wrapping — otherwise the newlines ride through as width-1 cells
+    /// and `serialize_row` writes them to stdout as bare LF bytes,
+    /// which under raw-mode + DECSTBM produces the staircase pattern
+    /// (cursor drops a row without returning to col 1, every LF also
+    /// triggers a region scroll).
     fn push_body_prefixed(
         &mut self,
         prefix: &str,
@@ -778,27 +786,29 @@ impl<W: Write + Send> RetainedRenderer<W> {
         if w == 0 {
             return;
         }
-        // First row carries the prefix; wrapped continuation rows
-        // use an indent of the same visible width so the body text
-        // column stays aligned.
         let prefix_w = crate::width::display_width(prefix);
         let first_budget = w.saturating_sub(prefix_w);
         let cont_pad: String = " ".repeat(prefix_w);
-        let chunks: Vec<String> = crate::width::wrap_line_to_width(body, first_budget.max(1))
-            .into_iter()
-            .map(|c| c.to_string())
-            .collect();
-        for (i, chunk) in chunks.iter().enumerate() {
-            let mut row = Vec::new();
-            let pad = CellStyle::default();
-            push_str_cells(&mut row, &" ".repeat(PAD_COL), &pad);
-            if i == 0 {
-                push_str_cells(&mut row, prefix, prefix_style);
-            } else {
-                push_str_cells(&mut row, &cont_pad, &pad);
+        let mut first_emitted = false;
+        for phys in body.split('\n') {
+            let chunks: Vec<String> =
+                crate::width::wrap_line_to_width(phys, first_budget.max(1))
+                    .into_iter()
+                    .map(|c| c.to_string())
+                    .collect();
+            for chunk in &chunks {
+                let mut row = Vec::new();
+                let pad = CellStyle::default();
+                push_str_cells(&mut row, &" ".repeat(PAD_COL), &pad);
+                if !first_emitted {
+                    push_str_cells(&mut row, prefix, prefix_style);
+                    first_emitted = true;
+                } else {
+                    push_str_cells(&mut row, &cont_pad, &pad);
+                }
+                push_str_cells(&mut row, chunk.as_str(), body_style);
+                self.push_body_row(row);
             }
-            push_str_cells(&mut row, chunk.as_str(), body_style);
-            self.push_body_row(row);
         }
     }
 

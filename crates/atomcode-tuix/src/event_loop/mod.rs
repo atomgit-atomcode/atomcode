@@ -284,9 +284,13 @@ impl Buffer {
                 BufferResult::Redraw
             }
             Action::HistoryPrev => {
-                if self.text.contains('\n') || history.is_empty() {
+                if history.is_empty() {
                     return BufferResult::Redraw;
                 }
+                // The current buffer (including any newlines) is stashed
+                // before we replace it with a history entry, so users
+                // who pressed Up mid-multi-line-compose can recover it
+                // via HistoryNext (Down). No need to block the action.
                 let new_idx = match self.history_idx {
                     None => {
                         self.stash = self.text.clone();

@@ -94,13 +94,42 @@ impl Cell {
     }
 }
 
+/// Fixed soft-tab width — `\t` expands to this many spaces when a
+/// caller pushes a string that slipped past higher-level tab-aware
+/// paths. Matches claude-code / CC-style tooling conventions.
+const SOFT_TAB_WIDTH: usize = 4;
+
 /// Append each char of `s` as cells, all sharing `style`. Wide chars
 /// (CJK, emoji, etc.) expand to one real cell carrying the glyph +
 /// `(display_width - 1)` continuation cells so `cell_index ==
 /// terminal_column` holds across the row — critical for the cell-diff
 /// to produce correct patches.
+///
+/// Control chars that would mis-align the cell model vs the terminal
+/// are normalised here:
+///   - `\n` / `\r`: dropped. Multi-line content must be split by the
+///     caller (`push_body_text` does this); writing a bare LF under
+///     raw-mode drops a row without CR, and a bare CR returns to col
+///     0 mid-row — both produce the "staircase" bug.
+///   - `\t`: expanded to SOFT_TAB_WIDTH spaces so cell col == terminal
+///     col. Without this, the terminal jumps to its hardware tab stop
+///     (col 9/17/25/…) while our cell model advances 1 col per `\t`
+///     cell, and subsequent diffs patch the wrong columns.
 pub fn push_str_cells(row: &mut Vec<Cell>, s: &str, style: &CellStyle) {
     for ch in s.chars() {
+        if ch == '\n' || ch == '\r' {
+            continue;
+        }
+        if ch == '\t' {
+            for _ in 0..SOFT_TAB_WIDTH {
+                row.push(Cell {
+                    ch: ' ',
+                    style: style.clone(),
+                    width: 1,
+                });
+            }
+            continue;
+        }
         let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(1);
         if w == 0 {
             // Zero-width (combining marks, control chars). Caller has

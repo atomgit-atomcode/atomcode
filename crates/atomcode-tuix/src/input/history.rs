@@ -14,12 +14,17 @@ pub struct History {
 impl History {
     pub fn load<P: Into<PathBuf>>(path: P) -> Self {
         let path = path.into();
+        // Each physical line is one JSON-encoded entry (so entries may
+        // contain `\n` — multi-line submissions via Alt+Enter need this).
+        // Fallback: any line that fails JSON parse is treated as a raw
+        // plain-text entry so histories written by older builds (which
+        // stored entries verbatim) continue to load.
         let entries = fs::read_to_string(&path)
             .ok()
             .map(|s| {
                 s.lines()
                     .filter(|l| !l.trim().is_empty())
-                    .map(|l| l.to_string())
+                    .map(|l| serde_json::from_str::<String>(l).unwrap_or_else(|_| l.to_string()))
                     .collect()
             })
             .unwrap_or_default();
@@ -55,7 +60,15 @@ impl History {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let contents = self.entries.join("\n");
+        // JSON-encode each entry so multi-line submissions survive the
+        // round-trip. A raw `entries.join("\n")` would split a single
+        // `"1\n2\n3"` entry into three on the next `load()`.
+        let contents: String = self
+            .entries
+            .iter()
+            .map(|e| serde_json::to_string(e).unwrap_or_else(|_| e.clone()))
+            .collect::<Vec<_>>()
+            .join("\n");
         fs::write(&self.path, contents)
     }
 }
@@ -83,6 +96,36 @@ mod tests {
 
         let h2 = History::load(&path);
         assert_eq!(h2.entries(), &vec!["one".to_string(), "two".to_string()]);
+    }
+
+    #[test]
+    fn multi_line_entry_survives_roundtrip() {
+        // Regression: a `"1\n2\n3"` entry must round-trip as ONE entry.
+        // The pre-JSON serialization split it into three on reload.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("hist");
+        let mut h = History::load(&path);
+        h.push("1\n2\n3".into());
+        h.push("next".into());
+        h.save().unwrap();
+
+        let h2 = History::load(&path);
+        assert_eq!(h2.entries(), &vec!["1\n2\n3".to_string(), "next".to_string()]);
+    }
+
+    #[test]
+    fn legacy_plaintext_history_still_loads() {
+        // Older builds wrote entries verbatim (one line per entry, no
+        // JSON encoding). Those files must still load — the fallback in
+        // `load()` treats unparseable lines as raw entries.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("hist");
+        fs::write(&path, "hello world\nanother line").unwrap();
+        let h = History::load(&path);
+        assert_eq!(
+            h.entries(),
+            &vec!["hello world".to_string(), "another line".to_string()]
+        );
     }
 
     #[test]
