@@ -349,16 +349,23 @@
 
 <pre><code>crates/atomcode-core/src/
 ├── ctx/                              <span class="cm">← 新增模块</span>
-│   ├── mod.rs             <span class="cm">── CtxBuilder trait + for_provider()</span>
-│   ├── default.rs         <span class="cm">── DefaultCtx(保 legacy 行为)</span>
+│   ├── mod.rs             <span class="cm">── CtxBuilder trait + re-exports</span>
+│   ├── resolver.rs        <span class="cm">── for_provider() 规则表</span>
+│   ├── render.rs          <span class="cm">── 默认 render / compression 策略</span>
+│   ├── default.rs         <span class="cm">── DefaultCtx = ctx::render 薄封装</span>
+│   ├── ollama.rs          <span class="cm">── OllamaCtx 小窗口本地模型</span>
 │   └── truncate.rs        <span class="cm">── 从 turn/truncation.rs 迁入</span>
 │
-├── conversation/mod.rs    <span class="cm">── 数据层(不动内部)，加 KEEP_MESSAGES pub(crate) const</span>
+├── conversation/mod.rs    <span class="cm">── 纯数据层(add_* / apply_compression + 字段)</span>
 ├── agent/mod.rs           <span class="cm">── AgentLoop 加 ctx 字段 + 4 call site 改走 self.ctx.*</span>
 ├── config/mod.rs          <span class="cm">── Config::default_context_window() helper</span>
 └── turn/
     ├── mod.rs             <span class="cm">── 去掉 pub mod truncation</span>
-    └── runner.rs          <span class="cm">── DRY context_window 查表</span></code></pre>
+    └── runner.rs          <span class="cm">── 调 ctx::render::build_messages</span></code></pre>
+
+<div class="panel info">
+<strong>依赖方向(严格 DAG)</strong>: <code>agent / turn</code> → <code>ctx::{default, ollama, resolver, render, truncate}</code> → <code>conversation</code>(叶子)。<code>conversation</code> 不反向引用 <code>ctx</code>,生产和测试代码都是(grep 验证)。
+</div>
 
 <h3>2.2 新增 / 修改详情</h3>
 
@@ -372,26 +379,44 @@
   <tr>
     <td><code>ctx/mod.rs</code></td>
     <td><span class="tag new">new</span></td>
-    <td>trait 定义 + <code>for_provider</code> 规则表</td>
-    <td class="num">~100 行</td>
+    <td>CtxBuilder trait 定义 + re-exports(routing 逻辑在 resolver.rs)</td>
+    <td class="num">~75 行</td>
+  </tr>
+  <tr>
+    <td><code>ctx/resolver.rs</code></td>
+    <td><span class="tag new">new</span></td>
+    <td><code>for_provider</code> 规则表,添加新模型在此登记</td>
+    <td class="num">~90 行</td>
+  </tr>
+  <tr>
+    <td><code>ctx/render.rs</code></td>
+    <td><span class="tag new">new</span></td>
+    <td>默认 render 管道:build_messages / needs_compression / build_compression_content + 4 个私有 helper (microcompact / replace_stale_reads / clean_message_pipeline / sanitize_messages),从 Conversation impl 搬出</td>
+    <td class="num">~720 行(含测试)</td>
   </tr>
   <tr>
     <td><code>ctx/default.rs</code></td>
     <td><span class="tag new">new</span></td>
-    <td><code>DefaultCtx</code> 实现 + 6 个回归测试</td>
-    <td class="num">~200 行</td>
+    <td><code>DefaultCtx</code> 薄封装(全部 delegate 到 ctx::render) + 基础测试</td>
+    <td class="num">~115 行</td>
+  </tr>
+  <tr>
+    <td><code>ctx/ollama.rs</code></td>
+    <td><span class="tag new">new</span></td>
+    <td><code>OllamaCtx</code> 小窗口优化:35% 压缩阈值 + 工具输出 2K-6K 字节 belt + UTF-8 安全截断</td>
+    <td class="num">~260 行</td>
   </tr>
   <tr>
     <td><code>ctx/truncate.rs</code></td>
     <td><span class="tag move">moved</span></td>
     <td>per-tool 截断（整体 git rename，内容不变）</td>
-    <td class="num">524 行</td>
+    <td class="num">521 行</td>
   </tr>
   <tr>
     <td><code>conversation/mod.rs</code></td>
     <td><span class="tag modify">modified</span></td>
-    <td>删 dead summary 4 方法 · 提 <code>KEEP_MESSAGES</code> 为模块级 <code>pub(crate) const</code></td>
-    <td class="num">−234 / +6</td>
+    <td>删 dead summary 4 方法 + render 3 方法 + 4 个 helper → 迁到 ctx::render; 保留 add_* / apply_compression / 字段 / KEEP_MESSAGES pub(crate) const</td>
+    <td class="num">≈ 2000 → 715 行</td>
   </tr>
   <tr>
     <td><code>agent/mod.rs</code></td>
@@ -776,19 +801,22 @@
     sys.<span class="fn">to_string</span>()   <span class="cm">// 示意</span>
 }</code></pre>
 
-<h4>步骤 2：在 <code>ctx/mod.rs</code> 注册</h4>
+<h4>步骤 2：在 <code>ctx/mod.rs</code> 声明 + <code>ctx/resolver.rs</code> 注册</h4>
 
-<pre><code><span class="kw">pub mod</span> ollama;
+<pre><code><span class="cm">// ctx/mod.rs: 加一行</span>
+<span class="kw">pub mod</span> ollama;
 
+<span class="cm">// ctx/resolver.rs: 在 for_provider 里加分支</span>
 <span class="kw">pub fn</span> <span class="fn">for_provider</span>(provider: &<span class="ty">ProviderConfig</span>) -> <span class="ty">Box</span>&lt;<span class="kw">dyn</span> <span class="ty">CtxBuilder</span>&gt; {
     <span class="kw">if</span> provider.provider_type == <span class="st">"ollama"</span> {
-        <span class="kw">return</span> <span class="ty">Box</span>::<span class="fn">new</span>(ollama::<span class="ty">OllamaCtx</span>::<span class="fn">new</span>(provider));
+        <span class="kw">return</span> <span class="ty">Box</span>::<span class="fn">new</span>(super::ollama::<span class="ty">OllamaCtx</span>::<span class="fn">new</span>(provider));
     }
+    <span class="cm">// ...其它规则...</span>
 
     <span class="ty">Box</span>::<span class="fn">new</span>(<span class="ty">DefaultCtx</span>::<span class="fn">new</span>(provider))
 }</code></pre>
 
-<h4>就这两步。</h4>
+<h4>就这三步。</h4>
 
 <p>用户配 <code>provider_type = "ollama"</code> → 自动走 <code>OllamaCtx</code>。其它 provider 不受影响。</p>
 
@@ -928,8 +956,7 @@
 </table>
 
 <div class="panel ok">
-  <strong>一致性保证</strong>：<code>DefaultCtx</code> 的 <code>default_ctx_matches_legacy_render_byte_for_byte</code> 测试锁死了「未命中任何规则 → 和重构前字节一致」。新增自定义 ctx 不影响这个不变量。
-</div>
+  <strong>一致性保证</strong>：未命中任何规则的 provider 走 <code>DefaultCtx</code>，后者完全委托给 <code>ctx::render</code>——与重构前行为一致(render 模块的代码就是 2026-04 从 <code>Conversation</code> impl 平移出来的,byte-equivalent)。<code>ctx/render.rs</code> 里搬过来的 12 个 budgeted/sanitize 回归测试直接守护这层行为。</div>
 
 <!-- ================================================ -->
 <h2 id="tests">附录 · 测试覆盖</h2>
@@ -942,8 +969,23 @@
   </tr>
   <tr>
     <td><code>ctx/default.rs</code></td>
-    <td>name / ctx_window clamp / empty conv / compression None / <strong>byte-equivalence vs legacy</strong> / compression_plan vs legacy</td>
-    <td class="num">6</td>
+    <td>name / ctx_window clamp / empty conv render / compression None</td>
+    <td class="num">4</td>
+  </tr>
+  <tr>
+    <td><code>ctx/ollama.rs</code></td>
+    <td>name / ctx clamp / tool_output_cap 公式 / 截断生效 / CJK boundary / 35% 阈值早触发 / compression None / 非空渲染</td>
+    <td class="num">7</td>
+  </tr>
+  <tr>
+    <td><code>ctx/render.rs</code></td>
+    <td>budgeted 路径 10 项(empty / recent / under_80pct / drops_oldest / keeps_latest / never_system_only / emergency / drops_no_summary / preserves_order / cold_zone_compression) + sanitize 2 项</td>
+    <td class="num">12</td>
+  </tr>
+  <tr>
+    <td><code>ctx/resolver.rs</code></td>
+    <td>ollama 命中 / unknown 回 default / 任意 model 配 ollama provider 都走 OllamaCtx</td>
+    <td class="num">3</td>
   </tr>
   <tr>
     <td><code>ctx/truncate.rs</code></td>
@@ -952,18 +994,18 @@
   </tr>
   <tr style="font-weight: 600;">
     <td colspan="2">合计</td>
-    <td class="num">16</td>
+    <td class="num">36</td>
   </tr>
 </table>
 
-<p>整 lib 套件 <code>cargo test -p atomcode-core --lib</code>: <strong>301 passed</strong>, 1 pre-existing fail (<code>self_update::is_newer_semver</code>, 与 ctx 无关)。</p>
+<p>整 lib 套件 <code>cargo test -p atomcode-core --lib</code>: <strong>310 passed</strong>, 1 pre-existing fail (<code>self_update::is_newer_semver</code>, 与 ctx 无关)。</p>
 
 <footer>
   <p>
     <strong>关联文档</strong><br>
     · <code>docs/architecture.md</code> — atomcode 整体架构<br>
     · 源码入口 <code>crates/atomcode-core/src/ctx/mod.rs</code><br>
-    · Commit: <code>e2ad2a1</code> on branch <code>feat/ctx-module</code>
+    · 源码 <code>crates/atomcode-core/src/ctx/</code> on branch <code>feat/ctx-module</code>
   </p>
   <p>
     文档生成于 2026-04-20 · atomcode v4.19.0
