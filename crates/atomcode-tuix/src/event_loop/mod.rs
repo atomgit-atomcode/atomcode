@@ -637,6 +637,18 @@ pub async fn run_loop(
         &ctx.working_dir.to_string_lossy(),
     );
     renderer.render(UiLine::Welcome { model: ctx.model_name.clone(), working_dir: dir_display.clone() });
+    // If this process was spawned by `apply_pending_upgrade` → `re_exec_self`,
+    // an env var carries the version we just upgraded from. Surface one line
+    // on the welcome screen so the user knows the upgrade succeeded, then
+    // clear the var so any subprocesses we spawn don't inherit a stale hint.
+    if let Ok(prev) = std::env::var("ATOMCODE_UPGRADED_FROM") {
+        std::env::remove_var("ATOMCODE_UPGRADED_FROM");
+        let current = format!("v{}", env!("CARGO_PKG_VERSION"));
+        renderer.render(UiLine::CommandOutput(format!(
+            "  ✓ Upgraded {} → {}\n",
+            prev, current
+        )));
+    }
     renderer.render(UiLine::InputPrompt {
         buf: String::new(),
         cursor_byte: 0,

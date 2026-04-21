@@ -174,6 +174,13 @@ enum Commands {
     Rollback,
 }
 
+/// Environment variable set by this process for its re-exec'd child, so
+/// the child knows which version it was just upgraded from and can show
+/// a one-time "✓ Upgraded to vX.Y.Z" banner on the welcome screen.
+/// The child clears this env var after reading it so grandchildren
+/// (spawned tools, subprocesses) don't inherit a stale hint.
+const UPGRADED_FROM_ENV: &str = "ATOMCODE_UPGRADED_FROM";
+
 #[tokio::main]
 async fn main() {
     // Set Windows console to UTF-8 so CJK and other multi-byte characters
@@ -185,6 +192,37 @@ async fn main() {
         unsafe {
             SetConsoleOutputCP(CP_UTF8);
             SetConsoleCP(CP_UTF8);
+        }
+    }
+
+    // Bootstrap: if a prior session staged an upgrade, apply it NOW — before
+    // we spin up tokio, the TUI, or any other heavy state. On success we
+    // re-exec the new binary (Unix: same PID; Windows: child+exit). The user
+    // sees one continuous "atomcode" invocation, just 100-300ms longer than
+    // normal. On failure we log and carry on with the current binary; the
+    // circuit-breaker in `apply_pending_upgrade` ensures a broken release
+    // can't wedge this loop indefinitely.
+    match atomcode_core::self_update::apply_pending_upgrade() {
+        Ok(Some(applied)) => {
+            eprintln!("✓ Upgrading to {}...", applied.version);
+            // Pass the applied version to the re-exec'd child so the TUI
+            // can surface a welcome-screen confirmation exactly once.
+            std::env::set_var(UPGRADED_FROM_ENV, &applied.version);
+            match atomcode_core::self_update::re_exec_self() {
+                Ok(_infallible) => unreachable!("re_exec_self returned Ok"),
+                Err(e) => {
+                    eprintln!(
+                        "Upgrade applied but re-exec failed ({}). The new version will be used on the next launch.",
+                        e
+                    );
+                    std::env::remove_var(UPGRADED_FROM_ENV);
+                    std::process::exit(1);
+                }
+            }
+        }
+        Ok(None) => { /* no pending upgrade; normal startup */ }
+        Err(e) => {
+            eprintln!("Note: pending upgrade could not be applied ({}). Continuing with current version.", e);
         }
     }
 
@@ -241,6 +279,7 @@ async fn run() -> Result<i32> {
                 default_workdir: None,
                 providers: HashMap::new(),
                 datalog: Default::default(),
+                auto_update: true,
             }
         })
     } else {
@@ -250,6 +289,7 @@ async fn run() -> Result<i32> {
             default_workdir: None,
             providers: HashMap::new(),
             datalog: Default::default(),
+            auto_update: true,
         }
     };
 

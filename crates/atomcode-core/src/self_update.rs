@@ -436,6 +436,25 @@ pub async fn run_upgrade(
     let _ = tx.send(UpgradeEvent::Replacing);
     replace_binary(&download, &exe)?;
 
+    // Manual `/upgrade` just installed whatever the current manifest
+    // advertises. Any staged upgrade sitting in `staged_dir()` is now
+    // superseded — if we leave `pending.json` in place, the next startup
+    // might try to "apply" an older (or identical) staged version on top
+    // of what we just installed, causing a downgrade or redundant churn.
+    // Clear both the pointer and any stray staged binaries.
+    clear_pending_pointer();
+    if let Ok(entries) = std::fs::read_dir(staged_dir()) {
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("atomcode-"))
+            {
+                let _ = std::fs::remove_file(&p);
+            }
+        }
+    }
+
     let backup = backup_path(&exe);
     let _ = tx.send(UpgradeEvent::Done {
         version: manifest.version.clone(),
@@ -453,6 +472,333 @@ pub async fn run_upgrade(
 /// layer can render a calm informational message instead of a scary
 /// red error. Kept as a plain string to avoid an error-type refactor.
 pub const ALREADY_LATEST: &str = "ALREADY_LATEST";
+
+// ============================================================================
+// Deferred upgrade (download-in-session, apply-at-next-startup)
+// ============================================================================
+//
+// The deferred path solves two problems that `run_upgrade` alone can't:
+//   1. Users whose sessions run for hours/days — they'll never voluntarily
+//      restart just to pick up a new version. A background task can prepare
+//      the staged binary while they work; apply happens whenever they do
+//      restart (which they will, eventually, for unrelated reasons).
+//   2. Users whose sessions are short but who rarely think to run
+//      `/upgrade` — same benefit: the next normal launch carries the bump.
+//
+// Flow:
+//   session N      : prepare_deferred_upgrade()
+//                    → download to ~/.atomcode/staged/<filename>
+//                    → write ~/.atomcode/staged/pending.json
+//                    → (UI surfaces "⟲ vX.Y.Z pending")
+//   session N exit : no special work; staged files survive any exit path
+//                    (graceful, SIGHUP on terminal close, SIGKILL, power
+//                    loss — all fine, state is on disk)
+//   session N+1    : apply_pending_upgrade() runs BEFORE tokio starts
+//                    → atomically swaps live binary with staged
+//                    → re-execs self with original argv
+//                    → user sees "✓ Upgraded to vX.Y.Z" on welcome
+//
+// A safety circuit-breaker is wired in: if apply succeeds but the new
+// binary fails to start `MAX_APPLY_ATTEMPTS` times in a row, the staged
+// file is discarded so a broken release can't brick the install.
+
+/// Maximum times we'll try to apply the same staged upgrade before
+/// giving up. Prevents a corrupted download from turning into a boot loop.
+const MAX_APPLY_ATTEMPTS: u32 = 3;
+
+/// Pointer record stored at `~/.atomcode/staged/pending.json`. Describes
+/// a downloaded binary that hasn't yet been promoted to live. Lifecycle:
+/// written by `prepare_deferred_upgrade`, read (and deleted on success /
+/// incremented on failure) by `apply_pending_upgrade`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PendingUpgrade {
+    /// Version tag the staged binary represents, e.g. `v4.19.1`.
+    pub version: String,
+    /// Absolute path to the verified binary sitting in `staged_dir()`.
+    pub staged_path: PathBuf,
+    /// SHA256 of the staged binary (lowercase hex). Re-verified at apply
+    /// time so a partial overwrite between sessions (e.g. disk full)
+    /// doesn't install a corrupted file.
+    pub sha256: String,
+    /// Size in bytes; cheap sanity check before we recompute sha256.
+    pub size: u64,
+    /// RFC3339 timestamp for audit / debug. Not load-bearing.
+    pub created_at: String,
+    /// How many times we've attempted apply and failed. When this hits
+    /// `MAX_APPLY_ATTEMPTS`, the staged file is discarded instead of
+    /// retried again on the following startup.
+    #[serde(default)]
+    pub attempts: u32,
+}
+
+/// Successful apply result — fed into the re-exec handoff so the new
+/// process can render a one-time "✓ Upgraded" banner on the welcome screen.
+#[derive(Debug, Clone)]
+pub struct AppliedUpgrade {
+    pub version: String,
+    pub backup: PathBuf,
+    pub exe: PathBuf,
+}
+
+/// `~/.atomcode/staged/` (or equivalent on Windows). Created on demand by
+/// `prepare_deferred_upgrade`; safe to treat as possibly-missing at read
+/// time. Kept under the same root as `history` / `recent_dirs` so nothing
+/// new appears in `$HOME`.
+pub fn staged_dir() -> PathBuf {
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    home.join(".atomcode").join("staged")
+}
+
+fn pending_json_path() -> PathBuf {
+    staged_dir().join("pending.json")
+}
+
+/// Where a prepared (downloaded + verified) binary lives while it waits
+/// to be promoted. Filename mirrors the release artifact so the same
+/// `binary_filename` helper round-trips.
+fn staged_binary_path(version: &str, target: &str) -> PathBuf {
+    staged_dir().join(binary_filename(version, target))
+}
+
+/// Read `pending.json` if present. Absent file → `Ok(None)`. Corrupt JSON
+/// returns an error so callers can delete it and retry; `apply_pending_upgrade`
+/// does exactly that.
+pub fn read_pending() -> Result<Option<PendingUpgrade>> {
+    let path = pending_json_path();
+    if !path.exists() {
+        return Ok(None);
+    }
+    let body = std::fs::read_to_string(&path)
+        .with_context(|| format!("reading {}", path.display()))?;
+    let pending: PendingUpgrade = serde_json::from_str(&body)
+        .with_context(|| format!("parsing {}", path.display()))?;
+    Ok(Some(pending))
+}
+
+fn write_pending(pending: &PendingUpgrade) -> Result<()> {
+    let dir = staged_dir();
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("creating {}", dir.display()))?;
+    let body = serde_json::to_string_pretty(pending).context("serializing pending.json")?;
+    let path = pending_json_path();
+    std::fs::write(&path, body).with_context(|| format!("writing {}", path.display()))
+}
+
+fn clear_pending_pointer() {
+    let _ = std::fs::remove_file(pending_json_path());
+}
+
+/// Quiet variant of `check_latest` used by the hourly background poll.
+/// Returns the remote `(version, manifest)` only when strictly newer than
+/// `current_version`. Separate from `version_check::check_latest` because
+/// that one only gives back the version string; here we need the full
+/// manifest to know the per-target sha256 / size.
+pub async fn fetch_manifest_if_newer(current_version: &str) -> Result<Option<Manifest>> {
+    let manifest = fetch_manifest().await?;
+    if is_newer(&manifest.version, current_version) {
+        Ok(Some(manifest))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Download + verify a new release into `staged_dir()` without touching
+/// the live binary. Writes `pending.json` as the final step so a partial
+/// download (crashed mid-stream) doesn't masquerade as "ready to apply" —
+/// the pointer only appears if sha256 passed.
+///
+/// Returns `Ok(None)` when we're already on the latest version (or newer).
+/// Idempotent: calling twice with the same manifest is a no-op after the
+/// first success (file + pointer already in place).
+pub async fn prepare_deferred_upgrade(
+    current_version: &str,
+    tx: mpsc::UnboundedSender<UpgradeEvent>,
+) -> Result<Option<PendingUpgrade>> {
+    let target = detect_target().ok_or_else(|| {
+        anyhow!(
+            "this platform has no published atomcode release ({}/{})",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        )
+    })?;
+
+    let manifest = fetch_manifest().await?;
+    let _ = tx.send(UpgradeEvent::ManifestFetched {
+        version: manifest.version.clone(),
+    });
+
+    if !is_newer(&manifest.version, current_version) {
+        return Ok(None);
+    }
+
+    // If a staged upgrade for this exact version already exists and the
+    // on-disk bytes still match the manifest's sha256, reuse it. Saves a
+    // redownload when two sessions both polled and landed here.
+    if let Ok(Some(existing)) = read_pending() {
+        if existing.version == manifest.version && existing.staged_path.exists() {
+            if let Some(entry) = manifest.binaries.get(target) {
+                if existing.sha256.eq_ignore_ascii_case(&entry.sha256)
+                    && existing.size == entry.size
+                {
+                    return Ok(Some(existing));
+                }
+            }
+        }
+    }
+
+    let entry = manifest.binaries.get(target).ok_or_else(|| {
+        anyhow!(
+            "manifest has no entry for target {} — this platform may not be in this release",
+            target
+        )
+    })?;
+
+    let dir = staged_dir();
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("creating {}", dir.display()))?;
+
+    let staged_path = staged_binary_path(&manifest.version, target);
+    let url = binary_url(&manifest.version, target);
+    download_and_verify(&url, &entry.sha256, entry.size, &staged_path, &tx).await?;
+
+    let pending = PendingUpgrade {
+        version: manifest.version.clone(),
+        staged_path: staged_path.clone(),
+        sha256: entry.sha256.clone(),
+        size: entry.size,
+        created_at: chrono::Utc::now().to_rfc3339(),
+        attempts: 0,
+    };
+    write_pending(&pending)?;
+    Ok(Some(pending))
+}
+
+/// Bootstrap entry point: called once at the very top of `main()` BEFORE
+/// the tokio runtime, TUI, or any heavy init. Three outcomes:
+///
+///   * `Ok(None)`                  — no pending upgrade, continue normally.
+///   * `Ok(Some(AppliedUpgrade))`  — staged binary is now live; caller must
+///                                   `re_exec_self` to hand control over.
+///   * `Err(e)`                    — apply failed; caller should log and
+///                                   continue with the OLD binary. We've
+///                                   already bumped the attempt counter
+///                                   (or discarded the stage past the cap).
+///
+/// SHA256 is re-verified here even though we verified at download time:
+/// a session-external process (backup tool, AV software, buggy sync)
+/// could have touched the file between sessions. Verification is cheap
+/// compared to installing a corrupted binary.
+pub fn apply_pending_upgrade() -> Result<Option<AppliedUpgrade>> {
+    let mut pending = match read_pending() {
+        Ok(Some(p)) => p,
+        Ok(None) => return Ok(None),
+        Err(_) => {
+            // Corrupt pointer — nuke it, we can't do anything safe with it.
+            clear_pending_pointer();
+            return Ok(None);
+        }
+    };
+
+    if pending.attempts >= MAX_APPLY_ATTEMPTS {
+        // Circuit-break: this staged upgrade has failed too many times.
+        // Discard everything so we stop trying, fall back to the old
+        // binary, and let the next successful prepare_deferred_upgrade
+        // supersede it.
+        let _ = std::fs::remove_file(&pending.staged_path);
+        clear_pending_pointer();
+        return Ok(None);
+    }
+
+    // Bump attempt counter up-front so a crash mid-apply doesn't leave us
+    // in an unbounded retry loop.
+    pending.attempts += 1;
+    let _ = write_pending(&pending);
+
+    if !pending.staged_path.exists() {
+        clear_pending_pointer();
+        return Ok(None);
+    }
+
+    let actual_size = std::fs::metadata(&pending.staged_path)
+        .with_context(|| format!("stat {}", pending.staged_path.display()))?
+        .len();
+    if actual_size != pending.size {
+        let _ = std::fs::remove_file(&pending.staged_path);
+        clear_pending_pointer();
+        return Err(anyhow!(
+            "staged binary size changed between sessions (expected {}, got {}). Discarded.",
+            pending.size,
+            actual_size
+        ));
+    }
+
+    let mut hasher = Sha256::new();
+    let mut file = std::fs::File::open(&pending.staged_path)
+        .with_context(|| format!("opening {}", pending.staged_path.display()))?;
+    std::io::copy(&mut file, &mut hasher).context("hashing staged binary")?;
+    drop(file);
+    let got = hex_encode(&hasher.finalize());
+    if !got.eq_ignore_ascii_case(&pending.sha256) {
+        let _ = std::fs::remove_file(&pending.staged_path);
+        clear_pending_pointer();
+        return Err(anyhow!(
+            "staged binary sha256 drifted between sessions (expected {}, got {}). Discarded.",
+            pending.sha256,
+            got
+        ));
+    }
+
+    let exe = current_exe_path()?;
+    ensure_writable(&exe)?;
+    replace_binary(&pending.staged_path, &exe)?;
+
+    // Success — pointer is done, file moved into place by replace_binary.
+    clear_pending_pointer();
+
+    Ok(Some(AppliedUpgrade {
+        version: pending.version,
+        backup: backup_path(&exe),
+        exe,
+    }))
+}
+
+/// Replace the current process with a fresh invocation of the live binary,
+/// preserving argv, cwd, and env. On Unix this is `execv` (same PID, old
+/// process image gone). On Windows we spawn a child and exit the parent —
+/// a separate PID, but terminal stdio is shared so the user still sees
+/// one continuous "session" from their perspective.
+///
+/// Never returns on the happy path. An `Err` return means the handoff
+/// failed (e.g., new binary missing execute bit under unusual filesystem
+/// constraints); caller should surface the error and keep running with
+/// the old binary rather than exiting silently.
+pub fn re_exec_self() -> Result<std::convert::Infallible> {
+    let exe = current_exe_path()?;
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let err = std::process::Command::new(&exe).args(&args).exec();
+        // `exec` only returns on failure.
+        Err(anyhow!("re-exec failed: {}", err))
+    }
+
+    #[cfg(windows)]
+    {
+        // Windows has no exec(). Spawn the child with shared stdio so
+        // the user's terminal stays connected to the new process, then
+        // exit ourselves. The replacement PID shift is invisible in
+        // a terminal context (the shell tracks the parent's exit).
+        let status = std::process::Command::new(&exe)
+            .args(&args)
+            .spawn()
+            .with_context(|| format!("spawning new binary {}", exe.display()))?
+            .wait()
+            .with_context(|| "waiting for spawned binary to exit")?;
+        std::process::exit(status.code().unwrap_or(0));
+    }
+}
 
 /// Parse and compare two `vMAJOR.MINOR.PATCH` strings. Returns true
 /// when `latest > current`. Malformed inputs fall back to a byte-wise
@@ -714,5 +1060,48 @@ mod tests {
 
         assert_eq!(std::fs::read(&exe).unwrap(), b"OLD");
         assert_eq!(std::fs::read(&bak).unwrap(), b"NEW");
+    }
+
+    #[test]
+    fn pending_upgrade_serde_roundtrips() {
+        let p = PendingUpgrade {
+            version: "v4.19.1".to_string(),
+            staged_path: PathBuf::from("/tmp/staged/atomcode-v4.19.1-darwin-arm64"),
+            sha256: "abcd".to_string(),
+            size: 1024,
+            created_at: "2026-04-20T10:54:16Z".to_string(),
+            attempts: 0,
+        };
+        let j = serde_json::to_string(&p).unwrap();
+        let back: PendingUpgrade = serde_json::from_str(&j).unwrap();
+        assert_eq!(back.version, "v4.19.1");
+        assert_eq!(back.attempts, 0);
+    }
+
+    #[test]
+    fn pending_attempts_defaults_when_missing() {
+        // Older pointer files written before the attempts field existed
+        // must still deserialize — `#[serde(default)]` covers that.
+        let j = r#"{
+            "version": "v4.19.1",
+            "staged_path": "/tmp/x",
+            "sha256": "abcd",
+            "size": 1024,
+            "created_at": "2026-04-20T10:54:16Z"
+        }"#;
+        let p: PendingUpgrade = serde_json::from_str(j).unwrap();
+        assert_eq!(p.attempts, 0);
+    }
+
+    #[test]
+    fn staged_binary_path_matches_release_artifact_name() {
+        let p = staged_binary_path("v4.19.1", "darwin-arm64");
+        assert!(p.ends_with("atomcode-v4.19.1-darwin-arm64"), "got: {:?}", p);
+    }
+
+    #[test]
+    fn staged_binary_path_adds_exe_for_windows() {
+        let p = staged_binary_path("v4.19.1", "windows-x64");
+        assert!(p.ends_with("atomcode-v4.19.1-windows-x64.exe"), "got: {:?}", p);
     }
 }

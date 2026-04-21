@@ -175,15 +175,67 @@ pub async fn run(
     // instead of waiting for the user's next keystroke.
     let update_hint = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
     let (wake_tx, wake_rx) = tokio::sync::mpsc::channel::<()>(1);
+
+    // Seed the hint from any prior-session staged upgrade so the user
+    // sees the pending status on the very first frame rather than
+    // waiting for the next poll to rediscover it.
+    if let Ok(Some(pending)) = atomcode_core::self_update::read_pending() {
+        if let Ok(mut g) = update_hint.lock() {
+            *g = Some(pending.version);
+        }
+    }
+
     {
         let slot = update_hint.clone();
+        let wake = wake_tx.clone();
         tokio::spawn(async move {
             let current = format!("v{}", env!("CARGO_PKG_VERSION"));
             if let Some(latest) = atomcode_core::version_check::check_latest(&current).await {
                 if let Ok(mut g) = slot.lock() {
                     *g = Some(latest);
                 }
-                let _ = wake_tx.try_send(());
+                let _ = wake.try_send(());
+            }
+        });
+    }
+
+    // Hourly deferred-upgrade poll. Runs alongside the one-shot version
+    // check above, but performs the full download + verify and writes
+    // `pending.json` so the next startup auto-applies. Only active when
+    // `config.auto_update` is true (default). Poll interval is
+    // intentionally long (1h) — more frequent polls just burn bandwidth
+    // for users who aren't going to restart more often than that anyway.
+    if config.auto_update {
+        let slot = update_hint.clone();
+        let wake = wake_tx.clone();
+        tokio::spawn(async move {
+            let current = format!("v{}", env!("CARGO_PKG_VERSION"));
+            // Small initial delay so the startup burst (manifest fetch,
+            // provider handshake, tool registration) doesn't compete for
+            // network with a background download that nobody's waiting on.
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            loop {
+                // Dispose of UpgradeEvent messages silently — the
+                // hourly poll is background-only and has no UI surface
+                // for per-byte progress. `/upgrade` (manual, foreground)
+                // is the flow that renders events.
+                let (tx, mut rx) =
+                    tokio::sync::mpsc::unbounded_channel::<atomcode_core::self_update::UpgradeEvent>();
+                tokio::spawn(async move { while rx.recv().await.is_some() {} });
+
+                match atomcode_core::self_update::prepare_deferred_upgrade(&current, tx).await {
+                    Ok(Some(pending)) => {
+                        if let Ok(mut g) = slot.lock() {
+                            *g = Some(pending.version);
+                        }
+                        let _ = wake.try_send(());
+                    }
+                    Ok(None) | Err(_) => {
+                        // Already latest, or a transient network error.
+                        // Either way we just try again next hour.
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
             }
         });
     }

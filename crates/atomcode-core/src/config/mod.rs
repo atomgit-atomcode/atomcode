@@ -59,6 +59,13 @@ pub struct Config {
     /// without needing to know the field names in advance.
     #[serde(default, skip_serializing)]
     pub datalog: DatalogConfig,
+    /// When true (default), atomcode polls for new releases every hour
+    /// while running and stages any newer version it finds. The stage is
+    /// applied on the next startup (see `self_update::apply_pending_upgrade`).
+    /// Set to `false` to disable auto-staging entirely; `/upgrade` still
+    /// works manually. Missing from older configs → defaults to `true`.
+    #[serde(default = "default_true")]
+    pub auto_update: bool,
 }
 
 /// Controls the per-turn markdown datalog writer.
@@ -289,6 +296,7 @@ mod tests {
             default_workdir: None,
             providers: HashMap::new(),
             datalog: DatalogConfig { enabled: false, dir: Some("/var/log/ac".to_string()) },
+            auto_update: true,
         };
         cfg.providers.insert("p".to_string(), ProviderConfig {
             provider_type: "openai".to_string(),

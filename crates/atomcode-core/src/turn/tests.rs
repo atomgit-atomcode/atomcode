@@ -174,6 +174,7 @@ fn test_config() -> Config {
         default_workdir: None,
         providers,
         datalog: Default::default(),
+        auto_update: false,
     }
 }
 
