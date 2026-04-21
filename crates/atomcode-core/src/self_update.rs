@@ -29,7 +29,7 @@ use tokio::sync::mpsc;
 pub const MANIFEST_URL: &str =
     "https://raw.atomgit.com/atomgit_atomcode/atomcode/raw/main/latest.json";
 pub const DOWNLOAD_BASE: &str =
-    "https://atomgit.com/atomgit_atomcode/atomcode-release/releases/download";
+    "https://atomgit.com/atomgit_atomcode/atomcode/releases/download";
 
 /// Streamed progress events from the upgrade/rollback machinery.
 ///
@@ -564,7 +564,7 @@ mod tests {
     fn binary_url_shape() {
         assert_eq!(
             binary_url("v4.19.0", "darwin-arm64"),
-            "https://atomgit.com/atomgit_atomcode/atomcode-release/releases/download/v4.19.0/atomcode-v4.19.0-darwin-arm64"
+            "https://atomgit.com/atomgit_atomcode/atomcode/releases/download/v4.19.0/atomcode-v4.19.0-darwin-arm64"
         );
     }
 

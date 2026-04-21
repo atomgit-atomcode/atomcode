@@ -1,6 +1,6 @@
 # AtomCode installer for Windows — PowerShell
 #
-#   irm https://atomgit.com/atomgit_atomcode/atomcode-release/raw/main/install.ps1 | iex
+#   irm https://atomgit.com/atomgit_atomcode/atomcode/raw/main/install.ps1 | iex
 #
 # Env overrides:
 #   $env:ATOMCODE_VERSION   release tag to install (default: v4.18.1)
@@ -9,7 +9,7 @@
 $ErrorActionPreference = "Stop"
 
 $Version = if ($env:ATOMCODE_VERSION) { $env:ATOMCODE_VERSION } else { "v4.18.1" }
-$RepoBase = "https://atomgit.com/atomgit_atomcode/atomcode-release/releases/download"
+$RepoBase = "https://atomgit.com/atomgit_atomcode/atomcode/releases/download"
 
 # --- detect arch ---
 # Prefer PROCESSOR_ARCHITEW6432 (set only when a 32-bit process runs on a 64-bit
