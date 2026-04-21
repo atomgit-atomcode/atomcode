@@ -69,6 +69,11 @@ impl AgentLoop {
             ));
         }
 
+        // Git snapshot (branch / HEAD / status) captured at session start.
+        // Empty string when `wd` isn't a git repo — push is a no-op.
+        // See `ctx::env` for the snapshot / disclaimer rationale.
+        prompt.push_str(&self.env_snapshot.as_prompt_section());
+
         // Plan mode: inject planning-only instructions before rules.
         if self.plan_mode {
             prompt.push_str(

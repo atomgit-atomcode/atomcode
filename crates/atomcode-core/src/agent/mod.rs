@@ -238,6 +238,13 @@ pub struct AgentLoop {
     /// (see the reload handler below).
     pub ctx: std::sync::Arc<dyn crate::ctx::CtxBuilder>,
 
+    /// Session-start environment snapshot — git branch / HEAD / status.
+    /// Captured once in `new()`, refreshed on `ChangeDir` (new working
+    /// tree ⇒ new repo). Stale-by-design: rendered with a disclaimer
+    /// in `build_system_prompt` so the model knows it's not live.
+    /// See `crate::ctx::env`.
+    pub env_snapshot: crate::ctx::EnvSnapshot,
+
     // Execution state
     pub phase: AgentPhase,
     pub turn_tokens: usize,
@@ -469,6 +476,12 @@ impl AgentLoop {
             file_read_counts: std::collections::HashMap::new(),
         };
 
+        // Capture session-start env snapshot (git status, branch, HEAD).
+        // Blocking I/O here is fine: `new()` runs once at startup, the
+        // capture is ~tens of ms for typical repos, and it's required
+        // before the first turn's system prompt is assembled.
+        let env_snapshot = crate::ctx::EnvSnapshot::capture(&working_dir);
+
         let agent = Self {
             conversation,
             tool_registry: shared_tools,
@@ -476,6 +489,7 @@ impl AgentLoop {
             permission_store,
             config,
             ctx,
+            env_snapshot,
             phase: AgentPhase::Idle,
             turn_tokens: 0,
             total_tokens: 0,

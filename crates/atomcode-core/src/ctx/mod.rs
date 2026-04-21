@@ -28,6 +28,7 @@
 //! impls may call or ignore at will.
 
 pub mod default;
+pub mod env;
 pub mod ollama;
 pub mod render;
 pub mod resolver;
@@ -38,6 +39,7 @@ use crate::conversation::message::Message;
 use crate::tool::ToolResult;
 
 pub use default::DefaultCtx;
+pub use env::EnvSnapshot;
 pub use ollama::OllamaCtx;
 pub use resolver::for_provider;
 

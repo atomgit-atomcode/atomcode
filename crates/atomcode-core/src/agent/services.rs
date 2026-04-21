@@ -75,6 +75,10 @@ impl AgentLoop {
             self.conversation.messages.clear();
             self.conversation.turn_tracker = crate::conversation::turn::TurnTracker::new();
             self.session_files.clear();
+            // Refresh env snapshot for the new directory. The old git
+            // branch / status belongs to the previous repo; keeping it
+            // would lie to the model.
+            self.env_snapshot = crate::ctx::EnvSnapshot::capture(&resolved);
             // Reload skills for the new working directory (project-level skills may differ)
             if let Ok(mut reg) = self.skill_registry.write() {
                 reg.reload(&resolved);
