@@ -34,8 +34,9 @@ impl CtxBuilder for DefaultCtx {
         &self,
         conv: &Conversation,
         system_prompt: &str,
+        turn_reminder: &str,
     ) -> (Vec<Message>, ContextStats) {
-        crate::ctx::render::build_messages(conv, system_prompt, self.ctx_window)
+        crate::ctx::render::build_messages(conv, system_prompt, self.ctx_window, turn_reminder)
     }
 
     fn needs_compression(&self, conv: &Conversation, system_tokens: usize) -> bool {
@@ -103,7 +104,7 @@ mod tests {
     fn build_messages_empty_conv_returns_system_only() {
         let d = DefaultCtx::new(&test_provider(128_000));
         let conv = Conversation::new();
-        let (msgs, _stats) = d.build_messages(&conv, "SYS");
+        let (msgs, _stats) = d.build_messages(&conv, "SYS", "");
         assert_eq!(msgs.len(), 1);
         assert!(matches!(
             msgs[0].role,

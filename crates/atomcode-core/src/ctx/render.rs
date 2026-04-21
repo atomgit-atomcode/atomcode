@@ -24,10 +24,16 @@ use crate::conversation::message::{self, Message, MessageContent, Role};
 /// The cold zone is populated by `Conversation::apply_compression` when
 /// total tokens exceed ~70% of budget. If still over 80% after cold zone
 /// injection, this function drops oldest turns inline.
+///
+/// `turn_reminder` — if non-empty, prepended to the last User message.
+/// Keeps the system prompt prefix stable across turns (好 cache),
+/// while still delivering per-turn dynamic context (git diff, current
+/// task, etc). Empty string = no injection.
 pub fn build_messages(
     conv: &Conversation,
     system_prompt: &str,
     token_budget: usize,
+    turn_reminder: &str,
 ) -> (Vec<Message>, ContextStats) {
     if conv.messages.is_empty() {
         return (vec![Message::new(Role::System, system_prompt)], ContextStats::default());
@@ -202,6 +208,20 @@ pub fn build_messages(
                 "[Emergency: prior conversation was dropped during compaction. Only the latest user message is preserved.]"
             ));
             result.push(last_user.clone());
+        }
+    }
+
+    // Turn reminder: prepend to last User message. Runs AFTER all
+    // compaction/cleanup so the reminder always rides the most recent
+    // user turn. Keeps system_prompt itself stable (cacheable).
+    if !turn_reminder.is_empty() {
+        for msg in result.iter_mut().rev() {
+            if matches!(msg.role, Role::User) {
+                if let MessageContent::Text(ref mut text) = msg.content {
+                    *text = format!("{}\n{}", turn_reminder, text);
+                    break;
+                }
+            }
         }
     }
 
@@ -725,7 +745,7 @@ mod tests {
     #[test]
     fn test_budgeted_empty_conversation() {
         let conv = Conversation::new();
-        let (msgs, _stats) = build_messages(&conv, "system prompt", 8000);
+        let (msgs, _stats) = build_messages(&conv, "system prompt", 8000, "");
         assert_eq!(msgs.len(), 1);
         assert!(matches!(msgs[0].role, Role::System));
     }
@@ -738,7 +758,7 @@ mod tests {
         conv.messages.push(Message::new(Role::Assistant, "hi there"));
         conv.add_user_message("do something");
 
-        let (msgs, _stats) = build_messages(&conv, "sys", 8000);
+        let (msgs, _stats) = build_messages(&conv, "sys", 8000, "");
         assert_eq!(msgs.len(), 4); // system + 3 messages
         assert!(matches!(msgs[0].role, Role::System));
     }
@@ -767,7 +787,7 @@ mod tests {
         conv.add_user_message("now what?");
 
         // Large budget — everything fits
-        let (msgs, stats) = build_messages(&conv, "sys", 100000);
+        let (msgs, stats) = build_messages(&conv, "sys", 100000, "");
         // system + 7 messages (2 turns * 3 msgs each + final user)
         assert_eq!(msgs.len(), 8);
         assert!(matches!(msgs[0].role, Role::System));
@@ -802,7 +822,7 @@ mod tests {
         }
         conv.add_user_message("now what?");
 
-        let (msgs, stats) = build_messages(&conv, "sys", 4000);
+        let (msgs, stats) = build_messages(&conv, "sys", 4000, "");
         // Oldest turns should be dropped
         assert!(stats.dropped_tokens > 0, "Some turns should have been dropped");
         // Most recent user message must survive
@@ -832,7 +852,7 @@ mod tests {
         });
 
         // Very small budget — system prompt is always kept
-        let (msgs, _stats) = build_messages(&conv, "sys", 1000);
+        let (msgs, _stats) = build_messages(&conv, "sys", 1000, "");
         assert!(!msgs.is_empty(), "Must at least have system prompt");
         assert!(matches!(msgs[0].role, Role::System));
     }
@@ -881,7 +901,7 @@ mod tests {
 
         // Budget too small to fit the huge output — compaction MUST still leave
         // at least one non-system message.
-        let (msgs, _stats) = build_messages(&conv, "sys", 10_000);
+        let (msgs, _stats) = build_messages(&conv, "sys", 10_000, "");
         let non_system = msgs.iter().filter(|m| !matches!(m.role, Role::System)).count();
         assert!(
             non_system > 0,
@@ -913,7 +933,7 @@ mod tests {
             });
         }
 
-        let (msgs, _stats) = build_messages(&conv, "sys", 5_000);
+        let (msgs, _stats) = build_messages(&conv, "sys", 5_000, "");
         let has_user = msgs.iter().any(|m| matches!(m.role, Role::User));
         assert!(has_user, "last user message must always survive, got {} msgs", msgs.len());
     }
@@ -949,7 +969,7 @@ mod tests {
         assert_eq!(conv.turn_tracker.turns.len(), 5); // 8 - 3
 
         // Budget check: cold zone should appear in output
-        let (msgs, _stats) = build_messages(&conv, "sys", 100000);
+        let (msgs, _stats) = build_messages(&conv, "sys", 100000, "");
         let has_cold = msgs.iter().any(|m| {
             m.text().map_or(false, |t| t.contains("Earlier conversation history"))
         });
@@ -979,7 +999,7 @@ mod tests {
         }
 
         // Small budget — force dropping
-        let (msgs, stats) = build_messages(&conv, "sys", 2000);
+        let (msgs, stats) = build_messages(&conv, "sys", 2000, "");
         assert!(stats.dropped_tokens > 0, "Should drop turns when over budget");
         assert!(matches!(msgs[0].role, Role::System));
     }
@@ -994,7 +1014,7 @@ mod tests {
         conv.messages.push(Message::new(Role::Assistant, "response 2"));
         conv.add_user_message("third");
 
-        let (msgs, _stats) = build_messages(&conv, "sys", 100000);
+        let (msgs, _stats) = build_messages(&conv, "sys", 100000, "");
         // system + 5 messages
         assert_eq!(msgs.len(), 6);
         assert_eq!(msgs[1].text(), Some("first"));

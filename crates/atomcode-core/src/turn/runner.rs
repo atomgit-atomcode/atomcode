@@ -71,26 +71,14 @@ impl TurnRunner {
         cancel: CancellationToken,
         allowed_tools: Option<&[&str]>,
     ) -> TurnResult {
-        // 1. Build messages within token budget
+        // 1. Build messages within token budget.
+        // turn_reminder injection now lives inside ctx::render::build_messages
+        // so per-model impls (e.g. OllamaCtx in the future) can override
+        // the injection strategy if desired.
         let context_window = self.config.default_context_window();
 
-        let (mut messages, ctx_stats) =
-            crate::ctx::render::build_messages(conversation, system_prompt, context_window);
-
-        // Inject turn reminder into the last user message.
-        // This keeps system prompt stable (cacheable) while providing
-        // per-turn dynamic context (previous session, current task, etc.).
-        if !turn_reminder.is_empty() {
-            // Find the last User message and prepend the reminder
-            for msg in messages.iter_mut().rev() {
-                if matches!(msg.role, crate::conversation::message::Role::User) {
-                    if let crate::conversation::message::MessageContent::Text(ref mut text) = msg.content {
-                        *text = format!("{}\n{}", turn_reminder, text);
-                        break;
-                    }
-                }
-            }
-        }
+        let (messages, ctx_stats) =
+            crate::ctx::render::build_messages(conversation, system_prompt, context_window, turn_reminder);
 
         let actual_tokens: usize = messages.iter().map(|m| m.estimate_tokens()).sum();
 

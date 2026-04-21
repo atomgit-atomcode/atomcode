@@ -46,15 +46,25 @@ pub use resolver::for_provider;
 pub trait CtxBuilder: Send + Sync {
     /// Build the messages array to send to the LLM for this turn.
     ///
-    /// Implementations are free to transform `system_prompt` (strip
-    /// tool schemas for small models, add cache-friendly markers for
-    /// Claude, replace entirely for fine-tuned models) and to choose
-    /// any render pipeline (delegate to [`crate::ctx::render::build_messages`],
-    /// call shared helpers directly, or roll their own).
+    /// Implementations are free to:
+    /// - Transform `system_prompt` (strip tool schemas for small models,
+    ///   add cache-friendly markers for Claude, replace entirely for
+    ///   fine-tuned models)
+    /// - Choose any render pipeline (delegate to
+    ///   [`crate::ctx::render::build_messages`], call shared helpers
+    ///   directly, or roll their own)
+    /// - Decide how to handle `turn_reminder` — per-turn dynamic
+    ///   context (git status, current task, prev edited files). The
+    ///   default policy prepends it to the last User message for
+    ///   system-prompt cache stability; a small-window model might
+    ///   drop it to save tokens; a cache-sensitive model might insert
+    ///   it as its own System message to keep the stable prefix clean.
+    ///   Pass `""` when no reminder applies.
     fn build_messages(
         &self,
         conv: &Conversation,
         system_prompt: &str,
+        turn_reminder: &str,
     ) -> (Vec<Message>, ContextStats);
 
     /// Whether the conversation should be compressed. Default: never.

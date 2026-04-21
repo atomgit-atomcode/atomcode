@@ -59,11 +59,12 @@ impl CtxBuilder for OllamaCtx {
         &self,
         conv: &Conversation,
         system_prompt: &str,
+        turn_reminder: &str,
     ) -> (Vec<Message>, ContextStats) {
         // 渲染透传给默认 render 管道,仅把 ctx_window 传下去决定
-        // token 预算; cold zone / microcompact / hard-cut 的具体
-        // 策略由 ctx::render 统一执行。
-        crate::ctx::render::build_messages(conv, system_prompt, self.ctx_window)
+        // token 预算; cold zone / microcompact / hard-cut / turn_reminder
+        // 注入的具体策略由 ctx::render 统一执行。
+        crate::ctx::render::build_messages(conv, system_prompt, self.ctx_window, turn_reminder)
     }
 
     /// 更早触发压缩:35% 阈值,而非 Default 的 50%。
@@ -261,7 +262,7 @@ mod tests {
         let o = OllamaCtx::new(&ollama_provider(8_000));
         let mut conv = Conversation::new();
         conv.add_user_message("hello");
-        let (msgs, stats) = o.build_messages(&conv, "SYS");
+        let (msgs, stats) = o.build_messages(&conv, "SYS", "");
         assert!(!msgs.is_empty());
         assert!(stats.sent_tokens <= 8_000);
     }

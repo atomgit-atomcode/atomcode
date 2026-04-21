@@ -841,7 +841,10 @@ impl AgentLoop {
             // Log LLM request to <working_dir>/datalog/llm/ — colocated with turn .md files.
             {
                 let context_window = self.ctx.ctx_window();
-                let (msgs, _) = self.ctx.build_messages(&conv, &system_prompt);
+                // Pass turn_reminder so datalog sees the exact bytes
+                // TurnRunner is about to send (reminder injection now
+                // lives inside ctx::render::build_messages).
+                let (msgs, _) = self.ctx.build_messages(&conv, &system_prompt, &turn_reminder);
                 let tool_defs = self.turn_runner.tools.get_definitions();
                 let wd = self.turn_runner.context.working_dir
                     .try_read().map(|g| g.clone()).unwrap_or_default();
