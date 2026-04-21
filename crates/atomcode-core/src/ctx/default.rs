@@ -18,6 +18,13 @@ pub struct DefaultCtx {
     /// clamped to a defensive minimum of 8000 to avoid divide-by-zero
     /// and thrashing in pathological configs).
     pub ctx_window: usize,
+
+    /// Lowercased model id. Used by
+    /// [`crate::ctx::render::apply_model_directives`] to decide whether
+    /// to append CJK language lock / MiniMax thinking discipline to the
+    /// system prompt. Captured at construction time so `build_messages`
+    /// stays `&self`.
+    model_id: String,
 }
 
 impl DefaultCtx {
@@ -25,6 +32,7 @@ impl DefaultCtx {
     pub fn new(provider: &ProviderConfig) -> Self {
         Self {
             ctx_window: provider.context_window.max(8000),
+            model_id: provider.model.to_lowercase(),
         }
     }
 }
@@ -36,7 +44,8 @@ impl CtxBuilder for DefaultCtx {
         system_prompt: &str,
         turn_reminder: &str,
     ) -> (Vec<Message>, ContextStats) {
-        crate::ctx::render::build_messages(conv, system_prompt, self.ctx_window, turn_reminder)
+        let sys = crate::ctx::render::apply_model_directives(system_prompt, &self.model_id);
+        crate::ctx::render::build_messages(conv, &sys, self.ctx_window, turn_reminder)
     }
 
     fn needs_compression(&self, conv: &Conversation, system_tokens: usize) -> bool {

@@ -77,12 +77,6 @@ impl AgentLoop {
             std::env::consts::OS, shell,
         );
 
-        // Model identity — needed for language discipline.
-        let model_id = self.config.providers
-            .get(&self.config.default_provider)
-            .map(|p| p.model.to_lowercase())
-            .unwrap_or_default();
-
         // Identity: inject model name so the model correctly identifies itself.
         let model_display = self.config.providers
             .get(&self.config.default_provider)
@@ -122,18 +116,6 @@ impl AgentLoop {
         // when it starts generating tool calls.
         prompt.push_str(&format!("\n=== RULES (follow these strictly) ===\n{rules}\n"));
 
-        // Language discipline: some models (MiniMax, Qwen, DeepSeek) default to
-        // English chain-of-thought even when the user speaks Chinese.
-        let needs_cn_lock = model_id.contains("minimax")
-            || model_id.contains("qwen")
-            || model_id.contains("deepseek")
-            || model_id.contains("kimi");
-        if needs_cn_lock {
-            prompt.push_str(
-                "\n用户可见的输出请用中文。工具调用和代码保持原样。\n"
-            );
-        }
-
         // Platform-specific rules — only injected on the target OS.
         let platform = crate::config::platform_rules();
         if !platform.is_empty() {
@@ -141,14 +123,12 @@ impl AgentLoop {
             prompt.push('\n');
         }
 
-        // MiniMax thinking discipline — inline as a rule, not a <system-reminder>
-        if model_id.contains("minimax") {
-            prompt.push_str(
-                "\n## THINKING 纪律:\n\
-                 内部思考（<think> 块）必须极简，只写必要的决策线索，\
-                 不要复述工具结果、不要分点展开、不要自问自答。目标 ≤ 3 句话。\n"
-            );
-        }
+        // NOTE: model-specific directives (CJK language lock for MiniMax/
+        // Qwen/DeepSeek/Kimi, MiniMax thinking discipline) were here but
+        // moved to `ctx::render::apply_model_directives`, invoked by each
+        // CtxBuilder impl in `build_messages`. Keeping them out of this
+        // function keeps agent::prompt free of `if model_id.contains(...)`
+        // branches — per-model customization now lives in ctx.
 
         prompt
     }

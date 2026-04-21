@@ -17,6 +17,56 @@
 use crate::conversation::{Conversation, ContextStats, KEEP_MESSAGES};
 use crate::conversation::message::{self, Message, MessageContent, Role};
 
+/// Append model-specific behavioral directives to a system prompt.
+///
+/// Previously scattered as `if model_id.contains(...)` branches inside
+/// `agent::prompt::build_system_prompt`. Moved here so per-model prompt
+/// customization lives in the ctx layer alongside other per-model logic
+/// (compression threshold, tool-output cap, etc).
+///
+/// `model_id` MUST already be lowercased by the caller (matching the
+/// original `provider.model.to_lowercase()` check).
+///
+/// Currently handles two groups:
+/// - CN language lock: minimax / qwen / deepseek / kimi models default
+///   to English reasoning even when the user speaks Chinese; one gentle
+///   line nudges user-visible output back to zh-CN.
+/// - MiniMax thinking discipline: MiniMax M2 has no reasoning_effort
+///   knob and defaults to extremely verbose `<think>` blocks; a
+///   system-reminder near the tail caps it to ≤3 sentences via recency
+///   bias.
+///
+/// Impls that don't want these (e.g. a hypothetical ClaudeCtx) simply
+/// don't call this function — the hooks live in each `build_messages`
+/// impl, not in `ctx::render::build_messages`.
+pub(crate) fn apply_model_directives(system_prompt: &str, model_id: &str) -> String {
+    let mut out = String::with_capacity(system_prompt.len() + 512);
+    out.push_str(system_prompt);
+
+    let needs_cn_lock = model_id.contains("minimax")
+        || model_id.contains("qwen")
+        || model_id.contains("deepseek")
+        || model_id.contains("kimi");
+    if needs_cn_lock {
+        out.push_str("\n用户可见的输出请用中文。工具调用和代码保持原样。\n");
+    }
+
+    // MiniMax M2 的 thinking 默认极其啰嗦，会大量消耗 output tokens 并拖慢响应。
+    // 模型本身没有 reasoning_effort 档位开关，只能用 prompt 约束。放在接近尾部
+    // 借助 recency 保证每轮都生效，等效于一个轻量 system-reminder。
+    if model_id.contains("minimax") {
+        out.push_str(
+            "\n<system-reminder>\n\
+             THINKING 简洁纪律：内部思考（<think> 块）必须极简，\
+             只写必要的决策线索，不要复述工具结果、不要分点展开、不要自问自答。\
+             目标 ≤ 3 句话。冗长 thinking 视为严重问题。\n\
+             </system-reminder>\n",
+        );
+    }
+
+    out
+}
+
 /// Context management with cold zone compression.
 ///
 /// Structure: [System] [Cold Zone (max 3 summaries)] [Last 5 turns full]
@@ -742,6 +792,47 @@ mod tests {
     use super::*;
     use crate::conversation::Conversation;
     use crate::conversation::message::{Message, Role};
+
+    #[test]
+    fn apply_model_directives_noop_for_generic_model() {
+        // gpt / claude / gemini 等模型不触发任何指令 — 原 prompt 原样返回。
+        let out = apply_model_directives("SYS", "gpt-4o");
+        assert_eq!(out, "SYS");
+        let out = apply_model_directives("SYS", "claude-opus-4-7");
+        assert_eq!(out, "SYS");
+    }
+
+    #[test]
+    fn apply_model_directives_cn_lock_for_cjk_tier() {
+        for id in ["qwen3-max", "deepseek-v3", "kimi-k2"] {
+            let out = apply_model_directives("SYS", id);
+            assert!(
+                out.contains("用户可见的输出请用中文"),
+                "model {id} missing CN lock"
+            );
+            assert!(!out.contains("THINKING 简洁纪律"), "model {id} got MiniMax directive erroneously");
+        }
+    }
+
+    #[test]
+    fn apply_model_directives_minimax_gets_both_blocks() {
+        let out = apply_model_directives("SYS", "minimax-m2");
+        assert!(out.contains("用户可见的输出请用中文"));
+        assert!(out.contains("THINKING 简洁纪律"));
+        // MiniMax 指令必须在 CN lock 之后(recency: 更尾部 = 更高优先级)
+        let cn_idx = out.find("用户可见的输出").unwrap();
+        let thinking_idx = out.find("THINKING").unwrap();
+        assert!(thinking_idx > cn_idx);
+    }
+
+    #[test]
+    fn apply_model_directives_preserves_system_prompt_prefix() {
+        // 追加模式:原 prompt 必须 100% 保留在开头,cache key 不破坏。
+        let sys = "You are AtomCode. Working directory: /tmp\n";
+        let out = apply_model_directives(sys, "minimax-m2");
+        assert!(out.starts_with(sys));
+    }
+
     #[test]
     fn test_budgeted_empty_conversation() {
         let conv = Conversation::new();

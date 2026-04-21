@@ -36,6 +36,11 @@ use crate::tool::ToolResult;
 pub struct OllamaCtx {
     /// Token budget, 至少 4K(再低就没意义了)
     ctx_window: usize,
+
+    /// Lowercased model id。用于 [`crate::ctx::render::apply_model_directives`]
+    /// 判断是否追加 CJK 语言锁 / MiniMax thinking 纪律。本地 Ollama 也
+    /// 常跑 qwen / deepseek / minimax 蒸馏版,同一套规则适用。
+    model_id: String,
 }
 
 impl OllamaCtx {
@@ -44,6 +49,7 @@ impl OllamaCtx {
         // 再给一个硬下限防 0 / 配置漂移。
         Self {
             ctx_window: provider.context_window.max(4000),
+            model_id: provider.model.to_lowercase(),
         }
     }
 
@@ -64,7 +70,10 @@ impl CtxBuilder for OllamaCtx {
         // 渲染透传给默认 render 管道,仅把 ctx_window 传下去决定
         // token 预算; cold zone / microcompact / hard-cut / turn_reminder
         // 注入的具体策略由 ctx::render 统一执行。
-        crate::ctx::render::build_messages(conv, system_prompt, self.ctx_window, turn_reminder)
+        // model_id 依赖的指令(CJK 语言锁 / MiniMax thinking 纪律)
+        // 在渲染管道前贴到 system prompt 上,与 DefaultCtx 一致。
+        let sys = crate::ctx::render::apply_model_directives(system_prompt, &self.model_id);
+        crate::ctx::render::build_messages(conv, &sys, self.ctx_window, turn_reminder)
     }
 
     /// 更早触发压缩:35% 阈值,而非 Default 的 50%。
