@@ -770,7 +770,14 @@ pub async fn run_loop(
             }
 
             // ── Agent events ──
-            maybe = ctx.agent.event_rx.recv(), if matches!(app.state.phase, UiPhase::Streaming) => {
+            // Consumed regardless of phase. Gating on Streaming missed
+            // the TurnComplete that arrives *after* an Error event: the
+            // Error handler flips phase to Idle, so the very next event
+            // on the channel is stuck until the user submits again —
+            // which is what "得发两次你好才结束" looked like in the UI.
+            // Phase-specific behaviour (spinner redraw, type-ahead queue
+            // drain) lives inside the match arms on `app.state.phase`.
+            maybe = ctx.agent.event_rx.recv() => {
                 let Some(ev) = maybe else { break };
                 let pre_phase = app.state.phase;
                 handle_agent_event(ev, &mut app.state, &mut app.think, renderer, &mut app.pending_tools);
@@ -868,7 +875,14 @@ pub async fn run_loop(
             }
 
             // ── Agent events ──
-            maybe = ctx.agent.event_rx.recv(), if matches!(app.state.phase, UiPhase::Streaming) => {
+            // Consumed regardless of phase. Gating on Streaming missed
+            // the TurnComplete that arrives *after* an Error event: the
+            // Error handler flips phase to Idle, so the very next event
+            // on the channel is stuck until the user submits again —
+            // which is what "得发两次你好才结束" looked like in the UI.
+            // Phase-specific behaviour (spinner redraw, type-ahead queue
+            // drain) lives inside the match arms on `app.state.phase`.
+            maybe = ctx.agent.event_rx.recv() => {
                 let Some(ev) = maybe else { break };
                 let pre_phase = app.state.phase;
                 handle_agent_event(ev, &mut app.state, &mut app.think, renderer, &mut app.pending_tools);

@@ -1574,7 +1574,24 @@ impl AgentLoop {
     }
 
     fn finish_turn(&mut self, stop_reason: TurnStopReason) {
-        self.conversation.turn_tracker.complete_current();
+        // Error exits must not leave the user's message in the history
+        // as an "orphan turn" (user message with no assistant reply).
+        // The next send_message would then stack another user message
+        // on top of it — an API call with two consecutive user turns
+        // and no intervening assistant, which weak models respond to
+        // with 0 tokens (see test 3 / 4: MiniMax-M2.7 returns empty
+        // after a failed localhost turn). Cancel the turn instead so
+        // the next user message starts from a clean transcript.
+        //
+        // Counters (turn_count / turn_tokens / tool_call_count) stay
+        // UNTOUCHED here so the TurnComplete event below still carries
+        // accurate stats for the UI's "✓ Nailed it · N rounds · M tok"
+        // line. `start_turn` resets them for the next message.
+        if matches!(stop_reason, TurnStopReason::Error) {
+            self.conversation.cancel_current_turn();
+        } else {
+            self.conversation.turn_tracker.complete_current();
+        }
 
         // Flush datalog with final stats
         self.datalog.end_turn(self.turn_tokens, self.tool_call_count);

@@ -132,7 +132,7 @@ shasum -a 256 atomcode-* 2>/dev/null | tee checksums.txt
 # rather than pointing at a 404.
 echo ""
 echo "=== Generating latest.json ==="
-MANIFEST="latest.json"
+MANIFEST="$(cd "$(dirname "$0")/.." && pwd)/latest.json"
 RELEASED_AT=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
 emit_entry() {
@@ -179,7 +179,7 @@ emit_entry() {
     printf '}\n'
 } > "$MANIFEST"
 
-echo "  -> ${DIST}/${MANIFEST}"
+echo "  -> ${MANIFEST}"
 cat "$MANIFEST"
 
 echo ""
