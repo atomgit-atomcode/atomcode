@@ -922,7 +922,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let content_w = w.saturating_sub(PAD_COL * 2);
         // Row 1: brand left + version · license right
         let left_txt = "◆ AtomCode";
-        let right_ver = "v4.19.0";
+        let right_ver = concat!("v", env!("CARGO_PKG_VERSION"));
         let right_lic = "MIT";
         let left_w = crate::width::display_width(left_txt);
         let right_w = right_ver.len() + 5 + right_lic.len();

@@ -4,7 +4,7 @@
 #   curl -fsSL https://atomgit.com/atomgit_atomcode/atomcode/raw/main/install.sh | sh
 #
 # Env overrides:
-#   ATOMCODE_VERSION   release tag to install (default: v4.15.1)
+#   ATOMCODE_VERSION   release tag to install (default: v4.18.1)
 #   ATOMCODE_PREFIX    install dir (default: /usr/local/bin, falls back to ~/.local/bin)
 set -eu
 
