@@ -14,6 +14,8 @@
 //! 同时匹配多个规则（例如 `provider_type == "ollama"` 且
 //! `model.starts_with("claude-")`，虽然现实中极少见），靠前的赢。
 
+use std::sync::Arc;
+
 use super::{CtxBuilder, DefaultCtx};
 use crate::config::provider::ProviderConfig;
 
@@ -21,23 +23,28 @@ use crate::config::provider::ProviderConfig;
 ///
 /// 由 [`crate::agent::AgentLoop::new`] 在会话开始时调用一次，
 /// 以及由 `AgentCommand::ReloadConfig` 在用户切模型时重新调用。
-pub fn for_provider(provider: &ProviderConfig) -> Box<dyn CtxBuilder> {
+///
+/// 返回 `Arc` 而非 `Box`:AgentLoop 与它持有的 `TurnRunner` 共享
+/// 同一个 ctx 实例,确保 datalog build_messages 和 runner 实际发送
+/// 走同一条 ctx 路径(不会因为一边走 trait 派发、另一边走自由函数
+/// 而漂移)。ReloadConfig 重建时两处一起更新。
+pub fn for_provider(provider: &ProviderConfig) -> Arc<dyn CtxBuilder> {
     // ── 规则表（按注册顺序匹配）─────────────────────────
 
     // Ollama: 本地小窗口模型
     if provider.provider_type == "ollama" {
-        return Box::new(super::ollama::OllamaCtx::new(provider));
+        return Arc::new(super::ollama::OllamaCtx::new(provider));
     }
 
     // （未来其它模型在此插入 —— Claude / GPT-4 / 自定义微调等）
     //
     // 示例:
     //   if provider.model.starts_with("claude-") {
-    //       return Box::new(super::claude::ClaudeCtx::new(provider));
+    //       return Arc::new(super::claude::ClaudeCtx::new(provider));
     //   }
 
     // ── Fallback ────────────────────────────────────────
-    Box::new(DefaultCtx::new(provider))
+    Arc::new(DefaultCtx::new(provider))
 }
 
 #[cfg(test)]

@@ -1591,11 +1591,28 @@ let session_manager = SessionManager::new(&working_dir);
     
     // Create turn runner with auto-bypass permission (API mode - no interactive approval)
     let permission = Box::new(AutoPermissionDecider::new(AutoPermissionMode::BypassAll));
+    // Same ctx selection as interactive AgentLoop: walk config.providers
+    // for the active provider, fallback to synthetic 128K config if absent.
+    let daemon_ctx = match config.providers.get(&config.default_provider) {
+        Some(pc) => atomcode_core::ctx::for_provider(pc),
+        None => atomcode_core::ctx::for_provider(&atomcode_core::config::provider::ProviderConfig {
+            provider_type: String::new(),
+            api_key: None,
+            model: String::new(),
+            base_url: None,
+            system_prompt: None,
+            user_agent: None,
+            context_window: 128_000,
+            max_tokens: None,
+            ephemeral: true,
+        }),
+    };
     let mut turn_runner = TurnRunner {
         provider: provider.into(),
         tools: shared_tools,
         context: tool_context,
         config: config.clone(),
+        ctx: daemon_ctx,
         permission,
         recently_edited_files: Vec::new(),
         recent_calls: Vec::new(),

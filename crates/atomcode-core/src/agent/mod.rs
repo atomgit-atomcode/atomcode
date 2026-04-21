@@ -215,7 +215,12 @@ pub struct AgentLoop {
     /// Context construction strategy for the active provider. Selected
     /// at construction via `ctx::for_provider` and rebuilt on
     /// `AgentCommand::ReloadConfig` when the provider changes.
-    pub ctx: Box<dyn crate::ctx::CtxBuilder>,
+    ///
+    /// `Arc` (not `Box`) — shared with `turn_runner.ctx` so datalog's
+    /// `build_messages` call and runner's actual send go through the
+    /// same instance. Rebuilds on `ReloadConfig` update both clones
+    /// (see the reload handler below).
+    pub ctx: std::sync::Arc<dyn crate::ctx::CtxBuilder>,
 
     // Execution state
     pub phase: AgentPhase,
@@ -414,20 +419,9 @@ impl AgentLoop {
         // Build the datalog writer before `config` is moved into the agent below.
         let datalog = crate::turn::datalog::DatalogWriter::new(&working_dir, &config.datalog);
 
-        let turn_runner = TurnRunner {
-            provider,
-            tools: shared_tools.clone(),
-            context: tool_context.clone(),
-            config: config.clone(),
-            permission: interactive_permission,
-            recently_edited_files: Vec::new(),
-            recent_calls: Vec::new(),
-            file_read_counts: std::collections::HashMap::new(),
-        };
-
         // Select the context-construction strategy once for this session.
         // Rebuilds on ReloadConfig when the provider changes.
-        let ctx: Box<dyn crate::ctx::CtxBuilder> = match config.providers.get(&config.default_provider) {
+        let ctx: std::sync::Arc<dyn crate::ctx::CtxBuilder> = match config.providers.get(&config.default_provider) {
             Some(pc) => crate::ctx::for_provider(pc),
             // Fallback for first-run / broken-config path: synthesize a
             // minimal provider so `for_provider` still gets its hands on
@@ -445,6 +439,18 @@ impl AgentLoop {
                 max_tokens: None,
                 ephemeral: true,
             }),
+        };
+
+        let turn_runner = TurnRunner {
+            provider,
+            tools: shared_tools.clone(),
+            context: tool_context.clone(),
+            config: config.clone(),
+            ctx: ctx.clone(),
+            permission: interactive_permission,
+            recently_edited_files: Vec::new(),
+            recent_calls: Vec::new(),
+            file_read_counts: std::collections::HashMap::new(),
         };
 
         let agent = Self {
@@ -574,8 +580,12 @@ impl AgentLoop {
                         // Rebuild the context strategy for the new provider.
                         // Selected once per provider; per-model customizations
                         // (e.g. Ollama schema trimming, Claude cache markers)
-                        // take effect from the next turn.
-                        self.ctx = crate::ctx::for_provider(provider_config);
+                        // take effect from the next turn. Assign the same
+                        // `Arc` to both `self.ctx` and `self.turn_runner.ctx`
+                        // so datalog and the send path stay locked together.
+                        let new_ctx = crate::ctx::for_provider(provider_config);
+                        self.ctx = new_ctx.clone();
+                        self.turn_runner.ctx = new_ctx;
                         match crate::provider::create_provider(provider_config) {
                             Ok(new_provider) => {
                                 self.turn_runner.provider = std::sync::Arc::from(new_provider);
@@ -843,9 +853,11 @@ impl AgentLoop {
             // Log LLM request to <working_dir>/datalog/llm/ — colocated with turn .md files.
             {
                 let context_window = self.ctx.ctx_window();
-                // Pass turn_reminder so datalog sees the exact bytes
-                // TurnRunner is about to send (reminder injection now
-                // lives inside ctx::render::build_messages).
+                // Byte-identical to what TurnRunner will send: `self.ctx`
+                // and `self.turn_runner.ctx` are the same `Arc` instance,
+                // so trait dispatch here and in runner produce the same
+                // messages (same system prompt, same directives, same
+                // reminder placement).
                 let (msgs, _) = self.ctx.build_messages(&conv, &system_prompt, &turn_reminder);
                 let tool_defs = self.turn_runner.tools.get_definitions();
                 let wd = self.turn_runner.context.working_dir

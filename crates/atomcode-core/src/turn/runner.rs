@@ -30,6 +30,13 @@ pub struct TurnRunner {
     pub tools: std::sync::Arc<ToolRegistry>,
     pub context: ToolContext,
     pub config: Config,
+    /// Context construction strategy. Shared with the parent
+    /// `AgentLoop::ctx` (same `Arc`) so the turn's actual send and
+    /// the agent's datalog snapshot go through one ctx — per-model
+    /// logic like `apply_model_directives` lands on both paths.
+    /// Rebuilt on `AgentCommand::ReloadConfig` alongside the agent's
+    /// clone.
+    pub ctx: std::sync::Arc<dyn crate::ctx::CtxBuilder>,
     pub permission: Box<dyn PermissionDecider>,
     /// Files edited during the current session (tracked for context awareness).
     pub recently_edited_files: Vec<String>,
@@ -72,13 +79,14 @@ impl TurnRunner {
         allowed_tools: Option<&[&str]>,
     ) -> TurnResult {
         // 1. Build messages within token budget.
-        // turn_reminder injection now lives inside ctx::render::build_messages
-        // so per-model impls (e.g. OllamaCtx in the future) can override
-        // the injection strategy if desired.
-        let context_window = self.config.default_context_window();
+        // Goes through `self.ctx.build_messages` (trait dispatch), NOT
+        // `ctx::render::build_messages` (free fn) — otherwise per-model
+        // logic like `apply_model_directives` only lands in datalog and
+        // the actually-sent messages diverge from what we logged.
+        let context_window = self.ctx.ctx_window();
 
         let (messages, ctx_stats) =
-            crate::ctx::render::build_messages(conversation, system_prompt, context_window, turn_reminder);
+            self.ctx.build_messages(conversation, system_prompt, turn_reminder);
 
         let actual_tokens: usize = messages.iter().map(|m| m.estimate_tokens()).sum();
 

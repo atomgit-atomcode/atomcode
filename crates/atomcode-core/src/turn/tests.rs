@@ -183,11 +183,28 @@ fn test_context() -> ToolContext {
 }
 
 fn make_runner(provider: MockProvider, tools: ToolRegistry, permission: Box<dyn super::permission::PermissionDecider>) -> TurnRunner {
+    // Tests don't set up real ProviderConfig, so construct a DefaultCtx
+    // directly with a generous window (matches test_config's implicit budget).
+    let test_provider = crate::config::provider::ProviderConfig {
+        provider_type: "test".into(),
+        api_key: None,
+        model: "test-model".into(),
+        base_url: None,
+        system_prompt: None,
+        user_agent: None,
+        context_window: 128_000,
+        max_tokens: None,
+        ephemeral: true,
+    };
+    let test_ctx: std::sync::Arc<dyn crate::ctx::CtxBuilder> =
+        std::sync::Arc::new(crate::ctx::DefaultCtx::new(&test_provider));
+
     TurnRunner {
         provider: std::sync::Arc::new(provider),
         tools: std::sync::Arc::new(tools),
         context: test_context(),
         config: test_config(),
+        ctx: test_ctx,
         permission,
         recently_edited_files: Vec::new(),
         recent_calls: Vec::new(),
