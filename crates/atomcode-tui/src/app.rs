@@ -833,7 +833,9 @@ impl App {
                 }
             }
             AgentEvent::WorkingDirChanged(new_dir) => {
-                // Only /cd (user command) triggers this — LLM tools cannot change working dir.
+                // Fires for both user `/cd` and LLM tool-driven cd (change_dir
+                // tool or a `bash` call starting with `cd`). Idempotent — if
+                // nothing changed we still rewrite the same path.
                 self.previous_working_dir = Some(self.working_dir.clone());
                 self.working_dir = new_dir.clone();
                 self.project_context_cache = None;

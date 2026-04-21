@@ -24,6 +24,7 @@ use atomcode_core::tool::read::ReadFileTool;
 use atomcode_core::tool::write::WriteFileTool;
 use atomcode_core::tool::edit::EditFileTool;
 use atomcode_core::tool::bash::BashTool;
+use atomcode_core::tool::cd::CdTool;
 use atomcode_core::tool::grep::GrepTool;
 use atomcode_core::tool::glob::GlobTool;
 use atomcode_core::tool::list_dir::ListDirTool;
@@ -355,6 +356,7 @@ async fn run() -> Result<i32> {
     if enabled("write_file")     { tool_registry.register(Box::new(WriteFileTool)); }
     if enabled("edit_file")      { tool_registry.register(Box::new(EditFileTool)); }
     if enabled("bash")           { tool_registry.register(Box::new(BashTool)); }
+    if enabled("change_dir")     { tool_registry.register(Box::new(CdTool)); }
     if enabled("grep")           { tool_registry.register(Box::new(GrepTool)); }
     if enabled("glob")           { tool_registry.register(Box::new(GlobTool)); }
     if enabled("list_directory") { tool_registry.register(Box::new(ListDirTool)); }

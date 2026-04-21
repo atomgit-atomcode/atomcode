@@ -711,6 +711,13 @@ _ = cancel.cancelled() => {
             }
         }
 
+        // Snapshot the shared working directory before executing. Tools like
+        // `change_dir` and `bash` (when the command starts with `cd`) mutate
+        // `ctx.working_dir` in place; we compare before/after to emit a
+        // `WorkingDirChanged` event so the TUI footer can track the cwd
+        // without polling the `Arc<RwLock<PathBuf>>` every frame.
+        let wd_before = self.context.working_dir.read().await.clone();
+
         // Execute the tool. Race against `cancel` so Ctrl+C aborts a
         // long-running tool future instead of waiting for it to finish.
         // Dropping the tool future is safe for read-only tools (glob /
@@ -738,6 +745,15 @@ _ = cancel.cancelled() => {
             }
         };
         let duration = start.elapsed();
+
+        // If the tool mutated the shared working directory, surface it as
+        // a TurnEvent so the TUI layer can keep its footer in sync. Emit
+        // before ToolCallResult so consumers that redraw on result see
+        // the new cwd in the same frame.
+        let wd_after = self.context.working_dir.read().await.clone();
+        if wd_after != wd_before {
+            let _ = event_tx.send(TurnEvent::WorkingDirChanged(wd_after));
+        }
 
         let tool_result = match result {
             Ok(mut r) => {

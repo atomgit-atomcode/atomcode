@@ -792,7 +792,7 @@ pub async fn run_loop(
             maybe = ctx.agent.event_rx.recv() => {
                 let Some(ev) = maybe else { break };
                 let pre_phase = app.state.phase;
-                handle_agent_event(ev, &mut app.state, &mut app.think, renderer, &mut app.pending_tools);
+                handle_agent_event(ev, &mut app.state, &mut app.think, renderer, &mut app.pending_tools, &mut ctx);
                 if pre_phase != app.state.phase {
                     crate::tuix_trace!("PH", "{:?} -> {:?}", pre_phase, app.state.phase);
                 }
@@ -897,7 +897,7 @@ pub async fn run_loop(
             maybe = ctx.agent.event_rx.recv() => {
                 let Some(ev) = maybe else { break };
                 let pre_phase = app.state.phase;
-                handle_agent_event(ev, &mut app.state, &mut app.think, renderer, &mut app.pending_tools);
+                handle_agent_event(ev, &mut app.state, &mut app.think, renderer, &mut app.pending_tools, &mut ctx);
                 if pre_phase != app.state.phase {
                     crate::tuix_trace!("PH", "{:?} -> {:?}", pre_phase, app.state.phase);
                 }
@@ -1502,6 +1502,7 @@ fn handle_agent_event(
     think: &mut ThinkStripper,
     renderer: &mut dyn Renderer,
     pending_tools: &mut std::collections::HashMap<String, (String, String, bool)>,
+    ctx: &mut LoopCtx,
 ) {
     match ev {
         AgentEvent::TextDelta(text) => {
@@ -1661,9 +1662,19 @@ fn handle_agent_event(
         AgentEvent::TokenUsage(u) => {
             state.total_tokens += u.completion_tokens;
         }
+        AgentEvent::WorkingDirChanged(new_dir) => {
+            // Fires when a tool (change_dir / bash cd) or an AgentCommand::ChangeDir
+            // mutated the shared cwd. Sync the footer's view so the status row
+            // reflects the new directory on the next redraw (spinner tick if
+            // streaming, idle redraw after turn complete). Without this the
+            // footer is stuck on the old path until the user types `/cd` or
+            // restarts the session.
+            if ctx.working_dir != new_dir {
+                ctx.previous_dir = Some(std::mem::replace(&mut ctx.working_dir, new_dir));
+            }
+        }
         AgentEvent::ContextStats { .. }
-        | AgentEvent::SubAgentProgress { .. }
-        | AgentEvent::WorkingDirChanged(_) => {}
+        | AgentEvent::SubAgentProgress { .. } => {}
     }
 }
 

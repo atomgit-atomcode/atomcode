@@ -1039,6 +1039,16 @@ impl AgentLoop {
                                 TurnEvent::Error(e) => {
                                     let _ = event_tx.send(AgentEvent::Error(e));
                                 }
+                                TurnEvent::WorkingDirChanged(new_dir) => {
+                                    // A tool (change_dir / bash cd) mutated the shared
+                                    // cwd. Surface it so the TUI footer can update.
+                                    // Intentionally does not mirror `services.rs::change_dir`
+                                    // (which clears the conversation, reloads the code graph,
+                                    // respawns the indexer) — those side effects are right for
+                                    // a user-initiated `/cd` but would destroy mid-turn state
+                                    // when the LLM is just navigating.
+                                    let _ = event_tx.send(AgentEvent::WorkingDirChanged(new_dir));
+                                }
                             }
                         }
 

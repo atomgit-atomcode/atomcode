@@ -1725,6 +1725,11 @@ let session_manager = SessionManager::new(&working_dir);
                 // Daemon/HTTP mode doesn't surface the "tool name streaming" phase —
                 // API clients receive the complete ToolCallStarted event when args are ready.
             }
+            TurnEvent::WorkingDirChanged(_) => {
+                // Daemon/HTTP mode doesn't maintain a TUI footer; the shared
+                // `ctx.working_dir` was already updated in the tool. Clients
+                // that need the cwd can read it from subsequent tool output.
+            }
         }
     }
     
