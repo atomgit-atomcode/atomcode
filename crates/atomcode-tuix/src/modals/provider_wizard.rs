@@ -322,16 +322,25 @@ fn handle_key(
                         return Ok(ModalAction::Continue);
                     }
                     None => {
-                        // All fields gathered — commit.
+                        // All fields gathered — commit and switch to it.
+                        // Users expect /provider add to behave like "create
+                        // and activate": after the wizard closes, the newly
+                        // added entry should be the current default so the
+                        // next message uses it without an extra /model step.
                         let name = draft.name.clone();
+                        let model = draft.model.clone();
                         let cfg = draft.into_config();
                         ctx.config.providers.insert(name.clone(), cfg);
-                        // If nothing was default, promote the newcomer.
-                        if ctx.config.default_provider.is_empty() {
-                            ctx.config.default_provider = name.clone();
-                        }
+                        ctx.config.default_provider = name.clone();
+                        ctx.model_name = model.clone();
                         save_and_reload(ctx, renderer);
-                        push(renderer, &format!("Added provider \"{}\".", name));
+                        push(
+                            renderer,
+                            &format!(
+                                "Added provider \"{}\" and switched to {} · {}.",
+                                name, name, model
+                            ),
+                        );
                         return Ok(ModalAction::Close);
                     }
                 }

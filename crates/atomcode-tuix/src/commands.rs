@@ -170,6 +170,27 @@ mod tests {
     }
 
     #[test]
+    fn parse_rejects_cjk_touching_command_name() {
+        // `/session是干什么的` — the user is asking the agent "what
+        // does /session do", NOT invoking /session. A CJK char
+        // directly after the command name (no whitespace) means it's
+        // prose, so parse_slash_line must return None and the line
+        // reaches the agent verbatim.
+        assert!(parse_slash_line("/session是干什么的").is_none());
+        assert!(parse_slash_line("/quit退出吗").is_none());
+        assert!(parse_slash_line("/model模型").is_none());
+    }
+
+    #[test]
+    fn parse_accepts_command_with_cjk_arg_after_space() {
+        // Whitespace separates cmd from args, so `/session 是干什么的`
+        // IS an invocation (with CJK-tail arg).
+        let (cmd, arg) = parse_slash_line("/session 是干什么的").unwrap();
+        assert_eq!(cmd, "session");
+        assert_eq!(arg, "是干什么的");
+    }
+
+    #[test]
     fn help_text_lists_all_commands() {
         let reg = CommandRegistry::builtin();
         let help = reg.help_text();
