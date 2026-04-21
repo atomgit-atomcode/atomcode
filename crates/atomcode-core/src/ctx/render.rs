@@ -371,7 +371,33 @@ pub fn build_compression_content(conv: &Conversation) -> (String, usize) {
         return (String::new(), 0);
     }
 
-    let compress_end_idx = conv.messages.len() - KEEP_MESSAGES;
+    let mut compress_end_idx = conv.messages.len() - KEEP_MESSAGES;
+
+    // ── Pair-preserving snap ──
+    // Anthropic API requires every `tool_result` to have its paired
+    // `tool_use` in the same conversation. If the naive cut lands on a
+    // ToolResult whose ATC lives in the drop range, the surviving range
+    // begins with an orphan — `clean_message_pipeline` would silently
+    // drop it and we'd lose the edit confirmation / tool output.
+    //
+    // Advance the cut forward past any trailing ToolResults so they
+    // get dropped WITH their paired ATC (already in the drop range),
+    // not kept as orphans. `compress_msgs` below uses the same index
+    // so the summary captures these results too.
+    while compress_end_idx < conv.messages.len() {
+        match &conv.messages[compress_end_idx].content {
+            message::MessageContent::ToolResult(_)
+            | message::MessageContent::ToolResultRef(_) => {
+                compress_end_idx += 1;
+            }
+            _ => break,
+        }
+    }
+
+    // If snapping consumed all remaining messages, nothing to compress.
+    if compress_end_idx >= conv.messages.len() {
+        return (String::new(), 0);
+    }
 
     // Group messages into logical rounds (assistant + tool_calls + tool_results)
     // and compress each round into a one-liner.
@@ -1260,5 +1286,127 @@ mod tests {
         sanitize_messages(&mut msgs);
         // All 4 messages should be preserved (valid pair)
         assert_eq!(msgs.len(), 4);
+    }
+
+    /// Regression: `build_compression_content` must not cut between an
+    /// `AssistantWithToolCalls` and its trailing `ToolResult`(s). Cutting
+    /// mid-pair leaves orphan tool_results which `clean_message_pipeline`
+    /// silently drops — the model loses edit confirmations. Anthropic API
+    /// also rejects orphan tool_results.
+    ///
+    /// Construct a conversation where the naive cut index
+    /// (`len - KEEP_MESSAGES`) lands on a ToolResult whose paired ATC
+    /// sits in the drop range. Verify the returned cut index skips past
+    /// ALL trailing ToolResults so no orphan survives.
+    #[test]
+    fn compression_cut_never_splits_tool_use_result_pair() {
+        use crate::tool::{ToolCall, ToolResult};
+
+        // Helper: build a conv where messages[cut_idx] = ToolResult
+        // with its ATC at messages[cut_idx - 1] (in drop range).
+        let build_conv = || {
+            let mut conv = Conversation::new();
+
+            // Pad with plain text turns until we reach the position where
+            // the problematic tool pair will land.
+            // KEEP_MESSAGES = 20. We want naive_cut = len - 20 to hit a
+            // ToolResult. If we put ATC at msg[N-21] and ToolResult at
+            // msg[N-20], then `conv.len() = N`, `naive_cut = N-20` →
+            // lands on the ToolResult. ✓
+            //
+            // Put a text-only prefix of 20 messages, then ATC+ToolResult,
+            // then another 20 text-only suffix → len = 42, naive_cut = 22
+            // which SHOULD be the ToolResult we planted.
+
+            for i in 0..10 {
+                conv.add_user_message(&format!("prefix task {}", i));
+                conv.push_delta(&format!("prefix reply {}", i));
+                conv.finalize_stream();
+            }
+            // After 10 text turns: 20 messages.
+
+            // Position 20 would be the next user msg. But we want ATC here
+            // (msg[20]) and ToolResult at msg[21]. Problem: ATC must be
+            // preceded by a User in a normal turn. Use a real tool round.
+            conv.add_user_message("trigger tool");                   // msg[20]
+            conv.add_assistant_tool_calls(Some("r"), vec![ToolCall { // msg[21]
+                id: "call_would_orphan".to_string(),
+                name: "bash".to_string(),
+                arguments: "{}".to_string(),
+            }]);
+            conv.add_tool_result(ToolResult {                        // msg[22]
+                call_id: "call_would_orphan".to_string(),
+                output: "tool output that must not be lost".to_string(),
+                success: true,
+            });
+            // After the tool round: 23 messages.
+
+            // Suffix: pad with text turns so len - KEEP_MESSAGES = 22.
+            // Need len = 42. Currently 23. Add 19 more → 42.
+            // Adding in user/assistant pairs: 19/2 = 9 full + 1 extra.
+            for i in 0..9 {
+                conv.add_user_message(&format!("suffix task {}", i));
+                conv.push_delta(&format!("suffix reply {}", i));
+                conv.finalize_stream();
+            }
+            // 23 + 18 = 41. Add one more user message.
+            conv.add_user_message("final task");
+            conv
+        };
+
+        let conv = build_conv();
+        let len = conv.messages.len();
+        assert_eq!(len, 42, "conv layout wrong");
+
+        let naive_cut = len - KEEP_MESSAGES;
+        assert_eq!(naive_cut, 22);
+        // Confirm msg[22] is indeed the ToolResult we planted.
+        assert!(
+            matches!(conv.messages[22].content, MessageContent::ToolResult(_)),
+            "test layout broken: msg[22] should be ToolResult"
+        );
+
+        // Now query the real fn. Fix guarantees the cut index points at
+        // a position that is NOT a ToolResult (advanced past trailing
+        // ToolResults so no orphan survives).
+        let (_summary, actual_cut) = build_compression_content(&conv);
+
+        if actual_cut < conv.messages.len() {
+            let first_survivor = &conv.messages[actual_cut];
+            let is_tool_result = matches!(
+                first_survivor.content,
+                MessageContent::ToolResult(_) | MessageContent::ToolResultRef(_)
+            );
+            assert!(
+                !is_tool_result,
+                "cut index {} lands on ToolResult (naive was {}); \
+                 surviving range would start with orphan",
+                actual_cut, naive_cut
+            );
+        }
+
+        // Applied-cut invariant: after draining [..actual_cut], every
+        // surviving ToolResult has its paired ATC in the surviving range.
+        let mut c2 = build_conv();
+        c2.apply_compression(actual_cut, "summary".to_string());
+
+        let mut live_call_ids = std::collections::HashSet::<String>::new();
+        for msg in &c2.messages {
+            match &msg.content {
+                MessageContent::AssistantWithToolCalls { tool_calls, .. } => {
+                    for tc in tool_calls {
+                        live_call_ids.insert(tc.id.clone());
+                    }
+                }
+                MessageContent::ToolResult(r) => {
+                    assert!(
+                        live_call_ids.contains(&r.call_id),
+                        "orphan ToolResult({}) in surviving range — its ATC was dropped",
+                        r.call_id
+                    );
+                }
+                _ => {}
+            }
+        }
     }
 }
