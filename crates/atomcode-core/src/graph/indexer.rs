@@ -57,7 +57,29 @@ impl GraphIndexer {
     /// 4. Parse dirty files, extract symbols and calls
     /// 5. Resolve calls to edges
     pub async fn index_all(&mut self) {
-        let files = self.collect_files();
+        // Refuse to index obvious non-projects. Walking $HOME (or /) pulls
+        // in Library/, Downloads/, Documents/ trees with hundreds of
+        // thousands of paths — the sync walk then pegs a tokio worker
+        // thread for seconds, starving the TUI event loop (the 5 ms
+        // deferred-render-tick stops firing, so typed characters don't
+        // show up until something else wakes the runtime). If someone
+        // really does keep code at $HOME, they can drop a `.git` in there
+        // and it'll be treated as a project again (see `looks_like_project`).
+        if is_home_or_root(&self.project_dir) && !looks_like_project(&self.project_dir) {
+            return;
+        }
+
+        // Walk + stat the tree on the blocking-thread pool rather than on
+        // an async worker. `WalkBuilder` is pure sync I/O; leaving it on
+        // an async task blocks that worker for the full walk duration,
+        // which (a) starves the select! / timer machinery and (b) defeats
+        // tokio's work-stealing (other tasks can't migrate *into* the
+        // stuck worker's queue). `spawn_blocking` is exactly what the
+        // docs prescribe for this.
+        let project_dir = self.project_dir.clone();
+        let files = tokio::task::spawn_blocking(move || collect_files_sync(&project_dir))
+            .await
+            .unwrap_or_default();
         let current_paths: HashSet<PathBuf> = files.iter().map(|(p, _)| p.clone()).collect();
 
         // Snapshot mtimes under a short read lock to determine dirty files.
@@ -187,52 +209,11 @@ impl GraphIndexer {
     }
 
     /// Walk the project directory, returning (path, mtime) for indexable files.
+    /// Kept as a method for legacy callers / tests; dispatches to the free
+    /// function so `index_all` can run the same logic on a blocking thread.
+    #[allow(dead_code)]
     fn collect_files(&self) -> Vec<(PathBuf, u64)> {
-        let mut files = Vec::new();
-
-        let walker = WalkBuilder::new(&self.project_dir)
-            .hidden(true)
-            .git_ignore(true)
-            .build();
-
-        for entry in walker {
-            let entry = match entry {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-
-            let path = entry.path();
-            if !path.is_file() {
-                continue;
-            }
-
-            // Filter by extension
-            let ext = match path.extension().and_then(|e| e.to_str()) {
-                Some(e) => e,
-                None => continue,
-            };
-
-            if !INDEXED_EXTENSIONS.contains(&ext) {
-                continue;
-            }
-
-            // Get mtime
-            let mtime = match entry.metadata() {
-                Ok(meta) => {
-                    use std::time::UNIX_EPOCH;
-                    meta.modified()
-                        .ok()
-                        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0)
-                }
-                Err(_) => 0,
-            };
-
-            files.push((path.to_path_buf(), mtime));
-        }
-
-        files
+        collect_files_sync(&self.project_dir)
     }
 
     /// Parse a single file: extract symbols and raw calls.
@@ -434,4 +415,85 @@ fn classify_symbol_kind(ts_kind: &str) -> SymbolKind {
         "impl_item" => SymbolKind::Other("impl".to_string()),
         other => SymbolKind::Other(other.to_string()),
     }
+}
+
+/// True when `path` is the user's HOME directory or the filesystem root.
+/// Either one hosts a massive tree the indexer should never walk in full.
+fn is_home_or_root(path: &Path) -> bool {
+    if path == Path::new("/") {
+        return true;
+    }
+    if let Some(home) = dirs::home_dir() {
+        if path == home.as_path() {
+            return true;
+        }
+    }
+    false
+}
+
+/// Cheap "is this a project?" heuristic — checks for a project-marker
+/// file or directory at the root. Used as an escape hatch for users who
+/// *do* keep code at $HOME: if a marker is present, the indexer walks it
+/// even though the path would otherwise look like a non-project.
+fn looks_like_project(dir: &Path) -> bool {
+    const MARKERS: &[&str] = &[
+        ".git",
+        ".atomcode",
+        "Cargo.toml",
+        "package.json",
+        "pyproject.toml",
+        "go.mod",
+        "pom.xml",
+        "build.gradle",
+        "build.gradle.kts",
+    ];
+    MARKERS.iter().any(|m| dir.join(m).exists())
+}
+
+/// Free-function form of the file walk so `tokio::task::spawn_blocking`
+/// can own it cleanly (taking only `&Path`, not `&self`).
+fn collect_files_sync(project_dir: &Path) -> Vec<(PathBuf, u64)> {
+    let mut files = Vec::new();
+
+    let walker = WalkBuilder::new(project_dir)
+        .hidden(true)
+        .git_ignore(true)
+        .build();
+
+    for entry in walker {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+
+        let ext = match path.extension().and_then(|e| e.to_str()) {
+            Some(e) => e,
+            None => continue,
+        };
+
+        if !INDEXED_EXTENSIONS.contains(&ext) {
+            continue;
+        }
+
+        let mtime = match entry.metadata() {
+            Ok(meta) => {
+                use std::time::UNIX_EPOCH;
+                meta.modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0)
+            }
+            Err(_) => 0,
+        };
+
+        files.push((path.to_path_buf(), mtime));
+    }
+
+    files
 }

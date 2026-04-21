@@ -221,12 +221,23 @@ pub async fn run(
     let (upgrade_tx, upgrade_rx) =
         tokio::sync::mpsc::unbounded_channel::<atomcode_core::self_update::UpgradeEvent>();
 
+    // Seed the recent-project-dirs ring from disk and guarantee the
+    // current working dir sits at index 0 so the `/cd` picker always
+    // has at least one entry (the dir the user just launched into).
+    let recent_dirs = {
+        let mut dirs = event_loop::commands::load_recent_dirs();
+        event_loop::commands::push_recent_dir(&mut dirs, working_dir.clone());
+        event_loop::commands::save_recent_dirs(&dirs);
+        dirs
+    };
+
     let ctx = LoopCtx {
         config,
         model_name,
         agent: agent_handle,
         working_dir,
         previous_dir: None,
+        recent_dirs,
         history,
         input_rx,
         commands: CommandRegistry::builtin(),

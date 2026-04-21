@@ -13,7 +13,7 @@
 // Over time more subfiles should split out (agent_events, redraw helpers,
 // Buffer); modal overlays already live in `crate::modals`.
 
-mod commands;
+pub(crate) mod commands;
 use commands::execute_slash_command;
 
 use std::collections::VecDeque;
@@ -42,6 +42,11 @@ pub struct LoopCtx {
     pub agent: AgentHandle,
     pub working_dir: PathBuf,
     pub previous_dir: Option<PathBuf>,
+    /// Recently visited project directories, most recent first (max 5).
+    /// Persisted to `~/.atomcode/recent_dirs.txt`. Drives the `/cd`
+    /// picker when invoked with no argument and is updated whenever
+    /// the working directory changes (via slash command or agent tool).
+    pub recent_dirs: Vec<PathBuf>,
     pub history: History,
     pub input_rx: mpsc::UnboundedReceiver<InputEvent>,
     pub commands: CommandRegistry,
@@ -1700,7 +1705,8 @@ fn handle_agent_event(
             // footer is stuck on the old path until the user types `/cd` or
             // restarts the session.
             if ctx.working_dir != new_dir {
-                ctx.previous_dir = Some(std::mem::replace(&mut ctx.working_dir, new_dir));
+                ctx.previous_dir = Some(std::mem::replace(&mut ctx.working_dir, new_dir.clone()));
+                commands::push_recent_dir(&mut ctx.recent_dirs, new_dir);
             }
         }
         AgentEvent::ContextStats { .. }

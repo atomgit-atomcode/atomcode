@@ -20,9 +20,12 @@ use atomcode_core::config::Config;
 use atomcode_core::config::provider::ProviderConfig;
 
 use super::{save_and_reload, LoopCtx};
-use crate::modals::{Modal, ModelPicker, ProviderWizard, SessionPicker};
+use crate::modals::{DirPicker, Modal, ModelPicker, ProviderWizard, SessionPicker};
 use crate::render::{Renderer, UiLine};
 use crate::state::UiState;
+
+/// Maximum recent project dirs we keep in memory + persist to disk.
+const MAX_RECENT_DIRS: usize = 5;
 
 /// Provider name used for the AtomGit OAuth provider entry in config.
 const OAUTH_PROVIDER_NAME: &str = "AtomGit";
@@ -318,15 +321,28 @@ pub(super) fn execute_slash_command(
             }
         }
         "cd" => {
+            // Bare `/cd` — open the interactive history picker (matches legacy
+            // TUI behaviour). The picker's Enter-handler invokes `apply_cd`
+            // itself, so there's nothing else to do here.
+            if arg.is_empty() {
+                if ctx.recent_dirs.is_empty() {
+                    renderer.render(UiLine::CommandOutput(format!(
+                        "  Working directory: {}\n  No recent projects. Use `/cd <path>` to switch.\n",
+                        ctx.working_dir.display()
+                    )));
+                    renderer.flush();
+                } else {
+                    *active_modal = Some(Box::new(DirPicker::open(
+                        ctx.recent_dirs.clone(),
+                        ctx.working_dir.clone(),
+                    )));
+                }
+                return Ok(());
+            }
             let new_dir = resolve_cd(arg, &ctx.working_dir, ctx.previous_dir.as_deref());
             match new_dir {
                 Ok(path) => {
-                    ctx.previous_dir = Some(ctx.working_dir.clone());
-                    ctx.working_dir = path.clone();
-                    ctx.agent
-                        .cmd_tx
-                        .send(AgentCommand::ChangeDir(path.to_string_lossy().to_string()))
-                        .ok();
+                    apply_cd(ctx, path.clone());
                     renderer.render(UiLine::CommandOutput(format!(
                         "  Changed to: {}\n",
                         path.display()
@@ -344,6 +360,59 @@ pub(super) fn execute_slash_command(
         }
     }
     Ok(())
+}
+
+/// Commit a new working-directory choice: notify the agent, update cwd +
+/// previous_dir on the shared context, push the new entry into the
+/// recent-dirs ring, and persist. Shared by the `/cd <path>` arm and the
+/// DirPicker modal's Enter handler so both paths keep state coherent.
+pub(crate) fn apply_cd(ctx: &mut LoopCtx, path: PathBuf) {
+    ctx.agent
+        .cmd_tx
+        .send(AgentCommand::ChangeDir(path.to_string_lossy().to_string()))
+        .ok();
+    ctx.previous_dir = Some(std::mem::replace(&mut ctx.working_dir, path.clone()));
+    push_recent_dir(&mut ctx.recent_dirs, path);
+    save_recent_dirs(&ctx.recent_dirs);
+}
+
+/// Move `new` to the front of `dirs`, dedup, and cap at `MAX_RECENT_DIRS`.
+/// Does NOT persist — call `save_recent_dirs` after, or use `apply_cd`
+/// which does both.
+pub(crate) fn push_recent_dir(dirs: &mut Vec<PathBuf>, new: PathBuf) {
+    dirs.retain(|d| d != &new);
+    dirs.insert(0, new);
+    dirs.truncate(MAX_RECENT_DIRS);
+}
+
+/// Read `~/.atomcode/recent_dirs.txt`. Silently drops missing directories
+/// so stale entries from a deleted project don't linger in the picker.
+pub(crate) fn load_recent_dirs() -> Vec<PathBuf> {
+    let path = atomcode_core::config::Config::config_dir().join("recent_dirs.txt");
+    std::fs::read_to_string(&path)
+        .ok()
+        .map(|s| {
+            s.lines()
+                .filter(|l| !l.trim().is_empty())
+                .map(PathBuf::from)
+                .filter(|p| p.is_dir())
+                .take(MAX_RECENT_DIRS)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Persist `dirs` to `~/.atomcode/recent_dirs.txt`. Best-effort — a write
+/// failure (read-only HOME, permission denied) is swallowed so it can
+/// never break an interactive `/cd`.
+pub(crate) fn save_recent_dirs(dirs: &[PathBuf]) {
+    let path = atomcode_core::config::Config::config_dir().join("recent_dirs.txt");
+    let content = dirs
+        .iter()
+        .map(|d| d.to_string_lossy().to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let _ = std::fs::write(&path, content);
 }
 
 fn resolve_cd(
