@@ -115,8 +115,13 @@ impl AgentLoop {
             }
             TurnEvent::ContextStats { system_tokens, sent_tokens, dropped_tokens, working_set_tokens, total_messages } => {
                 self.datalog.log_context_stats(system_tokens, sent_tokens, dropped_tokens, working_set_tokens, total_messages);
+                // Narrow stats — rich breakdown comes from handle_send_message.
                 let _ = self.event_tx.send(AgentEvent::ContextStats {
                     system_tokens, sent_tokens, dropped_tokens, working_set_tokens, total_messages,
+                    tool_defs_tokens: 0,
+                    cold_zone_tokens: 0,
+                    ctx_window: 0,
+                    ctx_name: String::new(),
                 });
             }
             TurnEvent::Error(e) => {

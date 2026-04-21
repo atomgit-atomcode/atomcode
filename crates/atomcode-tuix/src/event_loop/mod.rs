@@ -1673,8 +1673,28 @@ fn handle_agent_event(
                 ctx.previous_dir = Some(std::mem::replace(&mut ctx.working_dir, new_dir));
             }
         }
-        AgentEvent::ContextStats { .. }
-        | AgentEvent::SubAgentProgress { .. } => {}
+        AgentEvent::ContextStats {
+            system_tokens,
+            sent_tokens,
+            dropped_tokens: _,
+            working_set_tokens: _,
+            total_messages,
+            tool_defs_tokens,
+            cold_zone_tokens,
+            ctx_window,
+            ctx_name,
+        } => {
+            state.on_context_stats(
+                system_tokens,
+                sent_tokens,
+                tool_defs_tokens,
+                cold_zone_tokens,
+                total_messages,
+                ctx_window,
+                &ctx_name,
+            );
+        }
+        AgentEvent::SubAgentProgress { .. } => {}
     }
 }
 

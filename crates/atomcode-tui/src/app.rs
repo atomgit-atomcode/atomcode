@@ -846,7 +846,7 @@ impl App {
                 self.config.default_workdir = Some(new_dir.to_string_lossy().to_string());
                 let _ = self.config.save(&Config::default_path());
             }
-            AgentEvent::ContextStats { system_tokens, sent_tokens, dropped_tokens: _, working_set_tokens: _, total_messages: _ } => {
+            AgentEvent::ContextStats { system_tokens, sent_tokens, .. } => {
                 self.ctx_used_tokens = system_tokens + sent_tokens;
             }
             AgentEvent::SubAgentProgress { file, status } => {

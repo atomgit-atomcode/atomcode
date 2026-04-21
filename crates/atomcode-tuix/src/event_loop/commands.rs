@@ -227,6 +227,10 @@ pub(super) fn execute_slash_command(
             )));
             renderer.flush();
         }
+        "context" => {
+            renderer.render(UiLine::CommandOutput(render_context_report(state, ctx)));
+            renderer.flush();
+        }
         "login" => {
             run_login_flow(renderer, ctx)?;
         }
@@ -344,6 +348,108 @@ pub(super) fn execute_slash_command(
         }
     }
     Ok(())
+}
+
+/// Build the `/context` report — horizontal bar + category breakdown.
+///
+/// Thin wrapper around `format_context_report` that pulls the two inputs
+/// (snapshot + model name) out of state/ctx. Split for unit-testability:
+/// the inner function takes plain values and can be asserted on directly.
+fn render_context_report(state: &UiState, ctx: &LoopCtx) -> String {
+    format_context_report(state.last_context.as_ref(), &ctx.model_name)
+}
+
+/// Pure-function core of `/context` — testable without constructing
+/// `LoopCtx`. Returns the rendered CommandOutput body.
+fn format_context_report(
+    snapshot: Option<&crate::state::ContextSnapshot>,
+    model_name: &str,
+) -> String {
+    let Some(snap) = snapshot else {
+        return "  Context Usage\n  \n  (run at least one turn first — stats are captured per turn)\n".into();
+    };
+    if snap.ctx_window == 0 {
+        return "  Context Usage\n  \n  (waiting for first complete turn — partial stats only)\n".into();
+    }
+
+    let window = snap.ctx_window;
+    // Sum components excluding tool_defs (which in most providers counts
+    // against input tokens but atomcode tracks separately). Clamp used to
+    // window so a single oversized tool_defs doesn't drive "free" negative.
+    let sys = snap.system_tokens;
+    let tools = snap.tool_defs_tokens;
+    let cold = snap.cold_zone_tokens;
+    // Sent = everything sent minus the system message (ctx's own accounting).
+    // Cold zone is injected as a System message inside `sent`, so we avoid
+    // double-counting: subtract cold from sent for the "messages" bucket.
+    let messages = snap.sent_tokens.saturating_sub(cold);
+    let total_used = sys.saturating_add(tools).saturating_add(cold).saturating_add(messages);
+    let free = window.saturating_sub(total_used);
+
+    // Horizontal bar: 40 cells, one segment per category with a distinct glyph.
+    // Terminals universally render these blocks, no ANSI color required.
+    const BAR_WIDTH: usize = 40;
+    let cells = |tokens: usize| -> usize {
+        if window == 0 { return 0; }
+        (tokens as u128 * BAR_WIDTH as u128 / window as u128) as usize
+    };
+    let sys_cells = cells(sys);
+    let tools_cells = cells(tools);
+    let cold_cells = cells(cold);
+    let msg_cells = cells(messages);
+    // Guard: cell sum shouldn't exceed BAR_WIDTH (rounding can give +1).
+    let used_cells = sys_cells + tools_cells + cold_cells + msg_cells;
+    let free_cells = BAR_WIDTH.saturating_sub(used_cells.min(BAR_WIDTH));
+
+    let mut bar = String::with_capacity(BAR_WIDTH * 3);
+    bar.push_str(&"▒".repeat(sys_cells));       // system prompt
+    bar.push_str(&"▓".repeat(tools_cells));     // tool defs
+    bar.push_str(&"░".repeat(cold_cells));      // cold zone
+    bar.push_str(&"█".repeat(msg_cells));       // messages
+    bar.push_str(&"·".repeat(free_cells));      // free
+
+    let pct = |t: usize| -> String {
+        if window == 0 { return "  —".to_string(); }
+        format!("{:>4.1}%", (t as f64 * 100.0) / window as f64)
+    };
+    let k = |t: usize| -> String {
+        if t >= 1000 {
+            format!("{:.1}K", t as f64 / 1000.0)
+        } else {
+            format!("{}", t)
+        }
+    };
+
+    let used_pct = pct(total_used);
+
+    format!(
+        "  Context Usage\n  \
+         \n  \
+         {bar}\n  \
+         {used}/{window} tokens ({used_pct})\n  \
+         \n  \
+         Provider: {model}  ·  ctx: {ctx_name}\n  \
+         \n  \
+         ▒ System prompt : {sys_s:>7}  ({sys_p})\n  \
+         ▓ Tool defs     : {tools_s:>7}  ({tools_p})\n  \
+         ░ Cold zone     : {cold_s:>7}  ({cold_p})\n  \
+         █ Messages      : {msgs_s:>7}  ({msgs_p})\n  \
+         · Free          : {free_s:>7}  ({free_p})\n  \
+         \n  \
+         Messages in window: {n_msgs}\n",
+        bar = bar,
+        used = k(total_used),
+        window = k(window),
+        used_pct = used_pct,
+        model = model_name,
+        ctx_name = if snap.ctx_name.is_empty() { "default" } else { snap.ctx_name.as_str() },
+        sys_s = k(sys), sys_p = pct(sys),
+        tools_s = k(tools), tools_p = pct(tools),
+        cold_s = k(cold), cold_p = pct(cold),
+        msgs_s = k(messages), msgs_p = pct(messages),
+        free_s = k(free), free_p = pct(free),
+        n_msgs = snap.total_messages,
+    )
 }
 
 fn resolve_cd(
@@ -552,6 +658,109 @@ mod tests {
         let (_tmp, cwd, _sub) = make_dirs();
         let got = resolve_cd("~", &cwd, None).expect("~ resolves");
         assert_eq!(got, canon_home);
+    }
+
+    #[test]
+    fn context_report_without_snapshot_prompts_to_run_turn() {
+        let out = format_context_report(None, "claude-opus-4-7");
+        assert!(out.contains("run at least one turn"));
+        // Never leak a window/totals when there's nothing to show
+        assert!(!out.contains("tokens ("));
+    }
+
+    #[test]
+    fn context_report_with_zero_window_flags_partial_stats() {
+        let snap = crate::state::ContextSnapshot {
+            system_tokens: 100,
+            sent_tokens: 200,
+            tool_defs_tokens: 0,
+            cold_zone_tokens: 0,
+            total_messages: 5,
+            ctx_window: 0,
+            ctx_name: String::new(),
+        };
+        let out = format_context_report(Some(&snap), "test-model");
+        assert!(out.contains("waiting for first complete turn"));
+    }
+
+    #[test]
+    fn context_report_renders_full_breakdown() {
+        let snap = crate::state::ContextSnapshot {
+            system_tokens: 8_000,
+            sent_tokens: 30_000,  // includes cold
+            tool_defs_tokens: 14_500,
+            cold_zone_tokens: 2_000,
+            total_messages: 42,
+            ctx_window: 128_000,
+            ctx_name: "default".into(),
+        };
+        let out = format_context_report(Some(&snap), "claude-opus-4-7");
+
+        // Header
+        assert!(out.contains("Context Usage"));
+        // Bar renders (unicode blocks present)
+        assert!(out.contains("▒") || out.contains("█"));
+        // Category labels
+        assert!(out.contains("System prompt"));
+        assert!(out.contains("Tool defs"));
+        assert!(out.contains("Cold zone"));
+        assert!(out.contains("Messages"));
+        assert!(out.contains("Free"));
+        // Token values (K formatting)
+        assert!(out.contains("8.0K"));   // system
+        assert!(out.contains("14.5K"));  // tool defs
+        assert!(out.contains("2.0K"));   // cold zone
+        assert!(out.contains("128.0K")); // window
+        // Messages count
+        assert!(out.contains("42"));
+        // ctx name + model
+        assert!(out.contains("default"));
+        assert!(out.contains("claude-opus-4-7"));
+    }
+
+    #[test]
+    fn context_report_messages_excludes_cold_zone() {
+        // sent_tokens = messages + cold_zone (cold is injected as a
+        // System message inside `sent`). Renderer must subtract so
+        // "Messages" doesn't double-count.
+        let snap = crate::state::ContextSnapshot {
+            system_tokens: 1_000,
+            sent_tokens: 10_000,
+            tool_defs_tokens: 0,
+            cold_zone_tokens: 3_000,
+            total_messages: 10,
+            ctx_window: 100_000,
+            ctx_name: "default".into(),
+        };
+        let out = format_context_report(Some(&snap), "m");
+        // Messages bucket should be 10K - 3K = 7K, not 10K.
+        let messages_line = out.lines().find(|l| l.contains("Messages"))
+            .expect("messages line must exist");
+        assert!(messages_line.contains("7.0K"),
+            "expected Messages=7.0K (sent-cold), got line: {}", messages_line);
+    }
+
+    #[test]
+    fn context_report_free_is_nonneg_under_rounding() {
+        // Pathological: sum of components exactly = window. Free must
+        // render as 0, never blow up the subtraction.
+        let snap = crate::state::ContextSnapshot {
+            system_tokens: 20_000,
+            sent_tokens: 80_000,
+            tool_defs_tokens: 20_000,
+            cold_zone_tokens: 0,
+            total_messages: 50,
+            ctx_window: 120_000,
+            ctx_name: "default".into(),
+        };
+        let out = format_context_report(Some(&snap), "m");
+        // Free = window - (sys + tools + cold + messages)
+        //      = 120_000 - (20_000 + 20_000 + 0 + 80_000) = 0
+        assert!(out.contains("Free"));
+        // Should not panic and should render — look for "0" tokens on the Free line
+        let free_line = out.lines().find(|l| l.contains("Free"))
+            .expect("free line must exist");
+        assert!(free_line.contains("0"), "free line: {}", free_line);
     }
 
     #[test]

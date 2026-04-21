@@ -154,13 +154,29 @@ pub enum AgentEvent {
     },
     /// Working directory changed.
     WorkingDirChanged(PathBuf),
-    /// Context budget stats for logging (not displayed, only written to datalog).
+    /// Context budget stats — piped into datalog and cached by the TUI
+    /// for `/context`. Emitted after every turn's `ctx.build_messages`
+    /// call, so stats reflect the snapshot the model actually saw.
+    ///
+    /// The rich breakdown (tool defs / cold zone / ctx window / ctx name)
+    /// only appears on the second emission path in
+    /// `handle_send_message` — the first path (TurnEvent forwarding) uses
+    /// the narrow stats from the ctx::render output. TUI merges both.
     ContextStats {
         system_tokens: usize,
         sent_tokens: usize,
         dropped_tokens: usize,
         working_set_tokens: usize,
         total_messages: usize,
+        /// Total bytes of tool definitions / 4. 0 when not yet computed.
+        tool_defs_tokens: usize,
+        /// Tokens used by cold-zone compressed summaries.
+        cold_zone_tokens: usize,
+        /// Effective token budget from the active ctx strategy
+        /// (`ctx.ctx_window()`), including any defensive clamping.
+        ctx_window: usize,
+        /// Ctx strategy name — `default` / `ollama` / future impls.
+        ctx_name: String,
     },
 }
 
@@ -878,6 +894,50 @@ impl AgentLoop {
                     self.turn_runner.provider.model_name(),
                     context_window,
                 );
+
+                // Emit rich ContextStats for the `/context` command.
+                // Estimated token counts:
+                // - tool_defs: JSON-serialized size / 4 (rough GPT-style estimate)
+                // - cold_zone: sum of `estimate_tokens` across cold summaries
+                // - system / sent: recomputed from msgs so TUI gets a
+                //   self-consistent snapshot regardless of which path
+                //   fired first
+                let tool_defs_tokens: usize = tool_defs
+                    .iter()
+                    .map(|d| {
+                        // ToolDef { name, description, parameters (Value) }
+                        // Approximation: name + description chars + params JSON.
+                        let params = serde_json::to_string(&d.parameters).unwrap_or_default();
+                        (d.name.len() + d.description.len() + params.len()) / 4
+                    })
+                    .sum();
+
+                let cold_zone_tokens: usize = conv
+                    .cold_summaries
+                    .iter()
+                    .map(|s| s.len() / 4 + 4)
+                    .sum();
+
+                let system_tokens_local = msgs
+                    .iter()
+                    .find(|m| matches!(m.role, crate::conversation::message::Role::System))
+                    .map(|m| m.estimate_tokens())
+                    .unwrap_or(0);
+                let sent_tokens_local: usize = msgs.iter().map(|m| m.estimate_tokens()).sum::<usize>()
+                    .saturating_sub(system_tokens_local);
+                let total_messages_local = msgs.len();
+
+                let _ = self.event_tx.send(AgentEvent::ContextStats {
+                    system_tokens: system_tokens_local,
+                    sent_tokens: sent_tokens_local,
+                    dropped_tokens: 0,
+                    working_set_tokens: 0,
+                    total_messages: total_messages_local,
+                    tool_defs_tokens,
+                    cold_zone_tokens,
+                    ctx_window: context_window,
+                    ctx_name: self.ctx.name().to_string(),
+                });
             }
 
             // Run the turn in a scoped block so all borrows of self.turn_runner
@@ -1075,8 +1135,16 @@ impl AgentLoop {
                                         *context_collapsed = true;
                                     }
 
+                                    // Narrow stats path — rich fields (tool_defs / cold_zone /
+                                    // ctx_window / ctx_name) are sent from the datalog block in
+                                    // handle_send_message, which has access to self.ctx.
+                                    // TUI side merges both emissions into a single cache.
                                     let _ = event_tx.send(AgentEvent::ContextStats {
                                         system_tokens, sent_tokens, dropped_tokens, working_set_tokens, total_messages,
+                                        tool_defs_tokens: 0,
+                                        cold_zone_tokens: 0,
+                                        ctx_window: 0,
+                                        ctx_name: String::new(),
                                     });
                                 }
                                 TurnEvent::ToolCallStreaming { name, hint } => {
