@@ -1170,7 +1170,15 @@ fn handle_idle_key(
             app.buf.cursor = 0;
             app.buf.clear_pastes();
             app.menu.selected = 0;
-            if let Some((cmd, arg)) = parse_slash_line(&line) {
+            // Only treat `/name …` as a slash command when `name` is
+            // actually registered. Unrecognised `/foo …` (e.g. the user
+            // typed `/test 文件下有哪些文件` meaning to *ask about*
+            // `/test`, or just `/test` as a question) falls through to
+            // the regular message path — better than the old
+            // "Unknown command: /foo" dead-end.
+            let as_slash = parse_slash_line(&line)
+                .filter(|(cmd, _)| ctx.commands.find(cmd).is_some());
+            if let Some((cmd, arg)) = as_slash {
                 execute_slash_command(cmd, arg, &mut app.state, ctx, renderer, &mut app.active_modal)?;
                 if matches!(app.state.phase, UiPhase::Idle) {
                     redraw_after_slash(&app.buf, &app.state, ctx, &app.active_modal, renderer);
@@ -1338,8 +1346,13 @@ fn handle_streaming_key(
         BufferResult::Commit(line) => {
             // Slash commands are not queued — they need ctx access
             // that only makes sense between turns. Show a hint and
-            // leave the buf alone.
-            if line.starts_with('/') {
+            // leave the buf alone. Gate strictly on *registered*
+            // commands; unrecognised `/foo …` falls through to the
+            // type-ahead queue as a regular message.
+            let is_known_slash = parse_slash_line(&line)
+                .map(|(cmd, _)| ctx.commands.find(cmd).is_some())
+                .unwrap_or(false);
+            if is_known_slash {
                 renderer.render(UiLine::CommandOutput(
                     "  (slash commands are disabled while a turn is running)\n".into(),
                 ));
