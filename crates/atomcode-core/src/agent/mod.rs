@@ -646,9 +646,13 @@ impl AgentLoop {
         // Without this, the first tool call in a new turn reads the stale budget
         // from the previous turn's last LLM call (when ctx was full), causing
         // 670-line files to skeleton when there's plenty of room.
-        let ctx_window = self.config.default_context_window();
+        //
+        // Read from `self.ctx` not `self.config` — ctx applies defensive
+        // clamps (e.g. OllamaCtx floors at 4K) that config's raw
+        // `context_window` doesn't reflect. Using config would tell
+        // read_file "you have 128K" when actual budget is 4K.
         self.turn_runner.context.ctx_budget_hint.store(
-            ctx_window,
+            self.ctx.ctx_window(),
             std::sync::atomic::Ordering::Relaxed,
         );
 
@@ -735,8 +739,9 @@ impl AgentLoop {
         // Initialize datalog for this turn
         {
             let model_name = self.turn_runner.provider.model_name().to_string();
-            let ctx_window = self.config.default_context_window();
-            self.datalog.begin_turn(&content, &model_name, ctx_window);
+            // Use ctx's effective window so datalog matches what build_messages
+            // actually renders with (OllamaCtx 4K floor, etc).
+            self.datalog.begin_turn(&content, &model_name, self.ctx.ctx_window());
         }
 
         // State-based decisions (replaces keyword-based task_classifier).
@@ -835,7 +840,7 @@ impl AgentLoop {
 
             // Log LLM request to <working_dir>/datalog/llm/ — colocated with turn .md files.
             {
-                let context_window = self.config.default_context_window();
+                let context_window = self.ctx.ctx_window();
                 let (msgs, _) = self.ctx.build_messages(&conv, &system_prompt);
                 let tool_defs = self.turn_runner.tools.get_definitions();
                 let wd = self.turn_runner.context.working_dir

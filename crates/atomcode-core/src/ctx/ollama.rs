@@ -114,6 +114,10 @@ impl CtxBuilder for OllamaCtx {
         }
     }
 
+    fn ctx_window(&self) -> usize {
+        self.ctx_window
+    }
+
     fn name(&self) -> &'static str {
         "ollama"
     }

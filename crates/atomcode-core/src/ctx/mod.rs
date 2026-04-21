@@ -71,6 +71,16 @@ pub trait CtxBuilder: Send + Sync {
     /// Truncate a single tool output in place.
     fn truncate_tool_output(&self, result: &mut ToolResult, tool_name: &str);
 
+    /// Effective token budget for this strategy.
+    ///
+    /// Reflects any defensive clamps the impl applies (e.g. `OllamaCtx`
+    /// floors at 4K even if `provider.context_window == 0`). Callers
+    /// that need the actual budget — `ctx_budget_hint` reset, datalog,
+    /// per-tool truncation — should use this instead of
+    /// `Config::default_context_window()`, which returns the raw,
+    /// unclamped value and may diverge for degenerate configs.
+    fn ctx_window(&self) -> usize;
+
     /// Human-readable name for logging / debugging.
     fn name(&self) -> &'static str;
 }

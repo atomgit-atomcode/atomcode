@@ -55,6 +55,10 @@ impl CtxBuilder for DefaultCtx {
         crate::ctx::truncate::truncate_output(result, tool_name, self.ctx_window);
     }
 
+    fn ctx_window(&self) -> usize {
+        self.ctx_window
+    }
+
     fn name(&self) -> &'static str {
         "default"
     }
