@@ -3,6 +3,7 @@ set -e
 
 # Always run from project root
 cd "$(dirname "$0")/.."
+ROOT="$(pwd)"
 
 # Prefer rustup toolchain over Homebrew rustc — Homebrew's rust ships only the
 # host target, so cross-compiling to x86_64-apple-darwin fails with "can't find
@@ -132,7 +133,7 @@ shasum -a 256 atomcode-* 2>/dev/null | tee checksums.txt
 # rather than pointing at a 404.
 echo ""
 echo "=== Generating latest.json ==="
-MANIFEST="$(cd "$(dirname "$0")/.." && pwd)/latest.json"
+MANIFEST="$ROOT/latest.json"
 RELEASED_AT=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
 emit_entry() {
