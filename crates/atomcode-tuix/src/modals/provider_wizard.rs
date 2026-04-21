@@ -44,6 +44,7 @@ pub enum ProviderWizard {
 pub enum WizardStep {
     Name,
     ProviderType,
+    BaseUrl,
     ApiKey,
     Model,
 }
@@ -52,6 +53,7 @@ pub enum WizardStep {
 pub struct DraftProvider {
     pub name: String,
     pub provider_type: String,
+    pub base_url: String,
     pub api_key: String,
     pub model: String,
 }
@@ -62,6 +64,9 @@ impl DraftProvider {
     fn apply_onto(&self, base: &mut ProviderConfig) {
         if !self.provider_type.is_empty() {
             base.provider_type = self.provider_type.clone();
+        }
+        if !self.base_url.is_empty() {
+            base.base_url = Some(self.base_url.clone());
         }
         if !self.api_key.is_empty() {
             base.api_key = Some(self.api_key.clone());
@@ -82,7 +87,11 @@ impl DraftProvider {
                 Some(self.api_key)
             },
             model: self.model,
-            base_url: None,
+            base_url: if self.base_url.is_empty() {
+                None
+            } else {
+                Some(self.base_url)
+            },
             system_prompt: None,
             user_agent: None,
             context_window: default_context_window_for(&provider_type),
@@ -448,6 +457,13 @@ fn step_prompt_text(step: WizardStep, existing: Option<&ProviderConfig>) -> Stri
         (WizardStep::ProviderType, Some(p)) => {
             format!("Type? [{}] (openai / claude / ollama, blank to keep)", p.provider_type)
         }
+        (WizardStep::BaseUrl, None) => {
+            "Base URL? (blank to use provider default)".into()
+        }
+        (WizardStep::BaseUrl, Some(p)) => {
+            let hint = p.base_url.as_deref().unwrap_or("provider default");
+            format!("Base URL? [{}] (blank to keep)", hint)
+        }
         (WizardStep::ApiKey, None) => "API key? (blank to leave unset)".into(),
         (WizardStep::ApiKey, Some(p)) => {
             let hint = if p.api_key.is_some() { "set — blank to keep" } else { "unset" };
@@ -496,6 +512,10 @@ fn advance_add(
                 return Some(WizardStep::ProviderType);
             }
             draft.provider_type = ans.to_string();
+            Some(WizardStep::BaseUrl)
+        }
+        WizardStep::BaseUrl => {
+            draft.base_url = ans.to_string();
             Some(WizardStep::ApiKey)
         }
         WizardStep::ApiKey => {
@@ -537,6 +557,10 @@ fn advance_edit(
                 return Some(WizardStep::ProviderType);
             }
             draft.provider_type = ans.to_string();
+            Some(WizardStep::BaseUrl)
+        }
+        WizardStep::BaseUrl => {
+            draft.base_url = ans.to_string();
             Some(WizardStep::ApiKey)
         }
         WizardStep::ApiKey => {

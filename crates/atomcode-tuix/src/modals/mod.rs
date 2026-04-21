@@ -66,4 +66,22 @@ pub trait Modal: Send {
         ctx: &LoopCtx,
         renderer: &mut dyn Renderer,
     );
+
+    /// Handle a bracketed-paste payload while the modal is active.
+    /// Default: append the text to `buf` (so text-input wizard steps
+    /// naturally accept URL / API-key paste) and redraw. Modals that
+    /// only present pickers (no text input) can leave the default —
+    /// buf updates are harmless when the modal isn't displaying it.
+    fn handle_paste(
+        &mut self,
+        text: &str,
+        buf: &mut Buffer,
+        state: &mut UiState,
+        ctx: &mut LoopCtx,
+        renderer: &mut dyn Renderer,
+    ) -> Result<ModalAction> {
+        buf.insert_paste(text.to_string());
+        self.draw(buf, state, ctx, renderer);
+        Ok(ModalAction::Continue)
+    }
 }

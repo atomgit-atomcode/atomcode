@@ -128,7 +128,7 @@ impl Buffer {
     /// mis-handle payloads that mix CR-only separators. We fold `\r\n`
     /// and lone `\r` to `\n` at ingress so both the placeholder summary
     /// and the expanded agent payload are in canonical form.
-    fn insert_paste(&mut self, text: String) -> String {
+    pub fn insert_paste(&mut self, text: String) -> String {
         let text = normalize_newlines(&text);
         let line_count = text.lines().count().max(1);
         let char_count = text.chars().count();
@@ -940,12 +940,30 @@ fn handle_input(
             renderer.on_resize(cols, rows);
         }
         InputEvent::Paste(text) => {
-            // Allow pasting during Streaming too — it goes into the
-            // type-ahead buffer just like keyboard input. Modals have
-            // their own key handling and ignore paste events.
-            if matches!(app.state.phase, UiPhase::Idle | UiPhase::Streaming)
-                && app.active_modal.is_none()
-            {
+            // Route paste to the active modal when one is installed — the
+            // provider/model/session wizards all have text-input steps
+            // where pasting URLs / API keys / tokens is the natural UX.
+            // Modals that don't want paste can override `handle_paste`
+            // to drop it; the default inserts into `buf` + redraws.
+            if matches!(app.state.phase, UiPhase::Idle) {
+                if let Some(modal) = app.active_modal.as_mut() {
+                    let action = modal.handle_paste(
+                        &text,
+                        &mut app.buf,
+                        &mut app.state,
+                        ctx,
+                        renderer,
+                    )?;
+                    if matches!(action, crate::modals::ModalAction::Close) {
+                        app.active_modal = None;
+                        redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+                    }
+                    return Ok(());
+                }
+            }
+            // No modal: paste goes into the type-ahead buffer just like
+            // keyboard input (Idle or Streaming, both consume it).
+            if matches!(app.state.phase, UiPhase::Idle | UiPhase::Streaming) {
                 app.buf.insert_paste(text);
                 if matches!(app.state.phase, UiPhase::Streaming) {
                     draw_spinner_now(&mut app.state, &app.buf, ctx, renderer, app.message_queue.len(), app.menu.selected);
