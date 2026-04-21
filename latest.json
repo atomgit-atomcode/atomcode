@@ -1,8 +1,10 @@
 {
-  "version": "v4.19.1",
-  "released_at": "2026-04-20T13:41:47Z",
+  "version": "v4.19.0",
+  "released_at": "2026-04-21T08:59:34Z",
   "binaries": {
-    "darwin-arm64": { "sha256": "84660fac68456639828c55ee17e6609c6ad6bfe25f5f71ba27fa31fbaff42057", "size": 14543024 },
-    "darwin-x64": { "sha256": "8266bfc21bf877c0e065b867f3d66b24b31df11a2e30e697b789565f0ce2a4ba", "size": 15418332 }
+    "darwin-arm64": { "sha256": "d9c9da09737a67476b07e9cf2e8c76dc6c27eb5e1ad727baa3cec5620f84dc62", "size": 14493584 },
+    "darwin-x64": { "sha256": "079e59bfb245db2cd7cf98a2f71d94240e5d26f9f1bd8d21e5da321e457f95dc", "size": 15595232 },
+    "linux-x64": { "sha256": "13c05672fabc9b9614872bbab17a243f45bc55f648e838379aefadd3abd0f2f7", "size": 16897056 },
+    "windows-x64": { "sha256": "7f2a77206f746ef66c06010e2e4d5d83784a1c30a96c149f4e95de5874b2c2a8", "size": 15972352 }
   }
 }
