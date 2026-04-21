@@ -1,42 +1,13 @@
 use super::*;
 
 impl AgentLoop {
-    /// Graph-driven preread: identify call chain files from user message,
-    /// read their key functions, and inject into system prompt.
-    ///
-    /// Build a per-turn reminder string injected into the conversation.
-    /// Currently returns empty — reserved for future per-turn context injection.
-    pub(crate) fn build_turn_reminder(&self) -> String {
-        let mut parts = Vec::new();
-
-        // Previous turn's edited files — helps model avoid re-exploring
-        if !self.prev_turn_edited_files.is_empty() {
-            let files = self.prev_turn_edited_files.join(", ");
-            parts.push(format!(
-                "[Previous turn: you edited {}. If the user reports the same issue, start from these files.]",
-                files
-            ));
-        }
-
-        // Current task at the very end (recency bias)
-        if !self.current_task.is_empty() {
-            let task_short = if self.current_task.chars().count() > 300 {
-                format!("{}...", self.current_task.chars().take(297).collect::<String>())
-            } else {
-                self.current_task.clone()
-            };
-            parts.push(format!(
-                "=== CURRENT TASK ===\n{}\nAct on this task directly. Do NOT search for files you already know about.",
-                task_short
-            ));
-        }
-
-        if parts.is_empty() {
-            String::new()
-        } else {
-            parts.join("\n\n")
-        }
-    }
+    // NOTE: `build_turn_reminder` lived here but moved to
+    // `ctx::CtxBuilder::render_turn_reminder` (default impl in
+    // `ctx::render::render_turn_reminder`). The agent is the only
+    // consumer — having it on the ctx trait lets per-model impls
+    // override placement/content without touching agent code.
+    // AgentLoop owns the inputs (`prev_turn_edited_files`,
+    // `current_task`); the ctx owns the rendering policy.
 
     pub(crate) fn build_system_prompt(&mut self) -> String {
         // Dynamic rules: select prompt sections based on task type.

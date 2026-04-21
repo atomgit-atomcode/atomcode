@@ -817,7 +817,9 @@ impl AgentLoop {
             // the prompt guides the model to work efficiently.
 
             let system_prompt = self.build_system_prompt();
-            let turn_reminder = self.build_turn_reminder();
+            let turn_reminder = self
+                .ctx
+                .render_turn_reminder(&self.prev_turn_edited_files, &self.current_task);
             let cancel = self.cancel_token.clone();
 
             // Context compression: when > 70% budget, pause and compress

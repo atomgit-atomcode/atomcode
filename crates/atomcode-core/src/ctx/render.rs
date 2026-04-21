@@ -17,6 +17,55 @@
 use crate::conversation::{Conversation, ContextStats, KEEP_MESSAGES};
 use crate::conversation::message::{self, Message, MessageContent, Role};
 
+/// Render the per-turn dynamic reminder string from agent-owned state.
+///
+/// Default policy (used by [`crate::ctx::DefaultCtx`] / [`crate::ctx::OllamaCtx`]):
+///
+/// - If `prev_edited_files` is non-empty, emit a one-line hint pointing
+///   the model at last turn's touched files (avoids redundant search
+///   when the user follows up on the same area).
+/// - If `current_task` is non-empty, emit a `=== CURRENT TASK ===`
+///   block at the very end (recency: the last ~200 prompt tokens are
+///   what the model attends to most when starting a turn). Truncated
+///   to ~300 chars to bound the injection size.
+///
+/// Returns `String::new()` when both inputs are empty — callers should
+/// treat empty as "no reminder this turn" and skip injection entirely.
+///
+/// Per-ctx impls override [`crate::ctx::CtxBuilder::render_turn_reminder`]
+/// when they want different placement (e.g. a future ClaudeCtx may want
+/// the reminder as its own System message to keep cache prefix stable;
+/// a small-window ctx may want to drop it entirely to save tokens).
+pub fn render_turn_reminder(prev_edited_files: &[String], current_task: &str) -> String {
+    let mut parts: Vec<String> = Vec::new();
+
+    if !prev_edited_files.is_empty() {
+        let files = prev_edited_files.join(", ");
+        parts.push(format!(
+            "[Previous turn: you edited {}. If the user reports the same issue, start from these files.]",
+            files
+        ));
+    }
+
+    if !current_task.is_empty() {
+        let task_short = if current_task.chars().count() > 300 {
+            format!("{}...", current_task.chars().take(297).collect::<String>())
+        } else {
+            current_task.to_string()
+        };
+        parts.push(format!(
+            "=== CURRENT TASK ===\n{}\nAct on this task directly. Do NOT search for files you already know about.",
+            task_short
+        ));
+    }
+
+    if parts.is_empty() {
+        String::new()
+    } else {
+        parts.join("\n\n")
+    }
+}
+
 /// Append model-specific behavioral directives to a system prompt.
 ///
 /// Previously scattered as `if model_id.contains(...)` branches inside
@@ -792,6 +841,48 @@ mod tests {
     use super::*;
     use crate::conversation::Conversation;
     use crate::conversation::message::{Message, Role};
+
+    #[test]
+    fn render_turn_reminder_empty_when_no_state() {
+        assert_eq!(render_turn_reminder(&[], ""), "");
+    }
+
+    #[test]
+    fn render_turn_reminder_includes_prev_files_only() {
+        let files = vec!["src/foo.rs".to_string(), "src/bar.rs".to_string()];
+        let out = render_turn_reminder(&files, "");
+        assert!(out.contains("src/foo.rs, src/bar.rs"));
+        assert!(out.contains("Previous turn"));
+        assert!(!out.contains("CURRENT TASK"));
+    }
+
+    #[test]
+    fn render_turn_reminder_includes_current_task_only() {
+        let out = render_turn_reminder(&[], "fix the auth bug");
+        assert!(out.contains("CURRENT TASK"));
+        assert!(out.contains("fix the auth bug"));
+        assert!(!out.contains("Previous turn"));
+    }
+
+    #[test]
+    fn render_turn_reminder_truncates_long_task_at_300_chars() {
+        let task = "x".repeat(500);
+        let out = render_turn_reminder(&[], &task);
+        // 297 'x' + "..." + framing text — task body should be capped near 300
+        assert!(out.contains("xxx..."));
+        // ensure truncation happened (not all 500 x's verbatim)
+        assert!(!out.contains(&"x".repeat(400)));
+    }
+
+    #[test]
+    fn render_turn_reminder_task_appears_after_prev_files() {
+        // recency: task block must come last (it's the model's first focus)
+        let files = vec!["a.rs".to_string()];
+        let out = render_turn_reminder(&files, "do thing");
+        let prev_idx = out.find("Previous turn").unwrap();
+        let task_idx = out.find("CURRENT TASK").unwrap();
+        assert!(task_idx > prev_idx);
+    }
 
     #[test]
     fn apply_model_directives_noop_for_generic_model() {
