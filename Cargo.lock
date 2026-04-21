@@ -126,6 +126,7 @@ dependencies = [
  "clap",
  "crossterm 0.29.0",
  "dirs 6.0.0",
+ "libc",
  "mimalloc",
  "reqwest",
  "serde",

@@ -199,46 +199,20 @@ pub async fn run(
         });
     }
 
-    // Hourly deferred-upgrade poll. Runs alongside the one-shot version
-    // check above, but performs the full download + verify and writes
-    // `pending.json` so the next startup auto-applies. Only active when
-    // `config.auto_update` is true (default). Poll interval is
-    // intentionally long (1h) — more frequent polls just burn bandwidth
-    // for users who aren't going to restart more often than that anyway.
-    if config.auto_update {
-        let slot = update_hint.clone();
-        let wake = wake_tx.clone();
-        tokio::spawn(async move {
-            let current = format!("v{}", env!("CARGO_PKG_VERSION"));
-            // Small initial delay so the startup burst (manifest fetch,
-            // provider handshake, tool registration) doesn't compete for
-            // network with a background download that nobody's waiting on.
-            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-            loop {
-                // Dispose of UpgradeEvent messages silently — the
-                // hourly poll is background-only and has no UI surface
-                // for per-byte progress. `/upgrade` (manual, foreground)
-                // is the flow that renders events.
-                let (tx, mut rx) =
-                    tokio::sync::mpsc::unbounded_channel::<atomcode_core::self_update::UpgradeEvent>();
-                tokio::spawn(async move { while rx.recv().await.is_some() {} });
-
-                match atomcode_core::self_update::prepare_deferred_upgrade(&current, tx).await {
-                    Ok(Some(pending)) => {
-                        if let Ok(mut g) = slot.lock() {
-                            *g = Some(pending.version);
-                        }
-                        let _ = wake.try_send(());
-                    }
-                    Ok(None) | Err(_) => {
-                        // Already latest, or a transient network error.
-                        // Either way we just try again next hour.
-                    }
-                }
-                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
-            }
-        });
-    }
+    // NOTE: the in-process deferred-upgrade poll used to live here. It
+    // was moved out into a detached setsid'd subprocess spawned from
+    // `main.rs` (see `spawn_detached_upgrade_prep`). Rationale: the old
+    // task was tied to this tokio runtime, so any Ctrl+C / quick exit
+    // cancelled the download mid-flight and `pending.json` was never
+    // written — making "exit and restart to auto-upgrade" silently do
+    // nothing. The detached subprocess survives parent exits. Running
+    // both would race on `staged_path` (no temp-rename in
+    // `download_and_verify`), so the in-process copy is gone entirely.
+    //
+    // Trade-off: a session that runs through a whole release cycle
+    // (>1 h) won't re-stage the newer version mid-session. We accept
+    // that — `/upgrade` still works manually, and the update hint from
+    // the one-shot `version_check` above still surfaces the availability.
 
     // Long-lived progress channel for /upgrade. The sender is cloned
     // into each spawned upgrade task; the receiver stays in the event

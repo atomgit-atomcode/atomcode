@@ -86,6 +86,229 @@ fn truncate_log_line(s: &str, max_chars: usize) -> String {
     }
 }
 
+/// True when the currently-running binary's filename ends in `.bak`.
+/// `self_update::replace_binary` renames the previous version to
+/// `atomcode.bak` (or `atomcode.exe.bak`) during an upgrade so the user
+/// can roll back. Running that backup must NOT auto-upgrade — otherwise
+/// rolling back is impossible: any launch of `.bak` would just overwrite
+/// itself with the latest version again.
+///
+/// Defensive: if we can't read `current_exe()` for any reason, assume
+/// we're the live binary (not backup) so auto-upgrade still works for
+/// the common case.
+fn is_running_as_backup() -> bool {
+    std::env::current_exe()
+        .ok()
+        .as_deref()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .map(|n| n.ends_with(".bak"))
+        .unwrap_or(false)
+}
+
+/// Decide whether the startup-time synchronous upgrade path should fire.
+/// Returns false when any of these hold:
+///   * We're running as `atomcode.bak` → user wants the old binary,
+///     don't silently swap it back to latest.
+///   * `-p` / `--prompt` / `--prompt-file` is in argv → headless script run,
+///     shouldn't stall 5-20 s on a network download for a 2 s task.
+///   * A subcommand (login, logout, status, upgrade, rollback) is in argv
+///     → those have their own flows and don't want a surprise re-exec.
+///   * Config has `auto_update = false` → user explicitly opted out.
+/// Anything else (including missing config) → true, because fresh installs
+/// that haven't written a config yet are exactly the case we want to help.
+///
+/// Deliberately scans argv by hand — clap hasn't parsed yet at this point
+/// in main(), and we need to decide before any slower setup happens.
+fn should_try_sync_upgrade() -> bool {
+    if is_running_as_backup() {
+        return false;
+    }
+
+    let args: Vec<String> = std::env::args().collect();
+    let any = |needle: &[&str]| args.iter().skip(1).any(|a| needle.iter().any(|n| a == n || a.starts_with(&format!("{}=", n))));
+
+    if any(&["-p", "--prompt", "--prompt-file"]) {
+        return false;
+    }
+    if args.iter().skip(1).any(|a| matches!(a.as_str(),
+        "login" | "logout" | "status" | "upgrade" | "rollback" | "--version" | "-V" | "--help" | "-h")) {
+        return false;
+    }
+
+    // Load just enough of the config to honor `auto_update = false`.
+    // Failure to load = assume default (true) — fresh installs benefit.
+    let path = atomcode_core::config::Config::default_path();
+    if path.exists() {
+        if let Ok(cfg) = atomcode_core::config::Config::load(&path) {
+            if !cfg.auto_update {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Startup-time synchronous upgrade. Fetches the manifest, and if a newer
+/// release exists, downloads + verifies + stages + applies it in-line,
+/// then re-execs into the new binary. Progress is printed to stderr so
+/// the user sees something happen during the 5-20 s window (as opposed
+/// to a silent hang). Anything that fails → fall through; the parent's
+/// `main` continues with the current binary, and the detached worker
+/// spawned later (`spawn_detached_upgrade_prep`) is still there as a
+/// second chance for the next session.
+///
+/// Bounded by an overall 120 s timeout so a slow mirror / hung DNS can't
+/// wedge startup forever.
+async fn sync_stage_and_apply_if_newer() {
+    use atomcode_core::self_update::{self, UpgradeEvent};
+
+    let current = format!("v{}", env!("CARGO_PKG_VERSION"));
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<UpgradeEvent>();
+
+    // Progress consumer: renders ManifestFetched / Downloading / Verifying
+    // as a single-line updating status on stderr. Percent-debounced so a
+    // 15 MB download at 64 KiB chunks doesn't flood the terminal.
+    let progress = tokio::spawn(async move {
+        use std::io::Write;
+        let mut last_pct: i32 = -1;
+        while let Some(ev) = rx.recv().await {
+            match ev {
+                UpgradeEvent::ManifestFetched { version } => {
+                    eprintln!("✨ New version available: {}", version);
+                }
+                UpgradeEvent::Downloading { bytes, total } => {
+                    let pct = if total == 0 { 0 } else { ((bytes * 100) / total) as i32 };
+                    if pct != last_pct {
+                        eprint!("\r   Downloading {}% ({:.1} / {:.1} MB)      ",
+                                pct,
+                                bytes as f64 / 1_048_576.0,
+                                total as f64 / 1_048_576.0);
+                        let _ = std::io::stderr().flush();
+                        last_pct = pct;
+                    }
+                }
+                UpgradeEvent::Verifying => {
+                    eprintln!("\n✓ Verifying sha256");
+                }
+                _ => {}
+            }
+        }
+    });
+
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        self_update::prepare_deferred_upgrade(&current, tx),
+    )
+    .await;
+
+    // Wait briefly for the progress consumer to drain — it closes when
+    // the sender drops at the end of prepare_deferred_upgrade.
+    let _ = progress.await;
+
+    match outcome {
+        Ok(Ok(Some(_staged))) => {
+            // Staged successfully. Apply right now so the user gets the new
+            // binary on this same invocation.
+            match self_update::apply_pending_upgrade() {
+                Ok(Some(applied)) => {
+                    eprintln!("✓ Upgrading to {}...", applied.version);
+                    std::env::set_var(UPGRADED_FROM_ENV, &applied.version);
+                    match self_update::re_exec_self() {
+                        Ok(_infallible) => unreachable!("re_exec_self returned Ok"),
+                        Err(e) => {
+                            eprintln!(
+                                "Upgrade applied but re-exec failed ({}). The new version will be used on the next launch.",
+                                e
+                            );
+                            std::env::remove_var(UPGRADED_FROM_ENV);
+                        }
+                    }
+                }
+                _ => {
+                    // Stage succeeded but apply didn't — weird, just continue.
+                }
+            }
+        }
+        Ok(Ok(None)) => {
+            // Already latest, no-op.
+        }
+        Ok(Err(_)) | Err(_) => {
+            // Network error or 120 s timeout. Don't spam the user —
+            // `/upgrade` will surface the real error if they ask.
+            eprintln!("Note: could not check for updates at startup (will retry in background).");
+        }
+    }
+}
+
+/// Body of the detached upgrade-prep worker. One call to
+/// `prepare_deferred_upgrade` (which fetches the manifest, downloads the
+/// next version's binary if newer, verifies sha256, and writes
+/// `pending.json`). On success the next parent-atomcode start will pick
+/// up `pending.json` and apply. Silent: stdout/stderr are already /dev/null
+/// (see `spawn_detached_upgrade_prep`), so any output would be discarded.
+async fn run_prepare_upgrade_worker() -> i32 {
+    let current = format!("v{}", env!("CARGO_PKG_VERSION"));
+    // UpgradeEvent stream is per-byte progress; we don't surface it here
+    // (parent is gone), so drain to /dev/null.
+    let (tx, mut rx) =
+        tokio::sync::mpsc::unbounded_channel::<atomcode_core::self_update::UpgradeEvent>();
+    tokio::spawn(async move { while rx.recv().await.is_some() {} });
+
+    match atomcode_core::self_update::prepare_deferred_upgrade(&current, tx).await {
+        Ok(_) => 0,
+        Err(_) => 1,
+    }
+}
+
+/// Spawn a detached copy of this binary that runs the upgrade-prep worker
+/// and exits. "Detached" means:
+///   * New session on Unix (`setsid`) — parent's Ctrl+C goes to parent's
+///     foreground process group only; the child is in its own and ignores it.
+///   * `CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS` on Windows, same idea.
+///   * stdin/stdout/stderr → /dev/null so the child can't scribble over the
+///     parent's terminal and has no reason to stay attached to it.
+///
+/// Does NOT wait for the child (we intentionally don't — that would recreate
+/// the cancel-on-exit problem we're trying to solve). If spawning fails we
+/// just drop the error; auto-upgrade is best-effort.
+fn spawn_detached_upgrade_prep() {
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.env(INTERNAL_PREPARE_UPGRADE_ENV, "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            cmd.pre_exec(|| {
+                // Detach from parent's controlling terminal / process group.
+                // Return value ignored — setsid only fails when caller is
+                // already a process group leader (not our case post-fork).
+                libc::setsid();
+                Ok(())
+            });
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
+        const DETACHED_PROCESS: u32 = 0x00000008;
+        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
+    }
+
+    let _ = cmd.spawn();
+}
+
 const VERSION: &str = concat!(
     env!("CARGO_PKG_VERSION"),
     " (",
@@ -182,6 +405,12 @@ enum Commands {
 /// (spawned tools, subprocesses) don't inherit a stale hint.
 const UPGRADED_FROM_ENV: &str = "ATOMCODE_UPGRADED_FROM";
 
+/// Env var the parent sets when spawning a detached upgrade-prep worker.
+/// The child detects it at the very top of `main` and runs one
+/// `prepare_deferred_upgrade` cycle in its own session (setsid'd) so the
+/// parent can be Ctrl+C'd without cancelling the download.
+const INTERNAL_PREPARE_UPGRADE_ENV: &str = "ATOMCODE_INTERNAL_PREPARE_UPGRADE";
+
 #[tokio::main]
 async fn main() {
     // Set Windows console to UTF-8 so CJK and other multi-byte characters
@@ -196,6 +425,27 @@ async fn main() {
         }
     }
 
+    // Detached upgrade-prep worker mode. The parent atomcode spawns a
+    // subprocess with this env var set; that subprocess does one full
+    // download + verify + `pending.json` write, then exits. Because the
+    // subprocess is setsid'd (see `spawn_detached_upgrade_prep`), it
+    // survives Ctrl+C / quit in the parent — which is the whole point,
+    // since the previous in-process download was tied to the parent's
+    // tokio runtime and got cancelled on any quick exit.
+    if std::env::var(INTERNAL_PREPARE_UPGRADE_ENV).is_ok() {
+        let code = run_prepare_upgrade_worker().await;
+        std::process::exit(code);
+    }
+
+    // If this invocation is the `.bak` backup binary (left behind by a
+    // previous upgrade), skip all upgrade bootstrapping. `apply_pending_upgrade`
+    // would rewrite ourselves with the latest version and destroy the
+    // rollback target; the whole point of keeping `.bak` is for the user
+    // to be able to run / keep the old version. The only upgrade path
+    // still reachable from a `.bak` launch is the explicit `/upgrade`
+    // slash command inside the TUI — that's user-initiated and fine.
+    let is_backup = is_running_as_backup();
+
     // Bootstrap: if a prior session staged an upgrade, apply it NOW — before
     // we spin up tokio, the TUI, or any other heavy state. On success we
     // re-exec the new binary (Unix: same PID; Windows: child+exit). The user
@@ -203,6 +453,7 @@ async fn main() {
     // normal. On failure we log and carry on with the current binary; the
     // circuit-breaker in `apply_pending_upgrade` ensures a broken release
     // can't wedge this loop indefinitely.
+    if !is_backup {
     match atomcode_core::self_update::apply_pending_upgrade() {
         Ok(Some(applied)) => {
             eprintln!("✓ Upgrading to {}...", applied.version);
@@ -221,11 +472,27 @@ async fn main() {
                 }
             }
         }
-        Ok(None) => { /* no pending upgrade; normal startup */ }
+        Ok(None) => {
+            // No pre-staged upgrade. If the user isn't passing `-p` /
+            // `--prompt-file` (headless one-shots shouldn't pay the network
+            // tax) and auto_update isn't disabled, try to fetch + stage +
+            // apply v_next right here. This is the "user launched atomcode,
+            // wants it upgraded NOW" path — single invocation instead of
+            // the stage-on-session-N / apply-on-session-N+1 dance.
+            //
+            // Anything goes wrong (offline, timeout, sha mismatch, no
+            // newer release) → silently fall through and continue with
+            // the current binary. The `/upgrade` slash command is still
+            // there as the explicit/loud alternative.
+            if should_try_sync_upgrade() {
+                sync_stage_and_apply_if_newer().await;
+            }
+        }
         Err(e) => {
             eprintln!("Note: pending upgrade could not be applied ({}). Continuing with current version.", e);
         }
     }
+    } // end `if !is_backup`
 
     // Set panic hook to show errors cleanly
     std::panic::set_hook(Box::new(|info| {
@@ -412,6 +679,17 @@ async fn run() -> Result<i32> {
     // Headless mode: -p / --prompt-file triggers non-interactive execution.
     if let Some(prompt) = effective_prompt {
         return run_headless(agent_loop, agent_handle, prompt, cli.provider.as_deref(), cli.verbose).await;
+    }
+
+    // Fire-and-forget: spawn a setsid'd subprocess to stage the next
+    // release if one is out. Detached so a Ctrl+C in this parent doesn't
+    // also kill the download — that was the whole reason "exit and come
+    // back" wasn't picking up v_next on short sessions. Only armed when
+    // the user hasn't opted out via `auto_update = false` AND we're not
+    // running as `atomcode.bak` (backup should stay pinned; see the
+    // `is_running_as_backup` guard up top).
+    if config.auto_update && !is_running_as_backup() {
+        spawn_detached_upgrade_prep();
     }
 
     tokio::spawn(agent_loop.run());
