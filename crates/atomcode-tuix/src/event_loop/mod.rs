@@ -596,11 +596,13 @@ pub struct App {
     /// agent events — a tag straddling two chunks would break if the
     /// stripper were re-constructed each event.
     pub think: ThinkStripper,
-    /// call_id → (tool_name, detail). Populated on ToolCallStarted,
-    /// consumed on ToolCallResult so the result line reads
-    /// "name(detail) — summary" instead of a bare "✓ summary" detached
-    /// from its originating call.
-    pub pending_tools: std::collections::HashMap<String, (String, String)>,
+    /// call_id → (tool_name, detail, call_rendered). Populated on
+    /// ToolCallStarted, read by `ApprovalNeeded` (which renders the
+    /// `▸ Tool(detail)` line eagerly so the user sees *what* they're
+    /// being asked to approve), and consumed on ToolCallResult. The
+    /// `call_rendered` flag prevents rendering the tool-call line
+    /// twice when ApprovalNeeded fired first.
+    pub pending_tools: std::collections::HashMap<String, (String, String, bool)>,
 }
 
 impl App {
@@ -1460,7 +1462,7 @@ fn handle_agent_event(
     state: &mut UiState,
     think: &mut ThinkStripper,
     renderer: &mut dyn Renderer,
-    pending_tools: &mut std::collections::HashMap<String, (String, String)>,
+    pending_tools: &mut std::collections::HashMap<String, (String, String, bool)>,
 ) {
     match ev {
         AgentEvent::TextDelta(text) => {
@@ -1474,13 +1476,15 @@ fn handle_agent_event(
             state.on_tool_call_streaming(&display_tool_name(&name));
         }
         AgentEvent::ToolCallStarted { id, name, arguments } => {
-            // Don't emit the ▸ line yet; hold it in pending_tools until the
-            // matching ToolCallResult arrives. This preserves CC-style
-            // visual pairing even when the agent runs tools in parallel
-            // (all Starts then all Results in the event stream).
+            // Don't emit the ▸ line yet; hold it in pending_tools until
+            // either (a) an ApprovalNeeded for this call arrives and
+            // renders the line eagerly so the user can see what they're
+            // approving, or (b) the matching ToolCallResult arrives and
+            // renders the pair. `call_rendered=false` means no one has
+            // emitted the line yet.
             let detail = format_tool_detail(&name, &arguments);
             let display = display_tool_name(&name);
-            pending_tools.insert(id, (display.clone(), detail));
+            pending_tools.insert(id, (display.clone(), detail, false));
             state.on_tool_call_started(&display);
         }
         AgentEvent::ToolCallResult { call_id, name, output, success, .. } => {
@@ -1490,9 +1494,9 @@ fn handle_agent_event(
             // Prefer the display-name we stored at ToolCallStarted time;
             // fall back to converting the raw name if we missed the Start
             // (e.g. protocol surfaced a Result without a matching Start).
-            let (display_name, detail) = pending_tools
+            let (display_name, detail, call_rendered) = pending_tools
                 .remove(&call_id)
-                .unwrap_or_else(|| (display_tool_name(&name), String::new()));
+                .unwrap_or_else(|| (display_tool_name(&name), String::new(), false));
 
             // Filter empty tool names (model occasionally emits malformed
             // tool calls with "" as the name; agent surfaces the error via
@@ -1503,10 +1507,14 @@ fn handle_agent_event(
                 display_name
             };
 
-            renderer.render(UiLine::ToolCall {
-                name: safe_name.clone(),
-                detail: detail.clone(),
-            });
+            // Only emit the tool-call line here if ApprovalNeeded didn't
+            // already render it — otherwise we'd print it twice.
+            if !call_rendered {
+                renderer.render(UiLine::ToolCall {
+                    name: safe_name.clone(),
+                    detail: detail.clone(),
+                });
+            }
             let summary = summarise(&output);
             renderer.render(UiLine::ToolResult { success, summary });
             // Collect diff lines into a single batch — N individual
@@ -1539,9 +1547,33 @@ fn handle_agent_event(
             let _ = name;
         }
         AgentEvent::ApprovalNeeded { tool_name, call, .. } => {
+            // Emit the `▸ Tool(detail)` row BEFORE the approval prompt
+            // so the user sees what they're approving. If the matching
+            // ToolCallStarted already populated pending_tools, reuse
+            // its stored display/detail and flag the entry as rendered
+            // so ToolCallResult won't re-emit. If not (race condition
+            // where Approval arrives first), fall back to deriving
+            // display/detail from the event itself.
+            let display = display_tool_name(&tool_name);
             let detail = format_tool_detail(&tool_name, &call.arguments);
+            if let Some(entry) = pending_tools.get_mut(&call.id) {
+                let (disp, det, rendered) = entry;
+                if !*rendered {
+                    renderer.render(UiLine::ToolCall {
+                        name: disp.clone(),
+                        detail: det.clone(),
+                    });
+                    *rendered = true;
+                }
+            } else {
+                renderer.render(UiLine::ToolCall {
+                    name: display.clone(),
+                    detail: detail.clone(),
+                });
+                pending_tools.insert(call.id.clone(), (display.clone(), detail.clone(), true));
+            }
             renderer.render(UiLine::ApprovalPrompt {
-                tool: display_tool_name(&tool_name),
+                tool: display,
                 detail,
             });
             renderer.flush();
@@ -1568,9 +1600,11 @@ fn handle_agent_event(
         AgentEvent::TurnCancelled { .. } => {
             // Render any in-flight tool calls that never got a result
             // as "(cancelled)" so the user sees what was mid-flight.
-            for (_id, (name, detail)) in pending_tools.drain() {
+            for (_id, (name, detail, call_rendered)) in pending_tools.drain() {
                 let safe_name = if name.is_empty() { "(invalid)".into() } else { name };
-                renderer.render(UiLine::ToolCall { name: safe_name, detail });
+                if !call_rendered {
+                    renderer.render(UiLine::ToolCall { name: safe_name, detail });
+                }
                 renderer.render(UiLine::ToolResult {
                     success: false,
                     summary: "(cancelled)".into(),

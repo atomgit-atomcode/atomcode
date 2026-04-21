@@ -19,13 +19,21 @@ impl CommandRegistry {
     }
 
     pub fn find(&self, name: &str) -> Option<Command> {
-        self.commands.iter().find(|c| c.name == name).copied()
+        // Built-in command names are all ASCII, so an ASCII
+        // case-insensitive match is equivalent to a Unicode-correct
+        // one here. `/SESSION` resolves to the same `session` entry
+        // as `/session`.
+        self.commands
+            .iter()
+            .find(|c| c.name.eq_ignore_ascii_case(name))
+            .copied()
     }
 
     pub fn matching_prefix(&self, prefix: &str) -> Vec<Command> {
+        let prefix_lower = prefix.to_ascii_lowercase();
         self.commands
             .iter()
-            .filter(|c| c.name.starts_with(prefix))
+            .filter(|c| c.name.starts_with(prefix_lower.as_str()))
             .copied()
             .collect()
     }

@@ -215,6 +215,13 @@ pub struct RetainedRenderer<W: Write + Send> {
     /// paint so `\n` in the body-emit path only scrolls body rows,
     /// leaving the footer strip below untouched.
     scroll_region_bottom: Option<u16>,
+    /// Set by `pop_approval_prompt` so the immediately-following
+    /// body-line emit overwrites the approval row in place instead of
+    /// scrolling the region up one row. Without this, the ToolResult
+    /// that follows Y/A/N would push the ▸ ToolCall row off to make
+    /// space for itself, leaving a blank gap between `▸ Tool(detail)`
+    /// and `⎿ result`.
+    skip_next_body_scroll: bool,
 }
 
 impl RetainedRenderer<BufWriter<Stdout>> {
@@ -241,6 +248,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             dirty: false,
             last_painted_footer_rows: 0,
             scroll_region_bottom: None,
+            skip_next_body_scroll: false,
         }
     }
 
@@ -704,12 +712,12 @@ impl<W: Write + Send> RetainedRenderer<W> {
     /// region, scrolling the region up one line (oldest line enters
     /// scrollback, DECSTBM contains the scroll to the body strip).
     /// Assumes `ensure_scroll_region` has already set the region.
+    ///
+    /// When `skip_next_body_scroll` is set (see `pop_approval_prompt`),
+    /// the LF is skipped — the new row overwrites whatever was sitting
+    /// at body_bottom (typically the freshly-popped approval prompt)
+    /// so the visual flow `▸ Tool` → `⎿ result` has no gap.
     fn emit_body_line_inner(&mut self, row: &[Cell], bottom: u16) {
-        // Position at body bottom, LF to scroll the region up one
-        // row (oldest exits into scrollback), reposition, write row
-        // bytes. Explicit reposition after LF because cursor col
-        // semantics post-scroll aren't consistent across emulators.
-        //
         // `\x1b[K` (EL — erase from cursor to end of line) runs AFTER
         // reposition and BEFORE writing the row. ECMA-48 says SU at
         // bottom of a scroll region must blank the new bottom row, but
@@ -719,7 +727,17 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // empty spacer) let the previous row's tail bleed through —
         // classic symptom was `/provider  to add a custom model` from
         // the welcome banner leaking past shorter subsequent rows.
-        let _ = write!(self.out, "\x1b[{};1H\n\x1b[{};1H\x1b[K", bottom, bottom);
+        if self.skip_next_body_scroll {
+            // In-place overwrite: position + erase, no LF (so the
+            // body region isn't shifted up; the prior approval prompt
+            // at body_bottom gets replaced cleanly).
+            let seq = format!("\x1b[{};1H\x1b[K", bottom);
+            let _ = self.out.write_all(seq.as_bytes());
+            self.skip_next_body_scroll = false;
+        } else {
+            let seq = format!("\x1b[{};1H\n\x1b[{};1H\x1b[K", bottom, bottom);
+            let _ = self.out.write_all(seq.as_bytes());
+        }
         let bytes = serialize_row(row);
         let _ = self.out.write_all(&bytes);
     }
@@ -1197,15 +1215,17 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
             return;
         }
         self.body_lines.pop();
-        // Physically wipe the bottom body row — we just emitted the
-        // approval prompt there and it hasn't been scrolled out yet,
-        // so this is the only row that needs erasing. Older body
-        // rows on screen stay in place (they match `body_lines`'s
-        // new tail 1-to-1).
+        // Physically wipe the bottom body row for instant visual
+        // feedback on Y/A/N even before the ToolCallResult arrives.
+        // Then flag the next body emit to overwrite this row in place
+        // rather than scroll the region — so `⎿ result` lands exactly
+        // where the approval prompt used to be, keeping `▸ Tool` and
+        // `⎿ result` visually adjacent.
         let bottom = self.body_bottom_row();
         if bottom > 0 {
             let _ = write!(self.out, "\x1b[{};1H\x1b[2K", bottom);
             let _ = self.out.flush();
+            self.skip_next_body_scroll = true;
         }
         self.dirty = true;
     }

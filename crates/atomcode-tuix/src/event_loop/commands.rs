@@ -35,6 +35,12 @@ pub(super) fn execute_slash_command(
     renderer: &mut dyn Renderer,
     active_modal: &mut Option<Box<dyn Modal>>,
 ) -> Result<()> {
+    // Built-in commands are all lowercase ASCII; normalise the user's
+    // input so `/SESSION`, `/Session`, `/sEssIon` all hit the same arm
+    // as `/session`. `arg` is left untouched — paths / URLs are
+    // case-sensitive in general.
+    let cmd_lower = cmd.to_ascii_lowercase();
+    let cmd = cmd_lower.as_str();
     match cmd {
         "quit" | "exit" => {
             ctx.agent.cmd_tx.send(AgentCommand::Shutdown).ok();
