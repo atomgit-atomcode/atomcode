@@ -71,9 +71,42 @@ impl Tool for ReadFileTool {
         ApprovalRequirement::AutoApprove
     }
 
+    fn approval_with_context(&self, args: &str, ctx: &ToolContext) -> ApprovalRequirement {
+        let parsed = match serde_json::from_str::<ReadFileArgs>(args) {
+            Ok(parsed) => parsed,
+            Err(_) => return self.approval(args),
+        };
+        let working_dir = match ctx.working_dir.try_read() {
+            Ok(wd) => wd.clone(),
+            Err(_) => return self.approval(args),
+        };
+        match super::inspect_path_access(&parsed.file_path, &working_dir) {
+            Ok(access) if !access.within_workspace => ApprovalRequirement::RequireApproval(
+                format!(
+                    "Reading file outside working directory: {} (working dir: {})",
+                    parsed.file_path,
+                    access.workspace_root.display()
+                ),
+            ),
+            Ok(_) => self.approval(args),
+            Err(_) => self.approval(args),
+        }
+    }
+
     async fn execute(&self, args: &str, ctx: &ToolContext) -> Result<ToolResult> {
         let parsed: ReadFileArgs = serde_json::from_str(args)?;
-        let path = std::path::Path::new(&parsed.file_path);
+        let working_dir = ctx.working_dir.read().await.clone();
+        let path = match super::inspect_path_access(&parsed.file_path, &working_dir) {
+            Ok(access) => access.path,
+            Err(err) => {
+                return Ok(ToolResult {
+                    call_id: String::new(),
+                    output: err.to_string(),
+                    success: false,
+                });
+            }
+        };
+        let path_ref = path.as_path();
 
         // ── Read cache: performance optimization only, NOT a STUB gate ──
         // Cache stores (mtime, rendered_output). If mtime matches, skip disk read +
@@ -82,11 +115,11 @@ impl Tool for ReadFileTool {
         // legitimate re-reads and doesn't prevent short-distance duplicates
         // (model ignores STUB text due to lost-at-the-end attention).
         let cache_key: crate::tool::ReadCacheKey = (
-            path.to_path_buf(),
+            path.clone(),
             parsed.offset,
             parsed.limit,
         );
-        let disk_mtime = tokio::fs::metadata(&parsed.file_path).await.ok()
+        let disk_mtime = tokio::fs::metadata(&path).await.ok()
             .and_then(|m| m.modified().ok());
         if let Some(mtime) = disk_mtime {
             if let Some((cached_mtime, cached_output)) = ctx.read_cache.read().await.get(&cache_key).cloned() {
@@ -101,9 +134,9 @@ impl Tool for ReadFileTool {
         }
 
         // Auto-recover: if the path is a directory, return a listing instead of an error.
-        if path.is_dir() {
+        if path_ref.is_dir() {
             let mut entries: Vec<String> = Vec::new();
-            if let Ok(mut rd) = tokio::fs::read_dir(path).await {
+            if let Ok(mut rd) = tokio::fs::read_dir(path_ref).await {
                 while let Ok(Some(entry)) = rd.next_entry().await {
                     let name = entry.file_name().to_string_lossy().to_string();
                     let is_dir = entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false);
@@ -124,12 +157,11 @@ impl Tool for ReadFileTool {
 
         // If file doesn't exist, auto-find similar filenames and suggest.
         // Saves 2-3 turns of path guessing (7% of sessions hit this).
-        if !path.exists() {
-            let filename = path.file_name()
+        if !path_ref.exists() {
+            let filename = path_ref.file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_default();
             if !filename.is_empty() {
-                let wd = ctx.working_dir.read().await;
                 // Quick find: walk up to 5 levels deep for matching filename
                 let mut matches: Vec<String> = Vec::new();
                 fn find_file(dir: &std::path::Path, target: &str, depth: usize, max_depth: usize, results: &mut Vec<String>) {
@@ -147,7 +179,7 @@ impl Tool for ReadFileTool {
                         }
                     }
                 }
-                find_file(&wd, &filename, 0, 7, &mut matches);
+                find_file(&working_dir, &filename, 0, 7, &mut matches);
                 if !matches.is_empty() {
                     return Ok(ToolResult {
                         call_id: String::new(),
@@ -162,20 +194,20 @@ impl Tool for ReadFileTool {
             }
         }
 
-        let bytes = tokio::fs::read(&parsed.file_path).await?;
+        let bytes = tokio::fs::read(&path).await?;
 
         // Decode: UTF-8 first (the vast majority of text files), then GBK
         // fallback for plain-text extensions (Chinese Windows legacy files
         // that fail UTF-8 validation), then declare binary.
         let content = match String::from_utf8(bytes.clone()) {
             Ok(s) => s,
-            Err(_) => match decode_non_utf8_text(path, &bytes) {
+            Err(_) => match decode_non_utf8_text(path_ref, &bytes) {
                 Some(s) => s,
                 None => {
                     let output = format!(
                         "Binary file ({} bytes), cannot display as text.{}",
                         bytes.len(),
-                        binary_recovery_hint(path, &parsed.file_path),
+                        binary_recovery_hint(path_ref, &parsed.file_path),
                     );
                     if let Some(mtime) = disk_mtime {
                         ctx.read_cache.write().await.insert(cache_key.clone(), (mtime, output.clone()));
@@ -200,8 +232,8 @@ impl Tool for ReadFileTool {
 
         if auto_skeleton {
             let mut searcher = ctx.semantic.lock().await;
-            let skeleton = if let Some(symbols) = searcher.list_symbols(path) {
-                let fname = path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
+            let skeleton = if let Some(symbols) = searcher.list_symbols(path_ref) {
+                let fname = path_ref.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
                 let mut skel = format!("[File skeleton: {} ({} lines). Each symbol line ends with the exact offset/limit to read it — copy those into read_file, don't recompute.]\n\n",
                     fname, total_lines);
                 // Skeleton is fully driven by semantic layer's list_symbols().
@@ -309,7 +341,7 @@ impl Tool for ReadFileTool {
             // Model reads 51 lines but file has 600 — skeleton shows
             // what functions exist in the other 549 lines with line numbers.
             let mut searcher = ctx.semantic.lock().await;
-            let skeleton = if let Some(symbols) = searcher.list_symbols(path) {
+            let skeleton = if let Some(symbols) = searcher.list_symbols(path_ref) {
                 let unseen: Vec<String> = symbols.iter()
                     .filter(|s| s.start_line < offset + 1 || s.start_line > end)
                     .map(|s| {

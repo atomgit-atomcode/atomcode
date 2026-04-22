@@ -23,6 +23,8 @@ pub mod web_search;
 pub mod write;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
 /// Directories to skip when scanning file trees (build artifacts, caches, VCS).
 /// Used by glob, list_dir, project_context, and collect_project_files.
@@ -44,12 +46,117 @@ pub fn should_skip_dir(name: &str) -> bool {
     SKIP_DIRS.contains(&name)
         || SKIP_DIR_PREFIXES.iter().any(|p| name.starts_with(p))
 }
-use std::path::PathBuf;
-use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use tokio::sync::{Mutex, RwLock};
+
+fn expand_user_path(path: &str) -> PathBuf {
+    if path == "~" {
+        return dirs::home_dir().unwrap_or_else(|| PathBuf::from(path));
+    }
+
+    if let Some(rest) = path.strip_prefix("~/") {
+        return dirs::home_dir()
+            .map(|home| home.join(rest))
+            .unwrap_or_else(|| PathBuf::from(path));
+    }
+
+    PathBuf::from(path)
+}
+
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                let can_pop = normalized
+                    .components()
+                    .next_back()
+                    .is_some_and(|last| matches!(last, Component::Normal(_)));
+                if can_pop {
+                    normalized.pop();
+                } else if normalized.as_os_str().is_empty() {
+                    normalized.push(component.as_os_str());
+                }
+            }
+            Component::RootDir | Component::Prefix(_) | Component::Normal(_) => {
+                normalized.push(component.as_os_str());
+            }
+        }
+    }
+
+    normalized
+}
+
+fn canonicalize_candidate_path(path: &Path) -> Result<PathBuf> {
+    if path.exists() {
+        return std::fs::canonicalize(path)
+            .with_context(|| format!("Failed to resolve path {}", path.display()));
+    }
+
+    let mut missing_parts = Vec::new();
+    let mut current = path;
+
+    loop {
+        if current.exists() {
+            let mut resolved = std::fs::canonicalize(current)
+                .with_context(|| format!("Failed to resolve parent path {}", current.display()))?;
+            for part in missing_parts.iter().rev() {
+                resolved.push(part);
+            }
+            return Ok(resolved);
+        }
+
+        let name = current.file_name().ok_or_else(|| {
+            anyhow::anyhow!("Path {} has no existing parent directory", path.display())
+        })?;
+        missing_parts.push(name.to_os_string());
+        current = current.parent().ok_or_else(|| {
+            anyhow::anyhow!("Path {} has no existing parent directory", path.display())
+        })?;
+    }
+}
+
+pub struct ResolvedPath {
+    pub path: PathBuf,
+    pub workspace_root: PathBuf,
+    pub within_workspace: bool,
+}
+
+pub fn inspect_path_access(raw_path: &str, working_dir: &Path) -> Result<ResolvedPath> {
+    let workspace_root = std::fs::canonicalize(working_dir)
+        .with_context(|| format!("Failed to resolve working directory {}", working_dir.display()))?;
+    let expanded = expand_user_path(raw_path);
+    let candidate = if expanded.is_absolute() {
+        expanded
+    } else {
+        working_dir.join(expanded)
+    };
+    let candidate = normalize_path(&candidate);
+    let resolved = canonicalize_candidate_path(&candidate)?;
+
+    Ok(ResolvedPath {
+        within_workspace: resolved.starts_with(&workspace_root),
+        path: resolved,
+        workspace_root,
+    })
+}
+
+pub fn resolve_workspace_path(raw_path: &str, working_dir: &Path) -> Result<PathBuf> {
+    let resolved = inspect_path_access(raw_path, working_dir)?;
+    if resolved.within_workspace {
+        Ok(resolved.path)
+    } else {
+        bail!(
+            "Access denied: {} resolves outside working directory {}",
+            raw_path,
+            resolved.workspace_root.display()
+        );
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct ToolDef {
@@ -226,6 +333,9 @@ impl ToolContext {
 pub trait Tool: Send + Sync {
     fn definition(&self) -> ToolDef;
     fn approval(&self, args: &str) -> ApprovalRequirement;
+    fn approval_with_context(&self, args: &str, _ctx: &ToolContext) -> ApprovalRequirement {
+        self.approval(args)
+    }
     async fn execute(&self, args: &str, ctx: &ToolContext) -> Result<ToolResult>;
 }
 
@@ -275,6 +385,7 @@ impl ToolRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
 
     struct DummyTool;
 
@@ -328,6 +439,80 @@ mod tests {
         let result = tool.execute("{}", &ctx).await.unwrap();
         assert!(result.success);
         assert_eq!(result.output, "ok");
+    }
+
+    #[test]
+    fn resolve_workspace_path_rejects_parent_escape() {
+        let workspace = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let path = format!("{}/secret.txt", outside.path().display());
+        std::fs::write(outside.path().join("secret.txt"), "top-secret").unwrap();
+
+        let err = resolve_workspace_path(&path, workspace.path()).unwrap_err();
+        assert!(err.to_string().contains("outside working directory"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_workspace_path_rejects_symlink_escape() {
+        let workspace = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let target = outside.path().join("secret.txt");
+        std::fs::write(&target, "top-secret").unwrap();
+        let link = workspace.path().join("secret-link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let err = resolve_workspace_path(link.to_string_lossy().as_ref(), workspace.path()).unwrap_err();
+        assert!(err.to_string().contains("outside working directory"));
+    }
+
+    #[test]
+    fn inspect_path_access_marks_workspace_escape() {
+        let workspace = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let target = outside.path().join("secret.txt");
+        std::fs::write(&target, "top-secret").unwrap();
+
+        let access = inspect_path_access(&target.to_string_lossy(), workspace.path()).unwrap();
+        assert!(!access.within_workspace);
+        assert_eq!(access.path, target);
+    }
+
+    #[tokio::test]
+    async fn read_file_requests_approval_for_workspace_escape() {
+        let workspace = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let target = outside.path().join("secret.txt");
+        std::fs::write(&target, "top-secret").unwrap();
+
+        let tool = crate::tool::read::ReadFileTool;
+        let ctx = ToolContext::new(workspace.path().to_path_buf());
+        let args = format!(r#"{{"file_path":"{}"}}"#, target.display());
+
+        assert!(matches!(
+            tool.approval_with_context(&args, &ctx),
+            ApprovalRequirement::RequireApproval(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn edit_file_requests_approval_for_workspace_escape() {
+        let workspace = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let target = outside.path().join("secret.txt");
+        std::fs::write(&target, "top-secret").unwrap();
+
+        let tool = crate::tool::edit::EditFileTool;
+        let ctx = ToolContext::new(workspace.path().to_path_buf());
+        let args = format!(
+            r#"{{"file_path":"{}","old_string":"top-secret","new_string":"changed"}}"#,
+            target.display()
+        );
+
+        assert!(matches!(
+            tool.approval_with_context(&args, &ctx),
+            ApprovalRequirement::RequireApproval(_)
+        ));
     }
 
     // PermissionStore tests
