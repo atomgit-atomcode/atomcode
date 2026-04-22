@@ -320,8 +320,48 @@ pub(super) fn execute_slash_command(
                 });
             }
         }
-        "whip" => {
-            crate::whip::fire_whip(ctx, active_modal, state, renderer)?;
+        "fixissue" => {
+            // `/fixissue <url>` — fetch the issue via AtomGit API (blocking,
+            // ~1s), verify the current user is the assignee, then inject a
+            // synthesised prompt into the agent as if the user typed it.
+            // Not-assigned / fetch-fail paths print the reason and stay Idle.
+            let url = arg.trim();
+            if url.is_empty() {
+                renderer.render(UiLine::CommandOutput(
+                    "  Usage: /fixissue <issue-url>\n  Example: /fixissue https://atomgit.com/owner/repo/issues/42\n".into(),
+                ));
+                renderer.flush();
+            } else {
+                match atomcode_core::atomgit::fixissue::prepare(url, &ctx.working_dir) {
+                    Ok(atomcode_core::atomgit::fixissue::Prepared::Run {
+                        prompt,
+                        issue_title,
+                        issue_number,
+                    }) => {
+                        renderer.render(UiLine::CommandOutput(format!(
+                            "  [fixissue] issue #{}: {}\n  Handing off to agent...\n",
+                            issue_number, issue_title,
+                        )));
+                        renderer.flush();
+                        ctx.agent
+                            .cmd_tx
+                            .send(AgentCommand::SendMessage(prompt))
+                            .ok();
+                        state.on_submit();
+                    }
+                    Ok(atomcode_core::atomgit::fixissue::Prepared::Skip { reason }) => {
+                        renderer.render(UiLine::CommandOutput(format!("  {}\n", reason)));
+                        renderer.flush();
+                    }
+                    Err(e) => {
+                        renderer.render(UiLine::CommandOutput(format!(
+                            "  fixissue failed: {:#}\n",
+                            e
+                        )));
+                        renderer.flush();
+                    }
+                }
+            }
         }
         "cd" => {
             // Bare `/cd` — open the interactive history picker (matches legacy

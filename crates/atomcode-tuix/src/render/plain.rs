@@ -109,13 +109,6 @@ impl<W: Write + Send> Renderer for PlainRenderer<W> {
                     let _ = self.out.write_all(b"\n");
                 }
             }
-            UiLine::WhipFrame { phrase, .. } => {
-                // Pipe / CI renderer: no animation. Print the phrase once
-                // (on crack frame) so the user has a trace of what fired.
-                if let Some(p) = phrase {
-                    let _ = writeln!(self.out, "🐎 {}", scrub_controls(&p));
-                }
-            }
         }
     }
 

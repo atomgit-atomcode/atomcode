@@ -66,10 +66,6 @@ pub struct Config {
     /// works manually. Missing from older configs → defaults to `true`.
     #[serde(default = "default_true")]
     pub auto_update: bool,
-    /// `[whip]` — the Ctrl+G "urge the agent" feature. See `WhipConfig`.
-    /// Absent from older configs → defaults to enabled + built-in phrases.
-    #[serde(default)]
-    pub whip: WhipConfig,
 }
 
 /// Controls the per-turn markdown datalog writer.
@@ -92,28 +88,6 @@ fn default_true() -> bool { true }
 impl Default for DatalogConfig {
     fn default() -> Self {
         Self { enabled: true, dir: None }
-    }
-}
-
-/// Controls the Ctrl+G / `/whip` "urge the agent" feature.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WhipConfig {
-    /// When false, Ctrl+G falls through as a no-op and `/whip` errors out.
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    /// Minimum gap between two successive fires, in milliseconds.
-    #[serde(default = "default_whip_cooldown_ms")]
-    pub cooldown_ms: u64,
-    /// When non-empty, REPLACES the built-in phrase pool (not merged).
-    #[serde(default)]
-    pub phrases: Vec<String>,
-}
-
-fn default_whip_cooldown_ms() -> u64 { 1000 }
-
-impl Default for WhipConfig {
-    fn default() -> Self {
-        Self { enabled: true, cooldown_ms: 1000, phrases: Vec::new() }
     }
 }
 
@@ -323,7 +297,6 @@ mod tests {
             providers: HashMap::new(),
             datalog: DatalogConfig { enabled: false, dir: Some("/var/log/ac".to_string()) },
             auto_update: true,
-            whip: WhipConfig::default(),
         };
         cfg.providers.insert("p".to_string(), ProviderConfig {
             provider_type: "openai".to_string(),
@@ -365,42 +338,5 @@ mod tests {
         let config: Config = toml::from_str(toml_str).unwrap();
         let provider = config.active_provider(Some("openai")).unwrap();
         assert_eq!(provider.model, "gpt-4o");
-    }
-
-    #[test]
-    fn whip_config_defaults_when_missing() {
-        let toml_str = r#"
-            default_provider = "test"
-
-            [providers.test]
-            type = "openai"
-            api_key = "sk"
-            model = "m"
-        "#;
-        let cfg: Config = toml::from_str(toml_str).unwrap();
-        assert!(cfg.whip.enabled);
-        assert_eq!(cfg.whip.cooldown_ms, 1000);
-        assert!(cfg.whip.phrases.is_empty());
-    }
-
-    #[test]
-    fn whip_config_respects_overrides() {
-        let toml_str = r#"
-            default_provider = "test"
-
-            [providers.test]
-            type = "openai"
-            api_key = "sk"
-            model = "m"
-
-            [whip]
-            enabled = false
-            cooldown_ms = 500
-            phrases = ["a", "b"]
-        "#;
-        let cfg: Config = toml::from_str(toml_str).unwrap();
-        assert!(!cfg.whip.enabled);
-        assert_eq!(cfg.whip.cooldown_ms, 500);
-        assert_eq!(cfg.whip.phrases, vec!["a".to_string(), "b".to_string()]);
     }
 }

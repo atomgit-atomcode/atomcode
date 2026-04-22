@@ -42,9 +42,6 @@ pub struct LoopCtx {
     pub agent: AgentHandle,
     pub working_dir: PathBuf,
     pub previous_dir: Option<PathBuf>,
-    /// Timestamp of the last whip fire (Ctrl+G or `/whip`). None = never
-    /// fired. Used by `whip::Cooldown::try_fire` to rate-limit.
-    pub last_whip_at: Option<std::time::Instant>,
     /// Recently visited project directories, most recent first (max 5).
     /// Persisted to `~/.atomcode/recent_dirs.txt`. Drives the `/cd`
     /// picker when invoked with no argument and is updated whenever
@@ -77,50 +74,6 @@ pub struct LoopCtx {
     /// Consumed in the main `select!` so upgrade progress is rendered
     /// alongside agent events.
     pub upgrade_rx: mpsc::UnboundedReceiver<atomcode_core::self_update::UpgradeEvent>,
-}
-
-#[cfg(test)]
-impl LoopCtx {
-    /// Minimal `LoopCtx` for tests. Agent / input / wake / upgrade
-    /// channels are open but dangling; callers typically drain `cmd_rx`
-    /// (returned alongside) to inspect what `fire_whip` sent. Working
-    /// dir + session dir are a fresh subdir of `std::env::temp_dir()`.
-    pub fn for_tests(
-        config: Config,
-    ) -> (Self, mpsc::UnboundedReceiver<AgentCommand>) {
-        use atomcode_core::agent::{AgentCommand, AgentEvent, AgentHandle};
-        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<AgentCommand>();
-        let (_evt_tx, event_rx) = mpsc::unbounded_channel::<AgentEvent>();
-        let (_input_tx, input_rx) = mpsc::unbounded_channel();
-        let (_wake_tx, wake_rx) = mpsc::channel(1);
-        let (upgrade_tx, upgrade_rx) = mpsc::unbounded_channel();
-        let agent = AgentHandle { cmd_tx, event_rx };
-        let tmp = std::env::temp_dir().join(format!(
-            "atomcode-tuix-loopctx-{}",
-            std::process::id(),
-        ));
-        let _ = std::fs::create_dir_all(&tmp);
-        let session_manager = atomcode_core::session::SessionManager::new(&tmp);
-        let ctx = Self {
-            config,
-            model_name: "test-model".into(),
-            agent,
-            working_dir: tmp.clone(),
-            previous_dir: None,
-            last_whip_at: None,
-            recent_dirs: Vec::new(),
-            history: crate::input::history::History::load(tmp.join("hist.txt")),
-            input_rx,
-            commands: crate::commands::CommandRegistry::builtin(),
-            session_manager,
-            update_hint: std::sync::Arc::new(std::sync::Mutex::new(None)),
-            wake_rx,
-            reader: None,
-            upgrade_tx,
-            upgrade_rx,
-        };
-        (ctx, cmd_rx)
-    }
 }
 
 /// Line-edit buffer for input composition. Byte-indexed cursor.
@@ -384,9 +337,6 @@ impl Buffer {
                 BufferResult::Redraw
             }
             Action::NoOp => BufferResult::NoOp,
-            // Whip is short-circuited in the key handlers before reaching
-            // Buffer::apply; this arm exists only for match exhaustiveness.
-            Action::Whip => BufferResult::NoOp,
         }
     }
 
@@ -766,15 +716,6 @@ pub async fn run_loop(
     deferred_render_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     deferred_render_tick.tick().await; // consume the immediate fire
 
-    // Whip overlay advance tick. Driven at the same 33ms cadence as a
-    // single animation frame so the `WhipOverlay` can repaint each
-    // frame exactly once. No-op when no WhipOverlay is active.
-    let mut whip_tick = tokio::time::interval(Duration::from_millis(
-        crate::modals::whip_overlay::FRAME_MS,
-    ));
-    whip_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    whip_tick.tick().await; // consume immediate fire
-
     // Last-draw timestamp — consulted by the post-event pump so we
     // don't redraw more often than every 100ms even when handlers
     // fire back-to-back.
@@ -822,20 +763,6 @@ pub async fn run_loop(
             // when nothing is pending.
             _ = deferred_render_tick.tick() => {
                 renderer.flush_deferred();
-            }
-
-            // ── Whip overlay frame tick ──
-            // 33ms cadence — advances any active WhipOverlay. No-op when
-            // the active modal isn't an animated one. When the overlay
-            // signals done, drop it and repaint idle/streaming chrome
-            // so the 5-row overlay band doesn't linger as ghost text.
-            _ = whip_tick.tick() => {
-                if let Some(modal) = app.active_modal.as_mut() {
-                    if modal.advance(&app.buf, &app.state, &ctx, renderer) {
-                        app.active_modal = None;
-                        redraw_after_slash(&app.buf, &app.state, &ctx, &app.active_modal, renderer);
-                    }
-                }
             }
 
             // ── Spinner tick (from background task) ──
@@ -944,16 +871,6 @@ pub async fn run_loop(
             // when nothing is pending.
             _ = deferred_render_tick.tick() => {
                 renderer.flush_deferred();
-            }
-
-            // ── Whip overlay frame tick ──
-            _ = whip_tick.tick() => {
-                if let Some(modal) = app.active_modal.as_mut() {
-                    if modal.advance(&app.buf, &app.state, &ctx, renderer) {
-                        app.active_modal = None;
-                        redraw_after_slash(&app.buf, &app.state, &ctx, &app.active_modal, renderer);
-                    }
-                }
             }
 
             // ── Spinner tick (from background task) ──
@@ -1240,11 +1157,7 @@ fn handle_idle_key(
     }
 
     let action = classify(code, modifiers);
-    if action == Action::Whip {
-        crate::whip::fire_whip(ctx, &mut app.active_modal, &app.state, renderer)?;
-        return Ok(());
-    }
-    let result = app.buf.apply(action, ctx.history.entries(), &ctx.commands);
+let result = app.buf.apply(action, ctx.history.entries(), &ctx.commands);
     crate::tuix_trace!(
         "KEY",
         "idle result={} buf_len={} cursor={}",
@@ -1463,11 +1376,7 @@ fn handle_streaming_key(
     }
 
     let action = classify(code, modifiers);
-    if action == Action::Whip {
-        crate::whip::fire_whip(ctx, &mut app.active_modal, &app.state, renderer)?;
-        return Ok(());
-    }
-    match app.buf.apply(action, ctx.history.entries(), &ctx.commands) {
+match app.buf.apply(action, ctx.history.entries(), &ctx.commands) {
         BufferResult::NoOp => {}
         BufferResult::Redraw => {
             // Menu shape may have changed — reset selection if it
@@ -1487,28 +1396,12 @@ fn handle_streaming_key(
             // leave the buf alone. Gate strictly on *registered*
             // commands; unrecognised `/foo …` falls through to the
             // type-ahead queue as a regular message.
-            let parsed = parse_slash_line(&line);
-            let is_known_slash = parsed
+            let is_known_slash = parse_slash_line(&line)
                 .map(|(cmd, _)| ctx.commands.find(cmd).is_some())
                 .unwrap_or(false);
             if is_known_slash {
-                // `/whip` is the ONE slash command valid mid-stream — it's
-                // the whole reason the feature exists. Route it straight
-                // through the executor; every other known command falls
-                // into the "disabled while running" message below.
-                let (cmd_name, arg) = parsed.expect("is_known_slash => parsed is Some");
-                if cmd_name.eq_ignore_ascii_case("whip") {
-                    app.buf.text.clear();
-                    app.buf.cursor = 0;
-                    app.menu.selected = 0;
-                    execute_slash_command(
-                        cmd_name, arg, &mut app.state, ctx, renderer, &mut app.active_modal,
-                    )?;
-                    return Ok(());
-                }
                 renderer.render(UiLine::CommandOutput(
-                    "  (slash commands are disabled while a turn is running — except /whip)\n"
-                        .into(),
+                    "  (slash commands are disabled while a turn is running)\n".into(),
                 ));
                 renderer.flush();
                 app.buf.text.clear();

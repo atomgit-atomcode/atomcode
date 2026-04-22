@@ -23,12 +23,10 @@ pub mod dir_picker;
 pub mod model_picker;
 pub mod provider_wizard;
 pub mod session_picker;
-pub mod whip_overlay;
 pub use dir_picker::DirPicker;
 pub use model_picker::ModelPicker;
 pub use provider_wizard::ProviderWizard;
 pub use session_picker::SessionPicker;
-pub use whip_overlay::WhipOverlay;
 
 /// Result of a modal consuming one key event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,20 +85,5 @@ pub trait Modal: Send {
         buf.insert_paste(text.to_string());
         self.draw(buf, state, ctx, renderer);
         Ok(ModalAction::Continue)
-    }
-
-    /// Called by the event loop's 33ms "whip tick". Default implementation
-    /// is a no-op returning `false` (don't close). Overridden by
-    /// animation-driven modals (`WhipOverlay`) to advance frames and
-    /// signal when the animation has finished so the caller can drop
-    /// the modal. Non-animated modals inherit the no-op.
-    fn advance(
-        &mut self,
-        _buf: &Buffer,
-        _state: &UiState,
-        _ctx: &LoopCtx,
-        _renderer: &mut dyn Renderer,
-    ) -> bool {
-        false
     }
 }

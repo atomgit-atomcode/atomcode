@@ -175,7 +175,6 @@ fn test_config() -> Config {
         providers,
         datalog: Default::default(),
         auto_update: false,
-        whip: Default::default(),
     }
 }
 

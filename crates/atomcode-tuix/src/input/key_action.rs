@@ -9,7 +9,6 @@ pub enum Action {
     ClearLine,
     DeleteWordBackward,
     DeleteToEnd,
-    Whip,
     Insert(char),
     Complete,
     CursorLeft,
@@ -35,7 +34,6 @@ pub fn classify(code: KeyCode, modifiers: KeyModifiers) -> Action {
         (KeyCode::Char('u'), true) => Action::ClearLine,
         (KeyCode::Char('w'), true) => Action::DeleteWordBackward,
         (KeyCode::Char('k'), true) => Action::DeleteToEnd,
-        (KeyCode::Char('g'), true) => Action::Whip,
         (KeyCode::Char(c), false) => Action::Insert(c),
         (KeyCode::Tab, _) => Action::Complete,
         (KeyCode::Left, _) => Action::CursorLeft,
@@ -100,11 +98,6 @@ mod tests {
     #[test]
     fn ctrl_k_deletes_to_end() {
         assert_eq!(k(KeyCode::Char('k'), KeyModifiers::CONTROL), Action::DeleteToEnd);
-    }
-
-    #[test]
-    fn ctrl_g_whips() {
-        assert_eq!(k(KeyCode::Char('g'), KeyModifiers::CONTROL), Action::Whip);
     }
 
     #[test]

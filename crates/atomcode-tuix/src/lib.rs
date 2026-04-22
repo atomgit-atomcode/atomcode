@@ -14,7 +14,6 @@ pub mod terminal;
 pub mod test_term;
 pub mod think;
 pub mod trace;
-pub mod whip;
 pub mod width;
 
 use anyhow::Result;
@@ -238,7 +237,6 @@ pub async fn run(
         agent: agent_handle,
         working_dir,
         previous_dir: None,
-        last_whip_at: None,
         recent_dirs,
         history,
         input_rx,

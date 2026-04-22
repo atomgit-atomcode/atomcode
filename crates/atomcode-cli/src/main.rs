@@ -577,7 +577,6 @@ async fn run() -> Result<i32> {
                 providers: HashMap::new(),
                 datalog: Default::default(),
                 auto_update: true,
-                whip: Default::default(),
             }
         })
     } else {
@@ -588,7 +587,6 @@ async fn run() -> Result<i32> {
             providers: HashMap::new(),
             datalog: Default::default(),
             auto_update: true,
-            whip: Default::default(),
         }
     };
 

@@ -283,7 +283,6 @@ fn ui_line_tag(l: &UiLine) -> &'static str {
         UiLine::InputCommit => "InputCommit",
         UiLine::CommandOutput(_) => "CommandOutput",
         UiLine::TurnSeparator { .. } => "TurnSeparator",
-        UiLine::WhipFrame { .. } => "WhipFrame",
     }
 }
 

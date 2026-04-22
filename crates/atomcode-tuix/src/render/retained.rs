@@ -222,20 +222,6 @@ pub struct RetainedRenderer<W: Write + Send> {
     /// space for itself, leaving a blank gap between `▸ Tool(detail)`
     /// and `⎿ result`.
     skip_next_body_scroll: bool,
-    /// Latest whip overlay frame. `Some` = WhipOverlay modal is active
-    /// and the footer paint path should draw the 5 rows immediately
-    /// above the status line; `None` = no active overlay. Task 5 only
-    /// stores state; painting is polished in Task 10.
-    whip_frame: Option<WhipFrameState>,
-}
-
-/// Stashed state for the latest `UiLine::WhipFrame`. Clone-cheap because
-/// rows are stack-sized. Consumed by `paint_footer` on every frame.
-#[derive(Clone)]
-struct WhipFrameState {
-    rows: [String; 5],
-    phrase: Option<String>,
-    flash: bool,
 }
 
 impl RetainedRenderer<BufWriter<Stdout>> {
@@ -263,7 +249,6 @@ impl<W: Write + Send> RetainedRenderer<W> {
             last_painted_footer_rows: 0,
             scroll_region_bottom: None,
             skip_next_body_scroll: false,
-            whip_frame: None,
         }
     }
 
@@ -513,17 +498,13 @@ impl<W: Write + Send> RetainedRenderer<W> {
         };
 
         // Spinner only when menu not open (same rule as AnsiRenderer).
-        // When a whip overlay is active, hide both spinner and menu so
-        // the 5 whip rows have the band to themselves.
-        let whip_active = self.whip_frame.is_some();
-        let show_spinner = self.spinner.is_some() && self.menu.is_none() && !whip_active;
-        let menu_rows = if whip_active { 0 } else { menu_items.len().min(4) };
-        let whip_rows = if whip_active { 5 } else { 0 };
+        let show_spinner = self.spinner.is_some() && self.menu.is_none();
+        let menu_rows = menu_items.len().min(4);
         let has_status = !self.status.model.is_empty()
             || !self.status.cwd.is_empty()
             || self.status.hint.is_some();
         let status_rows = if has_status { 1 } else { 0 };
-        let total_rows = 1 + 1 + middle_rows + 1 + menu_rows + whip_rows + status_rows;
+        let total_rows = 1 + 1 + middle_rows + 1 + menu_rows + status_rows;
         let footer_top = h.saturating_sub(total_rows);
 
         // Pre-build every row vector (immutable borrows of self).
@@ -554,76 +535,6 @@ impl<W: Write + Send> RetainedRenderer<W> {
             })
             .collect();
 
-        // Whip overlay rows — computed only when the overlay is active.
-        // Each whip row is padded with PAD_COL leading spaces for visual
-        // symmetry with the menu/status rows, then rendered in dim grey
-        // for the body and (optionally) reverse-video for the crack
-        // flash. The phrase row (row 4) gets bold red accent.
-        let whip_cells: Vec<Vec<Cell>> = if let Some(wf) = self.whip_frame.clone() {
-            let pad = CellStyle::default();
-            let body_style = self.style_for(Role::Muted);
-            let flash_style = CellStyle {
-                fg: body_style.fg,
-                bold: false,
-                reverse: true,
-            };
-            let phrase_style = CellStyle {
-                fg: role(self.caps, Role::Accent),
-                bold: true,
-                reverse: false,
-            };
-            let mut rows_out = Vec::with_capacity(5);
-            for (i, raw) in wf.rows.iter().enumerate() {
-                let mut row = Vec::new();
-                push_str_cells(&mut row, &" ".repeat(PAD_COL), &pad);
-                let style = if wf.flash { flash_style.clone() } else { body_style.clone() };
-                // Render row content; when the flash bit is on, blank
-                // cells stay blank (no reverse on empty) — only the whip
-                // glyphs invert. push_str_cells on a string + style
-                // applies the style uniformly, but blank chars in the
-                // whip rows are explicit spaces so they'd also invert.
-                // Split the row into contiguous runs of non-space /
-                // space and style only the non-space ones.
-                let mut buf = String::new();
-                let mut buf_is_space = true;
-                for ch in raw.chars() {
-                    let is_space = ch == ' ';
-                    if is_space != buf_is_space && !buf.is_empty() {
-                        let s = if buf_is_space { &pad } else { &style };
-                        push_str_cells(&mut row, &buf, s);
-                        buf.clear();
-                    }
-                    buf.push(ch);
-                    buf_is_space = is_space;
-                }
-                if !buf.is_empty() {
-                    let s = if buf_is_space { &pad } else { &style };
-                    push_str_cells(&mut row, &buf, s);
-                }
-                // Row 4 is the phrase row — overlay the phrase centred
-                // when present, replacing whatever sweep glyphs landed
-                // there (typically nothing since rows 3-4 stay mostly
-                // blank during the sweep and only row 4 of the decay
-                // frames has any content at all).
-                if i == 4 {
-                    if let Some(p) = wf.phrase.as_ref() {
-                        let label = format!("💥 {}", p);
-                        let label_w = crate::width::display_width(&label);
-                        let target_w = rule_width;
-                        let left_pad = target_w.saturating_sub(label_w) / 2;
-                        let mut phrase_row = Vec::new();
-                        push_str_cells(&mut phrase_row, &" ".repeat(PAD_COL + left_pad), &pad);
-                        push_str_cells(&mut phrase_row, &label, &phrase_style);
-                        row = phrase_row;
-                    }
-                }
-                rows_out.push(row);
-            }
-            rows_out
-        } else {
-            Vec::new()
-        };
-
         // Mutate screen (now &mut self). Every footer row is padded to
         // screen width before emit so blank cells overwrite any stale
         // body content still showing from earlier frames (see
@@ -649,14 +560,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         Self::pad_row_to_width(&mut bot_rule, w);
         self.screen.draw_row(bot_rule_row, 0, &bot_rule);
 
-        // Menu is skipped when whip_active (menu_rows already forced to
-        // 0 in that branch); emit whatever the layout decided.
         for (i, r) in menu_cells.into_iter().enumerate() {
-            let mut padded = r;
-            Self::pad_row_to_width(&mut padded, w);
-            self.screen.draw_row(bot_rule_row + 1 + i, 0, &padded);
-        }
-        for (i, r) in whip_cells.into_iter().enumerate() {
             let mut padded = r;
             Self::pad_row_to_width(&mut padded, w);
             self.screen.draw_row(bot_rule_row + 1 + i, 0, &padded);
@@ -665,7 +569,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             let mut padded = st;
             Self::pad_row_to_width(&mut padded, w);
             self.screen
-                .draw_row(bot_rule_row + 1 + menu_rows + whip_rows, 0, &padded);
+                .draw_row(bot_rule_row + 1 + menu_rows, 0, &padded);
         }
 
         // Cursor park — 1-indexed, inside middle row at the input cell.
@@ -689,22 +593,17 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 .len()
                 .max(1)
         };
-        let whip_active = self.whip_frame.is_some();
-        let menu_rows = if whip_active {
-            0
-        } else {
-            self.menu
-                .as_ref()
-                .map(|m| m.items.len().min(4))
-                .unwrap_or(0)
-        };
-        let whip_rows = if whip_active { 5 } else { 0 };
+        let menu_rows = self
+            .menu
+            .as_ref()
+            .map(|m| m.items.len().min(4))
+            .unwrap_or(0);
         let has_status = !self.status.model.is_empty()
             || !self.status.cwd.is_empty()
             || self.status.hint.is_some();
         let status_rows = if has_status { 1 } else { 0 };
-        // 1 spinner + 1 top rule + middle + 1 bot rule + menu + whip + status
-        1 + 1 + middle_rows + 1 + menu_rows + whip_rows + status_rows
+        // 1 spinner + 1 top rule + middle + 1 bot rule + menu + status
+        1 + 1 + middle_rows + 1 + menu_rows + status_rows
     }
 
     /// Single-entry-point for painting a full frame. Body is already
@@ -1285,17 +1184,6 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
             UiLine::CommandOutput(text) => {
                 let safe = scrub_controls(&text);
                 self.push_body_text(&safe, &CellStyle::default());
-            }
-            UiLine::WhipFrame { rows, phrase, flash } => {
-                // Task 5 scaffold: remember the frame; Task 10 polishes
-                // the actual paint path. When `rows` are all blank AND
-                // phrase is None, treat as "close" and drop the state.
-                let all_blank = rows.iter().all(|r| r.trim().is_empty());
-                if all_blank && phrase.is_none() {
-                    self.whip_frame = None;
-                } else {
-                    self.whip_frame = Some(WhipFrameState { rows, phrase, flash });
-                }
             }
         }
         // Phase 5: widget state updated → mark frame dirty. No
