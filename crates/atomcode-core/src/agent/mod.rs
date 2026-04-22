@@ -1510,13 +1510,21 @@ impl AgentLoop {
                     let is_rate_limited = e.contains("429") || e.contains("rate") || e.contains("Too Many");
                     let is_auth_error = e.contains("401 ") || e.contains("403 ");
                     let is_messages_illegal = e.contains("illegal") || e.contains("messages");
+                    // Upstream context-length overflow (OpenRouter 400, OpenAI
+                    // context_length_exceeded, Anthropic "prompt is too long").
+                    // Without this, the error fell through to the generic
+                    // retry branch which slept and re-sent the same oversized
+                    // request — guaranteed to fail again.
+                    let is_context_overflow = is_context_overflow_error(&e);
 
-                    if is_messages_illegal && self.retry_count == 0 {
+                    if (is_messages_illegal || is_context_overflow) && self.retry_count < 2 {
                         self.retry_count += 1;
                         // Try compression first (preserve semantics), fall back to truncation.
                         let sys_prompt = self.build_system_prompt();
                         self.maybe_compress_history(&sys_prompt).await;
                         // If compression didn't help enough, truncate as last resort.
+                        // Two shots: one 700K-token mess rarely sheds enough in
+                        // a single compression + 4-msg truncate.
                         let len = self.conversation.messages.len();
                         if len > 10 {
                             self.conversation.messages.truncate(len - 4);
@@ -2004,6 +2012,55 @@ fn short_path(path: &str) -> String {
         0 | 1 => path.to_string(),
         2 => format!("{}/{}", parts[1], parts[0]),
         _ => format!(".../{}/{}", parts[1], parts[0]),
+    }
+}
+
+/// True when an upstream API error string indicates the request exceeded
+/// the model's context-length budget. Covers OpenRouter's verbose 400
+/// message, OpenAI's `context_length_exceeded` code, and Anthropic's
+/// "prompt is too long". Used by the retry path to route into the
+/// compression branch instead of blindly re-sending the same oversized
+/// request.
+fn is_context_overflow_error(e: &str) -> bool {
+    e.contains("context length")
+        || e.contains("context_length_exceeded")
+        || e.contains("maximum context")
+        || e.contains("prompt is too long")
+        || e.contains("reduce the length")
+}
+
+#[cfg(test)]
+mod classifier_tests {
+    use super::is_context_overflow_error;
+
+    #[test]
+    fn openrouter_400_is_overflow() {
+        let msg = "API error (400 Bad Request): This endpoint's maximum context \
+                   length is 204800 tokens. However, you requested about 745279 \
+                   tokens... Please reduce the length of either one.";
+        assert!(is_context_overflow_error(msg));
+    }
+
+    #[test]
+    fn openai_context_length_exceeded_is_overflow() {
+        assert!(is_context_overflow_error(
+            "{\"error\":{\"code\":\"context_length_exceeded\"}}"
+        ));
+    }
+
+    #[test]
+    fn anthropic_prompt_too_long_is_overflow() {
+        assert!(is_context_overflow_error("prompt is too long: 250000 tokens"));
+    }
+
+    #[test]
+    fn generic_rate_limit_is_not_overflow() {
+        assert!(!is_context_overflow_error("429 Too Many Requests"));
+    }
+
+    #[test]
+    fn auth_error_is_not_overflow() {
+        assert!(!is_context_overflow_error("401 Unauthorized"));
     }
 }
 
