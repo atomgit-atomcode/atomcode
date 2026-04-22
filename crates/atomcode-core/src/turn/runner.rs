@@ -154,6 +154,26 @@ impl TurnRunner {
             }
         }
 
+        // Log the request to <working_dir>/datalog/llm/<ts>.json right
+        // before send, paired with the `log_llm_response` call further
+        // down. Previously only AgentLoop logged the request, so any
+        // other caller (daemon) produced orphan responses — see
+        // `<wd>/datalog/llm/*_orphan_response.json`.
+        {
+            let wd = self.context.working_dir
+                .try_read().map(|g| g.clone()).unwrap_or_default();
+            super::log::log_llm_request(
+                &wd,
+                &messages,
+                &tool_defs,
+                self.provider.model_name(),
+                context_window,
+                0, // step — set by caller if needed; currently always 0
+                   // in calls.log, so matching that.
+                self.config.datalog.enabled,
+            );
+        }
+
         // 3. Start streaming
         let stream_start = std::time::Instant::now();
         let stream_result = self.provider.chat_stream(&messages, Some(&tool_defs));

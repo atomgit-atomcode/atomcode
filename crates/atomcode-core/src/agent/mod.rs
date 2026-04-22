@@ -885,27 +885,20 @@ impl AgentLoop {
             // Datalog: mark the start of a new LLM round-trip
             self.datalog.log_llm_call();
 
-            // Log LLM request to <working_dir>/datalog/llm/ — colocated with turn .md files.
+            // Rich ContextStats for `/context` + inline datalog dump.
+            // The file-level request log (`log_llm_request`) now lives
+            // inside `TurnRunner::run_with_filter`, paired with
+            // `log_llm_response`, so any caller — AgentLoop or daemon —
+            // gets symmetric request/response files. This block only
+            // feeds UI state + datalog md inline debug.
             {
                 let context_window = self.ctx.ctx_window();
-                // Byte-identical to what TurnRunner will send: `self.ctx`
-                // and `self.turn_runner.ctx` are the same `Arc` instance,
-                // so trait dispatch here and in runner produce the same
-                // messages (same system prompt, same directives, same
-                // reminder placement).
+                // Same `Arc` instance as `self.turn_runner.ctx`, so
+                // `build_messages` here and in the runner produce
+                // byte-identical output (same system prompt, same
+                // per-model directives, same reminder placement).
                 let (msgs, _) = self.ctx.build_messages(&conv, &system_prompt, &turn_reminder);
                 let tool_defs = self.turn_runner.tools.get_definitions();
-                let wd = self.turn_runner.context.working_dir
-                    .try_read().map(|g| g.clone()).unwrap_or_default();
-                crate::turn::log::log_llm_request(
-                    &wd,
-                    &msgs,
-                    &tool_defs,
-                    self.turn_runner.provider.model_name(),
-                    context_window,
-                    self.tool_call_count,
-                    self.config.datalog.enabled,
-                );
                 // Dump request to datalog for inline debugging
                 self.datalog.log_llm_dump(
                     &msgs,
