@@ -26,6 +26,13 @@ fn paste_candidate_char(ev: &Event) -> Option<char> {
     }
     match code {
         KeyCode::Char(c) => Some(*c),
+        // Shift+Enter is "insert newline", a user command — never a
+        // paste-burst char. Real pasted newlines arrive as Event::Paste
+        // (bracketed paste) or as plain Enter with NO modifier (conhost
+        // char-by-char). If we let Shift+Enter in here, the single-event
+        // else-branch at the bottom reconstructs KeyEvent with NONE
+        // modifiers and classify then collapses it to Submit.
+        KeyCode::Enter if modifiers.contains(KeyModifiers::SHIFT) => None,
         KeyCode::Enter => Some('\n'),
         KeyCode::Tab => Some('\t'),
         _ => None,
@@ -389,6 +396,30 @@ mod tests {
             .send((ReaderCommand::Shutdown, None))
             .expect("send shutdown");
         worker.join().expect("worker thread joins cleanly");
+    }
+
+    /// Shift+Enter must NOT qualify as a paste-burst char. If it did,
+    /// the single-event else-branch of the burst path reconstructs the
+    /// KeyEvent with `KeyModifiers::NONE`, stripping SHIFT, and
+    /// `key_action::classify` collapses the result to `Submit` instead
+    /// of `InsertNewline` — i.e. Shift+Enter silently sends the message.
+    #[test]
+    fn paste_candidate_rejects_shift_enter() {
+        let ev = Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+        assert_eq!(
+            paste_candidate_char(&ev),
+            None,
+            "Shift+Enter is a command (InsertNewline), not paste content"
+        );
+    }
+
+    /// Plain Enter must still flow through the paste-burst path so
+    /// multi-line pastes on terminals without bracketed paste (Windows
+    /// conhost) still aggregate into a single Paste event.
+    #[test]
+    fn paste_candidate_accepts_plain_enter() {
+        let ev = Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(paste_candidate_char(&ev), Some('\n'));
     }
 
     /// Regression for the Windows-resize crash. `crossterm::event::poll`

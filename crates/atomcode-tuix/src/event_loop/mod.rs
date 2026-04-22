@@ -82,11 +82,22 @@ pub struct LoopCtx {
     pub upgrade_rx: mpsc::UnboundedReceiver<atomcode_core::self_update::UpgradeEvent>,
     /// Signal channel from the `/issue` wizard modal back to the event
     /// loop. The wizard's Enter handler can't touch `App` directly
-    /// (modals only see `LoopCtx`), so it stores the collected URL
-    /// here, returns `Close`, and the event loop's post-close branch
-    /// picks it up + dispatches to the shared `launch_fixissue` helper
-    /// — same code path as `/fixissue <url>`.
-    pub pending_issue_url: Option<String>,
+    /// (modals only see `LoopCtx`), so it stores the collected title +
+    /// body here, returns `Close`, and the event loop's post-close
+    /// branch POSTs the issue to AtomGit and echoes the URL of the
+    /// newly-created issue back into the conversation.
+    pub pending_new_issue: Option<NewIssueDraft>,
+}
+
+/// What the `/issue` wizard hands back to the event loop after the user
+/// finishes step 2. The event loop turns this into a `POST /repos/.../issues`
+/// API call and echoes the resulting issue URL into scrollback.
+#[derive(Debug, Clone)]
+pub struct NewIssueDraft {
+    pub owner: String,
+    pub repo: String,
+    pub title: String,
+    pub body: String,
 }
 
 /// Line-edit buffer for input composition. Byte-indexed cursor.
@@ -1057,19 +1068,36 @@ fn handle_input(
                     )?;
                     if matches!(action, ModalAction::Close) {
                         app.active_modal = None;
-                        // IssueWizard signals a staged URL via
-                        // `ctx.pending_issue_url`; drain + dispatch
-                        // here so the wizard and inline `/issue <url>`
-                        // share one code path.
-                        if let Some(url) = ctx.pending_issue_url.take() {
-                            commands::launch_fixissue(
-                                &url,
-                                &mut app.state,
-                                ctx,
-                                renderer,
-                                &mut app.fixissue_pending,
-                                &mut app.fixissue_buffer,
-                            );
+                        // IssueWizard signals a staged title+body via
+                        // `ctx.pending_new_issue`. Drain + POST to the
+                        // AtomGit API here and echo the created-issue
+                        // URL into scrollback. Blocking call — the
+                        // wizard is modal so UI freezing briefly is
+                        // expected / acceptable.
+                        if let Some(draft) = ctx.pending_new_issue.take() {
+                            match atomcode_core::atomgit::Client::from_stored_auth()
+                                .and_then(|c| c.create_issue(&draft.owner, &draft.repo, &draft.title, &draft.body))
+                            {
+                                Ok(created) => {
+                                    let shown_url = created.html_url.clone().unwrap_or_else(|| {
+                                        format!(
+                                            "https://atomgit.com/{}/{}/issues/{}",
+                                            draft.owner, draft.repo, created.number
+                                        )
+                                    });
+                                    renderer.render(UiLine::CommandOutput(format!(
+                                        "  [issue] ✔ created #{}: {}\n  {}\n",
+                                        created.number, created.title, shown_url,
+                                    )));
+                                }
+                                Err(e) => {
+                                    renderer.render(UiLine::CommandOutput(format!(
+                                        "  [issue] ✗ create failed: {:#}\n",
+                                        e
+                                    )));
+                                }
+                            }
+                            renderer.flush();
                         }
                         redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
                     }

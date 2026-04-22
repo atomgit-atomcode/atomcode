@@ -650,14 +650,11 @@ impl<W: Write + Send> RetainedRenderer<W> {
         if self.scroll_region_bottom == Some(bottom) {
             return;
         }
-        let shrunk = matches!(
-            self.scroll_region_bottom,
-            Some(prev) if prev > bottom
-        );
-        let grew = matches!(
-            self.scroll_region_bottom,
-            Some(prev) if prev < bottom
-        );
+        // Capture the old region bottom BEFORE swapping in the new
+        // value — needed by the repaint branch below to know which
+        // rows may still hold stale body glyphs.
+        let prev_bottom = self.scroll_region_bottom;
+        let changed = matches!(prev_bottom, Some(prev) if prev != bottom);
         // Set the new region. 1-indexed, inclusive: `\x1b[1;N r`.
         // Pre-format into one buffer so the write hits the stream as
         // a single call — BufWriter's `write!` can fragment into 3-4
@@ -667,44 +664,104 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let seq = format!("\x1b[1;{}r", bottom);
         let _ = self.out.write_all(seq.as_bytes());
         self.scroll_region_bottom = Some(bottom);
-        if grew {
-            // Body region expanded into what was previously footer
-            // rows. Those rows still show old footer content on the
-            // terminal side; wipe + re-emit body tail so the view
-            // matches `body_lines`. Scrollback is preserved.
-            let _ = self.out.write_all(b"\x1b[2J\x1b[H");
-            self.screen.invalidate();
-            let rows = self.body_lines.clone();
-            for row in &rows {
-                self.emit_body_line_inner(row, bottom);
-            }
-        } else if shrunk {
-            // Body region shrank; previously-body rows are now footer
-            // rows. The tail of `body_lines` is currently displayed on
-            // terminal rows that no longer belong to the body region,
-            // and the cell model never tracked those writes (body goes
-            // through `emit_body_line_inner`, direct stdout). Footer
-            // paint can't reliably overwrite that stale text because
-            // the diff sees blank→blank for the padding cells and
-            // emits nothing.
+        if changed {
+            // Region shifted (footer grew or shrank). The visible
+            // body rows are now misaligned with body_lines — either
+            // stale body glyphs sit in what are now footer rows, or
+            // new blank rows opened up above the footer. Repaint
+            // the body in place so the viewport matches body_lines.
             //
-            // Classic symptom: the welcome banner's
-            // `/provider  to add a custom model` line leaking past
-            // spinner / status rows long after it should have scrolled
-            // off.
+            // CRITICAL — two constraints that together rule out the
+            // obvious "2J + re-emit" approach:
             //
-            // Cleanest fix is the same one the `grew` branch uses —
-            // wipe viewport + invalidate + re-emit body tail — so body
-            // content settles back to `bottom` (the new body_bottom)
-            // and every row from there down is either fresh body or
-            // fresh footer. Scrollback survives because \x1b[2J only
-            // clears the visible buffer.
-            let _ = self.out.write_all(b"\x1b[2J\x1b[H");
-            self.screen.invalidate();
-            let rows = self.body_lines.clone();
-            for row in &rows {
-                self.emit_body_line_inner(row, bottom);
+            //  1. No `\n`-based re-emit. `emit_body_line_inner` writes
+            //     LF at region bottom, which promotes the region-top
+            //     row into scrollback on every call. Each cached body
+            //     row already scrolled into scrollback once during its
+            //     original emit; re-emitting via LF here duplicates
+            //     those rows in scrollback (user report: "往上翻会看
+            //     到重复内容残留" after `/model`).
+            //
+            //  2. No `\x1b[2J`. macOS Terminal.app, iTerm2, and xterm
+            //     with `cbScrollback` copy every non-blank visible row
+            //     into scrollback when processing ED. That means the
+            //     very first footer-height transition after startup
+            //     (status line appears, body_bottom shrinks by 1)
+            //     shoves the whole welcome banner into scrollback
+            //     before we get a chance to repaint it (user report:
+            //     "首次启动都出现了两次，上面的不带输入框").
+            //
+            // Instead: paint the tail of body_lines at absolute
+            // positions with per-row EL (`\x1b[K`) for any stale
+            // content, invalidate the cell cache so the footer diff
+            // repaints rows fresh below body_bottom, and explicitly
+            // erase the narrow "transition zone" — rows that changed
+            // zone between old and new layouts and can't rely on
+            // either writer to clean them:
+            //
+            //  * SHRINK: rows (new_bottom+1)..=prev_bottom were body,
+            //    now footer. Footer diff would paint blank cells for
+            //    those rows (e.g., the spinner slot when no spinner
+            //    is active), but invalidated prev_cells are also
+            //    blank → diff skips blank→blank and stale body
+            //    glyphs persist. Symptom of the first-startup bug:
+            //    welcome's last row "leaks" into the spinner slot.
+            //
+            //  * GROW: rows (prev_body_top)..(new_body_top) were the
+            //    top of the old body but now sit above the new body
+            //    anchor and aren't covered by either painter
+            //    ("zombie zone" — fixed the `/` then Esc ghost
+            //    regression).
+            //
+            // Per-row EL is row-local (no scroll, no ED) so it can't
+            // leak content into scrollback the way `\x1b[2J` does on
+            // macOS Terminal.app / iTerm2.
+            let cap = bottom as usize;
+            let total = self.body_lines.len();
+            let start = total.saturating_sub(cap);
+            let visible_count = total - start;
+
+            if let Some(prev) = prev_bottom.map(|v| v as usize) {
+                if prev > cap {
+                    // Shrink: erase rows that moved body → footer.
+                    for row in (cap + 1)..=prev {
+                        let seq = format!("\x1b[{};1H\x1b[K", row);
+                        let _ = self.out.write_all(seq.as_bytes());
+                    }
+                } else if visible_count > 0 {
+                    // Grow: erase the zombie zone above the new body
+                    // anchor that would otherwise show stale old-body
+                    // top rows (menu-close ghost welcome).
+                    let prev_body_top = prev.saturating_sub(visible_count) + 1;
+                    let new_body_top = cap.saturating_sub(visible_count) + 1;
+                    if prev_body_top < new_body_top {
+                        for row in prev_body_top..new_body_top {
+                            let seq = format!("\x1b[{};1H\x1b[K", row);
+                            let _ = self.out.write_all(seq.as_bytes());
+                        }
+                    }
+                }
             }
+
+            self.screen.invalidate();
+
+            let start_row = (cap - visible_count) as u16 + 1;
+            // Clone once; serialize_row borrows immutably, the
+            // write borrows &mut self.out which is disjoint from
+            // body_lines.
+            let rows: Vec<Vec<Cell>> = self.body_lines[start..].to_vec();
+            for (i, row) in rows.iter().enumerate() {
+                let seq = format!("\x1b[{};1H\x1b[K", start_row + i as u16);
+                let _ = self.out.write_all(seq.as_bytes());
+                let bytes = serialize_row(row);
+                let _ = self.out.write_all(&bytes);
+            }
+            // Park the cursor at the bottom of the body region so
+            // the next `emit_body_line_inner` (with `\n` at bottom)
+            // behaves the same as if the region had been stable all
+            // along.
+            let seq = format!("\x1b[{};1H", bottom);
+            let _ = self.out.write_all(seq.as_bytes());
         }
     }
 
@@ -2883,6 +2940,176 @@ mod tests {
             !vterm.row_text(10).contains("project"),
             "menu-close: row 10 still shows ghost cwd:\n{}",
             vterm.dump()
+        );
+    }
+
+    /// Regression for user report: after `/model` switched providers,
+    /// scrolling up showed the welcome banner + prior messages
+    /// duplicated in scrollback. Root cause: `/model` changes the
+    /// status-line text, which can change the footer height (status
+    /// wraps, or spinner/menu rows differ between frames). When
+    /// `current_footer_rows()` shifts, `ensure_scroll_region`'s
+    /// shrunk/grew branches clear the viewport and re-emit every
+    /// cached body row through `emit_body_line_inner` — which uses
+    /// `\n` at the region bottom, scrolling the top row into
+    /// terminal scrollback. Any cached body row that had already
+    /// entered scrollback during its original emit now enters a
+    /// second time: a duplicate the user sees on scroll-up.
+    ///
+    /// Repro: fill body past the viewport so a known welcome line
+    /// lives in scrollback once, then change the footer height by
+    /// swapping in an input long enough to wrap the middle to 2+
+    /// rows. The hint line must still appear exactly once in
+    /// scrollback afterwards — the repaint must not re-scroll it.
+    #[test]
+    fn retained_footer_growth_does_not_duplicate_scrollback() {
+        let (mut r, buf) = new_capturing(80, 24);
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+        let status = status_basic();
+
+        // Welcome (6 body rows) + 20 User echoes (2 rows each =
+        // 40 body rows). Total 46 rows pushed; body region bottom
+        // with a 1-line-input footer is < 20, so ~26 rows are
+        // already in terminal scrollback via the normal emit path.
+        r.render(UiLine::Welcome {
+            model: "MiniMax-M2.7".into(),
+            working_dir: "~/Documents/workspace/atomcode".into(),
+        });
+        for i in 0..20 {
+            r.render(UiLine::User(format!("msg-{:03}", i)));
+        }
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // Fingerprint: welcome hint is unique and we pushed it
+        // early enough that it's sitting in scrollback by now.
+        let hint = "to add a custom model";
+        let count_hint = |vt: &crate::test_term::VirtualTerminal| {
+            vt.scrollback_texts()
+                .iter()
+                .filter(|row| row.contains(hint))
+                .count()
+        };
+        assert_eq!(
+            count_hint(&vterm),
+            1,
+            "baseline: hint should sit in scrollback exactly once \
+             after normal emits (got {}):\n{}",
+            count_hint(&vterm),
+            vterm.scrollback_texts().join("\n")
+        );
+        let sb_before = vterm.scrollback_len();
+
+        // Footer height change: long buffer wraps the middle to 3
+        // rows (text budget = 80 - 6 = 74 cols; 200 'x' → 3 rows).
+        // body_bottom shrinks → ensure_scroll_region's shrunk branch
+        // fires. Before the fix, this re-emits every cached body
+        // row via `\n`-scroll, pushing overflow into scrollback a
+        // second time.
+        let long: String = "x".repeat(200);
+        r.render(UiLine::InputPrompt {
+            buf: long.clone(),
+            cursor_byte: long.len(),
+            menu: None,
+            status: status.clone(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        assert_eq!(
+            count_hint(&vterm),
+            1,
+            "footer growth duplicated welcome hint in scrollback \
+             (got {} copies):\nscrollback:\n{}",
+            count_hint(&vterm),
+            vterm.scrollback_texts().join("\n")
+        );
+        // Broader sanity: no body row should have been pushed into
+        // scrollback by the repaint itself. The footer grew by N
+        // rows, which means the visible body shrank by N rows — the
+        // terminal's native region-shrink does not push rows to
+        // scrollback, only LFs at the bottom do. So the only way
+        // scrollback_len grew here is via the buggy re-emit.
+        assert_eq!(
+            vterm.scrollback_len(),
+            sb_before,
+            "footer growth pushed {} extra rows into scrollback; \
+             repaint must use absolute positioning, not LF-scroll",
+            vterm.scrollback_len() - sb_before
+        );
+    }
+
+    /// Regression for user report: on first startup the welcome
+    /// banner rendered TWICE — once at the top of the viewport
+    /// (pushed into scrollback, no input box) and once at the bottom
+    /// above the input box. Root cause: `ensure_scroll_region` used
+    /// `\x1b[2J` to wipe the viewport before re-painting the body.
+    /// macOS Terminal.app and iTerm2 (and xterm with `cbScrollback`)
+    /// copy every non-blank visible row into scrollback when
+    /// processing ED — so the 6 welcome rows painted during the
+    /// initial body emit were promoted into scrollback the moment
+    /// the first InputPrompt render caused the footer to grow by
+    /// 1 row (status line appears → body_bottom shrinks by 1).
+    ///
+    /// The repaint must never emit ED — per-row EL (`\x1b[K`) at
+    /// absolute positions is safe on every terminal and achieves
+    /// the same visible result without the scrollback side-channel.
+    #[test]
+    fn retained_first_startup_does_not_push_welcome_to_scrollback() {
+        let (mut r, buf) = new_capturing(80, 24);
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+        // Model the terminal's ED-promotes-to-scrollback behaviour —
+        // the specific mode the user's terminal is running under.
+        vterm.set_ed_promotes_to_scrollback(true);
+
+        // Minimal first-startup sequence: welcome then the first
+        // InputPrompt. The InputPrompt carries a non-empty status
+        // (model/cwd) so `current_footer_rows` grows from 4 (no
+        // status) to 5, which trips the repaint branch.
+        r.render(UiLine::Welcome {
+            model: "z-ai/glm-5".into(),
+            working_dir: "~/Documents/workspace/atomcode".into(),
+        });
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status_basic(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // Welcome fingerprint: the hint row is unique to the welcome
+        // banner. It must appear exactly once in the *visible*
+        // viewport and zero times in scrollback.
+        let hint = "to add a custom model";
+        let visible_count = (0..24)
+            .filter(|r| vterm.row_text(*r).contains(hint))
+            .count();
+        let sb_count = vterm
+            .scrollback_texts()
+            .iter()
+            .filter(|row| row.contains(hint))
+            .count();
+        assert_eq!(
+            visible_count, 1,
+            "welcome hint should be visible exactly once (got {}):\n{}",
+            visible_count,
+            vterm.dump()
+        );
+        assert_eq!(
+            sb_count, 0,
+            "first-startup footer transition promoted welcome into \
+             scrollback ({} copies); repaint must not emit ED:\n\
+             scrollback:\n{}",
+            sb_count,
+            vterm.scrollback_texts().join("\n")
         );
     }
 }

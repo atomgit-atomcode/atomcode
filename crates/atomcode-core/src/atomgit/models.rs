@@ -104,6 +104,19 @@ pub struct Comment {
     pub body: Option<String>,
 }
 
+/// Slimmed response shape for `POST /repos/{owner}/{repo}/issues`. We only
+/// use `number` (for logging) and `html_url` (to show the user where the
+/// new issue lives); everything else the API returns is discarded.
+#[derive(Debug, Deserialize)]
+pub struct CreatedIssue {
+    #[serde(deserialize_with = "deserialize_u64_from_string_or_int")]
+    pub number: u64,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub html_url: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -282,7 +282,7 @@ pub async fn run(
         reader: reader_handle,
         upgrade_tx,
         upgrade_rx,
-        pending_issue_url: None,
+        pending_new_issue: None,
     };
 
     let result = run_loop(ctx, renderer.as_mut()).await;

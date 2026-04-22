@@ -356,22 +356,37 @@ pub(super) fn execute_slash_command(
             }
         }
         "issue" => {
-            // Interactive wizard — prompts for URL, then routes into the
-            // same `launch_fixissue` helper as `/fixissue <url>`. See
-            // `IssueWizard::emit_prompt` for the prompt line; the wizard
-            // stashes the URL in `ctx.pending_issue_url` on Enter and
-            // the event loop picks it up after modal close.
+            // Two-step wizard to create a NEW issue on AtomGit in the
+            // current repo. Step 1 collects a title (required), step 2
+            // collects a description (required, Shift+Enter for
+            // newlines). On submit the event loop's post-close branch
+            // POSTs `/repos/{owner}/{repo}/issues` and echoes the new
+            // issue URL into scrollback.
             //
-            // If the user passes a URL inline (`/issue <url>`) we
-            // shortcut the wizard and run the pipeline directly — nice
-            // for power users who typed the URL into history already.
-            let url = arg.trim();
-            if !url.is_empty() {
-                launch_fixissue(url, state, ctx, renderer, fixissue_pending, fixissue_buffer);
-            } else {
-                let mut wiz = IssueWizard::open();
-                wiz.emit_prompt(renderer);
-                *active_modal = Some(Box::new(wiz));
+            // cwd must be an atomgit.com checkout — otherwise we have
+            // no way to know which repo to file the issue against.
+            // Abort early with a clear message rather than opening the
+            // wizard and then failing at the POST step.
+            let _ = arg; // reserved for future options (e.g. --template)
+            match atomcode_core::atomgit::url::detect_cwd_atomgit_repo(&ctx.working_dir) {
+                Ok(Some(repo)) => {
+                    let mut wiz = IssueWizard::open(repo.owner, repo.repo);
+                    wiz.emit_prompt(renderer);
+                    *active_modal = Some(Box::new(wiz));
+                }
+                Ok(None) => {
+                    renderer.render(UiLine::CommandOutput(
+                        "  /issue needs cwd to be a clone of an atomgit.com repo (origin remote).\n  cd into one first, or create the issue via the web UI.\n".into(),
+                    ));
+                    renderer.flush();
+                }
+                Err(e) => {
+                    renderer.render(UiLine::CommandOutput(format!(
+                        "  /issue failed to detect repo: {:#}\n",
+                        e
+                    )));
+                    renderer.flush();
+                }
             }
         }
         "cd" => {

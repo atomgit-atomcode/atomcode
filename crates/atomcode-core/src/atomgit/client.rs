@@ -2,7 +2,7 @@ use anyhow::{anyhow, Context, Result};
 
 use crate::auth;
 
-use super::models::{Comment, Issue, RepoLabel};
+use super::models::{Comment, CreatedIssue, Issue, RepoLabel};
 use super::url::IssueRef;
 
 const API_BASE: &str = "https://atomgit.com/api/v5";
@@ -74,6 +74,42 @@ impl Client {
             ));
         }
         resp.json::<Issue>().context("failed to parse issue JSON")
+    }
+
+    /// POST /api/v5/repos/{owner}/{repo}/issues — create a new issue in
+    /// the target repo. Used by the `/issue` wizard in the TUI; returns
+    /// the server's response so callers can surface the new issue's
+    /// number + `html_url` to the user.
+    pub fn create_issue(
+        &self,
+        owner: &str,
+        repo: &str,
+        title: &str,
+        body: &str,
+    ) -> Result<CreatedIssue> {
+        let url = format!("{}/repos/{}/{}/issues", API_BASE, owner, repo);
+        let payload = serde_json::json!({ "title": title, "body": body });
+        let resp = self
+            .http
+            .post(&url)
+            .query(&[("access_token", self.token.as_str())])
+            .header("Accept", "application/json")
+            .json(&payload)
+            .send()
+            .with_context(|| format!("POST {} failed", url))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().unwrap_or_default();
+            return Err(anyhow!(
+                "AtomGit returned {} creating issue in {}/{}: {}",
+                status,
+                owner,
+                repo,
+                body
+            ));
+        }
+        resp.json::<CreatedIssue>()
+            .context("failed to parse created-issue JSON")
     }
 
     /// POST /api/v5/repos/{owner}/{repo}/issues/{number}/comments —

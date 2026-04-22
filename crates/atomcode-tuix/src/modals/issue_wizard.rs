@@ -1,30 +1,51 @@
 // crates/atomcode-tuix/src/modals/issue_wizard.rs
 //
-// `/issue` modal — single-step text prompt that collects an AtomGit
-// issue URL from the user and hands it off to the same pipeline as
-// `/fixissue <url>`. Enter with non-empty input stashes the trimmed URL
-// in `ctx.pending_issue_url` and returns `Close`; the event loop picks
-// up the signal and dispatches to `launch_fixissue` so both entry
-// points (slash-with-arg and wizard) share one implementation.
+// `/issue` modal — two-step wizard that collects a **new** AtomGit
+// issue's title + body, then hands them to the event loop's post-close
+// branch which POSTs `/api/v5/repos/{owner}/{repo}/issues` and echoes
+// the created issue URL into scrollback.
+//
+// (Unrelated to `/fixissue <url>`, which pulls an *existing* issue.)
 
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyModifiers};
 
 use super::{Modal, ModalAction};
-use crate::event_loop::{build_status, Buffer, LoopCtx};
+use crate::event_loop::{build_status, Buffer, LoopCtx, NewIssueDraft};
 use crate::render::{Renderer, UiLine};
 use crate::state::UiState;
 
+/// Which field is currently being edited.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Step {
+    Title,
+    Description,
+}
+
 pub struct IssueWizard {
-    /// True once we've pushed the prompt line ("Enter issue URL:") into
-    /// scrollback. First `draw` flips this so repeated redraws on
-    /// subsequent keystrokes don't duplicate the line.
+    owner: String,
+    repo: String,
+    step: Step,
+    title: String,
+    /// True once `emit_prompt` has printed the step-1 ("Enter title")
+    /// header. Kept so step transitions only emit the step-2 header
+    /// after advancing (printing it on every redraw would duplicate).
     prompt_shown: bool,
+    /// True once the step-2 ("Enter description") header has been
+    /// printed into scrollback. Matches `prompt_shown` in purpose.
+    desc_prompt_shown: bool,
 }
 
 impl IssueWizard {
-    pub fn open() -> Self {
-        Self { prompt_shown: false }
+    pub fn open(owner: String, repo: String) -> Self {
+        Self {
+            owner,
+            repo,
+            step: Step::Title,
+            title: String::new(),
+            prompt_shown: false,
+            desc_prompt_shown: false,
+        }
     }
 }
 
@@ -32,7 +53,7 @@ impl Modal for IssueWizard {
     fn handle_key(
         &mut self,
         code: KeyCode,
-        _mods: KeyModifiers,
+        mods: KeyModifiers,
         buf: &mut Buffer,
         state: &mut UiState,
         ctx: &mut LoopCtx,
@@ -45,25 +66,58 @@ impl Modal for IssueWizard {
                 buf.cursor = 0;
                 Ok(ModalAction::Close)
             }
+            // Shift+Enter / Alt+Enter in the description step inserts a
+            // literal newline so users can write a multi-paragraph body.
+            // Step-1 (title) stays single-line: a newline in a title
+            // would look wrong on AtomGit anyway.
+            KeyCode::Enter
+                if self.step == Step::Description
+                    && (mods.contains(KeyModifiers::SHIFT)
+                        || mods.contains(KeyModifiers::ALT)) =>
+            {
+                buf.text.push('\n');
+                buf.cursor = buf.text.len();
+                self.draw(buf, state, ctx, renderer);
+                Ok(ModalAction::Continue)
+            }
             KeyCode::Enter => {
                 let entered = buf.text.trim().to_string();
+                if entered.is_empty() {
+                    let what = match self.step {
+                        Step::Title => "title",
+                        Step::Description => "description",
+                    };
+                    push(renderer, &format!("(required — type a {} or Esc to cancel)", what));
+                    return Ok(ModalAction::Continue);
+                }
                 buf.text.clear();
                 buf.cursor = 0;
-                if entered.is_empty() {
-                    push(renderer, "(cancelled — no URL entered)");
-                    return Ok(ModalAction::Close);
+                match self.step {
+                    Step::Title => {
+                        self.title = entered;
+                        self.step = Step::Description;
+                        self.emit_description_prompt(renderer);
+                        self.draw(buf, state, ctx, renderer);
+                        Ok(ModalAction::Continue)
+                    }
+                    Step::Description => {
+                        // Signal the event loop: it will POST to AtomGit
+                        // and render the resulting URL back into the
+                        // conversation. Wizard is done.
+                        ctx.pending_new_issue = Some(NewIssueDraft {
+                            owner: self.owner.clone(),
+                            repo: self.repo.clone(),
+                            title: std::mem::take(&mut self.title),
+                            body: entered,
+                        });
+                        Ok(ModalAction::Close)
+                    }
                 }
-                // Signal the event loop to run the fixissue pipeline.
-                // The loop's post-close branch handles it via the shared
-                // launch_fixissue helper — keeping wizard + /fixissue
-                // arm on a single code path.
-                ctx.pending_issue_url = Some(entered);
-                Ok(ModalAction::Close)
             }
             KeyCode::Backspace => {
                 if !buf.text.is_empty() {
                     let len = buf.text.len();
-                    // Pop one char (grapheme-aware is overkill for a URL).
+                    // Pop one char (grapheme-aware is overkill for free-form text).
                     let mut end = len;
                     while end > 0 && !buf.text.is_char_boundary(end - 1) {
                         end -= 1;
@@ -93,17 +147,6 @@ impl Modal for IssueWizard {
         ctx: &LoopCtx,
         renderer: &mut dyn Renderer,
     ) {
-        // Push the one-shot prompt line into scrollback the first time
-        // `draw` runs; subsequent redraws (on each keystroke) only
-        // refresh the input box.
-        if !self.prompt_shown {
-            // SAFETY: we're in &self so we can't mutate prompt_shown here;
-            // the flip happens in a wrapper below. This is a hack: push
-            // every time unconditionally is fine because `CommandOutput`
-            // is idempotent from the renderer's POV (each push is a new
-            // body line). But it would duplicate lines on redraw.
-            // Instead we push unconditionally only on `open_hook`.
-        }
         renderer.render(UiLine::InputPrompt {
             buf: buf.text.clone(),
             cursor_byte: buf.cursor,
@@ -115,18 +158,35 @@ impl Modal for IssueWizard {
 }
 
 impl IssueWizard {
-    /// Called once by the event loop right after installing the wizard
-    /// into `active_modal`. Pushes the "Enter issue URL:" prompt into
-    /// scrollback so the user sees what to type. Separate from `draw`
-    /// because `draw` takes `&self` and runs on every keystroke — we
-    /// only want the prompt line once.
+    /// Called once by the event loop right after installing the wizard.
+    /// Prints the "which repo" + step-1 ("enter title") header into
+    /// scrollback so the user knows what's being asked.
     pub fn emit_prompt(&mut self, renderer: &mut dyn Renderer) {
         if self.prompt_shown {
             return;
         }
         self.prompt_shown = true;
-        push(renderer, "Enter AtomGit issue URL (Esc to cancel):");
-        push(renderer, "  Example: https://atomgit.com/owner/repo/issues/42");
+        push(
+            renderer,
+            &format!("New issue on atomgit.com/{}/{}", self.owner, self.repo),
+        );
+        push(renderer, "Step 1/2 — enter title (required, Esc to cancel):");
+    }
+
+    fn emit_description_prompt(&mut self, renderer: &mut dyn Renderer) {
+        if self.desc_prompt_shown {
+            return;
+        }
+        self.desc_prompt_shown = true;
+        push(renderer, "");
+        push(
+            renderer,
+            &format!("✓ title: {}", abbreviate(&self.title, 80)),
+        );
+        push(
+            renderer,
+            "Step 2/2 — enter description (Shift+Enter = newline, Enter to submit, Esc to cancel):",
+        );
     }
 }
 
@@ -135,25 +195,39 @@ fn push(renderer: &mut dyn Renderer, text: &str) {
     renderer.flush();
 }
 
+/// Cap a line to `max` chars for display. Longer strings get a `…` tail
+/// so the step-2 "✓ title" summary never blows out one screen row.
+fn abbreviate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let head: String = s.chars().take(max.saturating_sub(1)).collect();
+        format!("{}…", head)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn open_starts_with_no_prompt_shown() {
-        let w = IssueWizard::open();
+    fn open_starts_on_title_step() {
+        let w = IssueWizard::open("o".into(), "r".into());
+        assert_eq!(w.step, Step::Title);
+        assert!(w.title.is_empty());
         assert!(!w.prompt_shown);
     }
 
     #[test]
-    fn emit_prompt_flips_flag_and_is_idempotent() {
-        use crate::render::plain::PlainRenderer;
-        let mut w = IssueWizard::open();
-        let mut r = PlainRenderer::new();
-        w.emit_prompt(&mut r);
-        assert!(w.prompt_shown);
-        // Second call is a no-op.
-        w.emit_prompt(&mut r);
-        assert!(w.prompt_shown);
+    fn abbreviate_short_string_unchanged() {
+        assert_eq!(abbreviate("hello", 80), "hello");
+    }
+
+    #[test]
+    fn abbreviate_long_string_tail_ellipsis() {
+        let long = "x".repeat(100);
+        let out = abbreviate(&long, 10);
+        assert!(out.ends_with('…'));
+        assert_eq!(out.chars().count(), 10);
     }
 }

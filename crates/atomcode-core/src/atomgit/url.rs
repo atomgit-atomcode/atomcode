@@ -33,6 +33,22 @@ impl From<&IssueRef> for RepoRef {
     }
 }
 
+/// Hosts we accept as "this is an atomgit.com repo". `gitcode.com` is
+/// the same physical origin mirrored onto a second domain — the owner /
+/// repo slug is identical and every API call still targets
+/// `api.atomgit.com`, so a checkout whose `origin` points to either host
+/// should be treated as the same repo for /issue / /fixissue purposes.
+///
+/// If more mirror hosts appear later (e.g. a private enterprise mirror),
+/// extend this list. Matching is case-insensitive.
+const ATOMGIT_MIRROR_HOSTS: &[&str] = &["atomgit.com", "gitcode.com"];
+
+fn is_atomgit_host(host: &str) -> bool {
+    ATOMGIT_MIRROR_HOSTS
+        .iter()
+        .any(|h| host.eq_ignore_ascii_case(h))
+}
+
 /// Parse a git remote URL into `(owner, repo)`. Supports the four
 /// common forms:
 ///   * `https://atomgit.com/owner/repo.git`
@@ -40,16 +56,21 @@ impl From<&IssueRef> for RepoRef {
 ///   * `git@atomgit.com:owner/repo.git`
 ///   * `ssh://git@atomgit.com/owner/repo.git`
 ///
-/// Returns `None` when the URL isn't an atomgit.com remote — used to
+/// Also accepts `gitcode.com` in any of those forms — atomgit mirrors
+/// every repo onto gitcode with the same slug, and the API always
+/// resolves against `api.atomgit.com`, so the host is effectively
+/// informational here.
+///
+/// Returns `None` when the URL isn't an atomgit mirror host — used to
 /// detect "cwd is in a git repo but it's a different host (e.g. GitHub)"
 /// and skip validation rather than false-positive.
 pub fn parse_repo_url(url: &str) -> Option<RepoRef> {
     let trimmed = url.trim();
 
-    // SSH shorthand: `git@atomgit.com:owner/repo.git`
+    // SSH shorthand: `git@host:owner/repo.git`
     if let Some(rest) = trimmed.strip_prefix("git@") {
         let (host, path) = rest.split_once(':')?;
-        if !host.eq_ignore_ascii_case("atomgit.com") {
+        if !is_atomgit_host(host) {
             return None;
         }
         return split_owner_repo(path);
@@ -68,7 +89,7 @@ pub fn parse_repo_url(url: &str) -> Option<RepoRef> {
     };
 
     let (host, path) = without_scheme.split_once('/')?;
-    if !host.eq_ignore_ascii_case("atomgit.com") {
+    if !is_atomgit_host(host) {
         return None;
     }
     split_owner_repo(path)
@@ -242,6 +263,28 @@ mod tests {
     fn parse_repo_url_rejects_non_atomgit() {
         assert!(parse_repo_url("https://github.com/foo/bar.git").is_none());
         assert!(parse_repo_url("git@github.com:foo/bar.git").is_none());
+    }
+
+    #[test]
+    fn parse_repo_url_accepts_gitcode_mirror() {
+        // gitcode.com is the second domain atomgit mirrors every repo
+        // onto. Plenty of users' local `origin` is set to the gitcode
+        // remote (e.g. `git@gitcode.com:atomgit_atomcode/atomcode.git`)
+        // while the issue / API still lives on atomgit.com. The slug is
+        // the same, so `/issue` / `/fixissue` must treat it as the same
+        // repo — otherwise cwd validation fails with "needs cwd to be a
+        // clone of an atomgit.com repo" and the user gets stuck.
+        for url in [
+            "git@gitcode.com:atomgit_atomcode/atomcode.git",
+            "https://gitcode.com/atomgit_atomcode/atomcode.git",
+            "https://gitcode.com/atomgit_atomcode/atomcode",
+            "ssh://git@gitcode.com/atomgit_atomcode/atomcode.git",
+        ] {
+            let r = parse_repo_url(url)
+                .unwrap_or_else(|| panic!("should parse gitcode mirror URL: {}", url));
+            assert_eq!(r.owner, "atomgit_atomcode");
+            assert_eq!(r.repo, "atomcode");
+        }
     }
 
     #[test]
