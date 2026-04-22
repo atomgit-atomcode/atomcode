@@ -7,6 +7,21 @@ impl AgentLoop {
     /// stagnation warnings. These polluted context and prevented model
     /// from stopping. These were harmful noise injections.
     pub(crate) fn apply_post_turn_discipline(&mut self) {
+        // Cadence reflection: every N tool calls, inject a scheduled
+        // "restate goal / what ruled out / next output" prompt regardless
+        // of whether the agent appears stuck. Language- and domain-neutral.
+        // Fires at turn end, so the agent answers the three questions at
+        // the start of the next turn before making more tool calls.
+        if let Some(delta) = should_inject_reflection(
+            self.tool_call_count,
+            self.discipline_state.last_reflection_at_tool_count,
+            self.config.reflection_cadence,
+        ) {
+            let msg = reflection_prompt(delta);
+            self.conversation.add_user_message(&msg);
+            self.discipline_state.last_reflection_at_tool_count = self.tool_call_count;
+        }
+
         // Re-read guard: when the same *region* of a file is read 2+ times,
         // inject a soft "re-plan" warning at turn end — this fires one call
         // *before* the hard Pattern 1 block (region cap = 3) in
