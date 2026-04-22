@@ -51,9 +51,17 @@ impl WhipOverlay {
         _ctx: &LoopCtx,
         renderer: &mut dyn Renderer,
     ) {
-        // Hardcoded width until Task 10 threads real terminal cols through.
-        let width: u16 = 60;
-        let f = anim::frame(frame_idx, width, &self.phrase);
+        let (cols, _) = crossterm::terminal::size().unwrap_or((60, 24));
+        // Narrow-terminal fallback: below 30 cols the 5-row animation
+        // can't look right; skip the pre-crack frames and just emit the
+        // phrase (crack frame) so the scrollback marker is the only
+        // visible cue. Overlay still auto-closes after the timeline.
+        if cols < 30 {
+            if frame_idx < anim::CRACK_FRAME {
+                return;
+            }
+        }
+        let f = anim::frame(frame_idx, cols, &self.phrase);
         renderer.render(UiLine::WhipFrame {
             rows: f.rows,
             phrase: f.phrase,
