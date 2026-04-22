@@ -64,6 +64,7 @@
           <tr><td><code>/model</code></td><td>在当前 provider 下切换模型,或跨 provider 切换</td></tr>
           <tr><td><code>/login</code></td><td>通过 AtomGit OAuth 登录,配置自动持久化到 config.toml</td></tr>
           <tr><td><code>/cd</code></td><td>切换工作目录,并写回 <code>default_workdir</code>。也可以直接输入 <code>cd /path</code>(无需斜杠前缀)</td></tr>
+          <tr><td><code>/whip</code></td><td>催促 Agent(亦可按 <code>Ctrl+G</code>)。流式回合运行中也可用,是唯一在 streaming 期间可执行的斜杠命令。会给 LLM 下一次调用追加一条随机鞭策语并播放一段挥鞭动画,不打断当前回合</td></tr>
         </tbody>
       </table>
 

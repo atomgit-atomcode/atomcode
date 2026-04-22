@@ -17,3 +17,15 @@ context_window = 64000
 [datalog]
 enabled = true
 # dir = "~/.atomcode/datalog"  # example: uncomment to redirect
+
+# The `/whip` / Ctrl+G "urge the agent" feature. Plays a 5-row ASCII
+# whip-sweep animation and (when a turn is running) prepends a random
+# encouragement phrase to the next LLM call via AppendInput — no
+# cancellation, no model/temperature change.
+# - enabled      : false silences both Ctrl+G and /whip entirely
+# - cooldown_ms  : minimum gap between successive fires
+# - phrases      : when non-empty, REPLACES the built-in bilingual pool
+[whip]
+enabled = true
+cooldown_ms = 1000
+# phrases = ["FASTER", "快点", "赶紧的"]
