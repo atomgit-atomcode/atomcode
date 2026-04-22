@@ -287,7 +287,14 @@ pub fn build_messages(
     // (read_file full content, bash output) are replaced with compact summaries.
     // This reduces context growth without LLM calls.
     // View replacement runs AFTER microcompact — edited files stay fresh.
-    microcompact(&mut result, conv.messages.len());
+    // Microcompact threshold scales with ctx_window: small-window
+    // ctx (Ollama 8K) needs to microcompact much earlier than the
+    // old hardcoded 100K-char gate implied. Formula: 40% of budget
+    // in chars (assuming ~4 chars/token), capped at 100K so large
+    // windows don't over-compact. Default (128K tokens) → 100K;
+    // Ollama (8K tokens) → 12.8K; small tunes in between.
+    let microcompact_threshold = (token_budget * 4 * 40 / 100).min(100_000);
+    microcompact(&mut result, conv.messages.len(), microcompact_threshold);
 
     replace_stale_reads(&mut result);
     clean_message_pipeline(&mut result);
@@ -599,7 +606,12 @@ fn snap_to_valid_boundary(messages: &[Message], idx: usize) -> usize {
 ///
 /// Other tool results (bash, grep, edit, etc.) are condensed after
 /// 20 messages to keep context growth in check.
-fn microcompact(msgs: &mut Vec<Message>, total_msg_count: usize) {
+///
+/// `threshold_chars` — compaction gate. Below this total-char count the
+/// function is a no-op. Previously hardcoded at 100K; now passed in by
+/// `build_messages` so small-window ctx (Ollama 8K) can compact at
+/// ~12K chars instead of waiting for 100K that never arrives.
+fn microcompact(msgs: &mut Vec<Message>, total_msg_count: usize, threshold_chars: usize) {
     const OTHER_KEEP: usize = 20;
 
     let total_chars: usize = msgs.iter().map(|m| {
@@ -609,7 +621,7 @@ fn microcompact(msgs: &mut Vec<Message>, total_msg_count: usize) {
             _ => 100,
         }
     }).sum();
-    if total_chars < 100_000 { return; }
+    if total_chars < threshold_chars { return; }
     if total_msg_count <= OTHER_KEEP { return; }
 
     let other_cutoff = total_msg_count.saturating_sub(OTHER_KEEP);
@@ -1286,6 +1298,76 @@ mod tests {
         sanitize_messages(&mut msgs);
         // All 4 messages should be preserved (valid pair)
         assert_eq!(msgs.len(), 4);
+    }
+
+    /// Regression: `microcompact` gate tied to `threshold_chars`.
+    ///
+    /// Before: hardcoded `total_chars < 100_000` meant any ctx with a
+    /// real budget under ~25K tokens (Ollama at 8K) could never hit
+    /// the gate — per-model `tool_output_cap` optimization was silently
+    /// neutralized. Now the threshold is passed in; small-window ctx
+    /// passes a proportionally smaller value.
+    #[test]
+    fn microcompact_respects_threshold_parameter() {
+        use crate::tool::{ToolCall, ToolResult};
+
+        // Build 25 turns each with a 1000-char bash result. Total
+        // tool-result bytes ≈ 25_000 — well below the old 100K gate
+        // but above a 10K gate.
+        fn build_msgs() -> Vec<Message> {
+            let mut msgs = vec![Message::new(Role::System, "sys")];
+            for i in 0..25 {
+                msgs.push(Message::new(Role::User, format!("task {}", i)));
+                msgs.push(Message {
+                    role: Role::Assistant,
+                    content: MessageContent::AssistantWithToolCalls {
+                        text: None,
+                        tool_calls: vec![ToolCall {
+                            id: format!("c{}", i),
+                            name: "bash".to_string(),
+                            arguments: "{}".to_string(),
+                        }],
+                    },
+                });
+                msgs.push(Message {
+                    role: Role::Tool,
+                    content: MessageContent::ToolResult(ToolResult {
+                        call_id: format!("c{}", i),
+                        output: "x".repeat(1000),
+                        success: true,
+                    }),
+                });
+            }
+            msgs
+        }
+
+        fn total_tool_bytes(msgs: &[Message]) -> usize {
+            msgs.iter().map(|m| match &m.content {
+                MessageContent::ToolResult(r) => r.output.len(),
+                _ => 0,
+            }).sum()
+        }
+
+        // High threshold (100K) → total 25K < 100K → no-op.
+        let mut msgs_high = build_msgs();
+        let before_high_len = msgs_high.len();
+        let before_high_bytes = total_tool_bytes(&msgs_high);
+        let msg_count_high = msgs_high.len();
+        microcompact(&mut msgs_high, msg_count_high, 100_000);
+        assert_eq!(msgs_high.len(), before_high_len, "high-threshold run must not drop msgs");
+        assert_eq!(total_tool_bytes(&msgs_high), before_high_bytes,
+            "high threshold (25K < 100K) must leave tool_result bytes untouched");
+
+        // Low threshold (10K) → total 25K >= 10K → microcompact kicks
+        // in and shrinks older ToolResults.
+        let mut msgs_low = build_msgs();
+        let before_low_bytes = total_tool_bytes(&msgs_low);
+        let msg_count_low = msgs_low.len();
+        microcompact(&mut msgs_low, msg_count_low, 10_000);
+        let after_low_bytes = total_tool_bytes(&msgs_low);
+        assert!(after_low_bytes < before_low_bytes,
+            "low threshold (25K > 10K) must shrink tool_result bytes, before={} after={}",
+            before_low_bytes, after_low_bytes);
     }
 
     /// Regression: `build_compression_content` must not cut between an

@@ -1683,6 +1683,7 @@ fn handle_agent_event(
             cold_zone_tokens,
             ctx_window,
             ctx_name,
+            system_prompt,
         } => {
             state.on_context_stats(
                 system_tokens,
@@ -1692,6 +1693,7 @@ fn handle_agent_event(
                 total_messages,
                 ctx_window,
                 &ctx_name,
+                &system_prompt,
             );
         }
         AgentEvent::SubAgentProgress { .. } => {}

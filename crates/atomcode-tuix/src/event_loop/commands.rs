@@ -228,7 +228,15 @@ pub(super) fn execute_slash_command(
             renderer.flush();
         }
         "context" => {
-            renderer.render(UiLine::CommandOutput(render_context_report(state, ctx)));
+            // `/context` = breakdown only.
+            // `/context prompt` = breakdown + full assembled system prompt
+            // (the exact bytes the most recent turn sent). Useful when
+            // the model is misbehaving and you want to verify what's
+            // actually in the prompt.
+            let show_prompt = arg.trim().eq_ignore_ascii_case("prompt");
+            renderer.render(UiLine::CommandOutput(
+                render_context_report(state, ctx, show_prompt),
+            ));
             renderer.flush();
         }
         "login" => {
@@ -350,13 +358,15 @@ pub(super) fn execute_slash_command(
     Ok(())
 }
 
-/// Build the `/context` report — horizontal bar + category breakdown.
+/// Build the `/context` report — horizontal bar + category breakdown,
+/// optionally followed by the full system prompt when `show_prompt`.
 ///
-/// Thin wrapper around `format_context_report` that pulls the two inputs
-/// (snapshot + model name) out of state/ctx. Split for unit-testability:
-/// the inner function takes plain values and can be asserted on directly.
-fn render_context_report(state: &UiState, ctx: &LoopCtx) -> String {
-    format_context_report(state.last_context.as_ref(), &ctx.model_name)
+/// Thin wrapper around `format_context_report` that pulls the inputs
+/// (snapshot + model name + flag) out of state/ctx. Split for
+/// unit-testability: the inner function takes plain values and can be
+/// asserted on directly.
+fn render_context_report(state: &UiState, ctx: &LoopCtx, show_prompt: bool) -> String {
+    format_context_report(state.last_context.as_ref(), &ctx.model_name, show_prompt)
 }
 
 /// Pure-function core of `/context` — testable without constructing
@@ -364,6 +374,7 @@ fn render_context_report(state: &UiState, ctx: &LoopCtx) -> String {
 fn format_context_report(
     snapshot: Option<&crate::state::ContextSnapshot>,
     model_name: &str,
+    show_prompt: bool,
 ) -> String {
     let Some(snap) = snapshot else {
         return "  Context Usage\n  \n  (run at least one turn first — stats are captured per turn)\n".into();
@@ -422,7 +433,7 @@ fn format_context_report(
 
     let used_pct = pct(total_used);
 
-    format!(
+    let mut out = format!(
         "  Context Usage\n  \
          \n  \
          {bar}\n  \
@@ -449,7 +460,33 @@ fn format_context_report(
         msgs_s = k(messages), msgs_p = pct(messages),
         free_s = k(free), free_p = pct(free),
         n_msgs = snap.total_messages,
-    )
+    );
+
+    // `/context prompt` — append the full system-prompt bytes the last
+    // turn sent. Kept out of the default output because the prompt is
+    // 5–15 KB and would swamp the breakdown dashboard every invocation.
+    // Hint line added when empty so the user knows WHY nothing showed
+    // (snapshot is populated only by the rich emission path, which
+    // fires once the first complete turn lands).
+    if show_prompt {
+        out.push('\n');
+        out.push_str("  === SYSTEM PROMPT ===\n");
+        if snap.system_prompt.is_empty() {
+            out.push_str("  (empty — wait for one complete turn to capture)\n");
+        } else {
+            // Indent each line with two spaces to match the surrounding
+            // CommandOutput formatting (every other block uses a 2-space
+            // left gutter). Avoids the model-prompt bytes looking like
+            // they're escaping the command-output indentation.
+            for line in snap.system_prompt.lines() {
+                out.push_str("  ");
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+    }
+
+    out
 }
 
 fn resolve_cd(
@@ -662,7 +699,7 @@ mod tests {
 
     #[test]
     fn context_report_without_snapshot_prompts_to_run_turn() {
-        let out = format_context_report(None, "claude-opus-4-7");
+        let out = format_context_report(None, "claude-opus-4-7", false);
         assert!(out.contains("run at least one turn"));
         // Never leak a window/totals when there's nothing to show
         assert!(!out.contains("tokens ("));
@@ -678,8 +715,9 @@ mod tests {
             total_messages: 5,
             ctx_window: 0,
             ctx_name: String::new(),
+            system_prompt: String::new(),
         };
-        let out = format_context_report(Some(&snap), "test-model");
+        let out = format_context_report(Some(&snap), "test-model", false);
         assert!(out.contains("waiting for first complete turn"));
     }
 
@@ -693,8 +731,9 @@ mod tests {
             total_messages: 42,
             ctx_window: 128_000,
             ctx_name: "default".into(),
+            system_prompt: String::new(),
         };
-        let out = format_context_report(Some(&snap), "claude-opus-4-7");
+        let out = format_context_report(Some(&snap), "claude-opus-4-7", false);
 
         // Header
         assert!(out.contains("Context Usage"));
@@ -731,8 +770,9 @@ mod tests {
             total_messages: 10,
             ctx_window: 100_000,
             ctx_name: "default".into(),
+            system_prompt: String::new(),
         };
-        let out = format_context_report(Some(&snap), "m");
+        let out = format_context_report(Some(&snap), "m", false);
         // Messages bucket should be 10K - 3K = 7K, not 10K.
         let messages_line = out.lines().find(|l| l.contains("Messages"))
             .expect("messages line must exist");
@@ -752,8 +792,9 @@ mod tests {
             total_messages: 50,
             ctx_window: 120_000,
             ctx_name: "default".into(),
+            system_prompt: String::new(),
         };
-        let out = format_context_report(Some(&snap), "m");
+        let out = format_context_report(Some(&snap), "m", false);
         // Free = window - (sys + tools + cold + messages)
         //      = 120_000 - (20_000 + 20_000 + 0 + 80_000) = 0
         assert!(out.contains("Free"));
@@ -761,6 +802,72 @@ mod tests {
         let free_line = out.lines().find(|l| l.contains("Free"))
             .expect("free line must exist");
         assert!(free_line.contains("0"), "free line: {}", free_line);
+    }
+
+    #[test]
+    fn context_report_without_show_prompt_omits_system_prompt_section() {
+        // Default `/context` output must not include the prompt dump
+        // even when the snapshot HAS a cached prompt. Otherwise the
+        // breakdown dashboard gets buried under 5-15K chars every call.
+        let snap = crate::state::ContextSnapshot {
+            system_tokens: 1_000,
+            sent_tokens: 5_000,
+            tool_defs_tokens: 500,
+            cold_zone_tokens: 0,
+            total_messages: 8,
+            ctx_window: 100_000,
+            ctx_name: "default".into(),
+            system_prompt: "You are AtomCode.\nSOME SENTINEL BYTES".into(),
+        };
+        let out = format_context_report(Some(&snap), "m", false);
+        assert!(!out.contains("SYSTEM PROMPT"),
+            "SYSTEM PROMPT header must not appear in default /context output");
+        assert!(!out.contains("SOME SENTINEL BYTES"),
+            "raw prompt body must not leak into default /context output");
+    }
+
+    #[test]
+    fn context_report_with_show_prompt_appends_cached_prompt() {
+        let snap = crate::state::ContextSnapshot {
+            system_tokens: 1_000,
+            sent_tokens: 5_000,
+            tool_defs_tokens: 500,
+            cold_zone_tokens: 0,
+            total_messages: 8,
+            ctx_window: 100_000,
+            ctx_name: "default".into(),
+            system_prompt: "You are AtomCode.\nRULE_LINE_ABC\nEND".into(),
+        };
+        let out = format_context_report(Some(&snap), "m", true);
+        assert!(out.contains("=== SYSTEM PROMPT ==="));
+        // Each line indented with leading 2 spaces — verify one line
+        // survives through the gutter indentation.
+        assert!(out.contains("  RULE_LINE_ABC"),
+            "prompt lines should keep content after 2-space indent");
+        // Breakdown still present (append, not replace)
+        assert!(out.contains("Context Usage"));
+        assert!(out.contains("System prompt"));
+    }
+
+    #[test]
+    fn context_report_show_prompt_with_empty_cached_prompt_shows_hint() {
+        // Partial snapshot: no turn has landed rich stats yet, so
+        // system_prompt is "". `/context prompt` should tell the user
+        // that — not just silently show an empty section.
+        let snap = crate::state::ContextSnapshot {
+            system_tokens: 100,
+            sent_tokens: 200,
+            tool_defs_tokens: 0,
+            cold_zone_tokens: 0,
+            total_messages: 3,
+            ctx_window: 100_000,
+            ctx_name: "default".into(),
+            system_prompt: String::new(),
+        };
+        let out = format_context_report(Some(&snap), "m", true);
+        assert!(out.contains("=== SYSTEM PROMPT ==="));
+        assert!(out.contains("(empty"),
+            "empty cached prompt must show an explanation, got: {}", out);
     }
 
     #[test]

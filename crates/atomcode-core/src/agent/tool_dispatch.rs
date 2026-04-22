@@ -122,6 +122,7 @@ impl AgentLoop {
                     cold_zone_tokens: 0,
                     ctx_window: 0,
                     ctx_name: String::new(),
+                    system_prompt: String::new(),
                 });
             }
             TurnEvent::Error(e) => {

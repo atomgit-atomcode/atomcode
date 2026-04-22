@@ -177,6 +177,11 @@ pub enum AgentEvent {
         ctx_window: usize,
         /// Ctx strategy name — `default` / `ollama` / future impls.
         ctx_name: String,
+        /// Full assembled system prompt for the turn — lets the TUI's
+        /// `/context prompt` show the exact bytes sent. Empty on the
+        /// narrow TurnEvent-forwarded path; only the rich emission in
+        /// `handle_send_message` fills this.
+        system_prompt: String,
     },
 }
 
@@ -951,6 +956,10 @@ impl AgentLoop {
                     cold_zone_tokens,
                     ctx_window: context_window,
                     ctx_name: self.ctx.name().to_string(),
+                    // Rich path carries the actual bytes we just passed
+                    // to ctx.build_messages — TUI's `/context prompt`
+                    // reads this cached value.
+                    system_prompt: system_prompt.clone(),
                 });
             }
 
@@ -1159,6 +1168,7 @@ impl AgentLoop {
                                         cold_zone_tokens: 0,
                                         ctx_window: 0,
                                         ctx_name: String::new(),
+                                        system_prompt: String::new(),
                                     });
                                 }
                                 TurnEvent::ToolCallStreaming { name, hint } => {
