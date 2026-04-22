@@ -1577,16 +1577,23 @@ let session_manager = SessionManager::new(&working_dir);
     // Build tool registry and context
     let tool_context = ToolContext::new(working_dir.clone());
     let mut tool_registry = ToolRegistry::new();
-    tool_registry.register(Box::new(ReadFileTool));
-    tool_registry.register(Box::new(WriteFileTool));
-    tool_registry.register(Box::new(EditFileTool));
-    tool_registry.register(Box::new(BashTool));
-    tool_registry.register(Box::new(GrepTool));
-    tool_registry.register(Box::new(GlobTool));
-    tool_registry.register(Box::new(ListDirTool));
-    tool_registry.register(Box::new(WebSearchTool));
-    tool_registry.register(Box::new(WebFetchTool));
-    tool_registry.register(Box::new(SearchReplaceTool));
+    // Honour ATOMCODE_DISABLE_TOOLS env var at daemon startup too, matching
+    // the CLI's --disable-tools behaviour. Comma-separated tool names.
+    let disabled_tools: std::collections::HashSet<String> = std::env::var("ATOMCODE_DISABLE_TOOLS")
+        .ok()
+        .map(|v| v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
+        .unwrap_or_default();
+    let enabled = |name: &str| !disabled_tools.contains(name);
+    if enabled("read_file") { tool_registry.register(Box::new(ReadFileTool)); }
+    if enabled("write_file") { tool_registry.register(Box::new(WriteFileTool)); }
+    if enabled("edit_file") { tool_registry.register(Box::new(EditFileTool)); }
+    if enabled("bash") { tool_registry.register(Box::new(BashTool)); }
+    if enabled("grep") { tool_registry.register(Box::new(GrepTool)); }
+    if enabled("glob") { tool_registry.register(Box::new(GlobTool)); }
+    if enabled("list_directory") { tool_registry.register(Box::new(ListDirTool)); }
+    if enabled("web_search") { tool_registry.register(Box::new(WebSearchTool)); }
+    if enabled("web_fetch") { tool_registry.register(Box::new(WebFetchTool)); }
+    if enabled("search_replace") { tool_registry.register(Box::new(SearchReplaceTool)); }
     let shared_tools = Arc::new(tool_registry);
     
     // Create turn runner with auto-bypass permission (API mode - no interactive approval)
