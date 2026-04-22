@@ -3135,7 +3135,7 @@ async fn refresh_gitcode_token() -> Result<String, String> {
         id, username
     ));
 
-    std::fs::write(&auth_path, new_content)
+    atomcode_core::auth::write_auth_file_secure(&auth_path, &new_content)
         .map_err(|e| format!("Failed to write auth.toml: {}", e))?;
 
     Ok(new_access_token)

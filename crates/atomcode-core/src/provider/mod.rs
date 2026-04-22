@@ -151,7 +151,7 @@ fn refresh_and_save(refresh_token: &str, auth_path: &std::path::Path) -> Result<
     if let Some(e) = token.expires_in {
         content.push_str(&format!("expires_in = {}\n", e));
     }
-    let _ = std::fs::write(auth_path, content);
+    let _ = crate::auth::write_auth_file_secure(auth_path, &content);
 
     Ok(access_token)
 }
