@@ -260,8 +260,22 @@ async fn bash_execute(args: &str, ctx: &ToolContext) -> Result<ToolResult> {
                     }
                 );
 
-                match child.try_wait() {
-                    Ok(Some(status)) => Some(status.success()),
+                // Readers have exited. Give the child up to 1s to
+                // actually exit before declaring it stuck. `try_wait`
+                // races with reap in the tokio runtime: a command that
+                // prints + exits in ~20 ms sometimes shows reader EOF
+                // before the runtime has reaped the zombie, so
+                // `try_wait` returns `Ok(None)` even though the process
+                // IS dead. Without this grace we end up in the "killed"
+                // branch below → bogus `success=false` + a hardcoded
+                // "no new output for 90s" message that never matches
+                // reality (elapsed was 2–3 s, not 90 s).
+                //
+                // For genuinely stuck commands (readers left via
+                // idle_timeout, child still churning) the 1s wait
+                // expires and we fall through to the kill path.
+                match tokio::time::timeout(Duration::from_secs(1), child.wait()).await {
+                    Ok(Ok(status)) => Some(status.success()),
                     _ => None,
                 }
             }
@@ -299,19 +313,24 @@ async fn bash_execute(args: &str, ctx: &ToolContext) -> Result<ToolResult> {
                 Ok(ToolResult { call_id: String::new(), output, success: effective_success })
             }
             Ok(None) => {
-                // Process still running but output stopped for SILENT_KILL_SECS = likely stuck.
-                // Kill it. Include elapsed time so agent can tell slow-work vs deadlock.
+                // Readers exited (idle timeout or EOF) but the child
+                // did not exit within the 1 s grace — process is stuck.
+                // Kill it. The elapsed marker already tells the model
+                // how long we waited; don't invent a hardcoded "90s"
+                // here (SILENT_KILL_SECS is a cap, not what actually
+                // happened — it lies when readers left via EOF and the
+                // grace wait is what fired).
                 let _ = child.kill().await;
                 let combined = format_output(&stdout_str, &stderr_str);
                 let output = if combined.is_empty() {
                     format!(
-                        "{} [killed: no output for {}s — treat as stuck, don't retry the same command]",
-                        elapsed_marker, SILENT_KILL_SECS
+                        "{} [killed: process did not exit; no output produced — treat as stuck, don't retry the same command]",
+                        elapsed_marker
                     )
                 } else {
                     format!(
-                        "{}\n{}\n\n[killed: no new output for {}s — output above is partial]",
-                        elapsed_marker, combined, SILENT_KILL_SECS
+                        "{}\n{}\n\n[killed: process did not exit cleanly — output above may be partial]",
+                        elapsed_marker, combined
                     )
                 };
                 Ok(ToolResult { call_id: String::new(), output, success: false })
@@ -593,5 +612,69 @@ mod sanitize_tests {
     fn drops_bel_and_other_c0() {
         let input = "hello\x07world\x08";
         assert_eq!(sanitize_terminal_output(input), "helloworld");
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────
+// Regression tests that exercise the real subprocess path.
+// Gated on Unix because the Windows branch uses cmd.exe and would
+// need its own echo/true equivalents.
+// ───────────────────────────────────────────────────────────────────
+
+#[cfg(all(test, not(target_os = "windows")))]
+mod exec_tests {
+    use super::bash_execute;
+    use crate::tool::ToolContext;
+
+    /// Regression: fast-exit command must report `success: true` and
+    /// must NOT include the stuck-process diagnostic text.
+    ///
+    /// Before the fix, `try_wait()` raced with tokio's reap → for a
+    /// command that exited in ~20 ms, try_wait returned `Ok(None)` →
+    /// fell into the Ok(None) branch → `success: false` + "[killed:
+    /// no new output for 90s]" stamp. Nothing was actually killed and
+    /// the "90s" was a hardcoded lie.
+    #[tokio::test]
+    async fn fast_exit_command_reports_success() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ctx = ToolContext::new(tmp.path().to_path_buf());
+        let args = r#"{"command": "echo hello-fast"}"#;
+        let result = bash_execute(args, &ctx).await.expect("bash_execute");
+
+        assert!(result.success, "fast echo must report success=true");
+        assert!(result.output.contains("hello-fast"),
+            "output must contain the actual stdout, got: {}", result.output);
+        assert!(!result.output.contains("killed"),
+            "output must NOT claim kill on a successful fast command, got: {}", result.output);
+        assert!(!result.output.contains("90s"),
+            "output must NOT leak the hardcoded 90s message, got: {}", result.output);
+    }
+
+    /// Silent fast-exit (`true`) — no stdout, quick success. Same bug
+    /// class as echo but exercises the empty-output path.
+    #[tokio::test]
+    async fn silent_fast_exit_reports_success() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ctx = ToolContext::new(tmp.path().to_path_buf());
+        let args = r#"{"command": "true"}"#;
+        let result = bash_execute(args, &ctx).await.expect("bash_execute");
+
+        assert!(result.success, "true must report success=true");
+        assert!(!result.output.contains("killed"),
+            "output must NOT claim kill, got: {}", result.output);
+    }
+
+    /// Command that exits non-zero should report success=false, with
+    /// the stderr preserved. This is the sanity-check that we didn't
+    /// just make every command succeed.
+    #[tokio::test]
+    async fn failing_command_reports_failure() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ctx = ToolContext::new(tmp.path().to_path_buf());
+        let args = r#"{"command": "false"}"#;
+        let result = bash_execute(args, &ctx).await.expect("bash_execute");
+
+        assert!(!result.success,
+            "`false` must report success=false, got output: {}", result.output);
     }
 }
