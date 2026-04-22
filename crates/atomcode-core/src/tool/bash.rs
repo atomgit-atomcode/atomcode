@@ -260,7 +260,7 @@ async fn bash_execute(args: &str, ctx: &ToolContext) -> Result<ToolResult> {
                     }
                 );
 
-                // Readers have exited. Give the child up to 1s to
+                // Readers have exited. Give the child up to 500 ms to
                 // actually exit before declaring it stuck. `try_wait`
                 // races with reap in the tokio runtime: a command that
                 // prints + exits in ~20 ms sometimes shows reader EOF
@@ -271,10 +271,12 @@ async fn bash_execute(args: &str, ctx: &ToolContext) -> Result<ToolResult> {
                 // "no new output for 90s" message that never matches
                 // reality (elapsed was 2–3 s, not 90 s).
                 //
-                // For genuinely stuck commands (readers left via
-                // idle_timeout, child still churning) the 1s wait
-                // expires and we fall through to the kill path.
-                match tokio::time::timeout(Duration::from_secs(1), child.wait()).await {
+                // 500 ms is chosen over 1 s as a tighter ceiling on
+                // real-stuck detection — EOF-to-reap on Unix is almost
+                // always <50 ms, so 500 ms covers the race with
+                // comfortable headroom while adding at most half a
+                // second to genuine kill paths.
+                match tokio::time::timeout(Duration::from_millis(500), child.wait()).await {
                     Ok(Ok(status)) => Some(status.success()),
                     _ => None,
                 }
