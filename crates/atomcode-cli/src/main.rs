@@ -213,7 +213,8 @@ async fn sync_stage_and_apply_if_newer() {
             match self_update::apply_pending_upgrade() {
                 Ok(Some(applied)) => {
                     eprintln!("✓ Upgrading to {}...", applied.version);
-                    std::env::set_var(UPGRADED_FROM_ENV, &applied.version);
+                    // Save the CURRENT version (before upgrade) so TUI can show "Upgraded old → new"
+                    std::env::set_var(UPGRADED_FROM_ENV, &current);
                     match self_update::re_exec_self() {
                         Ok(_infallible) => unreachable!("re_exec_self returned Ok"),
                         Err(e) => {
@@ -454,12 +455,14 @@ async fn main() {
     // circuit-breaker in `apply_pending_upgrade` ensures a broken release
     // can't wedge this loop indefinitely.
     if !is_backup {
+    // Capture current version BEFORE applying upgrade, so we can pass it to the re-exec'd child
+    let current_version = format!("v{}", env!("CARGO_PKG_VERSION"));
     match atomcode_core::self_update::apply_pending_upgrade() {
         Ok(Some(applied)) => {
             eprintln!("✓ Upgrading to {}...", applied.version);
-            // Pass the applied version to the re-exec'd child so the TUI
+            // Pass the CURRENT version (before upgrade) to the re-exec'd child so the TUI
             // can surface a welcome-screen confirmation exactly once.
-            std::env::set_var(UPGRADED_FROM_ENV, &applied.version);
+            std::env::set_var(UPGRADED_FROM_ENV, &current_version);
             match atomcode_core::self_update::re_exec_self() {
                 Ok(_infallible) => unreachable!("re_exec_self returned Ok"),
                 Err(e) => {
