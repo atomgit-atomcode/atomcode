@@ -207,7 +207,10 @@ pub(crate) struct DisciplineState {
     pub is_negative_feedback: bool,
     pub recent_calls: Vec<(String, u64)>,
     pub build_fail_count: usize,
-    pub file_read_counts: std::collections::HashMap<String, usize>,
+    /// Per-region read counter; key shape matches `TurnRunner.file_read_counts`
+    /// so the post-turn "stuck" warning in `discipline::apply_post_turn_discipline`
+    /// reads what the agent loop writes. See `turn::runner::read_region_key`.
+    pub file_read_counts: std::collections::HashMap<(String, u64), usize>,
     pub scouting_count: usize,
     pub api_confirmed_working: bool,
     pub consecutive_edits_file: Option<String>,
@@ -1126,9 +1129,13 @@ impl AgentLoop {
                                                     .map(|n| n.to_string_lossy().to_string())
                                                     .unwrap_or_else(|| fp.to_string());
                                                 session_files.insert(short.clone(), std::path::PathBuf::from(fp));
-                                                // Track per-file read count for re-read guard
+                                                // Track per-region read count for re-read guard.
+                                                // Key matches `TurnRunner.file_read_counts` shape so the
+                                                // post-turn warning in `discipline::apply_post_turn_discipline`
+                                                // agrees with the guard on what counts as "same region".
                                                 if name == "read_file" {
-                                                    *file_read_counts.entry(short.clone()).or_insert(0) += 1;
+                                                    let key = crate::turn::runner::read_region_key(&short, arguments);
+                                                    *file_read_counts.entry(key).or_insert(0) += 1;
                                                     if !files_read_this_turn.contains(&short) {
                                                         files_read_this_turn.push(short);
                                                     }

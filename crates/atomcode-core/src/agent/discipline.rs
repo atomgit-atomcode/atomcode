@@ -7,14 +7,25 @@ impl AgentLoop {
     /// stagnation warnings. These polluted context and prevented model
     /// from stopping. These were harmful noise injections.
     pub(crate) fn apply_post_turn_discipline(&mut self) {
-        // Re-read guard: when the same file is read 4+ times, the model is stuck.
-        // Re-inject the original task and force a re-plan.
-        let mut blocked_files: Vec<String> = Vec::new();
-        for (file, count) in &self.discipline_state.file_read_counts {
-            if *count >= 4 {
-                blocked_files.push(format!("{} ({}x)", file, count));
+        // Re-read guard: when the same *region* of a file is read 2+ times,
+        // inject a soft "re-plan" warning at turn end — this fires one call
+        // *before* the hard Pattern 1 block (region cap = 3) in
+        // `turn::runner::detect_call_loop`, giving the model a chance to
+        // course-correct before it gets hard-blocked.
+        // Scanning different regions of a large file produces different
+        // bucket keys and does NOT trip this — that is legitimate exploration.
+        let mut per_file_max: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        for ((file, _bucket), count) in &self.discipline_state.file_read_counts {
+            if *count >= 2 {
+                let slot = per_file_max.entry(file.clone()).or_insert(0);
+                *slot = (*slot).max(*count);
             }
         }
+        let blocked_files: Vec<String> = per_file_max
+            .into_iter()
+            .map(|(file, count)| format!("{} ({}x same region)", file, count))
+            .collect();
         if !blocked_files.is_empty() {
             let task = if self.current_task.is_empty() {
                 "the user's request".to_string()

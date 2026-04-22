@@ -42,15 +42,35 @@ pub struct TurnRunner {
     pub recently_edited_files: Vec<String>,
     /// Rolling history of `(tool_name, args_hash)` pairs — used to detect tool
     /// call loops (same tool + same args repeated without any edit in between).
-    /// Bounded to 20 entries to keep memory flat. For `read_file`, only the
-    /// file_path is hashed so paginated re-reads of the same file are treated
-    /// as repeats.
+    /// Bounded to 20 entries to keep memory flat. For `read_file` the hash
+    /// covers `(file_path, offset, limit)` so paginating through distinct
+    /// regions is not treated as a repeat; see `loop_args_hash`.
     pub recent_calls: Vec<(String, u64)>,
-    /// Per-basename read counter. 5+ consecutive reads of the same file without
-    /// an edit is an infinite loop (common when a file can't be parsed as text
-    /// — e.g. Office binaries — and the model keeps retrying with different
-    /// offset/limit values instead of giving up).
-    pub file_read_counts: std::collections::HashMap<String, u32>,
+    /// Per-region read counter, keyed by `(basename, offset / READ_REGION_BUCKET)`.
+    /// The region bucket means "scanning different parts of a large file" counts
+    /// as separate keys — only reading the *same* region 3+ times in a turn is
+    /// treated as a panic loop (typical of Office binaries, encoding mismatches,
+    /// or the model cycling offset/limit on an unreadable file).
+    pub file_read_counts: std::collections::HashMap<(String, u64), u32>,
+}
+
+/// Line-granularity of the read-region bucket used in `file_read_counts`.
+/// A single function body typically fits in one bucket (most are < 50 lines),
+/// so reading different functions of a large file produces different keys
+/// and doesn't cap. Shared so `DisciplineState` and the agent loop write
+/// counts under the same key the guard will read back.
+pub(crate) const READ_REGION_BUCKET: u64 = 50;
+
+/// Extract the region-bucket key for a `read_file` call so that writers
+/// (agent loop, discipline) and readers (loop guard) agree on the key shape.
+/// `short` is the file basename (not full path). Missing / malformed offset
+/// → bucket 0 (which is also the bucket for "whole-file" reads).
+pub(crate) fn read_region_key(short: &str, args: &str) -> (String, u64) {
+    let offset = serde_json::from_str::<serde_json::Value>(args)
+        .ok()
+        .and_then(|v| v.get("offset").and_then(|x| x.as_u64()))
+        .unwrap_or(0);
+    (short.to_string(), offset / READ_REGION_BUCKET)
 }
 
 impl TurnRunner {
@@ -810,13 +830,14 @@ _ = cancel.cancelled() => {
     ///
     /// Two patterns are caught:
     ///
-    /// 1. **Per-file read saturation** (`read_file` specific):
-    ///    5 unbroken `read_file` calls against the same basename — either the
-    ///    model is panicking on an unreadable file (Office binary, missing GBK
-    ///    decode, etc.) or legitimately paginating a large file. The block
-    ///    message steers toward grep/converter rather than assuming the model
-    ///    already has full content. Reset by a successful `edit_file` /
-    ///    `write_file` targeting the same file.
+    /// 1. **Per-region read saturation** (`read_file` specific):
+    ///    3 unbroken `read_file` calls against the *same region* of a file
+    ///    (basename + offset bucket). Paginating through distinct regions of
+    ///    a large file produces different keys and does NOT trip — this
+    ///    specifically targets the panic loop where the model re-reads the
+    ///    same slice hoping for different content (Office binary, encoding
+    ///    mismatch, etc.). Reset by a successful `edit_file` / `write_file`
+    ///    targeting the same file (clears ALL regions for that file).
     ///
     /// 2. **Exact repeats** (any tool): 3 calls with identical `(tool_name,
     ///    args_hash)` and no intervening `edit_file` / `write_file`. Means
@@ -826,8 +847,8 @@ _ = cancel.cancelled() => {
     /// For `read_file`, the hash covers `(file_path, offset, limit)` so that
     /// paginating through distinct regions of a large file does NOT count as
     /// a loop — only literal re-reads do.
-    fn detect_call_loop(&mut self, tool_name: &str, args: &str) -> Option<String> {
-        // --- Pattern 1: per-file read saturation ------------------------------
+    pub(super) fn detect_call_loop(&mut self, tool_name: &str, args: &str) -> Option<String> {
+        // --- Pattern 1: per-region read saturation ----------------------------
         if tool_name == "read_file" {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(args) {
                 if let Some(fp) = v.get("file_path").and_then(|v| v.as_str()) {
@@ -835,18 +856,19 @@ _ = cancel.cancelled() => {
                         .file_name()
                         .map(|n| n.to_string_lossy().to_string())
                         .unwrap_or_else(|| fp.to_string());
-                    let count = self.file_read_counts.entry(short.clone()).or_insert(0);
+                    let key = read_region_key(&short, args);
+                    let count = self.file_read_counts.entry(key).or_insert(0);
                     *count += 1;
-                    if *count >= 5 {
+                    if *count >= 3 {
                         return Some(format!(
-                            "BLOCKED: read_file '{}' hit its {}-call cap for this turn. \
-                             If you're still hunting for something specific, switch to grep — \
-                             it finds exact lines without loading more pages. \
-                             If the file is unreadable (Office binary, PDF, encoding mismatch), \
-                             stop retrying and use a bash converter \
-                             (pandoc / pdftotext / antiword / unzip for .docx) \
-                             or tell the user the format isn't supported. \
-                             Do not call read_file on this path again in this turn.",
+                            "BLOCKED: read_file '{}' hit its {}-call cap for the SAME region of this file. \
+                             You keep requesting the same slice and getting the same output. \
+                             If you need more of this file, pass a different offset to jump elsewhere. \
+                             If you're stuck because the file is unreadable (Office binary, PDF, \
+                             encoding mismatch), switch to a bash converter \
+                             (pandoc / pdftotext / antiword / unzip for .docx) or tell the user \
+                             the format isn't supported. \
+                             Do not re-read this region again in this turn.",
                             short, count
                         ));
                     }
@@ -854,9 +876,10 @@ _ = cancel.cancelled() => {
             }
         }
 
-        // A successful edit on the same file should reset its read counter so
-        // post-edit verification reads aren't blocked. `edit_file` / `write_file`
-        // also clear the global recent-repeat list further down.
+        // A successful edit on a file clears ALL of that file's region counts,
+        // so post-edit verification reads (potentially covering different parts)
+        // aren't blocked. `edit_file` / `write_file` also clear the global
+        // recent-repeat list further down.
         if matches!(tool_name, "edit_file" | "write_file" | "create_file") {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(args) {
                 if let Some(fp) = v.get("file_path").and_then(|v| v.as_str()) {
@@ -864,7 +887,7 @@ _ = cancel.cancelled() => {
                         .file_name()
                         .map(|n| n.to_string_lossy().to_string())
                         .unwrap_or_else(|| fp.to_string());
-                    self.file_read_counts.remove(&short);
+                    self.file_read_counts.retain(|(file, _), _| file != &short);
                 }
             }
         }
@@ -1115,7 +1138,7 @@ fn merge_edit_calls(calls: &mut Vec<ToolCall>) -> Vec<String> {
 
 #[cfg(test)]
 mod loop_hash_tests {
-    use super::loop_args_hash;
+    use super::{loop_args_hash, read_region_key, READ_REGION_BUCKET};
 
     // Using a separate module name to avoid conflicting with the sibling
     // `turn::tests` integration-style test module.
@@ -1166,6 +1189,40 @@ mod loop_hash_tests {
         let s1 = loop_args_hash("bash", r#"{"command":"ls"}"#);
         let s2 = loop_args_hash("bash", r#"{"command":"ls"}"#);
         assert_eq!(s1, s2);
+    }
+
+    #[test]
+    fn region_key_buckets_are_per_file() {
+        // Same file, same bucket regardless of how offset rounds down.
+        let a = read_region_key("render.rs", r#"{"file_path":"/x/render.rs","offset":100,"limit":50}"#);
+        let b = read_region_key("render.rs", r#"{"file_path":"/x/render.rs","offset":130,"limit":50}"#);
+        assert_eq!(a, b, "offsets 100 and 130 both land in bucket {}", 100 / READ_REGION_BUCKET);
+
+        // Jump by one full bucket → different key.
+        let far = read_region_key(
+            "render.rs",
+            &format!(r#"{{"file_path":"/x/render.rs","offset":{},"limit":50}}"#, READ_REGION_BUCKET + 200),
+        );
+        assert_ne!(a, far, "offsets across bucket boundaries must differ");
+
+        // Whole-file read and `offset=0` both normalize to bucket 0.
+        let full = read_region_key("render.rs", r#"{"file_path":"/x/render.rs"}"#);
+        let zero = read_region_key("render.rs", r#"{"file_path":"/x/render.rs","offset":0}"#);
+        assert_eq!(full, zero);
+        assert_eq!(full.1, 0);
+
+        // Different files are different keys even at the same offset bucket.
+        let other = read_region_key("mod.rs", r#"{"file_path":"/x/mod.rs","offset":100}"#);
+        assert_ne!(a, other);
+    }
+
+    #[test]
+    fn region_key_handles_malformed_args() {
+        // Garbage in → bucket 0 (same as no-offset), so at worst we over-count
+        // a single bucket and the model gets a helpful block message instead
+        // of a mis-routed one.
+        let bad = read_region_key("x.rs", "not json");
+        assert_eq!(bad, ("x.rs".to_string(), 0));
     }
 
     #[test]

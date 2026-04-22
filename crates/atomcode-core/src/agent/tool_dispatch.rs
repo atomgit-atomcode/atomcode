@@ -329,12 +329,15 @@ impl AgentLoop {
             if call.name == "read_file" {
                 if let Some(fp) = args.get("file_path").and_then(|v| v.as_str()) {
                     let short = short_path(fp);
+                    // `file_read_counts` key is `(basename, offset_bucket)`; this
+                    // dead-code path only needs the per-file total, so fold over
+                    // all buckets for this filename.
                     let read_count = self
                         .discipline_state
                         .file_read_counts
-                        .get(&short)
-                        .copied()
-                        .unwrap_or(0);
+                        .iter()
+                        .filter_map(|((f, _), c)| (f == &short).then_some(*c))
+                        .sum::<usize>();
                     if read_count == 0
                         && (args.get("offset").is_some() || args.get("limit").is_some())
                     {
@@ -382,12 +385,14 @@ impl AgentLoop {
                         .file_name()
                         .map(|n| n.to_string_lossy().to_string())
                         .unwrap_or_else(|| fp.to_string());
+                    // Dead-code path; key shape is `(basename, offset_bucket)`,
+                    // fold over buckets to get the per-file total.
                     let count = self
                         .discipline_state
                         .file_read_counts
-                        .get(&short)
-                        .copied()
-                        .unwrap_or(0);
+                        .iter()
+                        .filter_map(|((f, _), c)| (f == &short).then_some(*c))
+                        .sum::<usize>();
                     if count >= 5 {
                         return Some(format!(
                             "BLOCKED: You have read {} {} times. You already have the content. \
