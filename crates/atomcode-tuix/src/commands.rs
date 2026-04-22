@@ -64,6 +64,7 @@ const BUILTIN_COMMANDS: &[Command] = &[
     Command { name: "config",  desc: "Show config path" },
     Command { name: "reload",  desc: "Reload ~/.atomcode/config.toml from disk" },
     Command { name: "cd",      desc: "Change working directory" },
+    Command { name: "whip",    desc: "Urge the agent (also: Ctrl+G)" },
     Command { name: "diff",    desc: "Show git diff" },
     Command { name: "clear",   desc: "Clear screen" },
     Command { name: "session", desc: "Start a new session (clears conversation)" },

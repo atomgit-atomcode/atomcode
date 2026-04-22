@@ -320,6 +320,9 @@ pub(super) fn execute_slash_command(
                 });
             }
         }
+        "whip" => {
+            crate::whip::fire_whip(ctx, active_modal, state, renderer)?;
+        }
         "cd" => {
             // Bare `/cd` — open the interactive history picker (matches legacy
             // TUI behaviour). The picker's Enter-handler invokes `apply_cd`

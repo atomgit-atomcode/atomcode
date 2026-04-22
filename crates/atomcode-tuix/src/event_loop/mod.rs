@@ -1443,12 +1443,28 @@ fn handle_streaming_key(
             // leave the buf alone. Gate strictly on *registered*
             // commands; unrecognised `/foo …` falls through to the
             // type-ahead queue as a regular message.
-            let is_known_slash = parse_slash_line(&line)
+            let parsed = parse_slash_line(&line);
+            let is_known_slash = parsed
                 .map(|(cmd, _)| ctx.commands.find(cmd).is_some())
                 .unwrap_or(false);
             if is_known_slash {
+                // `/whip` is the ONE slash command valid mid-stream — it's
+                // the whole reason the feature exists. Route it straight
+                // through the executor; every other known command falls
+                // into the "disabled while running" message below.
+                let (cmd_name, arg) = parsed.expect("is_known_slash => parsed is Some");
+                if cmd_name.eq_ignore_ascii_case("whip") {
+                    app.buf.text.clear();
+                    app.buf.cursor = 0;
+                    app.menu.selected = 0;
+                    execute_slash_command(
+                        cmd_name, arg, &mut app.state, ctx, renderer, &mut app.active_modal,
+                    )?;
+                    return Ok(());
+                }
                 renderer.render(UiLine::CommandOutput(
-                    "  (slash commands are disabled while a turn is running)\n".into(),
+                    "  (slash commands are disabled while a turn is running — except /whip)\n"
+                        .into(),
                 ));
                 renderer.flush();
                 app.buf.text.clear();
