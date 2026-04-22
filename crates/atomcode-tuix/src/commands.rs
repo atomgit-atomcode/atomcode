@@ -55,6 +55,7 @@ impl CommandRegistry {
 
 const BUILTIN_COMMANDS: &[Command] = &[
     Command { name: "resume",  desc: "Resume a previous session" },
+    Command { name: "rename",  desc: "Rename current session" },
     Command { name: "login",   desc: "Sign in with AtomGit OAuth" },
     Command { name: "logout",  desc: "Sign out of AtomGit" },
     Command { name: "whoami",  desc: "Show current logged-in user" },

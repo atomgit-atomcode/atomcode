@@ -279,6 +279,7 @@ pub async fn run(
         reader: reader_handle,
         upgrade_tx,
         upgrade_rx,
+        current_session_id: None,
     };
 
     let result = run_loop(ctx, renderer.as_mut()).await;

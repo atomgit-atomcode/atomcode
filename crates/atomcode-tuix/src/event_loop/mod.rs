@@ -15,6 +15,7 @@
 
 pub(crate) mod commands;
 use commands::execute_slash_command;
+pub use commands::{perform_session_rename, validate_session_name, MAX_SESSION_NAME_LEN};
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -23,7 +24,7 @@ use std::time::Duration;
 use anyhow::Result;
 use atomcode_core::agent::{AgentCommand, AgentEvent, AgentHandle, AgentPhase};
 use atomcode_core::config::Config;
-use atomcode_core::session::SessionManager;
+use atomcode_core::session::{SessionId, SessionManager};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 use tokio::sync::mpsc;
 
@@ -74,6 +75,8 @@ pub struct LoopCtx {
     /// Consumed in the main `select!` so upgrade progress is rendered
     /// alongside agent events.
     pub upgrade_rx: mpsc::UnboundedReceiver<atomcode_core::self_update::UpgradeEvent>,
+    /// Current active session ID, set when a session is resumed.
+    pub current_session_id: Option<SessionId>,
 }
 
 /// Line-edit buffer for input composition. Byte-indexed cursor.
