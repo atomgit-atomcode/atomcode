@@ -238,6 +238,7 @@ pub async fn run(
         agent: agent_handle,
         working_dir,
         previous_dir: None,
+        last_whip_at: None,
         recent_dirs,
         history,
         input_rx,

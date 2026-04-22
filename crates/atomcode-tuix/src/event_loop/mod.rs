@@ -42,6 +42,9 @@ pub struct LoopCtx {
     pub agent: AgentHandle,
     pub working_dir: PathBuf,
     pub previous_dir: Option<PathBuf>,
+    /// Timestamp of the last whip fire (Ctrl+G or `/whip`). None = never
+    /// fired. Used by `whip::Cooldown::try_fire` to rate-limit.
+    pub last_whip_at: Option<std::time::Instant>,
     /// Recently visited project directories, most recent first (max 5).
     /// Persisted to `~/.atomcode/recent_dirs.txt`. Drives the `/cd`
     /// picker when invoked with no argument and is updated whenever
@@ -337,6 +340,9 @@ impl Buffer {
                 BufferResult::Redraw
             }
             Action::NoOp => BufferResult::NoOp,
+            // Whip is short-circuited in the key handlers before reaching
+            // Buffer::apply; this arm exists only for match exhaustiveness.
+            Action::Whip => BufferResult::NoOp,
         }
     }
 
