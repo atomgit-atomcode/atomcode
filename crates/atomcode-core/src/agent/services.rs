@@ -97,6 +97,13 @@ impl AgentLoop {
                 let mut g = self.turn_runner.context.graph.write().await;
                 *g = new_graph;
             }
+            // Cancel the previous indexer so rapid `/cd` chains don't
+            // stack parallel parses. Replace the token so the new spawn
+            // below gets a fresh one; the old spawn cooperatively
+            // exits at its next cancel check.
+            self.indexer_cancel.cancel();
+            self.indexer_cancel = CancellationToken::new();
+
             // Spawn new indexer — but only if the new dir is a real
             // project root. `/cd ~/project` (umbrella of many repos)
             // and `/cd ~` without markers would otherwise trigger a
@@ -105,12 +112,13 @@ impl AgentLoop {
             if crate::graph::indexer::should_index(&resolved) {
                 let graph_clone = self.turn_runner.context.graph.clone();
                 let wd_for_indexer = resolved.clone();
+                let cancel = self.indexer_cancel.clone();
                 tokio::spawn(async move {
                     let mut indexer = crate::graph::indexer::GraphIndexer::new(
                         graph_clone.clone(),
                         wd_for_indexer.clone(),
                     );
-                    indexer.index_all().await;
+                    indexer.index_all(cancel).await;
                     let gp = wd_for_indexer.join(".atomcode").join("graph.bin");
                     if let Ok(g) = graph_clone.try_read() {
                         let _ = crate::graph::persist::save(&g, &gp);

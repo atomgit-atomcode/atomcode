@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tokio::sync::RwLock;
+use tokio_util::sync::CancellationToken;
 
 use ignore::WalkBuilder;
 use tree_sitter::{Parser, Query, QueryCursor, StreamingIterator};
@@ -56,7 +57,16 @@ impl GraphIndexer {
     /// 3. Detect deleted files — remove from graph
     /// 4. Parse dirty files, extract symbols and calls
     /// 5. Resolve calls to edges
-    pub async fn index_all(&mut self) {
+    ///
+    /// `cancel` is checked at every point where abandoning is cheap: top
+    /// of the fn, between parse-file iterations (the expensive step),
+    /// and before the final write-lock mutation block. Cancellation is
+    /// cooperative — the sync `WalkBuilder` inside `spawn_blocking`
+    /// cannot itself be interrupted, so best we can do is skip the
+    /// parsing and mutation phases if cancel fires mid-walk. Rapid `/cd`
+    /// chains depend on this: without it, each cd spawns a fresh
+    /// indexer and all of them parse in parallel.
+    pub async fn index_all(&mut self, cancel: CancellationToken) {
         // Refuse to index obvious non-projects. See `should_index`:
         // guards against $HOME / `/` and "umbrella" directories whose
         // children are themselves projects (e.g. `~/project` that
@@ -67,6 +77,8 @@ impl GraphIndexer {
         if !should_index(&self.project_dir) {
             return;
         }
+
+        if cancel.is_cancelled() { return; }
 
         // Walk + stat the tree on the blocking-thread pool rather than on
         // an async worker. `WalkBuilder` is pure sync I/O; leaving it on
@@ -98,8 +110,12 @@ impl GraphIndexer {
         // Read lock released here.
 
         // Parse dirty files OUTSIDE the lock (CPU-intensive, no graph access needed).
+        // Check cancel between files — this is the hot loop where a
+        // stale indexer burns minutes of CPU after the user has already
+        // /cd'd elsewhere.
         let mut all_results: Vec<(PathBuf, u64, FileParseResult)> = Vec::new();
         for (path, mtime) in dirty_files {
+            if cancel.is_cancelled() { return; }
             if let Some(result) = self.parse_file(&path) {
                 all_results.push((path, mtime, result));
             }
@@ -108,6 +124,11 @@ impl GraphIndexer {
         if deleted.is_empty() && all_results.is_empty() {
             return; // Nothing to update
         }
+
+        // Final cancel check: skip the write-lock critical section if
+        // a newer indexer has been spawned. Contention on graph.write()
+        // would otherwise delay the new indexer's own write.
+        if cancel.is_cancelled() { return; }
 
         // Single write lock for ALL mutations — atomic from readers' perspective.
         // Grep/trace_callees will block briefly here but never see partial state.
@@ -602,5 +623,39 @@ mod tests {
         mk(tmp.path(), "other", &[]); // not a project
         assert!(should_index(tmp.path()),
             "2 child projects < umbrella threshold");
+    }
+
+    /// Regression: a pre-cancelled token must cause index_all to bail
+    /// before doing any parse / write-lock work. This is the guarantee
+    /// that makes rapid `/cd` chains cheap — each new /cd cancels the
+    /// prior indexer, which then cooperatively exits at its next
+    /// cancel check (top of fn / between parses / before write-lock).
+    #[tokio::test]
+    async fn index_all_bails_on_cancelled_token() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Marker so should_index returns true (we want the cancel
+        // check to be what stops us, not the umbrella guard).
+        std::fs::write(tmp.path().join(".atomcode"), "").unwrap();
+        // Drop a Rust source so there'd be real work if we proceeded.
+        std::fs::write(
+            tmp.path().join("lib.rs"),
+            "pub fn foo() {}\npub fn bar() {}\n",
+        )
+        .unwrap();
+
+        let graph = Arc::new(RwLock::new(super::super::CodeGraph::default()));
+        let mut indexer = GraphIndexer::new(graph.clone(), tmp.path().to_path_buf());
+
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        indexer.index_all(cancel).await;
+
+        // Graph must be untouched — cancel fired before any symbol
+        // insertion.
+        let g = graph.read().await;
+        assert!(
+            g.file_mtimes.is_empty(),
+            "cancelled indexer must not mutate graph"
+        );
     }
 }

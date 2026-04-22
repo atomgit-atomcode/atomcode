@@ -277,6 +277,11 @@ pub struct AgentLoop {
     // Cancellation token for the current turn
     cancel_token: CancellationToken,
 
+    /// Cancellation token for the background code-graph indexer.
+    /// Fresh-cancelled-then-rebuilt on every `/cd` so a prior indexer
+    /// (still parsing files) yields CPU instead of racing the new one.
+    indexer_cancel: CancellationToken,
+
     /// Discipline tracking — all counters for loop detection, stagnation,
     /// error streaks, and tool usage patterns. Extracted from AgentLoop to
     /// reduce God Object complexity (was 22 fields inline).
@@ -519,6 +524,7 @@ impl AgentLoop {
             approval_resp_tx,
             last_approval_request: None,
             cancel_token: CancellationToken::new(),
+            indexer_cancel: CancellationToken::new(),
             discipline_state: DisciplineState::default(),
             files_read_this_turn: Vec::new(),
             files_edited_this_turn: Vec::new(),
@@ -569,10 +575,11 @@ impl AgentLoop {
             let graph = self.turn_runner.context.graph.clone();
             let (reindex_tx, mut reindex_rx) = mpsc::unbounded_channel::<PathBuf>();
             let wd_for_indexer = working_dir.clone();
+            let cancel = self.indexer_cancel.clone();
             tokio::spawn(async move {
                 let mut indexer =
                     crate::graph::indexer::GraphIndexer::new(graph.clone(), wd_for_indexer.clone());
-                indexer.index_all().await;
+                indexer.index_all(cancel).await;
                 // Persist after initial indexing
                 let gp = wd_for_indexer.join(".atomcode").join("graph.bin");
                 if let Ok(g) = graph.try_read() {
