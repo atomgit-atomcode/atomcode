@@ -107,21 +107,25 @@ pub(crate) fn should_inject_reflection(
 }
 
 /// Render the cadence-reflection prompt injected every `cadence` tool
-/// calls. Language- and ecosystem-neutral by design — the three questions
-/// apply to any task and any tool. Phrased as a scheduled checkpoint (not
-/// a corrective intervention) because this fires every N steps regardless
-/// of whether the agent appears stuck; calling it an error would frame
-/// normal operation as failure.
+/// calls. Delivered as a user-message for delivery reasons (atomcode's
+/// conversation layer only exposes that channel today) but its wording
+/// explicitly flags itself as system meta, and phrases the three
+/// questions as gentle suggestions instead of commands — otherwise the
+/// prompt reads like the human user suddenly speaking in a different
+/// register, which confuses both the reader (UI) and the model.
+///
+/// Language- and ecosystem-neutral by design. Phrased as a scheduled
+/// checkpoint (not a corrective intervention); this fires every N steps
+/// regardless of whether the agent appears stuck.
 pub(crate) fn reflection_prompt(delta: usize) -> String {
     format!(
-        "[Checkpoint — not an interruption, just a scheduled recalibration.]\n\
-         You have made {} tool calls since the last checkpoint. \
-         Before your next tool call, answer in plain text:\n\
-         1. Restate the original task in one sentence.\n\
-         2. What have the last {} steps proven or ruled out?\n\
-         3. What is the next concrete output (an edit, an answer, a summary), \
-         and roughly how many steps away?\n",
-        delta, delta
+        "[System meta · not a user message]\n\
+         {} tool calls elapsed since the last self-check. \
+         Before the next tool call, it helps to:\n\
+         - restate the original goal in one sentence,\n\
+         - note what those steps proved or ruled out,\n\
+         - name the next concrete output and how close it is.\n",
+        delta
     )
 }
 
@@ -192,11 +196,11 @@ mod reflection_tests {
 
         // Must ask the three canonical language-neutral questions.
         assert!(
-            msg.contains("original task") || msg.contains("restate"),
-            "prompt must ask to restate the task, got: {}", msg
+            msg.contains("original task") || msg.contains("original goal") || msg.contains("restate"),
+            "prompt must ask to restate the task/goal, got: {}", msg
         );
         assert!(
-            msg.contains("ruled out") || msg.contains("learned") || msg.contains("proven"),
+            msg.contains("ruled out") || msg.contains("learned") || msg.contains("proven") || msg.contains("proved"),
             "prompt must ask what was learned/ruled out, got: {}", msg
         );
         assert!(
@@ -209,5 +213,37 @@ mod reflection_tests {
         assert!(!msg.to_lowercase().contains("cargo"));
         assert!(!msg.to_lowercase().contains("grep"));
         assert!(!msg.to_lowercase().contains("npm"));
+    }
+
+    #[test]
+    fn reflection_prompt_flags_itself_as_system_meta() {
+        // The injection is carried over a user-message channel for
+        // delivery reasons, but the text must make clear it is system
+        // meta, not the human user speaking. Without this self-flag the
+        // UI renders it as a user line and the model may interpret it
+        // as a direct instruction from the operator. This assertion
+        // guards against future rewording that drops the identity tag.
+        let msg = reflection_prompt(5);
+        assert!(
+            msg.contains("not a user message") || msg.contains("System meta"),
+            "prompt must self-flag as system meta / non-user, got: {}", msg
+        );
+    }
+
+    #[test]
+    fn reflection_prompt_uses_suggestion_voice_not_command_voice() {
+        // The earlier version opened with "answer in plain text:" and
+        // numbered imperatives — that reads like the user barking orders
+        // at the agent and produces a jarring context shift. The new
+        // voice is suggestive ("it helps to ...") rather than commanding.
+        let msg = reflection_prompt(5).to_lowercase();
+        assert!(
+            !msg.contains("answer in plain text"),
+            "prompt must not use direct-command phrasing, got: {}", msg
+        );
+        assert!(
+            !msg.contains("answer these"),
+            "prompt must not use direct-command phrasing, got: {}", msg
+        );
     }
 }
