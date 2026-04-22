@@ -1641,15 +1641,31 @@ let session_manager = SessionManager::new(&working_dir);
         // Loop until LLM produces text without tool calls
         loop {
             let result = turn_runner.run(&mut conv, &system_prompt, &turn_tx, cancel_token.clone()).await;
-            
+
             match result {
                 TurnResult::Responded { .. } => {
                     // LLM produced text, turn is complete
                     break;
                 }
-                TurnResult::UsedTools { .. } => {
-                    // Tools were executed, continue to next LLM call
-                    // The tool results are already added to conversation
+                TurnResult::UsedTools { tool_count, .. } => {
+                    // Truncate oversized tool outputs BEFORE the next LLM
+                    // call. Without this, a single `ls -la node_modules`
+                    // or wide `find` dump (multi-MB) stays raw in
+                    // conversation.messages and blows the upstream
+                    // context limit on the NEXT turn (OpenRouter 400
+                    // "maximum context length …"). Mirrors what
+                    // AgentLoop::post_process_tool_results does in CLI
+                    // mode — daemon had skipped this entirely.
+                    let ctx_window = turn_runner.ctx.ctx_window();
+                    atomcode_core::ctx::truncate::post_process_tool_results(
+                        &mut conv.messages,
+                        tool_count,
+                        "", // current_tool_name fallback only — each
+                            // result is keyed by its own call_id via
+                            // ATC lookup; the fallback is used only
+                            // for orphan results (test fixtures).
+                        ctx_window,
+                    );
                     continue;
                 }
                 TurnResult::Failed(e) => {
