@@ -129,3 +129,145 @@ mod tests {
         assert!(Cooldown::try_fire(Some(t0), t1, Duration::from_millis(1000)));
     }
 }
+
+#[cfg(test)]
+mod fire_whip_tests {
+    //! Black-box-ish tests for the `fire_whip` orchestrator. Uses the
+    //! `#[cfg(test)]` `LoopCtx::for_tests` helper in `event_loop/mod.rs`
+    //! so we can construct a real ctx with dangling channels and inspect
+    //! the AgentCommand stream.
+
+    use super::*;
+    use atomcode_core::config::Config;
+    use crate::event_loop::LoopCtx;
+    use crate::modals::Modal;
+    use crate::render::plain::PlainRenderer;
+    use crate::state::UiState;
+
+    fn mk_config() -> Config {
+        // Minimal viable Config — matches the pattern used in
+        // `atomcode-core::turn::tests::make_test_config`.
+        let mut providers = std::collections::HashMap::new();
+        providers.insert(
+            "test".to_string(),
+            atomcode_core::config::provider::ProviderConfig {
+                provider_type: "openai".to_string(),
+                api_key: Some("sk-test".to_string()),
+                model: "m".to_string(),
+                base_url: None,
+                system_prompt: None,
+                user_agent: None,
+                context_window: 16000,
+                max_tokens: None,
+                ephemeral: false,
+            },
+        );
+        Config {
+            default_provider: "test".to_string(),
+            default_workdir: None,
+            providers,
+            datalog: Default::default(),
+            auto_update: false,
+            whip: Default::default(),
+        }
+    }
+
+    #[test]
+    fn during_streaming_sends_append_input() {
+        let (mut ctx, mut cmd_rx) = LoopCtx::for_tests(mk_config());
+        let mut state = UiState::new();
+        state.on_submit(); // phase = Streaming
+        let mut modal: Option<Box<dyn Modal>> = None;
+        let mut r = PlainRenderer::new();
+
+        fire_whip(&mut ctx, &mut modal, &state, &mut r).unwrap();
+
+        let mut found = false;
+        while let Ok(c) = cmd_rx.try_recv() {
+            if matches!(c, atomcode_core::agent::AgentCommand::AppendInput(_)) {
+                found = true;
+            }
+        }
+        assert!(found, "AppendInput must be sent while streaming");
+        assert!(modal.is_some(), "overlay must be installed");
+    }
+
+    #[test]
+    fn during_idle_does_not_send_append_input() {
+        let (mut ctx, mut cmd_rx) = LoopCtx::for_tests(mk_config());
+        let state = UiState::new(); // Idle
+        let mut modal: Option<Box<dyn Modal>> = None;
+        let mut r = PlainRenderer::new();
+
+        fire_whip(&mut ctx, &mut modal, &state, &mut r).unwrap();
+
+        while let Ok(c) = cmd_rx.try_recv() {
+            assert!(
+                !matches!(c, atomcode_core::agent::AgentCommand::AppendInput(_)),
+                "no AppendInput at idle"
+            );
+        }
+        assert!(modal.is_some(), "overlay still shown at idle");
+    }
+
+    #[test]
+    fn during_approval_is_a_noop() {
+        let (mut ctx, mut cmd_rx) = LoopCtx::for_tests(mk_config());
+        let mut state = UiState::new();
+        state.on_submit();
+        state.on_approval_needed("bash");
+        let mut modal: Option<Box<dyn Modal>> = None;
+        let mut r = PlainRenderer::new();
+
+        fire_whip(&mut ctx, &mut modal, &state, &mut r).unwrap();
+        assert!(modal.is_none(), "no overlay during approval");
+        assert!(cmd_rx.try_recv().is_err(), "no commands sent during approval");
+    }
+
+    #[test]
+    fn cooldown_blocks_second_fire() {
+        let mut cfg = mk_config();
+        cfg.whip.cooldown_ms = 1000;
+        let (mut ctx, _rx) = LoopCtx::for_tests(cfg);
+        let mut state = UiState::new();
+        state.on_submit();
+        let mut modal: Option<Box<dyn Modal>> = None;
+        let mut r = PlainRenderer::new();
+
+        fire_whip(&mut ctx, &mut modal, &state, &mut r).unwrap();
+        modal = None; // simulate overlay having closed
+        fire_whip(&mut ctx, &mut modal, &state, &mut r).unwrap();
+        assert!(modal.is_none(), "second fire within cooldown must be silent");
+    }
+
+    #[test]
+    fn disabled_config_suppresses_everything() {
+        let mut cfg = mk_config();
+        cfg.whip.enabled = false;
+        let (mut ctx, mut cmd_rx) = LoopCtx::for_tests(cfg);
+        let mut state = UiState::new();
+        state.on_submit();
+        let mut modal: Option<Box<dyn Modal>> = None;
+        let mut r = PlainRenderer::new();
+
+        fire_whip(&mut ctx, &mut modal, &state, &mut r).unwrap();
+        assert!(modal.is_none());
+        assert!(cmd_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn modal_busy_blocks_whip() {
+        use crate::modals::SessionPicker;
+        let (mut ctx, mut cmd_rx) = LoopCtx::for_tests(mk_config());
+        let mut state = UiState::new();
+        state.on_submit();
+        // Install a dummy modal to simulate an open picker.
+        let mut modal: Option<Box<dyn Modal>> =
+            Some(Box::new(SessionPicker::open(Vec::new())));
+        let mut r = PlainRenderer::new();
+
+        fire_whip(&mut ctx, &mut modal, &state, &mut r).unwrap();
+        // Existing modal should NOT have been replaced.
+        assert!(cmd_rx.try_recv().is_err(), "no commands sent when modal busy");
+    }
+}

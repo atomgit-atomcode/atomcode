@@ -79,6 +79,50 @@ pub struct LoopCtx {
     pub upgrade_rx: mpsc::UnboundedReceiver<atomcode_core::self_update::UpgradeEvent>,
 }
 
+#[cfg(test)]
+impl LoopCtx {
+    /// Minimal `LoopCtx` for tests. Agent / input / wake / upgrade
+    /// channels are open but dangling; callers typically drain `cmd_rx`
+    /// (returned alongside) to inspect what `fire_whip` sent. Working
+    /// dir + session dir are a fresh subdir of `std::env::temp_dir()`.
+    pub fn for_tests(
+        config: Config,
+    ) -> (Self, mpsc::UnboundedReceiver<AgentCommand>) {
+        use atomcode_core::agent::{AgentCommand, AgentEvent, AgentHandle};
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<AgentCommand>();
+        let (_evt_tx, event_rx) = mpsc::unbounded_channel::<AgentEvent>();
+        let (_input_tx, input_rx) = mpsc::unbounded_channel();
+        let (_wake_tx, wake_rx) = mpsc::channel(1);
+        let (upgrade_tx, upgrade_rx) = mpsc::unbounded_channel();
+        let agent = AgentHandle { cmd_tx, event_rx };
+        let tmp = std::env::temp_dir().join(format!(
+            "atomcode-tuix-loopctx-{}",
+            std::process::id(),
+        ));
+        let _ = std::fs::create_dir_all(&tmp);
+        let session_manager = atomcode_core::session::SessionManager::new(&tmp);
+        let ctx = Self {
+            config,
+            model_name: "test-model".into(),
+            agent,
+            working_dir: tmp.clone(),
+            previous_dir: None,
+            last_whip_at: None,
+            recent_dirs: Vec::new(),
+            history: crate::input::history::History::load(tmp.join("hist.txt")),
+            input_rx,
+            commands: crate::commands::CommandRegistry::builtin(),
+            session_manager,
+            update_hint: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            wake_rx,
+            reader: None,
+            upgrade_tx,
+            upgrade_rx,
+        };
+        (ctx, cmd_rx)
+    }
+}
+
 /// Line-edit buffer for input composition. Byte-indexed cursor.
 ///
 /// Large pasted blocks are folded into `[Pasted #N +M lines]` placeholders
