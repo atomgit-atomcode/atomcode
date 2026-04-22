@@ -527,6 +527,21 @@ _ = cancel.cancelled() => {
             }
         }
 
+        // Truncate oversized tool outputs before returning. Without this,
+        // a single `ls -la node_modules` / wide `find` dump (multi-MB)
+        // stays raw in `conversation.messages` and the NEXT LLM call
+        // blows the upstream context limit. Every caller of TurnRunner
+        // used to have to remember to invoke this — daemon didn't, which
+        // was the root of the 738K-token 400 bug. Making runner own it
+        // removes the implicit contract.
+        crate::ctx::truncate::post_process_tool_results(
+            &mut conversation.messages,
+            tool_count,
+            "", // fallback only — each result is keyed by its own
+                // call_id → ATC.tool_name lookup (see ctx::truncate).
+            context_window,
+        );
+
         TurnResult::UsedTools {
             text: if text_buf.is_empty() {
                 None

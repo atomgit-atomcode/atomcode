@@ -141,20 +141,13 @@ impl AgentLoop {
         }
     }
 
-    /// Post-process tool results added by TurnRunner: truncate large outputs,
-    /// then extract file paths from error output and pre-read them.
+    /// Post-process tool results added by TurnRunner: CLI-specific
+    /// semantic enrichment (pre-read files mentioned in failed-bash
+    /// errors). The generic byte-level truncation (head/tail caps,
+    /// 300-line universal cap, 32K char cap, per-turn budget) moved
+    /// into `TurnRunner::run_with_filter` so daemon + any other caller
+    /// gets it for free — previously each caller had to remember.
     pub(crate) fn post_process_tool_results(&mut self, tool_count: usize) {
-        // Use ctx's effective window (may be clamped below config's raw
-        // value for small-window strategies). Tool truncation must honor
-        // the same budget build_messages uses, not the raw config.
-        let context_window = self.ctx.ctx_window();
-        crate::ctx::truncate::post_process_tool_results(
-            &mut self.conversation.messages,
-            tool_count,
-            &self.current_tool_name,
-            context_window,
-        );
-
         // Error file pre-injection: when a bash command fails, extract file paths
         // from the output and inject their content. This saves the model from
         // manually reading files mentioned in error messages (e.g., rustc errors
