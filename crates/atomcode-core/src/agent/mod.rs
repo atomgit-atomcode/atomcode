@@ -211,6 +211,11 @@ pub(crate) struct DisciplineState {
     /// so the post-turn "stuck" warning in `discipline::apply_post_turn_discipline`
     /// reads what the agent loop writes. See `turn::runner::read_region_key`.
     pub file_read_counts: std::collections::HashMap<(String, u64), usize>,
+    /// Snapshot of `AgentLoop.tool_call_count` at the last cadence reflection
+    /// injection. The delta `tool_call_count - last_reflection_at_tool_count`
+    /// feeds `should_inject_reflection` in `discipline`. Resets together with
+    /// `tool_call_count` when a new user task chain starts.
+    pub last_reflection_at_tool_count: usize,
     pub scouting_count: usize,
     pub api_confirmed_working: bool,
     pub consecutive_edits_file: Option<String>,
@@ -785,6 +790,10 @@ impl AgentLoop {
         self.conversation.add_user_message(&clean);
         self.turn_tokens = 0;
         self.tool_call_count = 0;
+        // Reset the reflection marker so the next cadence checkpoint is
+        // measured from the start of this new task chain, not from the
+        // tool count accumulated in the previous task.
+        self.discipline_state.last_reflection_at_tool_count = 0;
         self.turn_count = 0;
         self.retry_count = 0;
         self.discipline_state.recent_calls.clear();
