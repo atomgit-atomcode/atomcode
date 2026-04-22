@@ -502,14 +502,18 @@ fn is_umbrella_dir(dir: &Path) -> bool {
     false
 }
 
-/// Cheap "is this a project?" heuristic — checks for a project-marker
-/// file or directory at the root. Used as an escape hatch for users who
-/// *do* keep code at $HOME: if a marker is present, the indexer walks it
-/// even though the path would otherwise look like a non-project.
+/// Cheap "is this a project?" heuristic — checks for a user-maintained
+/// project-marker file or directory at the root.
+///
+/// `.atomcode` is intentionally NOT in this list even though atomcode
+/// writes `.atomcode/graph.bin` there: using atomcode's own storage
+/// dir as a "user opt-in" marker is self-fulfilling — the very first
+/// `/cd` to any directory creates `.atomcode/` and pins that dir as
+/// "project" forever, defeating the umbrella / $HOME guards. Only
+/// user-placed markers count.
 fn looks_like_project(dir: &Path) -> bool {
     const MARKERS: &[&str] = &[
         ".git",
-        ".atomcode",
         "Cargo.toml",
         "package.json",
         "pyproject.toml",
@@ -601,16 +605,41 @@ mod tests {
     }
 
     #[test]
-    fn should_index_accepts_umbrella_if_marked() {
-        // Same layout as above but with a `.atomcode` file at root —
-        // explicit opt-in, the escape hatch.
+    fn should_index_accepts_umbrella_with_real_marker() {
+        // Umbrella layout, but the umbrella itself also has a real
+        // user-placed marker (e.g. a root Cargo workspace). Under those
+        // circumstances indexing is intentional.
         let tmp = tempfile::TempDir::new().unwrap();
-        std::fs::write(tmp.path().join(".atomcode"), "").unwrap();
+        std::fs::write(tmp.path().join("Cargo.toml"), "[workspace]").unwrap();
         mk(tmp.path(), "a", &[".git"]);
         mk(tmp.path(), "b", &[".git"]);
         mk(tmp.path(), "c", &[".git"]);
         assert!(should_index(tmp.path()),
-            ".atomcode marker must override umbrella detection");
+            "user-placed marker must override umbrella detection");
+    }
+
+    /// Regression: `.atomcode` is atomcode's own storage dir (it gets
+    /// created by `graph::persist::save` on every successful index).
+    /// Using it as a project-marker is self-fulfilling — the very first
+    /// /cd to ~/project writes ~/project/.atomcode/graph.bin, and from
+    /// then on ~/project looks "marked" and the umbrella guard
+    /// never fires again. User-reported: `/cd ~/project` still spiked
+    /// CPU after the umbrella guard landed, because an earlier run
+    /// had already planted .atomcode there.
+    #[test]
+    fn should_index_refuses_umbrella_with_only_atomcode_storage_dir() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Simulate the state left by a prior indexer run.
+        std::fs::create_dir_all(tmp.path().join(".atomcode")).unwrap();
+        std::fs::write(tmp.path().join(".atomcode").join("graph.bin"), b"x").unwrap();
+        // And the umbrella shape.
+        mk(tmp.path(), "a", &[".git"]);
+        mk(tmp.path(), "b", &[".git"]);
+        mk(tmp.path(), "c", &[".git"]);
+        assert!(
+            !should_index(tmp.path()),
+            ".atomcode dir must not rescue an umbrella from the guard"
+        );
     }
 
     #[test]

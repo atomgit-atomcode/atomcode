@@ -127,9 +127,9 @@ impl AgentLoop {
             } else {
                 let _ = self.event_tx.send(AgentEvent::TextDelta(
                     "[skipped code graph index: directory has no project marker \
-                     and looks like a parent of multiple projects. \
-                     `cd` into a specific project to enable symbol search, \
-                     or drop a `.atomcode` file here to force indexing.]\n"
+                     (.git / Cargo.toml / package.json / pyproject.toml / go.mod / \
+                     pom.xml / build.gradle) and looks like a parent of multiple \
+                     projects. `cd` into a specific project to enable symbol search.]\n"
                         .to_string(),
                 ));
             }
