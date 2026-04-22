@@ -155,11 +155,11 @@ impl TurnRunner {
         }
 
         // Log the request to <working_dir>/datalog/llm/<ts>.json right
-        // before send, paired with the `log_llm_response` call further
-        // down. Previously only AgentLoop logged the request, so any
-        // other caller (daemon) produced orphan responses — see
-        // `<wd>/datalog/llm/*_orphan_response.json`.
-        {
+        // before send. `pending_request_log` holds the path so the
+        // response call below can merge into the same file — passed
+        // explicitly to avoid the old process-wide-static approach that
+        // bled across concurrent daemon sessions.
+        let pending_request_log = {
             let wd = self.context.working_dir
                 .try_read().map(|g| g.clone()).unwrap_or_default();
             super::log::log_llm_request(
@@ -168,11 +168,11 @@ impl TurnRunner {
                 &tool_defs,
                 self.provider.model_name(),
                 context_window,
-                0, // step — set by caller if needed; currently always 0
-                   // in calls.log, so matching that.
+                0, // step — always 0 in calls.log today; step param
+                   // kept for future per-tool-call correlation.
                 self.config.datalog.enabled,
-            );
-        }
+            )
+        };
 
         // 3. Start streaming
         let stream_start = std::time::Instant::now();
@@ -396,6 +396,7 @@ _ = cancel.cancelled() => {
             .try_read().map(|g| g.clone()).unwrap_or_default();
         super::log::log_llm_response(
             &wd,
+            pending_request_log,
             &text_buf,
             &tool_calls_buf,
             self.provider.model_name(),
