@@ -5,6 +5,12 @@ use serde_json::json;
 
 use super::{ApprovalRequirement, Tool, ToolContext, ToolDef, ToolResult};
 
+/// Files with more lines than this return a skeleton (structure overview)
+/// instead of full content when read without offset/limit. GLM-5 gets lost
+/// in the middle at ~685 lines — 300 is the safe full-content ceiling.
+/// Shared with `agent::tool_dispatch` so its first-read heuristic stays aligned.
+pub(crate) const SKELETON_LINE_THRESHOLD: usize = 300;
+
 pub struct ReadFileTool;
 
 /// Deserialize a number that may arrive as a float string (weak models often send "50.0" instead of 50).
@@ -182,12 +188,13 @@ impl Tool for ReadFileTool {
         let lines: Vec<&str> = content.lines().collect();
         let total_lines = lines.len();
 
-        // ── Layer A: full content default, skeleton for large files (>300 lines) ──
-        // Skeleton is the FALLBACK, not the default. ≤300 lines return full content
-        // so the model can grep→old_string→edit in 2 steps. >300 lines return
-        // skeleton because GLM-5 gets lost in the middle at ~685 lines.
+        // ── Layer A: full content default, skeleton for large files ──
+        // Skeleton is the FALLBACK, not the default. Files at or below the
+        // threshold return full content so the model can grep→old_string→edit
+        // in 2 steps. Above the threshold we return a skeleton (GLM-5 gets
+        // lost in the middle at ~685 lines).
         // With offset/limit: always return exact content (model chose a range).
-        let auto_skeleton = total_lines > 300
+        let auto_skeleton = total_lines > SKELETON_LINE_THRESHOLD
             && parsed.offset.is_none()
             && parsed.limit.is_none();
 
@@ -195,7 +202,7 @@ impl Tool for ReadFileTool {
             let mut searcher = ctx.semantic.lock().await;
             let skeleton = if let Some(symbols) = searcher.list_symbols(path) {
                 let fname = path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
-                let mut skel = format!("[File skeleton: {} ({} lines). Use read_file with offset and limit to read specific sections.]\n\n",
+                let mut skel = format!("[File skeleton: {} ({} lines). Each symbol line ends with the exact offset/limit to read it — copy those into read_file, don't recompute.]\n\n",
                     fname, total_lines);
                 // Skeleton is fully driven by semantic layer's list_symbols().
                 // For Vue/Svelte, list_symbols already includes <template>/<style> sections
@@ -233,8 +240,9 @@ impl Tool for ReadFileTool {
                         sig.to_string()
                     };
 
+                    let body_len = s.end_line.saturating_sub(s.start_line) + 1;
                     if expand_candidates.iter().any(|c| c.start_line == s.start_line && c.name == s.name) {
-                        // Auto-expand: show full body
+                        // Auto-expand: show full body (no read-params needed — already visible)
                         skel.push_str(&format!("{:>4}| {}  (L{}-{}) [auto-expanded]\n",
                             s.start_line, sig_short, s.start_line, s.end_line));
                         let start = s.start_line.saturating_sub(1);
@@ -245,8 +253,9 @@ impl Tool for ReadFileTool {
                             }
                         }
                     } else {
-                        skel.push_str(&format!("{:>4}| {}  (L{}-{})\n",
-                            s.start_line, sig_short, s.start_line, s.end_line));
+                        skel.push_str(&format!("{:>4}| {}  (L{}-{}, read offset={} limit={})\n",
+                            s.start_line, sig_short, s.start_line, s.end_line,
+                            s.start_line, body_len));
                     }
                 }
                 skel
@@ -308,7 +317,10 @@ impl Tool for ReadFileTool {
                             .map(|l| l.trim())
                             .unwrap_or(&s.name);
                         let sig_short: String = sig.chars().take(70).collect();
-                        format!("{:>4}| {}  (L{}-{})", s.start_line, sig_short, s.start_line, s.end_line)
+                        let body_len = s.end_line.saturating_sub(s.start_line) + 1;
+                        format!("{:>4}| {}  (L{}-{}, read offset={} limit={})",
+                            s.start_line, sig_short, s.start_line, s.end_line,
+                            s.start_line, body_len)
                     })
                     .collect();
                 if !unseen.is_empty() {
@@ -568,5 +580,42 @@ mod tests {
         assert_eq!(shell_quote("abc"), "'abc'");
         assert_eq!(shell_quote("a'b"), r"'a'\''b'");
         assert_eq!(shell_quote("/tmp/file with spaces.doc"), "'/tmp/file with spaces.doc'");
+    }
+
+    /// Skeleton symbol lines carry ready-to-copy offset/limit values so the
+    /// model doesn't have to compute body length from the L{start}-{end} span.
+    #[tokio::test]
+    async fn skeleton_includes_read_offset_limit_hints() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("big.rs");
+
+        // Build >SKELETON_LINE_THRESHOLD lines of Rust with one recognizable
+        // fn that is long enough to survive the auto-expand filter (>50 body
+        // lines → stays collapsed → should get the read-params hint).
+        let mut content = String::new();
+        content.push_str("pub fn save_session(id: &str) -> Result<()> {\n");
+        for i in 0..80 {
+            content.push_str(&format!("    let _x{} = {};\n", i, i));
+        }
+        content.push_str("    Ok(())\n");
+        content.push_str("}\n");
+        for i in 0..(SKELETON_LINE_THRESHOLD + 20) {
+            content.push_str(&format!("// filler {}\n", i));
+        }
+        std::fs::write(&path, &content).unwrap();
+
+        let ctx = ToolContext::new(dir.path().to_path_buf());
+        let tool = ReadFileTool;
+        let args = format!(r#"{{"file_path":"{}"}}"#, path.display());
+
+        let r = tool.execute(&args, &ctx).await.unwrap();
+        assert!(r.success);
+        assert!(r.output.contains("[File skeleton:"), "expected skeleton output, got:\n{}", r.output);
+        // A collapsed symbol line must carry the pre-computed read params.
+        assert!(
+            r.output.contains("read offset=1 limit="),
+            "skeleton should expose offset=1 limit=<body_len> for save_session\nGot:\n{}",
+            r.output
+        );
     }
 }

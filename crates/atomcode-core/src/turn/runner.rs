@@ -810,23 +810,23 @@ _ = cancel.cancelled() => {
     ///
     /// Two patterns are caught:
     ///
-    /// 1. **Paginated re-reads of the same file** (`read_file` specific):
-    ///    5 unbroken `read_file` calls against the same basename — typically
-    ///    the model panicking on an unreadable file (Office binary, missing
-    ///    GBK decode, etc.) and cycling through offset/limit combinations.
-    ///    Reset by a successful `edit_file` / `write_file` targeting the
-    ///    same file (that counts as real progress).
+    /// 1. **Per-file read saturation** (`read_file` specific):
+    ///    5 unbroken `read_file` calls against the same basename — either the
+    ///    model is panicking on an unreadable file (Office binary, missing GBK
+    ///    decode, etc.) or legitimately paginating a large file. The block
+    ///    message steers toward grep/converter rather than assuming the model
+    ///    already has full content. Reset by a successful `edit_file` /
+    ///    `write_file` targeting the same file.
     ///
     /// 2. **Exact repeats** (any tool): 3 calls with identical `(tool_name,
     ///    args_hash)` and no intervening `edit_file` / `write_file`. Means
     ///    the model re-issued the same command without reacting to the
     ///    previous failure.
     ///
-    /// For `read_file`, only `file_path` is hashed so `offset`/`limit`
-    /// variations still count as "same call".
+    /// For `read_file`, the hash covers `(file_path, offset, limit)` so that
+    /// paginating through distinct regions of a large file does NOT count as
+    /// a loop — only literal re-reads do.
     fn detect_call_loop(&mut self, tool_name: &str, args: &str) -> Option<String> {
-        use std::hash::{Hash, Hasher};
-
         // --- Pattern 1: per-file read saturation ------------------------------
         if tool_name == "read_file" {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(args) {
@@ -839,12 +839,14 @@ _ = cancel.cancelled() => {
                     *count += 1;
                     if *count >= 5 {
                         return Some(format!(
-                            "BLOCKED: read_file '{}' was called {} times without an edit. \
-                             You already have everything this file can give you via read_file. \
-                             If it's unreadable (Office binary, PDF, encoding mismatch), stop \
-                             retrying and either use a bash converter (pandoc / pdftotext / \
-                             antiword / unzip for .docx) or tell the user the format isn't \
-                             supported. If you have enough content, act on it now.",
+                            "BLOCKED: read_file '{}' hit its {}-call cap for this turn. \
+                             If you're still hunting for something specific, switch to grep — \
+                             it finds exact lines without loading more pages. \
+                             If the file is unreadable (Office binary, PDF, encoding mismatch), \
+                             stop retrying and use a bash converter \
+                             (pandoc / pdftotext / antiword / unzip for .docx) \
+                             or tell the user the format isn't supported. \
+                             Do not call read_file on this path again in this turn.",
                             short, count
                         ));
                     }
@@ -868,25 +870,7 @@ _ = cancel.cancelled() => {
         }
 
         // --- Pattern 2: exact-repeat across any tool --------------------------
-        let args_hash = {
-            let mut h = std::collections::hash_map::DefaultHasher::new();
-            if tool_name == "read_file" {
-                // offset/limit variations are still "same file" for loop purposes.
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(args) {
-                    if let Some(fp) = v.get("file_path").and_then(|v| v.as_str()) {
-                        fp.hash(&mut h);
-                    } else {
-                        args.hash(&mut h);
-                    }
-                } else {
-                    args.hash(&mut h);
-                }
-            } else {
-                args.hash(&mut h);
-            }
-            h.finish()
-        };
-
+        let args_hash = loop_args_hash(tool_name, args);
         let sig = (tool_name.to_string(), args_hash);
 
         // Count repeats of this exact signature *since the last edit*. An edit
@@ -919,6 +903,36 @@ _ = cancel.cancelled() => {
         }
         None
     }
+}
+
+/// Hash a tool call for exact-repeat loop detection.
+///
+/// For `read_file` we hash `(file_path, offset, limit)` — paginating through
+/// different regions of the same large file must NOT collapse to one hash
+/// (that was the historical behavior and it tripped the 3-repeat guard on
+/// legitimate scans). Missing `offset` / `limit` normalize to 0 so the hash
+/// is stable whether the model omits the field or sends it as `null`.
+///
+/// For every other tool we hash the whole `args` string.
+fn loop_args_hash(tool_name: &str, args: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    if tool_name == "read_file" {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(args) {
+            if let Some(fp) = v.get("file_path").and_then(|v| v.as_str()) {
+                fp.hash(&mut h);
+                v.get("offset").and_then(|x| x.as_u64()).unwrap_or(0).hash(&mut h);
+                v.get("limit").and_then(|x| x.as_u64()).unwrap_or(0).hash(&mut h);
+                return h.finish();
+            }
+        }
+        // Malformed args or missing file_path — hash raw so identical bad
+        // calls still collapse and trip the loop detector.
+        args.hash(&mut h);
+    } else {
+        args.hash(&mut h);
+    }
+    h.finish()
 }
 
 /// Strip model-internal reasoning tags from streaming output.
@@ -1097,4 +1111,76 @@ fn merge_edit_calls(calls: &mut Vec<ToolCall>) -> Vec<String> {
     }
 
     removed_ids
+}
+
+#[cfg(test)]
+mod loop_hash_tests {
+    use super::loop_args_hash;
+
+    // Using a separate module name to avoid conflicting with the sibling
+    // `turn::tests` integration-style test module.
+
+    #[test]
+    fn read_file_hash_distinguishes_different_windows() {
+        // The core fix: hashing must make paginated reads appear as distinct
+        // calls, otherwise the 3-repeat guard fires on legitimate scans of a
+        // single large file. If this test fails, the model is about to be
+        // blocked after 3 offsets.
+        let a = loop_args_hash("read_file", r#"{"file_path":"/a.rs","offset":1,"limit":60}"#);
+        let b = loop_args_hash("read_file", r#"{"file_path":"/a.rs","offset":100,"limit":60}"#);
+        assert_ne!(a, b, "offsets 1 vs 100 must hash differently");
+
+        let c = loop_args_hash("read_file", r#"{"file_path":"/a.rs","offset":1,"limit":60}"#);
+        let d = loop_args_hash("read_file", r#"{"file_path":"/a.rs","offset":1,"limit":120}"#);
+        assert_ne!(c, d, "limit 60 vs 120 must hash differently");
+
+        let e = loop_args_hash("read_file", r#"{"file_path":"/a.rs","offset":1,"limit":60}"#);
+        let f = loop_args_hash("read_file", r#"{"file_path":"/a.rs","offset":1,"limit":60}"#);
+        assert_eq!(e, f, "identical args must hash identically");
+
+        let g = loop_args_hash("read_file", r#"{"file_path":"/a.rs","offset":1,"limit":60}"#);
+        let h = loop_args_hash("read_file", r#"{"file_path":"/b.rs","offset":1,"limit":60}"#);
+        assert_ne!(g, h, "different files must hash differently");
+    }
+
+    #[test]
+    fn missing_offset_and_limit_normalize_to_zero() {
+        // `{path}` and `{path, offset:0, limit:0}` must hash the same — otherwise
+        // the model can evade the loop guard just by toggling the field's presence.
+        let bare = loop_args_hash("read_file", r#"{"file_path":"/a.rs"}"#);
+        let zeros = loop_args_hash(
+            "read_file",
+            r#"{"file_path":"/a.rs","offset":0,"limit":0}"#,
+        );
+        assert_eq!(bare, zeros);
+    }
+
+    #[test]
+    fn other_tools_hash_full_args() {
+        // Non-read tools keep full-args hashing so changing any field (path,
+        // pattern, command) is correctly treated as a different call.
+        let a = loop_args_hash("grep", r#"{"pattern":"foo","path":"/x"}"#);
+        let b = loop_args_hash("grep", r#"{"pattern":"foo","path":"/y"}"#);
+        assert_ne!(a, b);
+
+        let s1 = loop_args_hash("bash", r#"{"command":"ls"}"#);
+        let s2 = loop_args_hash("bash", r#"{"command":"ls"}"#);
+        assert_eq!(s1, s2);
+    }
+
+    #[test]
+    fn malformed_read_args_fall_back_to_raw_hash() {
+        // If args aren't valid JSON or lack file_path, still produce a stable
+        // hash from the raw string so the loop detector at least collapses
+        // exact duplicate bad calls.
+        let a = loop_args_hash("read_file", "not json at all");
+        let b = loop_args_hash("read_file", "not json at all");
+        assert_eq!(a, b);
+
+        let c = loop_args_hash("read_file", r#"{"no_file_path":"oops"}"#);
+        let d = loop_args_hash("read_file", r#"{"no_file_path":"oops"}"#);
+        assert_eq!(c, d);
+
+        assert_ne!(a, c, "different malformed inputs still differ");
+    }
 }
