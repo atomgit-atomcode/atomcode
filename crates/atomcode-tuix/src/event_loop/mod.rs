@@ -13,7 +13,7 @@
 // Over time more subfiles should split out (agent_events, redraw helpers,
 // Buffer); modal overlays already live in `crate::modals`.
 
-mod commands;
+pub(crate) mod commands;
 use commands::execute_slash_command;
 
 use std::collections::VecDeque;
@@ -42,6 +42,11 @@ pub struct LoopCtx {
     pub agent: AgentHandle,
     pub working_dir: PathBuf,
     pub previous_dir: Option<PathBuf>,
+    /// Recently visited project directories, most recent first (max 5).
+    /// Persisted to `~/.atomcode/recent_dirs.txt`. Drives the `/cd`
+    /// picker when invoked with no argument and is updated whenever
+    /// the working directory changes (via slash command or agent tool).
+    pub recent_dirs: Vec<PathBuf>,
     pub history: History,
     pub input_rx: mpsc::UnboundedReceiver<InputEvent>,
     pub commands: CommandRegistry,
@@ -603,7 +608,14 @@ pub struct App {
     /// `call_rendered` flag prevents rendering the tool-call line
     /// twice when ApprovalNeeded fired first.
     pub pending_tools: std::collections::HashMap<String, (String, String, bool)>,
+    /// Timestamp of the first Ctrl+C press on an empty idle buffer.
+    /// Requires a second press within `CTRL_C_EXIT_WINDOW` to actually
+    /// exit — protects against accidental single-tap exits.
+    pub exit_pending: Option<std::time::Instant>,
 }
+
+/// How long the "press Ctrl+C again to exit" confirmation stays armed.
+const CTRL_C_EXIT_WINDOW: Duration = Duration::from_secs(2);
 
 impl App {
     fn new() -> Self {
@@ -615,6 +627,7 @@ impl App {
             message_queue: VecDeque::new(),
             think: ThinkStripper::new(),
             pending_tools: std::collections::HashMap::new(),
+            exit_pending: None,
         }
     }
 }
@@ -1157,6 +1170,12 @@ fn handle_idle_key(
         app.buf.text.len(),
         app.buf.cursor
     );
+    // Any key that's not the Ctrl+C-on-empty-buffer exit path resets the
+    // "press again to exit" arming — otherwise the prompt would stick around
+    // across arbitrary edits, defeating the point of a short time window.
+    if !matches!(result, BufferResult::Exit) {
+        app.exit_pending = None;
+    }
     match result {
         BufferResult::NoOp => {}
         BufferResult::Redraw => {
@@ -1202,7 +1221,23 @@ fn handle_idle_key(
             }
         }
         BufferResult::Exit => {
-            ctx.agent.cmd_tx.send(AgentCommand::Shutdown).ok();
+            // Two-press confirmation: first Ctrl+C on an empty buffer arms
+            // the exit; a second Ctrl+C within the window actually exits.
+            // Any other keystroke (handled above) resets the arming.
+            let now = std::time::Instant::now();
+            let armed = app
+                .exit_pending
+                .is_some_and(|t| now.duration_since(t) <= CTRL_C_EXIT_WINDOW);
+            if armed {
+                ctx.agent.cmd_tx.send(AgentCommand::Shutdown).ok();
+            } else {
+                app.exit_pending = Some(now);
+                renderer.render(UiLine::CommandOutput(
+                    "  (press Ctrl+C again to exit)\n".into(),
+                ));
+                renderer.flush();
+                redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+            }
         }
     }
     Ok(())
@@ -1670,7 +1705,8 @@ fn handle_agent_event(
             // footer is stuck on the old path until the user types `/cd` or
             // restarts the session.
             if ctx.working_dir != new_dir {
-                ctx.previous_dir = Some(std::mem::replace(&mut ctx.working_dir, new_dir));
+                ctx.previous_dir = Some(std::mem::replace(&mut ctx.working_dir, new_dir.clone()));
+                commands::push_recent_dir(&mut ctx.recent_dirs, new_dir);
             }
         }
         AgentEvent::ContextStats {

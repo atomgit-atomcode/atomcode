@@ -22,6 +22,11 @@ serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 dirs = "6"
 
+# setsid() for the detached upgrade-prep subprocess. Unix-only — Windows
+# uses DETACHED_PROCESS creation flags instead (see main.rs).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 # Windows-only: default HeapAlloc is 3-5x slower than Linux glibc for the
 # small-string/Line-clone heavy render loop. mimalloc cuts per-frame alloc
 # cost enough to make typing feel smooth again on Windows Terminal / ConHost.

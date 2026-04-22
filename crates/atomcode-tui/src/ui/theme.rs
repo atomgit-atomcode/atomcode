@@ -155,7 +155,8 @@ fn rgb_to_256(r: u8, g: u8, b: u8) -> u8 {
     let gray_approx = if r == g && g == b {
         r
     } else {
-        ((r as u16 * 299 + g as u16 * 587 + b as u16 * 114) / 1000) as u8
+        // Use u32 to avoid overflow: max value is 255*299 + 255*587 + 255*114 = 255,000
+        ((r as u32 * 299 + g as u32 * 587 + b as u32 * 114) / 1000) as u8
     };
     let gray_idx = if gray_approx < 4 {
         0usize

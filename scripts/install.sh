@@ -4,11 +4,11 @@
 #   curl -fsSL https://atomgit.com/atomgit_atomcode/atomcode/raw/main/install.sh | sh
 #
 # Env overrides:
-#   ATOMCODE_VERSION   release tag to install (default: v4.19.1)
+#   ATOMCODE_VERSION   release tag to install (default: v4.19.3)
 #   ATOMCODE_PREFIX    install dir (default: /usr/local/bin, falls back to ~/.local/bin)
 set -eu
 
-VERSION="${ATOMCODE_VERSION:-v4.19.1}"
+VERSION="${ATOMCODE_VERSION:-v4.19.3}"
 REPO_BASE="https://atomgit.com/atomgit_atomcode/atomcode/releases/download"
 
 # --- detect platform ---

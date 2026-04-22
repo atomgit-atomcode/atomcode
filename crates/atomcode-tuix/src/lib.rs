@@ -20,7 +20,13 @@ use anyhow::Result;
 use atomcode_core::agent::AgentHandle;
 use atomcode_core::config::Config;
 use atomcode_core::tool::ToolContext;
-use crossterm::{execute, event::{EnableBracketedPaste, DisableBracketedPaste}};
+use crossterm::{
+    execute,
+    event::{
+        DisableBracketedPaste, EnableBracketedPaste, KeyboardEnhancementFlags,
+        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    },
+};
 use std::io;
 use tokio::sync::mpsc;
 
@@ -36,6 +42,10 @@ use crate::terminal::TerminalCaps;
 struct TerminalGuard {
     raw_enabled: bool,
     paste_enabled: bool,
+    /// Set when the Kitty keyboard protocol (CSI u) was successfully
+    /// pushed. Guards the matching pop in Drop so we don't send a stray
+    /// pop sequence on terminals that rejected the push.
+    kbd_flags_pushed: bool,
 }
 
 impl TerminalGuard {
@@ -44,6 +54,7 @@ impl TerminalGuard {
         let mut g = Self {
             raw_enabled: false,
             paste_enabled: false,
+            kbd_flags_pushed: false,
         };
         if caps.raw_mode {
             crossterm::terminal::enable_raw_mode()?;
@@ -52,6 +63,24 @@ impl TerminalGuard {
         if caps.bracketed_paste {
             execute!(io::stdout(), EnableBracketedPaste)?;
             g.paste_enabled = true;
+        }
+        // Enable Kitty keyboard protocol (CSI u / progressive enhancement)
+        // so terminals that support it report modifier+Enter as a distinct
+        // key event instead of collapsing Shift+Enter to plain Enter. Without
+        // this, crossterm sees `Enter, NONE` on both Enter and Shift+Enter
+        // and the input box can't insert a newline.
+        //
+        // `execute!` is best-effort — terminals that don't support CSI u
+        // (notably Apple Terminal.app) ignore the sequence; we just don't
+        // set `kbd_flags_pushed` and Drop won't try to pop.
+        if caps.tty
+            && execute!(
+                io::stdout(),
+                PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+            )
+            .is_ok()
+        {
+            g.kbd_flags_pushed = true;
         }
         // FIXED-FOOTER via DECSTBM. Scroll region `[1, H - footer_rows]`
         // is set by `AnsiRenderer` the first time it paints the footer;
@@ -86,6 +115,9 @@ impl Drop for TerminalGuard {
         let mut out = stdout.lock();
         let _ = write!(out, "\x1b[?7h\x1b[r\r\n");
         let _ = out.flush();
+        if self.kbd_flags_pushed {
+            let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
+        }
         if self.paste_enabled {
             let _ = execute!(io::stdout(), DisableBracketedPaste);
         }
@@ -199,46 +231,20 @@ pub async fn run(
         });
     }
 
-    // Hourly deferred-upgrade poll. Runs alongside the one-shot version
-    // check above, but performs the full download + verify and writes
-    // `pending.json` so the next startup auto-applies. Only active when
-    // `config.auto_update` is true (default). Poll interval is
-    // intentionally long (1h) — more frequent polls just burn bandwidth
-    // for users who aren't going to restart more often than that anyway.
-    if config.auto_update {
-        let slot = update_hint.clone();
-        let wake = wake_tx.clone();
-        tokio::spawn(async move {
-            let current = format!("v{}", env!("CARGO_PKG_VERSION"));
-            // Small initial delay so the startup burst (manifest fetch,
-            // provider handshake, tool registration) doesn't compete for
-            // network with a background download that nobody's waiting on.
-            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-            loop {
-                // Dispose of UpgradeEvent messages silently — the
-                // hourly poll is background-only and has no UI surface
-                // for per-byte progress. `/upgrade` (manual, foreground)
-                // is the flow that renders events.
-                let (tx, mut rx) =
-                    tokio::sync::mpsc::unbounded_channel::<atomcode_core::self_update::UpgradeEvent>();
-                tokio::spawn(async move { while rx.recv().await.is_some() {} });
-
-                match atomcode_core::self_update::prepare_deferred_upgrade(&current, tx).await {
-                    Ok(Some(pending)) => {
-                        if let Ok(mut g) = slot.lock() {
-                            *g = Some(pending.version);
-                        }
-                        let _ = wake.try_send(());
-                    }
-                    Ok(None) | Err(_) => {
-                        // Already latest, or a transient network error.
-                        // Either way we just try again next hour.
-                    }
-                }
-                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
-            }
-        });
-    }
+    // NOTE: the in-process deferred-upgrade poll used to live here. It
+    // was moved out into a detached setsid'd subprocess spawned from
+    // `main.rs` (see `spawn_detached_upgrade_prep`). Rationale: the old
+    // task was tied to this tokio runtime, so any Ctrl+C / quick exit
+    // cancelled the download mid-flight and `pending.json` was never
+    // written — making "exit and restart to auto-upgrade" silently do
+    // nothing. The detached subprocess survives parent exits. Running
+    // both would race on `staged_path` (no temp-rename in
+    // `download_and_verify`), so the in-process copy is gone entirely.
+    //
+    // Trade-off: a session that runs through a whole release cycle
+    // (>1 h) won't re-stage the newer version mid-session. We accept
+    // that — `/upgrade` still works manually, and the update hint from
+    // the one-shot `version_check` above still surfaces the availability.
 
     // Long-lived progress channel for /upgrade. The sender is cloned
     // into each spawned upgrade task; the receiver stays in the event
@@ -247,12 +253,23 @@ pub async fn run(
     let (upgrade_tx, upgrade_rx) =
         tokio::sync::mpsc::unbounded_channel::<atomcode_core::self_update::UpgradeEvent>();
 
+    // Seed the recent-project-dirs ring from disk and guarantee the
+    // current working dir sits at index 0 so the `/cd` picker always
+    // has at least one entry (the dir the user just launched into).
+    let recent_dirs = {
+        let mut dirs = event_loop::commands::load_recent_dirs();
+        event_loop::commands::push_recent_dir(&mut dirs, working_dir.clone());
+        event_loop::commands::save_recent_dirs(&dirs);
+        dirs
+    };
+
     let ctx = LoopCtx {
         config,
         model_name,
         agent: agent_handle,
         working_dir,
         previous_dir: None,
+        recent_dirs,
         history,
         input_rx,
         commands: CommandRegistry::builtin(),

@@ -1632,7 +1632,9 @@ let session_manager = SessionManager::new(&working_dir);
     let (turn_tx, mut turn_rx) = mpsc::unbounded_channel::<TurnEvent>();
     
     // Check if session was stopped before we started
-    if stopped_sessions.read().await.contains(&req.session_id.clone().unwrap_or_default()) {
+    // If so, clear the stopped marker and return - allows next chat to proceed normally
+    let session_id_str = req.session_id.clone().unwrap_or_default();
+    if stopped_sessions.write().await.take(&session_id_str).is_some() {
         let _ = event_tx.send(ChatEvent::Stopped);
         let _ = event_tx.send(ChatEvent::Done { tokens: 0, tool_calls: 0 });
         return Ok(());
