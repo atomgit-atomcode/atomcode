@@ -91,6 +91,25 @@ pub(crate) fn should_inject_reflection(
     }
 }
 
+/// Render the cadence-reflection prompt injected every `cadence` tool
+/// calls. Language- and ecosystem-neutral by design — the three questions
+/// apply to any task and any tool. Phrased as a scheduled checkpoint (not
+/// a corrective intervention) because this fires every N steps regardless
+/// of whether the agent appears stuck; calling it an error would frame
+/// normal operation as failure.
+pub(crate) fn reflection_prompt(delta: usize) -> String {
+    format!(
+        "[Checkpoint — not an interruption, just a scheduled recalibration.]\n\
+         You have made {} tool calls since the last checkpoint. \
+         Before your next tool call, answer in plain text:\n\
+         1. Restate the original task in one sentence.\n\
+         2. What have the last {} steps proven or ruled out?\n\
+         3. What is the next concrete output (an edit, an answer, a summary), \
+         and roughly how many steps away?\n",
+        delta, delta
+    )
+}
+
 #[cfg(test)]
 mod reflection_tests {
     use super::should_inject_reflection;
@@ -135,5 +154,45 @@ mod reflection_tests {
         // happen, but usize subtraction would underflow), saturate to 0
         // and do not fire.
         assert_eq!(should_inject_reflection(5, 10, 10), None);
+    }
+
+    use super::reflection_prompt;
+
+    #[test]
+    fn reflection_prompt_is_language_neutral_and_mentions_delta() {
+        let msg = reflection_prompt(12);
+
+        // The delta must appear so the model sees the scale of the gap.
+        assert!(msg.contains("12"), "prompt must include delta count, got: {}", msg);
+
+        // Must NOT pretend this is an error — it's a scheduled recalibration.
+        assert!(
+            !msg.to_lowercase().contains("error"),
+            "prompt must not frame as error, got: {}", msg
+        );
+        assert!(
+            !msg.to_lowercase().contains("blocked"),
+            "prompt must not look like a BLOCKED guard, got: {}", msg
+        );
+
+        // Must ask the three canonical language-neutral questions.
+        assert!(
+            msg.contains("original task") || msg.contains("restate"),
+            "prompt must ask to restate the task, got: {}", msg
+        );
+        assert!(
+            msg.contains("ruled out") || msg.contains("learned") || msg.contains("proven"),
+            "prompt must ask what was learned/ruled out, got: {}", msg
+        );
+        assert!(
+            msg.contains("next") && (msg.contains("concrete") || msg.contains("output")),
+            "prompt must ask for the next concrete output, got: {}", msg
+        );
+
+        // Must NOT embed language-/tool-specific hints (the whole point
+        // is the reflection being framework-level and generic).
+        assert!(!msg.to_lowercase().contains("cargo"));
+        assert!(!msg.to_lowercase().contains("grep"));
+        assert!(!msg.to_lowercase().contains("npm"));
     }
 }
