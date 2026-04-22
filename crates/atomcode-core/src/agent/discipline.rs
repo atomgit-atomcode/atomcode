@@ -107,12 +107,16 @@ pub(crate) fn should_inject_reflection(
 }
 
 /// Render the cadence-reflection prompt injected every `cadence` tool
-/// calls. Delivered as a user-message for delivery reasons (atomcode's
-/// conversation layer only exposes that channel today) but its wording
-/// explicitly flags itself as system meta, and phrases the three
-/// questions as gentle suggestions instead of commands — otherwise the
-/// prompt reads like the human user suddenly speaking in a different
-/// register, which confuses both the reader (UI) and the model.
+/// calls. Delivered as a user-message for plumbing reasons (atomcode's
+/// conversation layer only exposes that channel today), but the first
+/// line explicitly flags the text as system meta so the UI and model
+/// can tell it apart from a real operator turn.
+///
+/// Dogfooding note: an earlier draft used a purely suggestive voice
+/// ("it helps to ...") which read more naturally but empirically let
+/// the model skip the reflection altogether on GLM-5.1. The imperative
+/// form below keeps response rate high; the system-meta tag carries the
+/// "not a user turn" signal instead of softening the verbs.
 ///
 /// Language- and ecosystem-neutral by design. Phrased as a scheduled
 /// checkpoint (not a corrective intervention); this fires every N steps
@@ -121,11 +125,11 @@ pub(crate) fn reflection_prompt(delta: usize) -> String {
     format!(
         "[System meta · not a user message]\n\
          {} tool calls elapsed since the last self-check. \
-         Before the next tool call, it helps to:\n\
-         - restate the original goal in one sentence,\n\
-         - note what those steps proved or ruled out,\n\
-         - name the next concrete output and how close it is.\n",
-        delta
+         Before the next tool call, answer:\n\
+         1. Restate the original goal in one sentence.\n\
+         2. What did those {} steps prove or rule out?\n\
+         3. What is the next concrete output, and how close is it?\n",
+        delta, delta
     )
 }
 
@@ -200,7 +204,9 @@ mod reflection_tests {
             "prompt must ask to restate the task/goal, got: {}", msg
         );
         assert!(
-            msg.contains("ruled out") || msg.contains("learned") || msg.contains("proven") || msg.contains("proved"),
+            msg.contains("rule out") || msg.contains("ruled out")
+                || msg.contains("prove") || msg.contains("proved") || msg.contains("proven")
+                || msg.contains("learned"),
             "prompt must ask what was learned/ruled out, got: {}", msg
         );
         assert!(
@@ -231,19 +237,21 @@ mod reflection_tests {
     }
 
     #[test]
-    fn reflection_prompt_uses_suggestion_voice_not_command_voice() {
-        // The earlier version opened with "answer in plain text:" and
-        // numbered imperatives — that reads like the user barking orders
-        // at the agent and produces a jarring context shift. The new
-        // voice is suggestive ("it helps to ...") rather than commanding.
+    fn reflection_prompt_avoids_verbose_command_phrasing() {
+        // Short imperatives ("Before the next tool call, answer:") are
+        // fine and actually necessary — dogfooding on GLM-5.1 showed a
+        // purely suggestive voice lets the model skip the reflection.
+        // What we forbid is the *verbose* original phrasing that both
+        // padded the prompt and made it read like a user barking a
+        // multi-clause order.
         let msg = reflection_prompt(5).to_lowercase();
         assert!(
             !msg.contains("answer in plain text"),
-            "prompt must not use direct-command phrasing, got: {}", msg
+            "prompt must not repeat the verbose original phrasing, got: {}", msg
         );
         assert!(
             !msg.contains("answer these"),
-            "prompt must not use direct-command phrasing, got: {}", msg
+            "prompt must not repeat the verbose original phrasing, got: {}", msg
         );
     }
 }
