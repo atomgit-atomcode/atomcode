@@ -317,6 +317,31 @@ pub fn build_messages(
         }
     }
 
+    // ── FINAL BYTE CEILING (last-line-of-defense) ──
+    // microcompact protects the last 20 messages; the 80% drop cap at
+    // line ~181 skips entirely when `cold_summaries` is populated
+    // (legacy protection against a since-fixed pathology). That
+    // leaves the recent window with no byte enforcement, so accumulated
+    // mid-sized ToolResults can still blow the budget. Single
+    // oldest-first forward pass: condense each ToolResult once only
+    // (idempotent `condensed()` would otherwise spin), stop as soon
+    // as the total fits under 80% of budget. The last 4 messages
+    // (current turn's work) and Text / AssistantWithToolCalls are
+    // never touched.
+    let token_ceiling = token_budget.saturating_mul(80) / 100;
+    let keep_tail = 4.min(result.len());
+    let shrinkable_end = result.len().saturating_sub(keep_tail);
+    for i in 1..shrinkable_end {
+        let total: usize = result.iter().map(|m| m.estimate_tokens()).sum();
+        if total <= token_ceiling { break; }
+        if !matches!(result[i].content, MessageContent::ToolResult(_)) { continue; }
+        let before = result[i].estimate_tokens();
+        let condensed = result[i].condensed();
+        if condensed.estimate_tokens() < before {
+            result[i] = condensed;
+        }
+    }
+
     // Turn reminder: prepend to last User message. Runs AFTER all
     // compaction/cleanup so the reminder always rides the most recent
     // user turn. Keeps system_prompt itself stable (cacheable).
@@ -1222,6 +1247,60 @@ mod tests {
         let (msgs, stats) = build_messages(&conv, "sys", 2000, "");
         assert!(stats.dropped_tokens > 0, "Should drop turns when over budget");
         assert!(matches!(msgs[0].role, Role::System));
+    }
+
+
+    /// Bug b regression: after compression has run once, `cold_summaries`
+    /// is non-empty, which disables the 80% drop cap above (legacy
+    /// pathology guard). Microcompact still skips the last
+    /// `OTHER_KEEP=20` messages. That leaves the recent window with no
+    /// byte enforcement, so many mid-sized ToolResults can blow budget.
+    /// The final post-cleanup byte ceiling must condense oldest
+    /// ToolResults in `result` until total estimated tokens fit under
+    /// 80% of the budget.
+    #[test]
+    fn test_final_byte_ceiling_condenses_oversized_recent_toolresults() {
+        use crate::tool::{ToolCall, ToolResult};
+        let mut conv = Conversation::new();
+        // Mark that a prior compression already ran — cold_summaries
+        // non-empty is the precondition that disables the earlier cap.
+        conv.cold_summaries.push("earlier task summary".to_string());
+
+        // 20 turns, each with a 6K-char bash result. microcompact's
+        // OTHER_KEEP=20 leaves the trailing 20 messages (≈ last 6-7 turns)
+        // untouched — those alone sum to > 36K chars ≈ 9K+ est tokens,
+        // which exceeds the 80% ceiling of the chosen budget.
+        for turn in 0..20 {
+            conv.add_user_message(&format!("task {}", turn));
+            conv.add_assistant_tool_calls(Some("ok"), vec![ToolCall {
+                id: format!("c{}", turn),
+                name: "bash".to_string(),
+                arguments: "{}".to_string(),
+            }]);
+            conv.add_tool_result(ToolResult {
+                call_id: format!("c{}", turn),
+                output: "x".repeat(6000),
+                success: true,
+            });
+        }
+
+        // token_budget = 10K tokens → ceiling = 8K tokens.
+        let (msgs, _stats) = build_messages(&conv, "sys", 10_000, "");
+        let total_tokens: usize = msgs.iter().map(|m| m.estimate_tokens()).sum();
+        assert!(
+            total_tokens <= 8_000,
+            "Total estimated tokens {} exceeded 80% ceiling 8000 — \
+             final byte ceiling did not run",
+            total_tokens,
+        );
+        // The newest turn's tool result must survive in full (not condensed).
+        let newest_still_full = msgs.iter().any(|m| {
+            m.text().map_or(false, |t| t.contains(&"x".repeat(100)))
+        });
+        assert!(
+            newest_still_full,
+            "Newest turn's full-size tool result must be preserved",
+        );
     }
 
 
