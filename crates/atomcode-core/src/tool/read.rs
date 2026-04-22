@@ -118,16 +118,28 @@ impl Tool for ReadFileTool {
 
         // If file doesn't exist, auto-find similar filenames and suggest.
         // Saves 2-3 turns of path guessing (7% of sessions hit this).
+        //
+        // 2026-04-22: collect up to 20 candidates then rank by path-prefix
+        // similarity to what the agent asked for, show top 5. Without the
+        // prefix ranking, a random match in an unrelated subtree (e.g. the
+        // first `index.html` the walk hit) could outrank the correct one in
+        // the requested project — agent ignored the suggestion and started
+        // manual `ls` (see 426-atom 2026-04-21 session).
         if !path.exists() {
             let filename = path.file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_default();
             if !filename.is_empty() {
                 let wd = ctx.working_dir.read().await;
-                // Quick find: walk up to 5 levels deep for matching filename
                 let mut matches: Vec<String> = Vec::new();
-                fn find_file(dir: &std::path::Path, target: &str, depth: usize, max_depth: usize, results: &mut Vec<String>) {
-                    if depth > max_depth || results.len() >= 5 { return; }
+                fn find_file(
+                    dir: &std::path::Path,
+                    target: &str,
+                    depth: usize,
+                    max_depth: usize,
+                    results: &mut Vec<String>,
+                ) {
+                    if depth > max_depth || results.len() >= 20 { return; }
                     if let Ok(entries) = std::fs::read_dir(dir) {
                         for entry in entries.flatten() {
                             let name = entry.file_name().to_string_lossy().to_string();
@@ -143,12 +155,17 @@ impl Tool for ReadFileTool {
                 }
                 find_file(&wd, &filename, 0, 7, &mut matches);
                 if !matches.is_empty() {
+                    // Rank by shared-path-prefix length with the requested path.
+                    // The correct match almost always shares the most segments
+                    // with what the agent asked for.
+                    matches.sort_by_key(|m| std::cmp::Reverse(super::shared_prefix_len(&parsed.file_path, m)));
+                    let shown: Vec<String> = matches.iter().take(5).map(|m| format!("  {}", m)).collect();
                     return Ok(ToolResult {
                         call_id: String::new(),
                         output: format!(
                             "Error: No such file: {}\n\nDid you mean:\n{}",
                             parsed.file_path,
-                            matches.iter().map(|m| format!("  {}", m)).collect::<Vec<_>>().join("\n")
+                            shown.join("\n")
                         ),
                         success: false,
                     });
@@ -568,5 +585,43 @@ mod tests {
         assert_eq!(shell_quote("abc"), "'abc'");
         assert_eq!(shell_quote("a'b"), r"'a'\''b'");
         assert_eq!(shell_quote("/tmp/file with spaces.doc"), "'/tmp/file with spaces.doc'");
+    }
+
+    /// P0 #4: when a 404 recovery has multiple candidates, the one sharing
+    /// the most path prefix with the requested path must come first.
+    /// Regression for 426-atom 2026-04-21 session where agent asked for
+    /// `/proj/A/index.html` and a wrong-project `index.html` outranked the
+    /// correct one.
+    #[tokio::test]
+    async fn read_404_ranks_by_shared_path_prefix() {
+        let dir = TempDir::new().unwrap();
+        // Two projects with a same-named file. The one sharing more of the
+        // requested path must be listed first.
+        std::fs::create_dir_all(dir.path().join("proj-wanted").join("presentation")).unwrap();
+        std::fs::create_dir_all(dir.path().join("proj-other")).unwrap();
+        std::fs::write(
+            dir.path().join("proj-wanted/presentation/index.html"),
+            "<html></html>",
+        ).unwrap();
+        std::fs::write(dir.path().join("proj-other/index.html"), "<html></html>").unwrap();
+
+        let ctx = ToolContext::new(dir.path().to_path_buf());
+        let tool = ReadFileTool;
+        // Ask for a wrong path in proj-wanted — 404, both candidates found.
+        let asked = dir.path().join("proj-wanted/index.html");
+        let args = format!(r#"{{"file_path":"{}"}}"#, asked.display());
+
+        let r = tool.execute(&args, &ctx).await.unwrap();
+        assert!(!r.success);
+        assert!(r.output.contains("Did you mean"));
+        // The correct candidate (inside proj-wanted/) must appear before the
+        // cross-project noise (inside proj-other/).
+        let wanted_pos = r.output.find("proj-wanted/presentation/index.html").unwrap();
+        let other_pos = r.output.find("proj-other/index.html").unwrap();
+        assert!(
+            wanted_pos < other_pos,
+            "proj-wanted match must rank above proj-other. output:\n{}",
+            r.output
+        );
     }
 }
