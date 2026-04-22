@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -47,14 +47,33 @@ impl Tool for FileDependenciesTool {
         ApprovalRequirement::AutoApprove
     }
 
+    fn approval_with_context(&self, args: &str, ctx: &ToolContext) -> ApprovalRequirement {
+        let parsed = match serde_json::from_str::<FileDepsArgs>(args) {
+            Ok(parsed) => parsed,
+            Err(_) => return self.approval(args),
+        };
+        let working_dir = match ctx.working_dir.try_read() {
+            Ok(wd) => wd.clone(),
+            Err(_) => return self.approval(args),
+        };
+        match super::approval_for_path(&parsed.file, &working_dir, super::ExternalPathAction::Enumerate) {
+            Ok(approval) => approval,
+            Err(_) => self.approval(args),
+        }
+    }
+
     async fn execute(&self, args: &str, ctx: &ToolContext) -> Result<ToolResult> {
         let parsed: FileDepsArgs = serde_json::from_str(args)?;
         let wd = ctx.working_dir.read().await.clone();
-
-        let file_path = if Path::new(&parsed.file).is_absolute() {
-            PathBuf::from(&parsed.file)
-        } else {
-            wd.join(&parsed.file)
+        let file_path = match super::inspect_path_access(&parsed.file, &wd) {
+            Ok(access) => access.path,
+            Err(err) => {
+                return Ok(ToolResult {
+                    call_id: String::new(),
+                    output: err.to_string(),
+                    success: false,
+                });
+            }
         };
 
         let graph = ctx.graph.read().await;

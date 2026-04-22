@@ -93,10 +93,6 @@ impl Tool for WriteFileTool {
 
     fn approval_with_context(&self, args: &str, ctx: &ToolContext) -> ApprovalRequirement {
         let base = self.approval(args);
-        if matches!(base, ApprovalRequirement::RequireApproval(_)) {
-            return base;
-        }
-
         let parsed = match serde_json::from_str::<WriteFileArgs>(args) {
             Ok(parsed) => parsed,
             Err(_) => return base,
@@ -105,15 +101,13 @@ impl Tool for WriteFileTool {
             Ok(wd) => wd.clone(),
             Err(_) => return base,
         };
-        match super::inspect_path_access(&parsed.file_path, &working_dir) {
-            Ok(access) if !access.within_workspace => ApprovalRequirement::RequireApproval(
-                format!(
-                    "Writing file outside working directory: {} (working dir: {})",
-                    parsed.file_path,
-                    access.workspace_root.display()
-                ),
-            ),
-            Ok(_) => base,
+        match super::approval_for_path(&parsed.file_path, &working_dir, super::ExternalPathAction::Write) {
+            Ok(ApprovalRequirement::RequireApprovalAlways(reason)) => ApprovalRequirement::RequireApprovalAlways(reason),
+            Ok(ApprovalRequirement::RequireApproval(reason)) => ApprovalRequirement::RequireApproval(reason),
+            Ok(ApprovalRequirement::AutoApprove) => match base {
+                ApprovalRequirement::RequireApproval(reason) => ApprovalRequirement::RequireApprovalAlways(reason),
+                other => other,
+            },
             Err(_) => base,
         }
     }

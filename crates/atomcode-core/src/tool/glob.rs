@@ -45,13 +45,38 @@ impl Tool for GlobTool {
         ApprovalRequirement::AutoApprove
     }
 
+    fn approval_with_context(&self, args: &str, ctx: &ToolContext) -> ApprovalRequirement {
+        let parsed = match serde_json::from_str::<GlobArgs>(args) {
+            Ok(parsed) => parsed,
+            Err(_) => return self.approval(args),
+        };
+        let working_dir = match ctx.working_dir.try_read() {
+            Ok(wd) => wd.clone(),
+            Err(_) => return self.approval(args),
+        };
+        let base_dir = match super::inspect_path_access(parsed.path.as_deref().unwrap_or("."), &working_dir) {
+            Ok(access) => access.path.to_string_lossy().to_string(),
+            Err(_) => return self.approval(args),
+        };
+        let search_dir = derive_search_dir(&base_dir, &parsed.pattern);
+        match super::approval_for_path(&search_dir, &working_dir, super::ExternalPathAction::Enumerate) {
+            Ok(approval) => approval,
+            Err(_) => self.approval(args),
+        }
+    }
+
     async fn execute(&self, args: &str, ctx: &ToolContext) -> Result<ToolResult> {
         let parsed: GlobArgs = serde_json::from_str(args)?;
         let wd = ctx.working_dir.read().await.clone();
-        let base_dir = match &parsed.path {
-            Some(p) if std::path::Path::new(p).is_absolute() => p.clone(),
-            Some(p) => wd.join(p).to_string_lossy().to_string(),
-            None => wd.to_string_lossy().to_string(),
+        let base_dir = match super::inspect_path_access(parsed.path.as_deref().unwrap_or("."), &wd) {
+            Ok(access) => access.path.to_string_lossy().to_string(),
+            Err(err) => {
+                return Ok(ToolResult {
+                    call_id: String::new(),
+                    output: err.to_string(),
+                    success: false,
+                });
+            }
         };
 
         // Parse pattern: split into (search_dir, name_pattern).
@@ -62,51 +87,8 @@ impl Tool for GlobTool {
         //   "/absolute/path/**/*Auth*.java"      → (/absolute/path, "*Auth*.java")
         //   "*.vue"                              → (base_dir, "*.vue")
         //   "**/config.ts"                       → (base_dir, "config.ts")
-        let (search_dir, name_pattern) = {
-            let p = &parsed.pattern;
-
-            // Split at the FIRST occurrence of "**/" — everything before is directory,
-            // everything after (minus further path segments) is the name pattern.
-            if let Some(star_pos) = p.find("**/") {
-                let dir_part = &p[..star_pos];
-                let after_stars = &p[star_pos + 3..]; // skip "**/"
-
-                // after_stars might be "*.java" or "sub/*.java" — take the last segment as name
-                let name_part = after_stars.rsplit('/').next().unwrap_or(after_stars);
-
-                // Build search directory: dir_part might be absolute, relative, or empty
-                let dir = if dir_part.is_empty() {
-                    base_dir.clone()
-                } else {
-                    let trimmed = dir_part.trim_end_matches('/');
-                    if std::path::Path::new(trimmed).is_absolute() {
-                        trimmed.to_string()
-                    } else {
-                        std::path::Path::new(&base_dir)
-                            .join(trimmed)
-                            .to_string_lossy()
-                            .to_string()
-                    }
-                };
-                (dir, name_part.to_string())
-            } else if let Some(last_slash) = p.rfind('/') {
-                // No "**/" but has directory: "src/components/*.vue"
-                let dir_part = &p[..last_slash];
-                let name_part = &p[last_slash + 1..];
-                let dir = if std::path::Path::new(dir_part).is_absolute() {
-                    dir_part.to_string()
-                } else {
-                    std::path::Path::new(&base_dir)
-                        .join(dir_part)
-                        .to_string_lossy()
-                        .to_string()
-                };
-                (dir, name_part.to_string())
-            } else {
-                // Bare pattern: "*.vue" or "config.ts"
-                (base_dir.clone(), p.clone())
-            }
-        };
+        let search_dir = derive_search_dir(&base_dir, &parsed.pattern);
+        let name_pattern = derive_name_pattern(&parsed.pattern);
 
         // Verify search directory exists.
         if !std::path::Path::new(&search_dir).is_dir() {
@@ -160,5 +142,38 @@ impl Tool for GlobTool {
             output: result,
             success: true,
         })
+    }
+}
+
+fn derive_search_dir(base_dir: &str, pattern: &str) -> String {
+    if let Some(star_pos) = pattern.find("**/") {
+        let dir_part = pattern[..star_pos].trim_end_matches('/');
+        if dir_part.is_empty() {
+            base_dir.to_string()
+        } else if std::path::Path::new(dir_part).is_absolute() {
+            dir_part.to_string()
+        } else {
+            std::path::Path::new(base_dir).join(dir_part).to_string_lossy().to_string()
+        }
+    } else if let Some(last_slash) = pattern.rfind('/') {
+        let dir_part = &pattern[..last_slash];
+        if std::path::Path::new(dir_part).is_absolute() {
+            dir_part.to_string()
+        } else {
+            std::path::Path::new(base_dir).join(dir_part).to_string_lossy().to_string()
+        }
+    } else {
+        base_dir.to_string()
+    }
+}
+
+fn derive_name_pattern(pattern: &str) -> String {
+    if let Some(star_pos) = pattern.find("**/") {
+        let after_stars = &pattern[star_pos + 3..];
+        after_stars.rsplit('/').next().unwrap_or(after_stars).to_string()
+    } else if let Some(last_slash) = pattern.rfind('/') {
+        pattern[last_slash + 1..].to_string()
+    } else {
+        pattern.to_string()
     }
 }

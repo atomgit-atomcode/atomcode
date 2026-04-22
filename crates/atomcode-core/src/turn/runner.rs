@@ -719,7 +719,9 @@ _ = cancel.cancelled() => {
         // AutoApprove tools execute immediately; RequireApproval tools go through
         // the decider which handles interactive prompts or automatic policy.
         let approval = tool.approval_with_context(&call.arguments, &self.context);
-        if let crate::tool::ApprovalRequirement::RequireApproval(ref reason) = approval {
+        if let crate::tool::ApprovalRequirement::RequireApproval(ref reason)
+            | crate::tool::ApprovalRequirement::RequireApprovalAlways(ref reason) = approval
+        {
             let decision = self.permission.decide(call, reason).await;
             if !matches!(decision, PermissionDecision::Allow) {
                 let output = format!("Tool '{}' was denied by the user.", call.name);

@@ -234,15 +234,8 @@ impl Tool for EditFileTool {
             Ok(wd) => wd.clone(),
             Err(_) => return self.approval(args),
         };
-        match super::inspect_path_access(&parsed.file_path, &working_dir) {
-            Ok(access) if !access.within_workspace => ApprovalRequirement::RequireApproval(
-                format!(
-                    "Editing file outside working directory: {} (working dir: {})",
-                    parsed.file_path,
-                    access.workspace_root.display()
-                ),
-            ),
-            Ok(_) => self.approval(args),
+        match super::approval_for_path(&parsed.file_path, &working_dir, super::ExternalPathAction::Write) {
+            Ok(approval) => approval,
             Err(_) => self.approval(args),
         }
     }
