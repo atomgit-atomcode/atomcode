@@ -57,15 +57,14 @@ impl GraphIndexer {
     /// 4. Parse dirty files, extract symbols and calls
     /// 5. Resolve calls to edges
     pub async fn index_all(&mut self) {
-        // Refuse to index obvious non-projects. Walking $HOME (or /) pulls
-        // in Library/, Downloads/, Documents/ trees with hundreds of
-        // thousands of paths — the sync walk then pegs a tokio worker
-        // thread for seconds, starving the TUI event loop (the 5 ms
-        // deferred-render-tick stops firing, so typed characters don't
-        // show up until something else wakes the runtime). If someone
-        // really does keep code at $HOME, they can drop a `.git` in there
-        // and it'll be treated as a project again (see `looks_like_project`).
-        if is_home_or_root(&self.project_dir) && !looks_like_project(&self.project_dir) {
+        // Refuse to index obvious non-projects. See `should_index`:
+        // guards against $HOME / `/` and "umbrella" directories whose
+        // children are themselves projects (e.g. `~/project` that
+        // contains dozens of repos). Without the umbrella guard a
+        // single `/cd ~/project` spawns a full tree-sitter parse of
+        // every indexed file across every child repo — pegs CPU and
+        // starves the TUI event loop.
+        if !should_index(&self.project_dir) {
             return;
         }
 
@@ -419,6 +418,33 @@ fn classify_symbol_kind(ts_kind: &str) -> SymbolKind {
 
 /// True when `path` is the user's HOME directory or the filesystem root.
 /// Either one hosts a massive tree the indexer should never walk in full.
+/// Policy: should the indexer walk this directory?
+///
+/// Used both internally (`index_all` top guard) and externally by
+/// `agent/services.rs` to decide whether to even spawn the indexer
+/// task after a `/cd`. Returns `false` for:
+///
+/// - `$HOME` or `/` — walking pulls in Library / Downloads / Documents
+///   trees with hundreds of thousands of paths.
+/// - "Umbrella" dirs — the target itself has no project marker but
+///   three or more of its immediate child dirs are projects (e.g.
+///   `~/project` with 30+ repos inside). Indexing walks every child.
+///
+/// The escape hatch is [`looks_like_project`]: drop a `.atomcode`
+/// (or any other marker) at the root and indexing kicks in.
+pub fn should_index(project_dir: &Path) -> bool {
+    if looks_like_project(project_dir) {
+        return true;
+    }
+    if is_home_or_root(project_dir) {
+        return false;
+    }
+    if is_umbrella_dir(project_dir) {
+        return false;
+    }
+    true
+}
+
 fn is_home_or_root(path: &Path) -> bool {
     if path == Path::new("/") {
         return true;
@@ -426,6 +452,30 @@ fn is_home_or_root(path: &Path) -> bool {
     if let Some(home) = dirs::home_dir() {
         if path == home.as_path() {
             return true;
+        }
+    }
+    false
+}
+
+/// Detect an "umbrella" directory: the target itself has no project
+/// marker, but 3+ of its immediate child directories are projects.
+/// Covers the common `~/project/` or `~/code/` layout where the user
+/// keeps many repos side-by-side. Indexing such a dir walks every
+/// child — full tree-sitter parse across dozens of repos, minutes of
+/// CPU, starved TUI event loop.
+///
+/// Scan is capped at 200 immediate entries so the guard itself stays
+/// cheap. Returns on the third match.
+fn is_umbrella_dir(dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else { return false; };
+    let mut project_children = 0;
+    for entry in entries.flatten().take(200) {
+        let p = entry.path();
+        if p.is_dir() && looks_like_project(&p) {
+            project_children += 1;
+            if project_children >= 3 {
+                return true;
+            }
         }
     }
     false
@@ -496,4 +546,61 @@ fn collect_files_sync(project_dir: &Path) -> Vec<(PathBuf, u64)> {
     }
 
     files
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mk(parent: &Path, name: &str, markers: &[&str]) {
+        let p = parent.join(name);
+        std::fs::create_dir_all(&p).unwrap();
+        for m in markers {
+            std::fs::write(p.join(m), "").unwrap();
+        }
+    }
+
+    #[test]
+    fn should_index_accepts_marked_project() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("Cargo.toml"), "[package]").unwrap();
+        assert!(should_index(tmp.path()));
+    }
+
+    #[test]
+    fn should_index_refuses_umbrella_dir_with_many_child_projects() {
+        // Layout: umbrella/{a,b,c,d}/ each with .git — no marker at umbrella root.
+        let tmp = tempfile::TempDir::new().unwrap();
+        mk(tmp.path(), "a", &[".git"]);
+        mk(tmp.path(), "b", &[".git"]);
+        mk(tmp.path(), "c", &["package.json"]);
+        mk(tmp.path(), "d", &["Cargo.toml"]);
+        assert!(!should_index(tmp.path()),
+            "umbrella of 4 projects without own marker must be skipped");
+    }
+
+    #[test]
+    fn should_index_accepts_umbrella_if_marked() {
+        // Same layout as above but with a `.atomcode` file at root —
+        // explicit opt-in, the escape hatch.
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join(".atomcode"), "").unwrap();
+        mk(tmp.path(), "a", &[".git"]);
+        mk(tmp.path(), "b", &[".git"]);
+        mk(tmp.path(), "c", &[".git"]);
+        assert!(should_index(tmp.path()),
+            ".atomcode marker must override umbrella detection");
+    }
+
+    #[test]
+    fn should_index_accepts_dir_with_fewer_than_3_child_projects() {
+        // Two child projects doesn't qualify as umbrella — could be a
+        // monorepo with a couple of sub-packages.
+        let tmp = tempfile::TempDir::new().unwrap();
+        mk(tmp.path(), "a", &[".git"]);
+        mk(tmp.path(), "b", &[".git"]);
+        mk(tmp.path(), "other", &[]); // not a project
+        assert!(should_index(tmp.path()),
+            "2 child projects < umbrella threshold");
+    }
 }

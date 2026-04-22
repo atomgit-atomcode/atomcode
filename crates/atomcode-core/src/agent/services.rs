@@ -97,21 +97,37 @@ impl AgentLoop {
                 let mut g = self.turn_runner.context.graph.write().await;
                 *g = new_graph;
             }
-            // Spawn new indexer for the new project
-            let graph_clone = self.turn_runner.context.graph.clone();
-            let wd_for_indexer = resolved.clone();
-            tokio::spawn(async move {
-                let mut indexer = crate::graph::indexer::GraphIndexer::new(
-                    graph_clone.clone(),
-                    wd_for_indexer.clone(),
-                );
-                indexer.index_all().await;
-                let gp = wd_for_indexer.join(".atomcode").join("graph.bin");
-                if let Ok(g) = graph_clone.try_read() {
-                    let _ = crate::graph::persist::save(&g, &gp);
-                }
-            });
-            let _ = self.event_tx.send(AgentEvent::WorkingDirChanged(resolved));
+            // Spawn new indexer — but only if the new dir is a real
+            // project root. `/cd ~/project` (umbrella of many repos)
+            // and `/cd ~` without markers would otherwise trigger a
+            // multi-MB tree-sitter walk pegging CPU for minutes.
+            // `should_index` covers $HOME / `/` / umbrella cases.
+            if crate::graph::indexer::should_index(&resolved) {
+                let graph_clone = self.turn_runner.context.graph.clone();
+                let wd_for_indexer = resolved.clone();
+                tokio::spawn(async move {
+                    let mut indexer = crate::graph::indexer::GraphIndexer::new(
+                        graph_clone.clone(),
+                        wd_for_indexer.clone(),
+                    );
+                    indexer.index_all().await;
+                    let gp = wd_for_indexer.join(".atomcode").join("graph.bin");
+                    if let Ok(g) = graph_clone.try_read() {
+                        let _ = crate::graph::persist::save(&g, &gp);
+                    }
+                });
+            } else {
+                let _ = self.event_tx.send(AgentEvent::TextDelta(
+                    "[skipped code graph index: directory has no project marker \
+                     and looks like a parent of multiple projects. \
+                     `cd` into a specific project to enable symbol search, \
+                     or drop a `.atomcode` file here to force indexing.]\n"
+                        .to_string(),
+                ));
+            }
+            let _ = self
+                .event_tx
+                .send(AgentEvent::WorkingDirChanged(resolved));
         }
     }
 }
