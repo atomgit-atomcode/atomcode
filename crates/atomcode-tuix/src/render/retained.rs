@@ -222,6 +222,12 @@ pub struct RetainedRenderer<W: Write + Send> {
     /// space for itself, leaving a blank gap between `▸ Tool(detail)`
     /// and `⎿ result`.
     skip_next_body_scroll: bool,
+    /// Cached semantic welcome payload so resize can rebuild the
+    /// startup banner for the new terminal width.
+    welcome_banner: Option<(String, String)>,
+    /// Number of rows occupied by the welcome banner prefix in
+    /// `body_lines`.
+    welcome_line_count: usize,
 }
 
 impl RetainedRenderer<BufWriter<Stdout>> {
@@ -249,6 +255,8 @@ impl<W: Write + Send> RetainedRenderer<W> {
             last_painted_footer_rows: 0,
             scroll_region_bottom: None,
             skip_next_body_scroll: false,
+            welcome_banner: None,
+            welcome_line_count: 0,
         }
     }
 
@@ -841,7 +849,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
 
     /// Build one row with a leading `prefix` (often an accent
     /// glyph with its own style) and a plain-styled body. Used by
-/// User echo ("> …"), ToolCall ("▸ name(detail)"), etc.
+    /// User echo ("> …"), ToolCall ("▸ name(detail)"), etc.
     ///
     /// Multi-line `body` (Shift+Enter in the input, or a tool detail
     /// that happens to contain `\n`) is split on '\n' BEFORE width
@@ -866,11 +874,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let cont_pad: String = " ".repeat(prefix_w);
         let mut first_emitted = false;
         for phys in body.split('\n') {
-            let chunks: Vec<String> =
-                crate::width::wrap_line_to_width(phys, first_budget.max(1))
-                    .into_iter()
-                    .map(|c| c.to_string())
-                    .collect();
+            let chunks: Vec<String> = crate::width::wrap_line_to_width(phys, first_budget.max(1))
+                .into_iter()
+                .map(|c| c.to_string())
+                .collect();
             for chunk in &chunks {
                 let mut row = Vec::new();
                 let pad = CellStyle::default();
@@ -972,9 +979,8 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let _ = self.out.write_all(&bytes);
     }
 
-    fn push_welcome(&mut self, model: &str, working_dir: &str) {
+    fn build_welcome_rows(&self, model: &str, working_dir: &str) -> Vec<Vec<Cell>> {
         // Mirror AnsiRenderer::render_welcome — compact 6-row greet.
-        let caps = self.caps;
         let w = self.screen.width() as usize;
         let content_w = w.saturating_sub(PAD_COL * 2);
         // Row 1: brand left + version · license right
@@ -982,8 +988,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let right_ver = concat!("v", env!("CARGO_PKG_VERSION"));
         let right_lic = "MIT";
         let left_w = crate::width::display_width(left_txt);
-        let right_w = right_ver.len() + 5 + right_lic.len();
+        let right_txt = format!("{}  ·  {}", right_ver, right_lic);
+        let right_w = crate::width::display_width(&right_txt);
         let gap = content_w.saturating_sub(left_w + right_w);
+        let mut rows = Vec::with_capacity(6);
         let mut row1 = Vec::new();
         let pad = CellStyle::default();
         push_str_cells(&mut row1, &" ".repeat(PAD_COL), &pad);
@@ -994,7 +1002,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         push_str_cells(&mut row1, right_ver, &self.style_for(Role::Secondary));
         push_str_cells(&mut row1, "  ·  ", &self.style_for(Role::Muted));
         push_str_cells(&mut row1, right_lic, &self.style_for(Role::Muted));
-        self.push_body_row(row1);
+        rows.push(row1);
 
         let max_path = w.saturating_sub(6);
         let cwd_disp = crate::width::truncate_to_width(working_dir, max_path);
@@ -1002,17 +1010,17 @@ impl<W: Write + Send> RetainedRenderer<W> {
         push_str_cells(&mut row2, &" ".repeat(PAD_COL), &pad);
         push_str_cells(&mut row2, "∙ ", &self.style_for(Role::AccentDim));
         push_str_cells(&mut row2, &cwd_disp, &self.style_for(Role::Secondary));
-        self.push_body_row(row2);
+        rows.push(row2);
 
         let model_disp = crate::width::truncate_to_width(model, max_path);
         let mut row3 = Vec::new();
         push_str_cells(&mut row3, &" ".repeat(PAD_COL), &pad);
         push_str_cells(&mut row3, "∙ ", &self.style_for(Role::AccentDim));
         push_str_cells(&mut row3, &model_disp, &self.style_for(Role::Secondary));
-        self.push_body_row(row3);
+        rows.push(row3);
 
         // Blank separator.
-        self.push_body_row(Vec::new());
+        rows.push(Vec::new());
 
         // Hint rows.
         let mut row5 = Vec::new();
@@ -1028,7 +1036,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             "  to browse commands",
             &self.style_for(Role::AccentDim),
         );
-        self.push_body_row(row5);
+        rows.push(row5);
 
         let mut row6 = Vec::new();
         push_str_cells(&mut row6, &" ".repeat(PAD_COL), &pad);
@@ -1038,9 +1046,31 @@ impl<W: Write + Send> RetainedRenderer<W> {
             "  to add a custom model",
             &self.style_for(Role::AccentDim),
         );
-        self.push_body_row(row6);
+        rows.push(row6);
 
-        let _ = caps; // style helpers already captured
+        rows
+    }
+
+    fn push_welcome(&mut self, model: &str, working_dir: &str) {
+        let rows = self.build_welcome_rows(model, working_dir);
+        self.welcome_banner = Some((model.to_string(), working_dir.to_string()));
+        self.welcome_line_count = rows.len();
+        for row in rows {
+            self.push_body_row(row);
+        }
+    }
+
+    fn reflow_welcome_prefix(&mut self) {
+        let Some((ref model, ref working_dir)) = self.welcome_banner else {
+            return;
+        };
+        if self.welcome_line_count == 0 || self.body_lines.len() < self.welcome_line_count {
+            return;
+        }
+        let rows = self.build_welcome_rows(model, working_dir);
+        let replace = self.welcome_line_count.min(rows.len());
+        self.body_lines[..replace].clone_from_slice(&rows[..replace]);
+        self.welcome_line_count = rows.len();
     }
 }
 
@@ -1048,14 +1078,26 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
     fn render(&mut self, line: UiLine) {
         match line {
             // ── footer-only variants ──
-            UiLine::InputPrompt { buf, cursor_byte, menu, status } => {
+            UiLine::InputPrompt {
+                buf,
+                cursor_byte,
+                menu,
+                status,
+            } => {
                 self.spinner = None;
                 self.input_buf = buf;
                 self.input_cursor_byte = cursor_byte;
                 self.menu = menu;
                 self.status = status;
             }
-            UiLine::StreamingBox { buf, cursor_byte, frame, label, status, menu } => {
+            UiLine::StreamingBox {
+                buf,
+                cursor_byte,
+                frame,
+                label,
+                status,
+                menu,
+            } => {
                 self.spinner = Some((frame.to_string(), label));
                 self.input_buf = buf;
                 self.input_cursor_byte = cursor_byte;
@@ -1155,7 +1197,12 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 // for the tool-call line (acceptable in Phase 4,
                 // tightens in Phase 5/6).
                 let _ = muted;
-                self.push_body_prefixed("▸ ", &self.style_for(Role::Muted), &body_str, &tool_name_style);
+                self.push_body_prefixed(
+                    "▸ ",
+                    &self.style_for(Role::Muted),
+                    &body_str,
+                    &tool_name_style,
+                );
             }
             UiLine::ToolResult { success, summary } => {
                 self.flush_assistant_remainder();
@@ -1169,8 +1216,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 };
                 let body_style = if success { muted.clone() } else { error };
                 // Indent result lines 4 cols past the tool-call row.
-                let row_w =
-                    (self.screen.width() as usize).saturating_sub(PAD_COL * 2 + 6);
+                let row_w = (self.screen.width() as usize).saturating_sub(PAD_COL * 2 + 6);
                 for phys in body_str.split('\n') {
                     for chunk in crate::width::wrap_line_to_width(phys, row_w.max(1)) {
                         let mut row = Vec::new();
@@ -1217,7 +1263,11 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 let _ = (tool, detail);
                 let warn = self.style_for(Role::Warning);
                 let plain = CellStyle::default();
-                let chip = |c: Color| CellStyle { fg: Some(c), bold: true, reverse: true };
+                let chip = |c: Color| CellStyle {
+                    fg: Some(c),
+                    bold: true,
+                    reverse: true,
+                };
                 let chip_y = chip(Color::Green);
                 let chip_a = chip(Color::Cyan);
                 let chip_n = chip(Color::Red);
@@ -1368,8 +1418,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         if bottom > 0 {
             let tail: Vec<Vec<Cell>> = {
                 let n = self.body_lines.len().min(bottom as usize);
-                self.body_lines
-                    [self.body_lines.len() - n..]
+                self.body_lines[self.body_lines.len() - n..]
                     .iter()
                     .cloned()
                     .collect()
@@ -1488,10 +1537,10 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         let _ = self.out.write_all(b"\x1b[r\x1b[2J\x1b[H");
         self.scroll_region_bottom = None;
         self.screen.resize(cols, rows);
-        // IMPORTANT: keep `body_lines` intact — rows that are too
-        // wide just clip their right edge (serialize_row writes them
-        // as-is; the terminal truncates past width).
-        //
+        // Rebuild the semantic welcome banner against the new width so
+        // its right-aligned version/license pair stays adaptive after
+        // terminal resize instead of replaying stale gap cells.
+        self.reflow_welcome_prefix();
         // Re-emit body tail into the new region so the view matches
         // memory. Set region first so LFs scroll only within body.
         let bottom = self.body_bottom_row();
@@ -1593,23 +1642,14 @@ mod tests {
         }
     }
 
-    fn new_counting(
-        w: u16,
-        h: u16,
-    ) -> (RetainedRenderer<CountingSink>, Arc<AtomicU64>) {
+    fn new_counting(w: u16, h: u16) -> (RetainedRenderer<CountingSink>, Arc<AtomicU64>) {
         let counter = Arc::new(AtomicU64::new(0));
         let sink = CountingSink(counter.clone());
         let r = RetainedRenderer::with_writer(sink, caps_with_color(), w, h);
         (r, counter)
     }
 
-    fn new_capturing(
-        w: u16,
-        h: u16,
-    ) -> (
-        RetainedRenderer<CapturingSink>,
-        Arc<Mutex<Vec<u8>>>,
-    ) {
+    fn new_capturing(w: u16, h: u16) -> (RetainedRenderer<CapturingSink>, Arc<Mutex<Vec<u8>>>) {
         let buf = Arc::new(Mutex::new(Vec::new()));
         let sink = CapturingSink(buf.clone());
         let r = RetainedRenderer::with_writer(sink, caps_with_color(), w, h);
@@ -1621,10 +1661,7 @@ mod tests {
     /// `row_text` / `dump` reflect the post-paint on-screen state.
     /// The sink is left empty afterwards so subsequent renders
     /// accumulate their own bytes for another feed cycle.
-    fn drain_into_vterm(
-        buf: &Arc<Mutex<Vec<u8>>>,
-        vterm: &mut crate::test_term::VirtualTerminal,
-    ) {
+    fn drain_into_vterm(buf: &Arc<Mutex<Vec<u8>>>, vterm: &mut crate::test_term::VirtualTerminal) {
         let bytes: Vec<u8> = std::mem::take(&mut *buf.lock().unwrap());
         vterm.feed(&bytes);
     }
@@ -1822,7 +1859,9 @@ mod tests {
         let before_burst = sample(&counter);
         // Simulate IME burst: 40 keystrokes in zero time.
         let mut buf = String::new();
-        for ch in "你是谁你是谁你是谁你是谁你是谁你是谁你是谁你是谁你是谁你是谁你是谁你是谁你是谁".chars() {
+        for ch in
+            "你是谁你是谁你是谁你是谁你是谁你是谁你是谁你是谁你是谁你是谁你是谁你是谁你是谁".chars()
+        {
             buf.push(ch);
             r.render(UiLine::InputPrompt {
                 buf: buf.clone(),
@@ -1967,10 +2006,13 @@ mod tests {
         for col in 0..40usize {
             let cell = vterm.cell_at(bot_rule_row, col);
             assert_eq!(
-                cell.ch, '─',
+                cell.ch,
+                '─',
                 "bot_rule col {} (expected '─') shows {:?}\n\
                  full grid dump:\n{}",
-                col, cell, vterm.dump()
+                col,
+                cell,
+                vterm.dump()
             );
         }
     }
@@ -2017,7 +2059,8 @@ mod tests {
         assert_eq!(vterm.cell_at(middle_row, 0).ch, '\u{276f}');
         assert_eq!(vterm.cell_at(middle_row, 1).ch, ' ');
         assert_eq!(
-            vterm.cell_at(middle_row, 2).ch, '你',
+            vterm.cell_at(middle_row, 2).ch,
+            '你',
             "dump:\n{}",
             vterm.dump()
         );
@@ -2069,7 +2112,7 @@ mod tests {
         // + 1 status = 9 rows. Layout from screen_h=24:
         //   row 15: spinner blank
         //   row 16: top rule
-//   row 17: middle ("  > /")
+        //   row 17: middle ("  > /")
         //   row 18: bot rule
         //   rows 19-22: menu rows (selected @ 19)
         //   row 23: status
@@ -2148,7 +2191,11 @@ mod tests {
         assert!(
             found_brand && found_cwd && found_model && found_hint,
             "welcome rows missing (brand={} cwd={} model={} hint={})\ndump:\n{}",
-            found_brand, found_cwd, found_model, found_hint, vterm.dump()
+            found_brand,
+            found_cwd,
+            found_model,
+            found_hint,
+            vterm.dump()
         );
     }
 
@@ -2182,7 +2229,11 @@ mod tests {
 
         // Sanity: welcome is visible pre-resize (above footer).
         let pre_has = (0..24).any(|r| vterm.row_text(r).contains("AtomCode"));
-        assert!(pre_has, "welcome missing before resize\ndump:\n{}", vterm.dump());
+        assert!(
+            pre_has,
+            "welcome missing before resize\ndump:\n{}",
+            vterm.dump()
+        );
 
         // Resize smaller — welcome must still be on the new grid.
         r.on_resize(50, 16);
@@ -2196,6 +2247,90 @@ mod tests {
             "welcome disappeared after resize (regression of pre-fix behaviour)\n\
              dump:\n{}",
             vterm.dump()
+        );
+    }
+
+    #[test]
+    fn retained_resize_reflows_welcome_brand_row_when_expanding() {
+        let (mut r, buf) = new_capturing(40, 18);
+
+        r.render(UiLine::Welcome {
+            model: "glm-5".into(),
+            working_dir: "~/p/a".into(),
+        });
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status_basic(),
+        });
+        r.flush_deferred();
+        let mut pre = crate::test_term::VirtualTerminal::new(40, 18);
+        drain_into_vterm(&buf, &mut pre);
+
+        r.on_resize(80, 18);
+        r.flush_deferred();
+        let mut post = crate::test_term::VirtualTerminal::new(80, 18);
+        drain_into_vterm(&buf, &mut post);
+
+        let brand_row = (0..18)
+            .map(|row| post.row_text(row))
+            .find(|row| row.contains("AtomCode"))
+            .expect("brand row should remain visible after widening");
+        let atom_idx = brand_row.find("AtomCode").unwrap();
+        let ver_idx = brand_row
+            .find(concat!("v", env!("CARGO_PKG_VERSION")))
+            .unwrap();
+        let lic_idx = brand_row.find("MIT").unwrap();
+
+        assert!(
+            ver_idx > atom_idx + 20,
+            "version should move right after widening, row={:?}",
+            brand_row
+        );
+        assert!(
+            lic_idx > ver_idx,
+            "license should stay on the same row after widening, row={:?}",
+            brand_row
+        );
+    }
+
+    #[test]
+    fn retained_resize_reflows_welcome_brand_row_when_shrinking() {
+        let (mut r, buf) = new_capturing(80, 18);
+
+        r.render(UiLine::Welcome {
+            model: "glm-5".into(),
+            working_dir: "~/p/a".into(),
+        });
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status_basic(),
+        });
+        r.flush_deferred();
+        let mut pre = crate::test_term::VirtualTerminal::new(80, 18);
+        drain_into_vterm(&buf, &mut pre);
+
+        r.on_resize(40, 18);
+        r.flush_deferred();
+        let mut post = crate::test_term::VirtualTerminal::new(40, 18);
+        drain_into_vterm(&buf, &mut post);
+
+        let brand_row = (0..18)
+            .map(|row| post.row_text(row))
+            .find(|row| row.contains("AtomCode"))
+            .expect("brand row should remain visible after shrinking");
+        assert!(
+            brand_row.contains(concat!("v", env!("CARGO_PKG_VERSION"))),
+            "version should remain visible after shrinking, row={:?}",
+            brand_row
+        );
+        assert!(
+            brand_row.contains("MIT"),
+            "license should remain visible after shrinking, row={:?}",
+            brand_row
         );
     }
 
@@ -2222,7 +2357,10 @@ mod tests {
         // Prompt glyph depends on caps.unicode_symbols; caps_with_color
         // is UTF-8 + non-dumb so `prompt_chevron()` returns `❯ `.
         let found = vterm.any_row(|row| {
-            row.contains('\u{276f}') && row.contains('你') && row.contains('好') && row.contains("world")
+            row.contains('\u{276f}')
+                && row.contains('你')
+                && row.contains('好')
+                && row.contains("world")
         });
         assert!(found, "user echo missing\ndump:\n{}", vterm.dump());
     }
@@ -2246,9 +2384,8 @@ mod tests {
         });
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
-        let found = vterm.any_row(|row| {
-            row.contains("▸") && row.contains("bash") && row.contains("ls -la")
-        });
+        let found = vterm
+            .any_row(|row| row.contains("▸") && row.contains("bash") && row.contains("ls -la"));
         assert!(found, "tool call missing\ndump:\n{}", vterm.dump());
     }
 
@@ -2273,9 +2410,7 @@ mod tests {
         });
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
-        let found = vterm.any_row(|row| {
-            row.contains("⎿") && row.contains("3 files changed")
-        });
+        let found = vterm.any_row(|row| row.contains("⎿") && row.contains("3 files changed"));
         assert!(found, "tool result missing\ndump:\n{}", vterm.dump());
     }
 
@@ -2288,8 +2423,14 @@ mod tests {
         let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
         let status = status_basic();
         r.render(UiLine::DiffBlock(vec![
-            super::super::DiffEntry { added: true, text: "new line".into() },
-            super::super::DiffEntry { added: false, text: "old line".into() },
+            super::super::DiffEntry {
+                added: true,
+                text: "new line".into(),
+            },
+            super::super::DiffEntry {
+                added: false,
+                text: "old line".into(),
+            },
         ]));
         r.render(UiLine::InputPrompt {
             buf: String::new(),
@@ -2323,9 +2464,8 @@ mod tests {
         });
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
-        let found = vterm.any_row(|row| {
-            row.contains("─") && row.contains("Sealed") && row.contains("1 turn")
-        });
+        let found = vterm
+            .any_row(|row| row.contains("─") && row.contains("Sealed") && row.contains("1 turn"));
         assert!(found, "separator missing\ndump:\n{}", vterm.dump());
     }
 
@@ -2408,7 +2548,8 @@ mod tests {
         assert!(
             row.contains("⠋") && row.contains("Thinking"),
             "spinner row missing: {:?}\ndump:\n{}",
-            row, vterm.dump()
+            row,
+            vterm.dump()
         );
     }
 
@@ -2447,7 +2588,9 @@ mod tests {
         assert!(
             cell.bold,
             "bold cell at col {} should be bold: {:?}\ndump:\n{}",
-            bold_pos, cell, vterm.dump()
+            bold_pos,
+            cell,
+            vterm.dump()
         );
         // Inline code: markdown crate wraps it in \x1b[96m (cyan) fg.
         let code_pos = row_text
@@ -2499,9 +2642,8 @@ mod tests {
         let footer_top = h - footer_rows;
         // Layout: spinner + top_rule + middle×N + bot_rule + status.
         // With 2-row middle: bot_rule at footer_top + 2 + 2 = footer_top + 4
-// text_budget = w - 2 ("> " prefix) = 38 for w=40.
-        let (lines, _, _) =
-            crate::width::wrap_with_cursor(&long, 40 - 2, long.len());
+        // text_budget = w - 2 ("> " prefix) = 38 for w=40.
+        let (lines, _, _) = crate::width::wrap_with_cursor(&long, 40 - 2, long.len());
         assert!(lines.len() >= 2, "test setup: expected wrap");
         let bot_rule_row = footer_top + 2 + lines.len();
         let prev_cells = r.screen.prev_cells_for_test();
@@ -2631,10 +2773,7 @@ mod tests {
         r.render(UiLine::InputPrompt {
             buf: "/".into(),
             cursor_byte: 1,
-            menu: Some(MenuPayload {
-                items,
-                selected: 0,
-            }),
+            menu: Some(MenuPayload { items, selected: 0 }),
             status,
         });
         r.flush_deferred();
@@ -2763,7 +2902,8 @@ mod tests {
             .filter(|row| vterm.row_text(*row).contains("AtomCode"))
             .count();
         assert_eq!(
-            still_has, 1,
+            still_has,
+            1,
             "after /clear the welcome must appear exactly once (not 0, not 2+):\n{}",
             vterm.dump()
         );
@@ -3098,13 +3238,15 @@ mod tests {
             .filter(|row| row.contains(hint))
             .count();
         assert_eq!(
-            visible_count, 1,
+            visible_count,
+            1,
             "welcome hint should be visible exactly once (got {}):\n{}",
             visible_count,
             vterm.dump()
         );
         assert_eq!(
-            sb_count, 0,
+            sb_count,
+            0,
             "first-startup footer transition promoted welcome into \
              scrollback ({} copies); repaint must not emit ED:\n\
              scrollback:\n{}",
