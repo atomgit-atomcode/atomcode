@@ -28,7 +28,8 @@ impl AgentLoop {
                  1. What EXACTLY needs to change?\n\
                  2. Which file, which lines?\n\
                  3. Edit NOW or tell the user you cannot do it.",
-                blocked_files.join(", "), task
+                blocked_files.join(", "),
+                task
             );
             self.conversation.add_user_message(&warning);
             // Reset counts so the model gets another chance after re-planning
@@ -52,5 +53,4 @@ impl AgentLoop {
     pub(crate) fn check_turn_limit(&self) -> bool {
         self.max_turns.map_or(false, |m| self.turn_count >= m)
     }
-
 }

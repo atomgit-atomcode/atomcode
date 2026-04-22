@@ -48,7 +48,10 @@ pub fn parse_edit_instructions(text: &str) -> Vec<EditInstruction> {
             if let Some(prev_file) = current_file.take() {
                 let instr = current_lines.join("\n").trim().to_string();
                 if !instr.is_empty() {
-                    instructions.push(EditInstruction { file: prev_file, instruction: instr });
+                    instructions.push(EditInstruction {
+                        file: prev_file,
+                        instruction: instr,
+                    });
                 }
             }
             current_file = Some(file);
@@ -64,7 +67,10 @@ pub fn parse_edit_instructions(text: &str) -> Vec<EditInstruction> {
     if let Some(file) = current_file {
         let instr = current_lines.join("\n").trim().to_string();
         if !instr.is_empty() {
-            instructions.push(EditInstruction { file, instruction: instr });
+            instructions.push(EditInstruction {
+                file,
+                instruction: instr,
+            });
         }
     }
 
@@ -85,14 +91,25 @@ pub fn parse_edit_instructions(text: &str) -> Vec<EditInstruction> {
 
             if let Some(rest) = rest {
                 // Extract file name from beginning of rest
-                let words: Vec<&str> = rest.splitn(2, |c: char| c == ':' || c == '\u{2014}' || c == '-' || c == ' ').collect();
+                let words: Vec<&str> = rest
+                    .splitn(2, |c: char| {
+                        c == ':' || c == '\u{2014}' || c == '-' || c == ' '
+                    })
+                    .collect();
                 if let Some(first_word) = words.first() {
                     let first_word = first_word.trim().trim_matches('`');
                     if is_source_file(first_word) {
                         let file = first_word.to_string();
-                        let instr = if words.len() > 1 { words[1..].join(" ").trim().to_string() } else { String::new() };
+                        let instr = if words.len() > 1 {
+                            words[1..].join(" ").trim().to_string()
+                        } else {
+                            String::new()
+                        };
                         if !instr.is_empty() {
-                            instructions.push(EditInstruction { file, instruction: instr });
+                            instructions.push(EditInstruction {
+                                file,
+                                instruction: instr,
+                            });
                         }
                     }
                 }
@@ -108,7 +125,10 @@ fn extract_file_from_header(line: &str) -> Option<String> {
     // "### File: TopBar.vue" or "## File: TopBar.vue"
     if let Some(rest) = line.strip_prefix("###").or_else(|| line.strip_prefix("##")) {
         let rest = rest.trim();
-        if let Some(file_part) = rest.strip_prefix("File:").or_else(|| rest.strip_prefix("file:")) {
+        if let Some(file_part) = rest
+            .strip_prefix("File:")
+            .or_else(|| rest.strip_prefix("file:"))
+        {
             let file = file_part.trim().trim_matches('`');
             if is_source_file(file) {
                 return Some(file.to_string());
@@ -123,8 +143,16 @@ fn extract_file_from_header(line: &str) -> Option<String> {
 
     // "**TopBar.vue**:" or "**File: TopBar.vue**"
     if line.starts_with("**") && line.contains("**") {
-        let inner = line.trim_start_matches("**").split("**").next().unwrap_or("");
-        let inner = inner.strip_prefix("File:").or_else(|| inner.strip_prefix("file:")).unwrap_or(inner).trim();
+        let inner = line
+            .trim_start_matches("**")
+            .split("**")
+            .next()
+            .unwrap_or("");
+        let inner = inner
+            .strip_prefix("File:")
+            .or_else(|| inner.strip_prefix("file:"))
+            .unwrap_or(inner)
+            .trim();
         if is_source_file(inner) {
             return Some(inner.to_string());
         }
@@ -135,10 +163,18 @@ fn extract_file_from_header(line: &str) -> Option<String> {
 
 fn is_source_file(s: &str) -> bool {
     let s = s.trim_matches(|c: char| c == '`' || c == '*' || c == ':' || c == ' ');
-    s.ends_with(".vue") || s.ends_with(".ts") || s.ends_with(".tsx")
-        || s.ends_with(".js") || s.ends_with(".jsx") || s.ends_with(".java")
-        || s.ends_with(".py") || s.ends_with(".rs") || s.ends_with(".go")
-        || s.ends_with(".svelte") || s.ends_with(".html") || s.ends_with(".css")
+    s.ends_with(".vue")
+        || s.ends_with(".ts")
+        || s.ends_with(".tsx")
+        || s.ends_with(".js")
+        || s.ends_with(".jsx")
+        || s.ends_with(".java")
+        || s.ends_with(".py")
+        || s.ends_with(".rs")
+        || s.ends_with(".go")
+        || s.ends_with(".svelte")
+        || s.ends_with(".html")
+        || s.ends_with(".css")
 }
 
 /// Execute a list of edit instructions in EXECUTE mode.
@@ -162,32 +198,43 @@ pub async fn execute_instructions(
             match find_file(working_dir, &instr.file) {
                 Some(p) => p.to_string_lossy().to_string(),
                 None => {
-                    summaries.push(format!("EXECUTE {}/{}: {} — file not found", i + 1, instructions.len(), instr.file));
+                    summaries.push(format!(
+                        "EXECUTE {}/{}: {} — file not found",
+                        i + 1,
+                        instructions.len(),
+                        instr.file
+                    ));
                     all_success = false;
                     continue;
                 }
             }
         };
 
-        let _ = event_tx.send(AgentEvent::TextDelta(
-            format!("\n[EXECUTE {}/{}] Editing {} ...\n", i + 1, instructions.len(), instr.file)
-        ));
+        let _ = event_tx.send(AgentEvent::TextDelta(format!(
+            "\n[EXECUTE {}/{}] Editing {} ...\n",
+            i + 1,
+            instructions.len(),
+            instr.file
+        )));
 
         // Create a turn event channel for this execute call
         let (turn_tx, mut turn_rx) = mpsc::unbounded_channel::<TurnEvent>();
         let cancel = CancellationToken::new();
 
-        let result = runner.run_execute(
-            &file_path,
-            &instr.instruction,
-            &turn_tx,
-            cancel,
-        ).await;
+        let result = runner
+            .run_execute(&file_path, &instr.instruction, &turn_tx, cancel)
+            .await;
 
         // Forward turn events to agent event channel
         while let Ok(event) = turn_rx.try_recv() {
             match event {
-                TurnEvent::ToolCallResult { ref call_id, ref name, ref output, success, .. } => {
+                TurnEvent::ToolCallResult {
+                    ref call_id,
+                    ref name,
+                    ref output,
+                    success,
+                    ..
+                } => {
                     let _ = event_tx.send(AgentEvent::ToolCallResult {
                         call_id: call_id.clone(),
                         name: name.clone(),
@@ -205,22 +252,41 @@ pub async fn execute_instructions(
 
         match result {
             TurnResult::UsedTools { .. } => {
-                summaries.push(format!("EXECUTE {}/{}: {} — edited", i + 1, instructions.len(), instr.file));
+                summaries.push(format!(
+                    "EXECUTE {}/{}: {} — edited",
+                    i + 1,
+                    instructions.len(),
+                    instr.file
+                ));
             }
             TurnResult::Responded { ref text, .. } => {
                 // Model responded with text instead of calling edit_file — likely an error
-                summaries.push(format!("EXECUTE {}/{}: {} — no edit (model said: {})",
-                    i + 1, instructions.len(), instr.file,
+                summaries.push(format!(
+                    "EXECUTE {}/{}: {} — no edit (model said: {})",
+                    i + 1,
+                    instructions.len(),
+                    instr.file,
                     text.chars().take(100).collect::<String>()
                 ));
                 all_success = false;
             }
             TurnResult::Failed(ref e) => {
-                summaries.push(format!("EXECUTE {}/{}: {} — failed: {}", i + 1, instructions.len(), instr.file, e));
+                summaries.push(format!(
+                    "EXECUTE {}/{}: {} — failed: {}",
+                    i + 1,
+                    instructions.len(),
+                    instr.file,
+                    e
+                ));
                 all_success = false;
             }
             TurnResult::Cancelled => {
-                summaries.push(format!("EXECUTE {}/{}: {} — cancelled", i + 1, instructions.len(), instr.file));
+                summaries.push(format!(
+                    "EXECUTE {}/{}: {} — cancelled",
+                    i + 1,
+                    instructions.len(),
+                    instr.file
+                ));
                 all_success = false;
                 break;
             }
@@ -234,7 +300,9 @@ pub async fn execute_instructions(
 fn find_file(dir: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
     // Check direct path first
     let direct = dir.join(name);
-    if direct.exists() { return Some(direct); }
+    if direct.exists() {
+        return Some(direct);
+    }
 
     // Walk the tree
     let walker = ignore::WalkBuilder::new(dir)

@@ -12,7 +12,9 @@ impl AgentLoop {
     pub(crate) fn build_system_prompt(&mut self) -> String {
         // Dynamic rules: select prompt sections based on task type.
         // If user has a custom system_prompt in config, use that instead (override).
-        let rules = if let Some(custom) = self.config.providers
+        let rules = if let Some(custom) = self
+            .config
+            .providers
             .get(&self.config.default_provider)
             .and_then(|p| p.system_prompt.as_deref())
         {
@@ -22,7 +24,8 @@ impl AgentLoop {
         };
 
         let wd: PathBuf = self
-            .turn_runner.context
+            .turn_runner
+            .context
             .working_dir
             .try_read()
             .map(|g| g.clone())
@@ -43,13 +46,12 @@ impl AgentLoop {
         } else {
             std::env::var("SHELL").unwrap_or_else(|_| "bash".into())
         };
-        let env_info = format!(
-            "Platform: {} | Shell: {}",
-            std::env::consts::OS, shell,
-        );
+        let env_info = format!("Platform: {} | Shell: {}", std::env::consts::OS, shell,);
 
         // Identity: inject model name so the model correctly identifies itself.
-        let model_display = self.config.providers
+        let model_display = self
+            .config
+            .providers
             .get(&self.config.default_provider)
             .map(|p| p.model.as_str())
             .unwrap_or("unknown");
@@ -90,7 +92,9 @@ impl AgentLoop {
 
         // RULES GO LAST — recency effect ensures the model remembers these
         // when it starts generating tool calls.
-        prompt.push_str(&format!("\n=== RULES (follow these strictly) ===\n{rules}\n"));
+        prompt.push_str(&format!(
+            "\n=== RULES (follow these strictly) ===\n{rules}\n"
+        ));
 
         // Platform-specific rules — only injected on the target OS.
         let platform = crate::config::platform_rules();
@@ -108,5 +112,4 @@ impl AgentLoop {
 
         prompt
     }
-
 }

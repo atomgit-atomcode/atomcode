@@ -14,7 +14,7 @@ use std::collections::HashSet;
 /// A subtask = one file to modify.
 #[derive(Debug, Clone)]
 pub struct Subtask {
-    pub file: String,       // Short file name (e.g., "TagRebuildTaskService.java")
+    pub file: String, // Short file name (e.g., "TagRebuildTaskService.java")
     pub done: bool,
 }
 
@@ -51,9 +51,21 @@ impl SubtaskDriver {
         let reference_files = extract_reference_files(plan_text);
 
         // Extract all file names, skip those that are reference-only.
-        for word in plan_text.split(|c: char| c.is_whitespace() || c == ',' || c == '`' || c == '"' || c == '\'' || c == '(' || c == ')') {
-            let trimmed = word.trim().trim_matches(|c: char| c == '`' || c == '*' || c == ':');
-            if trimmed.is_empty() { continue; }
+        for word in plan_text.split(|c: char| {
+            c.is_whitespace()
+                || c == ','
+                || c == '`'
+                || c == '"'
+                || c == '\''
+                || c == '('
+                || c == ')'
+        }) {
+            let trimmed = word
+                .trim()
+                .trim_matches(|c: char| c == '`' || c == '*' || c == ':');
+            if trimmed.is_empty() {
+                continue;
+            }
 
             if is_source_file(trimmed) {
                 let file_name = trimmed.rsplit('/').next().unwrap_or(trimmed);
@@ -73,12 +85,24 @@ impl SubtaskDriver {
 
         // Sort: backend files first (.java), then frontend (.vue/.ts/.js)
         files.sort_by(|a, b| {
-            let a_backend = a.ends_with(".java") || a.ends_with(".py") || a.ends_with(".go") || a.ends_with(".rs");
-            let b_backend = b.ends_with(".java") || b.ends_with(".py") || b.ends_with(".go") || b.ends_with(".rs");
+            let a_backend = a.ends_with(".java")
+                || a.ends_with(".py")
+                || a.ends_with(".go")
+                || a.ends_with(".rs");
+            let b_backend = b.ends_with(".java")
+                || b.ends_with(".py")
+                || b.ends_with(".go")
+                || b.ends_with(".rs");
             b_backend.cmp(&a_backend) // backend first
         });
 
-        self.subtasks = files.into_iter().map(|f| Subtask { file: f, done: false }).collect();
+        self.subtasks = files
+            .into_iter()
+            .map(|f| Subtask {
+                file: f,
+                done: false,
+            })
+            .collect();
         self.current_idx = 0;
         self.active = true;
     }
@@ -86,9 +110,13 @@ impl SubtaskDriver {
     /// Get the instruction to inject for the current subtask.
     /// Returns None if all subtasks are done or driver is inactive.
     pub fn current_instruction(&self) -> Option<String> {
-        if !self.active { return None; }
+        if !self.active {
+            return None;
+        }
         let task = self.subtasks.get(self.current_idx)?;
-        if task.done { return None; }
+        if task.done {
+            return None;
+        }
 
         let total = self.subtasks.len();
         let remaining: Vec<&str> = self.subtasks[self.current_idx + 1..]
@@ -105,7 +133,10 @@ impl SubtaskDriver {
 
         Some(format!(
             "[Subtask {}/{}: Edit {} \u{2014} make ALL needed changes in ONE edit. {}]",
-            self.current_idx + 1, total, task.file, next_hint,
+            self.current_idx + 1,
+            total,
+            task.file,
+            next_hint,
         ))
     }
 
@@ -137,10 +168,14 @@ impl SubtaskDriver {
 
 /// Check if a string looks like a source file name.
 fn is_source_file(s: &str) -> bool {
-    s.ends_with(".java") || s.ends_with(".vue")
-        || s.ends_with(".ts") || s.ends_with(".tsx")
-        || s.ends_with(".py") || s.ends_with(".rs")
-        || s.ends_with(".go") || s.ends_with(".js")
+    s.ends_with(".java")
+        || s.ends_with(".vue")
+        || s.ends_with(".ts")
+        || s.ends_with(".tsx")
+        || s.ends_with(".py")
+        || s.ends_with(".rs")
+        || s.ends_with(".go")
+        || s.ends_with(".js")
         || s.ends_with(".svelte")
 }
 
@@ -150,31 +185,40 @@ fn extract_reference_files(plan_text: &str) -> HashSet<String> {
     let mut refs = HashSet::new();
 
     let ref_kw: &[&str] = &[
-        "\u{53C2}\u{8003}",   // 参考
-        "\u{53C2}\u{7167}",   // 参照
-        "\u{4EFF}\u{7167}",   // 仿照
-        "\u{7C7B}\u{4F3C}",   // 类似
-        "reference", "following", "same as", "style of", "follow",
+        "\u{53C2}\u{8003}", // 参考
+        "\u{53C2}\u{7167}", // 参照
+        "\u{4EFF}\u{7167}", // 仿照
+        "\u{7C7B}\u{4F3C}", // 类似
+        "reference",
+        "following",
+        "same as",
+        "style of",
+        "follow",
     ];
     let modify_kw: &[&str] = &[
-        "\u{4FEE}\u{6539}",   // 修改
-        "\u{7F16}\u{8F91}",   // 编辑
-        "\u{66F4}\u{65B0}",   // 更新
-        "\u{6DFB}\u{52A0}",   // 添加
-        "\u{5B9E}\u{73B0}",   // 实现
-        "\u{6539}",           // 改
-        "modify", "edit", "update", "add", "change", "implement",
+        "\u{4FEE}\u{6539}", // 修改
+        "\u{7F16}\u{8F91}", // 编辑
+        "\u{66F4}\u{65B0}", // 更新
+        "\u{6DFB}\u{52A0}", // 添加
+        "\u{5B9E}\u{73B0}", // 实现
+        "\u{6539}",         // 改
+        "modify",
+        "edit",
+        "update",
+        "add",
+        "change",
+        "implement",
     ];
 
     for line in plan_text.lines() {
         let lower = line.to_lowercase();
         let has_ref = ref_kw.iter().any(|k| lower.contains(k));
-        if !has_ref { continue; }
+        if !has_ref {
+            continue;
+        }
 
         // Find the byte position of the earliest modify keyword
-        let modify_pos = modify_kw.iter()
-            .filter_map(|k| lower.find(k))
-            .min();
+        let modify_pos = modify_kw.iter().filter_map(|k| lower.find(k)).min();
 
         // Reference portion: text before the first modify keyword
         let ref_portion = match modify_pos {
@@ -184,10 +228,18 @@ fn extract_reference_files(plan_text: &str) -> HashSet<String> {
 
         // Extract source file names from reference portion only
         for word in ref_portion.split(|c: char| {
-            c.is_whitespace() || c == ',' || c == '`' || c == '"'
-                || c == '\'' || c == '(' || c == ')' || c == '\u{FF0C}'
+            c.is_whitespace()
+                || c == ','
+                || c == '`'
+                || c == '"'
+                || c == '\''
+                || c == '('
+                || c == ')'
+                || c == '\u{FF0C}'
         }) {
-            let trimmed = word.trim().trim_matches(|c: char| c == '`' || c == '*' || c == ':');
+            let trimmed = word
+                .trim()
+                .trim_matches(|c: char| c == '`' || c == '*' || c == ':');
             if is_source_file(trimmed) {
                 let file_name = trimmed.rsplit('/').next().unwrap_or(trimmed);
                 refs.insert(file_name.to_string());
@@ -204,7 +256,8 @@ mod tests {
 
     #[test]
     fn extract_files_from_plan() {
-        let plan = "\u{6211}\u{8BA1}\u{5212}\u{4FEE}\u{6539}\u{4EE5}\u{4E0B}\u{6587}\u{4EF6}\u{FF1A}
+        let plan =
+            "\u{6211}\u{8BA1}\u{5212}\u{4FEE}\u{6539}\u{4EE5}\u{4E0B}\u{6587}\u{4EF6}\u{FF1A}
 1. TagRebuildTaskService.java \u{2014} \u{6DFB}\u{52A0} token \u{7EDF}\u{8BA1}
 2. AITagExtractionService.java \u{2014} \u{8FD4}\u{56DE} token \u{6D88}\u{8017}
 3. SettingsView.vue \u{2014} \u{524D}\u{7AEF}\u{663E}\u{793A}";
@@ -236,7 +289,8 @@ mod tests {
 
     #[test]
     fn reference_file_english() {
-        let plan = "I'll follow the style of IdeaCenter.vue and modify DevCenter.vue to add code reviews.";
+        let plan =
+            "I'll follow the style of IdeaCenter.vue and modify DevCenter.vue to add code reviews.";
 
         let mut driver = SubtaskDriver::new();
         driver.extract_from_plan(plan);

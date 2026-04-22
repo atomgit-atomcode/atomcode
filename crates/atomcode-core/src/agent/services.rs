@@ -19,7 +19,8 @@ impl AgentLoop {
         // Parse lsof output. Each line looks like:
         // node    80162 yubangxu   23u  IPv4 0x... TCP 127.0.0.1:3004 (LISTEN)
         // java    79842 yubangxu   45u  IPv6 0x... TCP *:8080 (LISTEN)
-        for line in stdout.lines().skip(1) { // skip header
+        for line in stdout.lines().skip(1) {
+            // skip header
             let parts: Vec<&str> = line.split_whitespace().collect();
             if parts.len() < 9 {
                 continue;
@@ -27,11 +28,15 @@ impl AgentLoop {
             let process = parts[0].to_lowercase();
             // Find the TCP address:port part
             // Match any TCP address:port — localhost, 127.0.0.1, [::1], *:
-            let addr_part = parts.iter()
-                .find(|p| p.contains(':') && (
-                    p.contains("localhost") || p.contains("127.0.0.1")
-                    || p.contains("[::1]") || p.starts_with("*:")
-                ))
+            let addr_part = parts
+                .iter()
+                .find(|p| {
+                    p.contains(':')
+                        && (p.contains("localhost")
+                            || p.contains("127.0.0.1")
+                            || p.contains("[::1]")
+                            || p.starts_with("*:"))
+                })
                 .copied()
                 .unwrap_or("");
 
@@ -56,7 +61,8 @@ impl AgentLoop {
                 .unwrap_or_else(|| std::path::PathBuf::from(path))
         } else {
             let wd: PathBuf = self
-                .turn_runner.context
+                .turn_runner
+                .context
                 .working_dir
                 .try_read()
                 .map(|g| g.clone())
@@ -96,7 +102,8 @@ impl AgentLoop {
             let wd_for_indexer = resolved.clone();
             tokio::spawn(async move {
                 let mut indexer = crate::graph::indexer::GraphIndexer::new(
-                    graph_clone.clone(), wd_for_indexer.clone(),
+                    graph_clone.clone(),
+                    wd_for_indexer.clone(),
                 );
                 indexer.index_all().await;
                 let gp = wd_for_indexer.join(".atomcode").join("graph.bin");
@@ -104,9 +111,7 @@ impl AgentLoop {
                     let _ = crate::graph::persist::save(&g, &gp);
                 }
             });
-            let _ = self
-                .event_tx
-                .send(AgentEvent::WorkingDirChanged(resolved));
+            let _ = self.event_tx.send(AgentEvent::WorkingDirChanged(resolved));
         }
     }
 }
@@ -127,21 +132,31 @@ pub(crate) fn extract_service_urls(
             let start = i + pos;
             let after = start + "http://localhost:".len();
             // Extract port digits.
-            let port_end = output[after..].find(|c: char| !c.is_ascii_digit())
+            let port_end = output[after..]
+                .find(|c: char| !c.is_ascii_digit())
                 .map(|p| after + p)
                 .unwrap_or(output.len());
             if port_end > after {
                 let url = &output[start..port_end];
                 // Guess label from the command.
                 let cmd_lower = cmd.to_lowercase();
-                let label = if cmd_lower.contains("vite") || cmd_lower.contains("npm run dev")
-                    || cmd_lower.contains("next") || cmd_lower.contains("webpack")
-                    || cmd_lower.contains("frontend") || cmd_lower.contains("yarn dev") {
+                let label = if cmd_lower.contains("vite")
+                    || cmd_lower.contains("npm run dev")
+                    || cmd_lower.contains("next")
+                    || cmd_lower.contains("webpack")
+                    || cmd_lower.contains("frontend")
+                    || cmd_lower.contains("yarn dev")
+                {
                     "frontend"
-                } else if cmd_lower.contains("spring") || cmd_lower.contains("mvn")
-                    || cmd_lower.contains("gradle") || cmd_lower.contains("flask")
-                    || cmd_lower.contains("uvicorn") || cmd_lower.contains("backend")
-                    || cmd_lower.contains("cargo run") || cmd_lower.contains("go run") {
+                } else if cmd_lower.contains("spring")
+                    || cmd_lower.contains("mvn")
+                    || cmd_lower.contains("gradle")
+                    || cmd_lower.contains("flask")
+                    || cmd_lower.contains("uvicorn")
+                    || cmd_lower.contains("backend")
+                    || cmd_lower.contains("cargo run")
+                    || cmd_lower.contains("go run")
+                {
                     "backend"
                 } else {
                     "service"
