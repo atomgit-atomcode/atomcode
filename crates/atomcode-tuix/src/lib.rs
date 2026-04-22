@@ -70,13 +70,25 @@ impl TerminalGuard {
         // this, crossterm sees `Enter, NONE` on both Enter and Shift+Enter
         // and the input box can't insert a newline.
         //
+        // `REPORT_EVENT_TYPES` is the second bit of the protocol and is what
+        // actually makes OS key autorepeat distinguishable from fresh presses:
+        // without it, every 30ms autorepeat tick reports as `KeyEventKind::Press`,
+        // so holding Shift+Enter for a normal 150ms press-down inserts 5-10
+        // newlines instead of one. With it enabled, autorepeats report as
+        // `KeyEventKind::Repeat` and are filtered out in `event_loop/mod.rs`.
+        //
         // `execute!` is best-effort — terminals that don't support CSI u
         // (notably Apple Terminal.app) ignore the sequence; we just don't
-        // set `kbd_flags_pushed` and Drop won't try to pop.
+        // set `kbd_flags_pushed` and Drop won't try to pop. Terminals that
+        // support DISAMBIGUATE but not REPORT_EVENT_TYPES ignore the extra
+        // bit silently — this never makes things worse than before.
         if caps.tty
             && execute!(
                 io::stdout(),
-                PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+                PushKeyboardEnhancementFlags(
+                    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                        | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+                )
             )
             .is_ok()
         {

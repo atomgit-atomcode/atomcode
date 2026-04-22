@@ -157,11 +157,27 @@ fn classify_poll(res: std::io::Result<bool>, tx_closed: bool) -> PollAction {
     }
 }
 
+/// Minimum gap between two modifier+Enter Press events to count them as
+/// distinct user actions. Anything closer is treated as OS key autorepeat
+/// leaking through as Press events (happens on terminals that advertise
+/// CSI u support but don't implement `REPORT_EVENT_TYPES`, so crossterm
+/// can't tag autorepeat as `KeyEventKind::Repeat`).
+///
+/// 40 ms sits between OS autorepeat cadence (~30 ms on macOS / Linux) and
+/// the fastest humans can actually chord Shift+Enter twice (~100+ ms).
+/// Scoped to Enter-with-modifiers only — plain-key autorepeat (Backspace,
+/// arrows) remains useful and is left untouched.
+const MODIFIER_ENTER_DEDUP: Duration = Duration::from_millis(40);
+
 fn run(
     tx: mpsc::UnboundedSender<InputEvent>,
     cmd_rx: stdmpsc::Receiver<(ReaderCommand, Option<stdmpsc::Sender<()>>)>,
 ) {
     let mut paused = false;
+    // Last accepted (modifiers, timestamp) for a modifier+Enter Press.
+    // Used to drop autorepeat duplicates that slip past the terminal
+    // protocol's Repeat filtering.
+    let mut last_mod_enter: Option<(KeyModifiers, std::time::Instant)> = None;
     loop {
         // If paused, block on the command channel — no poll, no read, so
         // the child process owns stdin cleanly. Only Resume / Shutdown
@@ -216,6 +232,31 @@ fn run(
                 continue;
             }
         };
+
+        // Autorepeat dedup for modifier+Enter. iTerm2's current CSI u
+        // implementation (3.5+/3.6) disambiguates Shift+Enter modifiers
+        // correctly but doesn't honour `REPORT_EVENT_TYPES`, so a held
+        // Shift+Enter emits N Press events at OS autorepeat cadence and
+        // the input box inserts N newlines for one physical keystroke.
+        // Drop same-modifier repeats that arrive within the dedup window.
+        if let Event::Key(k) = &ev {
+            if k.kind == KeyEventKind::Press
+                && k.code == KeyCode::Enter
+                && !k.modifiers.is_empty()
+            {
+                let now = std::time::Instant::now();
+                if let Some((last_mods, last_at)) = last_mod_enter {
+                    if last_mods == k.modifiers
+                        && now.duration_since(last_at) < MODIFIER_ENTER_DEDUP
+                    {
+                        crate::tuix_trace!("RD", "dedup mod+Enter {:?}", k.modifiers);
+                        last_mod_enter = Some((k.modifiers, now));
+                        continue;
+                    }
+                }
+                last_mod_enter = Some((k.modifiers, now));
+            }
+        }
 
         // Paste-burst detection for terminals without bracketed paste
         // (Windows conhost, some PowerShell setups). When a user pastes
@@ -396,6 +437,27 @@ mod tests {
             .send((ReaderCommand::Shutdown, None))
             .expect("send shutdown");
         worker.join().expect("worker thread joins cleanly");
+    }
+
+    /// `MODIFIER_ENTER_DEDUP` must sit above OS autorepeat cadence but
+    /// well below any realistic human chord rate. macOS / Linux autorepeat
+    /// ticks every ~30 ms; the next intentional Shift+Enter can't physically
+    /// happen faster than ~100 ms. 40 ms lands cleanly between the two.
+    #[test]
+    fn modifier_enter_dedup_window_brackets_autorepeat_but_not_humans() {
+        let win = MODIFIER_ENTER_DEDUP.as_millis() as u64;
+        assert!(
+            win > 30,
+            "dedup window {}ms must exceed typical OS autorepeat (30ms) \
+             so autorepeat duplicates are caught",
+            win
+        );
+        assert!(
+            win < 80,
+            "dedup window {}ms must stay below fastest realistic human \
+             chord repeat (~100ms) so intentional Shift+Enter×2 still works",
+            win
+        );
     }
 
     /// Shift+Enter must NOT qualify as a paste-burst char. If it did,

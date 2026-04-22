@@ -730,18 +730,52 @@ impl<W: Write + Send> RetainedRenderer<W> {
             let visible_count = total - start;
 
             if let Some(prev) = prev_bottom.map(|v| v as usize) {
-                if prev > cap {
-                    // Shrink: erase rows that moved body → footer.
-                    for row in (cap + 1)..=prev {
-                        let seq = format!("\x1b[{};1H\x1b[K", row);
-                        let _ = self.out.write_all(seq.as_bytes());
-                    }
-                } else if visible_count > 0 {
-                    // Grow: erase the zombie zone above the new body
-                    // anchor that would otherwise show stale old-body
-                    // top rows (menu-close ghost welcome).
-                    let prev_body_top = prev.saturating_sub(visible_count) + 1;
-                    let new_body_top = cap.saturating_sub(visible_count) + 1;
+                // Erase the union of old and new footer regions
+                // (rows min(prev,cap)+1 ..= h).
+                //
+                // Why the full union: the footer writer after this
+                // runs `invalidate()` (prev_cells all blank) and
+                // then only emits patches where new cells differ
+                // from blank. `pad_row_to_width` fills middle /
+                // spinner / absent-menu rows with default-style
+                // blanks — those match prev blanks → no erase
+                // patches. Meanwhile the terminal still holds the
+                // prior frame's top_rule / bot_rule `─`-filled
+                // cells at rows that are now blank in the new
+                // layout.
+                //
+                // Two symptoms this protects against:
+                //   * SHRINK: `❯ 1─────` — new middle content sits
+                //     at an absolute row that used to be top_rule;
+                //     the rule tail bleeds through.
+                //   * GROW: Shift+Enter then delete leaves an
+                //     extra ─── line above the input box — the
+                //     old top_rule row lands on the new spinner
+                //     slot (paint_footer writes a blank row there
+                //     when no spinner is active), cell diff sees
+                //     blank→blank, stale rule persists.
+                //
+                // Cost: a small handful of CUP+EL pairs per footer
+                // resize (not per frame). EL is row-local → no
+                // scroll, no scrollback pollution.
+                let screen_h = self.screen.height() as usize;
+                let transition_start = prev.min(cap) + 1;
+                for row in transition_start..=screen_h {
+                    let seq = format!("\x1b[{};1H\x1b[K", row);
+                    let _ = self.out.write_all(seq.as_bytes());
+                }
+
+                // Grow case only: the "zombie zone" above the new
+                // body anchor — rows that held the top of the old
+                // body but sit above the new body position and
+                // aren't covered by either body paint or footer
+                // diff. Fixed the menu-close ghost welcome
+                // regression.
+                if prev < cap && visible_count > 0 {
+                    let prev_body_top =
+                        prev.saturating_sub(visible_count) + 1;
+                    let new_body_top =
+                        cap.saturating_sub(visible_count) + 1;
                     if prev_body_top < new_body_top {
                         for row in prev_body_top..new_body_top {
                             let seq = format!("\x1b[{};1H\x1b[K", row);
@@ -1364,8 +1398,32 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         // Terminal-side wipe + full state reset. `body_lines` is
         // also dropped so post-reset the screen truly starts clean
         // (old transcript stays in the terminal's own scrollback).
-        // Release DECSTBM so the `\x1b[2J` affects the full screen.
-        let _ = self.out.write_all(b"\x1b[r\x1b[2J\x1b[H");
+        //
+        // Why per-row CUP+EL instead of `\x1b[2J`: ED behaviour is
+        // inconsistent across terminals — iTerm2 3.5+ was reported
+        // to leave pre-reset rows visible after `\x1b[2J` (trace
+        // shows `Ack Reset` fires and body_lines is cleared, but
+        // the old assistant response + Done separator + user echo
+        // stayed on screen while the freshly re-rendered welcome
+        // sat below them, leaving `/session` to produce a torn
+        // layout). ED also interacts badly with DECSTBM on some
+        // builds and can promote visible rows to scrollback rather
+        // than clearing. EL (`\x1b[K`) is row-local with no scroll
+        // or scrollback semantics, so a CUP+EL per row is
+        // unambiguous everywhere (same technique as
+        // `ensure_scroll_region`'s resize path).
+        //
+        // Release DECSTBM first so EL isn't constrained by the
+        // prior scroll region.
+        let _ = self.out.write_all(b"\x1b[r");
+        let h = self.screen.height() as usize;
+        let mut seq = String::with_capacity(h * 8 + 8);
+        for row in 1..=h {
+            use std::fmt::Write;
+            let _ = write!(seq, "\x1b[{};1H\x1b[K", row);
+        }
+        seq.push_str("\x1b[H");
+        let _ = self.out.write_all(seq.as_bytes());
         self.screen = Screen::new(self.screen.width(), self.screen.height());
         self.body_lines.clear();
         self.assistant_line_buf.clear();
@@ -1532,9 +1590,23 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
 
     fn on_resize(&mut self, cols: u16, rows: u16) {
         // Terminal-side wipe: resize leaves pre-resize chars at old
-        // absolute positions. Release DECSTBM first so `\x1b[2J`
-        // affects the whole new viewport rather than the stale region.
-        let _ = self.out.write_all(b"\x1b[r\x1b[2J\x1b[H");
+        // absolute positions. Use per-row CUP+EL instead of `\x1b[2J`
+        // for the same reason as `reset()` — iTerm2 3.5+ has been
+        // observed to ignore ED under certain states, leaving the
+        // pre-resize welcome + footer on screen while the body
+        // repaint below stamps a second copy. EL is row-local and
+        // unambiguous across terminals.
+        //
+        // Release DECSTBM first so EL isn't constrained by the
+        // stale (pre-resize) scroll region.
+        let _ = self.out.write_all(b"\x1b[r");
+        let mut seq = String::with_capacity((rows as usize) * 8 + 8);
+        for row in 1..=(rows as usize) {
+            use std::fmt::Write;
+            let _ = write!(seq, "\x1b[{};1H\x1b[K", row);
+        }
+        seq.push_str("\x1b[H");
+        let _ = self.out.write_all(seq.as_bytes());
         self.scroll_region_bottom = None;
         self.screen.resize(cols, rows);
         // Rebuild the semantic welcome banner against the new width so
@@ -3252,6 +3324,80 @@ mod tests {
              scrollback:\n{}",
             sb_count,
             vterm.scrollback_texts().join("\n")
+        );
+    }
+
+    /// Regression for user report: Shift+Enter in the input followed
+    /// by delete leaves an extra rule line on screen. Root cause:
+    /// Shift+Enter grows middle from 1 to 2 rows (body bottom -1);
+    /// delete shrinks it back (body bottom +1, a GROW transition).
+    /// In the new layout the OLD top-rule row lands on the new
+    /// spinner slot — which paint_footer writes as a blank row when
+    /// no spinner is active. `screen.invalidate()` zeroes prev_cells,
+    /// so cell diff sees blank→blank at that row and emits nothing;
+    /// the old rule glyphs persist on screen, stacked directly above
+    /// the new top rule.
+    ///
+    /// Fix: repaint must explicitly erase every row in the union of
+    /// old and new footer regions before the cell diff runs — EL is
+    /// row-local so it doesn't leak content into scrollback.
+    #[test]
+    fn retained_middle_grow_then_shrink_leaves_no_ghost_rule() {
+        let (mut r, buf) = new_capturing(80, 24);
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+        let status = status_basic();
+
+        // State A: 1-row middle (baseline).
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // State B: shift+enter — 2-row middle. Buf "\n" wraps to
+        // 2 lines per `wrap_with_cursor`. Footer +1, body -1.
+        r.render(UiLine::InputPrompt {
+            buf: "\n".into(),
+            cursor_byte: 1,
+            menu: None,
+            status: status.clone(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // State C: delete back to empty. Body grows 1 row. This is
+        // the transition that exposes the ghost rule.
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // The input frame has exactly one top rule and one bot rule.
+        // Each rule row is a full-width run of '─' (U+2500) with no
+        // other glyphs. Count rows whose content is ONLY rule cells
+        // — there must be exactly 2 after a clean grow+shrink. A
+        // ghost from the old layout pushes this to 3.
+        let rule_rows = (0..24)
+            .filter(|r| {
+                let txt = vterm.row_text(*r);
+                let trimmed = txt.trim_end();
+                !trimmed.is_empty()
+                    && trimmed.chars().all(|c| c == '\u{2500}')
+            })
+            .count();
+        assert_eq!(
+            rule_rows, 2,
+            "expected 2 rule rows (top + bot), got {} — grow \
+             transition left a ghost:\n{}",
+            rule_rows,
+            vterm.dump()
         );
     }
 }
