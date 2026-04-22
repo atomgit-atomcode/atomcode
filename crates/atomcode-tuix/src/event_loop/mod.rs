@@ -722,6 +722,15 @@ pub async fn run_loop(
     deferred_render_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     deferred_render_tick.tick().await; // consume the immediate fire
 
+    // Whip overlay advance tick. Driven at the same 33ms cadence as a
+    // single animation frame so the `WhipOverlay` can repaint each
+    // frame exactly once. No-op when no WhipOverlay is active.
+    let mut whip_tick = tokio::time::interval(Duration::from_millis(
+        crate::modals::whip_overlay::FRAME_MS,
+    ));
+    whip_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    whip_tick.tick().await; // consume immediate fire
+
     // Last-draw timestamp — consulted by the post-event pump so we
     // don't redraw more often than every 100ms even when handlers
     // fire back-to-back.
@@ -769,6 +778,20 @@ pub async fn run_loop(
             // when nothing is pending.
             _ = deferred_render_tick.tick() => {
                 renderer.flush_deferred();
+            }
+
+            // ── Whip overlay frame tick ──
+            // 33ms cadence — advances any active WhipOverlay. No-op when
+            // the active modal isn't an animated one. When the overlay
+            // signals done, drop it and repaint idle/streaming chrome
+            // so the 5-row overlay band doesn't linger as ghost text.
+            _ = whip_tick.tick() => {
+                if let Some(modal) = app.active_modal.as_mut() {
+                    if modal.advance(&app.buf, &app.state, &ctx, renderer) {
+                        app.active_modal = None;
+                        redraw_after_slash(&app.buf, &app.state, &ctx, &app.active_modal, renderer);
+                    }
+                }
             }
 
             // ── Spinner tick (from background task) ──
@@ -877,6 +900,16 @@ pub async fn run_loop(
             // when nothing is pending.
             _ = deferred_render_tick.tick() => {
                 renderer.flush_deferred();
+            }
+
+            // ── Whip overlay frame tick ──
+            _ = whip_tick.tick() => {
+                if let Some(modal) = app.active_modal.as_mut() {
+                    if modal.advance(&app.buf, &app.state, &ctx, renderer) {
+                        app.active_modal = None;
+                        redraw_after_slash(&app.buf, &app.state, &ctx, &app.active_modal, renderer);
+                    }
+                }
             }
 
             // ── Spinner tick (from background task) ──
@@ -1163,6 +1196,10 @@ fn handle_idle_key(
     }
 
     let action = classify(code, modifiers);
+    if action == Action::Whip {
+        crate::whip::fire_whip(ctx, &mut app.active_modal, &app.state, renderer)?;
+        return Ok(());
+    }
     let result = app.buf.apply(action, ctx.history.entries(), &ctx.commands);
     crate::tuix_trace!(
         "KEY",
@@ -1382,6 +1419,10 @@ fn handle_streaming_key(
     }
 
     let action = classify(code, modifiers);
+    if action == Action::Whip {
+        crate::whip::fire_whip(ctx, &mut app.active_modal, &app.state, renderer)?;
+        return Ok(());
+    }
     match app.buf.apply(action, ctx.history.entries(), &ctx.commands) {
         BufferResult::NoOp => {}
         BufferResult::Redraw => {

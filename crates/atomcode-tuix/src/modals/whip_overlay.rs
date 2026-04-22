@@ -43,32 +43,6 @@ impl WhipOverlay {
         f.min(anim::TOTAL_FRAMES)
     }
 
-    /// Called by the event loop's 33ms tick. Re-renders when a new
-    /// frame is due; when the timeline is exhausted returns `true` so
-    /// the caller can drop the modal.
-    pub fn advance(
-        &mut self,
-        buf: &Buffer,
-        state: &UiState,
-        ctx: &LoopCtx,
-        renderer: &mut dyn Renderer,
-    ) -> bool {
-        if self.done {
-            return true;
-        }
-        let now = Instant::now();
-        let frame = self.current_frame(now);
-        if self.last_frame_drawn != Some(frame) {
-            self.last_frame_drawn = Some(frame);
-            self.paint_frame(frame, buf, state, ctx, renderer);
-        }
-        if frame >= anim::TOTAL_FRAMES {
-            self.done = true;
-            return true;
-        }
-        false
-    }
-
     fn paint_frame(
         &self,
         frame_idx: u16,
@@ -117,6 +91,29 @@ impl Modal for WhipOverlay {
         // Initial paint so the user sees frame 0 before the first tick
         // arrives (~33ms later).
         self.paint_frame(0, buf, state, ctx, renderer);
+    }
+
+    fn advance(
+        &mut self,
+        buf: &Buffer,
+        state: &UiState,
+        ctx: &LoopCtx,
+        renderer: &mut dyn Renderer,
+    ) -> bool {
+        if self.done {
+            return true;
+        }
+        let now = Instant::now();
+        let frame = self.current_frame(now);
+        if self.last_frame_drawn != Some(frame) {
+            self.last_frame_drawn = Some(frame);
+            self.paint_frame(frame, buf, state, ctx, renderer);
+        }
+        if frame >= anim::TOTAL_FRAMES {
+            self.done = true;
+            return true;
+        }
+        false
     }
 }
 

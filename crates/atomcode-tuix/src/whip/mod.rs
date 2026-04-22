@@ -11,6 +11,14 @@ pub mod phrases;
 
 use std::time::{Duration, Instant};
 
+use anyhow::Result;
+use atomcode_core::agent::AgentCommand;
+
+use crate::event_loop::LoopCtx;
+use crate::modals::{Modal, WhipOverlay};
+use crate::render::{Renderer, UiLine};
+use crate::state::{UiPhase, UiState};
+
 /// Monotonic rate-limit gate shared by Ctrl+G and `/whip`. `last` is
 /// stored on `LoopCtx` (not inside this struct) so a single source of
 /// truth lives with the event loop; this struct is a stateless helper.
@@ -26,6 +34,68 @@ impl Cooldown {
             Some(t) => now.duration_since(t) >= window,
         }
     }
+}
+
+/// Fire a whip: print a scrollback marker, play the animation, and (if
+/// a turn is running) queue the encouragement phrase via
+/// `AgentCommand::AppendInput`. Idempotent under gates (disabled
+/// config, cooldown, modal conflict, approval/suspended phases) —
+/// returns `Ok(())` silently. Must be called from both the Ctrl+G
+/// keyboard handler and the `/whip` slash command so their semantics
+/// stay identical.
+pub fn fire_whip(
+    ctx: &mut LoopCtx,
+    active_modal: &mut Option<Box<dyn Modal>>,
+    state: &UiState,
+    renderer: &mut dyn Renderer,
+) -> Result<()> {
+    if !ctx.config.whip.enabled {
+        return Ok(());
+    }
+    // No whip during tool approval (agent is waiting on you, not slow)
+    // or while suspended (stdin is handed off to a child process).
+    if matches!(state.phase, UiPhase::Approval | UiPhase::Suspended) {
+        return Ok(());
+    }
+    if active_modal.is_some() {
+        return Ok(());
+    }
+    let now = Instant::now();
+    let window = Duration::from_millis(ctx.config.whip.cooldown_ms);
+    if !Cooldown::try_fire(ctx.last_whip_at, now, window) {
+        return Ok(());
+    }
+
+    let phrase = phrases::pick_phrase(&ctx.config.whip.phrases);
+    ctx.last_whip_at = Some(now);
+
+    // Scrollback marker — always printed so the user sees what happened
+    // even without the animation (pipe mode, narrow terminal).
+    let trace = if matches!(state.phase, UiPhase::Streaming) {
+        let suffix = state
+            .turn_elapsed()
+            .map(|d| format!(" (after {:.1}s)", d.as_secs_f32()))
+            .unwrap_or_default();
+        format!("  🐎 whip: {}{}\n", phrase, suffix)
+    } else {
+        format!("  🐎 whip: {}  (no turn running)\n", phrase)
+    };
+    renderer.render(UiLine::CommandOutput(trace));
+    renderer.flush();
+
+    // Inject into the LLM context only when a turn is actually running.
+    if matches!(state.phase, UiPhase::Streaming) {
+        ctx.agent
+            .cmd_tx
+            .send(AgentCommand::AppendInput(phrase.clone()))
+            .ok();
+    }
+
+    // Install the animation overlay in all eligible phases. The event
+    // loop's 33ms tick advances it via `WhipOverlay::advance`.
+    *active_modal = Some(Box::new(WhipOverlay::open(phrase)));
+
+    Ok(())
 }
 
 #[cfg(test)]

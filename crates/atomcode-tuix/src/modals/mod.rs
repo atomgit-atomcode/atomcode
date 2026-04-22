@@ -88,4 +88,19 @@ pub trait Modal: Send {
         self.draw(buf, state, ctx, renderer);
         Ok(ModalAction::Continue)
     }
+
+    /// Called by the event loop's 33ms "whip tick". Default implementation
+    /// is a no-op returning `false` (don't close). Overridden by
+    /// animation-driven modals (`WhipOverlay`) to advance frames and
+    /// signal when the animation has finished so the caller can drop
+    /// the modal. Non-animated modals inherit the no-op.
+    fn advance(
+        &mut self,
+        _buf: &Buffer,
+        _state: &UiState,
+        _ctx: &LoopCtx,
+        _renderer: &mut dyn Renderer,
+    ) -> bool {
+        false
+    }
 }
