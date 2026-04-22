@@ -370,6 +370,13 @@ struct Cli {
     #[arg(long)]
     max_turns: Option<usize>,
 
+    /// Inject a "restate goal / what ruled out / next output" reflection
+    /// prompt every N tool calls. 0 disables the checkpoint entirely.
+    /// Overrides the value in config.toml for this run. Default: use
+    /// config.toml's reflection_cadence (which itself defaults to 10).
+    #[arg(long, value_name = "N")]
+    reflection_cadence: Option<usize>,
+
     /// Comma-separated list of tool names to exclude from the registry.
     /// Use this to disable tools that are useless or harmful in a particular
     /// environment — e.g. `--disable-tools bash,web_fetch` for SWE-bench eval
@@ -663,6 +670,11 @@ async fn run() -> Result<i32> {
         conversation,
     );
     agent_loop.set_max_turns(cli.max_turns);
+    // CLI override for the cadence reflection knob. Matches the max_turns
+    // pattern — leave unset to honor config.toml; explicitly pass to force.
+    if let Some(n) = cli.reflection_cadence {
+        agent_loop.config.reflection_cadence = n;
+    }
 
     // Resolve effective prompt: --prompt-file reads from disk; -p is inline.
     // clap's conflicts_with ensures only one can be given at a time.
