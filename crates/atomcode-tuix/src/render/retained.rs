@@ -222,6 +222,22 @@ pub struct RetainedRenderer<W: Write + Send> {
     /// space for itself, leaving a blank gap between `▸ Tool(detail)`
     /// and `⎿ result`.
     skip_next_body_scroll: bool,
+    /// Latest whip overlay frame. `Some` = WhipOverlay modal is active
+    /// and the footer paint path should draw the 5 rows immediately
+    /// above the status line; `None` = no active overlay. Task 5 only
+    /// stores state; painting is polished in Task 10.
+    whip_frame: Option<WhipFrameState>,
+}
+
+/// Stashed state for the latest `UiLine::WhipFrame`. Clone-cheap because
+/// rows are stack-sized. Task 5 only stashes; Task 10 reads these fields
+/// from the footer paint path.
+#[derive(Clone)]
+#[allow(dead_code)]
+struct WhipFrameState {
+    rows: [String; 5],
+    phrase: Option<String>,
+    flash: bool,
 }
 
 impl RetainedRenderer<BufWriter<Stdout>> {
@@ -249,6 +265,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             last_painted_footer_rows: 0,
             scroll_region_bottom: None,
             skip_next_body_scroll: false,
+            whip_frame: None,
         }
     }
 
@@ -1184,6 +1201,17 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
             UiLine::CommandOutput(text) => {
                 let safe = scrub_controls(&text);
                 self.push_body_text(&safe, &CellStyle::default());
+            }
+            UiLine::WhipFrame { rows, phrase, flash } => {
+                // Task 5 scaffold: remember the frame; Task 10 polishes
+                // the actual paint path. When `rows` are all blank AND
+                // phrase is None, treat as "close" and drop the state.
+                let all_blank = rows.iter().all(|r| r.trim().is_empty());
+                if all_blank && phrase.is_none() {
+                    self.whip_frame = None;
+                } else {
+                    self.whip_frame = Some(WhipFrameState { rows, phrase, flash });
+                }
             }
         }
         // Phase 5: widget state updated → mark frame dirty. No

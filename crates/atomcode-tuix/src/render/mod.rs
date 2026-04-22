@@ -70,6 +70,17 @@ pub enum UiLine {
     CommandOutput(String),
     /// A visible separator between turns: `────── {label} ──────`.
     TurnSeparator { label: String },
+    /// Whip overlay frame — 5 rows painted immediately above the status
+    /// line. Ephemeral: each render replaces the previous frame. Closed
+    /// when the `WhipOverlay` modal finishes (overlay clears the band
+    /// on close by sending an all-empty frame).
+    WhipFrame {
+        rows: [String; 5],
+        /// Crack phrase, shown in bold accent when present.
+        phrase: Option<String>,
+        /// When true, the renderer should invert non-blank cells.
+        flash: bool,
+    },
 }
 
 pub trait Renderer: Send {
