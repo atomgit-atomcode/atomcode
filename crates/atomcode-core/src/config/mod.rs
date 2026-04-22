@@ -68,9 +68,10 @@ pub struct Config {
     pub auto_update: bool,
     /// Every N tool calls, inject a "restate goal / what ruled out / next
     /// output" reflection prompt before the next turn. 0 disables the
-    /// checkpoint entirely. Default 10 matches typical multi-file analysis
-    /// step counts — below which the reflection is overhead, above which
-    /// the agent can drift unnoticed.
+    /// checkpoint entirely. Default 7: dogfooding showed 10 is too slow
+    /// to catch early "same command, different flag" loops (6-7 tries
+    /// before the first checkpoint) while 5 over-injects on normal tasks.
+    /// 7 catches early loops in 1-2 retries without disturbing focused work.
     #[serde(default = "default_reflection_cadence")]
     pub reflection_cadence: usize,
 }
@@ -91,7 +92,7 @@ pub struct DatalogConfig {
 }
 
 fn default_true() -> bool { true }
-fn default_reflection_cadence() -> usize { 10 }
+fn default_reflection_cadence() -> usize { 7 }
 
 impl Default for DatalogConfig {
     fn default() -> Self {
@@ -316,7 +317,7 @@ mod tests {
             providers: HashMap::new(),
             datalog: DatalogConfig { enabled: false, dir: Some("/var/log/ac".to_string()) },
             auto_update: true,
-            reflection_cadence: 10,
+            reflection_cadence: 7,
         };
         cfg.providers.insert("p".to_string(), ProviderConfig {
             provider_type: "openai".to_string(),
@@ -366,13 +367,13 @@ mod reflection_config_tests {
     use super::*;
 
     #[test]
-    fn reflection_cadence_defaults_to_ten_when_missing_from_toml() {
+    fn reflection_cadence_defaults_to_seven_when_missing_from_toml() {
         let toml_text = r#"
 default_provider = "claude"
 [providers]
 "#;
         let cfg: Config = toml::from_str(toml_text).expect("parses minimal config");
-        assert_eq!(cfg.reflection_cadence, 10);
+        assert_eq!(cfg.reflection_cadence, 7);
     }
 
     #[test]
