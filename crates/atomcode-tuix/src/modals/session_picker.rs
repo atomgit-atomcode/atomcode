@@ -119,6 +119,11 @@ impl Modal for SessionPicker {
                             .cmd_tx
                             .send(AgentCommand::SetMessages(session.messages.clone()))
                             .ok();
+                        // Continue accumulating into the same session
+                        // file — future TurnComplete saves overwrite it
+                        // instead of leaving the old snapshot + creating
+                        // a new one beside it.
+                        ctx.current_session = session;
                         state.on_turn_complete();
                         Ok(ModalAction::Close)
                     }

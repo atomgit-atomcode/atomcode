@@ -20,7 +20,7 @@ use atomcode_core::config::Config;
 use atomcode_core::config::provider::ProviderConfig;
 
 use super::{save_and_reload, LoopCtx};
-use crate::modals::{DirPicker, Modal, ModelPicker, ProviderWizard, SessionPicker};
+use crate::modals::{DirPicker, IssueWizard, Modal, ModelPicker, ProviderWizard, SessionPicker};
 use crate::render::{Renderer, UiLine};
 use crate::state::UiState;
 
@@ -37,6 +37,8 @@ pub(super) fn execute_slash_command(
     ctx: &mut LoopCtx,
     renderer: &mut dyn Renderer,
     active_modal: &mut Option<Box<dyn Modal>>,
+    fixissue_pending: &mut Option<atomcode_core::atomgit::IssueRef>,
+    fixissue_buffer: &mut String,
 ) -> Result<()> {
     // Built-in commands are all lowercase ASCII; normalise the user's
     // input so `/SESSION`, `/Session`, `/sEssIon` all hit the same arm
@@ -140,6 +142,12 @@ pub(super) fn execute_slash_command(
             state.total_tokens = 0;
             state.thinking_idx = 0;
             state.on_turn_complete();
+            // New session = new session file on disk. Old session
+            // (already saved at its last TurnComplete) stays on disk so
+            // it can still be `/resume`d; we just stop writing into it.
+            ctx.current_session = atomcode_core::session::Session::default_session(
+                ctx.working_dir.clone(),
+            );
             // `reset()` wipes the terminal AND the renderer's cached
             // footer/stream state, so the next Welcome renders against
             // a known (row 1, col 1) anchor. This is what makes
@@ -332,6 +340,40 @@ pub(super) fn execute_slash_command(
                 });
             }
         }
+        "fixissue" => {
+            // `/fixissue <url>` — fetch the issue via AtomGit API (blocking,
+            // ~1s), verify the current user is the assignee, then inject a
+            // synthesised prompt into the agent as if the user typed it.
+            // Not-assigned / fetch-fail paths print the reason and stay Idle.
+            let url = arg.trim();
+            if url.is_empty() {
+                renderer.render(UiLine::CommandOutput(
+                    "  Usage: /fixissue <issue-url>\n  Example: /fixissue https://atomgit.com/owner/repo/issues/42\n  Or use the interactive wizard: /issue\n".into(),
+                ));
+                renderer.flush();
+            } else {
+                launch_fixissue(url, state, ctx, renderer, fixissue_pending, fixissue_buffer);
+            }
+        }
+        "issue" => {
+            // Interactive wizard — prompts for URL, then routes into the
+            // same `launch_fixissue` helper as `/fixissue <url>`. See
+            // `IssueWizard::emit_prompt` for the prompt line; the wizard
+            // stashes the URL in `ctx.pending_issue_url` on Enter and
+            // the event loop picks it up after modal close.
+            //
+            // If the user passes a URL inline (`/issue <url>`) we
+            // shortcut the wizard and run the pipeline directly — nice
+            // for power users who typed the URL into history already.
+            let url = arg.trim();
+            if !url.is_empty() {
+                launch_fixissue(url, state, ctx, renderer, fixissue_pending, fixissue_buffer);
+            } else {
+                let mut wiz = IssueWizard::open();
+                wiz.emit_prompt(renderer);
+                *active_modal = Some(Box::new(wiz));
+            }
+        }
         "cd" => {
             // Bare `/cd` — open the interactive history picker (matches legacy
             // TUI behaviour). The picker's Enter-handler invokes `apply_cd`
@@ -503,6 +545,56 @@ fn format_context_report(
     }
 
     out
+}
+
+/// Prepare + dispatch the fixissue pipeline for a given URL. Shared by:
+/// (a) the `/fixissue <url>` arm, (b) the `/issue <url>` arm, and (c)
+/// the event loop's post-close hook when `IssueWizard` has stashed a
+/// URL in `ctx.pending_issue_url`. Handles all three `Prepared` cases
+/// (Run / Skip / Err) and prints appropriate scrollback feedback. On
+/// Run it arms the post-completion hook (`fixissue_pending` +
+/// `fixissue_buffer`), sends `AgentCommand::SendMessage`, and flips
+/// UiState to Streaming via `state.on_submit()`.
+pub(crate) fn launch_fixissue(
+    url: &str,
+    state: &mut UiState,
+    ctx: &mut LoopCtx,
+    renderer: &mut dyn Renderer,
+    fixissue_pending: &mut Option<atomcode_core::atomgit::IssueRef>,
+    fixissue_buffer: &mut String,
+) {
+    match atomcode_core::atomgit::fixissue::prepare(url, &ctx.working_dir) {
+        Ok(atomcode_core::atomgit::fixissue::Prepared::Run {
+            prompt,
+            issue_title,
+            issue_number,
+            issue_ref,
+        }) => {
+            renderer.render(UiLine::CommandOutput(format!(
+                "  [fixissue] issue #{}: {}\n  Handing off to agent... (will post summary + 'fixed' label on completion)\n",
+                issue_number, issue_title,
+            )));
+            renderer.flush();
+            *fixissue_pending = Some(issue_ref);
+            fixissue_buffer.clear();
+            ctx.agent
+                .cmd_tx
+                .send(AgentCommand::SendMessage(prompt))
+                .ok();
+            state.on_submit();
+        }
+        Ok(atomcode_core::atomgit::fixissue::Prepared::Skip { reason }) => {
+            renderer.render(UiLine::CommandOutput(format!("  {}\n", reason)));
+            renderer.flush();
+        }
+        Err(e) => {
+            renderer.render(UiLine::CommandOutput(format!(
+                "  fixissue failed: {:#}\n",
+                e
+            )));
+            renderer.flush();
+        }
+    }
 }
 
 /// Commit a new working-directory choice: notify the agent, update cwd +

@@ -335,7 +335,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let pad = CellStyle::default();
         if is_first {
             let accent = self.style_for(Role::Accent);
-            push_str_cells(&mut row, "❯ ", &accent);
+            push_str_cells(&mut row, self.caps.prompt_chevron(), &accent);
         } else {
             push_str_cells(&mut row, "  ", &pad);
         }
@@ -454,7 +454,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // padding for the input box only).
         let rule_width = w.saturating_sub(PAD_COL * 2);
         let input_rule_width = w;
-        // "❯ " prompt prefix is 2 display cols; text fills the rest.
+        // "> " prompt prefix is 2 display cols; text fills the rest.
         let text_budget = input_rule_width.saturating_sub(2);
 
         // Wrap input + locate cursor in wrapped layout.
@@ -573,7 +573,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         }
 
         // Cursor park — 1-indexed, inside middle row at the input cell.
-        // Input row is now flush-left (no PAD_COL); "❯ " prefix is 2 cols.
+        // Input row is now flush-left (no PAD_COL); "> " prefix is 2 cols.
         let cursor_abs_row = (footer_top + 2 + cursor_row_in_middle + 1) as u16;
         let cursor_abs_col = (2 + cursor_col_in_row + 1) as u16;
         self.screen.set_cursor(cursor_abs_row, cursor_abs_col);
@@ -582,7 +582,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
     /// Footer total height — mirrors the computation inside
     /// `paint_footer` so `paint_body` knows where body_bottom lands.
     fn current_footer_rows(&self) -> usize {
-        // Mirror paint_footer: input box is full-width (only "❯ " prefix).
+        // Mirror paint_footer: input box is full-width (only "> " prefix).
         let text_budget = (self.screen.width() as usize).saturating_sub(2);
         let safe = scrub_controls(&self.input_buf);
         let middle_rows = if text_budget == 0 {
@@ -723,7 +723,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // bottom of a scroll region must blank the new bottom row, but
         // Terminal.app and iTerm2 both leave stale cells there when the
         // source content was wider than the new row. Without the
-        // explicit erase, short rows (e.g., "❯ hi", "(cancelled)", an
+        // explicit erase, short rows (e.g., "> hi", "(cancelled)", an
         // empty spacer) let the previous row's tail bleed through —
         // classic symptom was `/provider  to add a custom model` from
         // the welcome banner leaking past shorter subsequent rows.
@@ -784,7 +784,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
 
     /// Build one row with a leading `prefix` (often an accent
     /// glyph with its own style) and a plain-styled body. Used by
-    /// User echo ("❯ …"), ToolCall ("▸ name(detail)"), etc.
+/// User echo ("> …"), ToolCall ("▸ name(detail)"), etc.
     ///
     /// Multi-line `body` (Shift+Enter in the input, or a tool detail
     /// that happens to contain `\n`) is split on '\n' BEFORE width
@@ -1023,7 +1023,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 let safe = scrub_controls(&text);
                 let accent = self.style_bold(Role::Accent);
                 let plain = CellStyle::default();
-                self.push_body_prefixed("❯ ", &accent, &safe, &plain);
+                self.push_body_prefixed(self.caps.prompt_chevron(), &accent, &safe, &plain);
                 // Blank spacer row.
                 self.push_body_row(Vec::new());
                 // New user turn — reset markdown parser so code-block
@@ -1201,7 +1201,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
     fn pop_approval_prompt(&mut self) {
         // Approval rows are the only body rows whose column-PAD_COL cell
         // is '▶' (the prompt glyph we emit in the ApprovalPrompt arm).
-        // Other body lines lead with '▸' (tool call), '❯' (user turn),
+        // Other body lines lead with '▸' (tool call), '>' (user turn),
         // '─' (rule), or ordinary text — none of them match. Checking
         // the tail is safe because the agent doesn't append further body
         // rows between `ApprovalNeeded` and the user's Y/A/N reply.
@@ -1475,6 +1475,9 @@ mod tests {
             no_color: false,
             term: Some("xterm-256color".into()),
             colorterm: Some("truecolor".into()),
+            force_ascii: false,
+            lang: Some("en_US.UTF-8".into()),
+            lc_all: None,
         })
     }
 
@@ -1948,12 +1951,13 @@ mod tests {
         // Screen h=24, footer 5 rows = [19, 23]:
         //   row 19: spinner blank, row 20: top rule,
         //   row 21: middle, row 22: bot rule, row 23: status.
-        // "❯ 你是谁" in middle row (col 0-indexed, flush-left now):
+        // "你是谁" in middle row (col 0-indexed, flush-left now):
         //   col 0 '❯', col 1 ' ',
         //   col 2 '你' (cols 2-3, right half blank), col 4 '是',
         //   col 6 '谁'.
+        //   (caps_with_color has unicode_symbols=true so prompt_chevron() is "❯ ".)
         let middle_row = 21;
-        assert_eq!(vterm.cell_at(middle_row, 0).ch, '❯');
+        assert_eq!(vterm.cell_at(middle_row, 0).ch, '\u{276f}');
         assert_eq!(vterm.cell_at(middle_row, 1).ch, ' ');
         assert_eq!(
             vterm.cell_at(middle_row, 2).ch, '你',
@@ -2008,7 +2012,7 @@ mod tests {
         // + 1 status = 9 rows. Layout from screen_h=24:
         //   row 15: spinner blank
         //   row 16: top rule
-        //   row 17: middle ("  ❯ /")
+//   row 17: middle ("  > /")
         //   row 18: bot rule
         //   rows 19-22: menu rows (selected @ 19)
         //   row 23: status
@@ -2139,7 +2143,7 @@ mod tests {
     }
 
     /// User echo: `UiLine::User("hi")` produces a body row with
-    /// `❯ hi` accent prefix + a blank spacer. Grid-verified at
+    /// `> hi` accent prefix + a blank spacer. Grid-verified at
     /// absolute rows right above the footer (body bottom-anchored).
     #[test]
     fn retained_user_echo_renders_via_vterm() {
@@ -2158,8 +2162,10 @@ mod tests {
         // User line + blank spacer = 2 body rows somewhere in the
         // body area (scrollback-push layout is stack-like, exact
         // row depends on how many rows have been pushed).
+        // Prompt glyph depends on caps.unicode_symbols; caps_with_color
+        // is UTF-8 + non-dumb so `prompt_chevron()` returns `❯ `.
         let found = vterm.any_row(|row| {
-            row.contains('❯') && row.contains('你') && row.contains('好') && row.contains("world")
+            row.contains('\u{276f}') && row.contains('你') && row.contains('好') && row.contains("world")
         });
         assert!(found, "user echo missing\ndump:\n{}", vterm.dump());
     }
@@ -2436,7 +2442,7 @@ mod tests {
         let footer_top = h - footer_rows;
         // Layout: spinner + top_rule + middle×N + bot_rule + status.
         // With 2-row middle: bot_rule at footer_top + 2 + 2 = footer_top + 4
-        // text_budget = w - 2 ("❯ " prefix) = 38 for w=40.
+// text_budget = w - 2 ("> " prefix) = 38 for w=40.
         let (lines, _, _) =
             crate::width::wrap_with_cursor(&long, 40 - 2, long.len());
         assert!(lines.len() >= 2, "test setup: expected wrap");
