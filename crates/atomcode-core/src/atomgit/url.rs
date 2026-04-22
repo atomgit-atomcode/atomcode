@@ -8,6 +8,106 @@ pub struct IssueRef {
     pub number: u64,
 }
 
+/// `(owner, repo)` without the issue number — produced either from an
+/// issue URL (via `IssueRef`) or from a git remote URL (via
+/// `parse_repo_url`). Case-insensitive equality for comparison.
+#[derive(Debug, Clone)]
+pub struct RepoRef {
+    pub owner: String,
+    pub repo: String,
+}
+
+impl RepoRef {
+    pub fn matches(&self, other: &RepoRef) -> bool {
+        self.owner.eq_ignore_ascii_case(&other.owner)
+            && self.repo.eq_ignore_ascii_case(&other.repo)
+    }
+}
+
+impl From<&IssueRef> for RepoRef {
+    fn from(r: &IssueRef) -> Self {
+        Self {
+            owner: r.owner.clone(),
+            repo: r.repo.clone(),
+        }
+    }
+}
+
+/// Parse a git remote URL into `(owner, repo)`. Supports the four
+/// common forms:
+///   * `https://atomgit.com/owner/repo.git`
+///   * `https://atomgit.com/owner/repo`
+///   * `git@atomgit.com:owner/repo.git`
+///   * `ssh://git@atomgit.com/owner/repo.git`
+///
+/// Returns `None` when the URL isn't an atomgit.com remote — used to
+/// detect "cwd is in a git repo but it's a different host (e.g. GitHub)"
+/// and skip validation rather than false-positive.
+pub fn parse_repo_url(url: &str) -> Option<RepoRef> {
+    let trimmed = url.trim();
+
+    // SSH shorthand: `git@atomgit.com:owner/repo.git`
+    if let Some(rest) = trimmed.strip_prefix("git@") {
+        let (host, path) = rest.split_once(':')?;
+        if !host.eq_ignore_ascii_case("atomgit.com") {
+            return None;
+        }
+        return split_owner_repo(path);
+    }
+
+    // URL forms (https://, http://, ssh://)
+    let without_scheme = if let Some(rest) = trimmed.strip_prefix("https://") {
+        rest
+    } else if let Some(rest) = trimmed.strip_prefix("http://") {
+        rest
+    } else if let Some(rest) = trimmed.strip_prefix("ssh://") {
+        // Drop optional `git@` userinfo.
+        rest.strip_prefix("git@").unwrap_or(rest)
+    } else {
+        return None;
+    };
+
+    let (host, path) = without_scheme.split_once('/')?;
+    if !host.eq_ignore_ascii_case("atomgit.com") {
+        return None;
+    }
+    split_owner_repo(path)
+}
+
+fn split_owner_repo(path: &str) -> Option<RepoRef> {
+    let mut parts = path.trim_start_matches('/').split('/').filter(|s| !s.is_empty());
+    let owner = parts.next()?.to_string();
+    let repo = parts.next()?.to_string();
+    let repo = repo.strip_suffix(".git").unwrap_or(&repo).to_string();
+    if owner.is_empty() || repo.is_empty() {
+        return None;
+    }
+    Some(RepoRef { owner, repo })
+}
+
+/// Detect the atomgit.com (owner, repo) of a local git checkout by
+/// running `git remote get-url origin` in `cwd`. Returns:
+///   * `Ok(Some(RepoRef))` — found an atomgit.com origin.
+///   * `Ok(None)` — not a git repo, or origin points elsewhere / missing.
+///     Callers treat this as "can't validate, proceed with a warning".
+///   * `Err(...)` — the git command itself failed unexpectedly.
+pub fn detect_cwd_atomgit_repo(cwd: &std::path::Path) -> std::io::Result<Option<RepoRef>> {
+    let output = std::process::Command::new("git")
+        .args(["remote", "get-url", "origin"])
+        .current_dir(cwd)
+        .output()?;
+    if !output.status.success() {
+        // `git` returned non-zero — either not a repo, or no `origin`.
+        // Both are "can't validate"; don't bubble the raw stderr up.
+        return Ok(None);
+    }
+    let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if url.is_empty() {
+        return Ok(None);
+    }
+    Ok(parse_repo_url(&url))
+}
+
 impl IssueRef {
     /// Parse `https://atomgit.com/{owner}/{repo}/issues/{number}`.
     /// Trailing slash and `?query`/`#fragment` are tolerated.
@@ -109,5 +209,53 @@ mod tests {
     #[test]
     fn rejects_wrong_path() {
         assert!(IssueRef::parse("https://atomgit.com/a/b/pulls/1").is_err());
+    }
+
+    #[test]
+    fn parse_repo_url_https() {
+        let r = parse_repo_url("https://atomgit.com/owner/repo.git").unwrap();
+        assert_eq!(r.owner, "owner");
+        assert_eq!(r.repo, "repo");
+    }
+
+    #[test]
+    fn parse_repo_url_https_no_git_suffix() {
+        let r = parse_repo_url("https://atomgit.com/owner/repo").unwrap();
+        assert_eq!(r.repo, "repo");
+    }
+
+    #[test]
+    fn parse_repo_url_ssh_shorthand() {
+        let r = parse_repo_url("git@atomgit.com:owner/repo.git").unwrap();
+        assert_eq!(r.owner, "owner");
+        assert_eq!(r.repo, "repo");
+    }
+
+    #[test]
+    fn parse_repo_url_ssh_full() {
+        let r = parse_repo_url("ssh://git@atomgit.com/owner/repo.git").unwrap();
+        assert_eq!(r.owner, "owner");
+        assert_eq!(r.repo, "repo");
+    }
+
+    #[test]
+    fn parse_repo_url_rejects_non_atomgit() {
+        assert!(parse_repo_url("https://github.com/foo/bar.git").is_none());
+        assert!(parse_repo_url("git@github.com:foo/bar.git").is_none());
+    }
+
+    #[test]
+    fn repo_ref_matches_case_insensitive() {
+        let a = RepoRef { owner: "Atomgit_Atomcode".into(), repo: "AtomCode".into() };
+        let b = RepoRef { owner: "atomgit_atomcode".into(), repo: "atomcode".into() };
+        assert!(a.matches(&b));
+    }
+
+    #[test]
+    fn issue_ref_to_repo_ref() {
+        let r = IssueRef::parse("https://atomgit.com/o/r/issues/1").unwrap();
+        let rr: RepoRef = (&r).into();
+        assert_eq!(rr.owner, "o");
+        assert_eq!(rr.repo, "r");
     }
 }

@@ -2,7 +2,7 @@ use anyhow::{anyhow, Context, Result};
 
 use crate::auth;
 
-use super::models::{Comment, Issue};
+use super::models::{Comment, Issue, RepoLabel};
 use super::url::IssueRef;
 
 const API_BASE: &str = "https://atomgit.com/api/v5";
@@ -74,6 +74,131 @@ impl Client {
             ));
         }
         resp.json::<Issue>().context("failed to parse issue JSON")
+    }
+
+    /// POST /api/v5/repos/{owner}/{repo}/issues/{number}/comments —
+    /// append a comment to the issue. Used after a successful fixissue
+    /// run to leave the agent's repair summary on the issue.
+    pub fn post_issue_comment(&self, r: &IssueRef, body: &str) -> Result<()> {
+        let url = format!(
+            "{}/repos/{}/{}/issues/{}/comments",
+            API_BASE, r.owner, r.repo, r.number
+        );
+        let payload = serde_json::json!({ "body": body });
+        let resp = self
+            .http
+            .post(&url)
+            .bearer_auth(&self.token)
+            .header("Accept", "application/json")
+            .json(&payload)
+            .send()
+            .with_context(|| format!("POST {} failed", url))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().unwrap_or_default();
+            return Err(anyhow!(
+                "AtomGit returned {} posting comment on issue #{}: {}",
+                status,
+                r.number,
+                body
+            ));
+        }
+        Ok(())
+    }
+
+    /// GET /api/v5/repos/{owner}/{repo}/labels — list the repo's
+    /// defined labels. Used by `add_issue_label` to look up the numeric
+    /// ID that the issue-labels POST endpoint requires (AtomGit rejects
+    /// label-by-name; names alone return 400 "Request body parsing error").
+    pub fn list_labels(&self, owner: &str, repo: &str) -> Result<Vec<RepoLabel>> {
+        let url = format!("{}/repos/{}/{}/labels", API_BASE, owner, repo);
+        let resp = self
+            .http
+            .get(&url)
+            .bearer_auth(&self.token)
+            .header("Accept", "application/json")
+            .send()
+            .with_context(|| format!("GET {} failed", url))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().unwrap_or_default();
+            return Err(anyhow!(
+                "AtomGit returned {} listing labels for {}/{}: {}",
+                status,
+                owner,
+                repo,
+                body
+            ));
+        }
+        resp.json::<Vec<RepoLabel>>()
+            .context("failed to parse labels list")
+    }
+
+    /// POST /api/v5/repos/{owner}/{repo}/issues/{number}/labels —
+    /// attach a label to the issue. AtomGit's endpoint expects the
+    /// label's numeric **ID**, not its name, so this first calls
+    /// `list_labels` to resolve the name. If the label doesn't exist
+    /// in the repo we return a clear error instead of auto-creating —
+    /// label taxonomy is a repo-setting decision.
+    pub fn add_issue_label(&self, r: &IssueRef, label_name: &str) -> Result<()> {
+        let labels = self.list_labels(&r.owner, &r.repo)?;
+        let label = labels
+            .iter()
+            .find(|l| l.name.eq_ignore_ascii_case(label_name))
+            .ok_or_else(|| {
+                anyhow!(
+                    "label '{}' not found in repo {}/{} — create it first at \
+                     https://atomgit.com/{}/{}/labels (Repo Settings → Labels)",
+                    label_name,
+                    r.owner,
+                    r.repo,
+                    r.owner,
+                    r.repo
+                )
+            })?;
+
+        let url = format!(
+            "{}/repos/{}/{}/issues/{}/labels",
+            API_BASE, r.owner, r.repo, r.number
+        );
+        // AtomGit stringifies numeric IDs in JSON (e.g. the `number` field on
+        // issues comes back as `"140"` not `140`). Mirror that in the request
+        // body — sending a numeric ID here returns 400 "Request body parsing
+        // error". Let `.json()` handle the Content-Type; adding it manually
+        // on top of .json() has caused the server to reject bodies in the past.
+        let payload = serde_json::json!({ "labels": [label.id.to_string()] });
+        // This specific endpoint requires the token in a `?access_token=`
+        // query parameter rather than the `Authorization: Bearer` header.
+        // Passing it as a Bearer token makes AtomGit respond with
+        //   {"error_code":400,"error_code_name":"BAD_REQUEST",
+        //    "error_message":"Request body parsing error, please check if
+        //    the header content-type:application/json matches"}
+        // — the message is misleading (the body is fine), but switching
+        // to the query-parameter form makes the same request succeed.
+        // The other endpoints on the same API still accept Bearer auth,
+        // so we keep `bearer_auth` elsewhere and only special-case this
+        // one route.
+        let resp = self
+            .http
+            .post(&url)
+            .query(&[("access_token", self.token.as_str())])
+            .header("Accept", "application/json")
+            .json(&payload)
+            .send()
+            .with_context(|| format!("POST {} failed", url))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().unwrap_or_default();
+            return Err(anyhow!(
+                "AtomGit returned {} adding label '{}' (id={}) to issue #{}: {}",
+                status,
+                label.name,
+                label.id,
+                r.number,
+                body
+            ));
+        }
+        Ok(())
     }
 
     /// GET /api/v5/repos/{owner}/{repo}/issues/{number}/comments.
