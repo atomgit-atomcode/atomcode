@@ -518,7 +518,10 @@ impl Tool for EditFileTool {
                 output: format!(
                     "Error: old_string not found in {}.\n{}{}\n{}\n\
                      [HINT: old_string did not match. The file content around your target has been \
-                     returned above. Copy the EXACT text from the returned content as your new old_string.]",
+                     returned above. Copy the EXACT text from the returned content as your new old_string.]\n\
+                     [Do not fall back to shell file modification (in-place editors, redirects, \
+                     write scripts) — re-issue edit_file with the corrected old_string so the \
+                     change is tracked and reversible via /undo.]",
                     parsed.file_path, hint, line_hint, reread
                 ),
                 success: false,
@@ -1255,8 +1258,20 @@ fn find_closest_match_inner(
             }
             candidates.push((i, match_count));
         }
-        // Substring match of first line
-        else if trimmed.contains(first_line_trimmed) || first_line_trimmed.contains(trimmed) {
+        // Substring match of first line — require both sides to carry real
+        // signal. Without a length floor, `first_line_trimmed.contains("")`
+        // is TRUE for every blank line in the file (trim() → "") and
+        // `contains("}")` / `contains(")")` fire on every closing bracket,
+        // so the "closest match" result regularly pointed at the first
+        // blank line (session 2026-04-22 20-41: `.Run(...)` old_string →
+        // "Closest match found near line 3" which was an empty line, with
+        // a lines-1-16 snippet unrelated to the model's real target near
+        // line 270). Bumping to 4 chars filters blanks and single-token
+        // syntactic noise while still catching short identifiers like
+        // `main`, `impl`, `pub` that the length-15 prefix check would miss.
+        else if trimmed.len() >= 4 && first_line_trimmed.len() >= 4
+            && (trimmed.contains(first_line_trimmed) || first_line_trimmed.contains(trimmed))
+        {
             candidates.push((i, 0));
         }
         // Prefix match (first 25 chars)
