@@ -328,11 +328,33 @@ pub fn post_process_tool_results(
     let len = messages.len();
     let start = len.saturating_sub(tool_count);
 
-    // Pass 1: per-result truncation
+    // Build call_id → real tool_name lookup so each ToolResult is
+    // truncated by the rules of the tool that actually produced it.
+    // Without this a mixed-tool turn (e.g. read_file → bash) would
+    // truncate every result under whichever tool ran last
+    // (`current_tool_name`), which inverts read_file's cap exemption
+    // and shrinks file contents to ~30 lines.
+    let mut call_id_to_tool: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for msg in messages.iter() {
+        if let MessageContent::AssistantWithToolCalls { tool_calls, .. } = &msg.content {
+            for tc in tool_calls {
+                call_id_to_tool.insert(tc.id.clone(), tc.name.clone());
+            }
+        }
+    }
+
+    // Pass 1: per-result truncation, keyed by each result's real tool.
+    // `current_tool_name` is the fallback for results with no paired
+    // ATC in the message vec (e.g. orphaned test fixtures).
     for i in start..len {
         if let MessageContent::ToolResult(ref r) = messages[i].content {
+            let tool_name = call_id_to_tool
+                .get(&r.call_id)
+                .map(|s| s.as_str())
+                .unwrap_or(current_tool_name);
             let mut result = r.clone();
-            truncate_output(&mut result, current_tool_name, context_window);
+            truncate_output(&mut result, tool_name, context_window);
             messages[i].content = MessageContent::ToolResult(result);
         }
     }
@@ -377,7 +399,7 @@ pub fn post_process_tool_results(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tool::ToolResult;
+    use crate::tool::{ToolCall, ToolResult};
     use crate::conversation::message::{Message, MessageContent, Role};
 
     fn make_result(output: &str) -> ToolResult {
@@ -392,6 +414,31 @@ mod tests {
         Message {
             role: Role::Tool,
             content: MessageContent::ToolResult(make_result(output)),
+        }
+    }
+
+    fn make_atc(call_id: &str, tool_name: &str) -> Message {
+        Message {
+            role: Role::Assistant,
+            content: MessageContent::AssistantWithToolCalls {
+                text: None,
+                tool_calls: vec![ToolCall {
+                    id: call_id.to_string(),
+                    name: tool_name.to_string(),
+                    arguments: String::new(),
+                }],
+            },
+        }
+    }
+
+    fn make_tool_result_with_id(call_id: &str, output: &str) -> Message {
+        Message {
+            role: Role::Tool,
+            content: MessageContent::ToolResult(ToolResult {
+                call_id: call_id.to_string(),
+                output: output.to_string(),
+                success: true,
+            }),
         }
     }
 
@@ -516,6 +563,47 @@ mod tests {
         assert!(matches!(messages[0].content, MessageContent::ToolResult(_)));
         if let MessageContent::ToolResult(ref r) = messages[0].content {
             assert_eq!(r.output, "short output");
+        }
+    }
+
+    /// Regression: in a mixed-tool turn, each ToolResult must be truncated
+    /// using the rules of the tool that actually produced it — looked up
+    /// via call_id → ATC.name — NOT `current_tool_name` (which only
+    /// reflects whichever tool ran last). Without this, a `read_file`
+    /// result in a `read_file → bash` turn loses its hard-char-limit
+    /// exemption and gets shrunk to bash's HEAD+TAIL, defeating the
+    /// file-content preservation invariant.
+    #[test]
+    fn post_process_keys_truncation_by_each_result_tool_not_current() {
+        // 400-line "file content" — would trip bash's HEAD 10 + TAIL 20
+        // and the universal 300-line cap if keyed as bash, but read_file
+        // is explicitly exempt from both.
+        let file_content: String = (0..400)
+            .map(|i| format!("line {}", i))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let original_line_count = file_content.lines().count();
+
+        let mut messages = vec![
+            make_atc("rf1", "read_file"),
+            make_tool_result_with_id("rf1", &file_content),
+        ];
+
+        // current_tool_name="bash" as if bash ran last in this turn.
+        // The read_file result must still be recognized as read_file.
+        post_process_tool_results(&mut messages, 2, "bash", 128_000);
+
+        if let MessageContent::ToolResult(ref r) = messages[1].content {
+            assert_eq!(
+                r.output.lines().count(),
+                original_line_count,
+                "read_file content must stay intact when current_tool_name \
+                 is a different tool — got {} lines (expected {})",
+                r.output.lines().count(),
+                original_line_count,
+            );
+        } else {
+            panic!("expected ToolResult at index 1");
         }
     }
 }
