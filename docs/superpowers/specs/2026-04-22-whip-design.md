@@ -96,7 +96,7 @@ User types "/whip" + Enter during Streaming
 `fire_whip` does:
 
 1. Check `ctx.config.whip.enabled`; if false → no-op.
-2. Check `state.phase != UiPhase::Awaiting` (agent is waiting on tool
+2. Check `state.phase != UiPhase::Approval` (agent is waiting on tool
    approval, not slow); if Awaiting → no-op with scrollback notice
    `  🐎 whip disabled during approval`.
 3. Check cooldown via `ctx.last_whip_at`; if within `cooldown_ms` → no-op
@@ -311,7 +311,8 @@ untouched.
 | `cols < 30` | same as above — overlay needs at least 30 columns to look right |
 | `caps.colors < 256` or `NO_COLOR=1` | monochrome overlay, crack frame still reverses |
 | another modal already open | `fire_whip` returns early silently |
-| `state.phase == UiPhase::Awaiting` (tool approval) | no-op + "whip disabled during approval" scrollback line |
+| `state.phase == UiPhase::Approval` (tool approval) | no-op + "whip disabled during approval" scrollback line |
+| `state.phase == UiPhase::Suspended` (shell handoff / oauth) | no-op; input is going to child process anyway |
 | cooldown not elapsed | silent no-op |
 | `enabled = false` | Ctrl+G falls through as inert key; `/whip` emits "whip disabled in config" |
 | session resume | whip phrases never enter `session.messages`, so nothing to replay |
