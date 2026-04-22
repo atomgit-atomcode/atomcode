@@ -331,12 +331,31 @@ pub fn build_messages(
     let token_ceiling = token_budget.saturating_mul(80) / 100;
     let keep_tail = 4.min(result.len());
     let shrinkable_end = result.len().saturating_sub(keep_tail);
+    // Build call_id → tool_name so `condensed` can pick the right
+    // summarization strategy per tool (read_file → skeleton, others →
+    // first-line). Without this, `condensed` would have had to guess
+    // from output shape — a substring heuristic that false-positived
+    // on bash outputs with `"  N| ..."` lines.
+    let call_id_to_tool: std::collections::HashMap<String, String> = result.iter()
+        .filter_map(|m| {
+            if let MessageContent::AssistantWithToolCalls { tool_calls, .. } = &m.content {
+                Some(tool_calls.iter().map(|tc| (tc.id.clone(), tc.name.clone())))
+            } else { None }
+        })
+        .flatten()
+        .collect();
     for i in 1..shrinkable_end {
         let total: usize = result.iter().map(|m| m.estimate_tokens()).sum();
         if total <= token_ceiling { break; }
-        if !matches!(result[i].content, MessageContent::ToolResult(_)) { continue; }
+        let tool_name = match &result[i].content {
+            MessageContent::ToolResult(r) => call_id_to_tool
+                .get(&r.call_id)
+                .map(|s| s.as_str())
+                .unwrap_or(""),
+            _ => continue,
+        };
         let before = result[i].estimate_tokens();
-        let condensed = result[i].condensed();
+        let condensed = result[i].condensed(tool_name);
         if condensed.estimate_tokens() < before {
             result[i] = condensed;
         }

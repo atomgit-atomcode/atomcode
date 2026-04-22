@@ -68,17 +68,22 @@ impl Message {
     }
 
     /// Create a condensed version of this message for context budget savings.
-    /// Only condenses ToolResult messages (replaces full output with 1-line summary).
-    /// Other message types are returned as-is.
-    pub fn condensed(&self) -> Message {
+    /// Only condenses ToolResult messages (replaces full output with 1-line
+    /// summary). `tool_name` is looked up by the caller via the
+    /// paired ATC (see e.g. `ctx::truncate::post_process_tool_results`) —
+    /// pass `""` when unknown and this function will default to the generic
+    /// first-line summary. ToolResultRef and other variants return as-is.
+    ///
+    /// For `tool_name == "read_file"`, emits a skeleton that keeps function
+    /// signatures + line numbers so the model can still use line-number
+    /// edit mode without re-reading. Previously this decision used a
+    /// substring heuristic on the output format, which false-positived on
+    /// bash outputs that happened to start with `"  N| ..."` lines.
+    pub fn condensed(&self, tool_name: &str) -> Message {
         match &self.content {
             MessageContent::ToolResult(r) => {
                 let summary = if r.success {
-                    // For read_file results (detected by line-number format "  N| ..."),
-                    // generate a skeleton instead of just the first line.
-                    // This preserves function signatures + line numbers so the model
-                    // can use line-number mode for edits without re-reading.
-                    if is_file_read_output(&r.output) && r.output.lines().count() > 50 {
+                    if tool_name == "read_file" && r.output.lines().count() > 50 {
                         compress_file_to_skeleton(&r.output)
                     } else {
                         let first_line = r.output.lines().next().unwrap_or("OK");
@@ -148,18 +153,6 @@ impl Message {
             _ => None,
         }
     }
-}
-
-/// Detect if tool output looks like a read_file result (line-numbered content).
-fn is_file_read_output(output: &str) -> bool {
-    // read_file outputs lines like "   1| package com.devpress..."
-    let first_lines: Vec<&str> = output.lines().take(3).collect();
-    first_lines.len() >= 2
-        && first_lines.iter().any(|l| {
-            let trimmed = l.trim_start();
-            // Match pattern: digits followed by "| "
-            trimmed.chars().take_while(|c| c.is_ascii_digit()).count() > 0 && trimmed.contains("| ")
-        })
 }
 
 /// Compress a read_file result to a skeleton: keep import lines, function/class
@@ -247,4 +240,89 @@ fn compress_file_to_skeleton(output: &str) -> String {
         result.push('\n');
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tool::ToolResult;
+
+    fn tool_result_msg(output: &str) -> Message {
+        Message {
+            role: Role::Tool,
+            content: MessageContent::ToolResult(ToolResult {
+                call_id: "c1".to_string(),
+                output: output.to_string(),
+                success: true,
+            }),
+        }
+    }
+
+    /// A bash output that happens to start with `" N| ..."` lines
+    /// (numbered error dump, `cat -n`, etc.) must NOT be skeleton-compressed
+    /// when condensed as a bash result — only read_file should skeletonize.
+    /// The previous heuristic (`is_file_read_output`) false-positived here
+    /// and ran `compress_file_to_skeleton` on bash output, garbling it.
+    #[test]
+    fn condensed_bash_with_numbered_lines_uses_first_line_not_skeleton() {
+        // 60 lines of `" N| ..."` — would have triggered the old heuristic
+        // (first 3 lines match "digits + '| '") AND the 50-line floor.
+        let output: String = (1..=60)
+            .map(|n| format!("  {}| oops step failed at call {}", n, n))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let msg = tool_result_msg(&output);
+        let condensed = msg.condensed("bash");
+        let MessageContent::ToolResult(ref r) = condensed.content else {
+            panic!("expected ToolResult");
+        };
+        // Expected: single-line first-line summary, NOT a skeleton.
+        assert!(
+            !r.output.contains("[File skeleton"),
+            "bash result must not be skeletonized: {}",
+            r.output
+        );
+        assert_eq!(r.output.lines().count(), 1);
+        assert!(r.output.starts_with("  1| oops step failed"));
+    }
+
+    /// read_file results should still skeletonize so the model keeps
+    /// function signatures + line numbers for line-mode edits.
+    #[test]
+    fn condensed_read_file_keeps_skeleton() {
+        let mut lines: Vec<String> = Vec::new();
+        for i in 1..=80 {
+            lines.push(format!("   {}| some line of code", i));
+        }
+        lines.insert(10, "   11| pub fn foo() -> u32 {".to_string());
+        let output = lines.join("\n");
+        let msg = tool_result_msg(&output);
+        let condensed = msg.condensed("read_file");
+        let MessageContent::ToolResult(ref r) = condensed.content else {
+            panic!("expected ToolResult");
+        };
+        assert!(
+            r.output.contains("[File skeleton"),
+            "read_file large results should skeletonize: {}",
+            r.output
+        );
+    }
+
+    /// Empty/unknown tool_name falls back to first-line summary — no
+    /// skeleton. This is the safe default when the caller can't look up
+    /// the tool_name (orphan fixtures, older conversations).
+    #[test]
+    fn condensed_unknown_tool_uses_first_line() {
+        let output: String = (1..=80)
+            .map(|n| format!("   {}| line {}", n, n))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let msg = tool_result_msg(&output);
+        let condensed = msg.condensed("");
+        let MessageContent::ToolResult(ref r) = condensed.content else {
+            panic!("expected ToolResult");
+        };
+        assert!(!r.output.contains("[File skeleton"));
+        assert_eq!(r.output.lines().count(), 1);
+    }
 }
