@@ -396,6 +396,12 @@ enum Commands {
     },
     /// Roll back to the previous version (swap with .bak on disk)
     Rollback,
+    /// Fetch an AtomGit issue assigned to you and let the agent fix it
+    /// in the current project (no commit, no push — edits local files only).
+    Fixissue {
+        /// Full issue URL, e.g. https://atomgit.com/owner/repo/issues/42
+        url: String,
+    },
 }
 
 /// Environment variable set by this process for its re-exec'd child, so
@@ -517,11 +523,15 @@ async fn main() {
 async fn run() -> Result<i32> {
     let cli = Cli::parse();
 
-    // Handle subcommands
+    // Handle subcommands. Most are self-contained (`handle_command` runs
+    // and exits); `Login` falls through to the TUI, and `Fixissue` is
+    // like headless `-p` but with the prompt synthesised from a remote
+    // issue payload — so we resolve it here and hand it to the agent
+    // loop via `fixissue_prompt` below.
+    let mut fixissue_prompt: Option<String> = None;
     if let Some(cmd) = cli.command {
-        match &cmd {
+        match cmd {
             Commands::Login => {
-                // Login, then fall through to start TUI
                 HEADLESS_MODE.store(true, Ordering::Relaxed);
                 let auth = auth::login()?;
                 auth::save_auth(&auth)?;
@@ -529,8 +539,27 @@ async fn run() -> Result<i32> {
                 HEADLESS_MODE.store(false, Ordering::Relaxed);
                 // Fall through to TUI startup below
             }
-            _ => {
-                return handle_command(cmd).await.map(|_| 0);
+            Commands::Fixissue { url } => {
+                HEADLESS_MODE.store(true, Ordering::Relaxed);
+                let cwd = cli.dir.clone().unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+                match atomcode_core::atomgit::fixissue::prepare(&url, &cwd) {
+                    Ok(atomcode_core::atomgit::fixissue::Prepared::Run { prompt, issue_title, issue_number }) => {
+                        eprintln!("[fixissue] issue #{}: {}", issue_number, issue_title);
+                        fixissue_prompt = Some(prompt);
+                        // Fall through: agent loop will run this as a headless prompt.
+                    }
+                    Ok(atomcode_core::atomgit::fixissue::Prepared::Skip { reason }) => {
+                        eprintln!("{}", reason);
+                        return Ok(0);
+                    }
+                    Err(e) => {
+                        eprintln!("fixissue failed: {:#}", e);
+                        return Ok(1);
+                    }
+                }
+            }
+            other => {
+                return handle_command(other).await.map(|_| 0);
             }
         }
     }
@@ -661,21 +690,27 @@ async fn run() -> Result<i32> {
     );
     agent_loop.set_max_turns(cli.max_turns);
 
-    // Resolve effective prompt: --prompt-file reads from disk; -p is inline.
-    // clap's conflicts_with ensures only one can be given at a time.
-    let effective_prompt: Option<String> = match (cli.prompt.as_ref(), cli.prompt_file.as_ref()) {
-        (Some(p), None) => Some(p.clone()),
-        (None, Some(path)) => {
-            match std::fs::read_to_string(path) {
-                Ok(s) => Some(s),
-                Err(e) => {
-                    eprintln!("error: failed to read --prompt-file {}: {}", path.display(), e);
-                    std::process::exit(2);
+    // Resolve effective prompt: --prompt-file reads from disk; -p is inline;
+    // `fixissue` synthesises one from the AtomGit issue body. fixissue takes
+    // precedence — when it's set we've already committed to headless mode.
+    // clap's conflicts_with ensures `-p` and `--prompt-file` can't both be given.
+    let effective_prompt: Option<String> = if let Some(p) = fixissue_prompt.take() {
+        Some(p)
+    } else {
+        match (cli.prompt.as_ref(), cli.prompt_file.as_ref()) {
+            (Some(p), None) => Some(p.clone()),
+            (None, Some(path)) => {
+                match std::fs::read_to_string(path) {
+                    Ok(s) => Some(s),
+                    Err(e) => {
+                        eprintln!("error: failed to read --prompt-file {}: {}", path.display(), e);
+                        std::process::exit(2);
+                    }
                 }
             }
+            (None, None) => None,
+            (Some(_), Some(_)) => unreachable!("clap conflicts_with prevents this"),
         }
-        (None, None) => None,
-        (Some(_), Some(_)) => unreachable!("clap conflicts_with prevents this"),
     };
 
     // Headless mode: -p / --prompt-file triggers non-interactive execution.
@@ -888,6 +923,9 @@ async fn handle_command(cmd: Commands) -> Result<()> {
         }
         Commands::Upgrade { force } => run_upgrade_cli(force).await,
         Commands::Rollback => run_rollback_cli(),
+        Commands::Fixissue { .. } => {
+            unreachable!("Fixissue is handled inline in run() before handle_command")
+        }
     }
 }
 

@@ -7,6 +7,7 @@
 //   - mod.rs     : Cooldown + fire_whip orchestration (fire_whip in Task 7)
 
 pub mod anim;
+pub mod art;
 pub mod phrases;
 
 use std::time::{Duration, Instant};
@@ -69,18 +70,21 @@ pub fn fire_whip(
     let phrase = phrases::pick_phrase(&ctx.config.whip.phrases);
     ctx.last_whip_at = Some(now);
 
-    // Scrollback marker — always printed so the user sees what happened
-    // even without the animation (pipe mode, narrow terminal).
-    let trace = if matches!(state.phase, UiPhase::Streaming) {
-        let suffix = state
+    // Scrollback record — multi-row ASCII whip art pushed into history
+    // each time whip fires. The footer overlay is the live flourish;
+    // this is the permanent visual trace that survives scroll-back.
+    let suffix = if matches!(state.phase, UiPhase::Streaming) {
+        state
             .turn_elapsed()
             .map(|d| format!(" (after {:.1}s)", d.as_secs_f32()))
-            .unwrap_or_default();
-        format!("  🐎 whip: {}{}\n", phrase, suffix)
+            .unwrap_or_default()
     } else {
-        format!("  🐎 whip: {}  (no turn running)\n", phrase)
+        "  (no turn running)".to_string()
     };
-    renderer.render(UiLine::CommandOutput(trace));
+    let (cols, _) = crossterm::terminal::size().unwrap_or((80, 24));
+    for row in art::crack_art(&phrase, &suffix, cols) {
+        renderer.render(UiLine::CommandOutput(format!("{}\n", row)));
+    }
     renderer.flush();
 
     // Inject into the LLM context only when a turn is actually running.
