@@ -227,6 +227,7 @@ dependencies = [
  "crossterm 0.29.0",
  "dirs 6.0.0",
  "libc",
+ "rand",
  "serde_json",
  "tempfile",
  "tokio",

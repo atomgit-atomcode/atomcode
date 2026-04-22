@@ -14,6 +14,7 @@ pub mod terminal;
 pub mod test_term;
 pub mod think;
 pub mod trace;
+pub mod whip;
 pub mod width;
 
 use anyhow::Result;
