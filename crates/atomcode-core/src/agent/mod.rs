@@ -1521,6 +1521,20 @@ impl AgentLoop {
                         let len = self.conversation.messages.len();
                         if len > 10 {
                             self.conversation.messages.truncate(len - 4);
+                            // Bypassing `add_*` mutates `messages` directly, so
+                            // `turn_tracker` now points past the end of the
+                            // message list (last turn's start_idx + msg_count
+                            // can exceed messages.len()). Downstream
+                            // `build_messages` clamps via .min() so we don't
+                            // panic, but the drop-oldest loop uses wrong
+                            // boundaries. Rebuild the tracker from the
+                            // surviving messages — other truncation sites
+                            // (cancel_current_turn, ReloadConfig clear) do
+                            // the equivalent sync inline.
+                            self.conversation.turn_tracker =
+                                crate::conversation::turn::TurnTracker::rebuild(
+                                    &self.conversation.messages,
+                                );
                         }
                         let _ = self.event_tx.send(AgentEvent::TextDelta(
                             "\n[Context overflow — compressed history and retrying...]\n".to_string()

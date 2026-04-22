@@ -239,4 +239,58 @@ mod tests {
         tracker.on_user_message(2);
         assert_eq!(tracker.completed_count(), 1);
     }
+
+    /// Invariant: after `rebuild`, no turn's end_idx exceeds the
+    /// message vec length. Verifies the agent's retry-path fix: after
+    /// `messages.truncate(n)` followed by
+    /// `TurnTracker::rebuild(&messages)`, the tracker is internally
+    /// consistent with the surviving messages (unlike the previous
+    /// behavior where the tracker still pointed past the end).
+    #[test]
+    fn test_rebuild_matches_truncated_messages_length() {
+        use super::super::message::MessageContent;
+        use crate::tool::{ToolCall, ToolResult};
+
+        // Build a 12-msg conversation: 3 turns × 4 msgs each
+        // (user, atc, tool, assistant).
+        let mut msgs: Vec<Message> = Vec::new();
+        for t in 0..3 {
+            msgs.push(Message::new(Role::User, &format!("task {}", t)));
+            msgs.push(Message {
+                role: Role::Assistant,
+                content: MessageContent::AssistantWithToolCalls {
+                    text: Some("working".into()),
+                    tool_calls: vec![ToolCall {
+                        id: format!("c{}", t),
+                        name: "bash".into(),
+                        arguments: "{}".into(),
+                    }],
+                },
+            });
+            msgs.push(Message {
+                role: Role::Tool,
+                content: MessageContent::ToolResult(ToolResult {
+                    call_id: format!("c{}", t),
+                    output: "ok".into(),
+                    success: true,
+                }),
+            });
+            msgs.push(Message::new(Role::Assistant, &format!("done {}", t)));
+        }
+        assert_eq!(msgs.len(), 12);
+
+        // Simulate the agent's overflow retry: truncate 4 msgs.
+        msgs.truncate(msgs.len() - 4);
+        let tracker = TurnTracker::rebuild(&msgs);
+
+        for (i, t) in tracker.turns.iter().enumerate() {
+            assert!(
+                t.end_idx() <= msgs.len(),
+                "turn {} end_idx {} exceeds messages.len() {}",
+                i,
+                t.end_idx(),
+                msgs.len(),
+            );
+        }
+    }
 }
