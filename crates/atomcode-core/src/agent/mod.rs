@@ -937,6 +937,18 @@ impl AgentLoop {
                     .map(|s| s.len() / 4 + 4)
                     .sum();
 
+                // Extract the actual System message as rendered by ctx —
+                // this includes the per-model directives that ctx impls
+                // append inside `build_messages` (CN language lock for
+                // MiniMax/Qwen/DeepSeek/Kimi, MiniMax thinking
+                // discipline). Using the pre-ctx `system_prompt` here
+                // would hide those transforms from `/context prompt`.
+                let actual_system_prompt = msgs
+                    .iter()
+                    .find(|m| matches!(m.role, crate::conversation::message::Role::System))
+                    .and_then(|m| m.text().map(|s| s.to_string()))
+                    .unwrap_or_default();
+
                 let system_tokens_local = msgs
                     .iter()
                     .find(|m| matches!(m.role, crate::conversation::message::Role::System))
@@ -956,10 +968,9 @@ impl AgentLoop {
                     cold_zone_tokens,
                     ctx_window: context_window,
                     ctx_name: self.ctx.name().to_string(),
-                    // Rich path carries the actual bytes we just passed
-                    // to ctx.build_messages — TUI's `/context prompt`
-                    // reads this cached value.
-                    system_prompt: system_prompt.clone(),
+                    // Post-ctx bytes — matches what TurnRunner sends
+                    // (directives included). `/context prompt` reads this.
+                    system_prompt: actual_system_prompt,
                 });
             }
 
