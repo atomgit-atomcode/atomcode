@@ -12,6 +12,17 @@ impl AgentLoop {
         // of whether the agent appears stuck. Language- and domain-neutral.
         // Fires at turn end, so the agent answers the three questions at
         // the start of the next turn before making more tool calls.
+        //
+        // Visibility note: `add_user_message` only writes the core-side
+        // Conversation. The TUI keeps its own mirror synced via AgentEvent
+        // variants (TextDelta / ToolCallStarted / …), none of which carry
+        // injected user messages, so this prompt is INVISIBLE in the chat
+        // UI. The model still sees it (verify via `datalog/llm/*.json`,
+        // search `[System meta`). Treating this as expected — adding an
+        // AgentEvent::UserMessageInjected would forward the text, but
+        // all of atomcode's other silent injections ("Continue.",
+        // "Summarize…", stuck warnings) share the same gap, so fixing it
+        // is a separate architectural task, not part of this feature.
         if let Some(delta) = should_inject_reflection(
             self.tool_call_count,
             self.discipline_state.last_reflection_at_tool_count,
