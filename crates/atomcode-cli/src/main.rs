@@ -551,6 +551,7 @@ async fn run() -> Result<i32> {
                 providers: HashMap::new(),
                 datalog: Default::default(),
                 auto_update: true,
+                reflection_cadence: 10,
             }
         })
     } else {
@@ -561,6 +562,7 @@ async fn run() -> Result<i32> {
             providers: HashMap::new(),
             datalog: Default::default(),
             auto_update: true,
+            reflection_cadence: 10,
         }
     };
 

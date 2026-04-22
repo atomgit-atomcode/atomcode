@@ -66,6 +66,13 @@ pub struct Config {
     /// works manually. Missing from older configs → defaults to `true`.
     #[serde(default = "default_true")]
     pub auto_update: bool,
+    /// Every N tool calls, inject a "restate goal / what ruled out / next
+    /// output" reflection prompt before the next turn. 0 disables the
+    /// checkpoint entirely. Default 10 matches typical multi-file analysis
+    /// step counts — below which the reflection is overhead, above which
+    /// the agent can drift unnoticed.
+    #[serde(default = "default_reflection_cadence")]
+    pub reflection_cadence: usize,
 }
 
 /// Controls the per-turn markdown datalog writer.
@@ -84,6 +91,7 @@ pub struct DatalogConfig {
 }
 
 fn default_true() -> bool { true }
+fn default_reflection_cadence() -> usize { 10 }
 
 impl Default for DatalogConfig {
     fn default() -> Self {
@@ -308,6 +316,7 @@ mod tests {
             providers: HashMap::new(),
             datalog: DatalogConfig { enabled: false, dir: Some("/var/log/ac".to_string()) },
             auto_update: true,
+            reflection_cadence: 10,
         };
         cfg.providers.insert("p".to_string(), ProviderConfig {
             provider_type: "openai".to_string(),
@@ -349,5 +358,42 @@ mod tests {
         let config: Config = toml::from_str(toml_str).unwrap();
         let provider = config.active_provider(Some("openai")).unwrap();
         assert_eq!(provider.model, "gpt-4o");
+    }
+}
+
+#[cfg(test)]
+mod reflection_config_tests {
+    use super::*;
+
+    #[test]
+    fn reflection_cadence_defaults_to_ten_when_missing_from_toml() {
+        let toml_text = r#"
+default_provider = "claude"
+[providers]
+"#;
+        let cfg: Config = toml::from_str(toml_text).expect("parses minimal config");
+        assert_eq!(cfg.reflection_cadence, 10);
+    }
+
+    #[test]
+    fn reflection_cadence_zero_means_disabled() {
+        let toml_text = r#"
+default_provider = "claude"
+reflection_cadence = 0
+[providers]
+"#;
+        let cfg: Config = toml::from_str(toml_text).expect("parses config with 0");
+        assert_eq!(cfg.reflection_cadence, 0);
+    }
+
+    #[test]
+    fn reflection_cadence_custom_value_is_preserved() {
+        let toml_text = r#"
+default_provider = "claude"
+reflection_cadence = 7
+[providers]
+"#;
+        let cfg: Config = toml::from_str(toml_text).expect("parses");
+        assert_eq!(cfg.reflection_cadence, 7);
     }
 }

@@ -175,6 +175,7 @@ fn test_config() -> Config {
         providers,
         datalog: Default::default(),
         auto_update: false,
+        reflection_cadence: 10,
     }
 }
 
