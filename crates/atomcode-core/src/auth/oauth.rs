@@ -228,6 +228,7 @@ fn await_callback(port: u16) -> Result<(String, String)> {
     let (tx, rx) = mpsc::channel::<Result<(String, String)>>();
     let stop = Arc::new(AtomicBool::new(false));
 
+    #[cfg_attr(not(target_os = "windows"), allow(unused_variables))]
     let has_listener = listener.is_some();
     if let Some(listener) = listener {
         let tx_l = tx.clone();
@@ -238,15 +239,25 @@ fn await_callback(port: u16) -> Result<(String, String)> {
         });
     }
 
-    // Stdin reader (fallback) — only when the listener couldn't bind, i.e.
-    // WSL / headless Linux where the browser can't reach 127.0.0.1. On
-    // Windows with a bound listener this thread is poison: `read_line`
-    // blocks uncancellably on the console handle, and when the listener
-    // wins the race and the TUI resumes raw mode, the orphan keeps
-    // consuming console input — every keystroke the user types after
-    // login is swallowed by this zombie. Skip spawning it when the
-    // listener is handling the callback path.
-    if !has_listener {
+    // Stdin reader — spawn on Unix **regardless** of listener status. The
+    // listener covers the desktop path where the browser hits
+    // 127.0.0.1:8765; stdin covers everything else (headless Linux / SSH /
+    // Wayland without xdg-open / WSL under X forwarding failure). Earlier
+    // versions gated this on `!has_listener`, which silently broke Linux:
+    // the listener binds fine but the browser can't reach it, and with
+    // no stdin reader spawned the user's pasted URL went nowhere and the
+    // whole login hung forever.
+    //
+    // Windows is still gated off because its stdin `read_line` blocks on
+    // a console handle that can't be cancelled from another thread; when
+    // the listener wins the race the stdin thread sticks around as a
+    // zombie that eats keystrokes after raw mode comes back. On Unix,
+    // crossterm reads from `/dev/tty` rather than stdin FD 0, so a
+    // zombie stdin reader can't steal input — it just sits on FD 0
+    // harmlessly until process exit.
+    #[cfg(not(target_os = "windows"))]
+    {
+        let tx_stdin = tx.clone();
         thread::spawn(move || {
             let stdin = io::stdin();
             let mut line = String::new();
@@ -255,13 +266,30 @@ fn await_callback(port: u16) -> Result<(String, String)> {
                 Ok(_) => parse_pasted_callback(&line),
                 Err(e) => Err(anyhow::Error::new(e).context("Failed to read from stdin")),
             };
-            let _ = tx.send(r);
+            let _ = tx_stdin.send(r);
         });
-    } else {
-        // Keep `tx` alive long enough for the listener thread; dropping it
-        // immediately would close the channel before the callback arrives.
-        drop(tx);
     }
+    #[cfg(target_os = "windows")]
+    {
+        if !has_listener {
+            let tx_stdin = tx.clone();
+            thread::spawn(move || {
+                let stdin = io::stdin();
+                let mut line = String::new();
+                let r = match stdin.lock().read_line(&mut line) {
+                    Ok(0) => Err(anyhow::anyhow!("stdin closed")),
+                    Ok(_) => parse_pasted_callback(&line),
+                    Err(e) => Err(anyhow::Error::new(e).context("Failed to read from stdin")),
+                };
+                let _ = tx_stdin.send(r);
+            });
+        }
+    }
+    // Drop the original `tx` — the listener and stdin readers each
+    // cloned their own. Without this drop the channel would never
+    // close after both readers finish, so `rx.recv()` on an early
+    // cancellation would hang.
+    drop(tx);
 
     let result = rx.recv().context("login cancelled")?;
     stop.store(true, Ordering::Relaxed);

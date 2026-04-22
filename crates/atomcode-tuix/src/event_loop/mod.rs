@@ -51,6 +51,12 @@ pub struct LoopCtx {
     pub input_rx: mpsc::UnboundedReceiver<InputEvent>,
     pub commands: CommandRegistry,
     pub session_manager: SessionManager,
+    /// Session actively being accumulated. Updated on TurnComplete /
+    /// TurnCancelled (both carry the latest `messages` slice), saved to
+    /// disk via `session_manager` on the same events so `/resume` after
+    /// a quit sees the conversation. Replaced wholesale when the user
+    /// resumes another session via `/resume` + SessionPicker.
+    pub current_session: atomcode_core::session::Session,
     /// Shared "new version available" hint. Populated by the detached
     /// version-check task spawned from `run()`; read by `build_status`
     /// on each redraw. `None` = no hint (either check still pending,
@@ -74,6 +80,24 @@ pub struct LoopCtx {
     /// Consumed in the main `select!` so upgrade progress is rendered
     /// alongside agent events.
     pub upgrade_rx: mpsc::UnboundedReceiver<atomcode_core::self_update::UpgradeEvent>,
+    /// Signal channel from the `/issue` wizard modal back to the event
+    /// loop. The wizard's Enter handler can't touch `App` directly
+    /// (modals only see `LoopCtx`), so it stores the collected title +
+    /// body here, returns `Close`, and the event loop's post-close
+    /// branch POSTs the issue to AtomGit and echoes the URL of the
+    /// newly-created issue back into the conversation.
+    pub pending_new_issue: Option<NewIssueDraft>,
+}
+
+/// What the `/issue` wizard hands back to the event loop after the user
+/// finishes step 2. The event loop turns this into a `POST /repos/.../issues`
+/// API call and echoes the resulting issue URL into scrollback.
+#[derive(Debug, Clone)]
+pub struct NewIssueDraft {
+    pub owner: String,
+    pub repo: String,
+    pub title: String,
+    pub body: String,
 }
 
 /// Line-edit buffer for input composition. Byte-indexed cursor.
@@ -612,6 +636,16 @@ pub struct App {
     /// Requires a second press within `CTRL_C_EXIT_WINDOW` to actually
     /// exit — protects against accidental single-tap exits.
     pub exit_pending: Option<std::time::Instant>,
+    /// Set by `/fixissue <url>` while the agent is resolving that issue.
+    /// On `TurnComplete` the text buffered in `fixissue_buffer` is posted
+    /// back as an issue comment + the `fixed` label is applied. Cleared
+    /// on TurnComplete / TurnCancelled / Error so a subsequent normal
+    /// message doesn't accidentally trigger a post-back.
+    pub fixissue_pending: Option<atomcode_core::atomgit::IssueRef>,
+    /// Accumulates every visible `AssistantText` delta produced during a
+    /// fixissue turn, verbatim. Sent as the AtomGit comment body on
+    /// successful completion.
+    pub fixissue_buffer: String,
 }
 
 /// How long the "press Ctrl+C again to exit" confirmation stays armed.
@@ -628,6 +662,8 @@ impl App {
             think: ThinkStripper::new(),
             pending_tools: std::collections::HashMap::new(),
             exit_pending: None,
+            fixissue_pending: None,
+            fixissue_buffer: String::new(),
         }
     }
 }
@@ -805,7 +841,7 @@ pub async fn run_loop(
             maybe = ctx.agent.event_rx.recv() => {
                 let Some(ev) = maybe else { break };
                 let pre_phase = app.state.phase;
-                handle_agent_event(ev, &mut app.state, &mut app.think, renderer, &mut app.pending_tools, &mut ctx);
+                handle_agent_event(ev, &mut app.state, &mut app.think, renderer, &mut app.pending_tools, &mut ctx, &mut app.fixissue_pending, &mut app.fixissue_buffer);
                 if pre_phase != app.state.phase {
                     crate::tuix_trace!("PH", "{:?} -> {:?}", pre_phase, app.state.phase);
                 }
@@ -910,7 +946,7 @@ pub async fn run_loop(
             maybe = ctx.agent.event_rx.recv() => {
                 let Some(ev) = maybe else { break };
                 let pre_phase = app.state.phase;
-                handle_agent_event(ev, &mut app.state, &mut app.think, renderer, &mut app.pending_tools, &mut ctx);
+                handle_agent_event(ev, &mut app.state, &mut app.think, renderer, &mut app.pending_tools, &mut ctx, &mut app.fixissue_pending, &mut app.fixissue_buffer);
                 if pre_phase != app.state.phase {
                     crate::tuix_trace!("PH", "{:?} -> {:?}", pre_phase, app.state.phase);
                 }
@@ -1032,6 +1068,37 @@ fn handle_input(
                     )?;
                     if matches!(action, ModalAction::Close) {
                         app.active_modal = None;
+                        // IssueWizard signals a staged title+body via
+                        // `ctx.pending_new_issue`. Drain + POST to the
+                        // AtomGit API here and echo the created-issue
+                        // URL into scrollback. Blocking call — the
+                        // wizard is modal so UI freezing briefly is
+                        // expected / acceptable.
+                        if let Some(draft) = ctx.pending_new_issue.take() {
+                            match atomcode_core::atomgit::Client::from_stored_auth()
+                                .and_then(|c| c.create_issue(&draft.owner, &draft.repo, &draft.title, &draft.body))
+                            {
+                                Ok(created) => {
+                                    let shown_url = created.html_url.clone().unwrap_or_else(|| {
+                                        format!(
+                                            "https://atomgit.com/{}/{}/issues/{}",
+                                            draft.owner, draft.repo, created.number
+                                        )
+                                    });
+                                    renderer.render(UiLine::CommandOutput(format!(
+                                        "  [issue] ✔ created #{}: {}\n  {}\n",
+                                        created.number, created.title, shown_url,
+                                    )));
+                                }
+                                Err(e) => {
+                                    renderer.render(UiLine::CommandOutput(format!(
+                                        "  [issue] ✗ create failed: {:#}\n",
+                                        e
+                                    )));
+                                }
+                            }
+                            renderer.flush();
+                        }
                         redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
                     }
                     return Ok(());
@@ -1127,17 +1194,41 @@ fn handle_idle_key(
                 return Ok(());
             }
             (KeyCode::Enter, m) if !m.contains(crossterm::event::KeyModifiers::SHIFT) => {
-                // Accept the highlighted command as the committed line.
+                // Accept the highlighted command. Two shapes:
+                //   * arg-less commands (e.g. /help, /quit, /login) → execute
+                //     immediately on Enter, as before.
+                //   * commands that require an arg (e.g. /fixissue <url>) →
+                //     auto-complete the name + trailing space and park the
+                //     cursor so the user types the arg next. A SECOND Enter
+                //     (once the arg is filled in) commits normally through
+                //     the regular BufferResult::Commit → execute_slash_command
+                //     path at the bottom of this function.
                 let name = items[app.menu.selected].0.clone();
-                let committed = format!("/{}", name);
+                let needs_args = ctx
+                    .commands
+                    .find(&name)
+                    .map(|c| c.needs_args)
+                    .unwrap_or(false);
                 app.menu.selected = 0;
-                // Simulate a commit path.
+
+                if needs_args {
+                    // Rewrite buffer to `/name ` and park cursor at the end.
+                    // Menu rebuilds on next keystroke — with the trailing
+                    // space parse_slash_line returns `Some(("name", ""))`
+                    // so build_menu_items correctly hides the menu.
+                    app.buf.text = format!("/{} ", name);
+                    app.buf.cursor = app.buf.text.len();
+                    redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+                    return Ok(());
+                }
+
+                let committed = format!("/{}", name);
                 renderer.render(UiLine::ClearTransient);
                 renderer.render(UiLine::User(committed.clone()));
                 app.buf.text.clear();
                 app.buf.cursor = 0;
                 if let Some((cmd, arg)) = parse_slash_line(&committed) {
-                    execute_slash_command(cmd, arg, &mut app.state, ctx, renderer, &mut app.active_modal)?;
+                    execute_slash_command(cmd, arg, &mut app.state, ctx, renderer, &mut app.active_modal, &mut app.fixissue_pending, &mut app.fixissue_buffer)?;
                     if matches!(app.state.phase, UiPhase::Idle) {
                         redraw_after_slash(&app.buf, &app.state, ctx, &app.active_modal, renderer);
                     }
@@ -1157,7 +1248,7 @@ fn handle_idle_key(
     }
 
     let action = classify(code, modifiers);
-    let result = app.buf.apply(action, ctx.history.entries(), &ctx.commands);
+let result = app.buf.apply(action, ctx.history.entries(), &ctx.commands);
     crate::tuix_trace!(
         "KEY",
         "idle result={} buf_len={} cursor={}",
@@ -1210,7 +1301,7 @@ fn handle_idle_key(
             let as_slash = parse_slash_line(&line)
                 .filter(|(cmd, _)| ctx.commands.find(cmd).is_some());
             if let Some((cmd, arg)) = as_slash {
-                execute_slash_command(cmd, arg, &mut app.state, ctx, renderer, &mut app.active_modal)?;
+                execute_slash_command(cmd, arg, &mut app.state, ctx, renderer, &mut app.active_modal, &mut app.fixissue_pending, &mut app.fixissue_buffer)?;
                 if matches!(app.state.phase, UiPhase::Idle) {
                     redraw_after_slash(&app.buf, &app.state, ctx, &app.active_modal, renderer);
                 }
@@ -1376,7 +1467,7 @@ fn handle_streaming_key(
     }
 
     let action = classify(code, modifiers);
-    match app.buf.apply(action, ctx.history.entries(), &ctx.commands) {
+match app.buf.apply(action, ctx.history.entries(), &ctx.commands) {
         BufferResult::NoOp => {}
         BufferResult::Redraw => {
             // Menu shape may have changed — reset selection if it
@@ -1538,11 +1629,16 @@ fn handle_agent_event(
     renderer: &mut dyn Renderer,
     pending_tools: &mut std::collections::HashMap<String, (String, String, bool)>,
     ctx: &mut LoopCtx,
+    fixissue_pending: &mut Option<atomcode_core::atomgit::IssueRef>,
+    fixissue_buffer: &mut String,
 ) {
     match ev {
         AgentEvent::TextDelta(text) => {
             let visible = think.feed(&text);
             if !visible.is_empty() {
+                if fixissue_pending.is_some() {
+                    fixissue_buffer.push_str(&visible);
+                }
                 renderer.render(UiLine::AssistantText(visible));
                 renderer.flush();
             }
@@ -1659,7 +1755,7 @@ fn handle_agent_event(
             state.on_tool_call_streaming(&display_tool_name(&name));
         }
         AgentEvent::PhaseChange(_) => {}
-        AgentEvent::TurnComplete { duration, total_tokens, turn_count, tool_call_count, .. } => {
+        AgentEvent::TurnComplete { duration, total_tokens, turn_count, tool_call_count, messages, .. } => {
             renderer.render(UiLine::AssistantLineBreak);
             pending_tools.clear();
             let done = state.next_done_label();
@@ -1671,8 +1767,38 @@ fn handle_agent_event(
             renderer.render(UiLine::TurnSeparator { label });
             renderer.flush();
             state.on_turn_complete();
+
+            // Persist session after every completed turn so /resume can
+            // find it after a clean exit — the whole point of sessions.
+            persist_current_session(ctx, messages);
+
+            // fixissue post-run side effects — only on successful TurnComplete
+            // (TurnCancelled / Error arms below clear `fixissue_pending`
+            // without posting). Takes the IssueRef out so only this turn's
+            // completion triggers the post-back.
+            if let Some(issue_ref) = fixissue_pending.take() {
+                let body = std::mem::take(fixissue_buffer);
+                if body.trim().is_empty() {
+                    renderer.render(UiLine::CommandOutput(format!(
+                        "  [fixissue] agent produced no text; skipping comment + label on issue #{}\n",
+                        issue_ref.number
+                    )));
+                } else {
+                    match atomcode_core::atomgit::fixissue::post_completion(&issue_ref, &body) {
+                        Ok(()) => renderer.render(UiLine::CommandOutput(format!(
+                            "  [fixissue] ✔ posted summary + applied 'fixed' label to issue #{}\n",
+                            issue_ref.number
+                        ))),
+                        Err(e) => renderer.render(UiLine::CommandOutput(format!(
+                            "  [fixissue] ✗ post-back failed (local fix still saved): {:#}\n",
+                            e
+                        ))),
+                    }
+                }
+                renderer.flush();
+            }
         }
-        AgentEvent::TurnCancelled { .. } => {
+        AgentEvent::TurnCancelled { messages } => {
             // Render any in-flight tool calls that never got a result
             // as "(cancelled)" so the user sees what was mid-flight.
             for (_id, (name, detail, call_rendered)) in pending_tools.drain() {
@@ -1688,10 +1814,19 @@ fn handle_agent_event(
             renderer.render(UiLine::TurnCancelled);
             renderer.flush();
             state.on_turn_cancelled();
+            // Cancellation = agent didn't finish; don't post a comment
+            // against an incomplete "fix".
+            fixissue_pending.take();
+            fixissue_buffer.clear();
+            // Save what we did have — a user who Ctrl+C'd mid-stream
+            // should still be able to /resume the cleaned conversation.
+            persist_current_session(ctx, messages);
         }
         AgentEvent::Error(e) => {
             renderer.render(UiLine::Error(e));
             renderer.flush();
+            fixissue_pending.take();
+            fixissue_buffer.clear();
             state.on_error();
         }
         AgentEvent::TokenUsage(u) => {
@@ -1736,6 +1871,51 @@ fn handle_agent_event(
     }
 }
 
+
+/// Copy the latest conversation into `ctx.current_session`, auto-name
+/// the session from the first user message when it's still at its
+/// default label, and write the session file to disk. Called on every
+/// TurnComplete and TurnCancelled so `/resume` can find the
+/// conversation after a quit. No-op when the conversation is empty
+/// (don't save a blank session).
+fn persist_current_session(
+    ctx: &mut LoopCtx,
+    messages: Vec<atomcode_core::conversation::message::Message>,
+) {
+    if messages.is_empty() {
+        return;
+    }
+    ctx.current_session.messages = messages;
+    ctx.current_session.touch();
+    // Rename from the generated default (`default` or `session-<ts>`)
+    // to the first user message's first line, truncated. Keeps the
+    // `/resume` picker scannable.
+    let should_rename = ctx.current_session.name == "default"
+        || ctx.current_session.name.starts_with("session-");
+    if should_rename {
+        use atomcode_core::conversation::message::Role;
+        if let Some(first_user) = ctx
+            .current_session
+            .messages
+            .iter()
+            .find(|m| matches!(m.role, Role::User))
+        {
+            if let Some(text) = first_user.text() {
+                let name: String = text
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .chars()
+                    .take(40)
+                    .collect();
+                if !name.is_empty() {
+                    ctx.current_session.name = name;
+                }
+            }
+        }
+    }
+    let _ = ctx.session_manager.save(&ctx.current_session);
+}
 
 /// Build the persistent status line shown directly below the input box.
 /// Pulls model name from ctx, cwd from ctx.working_dir (with $HOME

@@ -138,6 +138,10 @@ pub enum AgentEvent {
         /// Why the loop stopped. `Natural` for ordinary completion; see
         /// TurnStopReason for budget / cancel / error variants.
         stop_reason: TurnStopReason,
+        /// Snapshot of the conversation messages at the moment the turn
+        /// ended. Mirrors `TurnCancelled.messages` so UIs have one uniform
+        /// path for persisting session state on either terminal event.
+        messages: Vec<crate::conversation::message::Message>,
     },
     /// Turn was cancelled by user before completion.
     /// The conversation has been cleaned up - partial messages removed.
@@ -1849,6 +1853,7 @@ impl AgentLoop {
             turn_count: self.turn_count,
             tool_call_count: self.tool_call_count,
             stop_reason,
+            messages: self.conversation.messages.clone(),
         });
         let _ = self
             .event_tx

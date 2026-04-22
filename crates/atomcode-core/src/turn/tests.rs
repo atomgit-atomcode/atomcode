@@ -149,6 +149,33 @@ impl Tool for DangerousTool {
     }
 }
 
+/// A tool that only requires approval when it can inspect the current context.
+struct ContextDangerousTool;
+
+#[async_trait]
+impl Tool for ContextDangerousTool {
+    fn definition(&self) -> ToolDef {
+        ToolDef {
+            name: "context_dangerous",
+            description: "Requires context-aware approval".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+        }
+    }
+    fn approval(&self, _args: &str) -> ApprovalRequirement {
+        ApprovalRequirement::AutoApprove
+    }
+    fn approval_with_context(&self, _args: &str, _ctx: &ToolContext) -> ApprovalRequirement {
+        ApprovalRequirement::RequireApproval("Needs context-aware confirmation".to_string())
+    }
+    async fn execute(&self, _args: &str, _ctx: &ToolContext) -> Result<ToolResult> {
+        Ok(ToolResult {
+            call_id: String::new(),
+            output: "context-aware action done".to_string(),
+            success: true,
+        })
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Test helpers: Config / Context
 // ---------------------------------------------------------------------------
@@ -501,6 +528,33 @@ async fn test_turn_runner_interactive_approval_deny() {
             resp_tx.send(PermissionDecision::Deny).unwrap();
         }
     });
+
+    let result = runner.run(&mut conv, "system", &tx, CancellationToken::new()).await;
+
+    match result {
+        TurnResult::UsedTools { .. } => {
+            let last = conv.messages.last().unwrap();
+            if let crate::conversation::message::MessageContent::ToolResult(ref r) = last.content {
+                assert!(!r.success, "Tool should have been denied");
+                assert!(r.output.contains("denied"));
+            } else {
+                panic!("Expected ToolResult");
+            }
+        }
+        other => panic!("Expected UsedTools, got {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn test_turn_runner_uses_context_aware_approval() {
+    let mut tools = ToolRegistry::new();
+    tools.register(Box::new(ContextDangerousTool));
+
+    let provider = MockProvider::with_tool_call("context_dangerous", "{}");
+    let mut runner = make_runner(provider, tools, auto_deny());
+    let mut conv = Conversation::new();
+    conv.add_user_message("do it");
+    let (tx, _rx) = mpsc::unbounded_channel();
 
     let result = runner.run(&mut conv, "system", &tx, CancellationToken::new()).await;
 

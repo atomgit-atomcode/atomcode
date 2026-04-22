@@ -23,6 +23,8 @@ pub mod web_search;
 pub mod write;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
 /// Directories to skip when scanning file trees (build artifacts, caches, VCS).
 /// Used by glob, list_dir, project_context, and collect_project_files.
@@ -44,12 +46,216 @@ pub fn should_skip_dir(name: &str) -> bool {
     SKIP_DIRS.contains(&name)
         || SKIP_DIR_PREFIXES.iter().any(|p| name.starts_with(p))
 }
-use std::path::PathBuf;
-use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use tokio::sync::{Mutex, RwLock};
+
+fn expand_user_path(path: &str) -> PathBuf {
+    if path == "~" {
+        return dirs::home_dir().unwrap_or_else(|| PathBuf::from(path));
+    }
+
+    if let Some(rest) = path.strip_prefix("~/") {
+        return dirs::home_dir()
+            .map(|home| home.join(rest))
+            .unwrap_or_else(|| PathBuf::from(path));
+    }
+
+    PathBuf::from(path)
+}
+
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                let can_pop = normalized
+                    .components()
+                    .next_back()
+                    .is_some_and(|last| matches!(last, Component::Normal(_)));
+                if can_pop {
+                    normalized.pop();
+                } else if normalized.as_os_str().is_empty() {
+                    normalized.push(component.as_os_str());
+                }
+            }
+            Component::RootDir | Component::Prefix(_) | Component::Normal(_) => {
+                normalized.push(component.as_os_str());
+            }
+        }
+    }
+
+    normalized
+}
+
+fn canonicalize_candidate_path(path: &Path) -> Result<PathBuf> {
+    if path.exists() {
+        return std::fs::canonicalize(path)
+            .with_context(|| format!("Failed to resolve path {}", path.display()));
+    }
+
+    let mut missing_parts = Vec::new();
+    let mut current = path;
+
+    loop {
+        if current.exists() {
+            let mut resolved = std::fs::canonicalize(current)
+                .with_context(|| format!("Failed to resolve parent path {}", current.display()))?;
+            for part in missing_parts.iter().rev() {
+                resolved.push(part);
+            }
+            return Ok(resolved);
+        }
+
+        let name = current.file_name().ok_or_else(|| {
+            anyhow::anyhow!("Path {} has no existing parent directory", path.display())
+        })?;
+        missing_parts.push(name.to_os_string());
+        current = current.parent().ok_or_else(|| {
+            anyhow::anyhow!("Path {} has no existing parent directory", path.display())
+        })?;
+    }
+}
+
+pub struct ResolvedPath {
+    pub path: PathBuf,
+    pub workspace_root: PathBuf,
+    pub within_workspace: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExternalPathAction {
+    Enumerate,
+    Read,
+    Write,
+}
+
+pub fn inspect_path_access(raw_path: &str, working_dir: &Path) -> Result<ResolvedPath> {
+    let workspace_root = std::fs::canonicalize(working_dir)
+        .with_context(|| format!("Failed to resolve working directory {}", working_dir.display()))?;
+    let expanded = expand_user_path(raw_path);
+    let candidate = if expanded.is_absolute() {
+        expanded
+    } else {
+        working_dir.join(expanded)
+    };
+    let candidate = normalize_path(&candidate);
+    let resolved = canonicalize_candidate_path(&candidate)?;
+
+    Ok(ResolvedPath {
+        within_workspace: resolved.starts_with(&workspace_root),
+        path: resolved,
+        workspace_root,
+    })
+}
+
+pub fn resolve_workspace_path(raw_path: &str, working_dir: &Path) -> Result<PathBuf> {
+    let resolved = inspect_path_access(raw_path, working_dir)?;
+    if resolved.within_workspace {
+        Ok(resolved.path)
+    } else {
+        bail!(
+            "Access denied: {} resolves outside working directory {}",
+            raw_path,
+            resolved.workspace_root.display()
+        );
+    }
+}
+
+fn is_sensitive_path(path: &Path) -> bool {
+    const SENSITIVE_ABS_PREFIXES: &[&str] = &["/etc"];
+    const SENSITIVE_HOME_DIRS: &[&str] = &[".ssh", ".aws", ".gnupg", ".config"];
+    const SENSITIVE_FILE_NAMES: &[&str] = &[
+        ".bashrc", ".bash_profile", ".zshrc", ".zprofile", ".zshenv",
+        ".npmrc", ".pypirc", ".env", ".env.local", "credentials", "config",
+        "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519",
+    ];
+    const SENSITIVE_EXTS: &[&str] = &["pem", "key", "p12", "pfx", "der", "crt", "cer"];
+
+    for prefix in SENSITIVE_ABS_PREFIXES {
+        if path.starts_with(prefix) {
+            return true;
+        }
+    }
+
+    if let Some(home) = dirs::home_dir() {
+        for dir in SENSITIVE_HOME_DIRS {
+            if path.starts_with(home.join(dir)) {
+                return true;
+            }
+        }
+
+        for file in SENSITIVE_FILE_NAMES {
+            if path == home.join(file) {
+                return true;
+            }
+        }
+    }
+
+    if path.file_name().and_then(|n| n.to_str()).is_some_and(|name| {
+        SENSITIVE_FILE_NAMES.contains(&name)
+    }) {
+        return true;
+    }
+
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| SENSITIVE_EXTS.iter().any(|candidate| ext.eq_ignore_ascii_case(candidate)))
+}
+
+pub fn approval_for_path(
+    raw_path: &str,
+    working_dir: &Path,
+    action: ExternalPathAction,
+) -> Result<ApprovalRequirement> {
+    let access = inspect_path_access(raw_path, working_dir)?;
+    if access.within_workspace {
+        return Ok(ApprovalRequirement::AutoApprove);
+    }
+
+    let sensitive = is_sensitive_path(&access.path);
+    let action_label = match action {
+        ExternalPathAction::Enumerate => "Accessing",
+        ExternalPathAction::Read => "Reading",
+        ExternalPathAction::Write => "Writing",
+    };
+    let base_reason = format!(
+        "{} path outside working directory: {} (working dir: {})",
+        action_label,
+        raw_path,
+        access.workspace_root.display()
+    );
+
+    Ok(match action {
+        ExternalPathAction::Enumerate => {
+            if sensitive {
+                ApprovalRequirement::RequireApprovalAlways(format!(
+                    "{}. This path looks sensitive and always requires confirmation.",
+                    base_reason
+                ))
+            } else {
+                ApprovalRequirement::AutoApprove
+            }
+        }
+        ExternalPathAction::Read => {
+            if sensitive {
+                ApprovalRequirement::RequireApprovalAlways(format!(
+                    "{}. This path looks sensitive and always requires confirmation.",
+                    base_reason
+                ))
+            } else {
+                ApprovalRequirement::RequireApproval(format!("{base_reason}."))
+            }
+        }
+        ExternalPathAction::Write => ApprovalRequirement::RequireApprovalAlways(format!(
+            "{}. Writing outside the workspace always requires confirmation.",
+            base_reason
+        )),
+    })
+}
 
 #[derive(Debug, Clone)]
 pub struct ToolDef {
@@ -84,6 +290,7 @@ pub struct ToolCallBuffer {
 pub enum ApprovalRequirement {
     AutoApprove,
     RequireApproval(String),
+    RequireApprovalAlways(String),
 }
 
 /// Coarse-grained permission level for a tool, stored in `PermissionStore`.
@@ -126,6 +333,10 @@ impl PermissionStore {
 
     /// Check whether a tool call should be auto-approved, needs asking, or denied.
     pub fn check(&self, tool_name: &str, approval: &ApprovalRequirement) -> PermissionDecision {
+        if let ApprovalRequirement::RequireApprovalAlways(reason) = approval {
+            return PermissionDecision::Ask(reason.clone());
+        }
+
         // 1. Session grant (user pressed [A] during this session).
         //    This overrides RequireApproval — the user explicitly chose "Always"
         //    for this tool, so don't prompt again. Bash still has its own
@@ -138,7 +349,6 @@ impl PermissionStore {
         if let ApprovalRequirement::RequireApproval(reason) = approval {
             return PermissionDecision::Ask(reason.clone());
         }
-
         // 3. Explicit per-tool override (only reached for AutoApprove tools).
         if let Some(level) = self.overrides.get(tool_name) {
             match level {
@@ -226,6 +436,9 @@ impl ToolContext {
 pub trait Tool: Send + Sync {
     fn definition(&self) -> ToolDef;
     fn approval(&self, args: &str) -> ApprovalRequirement;
+    fn approval_with_context(&self, args: &str, _ctx: &ToolContext) -> ApprovalRequirement {
+        self.approval(args)
+    }
     async fn execute(&self, args: &str, ctx: &ToolContext) -> Result<ToolResult>;
 }
 
@@ -275,6 +488,7 @@ impl ToolRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
 
     struct DummyTool;
 
@@ -330,6 +544,137 @@ mod tests {
         assert_eq!(result.output, "ok");
     }
 
+    #[test]
+    fn resolve_workspace_path_rejects_parent_escape() {
+        let workspace = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let path = format!("{}/secret.txt", outside.path().display());
+        std::fs::write(outside.path().join("secret.txt"), "top-secret").unwrap();
+
+        let err = resolve_workspace_path(&path, workspace.path()).unwrap_err();
+        assert!(err.to_string().contains("outside working directory"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_workspace_path_rejects_symlink_escape() {
+        let workspace = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let target = outside.path().join("secret.txt");
+        std::fs::write(&target, "top-secret").unwrap();
+        let link = workspace.path().join("secret-link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let err = resolve_workspace_path(link.to_string_lossy().as_ref(), workspace.path()).unwrap_err();
+        assert!(err.to_string().contains("outside working directory"));
+    }
+
+    #[test]
+    fn inspect_path_access_marks_workspace_escape() {
+        let workspace = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let target = outside.path().join("secret.txt");
+        std::fs::write(&target, "top-secret").unwrap();
+
+        let access = inspect_path_access(&target.to_string_lossy(), workspace.path()).unwrap();
+        assert!(!access.within_workspace);
+        assert_eq!(access.path, target);
+    }
+
+    #[test]
+    fn approval_for_non_sensitive_enumeration_outside_workspace_is_auto() {
+        let workspace = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+
+        let approval = approval_for_path(
+            &outside.path().to_string_lossy(),
+            workspace.path(),
+            ExternalPathAction::Enumerate,
+        ).unwrap();
+        assert!(matches!(approval, ApprovalRequirement::AutoApprove));
+    }
+
+    #[test]
+    fn approval_for_non_sensitive_read_outside_workspace_requires_confirmation() {
+        let workspace = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let target = outside.path().join("notes.txt");
+        std::fs::write(&target, "hello").unwrap();
+
+        let approval = approval_for_path(
+            &target.to_string_lossy(),
+            workspace.path(),
+            ExternalPathAction::Read,
+        ).unwrap();
+        assert!(matches!(approval, ApprovalRequirement::RequireApproval(_)));
+    }
+
+    #[test]
+    fn approval_for_sensitive_read_outside_workspace_requires_always() {
+        let workspace = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let target = outside.path().join("id_rsa");
+        std::fs::write(&target, "private-key").unwrap();
+
+        let approval = approval_for_path(
+            &target.to_string_lossy(),
+            workspace.path(),
+            ExternalPathAction::Read,
+        ).unwrap();
+        assert!(matches!(approval, ApprovalRequirement::RequireApprovalAlways(_)));
+    }
+
+    #[test]
+    fn approval_for_write_outside_workspace_requires_always() {
+        let workspace = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let target = outside.path().join("notes.txt");
+
+        let approval = approval_for_path(
+            &target.to_string_lossy(),
+            workspace.path(),
+            ExternalPathAction::Write,
+        ).unwrap();
+        assert!(matches!(approval, ApprovalRequirement::RequireApprovalAlways(_)));
+    }
+
+    #[tokio::test]
+    async fn read_file_requests_approval_for_workspace_escape() {
+        let workspace = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let target = outside.path().join("secret.txt");
+        std::fs::write(&target, "top-secret").unwrap();
+
+        let tool = crate::tool::read::ReadFileTool;
+        let ctx = ToolContext::new(workspace.path().to_path_buf());
+        let args = format!(r#"{{"file_path":"{}"}}"#, target.display());
+
+        assert!(matches!(
+            tool.approval_with_context(&args, &ctx),
+            ApprovalRequirement::RequireApproval(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn edit_file_requests_approval_for_workspace_escape() {
+        let workspace = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let target = outside.path().join("secret.txt");
+        std::fs::write(&target, "top-secret").unwrap();
+
+        let tool = crate::tool::edit::EditFileTool;
+        let ctx = ToolContext::new(workspace.path().to_path_buf());
+        let args = format!(
+            r#"{{"file_path":"{}","old_string":"top-secret","new_string":"changed"}}"#,
+            target.display()
+        );
+
+        assert!(matches!(
+            tool.approval_with_context(&args, &ctx),
+            ApprovalRequirement::RequireApproval(_)
+        ));
+    }
+
     // PermissionStore tests
 
     #[test]
@@ -355,6 +700,14 @@ mod tests {
         store.grant_session("bash");
         let decision = store.check("bash", &ApprovalRequirement::RequireApproval("Destructive".into()));
         assert!(matches!(decision, PermissionDecision::Allow));
+    }
+
+    #[test]
+    fn test_permission_store_session_grant_does_not_bypass_require_approval_always() {
+        let mut store = PermissionStore::new();
+        store.grant_session("bash");
+        let decision = store.check("bash", &ApprovalRequirement::RequireApprovalAlways("Sensitive".into()));
+        assert!(matches!(decision, PermissionDecision::Ask(_)));
     }
 
     #[test]

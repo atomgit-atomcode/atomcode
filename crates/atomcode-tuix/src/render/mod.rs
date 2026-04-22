@@ -39,7 +39,7 @@ pub enum UiLine {
     Spinner { frame: &'static str, label: String },
     /// Clear the current transient line (prepares for a permanent write).
     ClearTransient,
-    /// Draw the input prompt "❯ " + current buffer (transient, idle).
+    /// Draw the input prompt "> " + current buffer (transient, idle).
     /// When `menu` is Some, a command palette is drawn above the box.
     /// `cursor_byte` is a byte offset into `buf` — the renderer wraps
     /// `buf` to the available input width and derives the 2D cursor

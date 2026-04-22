@@ -110,14 +110,32 @@ impl GraphIndexer {
         // Read lock released here.
 
         // Parse dirty files OUTSIDE the lock (CPU-intensive, no graph access needed).
-        // Check cancel between files — this is the hot loop where a
-        // stale indexer burns minutes of CPU after the user has already
-        // /cd'd elsewhere.
+        //
+        // Two concerns stack on this loop and both fixes apply:
+        // 1. **CPU throttle** — tree-sitter parse per file is sync CPU work.
+        //    Running it in a tight loop inside an async task pegs one core
+        //    at ~99% for the whole initial index, which reads as "atomcode
+        //    hogs CPU at startup" on the user's Activity Monitor. Yield
+        //    after each file so the runtime can service UI renders / agent
+        //    events between parses; sleep briefly every CHUNK files so
+        //    cumulative CPU use stays moderate. Total added wall-clock
+        //    is tiny (~5 ms × N/CHUNK).
+        // 2. **Cancellation** — a stale indexer spawned by a previous
+        //    working-dir can burn minutes of CPU after the user has
+        //    already `/cd`'d elsewhere. The rapid-cd case spawns a fresh
+        //    indexer per cd and without this check they'd all parse in
+        //    parallel. Bail at the top of every iteration.
+        const CPU_BREATHE_CHUNK: usize = 16;
+        const CPU_BREATHE_MS: u64 = 5;
         let mut all_results: Vec<(PathBuf, u64, FileParseResult)> = Vec::new();
-        for (path, mtime) in dirty_files {
+        for (i, (path, mtime)) in dirty_files.into_iter().enumerate() {
             if cancel.is_cancelled() { return; }
             if let Some(result) = self.parse_file(&path) {
                 all_results.push((path, mtime, result));
+            }
+            tokio::task::yield_now().await;
+            if i > 0 && i % CPU_BREATHE_CHUNK == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(CPU_BREATHE_MS)).await;
             }
         }
 

@@ -199,6 +199,8 @@ pub async fn run(
         .unwrap_or_else(|| History::load(crate::platform::history_path()));
 
     let session_manager = atomcode_core::session::SessionManager::new(&working_dir);
+    // Fresh session by default; `/resume` replaces this on load.
+    let current_session = atomcode_core::session::Session::default_session(working_dir.clone());
 
     // Passive "new version available" check. Detached — never blocks
     // startup; on any error returns None silently. On a positive hit
@@ -274,11 +276,13 @@ pub async fn run(
         input_rx,
         commands: CommandRegistry::builtin(),
         session_manager,
+        current_session,
         update_hint,
         wake_rx,
         reader: reader_handle,
         upgrade_tx,
         upgrade_rx,
+        pending_new_issue: None,
     };
 
     let result = run_loop(ctx, renderer.as_mut()).await;

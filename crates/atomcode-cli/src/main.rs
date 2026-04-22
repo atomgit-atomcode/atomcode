@@ -404,6 +404,12 @@ enum Commands {
     },
     /// Roll back to the previous version (swap with .bak on disk)
     Rollback,
+    /// Fetch an AtomGit issue assigned to you and let the agent fix it
+    /// in the current project (no commit, no push — edits local files only).
+    Fixissue {
+        /// Full issue URL, e.g. https://atomgit.com/owner/repo/issues/42
+        url: String,
+    },
 }
 
 /// Environment variable set by this process for its re-exec'd child, so
@@ -527,11 +533,23 @@ async fn main() {
 async fn run() -> Result<i32> {
     let cli = Cli::parse();
 
-    // Handle subcommands
+    // Handle subcommands. Most are self-contained (`handle_command` runs
+    // and exits); `Login` falls through to the TUI, and `Fixissue` is
+    // like headless `-p` but with the prompt synthesised from a remote
+    // issue payload — so we resolve it here and hand it to the agent
+    // loop via `fixissue_prompt` below.
+    let mut fixissue_prompt: Option<String> = None;
+    // Saved when fixissue is parsed, so after the agent finishes we can
+    // POST the summary back to AtomGit as a comment + add the `fixed`
+    // label. `None` = not a fixissue run, skip the post-back step.
+    let mut fixissue_ref: Option<atomcode_core::atomgit::IssueRef> = None;
+    // `fixissue` is an interactive-feeling structured workflow (the user
+    // is watching progress, not piping output). Force verbose so they see
+    // tool calls / edits instead of long silences while the agent works.
+    let mut force_verbose = false;
     if let Some(cmd) = cli.command {
-        match &cmd {
+        match cmd {
             Commands::Login => {
-                // Login, then fall through to start TUI
                 HEADLESS_MODE.store(true, Ordering::Relaxed);
                 let auth = auth::login()?;
                 auth::save_auth(&auth)?;
@@ -539,8 +557,29 @@ async fn run() -> Result<i32> {
                 HEADLESS_MODE.store(false, Ordering::Relaxed);
                 // Fall through to TUI startup below
             }
-            _ => {
-                return handle_command(cmd).await.map(|_| 0);
+            Commands::Fixissue { url } => {
+                HEADLESS_MODE.store(true, Ordering::Relaxed);
+                let cwd = cli.dir.clone().unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+                match atomcode_core::atomgit::fixissue::prepare(&url, &cwd) {
+                    Ok(atomcode_core::atomgit::fixissue::Prepared::Run { prompt, issue_title, issue_number, issue_ref }) => {
+                        eprintln!("[fixissue] issue #{}: {}", issue_number, issue_title);
+                        fixissue_prompt = Some(prompt);
+                        fixissue_ref = Some(issue_ref);
+                        force_verbose = true;
+                        // Fall through: agent loop will run this as a headless prompt.
+                    }
+                    Ok(atomcode_core::atomgit::fixissue::Prepared::Skip { reason }) => {
+                        eprintln!("{}", reason);
+                        return Ok(0);
+                    }
+                    Err(e) => {
+                        eprintln!("fixissue failed: {:#}", e);
+                        return Ok(1);
+                    }
+                }
+            }
+            other => {
+                return handle_command(other).await.map(|_| 0);
             }
         }
     }
@@ -676,26 +715,70 @@ async fn run() -> Result<i32> {
         agent_loop.config.reflection_cadence = n;
     }
 
-    // Resolve effective prompt: --prompt-file reads from disk; -p is inline.
-    // clap's conflicts_with ensures only one can be given at a time.
-    let effective_prompt: Option<String> = match (cli.prompt.as_ref(), cli.prompt_file.as_ref()) {
-        (Some(p), None) => Some(p.clone()),
-        (None, Some(path)) => {
-            match std::fs::read_to_string(path) {
-                Ok(s) => Some(s),
-                Err(e) => {
-                    eprintln!("error: failed to read --prompt-file {}: {}", path.display(), e);
-                    std::process::exit(2);
+    // Resolve effective prompt: --prompt-file reads from disk; -p is inline;
+    // `fixissue` synthesises one from the AtomGit issue body. fixissue takes
+    // precedence — when it's set we've already committed to headless mode.
+    // clap's conflicts_with ensures `-p` and `--prompt-file` can't both be given.
+    let effective_prompt: Option<String> = if let Some(p) = fixissue_prompt.take() {
+        Some(p)
+    } else {
+        match (cli.prompt.as_ref(), cli.prompt_file.as_ref()) {
+            (Some(p), None) => Some(p.clone()),
+            (None, Some(path)) => {
+                match std::fs::read_to_string(path) {
+                    Ok(s) => Some(s),
+                    Err(e) => {
+                        eprintln!("error: failed to read --prompt-file {}: {}", path.display(), e);
+                        std::process::exit(2);
+                    }
                 }
             }
+            (None, None) => None,
+            (Some(_), Some(_)) => unreachable!("clap conflicts_with prevents this"),
         }
-        (None, None) => None,
-        (Some(_), Some(_)) => unreachable!("clap conflicts_with prevents this"),
     };
 
     // Headless mode: -p / --prompt-file triggers non-interactive execution.
+    // `fixissue` also sets `force_verbose` so tool activity is visible — the
+    // user is watching a single long-running task, not feeding a pipe.
     if let Some(prompt) = effective_prompt {
-        return run_headless(agent_loop, agent_handle, prompt, cli.provider.as_deref(), cli.verbose).await;
+        let verbose = cli.verbose || force_verbose;
+        // Capture the assistant's streamed text only when we need to post
+        // it back to AtomGit (fixissue). Plain `-p` stays zero-alloc.
+        let capture = fixissue_ref.is_some();
+        let (exit_code, captured) =
+            run_headless(agent_loop, agent_handle, prompt, cli.provider.as_deref(), verbose, capture).await?;
+
+        // Post-run side effects for fixissue: only on clean completion
+        // (exit 0 = TurnComplete Natural; 1 = error; 2 = denial; 130 = cancel).
+        // On non-zero we leave the issue alone — the user can retry.
+        if let Some(issue_ref) = fixissue_ref {
+            if exit_code == 0 {
+                if let Some(summary) = captured.filter(|s| !s.trim().is_empty()) {
+                    match atomcode_core::atomgit::fixissue::post_completion(&issue_ref, &summary) {
+                        Ok(()) => eprintln!(
+                            "[fixissue] ✔ posted summary + applied 'fixed' label to issue #{}",
+                            issue_ref.number
+                        ),
+                        Err(e) => eprintln!(
+                            "[fixissue] ✗ post-back failed (local fix is still saved): {:#}",
+                            e
+                        ),
+                    }
+                } else {
+                    eprintln!(
+                        "[fixissue] agent produced no text; skipping comment + label on issue #{}",
+                        issue_ref.number
+                    );
+                }
+            } else {
+                eprintln!(
+                    "[fixissue] agent exited non-zero ({}); skipping comment + label on issue #{}",
+                    exit_code, issue_ref.number
+                );
+            }
+        }
+        return Ok(exit_code);
     }
 
     // Fire-and-forget: spawn a setsid'd subprocess to stage the next
@@ -735,7 +818,8 @@ async fn run_headless(
     prompt: String,
     _provider_name: Option<&str>,
     verbose: bool,
-) -> Result<i32> {
+    capture: bool,
+) -> Result<(i32, Option<String>)> {
     // Tell the panic hook / error path to skip TUI cleanup — we never enter
     // the alternate screen here, so LeaveAlternateScreen would corrupt stdout.
     HEADLESS_MODE.store(true, Ordering::Relaxed);
@@ -751,12 +835,19 @@ async fn run_headless(
     let mut exit_code: i32 = 0;
     let mut had_denial = false;
     let mut last_text_ended_with_newline = true;
+    // When `capture` is set, we also buffer every TextDelta the agent
+    // emits so the caller (e.g. the fixissue workflow) can post the
+    // full assistant output back to AtomGit as an issue comment.
+    let mut captured: Option<String> = if capture { Some(String::new()) } else { None };
 
     while let Some(event) = event_rx.recv().await {
         match event {
             AgentEvent::TextDelta(text) => {
                 if !text.is_empty() {
                     last_text_ended_with_newline = text.ends_with('\n');
+                }
+                if let Some(buf) = captured.as_mut() {
+                    buf.push_str(&text);
                 }
                 print!("{}", text);
                 io::stdout().flush()?;
@@ -806,7 +897,7 @@ async fn run_headless(
             AgentEvent::PhaseChange(_) => {
                 // Silent in headless mode (in both default and verbose).
             }
-            AgentEvent::TurnComplete { duration, total_tokens, turn_count, tool_call_count, stop_reason } => {
+            AgentEvent::TurnComplete { duration, total_tokens, turn_count, tool_call_count, stop_reason, messages: _ } => {
                 // Always ensure stdout ends with a newline so downstream parsers see a clean line.
                 if !last_text_ended_with_newline {
                     println!();
@@ -863,7 +954,7 @@ AgentEvent::SubAgentProgress { file, status } => {
         exit_code = 2;
     }
 
-    Ok(exit_code)
+    Ok((exit_code, captured))
 }
 
 /// Handle subcommands (login, logout, status)
@@ -903,6 +994,9 @@ async fn handle_command(cmd: Commands) -> Result<()> {
         }
         Commands::Upgrade { force } => run_upgrade_cli(force).await,
         Commands::Rollback => run_rollback_cli(),
+        Commands::Fixissue { .. } => {
+            unreachable!("Fixissue is handled inline in run() before handle_command")
+        }
     }
 }
 

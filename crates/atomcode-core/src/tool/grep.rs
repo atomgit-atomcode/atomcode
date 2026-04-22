@@ -57,6 +57,22 @@ impl Tool for GrepTool {
         ApprovalRequirement::AutoApprove
     }
 
+    fn approval_with_context(&self, args: &str, ctx: &ToolContext) -> ApprovalRequirement {
+        let parsed = match serde_json::from_str::<GrepArgs>(args) {
+            Ok(parsed) => parsed,
+            Err(_) => return self.approval(args),
+        };
+        let working_dir = match ctx.working_dir.try_read() {
+            Ok(wd) => wd.clone(),
+            Err(_) => return self.approval(args),
+        };
+        let raw_path = parsed.path.as_deref().unwrap_or(".");
+        match super::approval_for_path(raw_path, &working_dir, super::ExternalPathAction::Read) {
+            Ok(approval) => approval,
+            Err(_) => self.approval(args),
+        }
+    }
+
     async fn execute(&self, args: &str, ctx: &ToolContext) -> Result<ToolResult> {
         let parsed: GrepArgs = serde_json::from_str(args)?;
         let path = parsed.path.as_deref().unwrap_or(".");
@@ -74,10 +90,15 @@ impl Tool for GrepTool {
 
         let max = parsed.max_results;
         let context_lines = parsed.context.min(10);
-        let resolved = if std::path::Path::new(path).is_absolute() {
-            std::path::PathBuf::from(path)
-        } else {
-            wd.join(path)
+        let resolved = match super::inspect_path_access(path, &wd) {
+            Ok(access) => access.path,
+            Err(err) => {
+                return Ok(ToolResult {
+                    call_id: String::new(),
+                    output: err.to_string(),
+                    success: false,
+                });
+            }
         };
 
         if !resolved.exists() {

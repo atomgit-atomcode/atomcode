@@ -225,15 +225,42 @@ impl Tool for EditFileTool {
         ApprovalRequirement::AutoApprove
     }
 
+    fn approval_with_context(&self, args: &str, ctx: &ToolContext) -> ApprovalRequirement {
+        let parsed = match serde_json::from_str::<EditFileArgs>(args) {
+            Ok(parsed) => parsed,
+            Err(_) => return self.approval(args),
+        };
+        let working_dir = match ctx.working_dir.try_read() {
+            Ok(wd) => wd.clone(),
+            Err(_) => return self.approval(args),
+        };
+        match super::approval_for_path(&parsed.file_path, &working_dir, super::ExternalPathAction::Write) {
+            Ok(approval) => approval,
+            Err(_) => self.approval(args),
+        }
+    }
+
     async fn execute(&self, args: &str, ctx: &ToolContext) -> Result<ToolResult> {
         let parsed: EditFileArgs = serde_json::from_str(args)?;
+        let working_dir = ctx.working_dir.read().await.clone();
+        let file_path = match super::inspect_path_access(&parsed.file_path, &working_dir) {
+            Ok(access) => access.path,
+            Err(err) => {
+                return Ok(ToolResult {
+                    call_id: String::new(),
+                    output: err.to_string(),
+                    success: false,
+                });
+            }
+        };
+        let file_path_str = file_path.to_string_lossy().to_string();
 
         // Backup file before any modification (file-level checkpointing).
-        ctx.file_history.lock().await.backup_before_write(&parsed.file_path).await;
+        ctx.file_history.lock().await.backup_before_write(&file_path_str).await;
 
-        let content = tokio::fs::read_to_string(&parsed.file_path)
+        let content = tokio::fs::read_to_string(&file_path)
             .await
-            .with_context(|| format!("Failed to read {}", parsed.file_path))?;
+            .with_context(|| format!("Failed to read {}", file_path.display()))?;
 
         // ── MULTI-EDIT MODE — disabled ──
         // Multi-edit 25次实测：apply 成功率高但改对率低，N个edit同时出错难回滚。
@@ -247,7 +274,7 @@ impl Tool for EditFileTool {
                     success: false,
                 });
             }
-            return self.execute_multi_edit(&parsed.file_path, &content, edits).await;
+            return self.execute_multi_edit(&file_path_str, &content, edits).await;
         }
 
         // Single-edit mode: new_string is required
@@ -1371,4 +1398,3 @@ fn find_closest_match_inner(
         content_lines.len()
     )
 }
-

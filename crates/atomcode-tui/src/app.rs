@@ -705,7 +705,7 @@ impl App {
                     }
                 }
             }
-            AgentEvent::TurnComplete { duration, total_tokens: _, turn_count: _, tool_call_count: _, stop_reason: _ } => {
+            AgentEvent::TurnComplete { duration, total_tokens: _, turn_count: _, tool_call_count: _, stop_reason: _, messages: _ } => {
                 // Clear any lingering streaming tool state — turn is over.
                 self.streaming_tool_name = None;
                 self.streaming_tools.clear();
@@ -1046,7 +1046,10 @@ impl App {
             self.last_ctrl_c = Some(now);
 
             if double_press {
-                // Double Ctrl+C: exit
+                // Double Ctrl+C: exit — save session before exiting
+                if !self.current_session.messages.is_empty() {
+                    let _ = self.session_manager.save(&self.current_session);
+                }
                 self.mode = AppMode::Exiting;
                 return;
             }

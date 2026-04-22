@@ -574,8 +574,24 @@ fn hash_path(path: &std::path::Path) -> String {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     
+    // Normalize the path before hashing to ensure consistent results across:
+    // - Different path separators (Windows: `\` vs `/`)
+    // - Case sensitivity (Windows paths are case-insensitive)
+    // - Trailing slashes
+    let normalized = path.to_string_lossy();
+    let mut normalized = normalized.replace('\\', "/");
+    
+    // Remove trailing slash (but keep root "/" or "C:/")
+    if normalized.len() > 1 && normalized.ends_with('/') {
+        normalized.pop();
+    }
+    
+    // On Windows, paths are case-insensitive
+    #[cfg(windows)]
+    let normalized = normalized.to_lowercase();
+    
     let mut hasher = DefaultHasher::new();
-    path.hash(&mut hasher);
+    normalized.hash(&mut hasher);
     format!("{:016x}", hasher.finish())
 }
 
