@@ -5,24 +5,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>AtomCode — 开源终端 AI 编码助手</title>
   <link rel="icon" type="image/png" href="https://cdn-static.gitcode.host/static/images/logo-favicon.png">
-  <script src="https://cdn.tailwindcss.com"></script>
-  <script>
-    tailwind.config = {
-      darkMode: 'class',
-      theme: {
-        extend: {
-          colors: {
-            brand: { 50: '#f3f0ff', 100: '#e9e3ff', 200: '#d4cbff', 400: '#a78bfa', 500: '#8b5cf6', 600: '#7c3aed', 700: '#6d28d9', 800: '#5b21b6', 900: '#1e1033' },
-            surface: { 50: '#f8fafc', 100: '#f1f5f9', 800: '#1e293b', 900: '#0f172a', 950: '#020617' }
-          },
-          fontFamily: { sans: ['Google Sans', 'Inter', 'system-ui', 'sans-serif'], mono: ['JetBrains Mono', 'Fira Code', 'monospace'] }
-        }
-      }
-    }
-  </script>
+  <link rel="stylesheet" href="dist.css">
   <style>
-    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
-    
+
     /* Prevent horizontal scroll */
     html, body { overflow-x: hidden; max-width: 100vw; }
     * { box-sizing: border-box; }
@@ -140,7 +125,7 @@
     <div class="max-w-6xl mx-auto px-4 md:px-6 h-14 md:h-16 flex items-center justify-between">
       <!-- Left: Logo -->
       <div class="flex items-center gap-2 md:gap-3 flex-shrink-0">
-        <img src="https://cdn-news.gitcode.com/news/atomcode-icon.png" alt="AtomCode" class="w-7 h-7 md:w-8 md:h-8 rounded-lg">
+        <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode" class="w-7 h-7 md:w-8 md:h-8 rounded-lg">
         <span class="text-base md:text-lg font-semibold tracking-tight">AtomCode</span>
         <span class="text-xs px-1.5 md:px-2 py-0.5 rounded-full bg-brand-600/20 text-brand-400 font-medium">v4.19.3</span>
       </div>
@@ -580,7 +565,7 @@ cp target/release/atomcode ~/.local/bin/</pre>
   <footer class="py-12 border-t border-white/5">
     <div class="max-w-5xl mx-auto px-6 flex flex-col md:flex-row items-center justify-between gap-4">
       <div class="flex items-center gap-3">
-        <img src="https://cdn-news.gitcode.com/news/atomcode-icon.png" alt="AtomCode" class="w-6 h-6 rounded">
+        <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode" class="w-6 h-6 rounded">
         <span class="text-sm text-slate-500" data-i18n="footer.tagline">AtomCode · 开源终端 AI 编码助手</span>
       </div>
       <div class="flex items-center gap-6 text-sm text-slate-500">

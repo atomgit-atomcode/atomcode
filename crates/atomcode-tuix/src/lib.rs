@@ -20,7 +20,13 @@ use anyhow::Result;
 use atomcode_core::agent::AgentHandle;
 use atomcode_core::config::Config;
 use atomcode_core::tool::ToolContext;
-use crossterm::{execute, event::{EnableBracketedPaste, DisableBracketedPaste}};
+use crossterm::{
+    execute,
+    event::{
+        DisableBracketedPaste, EnableBracketedPaste, KeyboardEnhancementFlags,
+        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    },
+};
 use std::io;
 use tokio::sync::mpsc;
 
@@ -36,6 +42,10 @@ use crate::terminal::TerminalCaps;
 struct TerminalGuard {
     raw_enabled: bool,
     paste_enabled: bool,
+    /// Set when the Kitty keyboard protocol (CSI u) was successfully
+    /// pushed. Guards the matching pop in Drop so we don't send a stray
+    /// pop sequence on terminals that rejected the push.
+    kbd_flags_pushed: bool,
 }
 
 impl TerminalGuard {
@@ -44,6 +54,7 @@ impl TerminalGuard {
         let mut g = Self {
             raw_enabled: false,
             paste_enabled: false,
+            kbd_flags_pushed: false,
         };
         if caps.raw_mode {
             crossterm::terminal::enable_raw_mode()?;
@@ -52,6 +63,24 @@ impl TerminalGuard {
         if caps.bracketed_paste {
             execute!(io::stdout(), EnableBracketedPaste)?;
             g.paste_enabled = true;
+        }
+        // Enable Kitty keyboard protocol (CSI u / progressive enhancement)
+        // so terminals that support it report modifier+Enter as a distinct
+        // key event instead of collapsing Shift+Enter to plain Enter. Without
+        // this, crossterm sees `Enter, NONE` on both Enter and Shift+Enter
+        // and the input box can't insert a newline.
+        //
+        // `execute!` is best-effort — terminals that don't support CSI u
+        // (notably Apple Terminal.app) ignore the sequence; we just don't
+        // set `kbd_flags_pushed` and Drop won't try to pop.
+        if caps.tty
+            && execute!(
+                io::stdout(),
+                PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+            )
+            .is_ok()
+        {
+            g.kbd_flags_pushed = true;
         }
         // FIXED-FOOTER via DECSTBM. Scroll region `[1, H - footer_rows]`
         // is set by `AnsiRenderer` the first time it paints the footer;
@@ -86,6 +115,9 @@ impl Drop for TerminalGuard {
         let mut out = stdout.lock();
         let _ = write!(out, "\x1b[?7h\x1b[r\r\n");
         let _ = out.flush();
+        if self.kbd_flags_pushed {
+            let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
+        }
         if self.paste_enabled {
             let _ = execute!(io::stdout(), DisableBracketedPaste);
         }
