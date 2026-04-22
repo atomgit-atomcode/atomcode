@@ -6,6 +6,7 @@
 //   - anim.rs    : frame generator (added in Task 4)
 //   - mod.rs     : Cooldown + fire_whip orchestration (fire_whip in Task 7)
 
+pub mod anim;
 pub mod phrases;
 
 use std::time::{Duration, Instant};
