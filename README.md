@@ -112,10 +112,14 @@ Connect to any LLM that supports OpenAI's function-calling API:
 ### Safety
 
 - **Destructive command detection** — `rm -rf`, `git push --force`, `DROP TABLE`, etc. require explicit approval
-- **Sensitive file protection** — writes to `/etc`, `~/.ssh`, shell configs require approval
+- **Path-aware confirmations** — external reads, sensitive paths, and all writes outside the workspace can require confirmation depending on risk level
+- **Sensitive file protection** — protected system paths, credential directories, shell configs, `.env` files, and key/cert files receive stronger confirmation rules
+- **Shell bypass protection** — common shell file commands like `cat`, `head`, `ls`, `cp`, `mv`, and `tee` inherit the same path approval model as file tools
 - **Per-session permission grants** — approve once per tool pattern, or always-allow
 - **Source file deletion requires approval** — `rm` on code files is never auto-approved
 - **Undo** — `/undo` rolls back the last turn's file edits via file-history snapshots
+
+See [Permission Model](./docs/security/permission-model.md) for the full design and current boundaries.
 
 ## Installation
 
