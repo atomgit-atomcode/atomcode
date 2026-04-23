@@ -174,10 +174,10 @@ async fn bash_execute(args: &str, ctx: &ToolContext) -> Result<ToolResult> {
             unsafe {
                 cmd.pre_exec(|| {
                     extern "C" {
-                        fn setsid() -> i32;
-                        fn open(path: *const u8, oflag: i32) -> i32;
-                        fn close(fd: i32) -> i32;
-                        fn ioctl(fd: i32, request: u64, ...) -> i32;
+                        fn setsid() -> libc::c_int;
+                        fn open(path: *const libc::c_char, oflag: libc::c_int) -> libc::c_int;
+                        fn close(fd: libc::c_int) -> libc::c_int;
+                        fn ioctl(fd: libc::c_int, request: libc::c_ulong, ...) -> libc::c_int;
                     }
                     // Create a new session — detaches from the controlling
                     // terminal so /dev/tty opens fail.
@@ -185,14 +185,9 @@ async fn bash_execute(args: &str, ctx: &ToolContext) -> Result<ToolResult> {
                     // Belt-and-suspenders: also try to explicitly detach using
                     // TIOCNOTTY, which works even when setsid alone doesn't
                     // fully sever the connection on some macOS versions.
-                    const O_RDWR: i32 = 2;
-                    #[cfg(target_os = "macos")]
-                    const TIOCNOTTY: u64 = 0x20007471;
-                    #[cfg(not(target_os = "macos"))]
-                    const TIOCNOTTY: u64 = 0x5422;
-                    let tty_fd = open(b"/dev/tty\0".as_ptr(), O_RDWR);
+                    let tty_fd = open(b"/dev/tty\0".as_ptr() as *const libc::c_char, libc::O_RDWR);
                     if tty_fd >= 0 {
-                        ioctl(tty_fd, TIOCNOTTY);
+                        ioctl(tty_fd, libc::TIOCNOTTY);
                         close(tty_fd);
                     }
                     Ok(())
