@@ -28,7 +28,7 @@ impl AgentLoop {
             self.discipline_state.last_reflection_at_tool_count,
             self.config.reflection_cadence,
         ) {
-            let msg = reflection_prompt(delta);
+            let msg = reflection_prompt(delta, &self.current_task);
             self.conversation.add_user_message(&msg);
             self.discipline_state.last_reflection_at_tool_count = self.tool_call_count;
         }
@@ -132,16 +132,49 @@ pub(crate) fn should_inject_reflection(
 /// Language- and ecosystem-neutral by design. Phrased as a scheduled
 /// checkpoint (not a corrective intervention); this fires every N steps
 /// regardless of whether the agent appears stuck.
-pub(crate) fn reflection_prompt(delta: usize) -> String {
-    format!(
-        "[System meta · not a user message]\n\
-         {} tool calls elapsed since the last self-check. \
-         Before the next tool call, answer:\n\
-         1. Restate the original goal in one sentence.\n\
-         2. What did those {} steps prove or rule out?\n\
-         3. What is the next concrete output, and how close is it?\n",
-        delta, delta
-    )
+pub(crate) fn reflection_prompt(delta: usize, current_task: &str) -> String {
+    // Preamble shared by both branches.
+    let mut out = String::new();
+    out.push_str("[System meta · not a user message]\n");
+    out.push_str(&format!(
+        "{} tool calls elapsed since the last self-check.\n",
+        delta
+    ));
+
+    if current_task.is_empty() {
+        // No verbatim task available — fall back to the recall question.
+        // Callers without a task (future API consumers, or edge cases
+        // before handle_send_message fires) still get a useful checkpoint.
+        out.push_str("Before the next tool call, answer:\n");
+        out.push_str(&format!(
+            "1. Restate the original goal in one sentence.\n\
+             2. What did those {} steps prove or rule out?\n\
+             3. What is the next concrete output, and how close is it?\n",
+            delta
+        ));
+    } else {
+        // Task is visible: bias Q1 from recall to coherence check.
+        // Truncation mirrors the budget that the former per-turn reminder
+        // used (297 chars + "...") so cadence-merged output stays small.
+        let task_short = if current_task.chars().count() > 300 {
+            format!("{}...", current_task.chars().take(297).collect::<String>())
+        } else {
+            current_task.to_string()
+        };
+        out.push_str(&format!(
+            "\n=== ORIGINAL TASK ===\n{}\n\n",
+            task_short
+        ));
+        out.push_str("Before the next tool call, answer:\n");
+        out.push_str(&format!(
+            "1. Does your current plan still match the task above? If not, correct course now.\n\
+             2. What did those {} steps prove or rule out?\n\
+             3. What is the next concrete output, and how close is it?\n",
+            delta
+        ));
+    }
+
+    out
 }
 
 #[cfg(test)]
@@ -194,12 +227,14 @@ mod reflection_tests {
 
     #[test]
     fn reflection_prompt_is_language_neutral_and_mentions_delta() {
-        let msg = reflection_prompt(12);
+        // Empty task → prompt stays in the original "restate the goal" mode
+        // so that callers without a task (future API consumers, first-turn
+        // edge cases before handle_send_message fires) still get a working
+        // checkpoint.
+        let msg = reflection_prompt(12, "");
 
-        // The delta must appear so the model sees the scale of the gap.
         assert!(msg.contains("12"), "prompt must include delta count, got: {}", msg);
 
-        // Must NOT pretend this is an error — it's a scheduled recalibration.
         assert!(
             !msg.to_lowercase().contains("error"),
             "prompt must not frame as error, got: {}", msg
@@ -209,10 +244,10 @@ mod reflection_tests {
             "prompt must not look like a BLOCKED guard, got: {}", msg
         );
 
-        // Must ask the three canonical language-neutral questions.
+        // Empty-task branch falls back to the recall question.
         assert!(
             msg.contains("original task") || msg.contains("original goal") || msg.contains("restate"),
-            "prompt must ask to restate the task/goal, got: {}", msg
+            "empty-task prompt must ask to restate the task/goal, got: {}", msg
         );
         assert!(
             msg.contains("rule out") || msg.contains("ruled out")
@@ -225,8 +260,6 @@ mod reflection_tests {
             "prompt must ask for the next concrete output, got: {}", msg
         );
 
-        // Must NOT embed language-/tool-specific hints (the whole point
-        // is the reflection being framework-level and generic).
         assert!(!msg.to_lowercase().contains("cargo"));
         assert!(!msg.to_lowercase().contains("grep"));
         assert!(!msg.to_lowercase().contains("npm"));
@@ -234,13 +267,7 @@ mod reflection_tests {
 
     #[test]
     fn reflection_prompt_flags_itself_as_system_meta() {
-        // The injection is carried over a user-message channel for
-        // delivery reasons, but the text must make clear it is system
-        // meta, not the human user speaking. Without this self-flag the
-        // UI renders it as a user line and the model may interpret it
-        // as a direct instruction from the operator. This assertion
-        // guards against future rewording that drops the identity tag.
-        let msg = reflection_prompt(5);
+        let msg = reflection_prompt(5, "");
         assert!(
             msg.contains("not a user message") || msg.contains("System meta"),
             "prompt must self-flag as system meta / non-user, got: {}", msg
@@ -249,13 +276,7 @@ mod reflection_tests {
 
     #[test]
     fn reflection_prompt_avoids_verbose_command_phrasing() {
-        // Short imperatives ("Before the next tool call, answer:") are
-        // fine and actually necessary — dogfooding on GLM-5.1 showed a
-        // purely suggestive voice lets the model skip the reflection.
-        // What we forbid is the *verbose* original phrasing that both
-        // padded the prompt and made it read like a user barking a
-        // multi-clause order.
-        let msg = reflection_prompt(5).to_lowercase();
+        let msg = reflection_prompt(5, "").to_lowercase();
         assert!(
             !msg.contains("answer in plain text"),
             "prompt must not repeat the verbose original phrasing, got: {}", msg
@@ -263,6 +284,64 @@ mod reflection_tests {
         assert!(
             !msg.contains("answer these"),
             "prompt must not repeat the verbose original phrasing, got: {}", msg
+        );
+    }
+
+    #[test]
+    fn reflection_prompt_embeds_verbatim_task_when_provided() {
+        // Task is short, non-empty: must appear verbatim under a clearly
+        // flagged "ORIGINAL TASK" header so the model doesn't have to
+        // reconstruct intent from compressed history.
+        let msg = reflection_prompt(7, "fix the auth token refresh loop");
+        assert!(
+            msg.contains("ORIGINAL TASK"),
+            "task branch must carry an ORIGINAL TASK marker, got: {}", msg
+        );
+        assert!(
+            msg.contains("fix the auth token refresh loop"),
+            "verbatim task must appear, got: {}", msg
+        );
+    }
+
+    #[test]
+    fn reflection_prompt_task_branch_asks_coherence_check_not_recall() {
+        // With the task verbatim in the prompt, Q1 becomes a coherence
+        // check against the current trajectory — "restate the original
+        // goal" would be busywork.
+        let msg = reflection_prompt(3, "refactor the cache layer").to_lowercase();
+        assert!(
+            msg.contains("current plan") && msg.contains("match"),
+            "task branch Q1 must ask whether the plan still matches the task, got: {}", msg
+        );
+        // And MUST NOT ask the model to restate what's already in front of it.
+        assert!(
+            !msg.contains("restate"),
+            "task branch must not ask the model to restate a visible task, got: {}", msg
+        );
+    }
+
+    #[test]
+    fn reflection_prompt_truncates_task_at_300_chars() {
+        // Long tasks get clipped so the checkpoint itself doesn't explode
+        // into a huge injection — the first 297 chars + "..." is the
+        // same budget the previous per-turn reminder used.
+        let long = "x".repeat(500);
+        let msg = reflection_prompt(4, &long);
+        assert!(msg.contains("xxx..."), "truncation marker missing: {}", msg);
+        assert!(
+            !msg.contains(&"x".repeat(400)),
+            "prompt must not carry 400+ contiguous x's (truncation failed): {}", msg
+        );
+    }
+
+    #[test]
+    fn reflection_prompt_empty_task_omits_original_task_block() {
+        // When there is no active task, skip the block entirely rather
+        // than emitting "ORIGINAL TASK: (empty)" noise.
+        let msg = reflection_prompt(5, "");
+        assert!(
+            !msg.contains("ORIGINAL TASK"),
+            "empty-task prompt must omit the task block, got: {}", msg
         );
     }
 }
