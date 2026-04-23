@@ -1417,7 +1417,6 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 let chip_n = chip(Color::Red);
 
                 let mut row = Vec::new();
-                push_str_cells(&mut row, &" ".repeat(PAD_COL), &plain);
                 push_str_cells(&mut row, "▶ Waiting for approval: ", &warn);
                 push_str_cells(&mut row, " Y ", &chip_y);
                 push_str_cells(&mut row, " Allow  ", &plain);
