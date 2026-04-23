@@ -15,14 +15,11 @@ RUN useradd -r -s /bin/bash atomcode
 WORKDIR /home/atomcode
 
 # Copy pre-built Linux binaries from dist directory
-COPY dist/atomcode-v*/atomcode-daemon-*-linux-x64.tar.gz /tmp/atomcode-daemon.tar.gz
+COPY dist/v*/atomcode-daemon-*-linux-x64 /tmp/atomcode-daemon
 
-# Extract and install binaries
-RUN cd /tmp && \
-    tar xzf atomcode-daemon.tar.gz && \
-    mv /tmp/atomcode-daemon-atomcode-v*-linux-x64 /usr/local/bin/atomcode-daemon && \
-    chmod +x /usr/local/bin/atomcode-daemon && \
-    rm -f /tmp/*.tar.gz
+# Install binaries
+RUN chmod +x /tmp/atomcode-daemon && \
+    mv /tmp/atomcode-daemon /usr/local/bin/atomcode-daemon
 
 # Expose daemon port
 EXPOSE 13456
