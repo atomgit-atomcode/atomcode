@@ -920,11 +920,8 @@ impl AgentLoop {
             // the prompt guides the model to work efficiently.
 
             let system_prompt = self.build_system_prompt();
-            // Per-turn reminder removed: verbatim task now rides on the
-            // cadence reflection checkpoint (see agent::discipline::reflection_prompt).
-            // The turn_reminder parameter is kept on the `build_messages`
-            // side because basic_run and the sub-agent path both already
-            // pass "" — changing the signature buys no code, only churn.
+            // Per-turn reminder removed: verbatim task now rides on the cadence
+            // reflection checkpoint — see agent::discipline::reflection_prompt.
             let turn_reminder = String::new();
             let cancel = self.cancel_token.clone();
 
