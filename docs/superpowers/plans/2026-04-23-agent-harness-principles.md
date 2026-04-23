@@ -189,7 +189,7 @@ Token/time 代价通过 AgentEvent 推到 UI + 超阈值注入 meta message。
 ### Status: 未启动
 
 ### Related plans:
-- `mutating-bash-approval`(P0 子集,聚焦 bash 的 `irreversible` 命令模式识别)
+- ~~`mutating-bash-approval`~~ —— 取消。原构想是重新引入 `sed -i` / `perl -pi` / `awk -i` 等 pattern 识别,但 upstream 于 2026-04-22 (`ff540aa`) 明确以 effect-based 机制(post-exec `snapshot_workspace_changes` diff + 文本 nudge)替代 pattern 枚举,判定 pattern list 必然 whack-a-mole。要重开需先 brainstorm 与 upstream 决策对齐的新方向(例如 pre-exec 预测、或升级 effect nudge 为 pre-exec gate)。
 - `tool-reversibility-trait`(更广,所有 tool 声明 reversibility)
 - `token-cost-feedback`(P2)
 
@@ -216,8 +216,9 @@ Token/time 代价通过 AgentEvent 推到 UI + 超阈值注入 meta message。
 | 阶段 | 原则 | Plan | 估规模 | 理由 |
 |---|---|---|---|---|
 | 已 ship | 3(部分)| `cadence-reflection` | 8 commits, ~400 loc | 最早可行,最小 blast radius |
-| **下一刀** | **4(子集)** | **`mutating-bash-approval`** | ~5 tasks | dogfooding 三次都踩,跨模型立竿见影,最小子集 |
-| 再下一刀 | 2 | `tool-failure-hints` | ~10 tasks | Tool trait 扩展 + 所有现有 tool 的 failure path。结构性投入大,但一次到位 |
+| 已 ship | 4(路径轴)| upstream `ff540aa` path-aware approval | — | 敏感路径 / workspace-escape 自动走 `RequireApprovalAlways`,不占本 roadmap 一刀 |
+| ~~下一刀~~ | ~~4(命令模式识别)~~ | ~~`mutating-bash-approval`~~ | — | **取消**。与 upstream 2026-04-22 effect-based 决策冲突,见上方"Related plans"脚注 |
+| **下一刀** | **2** | **`tool-failure-hints`** | ~10 tasks | Tool trait 扩展 + 所有现有 tool 的 failure path。结构性投入大,但一次到位;纯加法,不与 upstream 任何决策冲突 |
 | 长尾 | 1 | `hypothesis-slot` | ~8 tasks | schema 层 + 对比机制,需要 2/4 已稳了再推 |
 | 长尾 | 4(剩余)| `tool-reversibility-trait` + `token-cost-feedback` | 各 ~5 tasks | 4 的完整形态,增量做 |
 
