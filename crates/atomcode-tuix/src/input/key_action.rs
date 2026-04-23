@@ -64,7 +64,10 @@ mod tests {
 
     #[test]
     fn shift_enter_inserts_newline() {
-        assert_eq!(k(KeyCode::Enter, KeyModifiers::SHIFT), Action::InsertNewline);
+        assert_eq!(
+            k(KeyCode::Enter, KeyModifiers::SHIFT),
+            Action::InsertNewline
+        );
     }
 
     #[test]
@@ -87,27 +90,42 @@ mod tests {
 
     #[test]
     fn ctrl_u_clears_line() {
-        assert_eq!(k(KeyCode::Char('u'), KeyModifiers::CONTROL), Action::ClearLine);
+        assert_eq!(
+            k(KeyCode::Char('u'), KeyModifiers::CONTROL),
+            Action::ClearLine
+        );
     }
 
     #[test]
     fn ctrl_w_deletes_word() {
-        assert_eq!(k(KeyCode::Char('w'), KeyModifiers::CONTROL), Action::DeleteWordBackward);
+        assert_eq!(
+            k(KeyCode::Char('w'), KeyModifiers::CONTROL),
+            Action::DeleteWordBackward
+        );
     }
 
     #[test]
     fn ctrl_k_deletes_to_end() {
-        assert_eq!(k(KeyCode::Char('k'), KeyModifiers::CONTROL), Action::DeleteToEnd);
+        assert_eq!(
+            k(KeyCode::Char('k'), KeyModifiers::CONTROL),
+            Action::DeleteToEnd
+        );
     }
 
     #[test]
     fn plain_letter_inserts() {
-        assert_eq!(k(KeyCode::Char('a'), KeyModifiers::NONE), Action::Insert('a'));
+        assert_eq!(
+            k(KeyCode::Char('a'), KeyModifiers::NONE),
+            Action::Insert('a')
+        );
     }
 
     #[test]
     fn shifted_letter_inserts() {
-        assert_eq!(k(KeyCode::Char('A'), KeyModifiers::SHIFT), Action::Insert('A'));
+        assert_eq!(
+            k(KeyCode::Char('A'), KeyModifiers::SHIFT),
+            Action::Insert('A')
+        );
     }
 
     #[test]
@@ -128,7 +146,10 @@ mod tests {
     #[test]
     fn backspace_and_delete() {
         assert_eq!(k(KeyCode::Backspace, KeyModifiers::NONE), Action::Backspace);
-        assert_eq!(k(KeyCode::Delete, KeyModifiers::NONE), Action::DeleteForward);
+        assert_eq!(
+            k(KeyCode::Delete, KeyModifiers::NONE),
+            Action::DeleteForward
+        );
     }
 
     #[test]

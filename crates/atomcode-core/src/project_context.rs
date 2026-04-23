@@ -33,13 +33,18 @@ pub struct ProjectContext {
 /// Scans root and common monorepo subdirectories for build configs and frameworks.
 /// Find a file by name within max_depth levels of a directory.
 fn find_file_recursive(dir: &Path, name: &str, max_depth: usize) -> Option<PathBuf> {
-    if max_depth == 0 { return None; }
+    if max_depth == 0 {
+        return None;
+    }
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             let p = entry.path();
             let fname = entry.file_name().to_string_lossy().to_string();
-            if fname == name { return Some(p); }
-            if p.is_dir() && !fname.starts_with('.') && fname != "node_modules" && fname != "target" {
+            if fname == name {
+                return Some(p);
+            }
+            if p.is_dir() && !fname.starts_with('.') && fname != "node_modules" && fname != "target"
+            {
                 if let Some(found) = find_file_recursive(&p, name, max_depth - 1) {
                     return Some(found);
                 }
@@ -70,11 +75,21 @@ fn extract_tauri_commands(path: &Path) -> Vec<String> {
                 }
             }
             next_is_command = false;
-        } else if next_is_command && (trimmed.starts_with("pub fn ") || trimmed.starts_with("async fn ") || trimmed.starts_with("pub async fn ")) {
+        } else if next_is_command
+            && (trimmed.starts_with("pub fn ")
+                || trimmed.starts_with("async fn ")
+                || trimmed.starts_with("pub async fn "))
+        {
             let name = trimmed
-                .replace("pub ", "").replace("async ", "")
-                .strip_prefix("fn ").unwrap_or("")
-                .split('(').next().unwrap_or("").trim().to_string();
+                .replace("pub ", "")
+                .replace("async ", "")
+                .strip_prefix("fn ")
+                .unwrap_or("")
+                .split('(')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_string();
             if !name.is_empty() {
                 commands.push(name);
             }
@@ -178,10 +193,7 @@ fn detect_tech_stack(working_dir: &Path) -> String {
             if main_rs.exists() {
                 let commands = extract_tauri_commands(&main_rs);
                 if !commands.is_empty() {
-                    stack.push(format!(
-                        "Rust backend commands: [{}]",
-                        commands.join(", ")
-                    ));
+                    stack.push(format!("Rust backend commands: [{}]", commands.join(", ")));
                 }
             }
         }
@@ -201,7 +213,7 @@ fn detect_tech_stack(working_dir: &Path) -> String {
     if tauri_conf.is_some() {
         result.push_str(
             "Architecture: TypeScript frontend ↔ Rust backend via invoke(). \
-             Frontend must call invoke() to persist data through the Rust backend.\n"
+             Frontend must call invoke() to persist data through the Rust backend.\n",
         );
     }
 
@@ -215,7 +227,10 @@ pub fn build_project_context(dir: &Path) -> ProjectContext {
     build_project_context_with_graph(dir, None)
 }
 
-pub fn build_project_context_with_graph(dir: &Path, graph: Option<&crate::graph::CodeGraph>) -> ProjectContext {
+pub fn build_project_context_with_graph(
+    dir: &Path,
+    graph: Option<&crate::graph::CodeGraph>,
+) -> ProjectContext {
     let mut ctx = String::new();
     let mut included_files = HashSet::new();
 
@@ -243,7 +258,9 @@ pub fn build_project_context_with_graph(dir: &Path, graph: Option<&crate::graph:
     let mut included_names = Vec::new();
     let mut descriptor_tokens_used = 0usize;
     for &filename in DESCRIPTORS {
-        if descriptor_tokens_used >= DESCRIPTOR_BUDGET_TOKENS { break; }
+        if descriptor_tokens_used >= DESCRIPTOR_BUDGET_TOKENS {
+            break;
+        }
         let path = dir.join(filename);
         if path.exists() {
             if let Ok(content) = std::fs::read_to_string(&path) {
@@ -261,7 +278,9 @@ pub fn build_project_context_with_graph(dir: &Path, graph: Option<&crate::graph:
                         end -= 1;
                     }
                     // Snap to last newline within the safe range for cleaner output.
-                    if let Some(pos) = content[..end].rfind('\n') { end = pos; }
+                    if let Some(pos) = content[..end].rfind('\n') {
+                        end = pos;
+                    }
                     format!("{}...", &content[..end])
                 } else {
                     content.clone()
@@ -319,11 +338,11 @@ fn find_executables(dir: &Path) -> Vec<String> {
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
         let path = entry.path();
-        if !path.is_file() { continue; }
+        if !path.is_file() {
+            continue;
+        }
 
-        let known = name.ends_with(".sh")
-            || name == "Procfile"
-            || name == "Dockerfile";
+        let known = name.ends_with(".sh") || name == "Procfile" || name == "Dockerfile";
 
         #[cfg(unix)]
         let is_exec = {
@@ -345,35 +364,64 @@ fn find_executables(dir: &Path) -> Vec<String> {
 
 /// Source file extensions that get tree-sitter annotations in the file tree.
 const ANNOTATE_EXTS: &[&str] = &[
-    "rs", "py", "js", "ts", "tsx", "jsx", "vue", "svelte",
-    "go", "java", "c", "cpp", "cc", "h", "hpp",
+    "rs", "py", "js", "ts", "tsx", "jsx", "vue", "svelte", "go", "java", "c", "cpp", "cc", "h",
+    "hpp",
 ];
 
 /// Config file extensions — any file with these extensions is a config file.
-const CONFIG_EXTS: &[&str] = &[
-    "properties", "ini", "toml", "conf", "cfg",
-];
+const CONFIG_EXTS: &[&str] = &["properties", "ini", "toml", "conf", "cfg"];
 
 /// File name keywords — if the file stem contains any of these, it's a config file.
 const CONFIG_NAME_KEYWORDS: &[&str] = &[
-    "config", "settings", "security", "auth", "permission", "cors",
-    "middleware", "routes", "urls",
+    "config",
+    "settings",
+    "security",
+    "auth",
+    "permission",
+    "cors",
+    "middleware",
+    "routes",
+    "urls",
 ];
 
 /// Exact file names that are always config files.
 const CONFIG_EXACT_NAMES: &[&str] = &[
-    ".env", ".env.local", ".env.production", ".env.development",
-    "nginx.conf", "Caddyfile",
+    ".env",
+    ".env.local",
+    ".env.production",
+    ".env.development",
+    "nginx.conf",
+    "Caddyfile",
 ];
 
 /// Keywords in file content that indicate high-value config lines.
 const HIGH_VALUE_KEYWORDS: &[&str] = &[
-    "port", "host", "password", "passwd", "secret", "token",
-    "database", "datasource", "db_", "redis",
-    "url", "endpoint", "base_url", "api_key",
-    "allow", "deny", "permit", "auth", "cors", "origin",
-    "proxy", "target", "rewrite", "upstream",
-    "debug", "log_level",
+    "port",
+    "host",
+    "password",
+    "passwd",
+    "secret",
+    "token",
+    "database",
+    "datasource",
+    "db_",
+    "redis",
+    "url",
+    "endpoint",
+    "base_url",
+    "api_key",
+    "allow",
+    "deny",
+    "permit",
+    "auth",
+    "cors",
+    "origin",
+    "proxy",
+    "target",
+    "rewrite",
+    "upstream",
+    "debug",
+    "log_level",
 ];
 
 fn scan_tree(
@@ -393,7 +441,8 @@ fn scan_tree(
             let indent = "  ".repeat(depth);
             let mut out = format!("{}{}/ (deep path collapsed)\n", indent, collapsed_path);
             if let Ok(entries) = std::fs::read_dir(&leaf_dir) {
-                let mut items: Vec<_> = entries.filter_map(|e| e.ok())
+                let mut items: Vec<_> = entries
+                    .filter_map(|e| e.ok())
                     .filter(|e| !should_skip_dir(&e.file_name().to_string_lossy()))
                     .collect();
                 items.sort_by_key(|e| e.file_name());
@@ -422,7 +471,8 @@ fn scan_tree(
         .collect();
     items.sort_by_key(|e| e.file_name());
 
-    let (dirs, files): (Vec<_>, Vec<_>) = items.iter()
+    let (dirs, files): (Vec<_>, Vec<_>) = items
+        .iter()
         .partition(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false));
     let mut visible: Vec<&std::fs::DirEntry> = dirs.clone();
     let file_limit = 20;
@@ -436,7 +486,14 @@ fn scan_tree(
         let indent = "  ".repeat(depth);
         if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
             out.push_str(&format!("{}{}/\n", indent, name));
-            out.push_str(&scan_tree(&entry.path(), depth + 1, max_depth, searcher, _project_root, graph));
+            out.push_str(&scan_tree(
+                &entry.path(),
+                depth + 1,
+                max_depth,
+                searcher,
+                _project_root,
+                graph,
+            ));
         } else {
             let entry_path = entry.path();
 
@@ -450,7 +507,8 @@ fn scan_tree(
             }
 
             // Annotate source files with top-level symbol names (max 5)
-            let ext = entry_path.extension()
+            let ext = entry_path
+                .extension()
                 .and_then(|e| e.to_str())
                 .unwrap_or("");
             if depth <= 2 && ANNOTATE_EXTS.contains(&ext) {
@@ -458,21 +516,35 @@ fn scan_tree(
                     .map(|c| c.lines().count())
                     .unwrap_or(0);
                 if let Some(symbols) = searcher.list_symbols(&entry.path()) {
-                    let sym_names: Vec<&str> = symbols.iter()
+                    let sym_names: Vec<&str> = symbols
+                        .iter()
                         .filter(|s| !s.name.starts_with('<'))
                         .map(|s| s.name.as_str())
                         .take(5)
                         .collect();
                     if !sym_names.is_empty() {
-                        out.push_str(&format!("{}{} ({}L): {}\n",
-                            indent, name, line_count, sym_names.join(", ")));
+                        out.push_str(&format!(
+                            "{}{} ({}L): {}\n",
+                            indent,
+                            name,
+                            line_count,
+                            sym_names.join(", ")
+                        ));
 
                         // Graph: append cross-file call targets (max 3)
                         if let Some(g) = graph {
                             let callees = graph_file_callees(g, &entry_path);
                             if !callees.is_empty() {
-                                out.push_str(&format!("{}  → {}\n", indent,
-                                    callees.iter().take(3).cloned().collect::<Vec<_>>().join(", ")));
+                                out.push_str(&format!(
+                                    "{}  → {}\n",
+                                    indent,
+                                    callees
+                                        .iter()
+                                        .take(3)
+                                        .cloned()
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                ));
                             }
                         }
                         continue;
@@ -510,7 +582,9 @@ fn scan_config_recursive(
     max_depth: usize,
     results: &mut Vec<String>,
 ) {
-    if depth > max_depth || results.len() >= 10 { return; }
+    if depth > max_depth || results.len() >= 10 {
+        return;
+    }
 
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
@@ -519,7 +593,9 @@ fn scan_config_recursive(
 
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
-        if should_skip_dir(&name) { continue; }
+        if should_skip_dir(&name) {
+            continue;
+        }
 
         let path = entry.path();
         if path.is_dir() {
@@ -543,7 +619,11 @@ fn scan_config_recursive(
 /// 4. File is YAML and lives in a config-like directory
 fn is_config_file(name: &str, path: &Path) -> bool {
     let name_lower = name.to_lowercase();
-    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_lowercase();
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
 
     // Rule 1: Config extensions
@@ -563,8 +643,11 @@ fn is_config_file(name: &str, path: &Path) -> bool {
 
     // Rule 4: YAML in config-like directories or with config-like names
     if matches!(ext, "yml" | "yaml") {
-        let parent = path.parent().and_then(|p| p.file_name())
-            .and_then(|n| n.to_str()).unwrap_or("");
+        let parent = path
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
         if parent == "resources" || parent == "config" || parent == "conf" {
             return true;
         }
@@ -619,7 +702,9 @@ fn extract_config_summary(name: &str, path: &Path) -> Option<String> {
                 trimmed.to_string()
             };
             lines.push(display);
-            if lines.len() >= 10 { break; }
+            if lines.len() >= 10 {
+                break;
+            }
         }
     }
 
@@ -666,17 +751,20 @@ fn collapse_single_child_chain(dir: &Path) -> Option<(String, std::path::PathBuf
 
     loop {
         let entries: Vec<_> = match std::fs::read_dir(&current) {
-            Ok(e) => e.filter_map(|e| e.ok())
+            Ok(e) => e
+                .filter_map(|e| e.ok())
                 .filter(|e| !should_skip_dir(&e.file_name().to_string_lossy()))
                 .collect(),
             Err(_) => break,
         };
 
         // Count subdirectories vs files
-        let subdirs: Vec<_> = entries.iter()
+        let subdirs: Vec<_> = entries
+            .iter()
             .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
             .collect();
-        let files: Vec<_> = entries.iter()
+        let files: Vec<_> = entries
+            .iter()
             .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
             .collect();
 

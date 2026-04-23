@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crossterm::event::{Event, KeyEvent, MouseEvent, poll};
+use crossterm::event::{poll, Event, KeyEvent, MouseEvent};
 use std::io::{self, Write};
 use tokio::sync::mpsc;
 
@@ -38,10 +38,10 @@ pub fn disable_mouse_scroll_only() {
 pub enum AppEvent {
     Key(KeyEvent),
     Mouse(MouseEvent),
-    Paste(String),          // Bracketed paste content
+    Paste(String), // Bracketed paste content
     Resize(u16, u16),
     Tick,
-    IssueCreated { success: bool, message: String },  // Issue creation result
+    IssueCreated { success: bool, message: String }, // Issue creation result
 }
 
 pub struct EventLoop {
@@ -105,7 +105,7 @@ impl EventLoop {
                                         // 1. When capture is disabled, terminals convert scroll wheel to Up/Down keys
                                         // 2. This would incorrectly trigger history navigation in Input Box
                                         // 3. Text selection still works via terminal's native selection (shift+click or drag)
-                                        
+
                                         // Just forward all mouse events to the app
                                         AppEvent::Mouse(mouse)
                                     }

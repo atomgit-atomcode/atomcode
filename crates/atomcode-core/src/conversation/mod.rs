@@ -39,7 +39,6 @@ impl Default for Conversation {
     }
 }
 
-
 impl Conversation {
     pub fn new() -> Self {
         Self::default()
@@ -138,8 +137,10 @@ impl Conversation {
         if let Some(content) = self.stream_buffer.take() {
             // Clean up model artifacts
             let content = content
-                .replace("<think>", "").replace("</think>", "")
-                .replace("<|im_start|>", "").replace("<|im_end|>", "");
+                .replace("<think>", "")
+                .replace("</think>", "")
+                .replace("<|im_start|>", "")
+                .replace("<|im_end|>", "");
             // Strip leaked reasoning: MiniMax/DeepSeek sometimes output
             // reasoning as plain text (no <think> tag) followed by the
             // actual response. Detect by looking for the pattern:
@@ -148,7 +149,9 @@ impl Conversation {
             let content = dedup_trailing_repeat(&content);
             // Skip empty/whitespace-only assistant messages — they waste a message
             // slot in context without carrying information (common after <think> stripping).
-            if content.trim().is_empty() { return; }
+            if content.trim().is_empty() {
+                return;
+            }
             let idx = self.messages.len();
             self.messages.push(Message::new(Role::Assistant, content));
             self.turn_tracker.on_message_added(idx);
@@ -197,7 +200,11 @@ impl Conversation {
     /// Like to_provider_messages but only sends the last `window` messages.
     /// Ensures the window starts at a valid boundary — never in the middle
     /// of a tool_call/tool_result pair (which causes API "messages illegal" errors).
-    pub fn to_provider_messages_windowed(&self, system_prompt: &str, window: usize) -> Vec<Message> {
+    pub fn to_provider_messages_windowed(
+        &self,
+        system_prompt: &str,
+        window: usize,
+    ) -> Vec<Message> {
         let mut start = self.messages.len().saturating_sub(window);
 
         // Scan forward to find a valid start position:
@@ -246,7 +253,10 @@ impl Conversation {
         token_budget: usize,
     ) -> (Vec<Message>, ContextStats) {
         if self.messages.is_empty() {
-            return (vec![Message::new(Role::System, system_prompt)], ContextStats::default());
+            return (
+                vec![Message::new(Role::System, system_prompt)],
+                ContextStats::default(),
+            );
         }
 
         let system_msg = Message::new(Role::System, system_prompt);
@@ -256,7 +266,10 @@ impl Conversation {
 
         if turns.is_empty() {
             let remaining = token_budget.saturating_sub(system_tokens);
-            return (self.to_provider_messages_budgeted_fallback(system_msg, remaining), ContextStats::default());
+            return (
+                self.to_provider_messages_budgeted_fallback(system_msg, remaining),
+                ContextStats::default(),
+            );
         }
 
         let mut result = Vec::with_capacity(self.messages.len() + 3);
@@ -267,7 +280,11 @@ impl Conversation {
             let cold_text = format!(
                 "[Earlier conversation history ({} compression{})]\n{}",
                 self.cold_summaries.len(),
-                if self.cold_summaries.len() > 1 { "s" } else { "" },
+                if self.cold_summaries.len() > 1 {
+                    "s"
+                } else {
+                    ""
+                },
                 self.cold_summaries.join("\n---\n")
             );
             result.push(Message::new(Role::System, cold_text));
@@ -298,7 +315,8 @@ impl Conversation {
             // would settle on `self.messages.len()` → NO messages survive → sent=0 → agent
             // goes blind and repeats searches forever (2026-04-12 21:25 session pathology).
             let last_turn_idx = turns.len().saturating_sub(1);
-            let last_turn_start = turns.get(last_turn_idx)
+            let last_turn_start = turns
+                .get(last_turn_idx)
                 .map(|t| t.start_idx)
                 .unwrap_or(0)
                 .min(self.messages.len());
@@ -309,10 +327,14 @@ impl Conversation {
             let mut drop_count = 0usize;
 
             for ti in 0..turns.len().saturating_sub(1) {
-                if dropped_tokens >= tokens_to_drop { break; }
+                if dropped_tokens >= tokens_to_drop {
+                    break;
+                }
                 let turn = &turns[ti];
                 let end = turn.end_idx().min(self.messages.len());
-                if turn.start_idx >= self.messages.len() { continue; }
+                if turn.start_idx >= self.messages.len() {
+                    continue;
+                }
 
                 // Extract model reasoning and tool calls before dropping
                 let turn_msgs = &self.messages[turn.start_idx..end];
@@ -325,15 +347,17 @@ impl Conversation {
                                 parts.push(short);
                             }
                         }
-                        MessageContent::AssistantWithToolCalls { text, tool_calls, .. } => {
+                        MessageContent::AssistantWithToolCalls {
+                            text, tool_calls, ..
+                        } => {
                             if let Some(t) = text {
                                 let short: String = t.chars().take(150).collect();
                                 if !short.trim().is_empty() {
                                     parts.push(short);
                                 }
                             }
-                            let tools: Vec<&str> = tool_calls.iter()
-                                .map(|tc| tc.name.as_str()).collect();
+                            let tools: Vec<&str> =
+                                tool_calls.iter().map(|tc| tc.name.as_str()).collect();
                             if !tools.is_empty() {
                                 parts.push(format!("tools: {}", tools.join(", ")));
                             }
@@ -345,8 +369,7 @@ impl Conversation {
                     drop_summaries.push(parts.join(" | "));
                 }
 
-                dropped_tokens += turn_msgs.iter()
-                    .map(|m| m.estimate_tokens()).sum::<usize>();
+                dropped_tokens += turn_msgs.iter().map(|m| m.estimate_tokens()).sum::<usize>();
                 drop_count += 1;
             }
 
@@ -359,7 +382,9 @@ impl Conversation {
                 let digest = format!(
                     "[Context overflow: {} earlier turns compressed]\n{}",
                     drop_count,
-                    drop_summaries.iter().enumerate()
+                    drop_summaries
+                        .iter()
+                        .enumerate()
                         .map(|(i, s)| format!("{}. {}", i + 1, s))
                         .collect::<Vec<_>>()
                         .join("\n")
@@ -373,9 +398,13 @@ impl Conversation {
             for ti in 0..turns.len() {
                 let turn = &turns[ti];
                 let end = turn.end_idx().min(self.messages.len());
-                if turn.start_idx >= self.messages.len() { continue; }
+                if turn.start_idx >= self.messages.len() {
+                    continue;
+                }
                 let t: usize = self.messages[turn.start_idx..end]
-                    .iter().map(|m| m.estimate_tokens()).sum();
+                    .iter()
+                    .map(|m| m.estimate_tokens())
+                    .sum();
                 skipped += t;
                 if skipped >= dropped_tokens {
                     survived_start = if ti + 1 < turns.len() {
@@ -412,11 +441,14 @@ impl Conversation {
         // Placement matters: previously this ran BEFORE clean_message_pipeline, which
         // could theoretically strip the graft (step 1 removes empty assistants, but not
         // user text — still, defense in depth says put the floor last).
-        let non_system_count = result.iter().filter(|m| !matches!(m.role, Role::System)).count();
+        let non_system_count = result
+            .iter()
+            .filter(|m| !matches!(m.role, Role::System))
+            .count();
         if non_system_count == 0 {
-            if let Some(last_user) = self.messages.iter().rev()
-                .find(|m| matches!(m.role, Role::User) && matches!(m.content, MessageContent::Text(..)))
-            {
+            if let Some(last_user) = self.messages.iter().rev().find(|m| {
+                matches!(m.role, Role::User) && matches!(m.content, MessageContent::Text(..))
+            }) {
                 result.push(Message::new(
                     Role::System,
                     "[Emergency: prior conversation was dropped during compaction. Only the latest user message is preserved.]"
@@ -425,15 +457,21 @@ impl Conversation {
             }
         }
 
-        let sent_tokens: usize = result.iter().map(|m| m.estimate_tokens()).sum::<usize>()
+        let sent_tokens: usize = result
+            .iter()
+            .map(|m| m.estimate_tokens())
+            .sum::<usize>()
             .saturating_sub(system_tokens);
         let msg_count = result.len();
-        (result, ContextStats {
-            system_tokens,
-            sent_tokens,
-            dropped_tokens,
-            total_messages: msg_count,
-        })
+        (
+            result,
+            ContextStats {
+                system_tokens,
+                sent_tokens,
+                dropped_tokens,
+                total_messages: msg_count,
+            },
+        )
     }
 
     /// Check if context needs compression.
@@ -446,9 +484,15 @@ impl Conversation {
         // USER MESSAGES (1 user msg = 1 turn), but a single user message can
         // produce 15+ LLM calls with 35+ messages. The old `turns.len() < 6`
         // guard caused compression to NEVER trigger in agent-loop scenarios.
-        if self.messages.len() < 12 { return false; }
-        let total: usize = system_prompt_tokens + self.messages.iter()
-            .map(|m| m.estimate_tokens()).sum::<usize>();
+        if self.messages.len() < 12 {
+            return false;
+        }
+        let total: usize = system_prompt_tokens
+            + self
+                .messages
+                .iter()
+                .map(|m| m.estimate_tokens())
+                .sum::<usize>();
         let threshold = (token_budget * 50 / 100).min(50000);
         total > threshold
     }
@@ -511,7 +555,9 @@ impl Conversation {
     /// - All surviving turns must have: msg_count > 0
     /// These invariants prevent underflow in on_user_message(msg_idx).
     pub fn apply_compression(&mut self, remove_count: usize, summary: String) {
-        if remove_count == 0 || summary.is_empty() { return; }
+        if remove_count == 0 || summary.is_empty() {
+            return;
+        }
 
         // Add to cold zone (FIFO, max 3)
         self.cold_summaries.push(summary);
@@ -577,14 +623,21 @@ impl Conversation {
     /// Returns the number of turns that should be summarized.
     pub fn turns_needing_summary(&self, system_prompt_tokens: usize, token_budget: usize) -> usize {
         let turns = &self.turn_tracker.turns;
-        if turns.len() < 3 { return 0; } // Need at least 3 turns to summarize
+        if turns.len() < 3 {
+            return 0;
+        } // Need at least 3 turns to summarize
 
-        let total_tokens: usize = system_prompt_tokens + self.messages.iter()
-            .map(|m| m.estimate_tokens())
-            .sum::<usize>();
+        let total_tokens: usize = system_prompt_tokens
+            + self
+                .messages
+                .iter()
+                .map(|m| m.estimate_tokens())
+                .sum::<usize>();
 
         let budget_70pct = token_budget * 70 / 100;
-        if total_tokens <= budget_70pct { return 0; }
+        if total_tokens <= budget_70pct {
+            return 0;
+        }
 
         // Summarize enough old turns to get under 50% budget
         let target = token_budget * 50 / 100;
@@ -593,11 +646,17 @@ impl Conversation {
         let mut count = 0usize;
 
         for turn in turns.iter() {
-            if turn.summary.is_some() { continue; } // Already summarized
-            if count >= turns.len().saturating_sub(2) { break; } // Keep at least 2 recent turns
+            if turn.summary.is_some() {
+                continue;
+            } // Already summarized
+            if count >= turns.len().saturating_sub(2) {
+                break;
+            } // Keep at least 2 recent turns
 
             let end = turn.end_idx().min(self.messages.len());
-            if turn.start_idx >= self.messages.len() { continue; }
+            if turn.start_idx >= self.messages.len() {
+                continue;
+            }
             let turn_tokens: usize = self.messages[turn.start_idx..end]
                 .iter()
                 .map(|m| m.estimate_tokens())
@@ -605,7 +664,9 @@ impl Conversation {
 
             freed += turn_tokens;
             count += 1;
-            if freed >= tokens_to_free { break; }
+            if freed >= tokens_to_free {
+                break;
+            }
         }
 
         count
@@ -619,11 +680,17 @@ impl Conversation {
 
         let mut count = 0;
         for turn in turns.iter() {
-            if turn.summary.is_some() { continue; }
-            if count >= n_turns { break; }
+            if turn.summary.is_some() {
+                continue;
+            }
+            if count >= n_turns {
+                break;
+            }
 
             let end = turn.end_idx().min(self.messages.len());
-            if turn.start_idx >= self.messages.len() { continue; }
+            if turn.start_idx >= self.messages.len() {
+                continue;
+            }
             let turn_msgs = &self.messages[turn.start_idx..end];
 
             content.push_str(&format!("--- Turn {} ---\n", count + 1));
@@ -680,8 +747,12 @@ impl Conversation {
     pub fn apply_summary(&mut self, n_turns: usize, summary: String) {
         let mut count = 0;
         for turn in self.turn_tracker.turns.iter_mut() {
-            if turn.summary.is_some() { continue; }
-            if count >= n_turns { break; }
+            if turn.summary.is_some() {
+                continue;
+            }
+            if count >= n_turns {
+                break;
+            }
 
             if count == 0 {
                 // First turn gets the full summary
@@ -713,7 +784,8 @@ impl Conversation {
         for msg in turn_msgs {
             match (&msg.role, &msg.content) {
                 (Role::User, MessageContent::Text(s)) => {
-                    if !s.starts_with('[') { // skip system-injected messages
+                    if !s.starts_with('[') {
+                        // skip system-injected messages
                         user_text = if s.chars().count() > 60 {
                             format!("{}...", s.chars().take(57).collect::<String>())
                         } else {
@@ -736,21 +808,27 @@ impl Conversation {
                         }
                     }
                     for tc in tool_calls {
-                        let short = if let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
-                            let fp = args.get("file_path").and_then(|v| v.as_str())
-                                .map(|p| std::path::Path::new(p).file_name()
+                        let short = if let Ok(args) =
+                            serde_json::from_str::<serde_json::Value>(&tc.arguments)
+                        {
+                            let fp = args.get("file_path").and_then(|v| v.as_str()).map(|p| {
+                                std::path::Path::new(p)
+                                    .file_name()
                                     .map(|n| n.to_string_lossy().to_string())
-                                    .unwrap_or_else(|| p.to_string()));
+                                    .unwrap_or_else(|| p.to_string())
+                            });
                             match (tc.name.as_str(), fp) {
                                 ("read_file", Some(f)) => format!("read {}", f),
                                 ("edit_file", Some(f)) => format!("edit {}", f),
                                 ("write_file", Some(f)) => format!("write {}", f),
                                 ("grep", _) => {
-                                    let pat = args.get("pattern").and_then(|v| v.as_str()).unwrap_or("?");
+                                    let pat =
+                                        args.get("pattern").and_then(|v| v.as_str()).unwrap_or("?");
                                     format!("grep({})", pat)
                                 }
                                 ("bash", _) => {
-                                    let cmd = args.get("command").and_then(|v| v.as_str()).unwrap_or("?");
+                                    let cmd =
+                                        args.get("command").and_then(|v| v.as_str()).unwrap_or("?");
                                     let short_cmd: String = cmd.chars().take(30).collect();
                                     format!("bash({})", short_cmd)
                                 }
@@ -785,7 +863,11 @@ impl Conversation {
             }
         }
 
-        let tools_str = if tools.is_empty() { "no tools".to_string() } else { tools.join(", ") };
+        let tools_str = if tools.is_empty() {
+            "no tools".to_string()
+        } else {
+            tools.join(", ")
+        };
 
         // Format: "- Turn N: [user text] [assistant conclusion] → tools"
         // The assistant conclusion is the key addition — it's what prevents
@@ -800,7 +882,10 @@ impl Conversation {
         } else {
             String::new()
         };
-        format!("- Turn {}: {}{}→ {}", turn_num, prefix, conclusion, tools_str)
+        format!(
+            "- Turn {}: {}{}→ {}",
+            turn_num, prefix, conclusion, tools_str
+        )
     }
 
     /// Synthesize a brief outcome description for a turn that has no assistant text.
@@ -904,25 +989,33 @@ impl Conversation {
         // Don't compact until context is getting large.
         // Small context = keep everything so model can cross-reference freely.
         // Only start compacting non-read results when context pressure builds.
-        let total_chars: usize = msgs.iter().map(|m| {
-            match &m.content {
-                MessageContent::ToolResult(r) => r.output.len(),
-                MessageContent::Text(t) => t.len(),
-                _ => 100, // rough estimate for other types
-            }
-        }).sum();
+        let total_chars: usize = msgs
+            .iter()
+            .map(|m| {
+                match &m.content {
+                    MessageContent::ToolResult(r) => r.output.len(),
+                    MessageContent::Text(t) => t.len(),
+                    _ => 100, // rough estimate for other types
+                }
+            })
+            .sum();
         // Don't compact until > 100K chars (~25K tokens).
         // Yesterday's best sessions peaked at 22.8K tok (~91K chars) with
         // zero compaction — all reads stayed in context. Only start compacting
         // when context pressure is genuinely building toward the 50% LLM
         // compression threshold (32K tok = 128K chars).
-        if total_chars < 100_000 { return; }
-        if total_msg_count <= OTHER_KEEP { return; }
+        if total_chars < 100_000 {
+            return;
+        }
+        if total_msg_count <= OTHER_KEEP {
+            return;
+        }
 
         let other_cutoff = total_msg_count.saturating_sub(OTHER_KEEP);
 
         // Build call_id → tool_name map
-        let mut call_id_to_tool: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let mut call_id_to_tool: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
         for msg in msgs.iter() {
             if let MessageContent::AssistantWithToolCalls { tool_calls, .. } = &msg.content {
                 for tc in tool_calls {
@@ -932,7 +1025,8 @@ impl Conversation {
         }
 
         // Skip system messages at the front
-        let cold_msgs = msgs.iter()
+        let cold_msgs = msgs
+            .iter()
             .position(|m| !matches!(m.role, Role::System))
             .unwrap_or(0);
 
@@ -940,7 +1034,8 @@ impl Conversation {
 
         for i in cold_msgs..condense_end.min(msgs.len()) {
             if let MessageContent::ToolResult(ref r) = msgs[i].content {
-                let _tool_name = call_id_to_tool.get(&r.call_id)
+                let _tool_name = call_id_to_tool
+                    .get(&r.call_id)
                     .map(|s| s.as_str())
                     .unwrap_or("tool");
 
@@ -949,12 +1044,17 @@ impl Conversation {
                 // Exempting read_file caused 78% context bloat in multi-file tasks.
 
                 let msg_idx = i.saturating_sub(cold_msgs);
-                if msg_idx >= other_cutoff { continue; }
+                if msg_idx >= other_cutoff {
+                    continue;
+                }
 
                 // Only condense large results (>500 chars)
-                if r.output.len() <= 500 { continue; }
+                if r.output.len() <= 500 {
+                    continue;
+                }
 
-                let tool_name = call_id_to_tool.get(&r.call_id)
+                let tool_name = call_id_to_tool
+                    .get(&r.call_id)
                     .map(|s| s.as_str())
                     .unwrap_or("tool");
 
@@ -1011,25 +1111,43 @@ impl Conversation {
             offset: Option<usize>,
             limit: Option<usize>,
         }
-        let mut call_id_to_read: std::collections::HashMap<String, ReadInfo> = std::collections::HashMap::new();
+        let mut call_id_to_read: std::collections::HashMap<String, ReadInfo> =
+            std::collections::HashMap::new();
         // Map edit/write/create call_ids to their file paths (pending verification)
-        let mut edit_call_to_file: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let mut edit_call_to_file: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
         let mut edited_files: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         for msg in msgs.iter() {
             if let MessageContent::AssistantWithToolCalls { tool_calls, .. } = &msg.content {
                 for tc in tool_calls {
                     if let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
-                        let file_path = args.get("file_path")
+                        let file_path = args
+                            .get("file_path")
                             .and_then(|v| v.as_str())
                             .unwrap_or("")
                             .to_string();
                         if tc.name == "read_file" && !file_path.is_empty() {
-                            let offset = args.get("offset").and_then(|v| v.as_u64()).map(|v| v as usize);
-                            let limit = args.get("limit").and_then(|v| v.as_u64()).map(|v| v as usize);
-                            call_id_to_read.insert(tc.id.clone(), ReadInfo { file_path: file_path.clone(), offset, limit });
+                            let offset = args
+                                .get("offset")
+                                .and_then(|v| v.as_u64())
+                                .map(|v| v as usize);
+                            let limit = args
+                                .get("limit")
+                                .and_then(|v| v.as_u64())
+                                .map(|v| v as usize);
+                            call_id_to_read.insert(
+                                tc.id.clone(),
+                                ReadInfo {
+                                    file_path: file_path.clone(),
+                                    offset,
+                                    limit,
+                                },
+                            );
                         }
-                        if matches!(tc.name.as_str(), "edit_file" | "write_file" | "create_file") && !file_path.is_empty() {
+                        if matches!(tc.name.as_str(), "edit_file" | "write_file" | "create_file")
+                            && !file_path.is_empty()
+                        {
                             edit_call_to_file.insert(tc.id.clone(), file_path);
                         }
                     }
@@ -1054,7 +1172,9 @@ impl Conversation {
         for msg in msgs.iter_mut() {
             if let MessageContent::ToolResult(ref mut r) = msg.content {
                 if let Some(info) = call_id_to_read.get(&r.call_id) {
-                    if !edited_files.contains(&info.file_path) { continue; }
+                    if !edited_files.contains(&info.file_path) {
+                        continue;
+                    }
                     if let Ok(content) = std::fs::read_to_string(&info.file_path) {
                         let all_lines: Vec<&str> = content.lines().collect();
                         let total = all_lines.len();
@@ -1065,14 +1185,18 @@ impl Conversation {
                             let start = info.offset.unwrap_or(1).max(1) - 1;
                             let start = start.min(total);
                             let end = info.limit.map(|l| (start + l).min(total)).unwrap_or(total);
-                            let display: String = all_lines[start..end].iter().enumerate()
+                            let display: String = all_lines[start..end]
+                                .iter()
+                                .enumerate()
                                 .map(|(i, l)| format!("{:>4}| {}", start + i + 1, l))
                                 .collect::<Vec<_>>()
                                 .join("\n");
                             r.output = display;
                         } else if total <= 300 {
                             // Full read, small file: replace with current content
-                            r.output = all_lines.iter().enumerate()
+                            r.output = all_lines
+                                .iter()
+                                .enumerate()
                                 .map(|(i, l)| format!("{:>4}| {}", i + 1, l))
                                 .collect::<Vec<_>>()
                                 .join("\n");
@@ -1191,7 +1315,8 @@ impl Conversation {
         });
 
         // 2. Collect valid tool_use IDs from assistant messages
-        let mut valid_call_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut valid_call_ids: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
         for msg in msgs.iter() {
             if let MessageContent::AssistantWithToolCalls { tool_calls, .. } = &msg.content {
                 for tc in tool_calls {
@@ -1244,7 +1369,8 @@ fn strip_leaked_reasoning(text: &str) -> String {
     }
 
     // Split into paragraphs (separated by blank lines)
-    let paragraphs: Vec<&str> = trimmed.split("\n\n")
+    let paragraphs: Vec<&str> = trimmed
+        .split("\n\n")
         .map(|p| p.trim())
         .filter(|p| !p.is_empty())
         .collect();
@@ -1256,11 +1382,24 @@ fn strip_leaked_reasoning(text: &str) -> String {
     // Check if first paragraph is reasoning (self-analysis patterns)
     let first = paragraphs[0];
     let reasoning_markers = [
-        "要求", "需要", "这个问题", "用户", "根据规则", "我应该",
-        "让我", "分析", "涉及到", "敏感", "回避",
-        "I need to", "I should", "Let me", "The user",
+        "要求",
+        "需要",
+        "这个问题",
+        "用户",
+        "根据规则",
+        "我应该",
+        "让我",
+        "分析",
+        "涉及到",
+        "敏感",
+        "回避",
+        "I need to",
+        "I should",
+        "Let me",
+        "The user",
     ];
-    let is_reasoning = reasoning_markers.iter()
+    let is_reasoning = reasoning_markers
+        .iter()
         .any(|m| first.starts_with(m) || first.contains(m));
 
     if is_reasoning {
@@ -1268,7 +1407,9 @@ fn strip_leaked_reasoning(text: &str) -> String {
         // Find the first paragraph that doesn't look like reasoning
         let mut start = paragraphs.len() - 1;
         for (i, p) in paragraphs.iter().enumerate().skip(1) {
-            let still_reasoning = reasoning_markers.iter().any(|m| p.starts_with(m) || p.contains(m));
+            let still_reasoning = reasoning_markers
+                .iter()
+                .any(|m| p.starts_with(m) || p.contains(m));
             if !still_reasoning {
                 start = i;
                 break;
@@ -1284,10 +1425,14 @@ fn strip_leaked_reasoning(text: &str) -> String {
 /// Strategy: find a repeated heading/marker line and truncate at the second occurrence.
 fn dedup_trailing_repeat(text: &str) -> String {
     let text = text.trim_end();
-    if text.len() < 100 { return text.to_string(); }
+    if text.len() < 100 {
+        return text.to_string();
+    }
 
     let lines: Vec<&str> = text.lines().collect();
-    if lines.len() < 6 { return text.to_string(); }
+    if lines.len() < 6 {
+        return text.to_string();
+    }
 
     // Look for repeated marker lines: headings (**, ##) or key phrases.
     // If a distinctive line appears twice, the second occurrence starts the duplicate.
@@ -1296,17 +1441,25 @@ fn dedup_trailing_repeat(text: &str) -> String {
     for i in 0..half {
         let line = lines[i].trim();
         // Must be a "distinctive" line (heading, bold marker, numbered item header)
-        if line.len() < 8 { continue; }
-        let is_marker = line.starts_with("**") || line.starts_with("##")
-            || line.starts_with("1.") || line.starts_with("1、");
-        if !is_marker { continue; }
+        if line.len() < 8 {
+            continue;
+        }
+        let is_marker = line.starts_with("**")
+            || line.starts_with("##")
+            || line.starts_with("1.")
+            || line.starts_with("1、");
+        if !is_marker {
+            continue;
+        }
 
         // Look for this same line in the second half
         for j in half..lines.len() {
             let other = lines[j].trim();
             if other == line {
                 // Found repeat marker. Verify: at least 3 lines after j should ~match lines after i.
-                let match_count = lines[i..].iter().zip(lines[j..].iter())
+                let match_count = lines[i..]
+                    .iter()
+                    .zip(lines[j..].iter())
                     .filter(|(a, b)| a.trim() == b.trim())
                     .count();
                 let remaining = lines.len() - j;
@@ -1449,7 +1602,8 @@ mod tests {
     fn test_budgeted_includes_recent_messages() {
         let mut conv = Conversation::new();
         conv.add_user_message("hello");
-        conv.messages.push(Message::new(Role::Assistant, "hi there"));
+        conv.messages
+            .push(Message::new(Role::Assistant, "hi there"));
         conv.add_user_message("do something");
 
         let (msgs, _stats) = conv.to_provider_messages_budgeted("sys", 8000);
@@ -1516,7 +1670,10 @@ mod tests {
 
         let (msgs, stats) = conv.to_provider_messages_budgeted("sys", 4000);
         // Oldest turns should be dropped
-        assert!(stats.dropped_tokens > 0, "Some turns should have been dropped");
+        assert!(
+            stats.dropped_tokens > 0,
+            "Some turns should have been dropped"
+        );
         // Most recent user message must survive
         assert_eq!(msgs.last().unwrap().text(), Some("now what?"));
         // System prompt must be first
@@ -1592,7 +1749,10 @@ mod tests {
         // Budget too small to fit the huge output — compaction MUST still leave
         // at least one non-system message.
         let (msgs, _stats) = conv.to_provider_messages_budgeted("sys", 10_000);
-        let non_system = msgs.iter().filter(|m| !matches!(m.role, Role::System)).count();
+        let non_system = msgs
+            .iter()
+            .filter(|m| !matches!(m.role, Role::System))
+            .count();
         assert!(
             non_system > 0,
             "never return system-only result when messages exist — got msgs.len()={}",
@@ -1610,11 +1770,14 @@ mod tests {
         // Add 20 turns of huge assistant+tool content to force aggressive drop
         for i in 0..20 {
             use crate::tool::{ToolCall, ToolResult};
-            conv.add_assistant_tool_calls(Some(&format!("reasoning {}", i)), vec![ToolCall {
-                id: format!("c{}", i),
-                name: "bash".to_string(),
-                arguments: "{}".to_string(),
-            }]);
+            conv.add_assistant_tool_calls(
+                Some(&format!("reasoning {}", i)),
+                vec![ToolCall {
+                    id: format!("c{}", i),
+                    name: "bash".to_string(),
+                    arguments: "{}".to_string(),
+                }],
+            );
             conv.add_tool_result(ToolResult {
                 call_id: format!("c{}", i),
                 output: "y".repeat(10_000),
@@ -1624,7 +1787,11 @@ mod tests {
 
         let (msgs, _stats) = conv.to_provider_messages_budgeted("sys", 5_000);
         let has_user = msgs.iter().any(|m| matches!(m.role, Role::User));
-        assert!(has_user, "last user message must always survive, got {} msgs", msgs.len());
+        assert!(
+            has_user,
+            "last user message must always survive, got {} msgs",
+            msgs.len()
+        );
     }
 
     #[test]
@@ -1659,7 +1826,8 @@ mod tests {
         // Budget check: cold zone should appear in output
         let (msgs, _stats) = conv.to_provider_messages_budgeted("sys", 100000);
         let has_cold = msgs.iter().any(|m| {
-            m.text().map_or(false, |t| t.contains("Earlier conversation history"))
+            m.text()
+                .map_or(false, |t| t.contains("Earlier conversation history"))
         });
         assert!(has_cold, "Cold zone summary should appear in output");
     }
@@ -1709,7 +1877,10 @@ mod tests {
 
         // Small budget — force dropping
         let (msgs, stats) = conv.to_provider_messages_budgeted("sys", 2000);
-        assert!(stats.dropped_tokens > 0, "Should drop turns when over budget");
+        assert!(
+            stats.dropped_tokens > 0,
+            "Should drop turns when over budget"
+        );
         assert!(matches!(msgs[0].role, Role::System));
     }
 
@@ -1717,9 +1888,11 @@ mod tests {
     fn test_budgeted_preserves_message_order() {
         let mut conv = Conversation::new();
         conv.add_user_message("first");
-        conv.messages.push(Message::new(Role::Assistant, "response 1"));
+        conv.messages
+            .push(Message::new(Role::Assistant, "response 1"));
         conv.add_user_message("second");
-        conv.messages.push(Message::new(Role::Assistant, "response 2"));
+        conv.messages
+            .push(Message::new(Role::Assistant, "response 2"));
         conv.add_user_message("third");
 
         let (msgs, _stats) = conv.to_provider_messages_budgeted("sys", 100000);
@@ -1811,8 +1984,14 @@ mod tests {
 
         // Verify state before compression
         assert_eq!(conv.messages.len(), 4);
-        assert_eq!(conv.turn_tracker.turns[0].status, turn::TurnStatus::Completed);
-        assert_eq!(conv.turn_tracker.turns[1].status, turn::TurnStatus::Completed);
+        assert_eq!(
+            conv.turn_tracker.turns[0].status,
+            turn::TurnStatus::Completed
+        );
+        assert_eq!(
+            conv.turn_tracker.turns[1].status,
+            turn::TurnStatus::Completed
+        );
         assert_eq!(conv.turn_tracker.turns[0].msg_count, 2);
         assert_eq!(conv.turn_tracker.turns[1].msg_count, 2);
 
@@ -1832,7 +2011,10 @@ mod tests {
         // Verify final state
         assert_eq!(conv.messages.len(), 3);
         assert_eq!(conv.turn_tracker.turns.len(), 2);
-        assert_eq!(conv.turn_tracker.turns[0].status, turn::TurnStatus::Completed);
+        assert_eq!(
+            conv.turn_tracker.turns[0].status,
+            turn::TurnStatus::Completed
+        );
         assert_eq!(conv.turn_tracker.turns[0].msg_count, 2);
         assert_eq!(conv.turn_tracker.turns[1].status, turn::TurnStatus::Active);
         assert_eq!(conv.turn_tracker.turns[1].start_idx, 2);

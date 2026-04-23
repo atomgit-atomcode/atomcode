@@ -55,9 +55,7 @@ pub fn render_line(line: &str, state: &mut MdState, caps: TerminalCaps) -> Optio
             None => body,
         }
     };
-    let prefix_only = || -> Option<String> {
-        prefix.as_ref().map(|p| p.clone())
-    };
+    let prefix_only = || -> Option<String> { prefix.as_ref().map(|p| p.clone()) };
 
     // Fenced code block fence (``` or ~~~)
     if is_fence(trimmed) {
@@ -138,10 +136,8 @@ pub fn flush_aligned_table(rows: &[String], caps: TerminalCaps) -> String {
 
     // Identify separator row(s) — cells match `[-: ]+` only.
     let is_sep = |row: &[String]| -> bool {
-        row.iter().all(|c| {
-            !c.is_empty()
-                && c.chars().all(|ch| matches!(ch, '-' | ':' | ' '))
-        })
+        row.iter()
+            .all(|c| !c.is_empty() && c.chars().all(|ch| matches!(ch, '-' | ':' | ' ')))
     };
 
     let ncols = parsed.iter().map(|r| r.len()).max().unwrap_or(0);
@@ -329,14 +325,10 @@ fn is_fence(trimmed: &str) -> bool {
     let mut chars = trimmed.chars();
     match chars.next() {
         Some('`') => {
-            trimmed.len() >= 3
-                && trimmed.as_bytes()[1] == b'`'
-                && trimmed.as_bytes()[2] == b'`'
+            trimmed.len() >= 3 && trimmed.as_bytes()[1] == b'`' && trimmed.as_bytes()[2] == b'`'
         }
         Some('~') => {
-            trimmed.len() >= 3
-                && trimmed.as_bytes()[1] == b'~'
-                && trimmed.as_bytes()[2] == b'~'
+            trimmed.len() >= 3 && trimmed.as_bytes()[1] == b'~' && trimmed.as_bytes()[2] == b'~'
         }
         _ => false,
     }
@@ -411,7 +403,10 @@ mod tests {
 
     #[test]
     fn inline_bold() {
-        assert_eq!(render_inline_line("**bold**", caps()), "\x1b[1mbold\x1b[22m");
+        assert_eq!(
+            render_inline_line("**bold**", caps()),
+            "\x1b[1mbold\x1b[22m"
+        );
     }
 
     #[test]
@@ -488,6 +483,9 @@ mod tests {
 
     #[test]
     fn cjk_bold() {
-        assert_eq!(render_inline_line("**你好**", caps()), "\x1b[1m你好\x1b[22m");
+        assert_eq!(
+            render_inline_line("**你好**", caps()),
+            "\x1b[1m你好\x1b[22m"
+        );
     }
 }

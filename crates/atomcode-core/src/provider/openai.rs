@@ -39,7 +39,9 @@ impl OpenAiProvider {
                 .unwrap_or_else(|| "https://api.openai.com/v1".to_string()),
             // Cap at 16K: prevents models from spending 250s on thinking
             // with zero visible output. CC uses fixed 16-32K, not proportional.
-            max_tokens: config.max_tokens.unwrap_or((config.context_window / 4).clamp(8_000, 16_384)),
+            max_tokens: config
+                .max_tokens
+                .unwrap_or((config.context_window / 4).clamp(8_000, 16_384)),
         })
     }
 
@@ -69,35 +71,45 @@ impl OpenAiProvider {
                         if tool_calls.is_empty() {
                             // No tool calls — send as plain assistant text
                             let t = text.as_deref().unwrap_or("");
-                            if t.is_empty() { return None; }
+                            if t.is_empty() {
+                                return None;
+                            }
                             return Some(json!({"role": "assistant", "content": t}));
                         }
                         let mut msg = json!({"role": "assistant"});
                         // Always include content field — some APIs (DeepSeek/SiliconFlow)
                         // reject messages without it even when tool_calls is present.
                         msg["content"] = json!(text.as_deref().unwrap_or(""));
-                        msg["tool_calls"] = json!(tool_calls.iter().map(|tc| {
-                            // Ensure arguments is valid JSON — some APIs reject invalid JSON strings.
-                            let args = if serde_json::from_str::<serde_json::Value>(&tc.arguments).is_ok() {
-                                tc.arguments.clone()
-                            } else {
-                                // Try repair; if still invalid, wrap as a simple object
-                                let repaired = repair_tool_args(&tc.arguments);
-                                if serde_json::from_str::<serde_json::Value>(&repaired).is_ok() {
-                                    repaired
-                                } else {
-                                    json!({"input": tc.arguments}).to_string()
-                                }
-                            };
-                            json!({
-                                "id": tc.id,
-                                "type": "function",
-                                "function": {
-                                    "name": tc.name,
-                                    "arguments": args,
-                                }
+                        msg["tool_calls"] = json!(tool_calls
+                            .iter()
+                            .map(|tc| {
+                                // Ensure arguments is valid JSON — some APIs reject invalid JSON strings.
+                                let args =
+                                    if serde_json::from_str::<serde_json::Value>(&tc.arguments)
+                                        .is_ok()
+                                    {
+                                        tc.arguments.clone()
+                                    } else {
+                                        // Try repair; if still invalid, wrap as a simple object
+                                        let repaired = repair_tool_args(&tc.arguments);
+                                        if serde_json::from_str::<serde_json::Value>(&repaired)
+                                            .is_ok()
+                                        {
+                                            repaired
+                                        } else {
+                                            json!({"input": tc.arguments}).to_string()
+                                        }
+                                    };
+                                json!({
+                                    "id": tc.id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": tc.name,
+                                        "arguments": args,
+                                    }
+                                })
                             })
-                        }).collect::<Vec<_>>());
+                            .collect::<Vec<_>>());
                         Some(msg)
                     }
                     MessageContent::ToolResult(r) => {
@@ -201,14 +213,17 @@ impl LlmProvider for OpenAiProvider {
 
         if let Some(tool_defs) = tools {
             if !tool_defs.is_empty() {
-                body["tools"] = json!(tool_defs.iter().map(|td| json!({
-                    "type": "function",
-                    "function": {
-                        "name": td.name,
-                        "description": td.description,
-                        "parameters": td.parameters,
-                    }
-                })).collect::<Vec<_>>());
+                body["tools"] = json!(tool_defs
+                    .iter()
+                    .map(|td| json!({
+                        "type": "function",
+                        "function": {
+                            "name": td.name,
+                            "description": td.description,
+                            "parameters": td.parameters,
+                        }
+                    }))
+                    .collect::<Vec<_>>());
                 // Allow the model to decide whether to call multiple tools in parallel
             }
         }
@@ -237,9 +252,10 @@ impl LlmProvider for OpenAiProvider {
                 let status = response.status();
                 let resp_url = response.url().to_string();
                 let body = response.text().await.unwrap_or_default();
-                let _ = tx.send(Ok(StreamEvent::Error(
-                    format!("API error ({}) at `{}`:\n{}", status, resp_url, body),
-                )));
+                let _ = tx.send(Ok(StreamEvent::Error(format!(
+                    "API error ({}) at `{}`:\n{}",
+                    status, resp_url, body
+                ))));
                 return;
             }
 
@@ -256,12 +272,14 @@ impl LlmProvider for OpenAiProvider {
                 let chunk = match tokio::time::timeout(
                     std::time::Duration::from_secs(120),
                     byte_stream.next(),
-                ).await {
+                )
+                .await
+                {
                     Ok(Some(chunk)) => chunk,
                     Ok(None) => break, // stream ended
                     Err(_) => {
                         let _ = tx.send(Ok(StreamEvent::Error(
-                            "Stream timeout: no data received for 120 seconds".to_string()
+                            "Stream timeout: no data received for 120 seconds".to_string(),
                         )));
                         return;
                     }
@@ -295,10 +313,15 @@ impl LlmProvider for OpenAiProvider {
                             // usage in multiple chunks; we only want the final value.
                             if let Some(usage) = &chunk.usage {
                                 // Extract cached tokens from whichever field the provider uses
-                                let cached = usage.prompt_cache_hit_tokens
+                                let cached = usage
+                                    .prompt_cache_hit_tokens
                                     .or(usage.cached_tokens)
-                                    .or_else(|| usage.prompt_tokens_details.as_ref()
-                                        .and_then(|d| d.cached_tokens))
+                                    .or_else(|| {
+                                        usage
+                                            .prompt_tokens_details
+                                            .as_ref()
+                                            .and_then(|d| d.cached_tokens)
+                                    })
                                     .unwrap_or(0);
                                 last_usage = Some(crate::stream::TokenUsage {
                                     prompt_tokens: usage.prompt_tokens.unwrap_or(0),
@@ -322,7 +345,11 @@ impl LlmProvider for OpenAiProvider {
                                         let idx = tc.index.unwrap_or(0);
                                         // Grow the vec if this is a new tool call index
                                         while tool_calls.len() <= idx {
-                                            tool_calls.push((String::new(), String::new(), String::new()));
+                                            tool_calls.push((
+                                                String::new(),
+                                                String::new(),
+                                                String::new(),
+                                            ));
                                         }
                                         let entry = &mut tool_calls[idx];
                                         if let Some(id) = &tc.id {
@@ -338,7 +365,9 @@ impl LlmProvider for OpenAiProvider {
                                         if let Some(func) = &tc.function {
                                             if let Some(args) = &func.arguments {
                                                 entry.2.push_str(args);
-                                                let _ = tx.send(Ok(StreamEvent::ToolCallDelta(args.clone())));
+                                                let _ = tx.send(Ok(StreamEvent::ToolCallDelta(
+                                                    args.clone(),
+                                                )));
                                             }
                                         }
                                     }
@@ -357,11 +386,12 @@ impl LlmProvider for OpenAiProvider {
                                                         id: id.clone(),
                                                         name: name.clone(),
                                                         arguments: args.clone(),
-                                                    }
+                                                    },
                                                 )));
                                             }
                                             tool_calls.clear();
-                                            let _ = tx.send(Ok(StreamEvent::Done { truncated: false }));
+                                            let _ =
+                                                tx.send(Ok(StreamEvent::Done { truncated: false }));
                                             return;
                                         }
                                         "length" | "max_tokens" => {
@@ -378,15 +408,17 @@ impl LlmProvider for OpenAiProvider {
                                                         id: id.clone(),
                                                         name: name.clone(),
                                                         arguments: args.clone(),
-                                                    }
+                                                    },
                                                 )));
                                             }
                                             tool_calls.clear();
-                                            let _ = tx.send(Ok(StreamEvent::Done { truncated: true }));
+                                            let _ =
+                                                tx.send(Ok(StreamEvent::Done { truncated: true }));
                                             return;
                                         }
                                         "stop" | _ => {
-                                            let _ = tx.send(Ok(StreamEvent::Done { truncated: false }));
+                                            let _ =
+                                                tx.send(Ok(StreamEvent::Done { truncated: false }));
                                             return;
                                         }
                                     }
@@ -400,7 +432,9 @@ impl LlmProvider for OpenAiProvider {
             let _ = tx.send(Ok(StreamEvent::Done { truncated: false }));
         });
 
-        Ok(Box::pin(tokio_stream::wrappers::UnboundedReceiverStream::new(rx)))
+        Ok(Box::pin(
+            tokio_stream::wrappers::UnboundedReceiverStream::new(rx),
+        ))
     }
 
     fn model_name(&self) -> &str {
@@ -424,7 +458,9 @@ fn repair_tool_args(s: &str) -> String {
     loop {
         let before = r.clone();
         r = r.replace(",}", "}").replace(",]", "]");
-        if r == before { break; }
+        if r == before {
+            break;
+        }
     }
 
     // Ensure wrapped in braces

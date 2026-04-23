@@ -3,10 +3,10 @@ use serde::Deserialize;
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::hook::HookRegistry;
+use super::async_batcher::{AsyncWebhookConfig, AsyncWebhookRegistry};
 use super::script_runner::{ScriptHook, ScriptHookConfig};
-use super::webhook::{WebhookHook, WebhookConfig};
-use super::async_batcher::{AsyncWebhookRegistry, AsyncWebhookConfig};
+use super::webhook::{WebhookConfig, WebhookHook};
+use crate::hook::HookRegistry;
 
 /// Hooks 配置结构
 #[derive(Debug, Deserialize)]
@@ -63,7 +63,10 @@ impl HooksConfig {
             };
 
             if !script_path.exists() {
-                eprintln!("[Hook] Warning: Script not found: {}", script_path.display());
+                eprintln!(
+                    "[Hook] Warning: Script not found: {}",
+                    script_path.display()
+                );
                 continue;
             }
 
@@ -149,7 +152,10 @@ impl HooksConfig {
 
         // 存储异步注册表以便后续关闭
         if !async_registry.batchers.is_empty() {
-            eprintln!("[AsyncWebhook] Registered {} async batchers", async_registry.batchers.len());
+            eprintln!(
+                "[AsyncWebhook] Registered {} async batchers",
+                async_registry.batchers.len()
+            );
         }
     }
 }
@@ -174,7 +180,10 @@ pub fn load_hooks(registry: &mut HookRegistry) {
         if project_hooks_dir.exists() {
             if let Ok(config) = HooksConfig::from_dir(&project_hooks_dir) {
                 config.register_hooks(registry, &project_hooks_dir);
-                eprintln!("[Hook] Loaded project hooks from {}", project_hooks_dir.display());
+                eprintln!(
+                    "[Hook] Loaded project hooks from {}",
+                    project_hooks_dir.display()
+                );
             }
         }
     }

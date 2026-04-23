@@ -16,7 +16,9 @@ pub fn create_checkpoint(working_dir: &Path) -> Option<String> {
         .ok()
         .map(|o| o.status.success())
         .unwrap_or(false);
-    if !is_git { return None; }
+    if !is_git {
+        return None;
+    }
 
     // git stash create: creates stash commit, returns SHA. Empty if clean.
     let output = Command::new("git")
@@ -26,7 +28,11 @@ pub fn create_checkpoint(working_dir: &Path) -> Option<String> {
         .ok()?;
 
     let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if sha.is_empty() { None } else { Some(sha) }
+    if sha.is_empty() {
+        None
+    } else {
+        Some(sha)
+    }
 }
 
 /// Restore a checkpoint. Returns (success, message).
@@ -39,8 +45,13 @@ pub fn restore_checkpoint(working_dir: &Path, checkpoint_ref: &str) -> (bool, St
 
     if let Ok(o) = &reset {
         if !o.status.success() {
-            return (false, format!("Failed to reset working tree: {}",
-                String::from_utf8_lossy(&o.stderr).trim()));
+            return (
+                false,
+                format!(
+                    "Failed to reset working tree: {}",
+                    String::from_utf8_lossy(&o.stderr).trim()
+                ),
+            );
         }
     }
 
@@ -53,7 +64,13 @@ pub fn restore_checkpoint(working_dir: &Path, checkpoint_ref: &str) -> (bool, St
     match result {
         Ok(o) if o.status.success() => {
             let short = &checkpoint_ref[..8.min(checkpoint_ref.len())];
-            (true, format!("Restored to checkpoint {}. Agent's changes have been rolled back.", short))
+            (
+                true,
+                format!(
+                    "Restored to checkpoint {}. Agent's changes have been rolled back.",
+                    short
+                ),
+            )
         }
         Ok(o) => {
             let err = String::from_utf8_lossy(&o.stderr);

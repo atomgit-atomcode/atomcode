@@ -86,13 +86,7 @@ impl Modal for ModelPicker {
         }
     }
 
-    fn draw(
-        &self,
-        buf: &Buffer,
-        state: &UiState,
-        ctx: &LoopCtx,
-        renderer: &mut dyn Renderer,
-    ) {
+    fn draw(&self, buf: &Buffer, state: &UiState, ctx: &LoopCtx, renderer: &mut dyn Renderer) {
         let items: Vec<(String, String)> = self
             .providers
             .iter()

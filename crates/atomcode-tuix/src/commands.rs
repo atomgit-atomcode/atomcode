@@ -11,7 +11,9 @@ pub struct CommandRegistry {
 
 impl CommandRegistry {
     pub fn builtin() -> Self {
-        Self { commands: BUILTIN_COMMANDS }
+        Self {
+            commands: BUILTIN_COMMANDS,
+        }
     }
 
     pub fn all(&self) -> &'static [Command] {
@@ -39,7 +41,12 @@ impl CommandRegistry {
     }
 
     pub fn help_text(&self) -> String {
-        let max_name = self.commands.iter().map(|c| c.name.len()).max().unwrap_or(6);
+        let max_name = self
+            .commands
+            .iter()
+            .map(|c| c.name.len())
+            .max()
+            .unwrap_or(6);
         let mut out = String::from("  Available commands:\n");
         for c in self.commands {
             out.push_str(&format!(
@@ -54,24 +61,78 @@ impl CommandRegistry {
 }
 
 const BUILTIN_COMMANDS: &[Command] = &[
-    Command { name: "resume",  desc: "Resume a previous session" },
-    Command { name: "login",   desc: "Sign in with AtomGit OAuth" },
-    Command { name: "logout",  desc: "Sign out of AtomGit" },
-    Command { name: "whoami",  desc: "Show current logged-in user" },
-    Command { name: "model",   desc: "Switch provider / model" },
-    Command { name: "provider", desc: "Manage providers (add / edit / delete)" },
-    Command { name: "status",  desc: "Show session status" },
-    Command { name: "config",  desc: "Show config path" },
-    Command { name: "reload",  desc: "Reload ~/.atomcode/config.toml from disk" },
-    Command { name: "cd",      desc: "Change working directory" },
-    Command { name: "diff",    desc: "Show git diff" },
-    Command { name: "clear",   desc: "Clear screen" },
-    Command { name: "session", desc: "Start a new session (clears conversation)" },
-    Command { name: "cost",    desc: "Show token cost" },
-    Command { name: "undo",    desc: "Undo last change (not yet supported)" },
-    Command { name: "upgrade", desc: "Upgrade atomcode to latest (subcommand: rollback)" },
-    Command { name: "help",    desc: "Show this help" },
-    Command { name: "quit",    desc: "Exit AtomCode" },
+    Command {
+        name: "resume",
+        desc: "Resume a previous session",
+    },
+    Command {
+        name: "login",
+        desc: "Sign in with AtomGit OAuth",
+    },
+    Command {
+        name: "logout",
+        desc: "Sign out of AtomGit",
+    },
+    Command {
+        name: "whoami",
+        desc: "Show current logged-in user",
+    },
+    Command {
+        name: "model",
+        desc: "Switch provider / model",
+    },
+    Command {
+        name: "provider",
+        desc: "Manage providers (add / edit / delete)",
+    },
+    Command {
+        name: "status",
+        desc: "Show session status",
+    },
+    Command {
+        name: "config",
+        desc: "Show config path",
+    },
+    Command {
+        name: "reload",
+        desc: "Reload ~/.atomcode/config.toml from disk",
+    },
+    Command {
+        name: "cd",
+        desc: "Change working directory",
+    },
+    Command {
+        name: "diff",
+        desc: "Show git diff",
+    },
+    Command {
+        name: "clear",
+        desc: "Clear screen",
+    },
+    Command {
+        name: "session",
+        desc: "Start a new session (clears conversation)",
+    },
+    Command {
+        name: "cost",
+        desc: "Show token cost",
+    },
+    Command {
+        name: "undo",
+        desc: "Undo last change (not yet supported)",
+    },
+    Command {
+        name: "upgrade",
+        desc: "Upgrade atomcode to latest (subcommand: rollback)",
+    },
+    Command {
+        name: "help",
+        desc: "Show this help",
+    },
+    Command {
+        name: "quit",
+        desc: "Exit AtomCode",
+    },
 ];
 
 /// Parse `"/cmd args..."` into `(cmd, args)` when the leading `/` is a

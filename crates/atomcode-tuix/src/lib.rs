@@ -21,11 +21,11 @@ use atomcode_core::agent::AgentHandle;
 use atomcode_core::config::Config;
 use atomcode_core::tool::ToolContext;
 use crossterm::{
-    execute,
     event::{
         DisableBracketedPaste, EnableBracketedPaste, KeyboardEnhancementFlags,
         PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
+    execute,
 };
 use std::io;
 use tokio::sync::mpsc;
@@ -34,7 +34,9 @@ use crate::commands::CommandRegistry;
 use crate::event_loop::{run_loop, LoopCtx};
 use crate::input::history::History;
 use crate::input::reader;
-use crate::render::{plain::PlainRenderer, retained::RetainedRenderer, worker::TaskRenderer, Renderer};
+use crate::render::{
+    plain::PlainRenderer, retained::RetainedRenderer, worker::TaskRenderer, Renderer,
+};
 use crate::terminal::TerminalCaps;
 
 /// RAII guard: enables raw mode + bracketed paste on construction,

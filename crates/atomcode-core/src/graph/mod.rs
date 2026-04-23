@@ -313,12 +313,11 @@ impl CodeGraph {
 
     /// Generate a dependency summary for a file: what it uses, what uses it.
     pub fn file_dependency_summary(&self, filename: &str) -> Option<String> {
-        let (path, sym_ids) = self.file_symbols.iter()
-            .find(|(p, _)| {
-                p.file_name()
-                    .map(|f| f.to_string_lossy() == filename)
-                    .unwrap_or(false)
-            })?;
+        let (path, sym_ids) = self.file_symbols.iter().find(|(p, _)| {
+            p.file_name()
+                .map(|f| f.to_string_lossy() == filename)
+                .unwrap_or(false)
+        })?;
         let path = path.clone();
 
         let mut uses: Vec<String> = Vec::new();
@@ -327,7 +326,9 @@ impl CodeGraph {
                 for edge in edges {
                     if let Some(node) = self.node(edge.to) {
                         if node.file != path {
-                            let f = node.file.file_name()
+                            let f = node
+                                .file
+                                .file_name()
                                 .map(|n| n.to_string_lossy().to_string())
                                 .unwrap_or_default();
                             if !uses.contains(&f) {
@@ -340,7 +341,8 @@ impl CodeGraph {
         }
 
         let deps = self.file_dependents(&path, 2);
-        let dep_names: Vec<String> = deps.iter()
+        let dep_names: Vec<String> = deps
+            .iter()
             .filter_map(|p| p.file_name().map(|f| f.to_string_lossy().to_string()))
             .collect();
 
@@ -364,7 +366,8 @@ impl CodeGraph {
     pub fn call_chain_summary(&self, fn_name: &str) -> Option<String> {
         let symbols = self.find_by_name(fn_name);
         // Filter to functions/methods only, pick the one with most callees
-        let sym = symbols.iter()
+        let sym = symbols
+            .iter()
             .filter(|s| matches!(s.kind, SymbolKind::Function | SymbolKind::Method))
             .max_by_key(|s| self.callees(s.id).map(|e| e.len()).unwrap_or(0))?;
 
@@ -376,7 +379,9 @@ impl CodeGraph {
         let mut chain = format!("[Call chain: {}()", fn_name);
         for (callee_id, depth) in &callees {
             if let Some(node) = self.node(*callee_id) {
-                let short_file = node.file.file_name()
+                let short_file = node
+                    .file
+                    .file_name()
                     .map(|f| f.to_string_lossy().to_string())
                     .unwrap_or_default();
                 let indent = " → ".repeat(*depth);
@@ -387,8 +392,10 @@ impl CodeGraph {
             }
         }
         chain.push_str("]\n");
-        chain.push_str("[SCOPE: The issue is in ONE of these functions. \
-            Read ONLY these files — do not explore outside this chain.]");
+        chain.push_str(
+            "[SCOPE: The issue is in ONE of these functions. \
+            Read ONLY these files — do not explore outside this chain.]",
+        );
         Some(chain)
     }
 }

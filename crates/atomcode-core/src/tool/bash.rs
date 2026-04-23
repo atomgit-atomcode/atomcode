@@ -37,17 +37,30 @@ where
         fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
             f.write_str("a u64 or a string containing a u64")
         }
-        fn visit_none<E: de::Error>(self) -> std::result::Result<Self::Value, E> { Ok(None) }
-        fn visit_unit<E: de::Error>(self) -> std::result::Result<Self::Value, E> { Ok(None) }
-        fn visit_u64<E: de::Error>(self, v: u64) -> std::result::Result<Self::Value, E> { Ok(Some(v)) }
-        fn visit_i64<E: de::Error>(self, v: i64) -> std::result::Result<Self::Value, E> {
-            if v >= 0 { Ok(Some(v as u64)) } else { Err(de::Error::custom("negative timeout")) }
+        fn visit_none<E: de::Error>(self) -> std::result::Result<Self::Value, E> {
+            Ok(None)
         }
-        fn visit_f64<E: de::Error>(self, v: f64) -> std::result::Result<Self::Value, E> { Ok(Some(v as u64)) }
+        fn visit_unit<E: de::Error>(self) -> std::result::Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_u64<E: de::Error>(self, v: u64) -> std::result::Result<Self::Value, E> {
+            Ok(Some(v))
+        }
+        fn visit_i64<E: de::Error>(self, v: i64) -> std::result::Result<Self::Value, E> {
+            if v >= 0 {
+                Ok(Some(v as u64))
+            } else {
+                Err(de::Error::custom("negative timeout"))
+            }
+        }
+        fn visit_f64<E: de::Error>(self, v: f64) -> std::result::Result<Self::Value, E> {
+            Ok(Some(v as u64))
+        }
         fn visit_str<E: de::Error>(self, v: &str) -> std::result::Result<Self::Value, E> {
             let s = v.trim();
             // Try u64 first, then f64 (models often send "60.0" instead of 60)
-            s.parse::<u64>().map(Some)
+            s.parse::<u64>()
+                .map(Some)
                 .or_else(|_| s.parse::<f64>().map(|f| Some(f as u64)))
                 .map_err(de::Error::custom)
         }
@@ -130,208 +143,224 @@ impl Tool for BashTool {
 
         // Append cwd to every bash result so model always knows where it is.
         let wd = ctx.working_dir.read().await;
-        result.output.push_str(&format!("\n[cwd: {}]", wd.display()));
+        result
+            .output
+            .push_str(&format!("\n[cwd: {}]", wd.display()));
         Ok(result)
     }
 }
 
 async fn bash_execute(args: &str, ctx: &ToolContext) -> Result<ToolResult> {
-        let mut parsed: BashArgs = serde_json::from_str(args)?;
-        // Strip model-added tail/head pipes — framework's truncation handles output length.
-        parsed.command = strip_output_pipes(&parsed.command);
+    let mut parsed: BashArgs = serde_json::from_str(args)?;
+    // Strip model-added tail/head pipes — framework's truncation handles output length.
+    parsed.command = strip_output_pipes(&parsed.command);
 
-        // Cap timeout: model may request absurdly large values. Max 5 min.
-        let timeout_secs = parsed.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS).min(300);
-        let start_instant = Instant::now();
+    // Cap timeout: model may request absurdly large values. Max 5 min.
+    let timeout_secs = parsed.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS).min(300);
+    let start_instant = Instant::now();
 
-        let wd = ctx.working_dir.read().await.clone();
+    let wd = ctx.working_dir.read().await.clone();
 
-        // Platform-aware shell: cmd.exe on Windows, bash on Unix
-        #[cfg(target_os = "windows")]
-        let mut child = Command::new("cmd.exe")
-            .args(&["/C", &parsed.command])
+    // Platform-aware shell: cmd.exe on Windows, bash on Unix
+    #[cfg(target_os = "windows")]
+    let mut child = Command::new("cmd.exe")
+        .args(&["/C", &parsed.command])
+        .current_dir(&wd)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+
+    #[cfg(not(target_os = "windows"))]
+    let mut child = {
+        let mut cmd = Command::new("bash");
+        cmd.arg("-c")
+            .arg(&parsed.command)
             .current_dir(&wd)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()?;
+            .stderr(std::process::Stdio::piped());
+        // Detach child from the controlling terminal so neither it nor any
+        // grandchild (ssh, git credential helpers, server-side hook output
+        // rendered by git) can write directly to /dev/tty.  Without this,
+        // programs that open /dev/tty bypass our piped stdout/stderr and
+        // scribble ANSI escape sequences onto the TUI — producing artifacts
+        // like the [PASSED] box from AtomGit push hooks.
+        unsafe {
+            cmd.pre_exec(|| {
+                extern "C" {
+                    fn setsid() -> i32;
+                    fn open(path: *const u8, oflag: i32) -> i32;
+                    fn close(fd: i32) -> i32;
+                    fn ioctl(fd: i32, request: u64, ...) -> i32;
+                }
+                // Create a new session — detaches from the controlling
+                // terminal so /dev/tty opens fail.
+                setsid();
+                // Belt-and-suspenders: also try to explicitly detach using
+                // TIOCNOTTY, which works even when setsid alone doesn't
+                // fully sever the connection on some macOS versions.
+                const O_RDWR: i32 = 2;
+                #[cfg(target_os = "macos")]
+                const TIOCNOTTY: u64 = 0x20007471;
+                #[cfg(not(target_os = "macos"))]
+                const TIOCNOTTY: u64 = 0x5422;
+                let tty_fd = open(b"/dev/tty\0".as_ptr(), O_RDWR);
+                if tty_fd >= 0 {
+                    ioctl(tty_fd, TIOCNOTTY);
+                    close(tty_fd);
+                }
+                Ok(())
+            });
+        }
+        cmd.spawn()?
+    };
 
-        #[cfg(not(target_os = "windows"))]
-        let mut child = {
-            let mut cmd = Command::new("bash");
-            cmd.arg("-c")
-                .arg(&parsed.command)
-                .current_dir(&wd)
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped());
-            // Detach child from the controlling terminal so neither it nor any
-            // grandchild (ssh, git credential helpers, server-side hook output
-            // rendered by git) can write directly to /dev/tty.  Without this,
-            // programs that open /dev/tty bypass our piped stdout/stderr and
-            // scribble ANSI escape sequences onto the TUI — producing artifacts
-            // like the [PASSED] box from AtomGit push hooks.
-            unsafe {
-                cmd.pre_exec(|| {
-                    extern "C" {
-                        fn setsid() -> i32;
-                        fn open(path: *const u8, oflag: i32) -> i32;
-                        fn close(fd: i32) -> i32;
-                        fn ioctl(fd: i32, request: u64, ...) -> i32;
-                    }
-                    // Create a new session — detaches from the controlling
-                    // terminal so /dev/tty opens fail.
-                    setsid();
-                    // Belt-and-suspenders: also try to explicitly detach using
-                    // TIOCNOTTY, which works even when setsid alone doesn't
-                    // fully sever the connection on some macOS versions.
-                    const O_RDWR: i32 = 2;
-                    #[cfg(target_os = "macos")]
-                    const TIOCNOTTY: u64 = 0x20007471;
-                    #[cfg(not(target_os = "macos"))]
-                    const TIOCNOTTY: u64 = 0x5422;
-                    let tty_fd = open(b"/dev/tty\0".as_ptr(), O_RDWR);
-                    if tty_fd >= 0 {
-                        ioctl(tty_fd, TIOCNOTTY);
-                        close(tty_fd);
-                    }
-                    Ok(())
-                });
-            }
-            cmd.spawn()?
-        };
+    let mut stdout = child.stdout.take().unwrap();
+    let mut stderr = child.stderr.take().unwrap();
 
-        let mut stdout = child.stdout.take().unwrap();
-        let mut stderr = child.stderr.take().unwrap();
+    let mut stdout_buf = Vec::new();
+    let mut stderr_buf = Vec::new();
 
-        let mut stdout_buf = Vec::new();
-        let mut stderr_buf = Vec::new();
-
-        // Wait for process to finish or timeout. Read stdout/stderr concurrently.
-        // Idle detection: if output stops for SILENT_KILL_SECS after having produced
-        // some output, assume the command is truly stuck. This threshold needs to
-        // tolerate legitimate silent phases common across many tools/languages
-        // (build cache scan, dep lock waits, dep downloads, large file I/O, linking,
-        // compiler type-check pass, etc.) — none of which emit progress to stdout.
-        let idle_timeout = Duration::from_secs(SILENT_KILL_SECS);
-        let has_any_output = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let has_out_1 = has_any_output.clone();
-        let has_out_2 = has_any_output.clone();
-        let result = tokio::time::timeout(
-            Duration::from_secs(timeout_secs),
+    // Wait for process to finish or timeout. Read stdout/stderr concurrently.
+    // Idle detection: if output stops for SILENT_KILL_SECS after having produced
+    // some output, assume the command is truly stuck. This threshold needs to
+    // tolerate legitimate silent phases common across many tools/languages
+    // (build cache scan, dep lock waits, dep downloads, large file I/O, linking,
+    // compiler type-check pass, etc.) — none of which emit progress to stdout.
+    let idle_timeout = Duration::from_secs(SILENT_KILL_SECS);
+    let has_any_output = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let has_out_1 = has_any_output.clone();
+    let has_out_2 = has_any_output.clone();
+    let result = tokio::time::timeout(Duration::from_secs(timeout_secs), async {
+        let (_, _) = tokio::join!(
             async {
-                let (_, _) = tokio::join!(
-                    async {
-                        let mut buf = vec![0u8; 65536];
-                        loop {
-                            match tokio::time::timeout(idle_timeout, stdout.read(&mut buf)).await {
-                                Ok(Ok(0)) => break,
-                                Ok(Ok(n)) => {
-                                    stdout_buf.extend_from_slice(&buf[..n]);
-                                    has_out_1.store(true, std::sync::atomic::Ordering::Relaxed);
-                                }
-                                Ok(Err(_)) => break,
-                                Err(_) => {
-                                    // No new stdout for 3s — if we have ANY output, break
-                                    if has_out_1.load(std::sync::atomic::Ordering::Relaxed) {
-                                        break;
-                                    }
-                                }
-                            }
+                let mut buf = vec![0u8; 65536];
+                loop {
+                    match tokio::time::timeout(idle_timeout, stdout.read(&mut buf)).await {
+                        Ok(Ok(0)) => break,
+                        Ok(Ok(n)) => {
+                            stdout_buf.extend_from_slice(&buf[..n]);
+                            has_out_1.store(true, std::sync::atomic::Ordering::Relaxed);
                         }
-                    },
-                    async {
-                        let mut buf = vec![0u8; 65536];
-                        loop {
-                            match tokio::time::timeout(idle_timeout, stderr.read(&mut buf)).await {
-                                Ok(Ok(0)) => break,
-                                Ok(Ok(n)) => {
-                                    stderr_buf.extend_from_slice(&buf[..n]);
-                                    has_out_2.store(true, std::sync::atomic::Ordering::Relaxed);
-                                }
-                                Ok(Err(_)) => break,
-                                Err(_) => {
-                                    if has_out_2.load(std::sync::atomic::Ordering::Relaxed) {
-                                        break;
-                                    }
-                                }
+                        Ok(Err(_)) => break,
+                        Err(_) => {
+                            // No new stdout for 3s — if we have ANY output, break
+                            if has_out_1.load(std::sync::atomic::Ordering::Relaxed) {
+                                break;
                             }
                         }
                     }
-                );
-
-                match child.try_wait() {
-                    Ok(Some(status)) => Some(status.success()),
-                    _ => None,
+                }
+            },
+            async {
+                let mut buf = vec![0u8; 65536];
+                loop {
+                    match tokio::time::timeout(idle_timeout, stderr.read(&mut buf)).await {
+                        Ok(Ok(0)) => break,
+                        Ok(Ok(n)) => {
+                            stderr_buf.extend_from_slice(&buf[..n]);
+                            has_out_2.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        Ok(Err(_)) => break,
+                        Err(_) => {
+                            if has_out_2.load(std::sync::atomic::Ordering::Relaxed) {
+                                break;
+                            }
+                        }
+                    }
                 }
             }
-        ).await;
+        );
 
-        let stdout_str = String::from_utf8_lossy(&stdout_buf).to_string();
-        let stderr_str = String::from_utf8_lossy(&stderr_buf).to_string();
+        match child.try_wait() {
+            Ok(Some(status)) => Some(status.success()),
+            _ => None,
+        }
+    })
+    .await;
 
-        // Commands with & (backgrounded processes) may return non-zero even on success.
-        // pkill returns 1 when no process matched. These shouldn't be marked as failures.
-        let has_background = parsed.command.contains(" &");
-        let has_pkill = parsed.command.contains("pkill");
+    let stdout_str = String::from_utf8_lossy(&stdout_buf).to_string();
+    let stderr_str = String::from_utf8_lossy(&stderr_buf).to_string();
 
-        // Total elapsed wall-clock — appended to every result so the agent can
-        // judge "slow but succeeded" vs "stalled/hung" without any per-tool
-        // pattern matching. Purely numeric, tech-neutral.
-        let elapsed_secs = start_instant.elapsed().as_secs_f64();
-        let elapsed_marker = format!("[elapsed: {:.1}s]", elapsed_secs);
+    // Commands with & (backgrounded processes) may return non-zero even on success.
+    // pkill returns 1 when no process matched. These shouldn't be marked as failures.
+    let has_background = parsed.command.contains(" &");
+    let has_pkill = parsed.command.contains("pkill");
 
-        match result {
-            Ok(Some(success)) => {
-                let mut combined = format_output(&stdout_str, &stderr_str);
-                // For background/pkill commands: non-empty output = success
-                let effective_success = success || has_background || (has_pkill && !combined.is_empty());
+    // Total elapsed wall-clock — appended to every result so the agent can
+    // judge "slow but succeeded" vs "stalled/hung" without any per-tool
+    // pattern matching. Purely numeric, tech-neutral.
+    let elapsed_secs = start_instant.elapsed().as_secs_f64();
+    let elapsed_marker = format!("[elapsed: {:.1}s]", elapsed_secs);
 
-                if !effective_success && !combined.is_empty() {
-                    combined.push_str("\n\n[IMPORTANT: Command failed. Read the error above and fix the root cause. Do NOT retry the same command.]");
-                }
-                // Prepend elapsed so it's visible even when output is truncated later
-                let output = if combined.is_empty() {
-                    elapsed_marker
-                } else {
-                    format!("{}\n{}", elapsed_marker, combined)
-                };
-                Ok(ToolResult { call_id: String::new(), output, success: effective_success })
+    match result {
+        Ok(Some(success)) => {
+            let mut combined = format_output(&stdout_str, &stderr_str);
+            // For background/pkill commands: non-empty output = success
+            let effective_success =
+                success || has_background || (has_pkill && !combined.is_empty());
+
+            if !effective_success && !combined.is_empty() {
+                combined.push_str("\n\n[IMPORTANT: Command failed. Read the error above and fix the root cause. Do NOT retry the same command.]");
             }
-            Ok(None) => {
-                // Process still running but output stopped for SILENT_KILL_SECS = likely stuck.
-                // Kill it. Include elapsed time so agent can tell slow-work vs deadlock.
-                let _ = child.kill().await;
-                let combined = format_output(&stdout_str, &stderr_str);
-                let output = if combined.is_empty() {
-                    format!(
-                        "{} [killed: no output for {}s — treat as stuck, don't retry the same command]",
-                        elapsed_marker, SILENT_KILL_SECS
-                    )
-                } else {
-                    format!(
-                        "{}\n{}\n\n[killed: no new output for {}s — output above is partial]",
-                        elapsed_marker, combined, SILENT_KILL_SECS
-                    )
-                };
-                Ok(ToolResult { call_id: String::new(), output, success: false })
-            }
-            Err(_) => {
-                // Hard timeout — kill it
-                let _ = child.kill().await;
-                let combined = format_output(&stdout_str, &stderr_str);
-                let output = if combined.is_empty() {
-                    format!("{} [timed out after {}s with no output]", elapsed_marker, timeout_secs)
-                } else {
-                    format!(
+            // Prepend elapsed so it's visible even when output is truncated later
+            let output = if combined.is_empty() {
+                elapsed_marker
+            } else {
+                format!("{}\n{}", elapsed_marker, combined)
+            };
+            Ok(ToolResult {
+                call_id: String::new(),
+                output,
+                success: effective_success,
+            })
+        }
+        Ok(None) => {
+            // Process still running but output stopped for SILENT_KILL_SECS = likely stuck.
+            // Kill it. Include elapsed time so agent can tell slow-work vs deadlock.
+            let _ = child.kill().await;
+            let combined = format_output(&stdout_str, &stderr_str);
+            let output = if combined.is_empty() {
+                format!(
+                    "{} [killed: no output for {}s — treat as stuck, don't retry the same command]",
+                    elapsed_marker, SILENT_KILL_SECS
+                )
+            } else {
+                format!(
+                    "{}\n{}\n\n[killed: no new output for {}s — output above is partial]",
+                    elapsed_marker, combined, SILENT_KILL_SECS
+                )
+            };
+            Ok(ToolResult {
+                call_id: String::new(),
+                output,
+                success: false,
+            })
+        }
+        Err(_) => {
+            // Hard timeout — kill it
+            let _ = child.kill().await;
+            let combined = format_output(&stdout_str, &stderr_str);
+            let output = if combined.is_empty() {
+                format!(
+                    "{} [timed out after {}s with no output]",
+                    elapsed_marker, timeout_secs
+                )
+            } else {
+                format!(
                         "{}\n{}\n\n[timed out after {}s — consider passing a larger `timeout` if this command legitimately takes longer]",
                         elapsed_marker, combined, timeout_secs
                     )
-                };
-                Ok(ToolResult { call_id: String::new(), output, success: false })
-            }
+            };
+            Ok(ToolResult {
+                call_id: String::new(),
+                output,
+                success: false,
+            })
         }
     }
+}
 
 /// Check if a shell command contains destructive patterns that require user approval.
 fn check_destructive_command(command: &str) -> Option<String> {
@@ -355,7 +384,10 @@ fn check_destructive_command(command: &str) -> Option<String> {
         ("killall ", "Kill all matching processes"),
         ("git push --force", "Force push"),
         ("git push -f", "Force push"),
-        ("git reset --hard", "Hard reset (destroys uncommitted changes)"),
+        (
+            "git reset --hard",
+            "Hard reset (destroys uncommitted changes)",
+        ),
         ("git clean -f", "Force clean untracked files"),
     ];
 
@@ -369,29 +401,44 @@ fn check_destructive_command(command: &str) -> Option<String> {
             // Also allow piped kill patterns like `lsof -ti:PORT | xargs kill -9`
             // which are standard dev server restart operations.
             if pattern.contains("kill") {
-                let is_targeted_kill = cmd.contains("| xargs kill")
-                    || cmd.contains("| kill")
-                    || {
-                        // `kill -9 12345` — numeric PID follows
-                        let after_kill = if let Some(pos) = cmd.find("kill -9") {
-                            cmd[pos + 7..].trim_start()
-                        } else if let Some(pos) = cmd.find("kill ") {
-                            cmd[pos + 5..].trim_start()
-                        } else { "" };
-                        after_kill.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false)
+                let is_targeted_kill = cmd.contains("| xargs kill") || cmd.contains("| kill") || {
+                    // `kill -9 12345` — numeric PID follows
+                    let after_kill = if let Some(pos) = cmd.find("kill -9") {
+                        cmd[pos + 7..].trim_start()
+                    } else if let Some(pos) = cmd.find("kill ") {
+                        cmd[pos + 5..].trim_start()
+                    } else {
+                        ""
                     };
+                    after_kill
+                        .chars()
+                        .next()
+                        .map(|c| c.is_ascii_digit())
+                        .unwrap_or(false)
+                };
                 if is_targeted_kill {
                     continue;
                 }
             }
-            return Some(format!("Destructive command detected: {}. Command: {}", reason, command));
+            return Some(format!(
+                "Destructive command detected: {}. Command: {}",
+                reason, command
+            ));
         }
     }
 
     // Detect `rm` on files in the working directory (prevents rm+write_file bypass).
     // Tech-stack agnostic: any `rm` that isn't cleaning temp/build artifacts needs approval.
     if cmd.starts_with("rm ") && !cmd.contains("-r") {
-        let ignore_dirs = ["node_modules", "dist", "build", ".cache", "target", "__pycache__", ".tmp"];
+        let ignore_dirs = [
+            "node_modules",
+            "dist",
+            "build",
+            ".cache",
+            "target",
+            "__pycache__",
+            ".tmp",
+        ];
         let is_artifact = ignore_dirs.iter().any(|d| cmd.contains(d));
         if !is_artifact {
             return Some(format!(
@@ -403,7 +450,6 @@ fn check_destructive_command(command: &str) -> Option<String> {
 
     None
 }
-
 
 /// Detect if a bash command is (or starts with) a `cd` and extract the target
 /// directory.  Handles: `cd /path`, `cd ~/path`, `cd dir && ...`, `cd dir; ...`.
@@ -419,7 +465,8 @@ fn detect_cd_target(cmd: &str) -> Option<String> {
     }
     // Extract the path after `cd `, stopping at `&&`, `;`, `||`, `|`, or end.
     let after_cd = trimmed[3..].trim_start();
-    let end = after_cd.find(|c: char| c == '&' || c == ';' || c == '|')
+    let end = after_cd
+        .find(|c: char| c == '&' || c == ';' || c == '|')
         .unwrap_or(after_cd.len());
     let path = after_cd[..end].trim().trim_matches('"').trim_matches('\'');
     if path.is_empty() {
@@ -486,9 +533,15 @@ fn sanitize_terminal_output(s: &str) -> String {
                 b'[' => {
                     // CSI: ESC [ (params: 0x30-0x3f) (intermediates: 0x20-0x2f) (final: 0x40-0x7e)
                     let mut j = i + 2;
-                    while j < bytes.len() && (0x30..=0x3f).contains(&bytes[j]) { j += 1; }
-                    while j < bytes.len() && (0x20..=0x2f).contains(&bytes[j]) { j += 1; }
-                    if j < bytes.len() { j += 1; } // consume final byte
+                    while j < bytes.len() && (0x30..=0x3f).contains(&bytes[j]) {
+                        j += 1;
+                    }
+                    while j < bytes.len() && (0x20..=0x2f).contains(&bytes[j]) {
+                        j += 1;
+                    }
+                    if j < bytes.len() {
+                        j += 1;
+                    } // consume final byte
                     i = j;
                     continue;
                 }
@@ -496,9 +549,13 @@ fn sanitize_terminal_output(s: &str) -> String {
                     // OSC: ESC ] ... (BEL | ESC \)
                     let mut j = i + 2;
                     while j < bytes.len() {
-                        if bytes[j] == 0x07 { j += 1; break; }
+                        if bytes[j] == 0x07 {
+                            j += 1;
+                            break;
+                        }
                         if bytes[j] == 0x1b && j + 1 < bytes.len() && bytes[j + 1] == b'\\' {
-                            j += 2; break;
+                            j += 2;
+                            break;
                         }
                         j += 1;
                     }

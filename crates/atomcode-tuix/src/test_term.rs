@@ -227,8 +227,7 @@ impl VirtualTerminal {
         // wide). Retained emits a wide glyph once and we account
         // for both cells; terminal auto-wrap is off in retained
         // (we never exceed the right edge on purpose).
-        let w =
-            unicode_width::UnicodeWidthChar::width(ch).unwrap_or(1) as u16;
+        let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(1) as u16;
         self.cursor_col = self.cursor_col.saturating_add(w);
     }
 
@@ -244,10 +243,7 @@ impl VirtualTerminal {
         // sub-group (semicolon-separated in CSI), and we only
         // ever use its first element (crossterm never emits
         // colon-separated sub-params).
-        let codes: Vec<u16> = params
-            .iter()
-            .filter_map(|p| p.first().copied())
-            .collect();
+        let codes: Vec<u16> = params.iter().filter_map(|p| p.first().copied()).collect();
         let mut i = 0;
         while i < codes.len() {
             let code = codes[i];
@@ -266,8 +262,7 @@ impl VirtualTerminal {
                     // 38;5;N for basic Color variants (Red, Cyan,
                     // etc.) rather than the short 91/96 form.
                     if i + 2 < codes.len() && codes[i + 1] == 5 {
-                        self.style.fg =
-                            Some(ansi16_color(codes[i + 2]));
+                        self.style.fg = Some(ansi16_color(codes[i + 2]));
                         i += 2;
                     } else if i + 4 < codes.len() && codes[i + 1] == 2 {
                         let r = codes[i + 2] as u8;
@@ -338,30 +333,23 @@ impl Perform for VirtualTerminal {
         }
     }
 
-    fn csi_dispatch(
-        &mut self,
-        params: &Params,
-        intermediates: &[u8],
-        _ignore: bool,
-        action: char,
-    ) {
+    fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], _ignore: bool, action: char) {
         match action {
             // CUP / HVP: absolute cursor position `\x1b[R;CH`
             'H' | 'f' => {
                 let mut it = params.iter();
-                let row =
-                    it.next().and_then(|p| p.first().copied()).unwrap_or(1);
-                let col =
-                    it.next().and_then(|p| p.first().copied()).unwrap_or(1);
-                self.cursor_row =
-                    (row.saturating_sub(1) as u16).min(self.height.saturating_sub(1));
-                self.cursor_col =
-                    (col.saturating_sub(1) as u16).min(self.width.saturating_sub(1));
+                let row = it.next().and_then(|p| p.first().copied()).unwrap_or(1);
+                let col = it.next().and_then(|p| p.first().copied()).unwrap_or(1);
+                self.cursor_row = (row.saturating_sub(1) as u16).min(self.height.saturating_sub(1));
+                self.cursor_col = (col.saturating_sub(1) as u16).min(self.width.saturating_sub(1));
             }
             // ED: erase in display. `\x1b[2J` = whole screen.
             'J' => {
-                let mode =
-                    params.iter().next().and_then(|p| p.first().copied()).unwrap_or(0);
+                let mode = params
+                    .iter()
+                    .next()
+                    .and_then(|p| p.first().copied())
+                    .unwrap_or(0);
                 if mode == 2 {
                     let blank_row = vec![GridCell::default(); self.width as usize];
                     for row in &mut self.grid {
@@ -373,8 +361,11 @@ impl Perform for VirtualTerminal {
             }
             // EL: erase in line.
             'K' => {
-                let mode =
-                    params.iter().next().and_then(|p| p.first().copied()).unwrap_or(0);
+                let mode = params
+                    .iter()
+                    .next()
+                    .and_then(|p| p.first().copied())
+                    .unwrap_or(0);
                 if let Some(row) = self.grid.get_mut(self.cursor_row as usize) {
                     match mode {
                         0 => {
@@ -385,7 +376,9 @@ impl Perform for VirtualTerminal {
                         }
                         1 => {
                             // start to cursor
-                            for col in 0..=(self.cursor_col as usize).min(row.len().saturating_sub(1)) {
+                            for col in
+                                0..=(self.cursor_col as usize).min(row.len().saturating_sub(1))
+                            {
                                 row[col] = GridCell::default();
                             }
                         }
@@ -420,8 +413,11 @@ impl Perform for VirtualTerminal {
             // DECSET / DECRST: `\x1b[?...h` / `\x1b[?...l`
             'h' | 'l' if intermediates == b"?" => {
                 let on = action == 'h';
-                let code =
-                    params.iter().next().and_then(|p| p.first().copied()).unwrap_or(0);
+                let code = params
+                    .iter()
+                    .next()
+                    .and_then(|p| p.first().copied())
+                    .unwrap_or(0);
                 match code {
                     25 => self.cursor_visible = on,
                     // 7 (autowrap), 1049 (alt-screen), 2004 (bracketed
@@ -473,8 +469,8 @@ mod tests {
         let mut vt = VirtualTerminal::new(10, 1);
         vt.feed(b"a\x1b[1mb\x1b[7mc\x1b[0md");
         assert!(!vt.cell_at(0, 0).bold); // 'a' plain
-        assert!(vt.cell_at(0, 1).bold);  // 'b' bold
-        assert!(vt.cell_at(0, 2).bold);  // 'c' bold + reverse
+        assert!(vt.cell_at(0, 1).bold); // 'b' bold
+        assert!(vt.cell_at(0, 2).bold); // 'c' bold + reverse
         assert!(vt.cell_at(0, 2).reverse);
         assert!(!vt.cell_at(0, 3).bold); // 'd' reset
     }

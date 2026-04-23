@@ -39,28 +39,51 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
             lines.push(Line::from(vec![
                 Span::styled(
                     format!("  {} ", marker),
-                    Style::default().fg(marker_color).bg(theme::accent()).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(marker_color)
+                        .bg(theme::accent())
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
                     format!("{:<14}", name),
-                    Style::default().fg(theme::text_on_accent()).bg(theme::accent()).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(theme::text_on_accent())
+                        .bg(theme::accent())
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
                     format!(" {}", model),
-                    Style::default().fg(theme::text_on_accent()).bg(theme::accent()),
+                    Style::default()
+                        .fg(theme::text_on_accent())
+                        .bg(theme::accent()),
                 ),
             ]));
         } else {
             // Not selected: normal colors with explicit background
             let marker_style = if is_current {
-                Style::default().fg(theme::success()).bg(theme::bg_elevated()).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(theme::success())
+                    .bg(theme::bg_elevated())
+                    .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(theme::text_muted()).bg(theme::bg_elevated())
+                Style::default()
+                    .fg(theme::text_muted())
+                    .bg(theme::bg_elevated())
             };
             lines.push(Line::from(vec![
                 Span::styled(format!("  {} ", marker), marker_style),
-                Span::styled(format!("{:<14}", name), Style::default().fg(theme::text_primary()).bg(theme::bg_elevated())),
-                Span::styled(format!(" {}", model), Style::default().fg(theme::text_muted()).bg(theme::bg_elevated())),
+                Span::styled(
+                    format!("{:<14}", name),
+                    Style::default()
+                        .fg(theme::text_primary())
+                        .bg(theme::bg_elevated()),
+                ),
+                Span::styled(
+                    format!(" {}", model),
+                    Style::default()
+                        .fg(theme::text_muted())
+                        .bg(theme::bg_elevated()),
+                ),
             ]));
         }
     }
@@ -79,7 +102,9 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         .border_style(Style::default().fg(theme::border()))
         .title(Span::styled(
             " Switch Model ",
-            Style::default().fg(theme::accent()).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme::accent())
+                .add_modifier(Modifier::BOLD),
         ));
 
     let paragraph = Paragraph::new(lines)

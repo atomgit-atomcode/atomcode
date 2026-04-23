@@ -62,7 +62,9 @@ fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
 
 /// Compute exponential backoff delay with ±25% deterministic jitter.
 fn compute_backoff(attempt: u32, policy: &RetryPolicy) -> Duration {
-    let exp = policy.base_delay.saturating_mul(1u32 << attempt.saturating_sub(1).min(16));
+    let exp = policy
+        .base_delay
+        .saturating_mul(1u32 << attempt.saturating_sub(1).min(16));
     let capped = exp.min(policy.max_delay);
 
     // Deterministic pseudo-jitter from wall-clock nanos: ±25% of capped.
@@ -173,16 +175,23 @@ mod tests {
     #[test]
     fn parse_retry_after_http_date_returns_none() {
         let mut h = HeaderMap::new();
-        h.insert(RETRY_AFTER, HeaderValue::from_static("Wed, 21 Oct 2015 07:28:00 GMT"));
+        h.insert(
+            RETRY_AFTER,
+            HeaderValue::from_static("Wed, 21 Oct 2015 07:28:00 GMT"),
+        );
         assert_eq!(parse_retry_after(&h), None);
     }
 
     #[test]
     fn retryable_status_includes_429_and_5xx() {
         assert!(is_retryable_status(reqwest::StatusCode::TOO_MANY_REQUESTS));
-        assert!(is_retryable_status(reqwest::StatusCode::INTERNAL_SERVER_ERROR));
+        assert!(is_retryable_status(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR
+        ));
         assert!(is_retryable_status(reqwest::StatusCode::BAD_GATEWAY));
-        assert!(is_retryable_status(reqwest::StatusCode::SERVICE_UNAVAILABLE));
+        assert!(is_retryable_status(
+            reqwest::StatusCode::SERVICE_UNAVAILABLE
+        ));
         assert!(is_retryable_status(reqwest::StatusCode::GATEWAY_TIMEOUT));
         assert!(is_retryable_status(reqwest::StatusCode::REQUEST_TIMEOUT));
     }
@@ -229,7 +238,9 @@ mod tests {
             .await;
 
         let builder = client().post(format!("{}/chat", server.uri())).body("req");
-        let resp = send_with_retry(builder, &RetryPolicy::testing()).await.unwrap();
+        let resp = send_with_retry(builder, &RetryPolicy::testing())
+            .await
+            .unwrap();
         assert_eq!(resp.status(), 200);
     }
 
@@ -250,7 +261,9 @@ mod tests {
             .await;
 
         let builder = client().post(format!("{}/chat", server.uri())).body("req");
-        let resp = send_with_retry(builder, &RetryPolicy::testing()).await.unwrap();
+        let resp = send_with_retry(builder, &RetryPolicy::testing())
+            .await
+            .unwrap();
         assert_eq!(resp.status(), 200);
     }
 
@@ -265,7 +278,9 @@ mod tests {
             .await;
 
         let builder = client().post(format!("{}/chat", server.uri())).body("req");
-        let resp = send_with_retry(builder, &RetryPolicy::testing()).await.unwrap();
+        let resp = send_with_retry(builder, &RetryPolicy::testing())
+            .await
+            .unwrap();
         assert_eq!(resp.status(), 500);
     }
 
@@ -280,7 +295,9 @@ mod tests {
             .await;
 
         let builder = client().post(format!("{}/chat", server.uri())).body("req");
-        let resp = send_with_retry(builder, &RetryPolicy::testing()).await.unwrap();
+        let resp = send_with_retry(builder, &RetryPolicy::testing())
+            .await
+            .unwrap();
         assert_eq!(resp.status(), 401);
     }
 
@@ -289,9 +306,7 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/chat"))
-            .respond_with(
-                ResponseTemplate::new(429).insert_header("Retry-After", "1"),
-            )
+            .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "1"))
             .up_to_n_times(1)
             .mount(&server)
             .await;
@@ -303,7 +318,9 @@ mod tests {
 
         let start = std::time::Instant::now();
         let builder = client().post(format!("{}/chat", server.uri())).body("req");
-        let resp = send_with_retry(builder, &RetryPolicy::testing()).await.unwrap();
+        let resp = send_with_retry(builder, &RetryPolicy::testing())
+            .await
+            .unwrap();
         let elapsed = start.elapsed();
         assert_eq!(resp.status(), 200);
         assert!(
@@ -320,10 +337,10 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         drop(listener);
 
-        let builder = client()
-            .post(format!("http://{}/chat", addr))
-            .body("req");
-        let err = send_with_retry(builder, &RetryPolicy::testing()).await.unwrap_err();
+        let builder = client().post(format!("http://{}/chat", addr)).body("req");
+        let err = send_with_retry(builder, &RetryPolicy::testing())
+            .await
+            .unwrap_err();
         assert!(err.is_connect() || err.is_request(), "got {:?}", err);
     }
 }

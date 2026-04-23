@@ -4,8 +4,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
-use crate::app::App;
 use super::theme;
+use crate::app::App;
 
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -23,15 +23,21 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     // felt like a ribbon label glued onto the bar.
     left.push(Span::styled(
         " ( \u{25c9} )  ",
-        Style::default().fg(theme::accent()).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(theme::accent())
+            .add_modifier(Modifier::BOLD),
     ));
     left.push(Span::styled(
         "Atom",
-        Style::default().fg(theme::text_primary()).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(theme::text_primary())
+            .add_modifier(Modifier::BOLD),
     ));
     left.push(Span::styled(
         "Code",
-        Style::default().fg(theme::accent()).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(theme::accent())
+            .add_modifier(Modifier::BOLD),
     ));
     left.push(Span::styled(
         format!(" [{}]", env!("ATOMCODE_BUILD_ID")),
@@ -41,20 +47,30 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     if app.plan_mode {
         left.push(Span::styled(
             " PLAN ",
-            Style::default().fg(theme::text_on_accent()).bg(theme::info()).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme::text_on_accent())
+                .bg(theme::info())
+                .add_modifier(Modifier::BOLD),
         ));
         left.push(Span::styled(" ", Style::default()));
     }
-    left.push(Span::styled(&dir, Style::default().fg(theme::status_path())));
+    left.push(Span::styled(
+        &dir,
+        Style::default().fg(theme::status_path()),
+    ));
 
     // Calculate available space for session name
     // Right side content (will be computed below)
     let is_active = app.turn_start.is_some();
     let mut right_preview: Vec<String> = Vec::new();
-    
+
     if is_active {
         let secs = app.turn_start.unwrap().elapsed().as_secs();
-        let dur = if secs >= 60 { format!("{}m{}s", secs / 60, secs % 60) } else { format!("{}s", secs) };
+        let dur = if secs >= 60 {
+            format!("{}m{}s", secs / 60, secs % 60)
+        } else {
+            format!("{}s", secs)
+        };
         right_preview.push(format!("{} ", SPINNER[app.tick_count % SPINNER.len()]));
         if app.current_step_count > 0 {
             right_preview.push(format!("turn {}", app.current_step_count));
@@ -70,13 +86,21 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         }
         if let Some(dur) = app.last_turn_duration {
             let secs = dur.as_secs();
-            let dur_str = if secs >= 60 { format!("{}m{}s", secs / 60, secs % 60) } else { format!("{}s", secs) };
+            let dur_str = if secs >= 60 {
+                format!("{}m{}s", secs / 60, secs % 60)
+            } else {
+                format!("{}s", secs)
+            };
             right_preview.push(dur_str);
             right_preview.push(" │ ".to_string());
         }
     }
     if app.ctx_used_tokens > 0 && app.context_window > 0 {
-        right_preview.push(format!("ctx {}K/{}K", app.ctx_used_tokens / 1000, app.context_window / 1000));
+        right_preview.push(format!(
+            "ctx {}K/{}K",
+            app.ctx_used_tokens / 1000,
+            app.context_window / 1000
+        ));
         right_preview.push(" │ ".to_string());
     }
     right_preview.push(format!("{} ", model));
@@ -87,12 +111,12 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     let session_brackets_w = 3; // " [" + "]"
     let right_w: usize = right_preview.iter().map(|s| display_width(s)).sum();
     let min_padding = 1; // at least one space between left and right
-    
+
     let fixed_width = brand_w + dir_w + session_brackets_w + right_w + min_padding;
     let max_session_len = width.saturating_sub(fixed_width);
     // Allow up to 60 chars but at least 10
     let _max_session_len = max_session_len.min(60).max(10);
-    
+
     // Session name removed — takes up space without adding value.
 
     // Right side: turn state + model
@@ -100,7 +124,11 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         // ── Active turn: spinner + turn N + live timer ──
         let spin = SPINNER[app.tick_count % SPINNER.len()];
         let secs = app.turn_start.unwrap().elapsed().as_secs();
-        let dur = if secs >= 60 { format!("{}m{}s", secs / 60, secs % 60) } else { format!("{}s", secs) };
+        let dur = if secs >= 60 {
+            format!("{}m{}s", secs / 60, secs % 60)
+        } else {
+            format!("{}s", secs)
+        };
 
         let time_color = if secs < 10 {
             theme::wait_fast()
@@ -118,7 +146,10 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         ));
         if app.current_step_count > 0 {
             right.push(Span::styled(
-                format!("T{}/C{}", app.current_step_count, app.current_tool_call_count),
+                format!(
+                    "T{}/C{}",
+                    app.current_step_count, app.current_tool_call_count
+                ),
                 Style::default().fg(theme::text_secondary()),
             ));
             right.push(sep.clone());
@@ -132,24 +163,25 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         // overlay already shows it during active turns for users who care.
     } else if app.last_turn_duration.is_some() || app.current_step_count > 0 {
         // ── Completed turn: ✓ + duration ──
-        right.push(Span::styled(
-            "✓ ",
-            Style::default().fg(theme::success()),
-        ));
+        right.push(Span::styled("✓ ", Style::default().fg(theme::success())));
         if app.current_step_count > 0 {
             right.push(Span::styled(
-                format!("T{}/C{}", app.current_step_count, app.current_tool_call_count),
+                format!(
+                    "T{}/C{}",
+                    app.current_step_count, app.current_tool_call_count
+                ),
                 Style::default().fg(theme::text_secondary()),
             ));
             right.push(sep.clone());
         }
         if let Some(dur) = app.last_turn_duration {
             let secs = dur.as_secs();
-            let dur_str = if secs >= 60 { format!("{}m{}s", secs / 60, secs % 60) } else { format!("{}s", secs) };
-            right.push(Span::styled(
-                dur_str,
-                Style::default().fg(theme::success()),
-            ));
+            let dur_str = if secs >= 60 {
+                format!("{}m{}s", secs / 60, secs % 60)
+            } else {
+                format!("{}s", secs)
+            };
+            right.push(Span::styled(dur_str, Style::default().fg(theme::success())));
             right.push(sep.clone());
             // Total tokens dropped from status bar — kept context usage below which is
             // the metric that actually affects user behavior (compaction thresholds).
@@ -178,7 +210,9 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     // Model name (always)
     right.push(Span::styled(
         format!("{} ", model),
-        Style::default().fg(theme::status_model()).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(theme::status_model())
+            .add_modifier(Modifier::BOLD),
     ));
 
     // Layout
@@ -190,21 +224,31 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     all.push(Span::styled(" ".repeat(pad), Style::default()));
     all.extend(right);
 
-    let bar = Paragraph::new(Line::from(all))
-        .style(Style::default().bg(theme::bg_surface()));
+    let bar = Paragraph::new(Line::from(all)).style(Style::default().bg(theme::bg_surface()));
     frame.render_widget(bar, area);
 }
 
 fn display_width(s: &str) -> usize {
-    s.chars().map(|c| {
-        let cp = c as u32;
-        if (0x4E00..=0x9FFF).contains(&cp) || (0x3400..=0x4DBF).contains(&cp)
-            || (0x20000..=0x2A6DF).contains(&cp) || (0xF900..=0xFAFF).contains(&cp)
-            || (0xFF01..=0xFF60).contains(&cp) || (0xFFE0..=0xFFE6).contains(&cp)
-            || (0xAC00..=0xD7AF).contains(&cp) || (0x3000..=0x303F).contains(&cp)
-            || (0x3040..=0x309F).contains(&cp) || (0x30A0..=0x30FF).contains(&cp)
-        { 2 } else { 1 }
-    }).sum()
+    s.chars()
+        .map(|c| {
+            let cp = c as u32;
+            if (0x4E00..=0x9FFF).contains(&cp)
+                || (0x3400..=0x4DBF).contains(&cp)
+                || (0x20000..=0x2A6DF).contains(&cp)
+                || (0xF900..=0xFAFF).contains(&cp)
+                || (0xFF01..=0xFF60).contains(&cp)
+                || (0xFFE0..=0xFFE6).contains(&cp)
+                || (0xAC00..=0xD7AF).contains(&cp)
+                || (0x3000..=0x303F).contains(&cp)
+                || (0x3040..=0x309F).contains(&cp)
+                || (0x30A0..=0x30FF).contains(&cp)
+            {
+                2
+            } else {
+                1
+            }
+        })
+        .sum()
 }
 
 fn shorten_path(path: &str) -> String {

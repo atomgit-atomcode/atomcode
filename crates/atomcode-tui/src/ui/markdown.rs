@@ -1,4 +1,4 @@
-use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd, HeadingLevel};
+use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use syntect::easy::HighlightLines;
@@ -43,11 +43,11 @@ fn is_cjk_ideograph(c: char) -> bool {
     (0x4E00..=0x9FFF).contains(&cp) || (0x3400..=0x4DBF).contains(&cp)
 }
 
-
 fn strip_emoji(s: &str) -> String {
-    s.chars().filter(|c| {
-        let cp = *c as u32;
-        !((0x1F600..=0x1F64F).contains(&cp) ||   // Emoticons
+    s.chars()
+        .filter(|c| {
+            let cp = *c as u32;
+            !((0x1F600..=0x1F64F).contains(&cp) ||   // Emoticons
           (0x1F300..=0x1F5FF).contains(&cp) ||    // Misc Symbols & Pictographs
           (0x1F680..=0x1F6FF).contains(&cp) ||    // Transport & Map
           (0x1F1E0..=0x1F1FF).contains(&cp) ||    // Flags
@@ -55,8 +55,9 @@ fn strip_emoji(s: &str) -> String {
           (0x1FA00..=0x1FA6F).contains(&cp) ||    // Chess Symbols
           (0x1FA70..=0x1FAFF).contains(&cp) ||    // Symbols Extended-A
           (0x2700..=0x27BF).contains(&cp) ||       // Dingbats (✅❌⚡ etc.)
-          (0x2600..=0x26FF).contains(&cp))         // Misc Symbols (⚠️☁️ etc.)
-    }).collect()
+          (0x2600..=0x26FF).contains(&cp)) // Misc Symbols (⚠️☁️ etc.)
+        })
+        .collect()
 }
 
 struct MarkdownRenderer {
@@ -74,7 +75,9 @@ impl MarkdownRenderer {
             super::theme::Theme::Dark => "base16-ocean.dark",
             super::theme::Theme::Light => "InspiredGitHub",
         };
-        let theme = theme_set.themes.get(theme_name)
+        let theme = theme_set
+            .themes
+            .get(theme_name)
             .cloned()
             .unwrap_or_else(|| theme_set.themes["base16-ocean.dark"].clone());
         Self { syntax_set, theme }
@@ -120,27 +123,43 @@ impl MarkdownRenderer {
 
                 // Inline styles
                 Event::Start(Tag::Strong) => {
-                    let s = cur_style(&styles).fg(theme::text_primary()).add_modifier(Modifier::BOLD);
+                    let s = cur_style(&styles)
+                        .fg(theme::text_primary())
+                        .add_modifier(Modifier::BOLD);
                     styles.push(s);
                 }
-                Event::End(TagEnd::Strong) => { styles.pop(); }
+                Event::End(TagEnd::Strong) => {
+                    styles.pop();
+                }
                 Event::Start(Tag::Emphasis) => {
                     let s = cur_style(&styles).add_modifier(Modifier::ITALIC);
                     styles.push(s);
                 }
-                Event::End(TagEnd::Emphasis) => { styles.pop(); }
+                Event::End(TagEnd::Emphasis) => {
+                    styles.pop();
+                }
 
                 // Links
                 Event::Start(Tag::Link { dest_url, .. }) => {
-                    styles.push(Style::default().fg(theme::md_link()).add_modifier(Modifier::UNDERLINED));
+                    styles.push(
+                        Style::default()
+                            .fg(theme::md_link())
+                            .add_modifier(Modifier::UNDERLINED),
+                    );
                     link_url = Some(dest_url.to_string());
                 }
                 Event::End(TagEnd::Link) => {
                     styles.pop();
                     if let Some(url) = link_url.take() {
-                        let last = spans.last().map(|s| s.content.to_string()).unwrap_or_default();
+                        let last = spans
+                            .last()
+                            .map(|s| s.content.to_string())
+                            .unwrap_or_default();
                         if !last.is_empty() && last != url && !url.is_empty() {
-                            spans.push(Span::styled(format!(" ({})", url), Style::default().fg(theme::text_muted())));
+                            spans.push(Span::styled(
+                                format!(" ({})", url),
+                                Style::default().fg(theme::text_muted()),
+                            ));
                         }
                     }
                 }
@@ -203,7 +222,9 @@ impl MarkdownRenderer {
                         ));
                     }
                 }
-                Event::End(TagEnd::Item) => { flush(&mut lines, &mut spans); }
+                Event::End(TagEnd::Item) => {
+                    flush(&mut lines, &mut spans);
+                }
 
                 // Block quotes
                 Event::Start(Tag::BlockQuote(_)) => {
@@ -214,27 +235,41 @@ impl MarkdownRenderer {
                     in_quote = false;
                     styles.pop();
                     if !spans.is_empty() {
-                        let mut row = vec![Span::styled("  \u{2502} ", Style::default().fg(theme::md_quote_bar()))];
+                        let mut row = vec![Span::styled(
+                            "  \u{2502} ",
+                            Style::default().fg(theme::md_quote_bar()),
+                        )];
                         row.extend(std::mem::take(&mut spans));
                         lines.push(Line::from(row));
                     }
                 }
 
                 // Tables
-                Event::Start(Tag::Table(_)) => { table_header.clear(); table_rows.clear(); }
+                Event::Start(Tag::Table(_)) => {
+                    table_header.clear();
+                    table_rows.clear();
+                }
                 Event::End(TagEnd::Table) => {
                     render_table(&mut lines, &table_header, &table_rows);
-                    table_header.clear(); table_rows.clear();
+                    table_header.clear();
+                    table_rows.clear();
                 }
-                Event::Start(Tag::TableHead) => { collecting_header = true; table_row.clear(); }
+                Event::Start(Tag::TableHead) => {
+                    collecting_header = true;
+                    table_row.clear();
+                }
                 Event::End(TagEnd::TableHead) => {
                     collecting_header = false;
                     table_header = table_row.clone();
                     table_row.clear();
                 }
-                Event::Start(Tag::TableRow) => { table_row.clear(); }
+                Event::Start(Tag::TableRow) => {
+                    table_row.clear();
+                }
                 Event::End(TagEnd::TableRow) => {
-                    if !collecting_header { table_rows.push(table_row.clone()); }
+                    if !collecting_header {
+                        table_rows.push(table_row.clone());
+                    }
                     table_row.clear();
                 }
                 Event::Start(Tag::TableCell) => {}
@@ -252,7 +287,10 @@ impl MarkdownRenderer {
                         for (i, tl) in text.lines().enumerate() {
                             if i > 0 || !spans.is_empty() {
                                 if !spans.is_empty() {
-                                    let mut row = vec![Span::styled("  \u{2502} ", Style::default().fg(theme::md_quote_bar()))];
+                                    let mut row = vec![Span::styled(
+                                        "  \u{2502} ",
+                                        Style::default().fg(theme::md_quote_bar()),
+                                    )];
                                     row.extend(std::mem::take(&mut spans));
                                     lines.push(Line::from(row));
                                 }
@@ -270,22 +308,31 @@ impl MarkdownRenderer {
                         Style::default().fg(theme::md_inline_code()),
                     ));
                 }
-                Event::SoftBreak | Event::HardBreak => { flush(&mut lines, &mut spans); }
+                Event::SoftBreak | Event::HardBreak => {
+                    flush(&mut lines, &mut spans);
+                }
                 Event::Rule => {
-                    lines.push(Line::from(Span::styled("\u{2500}".repeat(40), Style::default().fg(theme::border()))));
+                    lines.push(Line::from(Span::styled(
+                        "\u{2500}".repeat(40),
+                        Style::default().fg(theme::border()),
+                    )));
                 }
                 _ => {}
             }
         }
 
-        if !spans.is_empty() { lines.push(Line::from(spans)); }
+        if !spans.is_empty() {
+            lines.push(Line::from(spans));
+        }
 
         // Collapse consecutive blank lines and trim trailing blanks
         let mut deduped: Vec<Line<'static>> = Vec::with_capacity(lines.len());
         let mut prev_blank = false;
         for line in lines {
             let is_blank = line.spans.is_empty();
-            if is_blank && prev_blank { continue; }
+            if is_blank && prev_blank {
+                continue;
+            }
             prev_blank = is_blank;
             deduped.push(line);
         }
@@ -302,27 +349,38 @@ impl MarkdownRenderer {
         let syntax = if lang.is_empty() {
             self.syntax_set.find_syntax_plain_text()
         } else {
-            self.syntax_set.find_syntax_by_token(lang)
+            self.syntax_set
+                .find_syntax_by_token(lang)
                 .unwrap_or_else(|| self.syntax_set.find_syntax_plain_text())
         };
 
         let mut hl = HighlightLines::new(syntax, &self.theme);
-        code.lines().map(|line| {
-            let regions = hl.highlight_line(line, &self.syntax_set).unwrap_or_default();
-            let mut s: Vec<Span<'static>> = Vec::with_capacity(regions.len() + 1);
-            // Subtle 2-space indent groups the block visually without borders.
-            s.push(Span::raw("  "));
-            for (style, text) in regions {
-                let fg = super::theme::rgb(style.foreground.r, style.foreground.g, style.foreground.b);
-                s.push(Span::styled(text.to_string(), Style::default().fg(fg)));
-            }
-            Line::from(s)
-        }).collect()
+        code.lines()
+            .map(|line| {
+                let regions = hl
+                    .highlight_line(line, &self.syntax_set)
+                    .unwrap_or_default();
+                let mut s: Vec<Span<'static>> = Vec::with_capacity(regions.len() + 1);
+                // Subtle 2-space indent groups the block visually without borders.
+                s.push(Span::raw("  "));
+                for (style, text) in regions {
+                    let fg = super::theme::rgb(
+                        style.foreground.r,
+                        style.foreground.g,
+                        style.foreground.b,
+                    );
+                    s.push(Span::styled(text.to_string(), Style::default().fg(fg)));
+                }
+                Line::from(s)
+            })
+            .collect()
     }
 }
 
 fn cur_style(stack: &[Style]) -> Style {
-    *stack.last().unwrap_or(&Style::default().fg(theme::text_secondary()))
+    *stack
+        .last()
+        .unwrap_or(&Style::default().fg(theme::text_secondary()))
 }
 
 fn flush(lines: &mut Vec<Line<'static>>, spans: &mut Vec<Span<'static>>) {
@@ -332,7 +390,9 @@ fn flush(lines: &mut Vec<Line<'static>>, spans: &mut Vec<Span<'static>>) {
 }
 
 fn render_table(lines: &mut Vec<Line<'static>>, header: &[String], rows: &[Vec<String>]) {
-    if header.is_empty() { return; }
+    if header.is_empty() {
+        return;
+    }
 
     // Trim trailing empty columns — models sometimes output a trailing `|`
     // which pulldown-cmark parses as an extra empty cell, producing a
@@ -340,7 +400,9 @@ fn render_table(lines: &mut Vec<Line<'static>>, header: &[String], rows: &[Vec<S
     let mut cols = header.len();
     while cols > 1
         && header.get(cols - 1).map(|s| s.is_empty()).unwrap_or(false)
-        && rows.iter().all(|r| r.get(cols - 1).map(|s| s.is_empty()).unwrap_or(true))
+        && rows
+            .iter()
+            .all(|r| r.get(cols - 1).map(|s| s.is_empty()).unwrap_or(true))
     {
         cols -= 1;
     }
@@ -349,13 +411,18 @@ fn render_table(lines: &mut Vec<Line<'static>>, header: &[String], rows: &[Vec<S
     // furniture, so they need to be as visible as the cell text itself. Anything dimmer
     // makes the table "recede into the background".
     let border = Style::default().fg(theme::text_primary());
-    let hdr_style = Style::default().fg(theme::text_primary()).add_modifier(Modifier::BOLD);
+    let hdr_style = Style::default()
+        .fg(theme::text_primary())
+        .add_modifier(Modifier::BOLD);
     let cell_style = Style::default().fg(theme::text_secondary());
 
     // Column widths: content + 2 padding, capped to prevent terminal overflow.
     // Max 40 chars per column — long content is truncated with "…".
     const MAX_COL_WIDTH: usize = 40;
-    let mut widths: Vec<usize> = header.iter().map(|h| display_width_str(h).min(MAX_COL_WIDTH)).collect();
+    let mut widths: Vec<usize> = header
+        .iter()
+        .map(|h| display_width_str(h).min(MAX_COL_WIDTH))
+        .collect();
     for row in rows {
         for (i, cell) in row.iter().enumerate() {
             if i < widths.len() {
@@ -376,7 +443,9 @@ fn render_table(lines: &mut Vec<Line<'static>>, header: &[String], rows: &[Vec<S
             let mut w = 0;
             for c in text.chars() {
                 let cw = char_width(c);
-                if w + cw + ellipsis_w > max_w { break; }
+                if w + cw + ellipsis_w > max_w {
+                    break;
+                }
                 result.push(c);
                 w += cw;
             }
@@ -401,7 +470,10 @@ fn render_table(lines: &mut Vec<Line<'static>>, header: &[String], rows: &[Vec<S
         let w = widths.get(i).copied().unwrap_or(4);
         let display = truncate_cell(hdr, w.saturating_sub(2));
         let pad = w.saturating_sub(display_width_str(&display) + 1);
-        h.push(Span::styled(format!(" {}{}", display, " ".repeat(pad)), hdr_style));
+        h.push(Span::styled(
+            format!(" {}{}", display, " ".repeat(pad)),
+            hdr_style,
+        ));
         h.push(Span::styled("\u{2502}", border));
     }
     lines.push(Line::from(h));
@@ -422,7 +494,10 @@ fn render_table(lines: &mut Vec<Line<'static>>, header: &[String], rows: &[Vec<S
             let w = widths.get(i).copied().unwrap_or(4);
             let display = truncate_cell(cell, w.saturating_sub(2));
             let pad = w.saturating_sub(display_width_str(&display) + 1);
-            r.push(Span::styled(format!(" {}{}", display, " ".repeat(pad)), cell_style));
+            r.push(Span::styled(
+                format!(" {}{}", display, " ".repeat(pad)),
+                cell_style,
+            ));
             r.push(Span::styled("\u{2502}", border));
         }
         lines.push(Line::from(r));
@@ -458,7 +533,9 @@ fn display_width_str(s: &str) -> usize {
 /// Splits spans at character boundaries, preserving styles.
 /// CJK characters count as 2 columns.
 pub fn wrap_lines(lines: Vec<Line<'static>>, max_width: usize) -> Vec<Line<'static>> {
-    if max_width == 0 { return lines; }
+    if max_width == 0 {
+        return lines;
+    }
     let mut result = Vec::with_capacity(lines.len());
     for line in lines {
         let total_w: usize = line.spans.iter().map(|s| span_width(s)).sum();
@@ -515,8 +592,13 @@ fn char_width(c: char) -> usize {
         || (0x3040..=0x309F).contains(&cp)   // Hiragana
         || (0x30A0..=0x30FF).contains(&cp)   // Katakana
         || (0x2E80..=0x2EFF).contains(&cp)   // CJK Radicals
-        || (0xFE30..=0xFE4F).contains(&cp)   // CJK Compatibility Forms
-    { 2 } else { 1 }
+        || (0xFE30..=0xFE4F).contains(&cp)
+    // CJK Compatibility Forms
+    {
+        2
+    } else {
+        1
+    }
 }
 
 #[cfg(test)]
@@ -535,8 +617,11 @@ mod tests {
     fn test_bold_text() {
         let lines = render_markdown("Hello **bold** world");
         assert!(!lines.is_empty());
-        let has_bold = lines.iter().any(|l| l.spans.iter().any(|s|
-            s.style.add_modifier.contains(Modifier::BOLD)));
+        let has_bold = lines.iter().any(|l| {
+            l.spans
+                .iter()
+                .any(|s| s.style.add_modifier.contains(Modifier::BOLD))
+        });
         assert!(has_bold);
     }
 
@@ -544,8 +629,11 @@ mod tests {
     fn test_heading() {
         let lines = render_markdown("# Title");
         assert!(!lines.is_empty());
-        let has_bold = lines.iter().any(|l| l.spans.iter().any(|s|
-            s.style.add_modifier.contains(Modifier::BOLD)));
+        let has_bold = lines.iter().any(|l| {
+            l.spans
+                .iter()
+                .any(|s| s.style.add_modifier.contains(Modifier::BOLD))
+        });
         assert!(has_bold);
     }
 
@@ -555,7 +643,8 @@ mod tests {
         let lines = render_markdown(md);
         // CC-style minimal rendering: no language label, no borders — just the highlighted code.
         assert!(!lines.is_empty());
-        let joined: String = lines.iter()
+        let joined: String = lines
+            .iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
             .collect();
         assert!(joined.contains("fn") && joined.contains("main"));

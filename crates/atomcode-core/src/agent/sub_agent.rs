@@ -51,10 +51,13 @@ impl SubAgentTask {
     ) -> SubAgentResult {
         // 1. Build minimal system prompt
         let rules = crate::config::prompt_sections::build_rules();
-        let vue_warning = if self.file_path.ends_with(".vue") || self.file_path.ends_with(".svelte") {
+        let vue_warning = if self.file_path.ends_with(".vue") || self.file_path.ends_with(".svelte")
+        {
             "\nCRITICAL: This is a Vue SFC. Edit <script> and <template> in SEPARATE edit_file calls. \
              Use old_string/new_string for each edit. Keep each edit focused on one region."
-        } else { "" };
+        } else {
+            ""
+        };
 
         let system_prompt = format!(
             "{}\n\n## SUB-AGENT RULES\n\
@@ -105,7 +108,9 @@ impl SubAgentTask {
 
         for _ in 0..max_turns {
             turns_used += 1;
-            let result = runner.run(&mut conversation, &system_prompt, &event_tx, cancel.clone()).await;
+            let result = runner
+                .run(&mut conversation, &system_prompt, &event_tx, cancel.clone())
+                .await;
 
             // Drain events
             while event_rx.try_recv().is_ok() {}

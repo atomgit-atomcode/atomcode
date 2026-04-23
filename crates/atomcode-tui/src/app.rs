@@ -43,9 +43,7 @@ impl TextSelection {
 
     /// Normalize start/end so start <= end in reading order.
     pub fn normalized(&self) -> ((u16, u16), (u16, u16)) {
-        if self.start.1 < self.end.1
-            || (self.start.1 == self.end.1 && self.start.0 <= self.end.0)
-        {
+        if self.start.1 < self.end.1 || (self.start.1 == self.end.1 && self.start.0 <= self.end.0) {
             (self.start, self.end)
         } else {
             (self.end, self.start)
@@ -64,7 +62,10 @@ pub struct WelcomeState {
 
 impl WelcomeState {
     pub fn new() -> Self {
-        Self { selected: 0, error: None }
+        Self {
+            selected: 0,
+            error: None,
+        }
     }
 }
 
@@ -117,11 +118,21 @@ pub enum AppMode {
 }
 
 impl AppMode {
-    pub fn is_welcome(&self) -> bool { matches!(self, AppMode::Welcome) }
-    pub fn is_normal(&self) -> bool { matches!(self, AppMode::Normal) }
-    pub fn is_streaming(&self) -> bool { matches!(self, AppMode::Streaming) }
-    pub fn is_exiting(&self) -> bool { matches!(self, AppMode::Exiting) }
-    pub fn is_provider_manager(&self) -> bool { matches!(self, AppMode::ProviderManager) }
+    pub fn is_welcome(&self) -> bool {
+        matches!(self, AppMode::Welcome)
+    }
+    pub fn is_normal(&self) -> bool {
+        matches!(self, AppMode::Normal)
+    }
+    pub fn is_streaming(&self) -> bool {
+        matches!(self, AppMode::Streaming)
+    }
+    pub fn is_exiting(&self) -> bool {
+        matches!(self, AppMode::Exiting)
+    }
+    pub fn is_provider_manager(&self) -> bool {
+        matches!(self, AppMode::ProviderManager)
+    }
     pub fn is_streaming_or_executing(&self) -> bool {
         matches!(self, AppMode::Streaming | AppMode::ToolExecuting)
     }
@@ -270,133 +281,143 @@ pub struct App {
 }
 
 impl App {
-   pub fn new(
-       model_name: String,
-       config: Config,
-       agent_handle: AgentHandle,
-       tool_context: ToolContext,
-       working_dir: PathBuf,
-       session_to_continue: Option<Session>,
-   ) -> Self {
-       // Input history (↑/↓ recall) is persisted separately from conversation
-       // messages in ~/.atomcode/input_history.txt — append-only across sessions,
-       // independent of session state. Oldest first, newest last.
-       let input_history: Vec<String> = InputHistory::load();
+    pub fn new(
+        model_name: String,
+        config: Config,
+        agent_handle: AgentHandle,
+        tool_context: ToolContext,
+        working_dir: PathBuf,
+        session_to_continue: Option<Session>,
+    ) -> Self {
+        // Input history (↑/↓ recall) is persisted separately from conversation
+        // messages in ~/.atomcode/input_history.txt — append-only across sessions,
+        // independent of session state. Oldest first, newest last.
+        let input_history: Vec<String> = InputHistory::load();
 
-       // Initialize session manager and load or create default session
-       let session_manager = SessionManager::new(&working_dir);
-       let current_session = session_to_continue
-           .unwrap_or_else(|| Session::default_session(working_dir.clone()));
+        // Initialize session manager and load or create default session
+        let session_manager = SessionManager::new(&working_dir);
+        let current_session =
+            session_to_continue.unwrap_or_else(|| Session::default_session(working_dir.clone()));
 
-       // Create conversation from session messages
-       let mut conversation = Conversation::new();
-       conversation.messages = current_session.messages.clone();
+        // Create conversation from session messages
+        let mut conversation = Conversation::new();
+        conversation.messages = current_session.messages.clone();
 
-       // Load skills for slash menu and manual invocation
-       let mut skill_registry = atomcode_core::skill::SkillRegistry::new();
-       skill_registry.reload(&working_dir);
-       let command_list = build_command_list(&skill_registry);
-       Self {
-           mode: if config.providers.is_empty() { AppMode::Welcome } else { AppMode::Normal },
-           conversation,
-           input: InputState::new(),
-           scroll_offset: 0,
-           at_bottom: true,
-           confirm_quit: false,
-           last_key_time: Instant::now(),
-           rapid_streak: 0,
-           rapid_buf: String::new(),
-           pending_appends: Vec::new(),
-           pending_editor: None,
-           pending_login: false,
-           pending_wecom_login: false,
-           attached_files: Vec::new(),
-           pasted_blocks: Vec::new(),
-           slash_menu: SlashMenu::new(),
-           provider_mgr: None,
-           welcome_state: WelcomeState::new(),
-           pending_oauth_name: None,
-           model_list: Vec::new(),
-           model_selected: 0,
-           skill_registry,
-           command_list,
-           last_ctrl_c: None,
-           tick_count: 0,
-           project_context_cache: None,
-           current_step_count: 0,
-           current_tool_call_count: 0,
-           executing_tool_info: String::new(),
-           streaming_tool_name: None,
-           streaming_tools: Vec::new(),
-           streaming_tool_hint: String::new(),
-           turn_start: None,
-           first_token_ms: None,
-           llm_call_start: None,
-           last_completed_tool: String::new(),
-           tool_start: None,
-           last_turn_duration: None,
-           tool_context,
-           previous_working_dir: None,
-           recent_dirs: {
-               let mut dirs = load_recent_dirs();
-               // Add current dir to recent list on startup
-               dirs.retain(|d| d != &working_dir);
-               dirs.insert(0, working_dir.clone());
-               dirs.truncate(5);
-               save_recent_dirs(&dirs);
-               dirs
-           },
-           dir_selector: None,
-           working_dir,
-           input_history,
-           history_index: None,
-           history_stash: None,
-           total_tokens: 0,
-           turn_tokens: 0,
-           ctx_used_tokens: 0,
-           context_window: config.providers.get(&config.default_provider)
-               .map(|p| p.context_window).unwrap_or(128000),
-           render_cache: Vec::new(),
-           render_cache_msg_count: 0,
-           selection: TextSelection::new(),
-           last_rendered_scroll: 0,
-           last_viewport_height: 0,
-           last_total_lines: 0,
-           // Keep a dummy provider for rebuild_provider path (legacy). The real LLM
-           // work is now handled by AgentLoop. This avoids removing all provider refs at once.
-           provider: {
-               use atomcode_core::provider::create_provider;
-               use atomcode_core::config::provider::ProviderConfig;
-               // Create a no-op placeholder; rebuild_provider will set the real one on /provider changes.
-               create_provider(&ProviderConfig {
-                   provider_type: "openai".to_string(),
-                   api_key: Some("placeholder".to_string()),
-                   model: model_name.clone(),
-                   base_url: Some("http://localhost:1".to_string()),
-                   system_prompt: None,
-                   user_agent: None,
-                   context_window: atomcode_core::config::provider::default_context_window_for("openai"),
-                   max_tokens: None,
-                   ephemeral: false,
-               }).unwrap_or_else(|_| {
-                   // Fallback: should never reach production path since AgentLoop handles LLM
-                   panic!("Failed to create placeholder provider")
-               })
-           },
-               config,
-               cancel_token: tokio_util::sync::CancellationToken::new(),
-               agent_handle,
-               model_name,
-               last_checkpoint: None,
-                session_manager,
-                current_session,
-                session_selector: None,
-                             session_selector_query: String::new(),
-                             session_selector_cursor: 0,
-                             last_sent_input: None,
-                             plan_mode: false,
-                    }
-                }
+        // Load skills for slash menu and manual invocation
+        let mut skill_registry = atomcode_core::skill::SkillRegistry::new();
+        skill_registry.reload(&working_dir);
+        let command_list = build_command_list(&skill_registry);
+        Self {
+            mode: if config.providers.is_empty() {
+                AppMode::Welcome
+            } else {
+                AppMode::Normal
+            },
+            conversation,
+            input: InputState::new(),
+            scroll_offset: 0,
+            at_bottom: true,
+            confirm_quit: false,
+            last_key_time: Instant::now(),
+            rapid_streak: 0,
+            rapid_buf: String::new(),
+            pending_appends: Vec::new(),
+            pending_editor: None,
+            pending_login: false,
+            pending_wecom_login: false,
+            attached_files: Vec::new(),
+            pasted_blocks: Vec::new(),
+            slash_menu: SlashMenu::new(),
+            provider_mgr: None,
+            welcome_state: WelcomeState::new(),
+            pending_oauth_name: None,
+            model_list: Vec::new(),
+            model_selected: 0,
+            skill_registry,
+            command_list,
+            last_ctrl_c: None,
+            tick_count: 0,
+            project_context_cache: None,
+            current_step_count: 0,
+            current_tool_call_count: 0,
+            executing_tool_info: String::new(),
+            streaming_tool_name: None,
+            streaming_tools: Vec::new(),
+            streaming_tool_hint: String::new(),
+            turn_start: None,
+            first_token_ms: None,
+            llm_call_start: None,
+            last_completed_tool: String::new(),
+            tool_start: None,
+            last_turn_duration: None,
+            tool_context,
+            previous_working_dir: None,
+            recent_dirs: {
+                let mut dirs = load_recent_dirs();
+                // Add current dir to recent list on startup
+                dirs.retain(|d| d != &working_dir);
+                dirs.insert(0, working_dir.clone());
+                dirs.truncate(5);
+                save_recent_dirs(&dirs);
+                dirs
+            },
+            dir_selector: None,
+            working_dir,
+            input_history,
+            history_index: None,
+            history_stash: None,
+            total_tokens: 0,
+            turn_tokens: 0,
+            ctx_used_tokens: 0,
+            context_window: config
+                .providers
+                .get(&config.default_provider)
+                .map(|p| p.context_window)
+                .unwrap_or(128000),
+            render_cache: Vec::new(),
+            render_cache_msg_count: 0,
+            selection: TextSelection::new(),
+            last_rendered_scroll: 0,
+            last_viewport_height: 0,
+            last_total_lines: 0,
+            // Keep a dummy provider for rebuild_provider path (legacy). The real LLM
+            // work is now handled by AgentLoop. This avoids removing all provider refs at once.
+            provider: {
+                use atomcode_core::config::provider::ProviderConfig;
+                use atomcode_core::provider::create_provider;
+                // Create a no-op placeholder; rebuild_provider will set the real one on /provider changes.
+                create_provider(&ProviderConfig {
+                    provider_type: "openai".to_string(),
+                    api_key: Some("placeholder".to_string()),
+                    model: model_name.clone(),
+                    base_url: Some("http://localhost:1".to_string()),
+                    system_prompt: None,
+                    user_agent: None,
+                    context_window: atomcode_core::config::provider::default_context_window_for(
+                        "openai",
+                    ),
+                    max_tokens: None,
+                    ephemeral: false,
+                })
+                .unwrap_or_else(|_| {
+                    // Fallback: should never reach production path since AgentLoop handles LLM
+                    panic!("Failed to create placeholder provider")
+                })
+            },
+            config,
+            cancel_token: tokio_util::sync::CancellationToken::new(),
+            agent_handle,
+            model_name,
+            last_checkpoint: None,
+            session_manager,
+            current_session,
+            session_selector: None,
+            session_selector_query: String::new(),
+            session_selector_cursor: 0,
+            last_sent_input: None,
+            plan_mode: false,
+        }
+    }
 
     /// Try to change working directory. Returns (success, message).
     fn try_change_dir(&mut self, path: &str) -> (bool, String) {
@@ -413,8 +434,7 @@ impl App {
         };
 
         // Try canonicalize first, fall back to direct path check
-        let resolved = std::fs::canonicalize(&new_path)
-            .unwrap_or_else(|_| new_path.clone());
+        let resolved = std::fs::canonicalize(&new_path).unwrap_or_else(|_| new_path.clone());
 
         if resolved.is_dir() {
             self.working_dir = resolved.clone();
@@ -425,7 +445,10 @@ impl App {
             self.project_context_cache = None; // Invalidate project context cache
             self.config.default_workdir = Some(resolved.to_string_lossy().to_string());
             let _ = self.config.save(&Config::default_path());
-            (true, format!("Changed working directory to {}", resolved.display()))
+            (
+                true,
+                format!("Changed working directory to {}", resolved.display()),
+            )
         } else if new_path.is_dir() {
             // canonicalize failed but path exists as dir
             self.working_dir = new_path.clone();
@@ -434,7 +457,10 @@ impl App {
             }
             self.config.default_workdir = Some(new_path.to_string_lossy().to_string());
             let _ = self.config.save(&Config::default_path());
-            (true, format!("Changed working directory to {}", new_path.display()))
+            (
+                true,
+                format!("Changed working directory to {}", new_path.display()),
+            )
         } else {
             (false, format!("Not a directory: {}", new_path.display()))
         }
@@ -465,8 +491,11 @@ impl App {
             self.at_bottom = true;
             // Load session for the new project directory
             self.session_manager = SessionManager::new(&self.working_dir);
-            self.current_session = self.session_manager.latest()
-                .ok().flatten()
+            self.current_session = self
+                .session_manager
+                .latest()
+                .ok()
+                .flatten()
                 .unwrap_or_else(|| Session::default_session(self.working_dir.clone()));
             if !self.current_session.messages.is_empty() {
                 // Resume previous session in this directory
@@ -499,7 +528,8 @@ impl App {
             };
 
             if let Err(e) = std::fs::create_dir_all(&new_path) {
-                self.conversation.push_delta(&format!("Failed to create directory: {}", e));
+                self.conversation
+                    .push_delta(&format!("Failed to create directory: {}", e));
                 self.conversation.finalize_stream();
                 return;
             }
@@ -512,7 +542,8 @@ impl App {
 
             // Create ATOMCODE.md with project name (seed file for project instructions;
             // atomcode's prompt builder reads `.atomcode.md` or `ATOMCODE.md`).
-            let project_name = new_path.file_name()
+            let project_name = new_path
+                .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_else(|| "project".to_string());
             let atomcode_md = format!("# {}\n\nNew project.\n", project_name);
@@ -566,9 +597,10 @@ impl App {
     /// Sync in-memory config (including ephemeral providers) to AgentLoop.
     /// Call this after any config change that should take effect immediately.
     pub(crate) fn sync_config_to_agent(&self) {
-        let _ = self.agent_handle.cmd_tx.send(
-            AgentCommand::ReloadConfig(self.config.clone())
-        );
+        let _ = self
+            .agent_handle
+            .cmd_tx
+            .send(AgentCommand::ReloadConfig(self.config.clone()));
     }
 
     /// Process an event coming from the AgentLoop. Updates local conversation mirror and UI state.
@@ -607,7 +639,11 @@ impl App {
                     self.streaming_tools.push((name, String::new()));
                 }
             }
-            AgentEvent::ToolCallStarted { id, name, arguments } => {
+            AgentEvent::ToolCallStarted {
+                id,
+                name,
+                arguments,
+            } => {
                 // Args fully assembled — streaming phase done for this tool.
                 // Remove from streaming list (first match only).
                 if let Some(pos) = self.streaming_tools.iter().position(|(n, _)| n == &name) {
@@ -639,10 +675,22 @@ impl App {
                 self.tool_start = Some(Instant::now());
                 self.at_bottom = true;
             }
-            AgentEvent::ToolCallResult { call_id, name, output, success, duration: _ } => {
+            AgentEvent::ToolCallResult {
+                call_id,
+                name,
+                output,
+                success,
+                duration: _,
+            } => {
                 // Format a short result summary for spinner display
                 let icon = if success { "\u{2713}" } else { "\u{2717}" };
-                let first_line = output.lines().next().unwrap_or("").chars().take(40).collect::<String>();
+                let first_line = output
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .chars()
+                    .take(40)
+                    .collect::<String>();
                 self.last_completed_tool = format!("{} {} {}", icon, name, first_line);
                 if name == "bash" {
                     // Sync working_dir — bash `cd` updates the shared context
@@ -669,7 +717,11 @@ impl App {
                 self.render_cache_msg_count = 0;
                 self.at_bottom = true;
             }
-            AgentEvent::ApprovalNeeded { tool_name: _, reason: _, call } => {
+            AgentEvent::ApprovalNeeded {
+                tool_name: _,
+                reason: _,
+                call,
+            } => {
                 self.mode = AppMode::WaitingApproval(call);
             }
             AgentEvent::PhaseChange(phase) => {
@@ -689,7 +741,8 @@ impl App {
                     AgentPhase::CallingTool(name) => {
                         self.mode = AppMode::Streaming;
                         // Show which tool the LLM is preparing (streaming args)
-                        let display_name = name.split('_')
+                        let display_name = name
+                            .split('_')
                             .map(|w| {
                                 let mut c = w.chars();
                                 match c.next() {
@@ -706,7 +759,13 @@ impl App {
                     }
                 }
             }
-            AgentEvent::TurnComplete { duration, total_tokens: _, turn_count: _, tool_call_count: _, stop_reason: _ } => {
+            AgentEvent::TurnComplete {
+                duration,
+                total_tokens: _,
+                turn_count: _,
+                tool_call_count: _,
+                stop_reason: _,
+            } => {
                 // Clear any lingering streaming tool state — turn is over.
                 self.streaming_tool_name = None;
                 self.streaming_tools.clear();
@@ -721,17 +780,24 @@ impl App {
                 // the UI knows those calls are done.
                 {
                     use atomcode_core::conversation::message::MessageContent;
-                    let mut existing_results: std::collections::HashSet<String> = std::collections::HashSet::new();
+                    let mut existing_results: std::collections::HashSet<String> =
+                        std::collections::HashSet::new();
                     for msg in &self.conversation.messages {
                         match &msg.content {
-                            MessageContent::ToolResult(r) => { existing_results.insert(r.call_id.clone()); }
-                            MessageContent::ToolResultRef(r) => { existing_results.insert(r.call_id.clone()); }
+                            MessageContent::ToolResult(r) => {
+                                existing_results.insert(r.call_id.clone());
+                            }
+                            MessageContent::ToolResultRef(r) => {
+                                existing_results.insert(r.call_id.clone());
+                            }
                             _ => {}
                         }
                     }
                     let mut orphans: Vec<String> = Vec::new();
                     for msg in &self.conversation.messages {
-                        if let MessageContent::AssistantWithToolCalls { tool_calls, .. } = &msg.content {
+                        if let MessageContent::AssistantWithToolCalls { tool_calls, .. } =
+                            &msg.content
+                        {
                             for call in tool_calls {
                                 if !existing_results.contains(&call.id) {
                                     orphans.push(call.id.clone());
@@ -760,19 +826,16 @@ impl App {
                 self.current_session.messages = self.conversation.messages.clone();
                 self.current_session.touch();
                 // Auto-name session from first user message if still default
-                if self.current_session.name == "default" || self.current_session.name.starts_with("session-") {
+                if self.current_session.name == "default"
+                    || self.current_session.name.starts_with("session-")
+                {
                     if let Some(first_user_msg) = self.conversation.messages.iter().find(|m| {
                         matches!(m.role, atomcode_core::conversation::message::Role::User)
                     }) {
                         if let Some(text) = first_user_msg.text() {
                             // Generate name from first user message (truncate to 40 chars)
-                            let name: String = text
-                                .lines()
-                                .next()
-                                .unwrap_or("")
-                                .chars()
-                                .take(40)
-                                .collect();
+                            let name: String =
+                                text.lines().next().unwrap_or("").chars().take(40).collect();
                             if !name.is_empty() {
                                 self.current_session.name = name;
                             }
@@ -829,8 +892,7 @@ impl App {
             AgentEvent::TokenUsage(usage) => {
                 self.turn_tokens += usage.completion_tokens;
                 self.total_tokens += usage.completion_tokens;
-                if usage.cached_tokens > 0 {
-                }
+                if usage.cached_tokens > 0 {}
             }
             AgentEvent::WorkingDirChanged(new_dir) => {
                 // Fires for both user `/cd` and LLM tool-driven cd (change_dir
@@ -847,7 +909,13 @@ impl App {
                 self.config.default_workdir = Some(new_dir.to_string_lossy().to_string());
                 let _ = self.config.save(&Config::default_path());
             }
-            AgentEvent::ContextStats { system_tokens, sent_tokens, dropped_tokens: _, working_set_tokens: _, total_messages: _ } => {
+            AgentEvent::ContextStats {
+                system_tokens,
+                sent_tokens,
+                dropped_tokens: _,
+                working_set_tokens: _,
+                total_messages: _,
+            } => {
                 self.ctx_used_tokens = system_tokens + sent_tokens;
             }
             AgentEvent::SubAgentProgress { file, status } => {
@@ -856,11 +924,20 @@ impl App {
                     // Header message
                     ("".to_string(), format!("\n  {}", status))
                 } else if status.starts_with("done") {
-                    ("\u{2713}".to_string(), format!("\n  \u{2713} {} \u{2014} {}", file, status))
+                    (
+                        "\u{2713}".to_string(),
+                        format!("\n  \u{2713} {} \u{2014} {}", file, status),
+                    )
                 } else if status.starts_with("failed") || status.starts_with("timeout") {
-                    ("\u{2717}".to_string(), format!("\n  \u{2717} {} \u{2014} {}", file, status))
+                    (
+                        "\u{2717}".to_string(),
+                        format!("\n  \u{2717} {} \u{2014} {}", file, status),
+                    )
                 } else {
-                    ("\u{25b8}".to_string(), format!("\n  \u{25b8} {} \u{2014} {}", file, status))
+                    (
+                        "\u{25b8}".to_string(),
+                        format!("\n  \u{25b8} {} \u{2014} {}", file, status),
+                    )
                 };
                 self.conversation.push_delta(&line);
             }
@@ -894,12 +971,16 @@ impl App {
 
                 // Provider manager / model selector / issue input have their own input —
                 // skip fast-paste detection and Ctrl+V so keys reach their handler.
-                let is_overlay_mode = matches!(self.mode, AppMode::ProviderManager | AppMode::ModelSelector)
-                    || matches!(self.mode, AppMode::IssueInput(_));
+                let is_overlay_mode =
+                    matches!(self.mode, AppMode::ProviderManager | AppMode::ModelSelector)
+                        || matches!(self.mode, AppMode::IssueInput(_));
 
-                let is_typable_nomods = key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT;
-                let is_typable = is_typable_nomods && matches!(key.code, KeyCode::Char(_) | KeyCode::Enter);
-                let paste_eligible = !is_overlay_mode && is_typable
+                let is_typable_nomods =
+                    key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT;
+                let is_typable =
+                    is_typable_nomods && matches!(key.code, KeyCode::Char(_) | KeyCode::Enter);
+                let paste_eligible = !is_overlay_mode
+                    && is_typable
                     && !matches!(self.mode, AppMode::WaitingApproval(_) | AppMode::Exiting);
 
                 if paste_eligible && interval_ms < 10 {
@@ -944,7 +1025,7 @@ impl App {
                         KeyCode::Char(c) => self.rapid_buf.push(c),
                         _ => unreachable!(),
                     }
-                                        return;
+                    return;
                 }
 
                 // Ctrl+V: clipboard paste
@@ -976,11 +1057,15 @@ impl App {
                     // Forward paste to provider manager's input buffer
                     if let Some(ref mut mgr) = self.provider_mgr {
                         // Normalize line endings
-                        mgr.input_buf.push_str(&text.replace("\r\n", "\n").replace('\r', "\n"));
+                        mgr.input_buf
+                            .push_str(&text.replace("\r\n", "\n").replace('\r', "\n"));
                     }
-                } else if matches!(self.mode, AppMode::Normal | AppMode::Streaming | AppMode::ToolExecuting) {
+                } else if matches!(
+                    self.mode,
+                    AppMode::Normal | AppMode::Streaming | AppMode::ToolExecuting
+                ) {
                     self.stage_paste(&text);
-                                    }
+                }
             }
             AppEvent::Mouse(mouse) => {
                 self.handle_mouse(mouse);
@@ -1027,7 +1112,8 @@ impl App {
         }
 
         // Ctrl+Shift+C: copy selection to clipboard (like Ctrl+C in Claude Code with selection)
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.modifiers.contains(KeyModifiers::SHIFT)
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && key.modifiers.contains(KeyModifiers::SHIFT)
             && key.code == KeyCode::Char('C')
         {
             if self.selection.has_selection {
@@ -1041,7 +1127,8 @@ impl App {
         // 2nd press (within 1s): exit program
         if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('c') {
             let now = Instant::now();
-            let double_press = self.last_ctrl_c
+            let double_press = self
+                .last_ctrl_c
                 .map(|t| now.duration_since(t).as_millis() < 1000)
                 .unwrap_or(false);
             self.last_ctrl_c = Some(now);
@@ -1111,7 +1198,10 @@ impl App {
                         let dir_str = dir.to_string_lossy().to_string();
                         self.dir_selector = None;
                         self.change_working_dir(&dir_str);
-                        let _ = self.agent_handle.cmd_tx.send(AgentCommand::ChangeDir(dir_str));
+                        let _ = self
+                            .agent_handle
+                            .cmd_tx
+                            .send(AgentCommand::ChangeDir(dir_str));
                     }
                 }
                 KeyCode::Esc | KeyCode::Char('q') => {
@@ -1126,7 +1216,9 @@ impl App {
             AppMode::Welcome => self.handle_key_welcome(key),
             AppMode::Normal => self.handle_key_normal(key, event_tx),
             AppMode::SessionSelector => self.handle_key_session_selector(key),
-            AppMode::IssueInput(ref state) => self.handle_key_issue_input(key, state.clone(), event_tx),
+            AppMode::IssueInput(ref state) => {
+                self.handle_key_issue_input(key, state.clone(), event_tx)
+            }
             AppMode::Streaming | AppMode::ToolExecuting => {
                 if key.code == KeyCode::Esc {
                     if self.slash_menu.visible {
@@ -1145,7 +1237,8 @@ impl App {
                         self.turn_start = None;
                     }
                 } else if (key.code == KeyCode::Enter && key.modifiers == KeyModifiers::NONE)
-                    || (key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('j')) {
+                    || (key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('j'))
+                {
                     // During streaming: queue user input locally for AFTER the current
                     // turn ends. Drained one-at-a-time on TurnComplete into a fresh
                     // SendMessage — each queued entry becomes its own new turn, matching
@@ -1213,15 +1306,21 @@ impl App {
     fn handle_key_session_selector(&mut self, key: KeyEvent) {
         if let Some((ref sessions, ref mut selected)) = self.session_selector {
             // Filter sessions by query for navigation
-            let filtered: Vec<usize> = sessions.iter().enumerate()
-                .filter(|(_, s)| self.session_selector_query.is_empty() 
-                    || s.name.to_lowercase().contains(&self.session_selector_query.to_lowercase()))
+            let filtered: Vec<usize> = sessions
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| {
+                    self.session_selector_query.is_empty()
+                        || s.name
+                            .to_lowercase()
+                            .contains(&self.session_selector_query.to_lowercase())
+                })
                 .map(|(i, _)| i)
                 .collect();
-            
+
             // Total items = search row (index 0) + filtered sessions (index 1+)
             let total_items = 1 + filtered.len();
-            
+
             match key.code {
                 KeyCode::Up => {
                     if *selected > 0 {
@@ -1257,8 +1356,11 @@ impl App {
                                 self.scroll_offset = 0;
                                 self.at_bottom = true;
                                 // Calculate total lines for scroll to work immediately
-                                self.last_total_lines = crate::ui::chat_panel::total_lines(&self.conversation);
-                                let _ = self.agent_handle.cmd_tx.send(AgentCommand::SetMessages(self.current_session.messages.clone()));
+                                self.last_total_lines =
+                                    crate::ui::chat_panel::total_lines(&self.conversation);
+                                let _ = self.agent_handle.cmd_tx.send(AgentCommand::SetMessages(
+                                    self.current_session.messages.clone(),
+                                ));
                             }
                             self.mode = AppMode::Normal;
                         }
@@ -1274,7 +1376,10 @@ impl App {
                 KeyCode::Backspace => {
                     if self.session_selector_cursor > 0 {
                         let prev = self.session_selector_query[..self.session_selector_cursor]
-                            .char_indices().next_back().map(|(i, _)| i).unwrap_or(0);
+                            .char_indices()
+                            .next_back()
+                            .map(|(i, _)| i)
+                            .unwrap_or(0);
                         self.session_selector_query.remove(prev);
                         self.session_selector_cursor = prev;
                     }
@@ -1283,7 +1388,8 @@ impl App {
                     }
                 }
                 KeyCode::Char(c) => {
-                    self.session_selector_query.insert(self.session_selector_cursor, c);
+                    self.session_selector_query
+                        .insert(self.session_selector_cursor, c);
                     self.session_selector_cursor += c.len_utf8();
                     if !filtered.is_empty() {
                         *selected = 1;
@@ -1294,14 +1400,19 @@ impl App {
                 KeyCode::Left => {
                     if self.session_selector_cursor > 0 {
                         let prev = self.session_selector_query[..self.session_selector_cursor]
-                            .char_indices().next_back().map(|(i, _)| i).unwrap_or(0);
+                            .char_indices()
+                            .next_back()
+                            .map(|(i, _)| i)
+                            .unwrap_or(0);
                         self.session_selector_cursor = prev;
                     }
                 }
                 KeyCode::Right => {
                     if self.session_selector_cursor < self.session_selector_query.len() {
                         let next = self.session_selector_query[self.session_selector_cursor..]
-                            .char_indices().nth(1).map(|(i, _)| self.session_selector_cursor + i)
+                            .char_indices()
+                            .nth(1)
+                            .map(|(i, _)| self.session_selector_cursor + i)
                             .unwrap_or(self.session_selector_query.len());
                         self.session_selector_cursor = next;
                     }
@@ -1311,7 +1422,12 @@ impl App {
         }
     }
 
-    fn handle_key_issue_input(&mut self, key: KeyEvent, state: IssueInputState, event_tx: &mpsc::UnboundedSender<AppEvent>) {
+    fn handle_key_issue_input(
+        &mut self,
+        key: KeyEvent,
+        state: IssueInputState,
+        event_tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
         match key.code {
             KeyCode::Tab => {
                 // Toggle between title and description fields
@@ -1360,10 +1476,12 @@ impl App {
                             new_state.submitting = true;
                             new_state.error = None;
                             self.mode = AppMode::IssueInput(new_state);
-                            
+
                             // Get access token from auth.toml
-                            let auth_path = atomcode_core::config::Config::config_dir().join("auth.toml");
-                            let access_token = std::fs::read_to_string(&auth_path).ok()
+                            let auth_path =
+                                atomcode_core::config::Config::config_dir().join("auth.toml");
+                            let access_token = std::fs::read_to_string(&auth_path)
+                                .ok()
                                 .and_then(|content| read_auth_field(&content, "access_token"));
 
                             {
@@ -1371,14 +1489,15 @@ impl App {
                                     let title = state.title.clone();
                                     let description = state.description.clone();
                                     let tx = event_tx.clone();
-                                    
+
                                     // Spawn async task to submit issue
                                     let _ = std::thread::spawn(move || {
                                         let rt = tokio::runtime::Runtime::new().unwrap();
                                         let result = rt.block_on(async {
-                                            submit_issue_to_gitcode(&token, &title, &description).await
+                                            submit_issue_to_gitcode(&token, &title, &description)
+                                                .await
                                         });
-                                        
+
                                         // Send result back to main event loop
                                         match result {
                                             Ok(issue_url) => {
@@ -1400,7 +1519,8 @@ impl App {
                                 } else {
                                     let mut new_state = state;
                                     new_state.submitting = false;
-                                    new_state.error = Some("Failed to read access token".to_string());
+                                    new_state.error =
+                                        Some("Failed to read access token".to_string());
                                     self.mode = AppMode::IssueInput(new_state);
                                 }
                             }
@@ -1486,7 +1606,8 @@ impl App {
                             // Delete char before cursor
                             let pos = title_cursor;
                             let chars: Vec<char> = title.chars().collect();
-                            new_state.title = chars[..pos-1].iter().chain(chars[pos..].iter()).collect();
+                            new_state.title =
+                                chars[..pos - 1].iter().chain(chars[pos..].iter()).collect();
                             new_state.title_cursor = pos - 1;
                         }
                     }
@@ -1494,7 +1615,8 @@ impl App {
                         if desc_cursor > 0 {
                             let pos = desc_cursor;
                             let chars: Vec<char> = description.chars().collect();
-                            new_state.description = chars[..pos-1].iter().chain(chars[pos..].iter()).collect();
+                            new_state.description =
+                                chars[..pos - 1].iter().chain(chars[pos..].iter()).collect();
                             new_state.desc_cursor = pos - 1;
                         }
                     }
@@ -1512,13 +1634,23 @@ impl App {
                     IssueField::Title => {
                         let pos = title_cursor;
                         let chars: Vec<char> = title.chars().collect();
-                        new_state.title = chars[..pos].iter().cloned().chain(std::iter::once(c)).chain(chars[pos..].iter().cloned()).collect();
+                        new_state.title = chars[..pos]
+                            .iter()
+                            .cloned()
+                            .chain(std::iter::once(c))
+                            .chain(chars[pos..].iter().cloned())
+                            .collect();
                         new_state.title_cursor = pos + 1;
                     }
                     IssueField::Description => {
                         let pos = desc_cursor;
                         let chars: Vec<char> = description.chars().collect();
-                        new_state.description = chars[..pos].iter().cloned().chain(std::iter::once(c)).chain(chars[pos..].iter().cloned()).collect();
+                        new_state.description = chars[..pos]
+                            .iter()
+                            .cloned()
+                            .chain(std::iter::once(c))
+                            .chain(chars[pos..].iter().cloned())
+                            .collect();
                         new_state.desc_cursor = pos + 1;
                     }
                 }
@@ -1535,7 +1667,10 @@ impl App {
                 self.mode = AppMode::ToolExecuting;
             }
             KeyCode::Char('a') | KeyCode::Char('A') => {
-                let _ = self.agent_handle.cmd_tx.send(AgentCommand::ApproveToolAlways);
+                let _ = self
+                    .agent_handle
+                    .cmd_tx
+                    .send(AgentCommand::ApproveToolAlways);
                 self.mode = AppMode::ToolExecuting;
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
@@ -1601,10 +1736,18 @@ impl App {
                         match field.as_str() {
                             "type" => p.provider_type = value.clone(),
                             "api_key" => {
-                                p.api_key = if value.is_empty() { None } else { Some(value.clone()) }
+                                p.api_key = if value.is_empty() {
+                                    None
+                                } else {
+                                    Some(value.clone())
+                                }
                             }
                             "base_url" => {
-                                p.base_url = if value.is_empty() { None } else { Some(value.clone()) }
+                                p.base_url = if value.is_empty() {
+                                    None
+                                } else {
+                                    Some(value.clone())
+                                }
                             }
                             "model" => p.model = value.clone(),
                             _ => {}
@@ -1760,7 +1903,7 @@ impl App {
                 self.current_tool_call_count = 0;
                 self.turn_tokens = 0;
                 self.total_tokens = 0;
-                            }
+            }
             // Emacs-style line editing (like Claude Code)
             (KeyModifiers::CONTROL, KeyCode::Char('a')) => {
                 self.input.move_home();
@@ -1805,7 +1948,7 @@ impl App {
                     }
                     if let Some(idx) = self.history_index {
                         if let Some(hist) = self.input_history.get(idx).cloned() {
-                                                        self.pasted_blocks.clear();
+                            self.pasted_blocks.clear();
                             self.load_history_entry(&hist);
                         }
                     }
@@ -1817,7 +1960,7 @@ impl App {
                     if idx + 1 < self.input_history.len() {
                         self.history_index = Some(idx + 1);
                         let hist = self.input_history[idx + 1].clone();
-                                                self.pasted_blocks.clear();
+                        self.pasted_blocks.clear();
                         self.load_history_entry(&hist);
                     } else {
                         // Exit history mode
@@ -1825,7 +1968,9 @@ impl App {
                         self.pasted_blocks.clear();
                         self.input.clear();
                         if let Some(stash) = self.history_stash.take() {
-                            for c in stash.chars() { self.input.insert_char(c); }
+                            for c in stash.chars() {
+                                self.input.insert_char(c);
+                            }
                         }
                     }
                 }
@@ -1836,7 +1981,10 @@ impl App {
                 if self.input.is_empty() && !self.pasted_blocks.is_empty() {
                     // When input is empty, Backspace removes the last pasted block
                     self.pasted_blocks.pop();
-                } else if self.input.is_empty() && self.pasted_blocks.is_empty() && !self.attached_files.is_empty() {
+                } else if self.input.is_empty()
+                    && self.pasted_blocks.is_empty()
+                    && !self.attached_files.is_empty()
+                {
                     // When input and pasted blocks are empty, Backspace removes the last attached file
                     self.attached_files.pop();
                 } else {
@@ -1872,7 +2020,8 @@ impl App {
         }
 
         // After any input change, update the slash menu (uses pre-built list, no alloc)
-        self.slash_menu.update(&self.input.content(), &self.command_list);
+        self.slash_menu
+            .update(&self.input.content(), &self.command_list);
 
         // Detect file path — auto-attach if input is a valid file path
         let content = self.input.content();
@@ -1880,7 +2029,8 @@ impl App {
         // Skip slash commands (except /file which is explicitly for file attachment)
         if trimmed.is_empty() || trimmed.starts_with('/') && !trimmed.starts_with("/file") {
             // Not a file path
-        } else if let Some(file) = crate::file_attach::detect_file_path(trimmed, &self.working_dir) {
+        } else if let Some(file) = crate::file_attach::detect_file_path(trimmed, &self.working_dir)
+        {
             // Only attach if not already attached
             if !self.attached_files.iter().any(|f| f.path == file.path) {
                 self.attached_files.push(file);
@@ -1977,7 +2127,8 @@ impl App {
         let chat_start_row: u16 = 1;
 
         // Convert terminal rows to line indices in the full content
-        let start_line = (start_row.saturating_sub(chat_start_row)) as usize + self.effective_scroll();
+        let start_line =
+            (start_row.saturating_sub(chat_start_row)) as usize + self.effective_scroll();
         let end_line = (end_row.saturating_sub(chat_start_row)) as usize + self.effective_scroll();
 
         let mut result = String::new();
@@ -1999,7 +2150,8 @@ impl App {
                 // Single line selection
                 let s = start_col as usize;
                 let e = end_col as usize;
-                let slice: String = chars[s.min(chars.len())..=e.min(chars.len().saturating_sub(1))]
+                let slice: String = chars
+                    [s.min(chars.len())..=e.min(chars.len().saturating_sub(1))]
                     .iter()
                     .collect();
                 result.push_str(&slice);
@@ -2010,7 +2162,9 @@ impl App {
                 result.push('\n');
             } else if i == end_line {
                 let e = end_col as usize;
-                let slice: String = chars[..=e.min(chars.len().saturating_sub(1))].iter().collect();
+                let slice: String = chars[..=e.min(chars.len().saturating_sub(1))]
+                    .iter()
+                    .collect();
                 result.push_str(&slice);
             } else {
                 result.push_str(&line_text);
@@ -2039,14 +2193,18 @@ impl App {
                 if self.input.cursor_col > 0 {
                     let line = &self.input.lines[self.input.cursor_row];
                     self.input.cursor_col = line[..self.input.cursor_col]
-                        .char_indices().last().map(|(i, _)| i).unwrap_or(0);
+                        .char_indices()
+                        .last()
+                        .map(|(i, _)| i)
+                        .unwrap_or(0);
                 }
             }
             (_, KeyCode::Right) => {
                 let line = &self.input.lines[self.input.cursor_row];
                 if self.input.cursor_col < line.len() {
                     self.input.cursor_col = line[self.input.cursor_col..]
-                        .char_indices().nth(1)
+                        .char_indices()
+                        .nth(1)
                         .map(|(i, _)| self.input.cursor_col + i)
                         .unwrap_or(line.len());
                 }
@@ -2090,21 +2248,24 @@ impl App {
                         config_path.display()
                     ));
                 } else {
-                    self.conversation.push_delta(&format!(
-                        "`{}`",
-                        config_path.display()
-                    ));
+                    self.conversation
+                        .push_delta(&format!("`{}`", config_path.display()));
                 }
                 self.conversation.finalize_stream();
             }
             "/model" => {
                 // Enter model selector mode
-                self.model_list = self.config.providers.iter()
+                self.model_list = self
+                    .config
+                    .providers
+                    .iter()
                     .map(|(name, p)| (name.clone(), p.model.clone()))
                     .collect();
                 self.model_list.sort_by(|a, b| a.0.cmp(&b.0));
                 // Pre-select current provider
-                self.model_selected = self.model_list.iter()
+                self.model_selected = self
+                    .model_list
+                    .iter()
                     .position(|(name, _)| name == &self.config.default_provider)
                     .unwrap_or(0);
                 self.conversation.messages.pop(); // Remove the /model user message
@@ -2112,15 +2273,18 @@ impl App {
             }
             "/copy" => {
                 // Find the last assistant text and copy to clipboard
-                let last_text = self.conversation.messages.iter().rev()
-                    .find_map(|m| {
-                        use atomcode_core::conversation::message::{MessageContent, Role};
-                        match &m.content {
-                            MessageContent::Text(s) if matches!(m.role, Role::Assistant) => Some(s.clone()),
-                            MessageContent::AssistantWithToolCalls { text: Some(t), .. } => Some(t.clone()),
-                            _ => None,
+                let last_text = self.conversation.messages.iter().rev().find_map(|m| {
+                    use atomcode_core::conversation::message::{MessageContent, Role};
+                    match &m.content {
+                        MessageContent::Text(s) if matches!(m.role, Role::Assistant) => {
+                            Some(s.clone())
                         }
-                    });
+                        MessageContent::AssistantWithToolCalls { text: Some(t), .. } => {
+                            Some(t.clone())
+                        }
+                        _ => None,
+                    }
+                });
                 if let Some(text) = last_text {
                     match copy_to_clipboard(&text) {
                         Ok(_) => {
@@ -2128,7 +2292,8 @@ impl App {
                             self.conversation.finalize_stream();
                         }
                         Err(e) => {
-                            self.conversation.push_delta(&format!("Failed to copy: {}", e));
+                            self.conversation
+                                .push_delta(&format!("Failed to copy: {}", e));
                             self.conversation.finalize_stream();
                         }
                     }
@@ -2155,14 +2320,20 @@ impl App {
                     if let Some(prev) = self.previous_working_dir.clone() {
                         let prev_str = prev.to_string_lossy().to_string();
                         self.change_working_dir(&prev_str);
-                        let _ = self.agent_handle.cmd_tx.send(AgentCommand::ChangeDir(prev_str));
+                        let _ = self
+                            .agent_handle
+                            .cmd_tx
+                            .send(AgentCommand::ChangeDir(prev_str));
                     } else {
                         self.conversation.push_delta("No previous directory");
                         self.conversation.finalize_stream();
                     }
                 } else {
                     self.change_working_dir(arg);
-                    let _ = self.agent_handle.cmd_tx.send(AgentCommand::ChangeDir(arg.to_string()));
+                    let _ = self
+                        .agent_handle
+                        .cmd_tx
+                        .send(AgentCommand::ChangeDir(arg.to_string()));
                 }
             }
             cmd if cmd == "/plan" || cmd.starts_with("/plan ") => {
@@ -2170,15 +2341,25 @@ impl App {
                 if arg.is_empty() {
                     // Toggle plan mode
                     self.plan_mode = !self.plan_mode;
-                    let _ = self.agent_handle.cmd_tx.send(AgentCommand::SetPlanMode(self.plan_mode));
-                    let status = if self.plan_mode { "**Plan mode ON** — read-only analysis, no edits." } else { "**Plan mode OFF** — full access restored." };
+                    let _ = self
+                        .agent_handle
+                        .cmd_tx
+                        .send(AgentCommand::SetPlanMode(self.plan_mode));
+                    let status = if self.plan_mode {
+                        "**Plan mode ON** — read-only analysis, no edits."
+                    } else {
+                        "**Plan mode OFF** — full access restored."
+                    };
                     self.conversation.push_delta(status);
                     self.conversation.finalize_stream();
                 } else {
                     // One-shot plan mode: enable and send message directly
                     if !self.plan_mode {
                         self.plan_mode = true;
-                        let _ = self.agent_handle.cmd_tx.send(AgentCommand::SetPlanMode(true));
+                        let _ = self
+                            .agent_handle
+                            .cmd_tx
+                            .send(AgentCommand::SetPlanMode(true));
                     }
                     let msg = arg.to_string();
                     self.input.clear();
@@ -2190,21 +2371,30 @@ impl App {
                     self.current_tool_call_count = 0;
                     self.turn_tokens = 0;
                     self.last_turn_duration = None;
-                    self.last_checkpoint = atomcode_core::agent::git_checkpoint::create_checkpoint(&self.working_dir);
-                    let _ = self.agent_handle.cmd_tx.send(AgentCommand::SendMessage(msg));
+                    self.last_checkpoint =
+                        atomcode_core::agent::git_checkpoint::create_checkpoint(&self.working_dir);
+                    let _ = self
+                        .agent_handle
+                        .cmd_tx
+                        .send(AgentCommand::SendMessage(msg));
                 }
                 return true;
             }
             "/undo" => {
                 if let Some(ref checkpoint) = self.last_checkpoint.clone() {
                     let (ok, msg) = atomcode_core::agent::git_checkpoint::restore_checkpoint(
-                        &self.working_dir, checkpoint,
+                        &self.working_dir,
+                        checkpoint,
                     );
                     self.conversation.push_delta(&msg);
                     self.conversation.finalize_stream();
-                    if ok { self.last_checkpoint = None; }
+                    if ok {
+                        self.last_checkpoint = None;
+                    }
                 } else {
-                    self.conversation.push_delta("No checkpoint available. /undo works after the agent has made edits.");
+                    self.conversation.push_delta(
+                        "No checkpoint available. /undo works after the agent has made edits.",
+                    );
                     self.conversation.finalize_stream();
                 }
                 return true;
@@ -2220,11 +2410,13 @@ impl App {
                         if diff.trim().is_empty() {
                             self.conversation.push_delta("No uncommitted changes.");
                         } else {
-                            self.conversation.push_delta(&format!("```diff\n{}\n```", diff.trim()));
+                            self.conversation
+                                .push_delta(&format!("```diff\n{}\n```", diff.trim()));
                         }
                     }
                     Err(e) => {
-                        self.conversation.push_delta(&format!("git diff failed: {}", e));
+                        self.conversation
+                            .push_delta(&format!("git diff failed: {}", e));
                     }
                 }
                 self.conversation.finalize_stream();
@@ -2232,7 +2424,11 @@ impl App {
             }
             "/cost" => {
                 let ctx_str = if self.context_window > 0 && self.ctx_used_tokens > 0 {
-                    format!("Context: {}K / {}K", self.ctx_used_tokens / 1000, self.context_window / 1000)
+                    format!(
+                        "Context: {}K / {}K",
+                        self.ctx_used_tokens / 1000,
+                        self.context_window / 1000
+                    )
                 } else {
                     "Context: (not yet measured)".to_string()
                 };
@@ -2252,7 +2448,10 @@ impl App {
                 self.current_session = Session::default_session(self.working_dir.clone());
                 let _ = self.session_manager.save(&self.current_session);
                 // Clear agent's conversation context
-                let _ = self.agent_handle.cmd_tx.send(AgentCommand::ClearConversation);
+                let _ = self
+                    .agent_handle
+                    .cmd_tx
+                    .send(AgentCommand::ClearConversation);
                 // Clear UI conversation
                 self.conversation.messages.clear();
                 self.render_cache.clear();
@@ -2268,11 +2467,14 @@ impl App {
                 match self.session_manager.list() {
                     Ok(all_sessions) => {
                         // Filter out sessions with no messages (cleared sessions)
-                        let sessions: Vec<_> = all_sessions.into_iter()
+                        let sessions: Vec<_> = all_sessions
+                            .into_iter()
                             .filter(|s| s.message_count > 0)
                             .collect();
                         if sessions.is_empty() {
-                            self.conversation.push_delta("No previous sessions found. Start a conversation first.");
+                            self.conversation.push_delta(
+                                "No previous sessions found. Start a conversation first.",
+                            );
                             self.conversation.finalize_stream();
                         } else {
                             // selected = 0 is search row, 1+ is session items
@@ -2286,7 +2488,8 @@ impl App {
                         }
                     }
                     Err(e) => {
-                        self.conversation.push_delta(&format!("Failed to list sessions: {}", e));
+                        self.conversation
+                            .push_delta(&format!("Failed to list sessions: {}", e));
                         self.conversation.finalize_stream();
                     }
                 }
@@ -2300,28 +2503,33 @@ impl App {
                 self.scroll_offset = 0;
                 self.at_bottom = true;
                 // Sync with agent (clear conversation)
-                let _ = self.agent_handle.cmd_tx.send(AgentCommand::ClearConversation);
+                let _ = self
+                    .agent_handle
+                    .cmd_tx
+                    .send(AgentCommand::ClearConversation);
                 // Don't save empty session - will be saved when first user message is sent
                 // Remove the /session user message
                 self.conversation.messages.pop();
             }
             "/login" => {
                 self.pending_login = true;
-                self.conversation.push_delta("Opening browser for AtomGit login...");
+                self.conversation
+                    .push_delta("Opening browser for AtomGit login...");
                 self.conversation.finalize_stream();
             }
             "/login-with-sso" => {
                 self.pending_wecom_login = true;
-                self.conversation.push_delta("Opening browser for SSO login...");
+                self.conversation
+                    .push_delta("Opening browser for SSO login...");
                 self.conversation.finalize_stream();
             }
             "/logout" => {
                 let mut logged_out = false;
                 let mut messages = Vec::new();
-                
+
                 // 1. Remove auth.toml (access_token and user info)
                 let auth_path = atomcode_core::config::Config::config_dir().join("auth.toml");
-                    
+
                 if auth_path.exists() {
                     match std::fs::remove_file(&auth_path) {
                         Ok(_) => {
@@ -2333,9 +2541,12 @@ impl App {
                         }
                     }
                 }
-                
+
                 // 2. Remove AtomGit provider from in-memory config
-                let atomgit_key = self.config.providers.keys()
+                let atomgit_key = self
+                    .config
+                    .providers
+                    .keys()
                     .find(|k| k.to_lowercase() == "atomgit")
                     .cloned();
 
@@ -2356,7 +2567,7 @@ impl App {
                     self.sync_config_to_agent();
                     logged_out = true;
                 }
-                
+
                 // 3. Show result message
                 if logged_out {
                     self.conversation.push_delta(&format!(
@@ -2371,7 +2582,8 @@ impl App {
             "/issue" => {
                 // Check login status from auth.toml
                 let auth_path = atomcode_core::config::Config::config_dir().join("auth.toml");
-                let logged_in = std::fs::read_to_string(&auth_path).ok()
+                let logged_in = std::fs::read_to_string(&auth_path)
+                    .ok()
                     .and_then(|content| read_auth_field(&content, "access_token"))
                     .is_some();
 
@@ -2386,27 +2598,31 @@ impl App {
             }
             "/status" => {
                 let mut status = String::new();
-                
+
                 // Check login status
                 let auth_path = atomcode_core::config::Config::config_dir().join("auth.toml");
-                    
+
                 if auth_path.exists() {
                     if let Ok(content) = std::fs::read_to_string(&auth_path) {
                         // Parse user info from auth.toml
                         let mut username: Option<String> = None;
                         let mut user_id: Option<String> = None;
-                        
+
                         for line in content.lines() {
                             if line.starts_with("username") {
-                                username = line.split('=').nth(1)
+                                username = line
+                                    .split('=')
+                                    .nth(1)
                                     .map(|s| s.trim().trim_matches('"').to_string());
                             }
                             if line.starts_with("id") {
-                                user_id = line.split('=').nth(1)
+                                user_id = line
+                                    .split('=')
+                                    .nth(1)
                                     .map(|s| s.trim().trim_matches('"').to_string());
                             }
                         }
-                        
+
                         status.push_str("**Login Status**\n\n");
                         status.push_str("- Status: **Logged in**\n");
                         if let Some(u) = username {
@@ -2421,21 +2637,21 @@ impl App {
                     status.push_str("**Login Status**\n\n");
                     status.push_str("- Status: Not logged in\n\n");
                 }
-                
+
                 // Show model info
                 let provider_name = &self.config.default_provider;
                 let model_name = self.provider.model_name().to_string();
-                    
+
                 status.push_str("**Model Info**\n\n");
                 status.push_str(&format!("- Provider: `{}`\n", provider_name));
                 status.push_str(&format!("- Model: `{}`\n", model_name));
-                
+
                 if let Some(provider_config) = self.config.providers.get(provider_name) {
                     if let Some(base_url) = &provider_config.base_url {
                         status.push_str(&format!("- Base URL: `{}`\n", base_url));
                     }
                 }
-                
+
                 self.conversation.push_delta(&status);
                 self.conversation.finalize_stream();
             }
@@ -2450,7 +2666,11 @@ impl App {
                     skills.sort_by(|a, b| a.name.cmp(&b.name));
                     help.push_str("\n**Skills** (from `~/.claude/skills/`, `.claude/skills/`, `commands/` dirs):\n\n");
                     for s in skills {
-                        let desc = if s.description.is_empty() { "skill".to_string() } else { s.description.clone() };
+                        let desc = if s.description.is_empty() {
+                            "skill".to_string()
+                        } else {
+                            s.description.clone()
+                        };
                         help.push_str(&format!("  `/{0}` — {1}\n", s.name, desc));
                     }
                 }
@@ -2477,10 +2697,8 @@ impl App {
                 if let Some(skill) = self.skill_registry.get(skill_name) {
                     let expanded = skill.expand(skill_args, "");
                     if expanded.trim().is_empty() {
-                        self.conversation.push_delta(&format!(
-                            "Skill `{}` has an empty template.",
-                            skill_name
-                        ));
+                        self.conversation
+                            .push_delta(&format!("Skill `{}` has an empty template.", skill_name));
                         self.conversation.finalize_stream();
                     } else {
                         // Replace the raw /skill-name message with the expanded prompt
@@ -2495,7 +2713,10 @@ impl App {
                         self.llm_call_start = Some(Instant::now());
                         self.last_completed_tool = String::new();
                         self.last_turn_duration = None;
-                        let _ = self.agent_handle.cmd_tx.send(AgentCommand::SendMessage(expanded));
+                        let _ = self
+                            .agent_handle
+                            .cmd_tx
+                            .send(AgentCommand::SendMessage(expanded));
                     }
                 } else {
                     // Not a known command or skill - treat as regular message
@@ -2530,7 +2751,7 @@ impl App {
         }
         let buf = std::mem::take(&mut self.rapid_buf);
         self.stage_paste(&buf);
-            }
+    }
 
     /// Single entry point for every paste pathway (Ctrl+V, bracketed paste,
     /// rapid-key burst). Runs file-path extraction first so drag-and-drop of
@@ -2545,9 +2766,9 @@ impl App {
         // files, that's the authoritative list.
         #[cfg(target_os = "windows")]
         {
-            if let Ok(files) = clipboard_win::get_clipboard::<Vec<String>, _>(
-                clipboard_win::formats::FileList,
-            ) {
+            if let Ok(files) =
+                clipboard_win::get_clipboard::<Vec<String>, _>(clipboard_win::formats::FileList)
+            {
                 if !files.is_empty() {
                     // Guard against false positives. CF_HDROP sticks around
                     // across unrelated operations — if the user copied files
@@ -2569,10 +2790,8 @@ impl App {
 
                     if related {
                         let as_text = files.join("\n");
-                        let (attachments, _remainder) = crate::file_attach::extract_file_paths(
-                            &as_text,
-                            &self.working_dir,
-                        );
+                        let (attachments, _remainder) =
+                            crate::file_attach::extract_file_paths(&as_text, &self.working_dir);
                         let mut any_added = false;
                         for file in attachments {
                             if !self.attached_files.iter().any(|f| f.path == file.path) {
@@ -2594,10 +2813,8 @@ impl App {
             text.to_string()
         };
 
-        let (files, remainder) = crate::file_attach::extract_file_paths(
-            &normalized,
-            &self.working_dir,
-        );
+        let (files, remainder) =
+            crate::file_attach::extract_file_paths(&normalized, &self.working_dir);
 
         for file in files {
             if !self.attached_files.iter().any(|f| f.path == file.path) {
@@ -2626,8 +2843,11 @@ impl App {
             Some(std::mem::take(&mut self.pasted_blocks).join("\n\n"))
         };
         let content = if let Some(pasted) = pasted {
-            if typed.trim().is_empty() { pasted }
-            else { format!("{}\n\n{}", typed, pasted) }
+            if typed.trim().is_empty() {
+                pasted
+            } else {
+                format!("{}\n\n{}", typed, pasted)
+            }
         } else {
             typed
         };
@@ -2662,7 +2882,10 @@ impl App {
                         self.conversation.add_user_message(trimmed);
                         let prev_str = prev.to_string_lossy().to_string();
                         self.change_working_dir(&prev_str);
-                        let _ = self.agent_handle.cmd_tx.send(AgentCommand::ChangeDir(prev_str));
+                        let _ = self
+                            .agent_handle
+                            .cmd_tx
+                            .send(AgentCommand::ChangeDir(prev_str));
                     } else {
                         self.conversation.add_user_message(trimmed);
                         self.conversation.push_delta("No previous directory");
@@ -2671,7 +2894,10 @@ impl App {
                 } else {
                     self.conversation.add_user_message(trimmed);
                     self.change_working_dir(arg);
-                    let _ = self.agent_handle.cmd_tx.send(AgentCommand::ChangeDir(arg.to_string()));
+                    let _ = self
+                        .agent_handle
+                        .cmd_tx
+                        .send(AgentCommand::ChangeDir(arg.to_string()));
                 }
                 self.input.clear();
                 self.pasted_blocks.clear();
@@ -2732,10 +2958,14 @@ impl App {
         self.last_turn_duration = None;
 
         // Git checkpoint before agent edits
-        self.last_checkpoint = atomcode_core::agent::git_checkpoint::create_checkpoint(&self.working_dir);
+        self.last_checkpoint =
+            atomcode_core::agent::git_checkpoint::create_checkpoint(&self.working_dir);
 
         // Delegate to the AgentLoop via channel.
-        let _ = self.agent_handle.cmd_tx.send(AgentCommand::SendMessage(full_content));
+        let _ = self
+            .agent_handle
+            .cmd_tx
+            .send(AgentCommand::SendMessage(full_content));
     }
 
     /// Submit a pre-resolved queued message as a fresh turn. Called by the
@@ -2762,18 +2992,21 @@ impl App {
         self.llm_call_start = Some(Instant::now());
         self.last_completed_tool = String::new();
         self.last_turn_duration = None;
-        self.last_checkpoint = atomcode_core::agent::git_checkpoint::create_checkpoint(
-            &self.working_dir,
-        );
+        self.last_checkpoint =
+            atomcode_core::agent::git_checkpoint::create_checkpoint(&self.working_dir);
         self.mode = AppMode::Streaming;
-        let _ = self.agent_handle.cmd_tx.send(AgentCommand::SendMessage(content));
+        let _ = self
+            .agent_handle
+            .cmd_tx
+            .send(AgentCommand::SendMessage(content));
     }
-
 }
 
 /// Format tool info for display (called once, cached in App).
 fn format_tool_info(call: &ToolCall) -> String {
-    let name: String = call.name.split('_')
+    let name: String = call
+        .name
+        .split('_')
         .map(|w| {
             let mut c = w.chars();
             match c.next() {
@@ -2802,7 +3035,6 @@ fn format_tool_info(call: &ToolCall) -> String {
     }
     name
 }
-
 
 fn copy_to_clipboard(text: &str) -> std::io::Result<()> {
     use std::io::Write;
@@ -2871,16 +3103,25 @@ fn read_clipboard() -> Option<String> {
             Command::new("pbpaste").output().ok()
         } else {
             // Try wl-paste (Wayland), xclip, xsel in order
-            Command::new("wl-paste").args(&["--no-newline"]).output().ok()
+            Command::new("wl-paste")
+                .args(&["--no-newline"])
+                .output()
+                .ok()
                 .filter(|o| o.status.success())
-                .or_else(|| Command::new("xclip")
-                    .args(&["-selection", "clipboard", "-o"])
-                    .output().ok()
-                    .filter(|o| o.status.success()))
-                .or_else(|| Command::new("xsel")
-                    .args(&["--clipboard", "--output"])
-                    .output().ok()
-                    .filter(|o| o.status.success()))
+                .or_else(|| {
+                    Command::new("xclip")
+                        .args(&["-selection", "clipboard", "-o"])
+                        .output()
+                        .ok()
+                        .filter(|o| o.status.success())
+                })
+                .or_else(|| {
+                    Command::new("xsel")
+                        .args(&["--clipboard", "--output"])
+                        .output()
+                        .ok()
+                        .filter(|o| o.status.success())
+                })
         };
 
         output
@@ -2912,7 +3153,8 @@ fn load_recent_dirs() -> Vec<PathBuf> {
 /// Save recent project directories to ~/.atomcode/recent_dirs.txt
 fn save_recent_dirs(dirs: &[PathBuf]) {
     let path = atomcode_core::config::Config::config_dir().join("recent_dirs.txt");
-    let content: String = dirs.iter()
+    let content: String = dirs
+        .iter()
         .map(|d| d.to_string_lossy().to_string())
         .collect::<Vec<_>>()
         .join("\n");
@@ -2987,12 +3229,15 @@ impl InputState {
 
     /// Delete word backward (Ctrl+W)
     pub fn delete_word_backward(&mut self) {
-        if self.cursor_col == 0 { return; }
+        if self.cursor_col == 0 {
+            return;
+        }
         let line = &self.lines[self.cursor_row];
         let before = &line[..self.cursor_col];
         // Skip trailing whitespace, then skip word chars
         let trimmed = before.trim_end();
-        let word_start = trimmed.rfind(|c: char| c.is_whitespace() || c == '/' || c == '.')
+        let word_start = trimmed
+            .rfind(|c: char| c.is_whitespace() || c == '/' || c == '.')
             .map(|i| i + 1)
             .unwrap_or(0);
         self.lines[self.cursor_row].drain(word_start..self.cursor_col);
@@ -3065,7 +3310,8 @@ const GITCODE_CLIENT_SECRET: &str = "756ef00061884c7aa1ac64bd4eae3be7";
 
 /// Read a value from auth.toml by key (line-based parsing, tolerates malformed TOML).
 fn read_auth_field(content: &str, key: &str) -> Option<String> {
-    content.lines()
+    content
+        .lines()
         .find(|line| line.starts_with(key))
         .and_then(|line| line.split('=').nth(1))
         .map(|s| s.trim().trim_matches('"').to_string())
@@ -3100,20 +3346,27 @@ async fn refresh_gitcode_token() -> Result<String, String> {
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
-        return Err(format!("Token refresh failed ({}): {} — please /login again", status, body));
+        return Err(format!(
+            "Token refresh failed ({}): {} — please /login again",
+            status, body
+        ));
     }
 
-    let token_resp: serde_json::Value = response.json().await
+    let token_resp: serde_json::Value = response
+        .json()
+        .await
         .map_err(|e| format!("Failed to parse refresh response: {}", e))?;
 
-    let new_access_token = token_resp["access_token"].as_str()
+    let new_access_token = token_resp["access_token"]
+        .as_str()
         .ok_or("No access_token in refresh response")?
         .to_string();
 
     // Rebuild auth.toml with updated tokens, preserving user section
     let username = read_auth_field(&content, "username").unwrap_or_default();
     let id = read_auth_field(&content, "id").unwrap_or_default();
-    let new_refresh = token_resp["refresh_token"].as_str()
+    let new_refresh = token_resp["refresh_token"]
+        .as_str()
         .map(|s| s.to_string())
         .or(Some(refresh_token));
     let now = std::time::SystemTime::now()
@@ -3143,7 +3396,11 @@ async fn refresh_gitcode_token() -> Result<String, String> {
 }
 
 /// Submit an issue to GitCode API. Automatically refreshes token on 401.
-async fn submit_issue_to_gitcode(access_token: &str, title: &str, body: &str) -> Result<String, String> {
+async fn submit_issue_to_gitcode(
+    access_token: &str,
+    title: &str,
+    body: &str,
+) -> Result<String, String> {
     let result = post_issue(access_token, title, body).await;
 
     // If 401, try refreshing the token and retry once
@@ -3177,9 +3434,12 @@ async fn post_issue(access_token: &str, title: &str, body: &str) -> Result<Strin
         .map_err(|e| format!("Request failed: {}", e))?;
 
     if response.status().is_success() {
-        let json: serde_json::Value = response.json().await
+        let json: serde_json::Value = response
+            .json()
+            .await
             .map_err(|e| format!("Failed to parse response: {}", e))?;
-        let issue_url = json["html_url"].as_str()
+        let issue_url = json["html_url"]
+            .as_str()
             .ok_or("No html_url in response")?
             .to_string();
         Ok(issue_url)

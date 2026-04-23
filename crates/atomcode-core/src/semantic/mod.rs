@@ -126,7 +126,9 @@ impl SemanticSearcher {
         if cursor.goto_first_child() {
             loop {
                 Self::collect_errors(cursor.node(), errors);
-                if !cursor.goto_next_sibling() { break; }
+                if !cursor.goto_next_sibling() {
+                    break;
+                }
             }
         }
     }
@@ -149,15 +151,20 @@ impl SemanticSearcher {
 
         Self::walk_matching_calls(tree.root_node(), &source, &pattern_lower, &mut results, "");
 
-        if results.is_empty() { return None; }
+        if results.is_empty() {
+            return None;
+        }
 
-        let short_name = path.file_name()
+        let short_name = path
+            .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| path.to_string_lossy().to_string());
 
         let mut out = format!(
             "{} calls matching '{}' in {}:\n",
-            results.len(), pattern, short_name
+            results.len(),
+            pattern,
+            short_name
         );
         for (line, call_text, func) in &results {
             if func.is_empty() {
@@ -180,7 +187,8 @@ impl SemanticSearcher {
         // Track enclosing function name
         let mut current_fn = enclosing_fn.to_string();
         let kind = node.kind();
-        if kind.contains("function") || kind.contains("method") || kind == "constructor_declaration" {
+        if kind.contains("function") || kind.contains("method") || kind == "constructor_declaration"
+        {
             if let Some(name_node) = node.child_by_field_name("name") {
                 current_fn = source[name_node.start_byte()..name_node.end_byte()].to_string();
             }
@@ -213,7 +221,9 @@ impl SemanticSearcher {
         if cursor.goto_first_child() {
             loop {
                 Self::walk_matching_calls(cursor.node(), source, pattern, results, &current_fn);
-                if !cursor.goto_next_sibling() { break; }
+                if !cursor.goto_next_sibling() {
+                    break;
+                }
             }
         }
     }
@@ -224,7 +234,9 @@ impl SemanticSearcher {
         // Find <template> section
         let template_start = source.find("<template")?;
         let template_end = source.rfind("</template>")?;
-        if template_start >= template_end { return None; }
+        if template_start >= template_end {
+            return None;
+        }
 
         // Byte offset of <template> in the original file
         let template_content_start = source[template_start..].find('>')? + template_start + 1;
@@ -252,10 +264,12 @@ impl SemanticSearcher {
 
         while let Some(m) = matches.next() {
             let name_cap = match m.captures.iter().find(|c| c.index == name_idx) {
-                Some(c) => c, None => continue,
+                Some(c) => c,
+                None => continue,
             };
             let def_cap = match m.captures.iter().find(|c| c.index == def_idx) {
-                Some(c) => c, None => continue,
+                Some(c) => c,
+                None => continue,
             };
             let name_node = name_cap.node;
             let def_node = def_cap.node;
@@ -264,19 +278,51 @@ impl SemanticSearcher {
             let start_line = def_node.start_position().row + line_offset;
 
             // Skip common noise tags, keep structural/component elements
-            if matches!(tag_name, "div" | "span" | "p" | "a" | "li" | "ul" | "ol"
-                | "br" | "hr" | "img" | "i" | "b" | "strong" | "em" | "small"
-                | "label" | "input" | "option" | "thead" | "tbody" | "tr" | "td" | "th") {
+            if matches!(
+                tag_name,
+                "div"
+                    | "span"
+                    | "p"
+                    | "a"
+                    | "li"
+                    | "ul"
+                    | "ol"
+                    | "br"
+                    | "hr"
+                    | "img"
+                    | "i"
+                    | "b"
+                    | "strong"
+                    | "em"
+                    | "small"
+                    | "label"
+                    | "input"
+                    | "option"
+                    | "thead"
+                    | "tbody"
+                    | "tr"
+                    | "td"
+                    | "th"
+            ) {
                 // Only keep div/span if they have interesting attributes
-                let line = template_content.lines().nth(def_node.start_position().row).unwrap_or("");
-                let has_vue_attr = line.contains("v-if") || line.contains("v-for")
-                    || line.contains("v-show") || line.contains("@click")
+                let line = template_content
+                    .lines()
+                    .nth(def_node.start_position().row)
+                    .unwrap_or("");
+                let has_vue_attr = line.contains("v-if")
+                    || line.contains("v-for")
+                    || line.contains("v-show")
+                    || line.contains("@click")
                     || line.contains("v-model");
-                if !has_vue_attr { continue; }
+                if !has_vue_attr {
+                    continue;
+                }
             }
 
             // Dedup by line
-            if !seen_lines.insert(start_line) { continue; }
+            if !seen_lines.insert(start_line) {
+                continue;
+            }
 
             let end_line = def_node.end_position().row + line_offset;
             symbols.push(Symbol {
@@ -288,10 +334,16 @@ impl SemanticSearcher {
                 kind: "element".to_string(),
             });
 
-            if symbols.len() >= 20 { break; } // Cap to avoid noise
+            if symbols.len() >= 20 {
+                break;
+            } // Cap to avoid noise
         }
 
-        if symbols.is_empty() { None } else { Some(symbols) }
+        if symbols.is_empty() {
+            None
+        } else {
+            Some(symbols)
+        }
     }
 
     // ── Tree-sitter implementation ──
@@ -318,7 +370,8 @@ impl SemanticSearcher {
         let mut cursor = QueryCursor::new();
 
         let mut symbols = Vec::new();
-        let mut seen_ranges: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
+        let mut seen_ranges: std::collections::HashSet<(usize, usize)> =
+            std::collections::HashSet::new();
 
         let mut matches = cursor.matches(&query, tree.root_node(), source.as_bytes());
         loop {
@@ -373,12 +426,7 @@ impl SemanticSearcher {
         Some(symbols)
     }
 
-    fn skeleton_treesitter(
-        &mut self,
-        path: &Path,
-        source: &str,
-        lang: Lang,
-    ) -> Option<String> {
+    fn skeleton_treesitter(&mut self, path: &Path, source: &str, lang: Lang) -> Option<String> {
         let symbols = self.list_symbols_treesitter(path, source, lang)?;
         let lines: Vec<&str> = source.lines().collect();
         let mut out = String::new();
@@ -414,7 +462,10 @@ impl SemanticSearcher {
 
             out.push_str(&format!(
                 "{:4}| {}  {{ ... }}  // {} ({} lines)\n",
-                sym.start_line, sig_line.trim_end(), line_range, body_lines
+                sym.start_line,
+                sig_line.trim_end(),
+                line_range,
+                body_lines
             ));
         }
 
@@ -451,7 +502,8 @@ impl SemanticSearcher {
 
         let mut cursor = QueryCursor::new();
         let mut symbols = Vec::new();
-        let mut seen_ranges: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
+        let mut seen_ranges: std::collections::HashSet<(usize, usize)> =
+            std::collections::HashSet::new();
 
         let mut matches = cursor.matches(&query, tree.root_node(), script.as_bytes());
         loop {
@@ -487,7 +539,9 @@ impl SemanticSearcher {
 
             if let (Some(name), true) = (sym_name, has_def) {
                 let range = (def_start, def_end);
-                if seen_ranges.contains(&range) { continue; }
+                if seen_ranges.contains(&range) {
+                    continue;
+                }
                 seen_ranges.insert(range);
 
                 symbols.push(Symbol {
@@ -508,12 +562,21 @@ impl SemanticSearcher {
         let lines: Vec<&str> = source.lines().collect();
         for (i, line) in lines.iter().enumerate() {
             let trimmed = line.trim();
-            if trimmed.starts_with("<template") || trimmed.starts_with("<script") || trimmed.starts_with("<style") {
-                let tag = if trimmed.starts_with("<template") { "template" }
-                    else if trimmed.starts_with("<script") { "script" }
-                    else { "style" };
+            if trimmed.starts_with("<template")
+                || trimmed.starts_with("<script")
+                || trimmed.starts_with("<style")
+            {
+                let tag = if trimmed.starts_with("<template") {
+                    "template"
+                } else if trimmed.starts_with("<script") {
+                    "script"
+                } else {
+                    "style"
+                };
                 let close_tag = format!("</{}>", tag);
-                let end_line = lines[i..].iter().position(|l| l.trim().starts_with(&close_tag))
+                let end_line = lines[i..]
+                    .iter()
+                    .position(|l| l.trim().starts_with(&close_tag))
                     .map(|p| i + p + 1)
                     .unwrap_or(lines.len());
                 let start_byte = lines[..i].iter().map(|l| l.len() + 1).sum::<usize>();
@@ -557,7 +620,9 @@ impl SemanticSearcher {
         let mut symbols = Vec::new();
         for (i, line) in lines.iter().enumerate() {
             let trimmed = line.trim();
-            if trimmed.is_empty() { continue; }
+            if trimmed.is_empty() {
+                continue;
+            }
             let indent = line.len() - line.trim_start().len();
             let is_match = trimmed.starts_with(":root")
                 || trimmed.starts_with("@keyframes")
@@ -574,7 +639,12 @@ impl SemanticSearcher {
             if is_match {
                 // Find the block end (matching closing brace)
                 let end = find_block_end(lines, i);
-                let name = trimmed.split('{').next().unwrap_or(trimmed).trim().to_string();
+                let name = trimmed
+                    .split('{')
+                    .next()
+                    .unwrap_or(trimmed)
+                    .trim()
+                    .to_string();
                 symbols.push(make_symbol(name, "css_rule", i, end, lines));
             }
         }
@@ -584,11 +654,25 @@ impl SemanticSearcher {
     /// HTML: structural tags
     fn list_symbols_html(&self, lines: &[&str]) -> Vec<Symbol> {
         let mut symbols = Vec::new();
-        let tags = ["<head", "<body", "<header", "<main", "<footer", "<nav", "<section", "<article", "<!DOCTYPE"];
+        let tags = [
+            "<head",
+            "<body",
+            "<header",
+            "<main",
+            "<footer",
+            "<nav",
+            "<section",
+            "<article",
+            "<!DOCTYPE",
+        ];
         for (i, line) in lines.iter().enumerate() {
             let trimmed = line.trim();
             if tags.iter().any(|t| trimmed.starts_with(t)) {
-                let name = trimmed.split(|c: char| c == '>' || c == ' ').next().unwrap_or(trimmed).to_string();
+                let name = trimmed
+                    .split(|c: char| c == '>' || c == ' ')
+                    .next()
+                    .unwrap_or(trimmed)
+                    .to_string();
                 symbols.push(make_symbol(name, "html_tag", i, i + 1, lines));
             }
         }
@@ -603,7 +687,13 @@ impl SemanticSearcher {
             let indent = line.len() - line.trim_start().len();
             // Top-level keys: indent ≤ 2, starts with "
             if indent <= 2 && trimmed.starts_with('"') && trimmed.contains(':') {
-                let name = trimmed.split(':').next().unwrap_or(trimmed).trim_matches('"').trim().to_string();
+                let name = trimmed
+                    .split(':')
+                    .next()
+                    .unwrap_or(trimmed)
+                    .trim_matches('"')
+                    .trim()
+                    .to_string();
                 symbols.push(make_symbol(name, "json_key", i, i + 1, lines));
             }
         }
@@ -616,8 +706,17 @@ impl SemanticSearcher {
         for (i, line) in lines.iter().enumerate() {
             let trimmed = line.trim();
             let indent = line.len() - line.trim_start().len();
-            if indent == 0 && !trimmed.is_empty() && !trimmed.starts_with('#') && !trimmed.starts_with("---") {
-                let name = trimmed.split(':').next().unwrap_or(trimmed).trim().to_string();
+            if indent == 0
+                && !trimmed.is_empty()
+                && !trimmed.starts_with('#')
+                && !trimmed.starts_with("---")
+            {
+                let name = trimmed
+                    .split(':')
+                    .next()
+                    .unwrap_or(trimmed)
+                    .trim()
+                    .to_string();
                 if !name.is_empty() {
                     symbols.push(make_symbol(name, "yaml_key", i, i + 1, lines));
                 }
@@ -634,7 +733,9 @@ impl SemanticSearcher {
             if trimmed.starts_with('#') {
                 let name = trimmed.trim_start_matches('#').trim().to_string();
                 // Find next heading or end
-                let end = lines[i + 1..].iter().position(|l| l.trim().starts_with('#'))
+                let end = lines[i + 1..]
+                    .iter()
+                    .position(|l| l.trim().starts_with('#'))
                     .map(|p| i + 1 + p)
                     .unwrap_or(lines.len());
                 symbols.push(make_symbol(name, "heading", i, end, lines));
@@ -684,12 +785,19 @@ impl SemanticSearcher {
                     while end < lines.len() {
                         let next = lines[end];
                         let next_trimmed = next.trim();
-                        if next_trimmed.is_empty() { end += 1; continue; }
+                        if next_trimmed.is_empty() {
+                            end += 1;
+                            continue;
+                        }
                         let next_indent = next.len() - next.trim_start().len();
-                        if next_indent == 0 && !next_trimmed.starts_with('}') { break; }
+                        if next_indent == 0 && !next_trimmed.starts_with('}') {
+                            break;
+                        }
                         end += 1;
                     }
-                    if end < lines.len() && lines[end].trim() == "}" { end += 1; }
+                    if end < lines.len() && lines[end].trim() == "}" {
+                        end += 1;
+                    }
 
                     let name = extract_indent_name(trimmed);
                     symbols.push(make_symbol(name, "indent_block", start, end, lines));
@@ -759,8 +867,12 @@ fn find_block_end(lines: &[&str], start: usize) -> usize {
     let mut depth = 0i32;
     for i in start..lines.len() {
         for ch in lines[i].chars() {
-            if ch == '{' { depth += 1; }
-            if ch == '}' { depth -= 1; }
+            if ch == '{' {
+                depth += 1;
+            }
+            if ch == '}' {
+                depth -= 1;
+            }
         }
         if depth <= 0 && i > start {
             return i + 1;
@@ -778,9 +890,15 @@ fn extract_indent_name(line: &str) -> String {
             continue; // skip the keyword itself
         }
         // Strip common suffixes: (, {, :, <
-        let clean = tok.trim_start_matches('*')
+        let clean = tok
+            .trim_start_matches('*')
             .trim_end_matches(|c: char| "({:<".contains(c));
-        if !clean.is_empty() && clean.chars().next().map_or(false, |c| c.is_alphabetic() || c == '_') {
+        if !clean.is_empty()
+            && clean
+                .chars()
+                .next()
+                .map_or(false, |c| c.is_alphabetic() || c == '_')
+        {
             return clean.to_string();
         }
     }
@@ -794,14 +912,35 @@ mod tests {
 
     #[test]
     fn test_language_detection() {
-        assert_eq!(LanguageRegistry::detect(Path::new("foo.rs")), Some(Lang::Rust));
-        assert_eq!(LanguageRegistry::detect(Path::new("bar.py")), Some(Lang::Python));
-        assert_eq!(LanguageRegistry::detect(Path::new("baz.js")), Some(Lang::JavaScript));
-        assert_eq!(LanguageRegistry::detect(Path::new("qux.ts")), Some(Lang::TypeScript));
-        assert_eq!(LanguageRegistry::detect(Path::new("main.go")), Some(Lang::Go));
-        assert_eq!(LanguageRegistry::detect(Path::new("App.java")), Some(Lang::Java));
+        assert_eq!(
+            LanguageRegistry::detect(Path::new("foo.rs")),
+            Some(Lang::Rust)
+        );
+        assert_eq!(
+            LanguageRegistry::detect(Path::new("bar.py")),
+            Some(Lang::Python)
+        );
+        assert_eq!(
+            LanguageRegistry::detect(Path::new("baz.js")),
+            Some(Lang::JavaScript)
+        );
+        assert_eq!(
+            LanguageRegistry::detect(Path::new("qux.ts")),
+            Some(Lang::TypeScript)
+        );
+        assert_eq!(
+            LanguageRegistry::detect(Path::new("main.go")),
+            Some(Lang::Go)
+        );
+        assert_eq!(
+            LanguageRegistry::detect(Path::new("App.java")),
+            Some(Lang::Java)
+        );
         assert_eq!(LanguageRegistry::detect(Path::new("main.c")), Some(Lang::C));
-        assert_eq!(LanguageRegistry::detect(Path::new("main.cpp")), Some(Lang::Cpp));
+        assert_eq!(
+            LanguageRegistry::detect(Path::new("main.cpp")),
+            Some(Lang::Cpp)
+        );
         assert_eq!(LanguageRegistry::detect(Path::new("readme.md")), None);
     }
 
@@ -910,6 +1049,10 @@ def world():
 
         let symbols = searcher.list_symbols(tmp.path()).unwrap();
         let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
-        assert!(names.contains(&"hello()"), "indent fallback symbols: {:?}", names);
+        assert!(
+            names.contains(&"hello()"),
+            "indent fallback symbols: {:?}",
+            names
+        );
     }
 }

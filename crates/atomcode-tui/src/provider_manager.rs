@@ -128,20 +128,34 @@ impl ProviderManager {
         match key.code {
             KeyCode::Left => {
                 if self.cursor_pos > 0 {
-                    let prev = self.input_buf[..self.cursor_pos].char_indices().next_back().map(|(i, _)| i).unwrap_or(0);
+                    let prev = self.input_buf[..self.cursor_pos]
+                        .char_indices()
+                        .next_back()
+                        .map(|(i, _)| i)
+                        .unwrap_or(0);
                     self.cursor_pos = prev;
                 }
                 true
             }
             KeyCode::Right => {
                 if self.cursor_pos < self.input_buf.len() {
-                    let next = self.input_buf[self.cursor_pos..].char_indices().nth(1).map(|(i, _)| self.cursor_pos + i).unwrap_or(self.input_buf.len());
+                    let next = self.input_buf[self.cursor_pos..]
+                        .char_indices()
+                        .nth(1)
+                        .map(|(i, _)| self.cursor_pos + i)
+                        .unwrap_or(self.input_buf.len());
                     self.cursor_pos = next;
                 }
                 true
             }
-            KeyCode::Home => { self.cursor_pos = 0; true }
-            KeyCode::End => { self.cursor_pos = self.input_buf.len(); true }
+            KeyCode::Home => {
+                self.cursor_pos = 0;
+                true
+            }
+            KeyCode::End => {
+                self.cursor_pos = self.input_buf.len();
+                true
+            }
             KeyCode::Delete => {
                 if self.cursor_pos < self.input_buf.len() {
                     self.input_buf.remove(self.cursor_pos);
@@ -234,7 +248,10 @@ impl ProviderManager {
                 }
                 if let Some(name) = self.selected_name() {
                     if name == config.default_provider {
-                        self.message = Some("Cannot delete the default provider. Set another as default first.".to_string());
+                        self.message = Some(
+                            "Cannot delete the default provider. Set another as default first."
+                                .to_string(),
+                        );
                         return None;
                     }
                 }
@@ -251,9 +268,7 @@ impl ProviderManager {
                 }
                 None
             }
-            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => {
-                Some(ManagerAction::Close)
-            }
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => Some(ManagerAction::Close),
             _ => None,
         }
     }
@@ -291,7 +306,9 @@ impl ProviderManager {
                             self.insert_at_cursor(c);
                         }
                     }
-                    _ => { self.handle_cursor_key(&key); }
+                    _ => {
+                        self.handle_cursor_key(&key);
+                    }
                 }
                 None
             }
@@ -353,7 +370,9 @@ impl ProviderManager {
                     KeyCode::Char(c) => {
                         self.insert_at_cursor(c);
                     }
-                    _ => { self.handle_cursor_key(&key); }
+                    _ => {
+                        self.handle_cursor_key(&key);
+                    }
                 }
                 None
             }
@@ -376,7 +395,9 @@ impl ProviderManager {
                     KeyCode::Char(c) => {
                         self.insert_at_cursor(c);
                     }
-                    _ => { self.handle_cursor_key(&key); }
+                    _ => {
+                        self.handle_cursor_key(&key);
+                    }
                 }
                 None
             }
@@ -412,7 +433,10 @@ impl ProviderManager {
                             },
                             system_prompt: None,
                             user_agent: None,
-                            context_window: atomcode_core::config::provider::default_context_window_for(&self.new_type),
+                            context_window:
+                                atomcode_core::config::provider::default_context_window_for(
+                                    &self.new_type,
+                                ),
                             max_tokens: None,
                             ephemeral: false,
                         };
@@ -424,7 +448,9 @@ impl ProviderManager {
                     KeyCode::Char(c) => {
                         self.insert_at_cursor(c);
                     }
-                    _ => { self.handle_cursor_key(&key); }
+                    _ => {
+                        self.handle_cursor_key(&key);
+                    }
                 }
                 None
             }
@@ -548,7 +574,10 @@ impl ProviderManager {
                         self.insert_at_cursor(c);
                         None
                     }
-                    _ => { self.handle_cursor_key(&key); None }
+                    _ => {
+                        self.handle_cursor_key(&key);
+                        None
+                    }
                 }
             }
         }

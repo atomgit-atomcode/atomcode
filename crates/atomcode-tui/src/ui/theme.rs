@@ -228,7 +228,10 @@ fn query_terminal_background() -> Option<(u8, u8, u8)> {
                     match io::stdin().read(&mut buf[read..]) {
                         Ok(n) if n > 0 => {
                             read += n;
-                            if buf[..read].windows(2).any(|w| w == b"\x1b\\" || w == b"\x07") {
+                            if buf[..read]
+                                .windows(2)
+                                .any(|w| w == b"\x1b\\" || w == b"\x07")
+                            {
                                 break;
                             }
                         }
@@ -244,7 +247,8 @@ fn query_terminal_background() -> Option<(u8, u8, u8)> {
         }
 
         if let Some(color_part) = response.split("11;").nth(1) {
-            let color_part = color_part.trim_end_matches(|c| c == '\x07' || c == '\x1b' || c == '\\');
+            let color_part =
+                color_part.trim_end_matches(|c| c == '\x07' || c == '\x1b' || c == '\\');
 
             if color_part.starts_with("rgb:") {
                 let parts: Vec<&str> = color_part[4..].split('/').collect();
@@ -254,7 +258,11 @@ fn query_terminal_background() -> Option<(u8, u8, u8)> {
                         u8::from_str_radix(s, 16).ok()
                     };
 
-                    if let (Some(r), Some(g), Some(b)) = (parse_hex(parts[0]), parse_hex(parts[1]), parse_hex(parts[2])) {
+                    if let (Some(r), Some(g), Some(b)) = (
+                        parse_hex(parts[0]),
+                        parse_hex(parts[1]),
+                        parse_hex(parts[2]),
+                    ) {
                         return Some((r, g, b));
                     }
                 }
@@ -339,7 +347,7 @@ pub fn text_muted() -> Color {
 
 pub fn text_on_accent() -> Color {
     match Theme::current() {
-        Theme::Dark => rgb(240, 235, 255),  // Light lavender text on dark purple
+        Theme::Dark => rgb(240, 235, 255), // Light lavender text on dark purple
         Theme::Light => rgb(255, 255, 255),
     }
 }
@@ -369,7 +377,7 @@ pub fn brand_fg() -> Color {
 pub fn brand_bg() -> Color {
     match Theme::current() {
         Theme::Dark => rgb(55, 38, 120),
-        Theme::Light => rgb(70, 50, 150),  // 更深的紫色，确保白色文字可见
+        Theme::Light => rgb(70, 50, 150), // 更深的紫色，确保白色文字可见
     }
 }
 

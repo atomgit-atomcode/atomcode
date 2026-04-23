@@ -62,11 +62,13 @@ pub fn detect_file_path(input: &str, working_dir: &Path) -> Option<AttachedFile>
         return None;
     }
 
-    let filename = resolved.file_name()
+    let filename = resolved
+        .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "file".to_string());
 
-    let ext = resolved.extension()
+    let ext = resolved
+        .extension()
         .map(|e| e.to_string_lossy().to_lowercase())
         .unwrap_or_default();
 
@@ -98,13 +100,16 @@ pub fn detect_file_path(input: &str, working_dir: &Path) -> Option<AttachedFile>
         "xml" => "XML",
         "txt" | "log" => "Text",
         "" => "File",
-        other => return Some(AttachedFile {
-            path: resolved.to_string_lossy().to_string(),
-            filename,
-            file_type: other.to_uppercase(),
-            size_bytes: size,
-        }),
-    }.to_string();
+        other => {
+            return Some(AttachedFile {
+                path: resolved.to_string_lossy().to_string(),
+                filename,
+                file_type: other.to_uppercase(),
+                size_bytes: size,
+            })
+        }
+    }
+    .to_string();
 
     Some(AttachedFile {
         path: resolved.to_string_lossy().to_string(),
@@ -228,56 +233,65 @@ pub fn extract_file(path: &Path, working_dir: &Path) -> Result<FileContent, Stri
         return Err(format!("File not found: {}", resolved.display()));
     }
 
-    let metadata = std::fs::metadata(&resolved)
-        .map_err(|e| format!("Cannot read file: {}", e))?;
+    let metadata = std::fs::metadata(&resolved).map_err(|e| format!("Cannot read file: {}", e))?;
 
     if metadata.is_dir() {
         return Err(format!("{} is a directory, not a file", resolved.display()));
     }
 
     let size = metadata.len();
-    let filename = resolved.file_name()
+    let filename = resolved
+        .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "unknown".to_string());
 
-    let ext = resolved.extension()
+    let ext = resolved
+        .extension()
         .map(|e| e.to_string_lossy().to_lowercase())
         .unwrap_or_default();
 
     let (file_type, content) = match ext.as_str() {
         // Text files — read directly
-        "txt" | "md" | "rs" | "py" | "js" | "ts" | "tsx" | "jsx"
-        | "go" | "java" | "c" | "cpp" | "h" | "hpp" | "cs"
-        | "rb" | "php" | "swift" | "kt" | "scala"
-        | "html" | "css" | "scss" | "less" | "sass"
-        | "json" | "yaml" | "yml" | "toml" | "xml" | "csv"
-        | "sh" | "bash" | "zsh" | "fish"
-        | "sql" | "graphql" | "proto"
-        | "dockerfile" | "makefile" | "cmake"
-        | "gitignore" | "env" | "cfg" | "ini" | "conf"
-        | "vue" | "svelte" | "astro"
-        | "r" | "jl" | "lua" | "zig" | "nim" | "dart" | "ex" | "exs"
-        | "log" | "diff" | "patch" => {
+        "txt" | "md" | "rs" | "py" | "js" | "ts" | "tsx" | "jsx" | "go" | "java" | "c" | "cpp"
+        | "h" | "hpp" | "cs" | "rb" | "php" | "swift" | "kt" | "scala" | "html" | "css"
+        | "scss" | "less" | "sass" | "json" | "yaml" | "yml" | "toml" | "xml" | "csv" | "sh"
+        | "bash" | "zsh" | "fish" | "sql" | "graphql" | "proto" | "dockerfile" | "makefile"
+        | "cmake" | "gitignore" | "env" | "cfg" | "ini" | "conf" | "vue" | "svelte" | "astro"
+        | "r" | "jl" | "lua" | "zig" | "nim" | "dart" | "ex" | "exs" | "log" | "diff" | "patch" => {
             let text = read_text(&resolved)?;
             (format!("text ({})", ext), text)
         }
 
         // No extension — try as text
-        "" => {
-            match read_text(&resolved) {
-                Ok(text) => ("text".to_string(), text),
-                Err(_) => ("binary".to_string(), format!("[Binary file, {} bytes]", size)),
-            }
-        }
+        "" => match read_text(&resolved) {
+            Ok(text) => ("text".to_string(), text),
+            Err(_) => (
+                "binary".to_string(),
+                format!("[Binary file, {} bytes]", size),
+            ),
+        },
 
         // PDF — extract with pdftotext
         "pdf" => {
             let text = run_extractor("pdftotext", &[resolved.to_str().unwrap_or(""), "-"])
-                .or_else(|_| run_extractor("python3", &["-c", &format!(
+                .or_else(|_| {
+                    run_extractor(
+                        "python3",
+                        &[
+                            "-c",
+                            &format!(
                     "import subprocess; subprocess.run(['pdftotext', '{}', '-'], check=True)",
                     resolved.display()
-                )]))
-                .unwrap_or_else(|_| format!("[PDF file, {} bytes. Install pdftotext for text extraction]", size));
+                ),
+                        ],
+                    )
+                })
+                .unwrap_or_else(|_| {
+                    format!(
+                        "[PDF file, {} bytes. Install pdftotext for text extraction]",
+                        size
+                    )
+                });
             ("pdf".to_string(), text)
         }
 
@@ -330,20 +344,25 @@ pub fn extract_file(path: &Path, working_dir: &Path) -> Result<FileContent, Stri
         }
 
         // Unknown — try as text, fallback to binary description
-        _ => {
-            match read_text(&resolved) {
-                Ok(text) => (format!("text ({})", ext), text),
-                Err(_) => (ext.clone(), format!("[Binary file .{}, {} bytes]", ext, size)),
-            }
-        }
+        _ => match read_text(&resolved) {
+            Ok(text) => (format!("text ({})", ext), text),
+            Err(_) => (
+                ext.clone(),
+                format!("[Binary file .{}, {} bytes]", ext, size),
+            ),
+        },
     };
 
     // Truncate very large content
     let max_chars = 50_000;
     let content = if content.chars().count() > max_chars {
         let truncated: String = content.chars().take(max_chars).collect();
-        format!("{}\n\n[... truncated, showing first {} chars of {} total]",
-            truncated, max_chars, content.chars().count())
+        format!(
+            "{}\n\n[... truncated, showing first {} chars of {} total]",
+            truncated,
+            max_chars,
+            content.chars().count()
+        )
     } else {
         content
     };
@@ -382,9 +401,8 @@ mod tests {
 
     #[test]
     fn quote_split_handles_windows_drag_drop_style() {
-        let tokens = split_respecting_quotes(
-            r#""C:\My Docs\a.txt" "C:\Users\x\b.log" C:\simple\c.rs"#
-        );
+        let tokens =
+            split_respecting_quotes(r#""C:\My Docs\a.txt" "C:\Users\x\b.log" C:\simple\c.rs"#);
         assert_eq!(tokens.len(), 3);
         assert_eq!(tokens[0], r"C:\My Docs\a.txt");
         assert_eq!(tokens[1], r"C:\Users\x\b.log");
@@ -423,7 +441,9 @@ mod tests {
         assert_eq!(attached.len(), 3);
         assert!(remainder.is_empty());
 
-        for p in &paths { let _ = fs::remove_file(p); }
+        for p in &paths {
+            let _ = fs::remove_file(p);
+        }
     }
 
     #[test]
@@ -457,7 +477,13 @@ mod tests {
 
         let pasted = format!("{}\n{}\n", p1.display(), p2.display());
         let (attached, remainder) = extract_file_paths(&pasted, &tmp);
-        assert_eq!(attached.len(), 2, "got {:?} remainder {:?}", attached, remainder);
+        assert_eq!(
+            attached.len(),
+            2,
+            "got {:?} remainder {:?}",
+            attached,
+            remainder
+        );
         assert!(remainder.is_empty());
 
         let _ = fs::remove_file(&p1);

@@ -16,8 +16,8 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use atomcode_core::agent::AgentCommand;
-use atomcode_core::config::Config;
 use atomcode_core::config::provider::ProviderConfig;
+use atomcode_core::config::Config;
 
 use super::{save_and_reload, LoopCtx};
 use crate::modals::{DirPicker, Modal, ModelPicker, ProviderWizard, SessionPicker};
@@ -155,9 +155,7 @@ pub(super) fn execute_slash_command(
         }
         "model" => {
             if ctx.config.providers.is_empty() {
-                renderer.render(UiLine::CommandOutput(
-                    "  No providers configured.\n".into(),
-                ));
+                renderer.render(UiLine::CommandOutput("  No providers configured.\n".into()));
                 renderer.flush();
             } else {
                 *active_modal = Some(Box::new(ModelPicker::open(&ctx.config)));
@@ -220,7 +218,9 @@ pub(super) fn execute_slash_command(
             renderer.flush();
         }
         "undo" => {
-            renderer.render(UiLine::CommandOutput("  Undo is not yet supported.\n".into()));
+            renderer.render(UiLine::CommandOutput(
+                "  Undo is not yet supported.\n".into(),
+            ));
             renderer.flush();
         }
         "cost" => {
@@ -236,9 +236,7 @@ pub(super) fn execute_slash_command(
         "logout" => {
             match atomcode_core::auth::logout() {
                 Ok(()) => {
-                    renderer.render(UiLine::CommandOutput(
-                        "  Signed out of AtomGit.\n".into(),
-                    ));
+                    renderer.render(UiLine::CommandOutput("  Signed out of AtomGit.\n".into()));
                 }
                 Err(e) => {
                     renderer.render(UiLine::Error(format!("logout failed: {}", e)));
@@ -285,9 +283,12 @@ pub(super) fn execute_slash_command(
                         );
                     }
                     Err(e) => {
-                        let _ = ctx.upgrade_tx.send(
-                            atomcode_core::self_update::UpgradeEvent::Failed(format!("{:#}", e)),
-                        );
+                        let _ =
+                            ctx.upgrade_tx
+                                .send(atomcode_core::self_update::UpgradeEvent::Failed(format!(
+                                    "{:#}",
+                                    e
+                                )));
                     }
                 }
             } else {
@@ -300,9 +301,7 @@ pub(super) fn execute_slash_command(
                     renderer.flush();
                     return Ok(());
                 }
-                renderer.render(UiLine::CommandOutput(
-                    "  正在检查更新...\n".into(),
-                ));
+                renderer.render(UiLine::CommandOutput("  正在检查更新...\n".into()));
                 renderer.flush();
                 let current = format!("v{}", env!("CARGO_PKG_VERSION"));
                 let tx = ctx.upgrade_tx.clone();
@@ -313,9 +312,10 @@ pub(super) fn execute_slash_command(
                     if let Err(e) =
                         atomcode_core::self_update::run_upgrade(current, force, tx.clone()).await
                     {
-                        let _ = tx.send(atomcode_core::self_update::UpgradeEvent::Failed(
-                            format!("{:#}", e),
-                        ));
+                        let _ = tx.send(atomcode_core::self_update::UpgradeEvent::Failed(format!(
+                            "{:#}",
+                            e
+                        )));
                     }
                 });
             }
@@ -571,8 +571,7 @@ mod tests {
     fn absolute_path_ignores_cwd() {
         let (_tmp, _cwd, sub) = make_dirs();
         let alt_cwd = PathBuf::from("/"); // unrelated cwd
-        let got = resolve_cd(sub.to_str().unwrap(), &alt_cwd, None)
-            .expect("absolute resolves");
+        let got = resolve_cd(sub.to_str().unwrap(), &alt_cwd, None).expect("absolute resolves");
         assert_eq!(got, sub);
     }
 
@@ -593,8 +592,7 @@ mod tests {
     #[test]
     fn nonexistent_path_errors() {
         let (_tmp, cwd, _sub) = make_dirs();
-        let err = resolve_cd("nope-does-not-exist", &cwd, None)
-            .expect_err("nonexistent errors");
+        let err = resolve_cd("nope-does-not-exist", &cwd, None).expect_err("nonexistent errors");
         assert!(err.contains("nope-does-not-exist"), "got: {}", err);
     }
 
@@ -603,8 +601,7 @@ mod tests {
         let (_tmp, cwd, _sub) = make_dirs();
         let file = cwd.join("a.txt");
         std::fs::write(&file, "hi").expect("write");
-        let err = resolve_cd(file.to_str().unwrap(), &cwd, None)
-            .expect_err("file is not a dir");
+        let err = resolve_cd(file.to_str().unwrap(), &cwd, None).expect_err("file is not a dir");
         assert!(err.contains("Not a directory"), "got: {}", err);
     }
 
@@ -630,7 +627,10 @@ mod tests {
         // the AtomGit gateway).
         let p = build_oauth_provider();
         assert_eq!(p.provider_type, "openai");
-        assert!(p.api_key.is_none(), "api_key must be None — loaded from auth.toml");
+        assert!(
+            p.api_key.is_none(),
+            "api_key must be None — loaded from auth.toml"
+        );
         assert_eq!(p.base_url.as_deref(), Some("https://api-ai.gitcode.com/v1"));
         assert!(p.context_window > 0);
     }

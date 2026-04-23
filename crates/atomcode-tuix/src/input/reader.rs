@@ -12,7 +12,13 @@ use super::InputEvent;
 /// itself. Modifier-carrying keys (Ctrl/Alt) and non-Press kinds are
 /// excluded — those are commands, not pasted content.
 fn paste_candidate_char(ev: &Event) -> Option<char> {
-    let Event::Key(KeyEvent { kind, code, modifiers, .. }) = ev else {
+    let Event::Key(KeyEvent {
+        kind,
+        code,
+        modifiers,
+        ..
+    }) = ev
+    else {
         return None;
     };
     if *kind != KeyEventKind::Press {
@@ -110,8 +116,7 @@ impl Drop for ReaderHandle {
 /// - `tx` is closed (send returns Err),
 /// - or a fatal crossterm read error fires.
 pub fn spawn(tx: mpsc::UnboundedSender<InputEvent>) -> ReaderHandle {
-    let (cmd_tx, cmd_rx) =
-        stdmpsc::channel::<(ReaderCommand, Option<stdmpsc::Sender<()>>)>();
+    let (cmd_tx, cmd_rx) = stdmpsc::channel::<(ReaderCommand, Option<stdmpsc::Sender<()>>)>();
     let join = std::thread::spawn(move || run(tx, cmd_rx));
     ReaderHandle {
         join: Some(join),
@@ -418,8 +423,11 @@ mod tests {
     #[test]
     fn classify_poll_ok_branches() {
         assert_eq!(classify_poll(Ok(true), false), PollAction::Read);
-        assert_eq!(classify_poll(Ok(true), true), PollAction::Read,
-            "Ok(true) always reads — caller will notice tx closed on send");
+        assert_eq!(
+            classify_poll(Ok(true), true),
+            PollAction::Read,
+            "Ok(true) always reads — caller will notice tx closed on send"
+        );
         assert_eq!(classify_poll(Ok(false), false), PollAction::Continue);
         assert_eq!(classify_poll(Ok(false), true), PollAction::Exit);
     }
@@ -442,7 +450,8 @@ mod tests {
             .expect("pause ACK");
 
         drop(cmd_tx); // Err on next recv → exit
-        worker.join().expect("paused worker joins after sender drop");
+        worker
+            .join()
+            .expect("paused worker joins after sender drop");
     }
 }
-

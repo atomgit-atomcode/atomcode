@@ -57,9 +57,11 @@ impl Tool for FindReferencesTool {
         let pattern = format!(r"\b{}\b", regex::escape(&parsed.symbol));
         let output = Command::new("rg")
             .args(&[
-                "--line-number", "--no-heading", "--color=never",
+                "--line-number",
+                "--no-heading",
+                "--color=never",
                 "--max-count=30",
-                "-w",  // word boundary
+                "-w", // word boundary
                 &pattern,
                 &search_dir,
             ])
@@ -80,7 +82,10 @@ impl Tool for FindReferencesTool {
         if rg_output.trim().is_empty() {
             return Ok(ToolResult {
                 call_id: String::new(),
-                output: format!("No references found for '{}' in {}", parsed.symbol, search_dir),
+                output: format!(
+                    "No references found for '{}' in {}",
+                    parsed.symbol, search_dir
+                ),
                 success: false,
             });
         }
@@ -93,7 +98,9 @@ impl Tool for FindReferencesTool {
         for line in rg_output.lines().take(30) {
             // Parse rg output: file:line:content
             let parts: Vec<&str> = line.splitn(3, ':').collect();
-            if parts.len() < 3 { continue; }
+            if parts.len() < 3 {
+                continue;
+            }
             let file = parts[0];
             let line_no: usize = parts[1].parse().unwrap_or(0);
             let content = parts[2].trim();
@@ -102,19 +109,28 @@ impl Tool for FindReferencesTool {
 
             // Try to determine if this is a definition or usage
             let is_def = if let Some(symbols) = searcher.list_symbols(file_path) {
-                symbols.iter().any(|s| s.name == parsed.symbol && s.start_line == line_no)
+                symbols
+                    .iter()
+                    .any(|s| s.name == parsed.symbol && s.start_line == line_no)
             } else {
                 // Heuristic: check if line contains definition keywords
                 let trimmed = content.trim();
-                trimmed.starts_with("fn ") || trimmed.starts_with("pub fn ")
-                    || trimmed.starts_with("def ") || trimmed.starts_with("class ")
-                    || trimmed.starts_with("function ") || trimmed.starts_with("func ")
-                    || trimmed.starts_with("struct ") || trimmed.starts_with("pub struct ")
-                    || trimmed.starts_with("type ") || trimmed.starts_with("interface ")
-                    || trimmed.contains("= function") || trimmed.contains("=> {")
+                trimmed.starts_with("fn ")
+                    || trimmed.starts_with("pub fn ")
+                    || trimmed.starts_with("def ")
+                    || trimmed.starts_with("class ")
+                    || trimmed.starts_with("function ")
+                    || trimmed.starts_with("func ")
+                    || trimmed.starts_with("struct ")
+                    || trimmed.starts_with("pub struct ")
+                    || trimmed.starts_with("type ")
+                    || trimmed.starts_with("interface ")
+                    || trimmed.contains("= function")
+                    || trimmed.contains("=> {")
             };
 
-            let short_file = file.strip_prefix(&search_dir)
+            let short_file = file
+                .strip_prefix(&search_dir)
                 .unwrap_or(file)
                 .trim_start_matches('/');
 

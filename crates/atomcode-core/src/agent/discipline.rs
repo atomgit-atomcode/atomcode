@@ -28,7 +28,8 @@ impl AgentLoop {
                  1. What EXACTLY needs to change?\n\
                  2. Which file, which lines?\n\
                  3. Edit NOW or tell the user you cannot do it.",
-                blocked_files.join(", "), task
+                blocked_files.join(", "),
+                task
             );
             self.conversation.add_user_message(&warning);
             // Reset counts so the model gets another chance after re-planning
@@ -57,7 +58,10 @@ impl AgentLoop {
     /// and suggest the model check them for the same bug pattern.
     #[allow(dead_code)]
     pub(crate) fn find_sibling_files_hint(&self) -> String {
-        let wd: PathBuf = self.turn_runner.context.working_dir
+        let wd: PathBuf = self
+            .turn_runner
+            .context
+            .working_dir
             .try_read()
             .map(|g| g.clone())
             .unwrap_or_default();
@@ -70,27 +74,41 @@ impl AgentLoop {
             // edited is like ".../views/SearchView.vue"
             // We need to find the directory and list siblings
             for msg in self.conversation.messages.iter().rev() {
-                if let crate::conversation::message::MessageContent::AssistantWithToolCalls { tool_calls, .. } = &msg.content {
+                if let crate::conversation::message::MessageContent::AssistantWithToolCalls {
+                    tool_calls,
+                    ..
+                } = &msg.content
+                {
                     for tc in tool_calls {
                         if tc.name == "edit_file" || tc.name == "create_file" {
-                            if let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
+                            if let Ok(args) =
+                                serde_json::from_str::<serde_json::Value>(&tc.arguments)
+                            {
                                 if let Some(fp) = args.get("file_path").and_then(|v| v.as_str()) {
                                     let path = std::path::Path::new(fp);
-                                    if let (Some(dir), Some(ext)) = (path.parent(), path.extension()) {
+                                    if let (Some(dir), Some(ext)) =
+                                        (path.parent(), path.extension())
+                                    {
                                         let dir_key = dir.to_string_lossy().to_string();
-                                        if seen_dirs.contains(&dir_key) { continue; }
+                                        if seen_dirs.contains(&dir_key) {
+                                            continue;
+                                        }
                                         seen_dirs.insert(dir_key);
 
                                         // List sibling files with same extension
                                         if let Ok(entries) = std::fs::read_dir(dir) {
                                             for entry in entries.flatten() {
-                                                let name = entry.file_name().to_string_lossy().to_string();
+                                                let name =
+                                                    entry.file_name().to_string_lossy().to_string();
                                                 let entry_path = entry.path();
                                                 if entry_path.extension() == Some(ext)
                                                     && entry_path != path
-                                                    && !self.files_edited_this_turn.iter().any(|e| name.contains(e) || e.contains(&name))
+                                                    && !self.files_edited_this_turn.iter().any(
+                                                        |e| name.contains(e) || e.contains(&name),
+                                                    )
                                                 {
-                                                    let rel = entry_path.strip_prefix(&wd)
+                                                    let rel = entry_path
+                                                        .strip_prefix(&wd)
                                                         .map(|p| p.to_string_lossy().to_string())
                                                         .unwrap_or_else(|_| name.clone());
                                                     siblings.push(rel);

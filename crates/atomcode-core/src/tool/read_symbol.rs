@@ -75,10 +75,15 @@ impl Tool for ReadSymbolTool {
                         let names: Vec<String> = symbols.iter().map(|s| s.name.clone()).collect();
                         format!(
                             "Symbol '{}' not found in {}.\nAvailable symbols: {}",
-                            parsed.symbol, parsed.file_path, names.join(", ")
+                            parsed.symbol,
+                            parsed.file_path,
+                            names.join(", ")
                         )
                     }
-                    None => format!("Symbol '{}' not found in {}", parsed.symbol, parsed.file_path),
+                    None => format!(
+                        "Symbol '{}' not found in {}",
+                        parsed.symbol, parsed.file_path
+                    ),
                 };
                 Ok(ToolResult {
                     call_id: String::new(),

@@ -28,8 +28,7 @@ use tokio::sync::mpsc;
 
 pub const MANIFEST_URL: &str =
     "https://raw.atomgit.com/atomgit_atomcode/atomcode/raw/main/latest.json";
-pub const DOWNLOAD_BASE: &str =
-    "https://atomgit.com/atomgit_atomcode/atomcode/releases/download";
+pub const DOWNLOAD_BASE: &str = "https://atomgit.com/atomgit_atomcode/atomcode/releases/download";
 
 /// Streamed progress events from the upgrade/rollback machinery.
 ///
@@ -38,17 +37,28 @@ pub const DOWNLOAD_BASE: &str =
 /// dropping the receiver must never block the upgrade.
 #[derive(Debug, Clone)]
 pub enum UpgradeEvent {
-    ManifestFetched { version: String },
-    Downloading { bytes: u64, total: u64 },
+    ManifestFetched {
+        version: String,
+    },
+    Downloading {
+        bytes: u64,
+        total: u64,
+    },
     Verifying,
     Replacing,
-    Done { version: String, backup: PathBuf },
+    Done {
+        version: String,
+        backup: PathBuf,
+    },
     /// Terminal failure. Carries the display-formatted error so the UI
     /// layer doesn't need `anyhow` to render it.
     Failed(String),
     /// Rollback finished. Reported through the same channel so the TUI
     /// can drive both flows with a single select arm.
-    RolledBack { exe: PathBuf, backup: PathBuf },
+    RolledBack {
+        exe: PathBuf,
+        backup: PathBuf,
+    },
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -568,17 +578,16 @@ pub fn read_pending() -> Result<Option<PendingUpgrade>> {
     if !path.exists() {
         return Ok(None);
     }
-    let body = std::fs::read_to_string(&path)
-        .with_context(|| format!("reading {}", path.display()))?;
-    let pending: PendingUpgrade = serde_json::from_str(&body)
-        .with_context(|| format!("parsing {}", path.display()))?;
+    let body =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let pending: PendingUpgrade =
+        serde_json::from_str(&body).with_context(|| format!("parsing {}", path.display()))?;
     Ok(Some(pending))
 }
 
 fn write_pending(pending: &PendingUpgrade) -> Result<()> {
     let dir = staged_dir();
-    std::fs::create_dir_all(&dir)
-        .with_context(|| format!("creating {}", dir.display()))?;
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let body = serde_json::to_string_pretty(pending).context("serializing pending.json")?;
     let path = pending_json_path();
     std::fs::write(&path, body).with_context(|| format!("writing {}", path.display()))
@@ -654,8 +663,7 @@ pub async fn prepare_deferred_upgrade(
     })?;
 
     let dir = staged_dir();
-    std::fs::create_dir_all(&dir)
-        .with_context(|| format!("creating {}", dir.display()))?;
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
 
     let staged_path = staged_binary_path(&manifest.version, target);
     let url = binary_url(&manifest.version, target);
@@ -856,10 +864,7 @@ pub fn run_rollback() -> Result<RollbackSummary> {
     if let Err(e) = std::fs::rename(&backup, &exe) {
         // Best-effort unwind of step 1.
         let _ = std::fs::rename(&rolling, &exe);
-        return Err(anyhow!(
-            "rollback failed at step 2 ({}); state restored",
-            e
-        ));
+        return Err(anyhow!("rollback failed at step 2 ({}); state restored", e));
     }
     // Step 3: rolling -> backup
     if let Err(e) = std::fs::rename(&rolling, &backup) {
@@ -919,7 +924,11 @@ mod tests {
         // We can't assert an exact value (depends on host), but every
         // supported dev platform should resolve to Some.
         let t = detect_target();
-        if cfg!(any(target_os = "macos", target_os = "linux", target_os = "windows")) {
+        if cfg!(any(
+            target_os = "macos",
+            target_os = "linux",
+            target_os = "windows"
+        )) {
             if cfg!(any(target_arch = "x86_64", target_arch = "aarch64")) {
                 assert!(t.is_some(), "expected target tag on this host");
             }
@@ -929,28 +938,22 @@ mod tests {
     #[test]
     fn backup_path_appends_bak() {
         let p = Path::new("/usr/local/bin/atomcode");
-        assert_eq!(
-            backup_path(p),
-            PathBuf::from("/usr/local/bin/atomcode.bak")
-        );
+        assert_eq!(backup_path(p), PathBuf::from("/usr/local/bin/atomcode.bak"));
     }
 
     #[test]
     fn backup_path_preserves_exe_suffix_on_windows_style() {
         let p = Path::new("C:/Tools/atomcode.exe");
-        assert_eq!(
-            backup_path(p),
-            PathBuf::from("C:/Tools/atomcode.exe.bak")
-        );
+        assert_eq!(backup_path(p), PathBuf::from("C:/Tools/atomcode.exe.bak"));
     }
 
     #[test]
     fn is_newer_semver() {
-        assert!(is_newer("v4.19.0", "v4.18.2"));  // latest, current
+        assert!(is_newer("v4.19.0", "v4.18.2")); // latest, current
         assert!(is_newer("v4.19.0", "v4.18.9"));
         assert!(is_newer("v5.0.0", "v4.99.99"));
         assert!(!is_newer("v4.19.0", "v4.19.0"));
-        assert!(!is_newer("v4.18.0", "v4.19.0"));  // latest is older than current
+        assert!(!is_newer("v4.18.0", "v4.19.0")); // latest is older than current
     }
 
     #[test]
@@ -1102,6 +1105,10 @@ mod tests {
     #[test]
     fn staged_binary_path_adds_exe_for_windows() {
         let p = staged_binary_path("v4.19.1", "windows-x64");
-        assert!(p.ends_with("atomcode-v4.19.1-windows-x64.exe"), "got: {:?}", p);
+        assert!(
+            p.ends_with("atomcode-v4.19.1-windows-x64.exe"),
+            "got: {:?}",
+            p
+        );
     }
 }

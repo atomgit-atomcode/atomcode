@@ -14,8 +14,8 @@ pub mod read;
 pub mod read_symbol;
 pub mod result_store;
 pub mod search_replace;
-pub mod trace_callers;
 pub mod trace_callees;
+pub mod trace_callers;
 pub mod trace_chain;
 pub mod use_skill;
 pub mod web_fetch;
@@ -27,11 +27,27 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 /// Directories to skip when scanning file trees (build artifacts, caches, VCS).
 /// Used by glob, list_dir, project_context, and collect_project_files.
 pub const SKIP_DIRS: &[&str] = &[
-    "node_modules", ".git", "target", "__pycache__", ".next",
-    "dist", "build", ".cache", "vendor", ".venv", "venv",
-    ".idea", ".vscode", ".DS_Store", ".env",
-    "datalog", "logs", "log", ".atomcode",
-    ".claude", "runs",
+    "node_modules",
+    ".git",
+    "target",
+    "__pycache__",
+    ".next",
+    "dist",
+    "build",
+    ".cache",
+    "vendor",
+    ".venv",
+    "venv",
+    ".idea",
+    ".vscode",
+    ".DS_Store",
+    ".env",
+    "datalog",
+    "logs",
+    "log",
+    ".atomcode",
+    ".claude",
+    "runs",
 ];
 
 /// Prefixes — any directory whose name starts with one of these is skipped.
@@ -41,8 +57,7 @@ pub const SKIP_DIR_PREFIXES: &[&str] = &[".venv-"];
 /// Check if a directory name should be skipped (exact match OR prefix match).
 /// Use this instead of `SKIP_DIRS.contains()` for complete coverage.
 pub fn should_skip_dir(name: &str) -> bool {
-    SKIP_DIRS.contains(&name)
-        || SKIP_DIR_PREFIXES.iter().any(|p| name.starts_with(p))
+    SKIP_DIRS.contains(&name) || SKIP_DIR_PREFIXES.iter().any(|p| name.starts_with(p))
 }
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -342,7 +357,10 @@ mod tests {
     #[test]
     fn test_permission_store_require_approval() {
         let store = PermissionStore::new();
-        let decision = store.check("bash", &ApprovalRequirement::RequireApproval("Destructive".into()));
+        let decision = store.check(
+            "bash",
+            &ApprovalRequirement::RequireApproval("Destructive".into()),
+        );
         assert!(matches!(decision, PermissionDecision::Ask(_)));
     }
 
@@ -353,7 +371,10 @@ mod tests {
         // its own destructive-command detection as a separate safety layer.
         let mut store = PermissionStore::new();
         store.grant_session("bash");
-        let decision = store.check("bash", &ApprovalRequirement::RequireApproval("Destructive".into()));
+        let decision = store.check(
+            "bash",
+            &ApprovalRequirement::RequireApproval("Destructive".into()),
+        );
         assert!(matches!(decision, PermissionDecision::Allow));
     }
 
@@ -380,7 +401,10 @@ mod tests {
         // Even AlwaysAllow override must NOT bypass RequireApproval.
         let mut store = PermissionStore::new();
         store.set_override("bash", PermissionLevel::AlwaysAllow);
-        let decision = store.check("bash", &ApprovalRequirement::RequireApproval("Destructive".into()));
+        let decision = store.check(
+            "bash",
+            &ApprovalRequirement::RequireApproval("Destructive".into()),
+        );
         assert!(matches!(decision, PermissionDecision::Ask(_)));
     }
 
@@ -419,7 +443,10 @@ mod tests {
         let mut store = PermissionStore::new();
         store.grant_session("bash");
         // Other tools are unaffected.
-        let decision = store.check("create_file", &ApprovalRequirement::RequireApproval("write".into()));
+        let decision = store.check(
+            "create_file",
+            &ApprovalRequirement::RequireApproval("write".into()),
+        );
         assert!(matches!(decision, PermissionDecision::Ask(_)));
     }
 }

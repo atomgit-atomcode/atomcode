@@ -204,7 +204,11 @@ pub trait PreToolExecutionHook: Hook {
 #[async_trait]
 pub trait PostToolExecutionHook: Hook {
     /// 接收工具执行结果
-    async fn on_post_execute(&self, ctx: &HookContext, result_ctx: &ToolResultContext) -> HookResult;
+    async fn on_post_execute(
+        &self,
+        ctx: &HookContext,
+        result_ctx: &ToolResultContext,
+    ) -> HookResult;
 }
 
 /// Turn 完成后钩子 - 在一轮对话结束后调用
@@ -444,11 +448,7 @@ impl HookRegistry {
     }
 
     /// 触发所有 post-tool hooks
-    pub async fn trigger_post_tool_hooks(
-        &self,
-        ctx: &HookContext,
-        result_ctx: &ToolResultContext,
-    ) {
+    pub async fn trigger_post_tool_hooks(&self, ctx: &HookContext, result_ctx: &ToolResultContext) {
         for hook in &self.post_tool_hooks {
             match hook.on_post_execute(ctx, result_ctx).await {
                 HookResult::Ok | HookResult::Warning(_) | HookResult::Modified(_) => {}
@@ -460,14 +460,13 @@ impl HookRegistry {
     }
 
     /// 触发所有 post-turn hooks
-    pub async fn trigger_post_turn_hooks(
-        &self,
-        ctx: &HookContext,
-        turn_result: &str,
-    ) {
+    pub async fn trigger_post_turn_hooks(&self, ctx: &HookContext, turn_result: &str) {
         for hook in &self.post_turn_hooks {
             match hook.on_post_turn(ctx, turn_result).await {
-                HookResult::Ok | HookResult::Warning(_) | HookResult::Denied(_) | HookResult::Modified(_) => {}
+                HookResult::Ok
+                | HookResult::Warning(_)
+                | HookResult::Denied(_)
+                | HookResult::Modified(_) => {}
             }
         }
     }
@@ -567,7 +566,10 @@ impl HookRegistry {
 
     /// 触发 on_tool_call_start hooks
     /// 返回 Err 表示应该阻止该工具调用
-    pub async fn trigger_on_tool_call_start(&self, ctx: &ToolCallStartContext) -> Result<(), String> {
+    pub async fn trigger_on_tool_call_start(
+        &self,
+        ctx: &ToolCallStartContext,
+    ) -> Result<(), String> {
         for hook in &self.on_tool_call_start_hooks {
             match hook.on_tool_call_start(ctx).await {
                 HookResult::Ok | HookResult::Warning(_) | HookResult::Modified(_) => {}
@@ -583,7 +585,10 @@ impl HookRegistry {
     pub async fn trigger_on_turn_complete(&self, ctx: &TurnCompleteContext) {
         for hook in &self.on_turn_complete_hooks {
             match hook.on_turn_complete(ctx).await {
-                HookResult::Ok | HookResult::Warning(_) | HookResult::Denied(_) | HookResult::Modified(_) => {}
+                HookResult::Ok
+                | HookResult::Warning(_)
+                | HookResult::Denied(_)
+                | HookResult::Modified(_) => {}
             }
         }
     }
@@ -592,7 +597,10 @@ impl HookRegistry {
     pub async fn trigger_on_session_start(&self, ctx: &SessionContext) {
         for hook in &self.on_session_start_hooks {
             match hook.on_session_start(ctx).await {
-                HookResult::Ok | HookResult::Warning(_) | HookResult::Denied(_) | HookResult::Modified(_) => {}
+                HookResult::Ok
+                | HookResult::Warning(_)
+                | HookResult::Denied(_)
+                | HookResult::Modified(_) => {}
             }
         }
     }
@@ -601,7 +609,10 @@ impl HookRegistry {
     pub async fn trigger_on_session_end(&self, ctx: &SessionContext) {
         for hook in &self.on_session_end_hooks {
             match hook.on_session_end(ctx).await {
-                HookResult::Ok | HookResult::Warning(_) | HookResult::Denied(_) | HookResult::Modified(_) => {}
+                HookResult::Ok
+                | HookResult::Warning(_)
+                | HookResult::Denied(_)
+                | HookResult::Modified(_) => {}
             }
         }
     }
@@ -610,7 +621,10 @@ impl HookRegistry {
     pub async fn trigger_on_error(&self, ctx: &ErrorContext) {
         for hook in &self.on_error_hooks {
             match hook.on_error(ctx).await {
-                HookResult::Ok | HookResult::Warning(_) | HookResult::Denied(_) | HookResult::Modified(_) => {}
+                HookResult::Ok
+                | HookResult::Warning(_)
+                | HookResult::Denied(_)
+                | HookResult::Modified(_) => {}
             }
         }
     }
@@ -619,7 +633,10 @@ impl HookRegistry {
     pub async fn trigger_on_model_response(&self, response: &str, turn_ctx: &TurnStartContext) {
         for hook in &self.on_model_response_hooks {
             match hook.on_model_response(response, turn_ctx).await {
-                HookResult::Ok | HookResult::Warning(_) | HookResult::Denied(_) | HookResult::Modified(_) => {}
+                HookResult::Ok
+                | HookResult::Warning(_)
+                | HookResult::Denied(_)
+                | HookResult::Modified(_) => {}
             }
         }
     }

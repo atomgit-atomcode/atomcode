@@ -1,12 +1,12 @@
 //! Tests for TurnRunner, discipline logic, and approval flow.
 
-use std::collections::HashMap;
-use std::path::PathBuf;
-use std::pin::Pin;
 use anyhow::Result;
 use async_trait::async_trait;
 use futures::stream;
 use futures::Stream;
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::pin::Pin;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -182,7 +182,11 @@ fn test_context() -> ToolContext {
     ToolContext::new(PathBuf::from("/tmp/test"))
 }
 
-fn make_runner(provider: MockProvider, tools: ToolRegistry, permission: Box<dyn super::permission::PermissionDecider>) -> TurnRunner {
+fn make_runner(
+    provider: MockProvider,
+    tools: ToolRegistry,
+    permission: Box<dyn super::permission::PermissionDecider>,
+) -> TurnRunner {
     TurnRunner {
         provider: std::sync::Arc::new(provider),
         tools: std::sync::Arc::new(tools),
@@ -210,12 +214,18 @@ fn auto_deny() -> Box<dyn super::permission::PermissionDecider> {
 
 #[tokio::test]
 async fn test_turn_runner_text_only_response() {
-    let mut runner = make_runner(MockProvider::text_only("Hello, world!"), ToolRegistry::new(), auto_bypass());
+    let mut runner = make_runner(
+        MockProvider::text_only("Hello, world!"),
+        ToolRegistry::new(),
+        auto_bypass(),
+    );
     let mut conv = Conversation::new();
     conv.add_user_message("Hi");
     let (tx, _rx) = mpsc::unbounded_channel();
 
-    let result = runner.run(&mut conv, "system", &tx, CancellationToken::new()).await;
+    let result = runner
+        .run(&mut conv, "system", &tx, CancellationToken::new())
+        .await;
 
     match result {
         TurnResult::Responded { text, tokens, .. } => {
@@ -228,12 +238,18 @@ async fn test_turn_runner_text_only_response() {
 
 #[tokio::test]
 async fn test_turn_runner_emits_text_delta_events() {
-    let mut runner = make_runner(MockProvider::text_only("Hello"), ToolRegistry::new(), auto_bypass());
+    let mut runner = make_runner(
+        MockProvider::text_only("Hello"),
+        ToolRegistry::new(),
+        auto_bypass(),
+    );
     let mut conv = Conversation::new();
     conv.add_user_message("Hi");
     let (tx, mut rx) = mpsc::unbounded_channel();
 
-    runner.run(&mut conv, "system", &tx, CancellationToken::new()).await;
+    runner
+        .run(&mut conv, "system", &tx, CancellationToken::new())
+        .await;
 
     // Collect events
     drop(tx);
@@ -257,7 +273,9 @@ async fn test_turn_runner_executes_tool_call() {
     conv.add_user_message("search for foo");
     let (tx, _rx) = mpsc::unbounded_channel();
 
-    let result = runner.run(&mut conv, "system", &tx, CancellationToken::new()).await;
+    let result = runner
+        .run(&mut conv, "system", &tx, CancellationToken::new())
+        .await;
 
     match result {
         TurnResult::UsedTools { tool_count, .. } => {
@@ -285,7 +303,9 @@ async fn test_turn_runner_emits_tool_events() {
     conv.add_user_message("search");
     let (tx, mut rx) = mpsc::unbounded_channel();
 
-    runner.run(&mut conv, "system", &tx, CancellationToken::new()).await;
+    runner
+        .run(&mut conv, "system", &tx, CancellationToken::new())
+        .await;
 
     drop(tx);
     let mut got_started = false;
@@ -313,7 +333,9 @@ async fn test_turn_runner_unknown_tool_returns_error_result() {
     conv.add_user_message("do something");
     let (tx, _rx) = mpsc::unbounded_channel();
 
-    let result = runner.run(&mut conv, "system", &tx, CancellationToken::new()).await;
+    let result = runner
+        .run(&mut conv, "system", &tx, CancellationToken::new())
+        .await;
 
     match result {
         TurnResult::UsedTools { tool_count, .. } => {
@@ -339,7 +361,9 @@ async fn test_turn_runner_handles_stream_error() {
     conv.add_user_message("Hi");
     let (tx, _rx) = mpsc::unbounded_channel();
 
-    let result = runner.run(&mut conv, "system", &tx, CancellationToken::new()).await;
+    let result = runner
+        .run(&mut conv, "system", &tx, CancellationToken::new())
+        .await;
 
     match result {
         TurnResult::Failed(e) => {
@@ -380,7 +404,9 @@ async fn test_turn_runner_auto_deny_blocks_dangerous_tool() {
     conv.add_user_message("do dangerous thing");
     let (tx, _rx) = mpsc::unbounded_channel();
 
-    let result = runner.run(&mut conv, "system", &tx, CancellationToken::new()).await;
+    let result = runner
+        .run(&mut conv, "system", &tx, CancellationToken::new())
+        .await;
 
     // Tool should be denied, but turn still returns UsedTools (with denied result)
     match result {
@@ -408,7 +434,9 @@ async fn test_turn_runner_auto_bypass_allows_dangerous_tool() {
     conv.add_user_message("do dangerous thing");
     let (tx, _rx) = mpsc::unbounded_channel();
 
-    let result = runner.run(&mut conv, "system", &tx, CancellationToken::new()).await;
+    let result = runner
+        .run(&mut conv, "system", &tx, CancellationToken::new())
+        .await;
 
     match result {
         TurnResult::UsedTools { .. } => {
@@ -447,7 +475,9 @@ async fn test_turn_runner_interactive_approval_allow() {
         }
     });
 
-    let result = runner.run(&mut conv, "system", &tx, CancellationToken::new()).await;
+    let result = runner
+        .run(&mut conv, "system", &tx, CancellationToken::new())
+        .await;
 
     match result {
         TurnResult::UsedTools { .. } => {
@@ -485,7 +515,9 @@ async fn test_turn_runner_interactive_approval_deny() {
         }
     });
 
-    let result = runner.run(&mut conv, "system", &tx, CancellationToken::new()).await;
+    let result = runner
+        .run(&mut conv, "system", &tx, CancellationToken::new())
+        .await;
 
     match result {
         TurnResult::UsedTools { .. } => {
@@ -600,12 +632,18 @@ fn should_inject_reminder(tool_call_count: usize) -> bool {
 
 #[tokio::test]
 async fn test_turn_runner_reports_token_usage() {
-    let mut runner = make_runner(MockProvider::text_only("Hello"), ToolRegistry::new(), auto_bypass());
+    let mut runner = make_runner(
+        MockProvider::text_only("Hello"),
+        ToolRegistry::new(),
+        auto_bypass(),
+    );
     let mut conv = Conversation::new();
     conv.add_user_message("Hi");
     let (tx, mut rx) = mpsc::unbounded_channel();
 
-    runner.run(&mut conv, "system", &tx, CancellationToken::new()).await;
+    runner
+        .run(&mut conv, "system", &tx, CancellationToken::new())
+        .await;
 
     drop(tx);
     let mut got_usage = false;
@@ -624,18 +662,27 @@ async fn test_turn_runner_reports_token_usage() {
 
 #[tokio::test]
 async fn test_turn_runner_adds_assistant_message_on_text_response() {
-    let mut runner = make_runner(MockProvider::text_only("Hello!"), ToolRegistry::new(), auto_bypass());
+    let mut runner = make_runner(
+        MockProvider::text_only("Hello!"),
+        ToolRegistry::new(),
+        auto_bypass(),
+    );
     let mut conv = Conversation::new();
     conv.add_user_message("Hi");
     let (tx, _rx) = mpsc::unbounded_channel();
     let msg_count_before = conv.messages.len();
 
-    runner.run(&mut conv, "system", &tx, CancellationToken::new()).await;
+    runner
+        .run(&mut conv, "system", &tx, CancellationToken::new())
+        .await;
 
     // Should have added an assistant text message
     assert_eq!(conv.messages.len(), msg_count_before + 1);
     let last = conv.messages.last().unwrap();
-    assert!(matches!(last.role, crate::conversation::message::Role::Assistant));
+    assert!(matches!(
+        last.role,
+        crate::conversation::message::Role::Assistant
+    ));
     assert_eq!(last.text(), Some("Hello!"));
 }
 
@@ -651,7 +698,9 @@ async fn test_turn_runner_adds_tool_call_and_result_messages() {
     let (tx, _rx) = mpsc::unbounded_channel();
     let msg_count_before = conv.messages.len();
 
-    runner.run(&mut conv, "system", &tx, CancellationToken::new()).await;
+    runner
+        .run(&mut conv, "system", &tx, CancellationToken::new())
+        .await;
 
     // Should have: AssistantWithToolCalls + ToolResult = 2 new messages
     assert_eq!(conv.messages.len(), msg_count_before + 2);
@@ -683,7 +732,9 @@ async fn test_tool_result_content_in_llm_context() {
     conv.add_user_message("search for foo");
     let (tx, _rx) = mpsc::unbounded_channel();
 
-    runner.run(&mut conv, "system prompt", &tx, CancellationToken::new()).await;
+    runner
+        .run(&mut conv, "system prompt", &tx, CancellationToken::new())
+        .await;
 
     // Build provider messages as TurnRunner would for the next LLM call.
     let provider_msgs = conv.to_provider_messages("system prompt");
@@ -692,29 +743,52 @@ async fn test_tool_result_content_in_llm_context() {
     assert_eq!(provider_msgs.len(), 4);
 
     // 1. System prompt
-    assert!(matches!(provider_msgs[0].role, crate::conversation::message::Role::System));
+    assert!(matches!(
+        provider_msgs[0].role,
+        crate::conversation::message::Role::System
+    ));
     assert_eq!(provider_msgs[0].text(), Some("system prompt"));
 
     // 2. User message preserved
-    assert!(matches!(provider_msgs[1].role, crate::conversation::message::Role::User));
+    assert!(matches!(
+        provider_msgs[1].role,
+        crate::conversation::message::Role::User
+    ));
     assert_eq!(provider_msgs[1].text(), Some("search for foo"));
 
     // 3. Assistant message with tool call — call_id and arguments preserved
-    if let crate::conversation::message::MessageContent::AssistantWithToolCalls { text: _, ref tool_calls } = provider_msgs[2].content {
+    if let crate::conversation::message::MessageContent::AssistantWithToolCalls {
+        text: _,
+        ref tool_calls,
+    } = provider_msgs[2].content
+    {
         assert_eq!(tool_calls.len(), 1);
         assert_eq!(tool_calls[0].name, "grep");
         assert_eq!(tool_calls[0].arguments, r#"{"pattern":"foo"}"#);
         assert_eq!(tool_calls[0].id, "call_1");
     } else {
-        panic!("Expected AssistantWithToolCalls, got {:?}", provider_msgs[2].content);
+        panic!(
+            "Expected AssistantWithToolCalls, got {:?}",
+            provider_msgs[2].content
+        );
     }
 
     // 4. Tool result — call_id matches, output contains actual tool execution result
-    if let crate::conversation::message::MessageContent::ToolResult(ref result) = provider_msgs[3].content {
+    if let crate::conversation::message::MessageContent::ToolResult(ref result) =
+        provider_msgs[3].content
+    {
         assert_eq!(result.call_id, "call_1", "call_id must match the tool call");
         assert!(result.success);
-        assert!(result.output.contains("executed grep"), "Tool output missing: {}", result.output);
-        assert!(result.output.contains(r#"{"pattern":"foo"}"#), "Args missing from output: {}", result.output);
+        assert!(
+            result.output.contains("executed grep"),
+            "Tool output missing: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains(r#"{"pattern":"foo"}"#),
+            "Args missing from output: {}",
+            result.output
+        );
     } else {
         panic!("Expected ToolResult, got {:?}", provider_msgs[3].content);
     }
@@ -731,13 +805,31 @@ async fn test_multiple_tool_calls_results_in_context() {
     // Provider returns two tool calls in sequence
     let provider = MockProvider {
         events: vec![
-            StreamEvent::ToolCallStart { id: "c1".into(), name: "grep".into() },
+            StreamEvent::ToolCallStart {
+                id: "c1".into(),
+                name: "grep".into(),
+            },
             StreamEvent::ToolCallDelta(r#"{"pattern":"foo"}"#.into()),
-            StreamEvent::ToolCallDone(ToolCall { id: "c1".into(), name: "grep".into(), arguments: r#"{"pattern":"foo"}"#.into() }),
-            StreamEvent::ToolCallStart { id: "c2".into(), name: "read_file".into() },
+            StreamEvent::ToolCallDone(ToolCall {
+                id: "c1".into(),
+                name: "grep".into(),
+                arguments: r#"{"pattern":"foo"}"#.into(),
+            }),
+            StreamEvent::ToolCallStart {
+                id: "c2".into(),
+                name: "read_file".into(),
+            },
             StreamEvent::ToolCallDelta(r#"{"file_path":"/tmp/x"}"#.into()),
-            StreamEvent::ToolCallDone(ToolCall { id: "c2".into(), name: "read_file".into(), arguments: r#"{"file_path":"/tmp/x"}"#.into() }),
-            StreamEvent::Usage(TokenUsage { prompt_tokens: 20, completion_tokens: 10, cached_tokens: 0 }),
+            StreamEvent::ToolCallDone(ToolCall {
+                id: "c2".into(),
+                name: "read_file".into(),
+                arguments: r#"{"file_path":"/tmp/x"}"#.into(),
+            }),
+            StreamEvent::Usage(TokenUsage {
+                prompt_tokens: 20,
+                completion_tokens: 10,
+                cached_tokens: 0,
+            }),
             StreamEvent::Done { truncated: false },
         ],
     };
@@ -747,7 +839,9 @@ async fn test_multiple_tool_calls_results_in_context() {
     conv.add_user_message("search and read");
     let (tx, _rx) = mpsc::unbounded_channel();
 
-    let result = runner.run(&mut conv, "sys", &tx, CancellationToken::new()).await;
+    let result = runner
+        .run(&mut conv, "sys", &tx, CancellationToken::new())
+        .await;
 
     // Should report 2 tool calls
     match result {
@@ -761,7 +855,11 @@ async fn test_multiple_tool_calls_results_in_context() {
     assert_eq!(msgs.len(), 5);
 
     // Verify AssistantWithToolCalls has both calls
-    if let crate::conversation::message::MessageContent::AssistantWithToolCalls { ref tool_calls, .. } = msgs[2].content {
+    if let crate::conversation::message::MessageContent::AssistantWithToolCalls {
+        ref tool_calls,
+        ..
+    } = msgs[2].content
+    {
         assert_eq!(tool_calls.len(), 2);
         assert_eq!(tool_calls[0].id, "c1");
         assert_eq!(tool_calls[0].name, "grep");
@@ -800,7 +898,9 @@ async fn test_denied_tool_result_in_llm_context() {
     conv.add_user_message("do it");
     let (tx, _rx) = mpsc::unbounded_channel();
 
-    runner.run(&mut conv, "sys", &tx, CancellationToken::new()).await;
+    runner
+        .run(&mut conv, "sys", &tx, CancellationToken::new())
+        .await;
 
     let msgs = conv.to_provider_messages("sys");
     // [System, User, AssistantWithToolCalls, ToolResult(denied)]
@@ -809,7 +909,11 @@ async fn test_denied_tool_result_in_llm_context() {
     if let crate::conversation::message::MessageContent::ToolResult(ref r) = msgs[3].content {
         assert_eq!(r.call_id, "call_1");
         assert!(!r.success, "Denied tool should have success=false");
-        assert!(r.output.contains("denied"), "Should indicate denial: {}", r.output);
+        assert!(
+            r.output.contains("denied"),
+            "Should indicate denial: {}",
+            r.output
+        );
     } else {
         panic!("Expected ToolResult for denied call");
     }
@@ -823,19 +927,35 @@ async fn test_denied_tool_result_in_llm_context() {
 /// not into the conversation history.
 #[tokio::test]
 async fn test_turn_reminder_injected_into_last_user_message() {
-    let mut runner = make_runner(MockProvider::text_only("ok"), ToolRegistry::new(), auto_bypass());
+    let mut runner = make_runner(
+        MockProvider::text_only("ok"),
+        ToolRegistry::new(),
+        auto_bypass(),
+    );
     let mut conv = Conversation::new();
     conv.add_user_message("fix the bug");
     let (tx, _rx) = mpsc::unbounded_channel();
 
     let reminder = "<system-reminder>\nCurrent task: fix the bug\n</system-reminder>";
-    runner.run_with_filter(&mut conv, "system", reminder, &tx, CancellationToken::new(), None).await;
+    runner
+        .run_with_filter(
+            &mut conv,
+            "system",
+            reminder,
+            &tx,
+            CancellationToken::new(),
+            None,
+        )
+        .await;
 
     // Conversation history should NOT contain the reminder
     for msg in &conv.messages {
         if let crate::conversation::message::MessageContent::Text(ref text) = msg.content {
-            assert!(!text.contains("system-reminder"),
-                "Turn reminder leaked into conversation history: {}", text);
+            assert!(
+                !text.contains("system-reminder"),
+                "Turn reminder leaked into conversation history: {}",
+                text
+            );
         }
     }
 }
@@ -843,13 +963,19 @@ async fn test_turn_reminder_injected_into_last_user_message() {
 /// Empty turn reminder should not modify messages.
 #[tokio::test]
 async fn test_empty_turn_reminder_is_noop() {
-    let mut runner = make_runner(MockProvider::text_only("ok"), ToolRegistry::new(), auto_bypass());
+    let mut runner = make_runner(
+        MockProvider::text_only("ok"),
+        ToolRegistry::new(),
+        auto_bypass(),
+    );
     let mut conv = Conversation::new();
     conv.add_user_message("hello");
     let (tx, _rx) = mpsc::unbounded_channel();
 
     // Empty reminder — should work exactly like run()
-    runner.run_with_filter(&mut conv, "system", "", &tx, CancellationToken::new(), None).await;
+    runner
+        .run_with_filter(&mut conv, "system", "", &tx, CancellationToken::new(), None)
+        .await;
 
     // Should have completed normally
     assert!(conv.messages.len() >= 2); // user + assistant
@@ -870,7 +996,10 @@ fn test_tool_registry_stable_order() {
     let names: Vec<&str> = defs.iter().map(|d| d.name).collect();
 
     // BTreeMap should give alphabetical order regardless of insertion order
-    assert_eq!(names, vec!["bash", "edit_file", "grep", "read_file", "write_file"]);
+    assert_eq!(
+        names,
+        vec!["bash", "edit_file", "grep", "read_file", "write_file"]
+    );
 
     // Call again — order must be identical
     let defs2 = registry.get_definitions();
@@ -885,16 +1014,36 @@ fn test_rules_no_tool_descriptions() {
     let rules = crate::config::prompt_sections::build_rules();
 
     // Should NOT contain tool usage descriptions (removed for token savings)
-    assert!(!rules.contains("Search code: grep"), "Rules should not describe grep usage");
-    assert!(!rules.contains("Find files: glob"), "Rules should not describe glob usage");
-    assert!(!rules.contains("Read code: read_file"), "Rules should not describe read_file usage");
-    assert!(!rules.contains("Edit files: edit_file"), "Rules should not describe edit_file usage");
-    assert!(!rules.contains("Create files: write_file"), "Rules should not describe write_file usage");
-    assert!(!rules.contains("Run commands: bash"), "Rules should not describe bash usage");
+    assert!(
+        !rules.contains("Search code: grep"),
+        "Rules should not describe grep usage"
+    );
+    assert!(
+        !rules.contains("Find files: glob"),
+        "Rules should not describe glob usage"
+    );
+    assert!(
+        !rules.contains("Read code: read_file"),
+        "Rules should not describe read_file usage"
+    );
+    assert!(
+        !rules.contains("Edit files: edit_file"),
+        "Rules should not describe edit_file usage"
+    );
+    assert!(
+        !rules.contains("Create files: write_file"),
+        "Rules should not describe write_file usage"
+    );
+    assert!(
+        !rules.contains("Run commands: bash"),
+        "Rules should not describe bash usage"
+    );
 
     // SHOULD still contain tool discipline rules
-    assert!(rules.contains("Call multiple tools in ONE turn"),
-        "Rules must contain batch tool call discipline");
+    assert!(
+        rules.contains("Call multiple tools in ONE turn"),
+        "Rules must contain batch tool call discipline"
+    );
 }
 
 /// System prompt should not contain dynamic content (date, git status, etc.)
@@ -904,6 +1053,12 @@ fn test_rules_no_dynamic_content() {
     let rules = crate::config::prompt_sections::build_rules();
 
     assert!(!rules.contains("Date:"), "Rules should not contain date");
-    assert!(!rules.contains("Git:"), "Rules should not contain git status");
-    assert!(!rules.contains("Recent activity"), "Rules should not contain recent activity");
+    assert!(
+        !rules.contains("Git:"),
+        "Rules should not contain git status"
+    );
+    assert!(
+        !rules.contains("Recent activity"),
+        "Rules should not contain recent activity"
+    );
 }

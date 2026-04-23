@@ -13,9 +13,7 @@ use atomcode_core::session::{Session, SessionMeta};
 use crossterm::event::{KeyCode, KeyModifiers};
 
 use super::{Modal, ModalAction};
-use crate::event_loop::{
-    build_status, format_tool_detail, summarise, Buffer, LoopCtx,
-};
+use crate::event_loop::{build_status, format_tool_detail, summarise, Buffer, LoopCtx};
 use crate::render::{MenuPayload, Renderer, UiLine};
 use crate::state::UiState;
 
@@ -134,13 +132,7 @@ impl Modal for SessionPicker {
         }
     }
 
-    fn draw(
-        &self,
-        buf: &Buffer,
-        state: &UiState,
-        ctx: &LoopCtx,
-        renderer: &mut dyn Renderer,
-    ) {
+    fn draw(&self, buf: &Buffer, state: &UiState, ctx: &LoopCtx, renderer: &mut dyn Renderer) {
         let payload = build_menu_payload(self);
         renderer.render(UiLine::InputPrompt {
             buf: buf.text.clone(),
@@ -295,8 +287,7 @@ mod tests {
 
     #[test]
     fn update_filter_resets_selection_to_zero() {
-        let mut p =
-            SessionPicker::open(vec![meta("one", 1), meta("two", 1), meta("three", 1)]);
+        let mut p = SessionPicker::open(vec![meta("one", 1), meta("two", 1), meta("three", 1)]);
         p.selected = 2;
         p.query = "on".to_string();
         p.update_filter();

@@ -14,7 +14,11 @@ pub enum TurnEvent {
     ToolCallStreaming { name: String, hint: String },
     /// Tool call fully assembled, about to execute.
     /// `id` is the provider-supplied call id — pairs with the matching `ToolCallResult.call_id`.
-    ToolCallStarted { id: String, name: String, arguments: String },
+    ToolCallStarted {
+        id: String,
+        name: String,
+        arguments: String,
+    },
     /// Tool call completed.
     /// `call_id` must equal the `id` emitted with the corresponding `ToolCallStarted`.
     ToolCallResult {
@@ -52,9 +56,17 @@ pub enum TurnEvent {
 pub enum TurnResult {
     /// LLM produced text only, no tool calls.
     /// `truncated` = true means finish_reason was "length" (model hit max_tokens).
-    Responded { text: String, tokens: usize, truncated: bool },
+    Responded {
+        text: String,
+        tokens: usize,
+        truncated: bool,
+    },
     /// LLM called tools, results added to conversation — ready for next turn
-    UsedTools { text: Option<String>, tool_count: usize, tokens: usize },
+    UsedTools {
+        text: Option<String>,
+        tool_count: usize,
+        tokens: usize,
+    },
     /// Unrecoverable error
     Failed(String),
     /// Cancelled by caller

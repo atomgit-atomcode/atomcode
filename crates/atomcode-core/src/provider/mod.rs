@@ -116,14 +116,12 @@ fn load_auth_token() -> Result<String> {
 /// Exchange refresh_token for a new access_token, save updated auth.toml.
 fn refresh_and_save(refresh_token: &str, auth_path: &std::path::Path) -> Result<String> {
     let client = reqwest::blocking::Client::new();
-    let builder = client
-        .post(OAUTH_TOKEN_URL)
-        .form(&[
-            ("client_id", OAUTH_CLIENT_ID),
-            ("client_secret", OAUTH_CLIENT_SECRET),
-            ("refresh_token", refresh_token),
-            ("grant_type", "refresh_token"),
-        ]);
+    let builder = client.post(OAUTH_TOKEN_URL).form(&[
+        ("client_id", OAUTH_CLIENT_ID),
+        ("client_secret", OAUTH_CLIENT_SECRET),
+        ("refresh_token", refresh_token),
+        ("grant_type", "refresh_token"),
+    ]);
     let policy = crate::provider::retry::RetryPolicy::default_policy();
     let resp = crate::provider::retry::send_with_retry_blocking(builder, &policy)
         .map_err(|e| anyhow::anyhow!("Token refresh failed: {} — please /login", e))?;
@@ -132,10 +130,12 @@ fn refresh_and_save(refresh_token: &str, auth_path: &std::path::Path) -> Result<
         anyhow::bail!("Token refresh failed ({}) — please /login", resp.status());
     }
 
-    let token: RefreshResponse = resp.json()
+    let token: RefreshResponse = resp
+        .json()
         .map_err(|e| anyhow::anyhow!("Token refresh parse error: {} — please /login", e))?;
 
-    let access_token = token.access_token
+    let access_token = token
+        .access_token
         .ok_or_else(|| anyhow::anyhow!("Refresh response missing access_token — please /login"))?;
 
     // Save updated auth.toml
@@ -170,13 +170,17 @@ mod tests {
             .join(".atomcode")
             .join("auth.toml");
 
-        assert_eq!(auth_module_path, expected_path,
-            "auth_file_path() should always return ~/.atomcode/auth.toml");
+        assert_eq!(
+            auth_module_path, expected_path,
+            "auth_file_path() should always return ~/.atomcode/auth.toml"
+        );
 
         // Verify the path ends with the expected directory structure
-        assert!(auth_module_path.ends_with(".atomcode/auth.toml") ||
-                auth_module_path.ends_with(".atomcode\\auth.toml"), // Windows compatibility
-                "Path should end with .atomcode/auth.toml, got: {}",
-                auth_module_path.display());
+        assert!(
+            auth_module_path.ends_with(".atomcode/auth.toml")
+                || auth_module_path.ends_with(".atomcode\\auth.toml"), // Windows compatibility
+            "Path should end with .atomcode/auth.toml, got: {}",
+            auth_module_path.display()
+        );
     }
 }

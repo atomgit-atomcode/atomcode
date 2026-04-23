@@ -14,23 +14,23 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 use atomcode_core::agent::{AgentCommand, AgentEvent, AgentLoop};
-use atomcode_core::config::provider::{ProviderConfig, default_context_window_for};
+use atomcode_core::config::provider::{default_context_window_for, ProviderConfig};
 use atomcode_core::config::Config;
 use atomcode_core::conversation::Conversation;
 use atomcode_core::provider::create_provider;
 use atomcode_core::session::SessionManager;
-use atomcode_core::tool::{ToolContext, ToolRegistry};
-use atomcode_core::tool::read::ReadFileTool;
-use atomcode_core::tool::write::WriteFileTool;
-use atomcode_core::tool::edit::EditFileTool;
 use atomcode_core::tool::bash::BashTool;
 use atomcode_core::tool::cd::CdTool;
-use atomcode_core::tool::grep::GrepTool;
+use atomcode_core::tool::edit::EditFileTool;
 use atomcode_core::tool::glob::GlobTool;
+use atomcode_core::tool::grep::GrepTool;
 use atomcode_core::tool::list_dir::ListDirTool;
-use atomcode_core::tool::web_search::WebSearchTool;
-use atomcode_core::tool::web_fetch::WebFetchTool;
+use atomcode_core::tool::read::ReadFileTool;
 use atomcode_core::tool::search_replace::SearchReplaceTool;
+use atomcode_core::tool::web_fetch::WebFetchTool;
+use atomcode_core::tool::web_search::WebSearchTool;
+use atomcode_core::tool::write::WriteFileTool;
+use atomcode_core::tool::{ToolContext, ToolRegistry};
 
 use atomcode_core::auth;
 
@@ -47,10 +47,7 @@ fn restore_terminal_if_tui() {
         return;
     }
     let _ = crossterm::terminal::disable_raw_mode();
-    let _ = crossterm::execute!(
-        std::io::stdout(),
-        crossterm::terminal::LeaveAlternateScreen,
-    );
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen,);
 }
 
 /// Resolve the working directory at startup. **Always** uses the current
@@ -126,13 +123,31 @@ fn should_try_sync_upgrade() -> bool {
     }
 
     let args: Vec<String> = std::env::args().collect();
-    let any = |needle: &[&str]| args.iter().skip(1).any(|a| needle.iter().any(|n| a == n || a.starts_with(&format!("{}=", n))));
+    let any = |needle: &[&str]| {
+        args.iter().skip(1).any(|a| {
+            needle
+                .iter()
+                .any(|n| a == n || a.starts_with(&format!("{}=", n)))
+        })
+    };
 
     if any(&["-p", "--prompt", "--prompt-file"]) {
         return false;
     }
-    if args.iter().skip(1).any(|a| matches!(a.as_str(),
-        "login" | "logout" | "status" | "upgrade" | "rollback" | "--version" | "-V" | "--help" | "-h")) {
+    if args.iter().skip(1).any(|a| {
+        matches!(
+            a.as_str(),
+            "login"
+                | "logout"
+                | "status"
+                | "upgrade"
+                | "rollback"
+                | "--version"
+                | "-V"
+                | "--help"
+                | "-h"
+        )
+    }) {
         return false;
     }
 
@@ -178,12 +193,18 @@ async fn sync_stage_and_apply_if_newer() {
                     eprintln!("✨ New version available: {}", version);
                 }
                 UpgradeEvent::Downloading { bytes, total } => {
-                    let pct = if total == 0 { 0 } else { ((bytes * 100) / total) as i32 };
+                    let pct = if total == 0 {
+                        0
+                    } else {
+                        ((bytes * 100) / total) as i32
+                    };
                     if pct != last_pct {
-                        eprint!("\r   Downloading {}% ({:.1} / {:.1} MB)      ",
-                                pct,
-                                bytes as f64 / 1_048_576.0,
-                                total as f64 / 1_048_576.0);
+                        eprint!(
+                            "\r   Downloading {}% ({:.1} / {:.1} MB)      ",
+                            pct,
+                            bytes as f64 / 1_048_576.0,
+                            total as f64 / 1_048_576.0
+                        );
                         let _ = std::io::stderr().flush();
                         last_pct = pct;
                     }
@@ -435,8 +456,8 @@ async fn main() {
     // render correctly instead of showing garbled output (mojibake).
     #[cfg(target_os = "windows")]
     {
-        use windows_sys::Win32::System::Console::{SetConsoleOutputCP, SetConsoleCP};
         use windows_sys::Win32::Globalization::CP_UTF8;
+        use windows_sys::Win32::System::Console::{SetConsoleCP, SetConsoleOutputCP};
         unsafe {
             SetConsoleOutputCP(CP_UTF8);
             SetConsoleCP(CP_UTF8);
@@ -472,46 +493,46 @@ async fn main() {
     // circuit-breaker in `apply_pending_upgrade` ensures a broken release
     // can't wedge this loop indefinitely.
     if !is_backup {
-    // Capture current version BEFORE applying upgrade, so we can pass it to the re-exec'd child
-    let current_version = format!("v{}", env!("CARGO_PKG_VERSION"));
-    match atomcode_core::self_update::apply_pending_upgrade() {
-        Ok(Some(applied)) => {
-            eprintln!("✓ Upgrading to {}...", applied.version);
-            // Pass the CURRENT version (before upgrade) to the re-exec'd child so the TUI
-            // can surface a welcome-screen confirmation exactly once.
-            std::env::set_var(UPGRADED_FROM_ENV, &current_version);
-            match atomcode_core::self_update::re_exec_self() {
-                Ok(_infallible) => unreachable!("re_exec_self returned Ok"),
-                Err(e) => {
-                    eprintln!(
+        // Capture current version BEFORE applying upgrade, so we can pass it to the re-exec'd child
+        let current_version = format!("v{}", env!("CARGO_PKG_VERSION"));
+        match atomcode_core::self_update::apply_pending_upgrade() {
+            Ok(Some(applied)) => {
+                eprintln!("✓ Upgrading to {}...", applied.version);
+                // Pass the CURRENT version (before upgrade) to the re-exec'd child so the TUI
+                // can surface a welcome-screen confirmation exactly once.
+                std::env::set_var(UPGRADED_FROM_ENV, &current_version);
+                match atomcode_core::self_update::re_exec_self() {
+                    Ok(_infallible) => unreachable!("re_exec_self returned Ok"),
+                    Err(e) => {
+                        eprintln!(
                         "Upgrade applied but re-exec failed ({}). The new version will be used on the next launch.",
                         e
                     );
-                    std::env::remove_var(UPGRADED_FROM_ENV);
-                    std::process::exit(1);
+                        std::env::remove_var(UPGRADED_FROM_ENV);
+                        std::process::exit(1);
+                    }
                 }
             }
-        }
-        Ok(None) => {
-            // No pre-staged upgrade. If the user isn't passing `-p` /
-            // `--prompt-file` (headless one-shots shouldn't pay the network
-            // tax) and auto_update isn't disabled, try to fetch + stage +
-            // apply v_next right here. This is the "user launched atomcode,
-            // wants it upgraded NOW" path — single invocation instead of
-            // the stage-on-session-N / apply-on-session-N+1 dance.
-            //
-            // Anything goes wrong (offline, timeout, sha mismatch, no
-            // newer release) → silently fall through and continue with
-            // the current binary. The `/upgrade` slash command is still
-            // there as the explicit/loud alternative.
-            if should_try_sync_upgrade() {
-                sync_stage_and_apply_if_newer().await;
+            Ok(None) => {
+                // No pre-staged upgrade. If the user isn't passing `-p` /
+                // `--prompt-file` (headless one-shots shouldn't pay the network
+                // tax) and auto_update isn't disabled, try to fetch + stage +
+                // apply v_next right here. This is the "user launched atomcode,
+                // wants it upgraded NOW" path — single invocation instead of
+                // the stage-on-session-N / apply-on-session-N+1 dance.
+                //
+                // Anything goes wrong (offline, timeout, sha mismatch, no
+                // newer release) → silently fall through and continue with
+                // the current binary. The `/upgrade` slash command is still
+                // there as the explicit/loud alternative.
+                if should_try_sync_upgrade() {
+                    sync_stage_and_apply_if_newer().await;
+                }
+            }
+            Err(e) => {
+                eprintln!("Note: pending upgrade could not be applied ({}). Continuing with current version.", e);
             }
         }
-        Err(e) => {
-            eprintln!("Note: pending upgrade could not be applied ({}). Continuing with current version.", e);
-        }
-    }
     } // end `if !is_backup`
 
     // Set panic hook to show errors cleanly
@@ -519,7 +540,12 @@ async fn main() {
         restore_terminal_if_tui();
         eprintln!("\nAtomCode crashed: {}", info);
         if let Some(location) = info.location() {
-            eprintln!("  at {}:{}:{}", location.file(), location.line(), location.column());
+            eprintln!(
+                "  at {}:{}:{}",
+                location.file(),
+                location.line(),
+                location.column()
+            );
         }
         eprintln!("\nPlease report this at: https://atomgit.com/atomgit_atomcode/atomcode/issues");
     }));
@@ -624,32 +650,69 @@ async fn run() -> Result<i32> {
     // ATOMCODE_DISABLE_TOOLS env var. The env var allows the SWE-bench
     // harness to opt-out of bash without rebuilding atomcode or threading a
     // CLI flag through every shell wrapper.
-    let mut disabled_tools: std::collections::HashSet<String> =
-        cli.disable_tools.iter().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+    let mut disabled_tools: std::collections::HashSet<String> = cli
+        .disable_tools
+        .iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
     if let Ok(env_list) = std::env::var("ATOMCODE_DISABLE_TOOLS") {
-        for name in env_list.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        for name in env_list
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+        {
             disabled_tools.insert(name.to_string());
         }
     }
     if !disabled_tools.is_empty() {
         let mut sorted: Vec<&String> = disabled_tools.iter().collect();
         sorted.sort();
-        eprintln!("[atomcode] tools disabled: {}", sorted.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "));
+        eprintln!(
+            "[atomcode] tools disabled: {}",
+            sorted
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
     }
     let enabled = |name: &str| !disabled_tools.contains(name);
 
     let mut tool_registry = ToolRegistry::new();
-    if enabled("read_file")      { tool_registry.register(Box::new(ReadFileTool)); }
-    if enabled("write_file")     { tool_registry.register(Box::new(WriteFileTool)); }
-    if enabled("edit_file")      { tool_registry.register(Box::new(EditFileTool)); }
-    if enabled("bash")           { tool_registry.register(Box::new(BashTool)); }
-    if enabled("change_dir")     { tool_registry.register(Box::new(CdTool)); }
-    if enabled("grep")           { tool_registry.register(Box::new(GrepTool)); }
-    if enabled("glob")           { tool_registry.register(Box::new(GlobTool)); }
-    if enabled("list_directory") { tool_registry.register(Box::new(ListDirTool)); }
-    if enabled("web_search")     { tool_registry.register(Box::new(WebSearchTool)); }
-    if enabled("web_fetch")      { tool_registry.register(Box::new(WebFetchTool)); }
-    if enabled("search_replace") { tool_registry.register(Box::new(SearchReplaceTool)); }
+    if enabled("read_file") {
+        tool_registry.register(Box::new(ReadFileTool));
+    }
+    if enabled("write_file") {
+        tool_registry.register(Box::new(WriteFileTool));
+    }
+    if enabled("edit_file") {
+        tool_registry.register(Box::new(EditFileTool));
+    }
+    if enabled("bash") {
+        tool_registry.register(Box::new(BashTool));
+    }
+    if enabled("change_dir") {
+        tool_registry.register(Box::new(CdTool));
+    }
+    if enabled("grep") {
+        tool_registry.register(Box::new(GrepTool));
+    }
+    if enabled("glob") {
+        tool_registry.register(Box::new(GlobTool));
+    }
+    if enabled("list_directory") {
+        tool_registry.register(Box::new(ListDirTool));
+    }
+    if enabled("web_search") {
+        tool_registry.register(Box::new(WebSearchTool));
+    }
+    if enabled("web_fetch") {
+        tool_registry.register(Box::new(WebFetchTool));
+    }
+    if enabled("search_replace") {
+        tool_registry.register(Box::new(SearchReplaceTool));
+    }
     let tool_context = ToolContext::new(working_dir.clone());
 
     // Auto-continue the latest session for this working directory.
@@ -683,22 +746,31 @@ async fn run() -> Result<i32> {
     // clap's conflicts_with ensures only one can be given at a time.
     let effective_prompt: Option<String> = match (cli.prompt.as_ref(), cli.prompt_file.as_ref()) {
         (Some(p), None) => Some(p.clone()),
-        (None, Some(path)) => {
-            match std::fs::read_to_string(path) {
-                Ok(s) => Some(s),
-                Err(e) => {
-                    eprintln!("error: failed to read --prompt-file {}: {}", path.display(), e);
-                    std::process::exit(2);
-                }
+        (None, Some(path)) => match std::fs::read_to_string(path) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                eprintln!(
+                    "error: failed to read --prompt-file {}: {}",
+                    path.display(),
+                    e
+                );
+                std::process::exit(2);
             }
-        }
+        },
         (None, None) => None,
         (Some(_), Some(_)) => unreachable!("clap conflicts_with prevents this"),
     };
 
     // Headless mode: -p / --prompt-file triggers non-interactive execution.
     if let Some(prompt) = effective_prompt {
-        return run_headless(agent_loop, agent_handle, prompt, cli.provider.as_deref(), cli.verbose).await;
+        return run_headless(
+            agent_loop,
+            agent_handle,
+            prompt,
+            cli.provider.as_deref(),
+            cli.verbose,
+        )
+        .await;
     }
 
     // Fire-and-forget: spawn a setsid'd subprocess to stage the next
@@ -714,9 +786,25 @@ async fn run() -> Result<i32> {
 
     tokio::spawn(agent_loop.run());
     if cli.tui {
-        atomcode_tui::run(config, model_name, agent_handle, tool_context, working_dir, session_to_continue).await?;
+        atomcode_tui::run(
+            config,
+            model_name,
+            agent_handle,
+            tool_context,
+            working_dir,
+            session_to_continue,
+        )
+        .await?;
     } else {
-        atomcode_tuix::run(config, model_name, agent_handle, tool_context, working_dir, session_to_continue).await?;
+        atomcode_tuix::run(
+            config,
+            model_name,
+            agent_handle,
+            tool_context,
+            working_dir,
+            session_to_continue,
+        )
+        .await?;
     }
     Ok(0)
 }
@@ -766,17 +854,31 @@ async fn run_headless(
             }
             AgentEvent::ToolCallStreaming { name, hint } => {
                 if verbose {
-                    let detail = if hint.is_empty() { String::new() } else { format!(" → {}", hint) };
+                    let detail = if hint.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" → {}", hint)
+                    };
                     eprintln!("[tool-streaming← {}{}]", name, detail);
                 }
             }
-            AgentEvent::ToolCallStarted { id: _, name, arguments } => {
+            AgentEvent::ToolCallStarted {
+                id: _,
+                name,
+                arguments,
+            } => {
                 if verbose {
                     let args = truncate_log_line(&arguments, 200);
                     eprintln!("[tool→ {} args={}]", name, args);
                 }
             }
-            AgentEvent::ToolCallResult { call_id: _, name, output, success, duration } => {
+            AgentEvent::ToolCallResult {
+                call_id: _,
+                name,
+                output,
+                success,
+                duration,
+            } => {
                 if verbose {
                     let status = if success { "OK" } else { "FAILED" };
                     let dur_ms = duration.as_millis();
@@ -789,7 +891,9 @@ async fn run_headless(
                     }
                 }
             }
-            AgentEvent::ApprovalNeeded { tool_name, reason, .. } => {
+            AgentEvent::ApprovalNeeded {
+                tool_name, reason, ..
+            } => {
                 if tool_name == "bash" {
                     // -p / headless cannot prompt; user opts in by using non-interactive mode.
                     eprintln!("[headless] auto-approved bash: {}", reason);
@@ -803,13 +907,22 @@ async fn run_headless(
             }
             AgentEvent::TokenUsage(usage) => {
                 if verbose {
-                    eprintln!("[tokens] prompt={} completion={}", usage.prompt_tokens, usage.completion_tokens);
+                    eprintln!(
+                        "[tokens] prompt={} completion={}",
+                        usage.prompt_tokens, usage.completion_tokens
+                    );
                 }
             }
             AgentEvent::PhaseChange(_) => {
                 // Silent in headless mode (in both default and verbose).
             }
-            AgentEvent::TurnComplete { duration, total_tokens, turn_count, tool_call_count, stop_reason } => {
+            AgentEvent::TurnComplete {
+                duration,
+                total_tokens,
+                turn_count,
+                tool_call_count,
+                stop_reason,
+            } => {
                 // Always ensure stdout ends with a newline so downstream parsers see a clean line.
                 if !last_text_ended_with_newline {
                     println!();
@@ -825,8 +938,14 @@ async fn run_headless(
                         atomcode_core::agent::TurnStopReason::Natural => String::new(),
                         other => format!(" stopped={}", other.as_tag()),
                     };
-                    eprintln!("[done] {:.1}s tokens={} turns={} tool_calls={}{}",
-                        duration.as_secs_f64(), total_tokens, turn_count, tool_call_count, suffix);
+                    eprintln!(
+                        "[done] {:.1}s tokens={} turns={} tool_calls={}{}",
+                        duration.as_secs_f64(),
+                        total_tokens,
+                        turn_count,
+                        tool_call_count,
+                        suffix
+                    );
                 }
                 let _ = cmd_tx.send(AgentCommand::Shutdown);
                 break;
@@ -853,7 +972,7 @@ async fn run_headless(
             AgentEvent::ContextStats { .. } => {
                 // Silent in headless mode
             }
-AgentEvent::SubAgentProgress { file, status } => {
+            AgentEvent::SubAgentProgress { file, status } => {
                 if verbose {
                     eprintln!("[sub-agent] {} {}", file, status);
                 }
@@ -890,7 +1009,10 @@ async fn handle_command(cmd: Commands) -> Result<()> {
         }
         Commands::Status => {
             if let Some(auth) = auth::get_stored_auth() {
-                println!("\n  Logged in as: {} ({})", auth.user.username, auth.user.id);
+                println!(
+                    "\n  Logged in as: {} ({})",
+                    auth.user.username, auth.user.id
+                );
                 if let Some(name) = auth.user.name {
                     println!("  Name: {}", name);
                 }
@@ -916,8 +1038,8 @@ async fn handle_hooks(cmd: HookCommands) -> Result<()> {
 
     match cmd {
         HookCommands::List => {
-            use atomcode_core::hook::HookRegistry;
             use atomcode_core::hook::config_loader::load_hooks;
+            use atomcode_core::hook::HookRegistry;
 
             let mut registry = HookRegistry::new();
             load_hooks(&mut registry);
@@ -946,13 +1068,19 @@ async fn handle_hooks(cmd: HookCommands) -> Result<()> {
                 println!("  {:<30} {:>5}", "─".repeat(30), "─".repeat(5));
 
                 if stats.on_message_received_hooks > 0 {
-                    println!("  {:<30} {:>5}", "OnMessageReceived", stats.on_message_received_hooks);
+                    println!(
+                        "  {:<30} {:>5}",
+                        "OnMessageReceived", stats.on_message_received_hooks
+                    );
                 }
                 if stats.on_turn_start_hooks > 0 {
                     println!("  {:<30} {:>5}", "OnTurnStart", stats.on_turn_start_hooks);
                 }
                 if stats.on_tool_call_start_hooks > 0 {
-                    println!("  {:<30} {:>5}", "OnToolCallStart", stats.on_tool_call_start_hooks);
+                    println!(
+                        "  {:<30} {:>5}",
+                        "OnToolCallStart", stats.on_tool_call_start_hooks
+                    );
                 }
                 if stats.pre_tool_hooks > 0 {
                     println!("  {:<30} {:>5}", "PreToolExecution", stats.pre_tool_hooks);
@@ -961,16 +1089,25 @@ async fn handle_hooks(cmd: HookCommands) -> Result<()> {
                     println!("  {:<30} {:>5}", "PostToolExecution", stats.post_tool_hooks);
                 }
                 if stats.on_turn_complete_hooks > 0 {
-                    println!("  {:<30} {:>5}", "OnTurnComplete", stats.on_turn_complete_hooks);
+                    println!(
+                        "  {:<30} {:>5}",
+                        "OnTurnComplete", stats.on_turn_complete_hooks
+                    );
                 }
                 if stats.post_turn_hooks > 0 {
                     println!("  {:<30} {:>5}", "PostTurn (legacy)", stats.post_turn_hooks);
                 }
                 if stats.on_model_response_hooks > 0 {
-                    println!("  {:<30} {:>5}", "OnModelResponse", stats.on_model_response_hooks);
+                    println!(
+                        "  {:<30} {:>5}",
+                        "OnModelResponse", stats.on_model_response_hooks
+                    );
                 }
                 if stats.on_session_start_hooks > 0 {
-                    println!("  {:<30} {:>5}", "OnSessionStart", stats.on_session_start_hooks);
+                    println!(
+                        "  {:<30} {:>5}",
+                        "OnSessionStart", stats.on_session_start_hooks
+                    );
                 }
                 if stats.on_session_end_hooks > 0 {
                     println!("  {:<30} {:>5}", "OnSessionEnd", stats.on_session_end_hooks);
@@ -1023,7 +1160,11 @@ async fn handle_hooks(cmd: HookCommands) -> Result<()> {
 
             if let Ok(cwd) = std::env::current_dir() {
                 let project_config = cwd.join(".atomcode").join("hooks").join("hooks.toml");
-                let exists = if project_config.exists() { "✓" } else { "✗" };
+                let exists = if project_config.exists() {
+                    "✓"
+                } else {
+                    "✗"
+                };
                 println!("  {} Project config:  {}", exists, project_config.display());
             }
 
@@ -1067,7 +1208,10 @@ async fn run_upgrade_cli(force: bool) -> Result<()> {
                     ((bytes * 100) / total) as i32
                 };
                 if pct != last_pct {
-                    print!("\r    downloading {}% ({} / {} bytes)   ", pct, bytes, total);
+                    print!(
+                        "\r    downloading {}% ({} / {} bytes)   ",
+                        pct, bytes, total
+                    );
                     io::stdout().flush().ok();
                     last_pct = pct;
                 }
@@ -1208,7 +1352,9 @@ mod tests {
         }
         let read_back = std::fs::read_to_string(&path).unwrap();
         std::fs::remove_file(&path).ok();
-        assert_eq!(read_back, content,
-            "--prompt-file must preserve trailing newline (unlike bash $(...))");
+        assert_eq!(
+            read_back, content,
+            "--prompt-file must preserve trailing newline (unlike bash $(...))"
+        );
     }
 }

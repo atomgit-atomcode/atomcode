@@ -38,7 +38,9 @@ pub fn log_llm_request(
     step: usize,
     enabled: bool,
 ) {
-    if !enabled { return; }
+    if !enabled {
+        return;
+    }
     use std::io::Write;
 
     let log_dir = working_dir.join("datalog").join("llm");
@@ -48,13 +50,16 @@ pub fn log_llm_request(
     let path = log_dir.join(format!("{}.json", ts));
 
     let msgs_json = serde_json::to_value(messages).unwrap_or(serde_json::json!([]));
-    let tools_json: Vec<serde_json::Value> = tool_defs.iter().map(|td| {
-        serde_json::json!({
-            "name": td.name,
-            "description": td.description,
-            "parameters": td.parameters,
+    let tools_json: Vec<serde_json::Value> = tool_defs
+        .iter()
+        .map(|td| {
+            serde_json::json!({
+                "name": td.name,
+                "description": td.description,
+                "parameters": td.parameters,
+            })
         })
-    }).collect();
+        .collect();
     let total_tokens: usize = messages.iter().map(|m| m.estimate_tokens()).sum();
 
     let log = serde_json::json!({
@@ -74,7 +79,11 @@ pub fn log_llm_request(
 
     let tmp = path.with_extension("json.tmp");
     if let Ok(mut f) = std::fs::File::create(&tmp) {
-        let _ = f.write_all(serde_json::to_string_pretty(&log).unwrap_or_default().as_bytes());
+        let _ = f.write_all(
+            serde_json::to_string_pretty(&log)
+                .unwrap_or_default()
+                .as_bytes(),
+        );
         let _ = std::fs::rename(&tmp, &path);
     }
 
@@ -98,23 +107,29 @@ pub fn log_llm_response(
     duration_ms: u64,
     enabled: bool,
 ) {
-    if !enabled { return; }
+    if !enabled {
+        return;
+    }
     use std::io::Write;
 
     let log_dir = working_dir.join("datalog").join("llm");
     let _ = std::fs::create_dir_all(&log_dir);
 
     let path = pending_request_path()
-        .lock().ok()
+        .lock()
+        .ok()
         .and_then(|mut g| g.take());
 
-    let tools_json: Vec<serde_json::Value> = tool_calls.iter().map(|tc| {
-        serde_json::json!({
-            "id": tc.id,
-            "name": tc.name,
-            "arguments": tc.arguments,
+    let tools_json: Vec<serde_json::Value> = tool_calls
+        .iter()
+        .map(|tc| {
+            serde_json::json!({
+                "id": tc.id,
+                "name": tc.name,
+                "arguments": tc.arguments,
+            })
         })
-    }).collect();
+        .collect();
     let response_value = serde_json::json!({
         "duration_ms": duration_ms,
         "text": text,
@@ -127,8 +142,8 @@ pub fn log_llm_response(
     // operation but we don't want to drop data on the floor).
     let (target_path, merged) = match path.as_ref().and_then(|p| std::fs::read_to_string(p).ok()) {
         Some(existing) => {
-            let mut val: serde_json::Value = serde_json::from_str(&existing)
-                .unwrap_or_else(|_| serde_json::json!({}));
+            let mut val: serde_json::Value =
+                serde_json::from_str(&existing).unwrap_or_else(|_| serde_json::json!({}));
             if let Some(obj) = val.as_object_mut() {
                 obj.insert("response".into(), response_value);
             }
@@ -150,15 +165,29 @@ pub fn log_llm_response(
 
     let tmp = target_path.with_extension("json.tmp");
     if let Ok(mut f) = std::fs::File::create(&tmp) {
-        let _ = f.write_all(serde_json::to_string_pretty(&merged).unwrap_or_default().as_bytes());
+        let _ = f.write_all(
+            serde_json::to_string_pretty(&merged)
+                .unwrap_or_default()
+                .as_bytes(),
+        );
         let _ = std::fs::rename(&tmp, &target_path);
     }
 
     // One-line summary to calls.log. Example:
     //   2026-04-14_12-50-54_123  glm-5  step=3  msgs=20/15000tok  →  4200ms  tools=2 [read_file, grep]
-    let ts_for_log = merged.get("timestamp").and_then(|v| v.as_str()).unwrap_or("?").to_string();
-    let msg_count = merged.pointer("/request/message_count").and_then(|v| v.as_u64()).unwrap_or(0);
-    let est_tokens = merged.pointer("/request/estimated_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+    let ts_for_log = merged
+        .get("timestamp")
+        .and_then(|v| v.as_str())
+        .unwrap_or("?")
+        .to_string();
+    let msg_count = merged
+        .pointer("/request/message_count")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let est_tokens = merged
+        .pointer("/request/estimated_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
     let tool_names: Vec<&str> = tool_calls.iter().map(|tc| tc.name.as_str()).collect();
     let tools_str = if tool_names.is_empty() {
         "text_only".to_string()
@@ -166,11 +195,22 @@ pub fn log_llm_response(
         format!("[{}]", tool_names.join(", "))
     };
     let calls_path = log_dir.join("calls.log");
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&calls_path) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&calls_path)
+    {
         let _ = writeln!(
             f,
             "{}  {}  step={}  msgs={}/{}tok  →  {}ms  tools={} {}",
-            ts_for_log, model, step, msg_count, est_tokens, duration_ms, tool_calls.len(), tools_str,
+            ts_for_log,
+            model,
+            step,
+            msg_count,
+            est_tokens,
+            duration_ms,
+            tool_calls.len(),
+            tools_str,
         );
     }
 }
@@ -186,7 +226,10 @@ fn timestamp() -> String {
     let h = (secs / 3600) % 24;
     let days = secs / 86400;
     let (y, mo, d) = epoch_days_to_ymd(days);
-    format!("{:04}-{:02}-{:02}_{:02}-{:02}-{:02}_{:03}", y, mo, d, h, m, s, millis)
+    format!(
+        "{:04}-{:02}-{:02}_{:02}-{:02}-{:02}_{:03}",
+        y, mo, d, h, m, s, millis
+    )
 }
 
 /// Convert days since Unix epoch to (year, month, day). Simple civil calendar math.
@@ -240,11 +283,17 @@ mod tests {
         );
 
         let log_dir = tmp.path().join("datalog").join("llm");
-        let json_files: Vec<_> = std::fs::read_dir(&log_dir).unwrap()
+        let json_files: Vec<_> = std::fs::read_dir(&log_dir)
+            .unwrap()
             .filter_map(|e| e.ok().map(|e| e.path()))
             .filter(|p| p.extension().map_or(false, |ext| ext == "json"))
             .collect();
-        assert_eq!(json_files.len(), 1, "expected one merged file, got {}", json_files.len());
+        assert_eq!(
+            json_files.len(),
+            1,
+            "expected one merged file, got {}",
+            json_files.len()
+        );
 
         let content = std::fs::read_to_string(&json_files[0]).unwrap();
         let v: serde_json::Value = serde_json::from_str(&content).unwrap();
@@ -266,18 +315,28 @@ mod tests {
     fn test_orphan_response_when_no_matching_request() {
         let tmp = tempfile::TempDir::new().unwrap();
         // Wipe any stashed pending path from previous tests (single static).
-        if let Ok(mut g) = pending_request_path().lock() { *g = None; }
+        if let Ok(mut g) = pending_request_path().lock() {
+            *g = None;
+        }
 
         log_llm_response(tmp.path(), "bare text", &[], "solo-model", 7, 50, true);
 
         let log_dir = tmp.path().join("datalog").join("llm");
-        let orphans: Vec<_> = std::fs::read_dir(&log_dir).unwrap()
+        let orphans: Vec<_> = std::fs::read_dir(&log_dir)
+            .unwrap()
             .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.file_name().map_or(false, |n| n.to_string_lossy().contains("orphan")))
+            .filter(|p| {
+                p.file_name()
+                    .map_or(false, |n| n.to_string_lossy().contains("orphan"))
+            })
             .collect();
         assert_eq!(orphans.len(), 1);
-        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&orphans[0]).unwrap()).unwrap();
-        assert!(v["warning"].as_str().unwrap().contains("no matching request"));
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&orphans[0]).unwrap()).unwrap();
+        assert!(v["warning"]
+            .as_str()
+            .unwrap()
+            .contains("no matching request"));
     }
 
     #[test]

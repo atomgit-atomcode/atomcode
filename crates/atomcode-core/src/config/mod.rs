@@ -1,5 +1,5 @@
-pub mod provider;
 pub mod prompt_sections;
+pub mod provider;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -83,11 +83,16 @@ pub struct DatalogConfig {
     pub dir: Option<String>,
 }
 
-fn default_true() -> bool { true }
+fn default_true() -> bool {
+    true
+}
 
 impl Default for DatalogConfig {
     fn default() -> Self {
-        Self { enabled: true, dir: None }
+        Self {
+            enabled: true,
+            dir: None,
+        }
     }
 }
 
@@ -137,7 +142,12 @@ impl Config {
         let mut persistent = self.clone();
         persistent.providers.retain(|_, v| !v.ephemeral);
         // If default_provider is ephemeral, don't change the saved default
-        if !self.providers.get(&self.default_provider).map(|p| !p.ephemeral).unwrap_or(true) {
+        if !self
+            .providers
+            .get(&self.default_provider)
+            .map(|p| !p.ephemeral)
+            .unwrap_or(true)
+        {
             // Restore original default from disk if possible
             if let Ok(disk) = Config::load(path) {
                 persistent.default_provider = disk.default_provider;
@@ -158,20 +168,18 @@ impl Config {
 
     /// Resolve the atomcode config dir. Pure function for testability —
     /// `config_dir()` is a thin wrapper that injects real env + real home.
-    fn resolve_config_dir(
-        env_atomcode_home: Option<String>,
-        home: Option<PathBuf>,
-    ) -> PathBuf {
+    fn resolve_config_dir(env_atomcode_home: Option<String>, home: Option<PathBuf>) -> PathBuf {
         if let Some(p) = env_atomcode_home {
             return PathBuf::from(p);
         }
-        home.unwrap_or_else(|| PathBuf::from("."))
-            .join(".atomcode")
+        home.unwrap_or_else(|| PathBuf::from(".")).join(".atomcode")
     }
 
     pub fn config_dir() -> PathBuf {
         Self::resolve_config_dir(
-            std::env::var("ATOMCODE_HOME").ok().filter(|s| !s.is_empty()),
+            std::env::var("ATOMCODE_HOME")
+                .ok()
+                .filter(|s| !s.is_empty()),
             dirs::home_dir(),
         )
     }
@@ -196,10 +204,7 @@ mod tests {
 
     #[test]
     fn test_resolve_config_dir_falls_back_to_home() {
-        let result = Config::resolve_config_dir(
-            None,
-            Some(PathBuf::from("/Users/foo")),
-        );
+        let result = Config::resolve_config_dir(None, Some(PathBuf::from("/Users/foo")));
         assert_eq!(result, PathBuf::from("/Users/foo/.atomcode"));
     }
 
@@ -252,7 +257,10 @@ mod tests {
         let config: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(config.default_provider, "openai");
         assert_eq!(config.providers.len(), 3);
-        assert_eq!(config.providers["ollama"].base_url.as_deref(), Some("http://localhost:11434"));
+        assert_eq!(
+            config.providers["ollama"].base_url.as_deref(),
+            Some("http://localhost:11434")
+        );
         assert!(config.providers["ollama"].api_key.is_none());
     }
 
@@ -277,12 +285,18 @@ mod tests {
         assert!(rendered.contains("[datalog]"));
         assert!(rendered.contains("enabled = true"));
         assert!(rendered.contains("# dir = "));
-        assert!(!rendered.contains("\ndir = "), "default must not emit active dir line");
+        assert!(
+            !rendered.contains("\ndir = "),
+            "default must not emit active dir line"
+        );
     }
 
     #[test]
     fn render_datalog_section_with_dir_emits_real_value() {
-        let cfg = DatalogConfig { enabled: false, dir: Some("~/.atomcode/logs".to_string()) };
+        let cfg = DatalogConfig {
+            enabled: false,
+            dir: Some("~/.atomcode/logs".to_string()),
+        };
         let rendered = render_datalog_section(&cfg);
         assert!(rendered.contains("enabled = false"));
         assert!(rendered.contains("dir = \"~/.atomcode/logs\""));
@@ -295,20 +309,26 @@ mod tests {
             default_provider: "p".to_string(),
             default_workdir: None,
             providers: HashMap::new(),
-            datalog: DatalogConfig { enabled: false, dir: Some("/var/log/ac".to_string()) },
+            datalog: DatalogConfig {
+                enabled: false,
+                dir: Some("/var/log/ac".to_string()),
+            },
             auto_update: true,
         };
-        cfg.providers.insert("p".to_string(), ProviderConfig {
-            provider_type: "openai".to_string(),
-            api_key: Some("k".to_string()),
-            model: "m".to_string(),
-            base_url: None,
-            system_prompt: None,
-            user_agent: None,
-            context_window: 16000,
-            max_tokens: None,
-            ephemeral: false,
-        });
+        cfg.providers.insert(
+            "p".to_string(),
+            ProviderConfig {
+                provider_type: "openai".to_string(),
+                api_key: Some("k".to_string()),
+                model: "m".to_string(),
+                base_url: None,
+                system_prompt: None,
+                user_agent: None,
+                context_window: 16000,
+                max_tokens: None,
+                ephemeral: false,
+            },
+        );
         cfg.save(&tmp).unwrap();
         let text = std::fs::read_to_string(&tmp).unwrap();
         assert!(text.contains("[datalog]"));

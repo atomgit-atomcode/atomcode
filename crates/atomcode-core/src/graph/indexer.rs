@@ -85,14 +85,15 @@ impl GraphIndexer {
         // Snapshot mtimes under a short read lock to determine dirty files.
         let (deleted, dirty_files) = {
             let graph = self.graph.read().await;
-            let deleted: Vec<PathBuf> = graph.file_mtimes.keys()
+            let deleted: Vec<PathBuf> = graph
+                .file_mtimes
+                .keys()
                 .filter(|p| !current_paths.contains(*p))
                 .cloned()
                 .collect();
-            let dirty: Vec<(PathBuf, u64)> = files.into_iter()
-                .filter(|(path, mtime)| {
-                    graph.file_mtimes.get(path) != Some(mtime)
-                })
+            let dirty: Vec<(PathBuf, u64)> = files
+                .into_iter()
+                .filter(|(path, mtime)| graph.file_mtimes.get(path) != Some(mtime))
                 .collect();
             (deleted, dirty)
         };
@@ -140,7 +141,11 @@ impl GraphIndexer {
                     {
                         graph.add_edge(
                             caller_id,
-                            Edge { to: callee_id, kind: EdgeKind::Calls, line: raw_call.line },
+                            Edge {
+                                to: callee_id,
+                                kind: EdgeKind::Calls,
+                                line: raw_call.line,
+                            },
                         );
                     }
                 }
@@ -227,10 +232,7 @@ impl GraphIndexer {
         let symbols = self.extract_symbols(path, &source, lang, &tree);
         let raw_calls = self.extract_calls(path, &source, lang, &tree, &symbols);
 
-        Some(FileParseResult {
-            symbols,
-            raw_calls,
-        })
+        Some(FileParseResult { symbols, raw_calls })
     }
 
     /// Extract symbol definitions from a parsed tree using the language's symbols_query.
@@ -366,10 +368,8 @@ impl GraphIndexer {
                     let caller_name = symbols
                         .iter()
                         .filter(|s| {
-                            matches!(
-                                s.kind,
-                                SymbolKind::Function | SymbolKind::Method
-                            ) && s.start_line <= call_line
+                            matches!(s.kind, SymbolKind::Function | SymbolKind::Method)
+                                && s.start_line <= call_line
                                 && call_line <= s.end_line
                         })
                         .last()

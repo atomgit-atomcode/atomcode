@@ -238,8 +238,8 @@ mod tests {
         push_str_cells(&mut cells, "x", &CellStyle::default());
         s.draw_row(0, 0, &cells);
         let _ = s.render_diff(); // first frame emits 'x'
-        // Redraw identical content — the render_diff above cleared
-        // the scratch to blank, so we need to re-push.
+                                 // Redraw identical content — the render_diff above cleared
+                                 // the scratch to blank, so we need to re-push.
         s.draw_row(0, 0, &cells);
         let bytes = s.render_diff();
         let out = String::from_utf8_lossy(&bytes);
@@ -261,7 +261,7 @@ mod tests {
         s.draw_row(0, 0, &a);
         s.draw_row(1, 0, &b);
         let _ = s.render_diff(); // swaps into prev, clears scratch
-        // Re-draw the same content then scroll.
+                                 // Re-draw the same content then scroll.
         s.draw_row(0, 0, &a);
         s.draw_row(1, 0, &b);
         s.scroll_up(2, 1);
@@ -322,10 +322,6 @@ mod tests {
         s.set_cursor(2, 5);
         let bytes = s.render_diff();
         let out = String::from_utf8_lossy(&bytes);
-        assert!(
-            out.contains("\x1b[2;5H"),
-            "cursor park missing: {:?}",
-            out
-        );
+        assert!(out.contains("\x1b[2;5H"), "cursor park missing: {:?}", out);
     }
 }

@@ -50,15 +50,17 @@ impl Tool for ListSymbolsTool {
 
         let mut searcher = ctx.semantic.lock().await;
         match searcher.list_symbols(path) {
-            Some(symbols) if symbols.is_empty() => {
-                Ok(ToolResult {
-                    call_id: String::new(),
-                    output: format!("No symbols found in {}", parsed.file_path),
-                    success: true,
-                })
-            }
+            Some(symbols) if symbols.is_empty() => Ok(ToolResult {
+                call_id: String::new(),
+                output: format!("No symbols found in {}", parsed.file_path),
+                success: true,
+            }),
             Some(symbols) => {
-                let mut out = format!("Symbols in {} ({} total):\n\n", parsed.file_path, symbols.len());
+                let mut out = format!(
+                    "Symbols in {} ({} total):\n\n",
+                    parsed.file_path,
+                    symbols.len()
+                );
                 for sym in &symbols {
                     out.push_str(&format!(
                         "  {:4}-{:4}  {}  ({})\n",
@@ -72,13 +74,11 @@ impl Tool for ListSymbolsTool {
                     success: true,
                 })
             }
-            None => {
-                Ok(ToolResult {
-                    call_id: String::new(),
-                    output: format!("Failed to parse {}", parsed.file_path),
-                    success: false,
-                })
-            }
+            None => Ok(ToolResult {
+                call_id: String::new(),
+                output: format!("Failed to parse {}", parsed.file_path),
+                success: false,
+            }),
         }
     }
 }

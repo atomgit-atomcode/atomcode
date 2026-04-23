@@ -58,7 +58,8 @@ impl TurnRunner {
         event_tx: &mpsc::UnboundedSender<TurnEvent>,
         cancel: CancellationToken,
     ) -> TurnResult {
-        self.run_with_filter(conversation, system_prompt, "", event_tx, cancel, None).await
+        self.run_with_filter(conversation, system_prompt, "", event_tx, cancel, None)
+            .await
     }
 
     /// Run with optional tool filter and turn reminder.
@@ -92,7 +93,9 @@ impl TurnRunner {
             // Find the last User message and prepend the reminder
             for msg in messages.iter_mut().rev() {
                 if matches!(msg.role, crate::conversation::message::Role::User) {
-                    if let crate::conversation::message::MessageContent::Text(ref mut text) = msg.content {
+                    if let crate::conversation::message::MessageContent::Text(ref mut text) =
+                        msg.content
+                    {
                         *text = format!("{}\n{}", turn_reminder, text);
                         break;
                     }
@@ -119,7 +122,8 @@ impl TurnRunner {
         // 3. Get tool definitions for the LLM
         let all_tool_defs = self.tools.get_definitions();
         let mut tool_defs: Vec<_> = if let Some(filter) = allowed_tools {
-            all_tool_defs.into_iter()
+            all_tool_defs
+                .into_iter()
                 .filter(|d| filter.contains(&d.name))
                 .collect()
         } else {
@@ -132,10 +136,16 @@ impl TurnRunner {
             let mut known_files: Vec<String> = self.recently_edited_files.clone();
             // Extract read files from conversation tool calls
             for msg in &messages {
-                if let crate::conversation::message::MessageContent::AssistantWithToolCalls { tool_calls, .. } = &msg.content {
+                if let crate::conversation::message::MessageContent::AssistantWithToolCalls {
+                    tool_calls,
+                    ..
+                } = &msg.content
+                {
                     for call in tool_calls {
                         if call.name == "read_file" {
-                            if let Ok(args) = serde_json::from_str::<serde_json::Value>(&call.arguments) {
+                            if let Ok(args) =
+                                serde_json::from_str::<serde_json::Value>(&call.arguments)
+                            {
                                 if let Some(fp) = args.get("file_path").and_then(|v| v.as_str()) {
                                     let short = fp.rsplit('/').next().unwrap_or(fp).to_string();
                                     if !known_files.contains(&short) {
@@ -150,13 +160,18 @@ impl TurnRunner {
             if !known_files.is_empty() {
                 if let Some(wf) = tool_defs.iter_mut().find(|d| d.name == "create_file") {
                     // Display basenames for readability in tool description
-                    let display_names: Vec<&str> = known_files.iter()
+                    let display_names: Vec<&str> = known_files
+                        .iter()
                         .map(|p| p.rsplit('/').next().unwrap_or(p.as_str()))
                         .collect();
                     let list = if display_names.len() <= 6 {
                         display_names.join(", ")
                     } else {
-                        format!("{}, ... ({} files)", display_names[..5].join(", "), display_names.len())
+                        format!(
+                            "{}, ... ({} files)",
+                            display_names[..5].join(", "),
+                            display_names.len()
+                        )
                     };
                     wf.description.push_str(&format!(
                         "\nThese files ALREADY EXIST — use edit_file instead: {}",
@@ -206,186 +221,194 @@ impl TurnRunner {
         let stream_timeout = timeout_from_env("ATOMCODE_STREAM_TIMEOUT_SECS", 300);
 
         loop {
-            let timeout = if got_any_event { stream_timeout } else { first_token_timeout };
+            let timeout = if got_any_event {
+                stream_timeout
+            } else {
+                first_token_timeout
+            };
             tokio::select! {
-                biased;
+                            biased;
 
-_ = cancel.cancelled() => {
-                    conversation.finalize_stream();
-                    return TurnResult::Cancelled;
-                }
-
-                _ = tokio::time::sleep(timeout) => {
-                    conversation.finalize_stream();
-                    return TurnResult::Failed(format!(
-                        "Stream timeout: no event for {:?}",
-                        timeout
-                    ));
-                }
-
-                event = stream.next() => {
-                    match event {
-                        Some(Ok(StreamEvent::Delta(text))) => {
-                            got_any_event = true;
-                            // Strip model-internal tags (DeepSeek </think>`, QwQ, etc.)
-                            let text = strip_model_tags(&text);
-                            if !text.is_empty() {
-                                conversation.push_delta(&text);
-                                text_buf.push_str(&text);
-                                let _ = event_tx.send(TurnEvent::TextDelta(text));
+            _ = cancel.cancelled() => {
+                                conversation.finalize_stream();
+                                return TurnResult::Cancelled;
                             }
-                        }
-                        Some(Ok(StreamEvent::Reasoning(text))) => {
-                            got_any_event = true;
-                            // Accumulate only. Don't push into conversation / emit
-                            // TextDelta here — default UX is to hide reasoning.
-                            // If `content` ends up empty, the `Done` arm below
-                            // promotes `reasoning_buf` to the answer.
-                            reasoning_buf.push_str(&text);
-                        }
-                        Some(Ok(StreamEvent::ToolCallStart { id, name })) => {
-                            got_any_event = true;
-                            // Surface the tool name to UI immediately — otherwise users see
-                            // "Generating…" for the entire args-streaming window (can be 30s+
-                            // for large write_file calls).
-                            let _ = event_tx.send(TurnEvent::ToolCallStreaming { name: name.clone(), hint: String::new() });
-                            conversation.tool_call_buffer = Some(ToolCallBuffer {
-                                id,
-                                name,
-                                arguments: String::new(),
-                                hint_sent: false,
-                            });
-                        }
 
-                        Some(Ok(StreamEvent::ToolCallDelta(args))) => {
-                            got_any_event = true;
-                            if let Some(ref mut buf) = conversation.tool_call_buffer {
-                                buf.arguments.push_str(&args);
-                                // Extract file_path from partial args (once only).
-                                if !buf.hint_sent && buf.arguments.len() < 300 {
-                                    if let Some(hint) = extract_path_hint(&buf.arguments) {
-                                        buf.hint_sent = true;
-                                        let _ = event_tx.send(TurnEvent::ToolCallStreaming {
-                                            name: buf.name.clone(),
-                                            hint,
+                            _ = tokio::time::sleep(timeout) => {
+                                conversation.finalize_stream();
+                                return TurnResult::Failed(format!(
+                                    "Stream timeout: no event for {:?}",
+                                    timeout
+                                ));
+                            }
+
+                            event = stream.next() => {
+                                match event {
+                                    Some(Ok(StreamEvent::Delta(text))) => {
+                                        got_any_event = true;
+                                        // Strip model-internal tags (DeepSeek </think>`, QwQ, etc.)
+                                        let text = strip_model_tags(&text);
+                                        if !text.is_empty() {
+                                            conversation.push_delta(&text);
+                                            text_buf.push_str(&text);
+                                            let _ = event_tx.send(TurnEvent::TextDelta(text));
+                                        }
+                                    }
+                                    Some(Ok(StreamEvent::Reasoning(text))) => {
+                                        got_any_event = true;
+                                        // Accumulate only. Don't push into conversation / emit
+                                        // TextDelta here — default UX is to hide reasoning.
+                                        // If `content` ends up empty, the `Done` arm below
+                                        // promotes `reasoning_buf` to the answer.
+                                        reasoning_buf.push_str(&text);
+                                    }
+                                    Some(Ok(StreamEvent::ToolCallStart { id, name })) => {
+                                        got_any_event = true;
+                                        // Surface the tool name to UI immediately — otherwise users see
+                                        // "Generating…" for the entire args-streaming window (can be 30s+
+                                        // for large write_file calls).
+                                        let _ = event_tx.send(TurnEvent::ToolCallStreaming { name: name.clone(), hint: String::new() });
+                                        conversation.tool_call_buffer = Some(ToolCallBuffer {
+                                            id,
+                                            name,
+                                            arguments: String::new(),
+                                            hint_sent: false,
                                         });
+                                    }
+
+                                    Some(Ok(StreamEvent::ToolCallDelta(args))) => {
+                                        got_any_event = true;
+                                        if let Some(ref mut buf) = conversation.tool_call_buffer {
+                                            buf.arguments.push_str(&args);
+                                            // Extract file_path from partial args (once only).
+                                            if !buf.hint_sent && buf.arguments.len() < 300 {
+                                                if let Some(hint) = extract_path_hint(&buf.arguments) {
+                                                    buf.hint_sent = true;
+                                                    let _ = event_tx.send(TurnEvent::ToolCallStreaming {
+                                                        name: buf.name.clone(),
+                                                        hint,
+                                                    });
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    Some(Ok(StreamEvent::ToolCallDone(call))) => {
+                                        conversation.tool_call_buffer = None;
+                                        let _ = event_tx.send(TurnEvent::ToolCallStarted {
+                                            id: call.id.clone(),
+                                            name: call.name.clone(),
+                                            arguments: call.arguments.clone(),
+                                        });
+                                        tool_calls_buf.push(call);
+                                    }
+
+                                    Some(Ok(StreamEvent::Usage(usage))) => {
+                                        total_tokens += usage.completion_tokens;
+                                        got_usage = true;
+                                        let _ = event_tx.send(TurnEvent::TokenUsage {
+                                            prompt_tokens: usage.prompt_tokens,
+                                            completion_tokens: usage.completion_tokens,
+                                            total_tokens: usage.prompt_tokens + usage.completion_tokens,
+                                            cached_tokens: usage.cached_tokens,
+                                        });
+                                    }
+
+                                    Some(Ok(StreamEvent::Done { truncated: is_truncated })) => {
+                                        // Reasoning-only fallback: some gateways route the
+                                        // entire response through `reasoning_content` for
+                                        // reasoning models (MiniMax-M2.7, DeepSeek-R1). If
+                                        // we end up here with empty `content`, empty
+                                        // tool_calls, but a non-empty reasoning buffer, treat
+                                        // the reasoning as the answer — otherwise the agent's
+                                        // empty-response retry loop fires twice, sleeps 4s,
+                                        // and finally reports a silent "Nailed it · 0 tok".
+                                        //
+                                        // Rescue runs before this so real tool-call-in-text
+                                        // escapes still take priority.
+                                        let rescued_tools = if tool_calls_buf.is_empty() {
+                                            let rescued = rescue_text_tool_calls(&text_buf);
+                                            if !rescued.is_empty() {
+                                                conversation.clear_stream_buffer();
+                                                tool_calls_buf.extend(rescued);
+                                                true
+                                            } else {
+                                                false
+                                            }
+                                        } else {
+                                            false
+                                        };
+
+                                        if text_buf.trim().is_empty()
+                                            && tool_calls_buf.is_empty()
+                                            && !rescued_tools
+                                            && !reasoning_buf.trim().is_empty()
+                                        {
+                                            let promoted = std::mem::take(&mut reasoning_buf);
+                                            conversation.push_delta(&promoted);
+                                            text_buf.push_str(&promoted);
+                                            let _ = event_tx.send(TurnEvent::TextDelta(promoted));
+                                        }
+
+                                        // Fallback: if the provider didn't report usage (many
+                                        // OpenAI-compatible APIs ignore stream_options), estimate
+                                        // output tokens from the streamed text + tool call args.
+                                        if !got_usage {
+                                            let mut output_chars = text_buf.len();
+                                            for tc in &tool_calls_buf {
+                                                output_chars += tc.arguments.len();
+                                            }
+                                            // Rough heuristic: ~2 chars per token for mixed
+                                            // Chinese/English, ~4 for pure English. Use 3 as a
+                                            // middle ground since most users mix both.
+                                            let estimated = (output_chars / 3).max(1);
+                                            total_tokens += estimated;
+                                            let _ = event_tx.send(TurnEvent::TokenUsage {
+                                                prompt_tokens: 0,
+                                                completion_tokens: estimated,
+                                                total_tokens: estimated,
+                                                cached_tokens: 0,
+                                            });
+                                        }
+
+                                        // Finalize conversation state
+                                        if !tool_calls_buf.is_empty() {
+                                            conversation.finalize_stream_with_tool_calls(&tool_calls_buf);
+                                        } else {
+                                            conversation.finalize_stream();
+                                        }
+                                        was_truncated = is_truncated;
+                                        break;
+                                    }
+
+                                    Some(Ok(StreamEvent::Error(e))) => {
+                                        conversation.finalize_stream();
+                                        return TurnResult::Failed(e);
+                                    }
+
+                                    Some(Err(e)) => {
+                                        conversation.finalize_stream();
+                                        return TurnResult::Failed(e.to_string());
+                                    }
+
+                                    None => {
+                                        // Stream ended without Done event
+                                        conversation.finalize_stream();
+                                        break;
                                     }
                                 }
                             }
                         }
-
-                        Some(Ok(StreamEvent::ToolCallDone(call))) => {
-                            conversation.tool_call_buffer = None;
-                            let _ = event_tx.send(TurnEvent::ToolCallStarted {
-                                id: call.id.clone(),
-                                name: call.name.clone(),
-                                arguments: call.arguments.clone(),
-                            });
-                            tool_calls_buf.push(call);
-                        }
-
-                        Some(Ok(StreamEvent::Usage(usage))) => {
-                            total_tokens += usage.completion_tokens;
-                            got_usage = true;
-                            let _ = event_tx.send(TurnEvent::TokenUsage {
-                                prompt_tokens: usage.prompt_tokens,
-                                completion_tokens: usage.completion_tokens,
-                                total_tokens: usage.prompt_tokens + usage.completion_tokens,
-                                cached_tokens: usage.cached_tokens,
-                            });
-                        }
-
-                        Some(Ok(StreamEvent::Done { truncated: is_truncated })) => {
-                            // Reasoning-only fallback: some gateways route the
-                            // entire response through `reasoning_content` for
-                            // reasoning models (MiniMax-M2.7, DeepSeek-R1). If
-                            // we end up here with empty `content`, empty
-                            // tool_calls, but a non-empty reasoning buffer, treat
-                            // the reasoning as the answer — otherwise the agent's
-                            // empty-response retry loop fires twice, sleeps 4s,
-                            // and finally reports a silent "Nailed it · 0 tok".
-                            //
-                            // Rescue runs before this so real tool-call-in-text
-                            // escapes still take priority.
-                            let rescued_tools = if tool_calls_buf.is_empty() {
-                                let rescued = rescue_text_tool_calls(&text_buf);
-                                if !rescued.is_empty() {
-                                    conversation.clear_stream_buffer();
-                                    tool_calls_buf.extend(rescued);
-                                    true
-                                } else {
-                                    false
-                                }
-                            } else {
-                                false
-                            };
-
-                            if text_buf.trim().is_empty()
-                                && tool_calls_buf.is_empty()
-                                && !rescued_tools
-                                && !reasoning_buf.trim().is_empty()
-                            {
-                                let promoted = std::mem::take(&mut reasoning_buf);
-                                conversation.push_delta(&promoted);
-                                text_buf.push_str(&promoted);
-                                let _ = event_tx.send(TurnEvent::TextDelta(promoted));
-                            }
-
-                            // Fallback: if the provider didn't report usage (many
-                            // OpenAI-compatible APIs ignore stream_options), estimate
-                            // output tokens from the streamed text + tool call args.
-                            if !got_usage {
-                                let mut output_chars = text_buf.len();
-                                for tc in &tool_calls_buf {
-                                    output_chars += tc.arguments.len();
-                                }
-                                // Rough heuristic: ~2 chars per token for mixed
-                                // Chinese/English, ~4 for pure English. Use 3 as a
-                                // middle ground since most users mix both.
-                                let estimated = (output_chars / 3).max(1);
-                                total_tokens += estimated;
-                                let _ = event_tx.send(TurnEvent::TokenUsage {
-                                    prompt_tokens: 0,
-                                    completion_tokens: estimated,
-                                    total_tokens: estimated,
-                                    cached_tokens: 0,
-                                });
-                            }
-
-                            // Finalize conversation state
-                            if !tool_calls_buf.is_empty() {
-                                conversation.finalize_stream_with_tool_calls(&tool_calls_buf);
-                            } else {
-                                conversation.finalize_stream();
-                            }
-                            was_truncated = is_truncated;
-                            break;
-                        }
-
-                        Some(Ok(StreamEvent::Error(e))) => {
-                            conversation.finalize_stream();
-                            return TurnResult::Failed(e);
-                        }
-
-                        Some(Err(e)) => {
-                            conversation.finalize_stream();
-                            return TurnResult::Failed(e.to_string());
-                        }
-
-                        None => {
-                            // Stream ended without Done event
-                            conversation.finalize_stream();
-                            break;
-                        }
-                    }
-                }
-            }
         }
 
         // Log LLM response (text + tool calls) to <working_dir>/datalog/llm/
         let response_duration = stream_start.elapsed().as_millis() as u64;
-        let wd = self.context.working_dir
-            .try_read().map(|g| g.clone()).unwrap_or_default();
+        let wd = self
+            .context
+            .working_dir
+            .try_read()
+            .map(|g| g.clone())
+            .unwrap_or_default();
         super::log::log_llm_response(
             &wd,
             &text_buf,
@@ -400,7 +423,7 @@ _ = cancel.cancelled() => {
         if tool_calls_buf.is_empty() {
             // Trigger post-turn hooks for Responded
             self.trigger_post_turn_hooks("Responded").await;
-            
+
             return TurnResult::Responded {
                 text: text_buf,
                 tokens: total_tokens,
@@ -432,11 +455,15 @@ _ = cancel.cancelled() => {
         // turn share the budget fairly — 1 read gets 20%, 3 reads get 6.7% each.
         // read.rs Layer A checks file_tokens against this to decide full vs skeleton.
         {
-            let num_reads = tool_calls_buf.iter()
+            let num_reads = tool_calls_buf
+                .iter()
                 .filter(|c| c.name == "read_file")
                 .count()
                 .max(1); // avoid division by zero
-            let budget = self.context.ctx_budget_hint.load(std::sync::atomic::Ordering::Relaxed);
+            let budget = self
+                .context
+                .ctx_budget_hint
+                .load(std::sync::atomic::Ordering::Relaxed);
             let per_file = budget / (5 * num_reads);
             self.context.read_budget_tokens.store(
                 per_file.max(2000), // floor: ~170 lines always get full content
@@ -445,7 +472,8 @@ _ = cancel.cancelled() => {
         }
 
         let tool_count = tool_calls_buf.len();
-        let mut seen_calls: std::collections::HashMap<(String, String), usize> = std::collections::HashMap::new();
+        let mut seen_calls: std::collections::HashMap<(String, String), usize> =
+            std::collections::HashMap::new();
         let mut is_dup: Vec<bool> = vec![false; tool_calls_buf.len()];
         for (i, call) in tool_calls_buf.iter().enumerate() {
             let key = (call.name.clone(), call.arguments.clone());
@@ -544,7 +572,9 @@ _ = cancel.cancelled() => {
             "".to_string(),
             working_dir.to_string_lossy().to_string(),
         );
-        self.hook_registry.trigger_post_turn_hooks(&hook_ctx, turn_result).await;
+        self.hook_registry
+            .trigger_post_turn_hooks(&hook_ctx, turn_result)
+            .await;
     }
 
     /// EXECUTE mode: run one LLM turn with minimal context.
@@ -585,14 +615,16 @@ _ = cancel.cancelled() => {
         let execute_tools = &["edit_file"];
 
         // 4. Run the LLM turn with filtered tools
-        let result = self.run_with_filter(
-            &mut mini_conv,
-            system_prompt,
-            "",
-            event_tx,
-            cancel,
-            Some(execute_tools),
-        ).await;
+        let result = self
+            .run_with_filter(
+                &mut mini_conv,
+                system_prompt,
+                "",
+                event_tx,
+                cancel,
+                Some(execute_tools),
+            )
+            .await;
 
         result
     }
@@ -615,8 +647,8 @@ _ = cancel.cancelled() => {
         let corrected_name = match name_lower.as_str() {
             "create_file" => "write_file",
             "find" | "find_files" => "glob",
-            "run" | "run_command" | "run_server" | "run_shell" | "run_app"
-                | "execute" | "shell" | "terminal" => "bash",
+            "run" | "run_command" | "run_server" | "run_shell" | "run_app" | "execute"
+            | "shell" | "terminal" => "bash",
             "list_files" | "ls" => "list_directory",
             "search" => "grep",
             _ => "",
@@ -625,7 +657,9 @@ _ = cancel.cancelled() => {
             // No alias match — try case-insensitive lookup in registry
             if self.tools.get(&call.name).is_some() {
                 call.name.as_str()
-            } else if let Some(name) = self.tools.iter()
+            } else if let Some(name) = self
+                .tools
+                .iter()
                 .find(|(k, _)| k.eq_ignore_ascii_case(&call.name))
                 .map(|(k, _)| k.as_ref())
             {
@@ -641,7 +675,9 @@ _ = cancel.cancelled() => {
         let tool = match self.tools.get_arc(corrected_name) {
             Some(t) => t,
             None => {
-                let available: String = self.tools.iter()
+                let available: String = self
+                    .tools
+                    .iter()
                     .map(|(name, _)| name.as_ref())
                     .collect::<Vec<&str>>()
                     .join(", ");
@@ -738,7 +774,7 @@ _ = cancel.cancelled() => {
             call.arguments.clone(),
             working_dir.to_string_lossy().to_string(),
         );
-        
+
         let mut final_args = call.arguments.clone();
         match self.hook_registry.trigger_pre_tool_hooks(&hook_ctx).await {
             Ok(Some(new_args)) => {
@@ -830,8 +866,10 @@ _ = cancel.cancelled() => {
             success: tool_result.success,
             duration_ms: duration.as_millis() as u64,
         };
-        
-        self.hook_registry.trigger_post_tool_hooks(&hook_ctx, &result_ctx).await;
+
+        self.hook_registry
+            .trigger_post_tool_hooks(&hook_ctx, &result_ctx)
+            .await;
 
         let _ = event_tx.send(TurnEvent::ToolCallResult {
             call_id: call.id.clone(),
@@ -1014,7 +1052,8 @@ fn rescue_text_tool_calls(text: &str) -> Vec<ToolCall> {
 
     while let Some(start) = remaining.find("<tool_call>") {
         let after_tag = &remaining[start + "<tool_call>".len()..];
-        let end = after_tag.find("</tool_call>")
+        let end = after_tag
+            .find("</tool_call>")
             .or_else(|| after_tag.find('\n'))
             .unwrap_or(after_tag.len());
         let body = after_tag[..end].trim();
@@ -1037,8 +1076,13 @@ fn rescue_text_tool_calls(text: &str) -> Vec<ToolCall> {
                             let k = part[..eq].trim();
                             let v = part[eq + 1..].trim();
                             // Quote the value if not already quoted
-                            let v_quoted = if v.starts_with('"') || v.starts_with('{') || v.starts_with('[')
-                                || v == "true" || v == "false" || v.parse::<f64>().is_ok() {
+                            let v_quoted = if v.starts_with('"')
+                                || v.starts_with('{')
+                                || v.starts_with('[')
+                                || v == "true"
+                                || v == "false"
+                                || v.parse::<f64>().is_ok()
+                            {
                                 v.to_string()
                             } else {
                                 format!("\"{}\"", v.replace('\\', "\\\\").replace('"', "\\\""))
@@ -1079,25 +1123,41 @@ fn merge_edit_calls(calls: &mut Vec<ToolCall>) -> Vec<String> {
     let mut file_groups: HashMap<String, Vec<usize>> = HashMap::new();
     let mut file_order: Vec<String> = Vec::new();
     for (i, call) in calls.iter().enumerate() {
-        if call.name != "edit_file" { continue; }
-        let fp = serde_json::from_str::<serde_json::Value>(&call.arguments).ok()
-            .and_then(|a| a.get("file_path").and_then(|v| v.as_str()).map(String::from));
+        if call.name != "edit_file" {
+            continue;
+        }
+        let fp = serde_json::from_str::<serde_json::Value>(&call.arguments)
+            .ok()
+            .and_then(|a| {
+                a.get("file_path")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+            });
         if let Some(fp) = fp {
             let entry = file_groups.entry(fp.clone()).or_default();
-            if entry.is_empty() { file_order.push(fp); }
+            if entry.is_empty() {
+                file_order.push(fp);
+            }
             entry.push(i);
         }
     }
 
     // Only merge groups with 2+ calls
-    let merge_targets: Vec<(String, Vec<usize>)> = file_order.into_iter()
+    let merge_targets: Vec<(String, Vec<usize>)> = file_order
+        .into_iter()
         .filter_map(|fp| {
             let indices = file_groups.remove(&fp)?;
-            if indices.len() >= 2 { Some((fp, indices)) } else { None }
+            if indices.len() >= 2 {
+                Some((fp, indices))
+            } else {
+                None
+            }
         })
         .collect();
 
-    if merge_targets.is_empty() { return Vec::new(); }
+    if merge_targets.is_empty() {
+        return Vec::new();
+    }
 
     let mut remove_indices: Vec<usize> = Vec::new();
     let mut removed_ids: Vec<String> = Vec::new();
@@ -1105,13 +1165,21 @@ fn merge_edit_calls(calls: &mut Vec<ToolCall>) -> Vec<String> {
         // Build edits array from individual calls
         let mut edits: Vec<serde_json::Value> = Vec::new();
         for &idx in indices {
-            let args: serde_json::Value = serde_json::from_str(&calls[idx].arguments)
-                .unwrap_or_default();
+            let args: serde_json::Value =
+                serde_json::from_str(&calls[idx].arguments).unwrap_or_default();
             let mut edit = serde_json::Map::new();
-            if let Some(v) = args.get("old_string") { edit.insert("old_string".into(), v.clone()); }
-            if let Some(v) = args.get("new_string") { edit.insert("new_string".into(), v.clone()); }
-            if let Some(v) = args.get("start_line") { edit.insert("start_line".into(), v.clone()); }
-            if let Some(v) = args.get("end_line") { edit.insert("end_line".into(), v.clone()); }
+            if let Some(v) = args.get("old_string") {
+                edit.insert("old_string".into(), v.clone());
+            }
+            if let Some(v) = args.get("new_string") {
+                edit.insert("new_string".into(), v.clone());
+            }
+            if let Some(v) = args.get("start_line") {
+                edit.insert("start_line".into(), v.clone());
+            }
+            if let Some(v) = args.get("end_line") {
+                edit.insert("end_line".into(), v.clone());
+            }
             edits.push(serde_json::Value::Object(edit));
         }
 

@@ -9,9 +9,9 @@ pub mod subtask_driver;
 // task_classifier removed — replaced by state-based decisions in handle_send_message.
 // pub mod task_classifier;
 
-pub mod execute;
 mod diagnose;
 mod discipline;
+pub mod execute;
 mod prompt;
 mod services;
 mod tool_dispatch;
@@ -28,10 +28,8 @@ use crate::conversation::Conversation;
 use crate::hook::HookRegistry;
 use crate::provider::LlmProvider;
 use crate::skill::SkillRegistry;
-use crate::tool::{
-    PermissionDecision, PermissionStore, ToolCall, ToolContext, ToolRegistry,
-};
 use crate::tool::use_skill::UseSkillTool;
+use crate::tool::{PermissionDecision, PermissionStore, ToolCall, ToolContext, ToolRegistry};
 use crate::turn::event::{TurnEvent, TurnResult};
 use crate::turn::runner::TurnRunner;
 
@@ -142,17 +140,16 @@ pub enum AgentEvent {
         /// TurnStopReason for budget / cancel / error variants.
         stop_reason: TurnStopReason,
     },
-/// Turn was cancelled by user before completion.
+    /// Turn was cancelled by user before completion.
     /// The conversation has been cleaned up - partial messages removed.
     /// Contains the cleaned message list for TUI to sync.
-    TurnCancelled { messages: Vec<crate::conversation::message::Message> },
+    TurnCancelled {
+        messages: Vec<crate::conversation::message::Message>,
+    },
     /// An error occurred.
     Error(String),
     /// Sub-agent progress (real-time parallel task display).
-    SubAgentProgress {
-        file: String,
-        status: String,
-    },
+    SubAgentProgress { file: String, status: String },
     /// Working directory changed.
     WorkingDirChanged(PathBuf),
     /// Context budget stats for logging (not displayed, only written to datalog).
@@ -339,7 +336,9 @@ impl AgentLoop {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
 
         // Load skills from disk and register the use_skill tool.
-        let working_dir = tool_context.working_dir.try_read()
+        let working_dir = tool_context
+            .working_dir
+            .try_read()
             .map(|g| g.clone())
             .unwrap_or_else(|_| std::path::PathBuf::from("."));
 
@@ -358,14 +357,22 @@ impl AgentLoop {
         // CLI tools at construction time, but AgentLoop::new adds internal
         // tools (graph queries, use_skill) that must respect the same
         // gate so `--disable-tools trace_callers` actually works.
-        let disabled_internal: std::collections::HashSet<String> = std::env::var("ATOMCODE_DISABLE_TOOLS")
-            .ok()
-            .map(|v| v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
-            .unwrap_or_default();
+        let disabled_internal: std::collections::HashSet<String> =
+            std::env::var("ATOMCODE_DISABLE_TOOLS")
+                .ok()
+                .map(|v| {
+                    v.split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default();
         let internal_enabled = |name: &str| !disabled_internal.contains(name);
 
         if has_skills && internal_enabled("use_skill") {
-            tool_registry.register(Box::new(UseSkillTool { registry: skill_registry.clone() }));
+            tool_registry.register(Box::new(UseSkillTool {
+                registry: skill_registry.clone(),
+            }));
         }
 
         // Graph query tools: not exposed to model (adds 5 tool definitions that
@@ -373,7 +380,10 @@ impl AgentLoop {
         // via grep's graph header and auto_inject_graph_context — the model benefits
         // from graph without needing to call these tools directly.
         // To re-enable: set ATOMCODE_GRAPH_TOOLS=1
-        if std::env::var("ATOMCODE_GRAPH_TOOLS").map(|v| v == "1").unwrap_or(false) {
+        if std::env::var("ATOMCODE_GRAPH_TOOLS")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+        {
             if internal_enabled("trace_callers") {
                 tool_registry.register(Box::new(crate::tool::trace_callers::TraceCallersTool));
             }
@@ -396,11 +406,12 @@ impl AgentLoop {
 
         let permission_store = std::sync::Arc::new(std::sync::RwLock::new(PermissionStore::new()));
 
-        let interactive_permission = Box::new(
-            crate::turn::permission::InteractivePermissionDecider::new(
-                approval_req_tx, approval_resp_rx, permission_store.clone(),
-            )
-        );
+        let interactive_permission =
+            Box::new(crate::turn::permission::InteractivePermissionDecider::new(
+                approval_req_tx,
+                approval_resp_rx,
+                permission_store.clone(),
+            ));
 
         // Share tool registry between AgentLoop and TurnRunner via Arc.
         let shared_tools = std::sync::Arc::new(tool_registry);
@@ -496,9 +507,8 @@ impl AgentLoop {
             let (reindex_tx, mut reindex_rx) = mpsc::unbounded_channel::<PathBuf>();
             let wd_for_indexer = working_dir.clone();
             tokio::spawn(async move {
-                let mut indexer = crate::graph::indexer::GraphIndexer::new(
-                    graph.clone(), wd_for_indexer.clone(),
-                );
+                let mut indexer =
+                    crate::graph::indexer::GraphIndexer::new(graph.clone(), wd_for_indexer.clone());
                 indexer.index_all().await;
                 // Persist after initial indexing
                 let gp = wd_for_indexer.join(".atomcode").join("graph.bin");
@@ -545,7 +555,8 @@ impl AgentLoop {
                     // If provider/model changed, clear conversation to avoid context pollution
                     if old_provider != new_provider_name {
                         self.conversation.messages.clear();
-                        self.conversation.turn_tracker = crate::conversation::turn::TurnTracker::new();
+                        self.conversation.turn_tracker =
+                            crate::conversation::turn::TurnTracker::new();
                         self.session_files.clear();
                     }
 
@@ -556,9 +567,10 @@ impl AgentLoop {
                                 self.turn_runner.config = self.config.clone();
                             }
                             Err(e) => {
-                                let _ = self.event_tx.send(AgentEvent::TextDelta(
-                                    format!("**Warning: failed to reload provider: {}**\n\n", e)
-                                ));
+                                let _ = self.event_tx.send(AgentEvent::TextDelta(format!(
+                                    "**Warning: failed to reload provider: {}**\n\n",
+                                    e
+                                )));
                             }
                         }
                     }
@@ -602,16 +614,40 @@ impl AgentLoop {
         // Detect negative feedback — user is unhappy with previous turn's work.
         let lower = content.to_lowercase();
         let negative_keywords = [
-            "改错", "不对", "错了", "还是不行", "没用", "不是这样", "搞错",
-            "又错", "白做", "越改越差", "恢复", "回滚", "撤销", "不行",
-            "wrong", "not right", "still broken", "doesn't work", "undo",
-            "revert", "go back", "that's worse", "stop", "broken",
+            "改错",
+            "不对",
+            "错了",
+            "还是不行",
+            "没用",
+            "不是这样",
+            "搞错",
+            "又错",
+            "白做",
+            "越改越差",
+            "恢复",
+            "回滚",
+            "撤销",
+            "不行",
+            "wrong",
+            "not right",
+            "still broken",
+            "doesn't work",
+            "undo",
+            "revert",
+            "go back",
+            "that's worse",
+            "stop",
+            "broken",
         ];
-        self.discipline_state.is_negative_feedback = content.chars().count() < 80
-            && negative_keywords.iter().any(|kw| lower.contains(kw));
+        self.discipline_state.is_negative_feedback =
+            content.chars().count() < 80 && negative_keywords.iter().any(|kw| lower.contains(kw));
 
         // Git checkpoint: snapshot working tree before agent starts editing.
-        let wd = self.turn_runner.context.working_dir.try_read()
+        let wd = self
+            .turn_runner
+            .context
+            .working_dir
+            .try_read()
             .map(|g| g.clone())
             .unwrap_or_default();
         self.last_checkpoint = git_checkpoint::create_checkpoint(&wd);
@@ -620,14 +656,16 @@ impl AgentLoop {
         // Without this, the first tool call in a new turn reads the stale budget
         // from the previous turn's last LLM call (when ctx was full), causing
         // 670-line files to skeleton when there's plenty of room.
-        let ctx_window = self.config.providers
+        let ctx_window = self
+            .config
+            .providers
             .get(&self.config.default_provider)
             .map(|p| p.context_window)
             .unwrap_or(128000);
-        self.turn_runner.context.ctx_budget_hint.store(
-            ctx_window,
-            std::sync::atomic::Ordering::Relaxed,
-        );
+        self.turn_runner
+            .context
+            .ctx_budget_hint
+            .store(ctx_window, std::sync::atomic::Ordering::Relaxed);
 
         // Auto-diagnose: if user mentions error keywords, scan logs and attach findings.
         // This gives the model the real error from Turn 1, instead of spending 3-5 turns grepping.
@@ -712,8 +750,12 @@ impl AgentLoop {
         // Initialize datalog for this turn
         {
             let model_name = self.turn_runner.provider.model_name().to_string();
-            let ctx_window = self.config.providers.get(&self.config.default_provider)
-                .map(|p| p.context_window).unwrap_or(128000);
+            let ctx_window = self
+                .config
+                .providers
+                .get(&self.config.default_provider)
+                .map(|p| p.context_window)
+                .unwrap_or(128000);
             self.datalog.begin_turn(&content, &model_name, ctx_window);
         }
 
@@ -721,14 +763,17 @@ impl AgentLoop {
         // Two facts, not guesses:
 
         // 1. Has the model read any files this session? If not → read-only first turn.
-        let has_file_context = !self.files_read_this_turn.is_empty()
-            || !self.files_edited_this_turn.is_empty();
+        let has_file_context =
+            !self.files_read_this_turn.is_empty() || !self.files_edited_this_turn.is_empty();
         self.diagnosis_read_only_turns = if has_file_context { 0 } else { 1 };
         self.planning_phase = !has_file_context;
 
         // Unified prepend — no task classification, no auto-build injection.
         // Build command detection deferred to Phase 5 (LLM-inferred project config).
-        let _content = format!("Read the relevant code first, then plan and implement.\n\n{}", content);
+        let _content = format!(
+            "Read the relevant code first, then plan and implement.\n\n{}",
+            content
+        );
 
         self.phase = AgentPhase::Thinking;
         let _ = self
@@ -766,7 +811,8 @@ impl AgentLoop {
 
             // Inject any pending user input appended during streaming.
             if let Some(input) = self.pending_input.take() {
-                self.conversation.add_user_message(&format!("[Additional context from user]: {}", input));
+                self.conversation
+                    .add_user_message(&format!("[Additional context from user]: {}", input));
             }
 
             // Planning phase: inject planning reminder on turn 3.
@@ -813,15 +859,21 @@ impl AgentLoop {
 
             // Log LLM request to <working_dir>/datalog/llm/ — colocated with turn .md files.
             {
-                let context_window = self.config
+                let context_window = self
+                    .config
                     .providers
                     .get(&self.config.default_provider)
                     .map(|p| p.context_window)
                     .unwrap_or(128000);
                 let (msgs, _) = conv.to_provider_messages_budgeted(&system_prompt, context_window);
                 let tool_defs = self.turn_runner.tools.get_definitions();
-                let wd = self.turn_runner.context.working_dir
-                    .try_read().map(|g| g.clone()).unwrap_or_default();
+                let wd = self
+                    .turn_runner
+                    .context
+                    .working_dir
+                    .try_read()
+                    .map(|g| g.clone())
+                    .unwrap_or_default();
                 crate::turn::log::log_llm_request(
                     &wd,
                     &msgs,
@@ -877,10 +929,17 @@ impl AgentLoop {
                 // ±5 lines context return, fuzzy match, delta validation) —
                 // not by blocking tools at the agent loop level.
                 let read_only_tools: &[&str] = &[
-                    "read_file", "grep", "glob", "list_directory",
-                    "web_search", "web_fetch",
-                    "trace_callees", "trace_callers", "trace_chain",
-                    "file_dependencies", "blast_radius",
+                    "read_file",
+                    "grep",
+                    "glob",
+                    "list_directory",
+                    "web_search",
+                    "web_fetch",
+                    "trace_callees",
+                    "trace_callers",
+                    "trace_chain",
+                    "file_dependencies",
+                    "blast_radius",
                 ];
                 let use_read_only = self.plan_mode || self.diagnosis_read_only_turns > 0;
                 let tool_filter: Option<&[&str]> = if use_read_only {
@@ -889,7 +948,12 @@ impl AgentLoop {
                     None // Full tool access — model can read, edit, bash, search_replace
                 };
                 let turn_fut = runner.run_with_filter(
-                    &mut conv, &system_prompt, &turn_reminder, &turn_tx, cancel, tool_filter,
+                    &mut conv,
+                    &system_prompt,
+                    &turn_reminder,
+                    &turn_tx,
+                    cancel,
+                    tool_filter,
                 );
                 tokio::pin!(turn_fut);
 
@@ -1138,7 +1202,11 @@ impl AgentLoop {
 
             // Handle result
             match result {
-                TurnResult::Responded { ref text, tokens, truncated } => {
+                TurnResult::Responded {
+                    ref text,
+                    tokens,
+                    truncated,
+                } => {
                     self.turn_tokens += tokens;
                     self.total_tokens += tokens;
                     // Log the final assistant text to datalog (TUI used to do this —
@@ -1174,8 +1242,12 @@ impl AgentLoop {
                         if self.subtask_driver.active {
                             let graph = self.turn_runner.context.graph.read().await;
                             if graph.is_ready() {
-                                let plan_files: Vec<&str> = self.subtask_driver.subtasks
-                                    .iter().map(|s| s.file.as_str()).collect();
+                                let plan_files: Vec<&str> = self
+                                    .subtask_driver
+                                    .subtasks
+                                    .iter()
+                                    .map(|s| s.file.as_str())
+                                    .collect();
                                 let mut missing_deps: Vec<String> = Vec::new();
                                 let mut seen = std::collections::HashSet::new();
 
@@ -1186,7 +1258,8 @@ impl AgentLoop {
                                 for plan_file in &plan_files {
                                     // Find this file in graph and get its dependencies
                                     for (path, _) in &graph.file_symbols {
-                                        let basename = path.file_name()
+                                        let basename = path
+                                            .file_name()
                                             .map(|f| f.to_string_lossy().to_string())
                                             .unwrap_or_default();
                                         if basename == *plan_file {
@@ -1196,9 +1269,15 @@ impl AgentLoop {
                                                 for &sid in ids.iter().take(20) {
                                                     if let Some(edges) = graph.callees(sid) {
                                                         for edge in edges {
-                                                            if let Some(node) = graph.node(edge.to) {
-                                                                let dep_name = node.file.file_name()
-                                                                    .map(|f| f.to_string_lossy().to_string())
+                                                            if let Some(node) = graph.node(edge.to)
+                                                            {
+                                                                let dep_name = node
+                                                                    .file
+                                                                    .file_name()
+                                                                    .map(|f| {
+                                                                        f.to_string_lossy()
+                                                                            .to_string()
+                                                                    })
                                                                     .unwrap_or_default();
                                                                 if !dep_name.is_empty()
                                                                     && !seen.contains(&dep_name)
@@ -1246,11 +1325,10 @@ impl AgentLoop {
                             crate::conversation::message::Message::new(
                                 crate::conversation::message::Role::Assistant,
                                 "(completed)".to_string(),
-                            )
+                            ),
                         );
-                        self.conversation.add_user_message(
-                            "Summarize what you changed and finish."
-                        );
+                        self.conversation
+                            .add_user_message("Summarize what you changed and finish.");
                         continue;
                     }
                     if is_empty && self.retry_count < 2 {
@@ -1262,7 +1340,7 @@ impl AgentLoop {
                             crate::conversation::message::Message::new(
                                 crate::conversation::message::Role::Assistant,
                                 "(continuing...)".to_string(),
-                            )
+                            ),
                         );
                         // Empty response retry: one uniform nudge regardless of whether
                         // edits happened. Removed the edit-specific "Summarize what you
@@ -1295,7 +1373,11 @@ impl AgentLoop {
                     self.finish_turn(TurnStopReason::Natural);
                     return;
                 }
-                TurnResult::UsedTools { tool_count, tokens, text } => {
+                TurnResult::UsedTools {
+                    tool_count,
+                    tokens,
+                    text,
+                } => {
                     self.turn_tokens += tokens;
                     self.total_tokens += tokens;
                     self.tool_call_count += tool_count;
@@ -1318,10 +1400,15 @@ impl AgentLoop {
                             && !plan_text.trim().is_empty()
                         {
                             self.subtask_driver.extract_from_plan(plan_text);
-                            if self.subtask_driver.active && self.subtask_driver.subtasks.len() >= 2 {
+                            if self.subtask_driver.active && self.subtask_driver.subtasks.len() >= 2
+                            {
                                 self.plan_text = Some(plan_text.clone());
-                                if let Some(sub_result) = self.try_sub_agent_dispatch(plan_text).await {
-                                    let _ = self.event_tx.send(AgentEvent::TextDelta(sub_result.clone()));
+                                if let Some(sub_result) =
+                                    self.try_sub_agent_dispatch(plan_text).await
+                                {
+                                    let _ = self
+                                        .event_tx
+                                        .send(AgentEvent::TextDelta(sub_result.clone()));
                                     self.subtask_driver = subtask_driver::SubtaskDriver::new();
 
                                     if sub_result.contains("BUILD ERRORS") {
@@ -1359,12 +1446,15 @@ impl AgentLoop {
                     }
                     // Continue to next turn
                     self.phase = AgentPhase::Thinking;
-                    let _ = self.event_tx.send(AgentEvent::PhaseChange(AgentPhase::Thinking));
+                    let _ = self
+                        .event_tx
+                        .send(AgentEvent::PhaseChange(AgentPhase::Thinking));
                     continue;
                 }
                 TurnResult::Failed(e) => {
                     // Retry logic for transient errors
-                    let is_rate_limited = e.contains("429") || e.contains("rate") || e.contains("Too Many");
+                    let is_rate_limited =
+                        e.contains("429") || e.contains("rate") || e.contains("Too Many");
                     let is_auth_error = e.contains("401 ") || e.contains("403 ");
                     let is_messages_illegal = e.contains("illegal") || e.contains("messages");
 
@@ -1379,15 +1469,17 @@ impl AgentLoop {
                             self.conversation.messages.truncate(len - 4);
                         }
                         let _ = self.event_tx.send(AgentEvent::TextDelta(
-                            "\n[Context overflow — compressed history and retrying...]\n".to_string()
+                            "\n[Context overflow — compressed history and retrying...]\n"
+                                .to_string(),
                         ));
                         continue;
                     } else if is_rate_limited && self.retry_count < 5 {
                         self.retry_count += 1;
                         let wait = (self.retry_count as u64 * 3).min(30);
-                        let _ = self.event_tx.send(AgentEvent::TextDelta(
-                            format!("\n[Rate limited — retrying in {}s...]\n", wait)
-                        ));
+                        let _ = self.event_tx.send(AgentEvent::TextDelta(format!(
+                            "\n[Rate limited — retrying in {}s...]\n",
+                            wait
+                        )));
                         tokio::time::sleep(Duration::from_secs(wait)).await;
                         continue;
                     } else if is_auth_error {
@@ -1398,9 +1490,10 @@ impl AgentLoop {
                     } else if self.retry_count < 3 {
                         self.retry_count += 1;
                         let wait = (self.retry_count as u64 * 3).min(15);
-                        let _ = self.event_tx.send(AgentEvent::TextDelta(
-                            format!("\n[API error — retrying in {}s ({}/3)...]\n", wait, self.retry_count)
-                        ));
+                        let _ = self.event_tx.send(AgentEvent::TextDelta(format!(
+                            "\n[API error — retrying in {}s ({}/3)...]\n",
+                            wait, self.retry_count
+                        )));
                         tokio::time::sleep(Duration::from_secs(wait)).await;
                         continue;
                     } else {
@@ -1428,10 +1521,13 @@ impl AgentLoop {
                     // that fires the next time the TUI's phase becomes Streaming —
                     // i.e. right after the user's next submission.
                     self.conversation.turn_tracker.complete_current();
-                    self.datalog.end_turn(self.turn_tokens, self.tool_call_count);
+                    self.datalog
+                        .end_turn(self.turn_tokens, self.tool_call_count);
                     self.turn_start = None;
                     self.phase = AgentPhase::Idle;
-                    let _ = self.event_tx.send(AgentEvent::PhaseChange(AgentPhase::Idle));
+                    let _ = self
+                        .event_tx
+                        .send(AgentEvent::PhaseChange(AgentPhase::Idle));
                     self.conversation.save(&Conversation::history_path());
                     return;
                 }
@@ -1450,19 +1546,25 @@ impl AgentLoop {
     /// Pauses the task, calls LLM to summarize, stores in cold zone.
     /// Falls back to mechanical compression if LLM fails.
     async fn maybe_compress_history(&mut self, system_prompt: &str) {
-        let context_window = self.config
+        let context_window = self
+            .config
             .providers
             .get(&self.config.default_provider)
             .map(|p| p.context_window)
             .unwrap_or(128000);
 
         let sys_tokens = system_prompt.len() / 4 + 4;
-        if !self.conversation.needs_compression(sys_tokens, context_window) {
+        if !self
+            .conversation
+            .needs_compression(sys_tokens, context_window)
+        {
             return;
         }
 
         let (content, n_turns) = self.conversation.build_compression_content();
-        if content.is_empty() || n_turns == 0 { return; }
+        if content.is_empty() || n_turns == 0 {
+            return;
+        }
 
         // Try LLM compression
         let summarize_prompt = format!(
@@ -1474,9 +1576,8 @@ impl AgentLoop {
 
         let mut mini_conv = crate::conversation::Conversation::new();
         mini_conv.add_user_message(&summarize_prompt);
-        let msgs = mini_conv.to_provider_messages(
-            "You are a conversation summarizer. Output ONLY the summary."
-        );
+        let msgs = mini_conv
+            .to_provider_messages("You are a conversation summarizer. Output ONLY the summary.");
 
         let mut summary = String::new();
         if let Ok(mut stream) = self.turn_runner.provider.chat_stream(&msgs, None) {
@@ -1486,13 +1587,20 @@ impl AgentLoop {
             let stream_timeout = std::time::Duration::from_secs(30);
             let mut got_token = false;
             loop {
-                let timeout = if got_token { stream_timeout } else { first_timeout };
+                let timeout = if got_token {
+                    stream_timeout
+                } else {
+                    first_timeout
+                };
                 match tokio::time::timeout(timeout, stream.next()).await {
                     Ok(Some(Ok(crate::stream::StreamEvent::Delta(text)))) => {
                         got_token = true;
                         // Strip model thinking tags (compression doesn't go through TurnRunner)
-                        let clean = text.replace("<think>", "").replace("</think>", "")
-                            .replace("<|im_start|>", "").replace("<|im_end|>", "");
+                        let clean = text
+                            .replace("<think>", "")
+                            .replace("</think>", "")
+                            .replace("<|im_start|>", "")
+                            .replace("<|im_end|>", "");
                         summary.push_str(&clean);
                     }
                     Ok(Some(Ok(crate::stream::StreamEvent::Done { .. }))) => break,
@@ -1518,11 +1626,19 @@ impl AgentLoop {
             state_parts.push(format!("TASK: {}", task_short));
         }
         if !self.files_edited_this_turn.is_empty() {
-            state_parts.push(format!("FILES EDITED: {}", self.files_edited_this_turn.join(", ")));
+            state_parts.push(format!(
+                "FILES EDITED: {}",
+                self.files_edited_this_turn.join(", ")
+            ));
         }
         if !self.files_read_this_turn.is_empty() {
-            let recent: Vec<&str> = self.files_read_this_turn.iter()
-                .rev().take(5).map(|s| s.as_str()).collect();
+            let recent: Vec<&str> = self
+                .files_read_this_turn
+                .iter()
+                .rev()
+                .take(5)
+                .map(|s| s.as_str())
+                .collect();
             state_parts.push(format!("RECENTLY READ: {}", recent.join(", ")));
         }
         if !state_parts.is_empty() {
@@ -1535,19 +1651,26 @@ impl AgentLoop {
 
     #[allow(dead_code)]
     async fn maybe_summarize_old_turns(&mut self, system_prompt: &str) {
-        let context_window = self.config
+        let context_window = self
+            .config
             .providers
             .get(&self.config.default_provider)
             .map(|p| p.context_window)
             .unwrap_or(128000);
 
         let sys_tokens = system_prompt.len() / 4 + 4;
-        let n_turns = self.conversation.turns_needing_summary(sys_tokens, context_window);
-        if n_turns == 0 { return; }
+        let n_turns = self
+            .conversation
+            .turns_needing_summary(sys_tokens, context_window);
+        if n_turns == 0 {
+            return;
+        }
 
         // Build the content to summarize
         let content = self.conversation.build_summary_content(n_turns);
-        if content.is_empty() { return; }
+        if content.is_empty() {
+            return;
+        }
 
         // Make a lightweight LLM call for summarization
         let summarize_prompt = format!(
@@ -1561,7 +1684,7 @@ impl AgentLoop {
         mini_conv.add_user_message(&summarize_prompt);
 
         let msgs = mini_conv.to_provider_messages(
-            "You are a conversation summarizer. Output only the summary, nothing else."
+            "You are a conversation summarizer. Output only the summary, nothing else.",
         );
 
         // Stream the summary (non-streaming would be simpler but we only have chat_stream)
@@ -1610,7 +1733,8 @@ impl AgentLoop {
         }
 
         // Flush datalog with final stats
-        self.datalog.end_turn(self.turn_tokens, self.tool_call_count);
+        self.datalog
+            .end_turn(self.turn_tokens, self.tool_call_count);
 
         let duration = self.turn_start.map(|t| t.elapsed()).unwrap_or_default();
         self.turn_start = None;
@@ -1643,7 +1767,11 @@ impl AgentLoop {
         return None;
 
         #[allow(unreachable_code)]
-        let wd = self.turn_runner.context.working_dir.try_read()
+        let wd = self
+            .turn_runner
+            .context
+            .working_dir
+            .try_read()
             .map(|g| g.clone())
             .ok()?;
 
@@ -1655,18 +1783,24 @@ impl AgentLoop {
         // Bug fix tasks should NOT use sub-agents — need serial diagnosis.
         // Only feature development (create/implement/add/beautify) benefits from parallel.
         let task_lower = self.current_task.to_lowercase();
-        let is_bugfix = task_lower.contains("报错") || task_lower.contains("错误")
-            || task_lower.contains("修复") || task_lower.contains("修一下")
-            || task_lower.contains("不行") || task_lower.contains("fix")
-            || task_lower.contains("error") || task_lower.contains("broken")
-            || task_lower.contains("bug") || task_lower.contains("还是");
+        let is_bugfix = task_lower.contains("报错")
+            || task_lower.contains("错误")
+            || task_lower.contains("修复")
+            || task_lower.contains("修一下")
+            || task_lower.contains("不行")
+            || task_lower.contains("fix")
+            || task_lower.contains("error")
+            || task_lower.contains("broken")
+            || task_lower.contains("bug")
+            || task_lower.contains("还是");
         if is_bugfix {
             return None;
         }
 
-        let _ = self.event_tx.send(AgentEvent::TextDelta(
-            format!("\n\n**Dispatching {} sub-agents in parallel...**\n", subtasks.len())
-        ));
+        let _ = self.event_tx.send(AgentEvent::TextDelta(format!(
+            "\n\n**Dispatching {} sub-agents in parallel...**\n",
+            subtasks.len()
+        )));
 
         // Read all target files. If any file can't be found, fall back to serial.
         let mut tasks = Vec::new();
@@ -1683,9 +1817,10 @@ impl AgentLoop {
                     match find_file_recursive(&wd, &subtask.file) {
                         Some(p) => p,
                         None => {
-                            let _ = self.event_tx.send(AgentEvent::TextDelta(
-                                format!("  Cannot find {}. Falling back to serial mode.\n", subtask.file)
-                            ));
+                            let _ = self.event_tx.send(AgentEvent::TextDelta(format!(
+                                "  Cannot find {}. Falling back to serial mode.\n",
+                                subtask.file
+                            )));
                             return None;
                         }
                     }
@@ -1695,17 +1830,15 @@ impl AgentLoop {
             let content = match std::fs::read_to_string(&file_path) {
                 Ok(c) => c,
                 Err(_) => {
-                    let _ = self.event_tx.send(AgentEvent::TextDelta(
-                        format!("  Cannot read {}. Falling back to serial mode.\n", subtask.file)
-                    ));
+                    let _ = self.event_tx.send(AgentEvent::TextDelta(format!(
+                        "  Cannot read {}. Falling back to serial mode.\n",
+                        subtask.file
+                    )));
                     return None;
                 }
             };
 
-            all_file_contents.push((
-                file_path.to_string_lossy().to_string(),
-                content,
-            ));
+            all_file_contents.push((file_path.to_string_lossy().to_string(), content));
         }
 
         // Generate sibling skeletons: compact view of other files
@@ -1713,14 +1846,15 @@ impl AgentLoop {
             let (ref file_path, ref _content) = all_file_contents[i];
             let mut siblings = String::new();
             for (j, (ref sib_path, ref sib_content)) in all_file_contents.iter().enumerate() {
-                if i == j { continue; }
+                if i == j {
+                    continue;
+                }
                 let short = std::path::Path::new(sib_path)
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_else(|| sib_path.clone());
                 // Take first 30 lines as skeleton
-                let skeleton: String = sib_content.lines().take(30)
-                    .collect::<Vec<_>>().join("\n");
+                let skeleton: String = sib_content.lines().take(30).collect::<Vec<_>>().join("\n");
                 siblings.push_str(&format!("### {}\n```\n{}\n```\n\n", short, skeleton));
             }
 
@@ -1743,7 +1877,9 @@ impl AgentLoop {
         let tools = self.tool_registry.clone();
         let config = self.config.clone();
 
-        let results = pool.execute_all(provider, tools, &config, &wd, &self.event_tx).await;
+        let results = pool
+            .execute_all(provider, tools, &config, &wd, &self.event_tx)
+            .await;
 
         // Build summary
         let mut summary = String::from("\n**Sub-agent results:**\n");
@@ -1777,10 +1913,17 @@ impl AgentLoop {
         }
 
         if all_success {
-            summary.push_str(&format!("\nAll {} sub-agents completed successfully.\n", results.len()));
+            summary.push_str(&format!(
+                "\nAll {} sub-agents completed successfully.\n",
+                results.len()
+            ));
         } else {
             let failed: Vec<_> = results.iter().filter(|r| !r.success).collect();
-            summary.push_str(&format!("\n{}/{} sub-agents failed.\n", failed.len(), results.len()));
+            summary.push_str(&format!(
+                "\n{}/{} sub-agents failed.\n",
+                failed.len(),
+                results.len()
+            ));
         }
 
         // Merge verification: compile/build to catch cross-file errors.
@@ -1798,7 +1941,8 @@ impl AgentLoop {
                 let stderr = String::from_utf8_lossy(&out.stderr);
                 let combined = format!("{}{}", stdout, stderr);
                 if !out.status.success() || combined.to_lowercase().contains("error") {
-                    let err_lines: String = combined.lines().take(10).collect::<Vec<_>>().join("\n");
+                    let err_lines: String =
+                        combined.lines().take(10).collect::<Vec<_>>().join("\n");
                     summary.push_str(&format!(
                         "\n⚠ BUILD ERRORS after sub-agent merge:\n{}\nFix these errors before proceeding.\n",
                         err_lines
@@ -1817,8 +1961,8 @@ impl AgentLoop {
 /// Returns the first match. Skips hidden dirs, node_modules, target, etc.
 fn find_file_recursive(dir: &std::path::Path, file_name: &str) -> Option<std::path::PathBuf> {
     let walker = ignore::WalkBuilder::new(dir)
-        .hidden(true)       // skip hidden
-        .git_ignore(true)   // respect .gitignore
+        .hidden(true) // skip hidden
+        .git_ignore(true) // respect .gitignore
         .max_depth(Some(10))
         .build();
 
@@ -1923,8 +2067,3 @@ fn short_path(path: &str) -> String {
         _ => format!(".../{}/{}", parts[1], parts[0]),
     }
 }
-
-
-
-
-

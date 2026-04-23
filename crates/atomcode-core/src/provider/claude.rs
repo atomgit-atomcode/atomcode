@@ -37,7 +37,9 @@ impl ClaudeProvider {
                 .base_url
                 .clone()
                 .unwrap_or_else(|| "https://api.anthropic.com".to_string()),
-            max_tokens: config.max_tokens.unwrap_or((config.context_window / 4).clamp(8_000, 16_384)),
+            max_tokens: config
+                .max_tokens
+                .unwrap_or((config.context_window / 4).clamp(8_000, 16_384)),
         })
     }
 
@@ -98,7 +100,9 @@ impl ClaudeProvider {
                     // serialized the same way — ToolResultRef uses its summary.
                     let (call_id, output) = match &m.content {
                         MessageContent::ToolResult(r) => (r.call_id.as_str(), r.output.as_str()),
-                        MessageContent::ToolResultRef(r) => (r.call_id.as_str(), r.summary.as_str()),
+                        MessageContent::ToolResultRef(r) => {
+                            (r.call_id.as_str(), r.summary.as_str())
+                        }
                         _ => continue,
                     };
                     msgs.push(json!({
@@ -281,12 +285,14 @@ impl LlmProvider for ClaudeProvider {
                 let chunk = match tokio::time::timeout(
                     std::time::Duration::from_secs(120),
                     byte_stream.next(),
-                ).await {
+                )
+                .await
+                {
                     Ok(Some(chunk)) => chunk,
                     Ok(None) => break,
                     Err(_) => {
                         let _ = tx.send(Ok(StreamEvent::Error(
-                            "Stream timeout: no data received for 120 seconds".to_string()
+                            "Stream timeout: no data received for 120 seconds".to_string(),
                         )));
                         return;
                     }
@@ -364,26 +370,25 @@ impl LlmProvider for ClaudeProvider {
                         }
                         "message_start" => {
                             // message_start nests usage under message.usage
-                            if let Some(usage) = evt.message.as_ref().and_then(|m| m.usage.as_ref()) {
-                                let _ = tx.send(Ok(StreamEvent::Usage(
-                                    crate::stream::TokenUsage {
+                            if let Some(usage) = evt.message.as_ref().and_then(|m| m.usage.as_ref())
+                            {
+                                let _ =
+                                    tx.send(Ok(StreamEvent::Usage(crate::stream::TokenUsage {
                                         prompt_tokens: usage.input_tokens,
                                         completion_tokens: usage.output_tokens,
                                         cached_tokens: usage.cache_read_input_tokens,
-                                    }
-                                )));
+                                    })));
                             }
                         }
                         "message_delta" => {
                             // message_delta has top-level usage with output_tokens
                             if let Some(usage) = &evt.usage {
-                                let _ = tx.send(Ok(StreamEvent::Usage(
-                                    crate::stream::TokenUsage {
+                                let _ =
+                                    tx.send(Ok(StreamEvent::Usage(crate::stream::TokenUsage {
                                         prompt_tokens: usage.input_tokens,
                                         completion_tokens: usage.output_tokens,
                                         cached_tokens: usage.cache_read_input_tokens,
-                                    }
-                                )));
+                                    })));
                             }
                         }
                         "message_stop" => {
@@ -490,8 +495,16 @@ mod tests {
     #[test]
     fn test_tools_last_has_cache_control() {
         let tools = vec![
-            ToolDef { name: "grep", description: "Search".into(), parameters: json!({"type": "object"}) },
-            ToolDef { name: "read_file", description: "Read".into(), parameters: json!({"type": "object"}) },
+            ToolDef {
+                name: "grep",
+                description: "Search".into(),
+                parameters: json!({"type": "object"}),
+            },
+            ToolDef {
+                name: "read_file",
+                description: "Read".into(),
+                parameters: json!({"type": "object"}),
+            },
         ];
 
         let body = ClaudeProvider::build_request_body(
@@ -508,27 +521,27 @@ mod tests {
         assert_eq!(arr.len(), 2);
 
         // First tool should NOT have cache_control
-        assert!(arr[0].get("cache_control").is_none(),
-            "First tool should not have cache_control");
+        assert!(
+            arr[0].get("cache_control").is_none(),
+            "First tool should not have cache_control"
+        );
 
         // Last tool SHOULD have cache_control
-        assert_eq!(arr[1]["cache_control"]["type"], "ephemeral",
-            "Last tool must have cache_control");
+        assert_eq!(
+            arr[1]["cache_control"]["type"], "ephemeral",
+            "Last tool must have cache_control"
+        );
     }
 
     #[test]
     fn test_single_tool_has_cache_control() {
-        let tools = vec![
-            ToolDef { name: "bash", description: "Run".into(), parameters: json!({"type": "object"}) },
-        ];
+        let tools = vec![ToolDef {
+            name: "bash",
+            description: "Run".into(),
+            parameters: json!({"type": "object"}),
+        }];
 
-        let body = ClaudeProvider::build_request_body(
-            "model",
-            8192,
-            None,
-            vec![],
-            Some(&tools),
-        );
+        let body = ClaudeProvider::build_request_body("model", 8192, None, vec![], Some(&tools));
 
         let arr = body["tools"].as_array().unwrap();
         assert_eq!(arr.len(), 1);
@@ -538,17 +551,19 @@ mod tests {
     #[test]
     fn test_empty_tools_no_tools_field() {
         let tools: Vec<ToolDef> = vec![];
-        let body = ClaudeProvider::build_request_body(
-            "model", 8192, None, vec![], Some(&tools),
+        let body = ClaudeProvider::build_request_body("model", 8192, None, vec![], Some(&tools));
+        assert!(
+            body.get("tools").is_none(),
+            "Empty tools should not add tools field"
         );
-        assert!(body.get("tools").is_none(), "Empty tools should not add tools field");
     }
 
     #[test]
     fn test_no_system_no_system_field() {
-        let body = ClaudeProvider::build_request_body(
-            "model", 8192, None, vec![], None,
+        let body = ClaudeProvider::build_request_body("model", 8192, None, vec![], None);
+        assert!(
+            body.get("system").is_none(),
+            "No system prompt should not add system field"
         );
-        assert!(body.get("system").is_none(), "No system prompt should not add system field");
     }
 }

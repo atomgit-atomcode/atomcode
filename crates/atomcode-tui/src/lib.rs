@@ -12,19 +12,19 @@ pub mod wecom_login;
 use std::io::Write;
 
 use anyhow::Result;
+#[cfg(not(target_os = "windows"))]
+use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
 use crossterm::{
-    execute,
     event::{
-        DisableMouseCapture,
-        KeyboardEnhancementFlags, PushKeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+        DisableMouseCapture, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+        PushKeyboardEnhancementFlags,
     },
+    execute,
     terminal::{
-        disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
-        SetTitle, Clear, ClearType,
+        disable_raw_mode, enable_raw_mode, Clear, ClearType, EnterAlternateScreen,
+        LeaveAlternateScreen, SetTitle,
     },
 };
-#[cfg(not(target_os = "windows"))]
-use crossterm::event::{EnableBracketedPaste, DisableBracketedPaste};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
@@ -128,8 +128,8 @@ fn resolve_editor() -> Result<String, String> {
 }
 
 use atomcode_core::agent::AgentHandle;
-use atomcode_core::config::Config;
 use atomcode_core::config::provider::ProviderConfig;
+use atomcode_core::config::Config;
 use atomcode_core::tool::ToolContext;
 
 use app::App;
@@ -219,18 +219,24 @@ fn build_wecom_provider(creds: &wecom_login::BrokerCreds) -> ProviderConfig {
 /// Parse query parameters from a callback URL (handles both full URL and path-only).
 fn parse_callback_params(url: &str) -> anyhow::Result<std::collections::HashMap<String, String>> {
     // Find the query string — works for both "/callback?code=..." and "http://...?code=..."
-    let query_start = url.find('?').ok_or_else(|| anyhow::anyhow!("No query parameters in URL"))?;
+    let query_start = url
+        .find('?')
+        .ok_or_else(|| anyhow::anyhow!("No query parameters in URL"))?;
     let query = &url[query_start + 1..];
 
-    Ok(query.split('&')
+    Ok(query
+        .split('&')
         .filter_map(|pair| {
             let mut parts = pair.splitn(2, '=');
             let key = parts.next()?;
             let value = parts.next().unwrap_or_default();
             // Basic URL decode
-            let decoded = value.replace('+', " ")
-                .replace("%3A", ":").replace("%2F", "/")
-                .replace("%3D", "=").replace("%26", "&");
+            let decoded = value
+                .replace('+', " ")
+                .replace("%3A", ":")
+                .replace("%2F", "/")
+                .replace("%3D", "=")
+                .replace("%26", "&");
             Some((key.to_string(), decoded))
         })
         .collect())
@@ -241,12 +247,13 @@ fn run_oauth_login() -> anyhow::Result<AuthInfo> {
     use std::io::{BufRead, Write};
     use std::net::TcpListener;
 
-
     // Generate state for CSRF protection
-    let state = format!("atomcode_{}", std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)?
-        .as_nanos());
-
+    let state = format!(
+        "atomcode_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos()
+    );
 
     // Build authorization URL
     let auth_url = format!(
@@ -261,18 +268,31 @@ fn run_oauth_login() -> anyhow::Result<AuthInfo> {
     // Try to open browser
     let browser_opened = {
         #[cfg(target_os = "macos")]
-        { std::process::Command::new("open").arg(&auth_url).spawn().is_ok() }
+        {
+            std::process::Command::new("open")
+                .arg(&auth_url)
+                .spawn()
+                .is_ok()
+        }
         #[cfg(target_os = "linux")]
-        { std::process::Command::new("xdg-open").arg(&auth_url).spawn().is_ok() }
+        {
+            std::process::Command::new("xdg-open")
+                .arg(&auth_url)
+                .spawn()
+                .is_ok()
+        }
         #[cfg(target_os = "windows")]
         {
             use std::os::windows::process::CommandExt;
             std::process::Command::new("cmd")
                 .raw_arg(format!("/C start \"\" \"{}\"", auth_url))
-                .spawn().is_ok()
+                .spawn()
+                .is_ok()
         }
         #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-        { false }
+        {
+            false
+        }
     };
 
     if browser_opened {
@@ -296,7 +316,10 @@ fn run_oauth_login() -> anyhow::Result<AuthInfo> {
         println!("  Waiting for callback on port {}...", oauth::REDIRECT_PORT);
         println!("  If you're on a remote server, paste the callback URL below instead.\n");
     } else {
-        println!("  Cannot listen on port {} (already in use?).", oauth::REDIRECT_PORT);
+        println!(
+            "  Cannot listen on port {} (already in use?).",
+            oauth::REDIRECT_PORT
+        );
         println!("  After authorizing, paste the callback URL from your browser below.\n");
     }
     println!("  Paste Callback URL: ");
@@ -320,14 +343,20 @@ fn run_oauth_login() -> anyhow::Result<AuthInfo> {
                     // Ctrl+H → Backspace (Linux terminal compat)
                     let code = if key.modifiers == crossterm::event::KeyModifiers::CONTROL
                         && key.code == crossterm::event::KeyCode::Char('h')
-                    { crossterm::event::KeyCode::Backspace } else { key.code };
+                    {
+                        crossterm::event::KeyCode::Backspace
+                    } else {
+                        key.code
+                    };
 
                     match code {
                         crossterm::event::KeyCode::Esc => {
                             break Err(anyhow::anyhow!("Login cancelled by user"));
                         }
                         crossterm::event::KeyCode::Char('c')
-                            if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) =>
+                            if key
+                                .modifiers
+                                .contains(crossterm::event::KeyModifiers::CONTROL) =>
                         {
                             break Err(anyhow::anyhow!("Login cancelled by user"));
                         }
@@ -385,7 +414,9 @@ fn run_oauth_login() -> anyhow::Result<AuthInfo> {
             let mut request_line = String::new();
             reader.read_line(&mut request_line)?;
 
-            let url: String = request_line.split_whitespace().nth(1)
+            let url: String = request_line
+                .split_whitespace()
+                .nth(1)
                 .ok_or_else(|| anyhow::anyhow!("Invalid HTTP request"))?
                 .to_string();
 
@@ -407,7 +438,10 @@ fn run_oauth_login() -> anyhow::Result<AuthInfo> {
             let _ = stream.write_all(response.as_bytes());
             let _ = stream.flush();
 
-            let code = params.get("code").ok_or_else(|| anyhow::anyhow!("No code in callback"))?.clone();
+            let code = params
+                .get("code")
+                .ok_or_else(|| anyhow::anyhow!("No code in callback"))?
+                .clone();
             let st = params.get("state").cloned().unwrap_or_default();
             (code, st)
         }
@@ -416,7 +450,10 @@ fn run_oauth_login() -> anyhow::Result<AuthInfo> {
             if let Some(error) = params.get("error") {
                 anyhow::bail!("OAuth error: {}", error);
             }
-            let code = params.get("code").ok_or_else(|| anyhow::anyhow!("No code in pasted URL"))?.clone();
+            let code = params
+                .get("code")
+                .ok_or_else(|| anyhow::anyhow!("No code in pasted URL"))?
+                .clone();
             let st = params.get("state").cloned().unwrap_or_default();
             (code, st)
         }
@@ -443,11 +480,17 @@ fn run_oauth_login() -> anyhow::Result<AuthInfo> {
 
     let response_text = response.text()?;
     println!("  Token response: {}\n", response_text);
-    
-    let token_resp: TokenResponse = serde_json::from_str(&response_text)
-        .map_err(|e| anyhow::anyhow!("Failed to parse token response: {} - body: {}", e, response_text))?;
-    
-    let access_token = token_resp.access_token
+
+    let token_resp: TokenResponse = serde_json::from_str(&response_text).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to parse token response: {} - body: {}",
+            e,
+            response_text
+        )
+    })?;
+
+    let access_token = token_resp
+        .access_token
         .ok_or_else(|| anyhow::anyhow!("No access_token in response"))?;
 
     // Get user info
@@ -455,18 +498,22 @@ fn run_oauth_login() -> anyhow::Result<AuthInfo> {
         .get(oauth::USER_URL)
         .bearer_auth(&access_token)
         .send()?;
-    
+
     let user_text = user_response.text()?;
     println!("  User response: {}\n", user_text);
-    
-    let user_resp: UserResponse = serde_json::from_str(&user_text)
-        .map_err(|e| anyhow::anyhow!("Failed to parse user response: {} - body: {}", e, user_text))?;
+
+    let user_resp: UserResponse = serde_json::from_str(&user_text).map_err(|e| {
+        anyhow::anyhow!("Failed to parse user response: {} - body: {}", e, user_text)
+    })?;
 
     let auth_info = AuthInfo {
         access_token: access_token.clone(),
         user: UserInfo {
             id: user_resp.id.unwrap_or_default(),
-            username: user_resp.login.clone().unwrap_or_else(|| "unknown".to_string()),
+            username: user_resp
+                .login
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string()),
             name: user_resp.name,
         },
     };
@@ -481,8 +528,10 @@ fn run_oauth_login() -> anyhow::Result<AuthInfo> {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs();
-    let mut auth_content = format!("access_token = \"{}\"\ncreated_at = {}\n",
-        access_token, now);
+    let mut auth_content = format!(
+        "access_token = \"{}\"\ncreated_at = {}\n",
+        access_token, now
+    );
     if let Some(ref rt) = token_resp.refresh_token {
         auth_content.push_str(&format!("refresh_token = \"{}\"\n", rt));
     }
@@ -515,7 +564,7 @@ pub async fn run(
 ) -> Result<()> {
     // Initialize theme (detect terminal background color)
     ui::theme::Theme::init();
-    
+
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
     // Clear main screen + scrollback BEFORE entering alternate screen so Terminal.app
@@ -538,9 +587,10 @@ pub async fn run(
     // Enable Kitty keyboard protocol so the terminal can distinguish
     // Shift+Enter from plain Enter (needed for multi-line input).
     // Silently ignored by terminals that don't support it.
-    let _ = execute!(stdout, PushKeyboardEnhancementFlags(
-        KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-    ));
+    let _ = execute!(
+        stdout,
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+    );
 
     // Wrap stdout in BufWriter: crossterm emits many small writes per frame
     // (cursor moves, style changes, cells). On Windows each write is a
@@ -554,7 +604,14 @@ pub async fn run(
     let backend = CrosstermBackend::new(std::io::BufWriter::with_capacity(512 * 1024, stdout));
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
-    let mut app = App::new(model_name, config, agent_handle, tool_context, working_dir, session_to_continue);
+    let mut app = App::new(
+        model_name,
+        config,
+        agent_handle,
+        tool_context,
+        working_dir,
+        session_to_continue,
+    );
     let mut event_loop = EventLoop::new();
     let event_tx = event_loop.sender();
     event_loop.start();
@@ -615,7 +672,9 @@ pub async fn run(
                 LeaveAlternateScreen
             );
             #[cfg(not(target_os = "windows"))]
-            { let _ = execute!(terminal.backend_mut(), DisableBracketedPaste); }
+            {
+                let _ = execute!(terminal.backend_mut(), DisableBracketedPaste);
+            }
             disable_raw_mode()?;
             terminal.show_cursor()?;
 
@@ -645,22 +704,32 @@ pub async fn run(
                                     // they only exist in memory, not on disk.
                                     for (name, provider) in &app.config.providers {
                                         if provider.ephemeral {
-                                            new_config.providers.insert(name.clone(), provider.clone());
+                                            new_config
+                                                .providers
+                                                .insert(name.clone(), provider.clone());
                                         }
                                     }
                                     // If the previous default was ephemeral and still exists, keep it.
-                                    if app.config.providers.get(&app.config.default_provider)
-                                        .map(|p| p.ephemeral).unwrap_or(false)
-                                        && new_config.providers.contains_key(&app.config.default_provider)
+                                    if app
+                                        .config
+                                        .providers
+                                        .get(&app.config.default_provider)
+                                        .map(|p| p.ephemeral)
+                                        .unwrap_or(false)
+                                        && new_config
+                                            .providers
+                                            .contains_key(&app.config.default_provider)
                                     {
-                                        new_config.default_provider = app.config.default_provider.clone();
+                                        new_config.default_provider =
+                                            app.config.default_provider.clone();
                                     }
                                     app.config = new_config;
                                     app.rebuild_provider();
                                     app.sync_config_to_agent();
                                     let default_name = app.config.default_provider.clone();
                                     if let Ok(provider) = app.config.active_provider(None) {
-                                        app.model_name = format!("{} / {}", default_name, provider.model);
+                                        app.model_name =
+                                            format!("{} / {}", default_name, provider.model);
                                     }
                                 }
                             }
@@ -688,9 +757,10 @@ pub async fn run(
             )?;
             #[cfg(not(target_os = "windows"))]
             execute!(terminal.backend_mut(), EnableBracketedPaste)?;
-            let _ = execute!(terminal.backend_mut(), PushKeyboardEnhancementFlags(
-                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-            ));
+            let _ = execute!(
+                terminal.backend_mut(),
+                PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+            );
             terminal.clear()?;
             event_loop.start();
             if let Some(msg) = spawn_error {
@@ -703,7 +773,6 @@ pub async fn run(
         // Handle pending OAuth login
         if app.pending_login {
             app.pending_login = false;
-
 
             // Stop the input-reading thread before releasing the terminal.
             // On Windows, if the background thread keeps calling
@@ -723,7 +792,9 @@ pub async fn run(
                 LeaveAlternateScreen
             );
             #[cfg(not(target_os = "windows"))]
-            { let _ = execute!(terminal.backend_mut(), DisableBracketedPaste); }
+            {
+                let _ = execute!(terminal.backend_mut(), DisableBracketedPaste);
+            }
             disable_raw_mode()?;
             terminal.show_cursor()?;
             let _ = std::io::stdout().flush();
@@ -733,7 +804,7 @@ pub async fn run(
 
             // reqwest::blocking owns a tokio runtime; run on a dedicated
             // blocking thread so its Drop doesn't panic from async context.
-// (Same pattern as /login-with-sso below.)
+            // (Same pattern as /login-with-sso below.)
             let login_result = tokio::task::spawn_blocking(run_oauth_login)
                 .await
                 .unwrap_or_else(|e| Err(anyhow::anyhow!("login task panicked: {}", e)));
@@ -741,11 +812,16 @@ pub async fn run(
             match login_result {
                 Ok(auth) => {
                     println!("\n  Login successful! Logged in as: {}", auth.user.username);
-                    let oauth_name = app.pending_oauth_name.take().unwrap_or_else(|| "AtomGit".to_string());
+                    let oauth_name = app
+                        .pending_oauth_name
+                        .take()
+                        .unwrap_or_else(|| "AtomGit".to_string());
                     // Save provider config to config.toml (without api_key).
                     // api_key comes from auth.toml at runtime.
                     let oauth_provider = build_oauth_provider();
-                    app.config.providers.insert(oauth_name.clone(), oauth_provider);
+                    app.config
+                        .providers
+                        .insert(oauth_name.clone(), oauth_provider);
                     app.config.default_provider = oauth_name.clone();
                     let _ = app.config.save(&Config::default_path());
                     // api_key stays None in config — create_provider() reads
@@ -779,9 +855,10 @@ pub async fn run(
             )?;
             #[cfg(not(target_os = "windows"))]
             execute!(terminal.backend_mut(), EnableBracketedPaste)?;
-            let _ = execute!(terminal.backend_mut(), PushKeyboardEnhancementFlags(
-                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-            ));
+            let _ = execute!(
+                terminal.backend_mut(),
+                PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+            );
             terminal.clear()?;
             event_loop.start();
             continue;
@@ -802,7 +879,9 @@ pub async fn run(
                 LeaveAlternateScreen
             );
             #[cfg(not(target_os = "windows"))]
-            { let _ = execute!(terminal.backend_mut(), DisableBracketedPaste); }
+            {
+                let _ = execute!(terminal.backend_mut(), DisableBracketedPaste);
+            }
             disable_raw_mode()?;
             terminal.show_cursor()?;
             let _ = std::io::stdout().flush();
@@ -815,8 +894,14 @@ pub async fn run(
 
             match login_result {
                 Ok((identity, Some(creds))) => {
-                    let display_name = identity.name.clone().unwrap_or_else(|| identity.userid.clone());
-                    println!("\n  Login successful! WeCom user: {} ({})", display_name, identity.userid);
+                    let display_name = identity
+                        .name
+                        .clone()
+                        .unwrap_or_else(|| identity.userid.clone());
+                    println!(
+                        "\n  Login successful! WeCom user: {} ({})",
+                        display_name, identity.userid
+                    );
                     let provider_name = wecom_login::INTERNAL_PROVIDER_NAME.to_string();
                     let provider = build_wecom_provider(&creds);
                     app.config.providers.insert(provider_name.clone(), provider);
@@ -824,7 +909,7 @@ pub async fn run(
                     app.rebuild_provider();
                     app.sync_config_to_agent();
                     let model_display = app.provider.model_name();
-app.conversation.add_user_message("/login-with-sso");
+                    app.conversation.add_user_message("/login-with-sso");
                     app.conversation.push_delta(&format!(
                         "Login successful! SSO user: **{}** ({}).\n\nProvider `{}` active (in-memory, not saved to config).\nModel: `{}`",
                         display_name, identity.userid, provider_name, model_display
@@ -833,13 +918,13 @@ app.conversation.add_user_message("/login-with-sso");
                 }
                 Ok((_identity, None)) => {
                     println!("\n  Broker returned no credentials; provider not registered.");
-app.conversation.add_user_message("/login-with-sso");
+                    app.conversation.add_user_message("/login-with-sso");
                     app.conversation.push_delta("Login completed, but broker returned no credentials. Contact the GitCode platform team.");
                     app.conversation.finalize_stream();
                 }
                 Err(e) => {
                     println!("\n  WeCom login failed: {}", e);
-app.conversation.add_user_message("/login-with-sso");
+                    app.conversation.add_user_message("/login-with-sso");
                     app.conversation.push_delta(&format!("Login failed: {}", e));
                     app.conversation.finalize_stream();
                 }
@@ -855,9 +940,10 @@ app.conversation.add_user_message("/login-with-sso");
             )?;
             #[cfg(not(target_os = "windows"))]
             execute!(terminal.backend_mut(), EnableBracketedPaste)?;
-            let _ = execute!(terminal.backend_mut(), PushKeyboardEnhancementFlags(
-                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-            ));
+            let _ = execute!(
+                terminal.backend_mut(),
+                PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+            );
             terminal.clear()?;
             event_loop.start();
             continue;

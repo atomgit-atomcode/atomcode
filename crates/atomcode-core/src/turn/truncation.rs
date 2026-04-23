@@ -19,7 +19,7 @@ use crate::tool::ToolResult;
 pub fn truncate_output(result: &mut ToolResult, tool_name: &str, context_window: usize) {
     match tool_name {
         "bash" => truncate_bash(result),
-        "read_file" => {}, // Layer A in read.rs is the single authority. No post-hoc truncation.
+        "read_file" => {} // Layer A in read.rs is the single authority. No post-hoc truncation.
         "web_fetch" => truncate_generic(result, 150, 20, 40),
         _ => truncate_generic(result, 200, 30, 50),
     }
@@ -75,7 +75,9 @@ pub fn truncate_output(result: &mut ToolResult, tool_name: &str, context_window:
         let head_chars = hard_char_limit * 2 / 3;
         let tail_chars = hard_char_limit / 3;
         let head_part: String = chars[..head_chars.min(chars.len())].iter().collect();
-        let tail_part: String = chars[chars.len().saturating_sub(tail_chars)..].iter().collect();
+        let tail_part: String = chars[chars.len().saturating_sub(tail_chars)..]
+            .iter()
+            .collect();
         let omitted = chars.len().saturating_sub(head_chars + tail_chars);
         result.output = format!(
             "{}\n\n[... {} chars omitted (universal {} char cap) ...]\n\n{}",
@@ -106,9 +108,22 @@ fn truncate_bash(result: &mut ToolResult) {
 
     // --- Phase 1: General error-line extraction (non-build output) ---
     // Generic error patterns — no language-specific strings.
-    let error_patterns = ["error", "Error", "ERROR", "FAILED", "STDERR:",
-        "panic", "Panic", "PANIC", "not found", "No such file",
-        "Permission denied", "cannot find", "undefined", "unresolved"];
+    let error_patterns = [
+        "error",
+        "Error",
+        "ERROR",
+        "FAILED",
+        "STDERR:",
+        "panic",
+        "Panic",
+        "PANIC",
+        "not found",
+        "No such file",
+        "Permission denied",
+        "cannot find",
+        "undefined",
+        "unresolved",
+    ];
     let mut important: Vec<bool> = vec![false; lines.len()];
 
     for (i, line) in lines.iter().enumerate() {
@@ -167,27 +182,51 @@ fn try_compress_compile_errors(lines: &[&str]) -> Option<String> {
     // Compile error patterns by ecosystem — match lines that carry diagnostic value.
     // Java / Maven / Gradle
     let java_patterns: &[&str] = &[
-        "[ERROR]", "error:", "cannot find symbol", "package does not exist",
-        "incompatible types", "unreported exception", "method does not override",
+        "[ERROR]",
+        "error:",
+        "cannot find symbol",
+        "package does not exist",
+        "incompatible types",
+        "unreported exception",
+        "method does not override",
     ];
     // TypeScript / Node
     let ts_patterns: &[&str] = &[
-        "error TS", "Error:", "SyntaxError", "TypeError", "ReferenceError",
-        "Module not found", "Cannot find module",
+        "error TS",
+        "Error:",
+        "SyntaxError",
+        "TypeError",
+        "ReferenceError",
+        "Module not found",
+        "Cannot find module",
     ];
     // Rust / Cargo
     let rust_patterns: &[&str] = &[
-        "error[E", "warning[", "cannot find", "error:", "error[",
-        "aborting due to", "could not compile",
+        "error[E",
+        "warning[",
+        "cannot find",
+        "error:",
+        "error[",
+        "aborting due to",
+        "could not compile",
     ];
     // Generic build status lines — always valuable.
     let status_patterns: &[&str] = &[
-        "BUILD", "FAILURE", "SUCCESS", "FAILED", "PASSED",
-        "warning:", "warnings generated", "error generated",
-        "✓", "✗", "gzip:",
+        "BUILD",
+        "FAILURE",
+        "SUCCESS",
+        "FAILED",
+        "PASSED",
+        "warning:",
+        "warnings generated",
+        "error generated",
+        "✓",
+        "✗",
+        "gzip:",
     ];
 
-    let all_patterns: Vec<&str> = java_patterns.iter()
+    let all_patterns: Vec<&str> = java_patterns
+        .iter()
         .chain(ts_patterns.iter())
         .chain(rust_patterns.iter())
         .chain(status_patterns.iter())
@@ -231,9 +270,12 @@ fn try_compress_compile_errors(lines: &[&str]) -> Option<String> {
         for line in lines {
             let trimmed = line.trim();
             // Extract error codes/types: "error[E0433]", "error TS2304", "Error:", etc.
-            let is_error = trimmed.contains("error[E") || trimmed.contains("error TS")
-                || trimmed.starts_with("error:") || trimmed.starts_with("Error:")
-                || trimmed.contains(": error") || trimmed.contains("[ERROR]");
+            let is_error = trimmed.contains("error[E")
+                || trimmed.contains("error TS")
+                || trimmed.starts_with("error:")
+                || trimmed.starts_with("Error:")
+                || trimmed.contains(": error")
+                || trimmed.contains("[ERROR]");
             if is_error {
                 // Normalize: take first 100 chars as dedup key
                 let key: String = trimmed.chars().take(100).collect();
@@ -246,7 +288,10 @@ fn try_compress_compile_errors(lines: &[&str]) -> Option<String> {
 
     let mut output = String::new();
     if unique_errors.len() > 1 {
-        output.push_str(&format!("[{} unique errors — fix ALL before re-running build:]\n", unique_errors.len()));
+        output.push_str(&format!(
+            "[{} unique errors — fix ALL before re-running build:]\n",
+            unique_errors.len()
+        ));
         for (i, err) in unique_errors.iter().take(15).enumerate() {
             output.push_str(&format!("  {}. {}\n", i + 1, err));
         }
@@ -299,7 +344,12 @@ fn assemble_important_lines(lines: &[&str], important: &[bool]) -> String {
 // which one actually controlled the output.
 
 /// Generic truncation: head + tail, skipping middle.
-pub(crate) fn truncate_generic(result: &mut ToolResult, max_lines: usize, head: usize, tail: usize) {
+pub(crate) fn truncate_generic(
+    result: &mut ToolResult,
+    max_lines: usize,
+    head: usize,
+    tail: usize,
+) {
     let lines: Vec<&str> = result.output.lines().collect();
     if lines.len() > max_lines {
         let head_part: String = lines[..head].join("\n");
@@ -362,7 +412,8 @@ pub fn post_process_tool_results(
                     let head = target * 2 / 3;
                     let tail = target / 3;
                     let head_part: String = chars[..head.min(chars.len())].iter().collect();
-                    let tail_part: String = chars[chars.len().saturating_sub(tail)..].iter().collect();
+                    let tail_part: String =
+                        chars[chars.len().saturating_sub(tail)..].iter().collect();
                     result.output = format!(
                         "{}\n[... trimmed to fit turn budget ...]\n{}",
                         head_part, tail_part,
@@ -377,8 +428,8 @@ pub fn post_process_tool_results(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tool::ToolResult;
     use crate::conversation::message::{Message, MessageContent, Role};
+    use crate::tool::ToolResult;
 
     fn make_result(output: &str) -> ToolResult {
         ToolResult {
@@ -420,7 +471,9 @@ mod tests {
     #[test]
     fn truncate_bash_build_output_compression() {
         // Build output with BUILD SUCCESS keyword
-        let mut lines: Vec<String> = (0..200).map(|i| format!("verbose build line {}", i)).collect();
+        let mut lines: Vec<String> = (0..200)
+            .map(|i| format!("verbose build line {}", i))
+            .collect();
         lines[10] = "[INFO] BUILD SUCCESS".to_string();
         lines[11] = "error: compilation failed".to_string();
         let output = lines.join("\n");
@@ -469,18 +522,33 @@ mod tests {
         let mut result = make_result(&output);
         truncate_output(&mut result, "unknown_tool", 16000);
         // Result should be at most ~8000 chars + omission marker.
-        assert!(result.output.len() <= 8_500, "got {} chars", result.output.len());
-        assert!(result.output.contains("chars omitted"), "got: {}", result.output);
+        assert!(
+            result.output.len() <= 8_500,
+            "got {} chars",
+            result.output.len()
+        );
+        assert!(
+            result.output.contains("chars omitted"),
+            "got: {}",
+            result.output
+        );
     }
 
     #[test]
     fn truncate_output_universal_line_cap() {
         // 500-line output should get capped to ~100 lines (50 head + 50 tail) + markers.
-        let output: String = (0..500).map(|i| format!("line {}", i)).collect::<Vec<_>>().join("\n");
+        let output: String = (0..500)
+            .map(|i| format!("line {}", i))
+            .collect::<Vec<_>>()
+            .join("\n");
         let mut result = make_result(&output);
         truncate_output(&mut result, "unknown_tool", 64_000);
         let line_count = result.output.lines().count();
-        assert!(line_count <= 110, "got {} lines, expected ≤ 110", line_count);
+        assert!(
+            line_count <= 110,
+            "got {} lines, expected ≤ 110",
+            line_count
+        );
         assert!(result.output.contains("lines omitted"));
     }
 
@@ -490,7 +558,11 @@ mod tests {
         let output = "x".repeat(200_000);
         let mut result = make_result(&output);
         truncate_output(&mut result, "unknown_tool", 1_000_000);
-        assert!(result.output.len() <= 33_000, "single tool output should never exceed 32K chars, got {}", result.output.len());
+        assert!(
+            result.output.len() <= 33_000,
+            "single tool output should never exceed 32K chars, got {}",
+            result.output.len()
+        );
     }
 
     // --- post_process_tool_results tests ---

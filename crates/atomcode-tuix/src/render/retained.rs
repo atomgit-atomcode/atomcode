@@ -809,11 +809,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let cont_pad: String = " ".repeat(prefix_w);
         let mut first_emitted = false;
         for phys in body.split('\n') {
-            let chunks: Vec<String> =
-                crate::width::wrap_line_to_width(phys, first_budget.max(1))
-                    .into_iter()
-                    .map(|c| c.to_string())
-                    .collect();
+            let chunks: Vec<String> = crate::width::wrap_line_to_width(phys, first_budget.max(1))
+                .into_iter()
+                .map(|c| c.to_string())
+                .collect();
             for chunk in &chunks {
                 let mut row = Vec::new();
                 let pad = CellStyle::default();
@@ -991,14 +990,26 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
     fn render(&mut self, line: UiLine) {
         match line {
             // ── footer-only variants ──
-            UiLine::InputPrompt { buf, cursor_byte, menu, status } => {
+            UiLine::InputPrompt {
+                buf,
+                cursor_byte,
+                menu,
+                status,
+            } => {
                 self.spinner = None;
                 self.input_buf = buf;
                 self.input_cursor_byte = cursor_byte;
                 self.menu = menu;
                 self.status = status;
             }
-            UiLine::StreamingBox { buf, cursor_byte, frame, label, status, menu } => {
+            UiLine::StreamingBox {
+                buf,
+                cursor_byte,
+                frame,
+                label,
+                status,
+                menu,
+            } => {
                 self.spinner = Some((frame.to_string(), label));
                 self.input_buf = buf;
                 self.input_cursor_byte = cursor_byte;
@@ -1098,7 +1109,12 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 // for the tool-call line (acceptable in Phase 4,
                 // tightens in Phase 5/6).
                 let _ = muted;
-                self.push_body_prefixed("▸ ", &self.style_for(Role::Muted), &body_str, &tool_name_style);
+                self.push_body_prefixed(
+                    "▸ ",
+                    &self.style_for(Role::Muted),
+                    &body_str,
+                    &tool_name_style,
+                );
             }
             UiLine::ToolResult { success, summary } => {
                 self.flush_assistant_remainder();
@@ -1112,8 +1128,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 };
                 let body_style = if success { muted.clone() } else { error };
                 // Indent result lines 4 cols past the tool-call row.
-                let row_w =
-                    (self.screen.width() as usize).saturating_sub(PAD_COL * 2 + 6);
+                let row_w = (self.screen.width() as usize).saturating_sub(PAD_COL * 2 + 6);
                 for phys in body_str.split('\n') {
                     for chunk in crate::width::wrap_line_to_width(phys, row_w.max(1)) {
                         let mut row = Vec::new();
@@ -1160,7 +1175,11 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 let _ = (tool, detail);
                 let warn = self.style_for(Role::Warning);
                 let plain = CellStyle::default();
-                let chip = |c: Color| CellStyle { fg: Some(c), bold: true, reverse: true };
+                let chip = |c: Color| CellStyle {
+                    fg: Some(c),
+                    bold: true,
+                    reverse: true,
+                };
                 let chip_y = chip(Color::Green);
                 let chip_a = chip(Color::Cyan);
                 let chip_n = chip(Color::Red);
@@ -1311,8 +1330,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         if bottom > 0 {
             let tail: Vec<Vec<Cell>> = {
                 let n = self.body_lines.len().min(bottom as usize);
-                self.body_lines
-                    [self.body_lines.len() - n..]
+                self.body_lines[self.body_lines.len() - n..]
                     .iter()
                     .cloned()
                     .collect()
@@ -1533,23 +1551,14 @@ mod tests {
         }
     }
 
-    fn new_counting(
-        w: u16,
-        h: u16,
-    ) -> (RetainedRenderer<CountingSink>, Arc<AtomicU64>) {
+    fn new_counting(w: u16, h: u16) -> (RetainedRenderer<CountingSink>, Arc<AtomicU64>) {
         let counter = Arc::new(AtomicU64::new(0));
         let sink = CountingSink(counter.clone());
         let r = RetainedRenderer::with_writer(sink, caps_with_color(), w, h);
         (r, counter)
     }
 
-    fn new_capturing(
-        w: u16,
-        h: u16,
-    ) -> (
-        RetainedRenderer<CapturingSink>,
-        Arc<Mutex<Vec<u8>>>,
-    ) {
+    fn new_capturing(w: u16, h: u16) -> (RetainedRenderer<CapturingSink>, Arc<Mutex<Vec<u8>>>) {
         let buf = Arc::new(Mutex::new(Vec::new()));
         let sink = CapturingSink(buf.clone());
         let r = RetainedRenderer::with_writer(sink, caps_with_color(), w, h);
@@ -1561,10 +1570,7 @@ mod tests {
     /// `row_text` / `dump` reflect the post-paint on-screen state.
     /// The sink is left empty afterwards so subsequent renders
     /// accumulate their own bytes for another feed cycle.
-    fn drain_into_vterm(
-        buf: &Arc<Mutex<Vec<u8>>>,
-        vterm: &mut crate::test_term::VirtualTerminal,
-    ) {
+    fn drain_into_vterm(buf: &Arc<Mutex<Vec<u8>>>, vterm: &mut crate::test_term::VirtualTerminal) {
         let bytes: Vec<u8> = std::mem::take(&mut *buf.lock().unwrap());
         vterm.feed(&bytes);
     }
@@ -1762,7 +1768,9 @@ mod tests {
         let before_burst = sample(&counter);
         // Simulate IME burst: 40 keystrokes in zero time.
         let mut buf = String::new();
-        for ch in "你是谁你是谁你是谁你是谁你是谁你是谁你是谁你是谁你是谁你是谁你是谁你是谁你是谁".chars() {
+        for ch in
+            "你是谁你是谁你是谁你是谁你是谁你是谁你是谁你是谁你是谁你是谁你是谁你是谁你是谁".chars()
+        {
             buf.push(ch);
             r.render(UiLine::InputPrompt {
                 buf: buf.clone(),
@@ -1907,10 +1915,13 @@ mod tests {
         for col in 0..40usize {
             let cell = vterm.cell_at(bot_rule_row, col);
             assert_eq!(
-                cell.ch, '─',
+                cell.ch,
+                '─',
                 "bot_rule col {} (expected '─') shows {:?}\n\
                  full grid dump:\n{}",
-                col, cell, vterm.dump()
+                col,
+                cell,
+                vterm.dump()
             );
         }
     }
@@ -1956,7 +1967,8 @@ mod tests {
         assert_eq!(vterm.cell_at(middle_row, 0).ch, '❯');
         assert_eq!(vterm.cell_at(middle_row, 1).ch, ' ');
         assert_eq!(
-            vterm.cell_at(middle_row, 2).ch, '你',
+            vterm.cell_at(middle_row, 2).ch,
+            '你',
             "dump:\n{}",
             vterm.dump()
         );
@@ -2087,7 +2099,11 @@ mod tests {
         assert!(
             found_brand && found_cwd && found_model && found_hint,
             "welcome rows missing (brand={} cwd={} model={} hint={})\ndump:\n{}",
-            found_brand, found_cwd, found_model, found_hint, vterm.dump()
+            found_brand,
+            found_cwd,
+            found_model,
+            found_hint,
+            vterm.dump()
         );
     }
 
@@ -2121,7 +2137,11 @@ mod tests {
 
         // Sanity: welcome is visible pre-resize (above footer).
         let pre_has = (0..24).any(|r| vterm.row_text(r).contains("AtomCode"));
-        assert!(pre_has, "welcome missing before resize\ndump:\n{}", vterm.dump());
+        assert!(
+            pre_has,
+            "welcome missing before resize\ndump:\n{}",
+            vterm.dump()
+        );
 
         // Resize smaller — welcome must still be on the new grid.
         r.on_resize(50, 16);
@@ -2183,9 +2203,8 @@ mod tests {
         });
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
-        let found = vterm.any_row(|row| {
-            row.contains("▸") && row.contains("bash") && row.contains("ls -la")
-        });
+        let found = vterm
+            .any_row(|row| row.contains("▸") && row.contains("bash") && row.contains("ls -la"));
         assert!(found, "tool call missing\ndump:\n{}", vterm.dump());
     }
 
@@ -2210,9 +2229,7 @@ mod tests {
         });
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
-        let found = vterm.any_row(|row| {
-            row.contains("⎿") && row.contains("3 files changed")
-        });
+        let found = vterm.any_row(|row| row.contains("⎿") && row.contains("3 files changed"));
         assert!(found, "tool result missing\ndump:\n{}", vterm.dump());
     }
 
@@ -2225,8 +2242,14 @@ mod tests {
         let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
         let status = status_basic();
         r.render(UiLine::DiffBlock(vec![
-            super::super::DiffEntry { added: true, text: "new line".into() },
-            super::super::DiffEntry { added: false, text: "old line".into() },
+            super::super::DiffEntry {
+                added: true,
+                text: "new line".into(),
+            },
+            super::super::DiffEntry {
+                added: false,
+                text: "old line".into(),
+            },
         ]));
         r.render(UiLine::InputPrompt {
             buf: String::new(),
@@ -2260,9 +2283,8 @@ mod tests {
         });
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
-        let found = vterm.any_row(|row| {
-            row.contains("─") && row.contains("Sealed") && row.contains("1 turn")
-        });
+        let found = vterm
+            .any_row(|row| row.contains("─") && row.contains("Sealed") && row.contains("1 turn"));
         assert!(found, "separator missing\ndump:\n{}", vterm.dump());
     }
 
@@ -2345,7 +2367,8 @@ mod tests {
         assert!(
             row.contains("⠋") && row.contains("Thinking"),
             "spinner row missing: {:?}\ndump:\n{}",
-            row, vterm.dump()
+            row,
+            vterm.dump()
         );
     }
 
@@ -2384,7 +2407,9 @@ mod tests {
         assert!(
             cell.bold,
             "bold cell at col {} should be bold: {:?}\ndump:\n{}",
-            bold_pos, cell, vterm.dump()
+            bold_pos,
+            cell,
+            vterm.dump()
         );
         // Inline code: markdown crate wraps it in \x1b[96m (cyan) fg.
         let code_pos = row_text
@@ -2437,8 +2462,7 @@ mod tests {
         // Layout: spinner + top_rule + middle×N + bot_rule + status.
         // With 2-row middle: bot_rule at footer_top + 2 + 2 = footer_top + 4
         // text_budget = w - 2 ("❯ " prefix) = 38 for w=40.
-        let (lines, _, _) =
-            crate::width::wrap_with_cursor(&long, 40 - 2, long.len());
+        let (lines, _, _) = crate::width::wrap_with_cursor(&long, 40 - 2, long.len());
         assert!(lines.len() >= 2, "test setup: expected wrap");
         let bot_rule_row = footer_top + 2 + lines.len();
         let prev_cells = r.screen.prev_cells_for_test();
@@ -2568,10 +2592,7 @@ mod tests {
         r.render(UiLine::InputPrompt {
             buf: "/".into(),
             cursor_byte: 1,
-            menu: Some(MenuPayload {
-                items,
-                selected: 0,
-            }),
+            menu: Some(MenuPayload { items, selected: 0 }),
             status,
         });
         r.flush_deferred();
@@ -2700,7 +2721,8 @@ mod tests {
             .filter(|row| vterm.row_text(*row).contains("AtomCode"))
             .count();
         assert_eq!(
-            still_has, 1,
+            still_has,
+            1,
             "after /clear the welcome must appear exactly once (not 0, not 2+):\n{}",
             vterm.dump()
         );

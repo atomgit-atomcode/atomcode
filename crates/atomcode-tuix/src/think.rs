@@ -20,7 +20,10 @@ impl Default for ThinkStripper {
 
 impl ThinkStripper {
     pub fn new() -> Self {
-        Self { carry: String::new(), inside: false }
+        Self {
+            carry: String::new(),
+            inside: false,
+        }
     }
 
     pub fn buffered_bytes(&self) -> usize {
@@ -105,7 +108,10 @@ fn find_open_tag(s: &str) -> TagScan {
         let abs = search_start + lt;
         let rest = &s[abs..];
         if let Some(end) = parse_open_tag(rest) {
-            return TagScan::Complete { start: abs, end: abs + end };
+            return TagScan::Complete {
+                start: abs,
+                end: abs + end,
+            };
         }
         // Could it be a partial prefix of an open tag?
         let lower: String = rest.chars().map(|c| c.to_ascii_lowercase()).collect();
@@ -129,7 +135,9 @@ fn find_open_tag(s: &str) -> TagScan {
 /// would confuse this parser. LLM-generated think tags in practice carry
 /// no meaningful attributes, so this trade-off is intentional.
 fn parse_open_tag(s: &str) -> Option<usize> {
-    if !s.starts_with('<') { return None; }
+    if !s.starts_with('<') {
+        return None;
+    }
     let lower_head: String = s.chars().take(10).map(|c| c.to_ascii_lowercase()).collect();
     let name_end = if lower_head.starts_with("<thinking") {
         9
@@ -154,7 +162,9 @@ fn parse_open_tag(s: &str) -> Option<usize> {
 /// Find the next `</think>` or `</thinking>` close tag (case-insensitive).
 fn find_close_tag(s: &str) -> Option<(usize, usize)> {
     let lower: String = s.chars().map(|c| c.to_ascii_lowercase()).collect();
-    let p1 = lower.find("</thinking>").map(|p| (p, p + "</thinking>".len()));
+    let p1 = lower
+        .find("</thinking>")
+        .map(|p| (p, p + "</thinking>".len()));
     let p2 = lower.find("</think>").map(|p| (p, p + "</think>".len()));
     match (p1, p2) {
         (Some(a), Some(b)) => Some(if a.0 < b.0 { a } else { b }),

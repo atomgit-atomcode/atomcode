@@ -61,13 +61,7 @@ pub trait Modal: Send {
     /// Paint the modal against the current terminal state. Called once
     /// when the modal is installed into `active_modal`; `handle_key`
     /// is expected to handle subsequent repaints after each key.
-    fn draw(
-        &self,
-        buf: &Buffer,
-        state: &UiState,
-        ctx: &LoopCtx,
-        renderer: &mut dyn Renderer,
-    );
+    fn draw(&self, buf: &Buffer, state: &UiState, ctx: &LoopCtx, renderer: &mut dyn Renderer);
 
     /// Handle a bracketed-paste payload while the modal is active.
     /// Default: append the text to `buf` (so text-input wizard steps

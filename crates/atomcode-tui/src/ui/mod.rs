@@ -10,12 +10,12 @@ pub mod status_bar;
 pub mod theme;
 pub mod welcome;
 
-use std::path::PathBuf;
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
+use std::path::PathBuf;
 
 use crate::app::{App, TextSelection};
 
@@ -47,10 +47,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     if app.mode.is_provider_manager() {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(1),
-                Constraint::Min(1),
-            ])
+            .constraints([Constraint::Length(1), Constraint::Min(1)])
             .split(frame.area());
 
         status_bar::render(frame, chunks[0], app);
@@ -62,10 +59,16 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 
     let terminal_height = frame.area().height;
     let terminal_width = frame.area().width;
-    let input_height = input_box::height(&app.input, terminal_height, terminal_width, !app.attached_files.is_empty(), app.pasted_blocks.len());
+    let input_height = input_box::height(
+        &app.input,
+        terminal_height,
+        terminal_width,
+        !app.attached_files.is_empty(),
+        app.pasted_blocks.len(),
+    );
 
-    let show_welcome = app.conversation.messages.is_empty()
-        && app.conversation.stream_buffer.is_none();
+    let show_welcome =
+        app.conversation.messages.is_empty() && app.conversation.stream_buffer.is_none();
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -81,16 +84,37 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     // Session selector mode: render inline in chat area
     if matches!(app.mode, crate::app::AppMode::SessionSelector) {
         if let Some((ref sessions, selected)) = app.session_selector {
-            session_selector::render(frame, chunks[1], sessions, selected, &app.session_selector_query, app.session_selector_cursor);
+            session_selector::render(
+                frame,
+                chunks[1],
+                sessions,
+                selected,
+                &app.session_selector_query,
+                app.session_selector_cursor,
+            );
         }
-        input_box::render(frame, chunks[2], &app.input, false, &app.attached_files, &app.pasted_blocks);
+        input_box::render(
+            frame,
+            chunks[2],
+            &app.input,
+            false,
+            &app.attached_files,
+            &app.pasted_blocks,
+        );
         return;
     }
 
     // Issue input mode: render issue form in chat area
     if let crate::app::AppMode::IssueInput(ref state) = app.mode {
         issue_input::render(frame, chunks[1], state);
-        input_box::render(frame, chunks[2], &app.input, false, &app.attached_files, &app.pasted_blocks);
+        input_box::render(
+            frame,
+            chunks[2],
+            &app.input,
+            false,
+            &app.attached_files,
+            &app.pasted_blocks,
+        );
         return;
     }
 
@@ -118,17 +142,29 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             ""
         };
         let (total_lines, rendered_scroll) = chat_panel::render(
-            frame, chunks[1], &app.conversation,
-            app.scroll_offset, app.at_bottom, &app.mode, app.tick_count,
-            app.turn_tokens, turn_elapsed, turn_seed,
-            app.current_step_count, tool_info_ref,
-            app.first_token_ms, llm_wait_ms, &app.last_completed_tool,
-            app.last_turn_duration, app.current_step_count,
+            frame,
+            chunks[1],
+            &app.conversation,
+            app.scroll_offset,
+            app.at_bottom,
+            &app.mode,
+            app.tick_count,
+            app.turn_tokens,
+            turn_elapsed,
+            turn_seed,
+            app.current_step_count,
+            tool_info_ref,
+            app.first_token_ms,
+            llm_wait_ms,
+            &app.last_completed_tool,
+            app.last_turn_duration,
+            app.current_step_count,
             app.streaming_tool_name.as_deref(),
             &app.streaming_tools,
             &app.streaming_tool_hint,
             &app.pending_appends,
-            &mut app.render_cache, &mut app.render_cache_msg_count,
+            &mut app.render_cache,
+            &mut app.render_cache_msg_count,
         );
         app.last_rendered_scroll = rendered_scroll;
         app.last_viewport_height = chunks[1].height;
@@ -149,7 +185,14 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         }
     }
 
-    input_box::render(frame, chunks[2], &app.input, app.mode.is_streaming_or_executing(), &app.attached_files, &app.pasted_blocks);
+    input_box::render(
+        frame,
+        chunks[2],
+        &app.input,
+        app.mode.is_streaming_or_executing(),
+        &app.attached_files,
+        &app.pasted_blocks,
+    );
 
     // Render slash menu as overlay above input box
     if app.slash_menu.visible {
@@ -177,7 +220,13 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 
     // Directory selector popup (overlay)
     if let Some(selected) = app.dir_selector {
-        render_dir_selector(frame, frame.area(), &app.recent_dirs, selected, &app.working_dir);
+        render_dir_selector(
+            frame,
+            frame.area(),
+            &app.recent_dirs,
+            selected,
+            &app.working_dir,
+        );
     }
 
     // Render text selection highlight — clipped to chat area only
@@ -197,7 +246,7 @@ fn render_selection_highlight(frame: &mut Frame, sel: &TextSelection, chat_area:
     let area_top = chat_area.y;
     let area_bottom = chat_area.y + chat_area.height;
 
-    let sel_bg = theme::rgb(40, 80, 160);  // Selection blue - works on both themes
+    let sel_bg = theme::rgb(40, 80, 160); // Selection blue - works on both themes
     let sel_fg = theme::text_primary();
 
     // Clamp row range to chat area — leave 1-row gap before input box
@@ -205,8 +254,16 @@ fn render_selection_highlight(frame: &mut Frame, sel: &TextSelection, chat_area:
     let row_end = end_row.min(area_bottom.saturating_sub(2));
 
     for row in row_start..=row_end {
-        let col_start = if row == start_row { start_col.max(area_left) } else { area_left };
-        let col_end = if row == end_row { end_col.min(area_right.saturating_sub(1)) } else { area_right.saturating_sub(1) };
+        let col_start = if row == start_row {
+            start_col.max(area_left)
+        } else {
+            area_left
+        };
+        let col_end = if row == end_row {
+            end_col.min(area_right.saturating_sub(1))
+        } else {
+            area_right.saturating_sub(1)
+        };
 
         for col in col_start..=col_end {
             if let Some(cell) = buf.cell_mut(Position::new(col, row)) {
@@ -218,7 +275,13 @@ fn render_selection_highlight(frame: &mut Frame, sel: &TextSelection, chat_area:
 }
 
 /// Render a floating directory picker popup.
-fn render_dir_selector(frame: &mut Frame, area: Rect, dirs: &[PathBuf], selected: usize, current: &PathBuf) {
+fn render_dir_selector(
+    frame: &mut Frame,
+    area: Rect,
+    dirs: &[PathBuf],
+    selected: usize,
+    current: &PathBuf,
+) {
     let height = (dirs.len() as u16 + 4).min(area.height.saturating_sub(4));
     let width = 60u16.min(area.width.saturating_sub(8));
     let x = (area.width.saturating_sub(width)) / 2;
@@ -230,7 +293,12 @@ fn render_dir_selector(frame: &mut Frame, area: Rect, dirs: &[PathBuf], selected
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme::accent_dim()))
-        .title(Span::styled(" Recent Projects ", Style::default().fg(theme::accent()).add_modifier(Modifier::BOLD)))
+        .title(Span::styled(
+            " Recent Projects ",
+            Style::default()
+                .fg(theme::accent())
+                .add_modifier(Modifier::BOLD),
+        ))
         .style(Style::default().bg(theme::bg_elevated()));
 
     let inner = block.inner(popup);
@@ -251,7 +319,12 @@ fn render_dir_selector(frame: &mut Frame, area: Rect, dirs: &[PathBuf], selected
         let is_current = dir == current;
 
         let (prefix, style) = if is_selected {
-            (" \u{25b8} ", Style::default().fg(theme::text_on_accent()).bg(theme::brand_bg()))
+            (
+                " \u{25b8} ",
+                Style::default()
+                    .fg(theme::text_on_accent())
+                    .bg(theme::brand_bg()),
+            )
         } else {
             ("   ", Style::default().fg(theme::text_secondary()))
         };
@@ -259,7 +332,10 @@ fn render_dir_selector(frame: &mut Frame, area: Rect, dirs: &[PathBuf], selected
         let mut spans = vec![Span::styled(prefix, style)];
         spans.push(Span::styled(display, style));
         if is_current {
-            spans.push(Span::styled("  (current)", Style::default().fg(theme::success())));
+            spans.push(Span::styled(
+                "  (current)",
+                Style::default().fg(theme::success()),
+            ));
         }
         lines.push(Line::from(spans));
     }
@@ -279,8 +355,11 @@ fn shorten_dir(path: &str) -> String {
     };
     if shortened.len() > 45 {
         let parts: Vec<&str> = shortened.rsplitn(3, '/').collect();
-        if parts.len() >= 3 { format!(".../{}/{}", parts[1], parts[0]) }
-        else { shortened }
+        if parts.len() >= 3 {
+            format!(".../{}/{}", parts[1], parts[0])
+        } else {
+            shortened
+        }
     } else {
         shortened
     }

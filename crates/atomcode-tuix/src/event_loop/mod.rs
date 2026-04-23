@@ -201,7 +201,12 @@ impl Buffer {
         self.pastes.clear();
     }
 
-    pub(crate) fn apply(&mut self, action: Action, history: &[String], commands: &CommandRegistry) -> BufferResult {
+    pub(crate) fn apply(
+        &mut self,
+        action: Action,
+        history: &[String],
+        commands: &CommandRegistry,
+    ) -> BufferResult {
         match action {
             Action::Insert(c) => {
                 self.text.insert(self.cursor, c);
@@ -247,7 +252,10 @@ impl Buffer {
                 BufferResult::Redraw
             }
             Action::DeleteToEnd => {
-                let end = self.text[self.cursor..].find('\n').map(|i| self.cursor + i).unwrap_or(self.text.len());
+                let end = self.text[self.cursor..]
+                    .find('\n')
+                    .map(|i| self.cursor + i)
+                    .unwrap_or(self.text.len());
                 self.text.drain(self.cursor..end);
                 BufferResult::Redraw
             }
@@ -279,12 +287,18 @@ impl Buffer {
                 BufferResult::Redraw
             }
             Action::LineStart => {
-                let start = self.text[..self.cursor].rfind('\n').map(|i| i + 1).unwrap_or(0);
+                let start = self.text[..self.cursor]
+                    .rfind('\n')
+                    .map(|i| i + 1)
+                    .unwrap_or(0);
                 self.cursor = start;
                 BufferResult::Redraw
             }
             Action::LineEnd => {
-                let end = self.text[self.cursor..].find('\n').map(|i| self.cursor + i).unwrap_or(self.text.len());
+                let end = self.text[self.cursor..]
+                    .find('\n')
+                    .map(|i| self.cursor + i)
+                    .unwrap_or(self.text.len());
                 self.cursor = end;
                 BufferResult::Redraw
             }
@@ -339,7 +353,6 @@ impl Buffer {
             Action::NoOp => BufferResult::NoOp,
         }
     }
-
 }
 
 #[cfg(test)]
@@ -500,10 +513,7 @@ mod tool_format_tests {
 
     #[test]
     fn format_tool_detail_bash_truncates_long_commands() {
-        let args = format!(
-            r#"{{"command":"{}"}}"#,
-            "a".repeat(500)
-        );
+        let args = format!(r#"{{"command":"{}"}}"#, "a".repeat(500));
         let out = format_tool_detail("bash", &args);
         // 200-col budget with a 1-col trailing '…' (3 UTF-8 bytes).
         assert!(
@@ -563,13 +573,17 @@ pub(crate) enum BufferResult {
 
 fn prev_boundary(s: &str, mut p: usize) -> usize {
     p -= 1;
-    while !s.is_char_boundary(p) { p -= 1; }
+    while !s.is_char_boundary(p) {
+        p -= 1;
+    }
     p
 }
 
 fn next_boundary(s: &str, mut p: usize) -> usize {
     p += 1;
-    while p < s.len() && !s.is_char_boundary(p) { p += 1; }
+    while p < s.len() && !s.is_char_boundary(p) {
+        p += 1;
+    }
     p
 }
 
@@ -632,10 +646,7 @@ impl App {
     }
 }
 
-pub async fn run_loop(
-    mut ctx: LoopCtx,
-    renderer: &mut dyn Renderer,
-) -> Result<()> {
+pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<()> {
     let mut app = App::new();
 
     crate::tuix_trace!(
@@ -646,10 +657,11 @@ pub async fn run_loop(
     );
 
     // Draw welcome + initial prompt
-    let dir_display = crate::platform::collapse_home(
-        &ctx.working_dir.to_string_lossy(),
-    );
-    renderer.render(UiLine::Welcome { model: ctx.model_name.clone(), working_dir: dir_display.clone() });
+    let dir_display = crate::platform::collapse_home(&ctx.working_dir.to_string_lossy());
+    renderer.render(UiLine::Welcome {
+        model: ctx.model_name.clone(),
+        working_dir: dir_display.clone(),
+    });
     // If this process was spawned by `apply_pending_upgrade` → `re_exec_self`,
     // an env var carries the version we just upgraded from. Surface one line
     // on the welcome screen so the user knows the upgrade succeeded, then
@@ -737,13 +749,11 @@ pub async fn run_loop(
     // 2. tokio::select! does not support #[cfg(...)] on individual arms, so signal
     //    handling is split into a cfg-gated loop variant below.
     #[cfg(unix)]
-    let mut sigtstp = tokio::signal::unix::signal(
-        tokio::signal::unix::SignalKind::from_raw(libc::SIGTSTP)
-    )?;
+    let mut sigtstp =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::from_raw(libc::SIGTSTP))?;
     #[cfg(unix)]
-    let mut sigcont = tokio::signal::unix::signal(
-        tokio::signal::unix::SignalKind::from_raw(libc::SIGCONT)
-    )?;
+    let mut sigcont =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::from_raw(libc::SIGCONT))?;
 
     loop {
         #[cfg(unix)]
@@ -988,13 +998,8 @@ fn handle_input(
             // to drop it; the default inserts into `buf` + redraws.
             if matches!(app.state.phase, UiPhase::Idle) {
                 if let Some(modal) = app.active_modal.as_mut() {
-                    let action = modal.handle_paste(
-                        &text,
-                        &mut app.buf,
-                        &mut app.state,
-                        ctx,
-                        renderer,
-                    )?;
+                    let action =
+                        modal.handle_paste(&text, &mut app.buf, &mut app.state, ctx, renderer)?;
                     if matches!(action, crate::modals::ModalAction::Close) {
                         app.active_modal = None;
                         redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
@@ -1007,7 +1012,14 @@ fn handle_input(
             if matches!(app.state.phase, UiPhase::Idle | UiPhase::Streaming) {
                 app.buf.insert_paste(text);
                 if matches!(app.state.phase, UiPhase::Streaming) {
-                    draw_spinner_now(&mut app.state, &app.buf, ctx, renderer, app.message_queue.len(), app.menu.selected);
+                    draw_spinner_now(
+                        &mut app.state,
+                        &app.buf,
+                        ctx,
+                        renderer,
+                        app.message_queue.len(),
+                        app.menu.selected,
+                    );
                 } else {
                     redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
                 }
@@ -1021,14 +1033,24 @@ fn handle_input(
         // ran the handler) and a held-down key fired again on every
         // Repeat tick, producing "ghost characters" / runaway backspace
         // the moment the OS autorepeat kicked in.
-        InputEvent::Key(KeyEvent { kind: KeyEventKind::Press, code, modifiers, .. }) => {
+        InputEvent::Key(KeyEvent {
+            kind: KeyEventKind::Press,
+            code,
+            modifiers,
+            ..
+        }) => {
             // Modal trumps phase handlers when it's installed — /model,
             // /provider, /resume all install a modal and the event loop
             // funnels every keystroke through it until it reports Close.
             if matches!(app.state.phase, UiPhase::Idle) {
                 if let Some(modal) = app.active_modal.as_mut() {
                     let action = modal.handle_key(
-                        code, modifiers, &mut app.buf, &mut app.state, ctx, renderer,
+                        code,
+                        modifiers,
+                        &mut app.buf,
+                        &mut app.state,
+                        ctx,
+                        renderer,
                     )?;
                     if matches!(action, ModalAction::Close) {
                         app.active_modal = None;
@@ -1116,14 +1138,28 @@ fn handle_idle_key(
         match (code, modifiers) {
             (KeyCode::Up, _) => {
                 app.menu.selected = app.menu.selected.saturating_sub(1);
-                redraw_with_menu(&app.buf, items, app.menu.selected, &app.state, ctx, renderer);
+                redraw_with_menu(
+                    &app.buf,
+                    items,
+                    app.menu.selected,
+                    &app.state,
+                    ctx,
+                    renderer,
+                );
                 return Ok(());
             }
             (KeyCode::Down, _) => {
                 if app.menu.selected + 1 < items.len() {
                     app.menu.selected += 1;
                 }
-                redraw_with_menu(&app.buf, items, app.menu.selected, &app.state, ctx, renderer);
+                redraw_with_menu(
+                    &app.buf,
+                    items,
+                    app.menu.selected,
+                    &app.state,
+                    ctx,
+                    renderer,
+                );
                 return Ok(());
             }
             (KeyCode::Enter, m) if !m.contains(crossterm::event::KeyModifiers::SHIFT) => {
@@ -1137,7 +1173,14 @@ fn handle_idle_key(
                 app.buf.text.clear();
                 app.buf.cursor = 0;
                 if let Some((cmd, arg)) = parse_slash_line(&committed) {
-                    execute_slash_command(cmd, arg, &mut app.state, ctx, renderer, &mut app.active_modal)?;
+                    execute_slash_command(
+                        cmd,
+                        arg,
+                        &mut app.state,
+                        ctx,
+                        renderer,
+                        &mut app.active_modal,
+                    )?;
                     if matches!(app.state.phase, UiPhase::Idle) {
                         redraw_after_slash(&app.buf, &app.state, ctx, &app.active_modal, renderer);
                     }
@@ -1185,7 +1228,14 @@ fn handle_idle_key(
                 if app.menu.selected >= items.len() {
                     app.menu.selected = 0;
                 }
-                redraw_with_menu(&app.buf, &items, app.menu.selected, &app.state, ctx, renderer);
+                redraw_with_menu(
+                    &app.buf,
+                    &items,
+                    app.menu.selected,
+                    &app.state,
+                    ctx,
+                    renderer,
+                );
             } else {
                 app.menu.selected = 0;
                 redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
@@ -1207,16 +1257,26 @@ fn handle_idle_key(
             // `/test`, or just `/test` as a question) falls through to
             // the regular message path — better than the old
             // "Unknown command: /foo" dead-end.
-            let as_slash = parse_slash_line(&line)
-                .filter(|(cmd, _)| ctx.commands.find(cmd).is_some());
+            let as_slash =
+                parse_slash_line(&line).filter(|(cmd, _)| ctx.commands.find(cmd).is_some());
             if let Some((cmd, arg)) = as_slash {
-                execute_slash_command(cmd, arg, &mut app.state, ctx, renderer, &mut app.active_modal)?;
+                execute_slash_command(
+                    cmd,
+                    arg,
+                    &mut app.state,
+                    ctx,
+                    renderer,
+                    &mut app.active_modal,
+                )?;
                 if matches!(app.state.phase, UiPhase::Idle) {
                     redraw_after_slash(&app.buf, &app.state, ctx, &app.active_modal, renderer);
                 }
             } else {
                 ctx.history.push(line.clone());
-                ctx.agent.cmd_tx.send(AgentCommand::SendMessage(expanded)).ok();
+                ctx.agent
+                    .cmd_tx
+                    .send(AgentCommand::SendMessage(expanded))
+                    .ok();
                 app.state.on_submit();
             }
         }
@@ -1267,12 +1327,7 @@ fn redraw_with_menu(
 /// Idle prompt without any menu/picker — used by the common
 /// "Redraw" path and the post-event-loop fallback after an agent
 /// event returns the UI to Idle.
-fn redraw_idle_plain(
-    buf: &Buffer,
-    state: &UiState,
-    ctx: &LoopCtx,
-    renderer: &mut dyn Renderer,
-) {
+fn redraw_idle_plain(buf: &Buffer, state: &UiState, ctx: &LoopCtx, renderer: &mut dyn Renderer) {
     renderer.render(UiLine::InputPrompt {
         buf: buf.text.clone(),
         cursor_byte: buf.cursor,
@@ -1354,21 +1409,42 @@ fn handle_streaming_key(
         match code {
             KeyCode::Up => {
                 app.menu.selected = app.menu.selected.saturating_sub(1);
-                draw_spinner_now(&mut app.state, &app.buf, ctx, renderer, app.message_queue.len(), app.menu.selected);
+                draw_spinner_now(
+                    &mut app.state,
+                    &app.buf,
+                    ctx,
+                    renderer,
+                    app.message_queue.len(),
+                    app.menu.selected,
+                );
                 return Ok(());
             }
             KeyCode::Down => {
                 if app.menu.selected + 1 < items.len() {
                     app.menu.selected += 1;
                 }
-                draw_spinner_now(&mut app.state, &app.buf, ctx, renderer, app.message_queue.len(), app.menu.selected);
+                draw_spinner_now(
+                    &mut app.state,
+                    &app.buf,
+                    ctx,
+                    renderer,
+                    app.message_queue.len(),
+                    app.menu.selected,
+                );
                 return Ok(());
             }
             KeyCode::Esc => {
                 app.buf.text.clear();
                 app.buf.cursor = 0;
                 app.menu.selected = 0;
-                draw_spinner_now(&mut app.state, &app.buf, ctx, renderer, app.message_queue.len(), app.menu.selected);
+                draw_spinner_now(
+                    &mut app.state,
+                    &app.buf,
+                    ctx,
+                    renderer,
+                    app.message_queue.len(),
+                    app.menu.selected,
+                );
                 return Ok(());
             }
             _ => {} // fall through to buffer edits
@@ -1388,7 +1464,14 @@ fn handle_streaming_key(
             } else {
                 app.menu.selected = 0;
             }
-            draw_spinner_now(&mut app.state, &app.buf, ctx, renderer, app.message_queue.len(), app.menu.selected);
+            draw_spinner_now(
+                &mut app.state,
+                &app.buf,
+                ctx,
+                renderer,
+                app.message_queue.len(),
+                app.menu.selected,
+            );
         }
         BufferResult::Commit(line) => {
             // Slash commands are not queued — they need ctx access
@@ -1407,7 +1490,14 @@ fn handle_streaming_key(
                 app.buf.text.clear();
                 app.buf.cursor = 0;
                 app.menu.selected = 0;
-                draw_spinner_now(&mut app.state, &app.buf, ctx, renderer, app.message_queue.len(), app.menu.selected);
+                draw_spinner_now(
+                    &mut app.state,
+                    &app.buf,
+                    ctx,
+                    renderer,
+                    app.message_queue.len(),
+                    app.menu.selected,
+                );
                 return Ok(());
             }
             // Expand any paste placeholders — agent sees full payload,
@@ -1422,7 +1512,14 @@ fn handle_streaming_key(
             // Echo as a queued entry so the user sees it landed.
             renderer.render(UiLine::CommandOutput(format!("  ↳ queued: {}\n", line)));
             renderer.flush();
-            draw_spinner_now(&mut app.state, &app.buf, ctx, renderer, app.message_queue.len(), app.menu.selected);
+            draw_spinner_now(
+                &mut app.state,
+                &app.buf,
+                ctx,
+                renderer,
+                app.message_queue.len(),
+                app.menu.selected,
+            );
         }
         BufferResult::Exit => {
             // Ctrl+C on empty buf during streaming — treat as cancel
@@ -1470,10 +1567,7 @@ pub(super) fn handle_upgrade_event(
     match ev {
         UpgradeEvent::ManifestFetched { version } => {
             *last_pct = -1;
-            renderer.render(UiLine::CommandOutput(format!(
-                "  最新版本: {}\n",
-                version
-            )));
+            renderer.render(UiLine::CommandOutput(format!("  最新版本: {}\n", version)));
         }
         UpgradeEvent::Downloading { bytes, total } => {
             let pct = if total == 0 {
@@ -1550,7 +1644,11 @@ fn handle_agent_event(
         AgentEvent::ToolCallStreaming { name, .. } => {
             state.on_tool_call_streaming(&display_tool_name(&name));
         }
-        AgentEvent::ToolCallStarted { id, name, arguments } => {
+        AgentEvent::ToolCallStarted {
+            id,
+            name,
+            arguments,
+        } => {
             // Don't emit the ▸ line yet; hold it in pending_tools until
             // either (a) an ApprovalNeeded for this call arrives and
             // renders the line eagerly so the user can see what they're
@@ -1562,7 +1660,13 @@ fn handle_agent_event(
             pending_tools.insert(id, (display.clone(), detail, false));
             state.on_tool_call_started(&display);
         }
-        AgentEvent::ToolCallResult { call_id, name, output, success, .. } => {
+        AgentEvent::ToolCallResult {
+            call_id,
+            name,
+            output,
+            success,
+            ..
+        } => {
             // Close any in-flight assistant line before emitting the pair.
             renderer.render(UiLine::AssistantLineBreak);
 
@@ -1621,7 +1725,9 @@ fn handle_agent_event(
             renderer.flush();
             let _ = name;
         }
-        AgentEvent::ApprovalNeeded { tool_name, call, .. } => {
+        AgentEvent::ApprovalNeeded {
+            tool_name, call, ..
+        } => {
             // Emit the `▸ Tool(detail)` row BEFORE the approval prompt
             // so the user sees what they're approving. If the matching
             // ToolCallStarted already populated pending_tools, reuse
@@ -1659,7 +1765,13 @@ fn handle_agent_event(
             state.on_tool_call_streaming(&display_tool_name(&name));
         }
         AgentEvent::PhaseChange(_) => {}
-        AgentEvent::TurnComplete { duration, total_tokens, turn_count, tool_call_count, .. } => {
+        AgentEvent::TurnComplete {
+            duration,
+            total_tokens,
+            turn_count,
+            tool_call_count,
+            ..
+        } => {
             renderer.render(UiLine::AssistantLineBreak);
             pending_tools.clear();
             let done = state.next_done_label();
@@ -1676,9 +1788,16 @@ fn handle_agent_event(
             // Render any in-flight tool calls that never got a result
             // as "(cancelled)" so the user sees what was mid-flight.
             for (_id, (name, detail, call_rendered)) in pending_tools.drain() {
-                let safe_name = if name.is_empty() { "(invalid)".into() } else { name };
+                let safe_name = if name.is_empty() {
+                    "(invalid)".into()
+                } else {
+                    name
+                };
                 if !call_rendered {
-                    renderer.render(UiLine::ToolCall { name: safe_name, detail });
+                    renderer.render(UiLine::ToolCall {
+                        name: safe_name,
+                        detail,
+                    });
                 }
                 renderer.render(UiLine::ToolResult {
                     success: false,
@@ -1709,11 +1828,9 @@ fn handle_agent_event(
                 commands::push_recent_dir(&mut ctx.recent_dirs, new_dir);
             }
         }
-        AgentEvent::ContextStats { .. }
-        | AgentEvent::SubAgentProgress { .. } => {}
+        AgentEvent::ContextStats { .. } | AgentEvent::SubAgentProgress { .. } => {}
     }
 }
-
 
 /// Build the persistent status line shown directly below the input box.
 /// Pulls model name from ctx, cwd from ctx.working_dir (with $HOME
@@ -1809,12 +1926,22 @@ pub(crate) fn format_tool_detail(name: &str, args_json: &str) -> String {
 
     match name {
         "read_file" | "edit_file" | "write_file" | "create_file" | "list_symbols" => {
-            get_str("file_path").map(|p| basename(&p)).unwrap_or_default()
+            get_str("file_path")
+                .map(|p| basename(&p))
+                .unwrap_or_default()
         }
         "read_symbol" => {
             let sym = get_str("symbol").unwrap_or_default();
-            let file = get_str("file_path").map(|p| basename(&p)).unwrap_or_default();
-            if sym.is_empty() { file } else if file.is_empty() { sym } else { format!("{} in {}", sym, file) }
+            let file = get_str("file_path")
+                .map(|p| basename(&p))
+                .unwrap_or_default();
+            if sym.is_empty() {
+                file
+            } else if file.is_empty() {
+                sym
+            } else {
+                format!("{} in {}", sym, file)
+            }
         }
         "glob" => get_str("pattern")
             .map(|p| crate::width::truncate_with_ellipsis(&p, 100))
@@ -1825,9 +1952,7 @@ pub(crate) fn format_tool_detail(name: &str, args_json: &str) -> String {
         "bash" => get_str("command")
             .map(|c| crate::width::truncate_with_ellipsis(&c, 200))
             .unwrap_or_default(),
-        "list_directory" | "change_dir" => {
-            get_str("path").unwrap_or_else(|| ".".into())
-        }
+        "list_directory" | "change_dir" => get_str("path").unwrap_or_else(|| ".".into()),
         "web_fetch" => get_str("url")
             .map(|u| crate::width::truncate_with_ellipsis(&u, 150))
             .unwrap_or_default(),
@@ -1844,7 +1969,11 @@ pub(crate) fn format_tool_detail(name: &str, args_json: &str) -> String {
             let file = get_str("file_path").or_else(|| get_str("file"));
             let pat = get_str("pattern").or_else(|| get_str("old"));
             match (file, pat) {
-                (Some(f), Some(p)) => format!("{}: {}", basename(&f), crate::width::truncate_with_ellipsis(&p, 60)),
+                (Some(f), Some(p)) => format!(
+                    "{}: {}",
+                    basename(&f),
+                    crate::width::truncate_with_ellipsis(&p, 60)
+                ),
                 (Some(f), None) => basename(&f),
                 (None, Some(p)) => crate::width::truncate_with_ellipsis(&p, 100),
                 _ => String::new(),
@@ -1853,7 +1982,17 @@ pub(crate) fn format_tool_detail(name: &str, args_json: &str) -> String {
         "use_skill" => get_str("name").unwrap_or_default(),
         _ => {
             // Fallback: try common single-key args that make sense as detail.
-            for key in ["file_path", "path", "file", "pattern", "query", "url", "name", "symbol", "command"] {
+            for key in [
+                "file_path",
+                "path",
+                "file",
+                "pattern",
+                "query",
+                "url",
+                "name",
+                "symbol",
+                "command",
+            ] {
                 if let Some(s) = get_str(key) {
                     return crate::width::truncate_with_ellipsis(&s, 100);
                 }

@@ -11,19 +11,28 @@ impl AgentLoop {
                 let _ = self.event_tx.send(AgentEvent::TextDelta(text));
             }
             TurnEvent::ToolCallStreaming { name, hint } => {
-                let _ = self.event_tx.send(AgentEvent::ToolCallStreaming { name, hint });
+                let _ = self
+                    .event_tx
+                    .send(AgentEvent::ToolCallStreaming { name, hint });
             }
-            TurnEvent::ToolCallStarted { ref id, ref name, ref arguments } => {
+            TurnEvent::ToolCallStarted {
+                ref id,
+                ref name,
+                ref arguments,
+            } => {
                 self.datalog.log_tool_call(name, arguments);
 
                 self.current_tool_name = name.clone();
                 self.phase = AgentPhase::CallingTool(name.clone());
-                let _ = self.event_tx.send(AgentEvent::PhaseChange(self.phase.clone()));
+                let _ = self
+                    .event_tx
+                    .send(AgentEvent::PhaseChange(self.phase.clone()));
 
                 // Track bash command for failure categorization
                 if name == "bash" {
                     if let Ok(args) = serde_json::from_str::<serde_json::Value>(arguments) {
-                        self.discipline_state.last_bash_cmd = args.get("command")
+                        self.discipline_state.last_bash_cmd = args
+                            .get("command")
                             .and_then(|v| v.as_str())
                             .unwrap_or("")
                             .to_string();
@@ -31,28 +40,46 @@ impl AgentLoop {
                 }
 
                 // Track files for Working Set
-                if matches!(name.as_str(), "read_file" | "edit_file" | "create_file" | "search_replace" | "glob" | "grep") {
+                if matches!(
+                    name.as_str(),
+                    "read_file" | "edit_file" | "create_file" | "search_replace" | "glob" | "grep"
+                ) {
                     if let Ok(args) = serde_json::from_str::<serde_json::Value>(arguments) {
-                        let fp = args.get("file_path").and_then(|v| v.as_str())
+                        let fp = args
+                            .get("file_path")
+                            .and_then(|v| v.as_str())
                             .or_else(|| args.get("path").and_then(|v| v.as_str()));
                         if let Some(fp) = fp {
                             let short = std::path::Path::new(fp)
                                 .file_name()
                                 .map(|n| n.to_string_lossy().to_string())
                                 .unwrap_or_else(|| fp.to_string());
-                            self.session_files.insert(short, std::path::PathBuf::from(fp));
+                            self.session_files
+                                .insert(short, std::path::PathBuf::from(fp));
                         }
                     }
                 }
 
-                let _ = self.event_tx.send(AgentEvent::ToolCallStarted { id: id.clone(), name: name.clone(), arguments: arguments.clone() });
+                let _ = self.event_tx.send(AgentEvent::ToolCallStarted {
+                    id: id.clone(),
+                    name: name.clone(),
+                    arguments: arguments.clone(),
+                });
             }
-            TurnEvent::ToolCallResult { call_id, name, output, success, duration } => {
+            TurnEvent::ToolCallResult {
+                call_id,
+                name,
+                output,
+                success,
+                duration,
+            } => {
                 // Track files for discipline
                 if let Some(pos) = output.find("Edited ") {
                     // Extract full path from "Edited /path/to/file ..." or "Edited /path/to/file\n..."
                     let rest = &output[pos + 7..];
-                    let full_path_end = rest.find(|c: char| c == ' ' || c == '\n' || c == '(').unwrap_or(rest.len());
+                    let full_path_end = rest
+                        .find(|c: char| c == ' ' || c == '\n' || c == '(')
+                        .unwrap_or(rest.len());
                     let full_path_str = rest[..full_path_end].trim();
                     if !full_path_str.is_empty() {
                         self.active_file = Some(PathBuf::from(full_path_str));
@@ -65,9 +92,15 @@ impl AgentLoop {
                     }
                 }
                 if let Some(pos) = output.find("Wrote ").or_else(|| output.find("Overwrote ")) {
-                    let keyword_len = if output[pos..].starts_with("Overwrote ") { 10 } else { 6 };
+                    let keyword_len = if output[pos..].starts_with("Overwrote ") {
+                        10
+                    } else {
+                        6
+                    };
                     let rest = &output[pos + keyword_len..];
-                    let full_path_end = rest.find(|c: char| c == ' ' || c == '\n' || c == '(').unwrap_or(rest.len());
+                    let full_path_end = rest
+                        .find(|c: char| c == ' ' || c == '\n' || c == '(')
+                        .unwrap_or(rest.len());
                     let full_path_str = rest[..full_path_end].trim();
                     if !full_path_str.is_empty() {
                         self.active_file = Some(PathBuf::from(full_path_str));
@@ -79,7 +112,10 @@ impl AgentLoop {
                         }
                     }
                 }
-                if matches!(name.as_str(), "read_file" | "list_directory" | "glob" | "grep") {
+                if matches!(
+                    name.as_str(),
+                    "read_file" | "list_directory" | "glob" | "grep"
+                ) {
                     self.discipline_state.consecutive_reads += 1;
                 } else if matches!(name.as_str(), "edit_file" | "create_file") {
                     self.discipline_state.consecutive_reads = 0;
@@ -88,8 +124,11 @@ impl AgentLoop {
                 // Track scouting commands for datalog metrics (no injection).
                 if name == "bash" {
                     let cmd = self.discipline_state.last_bash_cmd.to_lowercase();
-                    if cmd.contains("curl") || cmd.contains("lsof")
-                        || cmd.contains("ps aux") || cmd.contains("tail") {
+                    if cmd.contains("curl")
+                        || cmd.contains("lsof")
+                        || cmd.contains("ps aux")
+                        || cmd.contains("tail")
+                    {
                         self.discipline_state.scouting_count += 1;
                     }
                 } else if matches!(name.as_str(), "read_file" | "edit_file" | "create_file") {
@@ -98,25 +137,50 @@ impl AgentLoop {
 
                 self.datalog.log_tool_result(&output, success);
                 let _ = self.event_tx.send(AgentEvent::ToolCallResult {
-                    call_id, name, output, success, duration,
+                    call_id,
+                    name,
+                    output,
+                    success,
+                    duration,
                 });
             }
-            TurnEvent::TokenUsage { prompt_tokens, completion_tokens, total_tokens: _, cached_tokens } => {
+            TurnEvent::TokenUsage {
+                prompt_tokens,
+                completion_tokens,
+                total_tokens: _,
+                cached_tokens,
+            } => {
                 if cached_tokens > 0 {
                     self.datalog.log_cache_hit(prompt_tokens, cached_tokens);
                 }
-                let _ = self.event_tx.send(AgentEvent::TokenUsage(
-                    crate::stream::TokenUsage {
+                let _ = self
+                    .event_tx
+                    .send(AgentEvent::TokenUsage(crate::stream::TokenUsage {
                         prompt_tokens,
                         completion_tokens,
                         cached_tokens,
-                    }
-                ));
+                    }));
             }
-            TurnEvent::ContextStats { system_tokens, sent_tokens, dropped_tokens, working_set_tokens, total_messages } => {
-                self.datalog.log_context_stats(system_tokens, sent_tokens, dropped_tokens, working_set_tokens, total_messages);
+            TurnEvent::ContextStats {
+                system_tokens,
+                sent_tokens,
+                dropped_tokens,
+                working_set_tokens,
+                total_messages,
+            } => {
+                self.datalog.log_context_stats(
+                    system_tokens,
+                    sent_tokens,
+                    dropped_tokens,
+                    working_set_tokens,
+                    total_messages,
+                );
                 let _ = self.event_tx.send(AgentEvent::ContextStats {
-                    system_tokens, sent_tokens, dropped_tokens, working_set_tokens, total_messages,
+                    system_tokens,
+                    sent_tokens,
+                    dropped_tokens,
+                    working_set_tokens,
+                    total_messages,
                 });
             }
             TurnEvent::Error(e) => {
@@ -138,7 +202,8 @@ impl AgentLoop {
     /// Post-process tool results added by TurnRunner: truncate large outputs,
     /// then extract file paths from error output and pre-read them.
     pub(crate) fn post_process_tool_results(&mut self, tool_count: usize) {
-        let context_window = self.config
+        let context_window = self
+            .config
             .providers
             .get(&self.config.default_provider)
             .map(|p| p.context_window)
@@ -156,8 +221,13 @@ impl AgentLoop {
         // like "src/api.rs:42:5: error").
         // Language-agnostic: just find paths that exist on disk.
         if self.current_tool_name == "bash" {
-            let wd = self.turn_runner.context.working_dir
-                .try_read().map(|g| g.clone()).unwrap_or_default();
+            let wd = self
+                .turn_runner
+                .context
+                .working_dir
+                .try_read()
+                .map(|g| g.clone())
+                .unwrap_or_default();
 
             // Only for failed bash results
             let len = self.conversation.messages.len();
@@ -171,17 +241,25 @@ impl AgentLoop {
                         let paths = extract_file_paths(&r.output, &wd);
                         for path in paths.into_iter().take(3) {
                             // Skip files already read this turn
-                            let short = path.strip_prefix(&wd)
+                            let short = path
+                                .strip_prefix(&wd)
                                 .map(|p| p.to_string_lossy().to_string())
                                 .unwrap_or_else(|_| path.to_string_lossy().to_string());
-                            if self.files_read_this_turn.iter().any(|f| f.contains(&short) || short.contains(f)) {
+                            if self
+                                .files_read_this_turn
+                                .iter()
+                                .any(|f| f.contains(&short) || short.contains(f))
+                            {
                                 continue;
                             }
                             if let Ok(content) = std::fs::read_to_string(&path) {
                                 let lines: Vec<&str> = content.lines().collect();
                                 let preview = if lines.len() > 50 {
-                                    format!("{}\n[... {} more lines]",
-                                        lines[..50].join("\n"), lines.len() - 50)
+                                    format!(
+                                        "{}\n[... {} more lines]",
+                                        lines[..50].join("\n"),
+                                        lines.len() - 50
+                                    )
                                 } else {
                                     content.clone()
                                 };
@@ -193,7 +271,8 @@ impl AgentLoop {
             }
 
             if !files_to_inject.is_empty() {
-                let injection = files_to_inject.iter()
+                let injection = files_to_inject
+                    .iter()
                     .map(|(path, content)| format!("[Auto-read from error: {}]\n{}", path, content))
                     .collect::<Vec<_>>()
                     .join("\n\n");
@@ -205,7 +284,8 @@ impl AgentLoop {
     #[allow(dead_code)]
     pub(crate) fn resolve_args(&self, call: &ToolCall) -> String {
         let wd: PathBuf = self
-            .turn_runner.context
+            .turn_runner
+            .context
             .working_dir
             .try_read()
             .map(|g| g.clone())
@@ -214,7 +294,11 @@ impl AgentLoop {
         // Try parsing JSON directly, then repair, then specialized extractors
         let args_str = &call.arguments;
         let parsed = serde_json::from_str::<serde_json::Value>(args_str)
-            .or_else(|_| serde_json::from_str::<serde_json::Value>(&crate::turn::json_repair::repair_json(args_str)))
+            .or_else(|_| {
+                serde_json::from_str::<serde_json::Value>(&crate::turn::json_repair::repair_json(
+                    args_str,
+                ))
+            })
             .or_else(|_| {
                 // For edit_file: specialized parser that handles unescaped source code
                 if call.name == "edit_file" {
@@ -222,7 +306,9 @@ impl AgentLoop {
                         return Ok(v);
                     }
                 }
-                Ok::<serde_json::Value, serde_json::Error>(crate::turn::json_repair::extract_json_fields(args_str))
+                Ok::<serde_json::Value, serde_json::Error>(
+                    crate::turn::json_repair::extract_json_fields(args_str),
+                )
             });
 
         if let Ok(mut args) = parsed {
@@ -246,8 +332,15 @@ impl AgentLoop {
             if call.name == "read_file" {
                 if let Some(fp) = args.get("file_path").and_then(|v| v.as_str()) {
                     let short = short_path(fp);
-                    let read_count = self.discipline_state.file_read_counts.get(&short).copied().unwrap_or(0);
-                    if read_count == 0 && (args.get("offset").is_some() || args.get("limit").is_some()) {
+                    let read_count = self
+                        .discipline_state
+                        .file_read_counts
+                        .get(&short)
+                        .copied()
+                        .unwrap_or(0);
+                    if read_count == 0
+                        && (args.get("offset").is_some() || args.get("limit").is_some())
+                    {
                         // First read — remove offset/limit to get the full file.
                         if let Some(obj) = args.as_object_mut() {
                             obj.remove("offset");
@@ -271,7 +364,11 @@ impl AgentLoop {
     /// to actually be able to see the top-level layout when it asks.
     /// Does NOT intercept duplicate reads (the model may re-read with different params).
     #[allow(dead_code)]
-    pub(crate) fn intercept_redundant_call(&mut self, tool_name: &str, args: &str) -> Option<String> {
+    pub(crate) fn intercept_redundant_call(
+        &mut self,
+        tool_name: &str,
+        args: &str,
+    ) -> Option<String> {
         // Pre-read cache hit: if a file was already pre-read, return its content
         // directly from disk (zero overhead — the file is in OS cache).
         // This is better than saying "SKIPPED" because the model needs the actual
@@ -288,7 +385,12 @@ impl AgentLoop {
                         .file_name()
                         .map(|n| n.to_string_lossy().to_string())
                         .unwrap_or_else(|| fp.to_string());
-                    let count = self.discipline_state.file_read_counts.get(&short).copied().unwrap_or(0);
+                    let count = self
+                        .discipline_state
+                        .file_read_counts
+                        .get(&short)
+                        .copied()
+                        .unwrap_or(0);
                     if count >= 5 {
                         return Some(format!(
                             "BLOCKED: You have read {} {} times. You already have the content. \
@@ -388,12 +490,12 @@ impl AgentLoop {
             // Reading the SAME file you just edited (to check your work) should NOT
             // reset — otherwise edit→read_same→edit→read_same bypasses the limit.
             if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(args) {
-                let read_file = parsed.get("file_path")
+                let read_file = parsed
+                    .get("file_path")
                     .and_then(|v| v.as_str())
-                    .map(|fp| {
-                        fp.rsplit('/').next().unwrap_or(fp).to_string()
-                    });
-                let is_same_file = match (&read_file, &self.discipline_state.consecutive_edits_file) {
+                    .map(|fp| fp.rsplit('/').next().unwrap_or(fp).to_string());
+                let is_same_file = match (&read_file, &self.discipline_state.consecutive_edits_file)
+                {
                     (Some(rf), Some(ef)) => rf == ef,
                     _ => false,
                 };
@@ -412,7 +514,6 @@ impl AgentLoop {
         let _ = (tool_name, args);
         None
     }
-
 }
 
 /// Normalize a bash command for repeated-execution detection.
@@ -455,24 +556,31 @@ fn extract_file_paths(output: &str, working_dir: &std::path::Path) -> Vec<std::p
     let mut seen = std::collections::HashSet::new();
 
     let code_extensions = [
-        "rs", "py", "js", "ts", "tsx", "jsx", "java", "go", "c", "cpp", "h",
-        "vue", "svelte", "html", "css", "scss", "toml", "yaml", "yml", "json",
+        "rs", "py", "js", "ts", "tsx", "jsx", "java", "go", "c", "cpp", "h", "vue", "svelte",
+        "html", "css", "scss", "toml", "yaml", "yml", "json",
     ];
 
     for line in output.lines() {
         // Split on common delimiters to find path-like tokens
         for token in line.split(&[' ', ':', '"', '\'', '(', ')', ',', '='][..]) {
             let token = token.trim();
-            if token.len() < 4 || token.len() > 300 { continue; }
-            if !token.contains('/') && !token.contains('\\') { continue; }
+            if token.len() < 4 || token.len() > 300 {
+                continue;
+            }
+            if !token.contains('/') && !token.contains('\\') {
+                continue;
+            }
 
             // Strip trailing :line:col (e.g., "src/main.rs:42:5" → "src/main.rs")
             let path_str = token.split(':').next().unwrap_or(token);
 
             // Check extension
-            let has_code_ext = code_extensions.iter()
+            let has_code_ext = code_extensions
+                .iter()
                 .any(|ext| path_str.ends_with(&format!(".{}", ext)));
-            if !has_code_ext { continue; }
+            if !has_code_ext {
+                continue;
+            }
 
             // Try as absolute path first, then relative to working dir
             let path = std::path::Path::new(path_str);

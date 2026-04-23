@@ -21,7 +21,10 @@ impl AgentLoop {
         // Current task at the very end (recency bias)
         if !self.current_task.is_empty() {
             let task_short = if self.current_task.chars().count() > 300 {
-                format!("{}...", self.current_task.chars().take(297).collect::<String>())
+                format!(
+                    "{}...",
+                    self.current_task.chars().take(297).collect::<String>()
+                )
             } else {
                 self.current_task.clone()
             };
@@ -41,7 +44,9 @@ impl AgentLoop {
     pub(crate) fn build_system_prompt(&mut self) -> String {
         // Dynamic rules: select prompt sections based on task type.
         // If user has a custom system_prompt in config, use that instead (override).
-        let rules = if let Some(custom) = self.config.providers
+        let rules = if let Some(custom) = self
+            .config
+            .providers
             .get(&self.config.default_provider)
             .and_then(|p| p.system_prompt.as_deref())
         {
@@ -51,7 +56,8 @@ impl AgentLoop {
         };
 
         let wd: PathBuf = self
-            .turn_runner.context
+            .turn_runner
+            .context
             .working_dir
             .try_read()
             .map(|g| g.clone())
@@ -72,19 +78,20 @@ impl AgentLoop {
         } else {
             std::env::var("SHELL").unwrap_or_else(|_| "bash".into())
         };
-        let env_info = format!(
-            "Platform: {} | Shell: {}",
-            std::env::consts::OS, shell,
-        );
+        let env_info = format!("Platform: {} | Shell: {}", std::env::consts::OS, shell,);
 
         // Model identity — needed for language discipline.
-        let model_id = self.config.providers
+        let model_id = self
+            .config
+            .providers
             .get(&self.config.default_provider)
             .map(|p| p.model.to_lowercase())
             .unwrap_or_default();
 
         // Identity: inject model name so the model correctly identifies itself.
-        let model_display = self.config.providers
+        let model_display = self
+            .config
+            .providers
             .get(&self.config.default_provider)
             .map(|p| p.model.as_str())
             .unwrap_or("unknown");
@@ -120,7 +127,9 @@ impl AgentLoop {
 
         // RULES GO LAST — recency effect ensures the model remembers these
         // when it starts generating tool calls.
-        prompt.push_str(&format!("\n=== RULES (follow these strictly) ===\n{rules}\n"));
+        prompt.push_str(&format!(
+            "\n=== RULES (follow these strictly) ===\n{rules}\n"
+        ));
 
         // Language discipline: some models (MiniMax, Qwen, DeepSeek) default to
         // English chain-of-thought even when the user speaks Chinese.
@@ -129,9 +138,7 @@ impl AgentLoop {
             || model_id.contains("deepseek")
             || model_id.contains("kimi");
         if needs_cn_lock {
-            prompt.push_str(
-                "\n用户可见的输出请用中文。工具调用和代码保持原样。\n"
-            );
+            prompt.push_str("\n用户可见的输出请用中文。工具调用和代码保持原样。\n");
         }
 
         // Platform-specific rules — only injected on the target OS.
@@ -146,11 +153,10 @@ impl AgentLoop {
             prompt.push_str(
                 "\n## THINKING 纪律:\n\
                  内部思考（<think> 块）必须极简，只写必要的决策线索，\
-                 不要复述工具结果、不要分点展开、不要自问自答。目标 ≤ 3 句话。\n"
+                 不要复述工具结果、不要分点展开、不要自问自答。目标 ≤ 3 句话。\n",
             );
         }
 
         prompt
     }
-
 }

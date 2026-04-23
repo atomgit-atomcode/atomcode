@@ -17,12 +17,17 @@ pub enum StreamEvent {
     /// final text on `Done` if `content` ends up empty, which keeps us from
     /// silently returning 0-token "Nailed it" responses for reasoning models.
     Reasoning(String),
-    ToolCallStart { id: String, name: String },
+    ToolCallStart {
+        id: String,
+        name: String,
+    },
     ToolCallDelta(String),
     ToolCallDone(ToolCall),
     Usage(TokenUsage),
     /// Stream finished. `truncated` = true means finish_reason was "length"
     /// (model hit max_tokens and was cut off, should continue).
-    Done { truncated: bool },
+    Done {
+        truncated: bool,
+    },
     Error(String),
 }

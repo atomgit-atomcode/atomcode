@@ -4,8 +4,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
-use crate::app::{IssueField, IssueInputState};
 use super::theme;
+use crate::app::{IssueField, IssueInputState};
 
 pub fn render(frame: &mut Frame, area: Rect, state: &IssueInputState) {
     // Clear the entire chat area first to prevent artifacts when switching modes
@@ -23,7 +23,9 @@ pub fn render(frame: &mut Frame, area: Rect, state: &IssueInputState) {
         .border_style(Style::default().fg(theme::accent()))
         .title(Span::styled(
             " Create Issue on AtomGit ",
-            Style::default().fg(theme::accent()).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme::accent())
+                .add_modifier(Modifier::BOLD),
         ))
         .style(Style::default().bg(theme::bg_elevated()));
 
@@ -33,14 +35,14 @@ pub fn render(frame: &mut Frame, area: Rect, state: &IssueInputState) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),  // spacing
-            Constraint::Length(1),  // title label
-            Constraint::Length(2),  // title input
-            Constraint::Length(1),  // spacing
-            Constraint::Length(1),  // desc label
-            Constraint::Length(3),  // desc input (multiline visual)
-            Constraint::Length(1),  // spacing
-            Constraint::Length(1),  // help/error
+            Constraint::Length(1), // spacing
+            Constraint::Length(1), // title label
+            Constraint::Length(2), // title input
+            Constraint::Length(1), // spacing
+            Constraint::Length(1), // desc label
+            Constraint::Length(3), // desc input (multiline visual)
+            Constraint::Length(1), // spacing
+            Constraint::Length(1), // help/error
         ])
         .split(inner);
 
@@ -53,28 +55,34 @@ pub fn render(frame: &mut Frame, area: Rect, state: &IssueInputState) {
 
     // Title input box - use accent (light purple) for focus, with dark text for contrast
     let title_style = if state.cursor_field == IssueField::Title {
-        Style::default().fg(theme::text_on_accent()).bg(theme::accent())
+        Style::default()
+            .fg(theme::text_on_accent())
+            .bg(theme::accent())
     } else {
         Style::default().fg(theme::text_primary())
     };
-    let title_block = Block::default()
-        .borders(Borders::BOTTOM);
+    let title_block = Block::default().borders(Borders::BOTTOM);
     let title_text = if state.cursor_field == IssueField::Title {
         // Show cursor at current position with horizontal scroll
         let available_width = chunks[2].width.saturating_sub(2) as usize;
         let cursor_pos = state.title_cursor;
         let _char_count = state.title.chars().count();
-        
+
         // Calculate scroll offset to keep cursor visible
         let scroll_offset = if cursor_pos >= available_width {
             cursor_pos - available_width + 1
         } else {
             0
         };
-        
-        let chars: Vec<char> = state.title.chars().skip(scroll_offset).take(available_width).collect();
+
+        let chars: Vec<char> = state
+            .title
+            .chars()
+            .skip(scroll_offset)
+            .take(available_width)
+            .collect();
         let display: String = chars.iter().collect();
-        
+
         // Insert cursor at the right position
         let cursor_idx = cursor_pos.saturating_sub(scroll_offset);
         if cursor_idx < display.len() {
@@ -105,7 +113,9 @@ pub fn render(frame: &mut Frame, area: Rect, state: &IssueInputState) {
 
     // Description input box - use accent (light purple) for focus, with dark text for contrast
     let desc_style = if state.cursor_field == IssueField::Description {
-        Style::default().fg(theme::text_on_accent()).bg(theme::accent())
+        Style::default()
+            .fg(theme::text_on_accent())
+            .bg(theme::accent())
     } else {
         Style::default().fg(theme::text_primary())
     };
@@ -117,17 +127,22 @@ pub fn render(frame: &mut Frame, area: Rect, state: &IssueInputState) {
         let available_width = chunks[5].width.saturating_sub(2) as usize;
         let cursor_pos = state.desc_cursor;
         let _char_count = state.description.chars().count();
-        
+
         // Calculate scroll offset to keep cursor visible
         let scroll_offset = if cursor_pos >= available_width {
             cursor_pos - available_width + 1
         } else {
             0
         };
-        
-        let chars: Vec<char> = state.description.chars().skip(scroll_offset).take(available_width).collect();
+
+        let chars: Vec<char> = state
+            .description
+            .chars()
+            .skip(scroll_offset)
+            .take(available_width)
+            .collect();
         let display: String = chars.iter().collect();
-        
+
         // Insert cursor at the right position
         let cursor_idx = cursor_pos.saturating_sub(scroll_offset);
         if cursor_idx < display.len() {

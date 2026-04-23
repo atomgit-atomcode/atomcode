@@ -99,7 +99,9 @@ fn open_browser(url: &str) {
     #[cfg(target_os = "linux")]
     let _ = std::process::Command::new("xdg-open").arg(url).spawn();
     #[cfg(target_os = "windows")]
-    let _ = std::process::Command::new("cmd").args(["/C", "start", url]).spawn();
+    let _ = std::process::Command::new("cmd")
+        .args(["/C", "start", url])
+        .spawn();
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     let _ = url;
 }
@@ -109,7 +111,11 @@ pub fn build_authorize_url(state: &str) -> String {
 }
 
 fn build_authorize_url_with(authorize_url: &str, state: &str, parent_origin: &str) -> String {
-    let sep = if authorize_url.contains('?') { '&' } else { '?' };
+    let sep = if authorize_url.contains('?') {
+        '&'
+    } else {
+        '?'
+    };
     format!(
         "{}{}state={}&parent_origin={}",
         authorize_url,
@@ -136,9 +142,7 @@ fn receive_code(port: u16, expected_state: &str) -> Result<String> {
         .with_context(|| format!("Bind 127.0.0.1:{} — port in use?", port))?;
 
     // Set a short timeout so we can check for cancellation periodically.
-    listener
-        .set_nonblocking(true)
-        .context("set_nonblocking")?;
+    listener.set_nonblocking(true).context("set_nonblocking")?;
 
     let timeout = std::time::Duration::from_secs(300); // 5 minutes max wait
 
@@ -196,7 +200,9 @@ fn receive_code(port: u16, expected_state: &str) -> Result<String> {
 
     let mut reader = std::io::BufReader::new(&mut stream);
     let mut request_line = String::new();
-    reader.read_line(&mut request_line).context("Read callback HTTP line")?;
+    reader
+        .read_line(&mut request_line)
+        .context("Read callback HTTP line")?;
 
     let path = request_line
         .split_whitespace()
@@ -262,13 +268,12 @@ pub fn exchange_code_via_broker_with_url(
         .context("Build HTTP client")?;
 
     let body = serde_json::json!({ "code": code });
-    let resp = client
-        .post(url)
-        .json(&body)
-        .send()
-        .with_context(|| {
-            format!("Cannot reach broker login endpoint at {}. Check VPN/internal network.", url)
-        })?;
+    let resp = client.post(url).json(&body).send().with_context(|| {
+        format!(
+            "Cannot reach broker login endpoint at {}. Check VPN/internal network.",
+            url
+        )
+    })?;
 
     let status = resp.status();
     let text = resp.text().unwrap_or_default();
@@ -281,8 +286,12 @@ pub fn exchange_code_via_broker_with_url(
 }
 
 pub fn parse_broker_response(body: &str) -> Result<(WecomIdentity, Option<BrokerCreds>)> {
-    let resp: BrokerResponse = serde_json::from_str(body)
-        .with_context(|| format!("Parse broker JSON: {}", body.chars().take(500).collect::<String>()))?;
+    let resp: BrokerResponse = serde_json::from_str(body).with_context(|| {
+        format!(
+            "Parse broker JSON: {}",
+            body.chars().take(500).collect::<String>()
+        )
+    })?;
 
     if let Some(err) = resp.error {
         bail!("{}", err);
@@ -296,9 +305,11 @@ pub fn parse_broker_response(body: &str) -> Result<(WecomIdentity, Option<Broker
     };
 
     let creds = match (resp.api_key, resp.model, resp.api_base) {
-        (Some(api_key), Some(model), Some(api_base)) if !api_key.is_empty() => {
-            Some(BrokerCreds { api_key, model, api_base })
-        }
+        (Some(api_key), Some(model), Some(api_base)) if !api_key.is_empty() => Some(BrokerCreds {
+            api_key,
+            model,
+            api_base,
+        }),
         _ => None,
     };
 
@@ -319,14 +330,20 @@ pub fn login() -> Result<(WecomIdentity, Option<BrokerCreds>)> {
     println!("  If browser doesn't open, visit:\n    {}\n", auth_url);
     open_browser(&auth_url);
 
-    println!("  Waiting for callback on port {} (press ESC to cancel)...", REDIRECT_PORT);
+    println!(
+        "  Waiting for callback on port {} (press ESC to cancel)...",
+        REDIRECT_PORT
+    );
     let code = receive_code(REDIRECT_PORT, &state)?;
     println!("  Scan received, exchanging with broker...\n");
 
     let (identity, creds) = exchange_code_via_broker(&code)?;
     println!(
         "  Identity: {} ({})\n",
-        identity.name.clone().unwrap_or_else(|| identity.userid.clone()),
+        identity
+            .name
+            .clone()
+            .unwrap_or_else(|| identity.userid.clone()),
         identity.userid
     );
     Ok((identity, creds))
@@ -343,12 +360,18 @@ mod tests {
             "state_xyz",
             "http://127.0.0.1:8766/callback",
         );
-        assert!(url.starts_with("https://test-zouwu.gitcode.com/login?popup=1&corp=csdn&state=state_xyz&parent_origin="));
+        assert!(url.starts_with(
+            "https://test-zouwu.gitcode.com/login?popup=1&corp=csdn&state=state_xyz&parent_origin="
+        ));
     }
 
     #[test]
     fn build_authorize_url_uses_question_mark_when_no_query() {
-        let url = build_authorize_url_with("https://broker/login", "s", "http://127.0.0.1:8766/callback");
+        let url = build_authorize_url_with(
+            "https://broker/login",
+            "s",
+            "http://127.0.0.1:8766/callback",
+        );
         assert!(url.starts_with("https://broker/login?state=s&parent_origin="));
     }
 

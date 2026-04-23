@@ -4,15 +4,11 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph};
 use ratatui::Frame;
 
-use crate::app::{App, WelcomeState};
 use super::theme;
+use crate::app::{App, WelcomeState};
 
 // ── Atom logo — 3-line orbital, compact & geeky ──
-const ATOM: [&str; 3] = [
-    r"╱·╲",
-    r"( ◉ )",
-    r"╲·╱",
-];
+const ATOM: [&str; 3] = [r"╱·╲", r"( ◉ )", r"╲·╱"];
 
 /// Render the normal welcome screen (conversation empty, providers configured).
 /// Design D: Hermes-style box layout with project context + recent sessions.
@@ -45,21 +41,58 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     lines.push(box_line("", box_w, b));
 
     // ── Logo + brand ──
-    lines.push(box_line_spans(vec![
-        Span::styled(format!("  {} ", ATOM[0]), Style::default().fg(theme::accent_dim())),
-    ], box_w, b));
+    lines.push(box_line_spans(
+        vec![Span::styled(
+            format!("  {} ", ATOM[0]),
+            Style::default().fg(theme::accent_dim()),
+        )],
+        box_w,
+        b,
+    ));
 
-    lines.push(box_line_spans(vec![
-        Span::styled(format!(" {} ", ATOM[1]), Style::default().fg(theme::accent()).add_modifier(Modifier::BOLD)),
-        Span::styled("  Atom", Style::default().fg(theme::text_primary()).add_modifier(Modifier::BOLD)),
-        Span::styled("Code", Style::default().fg(theme::accent()).add_modifier(Modifier::BOLD)),
-        Span::styled(format!(" v{}", env!("CARGO_PKG_VERSION")), Style::default().fg(theme::text_muted())),
-    ], box_w, b));
+    lines.push(box_line_spans(
+        vec![
+            Span::styled(
+                format!(" {} ", ATOM[1]),
+                Style::default()
+                    .fg(theme::accent())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "  Atom",
+                Style::default()
+                    .fg(theme::text_primary())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "Code",
+                Style::default()
+                    .fg(theme::accent())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" v{}", env!("CARGO_PKG_VERSION")),
+                Style::default().fg(theme::text_muted()),
+            ),
+        ],
+        box_w,
+        b,
+    ));
 
-    lines.push(box_line_spans(vec![
-        Span::styled(format!("  {} ", ATOM[2]), Style::default().fg(theme::accent_dim())),
-        Span::styled("  AI Coding Agent", Style::default().fg(theme::text_muted())),
-    ], box_w, b));
+    lines.push(box_line_spans(
+        vec![
+            Span::styled(
+                format!("  {} ", ATOM[2]),
+                Style::default().fg(theme::accent_dim()),
+            ),
+            Span::styled(
+                "  AI Coding Agent",
+                Style::default().fg(theme::text_muted()),
+            ),
+        ],
+        box_w,
+        b,
+    ));
 
     // ── Empty line ──
     lines.push(box_line("", box_w, b));
@@ -76,17 +109,31 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     // ── Project info ──
     let git = git_info(&app.working_dir);
 
-    lines.push(box_line_spans(vec![
-        Span::styled(" ● ", Style::default().fg(theme::accent())),
-        Span::styled("Model   ", Style::default().fg(theme::text_muted())),
-        Span::styled(app.model_name.clone(), Style::default().fg(theme::text_primary())),
-    ], box_w, b));
+    lines.push(box_line_spans(
+        vec![
+            Span::styled(" ● ", Style::default().fg(theme::accent())),
+            Span::styled("Model   ", Style::default().fg(theme::text_muted())),
+            Span::styled(
+                app.model_name.clone(),
+                Style::default().fg(theme::text_primary()),
+            ),
+        ],
+        box_w,
+        b,
+    ));
 
-    lines.push(box_line_spans(vec![
-        Span::styled(" ● ", Style::default().fg(theme::info())),
-        Span::styled("Path    ", Style::default().fg(theme::text_muted())),
-        Span::styled(short_home(&app.working_dir), Style::default().fg(theme::text_primary())),
-    ], box_w, b));
+    lines.push(box_line_spans(
+        vec![
+            Span::styled(" ● ", Style::default().fg(theme::info())),
+            Span::styled("Path    ", Style::default().fg(theme::text_muted())),
+            Span::styled(
+                short_home(&app.working_dir),
+                Style::default().fg(theme::text_primary()),
+            ),
+        ],
+        box_w,
+        b,
+    ));
 
     if let Some((branch, dirty)) = &git {
         let mut spans = vec![
@@ -112,18 +159,30 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         )));
         lines.push(box_line("", box_w, b));
 
-        lines.push(box_line_spans(vec![
-            Span::styled(" Recent", Style::default().fg(theme::text_muted())),
-        ], box_w, b));
+        lines.push(box_line_spans(
+            vec![Span::styled(
+                " Recent",
+                Style::default().fg(theme::text_muted()),
+            )],
+            box_w,
+            b,
+        ));
 
         for (task, turns, ago) in recent.iter().take(3) {
             let max_task_w = inner_w.saturating_sub(20);
             let task_short = truncate_to_width(&task, max_task_w);
-            lines.push(box_line_spans(vec![
-                Span::styled(" ▸ ", Style::default().fg(theme::text_muted())),
-                Span::styled(task_short, Style::default().fg(theme::text_secondary())),
-                Span::styled(format!(" · {}T · {}", turns, ago), Style::default().fg(theme::border())),
-            ], box_w, b));
+            lines.push(box_line_spans(
+                vec![
+                    Span::styled(" ▸ ", Style::default().fg(theme::text_muted())),
+                    Span::styled(task_short, Style::default().fg(theme::text_secondary())),
+                    Span::styled(
+                        format!(" · {}T · {}", turns, ago),
+                        Style::default().fg(theme::border()),
+                    ),
+                ],
+                box_w,
+                b,
+            ));
         }
 
         lines.push(box_line("", box_w, b));
@@ -141,11 +200,16 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     let k = Style::default().fg(theme::text_secondary());
     let d = Style::default().fg(theme::text_muted());
     lines.push(Line::from(vec![
-        Span::styled("  Enter ", k), Span::styled("send  ", d),
-        Span::styled("↑↓ ", k), Span::styled("history  ", d),
-        Span::styled("/ ", k), Span::styled("commands  ", d),
-        Span::styled("/model ", k), Span::styled("switch  ", d),
-        Span::styled("Ctrl+C ", k), Span::styled("exit", d),
+        Span::styled("  Enter ", k),
+        Span::styled("send  ", d),
+        Span::styled("↑↓ ", k),
+        Span::styled("history  ", d),
+        Span::styled("/ ", k),
+        Span::styled("commands  ", d),
+        Span::styled("/model ", k),
+        Span::styled("switch  ", d),
+        Span::styled("Ctrl+C ", k),
+        Span::styled("exit", d),
     ]));
 
     lines.push(Line::default());
@@ -186,21 +250,58 @@ pub fn render_setup(frame: &mut Frame, area: Rect, state: &WelcomeState) {
     lines.push(box_line("", box_w, b));
 
     // ── Logo ──
-    lines.push(box_line_spans(vec![
-        Span::styled(format!("  {} ", ATOM[0]), Style::default().fg(theme::accent_dim())),
-    ], box_w, b));
+    lines.push(box_line_spans(
+        vec![Span::styled(
+            format!("  {} ", ATOM[0]),
+            Style::default().fg(theme::accent_dim()),
+        )],
+        box_w,
+        b,
+    ));
 
-    lines.push(box_line_spans(vec![
-        Span::styled(format!(" {} ", ATOM[1]), Style::default().fg(theme::accent()).add_modifier(Modifier::BOLD)),
-        Span::styled("  Atom", Style::default().fg(theme::text_primary()).add_modifier(Modifier::BOLD)),
-        Span::styled("Code", Style::default().fg(theme::accent()).add_modifier(Modifier::BOLD)),
-        Span::styled(format!(" v{}", env!("CARGO_PKG_VERSION")), Style::default().fg(theme::text_muted())),
-    ], box_w, b));
+    lines.push(box_line_spans(
+        vec![
+            Span::styled(
+                format!(" {} ", ATOM[1]),
+                Style::default()
+                    .fg(theme::accent())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "  Atom",
+                Style::default()
+                    .fg(theme::text_primary())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "Code",
+                Style::default()
+                    .fg(theme::accent())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" v{}", env!("CARGO_PKG_VERSION")),
+                Style::default().fg(theme::text_muted()),
+            ),
+        ],
+        box_w,
+        b,
+    ));
 
-    lines.push(box_line_spans(vec![
-        Span::styled(format!("  {} ", ATOM[2]), Style::default().fg(theme::accent_dim())),
-        Span::styled("  AI Coding Agent", Style::default().fg(theme::text_muted())),
-    ], box_w, b));
+    lines.push(box_line_spans(
+        vec![
+            Span::styled(
+                format!("  {} ", ATOM[2]),
+                Style::default().fg(theme::accent_dim()),
+            ),
+            Span::styled(
+                "  AI Coding Agent",
+                Style::default().fg(theme::text_muted()),
+            ),
+        ],
+        box_w,
+        b,
+    ));
 
     lines.push(box_line("", box_w, b));
 
@@ -212,45 +313,68 @@ pub fn render_setup(frame: &mut Frame, area: Rect, state: &WelcomeState) {
 
     lines.push(box_line("", box_w, b));
 
-    lines.push(box_line_spans(vec![
-        Span::styled(" Get started:", Style::default().fg(theme::text_secondary())),
-    ], box_w, b));
+    lines.push(box_line_spans(
+        vec![Span::styled(
+            " Get started:",
+            Style::default().fg(theme::text_secondary()),
+        )],
+        box_w,
+        b,
+    ));
 
     lines.push(box_line("", box_w, b));
 
     let options = [
         ("Login with AtomGit", "OAuth · recommended"),
         ("Configure manually", "API key"),
-        ("Skip for now",       "explore first"),
+        ("Skip for now", "explore first"),
     ];
     for (i, (label, hint)) in options.iter().enumerate() {
         let is_sel = i == state.selected;
         if is_sel {
-            lines.push(box_line_spans(vec![
-                Span::styled(" ▸ ", Style::default().fg(theme::accent())),
-                Span::styled(
-                    label.to_string(),
-                    Style::default().fg(theme::text_primary()).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    format!("  {}", hint),
-                    Style::default().fg(theme::text_muted()),
-                ),
-            ], box_w, b));
+            lines.push(box_line_spans(
+                vec![
+                    Span::styled(" ▸ ", Style::default().fg(theme::accent())),
+                    Span::styled(
+                        label.to_string(),
+                        Style::default()
+                            .fg(theme::text_primary())
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!("  {}", hint),
+                        Style::default().fg(theme::text_muted()),
+                    ),
+                ],
+                box_w,
+                b,
+            ));
         } else {
-            lines.push(box_line_spans(vec![
-                Span::styled("   ", Style::default()),
-                Span::styled(label.to_string(), Style::default().fg(theme::text_secondary())),
-            ], box_w, b));
+            lines.push(box_line_spans(
+                vec![
+                    Span::styled("   ", Style::default()),
+                    Span::styled(
+                        label.to_string(),
+                        Style::default().fg(theme::text_secondary()),
+                    ),
+                ],
+                box_w,
+                b,
+            ));
         }
     }
 
     lines.push(box_line("", box_w, b));
 
     if let Some(ref err) = state.error {
-        lines.push(box_line_spans(vec![
-            Span::styled(format!(" {}", err), Style::default().fg(theme::error())),
-        ], box_w, b));
+        lines.push(box_line_spans(
+            vec![Span::styled(
+                format!(" {}", err),
+                Style::default().fg(theme::error()),
+            )],
+            box_w,
+            b,
+        ));
         lines.push(box_line("", box_w, b));
     }
 
@@ -279,7 +403,10 @@ fn box_line(text: &str, box_w: usize, border_style: Style) -> Line<'static> {
     let pad = box_w.saturating_sub(display_width(text) + 1); // +1 for leading space
     Line::from(vec![
         Span::styled("  │", border_style),
-        Span::styled(format!(" {}", text), Style::default().fg(theme::text_primary())),
+        Span::styled(
+            format!(" {}", text),
+            Style::default().fg(theme::text_primary()),
+        ),
         Span::styled(" ".repeat(pad), Style::default()),
         Span::styled("│", border_style),
     ])
@@ -324,15 +451,26 @@ fn git_info(wd: &std::path::Path) -> Option<(String, bool)> {
 
 /// Display width accounting for CJK characters (width 2).
 fn display_width(s: &str) -> usize {
-    s.chars().map(|c| {
-        let cp = c as u32;
-        if (0x4E00..=0x9FFF).contains(&cp) || (0x3400..=0x4DBF).contains(&cp)
-            || (0x20000..=0x2A6DF).contains(&cp) || (0xF900..=0xFAFF).contains(&cp)
-            || (0xFF01..=0xFF60).contains(&cp) || (0xFFE0..=0xFFE6).contains(&cp)
-            || (0xAC00..=0xD7AF).contains(&cp) || (0x3000..=0x303F).contains(&cp)
-            || (0x3040..=0x309F).contains(&cp) || (0x30A0..=0x30FF).contains(&cp)
-        { 2 } else { 1 }
-    }).sum()
+    s.chars()
+        .map(|c| {
+            let cp = c as u32;
+            if (0x4E00..=0x9FFF).contains(&cp)
+                || (0x3400..=0x4DBF).contains(&cp)
+                || (0x20000..=0x2A6DF).contains(&cp)
+                || (0xF900..=0xFAFF).contains(&cp)
+                || (0xFF01..=0xFF60).contains(&cp)
+                || (0xFFE0..=0xFFE6).contains(&cp)
+                || (0xAC00..=0xD7AF).contains(&cp)
+                || (0x3000..=0x303F).contains(&cp)
+                || (0x3040..=0x309F).contains(&cp)
+                || (0x30A0..=0x30FF).contains(&cp)
+            {
+                2
+            } else {
+                1
+            }
+        })
+        .sum()
 }
 
 /// Truncate string to fit within `max_width` display columns, appending '…' if truncated.
@@ -342,12 +480,21 @@ fn truncate_to_width(s: &str, max_width: usize) -> String {
     for c in s.chars() {
         let cw = {
             let cp = c as u32;
-            if (0x4E00..=0x9FFF).contains(&cp) || (0x3400..=0x4DBF).contains(&cp)
-                || (0x20000..=0x2A6DF).contains(&cp) || (0xF900..=0xFAFF).contains(&cp)
-                || (0xFF01..=0xFF60).contains(&cp) || (0xFFE0..=0xFFE6).contains(&cp)
-                || (0xAC00..=0xD7AF).contains(&cp) || (0x3000..=0x303F).contains(&cp)
-                || (0x3040..=0x309F).contains(&cp) || (0x30A0..=0x30FF).contains(&cp)
-            { 2 } else { 1 }
+            if (0x4E00..=0x9FFF).contains(&cp)
+                || (0x3400..=0x4DBF).contains(&cp)
+                || (0x20000..=0x2A6DF).contains(&cp)
+                || (0xF900..=0xFAFF).contains(&cp)
+                || (0xFF01..=0xFF60).contains(&cp)
+                || (0xFFE0..=0xFFE6).contains(&cp)
+                || (0xAC00..=0xD7AF).contains(&cp)
+                || (0x3000..=0x303F).contains(&cp)
+                || (0x3040..=0x309F).contains(&cp)
+                || (0x30A0..=0x30FF).contains(&cp)
+            {
+                2
+            } else {
+                1
+            }
         };
         if width + cw > max_width.saturating_sub(1) {
             result.push('…');
@@ -420,7 +567,8 @@ fn load_recent_sessions(wd: &std::path::Path) -> Vec<(String, usize, String)> {
             .rfind("**Stats:**")
             .and_then(|pos| {
                 let stats = &content[pos..];
-                stats.split_whitespace()
+                stats
+                    .split_whitespace()
                     .find(|w| w.parse::<usize>().is_ok())
                     .and_then(|w| w.parse().ok())
             })

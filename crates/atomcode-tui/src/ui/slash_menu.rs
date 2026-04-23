@@ -65,9 +65,7 @@ pub fn render(frame: &mut Frame, input_area: Rect, menu: &SlashMenu) {
                     ),
                     Span::styled(
                         hint_str.clone(),
-                        Style::default()
-                            .fg(theme::text_on_accent())
-                            .bg(name_color),
+                        Style::default().fg(theme::text_on_accent()).bg(name_color),
                     ),
                     Span::styled(
                         format!("  {} ", entry.description),
@@ -76,14 +74,8 @@ pub fn render(frame: &mut Frame, input_area: Rect, menu: &SlashMenu) {
                 ])
             } else {
                 Line::from(vec![
-                    Span::styled(
-                        format!(" {}", entry.name),
-                        Style::default().fg(name_color),
-                    ),
-                    Span::styled(
-                        hint_str,
-                        Style::default().fg(theme::warning()),
-                    ),
+                    Span::styled(format!(" {}", entry.name), Style::default().fg(name_color)),
+                    Span::styled(hint_str, Style::default().fg(theme::warning())),
                     Span::styled(
                         format!("  {}", entry.description),
                         Style::default().fg(theme::text_muted()),

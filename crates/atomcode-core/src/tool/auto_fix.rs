@@ -27,7 +27,12 @@ pub struct ValidateResult {
 /// `post_edit_syntax_check` for on-disk syntax validation.
 /// `content` is the post-edit content (what would be written to disk).
 /// `original_content` is the pre-edit content (for delta validation).
-pub async fn validate_and_fix(content: &str, _file_path: &str, _new_string: &str, _original_content: &str) -> ValidateResult {
+pub async fn validate_and_fix(
+    content: &str,
+    _file_path: &str,
+    _new_string: &str,
+    _original_content: &str,
+) -> ValidateResult {
     let warnings: Vec<String> = Vec::new();
     let current = content.to_string();
 
@@ -73,18 +78,34 @@ fn count_delimiters(content: &str) -> (i64, i64, usize) {
     let mut string_char = ' ';
 
     for ch in content.chars() {
-        if ch == '\n' { line_num += 1; }
-        if escape { escape = false; continue; }
-        if ch == '\\' && in_string { escape = true; continue; }
+        if ch == '\n' {
+            line_num += 1;
+        }
+        if escape {
+            escape = false;
+            continue;
+        }
+        if ch == '\\' && in_string {
+            escape = true;
+            continue;
+        }
         if in_string {
-            if ch == string_char { in_string = false; }
+            if ch == string_char {
+                in_string = false;
+            }
             continue;
         }
         match ch {
-            '\'' | '"' | '`' => { in_string = true; string_char = ch; }
+            '\'' | '"' | '`' => {
+                in_string = true;
+                string_char = ch;
+            }
             '{' => {
                 braces += 1;
-                if braces > max_depth { max_depth = braces; max_depth_line = line_num; }
+                if braces > max_depth {
+                    max_depth = braces;
+                    max_depth_line = line_num;
+                }
             }
             '}' => braces -= 1,
             '[' => brackets += 1,
@@ -106,11 +127,19 @@ pub fn html_balance_score(content: &str, file_path: &str) -> i64 {
         if let Some(start) = content.find("<template") {
             if let Some(end) = content.rfind("</template>") {
                 &content[start..end]
-            } else { content }
-        } else { return 0; }
-    } else { content };
+            } else {
+                content
+            }
+        } else {
+            return 0;
+        }
+    } else {
+        content
+    };
 
-    let tags = ["div", "section", "main", "aside", "article", "nav", "header", "footer", "form"];
+    let tags = [
+        "div", "section", "main", "aside", "article", "nav", "header", "footer", "form",
+    ];
     let mut score: i64 = 0;
     for tag in &tags {
         let opens = check_content.matches(&format!("<{}", tag)).count() as i64;
@@ -127,11 +156,19 @@ fn check_html_balance(content: &str, file_path: &str) -> Vec<String> {
         if let Some(start) = content.find("<template") {
             if let Some(end) = content.rfind("</template>") {
                 &content[start..end]
-            } else { content }
-        } else { return vec![]; }
-    } else { content };
+            } else {
+                content
+            }
+        } else {
+            return vec![];
+        }
+    } else {
+        content
+    };
 
-    let tags = ["div", "section", "main", "aside", "article", "nav", "header", "footer", "form"];
+    let tags = [
+        "div", "section", "main", "aside", "article", "nav", "header", "footer", "form",
+    ];
     let mut errors = Vec::new();
 
     for tag in &tags {
@@ -147,7 +184,9 @@ fn check_html_balance(content: &str, file_path: &str) -> Vec<String> {
             } else {
                 errors.push(format!(
                     "STRUCTURAL ERROR: <{}> has {} extra closing tag(s). Remove the extra </{}>.",
-                    tag, diff.abs(), tag
+                    tag,
+                    diff.abs(),
+                    tag
                 ));
             }
         }
@@ -167,7 +206,10 @@ pub async fn post_edit_syntax_check(file_path: &str) -> String {
             return match tokio::fs::read_to_string(file_path).await {
                 Ok(content) => {
                     if serde_json::from_str::<serde_json::Value>(&content).is_err() {
-                        format!("\n\u{26a0} SYNTAX ERROR: {} is not valid JSON. Fix before proceeding.", file_path)
+                        format!(
+                            "\n\u{26a0} SYNTAX ERROR: {} is not valid JSON. Fix before proceeding.",
+                            file_path
+                        )
                     } else {
                         String::new()
                     }
@@ -209,7 +251,14 @@ pub async fn post_edit_syntax_check(file_path: &str) -> String {
             }
             return format!("\n⚠ VUE SYNTAX: {}", warnings.join("; "));
         }
-        "py" => Some(("python3", vec!["-m".to_string(), "py_compile".to_string(), file_path.to_string()])),
+        "py" => Some((
+            "python3",
+            vec![
+                "-m".to_string(),
+                "py_compile".to_string(),
+                file_path.to_string(),
+            ],
+        )),
         _ => None,
     };
 
@@ -238,7 +287,8 @@ pub async fn post_edit_syntax_check(file_path: &str) -> String {
 /// Returns a warning string if duplicates found, empty string otherwise.
 #[allow(dead_code)]
 fn detect_duplicate_blocks(new_content: &str, new_string: &str) -> String {
-    let sig_lines: Vec<&str> = new_string.lines()
+    let sig_lines: Vec<&str> = new_string
+        .lines()
         .map(|l| l.trim())
         .filter(|l| !l.is_empty())
         .collect();
@@ -285,7 +335,8 @@ fn detect_duplicate_blocks(new_content: &str, new_string: &str) -> String {
     }
 
     if !dup_lines.is_empty() {
-        let examples: String = dup_lines.iter()
+        let examples: String = dup_lines
+            .iter()
             .take(3)
             .map(|(line, text)| format!("  L{}: {}", line, text))
             .collect::<Vec<_>>()
@@ -302,7 +353,7 @@ fn detect_duplicate_blocks(new_content: &str, new_string: &str) -> String {
 #[allow(dead_code)]
 enum BraceFixResult {
     Balanced,
-    AutoFixed(String, String),   // (fixed_content, message)
+    AutoFixed(String, String), // (fixed_content, message)
     CannotFix(String),
 }
 
@@ -310,13 +361,16 @@ enum BraceFixResult {
 #[allow(dead_code)]
 fn fix_braces(content: &str, file_path: &str) -> BraceFixResult {
     let ext = file_path.rsplit('.').next().unwrap_or("");
-    if !matches!(ext, "js" | "ts" | "tsx" | "jsx" | "vue" | "svelte" | "java" | "rs" | "go" | "c" | "cpp" | "cs") {
+    if !matches!(
+        ext,
+        "js" | "ts" | "tsx" | "jsx" | "vue" | "svelte" | "java" | "rs" | "go" | "c" | "cpp" | "cs"
+    ) {
         return BraceFixResult::Balanced;
     }
 
     // Count brace AND bracket balance with string awareness
     let lines: Vec<&str> = content.lines().collect();
-    let mut brace_depth = 0i64;   // {}
+    let mut brace_depth = 0i64; // {}
     let mut bracket_depth = 0i64; // []
     let mut in_string = false;
     let mut escape = false;
@@ -326,14 +380,25 @@ fn fix_braces(content: &str, file_path: &str) -> BraceFixResult {
     let mut bracket_line_depths: Vec<i64> = Vec::with_capacity(lines.len());
     for line in &lines {
         for ch in line.chars() {
-            if escape { escape = false; continue; }
-            if ch == '\\' && in_string { escape = true; continue; }
+            if escape {
+                escape = false;
+                continue;
+            }
+            if ch == '\\' && in_string {
+                escape = true;
+                continue;
+            }
             if in_string {
-                if ch == string_char { in_string = false; }
+                if ch == string_char {
+                    in_string = false;
+                }
                 continue;
             }
             match ch {
-                '\'' | '"' | '`' => { in_string = true; string_char = ch; }
+                '\'' | '"' | '`' => {
+                    in_string = true;
+                    string_char = ch;
+                }
                 '{' => brace_depth += 1,
                 '}' => brace_depth -= 1,
                 '[' => bracket_depth += 1,
@@ -386,8 +451,14 @@ fn fix_braces(content: &str, file_path: &str) -> BraceFixResult {
             let indent = if idx > 0 {
                 let prev_line = &fixed_lines[idx];
                 let spaces = prev_line.len() - prev_line.trim_start().len();
-                if spaces >= 2 { spaces - 2 } else { 0 }
-            } else { 0 };
+                if spaces >= 2 {
+                    spaces - 2
+                } else {
+                    0
+                }
+            } else {
+                0
+            };
             let closing = format!("{}}}", " ".repeat(indent));
             fixed_lines.insert(idx + 1, closing);
             remaining -= 1;
@@ -410,23 +481,34 @@ fn fix_braces(content: &str, file_path: &str) -> BraceFixResult {
             // Re-count bracket depth on fixed_lines
             for (i, line) in fixed_lines.iter().enumerate().rev() {
                 for ch in line.chars() {
-                    if ch == ']' { bd += 1; }
+                    if ch == ']' {
+                        bd += 1;
+                    }
                     if ch == '[' {
-                        if bd > 0 { bd -= 1; }
-                        else {
+                        if bd > 0 {
+                            bd -= 1;
+                        } else {
                             insert_after = Some(i);
                             break;
                         }
                     }
                 }
-                if insert_after.is_some() { break; }
+                if insert_after.is_some() {
+                    break;
+                }
             }
             if let Some(idx) = insert_after {
                 let indent = if idx < fixed_lines.len() {
                     let l = &fixed_lines[idx];
                     let s = l.len() - l.trim_start().len();
-                    if s >= 2 { s - 2 } else { 0 }
-                } else { 0 };
+                    if s >= 2 {
+                        s - 2
+                    } else {
+                        0
+                    }
+                } else {
+                    0
+                };
                 fixed_lines.insert(idx + 1, format!("{}]", " ".repeat(indent)));
                 bracket_remaining -= 1;
             }
@@ -443,14 +525,19 @@ fn fix_braces(content: &str, file_path: &str) -> BraceFixResult {
     };
 
     let mut msg_parts = Vec::new();
-    if depth > 0 { msg_parts.push(format!("{} missing '}}'", depth)); }
-    if needs_bracket_fix { msg_parts.push(format!("{} missing ']'", bracket_depth)); }
+    if depth > 0 {
+        msg_parts.push(format!("{} missing '}}'", depth));
+    }
+    if needs_bracket_fix {
+        msg_parts.push(format!("{} missing ']'", bracket_depth));
+    }
 
     BraceFixResult::AutoFixed(
         new_content,
         format!(
             "\n[AUTO-FIXED: inserted {} in {}.]",
-            msg_parts.join(" + "), file_path
+            msg_parts.join(" + "),
+            file_path
         ),
     )
 }
@@ -458,7 +545,7 @@ fn fix_braces(content: &str, file_path: &str) -> BraceFixResult {
 #[allow(dead_code)]
 enum HtmlFixResult {
     Balanced,
-    AutoFixed(String, String),   // (fixed_content, message)
+    AutoFixed(String, String), // (fixed_content, message)
     CannotFix(String),
 }
 
@@ -474,15 +561,25 @@ fn fix_html_tags(content: &str, file_path: &str) -> HtmlFixResult {
 
     // Find <template> section boundaries for Vue files
     let (tpl_start, tpl_end) = if ext == "vue" {
-        let s = lines.iter().position(|l| l.trim_start().starts_with("<template")).unwrap_or(0);
-        let e = lines.iter().rposition(|l| l.trim_start().starts_with("</template>")).unwrap_or(lines.len());
+        let s = lines
+            .iter()
+            .position(|l| l.trim_start().starts_with("<template"))
+            .unwrap_or(0);
+        let e = lines
+            .iter()
+            .rposition(|l| l.trim_start().starts_with("</template>"))
+            .unwrap_or(lines.len());
         (s, e)
     } else {
         (0, lines.len())
     };
-    if tpl_start >= tpl_end { return HtmlFixResult::Balanced; }
+    if tpl_start >= tpl_end {
+        return HtmlFixResult::Balanced;
+    }
 
-    let tags = ["div", "section", "main", "aside", "article", "nav", "header", "footer", "form", "ul", "ol"];
+    let tags = [
+        "div", "section", "main", "aside", "article", "nav", "header", "footer", "form", "ul", "ol",
+    ];
     let mut fixes: Vec<String> = Vec::new();
     let mut fixed_lines: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
     let mut any_fixed = false;
@@ -501,10 +598,13 @@ fn fix_html_tags(content: &str, file_path: &str) -> HtmlFixResult {
                 let mut depth = 0i32;
                 for i in (tpl_start..tpl_end).rev() {
                     let trimmed = fixed_lines[i].trim();
-                    if trimmed.contains(&close_pattern) { depth += 1; }
+                    if trimmed.contains(&close_pattern) {
+                        depth += 1;
+                    }
                     if trimmed.contains(&open_pattern) {
-                        if depth > 0 { depth -= 1; }
-                        else {
+                        if depth > 0 {
+                            depth -= 1;
+                        } else {
                             let indent = fixed_lines[i].len() - fixed_lines[i].trim_start().len();
                             let closing = format!("{}</{}>", " ".repeat(indent), tag);
                             let insert_after = tpl_end - 1;
@@ -517,7 +617,11 @@ fn fix_html_tags(content: &str, file_path: &str) -> HtmlFixResult {
                 }
             }
         } else if closes > opens {
-            fixes.push(format!("<{}> has {} extra closing tag(s) — remove manually", tag, closes - opens));
+            fixes.push(format!(
+                "<{}> has {} extra closing tag(s) — remove manually",
+                tag,
+                closes - opens
+            ));
         }
     }
 
@@ -529,17 +633,15 @@ fn fix_html_tags(content: &str, file_path: &str) -> HtmlFixResult {
         };
         return HtmlFixResult::AutoFixed(
             new_content,
-            format!(
-                "\n[AUTO-FIXED HTML: {}. File rewritten.]",
-                fixes.join(", ")
-            ),
+            format!("\n[AUTO-FIXED HTML: {}. File rewritten.]", fixes.join(", ")),
         );
     }
 
     if !fixes.is_empty() {
         HtmlFixResult::CannotFix(format!(
             "\n\u{26a0} HTML TAG MISMATCH in {}: {}. Fix NOW.",
-            file_path, fixes.join("; ")
+            file_path,
+            fixes.join("; ")
         ))
     } else {
         HtmlFixResult::Balanced
@@ -551,7 +653,21 @@ fn fix_html_tags(content: &str, file_path: &str) -> HtmlFixResult {
 #[allow(dead_code)]
 pub fn check_brace_balance(content: &str, file_path: &str) -> String {
     let ext = file_path.rsplit('.').next().unwrap_or("");
-    if !matches!(ext, "js" | "ts" | "tsx" | "jsx" | "vue" | "svelte" | "java" | "rs" | "go" | "c" | "cpp" | "cs" | "json") {
+    if !matches!(
+        ext,
+        "js" | "ts"
+            | "tsx"
+            | "jsx"
+            | "vue"
+            | "svelte"
+            | "java"
+            | "rs"
+            | "go"
+            | "c"
+            | "cpp"
+            | "cs"
+            | "json"
+    ) {
         return String::new();
     }
 
@@ -565,15 +681,28 @@ pub fn check_brace_balance(content: &str, file_path: &str) -> String {
     let mut line_num = 1usize;
 
     for ch in content.chars() {
-        if ch == '\n' { line_num += 1; }
-        if escape { escape = false; continue; }
-        if ch == '\\' && in_string { escape = true; continue; }
+        if ch == '\n' {
+            line_num += 1;
+        }
+        if escape {
+            escape = false;
+            continue;
+        }
+        if ch == '\\' && in_string {
+            escape = true;
+            continue;
+        }
         if in_string {
-            if ch == string_char { in_string = false; }
+            if ch == string_char {
+                in_string = false;
+            }
             continue;
         }
         match ch {
-            '\'' | '"' | '`' => { in_string = true; string_char = ch; }
+            '\'' | '"' | '`' => {
+                in_string = true;
+                string_char = ch;
+            }
             '{' => {
                 braces += 1;
                 if braces > max_depth {
@@ -581,7 +710,9 @@ pub fn check_brace_balance(content: &str, file_path: &str) -> String {
                     max_depth_line = line_num;
                 }
             }
-            '}' => { braces -= 1; }
+            '}' => {
+                braces -= 1;
+            }
             _ => {}
         }
     }
@@ -597,7 +728,8 @@ pub fn check_brace_balance(content: &str, file_path: &str) -> String {
     } else {
         format!(
             "\n\u{26a0} BRACE MISMATCH in {}: {} extra closing '}}'. Remove the extra. Fix NOW.",
-            file_path, braces.abs()
+            file_path,
+            braces.abs()
         )
     }
 }

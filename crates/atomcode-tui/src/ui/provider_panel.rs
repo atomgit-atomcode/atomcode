@@ -7,9 +7,7 @@ use ratatui::Frame;
 
 use atomcode_core::config::Config;
 
-use crate::provider_manager::{
-    AddStep, EditField, ManagerState, ProviderManager, PROVIDER_TYPES,
-};
+use crate::provider_manager::{AddStep, EditField, ManagerState, ProviderManager, PROVIDER_TYPES};
 use crate::ui::theme;
 
 pub fn render(frame: &mut Frame, area: Rect, mgr: &ProviderManager, config: &Config) {
@@ -66,41 +64,63 @@ fn render_list(frame: &mut Frame, area: Rect, mgr: &ProviderManager, config: &Co
                 lines.push(Line::from(vec![
                     Span::styled(
                         format!("  {} ", marker),
-                        Style::default().fg(theme::text_on_accent()).bg(theme::accent()).add_modifier(Modifier::BOLD),
+                        Style::default()
+                            .fg(theme::text_on_accent())
+                            .bg(theme::accent())
+                            .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(
                         format!("{:<14}", name),
-                        Style::default().fg(theme::text_on_accent()).bg(theme::accent()).add_modifier(Modifier::BOLD),
+                        Style::default()
+                            .fg(theme::text_on_accent())
+                            .bg(theme::accent())
+                            .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(
                         format!("{:<10}", ptype),
-                        Style::default().fg(theme::text_on_accent()).bg(theme::accent()),
+                        Style::default()
+                            .fg(theme::text_on_accent())
+                            .bg(theme::accent()),
                     ),
                     Span::styled(
                         model.to_string(),
-                        Style::default().fg(theme::text_on_accent()).bg(theme::accent()),
+                        Style::default()
+                            .fg(theme::text_on_accent())
+                            .bg(theme::accent()),
                     ),
                 ]));
             } else {
                 // Not selected: normal colors with explicit background
                 let marker_style = if is_default {
-                    Style::default().fg(theme::success()).bg(theme::bg_elevated()).add_modifier(Modifier::BOLD)
+                    Style::default()
+                        .fg(theme::success())
+                        .bg(theme::bg_elevated())
+                        .add_modifier(Modifier::BOLD)
                 } else {
-                    Style::default().fg(theme::text_muted()).bg(theme::bg_elevated())
+                    Style::default()
+                        .fg(theme::text_muted())
+                        .bg(theme::bg_elevated())
                 };
                 lines.push(Line::from(vec![
                     Span::styled(format!("  {} ", marker), marker_style),
                     Span::styled(
                         format!("{:<14}", name),
-                        Style::default().fg(theme::accent()).bg(theme::bg_elevated()).add_modifier(Modifier::BOLD),
+                        Style::default()
+                            .fg(theme::accent())
+                            .bg(theme::bg_elevated())
+                            .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(
                         format!("{:<10}", ptype),
-                        Style::default().fg(theme::text_secondary()).bg(theme::bg_elevated()),
+                        Style::default()
+                            .fg(theme::text_secondary())
+                            .bg(theme::bg_elevated()),
                     ),
                     Span::styled(
                         model.to_string(),
-                        Style::default().fg(theme::text_muted()).bg(theme::bg_elevated()),
+                        Style::default()
+                            .fg(theme::text_muted())
+                            .bg(theme::bg_elevated()),
                     ),
                 ]));
             }
@@ -116,7 +136,9 @@ fn render_list(frame: &mut Frame, area: Rect, mgr: &ProviderManager, config: &Co
                 Span::styled("  Delete '", Style::default().fg(theme::error())),
                 Span::styled(
                     name.to_string(),
-                    Style::default().fg(theme::error()).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(theme::error())
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled("'? ", Style::default().fg(theme::error())),
                 Span::styled("[y]es / [n]o", Style::default().fg(theme::warning())),
@@ -159,34 +181,38 @@ fn render_add_form(frame: &mut Frame, area: Rect, mgr: &ProviderManager, step: &
         lines.push(Line::default());
         lines.push(Line::from(Span::styled(
             "  AtomGit Login",
-            Style::default().fg(theme::text_primary()).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme::text_primary())
+                .add_modifier(Modifier::BOLD),
         )));
-    lines.push(Line::default());
-    lines.push(Line::from(Span::styled(
-        "  Opening browser for AtomGit authorization...",
-        Style::default().fg(theme::success()),
-    )));
-    lines.push(Line::default());
-    lines.push(Line::from(Span::styled(
-        "  Waiting for callback on port 8765",
-        Style::default().fg(theme::info()),
-    )));
-    lines.push(Line::default());
-    lines.push(Line::from(Span::styled(
-        "  Press Esc to cancel",
-        Style::default().fg(theme::text_muted()),
-    )));
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled(
+            "  Opening browser for AtomGit authorization...",
+            Style::default().fg(theme::success()),
+        )));
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled(
+            "  Waiting for callback on port 8765",
+            Style::default().fg(theme::info()),
+        )));
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled(
+            "  Press Esc to cancel",
+            Style::default().fg(theme::text_muted()),
+        )));
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_set(border::ROUNDED)
-        .border_style(Style::default().fg(theme::accent()))
-        .title(Span::styled(
-            " Add Provider ",
-            Style::default().fg(theme::accent()).add_modifier(Modifier::BOLD),
-        ));
-    let paragraph = Paragraph::new(lines).block(block);
-    frame.render_widget(paragraph, area);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_set(border::ROUNDED)
+            .border_style(Style::default().fg(theme::accent()))
+            .title(Span::styled(
+                " Add Provider ",
+                Style::default()
+                    .fg(theme::accent())
+                    .add_modifier(Modifier::BOLD),
+            ));
+        let paragraph = Paragraph::new(lines).block(block);
+        frame.render_widget(paragraph, area);
         return;
     }
 
@@ -195,7 +221,9 @@ fn render_add_form(frame: &mut Frame, area: Rect, mgr: &ProviderManager, step: &
     let dim = Style::default().fg(theme::text_muted());
     let label = Style::default().fg(theme::text_secondary());
     let value = Style::default().fg(theme::text_primary());
-    let active_label = Style::default().fg(theme::accent()).add_modifier(Modifier::BOLD);
+    let active_label = Style::default()
+        .fg(theme::accent())
+        .add_modifier(Modifier::BOLD);
 
     lines.push(Line::default());
     lines.push(Line::from(Span::styled(
@@ -207,7 +235,11 @@ fn render_add_form(frame: &mut Frame, area: Rect, mgr: &ProviderManager, step: &
     lines.push(Line::default());
 
     // Show completed fields
-    let name_style = if *step == AddStep::Name { active_label } else { label };
+    let name_style = if *step == AddStep::Name {
+        active_label
+    } else {
+        label
+    };
     let name_val = if *step == AddStep::Name {
         mgr.input_display()
     } else if mgr.new_name.is_empty() {
@@ -221,14 +253,23 @@ fn render_add_form(frame: &mut Frame, area: Rect, mgr: &ProviderManager, step: &
     ]));
 
     if *step as usize >= AddStep::Type as usize {
-        let type_style = if *step == AddStep::Type { active_label } else { label };
+        let type_style = if *step == AddStep::Type {
+            active_label
+        } else {
+            label
+        };
         if *step == AddStep::Type {
-            lines.push(Line::from(Span::styled("  Type:     (select with Up/Down, Enter to confirm)", type_style)));
+            lines.push(Line::from(Span::styled(
+                "  Type:     (select with Up/Down, Enter to confirm)",
+                type_style,
+            )));
             for (i, (_, desc)) in PROVIDER_TYPES.iter().enumerate() {
                 let is_sel = i == mgr.type_selected;
                 let prefix = if is_sel { " ▸ " } else { "   " };
                 let style = if is_sel {
-                    Style::default().fg(theme::accent()).add_modifier(Modifier::BOLD)
+                    Style::default()
+                        .fg(theme::accent())
+                        .add_modifier(Modifier::BOLD)
                 } else {
                     dim
                 };
@@ -246,7 +287,11 @@ fn render_add_form(frame: &mut Frame, area: Rect, mgr: &ProviderManager, step: &
     }
 
     if *step as usize >= AddStep::ApiKey as usize {
-        let style = if *step == AddStep::ApiKey { active_label } else { label };
+        let style = if *step == AddStep::ApiKey {
+            active_label
+        } else {
+            label
+        };
         let val = if *step == AddStep::ApiKey {
             if mgr.input_buf.is_empty() {
                 mgr.input_display() + " (optional, press Enter to skip)"
@@ -265,7 +310,11 @@ fn render_add_form(frame: &mut Frame, area: Rect, mgr: &ProviderManager, step: &
     }
 
     if *step as usize >= AddStep::BaseUrl as usize {
-        let style = if *step == AddStep::BaseUrl { active_label } else { label };
+        let style = if *step == AddStep::BaseUrl {
+            active_label
+        } else {
+            label
+        };
         let val = if *step == AddStep::BaseUrl {
             mgr.input_display()
         } else if mgr.new_base_url.is_empty() {
@@ -275,12 +324,23 @@ fn render_add_form(frame: &mut Frame, area: Rect, mgr: &ProviderManager, step: &
         };
         lines.push(Line::from(vec![
             Span::styled("  Base URL: ", style),
-            Span::styled(val, if *step == AddStep::BaseUrl { value } else { dim }),
+            Span::styled(
+                val,
+                if *step == AddStep::BaseUrl {
+                    value
+                } else {
+                    dim
+                },
+            ),
         ]));
     }
 
     if *step as usize >= AddStep::Model as usize {
-        let style = if *step == AddStep::Model { active_label } else { label };
+        let style = if *step == AddStep::Model {
+            active_label
+        } else {
+            label
+        };
         let val = mgr.input_display();
         lines.push(Line::from(vec![
             Span::styled("  Model:    ", style),
@@ -355,8 +415,10 @@ fn render_edit_form(
         vec!["?".into(); 4]
     };
 
-    let is_field_input = matches!(field, EditField::ApiKey | EditField::BaseUrl | EditField::Model)
-        && *field != EditField::Type;
+    let is_field_input = matches!(
+        field,
+        EditField::ApiKey | EditField::BaseUrl | EditField::Model
+    ) && *field != EditField::Type;
 
     for (i, (f, v)) in fields.iter().zip(values.iter()).enumerate() {
         let is_sel = i == mgr.edit_field_selected;
@@ -410,10 +472,7 @@ fn render_edit_form(
 }
 
 fn render_bottom_bar(frame: &mut Frame, area: Rect, mgr: &ProviderManager) {
-    let msg = mgr
-        .message
-        .as_deref()
-        .unwrap_or("");
+    let msg = mgr.message.as_deref().unwrap_or("");
     let style = if msg.contains("Delete") || msg.contains("Cannot") {
         Style::default().fg(theme::error())
     } else if msg.contains("added") || msg.contains("set as") || msg.contains("Updated") {
@@ -422,9 +481,6 @@ fn render_bottom_bar(frame: &mut Frame, area: Rect, mgr: &ProviderManager) {
         Style::default().fg(theme::text_secondary())
     };
 
-    let paragraph = Paragraph::new(Line::from(Span::styled(
-        format!("  {}", msg),
-        style,
-    )));
+    let paragraph = Paragraph::new(Line::from(Span::styled(format!("  {}", msg), style)));
     frame.render_widget(paragraph, area);
 }

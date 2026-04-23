@@ -8,24 +8,46 @@ use super::{ApprovalRequirement, Tool, ToolContext, ToolDef, ToolResult};
 pub struct ReadFileTool;
 
 /// Deserialize a number that may arrive as a float string (weak models often send "50.0" instead of 50).
-fn deserialize_lenient_usize<'de, D>(deserializer: D) -> std::result::Result<Option<usize>, D::Error>
-where D: serde::Deserializer<'de> {
+fn deserialize_lenient_usize<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<usize>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
     use serde::de;
     struct V;
     impl<'de> de::Visitor<'de> for V {
         type Value = Option<usize>;
-        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result { f.write_str("usize or string") }
-        fn visit_none<E: de::Error>(self) -> std::result::Result<Self::Value, E> { Ok(None) }
-        fn visit_unit<E: de::Error>(self) -> std::result::Result<Self::Value, E> { Ok(None) }
-        fn visit_u64<E: de::Error>(self, v: u64) -> std::result::Result<Self::Value, E> { Ok(Some(v as usize)) }
-        fn visit_i64<E: de::Error>(self, v: i64) -> std::result::Result<Self::Value, E> {
-            if v >= 0 { Ok(Some(v as usize)) } else { Ok(None) }
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("usize or string")
         }
-        fn visit_f64<E: de::Error>(self, v: f64) -> std::result::Result<Self::Value, E> { Ok(Some(v as usize)) }
+        fn visit_none<E: de::Error>(self) -> std::result::Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_unit<E: de::Error>(self) -> std::result::Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_u64<E: de::Error>(self, v: u64) -> std::result::Result<Self::Value, E> {
+            Ok(Some(v as usize))
+        }
+        fn visit_i64<E: de::Error>(self, v: i64) -> std::result::Result<Self::Value, E> {
+            if v >= 0 {
+                Ok(Some(v as usize))
+            } else {
+                Ok(None)
+            }
+        }
+        fn visit_f64<E: de::Error>(self, v: f64) -> std::result::Result<Self::Value, E> {
+            Ok(Some(v as usize))
+        }
         fn visit_str<E: de::Error>(self, v: &str) -> std::result::Result<Self::Value, E> {
             // Handle "50.0" → 50
-            if let Ok(n) = v.trim().parse::<usize>() { return Ok(Some(n)); }
-            if let Ok(f) = v.trim().parse::<f64>() { return Ok(Some(f as usize)); }
+            if let Ok(n) = v.trim().parse::<usize>() {
+                return Ok(Some(n));
+            }
+            if let Ok(f) = v.trim().parse::<f64>() {
+                return Ok(Some(f as usize));
+            }
             Ok(None)
         }
     }
@@ -75,15 +97,16 @@ impl Tool for ReadFileTool {
         // what it asked for. STUB behavior was tried and reverted — it blocks
         // legitimate re-reads and doesn't prevent short-distance duplicates
         // (model ignores STUB text due to lost-at-the-end attention).
-        let cache_key: crate::tool::ReadCacheKey = (
-            path.to_path_buf(),
-            parsed.offset,
-            parsed.limit,
-        );
-        let disk_mtime = tokio::fs::metadata(&parsed.file_path).await.ok()
+        let cache_key: crate::tool::ReadCacheKey =
+            (path.to_path_buf(), parsed.offset, parsed.limit);
+        let disk_mtime = tokio::fs::metadata(&parsed.file_path)
+            .await
+            .ok()
             .and_then(|m| m.modified().ok());
         if let Some(mtime) = disk_mtime {
-            if let Some((cached_mtime, cached_output)) = ctx.read_cache.read().await.get(&cache_key).cloned() {
+            if let Some((cached_mtime, cached_output)) =
+                ctx.read_cache.read().await.get(&cache_key).cloned()
+            {
                 if cached_mtime == mtime {
                     return Ok(ToolResult {
                         call_id: String::new(),
@@ -119,19 +142,34 @@ impl Tool for ReadFileTool {
         // If file doesn't exist, auto-find similar filenames and suggest.
         // Saves 2-3 turns of path guessing (7% of sessions hit this).
         if !path.exists() {
-            let filename = path.file_name()
+            let filename = path
+                .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_default();
             if !filename.is_empty() {
                 let wd = ctx.working_dir.read().await;
                 // Quick find: walk up to 5 levels deep for matching filename
                 let mut matches: Vec<String> = Vec::new();
-                fn find_file(dir: &std::path::Path, target: &str, depth: usize, max_depth: usize, results: &mut Vec<String>) {
-                    if depth > max_depth || results.len() >= 5 { return; }
+                fn find_file(
+                    dir: &std::path::Path,
+                    target: &str,
+                    depth: usize,
+                    max_depth: usize,
+                    results: &mut Vec<String>,
+                ) {
+                    if depth > max_depth || results.len() >= 5 {
+                        return;
+                    }
                     if let Ok(entries) = std::fs::read_dir(dir) {
                         for entry in entries.flatten() {
                             let name = entry.file_name().to_string_lossy().to_string();
-                            if name.starts_with('.') || name == "node_modules" || name == "target" || name == ".git" { continue; }
+                            if name.starts_with('.')
+                                || name == "node_modules"
+                                || name == "target"
+                                || name == ".git"
+                            {
+                                continue;
+                            }
                             let p = entry.path();
                             if p.is_dir() {
                                 find_file(&p, target, depth + 1, max_depth, results);
@@ -148,7 +186,11 @@ impl Tool for ReadFileTool {
                         output: format!(
                             "Error: No such file: {}\n\nDid you mean:\n{}",
                             parsed.file_path,
-                            matches.iter().map(|m| format!("  {}", m)).collect::<Vec<_>>().join("\n")
+                            matches
+                                .iter()
+                                .map(|m| format!("  {}", m))
+                                .collect::<Vec<_>>()
+                                .join("\n")
                         ),
                         success: false,
                     });
@@ -172,9 +214,16 @@ impl Tool for ReadFileTool {
                         binary_recovery_hint(path, &parsed.file_path),
                     );
                     if let Some(mtime) = disk_mtime {
-                        ctx.read_cache.write().await.insert(cache_key.clone(), (mtime, output.clone()));
+                        ctx.read_cache
+                            .write()
+                            .await
+                            .insert(cache_key.clone(), (mtime, output.clone()));
                     }
-                    return Ok(ToolResult { call_id: String::new(), output, success: true });
+                    return Ok(ToolResult {
+                        call_id: String::new(),
+                        output,
+                        success: true,
+                    });
                 }
             },
         };
@@ -187,34 +236,44 @@ impl Tool for ReadFileTool {
         // so the model can grep→old_string→edit in 2 steps. >300 lines return
         // skeleton because GLM-5 gets lost in the middle at ~685 lines.
         // With offset/limit: always return exact content (model chose a range).
-        let auto_skeleton = total_lines > 300
-            && parsed.offset.is_none()
-            && parsed.limit.is_none();
+        let auto_skeleton = total_lines > 300 && parsed.offset.is_none() && parsed.limit.is_none();
 
         if auto_skeleton {
             let mut searcher = ctx.semantic.lock().await;
             let skeleton = if let Some(symbols) = searcher.list_symbols(path) {
-                let fname = path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
+                let fname = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy())
+                    .unwrap_or_default();
                 let mut skel = format!("[File skeleton: {} ({} lines). Use read_file with offset and limit to read specific sections.]\n\n",
                     fname, total_lines);
                 // Skeleton is fully driven by semantic layer's list_symbols().
                 // For Vue/Svelte, list_symbols already includes <template>/<style> sections
                 // as pseudo-symbols alongside script functions.
                 // Score symbols for auto-expansion: high-interest names get priority
-                let interest_keywords = ["handle", "process", "route", "search", "query",
-                    "fetch", "execute", "dispatch", "run", "main", "serve"];
-                let mut scored: Vec<(usize, &crate::semantic::Symbol)> = symbols.iter()
+                let interest_keywords = [
+                    "handle", "process", "route", "search", "query", "fetch", "execute",
+                    "dispatch", "run", "main", "serve",
+                ];
+                let mut scored: Vec<(usize, &crate::semantic::Symbol)> = symbols
+                    .iter()
                     .map(|s| {
                         let name_lower = s.name.to_lowercase();
                         let body_lines = s.end_line.saturating_sub(s.start_line) + 1;
-                        let keyword_score = if interest_keywords.iter().any(|k| name_lower.contains(k)) { 100 } else { 0 };
+                        let keyword_score =
+                            if interest_keywords.iter().any(|k| name_lower.contains(k)) {
+                                100
+                            } else {
+                                0
+                            };
                         (keyword_score + body_lines, s)
                     })
                     .collect();
                 scored.sort_by(|a, b| b.0.cmp(&a.0));
 
                 // Pick top 2 functions to auto-expand (5-50 lines each)
-                let expand_candidates: Vec<&crate::semantic::Symbol> = scored.iter()
+                let expand_candidates: Vec<&crate::semantic::Symbol> = scored
+                    .iter()
                     .filter(|(_, s)| {
                         let body = s.end_line.saturating_sub(s.start_line) + 1;
                         body >= 5 && body <= 50
@@ -224,7 +283,8 @@ impl Tool for ReadFileTool {
                     .collect();
 
                 for s in &symbols {
-                    let sig = lines.get(s.start_line.saturating_sub(1))
+                    let sig = lines
+                        .get(s.start_line.saturating_sub(1))
                         .map(|l| l.trim())
                         .unwrap_or(&s.name);
                     let sig_short = if sig.chars().count() > 70 {
@@ -233,10 +293,15 @@ impl Tool for ReadFileTool {
                         sig.to_string()
                     };
 
-                    if expand_candidates.iter().any(|c| c.start_line == s.start_line && c.name == s.name) {
+                    if expand_candidates
+                        .iter()
+                        .any(|c| c.start_line == s.start_line && c.name == s.name)
+                    {
                         // Auto-expand: show full body
-                        skel.push_str(&format!("{:>4}| {}  (L{}-{}) [auto-expanded]\n",
-                            s.start_line, sig_short, s.start_line, s.end_line));
+                        skel.push_str(&format!(
+                            "{:>4}| {}  (L{}-{}) [auto-expanded]\n",
+                            s.start_line, sig_short, s.start_line, s.end_line
+                        ));
                         let start = s.start_line.saturating_sub(1);
                         let end = s.end_line.min(total_lines);
                         for i in (start + 1)..end {
@@ -245,22 +310,34 @@ impl Tool for ReadFileTool {
                             }
                         }
                     } else {
-                        skel.push_str(&format!("{:>4}| {}  (L{}-{})\n",
-                            s.start_line, sig_short, s.start_line, s.end_line));
+                        skel.push_str(&format!(
+                            "{:>4}| {}  (L{}-{})\n",
+                            s.start_line, sig_short, s.start_line, s.end_line
+                        ));
                     }
                 }
                 skel
             } else {
                 // Unreachable: list_symbols always returns Some via indent fallback.
                 // Kept as safety net — produces minimal skeleton.
-                let fname = path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
+                let fname = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy())
+                    .unwrap_or_default();
                 format!("[File skeleton: {} ({} lines) — use grep to find relevant lines, then read with offset/limit.]\n",
                     fname, total_lines)
             };
             if let Some(mtime) = disk_mtime {
-                ctx.read_cache.write().await.insert(cache_key.clone(), (mtime, skeleton.clone()));
+                ctx.read_cache
+                    .write()
+                    .await
+                    .insert(cache_key.clone(), (mtime, skeleton.clone()));
             }
-            return Ok(ToolResult { call_id: String::new(), output: skeleton, success: true });
+            return Ok(ToolResult {
+                call_id: String::new(),
+                output: skeleton,
+                success: true,
+            });
         }
 
         let offset = parsed.offset.unwrap_or(1).max(1) - 1;
@@ -272,12 +349,16 @@ impl Tool for ReadFileTool {
         // limit=100. GLM-5 does this despite "do NOT use offset/limit" instruction.
         let limit = match (parsed.offset, parsed.limit) {
             (None, Some(_)) => total_lines, // offset=0 + limit → ignore limit, give full
-            (Some(_), Some(l)) => l,         // explicit range → respect it
-            _ => total_lines,                // no limit → full
+            (Some(_), Some(l)) => l,        // explicit range → respect it
+            _ => total_lines,               // no limit → full
         };
 
         // If offset > 0 but auto-expand would give the whole file, reset offset to 0
-        let offset = if offset > 0 && limit >= total_lines { 0 } else { offset };
+        let offset = if offset > 0 && limit >= total_lines {
+            0
+        } else {
+            offset
+        };
         // Clamp offset to file size — caller may pass an offset past EOF
         // (e.g. cached line count stale, or model hallucinates a line number).
         let offset = offset.min(total_lines);
@@ -301,14 +382,19 @@ impl Tool for ReadFileTool {
             // what functions exist in the other 549 lines with line numbers.
             let mut searcher = ctx.semantic.lock().await;
             let skeleton = if let Some(symbols) = searcher.list_symbols(path) {
-                let unseen: Vec<String> = symbols.iter()
+                let unseen: Vec<String> = symbols
+                    .iter()
                     .filter(|s| s.start_line < offset + 1 || s.start_line > end)
                     .map(|s| {
-                        let sig = lines.get(s.start_line.saturating_sub(1))
+                        let sig = lines
+                            .get(s.start_line.saturating_sub(1))
                             .map(|l| l.trim())
                             .unwrap_or(&s.name);
                         let sig_short: String = sig.chars().take(70).collect();
-                        format!("{:>4}| {}  (L{}-{})", s.start_line, sig_short, s.start_line, s.end_line)
+                        format!(
+                            "{:>4}| {}  (L{}-{})",
+                            s.start_line, sig_short, s.start_line, s.end_line
+                        )
                     })
                     .collect();
                 if !unseen.is_empty() {
@@ -322,14 +408,24 @@ impl Tool for ReadFileTool {
 
             output.push_str(&format!(
                 "\n\n[Showing lines {}-{} of {} total. Unseen structure:]{}",
-                offset + 1, end, total_lines, skeleton
+                offset + 1,
+                end,
+                total_lines,
+                skeleton
             ));
         }
 
         if let Some(mtime) = disk_mtime {
-            ctx.read_cache.write().await.insert(cache_key, (mtime, output.clone()));
+            ctx.read_cache
+                .write()
+                .await
+                .insert(cache_key, (mtime, output.clone()));
         }
-        Ok(ToolResult { call_id: String::new(), output, success: true })
+        Ok(ToolResult {
+            call_id: String::new(),
+            output,
+            success: true,
+        })
     }
 }
 
@@ -339,11 +435,9 @@ impl Tool for ReadFileTool {
 /// (GBK accepts most byte sequences) and dump random ideographs into the
 /// model's context.
 const GBK_CANDIDATE_EXTENSIONS: &[&str] = &[
-    "txt", "md", "markdown", "csv", "tsv", "log", "sql",
-    "ini", "conf", "cfg", "toml", "yaml", "yml",
-    "html", "htm", "xml", "json", "js", "ts", "css",
-    "py", "rb", "go", "rs", "c", "h", "cpp", "hpp", "java", "kt",
-    "sh", "bat", "ps1",
+    "txt", "md", "markdown", "csv", "tsv", "log", "sql", "ini", "conf", "cfg", "toml", "yaml",
+    "yml", "html", "htm", "xml", "json", "js", "ts", "css", "py", "rb", "go", "rs", "c", "h",
+    "cpp", "hpp", "java", "kt", "sh", "bat", "ps1",
 ];
 
 fn has_text_extension(path: &std::path::Path) -> bool {
@@ -376,7 +470,8 @@ fn decode_non_utf8_text(path: &std::path::Path, bytes: &[u8]) -> Option<String> 
 /// for .docx) on the first failure instead of cycling through offset/limit
 /// values for 30 turns.
 fn binary_recovery_hint(path: &std::path::Path, full_path_str: &str) -> String {
-    let ext = path.extension()
+    let ext = path
+        .extension()
         .and_then(|e| e.to_str())
         .map(|e| e.to_ascii_lowercase())
         .unwrap_or_default();
@@ -463,15 +558,22 @@ mod tests {
         let tool = ReadFileTool;
         let args = serde_json::json!({
             "file_path": path.to_string_lossy().to_string()
-        }).to_string();
+        })
+        .to_string();
 
         let r1 = tool.execute(&args, &ctx).await.unwrap();
         assert!(r1.success);
-        assert!(r1.output.contains("fn main"), "first read should return content");
+        assert!(
+            r1.output.contains("fn main"),
+            "first read should return content"
+        );
 
         let r2 = tool.execute(&args, &ctx).await.unwrap();
         assert!(r2.success);
-        assert!(r2.output.contains("fn main"), "cache hit should return same content");
+        assert!(
+            r2.output.contains("fn main"),
+            "cache hit should return same content"
+        );
     }
 
     /// Cache miss after file content changes — mtime shifts, cached entry is ignored.
@@ -485,7 +587,8 @@ mod tests {
         let tool = ReadFileTool;
         let args = serde_json::json!({
             "file_path": path.to_string_lossy().to_string()
-        }).to_string();
+        })
+        .to_string();
 
         let r1 = tool.execute(&args, &ctx).await.unwrap();
         let out1 = r1.output.clone();
@@ -495,7 +598,10 @@ mod tests {
         std::fs::write(&path, "fn main() { println!(\"hi\"); }\n").unwrap();
 
         let r2 = tool.execute(&args, &ctx).await.unwrap();
-        assert_ne!(r2.output, out1, "2nd read must re-read from disk when mtime changed");
+        assert_ne!(
+            r2.output, out1,
+            "2nd read must re-read from disk when mtime changed"
+        );
         assert!(r2.output.contains("println"));
     }
 
@@ -517,11 +623,16 @@ mod tests {
         let tool = ReadFileTool;
         let args = serde_json::json!({
             "file_path": path.to_string_lossy().to_string()
-        }).to_string();
+        })
+        .to_string();
 
         let r = tool.execute(&args, &ctx).await.unwrap();
         assert!(r.success, "GBK text should decode, got: {}", r.output);
-        assert!(r.output.contains("你好世界"), "expected decoded text, got: {}", r.output);
+        assert!(
+            r.output.contains("你好世界"),
+            "expected decoded text, got: {}",
+            r.output
+        );
         assert!(!r.output.contains("Binary file"));
     }
 
@@ -532,7 +643,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("spec.docx");
         // Docx is a zip — "PK\x03\x04" + random bytes that aren't valid UTF-8.
-        let docx_bytes: Vec<u8> = [b'P', b'K', 0x03, 0x04].iter().copied()
+        let docx_bytes: Vec<u8> = [b'P', b'K', 0x03, 0x04]
+            .iter()
+            .copied()
             .chain((0..200).map(|i| (i as u8).wrapping_mul(31).wrapping_add(0x80)))
             .collect();
         // Ensure non-UTF-8 (our mul trick usually produces invalid sequences,
@@ -545,11 +658,16 @@ mod tests {
         let tool = ReadFileTool;
         let args = serde_json::json!({
             "file_path": path.to_string_lossy().to_string()
-        }).to_string();
+        })
+        .to_string();
 
         let r = tool.execute(&args, &ctx).await.unwrap();
         assert!(r.output.contains("Binary file"));
-        assert!(r.output.contains("Recovery"), "should give recovery hint: {}", r.output);
+        assert!(
+            r.output.contains("Recovery"),
+            "should give recovery hint: {}",
+            r.output
+        );
         assert!(r.output.contains("unzip") || r.output.contains("pandoc"));
     }
 
@@ -566,17 +684,25 @@ mod tests {
         let tool = ReadFileTool;
         let args = serde_json::json!({
             "file_path": path.to_string_lossy().to_string()
-        }).to_string();
+        })
+        .to_string();
 
         let r = tool.execute(&args, &ctx).await.unwrap();
         assert!(r.output.contains("Binary file"));
-        assert!(r.output.contains("pdftotext"), "should suggest pdftotext: {}", r.output);
+        assert!(
+            r.output.contains("pdftotext"),
+            "should suggest pdftotext: {}",
+            r.output
+        );
     }
 
     #[test]
     fn shell_quote_escapes_single_quote() {
         assert_eq!(shell_quote("abc"), "'abc'");
         assert_eq!(shell_quote("a'b"), r"'a'\''b'");
-        assert_eq!(shell_quote("/tmp/file with spaces.doc"), "'/tmp/file with spaces.doc'");
+        assert_eq!(
+            shell_quote("/tmp/file with spaces.doc"),
+            "'/tmp/file with spaces.doc'"
+        );
     }
 }
