@@ -425,6 +425,12 @@ _ = cancel.cancelled() => {
             self.config.datalog.enabled,
         );
 
+        if tool_calls_buf.is_empty() && text_buf.trim().is_empty() {
+            return TurnResult::Failed(
+                "Provider returned an empty response (no text, no tool calls).".to_string(),
+            );
+        }
+
         // 5. If no tool calls, we're done — LLM produced text only
         if tool_calls_buf.is_empty() {
             return TurnResult::Responded {

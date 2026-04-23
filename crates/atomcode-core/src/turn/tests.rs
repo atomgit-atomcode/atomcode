@@ -77,6 +77,12 @@ impl MockProvider {
             events: vec![StreamEvent::Error(msg.to_string())],
         }
     }
+
+    fn empty() -> Self {
+        Self {
+            events: vec![StreamEvent::Done { truncated: false }],
+        }
+    }
 }
 
 #[async_trait]
@@ -267,6 +273,23 @@ async fn test_turn_runner_text_only_response() {
             assert!(tokens > 0);
         }
         other => panic!("Expected Responded, got {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn test_turn_runner_empty_response_is_failure() {
+    let mut runner = make_runner(MockProvider::empty(), ToolRegistry::new(), auto_bypass());
+    let mut conv = Conversation::new();
+    conv.add_user_message("Hi");
+    let (tx, _rx) = mpsc::unbounded_channel();
+
+    let result = runner.run(&mut conv, "system", &tx, CancellationToken::new()).await;
+
+    match result {
+        TurnResult::Failed(msg) => {
+            assert!(msg.contains("empty response"));
+        }
+        other => panic!("Expected Failed, got {:?}", other),
     }
 }
 

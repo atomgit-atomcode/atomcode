@@ -1640,7 +1640,7 @@ impl AgentLoop {
                         let wait = (self.retry_count as u64 * 3).min(15);
                         let reason = public_error_reason(&e);
                         let _ = self.event_tx.send(AgentEvent::TextDelta(format!(
-                            "\n[API 错误：{}，{} 秒后重试（{}/3）...]\n",
+                            "\n[API error{}，{} 秒后重试（{}/3）...]\n",
                             reason, wait, self.retry_count
                         )));
                         tokio::time::sleep(Duration::from_secs(wait)).await;
@@ -2233,7 +2233,7 @@ fn public_error_message(e: &str) -> String {
         "网络连接失败" => "连接模型服务失败，请检查网络后重试。".to_string(),
         "上游服务暂时不可用" => "模型服务暂时不可用，请稍后重试。".to_string(),
         "请求参数无效" => "请求被模型服务拒绝，请调整输入后重试。".to_string(),
-        _ => "请求模型服务失败，请稍后重试。".to_string(),
+        _ => e.to_string(),
     }
 }
 

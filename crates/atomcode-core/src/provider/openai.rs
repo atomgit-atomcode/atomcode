@@ -183,6 +183,25 @@ struct DeltaFunction {
     arguments: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct ChatCompletionResponse {
+    #[serde(default)]
+    choices: Vec<ResponseChoice>,
+    usage: Option<ChunkUsage>,
+}
+
+#[derive(Deserialize)]
+struct ResponseChoice {
+    message: Option<ResponseMessage>,
+    finish_reason: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ResponseMessage {
+    content: Option<String>,
+    reasoning_content: Option<String>,
+}
+
 #[async_trait]
 impl LlmProvider for OpenAiProvider {
     fn chat_stream(
@@ -250,6 +269,9 @@ impl LlmProvider for OpenAiProvider {
             // Track the last usage report — some providers (DeepSeek) send cumulative
             // usage in every chunk, so we only emit the final value.
             let mut last_usage: Option<crate::stream::TokenUsage> = None;
+            let mut saw_data_line = false;
+            let mut saw_valid_chunk = false;
+            let mut invalid_chunk_samples: Vec<String> = Vec::new();
 
             loop {
                 // 120s idle timeout: if no data arrives for 2 minutes, treat as dead connection.
@@ -282,6 +304,7 @@ impl LlmProvider for OpenAiProvider {
                     buffer = buffer[pos + 1..].to_string();
 
                     if line.starts_with("data:") {
+                        saw_data_line = true;
                         let data = line.strip_prefix("data:").unwrap().trim();
                         if data == "[DONE]" {
                             if let Some(usage) = last_usage.take() {
@@ -291,6 +314,7 @@ impl LlmProvider for OpenAiProvider {
                             return;
                         }
                         if let Ok(chunk) = serde_json::from_str::<ChatChunk>(data) {
+                            saw_valid_chunk = true;
                             // Store usage — don't emit yet. Some providers send cumulative
                             // usage in multiple chunks; we only want the final value.
                             if let Some(usage) = &chunk.usage {
@@ -389,12 +413,45 @@ impl LlmProvider for OpenAiProvider {
                                             let _ = tx.send(Ok(StreamEvent::Done { truncated: false }));
                                             return;
                                         }
+                                        }
                                     }
                                 }
-                            }
+                        } else if invalid_chunk_samples.len() < 3 && !data.is_empty() {
+                            invalid_chunk_samples.push(sample_for_error(data));
                         }
                     }
                 }
+            }
+
+            let tail = buffer.trim();
+            if !tail.is_empty() {
+                if let Some(events) = parse_nonstream_response(tail) {
+                    for event in events {
+                        let _ = tx.send(Ok(event));
+                    }
+                    return;
+                }
+            }
+
+            if saw_data_line && !saw_valid_chunk {
+                let detail = if invalid_chunk_samples.is_empty() {
+                    "no chunk could be parsed".to_string()
+                } else {
+                    format!("samples: {}", invalid_chunk_samples.join(" | "))
+                };
+                let _ = tx.send(Ok(StreamEvent::Error(format!(
+                    "Provider returned an unparseable OpenAI-compatible stream ({})",
+                    detail
+                ))));
+                return;
+            }
+
+            if !tail.is_empty() {
+                let _ = tx.send(Ok(StreamEvent::Error(format!(
+                    "Provider returned a non-SSE response AtomCode could not parse: {}",
+                    sample_for_error(tail)
+                ))));
+                return;
             }
 
             let _ = tx.send(Ok(StreamEvent::Done { truncated: false }));
@@ -453,5 +510,103 @@ fn normalize_base_url(base: &str) -> String {
         base.to_string()
     } else {
         format!("{}/chat/completions", base)
+    }
+}
+
+fn parse_nonstream_response(body: &str) -> Option<Vec<StreamEvent>> {
+    let response: ChatCompletionResponse = serde_json::from_str(body).ok()?;
+    let mut events = Vec::new();
+
+    if let Some(usage) = response.usage {
+        let cached = usage.prompt_cache_hit_tokens
+            .or(usage.cached_tokens)
+            .or_else(|| usage.prompt_tokens_details.as_ref().and_then(|d| d.cached_tokens))
+            .unwrap_or(0);
+        events.push(StreamEvent::Usage(crate::stream::TokenUsage {
+            prompt_tokens: usage.prompt_tokens.unwrap_or(0),
+            completion_tokens: usage.completion_tokens.unwrap_or(0),
+            cached_tokens: cached,
+        }));
+    }
+
+    for choice in response.choices {
+        if let Some(message) = choice.message {
+            if let Some(content) = message.content {
+                if !content.is_empty() {
+                    events.push(StreamEvent::Delta(content));
+                }
+            }
+            if let Some(reasoning) = message.reasoning_content {
+                if !reasoning.is_empty() {
+                    events.push(StreamEvent::Reasoning(reasoning));
+                }
+            }
+        }
+
+        let truncated = matches!(
+            choice.finish_reason.as_deref(),
+            Some("length") | Some("max_tokens")
+        );
+        events.push(StreamEvent::Done { truncated });
+    }
+
+    if events.is_empty() {
+        None
+    } else {
+        Some(events)
+    }
+}
+
+fn sample_for_error(s: &str) -> String {
+    let compact = s.replace('\n', "\\n");
+    let mut sample: String = compact.chars().take(160).collect();
+    if compact.chars().count() > 160 {
+        sample.push_str("...");
+    }
+    sample
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_nonstream_response, sample_for_error};
+    use crate::stream::StreamEvent;
+
+    #[test]
+    fn parses_nonstream_text_response() {
+        let body = r#"{
+          "choices": [
+            {
+              "message": { "content": "hello" },
+              "finish_reason": "stop"
+            }
+          ],
+          "usage": { "prompt_tokens": 11, "completion_tokens": 3 }
+        }"#;
+
+        let events = parse_nonstream_response(body).expect("should parse non-stream response");
+        assert!(matches!(events[0], StreamEvent::Usage(_)));
+        assert!(matches!(events[1], StreamEvent::Delta(ref s) if s == "hello"));
+        assert!(matches!(events[2], StreamEvent::Done { truncated: false }));
+    }
+
+    #[test]
+    fn parses_nonstream_reasoning_only_response() {
+        let body = r#"{
+          "choices": [
+            {
+              "message": { "reasoning_content": "thinking" },
+              "finish_reason": "length"
+            }
+          ]
+        }"#;
+
+        let events = parse_nonstream_response(body).expect("should parse non-stream response");
+        assert!(matches!(events[0], StreamEvent::Reasoning(ref s) if s == "thinking"));
+        assert!(matches!(events[1], StreamEvent::Done { truncated: true }));
+    }
+
+    #[test]
+    fn sample_for_error_flattens_newlines() {
+        assert_eq!(sample_for_error("a\nb"), "a\\nb");
     }
 }
