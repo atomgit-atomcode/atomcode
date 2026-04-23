@@ -176,9 +176,11 @@ pub struct RetainedRenderer<W: Write + Send> {
     status: StatusLine,
     // ── body history ──
     /// Pre-wrapped body rows, oldest first. Trimmed when exceeds
-    /// 2× screen height. Each row already carries its PAD_COL
-    /// prefix + styled cells, so `paint_body` just `draw_row`s
-    /// the last N directly.
+    /// 2× screen height. Symbol-bearing rows (`❯`, `▸`, `▶`, `⎿`)
+    /// are flush-left at col 0; plain text rows (assistant prose,
+    /// errors, cancelled, cmd output, diff, turn separator) carry a
+    /// `PAD_COL` indent. `paint_body` just `draw_row`s the last N
+    /// directly.
     body_lines: Vec<Vec<Cell>>,
     /// Line-buffer for streaming assistant text — chunks accumulate
     /// here until a `\n` boundary, at which point the completed
@@ -581,7 +583,8 @@ impl<W: Write + Send> RetainedRenderer<W> {
         }
 
         // Cursor park — 1-indexed, inside middle row at the input cell.
-        // Input row is now flush-left (no PAD_COL); "> " prefix is 2 cols.
+        // Input row is flush-left (no PAD_COL); "> " prefix is 2 cols.
+        // Symbol-bearing body rows share this col-0 baseline.
         let cursor_abs_row = (footer_top + 2 + cursor_row_in_middle + 1) as u16;
         let cursor_abs_col = (2 + cursor_col_in_row + 1) as u16;
         self.screen.set_cursor(cursor_abs_row, cursor_abs_col);
