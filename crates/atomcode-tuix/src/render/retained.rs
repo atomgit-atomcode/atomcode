@@ -1381,15 +1381,25 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
             let _ = self.out.write_all(&bytes);
             self.dirty = false;
         }
-        // Be defensive: clear any DECSTBM that the old AnsiRenderer
-        // might have set before we took over (if flag was toggled
-        // mid-session), re-enable autowrap, then wipe the visible
-        // viewport and home the cursor. Without the 2J, the welcome
-        // banner + input box survive as garbage that the shell's new
-        // prompt overwrites from the top — leaving the bottom half
-        // visible. Scrollback is preserved (2J clears only the
-        // visible area, not the scroll buffer).
-        let _ = self.out.write_all(b"\x1b[?7h\x1b[r\x1b[2J\x1b[H");
+        // Be defensive: re-enable autowrap, release any DECSTBM, then
+        // wipe the visible viewport and home the cursor. Without the
+        // wipe, the welcome banner + input box survive as garbage that
+        // the shell's new prompt overwrites from the top, leaving the
+        // bottom half visible.
+        //
+        // Per-row CUP+EL instead of `\x1b[2J` for the same reason as
+        // `reset()` / `on_resize()` — iTerm2 3.5+ ignores ED under
+        // certain states (see `reset()` rationale). EL is row-local
+        // and unambiguous. Scrollback is preserved either way.
+        let _ = self.out.write_all(b"\x1b[?7h\x1b[r");
+        let h = self.screen.height() as usize;
+        let mut seq = String::with_capacity(h * 8 + 8);
+        for row in 1..=h {
+            use std::fmt::Write;
+            let _ = write!(seq, "\x1b[{};1H\x1b[K", row);
+        }
+        seq.push_str("\x1b[H");
+        let _ = self.out.write_all(seq.as_bytes());
         self.scroll_region_bottom = None;
         let _ = self.out.flush();
     }
@@ -1465,7 +1475,20 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         // Wipe terminal + invalidate Screen + reset region state so
         // the next widget draw is a cold-start full repaint and the
         // next body emit resets DECSTBM. Scrollback is preserved.
-        let _ = self.out.write_all(b"\x1b[2J\x1b[H");
+        //
+        // Per-row CUP+EL instead of `\x1b[2J` for the same reason as
+        // `reset()` / `on_resize()` — iTerm2 3.5+ ignores ED under
+        // certain states, which after resume would leave the external
+        // process's output (shell, OAuth browser messages) overlaid
+        // with atomcode's re-painted UI.
+        let h = self.screen.height() as usize;
+        let mut seq = String::with_capacity(h * 8 + 8);
+        for row in 1..=h {
+            use std::fmt::Write;
+            let _ = write!(seq, "\x1b[{};1H\x1b[K", row);
+        }
+        seq.push_str("\x1b[H");
+        let _ = self.out.write_all(seq.as_bytes());
         self.screen.invalidate();
         self.scroll_region_bottom = None;
         let _ = self.out.flush();
@@ -1982,9 +2005,11 @@ mod tests {
     /// to erase — but the terminal still holds pre-resize glyphs at
     /// the old absolute positions.
     ///
-    /// Fix: `on_resize` emits `\x1b[2J\x1b[H` before repainting, so
-    /// the terminal's own display clears and the new frame owns
-    /// every visible column.
+    /// Fix: `on_resize` emits per-row CUP+EL for every row of the new
+    /// viewport before repainting, so the terminal's own display
+    /// clears and the new frame owns every visible column. (Uses EL
+    /// instead of `\x1b[2J` because iTerm2 3.5+ has been observed to
+    /// ignore ED under certain states — see `reset()` rationale.)
     #[test]
     fn retained_resize_clears_old_footer_via_vterm() {
         let (mut r, buf) = new_capturing(80, 24);
@@ -3031,9 +3056,14 @@ mod tests {
         r.resume_from_external();
         let resume_bytes = buf.lock().unwrap().clone();
         let resume_str = String::from_utf8_lossy(&resume_bytes);
+        // Resume now uses per-row CUP+EL instead of ED (iTerm2 3.5+
+        // observed to ignore `\x1b[2J` under certain states). Assert
+        // the equivalent semantics: at least one EL landed AND the
+        // cursor homes. The real behavioral check (no stale child
+        // noise) runs at the end of this test.
         assert!(
-            resume_str.contains("\x1b[2J") && resume_str.contains("\x1b[H"),
-            "resume must emit clear-screen + home: {:?}",
+            resume_str.contains("\x1b[K") && resume_str.contains("\x1b[H"),
+            "resume must emit per-row EL + home: {:?}",
             resume_str
         );
         drain_into_vterm(&buf, &mut vterm);

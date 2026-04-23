@@ -193,8 +193,17 @@ fn humanize_age(ts: u64) -> String {
 
 /// Emit historical session messages into scrollback as semantic UiLines,
 /// so the user sees the prior conversation before continuing.
+///
+/// Resets the renderer first so each /resume starts from a blank terminal.
+/// Without this, prior sessions' replayed content stacks up — after several
+/// switches, `body_lines` + the worker's render-cmd backlog both balloon,
+/// which manifests as dropped keystrokes ("吞字") and sluggish menu nav:
+/// each keystroke enqueues a `Line(InputPrompt)` behind the still-draining
+/// flood of `Line(User/Assistant/…)` commands from replay, adding 50-150 ms
+/// of visible latency per character. Mirrors what `/session` already does.
 fn replay_session(renderer: &mut dyn Renderer, session: &Session) {
     use atomcode_core::conversation::message::{MessageContent, Role};
+    renderer.reset();
     renderer.render(UiLine::TurnSeparator {
         label: format!("resumed: {}", session.name),
     });

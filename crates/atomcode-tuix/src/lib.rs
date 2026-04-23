@@ -105,7 +105,21 @@ impl TerminalGuard {
         if caps.tty {
             let stdout = io::stdout();
             let mut out = stdout.lock();
-            let _ = write!(out, "\x1b[2J\x1b[H");
+            // Per-row CUP+EL instead of `\x1b[2J` — iTerm2 3.5+ ignores
+            // ED under some states; the renderer paths (reset / resize
+            // / resume) all now use EL, so keep startup consistent.
+            // Fall back to 24 rows if crossterm can't query size (very
+            // rare; a wrong guess just under-clears a few trailing rows
+            // at startup — the renderer will paint over anything below
+            // that anyway).
+            let (_, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+            use std::fmt::Write as _;
+            let mut seq = String::with_capacity((rows as usize) * 8 + 4);
+            for row in 1..=(rows as usize) {
+                let _ = write!(seq, "\x1b[{};1H\x1b[K", row);
+            }
+            seq.push_str("\x1b[H");
+            let _ = out.write_all(seq.as_bytes());
             let _ = out.flush();
         }
         Ok(g)
