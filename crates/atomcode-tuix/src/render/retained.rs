@@ -2735,6 +2735,47 @@ mod tests {
         assert!(found, "tool result missing\ndump:\n{}", vterm.dump());
     }
 
+    /// ToolResult `⎿` glyph sits at col 4 — four spaces indent under
+    /// the tool call at col 0, mirroring CC's nested-result layout.
+    #[test]
+    fn retained_tool_result_arrow_at_col_4() {
+        let (mut r, buf) = new_capturing(80, 24);
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+        let status = status_basic();
+        r.render(UiLine::ToolResult {
+            success: true,
+            summary: "3 files changed".into(),
+        });
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        let row_idx = (0..vterm.height() as usize)
+            .find(|&i| vterm.row_text(i).contains("⎿") && vterm.row_text(i).contains("3 files"))
+            .unwrap_or_else(|| panic!("tool result row missing\ndump:\n{}", vterm.dump()));
+        assert_eq!(
+            vterm.cell_at(row_idx, 4).ch,
+            '⎿',
+            "tool-result glyph must land at col 4, got row: {:?}\ndump:\n{}",
+            vterm.row_text(row_idx),
+            vterm.dump()
+        );
+        for c in 0..4 {
+            assert_eq!(
+                vterm.cell_at(row_idx, c).ch,
+                ' ',
+                "cols 0..4 before ⎿ must be blank, col {} is {:?}",
+                c,
+                vterm.cell_at(row_idx, c).ch,
+            );
+        }
+    }
+
     /// DiffBlock: multiple added/removed lines, each with its own
     /// marker. Grid-verifies `+` and `-` both appear in the
     /// respective rows at the correct indent (7-space prefix).
