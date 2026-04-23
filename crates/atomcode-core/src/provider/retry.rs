@@ -80,19 +80,41 @@ fn compute_backoff(attempt: u32, policy: &RetryPolicy) -> Duration {
 
 /// Async retry wrapper for streaming providers.
 ///
-/// Clones the `RequestBuilder` per attempt (requires a non-stream body —
-/// panics via `expect` if `try_clone` returns None, which in practice only
-/// happens for stream bodies that we don't use).
+/// Uses `RequestBuilder::build_split()` so builder-chain errors
+/// (illegal header value, bad URL, JSON serialization failure)
+/// surface as a real `reqwest::Error` on the return path instead
+/// of crashing the process. A pasted api_key with a trailing
+/// newline is the classic trigger — historically this produced
+/// `panicked at .../retry.rs:94: send_with_retry: request body
+/// must be cloneable (no streams)` with no path to recovery.
 pub async fn send_with_retry(
     builder: reqwest::RequestBuilder,
     policy: &RetryPolicy,
 ) -> Result<reqwest::Response, reqwest::Error> {
+    // Split the builder into (client, Result<Request>). The Err
+    // variant carries the actual root cause of any failed chain
+    // call; `?` propagates it as a proper reqwest::Error instead
+    // of letting `try_clone` below return None and panic.
+    let (client, built) = builder.build_split();
+    let req = built?;
     let mut last_err: Option<reqwest::Error> = None;
     for attempt in 1..=policy.max_attempts {
-        let req = builder
-            .try_clone()
-            .expect("send_with_retry: request body must be cloneable (no streams)");
-        match req.send().await {
+        // `Request::try_clone` returns None only for stream bodies
+        // (our callers use `.json(...)` → Bytes, never streams). If
+        // a future caller ever attaches a stream, fall back rather
+        // than panic: surface whatever retryable error we've
+        // accumulated, or single-shot the original request on the
+        // very first attempt.
+        let this_req = match req.try_clone() {
+            Some(c) => c,
+            None => {
+                return match last_err {
+                    Some(e) => Err(e),
+                    None => client.execute(req).await,
+                };
+            }
+        };
+        match client.execute(this_req).await {
             Ok(resp) => {
                 if is_retryable_status(resp.status()) && attempt < policy.max_attempts {
                     let wait = parse_retry_after(resp.headers())
@@ -119,16 +141,26 @@ pub async fn send_with_retry(
 }
 
 /// Blocking variant for sync code paths (e.g. OAuth token refresh in `create_provider`).
+/// Same contract as `send_with_retry`: builder-chain errors are surfaced
+/// as `reqwest::Error` rather than panics.
 pub fn send_with_retry_blocking(
     builder: reqwest::blocking::RequestBuilder,
     policy: &RetryPolicy,
 ) -> Result<reqwest::blocking::Response, reqwest::Error> {
+    let (client, built) = builder.build_split();
+    let req = built?;
     let mut last_err: Option<reqwest::Error> = None;
     for attempt in 1..=policy.max_attempts {
-        let req = builder
-            .try_clone()
-            .expect("send_with_retry_blocking: request body must be cloneable");
-        match req.send() {
+        let this_req = match req.try_clone() {
+            Some(c) => c,
+            None => {
+                return match last_err {
+                    Some(e) => Err(e),
+                    None => client.execute(req),
+                };
+            }
+        };
+        match client.execute(this_req) {
             Ok(resp) => {
                 if is_retryable_status(resp.status()) && attempt < policy.max_attempts {
                     let wait = parse_retry_after(resp.headers())
@@ -325,5 +357,60 @@ mod tests {
             .body("req");
         let err = send_with_retry(builder, &RetryPolicy::testing()).await.unwrap_err();
         assert!(err.is_connect() || err.is_request(), "got {:?}", err);
+    }
+
+    /// Regression for user-reported crash: `send_with_retry: request
+    /// body must be cloneable (no streams)` panic at runtime.
+    ///
+    /// Real trigger: a `.header(...)` call in the builder chain
+    /// stashes an error (e.g. header value contains `\n` from a
+    /// copy-pasted token, or base URL is malformed). The builder
+    /// sits in `request: Err(...)` state. `try_clone()` returns
+    /// None for builders-in-error-state, and the old code called
+    /// `.expect("... must be cloneable")` — misleading message AND
+    /// a full process crash where the user sees no path to
+    /// recovery.
+    ///
+    /// After the fix `build_split()` pulls out the real error so
+    /// callers receive a proper reqwest::Error with an actionable
+    /// message instead of a panic.
+    #[tokio::test]
+    async fn send_with_retry_returns_builder_error_instead_of_panicking() {
+        let result = std::panic::AssertUnwindSafe(async {
+            let builder = client()
+                .post("http://127.0.0.1:1/")
+                // `\n` is illegal in an HTTP header value (ASCII
+                // control chars are rejected by http::HeaderValue).
+                // reqwest stashes the error in the builder and the
+                // failure only surfaces when we try to clone or
+                // build the request.
+                .header("Authorization", "Bearer token-with\n-newline");
+            send_with_retry(builder, &RetryPolicy::testing()).await
+        });
+        // The test runs the future inside catch_unwind so a panic
+        // would fail cleanly (AssertUnwindSafe bridges the closure).
+        let outcome = futures::FutureExt::catch_unwind(result).await;
+        let inner = match outcome {
+            Ok(r) => r,
+            Err(_) => panic!(
+                "send_with_retry panicked on builder-error input \
+                 (regression of the user's reported crash)"
+            ),
+        };
+        let err = inner.expect_err(
+            "builder with illegal header value must produce Err, \
+             not Ok",
+        );
+        // Sanity: the error must not be our panic masquerading as
+        // something else. reqwest::Error's Display should at least
+        // reference the underlying issue — we don't pin an exact
+        // phrase because reqwest's message text varies, but the
+        // error must be a real `reqwest::Error` and `is_builder()`
+        // must be true for builder-construction failures.
+        assert!(
+            err.is_builder(),
+            "expected is_builder() error, got {:?}",
+            err
+        );
     }
 }

@@ -18,8 +18,20 @@ use crate::tool::ToolResult;
 /// window and let a single message consume 25% of a 64K budget.
 pub fn truncate_output(result: &mut ToolResult, tool_name: &str, context_window: usize) {
     match tool_name {
-        "bash" => truncate_bash(result),
-        "read_file" => {}, // Layer A in read.rs is the single authority. No post-hoc truncation.
+        // bash: no per-tool truncation. The universal line/char caps below
+        // are sufficient and purely numeric. Pattern-based "smart
+        // extraction" (removed 2026-04-22) assumed English error keywords
+        // (`error`/`FAILED`/`panic`) and hard-coded build tool names
+        // (`cargo build`/`mvn compile`/`vite build`), which silently
+        // dropped non-matching stderr — e.g. a 50-line Chinese compiler
+        // trace was collapsed into `[... N lines skipped ...]` with no
+        // diagnostic content surviving. Technology-stack neutrality is a
+        // project rule (see `project_principles_vs_claude_md.md`), and
+        // main's `turn/runner.rs::detect_call_loop` now catches the
+        // retry-loop bug class that smart-extraction was trying to
+        // prevent.
+        "bash" => {}
+        "read_file" => {} // Layer A in read.rs is the single authority. No post-hoc truncation.
         "web_fetch" => truncate_generic(result, 150, 20, 40),
         _ => truncate_generic(result, 200, 30, 50),
     }
@@ -84,213 +96,9 @@ pub fn truncate_output(result: &mut ToolResult, tool_name: &str, context_window:
     }
 }
 
-/// Bash: preserve error lines, strip verbose build noise.
-/// Errors are the highest-value signal — keep all lines containing "error",
-/// "Error", "FAILED", "STDERR", "panic", plus surrounding context.
-fn truncate_bash(result: &mut ToolResult) {
-    let lines: Vec<&str> = result.output.lines().collect();
-    if lines.len() <= 80 {
-        return; // Short enough — keep everything.
-    }
-
-    // --- Phase 0: Compile error smart compression ---
-    // Detect build tool output and extract only error-bearing lines + context.
-    // This fires for Maven/Gradle, TypeScript/Node, Rust/Cargo, and generic builds.
-    let compressed = try_compress_compile_errors(&lines);
-    if let Some(compressed_output) = compressed {
-        if compressed_output.len() < result.output.len() {
-            result.output = compressed_output;
-            return;
-        }
-    }
-
-    // --- Phase 1: General error-line extraction (non-build output) ---
-    // Generic error patterns — no language-specific strings.
-    let error_patterns = ["error", "Error", "ERROR", "FAILED", "STDERR:",
-        "panic", "Panic", "PANIC", "not found", "No such file",
-        "Permission denied", "cannot find", "undefined", "unresolved"];
-    let mut important: Vec<bool> = vec![false; lines.len()];
-
-    for (i, line) in lines.iter().enumerate() {
-        if error_patterns.iter().any(|p| line.contains(p)) {
-            // Mark this line and 2 lines of context above/below.
-            let start = i.saturating_sub(2);
-            let end = (i + 3).min(lines.len());
-            for j in start..end {
-                important[j] = true;
-            }
-        }
-    }
-
-    // Phase 2: Always keep head (first 10 lines) and tail (last 20 lines).
-    const HEAD: usize = 10;
-    const TAIL: usize = 20;
-    for i in 0..HEAD.min(lines.len()) {
-        important[i] = true;
-    }
-    for i in lines.len().saturating_sub(TAIL)..lines.len() {
-        important[i] = true;
-    }
-
-    // Phase 3: Assemble, collapsing unimportant runs into "[N lines skipped]".
-    let output = assemble_important_lines(&lines, &important);
-    result.output = output;
-}
-
-/// Attempt to compress compile/build error output by extracting only error lines
-/// with surrounding context, plus head/tail for build status summary.
-/// Returns `Some(compressed)` if the output looks like build output and was compressed,
-/// `None` if it doesn't look like build output.
-fn try_compress_compile_errors(lines: &[&str]) -> Option<String> {
-    let full_text = lines.join("\n");
-
-    // Detect build tool output.
-    let is_build = full_text.contains("BUILD SUCCESS")
-        || full_text.contains("BUILD FAILURE")
-        || full_text.contains("Compiled successfully")
-        || full_text.contains("compiled successfully")
-        || full_text.contains("Compiling")
-        || full_text.contains("vite build")
-        || full_text.contains("vue-tsc")
-        || full_text.contains("tsc --")
-        || full_text.contains("npm run build")
-        || full_text.contains("cargo build")
-        || full_text.contains("cargo check")
-        || full_text.contains("mvn compile")
-        || full_text.contains("mvn package")
-        || full_text.contains("gradle build");
-
-    if !is_build {
-        return None;
-    }
-
-    // Compile error patterns by ecosystem — match lines that carry diagnostic value.
-    // Java / Maven / Gradle
-    let java_patterns: &[&str] = &[
-        "[ERROR]", "error:", "cannot find symbol", "package does not exist",
-        "incompatible types", "unreported exception", "method does not override",
-    ];
-    // TypeScript / Node
-    let ts_patterns: &[&str] = &[
-        "error TS", "Error:", "SyntaxError", "TypeError", "ReferenceError",
-        "Module not found", "Cannot find module",
-    ];
-    // Rust / Cargo
-    let rust_patterns: &[&str] = &[
-        "error[E", "warning[", "cannot find", "error:", "error[",
-        "aborting due to", "could not compile",
-    ];
-    // Generic build status lines — always valuable.
-    let status_patterns: &[&str] = &[
-        "BUILD", "FAILURE", "SUCCESS", "FAILED", "PASSED",
-        "warning:", "warnings generated", "error generated",
-        "✓", "✗", "gzip:",
-    ];
-
-    let all_patterns: Vec<&str> = java_patterns.iter()
-        .chain(ts_patterns.iter())
-        .chain(rust_patterns.iter())
-        .chain(status_patterns.iter())
-        .copied()
-        .collect();
-
-    // Mark error/diagnostic lines + 2 lines of context around each.
-    let mut important: Vec<bool> = vec![false; lines.len()];
-
-    for (i, line) in lines.iter().enumerate() {
-        if all_patterns.iter().any(|p| line.contains(p)) {
-            let start = i.saturating_sub(2);
-            let end = (i + 3).min(lines.len());
-            for j in start..end {
-                important[j] = true;
-            }
-        }
-    }
-
-    // Always keep first 5 and last 5 lines (command invocation + build status summary).
-    const HEAD: usize = 5;
-    const TAIL: usize = 5;
-    for i in 0..HEAD.min(lines.len()) {
-        important[i] = true;
-    }
-    for i in lines.len().saturating_sub(TAIL)..lines.len() {
-        important[i] = true;
-    }
-
-    let important_count = important.iter().filter(|&&v| v).count();
-
-    // Only compress if we actually removed a meaningful amount of lines.
-    if important_count >= lines.len() * 3 / 4 {
-        return None; // Not enough savings — let the general path handle it.
-    }
-
-    // Build a deduped error summary so the model sees ALL unique errors at a glance.
-    let mut unique_errors: Vec<String> = Vec::new();
-    {
-        let mut seen = std::collections::HashSet::new();
-        for line in lines {
-            let trimmed = line.trim();
-            // Extract error codes/types: "error[E0433]", "error TS2304", "Error:", etc.
-            let is_error = trimmed.contains("error[E") || trimmed.contains("error TS")
-                || trimmed.starts_with("error:") || trimmed.starts_with("Error:")
-                || trimmed.contains(": error") || trimmed.contains("[ERROR]");
-            if is_error {
-                // Normalize: take first 100 chars as dedup key
-                let key: String = trimmed.chars().take(100).collect();
-                if seen.insert(key) {
-                    unique_errors.push(trimmed.to_string());
-                }
-            }
-        }
-    }
-
-    let mut output = String::new();
-    if unique_errors.len() > 1 {
-        output.push_str(&format!("[{} unique errors — fix ALL before re-running build:]\n", unique_errors.len()));
-        for (i, err) in unique_errors.iter().take(15).enumerate() {
-            output.push_str(&format!("  {}. {}\n", i + 1, err));
-        }
-        output.push('\n');
-    }
-
-    output.push_str(&assemble_important_lines(lines, &important));
-    output.push_str(&format!(
-        "\n[{} lines of build output compressed to {} lines — showing errors only]",
-        lines.len(),
-        important_count,
-    ));
-    Some(output)
-}
-
-/// Assemble output from lines marked as important, collapsing unimportant runs
-/// into `[... N lines skipped ...]` markers.
-fn assemble_important_lines(lines: &[&str], important: &[bool]) -> String {
-    let mut output = String::with_capacity(lines.len() * 40);
-    let mut skipping = false;
-    let mut skip_count = 0usize;
-
-    for (i, line) in lines.iter().enumerate() {
-        if important[i] {
-            if skipping {
-                output.push_str(&format!("\n[... {} lines skipped ...]\n", skip_count));
-                skipping = false;
-                skip_count = 0;
-            }
-            if !output.is_empty() {
-                output.push('\n');
-            }
-            output.push_str(line);
-        } else {
-            skipping = true;
-            skip_count += 1;
-        }
-    }
-    if skipping {
-        output.push_str(&format!("\n[... {} lines skipped ...]", skip_count));
-    }
-
-    output
-}
+// truncate_bash + try_compress_compile_errors + assemble_important_lines
+// were removed 2026-04-22 (~250 lines) to enforce technology-stack
+// neutrality. See comment at top of `truncate_output` for why.
 
 // truncate_read_file: DELETED.
 // read_file truncation is now handled exclusively by Layer A (auto_skeleton)
@@ -442,42 +250,50 @@ mod tests {
         }
     }
 
-    // --- truncate_bash tests ---
+    // --- bash truncation tests (A1, 2026-04-22) ---
+    //
+    // bash has no per-tool truncation — relies entirely on the universal
+    // line/char caps in `truncate_output`. These tests lock in that
+    // behavior so future refactors don't silently reintroduce pattern-based
+    // extraction.
 
     #[test]
-    fn truncate_bash_short_output_unchanged() {
-        let output = "line1\nline2\nline3\n";
-        let mut result = make_result(output);
-        truncate_bash(&mut result);
-        assert_eq!(result.output, output);
+    fn bash_short_output_passes_through_verbatim() {
+        let output: String = (0..100).map(|i| format!("line {}", i)).collect::<Vec<_>>().join("\n");
+        let mut result = make_result(&output);
+        truncate_output(&mut result, "bash", 64_000);
+        assert_eq!(result.output, output, "bash output under 300 lines must not be touched");
     }
 
     #[test]
-    fn truncate_bash_preserves_error_lines() {
-        // Create output with >80 lines, including an error line
-        let mut lines: Vec<String> = (0..100).map(|i| format!("normal line {}", i)).collect();
-        lines[50] = "error: something went wrong".to_string();
-        let output = lines.join("\n");
+    fn bash_huge_output_hits_universal_line_cap_only() {
+        // 500 lines > UNIVERSAL_MAX_LINES (300) → head 50 + tail 50 + marker.
+        // Purely numeric — no English error-keyword heuristic fires.
+        let output: String = (0..500).map(|i| format!("line {}", i)).collect::<Vec<_>>().join("\n");
         let mut result = make_result(&output);
-        truncate_bash(&mut result);
-        // Error line and context should be preserved
-        assert!(result.output.contains("error: something went wrong"));
+        truncate_output(&mut result, "bash", 64_000);
+        assert!(result.output.contains("line 0"), "head must be preserved");
+        assert!(result.output.contains("line 499"), "tail must be preserved");
+        assert!(result.output.contains("lines omitted"), "omission marker required");
+        assert!(result.output.lines().count() <= 110);
     }
 
     #[test]
-    fn truncate_bash_build_output_compression() {
-        // Build output with BUILD SUCCESS keyword
-        let mut lines: Vec<String> = (0..200).map(|i| format!("verbose build line {}", i)).collect();
-        lines[10] = "[INFO] BUILD SUCCESS".to_string();
-        lines[11] = "error: compilation failed".to_string();
-        let output = lines.join("\n");
+    fn bash_chinese_stderr_survives_truncation() {
+        // Regression test for the 2026-04-22 forensic finding: the old
+        // pattern-based `truncate_bash` collapsed any line not matching
+        // English `error`/`Error`/`FAILED`/`panic` into
+        // `[... N lines skipped ...]`. A 50-line Chinese compiler trace
+        // was reduced to head+tail-only with every middle line dropped.
+        // Under A1 the output passes through verbatim (below universal
+        // caps).
+        let output: String = (0..50)
+            .map(|_| "编译失败：找不到符号".to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
         let mut result = make_result(&output);
-        truncate_bash(&mut result);
-        // Should be compressed significantly
-        assert!(result.output.len() < output.len());
-        // Should contain BUILD SUCCESS and error lines
-        assert!(result.output.contains("BUILD SUCCESS"));
-        assert!(result.output.contains("error: compilation failed"));
+        truncate_output(&mut result, "bash", 64_000);
+        assert_eq!(result.output.matches("编译失败").count(), 50);
     }
 
     // truncate_read_file tests: DELETED (function removed, Layer A in read.rs handles it)

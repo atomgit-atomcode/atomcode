@@ -1464,56 +1464,29 @@ impl AgentLoop {
                         // Sub-agent dispatch also disabled (try_sub_agent_dispatch returns None).
                     }
 
-                    // Empty response from LLM (common with DeepSeek/SiliconFlow/GLM):
-                    // Retry with a nudge — but ONLY if the response was fast (<60s).
-                    // Slow empty responses (300s) mean the model spent all max_tokens
-                    // on internal reasoning — retrying will produce the same result.
-                    let is_empty = text.trim().is_empty() || (text.trim().len() < 5 && tokens < 10);
-                    let turn_elapsed = self.turn_start.map(|t| t.elapsed().as_secs()).unwrap_or(0);
-                    // Slow empty: model spent all tokens on thinking. Don't retry
-                    // with "Continue" (will just burn tokens again). Instead nudge
-                    // model to summarize what it did and finish.
-                    let is_slow_empty = is_empty && turn_elapsed > 60;
-                    if is_slow_empty && self.retry_count < 1 {
-                        self.retry_count += 1;
-                        self.conversation.messages.push(
-                            crate::conversation::message::Message::new(
-                                crate::conversation::message::Role::Assistant,
-                                "(completed)".to_string(),
-                            ),
-                        );
-                        self.conversation
-                            .add_user_message("Summarize what you changed and finish.");
-                        continue;
-                    }
-                    if is_empty && self.retry_count < 2 {
-                        self.retry_count += 1;
-                        // Ensure valid message alternation: empty LLM response didn't add
-                        // an Assistant message, so add one before injecting User message.
-                        // Without this: ToolResult → User (invalid) → LLM returns empty.
-                        self.conversation.messages.push(
-                            crate::conversation::message::Message::new(
-                                crate::conversation::message::Role::Assistant,
-                                "(continuing...)".to_string(),
-                            ),
-                        );
-                        // Empty response retry: one uniform nudge regardless of whether
-                        // edits happened. Removed the edit-specific "Summarize what you
-                        // changed: <files>" branch — it prompted weak models to re-narrate
-                        // work already reflected in tool results.
-                        self.conversation.add_user_message("Continue.");
-                        tokio::time::sleep(Duration::from_secs(2)).await;
-                        continue;
-                    }
-                    // Plan completion guard: REMOVED.
-                    // Was injecting "You are NOT done" based on subtask_driver's regex-extracted
-                    // file list, which often didn't match actual edited files. This prevented
-                    // the model from stopping even when the task was complete.
-                    // Model decides when it's done. Same as CC.
-
-                    // Truncation guard: if LLM was cut off by max_tokens (finish_reason="length"),
-                    // automatically continue. No keyword heuristics needed — the API tells us.
-                    if truncated && self.retry_count < 3 {
+                    // finish_reason-based termination dispatch (2026-04-22).
+                    //
+                    // The previous code injected `(continuing...)` + `Continue.`
+                    // when the model returned empty text, under the theory that
+                    // empty = "was about to say more". In practice this conflated:
+                    //   (a) finish_reason="length" — real max-token cutoff
+                    //       mid-generation, retrying does salvage the session
+                    //   (b) finish_reason="stop" + no text — model cleanly
+                    //       decided to stop after reading tool results
+                    //       (e.g. `cargo check` passed, nothing more to say)
+                    // and cycled case (b) into meaningless `Continue.` loops.
+                    //
+                    // CC has no such recovery mechanism — empty-on-stop IS the
+                    // natural termination (`project_cc_prompt_philosophy.md`).
+                    //
+                    // Briefly tried adding an "empty-after-failure" branch
+                    // (2026-04-22 20:44) but the hermes 20-41 session showed
+                    // the real issue was upstream in edit.rs `find_closest_match_inner`
+                    // producing garbage "closest match" hints — the model
+                    // gave up because the framework's hint was actively
+                    // misleading, not because it needed more nudging.
+                    // Reverting to the principled state machine.
+                    if truncated && self.retry_count < 1 {
                         self.retry_count += 1;
                         self.conversation.add_user_message(
                             "Output limit hit. If the task is already complete, just output a \
@@ -1521,9 +1494,6 @@ impl AgentLoop {
                         );
                         continue;
                     }
-
-                    // Colon guard: REMOVED. End-of-text punctuation check is unnecessary.
-                    // If model stops mid-sentence, user can say "继续".
 
                     self.finish_turn(TurnStopReason::Natural);
                     return;

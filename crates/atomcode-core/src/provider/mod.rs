@@ -41,13 +41,43 @@ pub(super) fn build_http_client(ua_override: Option<&str>) -> reqwest::Client {
 /// If `api_key` is `None`, automatically loads from `~/.atomcode/auth.toml`
 /// (with token refresh if expired).
 pub fn create_provider(config: &ProviderConfig) -> Result<Box<dyn LlmProvider>> {
-    let config = if config.api_key.is_none() && config.provider_type != "ollama" {
+    let mut config = if config.api_key.is_none() && config.provider_type != "ollama" {
         let mut c = config.clone();
         c.api_key = Some(load_auth_token()?);
         c
     } else {
         config.clone()
     };
+    // Sanitize api_key at load time so the user sees an actionable
+    // config error instead of a cryptic "request body must be
+    // cloneable" panic downstream. Trailing `\n` from paste-from-web
+    // is the single most common trigger: `http::HeaderValue` rejects
+    // control chars, `reqwest::RequestBuilder::header` silently
+    // stashes the error, and `try_clone()` panics later when retry
+    // tries to repeat the request.
+    if let Some(key) = config.api_key.as_deref() {
+        let trimmed = key.trim();
+        if trimmed.is_empty() {
+            anyhow::bail!(
+                "API key for provider type '{}' is empty (or whitespace only) \
+                 — check the value in your config.toml",
+                config.provider_type
+            );
+        }
+        if trimmed.chars().any(|c| c.is_control()) {
+            anyhow::bail!(
+                "API key for provider type '{}' contains control characters \
+                 (newline/tab/etc.) — re-copy the key without surrounding \
+                 whitespace",
+                config.provider_type
+            );
+        }
+        if trimmed.len() != key.len() {
+            // Silently strip surrounding whitespace so a harmless
+            // paste artefact doesn't block the request.
+            config.api_key = Some(trimmed.to_string());
+        }
+    }
     match config.provider_type.as_str() {
         "claude" => Ok(Box::new(claude::ClaudeProvider::new(&config)?)),
         "openai" => Ok(Box::new(openai::OpenAiProvider::new(&config)?)),
@@ -178,5 +208,83 @@ mod tests {
                 auth_module_path.ends_with(".atomcode\\auth.toml"), // Windows compatibility
                 "Path should end with .atomcode/auth.toml, got: {}",
                 auth_module_path.display());
+    }
+
+    use crate::config::provider::ProviderConfig;
+
+    fn cfg(provider_type: &str, api_key: &str) -> ProviderConfig {
+        ProviderConfig {
+            provider_type: provider_type.to_string(),
+            api_key: Some(api_key.to_string()),
+            model: "m".to_string(),
+            base_url: Some("http://127.0.0.1:1/".to_string()),
+            system_prompt: None,
+            user_agent: None,
+            context_window: 8000,
+            max_tokens: None,
+            ephemeral: false,
+        }
+    }
+
+    /// INTERNAL control characters (vs surrounding whitespace, which
+    /// is silently trimmed) must fail at config-load time with an
+    /// actionable error — not at request time as a cryptic try_clone
+    /// panic. These are genuinely suspicious values (partial paste,
+    /// rendering glitch, someone editing config.toml in an editor
+    /// that inserted a CR) and cannot appear in a valid API key.
+    #[test]
+    fn create_provider_rejects_api_key_with_internal_control_chars() {
+        let result = super::create_provider(&cfg("openai", "sk-ab\nc"));
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("expected Err for api_key with internal \\n"),
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("control character"),
+            "expected control-char error, got: {}",
+            msg
+        );
+    }
+
+    /// Trailing `\n` (paste-from-web artefact) gets silently trimmed.
+    /// The user's config remains functional without needing a manual
+    /// edit — this is the user-friendly path for the common case.
+    #[test]
+    fn create_provider_silently_trims_trailing_newline() {
+        let result = super::create_provider(&cfg("openai", "sk-abc\n"));
+        assert!(
+            result.is_ok(),
+            "trailing \\n should be trimmed silently, got: {:?}",
+            result.err().map(|e| e.to_string())
+        );
+    }
+
+    #[test]
+    fn create_provider_rejects_empty_or_whitespace_api_key() {
+        let result = super::create_provider(&cfg("openai", "   "));
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("expected Err for whitespace-only api_key"),
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("empty") || msg.contains("whitespace"),
+            "expected empty/whitespace error, got: {}",
+            msg
+        );
+    }
+
+    /// Harmless surrounding whitespace (the typical copy-paste
+    /// artefact) gets trimmed — no error, the provider constructs
+    /// cleanly with the trimmed key.
+    #[test]
+    fn create_provider_silently_trims_surrounding_whitespace() {
+        let result = super::create_provider(&cfg("openai", "  sk-abc  "));
+        assert!(
+            result.is_ok(),
+            "trimmable key should be accepted, got: {:?}",
+            result.err().map(|e| e.to_string())
+        );
     }
 }

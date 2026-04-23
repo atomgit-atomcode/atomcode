@@ -47,6 +47,15 @@ pub fn should_skip_dir(name: &str) -> bool {
         || SKIP_DIR_PREFIXES.iter().any(|p| name.starts_with(p))
 }
 
+/// Count of leading characters shared between two paths. Used by read_file
+/// and glob 404 recovery to rank candidate suggestions: the match with the
+/// longest shared prefix with what the agent actually asked for is almost
+/// always the one it wanted. Pure character count, tech-neutral — no path
+/// segment parsing (avoids per-OS separator logic).
+pub fn shared_prefix_len(a: &str, b: &str) -> usize {
+    a.chars().zip(b.chars()).take_while(|(x, y)| x == y).count()
+}
+
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use tokio::sync::{Mutex, RwLock};
@@ -403,6 +412,21 @@ pub struct ToolContext {
     /// still matches. Avoids redoing UTF-8 parsing + semantic skeleton generation
     /// when the model re-reads the same file — these are CPU-heavy, not just I/O.
     pub read_cache: Arc<RwLock<std::collections::HashMap<ReadCacheKey, ReadCacheEntry>>>,
+    /// Top-5 most-distinctive lines captured from the first failed bash call
+    /// this session. Used for effect-based "error resolved" detection (P0 #5):
+    /// when a later bash succeeds and ≥3 of these 5 lines no longer appear,
+    /// the framework appends a hint nudging the model to summarize + stop.
+    ///
+    /// Why 5 lines with a majority threshold instead of 1 line (initial
+    /// design from 2026-04-22 morning): cargo / npm / pytest output
+    /// interleaves real diagnostics with ambient status (`Blocking waiting
+    /// for file lock`, `Checking crate v0.1.0`). A single-line signature
+    /// routinely caught a status line that appears on success too, so the
+    /// nudge never fired. Multi-line + majority absent is robust to noise
+    /// overlap without per-tool pattern matching.
+    ///
+    /// Stays set once captured — "original failure" anchor, not rolling.
+    pub first_error_signatures: Arc<RwLock<Vec<String>>>,
 }
 
 impl ToolContext {
@@ -419,6 +443,7 @@ impl ToolContext {
             read_budget_tokens: Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX)),
             graph: Arc::new(RwLock::new(crate::graph::CodeGraph::new())),
             read_cache: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            first_error_signatures: Arc::new(RwLock::new(Vec::new())),
         }
     }
 
@@ -430,6 +455,48 @@ impl ToolContext {
         ctx.graph = self.graph.clone();
         ctx
     }
+}
+
+/// Extract up to 5 distinctive diagnostic lines from a failed bash/tool
+/// output for use as a multi-signature "error anchor" (P0 #5).
+/// Selection rule: longest lines first. Rationale — status noise
+/// (`Checking v0.1.0 (/path)`, `Blocking waiting for file lock`) is almost
+/// always shorter than real diagnostic content (`error[E0425]: cannot find
+/// function \`foo\` in this scope`, full compiler traces). Sorting by length
+/// pushes ambient status to the back of the queue without hardcoding tool
+/// names.
+///
+/// Tech-neutral: no keyword matching on "error"/"failed"/"panic" etc. The
+/// caller uses majority-absent semantics (≥3 of 5 disappear on success → fire
+/// nudge) so lingering overlap on one or two status lines doesn't suppress
+/// the detection.
+pub fn extract_error_signatures(output: &str) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        // Framework markers all start with `[` — elapsed, cwd, workspace
+        // note, blocked messages. Skip them.
+        if trimmed.starts_with('[') {
+            continue;
+        }
+        if trimmed == "STDERR:" {
+            continue;
+        }
+        if trimmed.len() < 15 {
+            continue;
+        }
+        let s: String = trimmed.chars().take(120).collect();
+        if !lines.contains(&s) {
+            lines.push(s);
+        }
+    }
+    // Sort by length desc — longer lines are more likely to be specific
+    // diagnostic content (includes identifiers, paths, span markers).
+    lines.sort_by_key(|s| std::cmp::Reverse(s.len()));
+    lines.into_iter().take(5).collect()
 }
 
 #[async_trait]

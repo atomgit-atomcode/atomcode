@@ -90,13 +90,59 @@ impl Tool for GlobTool {
         let search_dir = derive_search_dir(&base_dir, &parsed.pattern);
         let name_pattern = derive_name_pattern(&parsed.pattern);
 
-        // Verify search directory exists.
+        // Verify search directory exists. If not, walk the workspace to find
+        // directories with the same basename so the agent can self-correct
+        // without a round of manual `ls`. 2026-04-22: added for P0 #4 after
+        // 426-atom 2026-04-21 session where agent spent 5 turns listing
+        // directories because `/426-atom/index.html` was actually at
+        // `/426-atom/presentation/index.html`.
         if !std::path::Path::new(&search_dir).is_dir() {
+            let target_basename = std::path::Path::new(&search_dir)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let mut dir_matches: Vec<String> = Vec::new();
+            if !target_basename.is_empty() {
+                fn find_dir(
+                    dir: &std::path::Path,
+                    target: &str,
+                    depth: usize,
+                    max_depth: usize,
+                    results: &mut Vec<String>,
+                ) {
+                    if depth > max_depth || results.len() >= 20 { return; }
+                    if let Ok(entries) = std::fs::read_dir(dir) {
+                        for entry in entries.flatten() {
+                            let name = entry.file_name().to_string_lossy().to_string();
+                            if name.starts_with('.') || super::should_skip_dir(&name) { continue; }
+                            let p = entry.path();
+                            if p.is_dir() {
+                                if name == target {
+                                    results.push(p.to_string_lossy().to_string());
+                                }
+                                find_dir(&p, target, depth + 1, max_depth, results);
+                            }
+                        }
+                    }
+                }
+                find_dir(std::path::Path::new(&wd), &target_basename, 0, 5, &mut dir_matches);
+            }
+            let hint = if dir_matches.is_empty() {
+                String::new()
+            } else {
+                dir_matches.sort_by_key(|d| std::cmp::Reverse(super::shared_prefix_len(&search_dir, d)));
+                let shown: Vec<String> = dir_matches
+                    .iter()
+                    .take(3)
+                    .map(|d| format!("  {}", d))
+                    .collect();
+                format!("\n\nSimilar directories found — did you mean one of these?\n{}", shown.join("\n"))
+            };
             return Ok(ToolResult {
                 call_id: String::new(),
                 output: format!(
-                    "No files matching '{}' (directory '{}' does not exist)",
-                    parsed.pattern, search_dir
+                    "No files matching '{}' (directory '{}' does not exist){}",
+                    parsed.pattern, search_dir, hint
                 ),
                 success: true,
             });
@@ -175,5 +221,78 @@ fn derive_name_pattern(pattern: &str) -> String {
         pattern[last_slash + 1..].to_string()
     } else {
         pattern.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tool::ToolContext;
+    use tempfile::TempDir;
+
+    /// P0 #4: when a glob's search dir doesn't exist, workspace-walk for dirs
+    /// with the same basename and surface top-3 by path-prefix similarity.
+    /// Regression for 426-atom 2026-04-21 session where agent burned 5
+    /// turns of `ls` to locate `/426-atom/presentation/` after asking glob
+    /// under `/426-atom/frontend/` (wrong segment).
+    #[tokio::test]
+    async fn glob_suggests_similar_directory_when_search_dir_missing() {
+        let dir = TempDir::new().unwrap();
+        // Set up a workspace with a `presentation/` dir that agent will miss.
+        std::fs::create_dir_all(dir.path().join("hermes/presentation")).unwrap();
+        std::fs::create_dir_all(dir.path().join("other/presentation")).unwrap();
+        std::fs::write(
+            dir.path().join("hermes/presentation/app.vue"),
+            "<template></template>",
+        ).unwrap();
+
+        let ctx = ToolContext::new(dir.path().to_path_buf());
+        let tool = GlobTool;
+        // Agent asks for `.vue` files under the WRONG path — `hermes/frontend/presentation`
+        // doesn't exist, but `hermes/presentation` does.
+        let wrong = dir.path().join("hermes/frontend/presentation");
+        let args = format!(
+            r#"{{"pattern":"{}/**/*.vue"}}"#,
+            wrong.display()
+        );
+
+        let r = tool.execute(&args, &ctx).await.unwrap();
+        assert!(r.success);
+        assert!(
+            r.output.contains("does not exist"),
+            "missing exists-check msg: {}",
+            r.output
+        );
+        assert!(
+            r.output.contains("Similar directories found"),
+            "must suggest similar directories: {}",
+            r.output
+        );
+        // Both `presentation/` dirs exist under wd; the hermes one shares
+        // more path prefix with what the agent asked for, so it must be
+        // listed first.
+        let hermes_pos = r.output.find("hermes/presentation").unwrap();
+        let other_pos = r.output.find("other/presentation").unwrap();
+        assert!(
+            hermes_pos < other_pos,
+            "hermes/presentation must outrank other/presentation. output:\n{}",
+            r.output
+        );
+    }
+
+    #[tokio::test]
+    async fn glob_existing_dir_does_not_trigger_hint() {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/a.ts"), "export {};").unwrap();
+
+        let ctx = ToolContext::new(dir.path().to_path_buf());
+        let tool = GlobTool;
+        let args = format!(r#"{{"pattern":"{}/**/*.ts"}}"#, dir.path().join("src").display());
+
+        let r = tool.execute(&args, &ctx).await.unwrap();
+        assert!(r.success);
+        assert!(!r.output.contains("Similar directories found"),
+            "no hint should fire when dir exists: {}", r.output);
     }
 }
