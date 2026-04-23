@@ -349,11 +349,11 @@ impl SkillRegistry {
     ///
     /// Load order (later entries overwrite earlier ones — higher priority wins):
     ///
-    /// Global (home dir):
-    ///   1. `~/.claude/commands/*.md`          legacy flat, Claude Code compat
-    ///   2. `~/.atomcode/commands/*.md`         legacy flat, atomcode native
-    ///   3. `~/.claude/skills/*/SKILL.md`       directory-style, Claude Code compat
-    ///   4. `~/.atomcode/skills/*/SKILL.md`     directory-style, atomcode native
+    /// Global (home dir or ATOMCODE_HOME):
+    ///   1. `{home}/.claude/commands/*.md`          legacy flat, Claude Code compat
+    ///   2. `{home}/.atomcode/commands/*.md`         legacy flat, atomcode native
+    ///   3. `{home}/.claude/skills/*/SKILL.md`       directory-style, Claude Code compat
+    ///   4. `{home}/.atomcode/skills/*/SKILL.md`     directory-style, atomcode native
     ///
     /// Project (working dir):
     ///   5. `.claude/commands/*.md`
@@ -363,16 +363,36 @@ impl SkillRegistry {
     ///
     /// Same-name skill from a `skills/` directory beats one from `commands/`
     /// at the same level because it is loaded after.
+    ///
+    /// Note: If ATOMCODE_HOME env var is set, it overrides the default home directory
+    /// for atomcode-specific paths (.atomcode/commands and .atomcode/skills).
+    /// Claude Code compat paths (.claude/*) always use the system home directory.
     pub fn reload(&mut self, working_dir: &Path) {
         self.skills.clear();
 
-        if let Some(home) = dirs::home_dir() {
+        // System home directory (for Claude Code compat paths)
+        let system_home = dirs::home_dir();
+        
+        // AtomCode home directory (respects ATOMCODE_HOME env var)
+        let atomcode_home: Option<PathBuf> = std::env::var("ATOMCODE_HOME")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| system_home.clone());
+
+        // Load Claude Code compat paths from system home (always)
+        if let Some(ref home) = system_home {
             self.load_flat_commands(&home.join(".claude").join("commands"), None);
-            self.load_flat_commands(&home.join(".atomcode").join("commands"), None);
             self.load_skills_dir(&home.join(".claude").join("skills"), None);
+        }
+
+        // Load atomcode native paths from ATOMCODE_HOME (or system home as fallback)
+        if let Some(ref home) = atomcode_home {
+            self.load_flat_commands(&home.join(".atomcode").join("commands"), None);
             self.load_skills_dir(&home.join(".atomcode").join("skills"), None);
         }
 
+        // Project-level skills (always from working dir)
         self.load_flat_commands(&working_dir.join(".claude").join("commands"), None);
         self.load_flat_commands(&working_dir.join(".atomcode").join("commands"), None);
         self.load_skills_dir(&working_dir.join(".claude").join("skills"), None);
