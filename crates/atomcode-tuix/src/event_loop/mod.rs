@@ -2025,6 +2025,15 @@ fn handle_agent_event(
             renderer.flush();
             state.on_turn_complete();
 
+            // Reset the think stripper between turns. If the previous turn
+            // left an unclosed `<think>` in flight (cancelled mid-stream,
+            // model never emitted `</think>`, provider switch that doesn't
+            // use `<think>` tags like Kimi thinking-mode via reasoning_content),
+            // the stripper stays `inside=true` and silently swallows every
+            // TextDelta of the NEXT turn — user sees blank assistant bubbles
+            // while datalog proves the model did return text.
+            think.reset();
+
             // Persist session after every completed turn so /resume can
             // find it after a clean exit — the whole point of sessions.
             persist_current_session(ctx, messages);
@@ -2086,6 +2095,10 @@ fn handle_agent_event(
             // against an incomplete "fix".
             fixissue_pending.take();
             fixissue_buffer.clear();
+            // Same reset rationale as TurnComplete: a cancelled turn is the
+            // single most common way for `<think>` to go unclosed, so this
+            // branch is even more important for the stripper's hygiene.
+            think.reset();
             // Save what we did have — a user who Ctrl+C'd mid-stream
             // should still be able to /resume the cleaned conversation.
             persist_current_session(ctx, messages);
@@ -2096,6 +2109,9 @@ fn handle_agent_event(
             fixissue_pending.take();
             fixissue_buffer.clear();
             state.on_error();
+            // Same reset rationale as TurnComplete / TurnCancelled — an
+            // aborted turn is another way to leave `<think>` half-open.
+            think.reset();
         }
         AgentEvent::TokenUsage(u) => {
             state.total_tokens += u.completion_tokens;
