@@ -400,10 +400,48 @@ fn sanitize_plain_text(s: &str) -> String {
         .join(" ")
 }
 
+#[cfg(target_os = "macos")]
+fn macos_terminal_bundle_id(app: Option<TerminalApp>) -> Option<&'static str> {
+    match app {
+        Some(TerminalApp::AppleTerminal) => Some("com.apple.Terminal"),
+        Some(TerminalApp::ITerm2) => Some("com.googlecode.iterm2"),
+        Some(TerminalApp::WezTerm) => Some("com.github.wez.wezterm"),
+        Some(TerminalApp::Kitty) => Some("net.kovidgoyal.kitty"),
+        _ => None,
+    }
+}
+
+fn find_executable_on_path(name: &str) -> Option<std::path::PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        let candidate = dir.join(name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
 fn spawn_system_notification(title: String, body: String) {
     std::thread::spawn(move || {
         #[cfg(target_os = "macos")]
         {
+            if let Some(bin) = find_executable_on_path("terminal-notifier") {
+                let mut cmd = Command::new(bin);
+                cmd.arg("-title")
+                    .arg(&title)
+                    .arg("-message")
+                    .arg(&body)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null());
+                if let Some(bundle_id) = macos_terminal_bundle_id(detect_terminal_app()) {
+                    cmd.arg("-activate").arg(bundle_id);
+                }
+                if cmd.spawn().is_ok() {
+                    return;
+                }
+            }
+
             let script = format!(
                 "display notification {} with title {}",
                 apple_script_string(&body),
@@ -631,6 +669,20 @@ mod tests {
         );
         set_terminal_focus_state(None);
         assert!(plan.is_none());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_terminal_bundle_ids_match_supported_terminals() {
+        assert_eq!(macos_terminal_bundle_id(Some(TerminalApp::AppleTerminal)), Some("com.apple.Terminal"));
+        assert_eq!(macos_terminal_bundle_id(Some(TerminalApp::ITerm2)), Some("com.googlecode.iterm2"));
+        assert_eq!(macos_terminal_bundle_id(Some(TerminalApp::WezTerm)), Some("com.github.wez.wezterm"));
+        assert_eq!(macos_terminal_bundle_id(Some(TerminalApp::Kitty)), Some("net.kovidgoyal.kitty"));
+    }
+
+    #[test]
+    fn missing_executable_lookup_returns_none() {
+        assert!(find_executable_on_path("__atomcode_missing_notifier__").is_none());
     }
 
     #[test]
