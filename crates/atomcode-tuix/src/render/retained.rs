@@ -1449,16 +1449,18 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
     }
 
     fn pop_approval_prompt(&mut self) {
-        // Approval rows are the only body rows whose column-PAD_COL cell
-        // is '▶' (the prompt glyph we emit in the ApprovalPrompt arm).
-        // Other body lines lead with '▸' (tool call), '>' (user turn),
-        // '─' (rule), or ordinary text — none of them match. Checking
-        // the tail is safe because the agent doesn't append further body
-        // rows between `ApprovalNeeded` and the user's Y/A/N reply.
+        // Approval rows are the only body rows whose col-0 cell is
+        // '▶' (the prompt glyph we emit in the ApprovalPrompt arm).
+        // Other body lines lead with '▸' (tool call), '❯' (user turn),
+        // '─' (rule), whitespace (assistant prose, errors, cmd output,
+        // turn separator at col 2), or '    ⎿' (tool result, col 4) —
+        // none of them match. Checking the tail is safe because the
+        // agent doesn't append further body rows between
+        // `ApprovalNeeded` and the user's Y/A/N reply.
         let is_approval = self
             .body_lines
             .last()
-            .and_then(|r| r.get(PAD_COL))
+            .and_then(|r| r.get(0))
             .map(|c| c.ch == '▶')
             .unwrap_or(false);
         if !is_approval {
@@ -2886,6 +2888,41 @@ mod tests {
         drain_into_vterm(&buf, &mut vterm);
         let found = vterm.any_row(|row| row.contains("Switched to glm5"));
         assert!(found, "command output missing\ndump:\n{}", vterm.dump());
+    }
+
+    /// After moving ▶ to col 0, `pop_approval_prompt` must still
+    /// detect the approval row via col 0 and must NOT be fooled by
+    /// an adjacent ▸ tool-call row (also at col 0, different glyph).
+    #[test]
+    fn retained_approval_pop_still_detects_glyph() {
+        let (mut r, _buf) = new_capturing(80, 24);
+
+        r.render(UiLine::ToolCall {
+            name: "bash".into(),
+            detail: "ls".into(),
+        });
+        r.render(UiLine::ApprovalPrompt {
+            tool: "bash".into(),
+            detail: "ls".into(),
+        });
+        let before = r.body_lines.len();
+        r.pop_approval_prompt();
+        let after = r.body_lines.len();
+        assert_eq!(
+            before - after,
+            1,
+            "pop_approval_prompt should drop exactly the approval row"
+        );
+
+        // Second call: last row is now the tool-call `▸`, not `▶`.
+        // Must be a no-op.
+        let before2 = r.body_lines.len();
+        r.pop_approval_prompt();
+        let after2 = r.body_lines.len();
+        assert_eq!(
+            before2, after2,
+            "pop_approval_prompt must not drop non-approval rows"
+        );
     }
 
     /// StreamingBox: spinner frame + label above the input rule.
