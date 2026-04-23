@@ -631,12 +631,27 @@ impl AgentLoop {
                     // Denial handled inside run_turn_loop via channels
                 }
                 AgentCommand::ReloadConfig(new_config) => {
-                    let old_provider = self.config.default_provider.clone();
+                    let old_provider_name = self.config.default_provider.clone();
+                    let old_type = self
+                        .config
+                        .providers
+                        .get(&old_provider_name)
+                        .map(|p| p.provider_type.clone());
                     self.config = new_config;
                     let new_provider_name = self.config.default_provider.clone();
+                    let new_type = self
+                        .config
+                        .providers
+                        .get(&new_provider_name)
+                        .map(|p| p.provider_type.clone());
 
-                    // If provider/model changed, clear conversation to avoid context pollution
-                    if old_provider != new_provider_name {
+                    let should_clear = reload_should_clear_conversation(
+                        &old_provider_name,
+                        old_type.as_deref(),
+                        &new_provider_name,
+                        new_type.as_deref(),
+                    );
+                    if should_clear {
                         self.conversation.messages.clear();
                         self.conversation.turn_tracker =
                             crate::conversation::turn::TurnTracker::new();
@@ -2197,6 +2212,38 @@ fn short_path(path: &str) -> String {
     }
 }
 
+/// Whether a `ReloadConfig` should wipe the existing conversation history.
+///
+/// Prior behavior cleared whenever the `default_provider` name changed.
+/// That was too aggressive: CodingPlan registers one provider entry per
+/// model, so a user swapping Kimi ↔ GLM via `/model` lost all context
+/// every time — even though both entries are the same `openai` type and
+/// all known cross-model differences (reasoning_content echo policy,
+/// DeepSeek content-field requirement, tool_call args JSON repair) are
+/// now handled in the per-provider send path.
+///
+/// Current policy:
+/// - Same `provider_type` on both sides → keep history. This covers the
+///   common Kimi/GLM/DeepSeek-through-AtomGit swap.
+/// - Different `provider_type` (e.g. openai → claude) → clear, because
+///   tool_call id formats and tool_use block translation between the
+///   OpenAI-shaped and Anthropic-shaped messages haven't been proven
+///   round-trip clean.
+/// - Can't resolve the old type (old provider was removed from config)
+///   → clear when the name changed, matching the pre-existing safe
+///   default.
+fn reload_should_clear_conversation(
+    old_name: &str,
+    old_type: Option<&str>,
+    new_name: &str,
+    new_type: Option<&str>,
+) -> bool {
+    match (old_type, new_type) {
+        (Some(a), Some(b)) => a != b,
+        _ => old_name != new_name,
+    }
+}
+
 /// True when an upstream API error string indicates the request exceeded
 /// the model's context-length budget. Covers OpenRouter's verbose 400
 /// message, OpenAI's `context_length_exceeded` code, and Anthropic's
@@ -2326,8 +2373,67 @@ fn build_post_compress_state(
 mod classifier_tests {
     use super::{
         is_auth_error, is_context_overflow_error, is_rate_limited_error, public_error_message,
-        public_error_reason,
+        public_error_reason, reload_should_clear_conversation,
     };
+
+    // ── reload_should_clear_conversation ──
+
+    #[test]
+    fn reload_same_type_different_name_keeps_history() {
+        // The common CodingPlan case: one provider entry per model, all
+        // `openai`-typed. User swaps Kimi ↔ GLM via `/model` — history MUST
+        // survive, otherwise every model switch is a brand-new session.
+        assert!(!reload_should_clear_conversation(
+            "AtomGit-kimi-k2.6",
+            Some("openai"),
+            "AtomGit-glm5",
+            Some("openai"),
+        ));
+    }
+
+    #[test]
+    fn reload_different_type_clears() {
+        // Cross-type (openai → claude) is not proven round-trip clean:
+        // tool_call id formats differ, tool_use block translation is
+        // non-trivial. Stay safe and clear.
+        assert!(reload_should_clear_conversation(
+            "kimi",
+            Some("openai"),
+            "claude-sonnet",
+            Some("claude"),
+        ));
+    }
+
+    #[test]
+    fn reload_missing_old_type_falls_back_to_name_change() {
+        // Old provider was removed from new_config (rename, delete, config
+        // rewritten by wizard). We can't tell whether types match, so fall
+        // back to the historical safe default: clear when the name flips.
+        assert!(reload_should_clear_conversation(
+            "old-gone",
+            None,
+            "new-arrival",
+            Some("openai"),
+        ));
+        assert!(!reload_should_clear_conversation(
+            "same",
+            None,
+            "same",
+            Some("openai"),
+        ));
+    }
+
+    #[test]
+    fn reload_same_name_never_clears() {
+        // A no-op ReloadConfig (same default, same type) is a noop here too.
+        // Sanity — should not accidentally wipe history.
+        assert!(!reload_should_clear_conversation(
+            "kimi",
+            Some("openai"),
+            "kimi",
+            Some("openai"),
+        ));
+    }
 
     #[test]
     fn openrouter_400_is_overflow() {
