@@ -461,7 +461,9 @@ mod tests {
 
         let ctx = ToolContext::new(dir.path().to_path_buf());
         let tool = ReadFileTool;
-        let args = format!(r#"{{"file_path":"{}"}}"#, path.display());
+        let args = serde_json::json!({
+            "file_path": path.to_string_lossy().to_string()
+        }).to_string();
 
         let r1 = tool.execute(&args, &ctx).await.unwrap();
         assert!(r1.success);
@@ -481,7 +483,9 @@ mod tests {
 
         let ctx = ToolContext::new(dir.path().to_path_buf());
         let tool = ReadFileTool;
-        let args = format!(r#"{{"file_path":"{}"}}"#, path.display());
+        let args = serde_json::json!({
+            "file_path": path.to_string_lossy().to_string()
+        }).to_string();
 
         let r1 = tool.execute(&args, &ctx).await.unwrap();
         let out1 = r1.output.clone();
@@ -511,7 +515,9 @@ mod tests {
 
         let ctx = ToolContext::new(dir.path().to_path_buf());
         let tool = ReadFileTool;
-        let args = format!(r#"{{"file_path":"{}"}}"#, path.display());
+        let args = serde_json::json!({
+            "file_path": path.to_string_lossy().to_string()
+        }).to_string();
 
         let r = tool.execute(&args, &ctx).await.unwrap();
         assert!(r.success, "GBK text should decode, got: {}", r.output);
@@ -537,7 +543,9 @@ mod tests {
 
         let ctx = ToolContext::new(dir.path().to_path_buf());
         let tool = ReadFileTool;
-        let args = format!(r#"{{"file_path":"{}"}}"#, path.display());
+        let args = serde_json::json!({
+            "file_path": path.to_string_lossy().to_string()
+        }).to_string();
 
         let r = tool.execute(&args, &ctx).await.unwrap();
         assert!(r.output.contains("Binary file"));
@@ -556,7 +564,9 @@ mod tests {
 
         let ctx = ToolContext::new(dir.path().to_path_buf());
         let tool = ReadFileTool;
-        let args = format!(r#"{{"file_path":"{}"}}"#, path.display());
+        let args = serde_json::json!({
+            "file_path": path.to_string_lossy().to_string()
+        }).to_string();
 
         let r = tool.execute(&args, &ctx).await.unwrap();
         assert!(r.output.contains("Binary file"));

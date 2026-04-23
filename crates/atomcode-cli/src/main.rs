@@ -397,6 +397,23 @@ enum Commands {
     },
     /// Roll back to the previous version (swap with .bak on disk)
     Rollback,
+    /// Manage hooks (list, test, enable/disable)
+    #[command(subcommand)]
+    Hooks(HookCommands),
+}
+
+/// Subcommands for hooks management
+#[derive(Subcommand)]
+enum HookCommands {
+    /// List all loaded hooks with their status
+    List,
+    /// Test a specific hook by name
+    Test {
+        /// Hook name to test
+        name: String,
+    },
+    /// Show hook configuration paths
+    Paths,
 }
 
 /// Environment variable set by this process for its re-exec'd child, so
@@ -889,6 +906,136 @@ async fn handle_command(cmd: Commands) -> Result<()> {
         }
         Commands::Upgrade { force } => run_upgrade_cli(force).await,
         Commands::Rollback => run_rollback_cli(),
+        Commands::Hooks(subcmd) => handle_hooks(subcmd).await,
+    }
+}
+
+/// Handle hooks subcommands
+async fn handle_hooks(cmd: HookCommands) -> Result<()> {
+    HEADLESS_MODE.store(true, Ordering::Relaxed);
+
+    match cmd {
+        HookCommands::List => {
+            use atomcode_core::hook::HookRegistry;
+            use atomcode_core::hook::config_loader::load_hooks;
+
+            let mut registry = HookRegistry::new();
+            load_hooks(&mut registry);
+
+            let stats = registry.stats();
+            let total = stats.pre_tool_hooks
+                + stats.post_tool_hooks
+                + stats.post_turn_hooks
+                + stats.system_prompt_hooks
+                + stats.on_message_received_hooks
+                + stats.on_turn_start_hooks
+                + stats.on_tool_call_start_hooks
+                + stats.on_turn_complete_hooks
+                + stats.on_session_start_hooks
+                + stats.on_session_end_hooks
+                + stats.on_error_hooks
+                + stats.on_model_response_hooks;
+
+            println!("\nLoaded Hooks:");
+            println!("─────────────────────────────────────────────");
+
+            if total == 0 {
+                println!("  (No hooks loaded)");
+            } else {
+                println!("  {:<30} {:>5}", "Type", "Count");
+                println!("  {:<30} {:>5}", "─".repeat(30), "─".repeat(5));
+
+                if stats.on_message_received_hooks > 0 {
+                    println!("  {:<30} {:>5}", "OnMessageReceived", stats.on_message_received_hooks);
+                }
+                if stats.on_turn_start_hooks > 0 {
+                    println!("  {:<30} {:>5}", "OnTurnStart", stats.on_turn_start_hooks);
+                }
+                if stats.on_tool_call_start_hooks > 0 {
+                    println!("  {:<30} {:>5}", "OnToolCallStart", stats.on_tool_call_start_hooks);
+                }
+                if stats.pre_tool_hooks > 0 {
+                    println!("  {:<30} {:>5}", "PreToolExecution", stats.pre_tool_hooks);
+                }
+                if stats.post_tool_hooks > 0 {
+                    println!("  {:<30} {:>5}", "PostToolExecution", stats.post_tool_hooks);
+                }
+                if stats.on_turn_complete_hooks > 0 {
+                    println!("  {:<30} {:>5}", "OnTurnComplete", stats.on_turn_complete_hooks);
+                }
+                if stats.post_turn_hooks > 0 {
+                    println!("  {:<30} {:>5}", "PostTurn (legacy)", stats.post_turn_hooks);
+                }
+                if stats.on_model_response_hooks > 0 {
+                    println!("  {:<30} {:>5}", "OnModelResponse", stats.on_model_response_hooks);
+                }
+                if stats.on_session_start_hooks > 0 {
+                    println!("  {:<30} {:>5}", "OnSessionStart", stats.on_session_start_hooks);
+                }
+                if stats.on_session_end_hooks > 0 {
+                    println!("  {:<30} {:>5}", "OnSessionEnd", stats.on_session_end_hooks);
+                }
+                if stats.on_error_hooks > 0 {
+                    println!("  {:<30} {:>5}", "OnError", stats.on_error_hooks);
+                }
+                if stats.system_prompt_hooks > 0 {
+                    println!("  {:<30} {:>5}", "SystemPrompt", stats.system_prompt_hooks);
+                }
+
+                println!("  {:<30} {:>5}", "─".repeat(30), "─".repeat(5));
+                println!("  {:<30} {:>5}", "Total", total);
+            }
+
+            println!();
+
+            // 显示 hooks 目录
+            println!("Hook Directories:");
+            println!("─────────────────────────────────────────────");
+            if let Some(home) = dirs::home_dir() {
+                let global_dir = home.join(".atomcode").join("hooks");
+                let exists = if global_dir.exists() { "✓" } else { "✗" };
+                println!("  {} Global:   {}", exists, global_dir.display());
+            }
+
+            if let Ok(cwd) = std::env::current_dir() {
+                let project_dir = cwd.join(".atomcode").join("hooks");
+                let exists = if project_dir.exists() { "✓" } else { "✗" };
+                println!("  {} Project:  {}", exists, project_dir.display());
+            }
+
+            println!();
+            Ok(())
+        }
+        HookCommands::Test { name } => {
+            println!("Testing hook: {}", name);
+            println!("(TODO: Implement hook testing)");
+            Ok(())
+        }
+        HookCommands::Paths => {
+            println!("\nHook Configuration Paths:");
+            println!("─────────────────────────────────────────────");
+
+            if let Some(home) = dirs::home_dir() {
+                let global_config = home.join(".atomcode").join("hooks").join("hooks.toml");
+                let exists = if global_config.exists() { "✓" } else { "✗" };
+                println!("  {} Global config:   {}", exists, global_config.display());
+            }
+
+            if let Ok(cwd) = std::env::current_dir() {
+                let project_config = cwd.join(".atomcode").join("hooks").join("hooks.toml");
+                let exists = if project_config.exists() { "✓" } else { "✗" };
+                println!("  {} Project config:  {}", exists, project_config.display());
+            }
+
+            println!("\nDocumentation:");
+            println!("─────────────────────────────────────────────");
+            println!("  docs/hooks.md - Hook usage guide");
+            println!("  docs/hook-timing-complete.md - Complete timing list");
+            println!("  docs/hook-expansion-summary.md - Expansion summary");
+            println!();
+
+            Ok(())
+        }
     }
 }
 

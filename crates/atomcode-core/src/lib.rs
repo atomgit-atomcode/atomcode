@@ -3,6 +3,7 @@ pub mod auth;
 pub mod config;
 pub mod conversation;
 pub mod graph;
+pub mod hook;
 pub mod input_history;
 pub mod project_context;
 pub mod provider;

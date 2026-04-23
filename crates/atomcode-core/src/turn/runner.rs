@@ -6,6 +6,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
 use crate::conversation::Conversation;
+use crate::hook::{HookContext, HookRegistry, ToolResultContext};
 use crate::provider::LlmProvider;
 use crate::stream::StreamEvent;
 use crate::tool::{
@@ -31,6 +32,8 @@ pub struct TurnRunner {
     pub context: ToolContext,
     pub config: Config,
     pub permission: Box<dyn PermissionDecider>,
+    /// Hook registry for pre/post tool execution hooks
+    pub hook_registry: HookRegistry,
     /// Files edited during the current session (tracked for context awareness).
     pub recently_edited_files: Vec<String>,
     /// Rolling history of `(tool_name, args_hash)` pairs — used to detect tool
@@ -395,6 +398,9 @@ _ = cancel.cancelled() => {
 
         // 5. If no tool calls, we're done — LLM produced text only
         if tool_calls_buf.is_empty() {
+            // Trigger post-turn hooks for Responded
+            self.trigger_post_turn_hooks("Responded").await;
+            
             return TurnResult::Responded {
                 text: text_buf,
                 tokens: total_tokens,
@@ -516,6 +522,9 @@ _ = cancel.cancelled() => {
             }
         }
 
+        // Trigger post-turn hooks
+        self.trigger_post_turn_hooks("UsedTools").await;
+
         TurnResult::UsedTools {
             text: if text_buf.is_empty() {
                 None
@@ -525,6 +534,17 @@ _ = cancel.cancelled() => {
             tool_count,
             tokens: total_tokens,
         }
+    }
+
+    /// Helper to trigger post-turn hooks with proper context
+    async fn trigger_post_turn_hooks(&self, turn_result: &str) {
+        let working_dir = self.context.working_dir.read().await.clone();
+        let hook_ctx = HookContext::new(
+            "".to_string(),
+            "".to_string(),
+            working_dir.to_string_lossy().to_string(),
+        );
+        self.hook_registry.trigger_post_turn_hooks(&hook_ctx, turn_result).await;
     }
 
     /// EXECUTE mode: run one LLM turn with minimal context.
@@ -711,6 +731,41 @@ _ = cancel.cancelled() => {
             }
         }
 
+        // Trigger pre-tool execution hooks
+        let working_dir = self.context.working_dir.read().await.clone();
+        let hook_ctx = HookContext::new(
+            call.name.clone(),
+            call.arguments.clone(),
+            working_dir.to_string_lossy().to_string(),
+        );
+        
+        let mut final_args = call.arguments.clone();
+        match self.hook_registry.trigger_pre_tool_hooks(&hook_ctx).await {
+            Ok(Some(new_args)) => {
+                // Hook modified the arguments
+                final_args = new_args;
+            }
+            Ok(None) => {
+                // Hooks passed, continue with original args
+            }
+            Err(reason) => {
+                // Hook denied execution
+                let output = format!("Tool '{}' was blocked by hook: {}", call.name, reason);
+                let _ = event_tx.send(TurnEvent::ToolCallResult {
+                    call_id: call.id.clone(),
+                    name: call.name.clone(),
+                    output: output.clone(),
+                    success: false,
+                    duration: std::time::Duration::ZERO,
+                });
+                return ToolResult {
+                    call_id: call.id.clone(),
+                    output,
+                    success: false,
+                };
+            }
+        }
+
         // Snapshot the shared working directory before executing. Tools like
         // `change_dir` and `bash` (when the command starts with `cd`) mutate
         // `ctx.working_dir` in place; we compare before/after to emit a
@@ -726,7 +781,7 @@ _ = cancel.cancelled() => {
         // is acceptable — user pressed Ctrl+C knowing they want to stop.
         let start = Instant::now();
         let result = tokio::select! {
-            r = tool.execute(&call.arguments, &self.context) => r,
+            r = tool.execute(&final_args, &self.context) => r,
             _ = cancel.cancelled() => {
                 let duration = start.elapsed();
                 let output = "[Cancelled by user]".to_string();
@@ -766,6 +821,17 @@ _ = cancel.cancelled() => {
                 success: false,
             },
         };
+
+        // Trigger post-tool execution hooks
+        let result_ctx = ToolResultContext {
+            tool_name: call.name.clone(),
+            tool_args: final_args.clone(),
+            result: tool_result.output.clone(),
+            success: tool_result.success,
+            duration_ms: duration.as_millis() as u64,
+        };
+        
+        self.hook_registry.trigger_post_tool_hooks(&hook_ctx, &result_ctx).await;
 
         let _ = event_tx.send(TurnEvent::ToolCallResult {
             call_id: call.id.clone(),

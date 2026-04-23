@@ -25,6 +25,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
 use crate::conversation::Conversation;
+use crate::hook::HookRegistry;
 use crate::provider::LlmProvider;
 use crate::skill::SkillRegistry;
 use crate::tool::{
@@ -410,12 +411,17 @@ impl AgentLoop {
         // Build the datalog writer before `config` is moved into the agent below.
         let datalog = crate::turn::datalog::DatalogWriter::new(&working_dir, &config.datalog);
 
+        // Initialize hook registry and load hooks from default locations
+        let mut hook_registry = HookRegistry::new();
+        crate::hook::config_loader::load_hooks(&mut hook_registry);
+
         let turn_runner = TurnRunner {
             provider,
             tools: shared_tools.clone(),
             context: tool_context.clone(),
             config: config.clone(),
             permission: interactive_permission,
+            hook_registry,
             recently_edited_files: Vec::new(),
             recent_calls: Vec::new(),
             file_read_counts: std::collections::HashMap::new(),

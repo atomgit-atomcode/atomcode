@@ -189,6 +189,7 @@ fn make_runner(provider: MockProvider, tools: ToolRegistry, permission: Box<dyn 
         context: test_context(),
         config: test_config(),
         permission,
+        hook_registry: crate::hook::HookRegistry::new(),
         recently_edited_files: Vec::new(),
         recent_calls: Vec::new(),
         file_read_counts: std::collections::HashMap::new(),

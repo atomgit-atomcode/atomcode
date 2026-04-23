@@ -1,0 +1,39 @@
+# AtomCode Hooks 配置示例
+# 将此文件保存为 ~/.atomcode/hooks/hooks.toml 或项目 .atomcode/hooks/hooks.toml
+
+[[hooks]]
+name = "log-tool-calls"
+description = "记录所有工具调用到日志文件"
+trigger = "post_tool"
+script = "log_tool_calls.sh"
+script_type = "shell"
+enabled = true
+timeout_secs = 2
+
+[[hooks]]
+name = "auto-commit"
+description = "每 5 轮对话后自动提交代码"
+trigger = "post_turn"
+script = "auto_commit.sh"
+script_type = "shell"
+enabled = false  # 默认禁用，需要时开启
+timeout_secs = 5
+
+[[hooks]]
+name = "code-review"
+description = "编辑后提示代码质量检查"
+trigger = "post_tool"
+script = "code_review.sh"
+script_type = "shell"
+enabled = true
+timeout_secs = 2
+
+# Python Hook 示例
+# [[hooks]]
+# name = "my-python-hook"
+# description = "用 Python 实现的自定义 hook"
+# trigger = "pre_tool"
+# script = "my_hook.py"
+# script_type = "python"
+# enabled = true
+# timeout_secs = 3

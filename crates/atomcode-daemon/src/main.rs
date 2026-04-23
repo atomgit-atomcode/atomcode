@@ -21,6 +21,7 @@ use tokio_util::sync::CancellationToken;
 use tower_http::cors::{Any, CorsLayer};
 
 use atomcode_core::config::Config;
+use atomcode_core::hook::HookRegistry;
 use atomcode_core::session::{Session, SessionId, SessionManager, SessionMeta};
 use atomcode_core::conversation::Conversation;
 use atomcode_core::provider;
@@ -1597,6 +1598,7 @@ let session_manager = SessionManager::new(&working_dir);
         context: tool_context,
         config: config.clone(),
         permission,
+        hook_registry: HookRegistry::new(), // Daemon mode doesn't use hooks for now
         recently_edited_files: Vec::new(),
         recent_calls: Vec::new(),
         file_read_counts: std::collections::HashMap::new(),
