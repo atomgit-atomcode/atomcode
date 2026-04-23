@@ -1,13 +1,11 @@
 use super::*;
 
 impl AgentLoop {
-    // NOTE: `build_turn_reminder` lived here but moved to
-    // `ctx::CtxBuilder::render_turn_reminder` (default impl in
-    // `ctx::render::render_turn_reminder`). The agent is the only
-    // consumer — having it on the ctx trait lets per-model impls
-    // override placement/content without touching agent code.
-    // AgentLoop owns the inputs (`prev_turn_edited_files`,
-    // `current_task`); the ctx owns the rendering policy.
+    // NOTE: the per-turn dynamic reminder mechanism (a string injected
+    // before each LLM turn containing CURRENT TASK + prev edited files)
+    // has been removed. The verbatim user task now rides on the cadence
+    // reflection checkpoint instead — see
+    // `agent::discipline::reflection_prompt`.
 
     pub(crate) fn build_system_prompt(&mut self) -> String {
         // Dynamic rules: select prompt sections based on task type.
