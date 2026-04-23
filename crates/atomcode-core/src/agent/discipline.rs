@@ -149,7 +149,7 @@ pub(crate) fn reflection_prompt(delta: usize, current_task: &str) -> String {
         out.push_str(&format!(
             "1. Restate the original goal in one sentence.\n\
              2. What did those {} steps prove or rule out?\n\
-             3. What is the next concrete output, and how close is it?\n",
+             3. What is the next concrete step?\n",
             delta
         ));
     } else {
@@ -169,7 +169,7 @@ pub(crate) fn reflection_prompt(delta: usize, current_task: &str) -> String {
         out.push_str(&format!(
             "1. Does your current plan still match the task above? If not, correct course now.\n\
              2. What did those {} steps prove or rule out?\n\
-             3. What is the next concrete output, and how close is it?\n",
+             3. What is the next concrete step?\n",
             delta
         ));
     }
@@ -256,8 +256,8 @@ mod reflection_tests {
             "prompt must ask what was learned/ruled out, got: {}", msg
         );
         assert!(
-            msg.contains("next") && (msg.contains("concrete") || msg.contains("output")),
-            "prompt must ask for the next concrete output, got: {}", msg
+            msg.contains("next") && msg.contains("concrete"),
+            "prompt must ask for the next concrete step, got: {}", msg
         );
 
         assert!(!msg.to_lowercase().contains("cargo"));
@@ -343,5 +343,28 @@ mod reflection_tests {
             !msg.contains("ORIGINAL TASK"),
             "empty-task prompt must omit the task block, got: {}", msg
         );
+    }
+
+    #[test]
+    fn reflection_prompt_q3_avoids_termination_bias() {
+        // Q3 must NOT contain phrases that push strong instruction
+        // followers toward landing-and-stopping at the checkpoint.
+        // Evidence (2026-04-23 dogfooding): MiniMax M2.7 treated the
+        // earlier "how close is it?" framing as a landing cue and stopped
+        // at the 2nd cadence trigger before running the core diagnostic
+        // (cargo clippy -D dead_code) on an exploratory task. See commit
+        // history for the Q3 rewrite from "next concrete output, how close"
+        // → "next concrete step".
+        for task in ["", "look for dead code"] {
+            let msg = reflection_prompt(5, task).to_lowercase();
+            assert!(
+                !msg.contains("how close"),
+                "Q3 must not ask 'how close' — termination bias, got: {}", msg
+            );
+            assert!(
+                msg.contains("next concrete step"),
+                "Q3 must ask for the next concrete step, got: {}", msg
+            );
+        }
     }
 }
