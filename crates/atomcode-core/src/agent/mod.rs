@@ -974,64 +974,7 @@ impl AgentLoop {
                     context_window,
                 );
 
-                // Emit rich ContextStats for the `/context` command.
-                // Estimated token counts:
-                // - tool_defs: JSON-serialized size / 4 (rough GPT-style estimate)
-                // - cold_zone: sum of `estimate_tokens` across cold summaries
-                // - system / sent: recomputed from msgs so TUI gets a
-                //   self-consistent snapshot regardless of which path
-                //   fired first
-                let tool_defs_tokens: usize = tool_defs
-                    .iter()
-                    .map(|d| {
-                        // ToolDef { name, description, parameters (Value) }
-                        // Approximation: name + description chars + params JSON.
-                        let params = serde_json::to_string(&d.parameters).unwrap_or_default();
-                        (d.name.len() + d.description.len() + params.len()) / 4
-                    })
-                    .sum();
-
-                let cold_zone_tokens: usize =
-                    conv.cold_summaries.iter().map(|s| s.len() / 4 + 4).sum();
-
-                // Extract the actual System message as rendered by ctx —
-                // this includes the per-model directives that ctx impls
-                // append inside `build_messages` (CN language lock for
-                // MiniMax/Qwen/DeepSeek/Kimi, MiniMax thinking
-                // discipline). Using the pre-ctx `system_prompt` here
-                // would hide those transforms from `/context prompt`.
-                let actual_system_prompt = msgs
-                    .iter()
-                    .find(|m| matches!(m.role, crate::conversation::message::Role::System))
-                    .and_then(|m| m.text().map(|s| s.to_string()))
-                    .unwrap_or_default();
-
-                let system_tokens_local = msgs
-                    .iter()
-                    .find(|m| matches!(m.role, crate::conversation::message::Role::System))
-                    .map(|m| m.estimate_tokens())
-                    .unwrap_or(0);
-                let sent_tokens_local: usize = msgs
-                    .iter()
-                    .map(|m| m.estimate_tokens())
-                    .sum::<usize>()
-                    .saturating_sub(system_tokens_local);
-                let total_messages_local = msgs.len();
-
-                let _ = self.event_tx.send(AgentEvent::ContextStats {
-                    system_tokens: system_tokens_local,
-                    sent_tokens: sent_tokens_local,
-                    dropped_tokens: 0,
-                    working_set_tokens: 0,
-                    total_messages: total_messages_local,
-                    tool_defs_tokens,
-                    cold_zone_tokens,
-                    ctx_window: context_window,
-                    ctx_name: self.ctx.name().to_string(),
-                    // Post-ctx bytes — matches what TurnRunner sends
-                    // (directives included). `/context prompt` reads this.
-                    system_prompt: actual_system_prompt,
-                });
+                self.emit_rich_context_stats(&conv, &msgs);
             }
 
             // Run the turn in a scoped block so all borrows of self.turn_runner
@@ -1760,6 +1703,58 @@ impl AgentLoop {
         self.inject_post_compress_state();
     }
 
+    /// Emit a full ContextStats snapshot for the `/context` command.
+    /// Callers pass the conversation and the already-built `msgs` (from
+    /// `self.ctx.build_messages`) so the estimate reflects exactly what
+    /// the model would see on the next turn — directives and all. Used by
+    /// both `handle_send_message` (once per turn, post-build_messages) and
+    /// `run_compact` (to refresh the cached stats TUI reads for `/context`
+    /// after an out-of-turn compaction).
+    fn emit_rich_context_stats(
+        &self,
+        conv: &Conversation,
+        msgs: &[crate::conversation::message::Message],
+    ) {
+        let tool_defs = self.turn_runner.tools.get_definitions();
+        let tool_defs_tokens: usize = tool_defs
+            .iter()
+            .map(|d| {
+                let params = serde_json::to_string(&d.parameters).unwrap_or_default();
+                (d.name.len() + d.description.len() + params.len()) / 4
+            })
+            .sum();
+        let cold_zone_tokens: usize =
+            conv.cold_summaries.iter().map(|s| s.len() / 4 + 4).sum();
+        let actual_system_prompt = msgs
+            .iter()
+            .find(|m| matches!(m.role, crate::conversation::message::Role::System))
+            .and_then(|m| m.text().map(|s| s.to_string()))
+            .unwrap_or_default();
+        let system_tokens_local = msgs
+            .iter()
+            .find(|m| matches!(m.role, crate::conversation::message::Role::System))
+            .map(|m| m.estimate_tokens())
+            .unwrap_or(0);
+        let sent_tokens_local: usize = msgs
+            .iter()
+            .map(|m| m.estimate_tokens())
+            .sum::<usize>()
+            .saturating_sub(system_tokens_local);
+        let total_messages_local = msgs.len();
+        let _ = self.event_tx.send(AgentEvent::ContextStats {
+            system_tokens: system_tokens_local,
+            sent_tokens: sent_tokens_local,
+            dropped_tokens: 0,
+            working_set_tokens: 0,
+            total_messages: total_messages_local,
+            tool_defs_tokens,
+            cold_zone_tokens,
+            ctx_window: self.ctx.ctx_window(),
+            ctx_name: self.ctx.name().to_string(),
+            system_prompt: actual_system_prompt,
+        });
+    }
+
     /// Post-compression task state restoration. After compression the model
     /// loses track of what it was doing — inject a short status so it can
     /// resume without re-exploring. Shared by auto-compact (threshold-driven
@@ -1804,6 +1799,15 @@ impl AgentLoop {
             removed,
             if removed == 1 { "" } else { "s" },
         )));
+
+        // Refresh the cached ContextStats so `/context` reflects the new
+        // post-compaction shape. Without this, TUI still shows the
+        // pre-compact numbers until the next user turn fires build_messages.
+        let system_prompt = self.build_system_prompt();
+        let (msgs, _) = self
+            .ctx
+            .build_messages(&self.conversation, &system_prompt, "");
+        self.emit_rich_context_stats(&self.conversation, &msgs);
     }
 
     fn finish_turn(&mut self, stop_reason: TurnStopReason) {
