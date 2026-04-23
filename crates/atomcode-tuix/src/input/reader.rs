@@ -2,7 +2,9 @@
 use std::sync::mpsc::{self as stdmpsc, TryRecvError};
 use std::time::Duration;
 
+use crossterm::execute;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{DisableFocusChange, EnableFocusChange};
 use tokio::sync::mpsc;
 
 use super::InputEvent;
@@ -61,6 +63,7 @@ pub enum ReaderCommand {
 pub struct ReaderHandle {
     join: Option<std::thread::JoinHandle<()>>,
     cmd_tx: stdmpsc::Sender<(ReaderCommand, Option<stdmpsc::Sender<()>>)>,
+    focus_tracking_enabled: bool,
 }
 
 impl ReaderHandle {
@@ -101,6 +104,10 @@ impl ReaderHandle {
 impl Drop for ReaderHandle {
     fn drop(&mut self) {
         let _ = self.cmd_tx.send((ReaderCommand::Shutdown, None));
+        if self.focus_tracking_enabled {
+            let _ = execute!(std::io::stdout(), DisableFocusChange);
+            atomcode_core::notify::set_terminal_focus_state(None);
+        }
         // Let the thread finish on its own — we don't join here because
         // the reader may be blocked inside `event::poll` for up to 100ms
         // and we'd rather not stall caller shutdown.
@@ -117,13 +124,27 @@ impl Drop for ReaderHandle {
 /// - `tx` is closed (send returns Err),
 /// - or a fatal crossterm read error fires.
 pub fn spawn(tx: mpsc::UnboundedSender<InputEvent>) -> ReaderHandle {
+    let focus_tracking_enabled = terminal_supports_focus_tracking();
+    if focus_tracking_enabled {
+        let _ = execute!(std::io::stdout(), EnableFocusChange);
+        atomcode_core::notify::set_terminal_focus_state(Some(true));
+    }
     let (cmd_tx, cmd_rx) =
         stdmpsc::channel::<(ReaderCommand, Option<stdmpsc::Sender<()>>)>();
     let join = std::thread::spawn(move || run(tx, cmd_rx));
     ReaderHandle {
         join: Some(join),
         cmd_tx,
+        focus_tracking_enabled,
     }
+}
+
+fn terminal_supports_focus_tracking() -> bool {
+    let term_program = std::env::var("TERM_PROGRAM").unwrap_or_default();
+    let lc_terminal = std::env::var("LC_TERMINAL").unwrap_or_default();
+    term_program == "iTerm.app"
+        || term_program.eq_ignore_ascii_case("iTerm2")
+        || lc_terminal.eq_ignore_ascii_case("iTerm2")
 }
 
 /// Decide what the reader loop should do next, given the `event::poll`
@@ -362,7 +383,15 @@ fn run(
                     }
                     Event::Paste(p) => InputEvent::Paste(p),
                     Event::Resize(w, h) => InputEvent::Resize(w, h),
-                    Event::Mouse(_) | Event::FocusGained | Event::FocusLost => continue,
+                    Event::Mouse(_) => continue,
+                    Event::FocusGained => {
+                        atomcode_core::notify::set_terminal_focus_state(Some(true));
+                        continue;
+                    }
+                    Event::FocusLost => {
+                        atomcode_core::notify::set_terminal_focus_state(Some(false));
+                        continue;
+                    }
                 };
                 if tx.send(msg).is_err() {
                     return;
@@ -384,7 +413,15 @@ fn run(
                 crate::tuix_trace!("RD", "resize {}x{}", w, h);
                 InputEvent::Resize(w, h)
             }
-            Event::Mouse(_) | Event::FocusGained | Event::FocusLost => {
+            Event::Mouse(_) => {
+                continue;
+            }
+            Event::FocusGained => {
+                atomcode_core::notify::set_terminal_focus_state(Some(true));
+                continue;
+            }
+            Event::FocusLost => {
+                atomcode_core::notify::set_terminal_focus_state(Some(false));
                 continue;
             }
         };
@@ -538,4 +575,3 @@ mod tests {
         worker.join().expect("paused worker joins after sender drop");
     }
 }
-

@@ -1881,6 +1881,14 @@ fn handle_agent_event(
                 detail,
             });
             renderer.flush();
+            atomcode_core::notify::notify(
+                &ctx.config.notifications,
+                atomcode_core::notify::NotificationEvent::ApprovalNeeded(atomcode_core::notify::ApprovalNotification {
+                    tool_name: &display_tool_name(&tool_name),
+                    detail: Some(&format_tool_detail(&tool_name, &call.arguments)),
+                    working_dir: Some(&ctx.working_dir),
+                }),
+            );
             state.on_approval_needed(&tool_name);
         }
         AgentEvent::PhaseChange(AgentPhase::Thinking) => state.on_thinking(),
@@ -1889,16 +1897,16 @@ fn handle_agent_event(
         }
         AgentEvent::PhaseChange(_) => {}
         AgentEvent::TurnComplete { duration, total_tokens, turn_count, tool_call_count, stop_reason, messages } => {
-            atomcode_core::notify::notify_turn_finished(
+            atomcode_core::notify::notify(
                 &ctx.config.notifications,
-                atomcode_core::notify::TurnNotification {
+                atomcode_core::notify::NotificationEvent::TurnFinished(atomcode_core::notify::TurnNotification {
                     duration,
                     turn_count,
                     tool_call_count,
                     total_tokens: Some(total_tokens),
                     stop_reason,
                     working_dir: Some(&ctx.working_dir),
-                },
+                }),
             );
             renderer.render(UiLine::AssistantLineBreak);
             pending_tools.clear();
@@ -1943,16 +1951,16 @@ fn handle_agent_event(
             }
         }
         AgentEvent::TurnCancelled { messages } => {
-            atomcode_core::notify::notify_turn_finished(
+            atomcode_core::notify::notify(
                 &ctx.config.notifications,
-                atomcode_core::notify::TurnNotification {
+                atomcode_core::notify::NotificationEvent::TurnFinished(atomcode_core::notify::TurnNotification {
                     duration: state.turn_elapsed().unwrap_or_default(),
                     turn_count: 0,
                     tool_call_count: pending_tools.len(),
                     total_tokens: None,
                     stop_reason: atomcode_core::agent::TurnStopReason::Cancelled,
                     working_dir: Some(&ctx.working_dir),
-                },
+                }),
             );
             // Render any in-flight tool calls that never got a result
             // as "(cancelled)" so the user sees what was mid-flight.

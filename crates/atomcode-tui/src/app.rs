@@ -668,7 +668,15 @@ impl App {
                 self.render_cache_msg_count = 0;
                 self.at_bottom = true;
             }
-            AgentEvent::ApprovalNeeded { tool_name: _, reason: _, call } => {
+            AgentEvent::ApprovalNeeded { tool_name, reason, call } => {
+                atomcode_core::notify::notify(
+                    &self.config.notifications,
+                    atomcode_core::notify::NotificationEvent::ApprovalNeeded(atomcode_core::notify::ApprovalNotification {
+                        tool_name: &tool_name,
+                        detail: Some(if reason.trim().is_empty() { &call.arguments } else { &reason }),
+                        working_dir: Some(&self.working_dir),
+                    }),
+                );
                 self.mode = AppMode::WaitingApproval(call);
             }
             AgentEvent::PhaseChange(phase) => {
@@ -706,16 +714,16 @@ impl App {
                 }
             }
             AgentEvent::TurnComplete { duration, total_tokens: _, turn_count: _, tool_call_count: _, stop_reason, messages: _ } => {
-                atomcode_core::notify::notify_turn_finished(
+                atomcode_core::notify::notify(
                     &self.config.notifications,
-                    atomcode_core::notify::TurnNotification {
+                    atomcode_core::notify::NotificationEvent::TurnFinished(atomcode_core::notify::TurnNotification {
                         duration,
                         turn_count: self.current_step_count,
                         tool_call_count: self.current_tool_call_count,
                         total_tokens: Some(self.turn_tokens),
                         stop_reason,
                         working_dir: Some(&self.working_dir),
-                    },
+                    }),
                 );
                 // Clear any lingering streaming tool state — turn is over.
                 self.streaming_tool_name = None;
@@ -802,16 +810,16 @@ impl App {
                 }
             }
             AgentEvent::TurnCancelled { messages } => {
-                atomcode_core::notify::notify_turn_finished(
+                atomcode_core::notify::notify(
                     &self.config.notifications,
-                    atomcode_core::notify::TurnNotification {
+                    atomcode_core::notify::NotificationEvent::TurnFinished(atomcode_core::notify::TurnNotification {
                         duration: self.turn_start.map(|t| t.elapsed()).unwrap_or_default(),
                         turn_count: self.current_step_count,
                         tool_call_count: self.current_tool_call_count,
                         total_tokens: Some(self.turn_tokens),
                         stop_reason: atomcode_core::agent::TurnStopReason::Cancelled,
                         working_dir: Some(&self.working_dir),
-                    },
+                    }),
                 );
                 // User cancelled - sync the cleaned conversation from agent
                 self.conversation.messages = messages;
