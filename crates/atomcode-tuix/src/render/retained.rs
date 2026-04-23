@@ -772,10 +772,8 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 // diff. Fixed the menu-close ghost welcome
                 // regression.
                 if prev < cap && visible_count > 0 {
-                    let prev_body_top =
-                        prev.saturating_sub(visible_count) + 1;
-                    let new_body_top =
-                        cap.saturating_sub(visible_count) + 1;
+                    let prev_body_top = prev.saturating_sub(visible_count) + 1;
+                    let new_body_top = cap.saturating_sub(visible_count) + 1;
                     if prev_body_top < new_body_top {
                         for row in prev_body_top..new_body_top {
                             let seq = format!("\x1b[{};1H\x1b[K", row);
@@ -1013,10 +1011,90 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let _ = self.out.write_all(&bytes);
     }
 
+    fn build_prefixed_wrapped_rows(
+        &self,
+        prefix: &str,
+        prefix_style: &CellStyle,
+        continuation_prefix: &str,
+        continuation_style: &CellStyle,
+        content: Vec<Cell>,
+        content_width: usize,
+    ) -> Vec<Vec<Cell>> {
+        let prefix_w = crate::width::display_width(prefix);
+        let cont_prefix_w = crate::width::display_width(continuation_prefix);
+        let first_budget = content_width.saturating_sub(prefix_w).max(1);
+        let cont_budget = content_width.saturating_sub(cont_prefix_w).max(1);
+
+        let first_chunks = wrap_cells_to_width(&content, first_budget);
+        let mut rows = Vec::with_capacity(first_chunks.len().max(1));
+        for (idx, chunk) in first_chunks.into_iter().enumerate() {
+            let mut row = Vec::new();
+            let pad = CellStyle::default();
+            push_str_cells(&mut row, &" ".repeat(PAD_COL), &pad);
+            if idx == 0 {
+                push_str_cells(&mut row, prefix, prefix_style);
+            } else {
+                push_str_cells(&mut row, continuation_prefix, continuation_style);
+            }
+            row.extend(chunk);
+            rows.push(row);
+        }
+        if rows.len() <= 1 {
+            return rows;
+        }
+
+        let mut normalized = Vec::new();
+        let mut first = true;
+        for row in rows {
+            if first {
+                normalized.push(row);
+                first = false;
+                continue;
+            }
+
+            let mut content_only = row;
+            let strip = PAD_COL + cont_prefix_w;
+            content_only.drain(..strip.min(content_only.len()));
+
+            let mut wrapped = wrap_cells_to_width(&content_only, cont_budget);
+            for chunk in wrapped.drain(..) {
+                let mut next = Vec::new();
+                let pad = CellStyle::default();
+                push_str_cells(&mut next, &" ".repeat(PAD_COL), &pad);
+                push_str_cells(&mut next, continuation_prefix, continuation_style);
+                next.extend(chunk);
+                normalized.push(next);
+            }
+        }
+        normalized
+    }
+
+    fn build_wrapped_text_rows(
+        &self,
+        parts: &[(&str, CellStyle)],
+        content_width: usize,
+    ) -> Vec<Vec<Cell>> {
+        let mut content = Vec::new();
+        for (text, style) in parts {
+            push_str_cells(&mut content, text, style);
+        }
+        let chunks = wrap_cells_to_width(&content, content_width.max(1));
+        let mut rows = Vec::with_capacity(chunks.len().max(1));
+        for chunk in chunks {
+            let mut row = Vec::new();
+            let pad = CellStyle::default();
+            push_str_cells(&mut row, &" ".repeat(PAD_COL), &pad);
+            row.extend(chunk);
+            rows.push(row);
+        }
+        rows
+    }
+
     fn build_welcome_rows(&self, model: &str, working_dir: &str) -> Vec<Vec<Cell>> {
-        // Mirror AnsiRenderer::render_welcome — compact 6-row greet.
+        // Mirror AnsiRenderer::render_welcome, but allow narrow terminals
+        // to reflow path/model/tips instead of truncating or colliding.
         let w = self.screen.width() as usize;
-        let content_w = w.saturating_sub(PAD_COL * 2);
+        let content_w = w.saturating_sub(PAD_COL * 2).max(1);
         // Row 1: brand left + version · license right
         let left_txt = "◆ AtomCode";
         let right_ver = concat!("v", env!("CARGO_PKG_VERSION"));
@@ -1024,63 +1102,90 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let left_w = crate::width::display_width(left_txt);
         let right_txt = format!("{}  ·  {}", right_ver, right_lic);
         let right_w = crate::width::display_width(&right_txt);
-        let gap = content_w.saturating_sub(left_w + right_w);
         let mut rows = Vec::with_capacity(6);
-        let mut row1 = Vec::new();
         let pad = CellStyle::default();
-        push_str_cells(&mut row1, &" ".repeat(PAD_COL), &pad);
-        push_str_cells(&mut row1, left_txt, &self.style_bold(Role::Brand));
-        for _ in 0..gap {
-            row1.push(Cell::blank());
+        if content_w > left_w + right_w {
+            let gap = content_w.saturating_sub(left_w + right_w);
+            let mut row1 = Vec::new();
+            push_str_cells(&mut row1, &" ".repeat(PAD_COL), &pad);
+            push_str_cells(&mut row1, left_txt, &self.style_bold(Role::Brand));
+            for _ in 0..gap {
+                row1.push(Cell::blank());
+            }
+            push_str_cells(&mut row1, right_ver, &self.style_for(Role::Secondary));
+            push_str_cells(&mut row1, "  ·  ", &self.style_for(Role::Muted));
+            push_str_cells(&mut row1, right_lic, &self.style_for(Role::Muted));
+            rows.push(row1);
+        } else {
+            let mut row1 = Vec::new();
+            push_str_cells(&mut row1, &" ".repeat(PAD_COL), &pad);
+            push_str_cells(&mut row1, left_txt, &self.style_bold(Role::Brand));
+            rows.push(row1);
+
+            let right_gap = content_w.saturating_sub(right_w);
+            let mut row1b = Vec::new();
+            push_str_cells(&mut row1b, &" ".repeat(PAD_COL), &pad);
+            for _ in 0..right_gap {
+                row1b.push(Cell::blank());
+            }
+            push_str_cells(&mut row1b, right_ver, &self.style_for(Role::Secondary));
+            push_str_cells(&mut row1b, "  ·  ", &self.style_for(Role::Muted));
+            push_str_cells(&mut row1b, right_lic, &self.style_for(Role::Muted));
+            rows.push(row1b);
         }
-        push_str_cells(&mut row1, right_ver, &self.style_for(Role::Secondary));
-        push_str_cells(&mut row1, "  ·  ", &self.style_for(Role::Muted));
-        push_str_cells(&mut row1, right_lic, &self.style_for(Role::Muted));
-        rows.push(row1);
 
-        let max_path = w.saturating_sub(6);
-        let cwd_disp = crate::width::truncate_to_width(working_dir, max_path);
-        let mut row2 = Vec::new();
-        push_str_cells(&mut row2, &" ".repeat(PAD_COL), &pad);
-        push_str_cells(&mut row2, "∙ ", &self.style_for(Role::AccentDim));
-        push_str_cells(&mut row2, &cwd_disp, &self.style_for(Role::Secondary));
-        rows.push(row2);
+        let bullet_style = self.style_for(Role::AccentDim);
+        let secondary_style = self.style_for(Role::Secondary);
+        let path_cells = {
+            let mut cells = Vec::new();
+            push_str_cells(&mut cells, working_dir, &secondary_style);
+            cells
+        };
+        rows.extend(self.build_prefixed_wrapped_rows(
+            "∙ ",
+            &bullet_style,
+            "  ",
+            &CellStyle::default(),
+            path_cells,
+            content_w,
+        ));
 
-        let model_disp = crate::width::truncate_to_width(model, max_path);
-        let mut row3 = Vec::new();
-        push_str_cells(&mut row3, &" ".repeat(PAD_COL), &pad);
-        push_str_cells(&mut row3, "∙ ", &self.style_for(Role::AccentDim));
-        push_str_cells(&mut row3, &model_disp, &self.style_for(Role::Secondary));
-        rows.push(row3);
+        let model_cells = {
+            let mut cells = Vec::new();
+            push_str_cells(&mut cells, model, &secondary_style);
+            cells
+        };
+        rows.extend(self.build_prefixed_wrapped_rows(
+            "∙ ",
+            &bullet_style,
+            "  ",
+            &CellStyle::default(),
+            model_cells,
+            content_w,
+        ));
 
         // Blank separator.
         rows.push(Vec::new());
 
         // Hint rows.
-        let mut row5 = Vec::new();
-        push_str_cells(&mut row5, &" ".repeat(PAD_COL), &pad);
-        push_str_cells(
-            &mut row5,
-            "type something, or press  ",
-            &self.style_for(Role::AccentDim),
-        );
-        push_str_cells(&mut row5, "/", &self.style_bold(Role::Accent));
-        push_str_cells(
-            &mut row5,
-            "  to browse commands",
-            &self.style_for(Role::AccentDim),
-        );
-        rows.push(row5);
+        let accent_dim = self.style_for(Role::AccentDim);
+        let accent_bold = self.style_bold(Role::Accent);
+        rows.extend(self.build_wrapped_text_rows(
+            &[
+                ("type something, or press  ", accent_dim.clone()),
+                ("/", accent_bold.clone()),
+                ("  to browse commands", accent_dim.clone()),
+            ],
+            content_w,
+        ));
 
-        let mut row6 = Vec::new();
-        push_str_cells(&mut row6, &" ".repeat(PAD_COL), &pad);
-        push_str_cells(&mut row6, "/provider", &self.style_bold(Role::Accent));
-        push_str_cells(
-            &mut row6,
-            "  to add a custom model",
-            &self.style_for(Role::AccentDim),
-        );
-        rows.push(row6);
+        rows.extend(self.build_wrapped_text_rows(
+            &[
+                ("/provider", accent_bold),
+                ("  to add a custom model", accent_dim),
+            ],
+            content_w,
+        ));
 
         rows
     }
@@ -1102,9 +1207,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
             return;
         }
         let rows = self.build_welcome_rows(model, working_dir);
-        let replace = self.welcome_line_count.min(rows.len());
-        self.body_lines[..replace].clone_from_slice(&rows[..replace]);
-        self.welcome_line_count = rows.len();
+        let new_len = rows.len();
+        self.body_lines
+            .splice(0..self.welcome_line_count, rows.into_iter());
+        self.welcome_line_count = new_len;
     }
 }
 
@@ -2410,24 +2516,80 @@ mod tests {
         let mut pre = crate::test_term::VirtualTerminal::new(80, 18);
         drain_into_vterm(&buf, &mut pre);
 
-        r.on_resize(40, 18);
+        r.on_resize(24, 18);
         r.flush_deferred();
-        let mut post = crate::test_term::VirtualTerminal::new(40, 18);
+        let mut post = crate::test_term::VirtualTerminal::new(24, 18);
         drain_into_vterm(&buf, &mut post);
 
         let brand_row = (0..18)
             .map(|row| post.row_text(row))
             .find(|row| row.contains("AtomCode"))
             .expect("brand row should remain visible after shrinking");
+        let version_row = (0..18)
+            .map(|row| post.row_text(row))
+            .find(|row| row.contains(concat!("v", env!("CARGO_PKG_VERSION"))))
+            .expect("version row should remain visible after shrinking");
         assert!(
-            brand_row.contains(concat!("v", env!("CARGO_PKG_VERSION"))),
-            "version should remain visible after shrinking, row={:?}",
-            brand_row
+            version_row.contains(concat!("v", env!("CARGO_PKG_VERSION"))),
+            "version should remain visible after shrinking, brand_row={:?}, version_row={:?}",
+            brand_row,
+            version_row
         );
         assert!(
-            brand_row.contains("MIT"),
-            "license should remain visible after shrinking, row={:?}",
-            brand_row
+            version_row.contains("MIT"),
+            "license should remain visible after shrinking, brand_row={:?}, version_row={:?}",
+            brand_row,
+            version_row
+        );
+    }
+
+    #[test]
+    fn retained_welcome_reflows_path_model_and_hints_on_narrow_terminal() {
+        let (mut r, buf) = new_capturing(22, 20);
+        let mut vterm = crate::test_term::VirtualTerminal::new(22, 20);
+
+        r.render(UiLine::Welcome {
+            model: "MiniMax-M2.7-long".into(),
+            working_dir: "~/workspace/gitcode_project/atomcode_family/atomcode".into(),
+        });
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status_basic(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        assert!(
+            (0..20).any(|row| vterm.row_text(row).contains("AtomCode")),
+            "brand missing on narrow terminal\n{}",
+            vterm.dump()
+        );
+        assert!(
+            (0..20).any(|row| vterm.row_text(row).contains("workspace")),
+            "path should wrap instead of disappearing on narrow terminal\n{}",
+            vterm.dump()
+        );
+        assert!(
+            (0..20).any(|row| vterm.row_text(row).contains("MiniMax")),
+            "model should wrap instead of disappearing on narrow terminal\n{}",
+            vterm.dump()
+        );
+        assert!(
+            (0..20).any(|row| vterm.row_text(row).contains("type something")),
+            "welcome input hint should remain visible on narrow terminal\n{}",
+            vterm.dump()
+        );
+        assert!(
+            (0..20).any(|row| vterm.row_text(row).contains("commands")),
+            "welcome commands hint should remain visible on narrow terminal\n{}",
+            vterm.dump()
+        );
+        assert!(
+            (0..20).any(|row| vterm.row_text(row).contains("/provider")),
+            "provider hint should remain visible on narrow terminal\n{}",
+            vterm.dump()
         );
     }
 
@@ -3418,12 +3580,12 @@ mod tests {
             .filter(|r| {
                 let txt = vterm.row_text(*r);
                 let trimmed = txt.trim_end();
-                !trimmed.is_empty()
-                    && trimmed.chars().all(|c| c == '\u{2500}')
+                !trimmed.is_empty() && trimmed.chars().all(|c| c == '\u{2500}')
             })
             .count();
         assert_eq!(
-            rule_rows, 2,
+            rule_rows,
+            2,
             "expected 2 rule rows (top + bot), got {} — grow \
              transition left a ghost:\n{}",
             rule_rows,
