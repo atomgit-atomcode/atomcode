@@ -897,7 +897,11 @@ impl<W: Write + Send> RetainedRenderer<W> {
         body: &str,
         body_style: &CellStyle,
     ) {
-        let w = (self.screen.width() as usize).saturating_sub(PAD_COL * 2);
+        // Symbol-anchored rows (user echo, tool call, approval) sit
+        // flush-left at col 0 to align with the input-box chevron.
+        // We keep a PAD_COL right-gutter so long text never touches
+        // the terminal's right edge.
+        let w = (self.screen.width() as usize).saturating_sub(PAD_COL);
         if w == 0 {
             return;
         }
@@ -913,7 +917,6 @@ impl<W: Write + Send> RetainedRenderer<W> {
             for chunk in &chunks {
                 let mut row = Vec::new();
                 let pad = CellStyle::default();
-                push_str_cells(&mut row, &" ".repeat(PAD_COL), &pad);
                 if !first_emitted {
                     push_str_cells(&mut row, prefix, prefix_style);
                     first_emitted = true;
