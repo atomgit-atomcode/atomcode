@@ -1587,6 +1587,18 @@ let session_manager = SessionManager::new(&working_dir);
     tool_registry.register(Box::new(WebSearchTool));
     tool_registry.register(Box::new(WebFetchTool));
     tool_registry.register(Box::new(SearchReplaceTool));
+    
+    // Load skills and register use_skill tool
+    let mut skill_registry = atomcode_core::skill::SkillRegistry::new();
+    skill_registry.reload(&working_dir);
+    let has_skills = !skill_registry.is_empty();
+    let skill_registry = Arc::new(std::sync::RwLock::new(skill_registry));
+    if has_skills {
+        tool_registry.register(Box::new(atomcode_core::tool::use_skill::UseSkillTool { 
+            registry: skill_registry.clone() 
+        }));
+    }
+    
     let shared_tools = Arc::new(tool_registry);
     
     // Create turn runner with auto-bypass permission (API mode - no interactive approval)
@@ -1603,7 +1615,7 @@ let session_manager = SessionManager::new(&working_dir);
     };
     
     // Build system prompt (minimal for API)
-    let system_prompt = build_api_system_prompt(&working_dir);
+    let system_prompt = build_api_system_prompt(&working_dir, &skill_registry);
     // Create turn event channel
     let (turn_tx, mut turn_rx) = mpsc::unbounded_channel::<TurnEvent>();
     
@@ -1770,9 +1782,9 @@ let session_manager = SessionManager::new(&working_dir);
 }
 
 /// Build minimal system prompt for API mode
-fn build_api_system_prompt(working_dir: &PathBuf) -> String {
+fn build_api_system_prompt(working_dir: &PathBuf, skill_registry: &Arc<std::sync::RwLock<atomcode_core::skill::SkillRegistry>>) -> String {
     let cwd = working_dir.to_string_lossy();
-    format!(
+    let mut prompt = format!(
         r#"You are AtomCode, an expert coding agent. You solve tasks efficiently with minimal tool calls.
 
 ## WORKING DIRECTORY
@@ -1790,7 +1802,29 @@ fn build_api_system_prompt(working_dir: &PathBuf) -> String {
 4. VERIFY: After EACH edit, compile/build. Fix errors before moving on.
 5. SUMMARIZE: Tell the user what you changed.
 "#
-    )
+    );
+    
+    // Inject available skills into system prompt
+    if let Ok(registry) = skill_registry.read() {
+        let skills: Vec<String> = registry
+            .invocable_by_llm()
+            .map(|s| {
+                let hint = s.argument_hint
+                    .as_ref()
+                    .map(|h| format!(" {}", h))
+                    .unwrap_or_default();
+                format!("- /{}{}: {}", s.name, hint, s.description)
+            })
+            .collect();
+        if !skills.is_empty() {
+            prompt.push_str("\n## AVAILABLE SKILLS\n");
+            prompt.push_str("Use the `use_skill` tool to invoke a skill when relevant to the task.\n");
+            prompt.push_str(&skills.join("\n"));
+            prompt.push('\n');
+        }
+    }
+    
+    prompt
 }
 
 /// Request to stop a chat session
