@@ -259,10 +259,13 @@ impl Conversation {
             return (self.to_provider_messages_budgeted_fallback(system_msg, remaining), ContextStats::default());
         }
 
-        let mut result = Vec::with_capacity(self.messages.len() + 3);
+        let mut result = Vec::with_capacity(self.messages.len() + 2);
         result.push(system_msg);
 
-        // Inject cold zone summaries (if any)
+        // Fold cold zone summaries into the head System message.
+        // Strict self-hosted gateways (e.g. vLLM-backed Qwen) reject any
+        // additional System after index 0 with "System message must be at
+        // the beginning". Only 1 System total, at the head, is allowed.
         if !self.cold_summaries.is_empty() {
             let cold_text = format!(
                 "[Earlier conversation history ({} compression{})]\n{}",
@@ -270,7 +273,7 @@ impl Conversation {
                 if self.cold_summaries.len() > 1 { "s" } else { "" },
                 self.cold_summaries.join("\n---\n")
             );
-            result.push(Message::new(Role::System, cold_text));
+            Self::append_to_head_system(&mut result, &cold_text);
         }
 
         // Add all current messages
@@ -350,9 +353,10 @@ impl Conversation {
                 drop_count += 1;
             }
 
-            // Rebuild: system + cold zone + drop digest + surviving messages
-            let cold_msgs = if self.cold_summaries.is_empty() { 1 } else { 2 };
-            result.truncate(cold_msgs);
+            // Rebuild: head System (already carries any cold summary folded in)
+            // + overflow digest (also folded in) + surviving messages.
+            // Strict gateways allow only 1 System, at index 0.
+            result.truncate(1);
 
             // Inject mechanical digest of dropped turns so model retains reasoning chain
             if !drop_summaries.is_empty() {
@@ -364,7 +368,7 @@ impl Conversation {
                         .collect::<Vec<_>>()
                         .join("\n")
                 );
-                result.push(Message::new(Role::System, digest));
+                Self::append_to_head_system(&mut result, &digest);
             }
 
             // Find first surviving message, clamped to last_turn_start so the last turn always survives.
@@ -417,10 +421,10 @@ impl Conversation {
             if let Some(last_user) = self.messages.iter().rev()
                 .find(|m| matches!(m.role, Role::User) && matches!(m.content, MessageContent::Text(..)))
             {
-                result.push(Message::new(
-                    Role::System,
+                Self::append_to_head_system(
+                    &mut result,
                     "[Emergency: prior conversation was dropped during compaction. Only the latest user message is preserved.]"
-                ));
+                );
                 result.push(last_user.clone());
             }
         }
@@ -857,6 +861,23 @@ impl Conversation {
             outcome.push_str(&format!(" Last action failed: {}", err_short));
         }
         outcome
+    }
+
+    /// Append meta-context text to the head System message's content.
+    /// Used instead of pushing a second System message, because strict
+    /// self-hosted gateways (vLLM-backed Qwen, etc.) reject any extra
+    /// System with 400 "System message must be at the beginning".
+    fn append_to_head_system(msgs: &mut [Message], text: &str) {
+        if let Some(first) = msgs.first_mut() {
+            if matches!(first.role, Role::System) {
+                if let MessageContent::Text(s) = &mut first.content {
+                    if !s.is_empty() { s.push_str("\n\n"); }
+                    s.push_str(text);
+                    return;
+                }
+            }
+        }
+        debug_assert!(false, "append_to_head_system called without a head System");
     }
 
     /// Fallback windowing when no turns are tracked.
@@ -1662,6 +1683,74 @@ mod tests {
             m.text().map_or(false, |t| t.contains("Earlier conversation history"))
         });
         assert!(has_cold, "Cold zone summary should appear in output");
+    }
+
+    /// Regression: strict self-hosted gateways (vLLM-backed Qwen, etc.) reject
+    /// any extra System message with 400 "System message must be at the
+    /// beginning". Cold summaries / overflow digests / emergency notices must
+    /// all fold into the head System — never a second System message.
+    #[test]
+    fn test_budgeted_emits_single_system_even_with_cold_summary() {
+        use crate::tool::{ToolCall, ToolResult};
+        let mut conv = Conversation::new();
+
+        for turn in 0..8 {
+            conv.add_user_message(&format!("task {}", turn));
+            let call = ToolCall {
+                id: format!("c{}", turn),
+                name: "bash".to_string(),
+                arguments: "{}".to_string(),
+            };
+            conv.add_assistant_tool_calls(Some("ok"), vec![call]);
+            conv.add_tool_result(ToolResult {
+                call_id: format!("c{}", turn),
+                output: "x".repeat(100),
+                success: true,
+            });
+        }
+
+        conv.apply_compression(9, "User ran tasks 0, 1, 2 with bash.".to_string());
+        assert_eq!(conv.cold_summaries.len(), 1);
+
+        let (msgs, _) = conv.to_provider_messages_budgeted("sys", 100000);
+        let system_count = msgs.iter().filter(|m| matches!(m.role, Role::System)).count();
+        assert_eq!(system_count, 1,
+            "strict-gateway invariant: exactly 1 System, got {}", system_count);
+        assert!(matches!(msgs[0].role, Role::System),
+            "the single System must be at index 0");
+        let sys_text = msgs[0].text().unwrap_or("");
+        assert!(sys_text.contains("Earlier conversation history"),
+            "cold summary must be folded into head System, got: {:?}", sys_text);
+    }
+
+    /// Regression: even under context-overflow path (drop digest added),
+    /// the result must still contain exactly one System message.
+    #[test]
+    fn test_budgeted_emits_single_system_even_with_overflow_digest() {
+        use crate::tool::{ToolCall, ToolResult};
+        let mut conv = Conversation::new();
+
+        for turn in 0..5 {
+            conv.add_user_message(&format!("task {}", turn));
+            let call = ToolCall {
+                id: format!("c{}", turn),
+                name: "bash".to_string(),
+                arguments: "{}".to_string(),
+            };
+            conv.add_assistant_tool_calls(Some("ok"), vec![call]);
+            conv.add_tool_result(ToolResult {
+                call_id: format!("c{}", turn),
+                output: "x".repeat(4000),
+                success: true,
+            });
+        }
+
+        let (msgs, stats) = conv.to_provider_messages_budgeted("sys", 2000);
+        assert!(stats.dropped_tokens > 0, "should drop under tight budget");
+        let system_count = msgs.iter().filter(|m| matches!(m.role, Role::System)).count();
+        assert_eq!(system_count, 1,
+            "strict-gateway invariant: exactly 1 System after overflow, got {}", system_count);
+        assert!(matches!(msgs[0].role, Role::System));
     }
 
     #[test]
