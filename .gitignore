@@ -56,6 +56,7 @@ backend.log
 # maintains atomcode source, but NOT pushed (it's personal guidance, may
 # diverge between contributors, and shouldn't imply official project rules).
 /CLAUDE.md
+.claude/settings.local.json
 
 # Local eval harness — kept off version control. Includes scripts,
 # baseline/config TOML (may hold API keys), case inputs, run outputs,
