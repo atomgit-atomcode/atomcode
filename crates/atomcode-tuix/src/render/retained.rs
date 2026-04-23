@@ -2967,6 +2967,38 @@ mod tests {
         );
     }
 
+    /// Plain assistant paragraphs must retain their 2-col indent even
+    /// after symbol-bearing rows move to col 0. Regression guard for
+    /// the hierarchy: symbols at col 0, prose at col 2.
+    #[test]
+    fn retained_assistant_paragraph_indent_preserved() {
+        let (mut r, buf) = new_capturing(80, 24);
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+        let status = status_basic();
+        r.render(UiLine::AssistantText("hello world\n".into()));
+        r.render(UiLine::TurnComplete);
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        let row_idx = (0..vterm.height() as usize)
+            .find(|&i| vterm.row_text(i).contains("hello world"))
+            .unwrap_or_else(|| panic!("assistant text row missing\ndump:\n{}", vterm.dump()));
+        assert_eq!(vterm.cell_at(row_idx, 0).ch, ' ', "col 0 must be blank");
+        assert_eq!(vterm.cell_at(row_idx, 1).ch, ' ', "col 1 must be blank");
+        assert_eq!(
+            vterm.cell_at(row_idx, 2).ch,
+            'h',
+            "assistant text must start at col 2, got row: {:?}",
+            vterm.row_text(row_idx)
+        );
+    }
+
     /// Regression: user reports bot_rule row visibly shortens when
     /// the input wraps from 1 line to 2 lines. Hypothesis: diff
     /// spurious-skips the bot_rule row, or paint_body/footer
