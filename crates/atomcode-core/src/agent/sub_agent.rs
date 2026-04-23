@@ -12,6 +12,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
 use crate::conversation::Conversation;
+use crate::hook::HookRegistry;
 use crate::provider::LlmProvider;
 use crate::tool::{ToolContext, ToolRegistry};
 use crate::turn::event::{TurnEvent, TurnResult};
@@ -508,6 +509,7 @@ impl SubAgentTask {
             config: config.clone(),
             ctx: build_ctx,
             permission,
+            hook_registry: HookRegistry::new(), // Sub-agents don't use hooks for now
             recently_edited_files: Vec::new(),
             hook_executor: std::sync::Arc::new(
                 crate::hook::executor::HookExecutor::new(hooks)

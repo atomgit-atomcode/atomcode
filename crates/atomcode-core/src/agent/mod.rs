@@ -25,6 +25,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
 use crate::conversation::Conversation;
+use crate::hook::HookRegistry;
 use crate::provider::LlmProvider;
 use crate::skill::SkillRegistry;
 use crate::tool::use_skill::UseSkillTool;
@@ -893,6 +894,10 @@ impl AgentLoop {
         let hooks = crate::hook::json_config::load_hooks_config(&working_dir);
         let hook_executor = std::sync::Arc::new(crate::hook::executor::HookExecutor::new(hooks));
 
+        // Initialize hook registry and load hooks from default locations
+        let mut hook_registry = HookRegistry::new();
+        crate::hook::config_loader::load_hooks(&mut hook_registry);
+
         let turn_runner = TurnRunner {
             provider,
             tools: shared_tools.clone(),
@@ -900,6 +905,7 @@ impl AgentLoop {
             config: config.clone(),
             ctx: ctx.clone(),
             permission: interactive_permission,
+            hook_registry,
             recently_edited_files: Vec::new(),
             hook_executor: hook_executor.clone(),
             loop_guard: Default::default(),

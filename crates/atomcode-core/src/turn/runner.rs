@@ -8,6 +8,7 @@ use atomcode_telemetry::{CurrentContext, Event as TelemetryEvent, LlmErrorKind, 
 
 use crate::config::Config;
 use crate::conversation::Conversation;
+use crate::hook::{HookCtx, HookRegistry, ToolResultContext};
 use crate::provider::LlmProvider;
 use crate::stream::StreamEvent;
 use crate::tool::{
@@ -41,6 +42,8 @@ pub struct TurnRunner {
     /// clone.
     pub ctx: std::sync::Arc<dyn crate::ctx::CtxBuilder>,
     pub permission: Box<dyn PermissionDecider>,
+    /// Hook registry for pre/post tool execution hooks
+    pub hook_registry: HookRegistry,
     /// Files edited during the current session (tracked for context awareness).
     pub recently_edited_files: Vec<String>,
     /// Hook executor — runs user-configured lifecycle hooks at tool execution boundaries.
@@ -767,6 +770,22 @@ impl TurnRunner {
         //    Use the FILTERED accumulator so downstream consumers
         //    (datalog `log_text`, ATLAS plan extraction, telemetry)
         //    see clean prose, not raw text_buf with leaked XML
+        //    tool_call blocks.
+        if tool_calls_buf.is_empty() {
+            // Trigger post-turn hooks for Responded
+            self.trigger_post_turn_hooks("Responded").await;
+            
+            return TurnResult::Responded {
+                text: visible_text_buf,
+                tokens: total_tokens,
+                truncated: was_truncated,
+            };
+        }
+
+        // 5. If no tool calls, we're done — LLM produced text only.
+        //    Use the FILTERED accumulator so downstream consumers
+        //    (datalog `log_text`, ATLAS plan extraction, telemetry)
+        //    see clean prose, not raw text_buf with leaked XML
         //    tool_call blocks. Earlier bug: 5-7 atomgr datalog
         //    20-14-23 Turn 5 logged `### 3. 传输层安全<tool_call>grep
         //    <arg_key>...` because Responded.text was raw.
@@ -998,6 +1017,9 @@ impl TurnRunner {
             });
         }
 
+        // Trigger post-turn hooks
+        self.trigger_post_turn_hooks("UsedTools").await;
+
         // Truncate oversized tool outputs before returning. Without this,
         // a single `ls -la node_modules` / wide `find` dump (multi-MB)
         // stays raw in `conversation.messages` and the NEXT LLM call
@@ -1028,6 +1050,17 @@ impl TurnRunner {
             },
             tool_count
         );
+    }
+
+    /// Helper to trigger post-turn hooks with proper context
+    async fn trigger_post_turn_hooks(&self, turn_result: &str) {
+        let working_dir = self.context.working_dir.read().await.clone();
+        let hook_ctx = HookCtx::new(
+            "".to_string(),
+            "".to_string(),
+            working_dir.to_string_lossy().to_string(),
+        );
+        self.hook_registry.trigger_post_turn_hooks(&hook_ctx, turn_result).await;
     }
 
     /// EXECUTE mode: run one LLM turn with minimal context.
@@ -1293,7 +1326,7 @@ impl TurnRunner {
             }
         }
 
-        // --- PreToolUse Hook ---
+        // --- PreToolUse Hook (upstream) ---
         if self.hook_executor.has_hooks() {
             let hook_ctx = self.build_hook_context(
                 "pre_tool_use",
@@ -1339,6 +1372,41 @@ impl TurnRunner {
             }
         }
 
+        // --- Pre-tool execution hooks (PR) ---
+        let working_dir = self.context.working_dir.read().await.clone();
+        let pr_hook_ctx = HookCtx::new(
+            call.name.clone(),
+            call.arguments.clone(),
+            working_dir.to_string_lossy().to_string(),
+        );
+        
+        let mut final_args = call.arguments.clone();
+        match self.hook_registry.trigger_pre_tool_hooks(&pr_hook_ctx).await {
+            Ok(Some(new_args)) => {
+                // Hook modified the arguments
+                final_args = new_args;
+            }
+            Ok(None) => {
+                // Hooks passed, continue with original args
+            }
+            Err(reason) => {
+                // Hook denied execution
+                let output = format!("Tool '{}' was blocked by hook: {}", call.name, reason);
+                let _ = event_tx.send(TurnEvent::ToolCallResult {
+                    call_id: call.id.clone(),
+                    name: call.name.clone(),
+                    output: output.clone(),
+                    success: false,
+                    duration: std::time::Duration::ZERO,
+                });
+                return ToolResult {
+                    call_id: call.id.clone(),
+                    output,
+                    success: false,
+                };
+            }
+        }
+
         // Snapshot the shared working directory before executing. Tools like
         // `change_dir` and `bash` (when the command starts with `cd`) mutate
         // `ctx.working_dir` in place; we compare before/after to emit a
@@ -1358,7 +1426,7 @@ impl TurnRunner {
         // is acceptable — user pressed Ctrl+C knowing they want to stop.
         let start = Instant::now();
         let result = tokio::select! {
-            r = tool.execute(&call.arguments, &self.context) => r,
+            r = tool.execute(&final_args, &self.context) => r,
             _ = cancel.cancelled() => {
                 // Clean up event sender
                 self.context.event_tx = None;
@@ -1421,7 +1489,7 @@ impl TurnRunner {
             },
         };
 
-        // --- PostToolUse Hook ---
+        // --- PostToolUse Hook (upstream) ---
         if self.hook_executor.has_hooks() {
             let hook_ctx = self.build_hook_context(
                 "post_tool_use",
@@ -1432,6 +1500,17 @@ impl TurnRunner {
             );
             self.hook_executor.run_post_tool_use(&call.name, &hook_ctx).await;
         }
+
+        // --- Post-tool execution hooks (PR) ---
+        let result_ctx = ToolResultContext {
+            tool_name: call.name.clone(),
+            tool_args: final_args.clone(),
+            result: tool_result.output.clone(),
+            success: tool_result.success,
+            duration_ms: duration.as_millis() as u64,
+        };
+        
+        self.hook_registry.trigger_post_tool_hooks(&pr_hook_ctx, &result_ctx).await;
 
         let _ = event_tx.send(TurnEvent::ToolCallResult {
             call_id: call.id.clone(),

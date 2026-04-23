@@ -345,6 +345,7 @@ fn make_runner(
         config: test_config(),
         ctx: test_ctx,
         permission,
+        hook_registry: crate::hook::HookRegistry::new(),
         recently_edited_files: Vec::new(),
         hook_executor: std::sync::Arc::new(
             crate::hook::executor::HookExecutor::empty()
