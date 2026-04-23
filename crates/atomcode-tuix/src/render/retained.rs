@@ -1069,6 +1069,17 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // vertical gaps that feel "unfinished". Allow at most one
         // blank row in a row — enough for paragraph separation,
         // nothing more.
+        //
+        // Special case: when the live spinner is the tail row, also
+        // skip blank pushes. Many models emit a leading `\n` warm-up
+        // before the first real reply chunk. Without this, that
+        // leading blank evicts the spinner + leaves a ghost blank
+        // row that the NEXT (non-blank) chunk then scrolls above
+        // the real content — producing a visible double-blank
+        // between the user message and the assistant reply. The
+        // spinner itself is transient (not a historical paragraph),
+        // so there's no paragraph boundary here worth marking with
+        // a blank.
         let is_blank = rendered.trim().is_empty();
         if is_blank {
             let tail_blank = self
@@ -1076,7 +1087,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 .last()
                 .map(|r| r.iter().all(|c| c.ch == ' '))
                 .unwrap_or(true);
-            if tail_blank {
+            if tail_blank || self.live_spinner_active {
                 return;
             }
         }
@@ -3201,6 +3212,58 @@ mod tests {
             !spinner_in_history,
             "spinner row still in body_lines — it must be popped when \
              covered"
+        );
+    }
+
+    /// Models commonly emit a leading `\n` (or several) before
+    /// actual reply text — a warm-up that prior code treated as a
+    /// paragraph-boundary blank because the tail was the live
+    /// spinner (non-blank cells, fails `tail_blank` check). Result
+    /// was a ghost blank row between the user message spacer and
+    /// the first real content. Fix: treat "tail is live spinner"
+    /// the same as "tail is blank" — the spinner is transient, not
+    /// a paragraph we need to visually separate from.
+    #[test]
+    fn retained_leading_blank_assistant_text_does_not_add_ghost_row() {
+        let (mut r, buf) = new_capturing(80, 24);
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+        let status = status_basic();
+
+        r.render(UiLine::User("hi-from-user".into()));
+        r.flush_deferred();
+        r.render(UiLine::StreamingBox {
+            buf: String::new(),
+            cursor_byte: 0,
+            frame: "⠋",
+            label: "Pondering".into(),
+            status: status.clone(),
+            menu: None,
+        });
+        // Leading `\n` warm-up from the model — this is the case
+        // that produces the ghost blank before the fix.
+        r.render(UiLine::AssistantText("\n".into()));
+        // Then the real content.
+        r.render(UiLine::AssistantText("Hello world\n".into()));
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        let user_row = (0..24)
+            .find(|r| vterm.row_text(*r).contains("hi-from-user"))
+            .unwrap_or_else(|| panic!("user echo missing:\n{}", vterm.dump()));
+        let hello_row = (0..24)
+            .find(|r| vterm.row_text(*r).contains("Hello world"))
+            .unwrap_or_else(|| panic!("Hello world missing:\n{}", vterm.dump()));
+
+        // Exactly ONE blank between user and assistant (the
+        // user-message spacer). A ghost blank would make it 2.
+        assert_eq!(
+            hello_row - user_row,
+            2,
+            "expected 1 blank row between user and assistant, got {} \
+             blank row(s) — leading `\\n` from model created a ghost \
+             spacer:\n{}",
+            hello_row.saturating_sub(user_row).saturating_sub(1),
+            vterm.dump()
         );
     }
 

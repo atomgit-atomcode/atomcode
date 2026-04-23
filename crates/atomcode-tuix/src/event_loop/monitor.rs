@@ -16,7 +16,7 @@
 // while sending a wake pulse). Non-CodingPlan providers never enter
 // this path — `is_codingplan_provider` gates every trigger.
 
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use atomcode_core::config::Config;
 
@@ -41,20 +41,23 @@ impl CodingPlanWarning {
     pub fn display_text(&self) -> String {
         match self {
             Self::ModelMissing(name) => format!("⚠ '{}' 已下线 — /codingplan", name),
-            Self::StaleList => "ⓘ CodingPlan 列表有更新 — /codingplan".into(),
+            Self::StaleList => "ⓘ CodingPlan 模型列表更新 — 可执行/codingplan".into(),
         }
     }
 }
 
-/// Staleness threshold: 24 hours. Exposed as a `pub const` so tests
-/// can exercise boundary conditions without drifting.
-pub const STALE_THRESHOLD: Duration = Duration::from_secs(24 * 3600);
-
-/// Minimum interval between successive background checks inside a
-/// single TUI session — prevents hitting the API on every turn.
-/// User can still force a fresh check by re-running `/codingplan` or
-/// switching providers via `/model`.
-pub const CHECK_COOLDOWN: Duration = Duration::from_secs(15 * 60);
+/// Rate limit for the background drift check — `spawn_check` won't
+/// hit `/coding-plan/models` more than once per this interval within a
+/// single TUI session. Doesn't gate warnings: once a check has run and
+/// drift is detected, the user is told immediately regardless of when
+/// they last ran `/codingplan`. Startup always does one check (the
+/// in-session `Instant` resets on restart).
+///
+/// 1 hour is a balance between:
+///   * fast enough that server-side additions get surfaced within a
+///     reasonable time on long-running sessions
+///   * slow enough that every user message doesn't burn an API round-trip
+pub const CHECK_COOLDOWN: Duration = Duration::from_secs(3600);
 
 /// Prefix that marks a provider as CodingPlan-managed (matches the
 /// wipe logic in `coding_plan::setup::is_codingplan_provider_name`).
@@ -80,17 +83,24 @@ pub fn local_atomgit_models(config: &Config) -> Vec<String> {
         .collect()
 }
 
-/// Pure decision function. Given the current moment, the persisted
-/// sync timestamp, the active model, the server's model list, and the
-/// local AtomGit* model list, returns the warning to display (or
-/// `None` if everything is fine).
+/// Pure decision function. Given the active model, the server's model
+/// list, and the local AtomGit* model list, returns the warning to
+/// display (or `None` if everything is fine).
 ///
 /// Priority: `ModelMissing` always wins over `StaleList` when both
 /// conditions could fire — surfacing a model that's about to break is
 /// more urgent than informing about silent drift.
+///
+/// No "recently synced" gate: once `spawn_check` has paid the HTTP
+/// round-trip and the response shows drift, the information is
+/// authoritative and the user should be told immediately — regardless
+/// of how recently they ran `/codingplan`. The original 24h gate was
+/// a solution to a non-problem: right after a successful `/codingplan`,
+/// `sorted_eq(server, local)` is true by construction (setup wipes
+/// AtomGit* entries and re-populates from the same server response),
+/// so no `StaleList` fires anyway. Rate-limiting the HTTP call itself
+/// is `CHECK_COOLDOWN`'s job.
 pub fn decide_warning(
-    now: SystemTime,
-    last_sync_at: Option<SystemTime>,
     default_model: &str,
     server_models: &[String],
     local_models: &[String],
@@ -99,12 +109,9 @@ pub fn decide_warning(
     if !server_models.iter().any(|m| m == default_model) {
         return Some(CodingPlanWarning::ModelMissing(default_model.to_string()));
     }
-    // Priority 2: local config stale (> 24h or never) AND lists drift.
-    let stale = match last_sync_at {
-        Some(t) => now.duration_since(t).unwrap_or_default() >= STALE_THRESHOLD,
-        None => true,
-    };
-    if stale && !sorted_eq(server_models, local_models) {
+    // Priority 2: any drift at all — the server list differs from what
+    // we have in config.
+    if !sorted_eq(server_models, local_models) {
         return Some(CodingPlanWarning::StaleList);
     }
     None
@@ -148,14 +155,7 @@ pub fn spawn_check(
         };
 
         let local_models = local_atomgit_models(&config_snapshot);
-        let last_sync = atomcode_core::coding_plan::read_last_sync();
-        let warning = decide_warning(
-            std::time::SystemTime::now(),
-            last_sync,
-            &default_model,
-            &server_models,
-            &local_models,
-        );
+        let warning = decide_warning(&default_model, &server_models, &local_models);
         if let Ok(mut g) = slot.lock() {
             *g = warning;
         }
@@ -202,88 +202,56 @@ mod tests {
         assert!(sorted_eq(&s(&[]), &s(&[])));
     }
 
-    /// Row 1: active model in server list, config fresh → no warning.
+    /// Active model in server list, lists match → no warning.
     #[test]
-    fn decide_no_warning_when_fresh_and_in_list() {
-        let now = SystemTime::now();
-        let fresh = Some(now - Duration::from_secs(60));
+    fn decide_no_warning_when_in_list_and_match() {
         let server = s(&["m1", "m2"]);
         let local = s(&["m1", "m2"]);
-        assert_eq!(decide_warning(now, fresh, "m1", &server, &local), None);
+        assert_eq!(decide_warning("m1", &server, &local), None);
     }
 
-    /// Row 2: > 24h but lists match → no warning (nothing changed).
+    /// Lists match (order differs) → still no warning — `sorted_eq`
+    /// does the order-independent comparison.
     #[test]
-    fn decide_no_warning_when_stale_but_lists_match() {
-        let now = SystemTime::now();
-        let stale = Some(now - Duration::from_secs(25 * 3600));
+    fn decide_no_warning_when_lists_match_out_of_order() {
         let server = s(&["m1", "m2"]);
-        let local = s(&["m2", "m1"]); // order differs
-        assert_eq!(decide_warning(now, stale, "m1", &server, &local), None);
+        let local = s(&["m2", "m1"]);
+        assert_eq!(decide_warning("m1", &server, &local), None);
     }
 
-    /// Row 3: > 24h AND lists differ → StaleList.
+    /// Lists differ → StaleList. No "recently synced" escape — we've
+    /// already done the HTTP round-trip and the drift is real.
+    /// Regression for the bug where a user who ran `/codingplan` 3 min
+    /// before restart got no hint even though the server had added a
+    /// new model during those 3 min.
     #[test]
-    fn decide_stale_warning_when_stale_and_lists_differ() {
-        let now = SystemTime::now();
-        let stale = Some(now - Duration::from_secs(25 * 3600));
+    fn decide_stale_warning_whenever_lists_differ() {
         let server = s(&["m1", "m2"]);
         let local = s(&["m1"]); // missing m2
         assert_eq!(
-            decide_warning(now, stale, "m1", &server, &local),
+            decide_warning("m1", &server, &local),
             Some(CodingPlanWarning::StaleList)
         );
     }
 
-    /// Row 4: active model not in server list → ModelMissing, regardless
-    /// of staleness.
+    /// Active model not in server list → ModelMissing.
     #[test]
-    fn decide_model_missing_overrides_stale_check() {
-        let now = SystemTime::now();
-        let fresh = Some(now - Duration::from_secs(60));
+    fn decide_model_missing_when_active_model_gone() {
         let server = s(&["m2", "m3"]);
         let local = s(&["m1", "m2", "m3"]);
         assert_eq!(
-            decide_warning(now, fresh, "m1", &server, &local),
+            decide_warning("m1", &server, &local),
             Some(CodingPlanWarning::ModelMissing("m1".into()))
         );
     }
 
-    /// Row 5: last_sync_at = None (never synced) → treat as stale →
-    /// StaleList when lists differ.
-    #[test]
-    fn decide_never_synced_counts_as_stale() {
-        let now = SystemTime::now();
-        let server = s(&["m1", "m2"]);
-        let local = s(&["m1"]);
-        assert_eq!(
-            decide_warning(now, None, "m1", &server, &local),
-            Some(CodingPlanWarning::StaleList)
-        );
-    }
-
-    /// Row 5b: last_sync_at = None but lists happen to match → no warning.
-    /// Edge case: fresh install, user just ran /codingplan once but the
-    /// marker write failed; we shouldn't spam StaleList pre-emptively
-    /// when the local config IS in sync with the server.
-    #[test]
-    fn decide_never_synced_no_warning_when_lists_match() {
-        let now = SystemTime::now();
-        let server = s(&["m1", "m2"]);
-        let local = s(&["m1", "m2"]);
-        assert_eq!(decide_warning(now, None, "m1", &server, &local), None);
-    }
-
-    /// Row 6: priority — ModelMissing wins over StaleList when both
-    /// could fire (stale + lists differ + default gone).
+    /// Priority: ModelMissing wins over StaleList when both could fire.
     #[test]
     fn decide_model_missing_wins_over_stale() {
-        let now = SystemTime::now();
-        let stale = Some(now - Duration::from_secs(25 * 3600));
         let server = s(&["m2"]);
         let local = s(&["m1"]);
         assert_eq!(
-            decide_warning(now, stale, "m1", &server, &local),
+            decide_warning("m1", &server, &local),
             Some(CodingPlanWarning::ModelMissing("m1".into()))
         );
     }
@@ -296,7 +264,7 @@ mod tests {
         );
         assert_eq!(
             CodingPlanWarning::StaleList.display_text(),
-            "ⓘ CodingPlan 列表有更新 — /codingplan"
+            "ⓘ CodingPlan 模型列表更新 — 可执行/codingplan"
         );
     }
 }

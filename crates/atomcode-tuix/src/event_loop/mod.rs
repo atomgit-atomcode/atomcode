@@ -768,6 +768,38 @@ pub async fn run_loop(
         renderer.flush();
     }
 
+    // Startup CodingPlan drift check. Without this, a user who ran
+    // `/codingplan` days ago and now sees a new model in the plan lineup
+    // wouldn't learn until they typed a message — the mid-turn trigger
+    // at the submit-path only fires on user action. Gating:
+    //
+    //   * Only when the active provider is an AtomGit* (CodingPlan)
+    //     provider — non-CodingPlan users do zero network work on boot.
+    //   * Still respects the 15-min cooldown against `monitor_last_check_at`
+    //     so rapid restarts (e.g. crash-loop during development) don't
+    //     spam the API gateway.
+    //
+    // The check itself is fully async (`spawn_check` returns immediately
+    // and runs on a tokio task); the event loop entering its main tick
+    // loop below isn't blocked, and the warning — when it arrives a
+    // second or two later — wakes the loop via `wake_tx` so the status
+    // row repaints without the user needing to press a key.
+    if monitor::is_codingplan_provider(&ctx.config.default_provider) {
+        let cooled = ctx
+            .monitor_last_check_at
+            .map(|t| t.elapsed() >= monitor::CHECK_COOLDOWN)
+            .unwrap_or(true);
+        if cooled {
+            ctx.monitor_last_check_at = Some(std::time::Instant::now());
+            monitor::spawn_check(
+                ctx.config.clone(),
+                ctx.model_name.clone(),
+                ctx.monitor_warning.clone(),
+                ctx.wake_tx.clone(),
+            );
+        }
+    }
+
     // Spinner tick channel — a background task fires a tick every 100ms
     // into a bounded (cap 1) mpsc. The main loop recv's this in the
     // `tokio::select!` alongside the agent-event channel, so spinner
@@ -2055,7 +2087,9 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
     let no_provider = ctx.config.providers.is_empty()
         && atomcode_core::auth::get_stored_auth().is_none();
     // Priority: no-provider (Warning red) > CodingPlan drift monitor
-    // (ModelMissing = Warning, StaleList = Info) > upgrade banner (Info).
+    // (both ModelMissing and StaleList render as Warning red — model
+    // list drift is an actionable UX event worth the same visual weight
+    // as "active model gone") > upgrade banner (Info dim).
     // Only one hint can render at a time (right-aligned on the status row).
     let hint: Option<(String, crate::render::HintSeverity)> = if no_provider {
         Some((
@@ -2068,15 +2102,7 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
         .ok()
         .and_then(|g| g.clone())
     {
-        let severity = match &warning {
-            crate::event_loop::monitor::CodingPlanWarning::ModelMissing(_) => {
-                crate::render::HintSeverity::Warning
-            }
-            crate::event_loop::monitor::CodingPlanWarning::StaleList => {
-                crate::render::HintSeverity::Info
-            }
-        };
-        Some((warning.display_text(), severity))
+        Some((warning.display_text(), crate::render::HintSeverity::Warning))
     } else {
         ctx.update_hint
             .lock()

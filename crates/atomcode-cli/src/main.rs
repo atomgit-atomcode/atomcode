@@ -1160,6 +1160,7 @@ fn run_codingplan_core() -> Result<String> {
             datalog: Default::default(),
             auto_update: true,
             reflection_cadence: 7,
+            notifications: Default::default(),
         },
     };
 
