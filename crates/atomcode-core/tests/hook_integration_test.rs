@@ -186,6 +186,8 @@ fn test_config() -> Config {
             user_agent: None,
             context_window: 16000,
             max_tokens: None,
+            thinking_type: None,
+            thinking_keep: None,
             ephemeral: false,
         },
     );
@@ -194,7 +196,9 @@ fn test_config() -> Config {
         default_workdir: None,
         providers,
         datalog: Default::default(),
+        notifications: Default::default(),
         auto_update: false,
+        reflection_cadence: 0,
     }
 }
 
@@ -206,11 +210,28 @@ fn create_test_runner(provider: MockProvider, hook_registry: HookRegistry) -> Tu
     let mut registry = ToolRegistry::new();
     registry.register(Box::new(MockEchoTool));
 
+    let test_provider = atomcode_core::config::provider::ProviderConfig {
+        provider_type: "mock".to_string(),
+        api_key: None,
+        model: "mock-model".to_string(),
+        base_url: None,
+        system_prompt: None,
+        user_agent: None,
+        context_window: 16000,
+        max_tokens: None,
+        thinking_type: None,
+        thinking_keep: None,
+        ephemeral: false,
+    };
+    let test_ctx: std::sync::Arc<dyn atomcode_core::ctx::CtxBuilder> =
+        std::sync::Arc::new(atomcode_core::ctx::DefaultCtx::new(&test_provider));
+
     TurnRunner {
         provider: Arc::new(provider),
         tools: Arc::new(registry),
         context: test_context(),
         config: test_config(),
+        ctx: test_ctx,
         permission: Box::new(AutoPermissionDecider::new(AutoPermissionMode::BypassAll)),
         hook_registry,
         recently_edited_files: Vec::new(),

@@ -71,7 +71,7 @@ impl ClaudeProvider {
                                 "content": [{"type": "text", "text": s}]
                             }));
                         }
-                        MessageContent::AssistantWithToolCalls { text, tool_calls } => {
+                        MessageContent::AssistantWithToolCalls { text, tool_calls, .. } => {
                             let mut parts: Vec<serde_json::Value> = Vec::new();
                             if let Some(t) = text {
                                 if !t.is_empty() {

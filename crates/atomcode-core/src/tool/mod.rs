@@ -23,6 +23,8 @@ pub mod web_search;
 pub mod write;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
 /// Directories to skip when scanning file trees (build artifacts, caches, VCS).
 /// Used by glob, list_dir, project_context, and collect_project_files.
@@ -59,12 +61,252 @@ pub const SKIP_DIR_PREFIXES: &[&str] = &[".venv-"];
 pub fn should_skip_dir(name: &str) -> bool {
     SKIP_DIRS.contains(&name) || SKIP_DIR_PREFIXES.iter().any(|p| name.starts_with(p))
 }
-use std::path::PathBuf;
-use std::sync::Arc;
 
-use anyhow::Result;
+/// Count of leading characters shared between two paths. Used by read_file
+/// and glob 404 recovery to rank candidate suggestions: the match with the
+/// longest shared prefix with what the agent actually asked for is almost
+/// always the one it wanted. Pure character count, tech-neutral — no path
+/// segment parsing (avoids per-OS separator logic).
+pub fn shared_prefix_len(a: &str, b: &str) -> usize {
+    a.chars().zip(b.chars()).take_while(|(x, y)| x == y).count()
+}
+
+use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use tokio::sync::{Mutex, RwLock};
+
+fn expand_user_path(path: &str) -> PathBuf {
+    if path == "~" {
+        return dirs::home_dir().unwrap_or_else(|| PathBuf::from(path));
+    }
+
+    if let Some(rest) = path.strip_prefix("~/") {
+        return dirs::home_dir()
+            .map(|home| home.join(rest))
+            .unwrap_or_else(|| PathBuf::from(path));
+    }
+
+    PathBuf::from(path)
+}
+
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                let can_pop = normalized
+                    .components()
+                    .next_back()
+                    .is_some_and(|last| matches!(last, Component::Normal(_)));
+                if can_pop {
+                    normalized.pop();
+                } else if normalized.as_os_str().is_empty() {
+                    normalized.push(component.as_os_str());
+                }
+            }
+            Component::RootDir | Component::Prefix(_) | Component::Normal(_) => {
+                normalized.push(component.as_os_str());
+            }
+        }
+    }
+
+    normalized
+}
+
+fn canonicalize_candidate_path(path: &Path) -> Result<PathBuf> {
+    if path.exists() {
+        return std::fs::canonicalize(path)
+            .with_context(|| format!("Failed to resolve path {}", path.display()));
+    }
+
+    let mut missing_parts = Vec::new();
+    let mut current = path;
+
+    loop {
+        if current.exists() {
+            let mut resolved = std::fs::canonicalize(current)
+                .with_context(|| format!("Failed to resolve parent path {}", current.display()))?;
+            for part in missing_parts.iter().rev() {
+                resolved.push(part);
+            }
+            return Ok(resolved);
+        }
+
+        let name = current.file_name().ok_or_else(|| {
+            anyhow::anyhow!("Path {} has no existing parent directory", path.display())
+        })?;
+        missing_parts.push(name.to_os_string());
+        current = current.parent().ok_or_else(|| {
+            anyhow::anyhow!("Path {} has no existing parent directory", path.display())
+        })?;
+    }
+}
+
+pub struct ResolvedPath {
+    pub path: PathBuf,
+    pub workspace_root: PathBuf,
+    pub within_workspace: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExternalPathAction {
+    Enumerate,
+    Read,
+    Write,
+}
+
+pub fn inspect_path_access(raw_path: &str, working_dir: &Path) -> Result<ResolvedPath> {
+    let workspace_root = std::fs::canonicalize(working_dir)
+        .with_context(|| format!("Failed to resolve working directory {}", working_dir.display()))?;
+    let expanded = expand_user_path(raw_path);
+    let candidate = if expanded.is_absolute() {
+        expanded
+    } else {
+        working_dir.join(expanded)
+    };
+    let candidate = normalize_path(&candidate);
+    let resolved = canonicalize_candidate_path(&candidate)?;
+
+    Ok(ResolvedPath {
+        within_workspace: resolved.starts_with(&workspace_root),
+        path: resolved,
+        workspace_root,
+    })
+}
+
+pub fn resolve_workspace_path(raw_path: &str, working_dir: &Path) -> Result<PathBuf> {
+    let resolved = inspect_path_access(raw_path, working_dir)?;
+    if resolved.within_workspace {
+        Ok(resolved.path)
+    } else {
+        bail!(
+            "Access denied: {} resolves outside working directory {}",
+            raw_path,
+            resolved.workspace_root.display()
+        );
+    }
+}
+
+fn is_sensitive_path(path: &Path) -> bool {
+    const SYSTEM_PROTECTED_PREFIXES: &[&str] = &[
+        "/System",
+        "/bin",
+        "/sbin",
+        "/usr",
+        "/var",
+        "/private/etc",
+        "/private/var",
+        "/etc",
+        "/root",
+        "/var/root",
+        "/private/var/root",
+    ];
+    const SYSTEM_PROTECTED_EXCEPTIONS: &[&str] = &[
+        "/usr/local",
+        "/private/usr/local",
+        "/Applications",
+        "/Library",
+        "/var/folders",
+        "/private/var/folders",
+        "/var/tmp",
+        "/private/var/tmp",
+    ];
+    const SECRET_HOME_DIRS: &[&str] = &[".ssh", ".aws", ".gnupg", ".config"];
+    const SECRET_FILE_NAMES: &[&str] = &[
+        ".bashrc", ".bash_profile", ".zshrc", ".zprofile", ".zshenv",
+        ".npmrc", ".pypirc", ".env", ".env.local", "credentials", "config",
+        "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519",
+    ];
+    const SECRET_EXTS: &[&str] = &["pem", "key", "p12", "pfx", "der", "crt", "cer"];
+
+    let has_protected_prefix = SYSTEM_PROTECTED_PREFIXES.iter().any(|prefix| {
+        path == Path::new(prefix) || path.starts_with(prefix)
+    });
+    let has_exception_prefix = SYSTEM_PROTECTED_EXCEPTIONS.iter().any(|prefix| {
+        path == Path::new(prefix) || path.starts_with(prefix)
+    });
+
+    if has_protected_prefix && !has_exception_prefix {
+        return true;
+    }
+
+    if let Some(home) = dirs::home_dir() {
+        for dir in SECRET_HOME_DIRS {
+            if path.starts_with(home.join(dir)) {
+                return true;
+            }
+        }
+
+        for file in SECRET_FILE_NAMES {
+            if path == home.join(file) {
+                return true;
+            }
+        }
+    }
+
+    if path.file_name().and_then(|n| n.to_str()).is_some_and(|name| {
+        SECRET_FILE_NAMES.contains(&name)
+    }) {
+        return true;
+    }
+
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| SECRET_EXTS.iter().any(|candidate| ext.eq_ignore_ascii_case(candidate)))
+}
+
+pub fn approval_for_path(
+    raw_path: &str,
+    working_dir: &Path,
+    action: ExternalPathAction,
+) -> Result<ApprovalRequirement> {
+    let access = inspect_path_access(raw_path, working_dir)?;
+    if access.within_workspace {
+        return Ok(ApprovalRequirement::AutoApprove);
+    }
+
+    let sensitive = is_sensitive_path(&access.path);
+    let action_label = match action {
+        ExternalPathAction::Enumerate => "Accessing",
+        ExternalPathAction::Read => "Reading",
+        ExternalPathAction::Write => "Writing",
+    };
+    let base_reason = format!(
+        "{} path outside working directory: {} (working dir: {})",
+        action_label,
+        raw_path,
+        access.workspace_root.display()
+    );
+
+    Ok(match action {
+        ExternalPathAction::Enumerate => {
+            if sensitive {
+                ApprovalRequirement::RequireApprovalAlways(format!(
+                    "{}. This path looks sensitive and always requires confirmation.",
+                    base_reason
+                ))
+            } else {
+                ApprovalRequirement::AutoApprove
+            }
+        }
+        ExternalPathAction::Read => {
+            if sensitive {
+                ApprovalRequirement::RequireApprovalAlways(format!(
+                    "{}. This path looks sensitive and always requires confirmation.",
+                    base_reason
+                ))
+            } else {
+                ApprovalRequirement::RequireApproval(format!("{base_reason}."))
+            }
+        }
+        ExternalPathAction::Write => ApprovalRequirement::RequireApprovalAlways(format!(
+            "{}. Writing outside the workspace always requires confirmation.",
+            base_reason
+        )),
+    })
+}
 
 #[derive(Debug, Clone)]
 pub struct ToolDef {
@@ -99,6 +341,7 @@ pub struct ToolCallBuffer {
 pub enum ApprovalRequirement {
     AutoApprove,
     RequireApproval(String),
+    RequireApprovalAlways(String),
 }
 
 /// Coarse-grained permission level for a tool, stored in `PermissionStore`.
@@ -141,6 +384,10 @@ impl PermissionStore {
 
     /// Check whether a tool call should be auto-approved, needs asking, or denied.
     pub fn check(&self, tool_name: &str, approval: &ApprovalRequirement) -> PermissionDecision {
+        if let ApprovalRequirement::RequireApprovalAlways(reason) = approval {
+            return PermissionDecision::Ask(reason.clone());
+        }
+
         // 1. Session grant (user pressed [A] during this session).
         //    This overrides RequireApproval — the user explicitly chose "Always"
         //    for this tool, so don't prompt again. Bash still has its own
@@ -153,7 +400,6 @@ impl PermissionStore {
         if let ApprovalRequirement::RequireApproval(reason) = approval {
             return PermissionDecision::Ask(reason.clone());
         }
-
         // 3. Explicit per-tool override (only reached for AutoApprove tools).
         if let Some(level) = self.overrides.get(tool_name) {
             match level {
@@ -208,6 +454,21 @@ pub struct ToolContext {
     /// still matches. Avoids redoing UTF-8 parsing + semantic skeleton generation
     /// when the model re-reads the same file — these are CPU-heavy, not just I/O.
     pub read_cache: Arc<RwLock<std::collections::HashMap<ReadCacheKey, ReadCacheEntry>>>,
+    /// Top-5 most-distinctive lines captured from the first failed bash call
+    /// this session. Used for effect-based "error resolved" detection (P0 #5):
+    /// when a later bash succeeds and ≥3 of these 5 lines no longer appear,
+    /// the framework appends a hint nudging the model to summarize + stop.
+    ///
+    /// Why 5 lines with a majority threshold instead of 1 line (initial
+    /// design from 2026-04-22 morning): cargo / npm / pytest output
+    /// interleaves real diagnostics with ambient status (`Blocking waiting
+    /// for file lock`, `Checking crate v0.1.0`). A single-line signature
+    /// routinely caught a status line that appears on success too, so the
+    /// nudge never fired. Multi-line + majority absent is robust to noise
+    /// overlap without per-tool pattern matching.
+    ///
+    /// Stays set once captured — "original failure" anchor, not rolling.
+    pub first_error_signatures: Arc<RwLock<Vec<String>>>,
 }
 
 impl ToolContext {
@@ -224,6 +485,7 @@ impl ToolContext {
             read_budget_tokens: Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX)),
             graph: Arc::new(RwLock::new(crate::graph::CodeGraph::new())),
             read_cache: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            first_error_signatures: Arc::new(RwLock::new(Vec::new())),
         }
     }
 
@@ -237,10 +499,55 @@ impl ToolContext {
     }
 }
 
+/// Extract up to 5 distinctive diagnostic lines from a failed bash/tool
+/// output for use as a multi-signature "error anchor" (P0 #5).
+/// Selection rule: longest lines first. Rationale — status noise
+/// (`Checking v0.1.0 (/path)`, `Blocking waiting for file lock`) is almost
+/// always shorter than real diagnostic content (`error[E0425]: cannot find
+/// function \`foo\` in this scope`, full compiler traces). Sorting by length
+/// pushes ambient status to the back of the queue without hardcoding tool
+/// names.
+///
+/// Tech-neutral: no keyword matching on "error"/"failed"/"panic" etc. The
+/// caller uses majority-absent semantics (≥3 of 5 disappear on success → fire
+/// nudge) so lingering overlap on one or two status lines doesn't suppress
+/// the detection.
+pub fn extract_error_signatures(output: &str) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        // Framework markers all start with `[` — elapsed, cwd, workspace
+        // note, blocked messages. Skip them.
+        if trimmed.starts_with('[') {
+            continue;
+        }
+        if trimmed == "STDERR:" {
+            continue;
+        }
+        if trimmed.len() < 15 {
+            continue;
+        }
+        let s: String = trimmed.chars().take(120).collect();
+        if !lines.contains(&s) {
+            lines.push(s);
+        }
+    }
+    // Sort by length desc — longer lines are more likely to be specific
+    // diagnostic content (includes identifiers, paths, span markers).
+    lines.sort_by_key(|s| std::cmp::Reverse(s.len()));
+    lines.into_iter().take(5).collect()
+}
+
 #[async_trait]
 pub trait Tool: Send + Sync {
     fn definition(&self) -> ToolDef;
     fn approval(&self, args: &str) -> ApprovalRequirement;
+    fn approval_with_context(&self, args: &str, _ctx: &ToolContext) -> ApprovalRequirement {
+        self.approval(args)
+    }
     async fn execute(&self, args: &str, ctx: &ToolContext) -> Result<ToolResult>;
 }
 
@@ -290,6 +597,7 @@ impl ToolRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
 
     struct DummyTool;
 
@@ -345,6 +653,157 @@ mod tests {
         assert_eq!(result.output, "ok");
     }
 
+    #[test]
+    fn resolve_workspace_path_rejects_parent_escape() {
+        let workspace = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let path = format!("{}/secret.txt", outside.path().display());
+        std::fs::write(outside.path().join("secret.txt"), "top-secret").unwrap();
+
+        let err = resolve_workspace_path(&path, workspace.path()).unwrap_err();
+        assert!(err.to_string().contains("outside working directory"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_workspace_path_rejects_symlink_escape() {
+        let workspace = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let target = outside.path().join("secret.txt");
+        std::fs::write(&target, "top-secret").unwrap();
+        let link = workspace.path().join("secret-link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let err = resolve_workspace_path(link.to_string_lossy().as_ref(), workspace.path()).unwrap_err();
+        assert!(err.to_string().contains("outside working directory"));
+    }
+
+    #[test]
+    fn inspect_path_access_marks_workspace_escape() {
+        let workspace = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let target = outside.path().join("secret.txt");
+        std::fs::write(&target, "top-secret").unwrap();
+
+        let access = inspect_path_access(&target.to_string_lossy(), workspace.path()).unwrap();
+        assert!(!access.within_workspace);
+        assert_eq!(access.path, target);
+    }
+
+    #[test]
+    fn approval_for_non_sensitive_enumeration_outside_workspace_is_auto() {
+        let workspace = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+
+        let approval = approval_for_path(
+            &outside.path().to_string_lossy(),
+            workspace.path(),
+            ExternalPathAction::Enumerate,
+        ).unwrap();
+        assert!(matches!(approval, ApprovalRequirement::AutoApprove));
+    }
+
+    #[test]
+    fn approval_for_non_sensitive_read_outside_workspace_requires_confirmation() {
+        let workspace = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let target = outside.path().join("notes.txt");
+        std::fs::write(&target, "hello").unwrap();
+
+        let approval = approval_for_path(
+            &target.to_string_lossy(),
+            workspace.path(),
+            ExternalPathAction::Read,
+        ).unwrap();
+        assert!(matches!(approval, ApprovalRequirement::RequireApproval(_)));
+    }
+
+    #[test]
+    fn approval_for_sensitive_read_outside_workspace_requires_always() {
+        let workspace = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let target = outside.path().join("id_rsa");
+        std::fs::write(&target, "private-key").unwrap();
+
+        let approval = approval_for_path(
+            &target.to_string_lossy(),
+            workspace.path(),
+            ExternalPathAction::Read,
+        ).unwrap();
+        assert!(matches!(approval, ApprovalRequirement::RequireApprovalAlways(_)));
+    }
+
+    #[test]
+    fn approval_for_system_protected_prefix_requires_always() {
+        assert!(is_sensitive_path(Path::new("/System/Library/CoreServices/boot.efi")));
+    }
+
+    #[test]
+    fn approval_for_usr_local_exception_is_not_sensitive() {
+        assert!(!is_sensitive_path(Path::new("/usr/local/bin/tool")));
+    }
+
+    #[test]
+    fn approval_for_private_var_prefix_requires_always() {
+        assert!(is_sensitive_path(Path::new("/private/var/db/config")));
+    }
+
+    #[test]
+    fn approval_for_private_var_folders_exception_is_not_sensitive() {
+        assert!(!is_sensitive_path(Path::new("/private/var/folders/xx/yy/T/file.txt")));
+    }
+
+    #[test]
+    fn approval_for_write_outside_workspace_requires_always() {
+        let workspace = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let target = outside.path().join("notes.txt");
+
+        let approval = approval_for_path(
+            &target.to_string_lossy(),
+            workspace.path(),
+            ExternalPathAction::Write,
+        ).unwrap();
+        assert!(matches!(approval, ApprovalRequirement::RequireApprovalAlways(_)));
+    }
+
+    #[tokio::test]
+    async fn read_file_requests_approval_for_workspace_escape() {
+        let workspace = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let target = outside.path().join("secret.txt");
+        std::fs::write(&target, "top-secret").unwrap();
+
+        let tool = crate::tool::read::ReadFileTool;
+        let ctx = ToolContext::new(workspace.path().to_path_buf());
+        let args = format!(r#"{{"file_path":"{}"}}"#, target.display());
+
+        assert!(matches!(
+            tool.approval_with_context(&args, &ctx),
+            ApprovalRequirement::RequireApproval(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn edit_file_requests_approval_for_workspace_escape() {
+        let workspace = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let target = outside.path().join("secret.txt");
+        std::fs::write(&target, "top-secret").unwrap();
+
+        let tool = crate::tool::edit::EditFileTool;
+        let ctx = ToolContext::new(workspace.path().to_path_buf());
+        let args = format!(
+            r#"{{"file_path":"{}","old_string":"top-secret","new_string":"changed"}}"#,
+            target.display()
+        );
+
+        assert!(matches!(
+            tool.approval_with_context(&args, &ctx),
+            ApprovalRequirement::RequireApprovalAlways(_)
+        ));
+    }
+
     // PermissionStore tests
 
     #[test]
@@ -376,6 +835,14 @@ mod tests {
             &ApprovalRequirement::RequireApproval("Destructive".into()),
         );
         assert!(matches!(decision, PermissionDecision::Allow));
+    }
+
+    #[test]
+    fn test_permission_store_session_grant_does_not_bypass_require_approval_always() {
+        let mut store = PermissionStore::new();
+        store.grant_session("bash");
+        let decision = store.check("bash", &ApprovalRequirement::RequireApprovalAlways("Sensitive".into()));
+        assert!(matches!(decision, PermissionDecision::Ask(_)));
     }
 
     #[test]

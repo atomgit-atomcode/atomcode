@@ -40,17 +40,34 @@ impl Tool for FindReferencesTool {
         ApprovalRequirement::AutoApprove
     }
 
+    fn approval_with_context(&self, args: &str, ctx: &ToolContext) -> ApprovalRequirement {
+        let parsed = match serde_json::from_str::<FindReferencesArgs>(args) {
+            Ok(parsed) => parsed,
+            Err(_) => return self.approval(args),
+        };
+        let working_dir = match ctx.working_dir.try_read() {
+            Ok(wd) => wd.clone(),
+            Err(_) => return self.approval(args),
+        };
+        let raw_path = parsed.path.as_deref().unwrap_or(".");
+        match super::approval_for_path(raw_path, &working_dir, super::ExternalPathAction::Read) {
+            Ok(approval) => approval,
+            Err(_) => self.approval(args),
+        }
+    }
+
     async fn execute(&self, args: &str, ctx: &ToolContext) -> Result<ToolResult> {
         let parsed: FindReferencesArgs = serde_json::from_str(args)?;
         let wd = ctx.working_dir.read().await.clone();
-        let search_dir = if let Some(ref p) = parsed.path {
-            if std::path::Path::new(p).is_absolute() {
-                p.clone()
-            } else {
-                wd.join(p).to_string_lossy().to_string()
+        let search_dir = match super::inspect_path_access(parsed.path.as_deref().unwrap_or("."), &wd) {
+            Ok(access) => access.path.to_string_lossy().to_string(),
+            Err(err) => {
+                return Ok(ToolResult {
+                    call_id: String::new(),
+                    output: err.to_string(),
+                    success: false,
+                });
             }
-        } else {
-            wd.to_string_lossy().to_string()
         };
 
         // Use ripgrep to find all occurrences (word boundary match)

@@ -56,6 +56,29 @@ pub const DONE_LABELS: &[&str] = &[
     "Tied off",
 ];
 
+/// Snapshot of the agent's context budget, cached from `AgentEvent::ContextStats`
+/// and surfaced by the `/context` command.
+///
+/// Merged across two emission paths: the narrow TurnEvent-forwarded one
+/// (system/sent/total_messages) and the rich one from `handle_send_message`
+/// (tool_defs / cold_zone / ctx_window / ctx_name). Each path leaves the
+/// fields it doesn't know at 0 / empty, so we merge by keeping non-zero
+/// updates. See `UiState::on_context_stats`.
+#[derive(Debug, Clone, Default)]
+pub struct ContextSnapshot {
+    pub system_tokens: usize,
+    pub sent_tokens: usize,
+    pub tool_defs_tokens: usize,
+    pub cold_zone_tokens: usize,
+    pub total_messages: usize,
+    pub ctx_window: usize,
+    pub ctx_name: String,
+    /// Full assembled system prompt from the most recent turn.
+    /// Surfaced by `/context prompt`. Empty until the first rich
+    /// emission lands.
+    pub system_prompt: String,
+}
+
 pub struct UiState {
     pub phase: UiPhase,
     pub spinner_label: String,
@@ -69,6 +92,17 @@ pub struct UiState {
     /// turn-complete / turn-cancelled / error. Used by the spinner to
     /// display live elapsed time.
     pub turn_started_at: Option<std::time::Instant>,
+    /// Last observed context breakdown. Populated from
+    /// `AgentEvent::ContextStats` — `/context` renders this. `None`
+    /// before the first turn completes.
+    pub last_context: Option<ContextSnapshot>,
+    /// Verbatim text of the message that is currently running. Set
+    /// on every submit, cleared on turn-complete. When the user hits
+    /// Ctrl+C / Esc mid-stream the streaming-key handler takes this
+    /// and restores it to the input buffer so the cancelled message
+    /// can be edited + resent without re-typing. `None` between
+    /// turns and after any successful completion.
+    pub last_submitted_message: Option<String>,
 }
 
 impl Default for UiState {
@@ -87,7 +121,43 @@ impl UiState {
             prior_phase: None,
             thinking_idx: 0,
             turn_started_at: None,
+            last_context: None,
+            last_submitted_message: None,
         }
+    }
+
+    /// Merge one `AgentEvent::ContextStats` emission into the cached
+    /// snapshot. The agent side fires two emissions per turn: one narrow
+    /// (from `TurnRunner`) and one rich (from `handle_send_message`).
+    /// Each leaves the fields it doesn't know at 0 / empty — we keep the
+    /// most-recent non-zero value per field so either order works.
+    pub fn on_context_stats(
+        &mut self,
+        system_tokens: usize,
+        sent_tokens: usize,
+        tool_defs_tokens: usize,
+        cold_zone_tokens: usize,
+        total_messages: usize,
+        ctx_window: usize,
+        ctx_name: &str,
+        system_prompt: &str,
+    ) {
+        let snap = self.last_context.get_or_insert_with(ContextSnapshot::default);
+        if system_tokens > 0 { snap.system_tokens = system_tokens; }
+        if sent_tokens > 0 { snap.sent_tokens = sent_tokens; }
+        if tool_defs_tokens > 0 { snap.tool_defs_tokens = tool_defs_tokens; }
+        // cold_zone can be 0 legitimately (no compression yet) — the rich
+        // emission always sends an accurate value, so only overwrite when
+        // the emission carries the ctx_window signal (rich path).
+        if ctx_window > 0 {
+            snap.cold_zone_tokens = cold_zone_tokens;
+            snap.ctx_window = ctx_window;
+        }
+        if total_messages > 0 { snap.total_messages = total_messages; }
+        if !ctx_name.is_empty() { snap.ctx_name = ctx_name.to_string(); }
+        // system_prompt — only the rich path sends non-empty bytes;
+        // narrow path passes "" and we keep whatever was cached last.
+        if !system_prompt.is_empty() { snap.system_prompt = system_prompt.to_string(); }
     }
 
     /// Elapsed wall time since the current turn began, if a turn is
@@ -112,6 +182,12 @@ impl UiState {
         self.phase = UiPhase::Idle;
         self.spinner_label.clear();
         self.turn_started_at = None;
+        // Turn finished normally — no need to offer resubmit of the
+        // message any more. (On cancel, the streaming-key handler
+        // already took() the Option before the TurnCancelled event
+        // reaches here, so the cancelled path naturally leaves this
+        // None too.)
+        self.last_submitted_message = None;
     }
 
     pub fn on_turn_cancelled(&mut self) {

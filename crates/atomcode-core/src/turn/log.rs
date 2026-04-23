@@ -1,7 +1,6 @@
 use crate::conversation::message::Message;
 use crate::tool::{ToolCall, ToolDef};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
 
 /// Per-round LLM log files live under `<working_dir>/datalog/llm/`.
 /// One file per LLM round-trip, containing both `request` and `response`
@@ -10,25 +9,19 @@ use std::sync::{Mutex, OnceLock};
 /// Split-file layout (prior design) produced two JSONs per round plus a CSV
 /// entry per half — hard to read and review. One-file-per-round is both
 /// AI-friendly (single JSON to grep/diff/feed back) and human-friendly.
-
-/// Shared state: path of the in-progress request file. The caller of
-/// `log_llm_request` writes the request JSON to a file and stashes the path
-/// here; when `log_llm_response` runs (same process, sequential), it reads
-/// the file back, merges the response, and writes the final JSON in place.
 ///
-/// Single-threaded in atomcode (one agent turn at a time), so a plain Mutex
-/// is enough — no race. If future parallelism is added, this needs to become
-/// a per-task thread-local or passed explicitly.
-fn pending_request_path() -> &'static Mutex<Option<PathBuf>> {
-    static P: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
-    P.get_or_init(|| Mutex::new(None))
-}
+/// Request / response pairing: `log_llm_request` returns the path of the
+/// JSON file it wrote; the caller holds that `PathBuf` locally and passes
+/// it to `log_llm_response` so the response section merges into the SAME
+/// file. No process-wide shared state — safe for concurrent `chat_stream`
+/// handlers in the daemon (prior design used a `static Mutex<Option<PathBuf>>`
+/// that bled across sessions).
 
 /// Log the LLM request. Writes a JSON file containing the `request` section
-/// under `<working_dir>/datalog/llm/<timestamp>.json` and stashes the path
-/// for the subsequent `log_llm_response` call to append to.
+/// under `<working_dir>/datalog/llm/<timestamp>.json`.
 ///
-/// If `enabled` is false, this function is a no-op.
+/// Returns the path so the caller can pass it to `log_llm_response` for
+/// in-place merge. Returns `None` if `enabled` is false or the write failed.
 pub fn log_llm_request(
     working_dir: &Path,
     messages: &[Message],
@@ -37,10 +30,8 @@ pub fn log_llm_request(
     context_window: usize,
     step: usize,
     enabled: bool,
-) {
-    if !enabled {
-        return;
-    }
+) -> Option<PathBuf> {
+    if !enabled { return None; }
     use std::io::Write;
 
     let log_dir = working_dir.join("datalog").join("llm");
@@ -50,16 +41,13 @@ pub fn log_llm_request(
     let path = log_dir.join(format!("{}.json", ts));
 
     let msgs_json = serde_json::to_value(messages).unwrap_or(serde_json::json!([]));
-    let tools_json: Vec<serde_json::Value> = tool_defs
-        .iter()
-        .map(|td| {
-            serde_json::json!({
-                "name": td.name,
-                "description": td.description,
-                "parameters": td.parameters,
-            })
+    let tools_json: Vec<serde_json::Value> = tool_defs.iter().map(|td| {
+        serde_json::json!({
+            "name": td.name,
+            "description": td.description,
+            "parameters": td.parameters,
         })
-        .collect();
+    }).collect();
     let total_tokens: usize = messages.iter().map(|m| m.estimate_tokens()).sum();
 
     let log = serde_json::json!({
@@ -78,61 +66,60 @@ pub fn log_llm_request(
     });
 
     let tmp = path.with_extension("json.tmp");
-    if let Ok(mut f) = std::fs::File::create(&tmp) {
-        let _ = f.write_all(
-            serde_json::to_string_pretty(&log)
-                .unwrap_or_default()
-                .as_bytes(),
-        );
-        let _ = std::fs::rename(&tmp, &path);
-    }
-
-    // Remember for log_llm_response.
-    if let Ok(mut guard) = pending_request_path().lock() {
-        *guard = Some(path);
+    match std::fs::File::create(&tmp) {
+        Ok(mut f) => {
+            if f.write_all(serde_json::to_string_pretty(&log).unwrap_or_default().as_bytes()).is_err() {
+                return None;
+            }
+            if std::fs::rename(&tmp, &path).is_err() {
+                return None;
+            }
+            Some(path)
+        }
+        Err(_) => None,
     }
 }
 
-/// Log the LLM response by reading the pending request file, adding a
-/// `response` section, and writing the merged JSON back. Also appends a
-/// one-line summary to `calls.log`.
+/// Log the LLM response by merging it into the request file identified by
+/// `pending_request`. If `pending_request` is `None` (no prior request, or
+/// request write failed), writes a standalone `*_orphan_response.json`
+/// marked with a warning. Also appends a one-line summary to `calls.log`.
 ///
 /// If `enabled` is false, this function is a no-op.
 pub fn log_llm_response(
     working_dir: &Path,
+    pending_request: Option<PathBuf>,
     text: &str,
     tool_calls: &[ToolCall],
+    reasoning: &str,
     model: &str,
     step: usize,
     duration_ms: u64,
     enabled: bool,
 ) {
-    if !enabled {
-        return;
-    }
+    if !enabled { return; }
     use std::io::Write;
 
     let log_dir = working_dir.join("datalog").join("llm");
     let _ = std::fs::create_dir_all(&log_dir);
 
-    let path = pending_request_path()
-        .lock()
-        .ok()
-        .and_then(|mut g| g.take());
+    let path = pending_request;
 
-    let tools_json: Vec<serde_json::Value> = tool_calls
-        .iter()
-        .map(|tc| {
-            serde_json::json!({
-                "id": tc.id,
-                "name": tc.name,
-                "arguments": tc.arguments,
-            })
+    let tools_json: Vec<serde_json::Value> = tool_calls.iter().map(|tc| {
+        serde_json::json!({
+            "id": tc.id,
+            "name": tc.name,
+            "arguments": tc.arguments,
         })
-        .collect();
+    }).collect();
+    // Record reasoning_content emitted by thinking models (Moonshot Kimi,
+    // DeepSeek-R1, MiniMax-M2, etc.). Without this, bugs like issue #165
+    // ("reasoning_content missing in assistant tool call message") are
+    // impossible to diagnose from datalog alone.
     let response_value = serde_json::json!({
         "duration_ms": duration_ms,
         "text": text,
+        "reasoning_content": reasoning,
         "tool_calls": tools_json,
     });
 
@@ -142,8 +129,8 @@ pub fn log_llm_response(
     // operation but we don't want to drop data on the floor).
     let (target_path, merged) = match path.as_ref().and_then(|p| std::fs::read_to_string(p).ok()) {
         Some(existing) => {
-            let mut val: serde_json::Value =
-                serde_json::from_str(&existing).unwrap_or_else(|_| serde_json::json!({}));
+            let mut val: serde_json::Value = serde_json::from_str(&existing)
+                .unwrap_or_else(|_| serde_json::json!({}));
             if let Some(obj) = val.as_object_mut() {
                 obj.insert("response".into(), response_value);
             }
@@ -165,29 +152,15 @@ pub fn log_llm_response(
 
     let tmp = target_path.with_extension("json.tmp");
     if let Ok(mut f) = std::fs::File::create(&tmp) {
-        let _ = f.write_all(
-            serde_json::to_string_pretty(&merged)
-                .unwrap_or_default()
-                .as_bytes(),
-        );
+        let _ = f.write_all(serde_json::to_string_pretty(&merged).unwrap_or_default().as_bytes());
         let _ = std::fs::rename(&tmp, &target_path);
     }
 
     // One-line summary to calls.log. Example:
     //   2026-04-14_12-50-54_123  glm-5  step=3  msgs=20/15000tok  →  4200ms  tools=2 [read_file, grep]
-    let ts_for_log = merged
-        .get("timestamp")
-        .and_then(|v| v.as_str())
-        .unwrap_or("?")
-        .to_string();
-    let msg_count = merged
-        .pointer("/request/message_count")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-    let est_tokens = merged
-        .pointer("/request/estimated_tokens")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
+    let ts_for_log = merged.get("timestamp").and_then(|v| v.as_str()).unwrap_or("?").to_string();
+    let msg_count = merged.pointer("/request/message_count").and_then(|v| v.as_u64()).unwrap_or(0);
+    let est_tokens = merged.pointer("/request/estimated_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
     let tool_names: Vec<&str> = tool_calls.iter().map(|tc| tc.name.as_str()).collect();
     let tools_str = if tool_names.is_empty() {
         "text_only".to_string()
@@ -195,57 +168,19 @@ pub fn log_llm_response(
         format!("[{}]", tool_names.join(", "))
     };
     let calls_path = log_dir.join("calls.log");
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&calls_path)
-    {
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&calls_path) {
         let _ = writeln!(
             f,
             "{}  {}  step={}  msgs={}/{}tok  →  {}ms  tools={} {}",
-            ts_for_log,
-            model,
-            step,
-            msg_count,
-            est_tokens,
-            duration_ms,
-            tool_calls.len(),
-            tools_str,
+            ts_for_log, model, step, msg_count, est_tokens, duration_ms, tool_calls.len(), tools_str,
         );
     }
 }
 
+/// Filename timestamp: `YYYY-MM-DD_HH-MM-SS_sss` (UTC).
+/// Format preserved bit-for-bit from the prior hand-rolled implementation.
 fn timestamp() -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    let secs = now.as_secs();
-    let millis = now.subsec_millis();
-    let s = secs % 60;
-    let m = (secs / 60) % 60;
-    let h = (secs / 3600) % 24;
-    let days = secs / 86400;
-    let (y, mo, d) = epoch_days_to_ymd(days);
-    format!(
-        "{:04}-{:02}-{:02}_{:02}-{:02}-{:02}_{:03}",
-        y, mo, d, h, m, s, millis
-    )
-}
-
-/// Convert days since Unix epoch to (year, month, day). Simple civil calendar math.
-/// Algorithm from http://howardhinnant.github.io/date_algorithms.html
-fn epoch_days_to_ymd(days: u64) -> (u64, u64, u64) {
-    let z = days + 719468;
-    let era = z / 146097;
-    let doe = z - era * 146097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    (y, m, d)
+    chrono::Utc::now().format("%Y-%m-%d_%H-%M-%S_%3f").to_string()
 }
 
 #[cfg(test)]
@@ -267,15 +202,18 @@ mod tests {
             parameters: serde_json::json!({"type": "object"}),
         }];
 
-        log_llm_request(tmp.path(), &messages, &tools, "test-model", 16000, 3, true);
+        let pending = log_llm_request(tmp.path(), &messages, &tools, "test-model", 16000, 3, true);
+        assert!(pending.is_some(), "request log should return its path");
         log_llm_response(
             tmp.path(),
+            pending,
             "hi back",
             &[ToolCall {
                 id: "c1".into(),
                 name: "bash".into(),
                 arguments: "{}".into(),
             }],
+            "",
             "test-model",
             3,
             123,
@@ -283,17 +221,11 @@ mod tests {
         );
 
         let log_dir = tmp.path().join("datalog").join("llm");
-        let json_files: Vec<_> = std::fs::read_dir(&log_dir)
-            .unwrap()
+        let json_files: Vec<_> = std::fs::read_dir(&log_dir).unwrap()
             .filter_map(|e| e.ok().map(|e| e.path()))
             .filter(|p| p.extension().map_or(false, |ext| ext == "json"))
             .collect();
-        assert_eq!(
-            json_files.len(),
-            1,
-            "expected one merged file, got {}",
-            json_files.len()
-        );
+        assert_eq!(json_files.len(), 1, "expected one merged file, got {}", json_files.len());
 
         let content = std::fs::read_to_string(&json_files[0]).unwrap();
         let v: serde_json::Value = serde_json::from_str(&content).unwrap();
@@ -314,38 +246,71 @@ mod tests {
     #[test]
     fn test_orphan_response_when_no_matching_request() {
         let tmp = tempfile::TempDir::new().unwrap();
-        // Wipe any stashed pending path from previous tests (single static).
-        if let Ok(mut g) = pending_request_path().lock() {
-            *g = None;
-        }
 
-        log_llm_response(tmp.path(), "bare text", &[], "solo-model", 7, 50, true);
+        log_llm_response(tmp.path(), None, "bare text", &[], "", "solo-model", 7, 50, true);
 
         let log_dir = tmp.path().join("datalog").join("llm");
-        let orphans: Vec<_> = std::fs::read_dir(&log_dir)
-            .unwrap()
+        let orphans: Vec<_> = std::fs::read_dir(&log_dir).unwrap()
             .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| {
-                p.file_name()
-                    .map_or(false, |n| n.to_string_lossy().contains("orphan"))
-            })
+            .filter(|p| p.file_name().map_or(false, |n| n.to_string_lossy().contains("orphan")))
             .collect();
         assert_eq!(orphans.len(), 1);
-        let v: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&orphans[0]).unwrap()).unwrap();
-        assert!(v["warning"]
-            .as_str()
-            .unwrap()
-            .contains("no matching request"));
+        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&orphans[0]).unwrap()).unwrap();
+        assert!(v["warning"].as_str().unwrap().contains("no matching request"));
+    }
+
+    /// Regression: prior design used a process-wide `static Mutex<Option<PathBuf>>`
+    /// to pair request/response. Two concurrent sessions would clobber each
+    /// other's pending path — one session's response would merge into the
+    /// OTHER session's request file. This test interleaves two sessions
+    /// and asserts each response lands in its own request file.
+    #[test]
+    fn test_concurrent_sessions_do_not_mix_request_response() {
+        let tmp_a = tempfile::TempDir::new().unwrap();
+        let tmp_b = tempfile::TempDir::new().unwrap();
+        let msgs_a = vec![Message::new(Role::User, "alpha")];
+        let msgs_b = vec![Message::new(Role::User, "beta")];
+
+        // Interleaved: A-req, B-req, A-resp, B-resp — the exact pattern
+        // that would corrupt results under the old static-Mutex design.
+        let pending_a = log_llm_request(tmp_a.path(), &msgs_a, &[], "model-a", 16000, 0, true);
+        let pending_b = log_llm_request(tmp_b.path(), &msgs_b, &[], "model-b", 16000, 0, true);
+        log_llm_response(tmp_a.path(), pending_a, "reply-A", &[], "", "model-a", 0, 10, true);
+        log_llm_response(tmp_b.path(), pending_b, "reply-B", &[], "", "model-b", 0, 20, true);
+
+        let read_merged = |dir: &Path| -> serde_json::Value {
+            let log_dir = dir.join("datalog").join("llm");
+            let files: Vec<_> = std::fs::read_dir(&log_dir).unwrap()
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| p.extension().map_or(false, |ext| ext == "json")
+                    && !p.file_name().map_or(false, |n| n.to_string_lossy().contains("orphan")))
+                .collect();
+            assert_eq!(files.len(), 1, "each session gets its own merged file");
+            serde_json::from_str(&std::fs::read_to_string(&files[0]).unwrap()).unwrap()
+        };
+
+        let a = read_merged(tmp_a.path());
+        let b = read_merged(tmp_b.path());
+        assert_eq!(a["model"], "model-a");
+        assert_eq!(a["response"]["text"], "reply-A");
+        assert_eq!(b["model"], "model-b");
+        assert_eq!(b["response"]["text"], "reply-B");
     }
 
     #[test]
-    fn test_epoch_days_to_ymd() {
-        assert_eq!(epoch_days_to_ymd(0), (1970, 1, 1));
-        assert_eq!(epoch_days_to_ymd(1), (1970, 1, 2));
-        assert_eq!(epoch_days_to_ymd(10957), (2000, 1, 1));
-        let (y, m, _d) = epoch_days_to_ymd(19783);
-        assert_eq!(y, 2024);
-        assert_eq!(m, 3);
+    fn timestamp_format_is_stable() {
+        // Guard: filename pattern YYYY-MM-DD_HH-MM-SS_sss. Callers of
+        // log_llm_request rely on this shape (daemon / tests glob `*.json`
+        // and orphan_response detection splits on this layout).
+        let ts = timestamp();
+        assert_eq!(ts.len(), 23, "expected 23-char timestamp, got {:?}", ts);
+        assert_eq!(&ts[4..5], "-");
+        assert_eq!(&ts[7..8], "-");
+        assert_eq!(&ts[10..11], "_");
+        assert_eq!(&ts[13..14], "-");
+        assert_eq!(&ts[16..17], "-");
+        assert_eq!(&ts[19..20], "_");
+        assert!(ts[..4].chars().all(|c| c.is_ascii_digit()));
+        assert!(ts[20..].chars().all(|c| c.is_ascii_digit()));
     }
 }

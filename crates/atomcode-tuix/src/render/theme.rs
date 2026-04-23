@@ -98,6 +98,9 @@ mod tests {
             no_color: !colors,
             term: Some("xterm".to_string()),
             colorterm: Some("truecolor".to_string()),
+            force_ascii: false,
+            lang: Some("en_US.UTF-8".to_string()),
+            lc_all: None,
         })
     }
 

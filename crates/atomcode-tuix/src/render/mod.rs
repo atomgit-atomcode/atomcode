@@ -57,7 +57,7 @@ pub enum UiLine {
     },
     /// Clear the current transient line (prepares for a permanent write).
     ClearTransient,
-    /// Draw the input prompt "❯ " + current buffer (transient, idle).
+    /// Draw the input prompt "> " + current buffer (transient, idle).
     /// When `menu` is Some, a command palette is drawn above the box.
     /// `cursor_byte` is a byte offset into `buf` — the renderer wraps
     /// `buf` to the available input width and derives the 2D cursor
@@ -162,6 +162,16 @@ pub struct MenuPayload {
 }
 
 /// Persistent status line drawn directly below the input box — CC-style
+/// Severity classification for the right-aligned status hint.
+/// Warning → Role::Error (red, e.g. "no provider", "model retired").
+/// Info → Role::Muted (dim, e.g. "new version available", drift notice).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HintSeverity {
+    #[default]
+    Warning,
+    Info,
+}
+
 /// "model · cwd · tokens" chrome. Visible in both Idle and Streaming
 /// phases so the user always sees what provider is active.
 #[derive(Debug, Clone, Default)]
@@ -169,9 +179,10 @@ pub struct StatusLine {
     pub model: String,
     pub cwd: String, // HOME replaced with "~"
     pub total_tokens: usize,
-    /// Right-aligned passive hint. Currently used for "new version available"
-    /// at startup. None = render status row as left-only, same as before.
-    pub hint: Option<String>,
+    /// Right-aligned passive hint with severity. `Warning` renders red
+    /// (no-provider nudge, CodingPlan model-missing); `Info` renders
+    /// muted (upgrade banner, CodingPlan drift notice). None → no hint.
+    pub hint: Option<(String, HintSeverity)>,
 }
 
 /// One line in a diff batch. `added = true` renders as `+`, false as `-`.

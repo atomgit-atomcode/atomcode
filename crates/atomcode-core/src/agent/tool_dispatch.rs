@@ -175,12 +175,18 @@ impl AgentLoop {
                     working_set_tokens,
                     total_messages,
                 );
+                // Narrow stats — rich breakdown comes from handle_send_message.
                 let _ = self.event_tx.send(AgentEvent::ContextStats {
                     system_tokens,
                     sent_tokens,
                     dropped_tokens,
                     working_set_tokens,
                     total_messages,
+                    tool_defs_tokens: 0,
+                    cold_zone_tokens: 0,
+                    ctx_window: 0,
+                    ctx_name: String::new(),
+                    system_prompt: String::new(),
                 });
             }
             TurnEvent::Error(e) => {
@@ -199,22 +205,13 @@ impl AgentLoop {
         }
     }
 
-    /// Post-process tool results added by TurnRunner: truncate large outputs,
-    /// then extract file paths from error output and pre-read them.
+    /// Post-process tool results added by TurnRunner: CLI-specific
+    /// semantic enrichment (pre-read files mentioned in failed-bash
+    /// errors). The generic byte-level truncation (head/tail caps,
+    /// 300-line universal cap, 32K char cap, per-turn budget) moved
+    /// into `TurnRunner::run_with_filter` so daemon + any other caller
+    /// gets it for free — previously each caller had to remember.
     pub(crate) fn post_process_tool_results(&mut self, tool_count: usize) {
-        let context_window = self
-            .config
-            .providers
-            .get(&self.config.default_provider)
-            .map(|p| p.context_window)
-            .unwrap_or(128000);
-        crate::turn::truncation::post_process_tool_results(
-            &mut self.conversation.messages,
-            tool_count,
-            &self.current_tool_name,
-            context_window,
-        );
-
         // Error file pre-injection: when a bash command fails, extract file paths
         // from the output and inject their content. This saves the model from
         // manually reading files mentioned in error messages (e.g., rustc errors
@@ -332,12 +329,15 @@ impl AgentLoop {
             if call.name == "read_file" {
                 if let Some(fp) = args.get("file_path").and_then(|v| v.as_str()) {
                     let short = short_path(fp);
+                    // `file_read_counts` key is `(basename, offset_bucket)`; this
+                    // dead-code path only needs the per-file total, so fold over
+                    // all buckets for this filename.
                     let read_count = self
                         .discipline_state
                         .file_read_counts
-                        .get(&short)
-                        .copied()
-                        .unwrap_or(0);
+                        .iter()
+                        .filter_map(|((f, _), c)| (f == &short).then_some(*c))
+                        .sum::<usize>();
                     if read_count == 0
                         && (args.get("offset").is_some() || args.get("limit").is_some())
                     {
@@ -385,12 +385,14 @@ impl AgentLoop {
                         .file_name()
                         .map(|n| n.to_string_lossy().to_string())
                         .unwrap_or_else(|| fp.to_string());
+                    // Dead-code path; key shape is `(basename, offset_bucket)`,
+                    // fold over buckets to get the per-file total.
                     let count = self
                         .discipline_state
                         .file_read_counts
-                        .get(&short)
-                        .copied()
-                        .unwrap_or(0);
+                        .iter()
+                        .filter_map(|((f, _), c)| (f == &short).then_some(*c))
+                        .sum::<usize>();
                     if count >= 5 {
                         return Some(format!(
                             "BLOCKED: You have read {} {} times. You already have the content. \

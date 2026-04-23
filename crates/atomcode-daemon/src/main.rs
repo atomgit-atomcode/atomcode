@@ -5,7 +5,7 @@
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
-    response::{sse::Sse, IntoResponse, Json},
+    response::{IntoResponse, Json, sse::Sse},
     routing::{get, post},
     Router,
 };
@@ -21,14 +21,14 @@ use tokio_util::sync::CancellationToken;
 use tower_http::cors::{Any, CorsLayer};
 
 use atomcode_core::config::Config;
-use atomcode_core::conversation::Conversation;
 use atomcode_core::hook::HookRegistry;
-use atomcode_core::provider;
 use atomcode_core::session::{Session, SessionId, SessionManager, SessionMeta};
+use atomcode_core::conversation::Conversation;
+use atomcode_core::provider;
 use atomcode_core::tool::{ToolContext, ToolRegistry};
+use atomcode_core::turn::runner::TurnRunner;
 use atomcode_core::turn::event::{TurnEvent, TurnResult};
 use atomcode_core::turn::permission::{AutoPermissionDecider, AutoPermissionMode};
-use atomcode_core::turn::runner::TurnRunner;
 #[derive(Debug, Clone, Serialize)]
 pub struct ProjectInfo {
     /// Project hash (directory name in sessions/)
@@ -150,8 +150,7 @@ fn init_project_state() -> ProjectState {
         if let Some(ref workdir) = config.default_workdir {
             let path = PathBuf::from(workdir);
             if path.exists() {
-                let name = path
-                    .file_name()
+                let name = path.file_name()
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_else(|| "project".to_string());
                 return ProjectState {
@@ -164,8 +163,7 @@ fn init_project_state() -> ProjectState {
         }
     }
     let path = default_working_dir();
-    let name = path
-        .file_name()
+    let name = path.file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "project".to_string());
     ProjectState {
@@ -181,7 +179,7 @@ fn init_project_state() -> ProjectState {
 pub struct ArtifactInfo {
     pub id: String,
     #[allow(dead_code)]
-    pub artifact_type: String, // "html", "svg", "mermaid", "code"
+    pub artifact_type: String,  // "html", "svg", "mermaid", "code"
     pub title: Option<String>,
     #[allow(dead_code)]
     pub language: Option<String>,
@@ -228,18 +226,14 @@ impl From<&atomcode_core::conversation::message::Message> for MessageInfo {
             atomcode_core::conversation::message::Role::Assistant => "assistant",
             atomcode_core::conversation::message::Role::Tool => "tool",
         };
-
+        
         let (content, tool_calls, tool_result, artifacts) = match &msg.content {
             atomcode_core::conversation::message::MessageContent::Text(s) => {
                 // No artifacts from plain text messages (code blocks not extracted)
                 (s.clone(), None, None, None)
             }
-            atomcode_core::conversation::message::MessageContent::AssistantWithToolCalls {
-                text,
-                tool_calls,
-            } => {
-                let calls: Vec<ToolCallInfo> = tool_calls
-                    .iter()
+            atomcode_core::conversation::message::MessageContent::AssistantWithToolCalls { text, tool_calls, .. } => {
+                let calls: Vec<ToolCallInfo> = tool_calls.iter()
                     .map(|tc| ToolCallInfo {
                         id: tc.id.clone(),
                         name: tc.name.clone(),
@@ -247,15 +241,10 @@ impl From<&atomcode_core::conversation::message::Message> for MessageInfo {
                         display: format_tool_args(&tc.name, &tc.arguments),
                     })
                     .collect();
-
+                
                 // Extract artifacts from tool calls (e.g., write_file for HTML)
                 let artifacts = extract_artifacts_from_tool_calls(tool_calls);
-                (
-                    text.clone().unwrap_or_default(),
-                    Some(calls),
-                    None,
-                    artifacts,
-                )
+                (text.clone().unwrap_or_default(), Some(calls), None, artifacts)
             }
             atomcode_core::conversation::message::MessageContent::ToolResult(r) => {
                 let lines = r.output.lines().count();
@@ -265,29 +254,18 @@ impl From<&atomcode_core::conversation::message::Message> for MessageInfo {
                 } else {
                     first_line.to_string()
                 };
-                (
-                    r.output.clone(),
-                    None,
-                    Some(ToolResultInfo {
-                        success: r.success,
-                        summary,
-                        line_count: lines,
-                    }),
-                    None,
-                )
+                (r.output.clone(), None, Some(ToolResultInfo {
+                    success: r.success,
+                    summary,
+                    line_count: lines,
+                }), None)
             }
             atomcode_core::conversation::message::MessageContent::ToolResultRef(r) => {
                 (r.summary.clone(), None, None, None)
             }
         };
-
-        Self {
-            role: role.to_string(),
-            content,
-            tool_calls,
-            tool_result,
-            artifacts,
-        }
+        
+        Self { role: role.to_string(), content, tool_calls, tool_result, artifacts }
     }
 }
 
@@ -296,14 +274,14 @@ impl From<&atomcode_core::conversation::message::Message> for MessageInfo {
 fn extract_code_blocks(text: &str) -> Option<Vec<ArtifactInfo>> {
     let mut artifacts = Vec::new();
     let mut id_counter = 0;
-
+    
     // Match code blocks: ```language\ncontent\n```
     let re = regex::Regex::new(r"```(\w+)\n([\s\S]*?)```").ok()?;
-
+    
     for cap in re.captures_iter(text) {
         let language = cap.get(1)?.as_str().to_string();
         let content = cap.get(2)?.as_str().to_string();
-
+        
         // Determine artifact type based on language
         let artifact_type = match language.as_str() {
             "html" | "htm" => "html",
@@ -311,9 +289,9 @@ fn extract_code_blocks(text: &str) -> Option<Vec<ArtifactInfo>> {
             "mermaid" => "mermaid",
             "markdown" | "md" => "markdown",
             "javascript" | "typescript" | "python" | "rust" | "java" => "code",
-            _ => continue, // Skip other languages
+            _ => continue,  // Skip other languages
         };
-
+        
         id_counter += 1;
         artifacts.push(ArtifactInfo {
             id: format!("block-{}", id_counter),
@@ -323,20 +301,14 @@ fn extract_code_blocks(text: &str) -> Option<Vec<ArtifactInfo>> {
             content,
         });
     }
-
-    if artifacts.is_empty() {
-        None
-    } else {
-        Some(artifacts)
-    }
+    
+    if artifacts.is_empty() { None } else { Some(artifacts) }
 }
 
 /// Extract artifacts from tool calls (e.g., write_file creating HTML files)
-fn extract_artifacts_from_tool_calls(
-    tool_calls: &[atomcode_core::tool::ToolCall],
-) -> Option<Vec<ArtifactInfo>> {
+fn extract_artifacts_from_tool_calls(tool_calls: &[atomcode_core::tool::ToolCall]) -> Option<Vec<ArtifactInfo>> {
     let mut artifacts = Vec::new();
-
+    
     for tc in tool_calls {
         if tc.name == "create_file" || tc.name == "edit_file" {
             // Parse arguments
@@ -344,12 +316,12 @@ fn extract_artifacts_from_tool_calls(
                 Ok(v) => v,
                 Err(_) => continue,
             };
-
+            
             let path = match args.get("file_path").and_then(|v| v.as_str()) {
                 Some(p) => p,
                 None => continue,
             };
-
+            
             let (artifact_type, language) = if path.ends_with(".html") || path.ends_with(".htm") {
                 ("html", "html")
             } else if path.ends_with(".svg") {
@@ -365,21 +337,17 @@ fn extract_artifacts_from_tool_calls(
             } else if path.ends_with(".pdf") {
                 ("pdf", "pdf")
             } else {
-                continue; // Skip other file types
+                continue;  // Skip other file types
             };
-
+            
             // Get content from arguments (optional for binary files)
-            let content = args
-                .get("content")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-
+            let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            
             // Extract title from path
             let title = PathBuf::from(path)
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string());
-
+            
             artifacts.push(ArtifactInfo {
                 id: format!("file-{}", artifacts.len() + 1),
                 artifact_type: artifact_type.to_string(),
@@ -393,16 +361,15 @@ fn extract_artifacts_from_tool_calls(
                 Ok(v) => v,
                 Err(_) => continue,
             };
-
+            
             let command = match args.get("command").and_then(|v| v.as_str()) {
                 Some(c) => c,
                 None => continue,
             };
-
+            
             // Look for file redirection ( > or >> ) to artifact file types
             if let Some(path) = extract_output_file_from_bash(command) {
-                let (artifact_type, language) = if path.ends_with(".html") || path.ends_with(".htm")
-                {
+                let (artifact_type, language) = if path.ends_with(".html") || path.ends_with(".htm") {
                     ("html", "html")
                 } else if path.ends_with(".svg") {
                     ("svg", "xml")
@@ -419,11 +386,11 @@ fn extract_artifacts_from_tool_calls(
                 } else {
                     continue;
                 };
-
+                
                 let title = PathBuf::from(&path)
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string());
-
+                
                 artifacts.push(ArtifactInfo {
                     id: format!("file-{}", artifacts.len() + 1),
                     artifact_type: artifact_type.to_string(),
@@ -434,55 +401,37 @@ fn extract_artifacts_from_tool_calls(
             }
         }
     }
-
-    if artifacts.is_empty() {
-        None
-    } else {
-        Some(artifacts)
-    }
+    
+    if artifacts.is_empty() { None } else { Some(artifacts) }
 }
 
 /// Extract output file path from bash command (handles > and >> redirection, and quoted paths)
 fn extract_output_file_from_bash(command: &str) -> Option<String> {
     // Artifact file extensions to look for
-    let artifact_extensions = [
-        ".html",
-        ".htm",
-        ".svg",
-        ".md",
-        ".markdown",
-        ".pptx",
-        ".docx",
-        ".xlsx",
-        ".pdf",
-    ];
-
+    let artifact_extensions = [".html", ".htm", ".svg", ".md", ".markdown", ".pptx", ".docx", ".xlsx", ".pdf"];
+    
     // First, try to find > or >> redirection
     let chars: Vec<char> = command.chars().collect();
     let mut i = 0;
-
+    
     while i < chars.len() {
         if chars[i] == '>' {
             // Found redirection
             let append_mode = i + 1 < chars.len() && chars[i + 1] == '>';
             let start = if append_mode { i + 2 } else { i + 1 };
-
+            
             // Skip whitespace
             let mut j = start;
             while j < chars.len() && chars[j].is_whitespace() {
                 j += 1;
             }
-
+            
             // Extract file path until whitespace or end
             let mut path_end = j;
-            while path_end < chars.len()
-                && !chars[path_end].is_whitespace()
-                && chars[path_end] != ';'
-                && chars[path_end] != '&'
-            {
+            while path_end < chars.len() && !chars[path_end].is_whitespace() && chars[path_end] != ';' && chars[path_end] != '&' {
                 path_end += 1;
             }
-
+            
             if j < path_end {
                 let path: String = chars[j..path_end].iter().collect();
                 // Remove quotes if present
@@ -494,14 +443,14 @@ fn extract_output_file_from_bash(command: &str) -> Option<String> {
         }
         i += 1;
     }
-
+    
     // Look for quoted paths with artifact extensions
     // Pattern: 'path.pptx' or "path.docx"
     let mut in_single_quote = false;
     let mut in_double_quote = false;
     let mut quote_start = 0usize;
     let chars: Vec<char> = command.chars().collect();
-
+    
     for (idx, &ch) in chars.iter().enumerate() {
         if ch == '\'' && !in_double_quote {
             if in_single_quote {
@@ -529,7 +478,7 @@ fn extract_output_file_from_bash(command: &str) -> Option<String> {
             }
         }
     }
-
+    
     None
 }
 
@@ -554,11 +503,7 @@ fn format_tool_args(tool_name: &str, args_json: &str) -> String {
         }
         "create_file" => {
             let path = args.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
-            let size = args
-                .get("content")
-                .and_then(|v| v.as_str())
-                .map(|s| s.len())
-                .unwrap_or(0);
+            let size = args.get("content").and_then(|v| v.as_str()).map(|s| s.len()).unwrap_or(0);
             format!("{} ({} bytes)", short_path(path), size)
         }
         "edit_file" => {
@@ -567,10 +512,10 @@ fn format_tool_args(tool_name: &str, args_json: &str) -> String {
         }
         "bash" => {
             let cmd = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
-            if cmd.chars().count() > 80 {
-                format!("`{}...`", cmd.chars().take(77).collect::<String>())
-            } else {
-                format!("`{}`", cmd)
+            if cmd.chars().count() > 80 { 
+                format!("`{}...`", cmd.chars().take(77).collect::<String>()) 
+            } else { 
+                format!("`{}`", cmd) 
             }
         }
         "list_directory" => {
@@ -625,12 +570,29 @@ fn short_path(path: &str) -> String {
     }
 }
 
+
 fn hash_path(path: &std::path::Path) -> String {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
-
+    
+    // Normalize the path before hashing to ensure consistent results across:
+    // - Different path separators (Windows: `\` vs `/`)
+    // - Case sensitivity (Windows paths are case-insensitive)
+    // - Trailing slashes
+    let normalized = path.to_string_lossy();
+    let mut normalized = normalized.replace('\\', "/");
+    
+    // Remove trailing slash (but keep root "/" or "C:/")
+    if normalized.len() > 1 && normalized.ends_with('/') {
+        normalized.pop();
+    }
+    
+    // On Windows, paths are case-insensitive
+    #[cfg(windows)]
+    let normalized = normalized.to_lowercase();
+    
     let mut hasher = DefaultHasher::new();
-    path.hash(&mut hasher);
+    normalized.hash(&mut hasher);
     format!("{:016x}", hasher.finish())
 }
 
@@ -638,29 +600,29 @@ fn hash_path(path: &std::path::Path) -> String {
 fn list_projects() -> std::io::Result<Vec<ProjectInfo>> {
     let sessions_root = SessionManager::sessions_root_dir();
     let mut projects = Vec::new();
-
+    
     if !sessions_root.exists() {
         return Ok(projects);
     }
-
+    
     // Scan sessions directory for actual session data
     for entry in std::fs::read_dir(sessions_root)? {
         let entry = entry?;
         let path = entry.path();
-
+        
         if path.is_dir() {
             let hash = path.file_name().unwrap().to_string_lossy().to_string();
-
+            
             // Scan sessions in this project to get working_dir and stats
             let mut session_count = 0;
             let mut last_updated = 0u64;
             let mut created_at = u64::MAX;
             let mut working_dir = PathBuf::new();
-
+            
             for session_file in std::fs::read_dir(&path)? {
                 let session_file = session_file?;
                 let file_path = session_file.path();
-
+                
                 if file_path.extension().map_or(false, |ext| ext == "json") {
                     if let Ok(json) = std::fs::read_to_string(&file_path) {
                         if let Ok(session) = serde_json::from_str::<Session>(&json) {
@@ -674,34 +636,30 @@ fn list_projects() -> std::io::Result<Vec<ProjectInfo>> {
                     }
                 }
             }
-
+            
             // Only include projects with at least one session
             if session_count > 0 {
                 let name = working_dir
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_else(|| "unknown".to_string());
-
+                
                 projects.push(ProjectInfo {
                     hash,
                     name,
                     working_dir,
                     description: None,
                     session_count,
-                    created_at: if created_at == u64::MAX {
-                        0
-                    } else {
-                        created_at
-                    },
+                    created_at: if created_at == u64::MAX { 0 } else { created_at },
                     last_updated,
                 });
             }
         }
     }
-
+    
     // Sort by last updated (most recent first)
     projects.sort_by(|a, b| b.last_updated.cmp(&a.last_updated));
-
+    
     Ok(projects)
 }
 
@@ -721,11 +679,11 @@ fn list_sessions(project_hash: &str) -> std::io::Result<Vec<SessionMeta>> {
     }
 
     let mut sessions = Vec::new();
-
+    
     for entry in std::fs::read_dir(project_dir)? {
         let entry = entry?;
         let path = entry.path();
-
+        
         if path.extension().map_or(false, |ext| ext == "json") {
             let file_size = entry.metadata().map(|m| m.len()).unwrap_or(0);
             if let Ok(json) = std::fs::read_to_string(&path) {
@@ -741,7 +699,7 @@ fn list_sessions(project_hash: &str) -> std::io::Result<Vec<SessionMeta>> {
             }
         }
     }
-
+    
     // Sort by updated_at descending
     sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
     Ok(sessions)
@@ -755,18 +713,18 @@ fn list_all_sessions() -> std::io::Result<Vec<SessionMetaWithProject>> {
     }
 
     let mut all_sessions = Vec::new();
-
+    
     for entry in std::fs::read_dir(sessions_root)? {
         let entry = entry?;
         let path = entry.path();
-
+        
         if path.is_dir() {
             let project_hash = path.file_name().unwrap().to_string_lossy().to_string();
-
+            
             for session_file in std::fs::read_dir(&path)? {
                 let session_file = session_file?;
                 let file_path = session_file.path();
-
+                
                 if file_path.extension().map_or(false, |ext| ext == "json") {
                     let file_size = session_file.metadata().map(|m| m.len()).unwrap_or(0);
                     if let Ok(json) = std::fs::read_to_string(&file_path) {
@@ -787,7 +745,7 @@ fn list_all_sessions() -> std::io::Result<Vec<SessionMetaWithProject>> {
             }
         }
     }
-
+    
     // Sort by updated_at descending
     all_sessions.sort_by(|a, b| b.meta.updated_at.cmp(&a.meta.updated_at));
     // Limit to first 50 sessions
@@ -800,9 +758,10 @@ fn load_session(project_hash: &str, session_id: &str) -> std::io::Result<Session
     let path = SessionManager::sessions_root_dir()
         .join(project_hash)
         .join(format!("{}.json", session_id));
-
+    
     let json = std::fs::read_to_string(path)?;
-    serde_json::from_str(&json).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+    serde_json::from_str(&json)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
 }
 
 // ============== HTTP Handlers ==============
@@ -825,7 +784,9 @@ async fn health() -> impl IntoResponse {
 }
 
 /// GET /project - Get current project state
-async fn get_project_state(State(state): State<AppState>) -> impl IntoResponse {
+async fn get_project_state(
+    State(state): State<AppState>,
+) -> impl IntoResponse {
     let state = state.project.read().await;
     Json(ProjectState {
         working_dir: state.working_dir.clone(),
@@ -841,7 +802,7 @@ async fn change_dir(
     Json(req): Json<ChangeDirRequest>,
 ) -> impl IntoResponse {
     let mut project = state.project.write().await;
-
+    
     // Handle "-" to go back to previous directory
     let new_path = if req.path == "-" {
         match &project.previous_dir {
@@ -859,25 +820,18 @@ async fn change_dir(
         // Expand ~ and make absolute
         let expanded = if req.path.starts_with('~') {
             dirs::home_dir()
-                .map(|h| {
-                    h.join(
-                        req.path
-                            .strip_prefix('~')
-                            .unwrap_or("")
-                            .trim_start_matches('/'),
-                    )
-                })
+                .map(|h| h.join(req.path.strip_prefix('~').unwrap_or("").trim_start_matches('/')))
                 .unwrap_or_else(|| PathBuf::from(&req.path))
         } else {
             PathBuf::from(&req.path)
         };
-
+        
         let resolved = if expanded.is_absolute() {
             expanded
         } else {
             project.working_dir.join(&expanded)
         };
-
+        
         // Check if directory exists
         if !resolved.exists() {
             return Json(ChangeDirResponse {
@@ -887,7 +841,7 @@ async fn change_dir(
                 project_hash: hash_path(&project.working_dir),
             });
         }
-
+        
         if !resolved.is_dir() {
             return Json(ChangeDirResponse {
                 success: false,
@@ -896,31 +850,30 @@ async fn change_dir(
                 project_hash: hash_path(&project.working_dir),
             });
         }
-
+        
         resolved
     };
-
+    
     // Update state
     let old_dir = project.working_dir.clone();
     project.previous_dir = Some(old_dir);
     project.working_dir = new_path.clone();
-    project.name = new_path
-        .file_name()
+    project.name = new_path.file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "project".to_string());
-
+    
     // Update recent dirs (max 5, deduplicated)
     project.recent_dirs.retain(|d| d != &new_path);
     project.recent_dirs.insert(0, new_path.clone());
     project.recent_dirs.truncate(5);
-
+    
     // Persist to config
     let config_path = Config::default_path();
     if let Ok(mut config) = Config::load(&config_path) {
         config.default_workdir = Some(new_path.to_string_lossy().to_string());
         let _ = config.save(&config_path);
     }
-
+    
     let hash = hash_path(&new_path);
     Json(ChangeDirResponse {
         success: true,
@@ -953,7 +906,9 @@ async fn get_project_sessions(Path(hash): Path<String>) -> impl IntoResponse {
 }
 
 /// GET /projects/:hash/sessions/:id - Get session detail
-async fn get_session_detail(Path((hash, id)): Path<(String, String)>) -> impl IntoResponse {
+async fn get_session_detail(
+    Path((hash, id)): Path<(String, String)>,
+) -> impl IntoResponse {
     match load_session(&hash, &id) {
         Ok(session) => {
             let detail = SessionDetail {
@@ -999,7 +954,7 @@ async fn create_session(
             project.working_dir.clone()
         }
     };
-
+    
     // Ensure working directory exists
     if !working_dir.exists() {
         // Create atomchat directory in user's home if default
@@ -1012,31 +967,31 @@ async fn create_session(
             return (StatusCode::BAD_REQUEST, Json(msg)).into_response();
         }
     }
-
+    
     // Create session manager
     let manager = SessionManager::new(&working_dir);
-
+    
     // Create new session
     let mut session = Session::new(working_dir.clone());
-
+    
     // Set title if provided
     if let Some(title) = req.title {
         session.rename(title);
     }
-
+    
     // Save session
     if let Err(e) = manager.save(&session) {
         let msg = format!("Failed to save session: {}", e);
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(msg)).into_response();
     }
-
+    
     // Calculate project hash for response
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     let mut hasher = DefaultHasher::new();
     working_dir.hash(&mut hasher);
     let project_hash = format!("{:016x}", hasher.finish());
-
+    
     let response = CreateSessionResponse {
         id: session.id.to_string(),
         name: session.name.clone(),
@@ -1044,7 +999,7 @@ async fn create_session(
         project_hash,
         created_at: session.created_at,
     };
-
+    
     (StatusCode::CREATED, Json(response)).into_response()
 }
 
@@ -1057,18 +1012,18 @@ fn search_sessions_by_name(keyword: &str) -> std::io::Result<Vec<SessionMetaWith
 
     let keyword_lower = keyword.to_lowercase();
     let mut results = Vec::new();
-
+    
     for entry in std::fs::read_dir(sessions_root)? {
         let entry = entry?;
         let path = entry.path();
-
+        
         if path.is_dir() {
             let project_hash = path.file_name().unwrap().to_string_lossy().to_string();
-
+            
             for session_file in std::fs::read_dir(&path)? {
                 let session_file = session_file?;
                 let file_path = session_file.path();
-
+                
                 if file_path.extension().map_or(false, |ext| ext == "json") {
                     let file_size = session_file.metadata().map(|m| m.len()).unwrap_or(0);
                     if let Ok(json) = std::fs::read_to_string(&file_path) {
@@ -1092,7 +1047,7 @@ fn search_sessions_by_name(keyword: &str) -> std::io::Result<Vec<SessionMetaWith
             }
         }
     }
-
+    
     // Sort by updated_at descending
     results.sort_by(|a, b| b.meta.updated_at.cmp(&a.meta.updated_at));
     Ok(results)
@@ -1101,13 +1056,9 @@ fn search_sessions_by_name(keyword: &str) -> std::io::Result<Vec<SessionMetaWith
 /// GET /sessions/search?q=keyword - Search sessions by name
 async fn search_sessions(Query(query): Query<SearchQuery>) -> impl IntoResponse {
     if query.q.trim().is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json("Search keyword cannot be empty"),
-        )
-            .into_response();
+        return (StatusCode::BAD_REQUEST, Json("Search keyword cannot be empty")).into_response();
     }
-
+    
     match search_sessions_by_name(&query.q) {
         Ok(sessions) => Json(sessions).into_response(),
         Err(e) => {
@@ -1122,19 +1073,21 @@ fn delete_session_file(project_hash: &str, session_id: &str) -> std::io::Result<
     let path = SessionManager::sessions_root_dir()
         .join(project_hash)
         .join(format!("{}.json", session_id));
-
+    
     if !path.exists() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
-            format!("Session not found: {}/{}", project_hash, session_id),
+            format!("Session not found: {}/{}", project_hash, session_id)
         ));
     }
-
+    
     std::fs::remove_file(path)
 }
 
 /// DELETE /projects/:hash/sessions/:id - Delete a session
-async fn delete_session(Path((hash, id)): Path<(String, String)>) -> impl IntoResponse {
+async fn delete_session(
+    Path((hash, id)): Path<(String, String)>,
+) -> impl IntoResponse {
     match delete_session_file(&hash, &id) {
         Ok(()) => {
             let msg = format!("Session {} deleted successfully", id);
@@ -1154,29 +1107,25 @@ pub struct RenameRequest {
 }
 
 /// Rename a session
-fn rename_session_file(
-    project_hash: &str,
-    session_id: &str,
-    new_name: &str,
-) -> std::io::Result<()> {
+fn rename_session_file(project_hash: &str, session_id: &str, new_name: &str) -> std::io::Result<()> {
     let path = SessionManager::sessions_root_dir()
         .join(project_hash)
         .join(format!("{}.json", session_id));
-
+    
     if !path.exists() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
-            format!("Session not found: {}/{}", project_hash, session_id),
+            format!("Session not found: {}/{}", project_hash, session_id)
         ));
     }
-
+    
     // Load, rename, and save
     let json = std::fs::read_to_string(&path)?;
     let mut session: Session = serde_json::from_str(&json)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-
+    
     session.rename(new_name.to_string());
-
+    
     let manager = SessionManager::new(&PathBuf::from(&session.working_dir));
     manager.save(&session)
 }
@@ -1217,14 +1166,10 @@ async fn get_models() -> impl IntoResponse {
     let config = match Config::load(&config_path) {
         Ok(c) => c,
         Err(_e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(Vec::<ModelInfo>::new()),
-            )
-                .into_response();
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(Vec::<ModelInfo>::new())).into_response();
         }
     };
-
+    
     let models: Vec<ModelInfo> = config
         .providers
         .iter()
@@ -1235,7 +1180,7 @@ async fn get_models() -> impl IntoResponse {
             is_default: name == &config.default_provider,
         })
         .collect();
-
+    
     (StatusCode::OK, Json(models)).into_response()
 }
 
@@ -1269,24 +1214,15 @@ pub enum ChatEvent {
     ToolCallStarted { name: String, arguments: String },
     /// Tool call completed
     #[serde(rename = "tool_result")]
-    ToolCallResult {
-        name: String,
-        output: String,
-        success: bool,
-        duration_ms: u64,
-    },
+    ToolCallResult { name: String, output: String, success: bool, duration_ms: u64 },
     /// Token usage update
     #[serde(rename = "tokens")]
-    TokenUsage {
-        prompt: usize,
-        completion: usize,
-        total: usize,
-    },
+    TokenUsage { prompt: usize, completion: usize, total: usize },
     /// Artifact started - detected code block or HTML
     #[serde(rename = "artifact_start")]
     ArtifactStart {
         id: String,
-        artifact_type: String,    // "code", "html", "markdown"
+        artifact_type: String,  // "code", "html", "markdown"
         language: Option<String>, // for code blocks
         title: Option<String>,
     },
@@ -1328,9 +1264,15 @@ enum ArtifactDetectorState {
         content: String,
     },
     /// Inside HTML block (detected by <html>, <!DOCTYPE, or substantial HTML tags)
-    InHtml { id: String, content: String },
+    InHtml {
+        id: String,
+        content: String,
+    },
     /// Inside SVG block (detected by <svg> tag)
-    InSvg { id: String, content: String },
+    InSvg {
+        id: String,
+        content: String,
+    },
 }
 
 impl ArtifactDetector {
@@ -1340,12 +1282,12 @@ impl ArtifactDetector {
             state: ArtifactDetectorState::Normal,
         }
     }
-
+    
     fn next_id(&mut self) -> String {
         self.artifact_counter += 1;
         format!("artifact_{}", self.artifact_counter)
     }
-
+    
     /// Map code block language to artifact type for rendering
     fn artifact_type_for_language(language: &str) -> (String, Option<String>) {
         let lang_lower = language.to_lowercase();
@@ -1368,11 +1310,11 @@ impl ArtifactDetector {
         };
         (artifact_type.to_string(), title)
     }
-
+    
     /// Process incoming text delta and return events to emit
     fn process(&mut self, text: &str) -> Vec<ChatEvent> {
         let mut events = Vec::new();
-
+        
         match &mut self.state {
             ArtifactDetectorState::Normal => {
                 // Check for code block start
@@ -1380,7 +1322,7 @@ impl ArtifactDetector {
                     let rest = &text[3..];
                     let end_of_line = rest.find('\n').unwrap_or(rest.len());
                     let language = rest[..end_of_line].trim().to_string();
-
+                    
                     let (artifact_type, title) = Self::artifact_type_for_language(&language);
                     let id = self.next_id();
                     events.push(ChatEvent::ArtifactStart {
@@ -1389,7 +1331,7 @@ impl ArtifactDetector {
                         language: Some(language.clone()),
                         title,
                     });
-
+                    
                     self.state = ArtifactDetectorState::InCodeBlock {
                         id,
                         language,
@@ -1410,7 +1352,7 @@ impl ArtifactDetector {
                         id: id.clone(),
                         content: text.to_string(),
                     });
-
+                    
                     self.state = ArtifactDetectorState::InSvg {
                         id,
                         content: text.to_string(),
@@ -1429,24 +1371,18 @@ impl ArtifactDetector {
                         id: id.clone(),
                         content: text.to_string(),
                     });
-
+                    
                     self.state = ArtifactDetectorState::InHtml {
                         id,
                         content: text.to_string(),
                     };
-                } else {
+                }
+                else {
                     // Normal text
-                    events.push(ChatEvent::TextDelta {
-                        content: text.to_string(),
-                    });
+                    events.push(ChatEvent::TextDelta { content: text.to_string() });
                 }
             }
-            ArtifactDetectorState::InCodeBlock {
-                id,
-                language: _,
-                artifact_type: _,
-                content,
-            } => {
+            ArtifactDetectorState::InCodeBlock { id, language: _, artifact_type: _, content } => {
                 // Check for code block end
                 if text.trim() == "```" {
                     // Emit the accumulated content
@@ -1470,11 +1406,8 @@ impl ArtifactDetector {
             ArtifactDetectorState::InHtml { id, content } => {
                 // Check for HTML end (simple heuristic: </html> or </body>)
                 let trimmed = text.trim();
-                if trimmed.ends_with("</html>")
-                    || trimmed.ends_with("</HTML>")
-                    || trimmed.ends_with("</body>")
-                    || trimmed.ends_with("</BODY>")
-                {
+                if trimmed.ends_with("</html>") || trimmed.ends_with("</HTML>") 
+                    || trimmed.ends_with("</body>") || trimmed.ends_with("</BODY>") {
                     content.push_str(text);
                     events.push(ChatEvent::ArtifactContent {
                         id: id.clone(),
@@ -1510,23 +1443,23 @@ impl ArtifactDetector {
                 }
             }
         }
-
+        
         events
     }
-
+    
     fn is_html_start(&self, text: &str) -> bool {
         let trimmed = text.trim();
-        trimmed.starts_with("<!DOCTYPE html")
+        trimmed.starts_with("<!DOCTYPE html") 
             || trimmed.starts_with("<!DOCTYPE HTML")
             || trimmed.starts_with("<html")
             || trimmed.starts_with("<HTML")
     }
-
+    
     fn is_svg_start(&self, text: &str) -> bool {
         let trimmed = text.trim();
         trimmed.starts_with("<svg") || trimmed.starts_with("<SVG")
     }
-
+    
     /// Finalize any pending artifact
     fn finish(&mut self) -> Option<ChatEvent> {
         match &self.state {
@@ -1558,41 +1491,33 @@ async fn chat_stream(
     State(state): State<AppState>,
     Json(mut req): Json<ChatRequest>,
 ) -> impl IntoResponse {
-    // Use current project working directory if not specified
+// Use current project working directory if not specified
     if req.working_dir.is_none() {
         let project = state.project.read().await;
         req.working_dir = Some(project.working_dir.clone());
     }
-
+    
     let (tx, rx) = mpsc::unbounded_channel::<ChatEvent>();
-
+    
     // Create cancellation token for this chat
     let cancel_token = CancellationToken::new();
-
+    
     // Register this chat task if we have a session_id
     let session_id = req.session_id.clone();
     if let Some(ref sid) = session_id {
-        state
-            .chat_tasks
-            .write()
-            .await
-            .insert(sid.clone(), cancel_token.clone());
+        state.chat_tasks.write().await.insert(sid.clone(), cancel_token.clone());
     }
-
+    
     // Clone state for the spawned task
     let chat_tasks = state.chat_tasks.clone();
     let stopped_sessions = state.stopped_sessions.clone();
-
+    
     // Spawn the chat processing task
     tokio::spawn(async move {
-        if let Err(e) =
-            process_chat_request(req, tx.clone(), cancel_token, stopped_sessions.clone()).await
-        {
-            let _ = tx.send(ChatEvent::Error {
-                message: e.to_string(),
-            });
+        if let Err(e) = process_chat_request(req, tx.clone(), cancel_token, stopped_sessions.clone()).await {
+            let _ = tx.send(ChatEvent::Error { message: e.to_string() });
         }
-
+        
         // Cleanup: remove from chat_tasks
         if let Some(sid) = session_id {
             chat_tasks.write().await.remove(&sid);
@@ -1600,9 +1525,11 @@ async fn chat_stream(
     });
     let stream = UnboundedReceiverStream::new(rx).map(|event| {
         let json = serde_json::to_string(&event).unwrap_or_default();
-        Ok::<_, std::convert::Infallible>(axum::response::sse::Event::default().data(json))
+        Ok::<_, std::convert::Infallible>(
+            axum::response::sse::Event::default().data(json)
+        )
     });
-
+    
     Sse::new(stream).keep_alive(
         axum::response::sse::KeepAlive::new()
             .interval(Duration::from_secs(15))
@@ -1618,36 +1545,30 @@ async fn process_chat_request(
     stopped_sessions: StoppedSessionsStore,
 ) -> anyhow::Result<()> {
     use atomcode_core::tool::{
-        bash::BashTool, edit::EditFileTool, glob::GlobTool, grep::GrepTool, list_dir::ListDirTool,
-        read::ReadFileTool, search_replace::SearchReplaceTool, web_fetch::WebFetchTool,
-        web_search::WebSearchTool, write::WriteFileTool,
+        bash::BashTool, read::ReadFileTool, write::WriteFileTool, edit::EditFileTool,
+        grep::GrepTool, glob::GlobTool, list_dir::ListDirTool,
+        web_search::WebSearchTool, web_fetch::WebFetchTool, search_replace::SearchReplaceTool,
     };
     // Load config
     let config_path = Config::default_path();
     let config = Config::load(&config_path)?;
-
+    
     // Determine provider
-    let provider_name = req
-        .provider
-        .unwrap_or_else(|| config.default_provider.clone());
-    let provider_config = config
-        .providers
-        .get(&provider_name)
+    let provider_name = req.provider.unwrap_or_else(|| config.default_provider.clone());
+    let provider_config = config.providers.get(&provider_name)
         .ok_or_else(|| anyhow::anyhow!("Provider '{}' not found", provider_name))?;
-
+    
     // Create provider instance
     let provider = provider::create_provider(provider_config)?;
-
+    
     // Get working directory
-    let working_dir = req
-        .working_dir
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-
+    let working_dir = req.working_dir.unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    
     // Create session manager for this working directory
-    let session_manager = SessionManager::new(&working_dir);
-
+let session_manager = SessionManager::new(&working_dir);
+    
     // Load or create session
-    // Load or create session
+// Load or create session
     let mut session = if let Some(ref session_id_str) = req.session_id {
         // Try to load existing session
         let session_id = SessionId::from_string(session_id_str.clone());
@@ -1673,66 +1594,94 @@ async fn process_chat_request(
     // Build tool registry and context
     let tool_context = ToolContext::new(working_dir.clone());
     let mut tool_registry = ToolRegistry::new();
-    tool_registry.register(Box::new(ReadFileTool));
-    tool_registry.register(Box::new(WriteFileTool));
-    tool_registry.register(Box::new(EditFileTool));
-    tool_registry.register(Box::new(BashTool));
-    tool_registry.register(Box::new(GrepTool));
-    tool_registry.register(Box::new(GlobTool));
-    tool_registry.register(Box::new(ListDirTool));
-    tool_registry.register(Box::new(WebSearchTool));
-    tool_registry.register(Box::new(WebFetchTool));
-    tool_registry.register(Box::new(SearchReplaceTool));
-    let shared_tools = Arc::new(tool_registry);
+    // Honour ATOMCODE_DISABLE_TOOLS env var at daemon startup too, matching
+    // the CLI's --disable-tools behaviour. Comma-separated tool names.
+    let disabled_tools: std::collections::HashSet<String> = std::env::var("ATOMCODE_DISABLE_TOOLS")
+        .ok()
+        .map(|v| v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
+        .unwrap_or_default();
+    let enabled = |name: &str| !disabled_tools.contains(name);
+    if enabled("read_file") { tool_registry.register(Box::new(ReadFileTool)); }
+    if enabled("write_file") { tool_registry.register(Box::new(WriteFileTool)); }
+    if enabled("edit_file") { tool_registry.register(Box::new(EditFileTool)); }
+    if enabled("bash") { tool_registry.register(Box::new(BashTool)); }
+    if enabled("grep") { tool_registry.register(Box::new(GrepTool)); }
+    if enabled("glob") { tool_registry.register(Box::new(GlobTool)); }
+    if enabled("list_directory") { tool_registry.register(Box::new(ListDirTool)); }
+    if enabled("web_search") { tool_registry.register(Box::new(WebSearchTool)); }
+    if enabled("web_fetch") { tool_registry.register(Box::new(WebFetchTool)); }
+    if enabled("search_replace") { tool_registry.register(Box::new(SearchReplaceTool)); }
 
+    // Load skills and register use_skill tool
+    let mut skill_registry = atomcode_core::skill::SkillRegistry::new();
+    skill_registry.reload(&working_dir);
+    let has_skills = !skill_registry.is_empty();
+    let skill_registry = Arc::new(std::sync::RwLock::new(skill_registry));
+    if has_skills && enabled("use_skill") {
+        tool_registry.register(Box::new(atomcode_core::tool::use_skill::UseSkillTool {
+            registry: skill_registry.clone()
+        }));
+    }
+
+    let shared_tools = Arc::new(tool_registry);
+    
     // Create turn runner with auto-bypass permission (API mode - no interactive approval)
     let permission = Box::new(AutoPermissionDecider::new(AutoPermissionMode::BypassAll));
+    // Same ctx selection as interactive AgentLoop: walk config.providers
+    // for the active provider, fallback to synthetic 128K config if absent.
+    let daemon_ctx = match config.providers.get(&config.default_provider) {
+        Some(pc) => atomcode_core::ctx::for_provider(pc),
+        None => atomcode_core::ctx::for_provider(&atomcode_core::config::provider::ProviderConfig {
+            provider_type: String::new(),
+            api_key: None,
+            model: String::new(),
+            base_url: None,
+            system_prompt: None,
+            user_agent: None,
+            context_window: 128_000,
+            max_tokens: None,
+            thinking_type: None,
+            thinking_keep: None,
+            ephemeral: true,
+        }),
+    };
     let mut turn_runner = TurnRunner {
         provider: provider.into(),
         tools: shared_tools,
         context: tool_context,
         config: config.clone(),
+        ctx: daemon_ctx,
         permission,
         hook_registry: HookRegistry::new(), // Daemon mode doesn't use hooks for now
         recently_edited_files: Vec::new(),
         recent_calls: Vec::new(),
         file_read_counts: std::collections::HashMap::new(),
     };
-
+    
     // Build system prompt (minimal for API)
-    let system_prompt = build_api_system_prompt(&working_dir);
+    let system_prompt = build_api_system_prompt(&working_dir, &skill_registry);
     // Create turn event channel
     let (turn_tx, mut turn_rx) = mpsc::unbounded_channel::<TurnEvent>();
-
+    
     // Check if session was stopped before we started
     // If so, clear the stopped marker and return - allows next chat to proceed normally
     let session_id_str = req.session_id.clone().unwrap_or_default();
-    if stopped_sessions
-        .write()
-        .await
-        .take(&session_id_str)
-        .is_some()
-    {
+    if stopped_sessions.write().await.take(&session_id_str).is_some() {
         let _ = event_tx.send(ChatEvent::Stopped);
-        let _ = event_tx.send(ChatEvent::Done {
-            tokens: 0,
-            tool_calls: 0,
-        });
+        let _ = event_tx.send(ChatEvent::Done { tokens: 0, tool_calls: 0 });
         return Ok(());
     }
-
+    
     // Clone conversation Arc for the spawn task
     let conversation_clone = conversation.clone();
-
+    
     // Run turn(s) in background task - may need multiple turns if tools are used
     tokio::spawn(async move {
         let mut conv = conversation_clone.lock().await;
-
+        
         // Loop until LLM produces text without tool calls
         loop {
-            let result = turn_runner
-                .run(&mut conv, &system_prompt, &turn_tx, cancel_token.clone())
-                .await;
+            let result = turn_runner.run(&mut conv, &system_prompt, &turn_tx, cancel_token.clone()).await;
 
             match result {
                 TurnResult::Responded { .. } => {
@@ -1740,8 +1689,9 @@ async fn process_chat_request(
                     break;
                 }
                 TurnResult::UsedTools { .. } => {
-                    // Tools were executed, continue to next LLM call
-                    // The tool results are already added to conversation
+                    // Truncation of tool outputs is handled inside
+                    // TurnRunner::run_with_filter now. Nothing to do
+                    // here — just loop back for the next LLM call.
                     continue;
                 }
                 TurnResult::Failed(e) => {
@@ -1754,12 +1704,12 @@ async fn process_chat_request(
             }
         }
     });
-
-    // Forward turn events to chat events
+    
+// Forward turn events to chat events
     let mut total_tokens = 0usize;
     let mut tool_call_count = 0usize;
     let mut artifact_detector = ArtifactDetector::new();
-
+    
     while let Some(event) = turn_rx.recv().await {
         match event {
             TurnEvent::TextDelta(text) => {
@@ -1768,38 +1718,29 @@ async fn process_chat_request(
                     let _ = event_tx.send(chat_event);
                 }
             }
-            TurnEvent::ToolCallStarted {
-                id: _,
-                name,
-                arguments,
-            } => {
+            TurnEvent::ToolCallStarted { id: _, name, arguments } => {
                 tool_call_count += 1;
-                let _ = event_tx.send(ChatEvent::ToolCallStarted {
-                    name: name.clone(),
-                    arguments: arguments.clone(),
-                });
-
+                let _ = event_tx.send(ChatEvent::ToolCallStarted { name: name.clone(), arguments: arguments.clone() });
+                
                 // Extract artifacts from write_file/edit_file tool calls
                 if name == "create_file" || name == "edit_file" {
                     if let Ok(args) = serde_json::from_str::<serde_json::Value>(&arguments) {
                         if let Some(path) = args.get("file_path").and_then(|v| v.as_str()) {
-                            let artifact_type = if path.ends_with(".html") || path.ends_with(".htm")
-                            {
+                            let artifact_type = if path.ends_with(".html") || path.ends_with(".htm") {
                                 "html"
                             } else if path.ends_with(".svg") {
                                 "svg"
                             } else {
                                 ""
                             };
-
+                            
                             if !artifact_type.is_empty() {
-                                if let Some(content) = args.get("content").and_then(|v| v.as_str())
-                                {
+                                if let Some(content) = args.get("content").and_then(|v| v.as_str()) {
                                     let id = format!("file-{}", uuid::Uuid::new_v4());
                                     let title = std::path::PathBuf::from(path)
                                         .file_name()
                                         .map(|n| n.to_string_lossy().to_string());
-
+                                    
                                     let _ = event_tx.send(ChatEvent::ArtifactStart {
                                         id: id.clone(),
                                         artifact_type: artifact_type.to_string(),
@@ -1817,13 +1758,7 @@ async fn process_chat_request(
                     }
                 }
             }
-            TurnEvent::ToolCallResult {
-                call_id: _,
-                name,
-                output,
-                success,
-                duration,
-            } => {
+            TurnEvent::ToolCallResult { call_id: _, name, output, success, duration } => {
                 let _ = event_tx.send(ChatEvent::ToolCallResult {
                     name,
                     output,
@@ -1831,12 +1766,7 @@ async fn process_chat_request(
                     duration_ms: duration.as_millis() as u64,
                 });
             }
-            TurnEvent::TokenUsage {
-                prompt_tokens,
-                completion_tokens,
-                total_tokens: tt,
-                cached_tokens: _,
-            } => {
+            TurnEvent::TokenUsage { prompt_tokens, completion_tokens, total_tokens: tt, cached_tokens: _ } => {
                 total_tokens = tt;
                 let _ = event_tx.send(ChatEvent::TokenUsage {
                     prompt: prompt_tokens,
@@ -1861,16 +1791,16 @@ async fn process_chat_request(
             }
         }
     }
-
+    
     // Finalize any pending artifact
     if let Some(event) = artifact_detector.finish() {
         let _ = event_tx.send(event);
     }
-
+    
     // Save session after conversation completes (unless stopped)
     let session_id_str = req.session_id.clone().unwrap_or_default();
     let was_stopped = stopped_sessions.read().await.contains(&session_id_str);
-
+    
     if was_stopped {
         // Session was stopped, don't save the messages
         eprintln!("Session {} was stopped, skipping save", session_id_str);
@@ -1882,12 +1812,12 @@ async fn process_chat_request(
             eprintln!("Warning: Failed to save session: {}", e);
         }
     }
-
+    
     // Clean up stopped sessions marker if present
     if was_stopped {
         stopped_sessions.write().await.remove(&session_id_str);
     }
-
+    
     // Send done event
     let _ = event_tx.send(ChatEvent::Done {
         tokens: total_tokens,
@@ -1897,9 +1827,9 @@ async fn process_chat_request(
 }
 
 /// Build minimal system prompt for API mode
-fn build_api_system_prompt(working_dir: &PathBuf) -> String {
+fn build_api_system_prompt(working_dir: &PathBuf, skill_registry: &Arc<std::sync::RwLock<atomcode_core::skill::SkillRegistry>>) -> String {
     let cwd = working_dir.to_string_lossy();
-    format!(
+    let mut prompt = format!(
         r#"You are AtomCode, an expert coding agent. You solve tasks efficiently with minimal tool calls.
 
 ## WORKING DIRECTORY
@@ -1917,7 +1847,29 @@ fn build_api_system_prompt(working_dir: &PathBuf) -> String {
 4. VERIFY: After EACH edit, compile/build. Fix errors before moving on.
 5. SUMMARIZE: Tell the user what you changed.
 "#
-    )
+    );
+    
+    // Inject available skills into system prompt
+    if let Ok(registry) = skill_registry.read() {
+        let skills: Vec<String> = registry
+            .invocable_by_llm()
+            .map(|s| {
+                let hint = s.argument_hint
+                    .as_ref()
+                    .map(|h| format!(" {}", h))
+                    .unwrap_or_default();
+                format!("- /{}{}: {}", s.name, hint, s.description)
+            })
+            .collect();
+        if !skills.is_empty() {
+            prompt.push_str("\n## AVAILABLE SKILLS\n");
+            prompt.push_str("Use the `use_skill` tool to invoke a skill when relevant to the task.\n");
+            prompt.push_str(&skills.join("\n"));
+            prompt.push('\n');
+        }
+    }
+    
+    prompt
 }
 
 /// Request to stop a chat session
@@ -1939,34 +1891,21 @@ async fn stop_chat(
     Json(req): Json<StopChatRequest>,
 ) -> impl IntoResponse {
     // Add to stopped sessions set
-    state
-        .stopped_sessions
-        .write()
-        .await
-        .insert(req.session_id.clone());
-
+    state.stopped_sessions.write().await.insert(req.session_id.clone());
+    
     // Cancel the chat task if it exists
     if let Some(cancel_token) = state.chat_tasks.read().await.get(&req.session_id) {
         cancel_token.cancel();
-        (
-            axum::http::StatusCode::OK,
-            Json(StopChatResponse {
-                success: true,
-                message: format!("Chat session {} stopped", req.session_id),
-            }),
-        )
+        (axum::http::StatusCode::OK, Json(StopChatResponse {
+            success: true,
+            message: format!("Chat session {} stopped", req.session_id),
+        }))
     } else {
         // Session wasn't running, but we marked it as stopped
-        (
-            axum::http::StatusCode::OK,
-            Json(StopChatResponse {
-                success: true,
-                message: format!(
-                    "Chat session {} marked as stopped (was not running)",
-                    req.session_id
-                ),
-            }),
-        )
+        (axum::http::StatusCode::OK, Json(StopChatResponse {
+            success: true,
+            message: format!("Chat session {} marked as stopped (was not running)", req.session_id),
+        }))
     }
 }
 
@@ -1984,7 +1923,7 @@ async fn main() {
         chat_tasks: Arc::new(RwLock::new(HashMap::new())),
         stopped_sessions: Arc::new(RwLock::new(HashSet::new())),
     };
-
+    
     let app = Router::new()
         // Health check
         .route("/health", get(health))
@@ -1997,10 +1936,7 @@ async fn main() {
         // Historical projects (from sessions directory)
         .route("/projects", get(get_projects))
         .route("/projects/:hash/sessions", get(get_project_sessions))
-        .route(
-            "/projects/:hash/sessions/:id",
-            get(get_session_detail).delete(delete_session),
-        )
+.route("/projects/:hash/sessions/:id", get(get_session_detail).delete(delete_session))
         .route("/projects/:hash/sessions/:id/rename", patch(rename_session))
         // Model API
         .route("/models", get(get_models))
@@ -2015,9 +1951,7 @@ async fn main() {
     println!("\nAPI endpoints:");
     println!("  GET    /health                        - Health check");
     println!("  GET    /project                        - Get current working directory");
-    println!(
-        "  POST   /cd                             - Change working directory (like /cd command)"
-    );
+    println!("  POST   /cd                             - Change working directory (like /cd command)");
     println!("  GET    /projects                       - List historical projects");
     println!("  GET    /projects/:hash/sessions        - List sessions in a project");
     println!("  GET    /projects/:hash/sessions/:id    - Get session detail");

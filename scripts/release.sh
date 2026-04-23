@@ -12,18 +12,25 @@ if [ -x "$HOME/.cargo/bin/rustc" ]; then
     export PATH="$HOME/.cargo/bin:$PATH"
 fi
 
-# Allow override via env (CI / one-off rebuilds without re-tagging).
-# Otherwise pick the most recent v*.*.* tag — `git describe --tags`
-# alone returns *any* recent tag, including internal deploy tags like
-# "快速发布-atomcode-atomgit-4181" which produce non-ASCII binary
-# filenames and break the /upgrade download URL.
+# Source of truth: [workspace.package].version in Cargo.toml — the binary
+# embeds this via env!("CARGO_PKG_VERSION"), so keying releases off it
+# guarantees the package filename matches `atomcode --version`. Git tags
+# can drift (Cargo bumped but tag not yet pushed, or vice versa).
+# ATOMCODE_VERSION env override is preserved for CI / one-off rebuilds.
 VERSION="${ATOMCODE_VERSION:-}"
 if [ -z "$VERSION" ]; then
-    VERSION=$(git tag -l 'v[0-9]*' --sort=-v:refname | head -n1)
+    CARGO_VERSION=$(awk -F'"' '
+        /^\[workspace\.package\]/ { in_section = 1; next }
+        /^\[/ { in_section = 0 }
+        in_section && /^version *=/ { print $2; exit }
+    ' Cargo.toml)
+    if [ -n "$CARGO_VERSION" ]; then
+        VERSION="v${CARGO_VERSION}"
+    fi
 fi
 if [ -z "$VERSION" ]; then
-    echo "No v*.*.* git tag found. Create one first:  git tag -a v1.0.0 -m 'v1.0.0'"
-    echo "Or set ATOMCODE_VERSION=v1.0.0 to override."
+    echo "Could not determine version. Set [workspace.package].version in Cargo.toml,"
+    echo "or override with ATOMCODE_VERSION=v1.0.0."
     exit 1
 fi
 case "$VERSION" in
@@ -42,66 +49,94 @@ mkdir -p "$DIST"
 echo "=== AtomCode Release ${VERSION} ==="
 echo ""
 
+# Default to CLI-only builds. Daemon is internal/CI-facing (see sign-macos.sh
+# header) and shipping it in releases bloats artifacts + signing surface.
+# Set ATOMCODE_INCLUDE_DAEMON=1 to also build and package atomcode-daemon.
+INCLUDE_DAEMON="${ATOMCODE_INCLUDE_DAEMON:-0}"
+CARGO_PKG_ARGS=(-p atomcode)
+if [ "$INCLUDE_DAEMON" = "1" ]; then
+    CARGO_PKG_ARGS+=(-p atomcode-daemon)
+fi
+
+# Copies the daemon binary if INCLUDE_DAEMON=1; no-op otherwise.
+# $1 = source path (without .exe extension), $2 = dest path (without .exe extension), $3 = ".exe" or ""
+copy_daemon() {
+    [ "$INCLUDE_DAEMON" = "1" ] || return 0
+    local src="$1$3" dst="$2$3"
+    cp "$src" "$dst"
+    echo "  -> $dst"
+}
+
 # --- macOS ARM (Apple Silicon) ---
 TARGET_ARM="aarch64-apple-darwin"
-echo "[1/5] Building ${TARGET_ARM}..."
+echo "[1/6] Building ${TARGET_ARM}..."
 rustup target add "$TARGET_ARM" 2>/dev/null || true
-cargo build --release --target "$TARGET_ARM"
+cargo build --release --target "$TARGET_ARM" "${CARGO_PKG_ARGS[@]}"
 cp "target/${TARGET_ARM}/release/atomcode" "${DIST}/atomcode-${VERSION}-darwin-arm64"
-cp "target/${TARGET_ARM}/release/atomcode-daemon" "${DIST}/atomcode-daemon-${VERSION}-darwin-arm64"
 echo "  -> ${DIST}/atomcode-${VERSION}-darwin-arm64"
-echo "  -> ${DIST}/atomcode-daemon-${VERSION}-darwin-arm64"
+copy_daemon "target/${TARGET_ARM}/release/atomcode-daemon" "${DIST}/atomcode-daemon-${VERSION}-darwin-arm64" ""
 
 # --- macOS Intel ---
 TARGET_X86="x86_64-apple-darwin"
-echo "[2/5] Building ${TARGET_X86}..."
+echo "[2/6] Building ${TARGET_X86}..."
 rustup target add "$TARGET_X86" 2>/dev/null || true
-cargo build --release --target "$TARGET_X86"
+cargo build --release --target "$TARGET_X86" "${CARGO_PKG_ARGS[@]}"
 cp "target/${TARGET_X86}/release/atomcode" "${DIST}/atomcode-${VERSION}-darwin-x64"
-cp "target/${TARGET_X86}/release/atomcode-daemon" "${DIST}/atomcode-daemon-${VERSION}-darwin-x64"
 echo "  -> ${DIST}/atomcode-${VERSION}-darwin-x64"
-echo "  -> ${DIST}/atomcode-daemon-${VERSION}-darwin-x64"
+copy_daemon "target/${TARGET_X86}/release/atomcode-daemon" "${DIST}/atomcode-daemon-${VERSION}-darwin-x64" ""
 
 # --- Linux x64 (cross-compile with musl) ---
 TARGET_LINUX="x86_64-unknown-linux-musl"
-echo "[3/5] Building ${TARGET_LINUX}..."
+echo "[3/6] Building ${TARGET_LINUX}..."
 rustup target add "$TARGET_LINUX" 2>/dev/null || true
 if command -v x86_64-linux-musl-gcc &>/dev/null; then
     export CC_x86_64_unknown_linux_musl=x86_64-linux-musl-gcc
     export CFLAGS_x86_64_unknown_linux_musl="-fPIC"
-    cargo build --release --target "$TARGET_LINUX"
+    cargo build --release --target "$TARGET_LINUX" "${CARGO_PKG_ARGS[@]}"
     cp "target/${TARGET_LINUX}/release/atomcode" "${DIST}/atomcode-${VERSION}-linux-x64"
-    cp "target/${TARGET_LINUX}/release/atomcode-daemon" "${DIST}/atomcode-daemon-${VERSION}-linux-x64"
     echo "  -> ${DIST}/atomcode-${VERSION}-linux-x64"
-    echo "  -> ${DIST}/atomcode-daemon-${VERSION}-linux-x64"
+    copy_daemon "target/${TARGET_LINUX}/release/atomcode-daemon" "${DIST}/atomcode-daemon-${VERSION}-linux-x64" ""
 else
     echo "  !! Skipped: musl-cross not installed (brew install FiloSottile/musl-cross/musl-cross)"
 fi
 
+# --- Linux ARM64 (cross-compile with musl) ---
+TARGET_LINUX_ARM="aarch64-unknown-linux-musl"
+echo "[4/6] Building ${TARGET_LINUX_ARM}..."
+rustup target add "$TARGET_LINUX_ARM" 2>/dev/null || true
+if command -v aarch64-linux-musl-gcc &>/dev/null; then
+    export CC_aarch64_unknown_linux_musl=aarch64-linux-musl-gcc
+    export CFLAGS_aarch64_unknown_linux_musl="-fPIC"
+    cargo build --release --target "$TARGET_LINUX_ARM" "${CARGO_PKG_ARGS[@]}"
+    cp "target/${TARGET_LINUX_ARM}/release/atomcode" "${DIST}/atomcode-${VERSION}-linux-arm64"
+    echo "  -> ${DIST}/atomcode-${VERSION}-linux-arm64"
+    copy_daemon "target/${TARGET_LINUX_ARM}/release/atomcode-daemon" "${DIST}/atomcode-daemon-${VERSION}-linux-arm64" ""
+else
+    echo "  !! Skipped: aarch64 musl-cross not installed (brew reinstall FiloSottile/musl-cross/musl-cross — aarch64 ships by default; do NOT pass --with-aarch64, it gets fuzzy-matched to --without-aarch64)"
+fi
+
 # --- Windows x64 (cross-compile) ---
 TARGET_WIN="x86_64-pc-windows-gnu"
-echo "[4/5] Building ${TARGET_WIN}..."
+echo "[5/6] Building ${TARGET_WIN}..."
 rustup target add "$TARGET_WIN" 2>/dev/null || true
 if command -v x86_64-w64-mingw32-gcc &>/dev/null; then
-    cargo build --release --target "$TARGET_WIN"
+    cargo build --release --target "$TARGET_WIN" "${CARGO_PKG_ARGS[@]}"
     cp "target/${TARGET_WIN}/release/atomcode.exe" "${DIST}/atomcode-${VERSION}-windows-x64.exe"
-    cp "target/${TARGET_WIN}/release/atomcode-daemon.exe" "${DIST}/atomcode-daemon-${VERSION}-windows-x64.exe"
     echo "  -> ${DIST}/atomcode-${VERSION}-windows-x64.exe"
-    echo "  -> ${DIST}/atomcode-daemon-${VERSION}-windows-x64.exe"
+    copy_daemon "target/${TARGET_WIN}/release/atomcode-daemon" "${DIST}/atomcode-daemon-${VERSION}-windows-x64" ".exe"
 else
     echo "  !! Skipped: mingw-w64 not installed (brew install mingw-w64)"
 fi
 
 # --- Windows ARM64 (cross-compile) ---
 TARGET_WIN_ARM="aarch64-pc-windows-gnullvm"
-echo "[5/5] Building ${TARGET_WIN_ARM}..."
+echo "[6/6] Building ${TARGET_WIN_ARM}..."
 rustup target add "$TARGET_WIN_ARM" 2>/dev/null || true
 if command -v aarch64-w64-mingw32-gcc &>/dev/null; then
-    cargo build --release --target "$TARGET_WIN_ARM"
+    cargo build --release --target "$TARGET_WIN_ARM" "${CARGO_PKG_ARGS[@]}"
     cp "target/${TARGET_WIN_ARM}/release/atomcode.exe" "${DIST}/atomcode-${VERSION}-windows-arm64.exe"
-    cp "target/${TARGET_WIN_ARM}/release/atomcode-daemon.exe" "${DIST}/atomcode-daemon-${VERSION}-windows-arm64.exe"
     echo "  -> ${DIST}/atomcode-${VERSION}-windows-arm64.exe"
-    echo "  -> ${DIST}/atomcode-daemon-${VERSION}-windows-arm64.exe"
+    copy_daemon "target/${TARGET_WIN_ARM}/release/atomcode-daemon" "${DIST}/atomcode-daemon-${VERSION}-windows-arm64" ".exe"
 else
     echo "  !! Skipped: llvm-mingw not installed (brew install llvm-mingw or see https://github.com/mstorsjo/llvm-mingw)"
 fi
@@ -165,6 +200,7 @@ emit_entry() {
         "darwin-arm64:atomcode-${VERSION}-darwin-arm64" \
         "darwin-x64:atomcode-${VERSION}-darwin-x64" \
         "linux-x64:atomcode-${VERSION}-linux-x64" \
+        "linux-arm64:atomcode-${VERSION}-linux-arm64" \
         "windows-x64:atomcode-${VERSION}-windows-x64.exe" \
         "windows-arm64:atomcode-${VERSION}-windows-arm64.exe"
     do

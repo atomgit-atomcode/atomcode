@@ -39,9 +39,34 @@ impl Tool for ReadSymbolTool {
         ApprovalRequirement::AutoApprove
     }
 
+    fn approval_with_context(&self, args: &str, ctx: &ToolContext) -> ApprovalRequirement {
+        let parsed = match serde_json::from_str::<ReadSymbolArgs>(args) {
+            Ok(parsed) => parsed,
+            Err(_) => return self.approval(args),
+        };
+        let working_dir = match ctx.working_dir.try_read() {
+            Ok(wd) => wd.clone(),
+            Err(_) => return self.approval(args),
+        };
+        match super::approval_for_path(&parsed.file_path, &working_dir, super::ExternalPathAction::Read) {
+            Ok(approval) => approval,
+            Err(_) => self.approval(args),
+        }
+    }
+
     async fn execute(&self, args: &str, ctx: &ToolContext) -> Result<ToolResult> {
         let parsed: ReadSymbolArgs = serde_json::from_str(args)?;
-        let path = std::path::Path::new(&parsed.file_path);
+        let working_dir = ctx.working_dir.read().await.clone();
+        let path = match super::inspect_path_access(&parsed.file_path, &working_dir) {
+            Ok(access) => access.path,
+            Err(err) => {
+                return Ok(ToolResult {
+                    call_id: String::new(),
+                    output: err.to_string(),
+                    success: false,
+                });
+            }
+        };
 
         if !path.exists() {
             return Ok(ToolResult {
@@ -52,7 +77,7 @@ impl Tool for ReadSymbolTool {
         }
 
         let mut searcher = ctx.semantic.lock().await;
-        match searcher.extract_symbol(path, &parsed.symbol) {
+        match searcher.extract_symbol(&path, &parsed.symbol) {
             Some(slice) => {
                 let mut out = format!(
                     "{}  ({}, lines {}-{})\n\n",
@@ -70,7 +95,7 @@ impl Tool for ReadSymbolTool {
             }
             None => {
                 // Try to list available symbols as a helpful hint
-                let hint = match searcher.list_symbols(path) {
+                let hint = match searcher.list_symbols(&path) {
                     Some(symbols) => {
                         let names: Vec<String> = symbols.iter().map(|s| s.name.clone()).collect();
                         format!(

@@ -31,6 +31,13 @@ pub struct TurnRunner {
     pub tools: std::sync::Arc<ToolRegistry>,
     pub context: ToolContext,
     pub config: Config,
+    /// Context construction strategy. Shared with the parent
+    /// `AgentLoop::ctx` (same `Arc`) so the turn's actual send and
+    /// the agent's datalog snapshot go through one ctx — per-model
+    /// logic like `apply_model_directives` lands on both paths.
+    /// Rebuilt on `AgentCommand::ReloadConfig` alongside the agent's
+    /// clone.
+    pub ctx: std::sync::Arc<dyn crate::ctx::CtxBuilder>,
     pub permission: Box<dyn PermissionDecider>,
     /// Hook registry for pre/post tool execution hooks
     pub hook_registry: HookRegistry,
@@ -38,15 +45,35 @@ pub struct TurnRunner {
     pub recently_edited_files: Vec<String>,
     /// Rolling history of `(tool_name, args_hash)` pairs — used to detect tool
     /// call loops (same tool + same args repeated without any edit in between).
-    /// Bounded to 20 entries to keep memory flat. For `read_file`, only the
-    /// file_path is hashed so paginated re-reads of the same file are treated
-    /// as repeats.
+    /// Bounded to 20 entries to keep memory flat. For `read_file` the hash
+    /// covers `(file_path, offset, limit)` so paginating through distinct
+    /// regions is not treated as a repeat; see `loop_args_hash`.
     pub recent_calls: Vec<(String, u64)>,
-    /// Per-basename read counter. 5+ consecutive reads of the same file without
-    /// an edit is an infinite loop (common when a file can't be parsed as text
-    /// — e.g. Office binaries — and the model keeps retrying with different
-    /// offset/limit values instead of giving up).
-    pub file_read_counts: std::collections::HashMap<String, u32>,
+    /// Per-region read counter, keyed by `(basename, offset / READ_REGION_BUCKET)`.
+    /// The region bucket means "scanning different parts of a large file" counts
+    /// as separate keys — only reading the *same* region 3+ times in a turn is
+    /// treated as a panic loop (typical of Office binaries, encoding mismatches,
+    /// or the model cycling offset/limit on an unreadable file).
+    pub file_read_counts: std::collections::HashMap<(String, u64), u32>,
+}
+
+/// Line-granularity of the read-region bucket used in `file_read_counts`.
+/// A single function body typically fits in one bucket (most are < 50 lines),
+/// so reading different functions of a large file produces different keys
+/// and doesn't cap. Shared so `DisciplineState` and the agent loop write
+/// counts under the same key the guard will read back.
+pub(crate) const READ_REGION_BUCKET: u64 = 50;
+
+/// Extract the region-bucket key for a `read_file` call so that writers
+/// (agent loop, discipline) and readers (loop guard) agree on the key shape.
+/// `short` is the file basename (not full path). Missing / malformed offset
+/// → bucket 0 (which is also the bucket for "whole-file" reads).
+pub(crate) fn read_region_key(short: &str, args: &str) -> (String, u64) {
+    let offset = serde_json::from_str::<serde_json::Value>(args)
+        .ok()
+        .and_then(|v| v.get("offset").and_then(|x| x.as_u64()))
+        .unwrap_or(0);
+    (short.to_string(), offset / READ_REGION_BUCKET)
 }
 
 impl TurnRunner {
@@ -58,8 +85,7 @@ impl TurnRunner {
         event_tx: &mpsc::UnboundedSender<TurnEvent>,
         cancel: CancellationToken,
     ) -> TurnResult {
-        self.run_with_filter(conversation, system_prompt, "", event_tx, cancel, None)
-            .await
+        self.run_with_filter(conversation, system_prompt, "", event_tx, cancel, None).await
     }
 
     /// Run with optional tool filter and turn reminder.
@@ -75,33 +101,15 @@ impl TurnRunner {
         cancel: CancellationToken,
         allowed_tools: Option<&[&str]>,
     ) -> TurnResult {
-        // 1. Build messages within token budget
-        let context_window = self
-            .config
-            .providers
-            .get(&self.config.default_provider)
-            .map(|p| p.context_window)
-            .unwrap_or(128000);
+        // 1. Build messages within token budget.
+        // Goes through `self.ctx.build_messages` (trait dispatch), NOT
+        // `ctx::render::build_messages` (free fn) — otherwise per-model
+        // logic like `apply_model_directives` only lands in datalog and
+        // the actually-sent messages diverge from what we logged.
+        let context_window = self.ctx.ctx_window();
 
-        let (mut messages, ctx_stats) =
-            conversation.to_provider_messages_budgeted(system_prompt, context_window);
-
-        // Inject turn reminder into the last user message.
-        // This keeps system prompt stable (cacheable) while providing
-        // per-turn dynamic context (previous session, current task, etc.).
-        if !turn_reminder.is_empty() {
-            // Find the last User message and prepend the reminder
-            for msg in messages.iter_mut().rev() {
-                if matches!(msg.role, crate::conversation::message::Role::User) {
-                    if let crate::conversation::message::MessageContent::Text(ref mut text) =
-                        msg.content
-                    {
-                        *text = format!("{}\n{}", turn_reminder, text);
-                        break;
-                    }
-                }
-            }
-        }
+        let (messages, ctx_stats) =
+            self.ctx.build_messages(conversation, system_prompt, turn_reminder);
 
         let actual_tokens: usize = messages.iter().map(|m| m.estimate_tokens()).sum();
 
@@ -122,8 +130,7 @@ impl TurnRunner {
         // 3. Get tool definitions for the LLM
         let all_tool_defs = self.tools.get_definitions();
         let mut tool_defs: Vec<_> = if let Some(filter) = allowed_tools {
-            all_tool_defs
-                .into_iter()
+            all_tool_defs.into_iter()
                 .filter(|d| filter.contains(&d.name))
                 .collect()
         } else {
@@ -136,16 +143,10 @@ impl TurnRunner {
             let mut known_files: Vec<String> = self.recently_edited_files.clone();
             // Extract read files from conversation tool calls
             for msg in &messages {
-                if let crate::conversation::message::MessageContent::AssistantWithToolCalls {
-                    tool_calls,
-                    ..
-                } = &msg.content
-                {
+                if let crate::conversation::message::MessageContent::AssistantWithToolCalls { tool_calls, .. } = &msg.content {
                     for call in tool_calls {
                         if call.name == "read_file" {
-                            if let Ok(args) =
-                                serde_json::from_str::<serde_json::Value>(&call.arguments)
-                            {
+                            if let Ok(args) = serde_json::from_str::<serde_json::Value>(&call.arguments) {
                                 if let Some(fp) = args.get("file_path").and_then(|v| v.as_str()) {
                                     let short = fp.rsplit('/').next().unwrap_or(fp).to_string();
                                     if !known_files.contains(&short) {
@@ -160,18 +161,13 @@ impl TurnRunner {
             if !known_files.is_empty() {
                 if let Some(wf) = tool_defs.iter_mut().find(|d| d.name == "create_file") {
                     // Display basenames for readability in tool description
-                    let display_names: Vec<&str> = known_files
-                        .iter()
+                    let display_names: Vec<&str> = known_files.iter()
                         .map(|p| p.rsplit('/').next().unwrap_or(p.as_str()))
                         .collect();
                     let list = if display_names.len() <= 6 {
                         display_names.join(", ")
                     } else {
-                        format!(
-                            "{}, ... ({} files)",
-                            display_names[..5].join(", "),
-                            display_names.len()
-                        )
+                        format!("{}, ... ({} files)", display_names[..5].join(", "), display_names.len())
                     };
                     wf.description.push_str(&format!(
                         "\nThese files ALREADY EXIST — use edit_file instead: {}",
@@ -180,6 +176,26 @@ impl TurnRunner {
                 }
             }
         }
+
+        // Log the request to <working_dir>/datalog/llm/<ts>.json right
+        // before send. `pending_request_log` holds the path so the
+        // response call below can merge into the same file — passed
+        // explicitly to avoid the old process-wide-static approach that
+        // bled across concurrent daemon sessions.
+        let pending_request_log = {
+            let wd = self.context.working_dir
+                .try_read().map(|g| g.clone()).unwrap_or_default();
+            super::log::log_llm_request(
+                &wd,
+                &messages,
+                &tool_defs,
+                self.provider.model_name(),
+                context_window,
+                0, // step — always 0 in calls.log today; step param
+                   // kept for future per-tool-call correlation.
+                self.config.datalog.enabled,
+            )
+        };
 
         // 3. Start streaming
         let stream_start = std::time::Instant::now();
@@ -221,209 +237,224 @@ impl TurnRunner {
         let stream_timeout = timeout_from_env("ATOMCODE_STREAM_TIMEOUT_SECS", 300);
 
         loop {
-            let timeout = if got_any_event {
-                stream_timeout
-            } else {
-                first_token_timeout
-            };
+            let timeout = if got_any_event { stream_timeout } else { first_token_timeout };
             tokio::select! {
-                            biased;
+                biased;
 
-            _ = cancel.cancelled() => {
-                                conversation.finalize_stream();
-                                return TurnResult::Cancelled;
+_ = cancel.cancelled() => {
+                    conversation.finalize_stream();
+                    return TurnResult::Cancelled;
+                }
+
+                _ = tokio::time::sleep(timeout) => {
+                    conversation.finalize_stream();
+                    return TurnResult::Failed(format!(
+                        "Stream timeout: no event for {:?}",
+                        timeout
+                    ));
+                }
+
+                event = stream.next() => {
+                    match event {
+                        Some(Ok(StreamEvent::Delta(text))) => {
+                            got_any_event = true;
+                            // Strip model-internal tags (DeepSeek </think>`, QwQ, etc.)
+                            let text = strip_model_tags(&text);
+                            if !text.is_empty() {
+                                conversation.push_delta(&text);
+                                text_buf.push_str(&text);
+                                let _ = event_tx.send(TurnEvent::TextDelta(text));
                             }
+                        }
+                        Some(Ok(StreamEvent::Reasoning(text))) => {
+                            got_any_event = true;
+                            // Accumulate only. Don't push into conversation / emit
+                            // TextDelta here — default UX is to hide reasoning.
+                            // If `content` ends up empty, the `Done` arm below
+                            // promotes `reasoning_buf` to the answer.
+                            reasoning_buf.push_str(&text);
+                        }
+                        Some(Ok(StreamEvent::ToolCallStart { id, name })) => {
+                            got_any_event = true;
+                            // Surface the tool name to UI immediately — otherwise users see
+                            // "Generating…" for the entire args-streaming window (can be 30s+
+                            // for large write_file calls).
+                            let _ = event_tx.send(TurnEvent::ToolCallStreaming { name: name.clone(), hint: String::new() });
+                            conversation.tool_call_buffer = Some(ToolCallBuffer {
+                                id,
+                                name,
+                                arguments: String::new(),
+                                hint_sent: false,
+                            });
+                        }
 
-                            _ = tokio::time::sleep(timeout) => {
-                                conversation.finalize_stream();
-                                return TurnResult::Failed(format!(
-                                    "Stream timeout: no event for {:?}",
-                                    timeout
-                                ));
-                            }
-
-                            event = stream.next() => {
-                                match event {
-                                    Some(Ok(StreamEvent::Delta(text))) => {
-                                        got_any_event = true;
-                                        // Strip model-internal tags (DeepSeek </think>`, QwQ, etc.)
-                                        let text = strip_model_tags(&text);
-                                        if !text.is_empty() {
-                                            conversation.push_delta(&text);
-                                            text_buf.push_str(&text);
-                                            let _ = event_tx.send(TurnEvent::TextDelta(text));
-                                        }
-                                    }
-                                    Some(Ok(StreamEvent::Reasoning(text))) => {
-                                        got_any_event = true;
-                                        // Accumulate only. Don't push into conversation / emit
-                                        // TextDelta here — default UX is to hide reasoning.
-                                        // If `content` ends up empty, the `Done` arm below
-                                        // promotes `reasoning_buf` to the answer.
-                                        reasoning_buf.push_str(&text);
-                                    }
-                                    Some(Ok(StreamEvent::ToolCallStart { id, name })) => {
-                                        got_any_event = true;
-                                        // Surface the tool name to UI immediately — otherwise users see
-                                        // "Generating…" for the entire args-streaming window (can be 30s+
-                                        // for large write_file calls).
-                                        let _ = event_tx.send(TurnEvent::ToolCallStreaming { name: name.clone(), hint: String::new() });
-                                        conversation.tool_call_buffer = Some(ToolCallBuffer {
-                                            id,
-                                            name,
-                                            arguments: String::new(),
-                                            hint_sent: false,
+                        Some(Ok(StreamEvent::ToolCallDelta(args))) => {
+                            got_any_event = true;
+                            if let Some(ref mut buf) = conversation.tool_call_buffer {
+                                buf.arguments.push_str(&args);
+                                // Extract file_path from partial args (once only).
+                                if !buf.hint_sent && buf.arguments.len() < 300 {
+                                    if let Some(hint) = extract_path_hint(&buf.arguments) {
+                                        buf.hint_sent = true;
+                                        let _ = event_tx.send(TurnEvent::ToolCallStreaming {
+                                            name: buf.name.clone(),
+                                            hint,
                                         });
-                                    }
-
-                                    Some(Ok(StreamEvent::ToolCallDelta(args))) => {
-                                        got_any_event = true;
-                                        if let Some(ref mut buf) = conversation.tool_call_buffer {
-                                            buf.arguments.push_str(&args);
-                                            // Extract file_path from partial args (once only).
-                                            if !buf.hint_sent && buf.arguments.len() < 300 {
-                                                if let Some(hint) = extract_path_hint(&buf.arguments) {
-                                                    buf.hint_sent = true;
-                                                    let _ = event_tx.send(TurnEvent::ToolCallStreaming {
-                                                        name: buf.name.clone(),
-                                                        hint,
-                                                    });
-                                                }
-                                            }
-                                        }
-                                    }
-
-                                    Some(Ok(StreamEvent::ToolCallDone(call))) => {
-                                        conversation.tool_call_buffer = None;
-                                        let _ = event_tx.send(TurnEvent::ToolCallStarted {
-                                            id: call.id.clone(),
-                                            name: call.name.clone(),
-                                            arguments: call.arguments.clone(),
-                                        });
-                                        tool_calls_buf.push(call);
-                                    }
-
-                                    Some(Ok(StreamEvent::Usage(usage))) => {
-                                        total_tokens += usage.completion_tokens;
-                                        got_usage = true;
-                                        let _ = event_tx.send(TurnEvent::TokenUsage {
-                                            prompt_tokens: usage.prompt_tokens,
-                                            completion_tokens: usage.completion_tokens,
-                                            total_tokens: usage.prompt_tokens + usage.completion_tokens,
-                                            cached_tokens: usage.cached_tokens,
-                                        });
-                                    }
-
-                                    Some(Ok(StreamEvent::Done { truncated: is_truncated })) => {
-                                        // Reasoning-only fallback: some gateways route the
-                                        // entire response through `reasoning_content` for
-                                        // reasoning models (MiniMax-M2.7, DeepSeek-R1). If
-                                        // we end up here with empty `content`, empty
-                                        // tool_calls, but a non-empty reasoning buffer, treat
-                                        // the reasoning as the answer — otherwise the agent's
-                                        // empty-response retry loop fires twice, sleeps 4s,
-                                        // and finally reports a silent "Nailed it · 0 tok".
-                                        //
-                                        // Rescue runs before this so real tool-call-in-text
-                                        // escapes still take priority.
-                                        let rescued_tools = if tool_calls_buf.is_empty() {
-                                            let rescued = rescue_text_tool_calls(&text_buf);
-                                            if !rescued.is_empty() {
-                                                conversation.clear_stream_buffer();
-                                                tool_calls_buf.extend(rescued);
-                                                true
-                                            } else {
-                                                false
-                                            }
-                                        } else {
-                                            false
-                                        };
-
-                                        if text_buf.trim().is_empty()
-                                            && tool_calls_buf.is_empty()
-                                            && !rescued_tools
-                                            && !reasoning_buf.trim().is_empty()
-                                        {
-                                            let promoted = std::mem::take(&mut reasoning_buf);
-                                            conversation.push_delta(&promoted);
-                                            text_buf.push_str(&promoted);
-                                            let _ = event_tx.send(TurnEvent::TextDelta(promoted));
-                                        }
-
-                                        // Fallback: if the provider didn't report usage (many
-                                        // OpenAI-compatible APIs ignore stream_options), estimate
-                                        // output tokens from the streamed text + tool call args.
-                                        if !got_usage {
-                                            let mut output_chars = text_buf.len();
-                                            for tc in &tool_calls_buf {
-                                                output_chars += tc.arguments.len();
-                                            }
-                                            // Rough heuristic: ~2 chars per token for mixed
-                                            // Chinese/English, ~4 for pure English. Use 3 as a
-                                            // middle ground since most users mix both.
-                                            let estimated = (output_chars / 3).max(1);
-                                            total_tokens += estimated;
-                                            let _ = event_tx.send(TurnEvent::TokenUsage {
-                                                prompt_tokens: 0,
-                                                completion_tokens: estimated,
-                                                total_tokens: estimated,
-                                                cached_tokens: 0,
-                                            });
-                                        }
-
-                                        // Finalize conversation state
-                                        if !tool_calls_buf.is_empty() {
-                                            conversation.finalize_stream_with_tool_calls(&tool_calls_buf);
-                                        } else {
-                                            conversation.finalize_stream();
-                                        }
-                                        was_truncated = is_truncated;
-                                        break;
-                                    }
-
-                                    Some(Ok(StreamEvent::Error(e))) => {
-                                        conversation.finalize_stream();
-                                        return TurnResult::Failed(e);
-                                    }
-
-                                    Some(Err(e)) => {
-                                        conversation.finalize_stream();
-                                        return TurnResult::Failed(e.to_string());
-                                    }
-
-                                    None => {
-                                        // Stream ended without Done event
-                                        conversation.finalize_stream();
-                                        break;
                                     }
                                 }
                             }
                         }
+
+                        Some(Ok(StreamEvent::ToolCallDone(call))) => {
+                            conversation.tool_call_buffer = None;
+                            let _ = event_tx.send(TurnEvent::ToolCallStarted {
+                                id: call.id.clone(),
+                                name: call.name.clone(),
+                                arguments: call.arguments.clone(),
+                            });
+                            tool_calls_buf.push(call);
+                        }
+
+                        Some(Ok(StreamEvent::Usage(usage))) => {
+                            total_tokens += usage.completion_tokens;
+                            got_usage = true;
+                            let _ = event_tx.send(TurnEvent::TokenUsage {
+                                prompt_tokens: usage.prompt_tokens,
+                                completion_tokens: usage.completion_tokens,
+                                total_tokens: usage.prompt_tokens + usage.completion_tokens,
+                                cached_tokens: usage.cached_tokens,
+                            });
+                        }
+
+                        Some(Ok(StreamEvent::Done { truncated: is_truncated })) => {
+                            // Reasoning-only fallback: some gateways route the
+                            // entire response through `reasoning_content` for
+                            // reasoning models (MiniMax-M2.7, DeepSeek-R1). If
+                            // we end up here with empty `content`, empty
+                            // tool_calls, but a non-empty reasoning buffer, treat
+                            // the reasoning as the answer — otherwise the agent's
+                            // empty-response retry loop fires twice, sleeps 4s,
+                            // and finally reports a silent "Nailed it · 0 tok".
+                            //
+                            // Rescue runs before this so real tool-call-in-text
+                            // escapes still take priority.
+                            let rescued_tools = if tool_calls_buf.is_empty() {
+                                let rescued = rescue_text_tool_calls(&text_buf);
+                                if !rescued.is_empty() {
+                                    conversation.clear_stream_buffer();
+                                    tool_calls_buf.extend(rescued);
+                                    true
+                                } else {
+                                    false
+                                }
+                            } else {
+                                false
+                            };
+
+                            if text_buf.trim().is_empty()
+                                && tool_calls_buf.is_empty()
+                                && !rescued_tools
+                                && !reasoning_buf.trim().is_empty()
+                            {
+                                let promoted = std::mem::take(&mut reasoning_buf);
+                                conversation.push_delta(&promoted);
+                                text_buf.push_str(&promoted);
+                                let _ = event_tx.send(TurnEvent::TextDelta(promoted));
+                            }
+
+                            // Fallback: if the provider didn't report usage (many
+                            // OpenAI-compatible APIs ignore stream_options), estimate
+                            // output tokens from the streamed text + tool call args.
+                            if !got_usage {
+                                let mut output_chars = text_buf.len();
+                                for tc in &tool_calls_buf {
+                                    output_chars += tc.arguments.len();
+                                }
+                                // Rough heuristic: ~2 chars per token for mixed
+                                // Chinese/English, ~4 for pure English. Use 3 as a
+                                // middle ground since most users mix both.
+                                let estimated = (output_chars / 3).max(1);
+                                total_tokens += estimated;
+                                let _ = event_tx.send(TurnEvent::TokenUsage {
+                                    prompt_tokens: 0,
+                                    completion_tokens: estimated,
+                                    total_tokens: estimated,
+                                    cached_tokens: 0,
+                                });
+                            }
+
+                            // Finalize conversation state. Pass the accumulated
+                            // reasoning_buf so thinking-model providers (Moonshot
+                            // Kimi K2-thinking/K2.6, etc.) can echo it back on
+                            // the next request — without this the provider 400s
+                            // with "reasoning_content is missing in assistant
+                            // tool call message". The send-side ReasoningPolicy
+                            // (per-provider) decides whether the field actually
+                            // reaches the wire.
+                            if !tool_calls_buf.is_empty() {
+                                let reasoning = if reasoning_buf.trim().is_empty() {
+                                    None
+                                } else {
+                                    Some(reasoning_buf.as_str())
+                                };
+                                conversation.finalize_stream_with_tool_calls(
+                                    &tool_calls_buf,
+                                    reasoning,
+                                );
+                            } else {
+                                conversation.finalize_stream();
+                            }
+                            was_truncated = is_truncated;
+                            break;
+                        }
+
+                        Some(Ok(StreamEvent::Error(e))) => {
+                            conversation.finalize_stream();
+                            return TurnResult::Failed(e);
+                        }
+
+                        Some(Err(e)) => {
+                            conversation.finalize_stream();
+                            return TurnResult::Failed(e.to_string());
+                        }
+
+                        None => {
+                            // Stream ended without Done event
+                            conversation.finalize_stream();
+                            break;
+                        }
+                    }
+                }
+            }
         }
 
         // Log LLM response (text + tool calls) to <working_dir>/datalog/llm/
         let response_duration = stream_start.elapsed().as_millis() as u64;
-        let wd = self
-            .context
-            .working_dir
-            .try_read()
-            .map(|g| g.clone())
-            .unwrap_or_default();
+        let wd = self.context.working_dir
+            .try_read().map(|g| g.clone()).unwrap_or_default();
         super::log::log_llm_response(
             &wd,
+            pending_request_log,
             &text_buf,
             &tool_calls_buf,
+            &reasoning_buf,
             self.provider.model_name(),
             0, // step is set by caller
             response_duration,
             self.config.datalog.enabled,
         );
 
+        if tool_calls_buf.is_empty() && text_buf.trim().is_empty() {
+            return TurnResult::Failed(
+                "Provider returned an empty response (no text, no tool calls).".to_string(),
+            );
+        }
+
         // 5. If no tool calls, we're done — LLM produced text only
         if tool_calls_buf.is_empty() {
             // Trigger post-turn hooks for Responded
             self.trigger_post_turn_hooks("Responded").await;
-
+            
             return TurnResult::Responded {
                 text: text_buf,
                 tokens: total_tokens,
@@ -455,15 +486,11 @@ impl TurnRunner {
         // turn share the budget fairly — 1 read gets 20%, 3 reads get 6.7% each.
         // read.rs Layer A checks file_tokens against this to decide full vs skeleton.
         {
-            let num_reads = tool_calls_buf
-                .iter()
+            let num_reads = tool_calls_buf.iter()
                 .filter(|c| c.name == "read_file")
                 .count()
                 .max(1); // avoid division by zero
-            let budget = self
-                .context
-                .ctx_budget_hint
-                .load(std::sync::atomic::Ordering::Relaxed);
+            let budget = self.context.ctx_budget_hint.load(std::sync::atomic::Ordering::Relaxed);
             let per_file = budget / (5 * num_reads);
             self.context.read_budget_tokens.store(
                 per_file.max(2000), // floor: ~170 lines always get full content
@@ -472,8 +499,7 @@ impl TurnRunner {
         }
 
         let tool_count = tool_calls_buf.len();
-        let mut seen_calls: std::collections::HashMap<(String, String), usize> =
-            std::collections::HashMap::new();
+        let mut seen_calls: std::collections::HashMap<(String, String), usize> = std::collections::HashMap::new();
         let mut is_dup: Vec<bool> = vec![false; tool_calls_buf.len()];
         for (i, call) in tool_calls_buf.iter().enumerate() {
             let key = (call.name.clone(), call.arguments.clone());
@@ -550,6 +576,21 @@ impl TurnRunner {
             }
         }
 
+        // Truncate oversized tool outputs before returning. Without this,
+        // a single `ls -la node_modules` / wide `find` dump (multi-MB)
+        // stays raw in `conversation.messages` and the NEXT LLM call
+        // blows the upstream context limit. Every caller of TurnRunner
+        // used to have to remember to invoke this — daemon didn't, which
+        // was the root of the 738K-token 400 bug. Making runner own it
+        // removes the implicit contract.
+        crate::ctx::truncate::post_process_tool_results(
+            &mut conversation.messages,
+            tool_count,
+            "", // fallback only — each result is keyed by its own
+                // call_id → ATC.tool_name lookup (see ctx::truncate).
+            context_window,
+        );
+
         // Trigger post-turn hooks
         self.trigger_post_turn_hooks("UsedTools").await;
 
@@ -572,9 +613,7 @@ impl TurnRunner {
             "".to_string(),
             working_dir.to_string_lossy().to_string(),
         );
-        self.hook_registry
-            .trigger_post_turn_hooks(&hook_ctx, turn_result)
-            .await;
+        self.hook_registry.trigger_post_turn_hooks(&hook_ctx, turn_result).await;
     }
 
     /// EXECUTE mode: run one LLM turn with minimal context.
@@ -615,16 +654,14 @@ impl TurnRunner {
         let execute_tools = &["edit_file"];
 
         // 4. Run the LLM turn with filtered tools
-        let result = self
-            .run_with_filter(
-                &mut mini_conv,
-                system_prompt,
-                "",
-                event_tx,
-                cancel,
-                Some(execute_tools),
-            )
-            .await;
+        let result = self.run_with_filter(
+            &mut mini_conv,
+            system_prompt,
+            "",
+            event_tx,
+            cancel,
+            Some(execute_tools),
+        ).await;
 
         result
     }
@@ -647,8 +684,8 @@ impl TurnRunner {
         let corrected_name = match name_lower.as_str() {
             "create_file" => "write_file",
             "find" | "find_files" => "glob",
-            "run" | "run_command" | "run_server" | "run_shell" | "run_app" | "execute"
-            | "shell" | "terminal" => "bash",
+            "run" | "run_command" | "run_server" | "run_shell" | "run_app"
+                | "execute" | "shell" | "terminal" => "bash",
             "list_files" | "ls" => "list_directory",
             "search" => "grep",
             _ => "",
@@ -657,9 +694,7 @@ impl TurnRunner {
             // No alias match — try case-insensitive lookup in registry
             if self.tools.get(&call.name).is_some() {
                 call.name.as_str()
-            } else if let Some(name) = self
-                .tools
-                .iter()
+            } else if let Some(name) = self.tools.iter()
                 .find(|(k, _)| k.eq_ignore_ascii_case(&call.name))
                 .map(|(k, _)| k.as_ref())
             {
@@ -675,9 +710,7 @@ impl TurnRunner {
         let tool = match self.tools.get_arc(corrected_name) {
             Some(t) => t,
             None => {
-                let available: String = self
-                    .tools
-                    .iter()
+                let available: String = self.tools.iter()
                     .map(|(name, _)| name.as_ref())
                     .collect::<Vec<&str>>()
                     .join(", ");
@@ -747,8 +780,10 @@ impl TurnRunner {
         // Check permission via the injected PermissionDecider.
         // AutoApprove tools execute immediately; RequireApproval tools go through
         // the decider which handles interactive prompts or automatic policy.
-        let approval = tool.approval(&call.arguments);
-        if let crate::tool::ApprovalRequirement::RequireApproval(ref reason) = approval {
+        let approval = tool.approval_with_context(&call.arguments, &self.context);
+        if let crate::tool::ApprovalRequirement::RequireApproval(ref reason)
+            | crate::tool::ApprovalRequirement::RequireApprovalAlways(ref reason) = approval
+        {
             let decision = self.permission.decide(call, reason).await;
             if !matches!(decision, PermissionDecision::Allow) {
                 let output = format!("Tool '{}' was denied by the user.", call.name);
@@ -774,7 +809,7 @@ impl TurnRunner {
             call.arguments.clone(),
             working_dir.to_string_lossy().to_string(),
         );
-
+        
         let mut final_args = call.arguments.clone();
         match self.hook_registry.trigger_pre_tool_hooks(&hook_ctx).await {
             Ok(Some(new_args)) => {
@@ -866,10 +901,8 @@ impl TurnRunner {
             success: tool_result.success,
             duration_ms: duration.as_millis() as u64,
         };
-
-        self.hook_registry
-            .trigger_post_tool_hooks(&hook_ctx, &result_ctx)
-            .await;
+        
+        self.hook_registry.trigger_post_tool_hooks(&hook_ctx, &result_ctx).await;
 
         let _ = event_tx.send(TurnEvent::ToolCallResult {
             call_id: call.id.clone(),
@@ -887,24 +920,25 @@ impl TurnRunner {
     ///
     /// Two patterns are caught:
     ///
-    /// 1. **Paginated re-reads of the same file** (`read_file` specific):
-    ///    5 unbroken `read_file` calls against the same basename — typically
-    ///    the model panicking on an unreadable file (Office binary, missing
-    ///    GBK decode, etc.) and cycling through offset/limit combinations.
-    ///    Reset by a successful `edit_file` / `write_file` targeting the
-    ///    same file (that counts as real progress).
+    /// 1. **Per-region read saturation** (`read_file` specific):
+    ///    3 unbroken `read_file` calls against the *same region* of a file
+    ///    (basename + offset bucket). Paginating through distinct regions of
+    ///    a large file produces different keys and does NOT trip — this
+    ///    specifically targets the panic loop where the model re-reads the
+    ///    same slice hoping for different content (Office binary, encoding
+    ///    mismatch, etc.). Reset by a successful `edit_file` / `write_file`
+    ///    targeting the same file (clears ALL regions for that file).
     ///
     /// 2. **Exact repeats** (any tool): 3 calls with identical `(tool_name,
     ///    args_hash)` and no intervening `edit_file` / `write_file`. Means
     ///    the model re-issued the same command without reacting to the
     ///    previous failure.
     ///
-    /// For `read_file`, only `file_path` is hashed so `offset`/`limit`
-    /// variations still count as "same call".
-    fn detect_call_loop(&mut self, tool_name: &str, args: &str) -> Option<String> {
-        use std::hash::{Hash, Hasher};
-
-        // --- Pattern 1: per-file read saturation ------------------------------
+    /// For `read_file`, the hash covers `(file_path, offset, limit)` so that
+    /// paginating through distinct regions of a large file does NOT count as
+    /// a loop — only literal re-reads do.
+    pub(super) fn detect_call_loop(&mut self, tool_name: &str, args: &str) -> Option<String> {
+        // --- Pattern 1: per-region read saturation ----------------------------
         if tool_name == "read_file" {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(args) {
                 if let Some(fp) = v.get("file_path").and_then(|v| v.as_str()) {
@@ -912,16 +946,19 @@ impl TurnRunner {
                         .file_name()
                         .map(|n| n.to_string_lossy().to_string())
                         .unwrap_or_else(|| fp.to_string());
-                    let count = self.file_read_counts.entry(short.clone()).or_insert(0);
+                    let key = read_region_key(&short, args);
+                    let count = self.file_read_counts.entry(key).or_insert(0);
                     *count += 1;
-                    if *count >= 5 {
+                    if *count >= 3 {
                         return Some(format!(
-                            "BLOCKED: read_file '{}' was called {} times without an edit. \
-                             You already have everything this file can give you via read_file. \
-                             If it's unreadable (Office binary, PDF, encoding mismatch), stop \
-                             retrying and either use a bash converter (pandoc / pdftotext / \
-                             antiword / unzip for .docx) or tell the user the format isn't \
-                             supported. If you have enough content, act on it now.",
+                            "BLOCKED: read_file '{}' hit its {}-call cap for the SAME region of this file. \
+                             You keep requesting the same slice and getting the same output. \
+                             If you need more of this file, pass a different offset to jump elsewhere. \
+                             If you're stuck because the file is unreadable (Office binary, PDF, \
+                             encoding mismatch), switch to a bash converter \
+                             (pandoc / pdftotext / antiword / unzip for .docx) or tell the user \
+                             the format isn't supported. \
+                             Do not re-read this region again in this turn.",
                             short, count
                         ));
                     }
@@ -929,9 +966,10 @@ impl TurnRunner {
             }
         }
 
-        // A successful edit on the same file should reset its read counter so
-        // post-edit verification reads aren't blocked. `edit_file` / `write_file`
-        // also clear the global recent-repeat list further down.
+        // A successful edit on a file clears ALL of that file's region counts,
+        // so post-edit verification reads (potentially covering different parts)
+        // aren't blocked. `edit_file` / `write_file` also clear the global
+        // recent-repeat list further down.
         if matches!(tool_name, "edit_file" | "write_file" | "create_file") {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(args) {
                 if let Some(fp) = v.get("file_path").and_then(|v| v.as_str()) {
@@ -939,31 +977,13 @@ impl TurnRunner {
                         .file_name()
                         .map(|n| n.to_string_lossy().to_string())
                         .unwrap_or_else(|| fp.to_string());
-                    self.file_read_counts.remove(&short);
+                    self.file_read_counts.retain(|(file, _), _| file != &short);
                 }
             }
         }
 
         // --- Pattern 2: exact-repeat across any tool --------------------------
-        let args_hash = {
-            let mut h = std::collections::hash_map::DefaultHasher::new();
-            if tool_name == "read_file" {
-                // offset/limit variations are still "same file" for loop purposes.
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(args) {
-                    if let Some(fp) = v.get("file_path").and_then(|v| v.as_str()) {
-                        fp.hash(&mut h);
-                    } else {
-                        args.hash(&mut h);
-                    }
-                } else {
-                    args.hash(&mut h);
-                }
-            } else {
-                args.hash(&mut h);
-            }
-            h.finish()
-        };
-
+        let args_hash = loop_args_hash(tool_name, args);
         let sig = (tool_name.to_string(), args_hash);
 
         // Count repeats of this exact signature *since the last edit*. An edit
@@ -996,6 +1016,36 @@ impl TurnRunner {
         }
         None
     }
+}
+
+/// Hash a tool call for exact-repeat loop detection.
+///
+/// For `read_file` we hash `(file_path, offset, limit)` — paginating through
+/// different regions of the same large file must NOT collapse to one hash
+/// (that was the historical behavior and it tripped the 3-repeat guard on
+/// legitimate scans). Missing `offset` / `limit` normalize to 0 so the hash
+/// is stable whether the model omits the field or sends it as `null`.
+///
+/// For every other tool we hash the whole `args` string.
+fn loop_args_hash(tool_name: &str, args: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    if tool_name == "read_file" {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(args) {
+            if let Some(fp) = v.get("file_path").and_then(|v| v.as_str()) {
+                fp.hash(&mut h);
+                v.get("offset").and_then(|x| x.as_u64()).unwrap_or(0).hash(&mut h);
+                v.get("limit").and_then(|x| x.as_u64()).unwrap_or(0).hash(&mut h);
+                return h.finish();
+            }
+        }
+        // Malformed args or missing file_path — hash raw so identical bad
+        // calls still collapse and trip the loop detector.
+        args.hash(&mut h);
+    } else {
+        args.hash(&mut h);
+    }
+    h.finish()
 }
 
 /// Strip model-internal reasoning tags from streaming output.
@@ -1052,8 +1102,7 @@ fn rescue_text_tool_calls(text: &str) -> Vec<ToolCall> {
 
     while let Some(start) = remaining.find("<tool_call>") {
         let after_tag = &remaining[start + "<tool_call>".len()..];
-        let end = after_tag
-            .find("</tool_call>")
+        let end = after_tag.find("</tool_call>")
             .or_else(|| after_tag.find('\n'))
             .unwrap_or(after_tag.len());
         let body = after_tag[..end].trim();
@@ -1076,13 +1125,8 @@ fn rescue_text_tool_calls(text: &str) -> Vec<ToolCall> {
                             let k = part[..eq].trim();
                             let v = part[eq + 1..].trim();
                             // Quote the value if not already quoted
-                            let v_quoted = if v.starts_with('"')
-                                || v.starts_with('{')
-                                || v.starts_with('[')
-                                || v == "true"
-                                || v == "false"
-                                || v.parse::<f64>().is_ok()
-                            {
+                            let v_quoted = if v.starts_with('"') || v.starts_with('{') || v.starts_with('[')
+                                || v == "true" || v == "false" || v.parse::<f64>().is_ok() {
                                 v.to_string()
                             } else {
                                 format!("\"{}\"", v.replace('\\', "\\\\").replace('"', "\\\""))
@@ -1123,41 +1167,25 @@ fn merge_edit_calls(calls: &mut Vec<ToolCall>) -> Vec<String> {
     let mut file_groups: HashMap<String, Vec<usize>> = HashMap::new();
     let mut file_order: Vec<String> = Vec::new();
     for (i, call) in calls.iter().enumerate() {
-        if call.name != "edit_file" {
-            continue;
-        }
-        let fp = serde_json::from_str::<serde_json::Value>(&call.arguments)
-            .ok()
-            .and_then(|a| {
-                a.get("file_path")
-                    .and_then(|v| v.as_str())
-                    .map(String::from)
-            });
+        if call.name != "edit_file" { continue; }
+        let fp = serde_json::from_str::<serde_json::Value>(&call.arguments).ok()
+            .and_then(|a| a.get("file_path").and_then(|v| v.as_str()).map(String::from));
         if let Some(fp) = fp {
             let entry = file_groups.entry(fp.clone()).or_default();
-            if entry.is_empty() {
-                file_order.push(fp);
-            }
+            if entry.is_empty() { file_order.push(fp); }
             entry.push(i);
         }
     }
 
     // Only merge groups with 2+ calls
-    let merge_targets: Vec<(String, Vec<usize>)> = file_order
-        .into_iter()
+    let merge_targets: Vec<(String, Vec<usize>)> = file_order.into_iter()
         .filter_map(|fp| {
             let indices = file_groups.remove(&fp)?;
-            if indices.len() >= 2 {
-                Some((fp, indices))
-            } else {
-                None
-            }
+            if indices.len() >= 2 { Some((fp, indices)) } else { None }
         })
         .collect();
 
-    if merge_targets.is_empty() {
-        return Vec::new();
-    }
+    if merge_targets.is_empty() { return Vec::new(); }
 
     let mut remove_indices: Vec<usize> = Vec::new();
     let mut removed_ids: Vec<String> = Vec::new();
@@ -1165,21 +1193,13 @@ fn merge_edit_calls(calls: &mut Vec<ToolCall>) -> Vec<String> {
         // Build edits array from individual calls
         let mut edits: Vec<serde_json::Value> = Vec::new();
         for &idx in indices {
-            let args: serde_json::Value =
-                serde_json::from_str(&calls[idx].arguments).unwrap_or_default();
+            let args: serde_json::Value = serde_json::from_str(&calls[idx].arguments)
+                .unwrap_or_default();
             let mut edit = serde_json::Map::new();
-            if let Some(v) = args.get("old_string") {
-                edit.insert("old_string".into(), v.clone());
-            }
-            if let Some(v) = args.get("new_string") {
-                edit.insert("new_string".into(), v.clone());
-            }
-            if let Some(v) = args.get("start_line") {
-                edit.insert("start_line".into(), v.clone());
-            }
-            if let Some(v) = args.get("end_line") {
-                edit.insert("end_line".into(), v.clone());
-            }
+            if let Some(v) = args.get("old_string") { edit.insert("old_string".into(), v.clone()); }
+            if let Some(v) = args.get("new_string") { edit.insert("new_string".into(), v.clone()); }
+            if let Some(v) = args.get("start_line") { edit.insert("start_line".into(), v.clone()); }
+            if let Some(v) = args.get("end_line") { edit.insert("end_line".into(), v.clone()); }
             edits.push(serde_json::Value::Object(edit));
         }
 
@@ -1204,4 +1224,110 @@ fn merge_edit_calls(calls: &mut Vec<ToolCall>) -> Vec<String> {
     }
 
     removed_ids
+}
+
+#[cfg(test)]
+mod loop_hash_tests {
+    use super::{loop_args_hash, read_region_key, READ_REGION_BUCKET};
+
+    // Using a separate module name to avoid conflicting with the sibling
+    // `turn::tests` integration-style test module.
+
+    #[test]
+    fn read_file_hash_distinguishes_different_windows() {
+        // The core fix: hashing must make paginated reads appear as distinct
+        // calls, otherwise the 3-repeat guard fires on legitimate scans of a
+        // single large file. If this test fails, the model is about to be
+        // blocked after 3 offsets.
+        let a = loop_args_hash("read_file", r#"{"file_path":"/a.rs","offset":1,"limit":60}"#);
+        let b = loop_args_hash("read_file", r#"{"file_path":"/a.rs","offset":100,"limit":60}"#);
+        assert_ne!(a, b, "offsets 1 vs 100 must hash differently");
+
+        let c = loop_args_hash("read_file", r#"{"file_path":"/a.rs","offset":1,"limit":60}"#);
+        let d = loop_args_hash("read_file", r#"{"file_path":"/a.rs","offset":1,"limit":120}"#);
+        assert_ne!(c, d, "limit 60 vs 120 must hash differently");
+
+        let e = loop_args_hash("read_file", r#"{"file_path":"/a.rs","offset":1,"limit":60}"#);
+        let f = loop_args_hash("read_file", r#"{"file_path":"/a.rs","offset":1,"limit":60}"#);
+        assert_eq!(e, f, "identical args must hash identically");
+
+        let g = loop_args_hash("read_file", r#"{"file_path":"/a.rs","offset":1,"limit":60}"#);
+        let h = loop_args_hash("read_file", r#"{"file_path":"/b.rs","offset":1,"limit":60}"#);
+        assert_ne!(g, h, "different files must hash differently");
+    }
+
+    #[test]
+    fn missing_offset_and_limit_normalize_to_zero() {
+        // `{path}` and `{path, offset:0, limit:0}` must hash the same — otherwise
+        // the model can evade the loop guard just by toggling the field's presence.
+        let bare = loop_args_hash("read_file", r#"{"file_path":"/a.rs"}"#);
+        let zeros = loop_args_hash(
+            "read_file",
+            r#"{"file_path":"/a.rs","offset":0,"limit":0}"#,
+        );
+        assert_eq!(bare, zeros);
+    }
+
+    #[test]
+    fn other_tools_hash_full_args() {
+        // Non-read tools keep full-args hashing so changing any field (path,
+        // pattern, command) is correctly treated as a different call.
+        let a = loop_args_hash("grep", r#"{"pattern":"foo","path":"/x"}"#);
+        let b = loop_args_hash("grep", r#"{"pattern":"foo","path":"/y"}"#);
+        assert_ne!(a, b);
+
+        let s1 = loop_args_hash("bash", r#"{"command":"ls"}"#);
+        let s2 = loop_args_hash("bash", r#"{"command":"ls"}"#);
+        assert_eq!(s1, s2);
+    }
+
+    #[test]
+    fn region_key_buckets_are_per_file() {
+        // Same file, same bucket regardless of how offset rounds down.
+        let a = read_region_key("render.rs", r#"{"file_path":"/x/render.rs","offset":100,"limit":50}"#);
+        let b = read_region_key("render.rs", r#"{"file_path":"/x/render.rs","offset":130,"limit":50}"#);
+        assert_eq!(a, b, "offsets 100 and 130 both land in bucket {}", 100 / READ_REGION_BUCKET);
+
+        // Jump by one full bucket → different key.
+        let far = read_region_key(
+            "render.rs",
+            &format!(r#"{{"file_path":"/x/render.rs","offset":{},"limit":50}}"#, READ_REGION_BUCKET + 200),
+        );
+        assert_ne!(a, far, "offsets across bucket boundaries must differ");
+
+        // Whole-file read and `offset=0` both normalize to bucket 0.
+        let full = read_region_key("render.rs", r#"{"file_path":"/x/render.rs"}"#);
+        let zero = read_region_key("render.rs", r#"{"file_path":"/x/render.rs","offset":0}"#);
+        assert_eq!(full, zero);
+        assert_eq!(full.1, 0);
+
+        // Different files are different keys even at the same offset bucket.
+        let other = read_region_key("mod.rs", r#"{"file_path":"/x/mod.rs","offset":100}"#);
+        assert_ne!(a, other);
+    }
+
+    #[test]
+    fn region_key_handles_malformed_args() {
+        // Garbage in → bucket 0 (same as no-offset), so at worst we over-count
+        // a single bucket and the model gets a helpful block message instead
+        // of a mis-routed one.
+        let bad = read_region_key("x.rs", "not json");
+        assert_eq!(bad, ("x.rs".to_string(), 0));
+    }
+
+    #[test]
+    fn malformed_read_args_fall_back_to_raw_hash() {
+        // If args aren't valid JSON or lack file_path, still produce a stable
+        // hash from the raw string so the loop detector at least collapses
+        // exact duplicate bad calls.
+        let a = loop_args_hash("read_file", "not json at all");
+        let b = loop_args_hash("read_file", "not json at all");
+        assert_eq!(a, b);
+
+        let c = loop_args_hash("read_file", r#"{"no_file_path":"oops"}"#);
+        let d = loop_args_hash("read_file", r#"{"no_file_path":"oops"}"#);
+        assert_eq!(c, d);
+
+        assert_ne!(a, c, "different malformed inputs still differ");
+    }
 }

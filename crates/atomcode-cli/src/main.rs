@@ -593,7 +593,9 @@ async fn run() -> Result<i32> {
                 default_workdir: None,
                 providers: HashMap::new(),
                 datalog: Default::default(),
+                notifications: Default::default(),
                 auto_update: true,
+                reflection_cadence: 7,
             }
         })
     } else {
@@ -603,7 +605,9 @@ async fn run() -> Result<i32> {
             default_workdir: None,
             providers: HashMap::new(),
             datalog: Default::default(),
+            notifications: Default::default(),
             auto_update: true,
+            reflection_cadence: 7,
         }
     };
 
@@ -619,6 +623,8 @@ async fn run() -> Result<i32> {
             user_agent: None,
             context_window: default_context_window_for("openai"),
             max_tokens: None,
+            thinking_type: None,
+            thinking_keep: None,
             ephemeral: false,
         };
         (dummy, String::new())
@@ -922,6 +928,7 @@ async fn run_headless(
                 turn_count,
                 tool_call_count,
                 stop_reason,
+                messages: _,
             } => {
                 // Always ensure stdout ends with a newline so downstream parsers see a clean line.
                 if !last_text_ended_with_newline {

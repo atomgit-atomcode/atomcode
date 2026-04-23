@@ -82,14 +82,37 @@ impl SubAgentTask {
         conversation.add_user_message(&user_message);
 
         // 3. Create isolated ToolContext + TurnRunner
-        let ctx = ToolContext::new(working_dir.to_path_buf());
+        let tool_ctx = ToolContext::new(working_dir.to_path_buf());
         let permission = Box::new(AutoPermissionDecider::new(AutoPermissionMode::BypassAll));
+
+        // Pick the same ctx strategy the parent AgentLoop would. Sub-agents
+        // run on the same provider, so `for_provider` returns the matching
+        // builder (DefaultCtx / OllamaCtx / future per-model strategies).
+        // Falls back to a synthetic 128K-window config if the provider name
+        // isn't in the config — matches AgentLoop::new's fallback.
+        let build_ctx = match config.providers.get(&config.default_provider) {
+            Some(pc) => crate::ctx::for_provider(pc),
+            None => crate::ctx::for_provider(&crate::config::provider::ProviderConfig {
+                provider_type: String::new(),
+                api_key: None,
+                model: String::new(),
+                base_url: None,
+                system_prompt: None,
+                user_agent: None,
+                context_window: 128_000,
+                max_tokens: None,
+                thinking_type: None,
+                thinking_keep: None,
+                ephemeral: true,
+            }),
+        };
 
         let mut runner = TurnRunner {
             provider,
             tools,
-            context: ctx,
+            context: tool_ctx,
             config: config.clone(),
+            ctx: build_ctx,
             permission,
             hook_registry: HookRegistry::new(), // Sub-agents don't use hooks for now
             recently_edited_files: Vec::new(),

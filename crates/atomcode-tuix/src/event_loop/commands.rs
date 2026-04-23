@@ -16,19 +16,36 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use atomcode_core::agent::AgentCommand;
-use atomcode_core::config::provider::ProviderConfig;
 use atomcode_core::config::Config;
-
 use super::{save_and_reload, LoopCtx};
-use crate::modals::{DirPicker, Modal, ModelPicker, ProviderWizard, SessionPicker};
+use crate::modals::{DirPicker, IssueWizard, Modal, ModelPicker, ProviderWizard, SessionPicker};
 use crate::render::{Renderer, UiLine};
 use crate::state::UiState;
+use atomcode_core::config::provider::ProviderConfig;
 
 /// Maximum recent project dirs we keep in memory + persist to disk.
 const MAX_RECENT_DIRS: usize = 5;
 
-/// Provider name used for the AtomGit OAuth provider entry in config.
-const OAUTH_PROVIDER_NAME: &str = "AtomGit";
+fn build_oauth_provider() -> ProviderConfig {
+    ProviderConfig {
+        provider_type: "openai".to_string(),
+        api_key: None,
+        model: "MiniMax-M2.7".to_string(),
+        base_url: Some("https://api-ai.gitcode.com/v1".to_string()),
+        system_prompt: None,
+        user_agent: None,
+        context_window: 64_000,
+        max_tokens: None,
+        thinking_type: None,
+        thinking_keep: None,
+        ephemeral: false,
+    }
+}
+
+// Historical note: there was a `const OAUTH_PROVIDER_NAME = "AtomGit"`
+// and a `build_oauth_provider` helper here. Both are owned by
+// `coding_plan::setup` now — `/login` is identity-only, provider
+// registration is the job of `/codingplan`.
 
 pub(super) fn execute_slash_command(
     cmd: &str,
@@ -37,6 +54,8 @@ pub(super) fn execute_slash_command(
     ctx: &mut LoopCtx,
     renderer: &mut dyn Renderer,
     active_modal: &mut Option<Box<dyn Modal>>,
+    fixissue_pending: &mut Option<atomcode_core::atomgit::IssueRef>,
+    fixissue_buffer: &mut String,
 ) -> Result<()> {
     // Built-in commands are all lowercase ASCII; normalise the user's
     // input so `/SESSION`, `/Session`, `/sEssIon` all hit the same arm
@@ -140,6 +159,12 @@ pub(super) fn execute_slash_command(
             state.total_tokens = 0;
             state.thinking_idx = 0;
             state.on_turn_complete();
+            // New session = new session file on disk. Old session
+            // (already saved at its last TurnComplete) stays on disk so
+            // it can still be `/resume`d; we just stop writing into it.
+            ctx.current_session = atomcode_core::session::Session::default_session(
+                ctx.working_dir.clone(),
+            );
             // `reset()` wipes the terminal AND the renderer's cached
             // footer/stream state, so the next Welcome renders against
             // a known (row 1, col 1) anchor. This is what makes
@@ -155,7 +180,9 @@ pub(super) fn execute_slash_command(
         }
         "model" => {
             if ctx.config.providers.is_empty() {
-                renderer.render(UiLine::CommandOutput("  No providers configured.\n".into()));
+                renderer.render(UiLine::CommandOutput(
+                    "  No providers configured.\n".into(),
+                ));
                 renderer.flush();
             } else {
                 *active_modal = Some(Box::new(ModelPicker::open(&ctx.config)));
@@ -187,13 +214,14 @@ pub(super) fn execute_slash_command(
             renderer.flush();
         }
         "status" => {
-            let txt = format!(
+            let mut txt = format!(
                 "  Model:  {}\n  Dir:    {}\n  Config: {}\n  Tokens: {}\n",
                 ctx.model_name,
                 ctx.working_dir.display(),
                 Config::default_path().display(),
                 state.total_tokens,
             );
+            txt.push_str(&render_codingplan_status_for_status_cmd());
             renderer.render(UiLine::CommandOutput(txt));
             renderer.flush();
         }
@@ -218,9 +246,7 @@ pub(super) fn execute_slash_command(
             renderer.flush();
         }
         "undo" => {
-            renderer.render(UiLine::CommandOutput(
-                "  Undo is not yet supported.\n".into(),
-            ));
+            renderer.render(UiLine::CommandOutput("  Undo is not yet supported.\n".into()));
             renderer.flush();
         }
         "cost" => {
@@ -230,13 +256,51 @@ pub(super) fn execute_slash_command(
             )));
             renderer.flush();
         }
+        "context" => {
+            // `/context` = breakdown only.
+            // `/context prompt` = breakdown + full assembled system prompt
+            // (the exact bytes the most recent turn sent). Useful when
+            // the model is misbehaving and you want to verify what's
+            // actually in the prompt.
+            let show_prompt = arg.trim().eq_ignore_ascii_case("prompt");
+            renderer.render(UiLine::CommandOutput(
+                render_context_report(state, ctx, show_prompt),
+            ));
+            renderer.flush();
+        }
+        "compact" => {
+            let prompt = (!arg.trim().is_empty()).then(|| arg.trim().to_string());
+            // Agent streams the authoritative result back as TextDelta
+            // ("nothing to compact" / "compacted — dropped N messages").
+            // Don't pre-render a placeholder — the agent's reply could
+            // contradict it when the conversation is too short.
+            ctx.agent
+                .cmd_tx
+                .send(AgentCommand::Compact { prompt })
+                .ok();
+        }
         "login" => {
             run_login_flow(renderer, ctx)?;
         }
+        "codingplan" => {
+            run_codingplan_flow(renderer, ctx)?;
+        }
         "logout" => {
+            // /logout only invalidates the OAuth token on disk.
+            // Provider config is a user asset and stays in config.toml
+            // untouched — if the user's default is an AtomGit* provider,
+            // the next LLM request fails with a "re-run /codingplan"
+            // hint instead of the TUI crashing on next startup because
+            // `default_provider` got cleared.
             match atomcode_core::auth::logout() {
                 Ok(()) => {
-                    renderer.render(UiLine::CommandOutput("  Signed out of AtomGit.\n".into()));
+                    let _ = ctx
+                        .agent
+                        .cmd_tx
+                        .send(AgentCommand::ReloadConfig(ctx.config.clone()));
+                    renderer.render(UiLine::CommandOutput(
+                        "  Signed out of AtomGit. Permissions refreshed.\n".into(),
+                    ));
                 }
                 Err(e) => {
                     renderer.render(UiLine::Error(format!("logout failed: {}", e)));
@@ -283,12 +347,9 @@ pub(super) fn execute_slash_command(
                         );
                     }
                     Err(e) => {
-                        let _ =
-                            ctx.upgrade_tx
-                                .send(atomcode_core::self_update::UpgradeEvent::Failed(format!(
-                                    "{:#}",
-                                    e
-                                )));
+                        let _ = ctx.upgrade_tx.send(
+                            atomcode_core::self_update::UpgradeEvent::Failed(format!("{:#}", e)),
+                        );
                     }
                 }
             } else {
@@ -301,7 +362,9 @@ pub(super) fn execute_slash_command(
                     renderer.flush();
                     return Ok(());
                 }
-                renderer.render(UiLine::CommandOutput("  正在检查更新...\n".into()));
+                renderer.render(UiLine::CommandOutput(
+                    "  正在检查更新...\n".into(),
+                ));
                 renderer.flush();
                 let current = format!("v{}", env!("CARGO_PKG_VERSION"));
                 let tx = ctx.upgrade_tx.clone();
@@ -312,12 +375,60 @@ pub(super) fn execute_slash_command(
                     if let Err(e) =
                         atomcode_core::self_update::run_upgrade(current, force, tx.clone()).await
                     {
-                        let _ = tx.send(atomcode_core::self_update::UpgradeEvent::Failed(format!(
-                            "{:#}",
-                            e
-                        )));
+                        let _ = tx.send(atomcode_core::self_update::UpgradeEvent::Failed(
+                            format!("{:#}", e),
+                        ));
                     }
                 });
+            }
+        }
+        "fixissue" => {
+            // `/fixissue <url>` — fetch the issue via AtomGit API (blocking,
+            // ~1s), verify the current user is the assignee, then inject a
+            // synthesised prompt into the agent as if the user typed it.
+            // Not-assigned / fetch-fail paths print the reason and stay Idle.
+            let url = arg.trim();
+            if url.is_empty() {
+                renderer.render(UiLine::CommandOutput(
+                    "  Usage: /fixissue <issue-url>\n  Example: /fixissue https://atomgit.com/owner/repo/issues/42\n  Or use the interactive wizard: /issue\n".into(),
+                ));
+                renderer.flush();
+            } else {
+                launch_fixissue(url, state, ctx, renderer, fixissue_pending, fixissue_buffer);
+            }
+        }
+        "issue" => {
+            // Two-step wizard to create a NEW issue on AtomGit in the
+            // current repo. Step 1 collects a title (required), step 2
+            // collects a description (required, Shift+Enter for
+            // newlines). On submit the event loop's post-close branch
+            // POSTs `/repos/{owner}/{repo}/issues` and echoes the new
+            // issue URL into scrollback.
+            //
+            // cwd must be an atomgit.com checkout — otherwise we have
+            // no way to know which repo to file the issue against.
+            // Abort early with a clear message rather than opening the
+            // wizard and then failing at the POST step.
+            let _ = arg; // reserved for future options (e.g. --template)
+            match atomcode_core::atomgit::url::detect_cwd_atomgit_repo(&ctx.working_dir) {
+                Ok(Some(repo)) => {
+                    let mut wiz = IssueWizard::open(repo.owner, repo.repo);
+                    wiz.emit_prompt(renderer);
+                    *active_modal = Some(Box::new(wiz));
+                }
+                Ok(None) => {
+                    renderer.render(UiLine::CommandOutput(
+                        "  /issue needs cwd to be a clone of an atomgit.com repo (origin remote).\n  cd into one first, or create the issue via the web UI.\n".into(),
+                    ));
+                    renderer.flush();
+                }
+                Err(e) => {
+                    renderer.render(UiLine::CommandOutput(format!(
+                        "  /issue failed to detect repo: {:#}\n",
+                        e
+                    )));
+                    renderer.flush();
+                }
             }
         }
         "cd" => {
@@ -360,6 +471,238 @@ pub(super) fn execute_slash_command(
         }
     }
     Ok(())
+}
+
+/// Build the `/context` report — horizontal bar + category breakdown,
+/// optionally followed by the full system prompt when `show_prompt`.
+///
+/// Thin wrapper around `format_context_report` that pulls the inputs
+/// (snapshot + model name + flag) out of state/ctx. Split for
+/// unit-testability: the inner function takes plain values and can be
+/// asserted on directly.
+fn render_context_report(state: &UiState, ctx: &LoopCtx, show_prompt: bool) -> String {
+    format_context_report(state.last_context.as_ref(), &ctx.model_name, show_prompt)
+}
+
+/// Fetch + format the CodingPlan section appended to `/status`. Runs a
+/// blocking HTTP call (~100–500ms) against `/coding-plan/status` — same
+/// endpoint as the `/codingplan` flow's step 4. Falls back to a one-line
+/// hint when the user isn't signed in, has no active plan, or the API
+/// call fails. Never panics and never returns an error: `/status` is a
+/// quick-glance command, so any fetch problem degrades into a visible
+/// note instead of aborting the whole command.
+fn render_codingplan_status_for_status_cmd() -> String {
+    use atomcode_core::coding_plan::client::Client;
+
+    let client = match Client::from_stored_auth() {
+        Ok(c) => c,
+        Err(_) => {
+            return "  CodingPlan: (not signed in — run /codingplan to set up)\n".into();
+        }
+    };
+    let status = match client.status() {
+        Ok(s) => s,
+        Err(e) => {
+            return format!("  CodingPlan: (status fetch failed — {:#})\n", e);
+        }
+    };
+    let plan = match &status.codingplan_free {
+        Some(p) => p,
+        None => {
+            return "  CodingPlan: (no active plan — run /codingplan)\n".into();
+        }
+    };
+
+    let mut out = format!(
+        "  CodingPlan: {}  ·  expires {} ({}d/{}d)\n",
+        plan.plan_name, plan.expires_at, plan.remaining_days, plan.total_days,
+    );
+    if let Some(u) = &status.current_usage {
+        out.push_str(&format!(
+            "  Usage: {}  ·  resets {} (in {}s)\n",
+            u.display_desc(),
+            u.reset_at_display,
+            u.seconds_until_reset,
+        ));
+    }
+    if status.window_quota_exhausted {
+        if let Some(hint) = &status.window_quota_hint {
+            out.push_str(&format!("  ⚠ {}\n", hint));
+        } else {
+            out.push_str("  ⚠ Current window quota exhausted\n");
+        }
+    }
+    out
+}
+
+/// Pure-function core of `/context` — testable without constructing
+/// `LoopCtx`. Returns the rendered CommandOutput body.
+fn format_context_report(
+    snapshot: Option<&crate::state::ContextSnapshot>,
+    model_name: &str,
+    show_prompt: bool,
+) -> String {
+    let Some(snap) = snapshot else {
+        return "  Context Usage\n  \n  (run at least one turn first — stats are captured per turn)\n".into();
+    };
+    if snap.ctx_window == 0 {
+        return "  Context Usage\n  \n  (waiting for first complete turn — partial stats only)\n".into();
+    }
+
+    let window = snap.ctx_window;
+    // Sum components excluding tool_defs (which in most providers counts
+    // against input tokens but atomcode tracks separately). Clamp used to
+    // window so a single oversized tool_defs doesn't drive "free" negative.
+    let sys = snap.system_tokens;
+    let tools = snap.tool_defs_tokens;
+    let cold = snap.cold_zone_tokens;
+    // Sent = everything sent minus the system message (ctx's own accounting).
+    // Cold zone is injected as a System message inside `sent`, so we avoid
+    // double-counting: subtract cold from sent for the "messages" bucket.
+    let messages = snap.sent_tokens.saturating_sub(cold);
+    let total_used = sys.saturating_add(tools).saturating_add(cold).saturating_add(messages);
+    let free = window.saturating_sub(total_used);
+
+    // Horizontal bar: 40 cells, one segment per category with a distinct glyph.
+    // Terminals universally render these blocks, no ANSI color required.
+    const BAR_WIDTH: usize = 40;
+    let cells = |tokens: usize| -> usize {
+        if window == 0 { return 0; }
+        (tokens as u128 * BAR_WIDTH as u128 / window as u128) as usize
+    };
+    let sys_cells = cells(sys);
+    let tools_cells = cells(tools);
+    let cold_cells = cells(cold);
+    let msg_cells = cells(messages);
+    // Guard: cell sum shouldn't exceed BAR_WIDTH (rounding can give +1).
+    let used_cells = sys_cells + tools_cells + cold_cells + msg_cells;
+    let free_cells = BAR_WIDTH.saturating_sub(used_cells.min(BAR_WIDTH));
+
+    let mut bar = String::with_capacity(BAR_WIDTH * 3);
+    bar.push_str(&"▒".repeat(sys_cells));       // system prompt
+    bar.push_str(&"▓".repeat(tools_cells));     // tool defs
+    bar.push_str(&"░".repeat(cold_cells));      // cold zone
+    bar.push_str(&"█".repeat(msg_cells));       // messages
+    bar.push_str(&"·".repeat(free_cells));      // free
+
+    let pct = |t: usize| -> String {
+        if window == 0 { return "  —".to_string(); }
+        format!("{:>4.1}%", (t as f64 * 100.0) / window as f64)
+    };
+    let k = |t: usize| -> String {
+        if t >= 1000 {
+            format!("{:.1}K", t as f64 / 1000.0)
+        } else {
+            format!("{}", t)
+        }
+    };
+
+    let used_pct = pct(total_used);
+
+    let mut out = format!(
+        "  Context Usage\n  \
+         \n  \
+         {bar}\n  \
+         {used}/{window} tokens ({used_pct})\n  \
+         \n  \
+         Provider: {model}  ·  ctx: {ctx_name}\n  \
+         \n  \
+         ▒ System prompt : {sys_s:>7}  ({sys_p})\n  \
+         ▓ Tool defs     : {tools_s:>7}  ({tools_p})\n  \
+         ░ Cold zone     : {cold_s:>7}  ({cold_p})\n  \
+         █ Messages      : {msgs_s:>7}  ({msgs_p})\n  \
+         · Free          : {free_s:>7}  ({free_p})\n  \
+         \n  \
+         Messages in window: {n_msgs}\n",
+        bar = bar,
+        used = k(total_used),
+        window = k(window),
+        used_pct = used_pct,
+        model = model_name,
+        ctx_name = if snap.ctx_name.is_empty() { "default" } else { snap.ctx_name.as_str() },
+        sys_s = k(sys), sys_p = pct(sys),
+        tools_s = k(tools), tools_p = pct(tools),
+        cold_s = k(cold), cold_p = pct(cold),
+        msgs_s = k(messages), msgs_p = pct(messages),
+        free_s = k(free), free_p = pct(free),
+        n_msgs = snap.total_messages,
+    );
+
+    // `/context prompt` — append the full system-prompt bytes the last
+    // turn sent. Kept out of the default output because the prompt is
+    // 5–15 KB and would swamp the breakdown dashboard every invocation.
+    // Hint line added when empty so the user knows WHY nothing showed
+    // (snapshot is populated only by the rich emission path, which
+    // fires once the first complete turn lands).
+    if show_prompt {
+        out.push('\n');
+        out.push_str("  === SYSTEM PROMPT ===\n");
+        if snap.system_prompt.is_empty() {
+            out.push_str("  (empty — wait for one complete turn to capture)\n");
+        } else {
+            // Indent each line with two spaces to match the surrounding
+            // CommandOutput formatting (every other block uses a 2-space
+            // left gutter). Avoids the model-prompt bytes looking like
+            // they're escaping the command-output indentation.
+            for line in snap.system_prompt.lines() {
+                out.push_str("  ");
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+    }
+
+    out
+}
+
+/// Prepare + dispatch the fixissue pipeline for a given URL. Shared by:
+/// (a) the `/fixissue <url>` arm, (b) the `/issue <url>` arm, and (c)
+/// the event loop's post-close hook when `IssueWizard` has stashed a
+/// URL in `ctx.pending_issue_url`. Handles all three `Prepared` cases
+/// (Run / Skip / Err) and prints appropriate scrollback feedback. On
+/// Run it arms the post-completion hook (`fixissue_pending` +
+/// `fixissue_buffer`), sends `AgentCommand::SendMessage`, and flips
+/// UiState to Streaming via `state.on_submit()`.
+pub(crate) fn launch_fixissue(
+    url: &str,
+    state: &mut UiState,
+    ctx: &mut LoopCtx,
+    renderer: &mut dyn Renderer,
+    fixissue_pending: &mut Option<atomcode_core::atomgit::IssueRef>,
+    fixissue_buffer: &mut String,
+) {
+    match atomcode_core::atomgit::fixissue::prepare(url, &ctx.working_dir) {
+        Ok(atomcode_core::atomgit::fixissue::Prepared::Run {
+            prompt,
+            issue_title,
+            issue_number,
+            issue_ref,
+        }) => {
+            renderer.render(UiLine::CommandOutput(format!(
+                "  [fixissue] issue #{}: {}\n  Handing off to agent... (will post summary + 'fixed' label on completion)\n",
+                issue_number, issue_title,
+            )));
+            renderer.flush();
+            *fixissue_pending = Some(issue_ref);
+            fixissue_buffer.clear();
+            ctx.agent
+                .cmd_tx
+                .send(AgentCommand::SendMessage(prompt))
+                .ok();
+            state.on_submit();
+        }
+        Ok(atomcode_core::atomgit::fixissue::Prepared::Skip { reason }) => {
+            renderer.render(UiLine::CommandOutput(format!("  {}\n", reason)));
+            renderer.flush();
+        }
+        Err(e) => {
+            renderer.render(UiLine::CommandOutput(format!(
+                "  fixissue failed: {:#}\n",
+                e
+            )));
+            renderer.flush();
+        }
+    }
 }
 
 /// Commit a new working-directory choice: notify the agent, update cwd +
@@ -451,28 +794,12 @@ fn resolve_cd(
     Ok(canon)
 }
 
-/// Build the AtomGit OAuth ProviderConfig. api_key is intentionally None —
-/// it's loaded from auth.toml at runtime by `create_provider()`.
-fn build_oauth_provider() -> ProviderConfig {
-    ProviderConfig {
-        provider_type: "openai".to_string(),
-        api_key: None,
-        model: "MiniMax-M2.7".to_string(),
-        base_url: Some("https://api-ai.gitcode.com/v1".to_string()),
-        system_prompt: None,
-        user_agent: None,
-        context_window: 64000,
-        max_tokens: None,
-        ephemeral: false,
-    }
-}
-
 /// Drop out of raw mode, run the (blocking) OAuth login flow so the user
 /// can interact with the browser callback in a normal terminal, then
 /// re-enter raw mode and redraw the welcome screen. OAuth uses stdout
 /// prints + opens a browser — mixing that with our footer-managing
 /// raw-mode renderer would collide on stdin/stdout, so we suspend.
-fn run_login_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx) -> Result<()> {
+pub(crate) fn run_login_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx) -> Result<()> {
     // Pause the reader thread BEFORE disabling raw mode so it stops
     // calling `event::poll` / `event::read`. Without this, the reader
     // would keep consuming bytes from stdin in cooked mode (keystrokes
@@ -511,33 +838,112 @@ fn run_login_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx) -> Result<()> 
 
     match result {
         Ok(auth) => {
-            // Register the AtomGit OAuth provider and switch to it so the
-            // freshly logged-in token is actually used. Without this the
-            // status bar / next turn would keep using whatever provider was
-            // active before login.
-            let provider = build_oauth_provider();
-            let model = provider.model.clone();
-            ctx.config
-                .providers
-                .insert(OAUTH_PROVIDER_NAME.to_string(), provider);
-            ctx.config.default_provider = OAUTH_PROVIDER_NAME.to_string();
-            ctx.model_name = model.clone();
-            save_and_reload(ctx, renderer);
-
+            // /login is identity-only. Provider / model setup lives in
+            // /codingplan — that flow pulls the authoritative model list
+            // from the CodingPlan API and writes matching providers.
+            // Conflating the two paths was the source of a stale
+            // MiniMax-M2.7 entry being hardcoded here.
             let name = auth
                 .user
                 .name
                 .as_deref()
                 .unwrap_or(&auth.user.username)
                 .to_string();
+            let had_provider = !ctx.config.providers.is_empty()
+                && ctx.config.providers.contains_key(&ctx.config.default_provider);
+            if !had_provider {
+                let provider_name = "AtomGit".to_string();
+                let provider = build_oauth_provider();
+                ctx.model_name = provider.model.clone();
+                ctx.config.providers.insert(provider_name.clone(), provider);
+                ctx.config.default_provider = provider_name;
+                save_and_reload(ctx, renderer);
+            } else {
+                if let Some(provider) = ctx.config.providers.get(&ctx.config.default_provider) {
+                    ctx.model_name = provider.model.clone();
+                }
+                let _ = ctx
+                    .agent
+                    .cmd_tx
+                    .send(AgentCommand::ReloadConfig(ctx.config.clone()));
+            }
             renderer.render(UiLine::CommandOutput(format!(
-                "  Signed in as {} ({}). Model switched to {}.\n",
-                name, auth.user.username, model
+                "  Signed in as {} ({}). You can chat now; run /codingplan to sync the latest model access.\n",
+                name, auth.user.username
             )));
             renderer.flush();
         }
         Err(e) => {
             renderer.render(UiLine::Error(format!("login failed: {}", e)));
+            renderer.flush();
+        }
+    }
+    Ok(())
+}
+
+/// Run the full CodingPlan setup flow: login (if needed) → claim →
+/// fetch models + register providers → fetch status. Shares the
+/// orchestrator with `atomcode codingplan` (CLI). Suspends raw mode so
+/// the OAuth browser callback and any stdout from `auth::login()` don't
+/// collide with the footer-managing renderer.
+pub(crate) fn run_codingplan_flow(
+    renderer: &mut dyn Renderer,
+    ctx: &mut LoopCtx,
+) -> Result<()> {
+    // Same pause / suspend / resume / unpause choreography as /login —
+    // the orchestrator may call `auth::login()` which prints to stdout
+    // and spawns a browser; that needs cooked stdout + no reader racing
+    // for stdin. We suspend unconditionally here (even when already
+    // logged in) because the tiny cost of the raw-mode cycle is
+    // invisible to the user next to the HTTP round-trips that follow.
+    if let Some(reader) = ctx.reader.as_ref() {
+        let _ = reader.pause_blocking();
+    }
+    renderer.suspend_for_external();
+
+    let report = atomcode_core::coding_plan::run(&mut ctx.config);
+
+    renderer.resume_from_external();
+    if let Some(reader) = ctx.reader.as_ref() {
+        reader.resume();
+    }
+
+    match report {
+        Ok(report) => {
+            if report.should_persist_config() {
+                // Config mutation only persists when critical steps passed —
+                // don't write a half-set-up config if login or models failed.
+                save_and_reload(ctx, renderer);
+                // Stamp the drift-monitor sync marker alongside the config
+                // write. Failures are non-fatal: at worst the 24h staleness
+                // hint mis-fires once.
+                let _ = atomcode_core::coding_plan::write_last_sync_now();
+                // Also bump our own last-seen timestamp so the cross-process
+                // sync-check on the next keystroke doesn't redundantly
+                // reload the config we just saved ourselves.
+                ctx.monitor_last_sync_seen =
+                    atomcode_core::coding_plan::read_last_sync();
+                // Sync ctx.model_name with the freshly-picked default so the
+                // status line and the next turn use the right model without
+                // requiring a /reload.
+                if let Some(p) = ctx.config.providers.get(&ctx.config.default_provider) {
+                    ctx.model_name = p.model.clone();
+                }
+                // Clear any stale drift warning now that we've just
+                // re-synced. Also reset the cooldown so the next
+                // pre-turn trigger (if conditions change) can fire
+                // immediately — no need to wait 15 min after a manual
+                // refresh.
+                if let Ok(mut g) = ctx.monitor_warning.lock() {
+                    *g = None;
+                }
+                ctx.monitor_last_check_at = None;
+            }
+            renderer.render(UiLine::CommandOutput(report.render()));
+            renderer.flush();
+        }
+        Err(e) => {
+            renderer.render(UiLine::Error(format!("codingplan setup failed: {:#}", e)));
             renderer.flush();
         }
     }
@@ -571,7 +977,8 @@ mod tests {
     fn absolute_path_ignores_cwd() {
         let (_tmp, _cwd, sub) = make_dirs();
         let alt_cwd = PathBuf::from("/"); // unrelated cwd
-        let got = resolve_cd(sub.to_str().unwrap(), &alt_cwd, None).expect("absolute resolves");
+        let got = resolve_cd(sub.to_str().unwrap(), &alt_cwd, None)
+            .expect("absolute resolves");
         assert_eq!(got, sub);
     }
 
@@ -592,7 +999,8 @@ mod tests {
     #[test]
     fn nonexistent_path_errors() {
         let (_tmp, cwd, _sub) = make_dirs();
-        let err = resolve_cd("nope-does-not-exist", &cwd, None).expect_err("nonexistent errors");
+        let err = resolve_cd("nope-does-not-exist", &cwd, None)
+            .expect_err("nonexistent errors");
         assert!(err.contains("nope-does-not-exist"), "got: {}", err);
     }
 
@@ -601,7 +1009,8 @@ mod tests {
         let (_tmp, cwd, _sub) = make_dirs();
         let file = cwd.join("a.txt");
         std::fs::write(&file, "hi").expect("write");
-        let err = resolve_cd(file.to_str().unwrap(), &cwd, None).expect_err("file is not a dir");
+        let err = resolve_cd(file.to_str().unwrap(), &cwd, None)
+            .expect_err("file is not a dir");
         assert!(err.contains("Not a directory"), "got: {}", err);
     }
 
@@ -621,17 +1030,176 @@ mod tests {
     }
 
     #[test]
-    fn build_oauth_provider_has_expected_defaults() {
-        // Guardrail against accidental edits to the OAuth-provider
-        // seed values (api_key must be None; base_url must point to
-        // the AtomGit gateway).
-        let p = build_oauth_provider();
-        assert_eq!(p.provider_type, "openai");
-        assert!(
-            p.api_key.is_none(),
-            "api_key must be None — loaded from auth.toml"
-        );
-        assert_eq!(p.base_url.as_deref(), Some("https://api-ai.gitcode.com/v1"));
-        assert!(p.context_window > 0);
+    fn context_report_without_snapshot_prompts_to_run_turn() {
+        let out = format_context_report(None, "claude-opus-4-7", false);
+        assert!(out.contains("run at least one turn"));
+        // Never leak a window/totals when there's nothing to show
+        assert!(!out.contains("tokens ("));
     }
+
+    #[test]
+    fn context_report_with_zero_window_flags_partial_stats() {
+        let snap = crate::state::ContextSnapshot {
+            system_tokens: 100,
+            sent_tokens: 200,
+            tool_defs_tokens: 0,
+            cold_zone_tokens: 0,
+            total_messages: 5,
+            ctx_window: 0,
+            ctx_name: String::new(),
+            system_prompt: String::new(),
+        };
+        let out = format_context_report(Some(&snap), "test-model", false);
+        assert!(out.contains("waiting for first complete turn"));
+    }
+
+    #[test]
+    fn context_report_renders_full_breakdown() {
+        let snap = crate::state::ContextSnapshot {
+            system_tokens: 8_000,
+            sent_tokens: 30_000,  // includes cold
+            tool_defs_tokens: 14_500,
+            cold_zone_tokens: 2_000,
+            total_messages: 42,
+            ctx_window: 128_000,
+            ctx_name: "default".into(),
+            system_prompt: String::new(),
+        };
+        let out = format_context_report(Some(&snap), "claude-opus-4-7", false);
+
+        // Header
+        assert!(out.contains("Context Usage"));
+        // Bar renders (unicode blocks present)
+        assert!(out.contains("▒") || out.contains("█"));
+        // Category labels
+        assert!(out.contains("System prompt"));
+        assert!(out.contains("Tool defs"));
+        assert!(out.contains("Cold zone"));
+        assert!(out.contains("Messages"));
+        assert!(out.contains("Free"));
+        // Token values (K formatting)
+        assert!(out.contains("8.0K"));   // system
+        assert!(out.contains("14.5K"));  // tool defs
+        assert!(out.contains("2.0K"));   // cold zone
+        assert!(out.contains("128.0K")); // window
+        // Messages count
+        assert!(out.contains("42"));
+        // ctx name + model
+        assert!(out.contains("default"));
+        assert!(out.contains("claude-opus-4-7"));
+    }
+
+    #[test]
+    fn context_report_messages_excludes_cold_zone() {
+        // sent_tokens = messages + cold_zone (cold is injected as a
+        // System message inside `sent`). Renderer must subtract so
+        // "Messages" doesn't double-count.
+        let snap = crate::state::ContextSnapshot {
+            system_tokens: 1_000,
+            sent_tokens: 10_000,
+            tool_defs_tokens: 0,
+            cold_zone_tokens: 3_000,
+            total_messages: 10,
+            ctx_window: 100_000,
+            ctx_name: "default".into(),
+            system_prompt: String::new(),
+        };
+        let out = format_context_report(Some(&snap), "m", false);
+        // Messages bucket should be 10K - 3K = 7K, not 10K.
+        let messages_line = out.lines().find(|l| l.contains("Messages"))
+            .expect("messages line must exist");
+        assert!(messages_line.contains("7.0K"),
+            "expected Messages=7.0K (sent-cold), got line: {}", messages_line);
+    }
+
+    #[test]
+    fn context_report_free_is_nonneg_under_rounding() {
+        // Pathological: sum of components exactly = window. Free must
+        // render as 0, never blow up the subtraction.
+        let snap = crate::state::ContextSnapshot {
+            system_tokens: 20_000,
+            sent_tokens: 80_000,
+            tool_defs_tokens: 20_000,
+            cold_zone_tokens: 0,
+            total_messages: 50,
+            ctx_window: 120_000,
+            ctx_name: "default".into(),
+            system_prompt: String::new(),
+        };
+        let out = format_context_report(Some(&snap), "m", false);
+        // Free = window - (sys + tools + cold + messages)
+        //      = 120_000 - (20_000 + 20_000 + 0 + 80_000) = 0
+        assert!(out.contains("Free"));
+        // Should not panic and should render — look for "0" tokens on the Free line
+        let free_line = out.lines().find(|l| l.contains("Free"))
+            .expect("free line must exist");
+        assert!(free_line.contains("0"), "free line: {}", free_line);
+    }
+
+    #[test]
+    fn context_report_without_show_prompt_omits_system_prompt_section() {
+        // Default `/context` output must not include the prompt dump
+        // even when the snapshot HAS a cached prompt. Otherwise the
+        // breakdown dashboard gets buried under 5-15K chars every call.
+        let snap = crate::state::ContextSnapshot {
+            system_tokens: 1_000,
+            sent_tokens: 5_000,
+            tool_defs_tokens: 500,
+            cold_zone_tokens: 0,
+            total_messages: 8,
+            ctx_window: 100_000,
+            ctx_name: "default".into(),
+            system_prompt: "You are AtomCode.\nSOME SENTINEL BYTES".into(),
+        };
+        let out = format_context_report(Some(&snap), "m", false);
+        assert!(!out.contains("SYSTEM PROMPT"),
+            "SYSTEM PROMPT header must not appear in default /context output");
+        assert!(!out.contains("SOME SENTINEL BYTES"),
+            "raw prompt body must not leak into default /context output");
+    }
+
+    #[test]
+    fn context_report_with_show_prompt_appends_cached_prompt() {
+        let snap = crate::state::ContextSnapshot {
+            system_tokens: 1_000,
+            sent_tokens: 5_000,
+            tool_defs_tokens: 500,
+            cold_zone_tokens: 0,
+            total_messages: 8,
+            ctx_window: 100_000,
+            ctx_name: "default".into(),
+            system_prompt: "You are AtomCode.\nRULE_LINE_ABC\nEND".into(),
+        };
+        let out = format_context_report(Some(&snap), "m", true);
+        assert!(out.contains("=== SYSTEM PROMPT ==="));
+        // Each line indented with leading 2 spaces — verify one line
+        // survives through the gutter indentation.
+        assert!(out.contains("  RULE_LINE_ABC"),
+            "prompt lines should keep content after 2-space indent");
+        // Breakdown still present (append, not replace)
+        assert!(out.contains("Context Usage"));
+        assert!(out.contains("System prompt"));
+    }
+
+    #[test]
+    fn context_report_show_prompt_with_empty_cached_prompt_shows_hint() {
+        // Partial snapshot: no turn has landed rich stats yet, so
+        // system_prompt is "". `/context prompt` should tell the user
+        // that — not just silently show an empty section.
+        let snap = crate::state::ContextSnapshot {
+            system_tokens: 100,
+            sent_tokens: 200,
+            tool_defs_tokens: 0,
+            cold_zone_tokens: 0,
+            total_messages: 3,
+            ctx_window: 100_000,
+            ctx_name: "default".into(),
+            system_prompt: String::new(),
+        };
+        let out = format_context_report(Some(&snap), "m", true);
+        assert!(out.contains("=== SYSTEM PROMPT ==="));
+        assert!(out.contains("(empty"),
+            "empty cached prompt must show an explanation, got: {}", out);
+    }
+
 }

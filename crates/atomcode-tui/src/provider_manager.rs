@@ -438,6 +438,8 @@ impl ProviderManager {
                                     &self.new_type,
                                 ),
                             max_tokens: None,
+                            thinking_type: None,
+                            thinking_keep: None,
                             ephemeral: false,
                         };
                         return Some(ManagerAction::Add(self.new_name.clone(), provider));

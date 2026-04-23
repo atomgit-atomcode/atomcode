@@ -108,6 +108,8 @@ impl DraftProvider {
             user_agent: None,
             context_window: default_context_window_for(&provider_type),
             max_tokens: None,
+            thinking_type: None,
+            thinking_keep: None,
             ephemeral: false,
         }
     }

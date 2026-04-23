@@ -42,22 +42,48 @@ impl Tool for ListDirTool {
         ApprovalRequirement::AutoApprove
     }
 
-    async fn execute(&self, args: &str, _ctx: &ToolContext) -> Result<ToolResult> {
+    fn approval_with_context(&self, args: &str, ctx: &ToolContext) -> ApprovalRequirement {
+        let parsed = match serde_json::from_str::<ListDirArgs>(args) {
+            Ok(parsed) => parsed,
+            Err(_) => return self.approval(args),
+        };
+        let working_dir = match ctx.working_dir.try_read() {
+            Ok(wd) => wd.clone(),
+            Err(_) => return self.approval(args),
+        };
+        let raw_path = parsed.path.as_deref().unwrap_or(".");
+        match super::approval_for_path(raw_path, &working_dir, super::ExternalPathAction::Enumerate) {
+            Ok(approval) => approval,
+            Err(_) => self.approval(args),
+        }
+    }
+
+    async fn execute(&self, args: &str, ctx: &ToolContext) -> Result<ToolResult> {
         let parsed: ListDirArgs = serde_json::from_str(args)?;
+        let working_dir = ctx.working_dir.read().await.clone();
         let path = parsed.path.as_deref().unwrap_or(".");
         let depth = parsed.depth.min(5); // Cap at 5
 
-        let dir = std::path::Path::new(path);
+        let dir = match super::inspect_path_access(path, &working_dir) {
+            Ok(access) => access.path,
+            Err(err) => {
+                return Ok(ToolResult {
+                    call_id: String::new(),
+                    output: err.to_string(),
+                    success: false,
+                });
+            }
+        };
         if !dir.exists() {
             return Ok(ToolResult {
                 call_id: String::new(),
-                output: format!("Directory not found: {}", path),
+                output: format!("Directory not found: {}", dir.display()),
                 success: false,
             });
         }
 
         let mut lines = Vec::new();
-        scan_dir(&mut lines, dir, 0, depth);
+        scan_dir(&mut lines, &dir, 0, depth);
 
         if lines.len() > 200 {
             lines.truncate(200);

@@ -34,6 +34,22 @@ pub fn classify(code: KeyCode, modifiers: KeyModifiers) -> Action {
         (KeyCode::Char('u'), true) => Action::ClearLine,
         (KeyCode::Char('w'), true) => Action::DeleteWordBackward,
         (KeyCode::Char('k'), true) => Action::DeleteToEnd,
+        // Emacs-style line navigation — Home/End aliases. Docs already
+        // promise these in site/docs/keybindings.html.
+        (KeyCode::Char('a'), true) => Action::LineStart,
+        (KeyCode::Char('e'), true) => Action::LineEnd,
+        // Ctrl+H is the POSIX / readline alias for Backspace. MobaXterm,
+        // PuTTY and other Windows SSH clients often ship with "Backspace
+        // sends ^H" turned on by default, so the physical Backspace key
+        // arrives here as `Ctrl+Char('h')` rather than `KeyCode::Backspace`.
+        // Without this arm the key is a no-op on those terminals — the
+        // user sees their input line accumulate characters they can't
+        // erase.
+        (KeyCode::Char('h'), true) => Action::Backspace,
+        // Ctrl+? (ASCII 0x7F with modifier coerced) — some xterm-family
+        // terminals emit this for the literal Delete key. Keep the
+        // behaviour symmetric with the bare `KeyCode::Delete` arm below.
+        (KeyCode::Char('?'), true) => Action::DeleteForward,
         (KeyCode::Char(c), false) => Action::Insert(c),
         (KeyCode::Tab, _) => Action::Complete,
         (KeyCode::Left, _) => Action::CursorLeft,
@@ -109,6 +125,31 @@ mod tests {
         assert_eq!(
             k(KeyCode::Char('k'), KeyModifiers::CONTROL),
             Action::DeleteToEnd
+        );
+    }
+
+    #[test]
+    fn ctrl_a_jumps_to_line_start() {
+        assert_eq!(k(KeyCode::Char('a'), KeyModifiers::CONTROL), Action::LineStart);
+    }
+
+    #[test]
+    fn ctrl_e_jumps_to_line_end() {
+        assert_eq!(k(KeyCode::Char('e'), KeyModifiers::CONTROL), Action::LineEnd);
+    }
+
+    #[test]
+    fn ctrl_h_acts_as_backspace() {
+        // MobaXterm / PuTTY default: Backspace key sends ^H. Must delete
+        // a char, not be a silent no-op.
+        assert_eq!(k(KeyCode::Char('h'), KeyModifiers::CONTROL), Action::Backspace);
+    }
+
+    #[test]
+    fn ctrl_questionmark_acts_as_delete_forward() {
+        assert_eq!(
+            k(KeyCode::Char('?'), KeyModifiers::CONTROL),
+            Action::DeleteForward,
         );
     }
 

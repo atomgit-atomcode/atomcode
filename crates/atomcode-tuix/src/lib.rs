@@ -72,13 +72,25 @@ impl TerminalGuard {
         // this, crossterm sees `Enter, NONE` on both Enter and Shift+Enter
         // and the input box can't insert a newline.
         //
+        // `REPORT_EVENT_TYPES` is the second bit of the protocol and is what
+        // actually makes OS key autorepeat distinguishable from fresh presses:
+        // without it, every 30ms autorepeat tick reports as `KeyEventKind::Press`,
+        // so holding Shift+Enter for a normal 150ms press-down inserts 5-10
+        // newlines instead of one. With it enabled, autorepeats report as
+        // `KeyEventKind::Repeat` and are filtered out in `event_loop/mod.rs`.
+        //
         // `execute!` is best-effort — terminals that don't support CSI u
         // (notably Apple Terminal.app) ignore the sequence; we just don't
-        // set `kbd_flags_pushed` and Drop won't try to pop.
+        // set `kbd_flags_pushed` and Drop won't try to pop. Terminals that
+        // support DISAMBIGUATE but not REPORT_EVENT_TYPES ignore the extra
+        // bit silently — this never makes things worse than before.
         if caps.tty
             && execute!(
                 io::stdout(),
-                PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+                PushKeyboardEnhancementFlags(
+                    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                        | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+                )
             )
             .is_ok()
         {
@@ -95,7 +107,21 @@ impl TerminalGuard {
         if caps.tty {
             let stdout = io::stdout();
             let mut out = stdout.lock();
-            let _ = write!(out, "\x1b[2J\x1b[H");
+            // Per-row CUP+EL instead of `\x1b[2J` — iTerm2 3.5+ ignores
+            // ED under some states; the renderer paths (reset / resize
+            // / resume) all now use EL, so keep startup consistent.
+            // Fall back to 24 rows if crossterm can't query size (very
+            // rare; a wrong guess just under-clears a few trailing rows
+            // at startup — the renderer will paint over anything below
+            // that anyway).
+            let (_, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+            use std::fmt::Write as _;
+            let mut seq = String::with_capacity((rows as usize) * 8 + 4);
+            for row in 1..=(rows as usize) {
+                let _ = write!(seq, "\x1b[{};1H\x1b[K", row);
+            }
+            seq.push_str("\x1b[H");
+            let _ = out.write_all(seq.as_bytes());
             let _ = out.flush();
         }
         Ok(g)
@@ -201,6 +227,8 @@ pub async fn run(
         .unwrap_or_else(|| History::load(crate::platform::history_path()));
 
     let session_manager = atomcode_core::session::SessionManager::new(&working_dir);
+    // Fresh session by default; `/resume` replaces this on load.
+    let current_session = atomcode_core::session::Session::default_session(working_dir.clone());
 
     // Passive "new version available" check. Detached — never blocks
     // startup; on any error returns None silently. On a positive hit
@@ -276,12 +304,37 @@ pub async fn run(
         input_rx,
         commands: CommandRegistry::builtin(),
         session_manager,
+        current_session,
         update_hint,
+        monitor_warning: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        monitor_last_check_at: None,
+        // Seed with whatever's on disk now — any NEWER mtime observed
+        // later means another atomcode process resynced and our drift
+        // warning (if any) is stale.
+        monitor_last_sync_seen: atomcode_core::coding_plan::read_last_sync(),
         wake_rx,
+        wake_tx: wake_tx.clone(),
         reader: reader_handle,
         upgrade_tx,
         upgrade_rx,
+        pending_new_issue: None,
+        pending_run_codingplan: false,
+        pending_open_provider_wizard: false,
     };
+
+    // CodingPlan drift monitor — kick off a startup check if the current
+    // default provider is CodingPlan-managed. Non-CodingPlan users skip
+    // this entirely (no HTTP, no state touched). Check runs in the
+    // background via tokio::spawn → the warning shows up on the next
+    // footer repaint once it resolves.
+    if event_loop::monitor::is_codingplan_provider(&ctx.config.default_provider) {
+        event_loop::monitor::spawn_check(
+            ctx.config.clone(),
+            ctx.model_name.clone(),
+            ctx.monitor_warning.clone(),
+            ctx.wake_tx.clone(),
+        );
+    }
 
     let result = run_loop(ctx, renderer.as_mut()).await;
 

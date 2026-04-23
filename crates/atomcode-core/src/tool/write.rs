@@ -33,7 +33,11 @@ fn is_sensitive_path(path: &str) -> bool {
         let bash_profile = home.join(".bash_profile");
         let zshrc = home.join(".zshrc");
         let p = std::path::Path::new(&expanded);
-        if p.starts_with(&ssh_dir) || p == bashrc || p == bash_profile || p == zshrc {
+        if p.starts_with(&ssh_dir)
+            || p == bashrc
+            || p == bash_profile
+            || p == zshrc
+        {
             return true;
         }
     }
@@ -52,12 +56,10 @@ impl Tool for WriteFileTool {
     fn definition(&self) -> ToolDef {
         ToolDef {
             name: "write_file",
-            description:
-                "Write content to a file. Creates new files or overwrites existing ones.\n\
+            description: "Write content to a file. Creates new files or overwrites existing ones.\n\
                 Use this for: creating new files, or rewriting an entire file from scratch.\n\
                 For small edits to existing files, prefer edit_file instead.\n\
-                Parent directories are auto-created if they don't exist."
-                    .to_string(),
+                Parent directories are auto-created if they don't exist.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -80,14 +82,34 @@ impl Tool for WriteFileTool {
             }
         };
         if is_sensitive_path(&parsed.file_path) {
-            return ApprovalRequirement::RequireApproval(format!(
-                "Writing to sensitive system path: {}",
-                parsed.file_path
-            ));
+            return ApprovalRequirement::RequireApproval(
+                format!("Writing to sensitive system path: {}", parsed.file_path),
+            );
         }
         // Overwriting existing files is blocked in execute() — no need to
         // RequireApproval here. Only new file creation is auto-approved.
         ApprovalRequirement::AutoApprove
+    }
+
+    fn approval_with_context(&self, args: &str, ctx: &ToolContext) -> ApprovalRequirement {
+        let base = self.approval(args);
+        let parsed = match serde_json::from_str::<WriteFileArgs>(args) {
+            Ok(parsed) => parsed,
+            Err(_) => return base,
+        };
+        let working_dir = match ctx.working_dir.try_read() {
+            Ok(wd) => wd.clone(),
+            Err(_) => return base,
+        };
+        match super::approval_for_path(&parsed.file_path, &working_dir, super::ExternalPathAction::Write) {
+            Ok(ApprovalRequirement::RequireApprovalAlways(reason)) => ApprovalRequirement::RequireApprovalAlways(reason),
+            Ok(ApprovalRequirement::RequireApproval(reason)) => ApprovalRequirement::RequireApproval(reason),
+            Ok(ApprovalRequirement::AutoApprove) => match base {
+                ApprovalRequirement::RequireApproval(reason) => ApprovalRequirement::RequireApprovalAlways(reason),
+                other => other,
+            },
+            Err(_) => base,
+        }
     }
 
     async fn execute(&self, args: &str, ctx: &ToolContext) -> Result<ToolResult> {
@@ -115,18 +137,24 @@ impl Tool for WriteFileTool {
                 });
             }
         };
-        let path = std::path::Path::new(&parsed.file_path);
+        let working_dir = ctx.working_dir.read().await.clone();
+        let path = match super::inspect_path_access(&parsed.file_path, &working_dir) {
+            Ok(access) => access.path,
+            Err(err) => {
+                return Ok(ToolResult {
+                    call_id: String::new(),
+                    output: err.to_string(),
+                    success: false,
+                });
+            }
+        };
 
         // Backup before write (git checkpoint + file-level backup)
-        ctx.file_history
-            .lock()
-            .await
-            .backup_before_write(&parsed.file_path)
-            .await;
+        ctx.file_history.lock().await.backup_before_write(&path.to_string_lossy()).await;
 
         // Check if overwriting existing file — build appropriate output message
         let overwrite_info = if path.exists() {
-            let old_lines = std::fs::read_to_string(path)
+            let old_lines = std::fs::read_to_string(&path)
                 .map(|c| c.lines().count())
                 .unwrap_or(0);
             Some(old_lines)
@@ -140,14 +168,14 @@ impl Tool for WriteFileTool {
 
         let new_lines = parsed.content.lines().count();
         let bytes = parsed.content.len();
-        tokio::fs::write(&parsed.file_path, &parsed.content).await?;
+        tokio::fs::write(&path, &parsed.content).await?;
 
         let output = if let Some(old_lines) = overwrite_info {
             let diff = new_lines as i64 - old_lines as i64;
             let sign = if diff >= 0 { "+" } else { "" };
             let mut msg = format!(
                 "Overwrote {} (was {} lines, now {} lines, {}{})",
-                parsed.file_path, old_lines, new_lines, sign, diff
+                path.display(), old_lines, new_lines, sign, diff
             );
             // Warn if significant content reduction (might have lost code)
             if old_lines > 20 && new_lines < old_lines / 2 {
@@ -158,10 +186,7 @@ impl Tool for WriteFileTool {
             }
             msg
         } else {
-            format!(
-                "Created new file {} ({} bytes, {} lines)",
-                parsed.file_path, bytes, new_lines
-            )
+            format!("Created new file {} ({} bytes, {} lines)", path.display(), bytes, new_lines)
         };
 
         Ok(ToolResult {

@@ -18,7 +18,10 @@
 
 use std::io::{BufWriter, Stdout, Write};
 
-use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
+use crossterm::event::{
+    DisableBracketedPaste, EnableBracketedPaste, KeyboardEnhancementFlags,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+};
 use crossterm::execute;
 
 use super::cell::{push_str_cells, serialize_row, Cell, CellStyle};
@@ -171,14 +174,15 @@ pub struct RetainedRenderer<W: Write + Send> {
     // ── widget state ──
     input_buf: String,
     input_cursor_byte: usize,
-    spinner: Option<(String, String)>,
     menu: Option<MenuPayload>,
     status: StatusLine,
     // ── body history ──
     /// Pre-wrapped body rows, oldest first. Trimmed when exceeds
-    /// 2× screen height. Each row already carries its PAD_COL
-    /// prefix + styled cells, so `paint_body` just `draw_row`s
-    /// the last N directly.
+    /// 2× screen height. Symbol-bearing rows (`❯`, `▸`, `▶`, `⎿`)
+    /// are flush-left at col 0; plain text rows (assistant prose,
+    /// errors, cancelled, cmd output, diff, turn separator) carry a
+    /// `PAD_COL` indent. `paint_body` just `draw_row`s the last N
+    /// directly.
     body_lines: Vec<Vec<Cell>>,
     /// Line-buffer for streaming assistant text — chunks accumulate
     /// here until a `\n` boundary, at which point the completed
@@ -222,6 +226,20 @@ pub struct RetainedRenderer<W: Write + Send> {
     /// space for itself, leaving a blank gap between `▸ Tool(detail)`
     /// and `⎿ result`.
     skip_next_body_scroll: bool,
+    /// Cached semantic welcome payload so resize can rebuild the
+    /// startup banner for the new terminal width.
+    welcome_banner: Option<(String, String)>,
+    /// Number of rows occupied by the welcome banner prefix in
+    /// `body_lines`.
+    welcome_line_count: usize,
+    /// True when `body_lines.last()` is a LIVE spinner row (the
+    /// emoji/label pair emitted by `UiLine::Spinner` /
+    /// `UiLine::StreamingBox`). A live row gets in-place re-emitted
+    /// on each subsequent spinner tick so body_lines doesn't grow
+    /// one entry per frame. Any non-spinner body push finalises
+    /// the row (flag flips to false) so the last animation frame
+    /// stays frozen as a historical paragraph header.
+    live_spinner_active: bool,
 }
 
 impl RetainedRenderer<BufWriter<Stdout>> {
@@ -239,7 +257,6 @@ impl<W: Write + Send> RetainedRenderer<W> {
             screen: Screen::new(w, h),
             input_buf: String::new(),
             input_cursor_byte: 0,
-            spinner: None,
             menu: None,
             status: StatusLine::default(),
             body_lines: Vec::new(),
@@ -249,6 +266,9 @@ impl<W: Write + Send> RetainedRenderer<W> {
             last_painted_footer_rows: 0,
             scroll_region_bottom: None,
             skip_next_body_scroll: false,
+            welcome_banner: None,
+            welcome_line_count: 0,
+            live_spinner_active: false,
         }
     }
 
@@ -279,17 +299,18 @@ impl<W: Write + Send> RetainedRenderer<W> {
         }
     }
 
-    fn build_spinner_row(&self) -> Vec<Cell> {
+    /// Build the cells for a spinner body row: `<frame> <label>`,
+    /// flush-left at col 0 (no PAD_COL indent) so the frame glyph
+    /// aligns with `❯` user echoes and `▸` tool calls in the same
+    /// column. Used by the live spinner path to paint / re-paint
+    /// the "in-progress" row each tick.
+    fn build_spinner_body_row(&self, frame: &str, label: &str) -> Vec<Cell> {
         let mut row = Vec::new();
-        let pad = CellStyle::default();
-        push_str_cells(&mut row, &" ".repeat(PAD_COL), &pad);
-        if let Some((frame, label)) = self.spinner.as_ref() {
-            let brand = self.style_for(Role::Brand);
-            push_str_cells(&mut row, frame, &brand);
-            push_str_cells(&mut row, " ", &pad);
-            let label_style = self.style_bold(Role::Secondary);
-            push_str_cells(&mut row, &scrub_controls(label), &label_style);
-        }
+        let frame_style = self.style_for(Role::Brand);
+        push_str_cells(&mut row, frame, &frame_style);
+        push_str_cells(&mut row, " ", &CellStyle::default());
+        let label_style = self.style_bold(Role::Secondary);
+        push_str_cells(&mut row, &scrub_controls(label), &label_style);
         row
     }
 
@@ -335,7 +356,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let pad = CellStyle::default();
         if is_first {
             let accent = self.style_for(Role::Accent);
-            push_str_cells(&mut row, "❯ ", &accent);
+            push_str_cells(&mut row, self.caps.prompt_chevron(), &accent);
         } else {
             push_str_cells(&mut row, "  ", &pad);
         }
@@ -406,9 +427,13 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let left = parts.join(" · ");
         let max = rule_width.max(1);
 
-        if let Some(raw_hint) = status.hint.as_deref() {
+        if let Some((raw_hint, severity)) = status.hint.as_ref() {
             let hint = scrub_controls(raw_hint);
             let hint_w = crate::width::display_width(&hint);
+            let hint_style = match severity {
+                crate::render::HintSeverity::Warning => error,
+                crate::render::HintSeverity::Info => muted.clone(),
+            };
             if hint_w + 1 < max {
                 let left_budget = max - hint_w - 1;
                 let left_truncated = crate::width::truncate_to_width(&left, left_budget);
@@ -416,7 +441,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 let pad_w = max - left_w - hint_w;
                 push_str_cells(&mut row, &left_truncated, &muted);
                 push_str_cells(&mut row, &" ".repeat(pad_w), &pad);
-                push_str_cells(&mut row, &hint, &error);
+                push_str_cells(&mut row, &hint, &hint_style);
             } else {
                 let truncated = crate::width::truncate_to_width(&left, max);
                 push_str_cells(&mut row, &truncated, &muted);
@@ -454,7 +479,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // padding for the input box only).
         let rule_width = w.saturating_sub(PAD_COL * 2);
         let input_rule_width = w;
-        // "❯ " prompt prefix is 2 display cols; text fills the rest.
+        // "> " prompt prefix is 2 display cols; text fills the rest.
         let text_budget = input_rule_width.saturating_sub(2);
 
         // Wrap input + locate cursor in wrapped layout.
@@ -497,22 +522,18 @@ impl<W: Write + Send> RetainedRenderer<W> {
             (Vec::new(), None)
         };
 
-        // Spinner only when menu not open (same rule as AnsiRenderer).
-        let show_spinner = self.spinner.is_some() && self.menu.is_none();
+        // Spinner moved to body as a live paragraph row — footer no
+        // longer reserves a spinner slot. Footer layout:
+        //   top_rule / middle... / bot_rule / menu... / status
         let menu_rows = menu_items.len().min(4);
         let has_status = !self.status.model.is_empty()
             || !self.status.cwd.is_empty()
             || self.status.hint.is_some();
         let status_rows = if has_status { 1 } else { 0 };
-        let total_rows = 1 + 1 + middle_rows + 1 + menu_rows + status_rows;
+        let total_rows = 1 + middle_rows + 1 + menu_rows + status_rows;
         let footer_top = h.saturating_sub(total_rows);
 
         // Pre-build every row vector (immutable borrows of self).
-        let spin_row = if show_spinner {
-            Some(self.build_spinner_row())
-        } else {
-            None
-        };
         let top_rule = self.build_rule_row(input_rule_width);
         let middle_cells: Vec<Vec<Cell>> = lines
             .iter()
@@ -538,24 +559,18 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // Mutate screen (now &mut self). Every footer row is padded to
         // screen width before emit so blank cells overwrite any stale
         // body content still showing from earlier frames (see
-        // `pad_row_to_width` for full rationale). When the spinner slot
-        // is empty (turn idle), we still emit a blank row there so the
-        // spinner position from the previous turn is actively cleared.
-        let mut sr = spin_row.unwrap_or_default();
-        Self::pad_row_to_width(&mut sr, w);
-        self.screen.draw_row(footer_top, 0, &sr);
-
+        // `pad_row_to_width` for full rationale).
         let mut top_rule = top_rule;
         Self::pad_row_to_width(&mut top_rule, w);
-        self.screen.draw_row(footer_top + 1, 0, &top_rule);
+        self.screen.draw_row(footer_top, 0, &top_rule);
 
         for (i, r) in middle_cells.into_iter().enumerate() {
             let mut padded = r;
             Self::pad_row_to_width(&mut padded, w);
-            self.screen.draw_row(footer_top + 2 + i, 0, &padded);
+            self.screen.draw_row(footer_top + 1 + i, 0, &padded);
         }
 
-        let bot_rule_row = footer_top + 2 + middle_rows;
+        let bot_rule_row = footer_top + 1 + middle_rows;
         let mut bot_rule = bot_rule;
         Self::pad_row_to_width(&mut bot_rule, w);
         self.screen.draw_row(bot_rule_row, 0, &bot_rule);
@@ -573,8 +588,12 @@ impl<W: Write + Send> RetainedRenderer<W> {
         }
 
         // Cursor park — 1-indexed, inside middle row at the input cell.
-        // Input row is now flush-left (no PAD_COL); "❯ " prefix is 2 cols.
-        let cursor_abs_row = (footer_top + 2 + cursor_row_in_middle + 1) as u16;
+        // Input row is flush-left (no PAD_COL); "> " prefix is 2 cols.
+        // Symbol-bearing body rows share this col-0 baseline.
+        // Middle row lives at `footer_top + 1 + cursor_row_in_middle`
+        // (0-indexed); +1 more to convert to the 1-indexed form the
+        // cursor-set helper expects.
+        let cursor_abs_row = (footer_top + 1 + cursor_row_in_middle + 1) as u16;
         let cursor_abs_col = (2 + cursor_col_in_row + 1) as u16;
         self.screen.set_cursor(cursor_abs_row, cursor_abs_col);
     }
@@ -582,7 +601,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
     /// Footer total height — mirrors the computation inside
     /// `paint_footer` so `paint_body` knows where body_bottom lands.
     fn current_footer_rows(&self) -> usize {
-        // Mirror paint_footer: input box is full-width (only "❯ " prefix).
+        // Mirror paint_footer: input box is full-width (only "> " prefix).
         let text_budget = (self.screen.width() as usize).saturating_sub(2);
         let safe = scrub_controls(&self.input_buf);
         let middle_rows = if text_budget == 0 {
@@ -602,8 +621,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
             || !self.status.cwd.is_empty()
             || self.status.hint.is_some();
         let status_rows = if has_status { 1 } else { 0 };
-        // 1 spinner + 1 top rule + middle + 1 bot rule + menu + status
-        1 + 1 + middle_rows + 1 + menu_rows + status_rows
+        // 1 top rule + middle + 1 bot rule + menu + status.
+        // (Spinner used to reserve a row here but now lives in body as
+        // a live paragraph — see `push_or_update_live_spinner`.)
+        1 + middle_rows + 1 + menu_rows + status_rows
     }
 
     /// Single-entry-point for painting a full frame. Body is already
@@ -650,14 +671,11 @@ impl<W: Write + Send> RetainedRenderer<W> {
         if self.scroll_region_bottom == Some(bottom) {
             return;
         }
-        let shrunk = matches!(
-            self.scroll_region_bottom,
-            Some(prev) if prev > bottom
-        );
-        let grew = matches!(
-            self.scroll_region_bottom,
-            Some(prev) if prev < bottom
-        );
+        // Capture the old region bottom BEFORE swapping in the new
+        // value — needed by the repaint branch below to know which
+        // rows may still hold stale body glyphs.
+        let prev_bottom = self.scroll_region_bottom;
+        let changed = matches!(prev_bottom, Some(prev) if prev != bottom);
         // Set the new region. 1-indexed, inclusive: `\x1b[1;N r`.
         // Pre-format into one buffer so the write hits the stream as
         // a single call — BufWriter's `write!` can fragment into 3-4
@@ -667,44 +685,136 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let seq = format!("\x1b[1;{}r", bottom);
         let _ = self.out.write_all(seq.as_bytes());
         self.scroll_region_bottom = Some(bottom);
-        if grew {
-            // Body region expanded into what was previously footer
-            // rows. Those rows still show old footer content on the
-            // terminal side; wipe + re-emit body tail so the view
-            // matches `body_lines`. Scrollback is preserved.
-            let _ = self.out.write_all(b"\x1b[2J\x1b[H");
-            self.screen.invalidate();
-            let rows = self.body_lines.clone();
-            for row in &rows {
-                self.emit_body_line_inner(row, bottom);
-            }
-        } else if shrunk {
-            // Body region shrank; previously-body rows are now footer
-            // rows. The tail of `body_lines` is currently displayed on
-            // terminal rows that no longer belong to the body region,
-            // and the cell model never tracked those writes (body goes
-            // through `emit_body_line_inner`, direct stdout). Footer
-            // paint can't reliably overwrite that stale text because
-            // the diff sees blank→blank for the padding cells and
-            // emits nothing.
+        if changed {
+            // Region shifted (footer grew or shrank). The visible
+            // body rows are now misaligned with body_lines — either
+            // stale body glyphs sit in what are now footer rows, or
+            // new blank rows opened up above the footer. Repaint
+            // the body in place so the viewport matches body_lines.
             //
-            // Classic symptom: the welcome banner's
-            // `/provider  to add a custom model` line leaking past
-            // spinner / status rows long after it should have scrolled
-            // off.
+            // CRITICAL — two constraints that together rule out the
+            // obvious "2J + re-emit" approach:
             //
-            // Cleanest fix is the same one the `grew` branch uses —
-            // wipe viewport + invalidate + re-emit body tail — so body
-            // content settles back to `bottom` (the new body_bottom)
-            // and every row from there down is either fresh body or
-            // fresh footer. Scrollback survives because \x1b[2J only
-            // clears the visible buffer.
-            let _ = self.out.write_all(b"\x1b[2J\x1b[H");
-            self.screen.invalidate();
-            let rows = self.body_lines.clone();
-            for row in &rows {
-                self.emit_body_line_inner(row, bottom);
+            //  1. No `\n`-based re-emit. `emit_body_line_inner` writes
+            //     LF at region bottom, which promotes the region-top
+            //     row into scrollback on every call. Each cached body
+            //     row already scrolled into scrollback once during its
+            //     original emit; re-emitting via LF here duplicates
+            //     those rows in scrollback (user report: "往上翻会看
+            //     到重复内容残留" after `/model`).
+            //
+            //  2. No `\x1b[2J`. macOS Terminal.app, iTerm2, and xterm
+            //     with `cbScrollback` copy every non-blank visible row
+            //     into scrollback when processing ED. That means the
+            //     very first footer-height transition after startup
+            //     (status line appears, body_bottom shrinks by 1)
+            //     shoves the whole welcome banner into scrollback
+            //     before we get a chance to repaint it (user report:
+            //     "首次启动都出现了两次，上面的不带输入框").
+            //
+            // Instead: paint the tail of body_lines at absolute
+            // positions with per-row EL (`\x1b[K`) for any stale
+            // content, invalidate the cell cache so the footer diff
+            // repaints rows fresh below body_bottom, and explicitly
+            // erase the narrow "transition zone" — rows that changed
+            // zone between old and new layouts and can't rely on
+            // either writer to clean them:
+            //
+            //  * SHRINK: rows (new_bottom+1)..=prev_bottom were body,
+            //    now footer. Footer diff would paint blank cells for
+            //    those rows (e.g., the spinner slot when no spinner
+            //    is active), but invalidated prev_cells are also
+            //    blank → diff skips blank→blank and stale body
+            //    glyphs persist. Symptom of the first-startup bug:
+            //    welcome's last row "leaks" into the spinner slot.
+            //
+            //  * GROW: rows (prev_body_top)..(new_body_top) were the
+            //    top of the old body but now sit above the new body
+            //    anchor and aren't covered by either painter
+            //    ("zombie zone" — fixed the `/` then Esc ghost
+            //    regression).
+            //
+            // Per-row EL is row-local (no scroll, no ED) so it can't
+            // leak content into scrollback the way `\x1b[2J` does on
+            // macOS Terminal.app / iTerm2.
+            let cap = bottom as usize;
+            let total = self.body_lines.len();
+            let start = total.saturating_sub(cap);
+            let visible_count = total - start;
+
+            if let Some(prev) = prev_bottom.map(|v| v as usize) {
+                // Erase the union of old and new footer regions
+                // (rows min(prev,cap)+1 ..= h).
+                //
+                // Why the full union: the footer writer after this
+                // runs `invalidate()` (prev_cells all blank) and
+                // then only emits patches where new cells differ
+                // from blank. `pad_row_to_width` fills middle /
+                // spinner / absent-menu rows with default-style
+                // blanks — those match prev blanks → no erase
+                // patches. Meanwhile the terminal still holds the
+                // prior frame's top_rule / bot_rule `─`-filled
+                // cells at rows that are now blank in the new
+                // layout.
+                //
+                // Two symptoms this protects against:
+                //   * SHRINK: `❯ 1─────` — new middle content sits
+                //     at an absolute row that used to be top_rule;
+                //     the rule tail bleeds through.
+                //   * GROW: Shift+Enter then delete leaves an
+                //     extra ─── line above the input box — the
+                //     old top_rule row lands on the new spinner
+                //     slot (paint_footer writes a blank row there
+                //     when no spinner is active), cell diff sees
+                //     blank→blank, stale rule persists.
+                //
+                // Cost: a small handful of CUP+EL pairs per footer
+                // resize (not per frame). EL is row-local → no
+                // scroll, no scrollback pollution.
+                let screen_h = self.screen.height() as usize;
+                let transition_start = prev.min(cap) + 1;
+                for row in transition_start..=screen_h {
+                    let seq = format!("\x1b[{};1H\x1b[K", row);
+                    let _ = self.out.write_all(seq.as_bytes());
+                }
+
+                // Grow case only: the "zombie zone" above the new
+                // body anchor — rows that held the top of the old
+                // body but sit above the new body position and
+                // aren't covered by either body paint or footer
+                // diff. Fixed the menu-close ghost welcome
+                // regression.
+                if prev < cap && visible_count > 0 {
+                    let prev_body_top = prev.saturating_sub(visible_count) + 1;
+                    let new_body_top = cap.saturating_sub(visible_count) + 1;
+                    if prev_body_top < new_body_top {
+                        for row in prev_body_top..new_body_top {
+                            let seq = format!("\x1b[{};1H\x1b[K", row);
+                            let _ = self.out.write_all(seq.as_bytes());
+                        }
+                    }
+                }
             }
+
+            self.screen.invalidate();
+
+            let start_row = (cap - visible_count) as u16 + 1;
+            // Clone once; serialize_row borrows immutably, the
+            // write borrows &mut self.out which is disjoint from
+            // body_lines.
+            let rows: Vec<Vec<Cell>> = self.body_lines[start..].to_vec();
+            for (i, row) in rows.iter().enumerate() {
+                let seq = format!("\x1b[{};1H\x1b[K", start_row + i as u16);
+                let _ = self.out.write_all(seq.as_bytes());
+                let bytes = serialize_row(row);
+                let _ = self.out.write_all(&bytes);
+            }
+            // Park the cursor at the bottom of the body region so
+            // the next `emit_body_line_inner` (with `\n` at bottom)
+            // behaves the same as if the region had been stable all
+            // along.
+            let seq = format!("\x1b[{};1H", bottom);
+            let _ = self.out.write_all(seq.as_bytes());
         }
     }
 
@@ -723,7 +833,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // bottom of a scroll region must blank the new bottom row, but
         // Terminal.app and iTerm2 both leave stale cells there when the
         // source content was wider than the new row. Without the
-        // explicit erase, short rows (e.g., "❯ hi", "(cancelled)", an
+        // explicit erase, short rows (e.g., "> hi", "(cancelled)", an
         // empty spacer) let the previous row's tail bleed through —
         // classic symptom was `/provider  to add a custom model` from
         // the welcome banner leaking past shorter subsequent rows.
@@ -742,11 +852,53 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let _ = self.out.write_all(&bytes);
     }
 
+    /// Erase the live spinner if one is active: pop the transient
+    /// last row from `body_lines`, wipe its cells from the terminal
+    /// at `body_bottom`, and clear the active flag. Returns true iff
+    /// a clear actually happened, so callers (e.g. `push_body_row`)
+    /// can arrange for their replacement row to overwrite in-place
+    /// instead of scrolling.
+    ///
+    /// The spinner is treated as an in-progress indicator, not a
+    /// historical paragraph header: any transition away from it
+    /// (assistant text arriving, tool call pushing, user returning
+    /// to the input prompt) means the row's purpose is done and it
+    /// should disappear without residue — that matches what users
+    /// expected from the old footer-based spinner (cell diff
+    /// naturally cleared it on the next frame).
+    fn clear_live_spinner(&mut self) -> bool {
+        if !self.live_spinner_active {
+            return false;
+        }
+        self.live_spinner_active = false;
+        self.body_lines.pop();
+        self.ensure_scroll_region();
+        let bottom = self.body_bottom_row();
+        if bottom > 0 {
+            let seq = format!("\x1b[{};1H\x1b[K", bottom);
+            let _ = self.out.write_all(seq.as_bytes());
+        }
+        true
+    }
+
     /// Append a fully-cell-formatted body row to history AND emit it
     /// immediately so it enters terminal scrollback. Trims oldest
     /// `body_lines` when over the retention cap (memory-only — rows
     /// already pushed to scrollback live on in the terminal's buffer).
+    ///
+    /// If a live spinner row is currently sitting at `body_bottom`,
+    /// erase it first and overwrite in-place: the spinner is
+    /// transient, the new row takes its slot without scrolling other
+    /// history up by one.
     fn push_body_row(&mut self, row: Vec<Cell>) {
+        if self.clear_live_spinner() {
+            // In-place overwrite at `body_bottom` — `emit_body_line_inner`
+            // honours this flag to skip its LF and just CUP+EL+write at
+            // the current bottom row. That way the slot previously held
+            // by the spinner becomes the slot for this new body row,
+            // with no intervening blank line.
+            self.skip_next_body_scroll = true;
+        }
         // Region might be stale (first call after resume, or footer
         // just changed); sync before emit so the LF in emit_body_line
         // scrolls only within the body strip.
@@ -760,6 +912,35 @@ impl<W: Write + Send> RetainedRenderer<W> {
         if self.body_lines.len() > max_keep {
             let drain = self.body_lines.len() - max_keep;
             self.body_lines.drain(0..drain);
+        }
+    }
+
+    /// Push or update the live spinner body row. On the first call of a
+    /// run it pushes fresh via `push_body_row` and marks the row live.
+    /// On subsequent calls (every tick), it REPLACES `body_lines.last()`
+    /// and re-emits at absolute `body_bottom_row()` without the
+    /// `\n`-scroll — that way 80ms animation frames don't each push a
+    /// new row into scrollback and don't scroll the user's real history
+    /// off-screen.
+    fn push_or_update_live_spinner(&mut self, row_cells: Vec<Cell>) {
+        if self.live_spinner_active {
+            if let Some(last) = self.body_lines.last_mut() {
+                *last = row_cells.clone();
+            }
+            self.ensure_scroll_region();
+            let bottom = self.body_bottom_row();
+            if bottom > 0 {
+                let seq = format!("\x1b[{};1H\x1b[K", bottom);
+                let _ = self.out.write_all(seq.as_bytes());
+                let bytes = serialize_row(&row_cells);
+                let _ = self.out.write_all(&bytes);
+            }
+        } else {
+            // `push_body_row` clears `live_spinner_active`; set it back
+            // afterwards so the next tick takes the update-in-place
+            // branch above.
+            self.push_body_row(row_cells);
+            self.live_spinner_active = true;
         }
     }
 
@@ -784,7 +965,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
 
     /// Build one row with a leading `prefix` (often an accent
     /// glyph with its own style) and a plain-styled body. Used by
-    /// User echo ("❯ …"), ToolCall ("▸ name(detail)"), etc.
+    /// User echo ("> …"), ToolCall ("▸ name(detail)"), etc.
     ///
     /// Multi-line `body` (Shift+Enter in the input, or a tool detail
     /// that happens to contain `\n`) is split on '\n' BEFORE width
@@ -800,7 +981,11 @@ impl<W: Write + Send> RetainedRenderer<W> {
         body: &str,
         body_style: &CellStyle,
     ) {
-        let w = (self.screen.width() as usize).saturating_sub(PAD_COL * 2);
+        // Symbol-anchored rows (user echo, tool call, approval) sit
+        // flush-left at col 0 to align with the input-box chevron.
+        // We keep a PAD_COL right-gutter so long text never touches
+        // the terminal's right edge.
+        let w = (self.screen.width() as usize).saturating_sub(PAD_COL);
         if w == 0 {
             return;
         }
@@ -816,7 +1001,6 @@ impl<W: Write + Send> RetainedRenderer<W> {
             for chunk in &chunks {
                 let mut row = Vec::new();
                 let pad = CellStyle::default();
-                push_str_cells(&mut row, &" ".repeat(PAD_COL), &pad);
                 if !first_emitted {
                     push_str_cells(&mut row, prefix, prefix_style);
                     first_emitted = true;
@@ -885,6 +1069,17 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // vertical gaps that feel "unfinished". Allow at most one
         // blank row in a row — enough for paragraph separation,
         // nothing more.
+        //
+        // Special case: when the live spinner is the tail row, also
+        // skip blank pushes. Many models emit a leading `\n` warm-up
+        // before the first real reply chunk. Without this, that
+        // leading blank evicts the spinner + leaves a ghost blank
+        // row that the NEXT (non-blank) chunk then scrolls above
+        // the real content — producing a visible double-blank
+        // between the user message and the assistant reply. The
+        // spinner itself is transient (not a historical paragraph),
+        // so there's no paragraph boundary here worth marking with
+        // a blank.
         let is_blank = rendered.trim().is_empty();
         if is_blank {
             let tail_blank = self
@@ -892,7 +1087,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 .last()
                 .map(|r| r.iter().all(|c| c.ch == ' '))
                 .unwrap_or(true);
-            if tail_blank {
+            if tail_blank || self.live_spinner_active {
                 return;
             }
         }
@@ -914,75 +1109,206 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let _ = self.out.write_all(&bytes);
     }
 
-    fn push_welcome(&mut self, model: &str, working_dir: &str) {
-        // Mirror AnsiRenderer::render_welcome — compact 6-row greet.
-        let caps = self.caps;
+    fn build_prefixed_wrapped_rows(
+        &self,
+        prefix: &str,
+        prefix_style: &CellStyle,
+        continuation_prefix: &str,
+        continuation_style: &CellStyle,
+        content: Vec<Cell>,
+        content_width: usize,
+    ) -> Vec<Vec<Cell>> {
+        let prefix_w = crate::width::display_width(prefix);
+        let cont_prefix_w = crate::width::display_width(continuation_prefix);
+        let first_budget = content_width.saturating_sub(prefix_w).max(1);
+        let cont_budget = content_width.saturating_sub(cont_prefix_w).max(1);
+
+        let first_chunks = wrap_cells_to_width(&content, first_budget);
+        let mut rows = Vec::with_capacity(first_chunks.len().max(1));
+        for (idx, chunk) in first_chunks.into_iter().enumerate() {
+            let mut row = Vec::new();
+            let pad = CellStyle::default();
+            push_str_cells(&mut row, &" ".repeat(PAD_COL), &pad);
+            if idx == 0 {
+                push_str_cells(&mut row, prefix, prefix_style);
+            } else {
+                push_str_cells(&mut row, continuation_prefix, continuation_style);
+            }
+            row.extend(chunk);
+            rows.push(row);
+        }
+        if rows.len() <= 1 {
+            return rows;
+        }
+
+        let mut normalized = Vec::new();
+        let mut first = true;
+        for row in rows {
+            if first {
+                normalized.push(row);
+                first = false;
+                continue;
+            }
+
+            let mut content_only = row;
+            let strip = PAD_COL + cont_prefix_w;
+            content_only.drain(..strip.min(content_only.len()));
+
+            let mut wrapped = wrap_cells_to_width(&content_only, cont_budget);
+            for chunk in wrapped.drain(..) {
+                let mut next = Vec::new();
+                let pad = CellStyle::default();
+                push_str_cells(&mut next, &" ".repeat(PAD_COL), &pad);
+                push_str_cells(&mut next, continuation_prefix, continuation_style);
+                next.extend(chunk);
+                normalized.push(next);
+            }
+        }
+        normalized
+    }
+
+    fn build_wrapped_text_rows(
+        &self,
+        parts: &[(&str, CellStyle)],
+        content_width: usize,
+    ) -> Vec<Vec<Cell>> {
+        let mut content = Vec::new();
+        for (text, style) in parts {
+            push_str_cells(&mut content, text, style);
+        }
+        let chunks = wrap_cells_to_width(&content, content_width.max(1));
+        let mut rows = Vec::with_capacity(chunks.len().max(1));
+        for chunk in chunks {
+            let mut row = Vec::new();
+            let pad = CellStyle::default();
+            push_str_cells(&mut row, &" ".repeat(PAD_COL), &pad);
+            row.extend(chunk);
+            rows.push(row);
+        }
+        rows
+    }
+
+    fn build_welcome_rows(&self, model: &str, working_dir: &str) -> Vec<Vec<Cell>> {
+        // Mirror AnsiRenderer::render_welcome, but allow narrow terminals
+        // to reflow path/model/tips instead of truncating or colliding.
         let w = self.screen.width() as usize;
-        let content_w = w.saturating_sub(PAD_COL * 2);
+        let content_w = w.saturating_sub(PAD_COL * 2).max(1);
         // Row 1: brand left + version · license right
         let left_txt = "◆ AtomCode";
         let right_ver = concat!("v", env!("CARGO_PKG_VERSION"));
         let right_lic = "MIT";
         let left_w = crate::width::display_width(left_txt);
-        let right_w = right_ver.len() + 5 + right_lic.len();
-        let gap = content_w.saturating_sub(left_w + right_w);
-        let mut row1 = Vec::new();
+        let right_txt = format!("{}  ·  {}", right_ver, right_lic);
+        let right_w = crate::width::display_width(&right_txt);
+        let mut rows = Vec::with_capacity(6);
         let pad = CellStyle::default();
-        push_str_cells(&mut row1, &" ".repeat(PAD_COL), &pad);
-        push_str_cells(&mut row1, left_txt, &self.style_bold(Role::Brand));
-        for _ in 0..gap {
-            row1.push(Cell::blank());
+        if content_w > left_w + right_w {
+            let gap = content_w.saturating_sub(left_w + right_w);
+            let mut row1 = Vec::new();
+            push_str_cells(&mut row1, &" ".repeat(PAD_COL), &pad);
+            push_str_cells(&mut row1, left_txt, &self.style_bold(Role::Brand));
+            for _ in 0..gap {
+                row1.push(Cell::blank());
+            }
+            push_str_cells(&mut row1, right_ver, &self.style_for(Role::Secondary));
+            push_str_cells(&mut row1, "  ·  ", &self.style_for(Role::Muted));
+            push_str_cells(&mut row1, right_lic, &self.style_for(Role::Muted));
+            rows.push(row1);
+        } else {
+            let mut row1 = Vec::new();
+            push_str_cells(&mut row1, &" ".repeat(PAD_COL), &pad);
+            push_str_cells(&mut row1, left_txt, &self.style_bold(Role::Brand));
+            rows.push(row1);
+
+            let right_gap = content_w.saturating_sub(right_w);
+            let mut row1b = Vec::new();
+            push_str_cells(&mut row1b, &" ".repeat(PAD_COL), &pad);
+            for _ in 0..right_gap {
+                row1b.push(Cell::blank());
+            }
+            push_str_cells(&mut row1b, right_ver, &self.style_for(Role::Secondary));
+            push_str_cells(&mut row1b, "  ·  ", &self.style_for(Role::Muted));
+            push_str_cells(&mut row1b, right_lic, &self.style_for(Role::Muted));
+            rows.push(row1b);
         }
-        push_str_cells(&mut row1, right_ver, &self.style_for(Role::Secondary));
-        push_str_cells(&mut row1, "  ·  ", &self.style_for(Role::Muted));
-        push_str_cells(&mut row1, right_lic, &self.style_for(Role::Muted));
-        self.push_body_row(row1);
 
-        let max_path = w.saturating_sub(6);
-        let cwd_disp = crate::width::truncate_to_width(working_dir, max_path);
-        let mut row2 = Vec::new();
-        push_str_cells(&mut row2, &" ".repeat(PAD_COL), &pad);
-        push_str_cells(&mut row2, "∙ ", &self.style_for(Role::AccentDim));
-        push_str_cells(&mut row2, &cwd_disp, &self.style_for(Role::Secondary));
-        self.push_body_row(row2);
+        let bullet_style = self.style_for(Role::AccentDim);
+        let secondary_style = self.style_for(Role::Secondary);
+        let path_cells = {
+            let mut cells = Vec::new();
+            push_str_cells(&mut cells, working_dir, &secondary_style);
+            cells
+        };
+        rows.extend(self.build_prefixed_wrapped_rows(
+            "∙ ",
+            &bullet_style,
+            "  ",
+            &CellStyle::default(),
+            path_cells,
+            content_w,
+        ));
 
-        let model_disp = crate::width::truncate_to_width(model, max_path);
-        let mut row3 = Vec::new();
-        push_str_cells(&mut row3, &" ".repeat(PAD_COL), &pad);
-        push_str_cells(&mut row3, "∙ ", &self.style_for(Role::AccentDim));
-        push_str_cells(&mut row3, &model_disp, &self.style_for(Role::Secondary));
-        self.push_body_row(row3);
+        let model_cells = {
+            let mut cells = Vec::new();
+            push_str_cells(&mut cells, model, &secondary_style);
+            cells
+        };
+        rows.extend(self.build_prefixed_wrapped_rows(
+            "∙ ",
+            &bullet_style,
+            "  ",
+            &CellStyle::default(),
+            model_cells,
+            content_w,
+        ));
 
         // Blank separator.
-        self.push_body_row(Vec::new());
+        rows.push(Vec::new());
 
         // Hint rows.
-        let mut row5 = Vec::new();
-        push_str_cells(&mut row5, &" ".repeat(PAD_COL), &pad);
-        push_str_cells(
-            &mut row5,
-            "type something, or press  ",
-            &self.style_for(Role::AccentDim),
-        );
-        push_str_cells(&mut row5, "/", &self.style_bold(Role::Accent));
-        push_str_cells(
-            &mut row5,
-            "  to browse commands",
-            &self.style_for(Role::AccentDim),
-        );
-        self.push_body_row(row5);
+        let accent_dim = self.style_for(Role::AccentDim);
+        let accent_bold = self.style_bold(Role::Accent);
+        rows.extend(self.build_wrapped_text_rows(
+            &[
+                ("type something, or press  ", accent_dim.clone()),
+                ("/", accent_bold.clone()),
+                ("  to browse commands", accent_dim.clone()),
+            ],
+            content_w,
+        ));
 
-        let mut row6 = Vec::new();
-        push_str_cells(&mut row6, &" ".repeat(PAD_COL), &pad);
-        push_str_cells(&mut row6, "/provider", &self.style_bold(Role::Accent));
-        push_str_cells(
-            &mut row6,
-            "  to add a custom model",
-            &self.style_for(Role::AccentDim),
-        );
-        self.push_body_row(row6);
+        rows.extend(self.build_wrapped_text_rows(
+            &[
+                ("/provider", accent_bold),
+                ("  to add a custom model", accent_dim),
+            ],
+            content_w,
+        ));
 
-        let _ = caps; // style helpers already captured
+        rows
+    }
+
+    fn push_welcome(&mut self, model: &str, working_dir: &str) {
+        let rows = self.build_welcome_rows(model, working_dir);
+        self.welcome_banner = Some((model.to_string(), working_dir.to_string()));
+        self.welcome_line_count = rows.len();
+        for row in rows {
+            self.push_body_row(row);
+        }
+    }
+
+    fn reflow_welcome_prefix(&mut self) {
+        let Some((ref model, ref working_dir)) = self.welcome_banner else {
+            return;
+        };
+        if self.welcome_line_count == 0 || self.body_lines.len() < self.welcome_line_count {
+            return;
+        }
+        let rows = self.build_welcome_rows(model, working_dir);
+        let new_len = rows.len();
+        self.body_lines
+            .splice(0..self.welcome_line_count, rows.into_iter());
+        self.welcome_line_count = new_len;
     }
 }
 
@@ -996,7 +1322,11 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 menu,
                 status,
             } => {
-                self.spinner = None;
+                // Returning to idle input: the spinner row served its
+                // purpose — clear it from both body history and the
+                // terminal so the user sees a clean input prompt, not
+                // a stale `⠋ Pondering…` row above the input box.
+                self.clear_live_spinner();
                 self.input_buf = buf;
                 self.input_cursor_byte = cursor_byte;
                 self.menu = menu;
@@ -1010,14 +1340,21 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 status,
                 menu,
             } => {
-                self.spinner = Some((frame.to_string(), label));
+                // Input box / status / menu still belong in the footer.
                 self.input_buf = buf;
                 self.input_cursor_byte = cursor_byte;
                 self.menu = menu;
                 self.status = status;
+                // Spinner (frame + label) goes into body as the live
+                // paragraph header — each tick replaces the same row
+                // via `push_or_update_live_spinner`, so animation
+                // doesn't push a new row every 80ms.
+                let cells = self.build_spinner_body_row(frame, &label);
+                self.push_or_update_live_spinner(cells);
             }
             UiLine::Spinner { frame, label } => {
-                self.spinner = Some((frame.to_string(), label));
+                let cells = self.build_spinner_body_row(frame, &label);
+                self.push_or_update_live_spinner(cells);
             }
             UiLine::ClearTransient | UiLine::InputCommit => {
                 // No-op in retained mode.
@@ -1034,7 +1371,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 let safe = scrub_controls(&text);
                 let accent = self.style_bold(Role::Accent);
                 let plain = CellStyle::default();
-                self.push_body_prefixed("❯ ", &accent, &safe, &plain);
+                self.push_body_prefixed(self.caps.prompt_chevron(), &accent, &safe, &plain);
                 // Blank spacer row.
                 self.push_body_row(Vec::new());
                 // New user turn — reset markdown parser so code-block
@@ -1127,13 +1464,14 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                     format!("✗ {}", safe)
                 };
                 let body_style = if success { muted.clone() } else { error };
-                // Indent result lines 4 cols past the tool-call row.
-                let row_w = (self.screen.width() as usize).saturating_sub(PAD_COL * 2 + 6);
+                // Indent result rows 4 cols past the tool-call row at
+                // col 0: "    ⎿ " is 4 spaces + glyph + space, so ⎿
+                // lands at col 4. Width reserves PAD_COL for the right
+                // gutter + 6 for "    ⎿ ".
+                let row_w = (self.screen.width() as usize).saturating_sub(PAD_COL + 6);
                 for phys in body_str.split('\n') {
                     for chunk in crate::width::wrap_line_to_width(phys, row_w.max(1)) {
                         let mut row = Vec::new();
-                        let pad = CellStyle::default();
-                        push_str_cells(&mut row, &" ".repeat(PAD_COL), &pad);
                         push_str_cells(&mut row, "    ⎿ ", &muted);
                         push_str_cells(&mut row, &chunk, &body_style);
                         self.push_body_row(row);
@@ -1185,7 +1523,6 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 let chip_n = chip(Color::Red);
 
                 let mut row = Vec::new();
-                push_str_cells(&mut row, &" ".repeat(PAD_COL), &plain);
                 push_str_cells(&mut row, "▶ Waiting for approval: ", &warn);
                 push_str_cells(&mut row, " Y ", &chip_y);
                 push_str_cells(&mut row, " Allow  ", &plain);
@@ -1218,16 +1555,19 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
     }
 
     fn pop_approval_prompt(&mut self) {
-        // Approval rows are the only body rows whose column-PAD_COL cell
-        // is '▶' (the prompt glyph we emit in the ApprovalPrompt arm).
-        // Other body lines lead with '▸' (tool call), '❯' (user turn),
-        // '─' (rule), or ordinary text — none of them match. Checking
-        // the tail is safe because the agent doesn't append further body
-        // rows between `ApprovalNeeded` and the user's Y/A/N reply.
+        // Approval rows are the only body rows whose col-0 cell is
+        // '▶' (the prompt glyph we emit in the ApprovalPrompt arm).
+        // Other symbol rows hold '▸' (tool call) or '❯' (user turn)
+        // at col 0 — distinct glyphs. All remaining body rows
+        // (assistant prose, errors, cmd output, diff, turn separator
+        // with '─' at col 2, tool result with '⎿' at col 4) have
+        // whitespace at col 0. None match '▶'. Checking the tail is
+        // safe because the agent doesn't append further body rows
+        // between `ApprovalNeeded` and the user's Y/A/N reply.
         let is_approval = self
             .body_lines
             .last()
-            .and_then(|r| r.get(PAD_COL))
+            .and_then(|r| r.get(0))
             .map(|c| c.ch == '▶')
             .unwrap_or(false);
         if !is_approval {
@@ -1259,15 +1599,25 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
             let _ = self.out.write_all(&bytes);
             self.dirty = false;
         }
-        // Be defensive: clear any DECSTBM that the old AnsiRenderer
-        // might have set before we took over (if flag was toggled
-        // mid-session), re-enable autowrap, then wipe the visible
-        // viewport and home the cursor. Without the 2J, the welcome
-        // banner + input box survive as garbage that the shell's new
-        // prompt overwrites from the top — leaving the bottom half
-        // visible. Scrollback is preserved (2J clears only the
-        // visible area, not the scroll buffer).
-        let _ = self.out.write_all(b"\x1b[?7h\x1b[r\x1b[2J\x1b[H");
+        // Be defensive: re-enable autowrap, release any DECSTBM, then
+        // wipe the visible viewport and home the cursor. Without the
+        // wipe, the welcome banner + input box survive as garbage that
+        // the shell's new prompt overwrites from the top, leaving the
+        // bottom half visible.
+        //
+        // Per-row CUP+EL instead of `\x1b[2J` for the same reason as
+        // `reset()` / `on_resize()` — iTerm2 3.5+ ignores ED under
+        // certain states (see `reset()` rationale). EL is row-local
+        // and unambiguous. Scrollback is preserved either way.
+        let _ = self.out.write_all(b"\x1b[?7h\x1b[r");
+        let h = self.screen.height() as usize;
+        let mut seq = String::with_capacity(h * 8 + 8);
+        for row in 1..=h {
+            use std::fmt::Write;
+            let _ = write!(seq, "\x1b[{};1H\x1b[K", row);
+        }
+        seq.push_str("\x1b[H");
+        let _ = self.out.write_all(seq.as_bytes());
         self.scroll_region_bottom = None;
         let _ = self.out.flush();
     }
@@ -1276,8 +1626,32 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         // Terminal-side wipe + full state reset. `body_lines` is
         // also dropped so post-reset the screen truly starts clean
         // (old transcript stays in the terminal's own scrollback).
-        // Release DECSTBM so the `\x1b[2J` affects the full screen.
-        let _ = self.out.write_all(b"\x1b[r\x1b[2J\x1b[H");
+        //
+        // Why per-row CUP+EL instead of `\x1b[2J`: ED behaviour is
+        // inconsistent across terminals — iTerm2 3.5+ was reported
+        // to leave pre-reset rows visible after `\x1b[2J` (trace
+        // shows `Ack Reset` fires and body_lines is cleared, but
+        // the old assistant response + Done separator + user echo
+        // stayed on screen while the freshly re-rendered welcome
+        // sat below them, leaving `/session` to produce a torn
+        // layout). ED also interacts badly with DECSTBM on some
+        // builds and can promote visible rows to scrollback rather
+        // than clearing. EL (`\x1b[K`) is row-local with no scroll
+        // or scrollback semantics, so a CUP+EL per row is
+        // unambiguous everywhere (same technique as
+        // `ensure_scroll_region`'s resize path).
+        //
+        // Release DECSTBM first so EL isn't constrained by the
+        // prior scroll region.
+        let _ = self.out.write_all(b"\x1b[r");
+        let h = self.screen.height() as usize;
+        let mut seq = String::with_capacity(h * 8 + 8);
+        for row in 1..=h {
+            use std::fmt::Write;
+            let _ = write!(seq, "\x1b[{};1H\x1b[K", row);
+        }
+        seq.push_str("\x1b[H");
+        let _ = self.out.write_all(seq.as_bytes());
         self.screen = Screen::new(self.screen.width(), self.screen.height());
         self.body_lines.clear();
         self.assistant_line_buf.clear();
@@ -1301,6 +1675,17 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         let _ = self.out.write_all(b"\x1b[r\x1b[?7h\r\n");
         self.scroll_region_bottom = None;
         let _ = self.out.flush();
+        // Pop Kitty keyboard enhancement flags if they were pushed at
+        // startup. Without this, the child (OAuth browser output, a
+        // shell prompt) runs in a terminal whose key-reporting mode
+        // was modified by us — and on some terminals the non-standard
+        // CSI u sequences bleed through as unexpected bytes on stdin
+        // that the cooked-mode child process then echoes back as
+        // gibberish. `execute!` is best-effort — terminals that never
+        // accepted the push silently ignore the pop.
+        if self.caps.tty {
+            let _ = execute!(self.out, PopKeyboardEnhancementFlags);
+        }
         if self.caps.bracketed_paste {
             let _ = execute!(self.out, DisableBracketedPaste);
         }
@@ -1316,10 +1701,39 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         if self.caps.bracketed_paste {
             let _ = execute!(self.out, EnableBracketedPaste);
         }
+        // Re-push Kitty keyboard enhancement flags (mirror of the pop in
+        // suspend_for_external, and the initial push in TerminalGuard).
+        // Without this, post-OAuth the terminal is in a different
+        // key-reporting mode than we initialised with — autorepeat stops
+        // coming as `Repeat`, Shift+Enter stops carrying SHIFT, and any
+        // other logic that depended on CSI u event types silently
+        // degrades. Same flag set as `TerminalGuard::activate`.
+        if self.caps.tty {
+            let _ = execute!(
+                self.out,
+                PushKeyboardEnhancementFlags(
+                    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                        | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+                )
+            );
+        }
         // Wipe terminal + invalidate Screen + reset region state so
         // the next widget draw is a cold-start full repaint and the
         // next body emit resets DECSTBM. Scrollback is preserved.
-        let _ = self.out.write_all(b"\x1b[2J\x1b[H");
+        //
+        // Per-row CUP+EL instead of `\x1b[2J` for the same reason as
+        // `reset()` / `on_resize()` — iTerm2 3.5+ ignores ED under
+        // certain states, which after resume would leave the external
+        // process's output (shell, OAuth browser messages) overlaid
+        // with atomcode's re-painted UI.
+        let h = self.screen.height() as usize;
+        let mut seq = String::with_capacity(h * 8 + 8);
+        for row in 1..=h {
+            use std::fmt::Write;
+            let _ = write!(seq, "\x1b[{};1H\x1b[K", row);
+        }
+        seq.push_str("\x1b[H");
+        let _ = self.out.write_all(seq.as_bytes());
         self.screen.invalidate();
         self.scroll_region_bottom = None;
         let _ = self.out.flush();
@@ -1343,6 +1757,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 self.emit_body_line_inner(row, bottom);
             }
         }
+        let _ = self.out.flush();
     }
 
     fn flush_deferred(&mut self) {
@@ -1444,15 +1859,29 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
 
     fn on_resize(&mut self, cols: u16, rows: u16) {
         // Terminal-side wipe: resize leaves pre-resize chars at old
-        // absolute positions. Release DECSTBM first so `\x1b[2J`
-        // affects the whole new viewport rather than the stale region.
-        let _ = self.out.write_all(b"\x1b[r\x1b[2J\x1b[H");
+        // absolute positions. Use per-row CUP+EL instead of `\x1b[2J`
+        // for the same reason as `reset()` — iTerm2 3.5+ has been
+        // observed to ignore ED under certain states, leaving the
+        // pre-resize welcome + footer on screen while the body
+        // repaint below stamps a second copy. EL is row-local and
+        // unambiguous across terminals.
+        //
+        // Release DECSTBM first so EL isn't constrained by the
+        // stale (pre-resize) scroll region.
+        let _ = self.out.write_all(b"\x1b[r");
+        let mut seq = String::with_capacity((rows as usize) * 8 + 8);
+        for row in 1..=(rows as usize) {
+            use std::fmt::Write;
+            let _ = write!(seq, "\x1b[{};1H\x1b[K", row);
+        }
+        seq.push_str("\x1b[H");
+        let _ = self.out.write_all(seq.as_bytes());
         self.scroll_region_bottom = None;
         self.screen.resize(cols, rows);
-        // IMPORTANT: keep `body_lines` intact — rows that are too
-        // wide just clip their right edge (serialize_row writes them
-        // as-is; the terminal truncates past width).
-        //
+        // Rebuild the semantic welcome banner against the new width so
+        // its right-aligned version/license pair stays adaptive after
+        // terminal resize instead of replaying stale gap cells.
+        self.reflow_welcome_prefix();
         // Re-emit body tail into the new region so the view matches
         // memory. Set region first so LFs scroll only within body.
         let bottom = self.body_bottom_row();
@@ -1493,6 +1922,9 @@ mod tests {
             no_color: false,
             term: Some("xterm-256color".into()),
             colorterm: Some("truecolor".into()),
+            force_ascii: false,
+            lang: Some("en_US.UTF-8".into()),
+            lc_all: None,
         })
     }
 
@@ -1819,9 +2251,11 @@ mod tests {
     /// to erase — but the terminal still holds pre-resize glyphs at
     /// the old absolute positions.
     ///
-    /// Fix: `on_resize` emits `\x1b[2J\x1b[H` before repainting, so
-    /// the terminal's own display clears and the new frame owns
-    /// every visible column.
+    /// Fix: `on_resize` emits per-row CUP+EL for every row of the new
+    /// viewport before repainting, so the terminal's own display
+    /// clears and the new frame owns every visible column. (Uses EL
+    /// instead of `\x1b[2J` because iTerm2 3.5+ has been observed to
+    /// ignore ED under certain states — see `reset()` rationale.)
     #[test]
     fn retained_resize_clears_old_footer_via_vterm() {
         let (mut r, buf) = new_capturing(80, 24);
@@ -1959,12 +2393,13 @@ mod tests {
         // Screen h=24, footer 5 rows = [19, 23]:
         //   row 19: spinner blank, row 20: top rule,
         //   row 21: middle, row 22: bot rule, row 23: status.
-        // "❯ 你是谁" in middle row (col 0-indexed, flush-left now):
+        // "你是谁" in middle row (col 0-indexed, flush-left now):
         //   col 0 '❯', col 1 ' ',
         //   col 2 '你' (cols 2-3, right half blank), col 4 '是',
         //   col 6 '谁'.
+        //   (caps_with_color has unicode_symbols=true so prompt_chevron() is "❯ ".)
         let middle_row = 21;
-        assert_eq!(vterm.cell_at(middle_row, 0).ch, '❯');
+        assert_eq!(vterm.cell_at(middle_row, 0).ch, '\u{276f}');
         assert_eq!(vterm.cell_at(middle_row, 1).ch, ' ');
         assert_eq!(
             vterm.cell_at(middle_row, 2).ch,
@@ -2020,7 +2455,7 @@ mod tests {
         // + 1 status = 9 rows. Layout from screen_h=24:
         //   row 15: spinner blank
         //   row 16: top rule
-        //   row 17: middle ("  ❯ /")
+        //   row 17: middle ("  > /")
         //   row 18: bot rule
         //   rows 19-22: menu rows (selected @ 19)
         //   row 23: status
@@ -2158,8 +2593,148 @@ mod tests {
         );
     }
 
+    #[test]
+    fn retained_resize_reflows_welcome_brand_row_when_expanding() {
+        let (mut r, buf) = new_capturing(40, 18);
+
+        r.render(UiLine::Welcome {
+            model: "glm-5".into(),
+            working_dir: "~/p/a".into(),
+        });
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status_basic(),
+        });
+        r.flush_deferred();
+        let mut pre = crate::test_term::VirtualTerminal::new(40, 18);
+        drain_into_vterm(&buf, &mut pre);
+
+        r.on_resize(80, 18);
+        r.flush_deferred();
+        let mut post = crate::test_term::VirtualTerminal::new(80, 18);
+        drain_into_vterm(&buf, &mut post);
+
+        let brand_row = (0..18)
+            .map(|row| post.row_text(row))
+            .find(|row| row.contains("AtomCode"))
+            .expect("brand row should remain visible after widening");
+        let atom_idx = brand_row.find("AtomCode").unwrap();
+        let ver_idx = brand_row
+            .find(concat!("v", env!("CARGO_PKG_VERSION")))
+            .unwrap();
+        let lic_idx = brand_row.find("MIT").unwrap();
+
+        assert!(
+            ver_idx > atom_idx + 20,
+            "version should move right after widening, row={:?}",
+            brand_row
+        );
+        assert!(
+            lic_idx > ver_idx,
+            "license should stay on the same row after widening, row={:?}",
+            brand_row
+        );
+    }
+
+    #[test]
+    fn retained_resize_reflows_welcome_brand_row_when_shrinking() {
+        let (mut r, buf) = new_capturing(80, 18);
+
+        r.render(UiLine::Welcome {
+            model: "glm-5".into(),
+            working_dir: "~/p/a".into(),
+        });
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status_basic(),
+        });
+        r.flush_deferred();
+        let mut pre = crate::test_term::VirtualTerminal::new(80, 18);
+        drain_into_vterm(&buf, &mut pre);
+
+        r.on_resize(24, 18);
+        r.flush_deferred();
+        let mut post = crate::test_term::VirtualTerminal::new(24, 18);
+        drain_into_vterm(&buf, &mut post);
+
+        let brand_row = (0..18)
+            .map(|row| post.row_text(row))
+            .find(|row| row.contains("AtomCode"))
+            .expect("brand row should remain visible after shrinking");
+        let version_row = (0..18)
+            .map(|row| post.row_text(row))
+            .find(|row| row.contains(concat!("v", env!("CARGO_PKG_VERSION"))))
+            .expect("version row should remain visible after shrinking");
+        assert!(
+            version_row.contains(concat!("v", env!("CARGO_PKG_VERSION"))),
+            "version should remain visible after shrinking, brand_row={:?}, version_row={:?}",
+            brand_row,
+            version_row
+        );
+        assert!(
+            version_row.contains("MIT"),
+            "license should remain visible after shrinking, brand_row={:?}, version_row={:?}",
+            brand_row,
+            version_row
+        );
+    }
+
+    #[test]
+    fn retained_welcome_reflows_path_model_and_hints_on_narrow_terminal() {
+        let (mut r, buf) = new_capturing(22, 20);
+        let mut vterm = crate::test_term::VirtualTerminal::new(22, 20);
+
+        r.render(UiLine::Welcome {
+            model: "MiniMax-M2.7-long".into(),
+            working_dir: "~/workspace/gitcode_project/atomcode_family/atomcode".into(),
+        });
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status_basic(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        assert!(
+            (0..20).any(|row| vterm.row_text(row).contains("AtomCode")),
+            "brand missing on narrow terminal\n{}",
+            vterm.dump()
+        );
+        assert!(
+            (0..20).any(|row| vterm.row_text(row).contains("workspace")),
+            "path should wrap instead of disappearing on narrow terminal\n{}",
+            vterm.dump()
+        );
+        assert!(
+            (0..20).any(|row| vterm.row_text(row).contains("MiniMax")),
+            "model should wrap instead of disappearing on narrow terminal\n{}",
+            vterm.dump()
+        );
+        assert!(
+            (0..20).any(|row| vterm.row_text(row).contains("type something")),
+            "welcome input hint should remain visible on narrow terminal\n{}",
+            vterm.dump()
+        );
+        assert!(
+            (0..20).any(|row| vterm.row_text(row).contains("commands")),
+            "welcome commands hint should remain visible on narrow terminal\n{}",
+            vterm.dump()
+        );
+        assert!(
+            (0..20).any(|row| vterm.row_text(row).contains("/provider")),
+            "provider hint should remain visible on narrow terminal\n{}",
+            vterm.dump()
+        );
+    }
+
     /// User echo: `UiLine::User("hi")` produces a body row with
-    /// `❯ hi` accent prefix + a blank spacer. Grid-verified at
+    /// `> hi` accent prefix + a blank spacer. Grid-verified at
     /// absolute rows right above the footer (body bottom-anchored).
     #[test]
     fn retained_user_echo_renders_via_vterm() {
@@ -2178,10 +2753,45 @@ mod tests {
         // User line + blank spacer = 2 body rows somewhere in the
         // body area (scrollback-push layout is stack-like, exact
         // row depends on how many rows have been pushed).
+        // Prompt glyph depends on caps.unicode_symbols; caps_with_color
+        // is UTF-8 + non-dumb so `prompt_chevron()` returns `❯ `.
         let found = vterm.any_row(|row| {
-            row.contains('❯') && row.contains('你') && row.contains('好') && row.contains("world")
+            row.contains('\u{276f}')
+                && row.contains('你')
+                && row.contains('好')
+                && row.contains("world")
         });
         assert!(found, "user echo missing\ndump:\n{}", vterm.dump());
+    }
+
+    /// User-echo chevron must sit at col 0 — the same column as the
+    /// input-box chevron below — so history symbols align with the
+    /// live prompt.
+    #[test]
+    fn retained_user_echo_chevron_at_col_0() {
+        let (mut r, buf) = new_capturing(80, 24);
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+        let status = status_basic();
+        r.render(UiLine::User("hello".into()));
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        let row_idx = (0..vterm.height() as usize)
+            .find(|&i| vterm.row_text(i).contains('\u{276f}') && vterm.row_text(i).contains("hello"))
+            .unwrap_or_else(|| panic!("user echo row missing\ndump:\n{}", vterm.dump()));
+        assert_eq!(
+            vterm.cell_at(row_idx, 0).ch,
+            '\u{276f}',
+            "user-echo chevron must land at col 0, got row: {:?}\ndump:\n{}",
+            vterm.row_text(row_idx),
+            vterm.dump()
+        );
     }
 
     /// ToolCall: `▸ name(detail)` formatted. Grid-verifies the
@@ -2208,6 +2818,38 @@ mod tests {
         assert!(found, "tool call missing\ndump:\n{}", vterm.dump());
     }
 
+    /// ToolCall arrow `▸` must sit at col 0, same baseline as user
+    /// echo and input chevron.
+    #[test]
+    fn retained_tool_call_arrow_at_col_0() {
+        let (mut r, buf) = new_capturing(80, 24);
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+        let status = status_basic();
+        r.render(UiLine::ToolCall {
+            name: "bash".into(),
+            detail: "ls -la".into(),
+        });
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        let row_idx = (0..vterm.height() as usize)
+            .find(|&i| vterm.row_text(i).contains("▸") && vterm.row_text(i).contains("bash"))
+            .unwrap_or_else(|| panic!("tool call row missing\ndump:\n{}", vterm.dump()));
+        assert_eq!(
+            vterm.cell_at(row_idx, 0).ch,
+            '▸',
+            "tool-call arrow must land at col 0, got row: {:?}\ndump:\n{}",
+            vterm.row_text(row_idx),
+            vterm.dump()
+        );
+    }
+
     /// ToolResult success: `⎿ summary` + blank spacer; failure
     /// prepends `✗ `. We test success path here; the error styling
     /// (Role::Error red) is a cell-style detail not asserted in
@@ -2231,6 +2873,47 @@ mod tests {
         drain_into_vterm(&buf, &mut vterm);
         let found = vterm.any_row(|row| row.contains("⎿") && row.contains("3 files changed"));
         assert!(found, "tool result missing\ndump:\n{}", vterm.dump());
+    }
+
+    /// ToolResult `⎿` glyph sits at col 4 — four spaces indent under
+    /// the tool call at col 0, mirroring CC's nested-result layout.
+    #[test]
+    fn retained_tool_result_arrow_at_col_4() {
+        let (mut r, buf) = new_capturing(80, 24);
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+        let status = status_basic();
+        r.render(UiLine::ToolResult {
+            success: true,
+            summary: "3 files changed".into(),
+        });
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        let row_idx = (0..vterm.height() as usize)
+            .find(|&i| vterm.row_text(i).contains("⎿") && vterm.row_text(i).contains("3 files"))
+            .unwrap_or_else(|| panic!("tool result row missing\ndump:\n{}", vterm.dump()));
+        assert_eq!(
+            vterm.cell_at(row_idx, 4).ch,
+            '⎿',
+            "tool-result glyph must land at col 4, got row: {:?}\ndump:\n{}",
+            vterm.row_text(row_idx),
+            vterm.dump()
+        );
+        for c in 0..4 {
+            assert_eq!(
+                vterm.cell_at(row_idx, c).ch,
+                ' ',
+                "cols 0..4 before ⎿ must be blank, col {} is {:?}",
+                c,
+                vterm.cell_at(row_idx, c).ch,
+            );
+        }
     }
 
     /// DiffBlock: multiple added/removed lines, each with its own
@@ -2342,12 +3025,49 @@ mod tests {
         assert!(found, "command output missing\ndump:\n{}", vterm.dump());
     }
 
-    /// StreamingBox: spinner frame + label above the input rule.
-    /// During streaming the footer shows the active model status
-    /// with a cycling dot animation — verify the frame char lands
-    /// at col 2 (PAD_COL) of the spinner row.
+    /// After moving ▶ to col 0, `pop_approval_prompt` must still
+    /// detect the approval row via col 0 and must NOT be fooled by
+    /// an adjacent ▸ tool-call row (also at col 0, different glyph).
     #[test]
-    fn retained_streaming_box_spinner_via_vterm() {
+    fn retained_approval_pop_still_detects_glyph() {
+        let (mut r, _buf) = new_capturing(80, 24);
+
+        r.render(UiLine::ToolCall {
+            name: "bash".into(),
+            detail: "ls".into(),
+        });
+        r.render(UiLine::ApprovalPrompt {
+            tool: "bash".into(),
+            detail: "ls".into(),
+        });
+        let before = r.body_lines.len();
+        r.pop_approval_prompt();
+        let after = r.body_lines.len();
+        assert_eq!(
+            before - after,
+            1,
+            "pop_approval_prompt should drop exactly the approval row"
+        );
+
+        // Second call: last row is now the tool-call `▸`, not `▶`.
+        // Must be a no-op.
+        let before2 = r.body_lines.len();
+        r.pop_approval_prompt();
+        let after2 = r.body_lines.len();
+        assert_eq!(
+            before2, after2,
+            "pop_approval_prompt must not drop non-approval rows"
+        );
+    }
+
+    /// StreamingBox / Spinner: the `frame + label` pair now lives in
+    /// the BODY (not the footer) as an animated "live" row at
+    /// body_bottom. The emoji/frame is flush-left at col 0 — same
+    /// gutter as `▸` tool calls and `❯` user echoes — because the
+    /// previous footer position (col 2, inside PAD_COL margin) left
+    /// it visually misaligned with surrounding body paragraphs.
+    #[test]
+    fn retained_spinner_renders_as_body_row_flush_left() {
         let (mut r, buf) = new_capturing(80, 24);
         let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
         let status = status_basic();
@@ -2361,13 +3081,334 @@ mod tests {
         });
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
-        // Footer 5 rows on h=24 → spinner row at 19 (footer_top).
-        // Layout: row 19 spinner, 20 top rule, 21 middle, 22 bot rule, 23 status.
-        let row = vterm.row_text(19);
+
+        // Spinner must appear on the LAST body row (just above the
+        // footer's top_rule), with the frame at col 0.
+        // Footer with 4 rows on h=24 → top_rule at row 20 (0-idx),
+        // so last body row = 0-idx row 19.
+        let spinner_row = vterm.row_text(19);
         assert!(
-            row.contains("⠋") && row.contains("Thinking"),
-            "spinner row missing: {:?}\ndump:\n{}",
-            row,
+            spinner_row.contains("⠋") && spinner_row.contains("Thinking"),
+            "spinner not found on last body row (got {:?}):\n{}",
+            spinner_row,
+            vterm.dump()
+        );
+        // Frame glyph at absolute col 0 — flush-left with body paragraphs.
+        assert_eq!(
+            vterm.cell_at(19, 0).ch,
+            '⠋',
+            "expected frame at col 0, found {:?}:\n{}",
+            vterm.cell_at(19, 0).ch,
+            vterm.dump()
+        );
+
+        // Footer no longer hosts the spinner — the row right above
+        // top_rule (which USED to be the spinner slot) must be empty
+        // of any spinner glyphs. With the new footer geometry
+        // (4 rows: top_rule / middle / bot_rule / status on h=24),
+        // row 20 is top_rule and the ex-spinner slot no longer exists.
+        let top_rule_row = vterm.row_text(20);
+        assert!(
+            !top_rule_row.contains("Thinking"),
+            "footer row still carries spinner label: {:?}:\n{}",
+            top_rule_row,
+            vterm.dump()
+        );
+    }
+
+    /// Consecutive Spinner ticks must UPDATE the same body row
+    /// in-place (animation), not push a new row each tick — otherwise
+    /// 100ms of animation at 80ms/frame would accumulate 1 row per
+    /// frame and scroll the user's actual history off-screen in
+    /// seconds.
+    #[test]
+    fn retained_consecutive_spinner_ticks_update_same_body_row() {
+        let (mut r, _buf) = new_capturing(80, 24);
+        let status = status_basic();
+        r.render(UiLine::StreamingBox {
+            buf: String::new(),
+            cursor_byte: 0,
+            frame: "⠋",
+            label: "Thinking".into(),
+            status: status.clone(),
+            menu: None,
+        });
+        let after_first = r.body_lines.len();
+        assert!(
+            after_first >= 1,
+            "spinner event must push at least 1 body row (got {})",
+            after_first
+        );
+
+        // 9 more spinner frames — the usual Braille cycle.
+        for frame in ["⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"] {
+            r.render(UiLine::StreamingBox {
+                buf: String::new(),
+                cursor_byte: 0,
+                frame,
+                label: "Thinking".into(),
+                status: status.clone(),
+                menu: None,
+            });
+        }
+        assert_eq!(
+            r.body_lines.len(),
+            after_first,
+            "spinner ticks grew body_lines from {} to {} — each tick \
+             must update the same row, not append",
+            after_first,
+            r.body_lines.len()
+        );
+    }
+
+    /// AssistantText arriving after a live spinner COVERS the
+    /// spinner row (it's a transient indicator, not a historical
+    /// paragraph header). Answer text appears exactly where
+    /// `⠋ Pondering…` was, no stacked ghost, no scrollback pollution.
+    #[test]
+    fn retained_assistant_text_covers_spinner_row() {
+        let (mut r, buf) = new_capturing(80, 24);
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+        let status = status_basic();
+        r.render(UiLine::StreamingBox {
+            buf: String::new(),
+            cursor_byte: 0,
+            frame: "⠋",
+            label: "Pondering".into(),
+            status: status.clone(),
+            menu: None,
+        });
+        r.render(UiLine::AssistantText("Hello world\n".into()));
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // Spinner must be GONE from the visible grid — assistant
+        // text has overwritten its row.
+        let has_spinner =
+            vterm.any_row(|row| row.contains("⠋") && row.contains("Pondering"));
+        let has_text = vterm.any_row(|row| row.contains("Hello world"));
+        assert!(
+            !has_spinner,
+            "spinner still visible after AssistantText — it must be \
+             covered, not frozen:\n{}",
+            vterm.dump()
+        );
+        assert!(has_text, "assistant text missing:\n{}", vterm.dump());
+
+        // And removed from history: body_lines should not carry a
+        // lingering spinner entry that would re-surface on
+        // ensure_scroll_region repaints or resize.
+        let spinner_in_history = r.body_lines.iter().any(|row| {
+            let text: String = row.iter().map(|c| c.ch).collect();
+            text.contains("Pondering")
+        });
+        assert!(
+            !spinner_in_history,
+            "spinner row still in body_lines — it must be popped when \
+             covered"
+        );
+    }
+
+    /// Models commonly emit a leading `\n` (or several) before
+    /// actual reply text — a warm-up that prior code treated as a
+    /// paragraph-boundary blank because the tail was the live
+    /// spinner (non-blank cells, fails `tail_blank` check). Result
+    /// was a ghost blank row between the user message spacer and
+    /// the first real content. Fix: treat "tail is live spinner"
+    /// the same as "tail is blank" — the spinner is transient, not
+    /// a paragraph we need to visually separate from.
+    #[test]
+    fn retained_leading_blank_assistant_text_does_not_add_ghost_row() {
+        let (mut r, buf) = new_capturing(80, 24);
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+        let status = status_basic();
+
+        r.render(UiLine::User("hi-from-user".into()));
+        r.flush_deferred();
+        r.render(UiLine::StreamingBox {
+            buf: String::new(),
+            cursor_byte: 0,
+            frame: "⠋",
+            label: "Pondering".into(),
+            status: status.clone(),
+            menu: None,
+        });
+        // Leading `\n` warm-up from the model — this is the case
+        // that produces the ghost blank before the fix.
+        r.render(UiLine::AssistantText("\n".into()));
+        // Then the real content.
+        r.render(UiLine::AssistantText("Hello world\n".into()));
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        let user_row = (0..24)
+            .find(|r| vterm.row_text(*r).contains("hi-from-user"))
+            .unwrap_or_else(|| panic!("user echo missing:\n{}", vterm.dump()));
+        let hello_row = (0..24)
+            .find(|r| vterm.row_text(*r).contains("Hello world"))
+            .unwrap_or_else(|| panic!("Hello world missing:\n{}", vterm.dump()));
+
+        // Exactly ONE blank between user and assistant (the
+        // user-message spacer). A ghost blank would make it 2.
+        assert_eq!(
+            hello_row - user_row,
+            2,
+            "expected 1 blank row between user and assistant, got {} \
+             blank row(s) — leading `\\n` from model created a ghost \
+             spacer:\n{}",
+            hello_row.saturating_sub(user_row).saturating_sub(1),
+            vterm.dump()
+        );
+    }
+
+    /// Realistic flow: user sends a message → spinner shows →
+    /// assistant text streams in. The assistant text must land on
+    /// EXACTLY the spinner's row (no empty row between spinner's
+    /// former slot and the new text). User-message blank spacer is
+    /// still there (it lives above the spinner's slot), but no
+    /// additional blank gets introduced by clear_live_spinner.
+    #[test]
+    fn retained_spinner_replacement_leaves_no_extra_blank() {
+        let (mut r, buf) = new_capturing(80, 24);
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+        let status = status_basic();
+
+        r.render(UiLine::User("hi-from-user".into()));
+        r.render(UiLine::StreamingBox {
+            buf: String::new(),
+            cursor_byte: 0,
+            frame: "⠋",
+            label: "Pondering".into(),
+            status: status.clone(),
+            menu: None,
+        });
+        r.render(UiLine::AssistantText("Hello world\n".into()));
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // Find the rows that carry our 3 markers.
+        let user_row = (0..24)
+            .find(|r| vterm.row_text(*r).contains("hi-from-user"))
+            .unwrap_or_else(|| panic!("user echo row missing:\n{}", vterm.dump()));
+        let hello_row = (0..24)
+            .find(|r| vterm.row_text(*r).contains("Hello world"))
+            .unwrap_or_else(|| panic!("assistant text row missing:\n{}", vterm.dump()));
+
+        // Expected layout (bottom-anchored):
+        //   <user_row>:     "> 你好啊"
+        //   <user_row + 1>: blank (UiLine::User's spacer)
+        //   <user_row + 2>: "Hello world"  ← replaced spinner in-place
+        //
+        // Critical invariant: exactly ONE blank row between them.
+        // No extra gap would mean 2 consecutive blanks.
+        assert_eq!(
+            hello_row - user_row,
+            2,
+            "expected 1 spacer row between user and assistant, got {} \
+             rows gap:\n{}",
+            hello_row.saturating_sub(user_row).saturating_sub(1),
+            vterm.dump()
+        );
+    }
+
+    /// Diagnostic: realistic flow — User → idle InputPrompt (sent
+    /// BEFORE the first spinner tick to mirror the on_submit
+    /// transition) → multiple spinner ticks → assertion on grid
+    /// layout. User reported TWO blanks between `> 你好` and
+    /// `● Pondering` — spec says there should be exactly ONE.
+    #[test]
+    fn retained_user_then_spinner_has_exactly_one_blank_between() {
+        let (mut r, buf) = new_capturing(80, 24);
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+        let status = status_basic();
+
+        r.render(UiLine::User("hi-from-user".into()));
+        // on_submit in the real app triggers a render pass before
+        // the first spinner tick lands — simulate that here.
+        r.flush_deferred();
+        r.render(UiLine::StreamingBox {
+            buf: String::new(),
+            cursor_byte: 0,
+            frame: "⠋",
+            label: "Pondering".into(),
+            status: status.clone(),
+            menu: None,
+        });
+        // Several animation ticks, then a final flush.
+        for frame in ["⠙", "⠹", "⠸", "⠼"] {
+            r.render(UiLine::StreamingBox {
+                buf: String::new(),
+                cursor_byte: 0,
+                frame,
+                label: "Pondering".into(),
+                status: status.clone(),
+                menu: None,
+            });
+        }
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        let user_row = (0..24)
+            .find(|r| vterm.row_text(*r).contains("hi-from-user"))
+            .unwrap_or_else(|| panic!("user echo missing:\n{}", vterm.dump()));
+        let spin_row = (0..24)
+            .find(|r| vterm.row_text(*r).contains("Pondering"))
+            .unwrap_or_else(|| panic!("spinner missing:\n{}", vterm.dump()));
+
+        assert_eq!(
+            spin_row - user_row,
+            2,
+            "expected exactly 1 blank row between user message and \
+             spinner, got {} blank row(s):\n{}",
+            spin_row.saturating_sub(user_row).saturating_sub(1),
+            vterm.dump()
+        );
+    }
+
+    /// If the turn ends with NO text output (just an empty input
+    /// prompt arrives after the spinner), the spinner must also
+    /// disappear. User's view: the in-progress indicator was
+    /// transient; once the render state moves on, no residue remains.
+    #[test]
+    fn retained_input_prompt_clears_live_spinner() {
+        let (mut r, buf) = new_capturing(80, 24);
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+        let status = status_basic();
+        r.render(UiLine::StreamingBox {
+            buf: String::new(),
+            cursor_byte: 0,
+            frame: "⠋",
+            label: "Pondering".into(),
+            status: status.clone(),
+            menu: None,
+        });
+        // Directly back to input with no assistant output between.
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        let has_spinner =
+            vterm.any_row(|row| row.contains("⠋") && row.contains("Pondering"));
+        assert!(
+            !has_spinner,
+            "spinner still visible after returning to input prompt:\n{}",
             vterm.dump()
         );
     }
@@ -2424,6 +3465,38 @@ mod tests {
         );
     }
 
+    /// Plain assistant paragraphs must retain their 2-col indent even
+    /// after symbol-bearing rows move to col 0. Regression guard for
+    /// the hierarchy: symbols at col 0, prose at col 2.
+    #[test]
+    fn retained_assistant_paragraph_indent_preserved() {
+        let (mut r, buf) = new_capturing(80, 24);
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+        let status = status_basic();
+        r.render(UiLine::AssistantText("hello world\n".into()));
+        r.render(UiLine::TurnComplete);
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        let row_idx = (0..vterm.height() as usize)
+            .find(|&i| vterm.row_text(i).contains("hello world"))
+            .unwrap_or_else(|| panic!("assistant text row missing\ndump:\n{}", vterm.dump()));
+        assert_eq!(vterm.cell_at(row_idx, 0).ch, ' ', "col 0 must be blank");
+        assert_eq!(vterm.cell_at(row_idx, 1).ch, ' ', "col 1 must be blank");
+        assert_eq!(
+            vterm.cell_at(row_idx, 2).ch,
+            'h',
+            "assistant text must start at col 2, got row: {:?}",
+            vterm.row_text(row_idx)
+        );
+    }
+
     /// Regression: user reports bot_rule row visibly shortens when
     /// the input wraps from 1 line to 2 lines. Hypothesis: diff
     /// spurious-skips the bot_rule row, or paint_body/footer
@@ -2459,12 +3532,13 @@ mod tests {
         let h = r.screen.height() as usize;
         let footer_rows = r.current_footer_rows();
         let footer_top = h - footer_rows;
-        // Layout: spinner + top_rule + middle×N + bot_rule + status.
-        // With 2-row middle: bot_rule at footer_top + 2 + 2 = footer_top + 4
-        // text_budget = w - 2 ("❯ " prefix) = 38 for w=40.
+        // Layout: top_rule + middle×N + bot_rule + status (spinner no
+        // longer reserves a footer row — lives in body now).
+        // With 2-row middle: bot_rule at footer_top + 1 + 2 = footer_top + 3
+        // text_budget = w - 2 ("> " prefix) = 38 for w=40.
         let (lines, _, _) = crate::width::wrap_with_cursor(&long, 40 - 2, long.len());
         assert!(lines.len() >= 2, "test setup: expected wrap");
-        let bot_rule_row = footer_top + 2 + lines.len();
+        let bot_rule_row = footer_top + 1 + lines.len();
         let prev_cells = r.screen.prev_cells_for_test();
         let row_cells = &prev_cells[bot_rule_row];
 
@@ -2522,8 +3596,9 @@ mod tests {
         // body area overlaps the multi-row middle.
         assert_eq!(
             r.current_footer_rows(),
-            // 1 spinner + 1 top rule + lines.len() + 1 bot rule + 0 menu + status(1)
-            1 + 1 + lines.len() + 1 + 1,
+            // 1 top rule + lines.len() + 1 bot rule + 0 menu + status(1)
+            // (spinner moved to body — no longer reserves a footer row)
+            1 + lines.len() + 1 + 1,
             "footer_rows must account for wrapped middle row count"
         );
     }
@@ -2778,9 +3853,14 @@ mod tests {
         r.resume_from_external();
         let resume_bytes = buf.lock().unwrap().clone();
         let resume_str = String::from_utf8_lossy(&resume_bytes);
+        // Resume now uses per-row CUP+EL instead of ED (iTerm2 3.5+
+        // observed to ignore `\x1b[2J` under certain states). Assert
+        // the equivalent semantics: at least one EL landed AND the
+        // cursor homes. The real behavioral check (no stale child
+        // noise) runs at the end of this test.
         assert!(
-            resume_str.contains("\x1b[2J") && resume_str.contains("\x1b[H"),
-            "resume must emit clear-screen + home: {:?}",
+            resume_str.contains("\x1b[K") && resume_str.contains("\x1b[H"),
+            "resume must emit per-row EL + home: {:?}",
             resume_str
         );
         drain_into_vterm(&buf, &mut vterm);
@@ -2829,8 +3909,9 @@ mod tests {
         let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
         let status = status_basic();
 
-        // Initial welcome (no menu). Welcome 6 rows bottom-anchored
-        // above a 5-row footer → rows 13..=18.
+        // Initial welcome (no menu). Footer = 4 rows (top_rule /
+        // middle / bot_rule / status). Welcome 6 rows bottom-anchored
+        // at rows 14..=19 (0-idx).
         r.render(UiLine::Welcome {
             model: "glm-5".into(),
             working_dir: "~/project/atomcode".into(),
@@ -2844,8 +3925,8 @@ mod tests {
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
 
-        // Open menu ("/" pressed). Footer grows by 4 rows (menu) so
-        // welcome now paints at rows 9..=14.
+        // Open menu ("/" pressed). Footer grows by 4 rows (menu) →
+        // 8 rows. Welcome paints at 0-idx rows 10..=15.
         let items: Vec<(String, String)> = vec![
             ("model".into(), "Switch model".into()),
             ("provider".into(), "Add provider".into()),
@@ -2864,13 +3945,9 @@ mod tests {
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
 
-        // With the scrollback-push body model the menu-open state
-        // doesn't reflow old body rows upward — footer grows and
-        // simply occludes bottom body rows. Skip the mid-state
-        // assertion; the post-close check below is what matters.
-
-        // Close menu (Esc). Footer shrinks back to 5 rows, welcome
-        // re-paints via `ensure_scroll_region`'s grew branch.
+        // Close menu (Esc). Footer shrinks back to 4, welcome
+        // re-paints via `ensure_scroll_region`'s grew branch →
+        // back to 0-idx rows 14..=19.
         r.render(UiLine::InputPrompt {
             buf: String::new(),
             cursor_byte: 0,
@@ -2880,24 +3957,269 @@ mod tests {
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
 
-        // Welcome brand must now live at row 13 AND must no longer
-        // appear at row 9 — that row went back into the blank
-        // above-body region. If row 9 still shows "AtomCode" the
-        // diff failed to erase the pre-close paint.
+        // Welcome brand at row 14 post-close. Row 10 (where brand
+        // lived mid-menu) must be blank now — the zombie-zone erase
+        // must have cleaned it.
         assert!(
-            vterm.row_text(13).contains("AtomCode"),
-            "menu-close: welcome brand missing at row 13:\n{}",
+            vterm.row_text(14).contains("AtomCode"),
+            "menu-close: welcome brand missing at row 14:\n{}",
             vterm.dump()
         );
         assert!(
-            !vterm.row_text(9).contains("AtomCode"),
-            "menu-close: row 9 still shows ghost welcome brand:\n{}",
+            !vterm.row_text(10).contains("AtomCode"),
+            "menu-close: row 10 still shows ghost welcome brand:\n{}",
             vterm.dump()
         );
-        // Same for cwd row (was row 10, moves to row 14).
+        // Same for cwd row (was 0-idx row 11 mid-menu, moves to 15).
         assert!(
-            !vterm.row_text(10).contains("project"),
-            "menu-close: row 10 still shows ghost cwd:\n{}",
+            !vterm.row_text(11).contains("project"),
+            "menu-close: row 11 still shows ghost cwd:\n{}",
+            vterm.dump()
+        );
+    }
+
+    /// Regression for user report: after `/model` switched providers,
+    /// scrolling up showed the welcome banner + prior messages
+    /// duplicated in scrollback. Root cause: `/model` changes the
+    /// status-line text, which can change the footer height (status
+    /// wraps, or spinner/menu rows differ between frames). When
+    /// `current_footer_rows()` shifts, `ensure_scroll_region`'s
+    /// shrunk/grew branches clear the viewport and re-emit every
+    /// cached body row through `emit_body_line_inner` — which uses
+    /// `\n` at the region bottom, scrolling the top row into
+    /// terminal scrollback. Any cached body row that had already
+    /// entered scrollback during its original emit now enters a
+    /// second time: a duplicate the user sees on scroll-up.
+    ///
+    /// Repro: fill body past the viewport so a known welcome line
+    /// lives in scrollback once, then change the footer height by
+    /// swapping in an input long enough to wrap the middle to 2+
+    /// rows. The hint line must still appear exactly once in
+    /// scrollback afterwards — the repaint must not re-scroll it.
+    #[test]
+    fn retained_footer_growth_does_not_duplicate_scrollback() {
+        let (mut r, buf) = new_capturing(80, 24);
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+        let status = status_basic();
+
+        // Welcome (6 body rows) + 20 User echoes (2 rows each =
+        // 40 body rows). Total 46 rows pushed; body region bottom
+        // with a 1-line-input footer is < 20, so ~26 rows are
+        // already in terminal scrollback via the normal emit path.
+        r.render(UiLine::Welcome {
+            model: "MiniMax-M2.7".into(),
+            working_dir: "~/Documents/workspace/atomcode".into(),
+        });
+        for i in 0..20 {
+            r.render(UiLine::User(format!("msg-{:03}", i)));
+        }
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // Fingerprint: welcome hint is unique and we pushed it
+        // early enough that it's sitting in scrollback by now.
+        let hint = "to add a custom model";
+        let count_hint = |vt: &crate::test_term::VirtualTerminal| {
+            vt.scrollback_texts()
+                .iter()
+                .filter(|row| row.contains(hint))
+                .count()
+        };
+        assert_eq!(
+            count_hint(&vterm),
+            1,
+            "baseline: hint should sit in scrollback exactly once \
+             after normal emits (got {}):\n{}",
+            count_hint(&vterm),
+            vterm.scrollback_texts().join("\n")
+        );
+        let sb_before = vterm.scrollback_len();
+
+        // Footer height change: long buffer wraps the middle to 3
+        // rows (text budget = 80 - 6 = 74 cols; 200 'x' → 3 rows).
+        // body_bottom shrinks → ensure_scroll_region's shrunk branch
+        // fires. Before the fix, this re-emits every cached body
+        // row via `\n`-scroll, pushing overflow into scrollback a
+        // second time.
+        let long: String = "x".repeat(200);
+        r.render(UiLine::InputPrompt {
+            buf: long.clone(),
+            cursor_byte: long.len(),
+            menu: None,
+            status: status.clone(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        assert_eq!(
+            count_hint(&vterm),
+            1,
+            "footer growth duplicated welcome hint in scrollback \
+             (got {} copies):\nscrollback:\n{}",
+            count_hint(&vterm),
+            vterm.scrollback_texts().join("\n")
+        );
+        // Broader sanity: no body row should have been pushed into
+        // scrollback by the repaint itself. The footer grew by N
+        // rows, which means the visible body shrank by N rows — the
+        // terminal's native region-shrink does not push rows to
+        // scrollback, only LFs at the bottom do. So the only way
+        // scrollback_len grew here is via the buggy re-emit.
+        assert_eq!(
+            vterm.scrollback_len(),
+            sb_before,
+            "footer growth pushed {} extra rows into scrollback; \
+             repaint must use absolute positioning, not LF-scroll",
+            vterm.scrollback_len() - sb_before
+        );
+    }
+
+    /// Regression for user report: on first startup the welcome
+    /// banner rendered TWICE — once at the top of the viewport
+    /// (pushed into scrollback, no input box) and once at the bottom
+    /// above the input box. Root cause: `ensure_scroll_region` used
+    /// `\x1b[2J` to wipe the viewport before re-painting the body.
+    /// macOS Terminal.app and iTerm2 (and xterm with `cbScrollback`)
+    /// copy every non-blank visible row into scrollback when
+    /// processing ED — so the 6 welcome rows painted during the
+    /// initial body emit were promoted into scrollback the moment
+    /// the first InputPrompt render caused the footer to grow by
+    /// 1 row (status line appears → body_bottom shrinks by 1).
+    ///
+    /// The repaint must never emit ED — per-row EL (`\x1b[K`) at
+    /// absolute positions is safe on every terminal and achieves
+    /// the same visible result without the scrollback side-channel.
+    #[test]
+    fn retained_first_startup_does_not_push_welcome_to_scrollback() {
+        let (mut r, buf) = new_capturing(80, 24);
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+        // Model the terminal's ED-promotes-to-scrollback behaviour —
+        // the specific mode the user's terminal is running under.
+        vterm.set_ed_promotes_to_scrollback(true);
+
+        // Minimal first-startup sequence: welcome then the first
+        // InputPrompt. The InputPrompt carries a non-empty status
+        // (model/cwd) so `current_footer_rows` grows from 4 (no
+        // status) to 5, which trips the repaint branch.
+        r.render(UiLine::Welcome {
+            model: "z-ai/glm-5".into(),
+            working_dir: "~/Documents/workspace/atomcode".into(),
+        });
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status_basic(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // Welcome fingerprint: the hint row is unique to the welcome
+        // banner. It must appear exactly once in the *visible*
+        // viewport and zero times in scrollback.
+        let hint = "to add a custom model";
+        let visible_count = (0..24)
+            .filter(|r| vterm.row_text(*r).contains(hint))
+            .count();
+        let sb_count = vterm
+            .scrollback_texts()
+            .iter()
+            .filter(|row| row.contains(hint))
+            .count();
+        assert_eq!(
+            visible_count,
+            1,
+            "welcome hint should be visible exactly once (got {}):\n{}",
+            visible_count,
+            vterm.dump()
+        );
+        assert_eq!(
+            sb_count,
+            0,
+            "first-startup footer transition promoted welcome into \
+             scrollback ({} copies); repaint must not emit ED:\n\
+             scrollback:\n{}",
+            sb_count,
+            vterm.scrollback_texts().join("\n")
+        );
+    }
+
+    /// Regression for user report: Shift+Enter in the input followed
+    /// by delete leaves an extra rule line on screen. Root cause:
+    /// Shift+Enter grows middle from 1 to 2 rows (body bottom -1);
+    /// delete shrinks it back (body bottom +1, a GROW transition).
+    /// In the new layout the OLD top-rule row lands on the new
+    /// spinner slot — which paint_footer writes as a blank row when
+    /// no spinner is active. `screen.invalidate()` zeroes prev_cells,
+    /// so cell diff sees blank→blank at that row and emits nothing;
+    /// the old rule glyphs persist on screen, stacked directly above
+    /// the new top rule.
+    ///
+    /// Fix: repaint must explicitly erase every row in the union of
+    /// old and new footer regions before the cell diff runs — EL is
+    /// row-local so it doesn't leak content into scrollback.
+    #[test]
+    fn retained_middle_grow_then_shrink_leaves_no_ghost_rule() {
+        let (mut r, buf) = new_capturing(80, 24);
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+        let status = status_basic();
+
+        // State A: 1-row middle (baseline).
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // State B: shift+enter — 2-row middle. Buf "\n" wraps to
+        // 2 lines per `wrap_with_cursor`. Footer +1, body -1.
+        r.render(UiLine::InputPrompt {
+            buf: "\n".into(),
+            cursor_byte: 1,
+            menu: None,
+            status: status.clone(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // State C: delete back to empty. Body grows 1 row. This is
+        // the transition that exposes the ghost rule.
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // The input frame has exactly one top rule and one bot rule.
+        // Each rule row is a full-width run of '─' (U+2500) with no
+        // other glyphs. Count rows whose content is ONLY rule cells
+        // — there must be exactly 2 after a clean grow+shrink. A
+        // ghost from the old layout pushes this to 3.
+        let rule_rows = (0..24)
+            .filter(|r| {
+                let txt = vterm.row_text(*r);
+                let trimmed = txt.trim_end();
+                !trimmed.is_empty() && trimmed.chars().all(|c| c == '\u{2500}')
+            })
+            .count();
+        assert_eq!(
+            rule_rows,
+            2,
+            "expected 2 rule rows (top + bot), got {} — grow \
+             transition left a ghost:\n{}",
+            rule_rows,
             vterm.dump()
         );
     }

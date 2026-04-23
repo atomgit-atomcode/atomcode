@@ -35,4 +35,17 @@ fn main() {
         "cargo:rustc-env=ATOMCODE_BUILD_DIRTY={}",
         if dirty { "+dirty" } else { "" }
     );
+
+    // Embed icon when targeting Windows. Gated on CARGO_CFG_TARGET_OS
+    // (the *build target*, not the host) so cross-compile from macOS
+    // fires this while native mac/linux builds skip it.
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        let icon = "assets/atomcode.ico";
+        println!("cargo:rerun-if-changed={}", icon);
+        let mut res = winresource::WindowsResource::new();
+        res.set_icon(icon);
+        if let Err(e) = res.compile() {
+            println!("cargo:warning=winresource compile failed: {}", e);
+        }
+    }
 }

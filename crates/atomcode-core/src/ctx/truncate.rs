@@ -18,7 +18,19 @@ use crate::tool::ToolResult;
 /// window and let a single message consume 25% of a 64K budget.
 pub fn truncate_output(result: &mut ToolResult, tool_name: &str, context_window: usize) {
     match tool_name {
-        "bash" => truncate_bash(result),
+        // bash: no per-tool truncation. The universal line/char caps below
+        // are sufficient and purely numeric. Pattern-based "smart
+        // extraction" (removed 2026-04-22) assumed English error keywords
+        // (`error`/`FAILED`/`panic`) and hard-coded build tool names
+        // (`cargo build`/`mvn compile`/`vite build`), which silently
+        // dropped non-matching stderr — e.g. a 50-line Chinese compiler
+        // trace was collapsed into `[... N lines skipped ...]` with no
+        // diagnostic content surviving. Technology-stack neutrality is a
+        // project rule (see `project_principles_vs_claude_md.md`), and
+        // main's `turn/runner.rs::detect_call_loop` now catches the
+        // retry-loop bug class that smart-extraction was trying to
+        // prevent.
+        "bash" => {}
         "read_file" => {} // Layer A in read.rs is the single authority. No post-hoc truncation.
         "web_fetch" => truncate_generic(result, 150, 20, 40),
         _ => truncate_generic(result, 200, 30, 50),
@@ -75,9 +87,7 @@ pub fn truncate_output(result: &mut ToolResult, tool_name: &str, context_window:
         let head_chars = hard_char_limit * 2 / 3;
         let tail_chars = hard_char_limit / 3;
         let head_part: String = chars[..head_chars.min(chars.len())].iter().collect();
-        let tail_part: String = chars[chars.len().saturating_sub(tail_chars)..]
-            .iter()
-            .collect();
+        let tail_part: String = chars[chars.len().saturating_sub(tail_chars)..].iter().collect();
         let omitted = chars.len().saturating_sub(head_chars + tail_chars);
         result.output = format!(
             "{}\n\n[... {} chars omitted (universal {} char cap) ...]\n\n{}",
@@ -86,256 +96,9 @@ pub fn truncate_output(result: &mut ToolResult, tool_name: &str, context_window:
     }
 }
 
-/// Bash: preserve error lines, strip verbose build noise.
-/// Errors are the highest-value signal — keep all lines containing "error",
-/// "Error", "FAILED", "STDERR", "panic", plus surrounding context.
-fn truncate_bash(result: &mut ToolResult) {
-    let lines: Vec<&str> = result.output.lines().collect();
-    if lines.len() <= 80 {
-        return; // Short enough — keep everything.
-    }
-
-    // --- Phase 0: Compile error smart compression ---
-    // Detect build tool output and extract only error-bearing lines + context.
-    // This fires for Maven/Gradle, TypeScript/Node, Rust/Cargo, and generic builds.
-    let compressed = try_compress_compile_errors(&lines);
-    if let Some(compressed_output) = compressed {
-        if compressed_output.len() < result.output.len() {
-            result.output = compressed_output;
-            return;
-        }
-    }
-
-    // --- Phase 1: General error-line extraction (non-build output) ---
-    // Generic error patterns — no language-specific strings.
-    let error_patterns = [
-        "error",
-        "Error",
-        "ERROR",
-        "FAILED",
-        "STDERR:",
-        "panic",
-        "Panic",
-        "PANIC",
-        "not found",
-        "No such file",
-        "Permission denied",
-        "cannot find",
-        "undefined",
-        "unresolved",
-    ];
-    let mut important: Vec<bool> = vec![false; lines.len()];
-
-    for (i, line) in lines.iter().enumerate() {
-        if error_patterns.iter().any(|p| line.contains(p)) {
-            // Mark this line and 2 lines of context above/below.
-            let start = i.saturating_sub(2);
-            let end = (i + 3).min(lines.len());
-            for j in start..end {
-                important[j] = true;
-            }
-        }
-    }
-
-    // Phase 2: Always keep head (first 10 lines) and tail (last 20 lines).
-    const HEAD: usize = 10;
-    const TAIL: usize = 20;
-    for i in 0..HEAD.min(lines.len()) {
-        important[i] = true;
-    }
-    for i in lines.len().saturating_sub(TAIL)..lines.len() {
-        important[i] = true;
-    }
-
-    // Phase 3: Assemble, collapsing unimportant runs into "[N lines skipped]".
-    let output = assemble_important_lines(&lines, &important);
-    result.output = output;
-}
-
-/// Attempt to compress compile/build error output by extracting only error lines
-/// with surrounding context, plus head/tail for build status summary.
-/// Returns `Some(compressed)` if the output looks like build output and was compressed,
-/// `None` if it doesn't look like build output.
-fn try_compress_compile_errors(lines: &[&str]) -> Option<String> {
-    let full_text = lines.join("\n");
-
-    // Detect build tool output.
-    let is_build = full_text.contains("BUILD SUCCESS")
-        || full_text.contains("BUILD FAILURE")
-        || full_text.contains("Compiled successfully")
-        || full_text.contains("compiled successfully")
-        || full_text.contains("Compiling")
-        || full_text.contains("vite build")
-        || full_text.contains("vue-tsc")
-        || full_text.contains("tsc --")
-        || full_text.contains("npm run build")
-        || full_text.contains("cargo build")
-        || full_text.contains("cargo check")
-        || full_text.contains("mvn compile")
-        || full_text.contains("mvn package")
-        || full_text.contains("gradle build");
-
-    if !is_build {
-        return None;
-    }
-
-    // Compile error patterns by ecosystem — match lines that carry diagnostic value.
-    // Java / Maven / Gradle
-    let java_patterns: &[&str] = &[
-        "[ERROR]",
-        "error:",
-        "cannot find symbol",
-        "package does not exist",
-        "incompatible types",
-        "unreported exception",
-        "method does not override",
-    ];
-    // TypeScript / Node
-    let ts_patterns: &[&str] = &[
-        "error TS",
-        "Error:",
-        "SyntaxError",
-        "TypeError",
-        "ReferenceError",
-        "Module not found",
-        "Cannot find module",
-    ];
-    // Rust / Cargo
-    let rust_patterns: &[&str] = &[
-        "error[E",
-        "warning[",
-        "cannot find",
-        "error:",
-        "error[",
-        "aborting due to",
-        "could not compile",
-    ];
-    // Generic build status lines — always valuable.
-    let status_patterns: &[&str] = &[
-        "BUILD",
-        "FAILURE",
-        "SUCCESS",
-        "FAILED",
-        "PASSED",
-        "warning:",
-        "warnings generated",
-        "error generated",
-        "✓",
-        "✗",
-        "gzip:",
-    ];
-
-    let all_patterns: Vec<&str> = java_patterns
-        .iter()
-        .chain(ts_patterns.iter())
-        .chain(rust_patterns.iter())
-        .chain(status_patterns.iter())
-        .copied()
-        .collect();
-
-    // Mark error/diagnostic lines + 2 lines of context around each.
-    let mut important: Vec<bool> = vec![false; lines.len()];
-
-    for (i, line) in lines.iter().enumerate() {
-        if all_patterns.iter().any(|p| line.contains(p)) {
-            let start = i.saturating_sub(2);
-            let end = (i + 3).min(lines.len());
-            for j in start..end {
-                important[j] = true;
-            }
-        }
-    }
-
-    // Always keep first 5 and last 5 lines (command invocation + build status summary).
-    const HEAD: usize = 5;
-    const TAIL: usize = 5;
-    for i in 0..HEAD.min(lines.len()) {
-        important[i] = true;
-    }
-    for i in lines.len().saturating_sub(TAIL)..lines.len() {
-        important[i] = true;
-    }
-
-    let important_count = important.iter().filter(|&&v| v).count();
-
-    // Only compress if we actually removed a meaningful amount of lines.
-    if important_count >= lines.len() * 3 / 4 {
-        return None; // Not enough savings — let the general path handle it.
-    }
-
-    // Build a deduped error summary so the model sees ALL unique errors at a glance.
-    let mut unique_errors: Vec<String> = Vec::new();
-    {
-        let mut seen = std::collections::HashSet::new();
-        for line in lines {
-            let trimmed = line.trim();
-            // Extract error codes/types: "error[E0433]", "error TS2304", "Error:", etc.
-            let is_error = trimmed.contains("error[E")
-                || trimmed.contains("error TS")
-                || trimmed.starts_with("error:")
-                || trimmed.starts_with("Error:")
-                || trimmed.contains(": error")
-                || trimmed.contains("[ERROR]");
-            if is_error {
-                // Normalize: take first 100 chars as dedup key
-                let key: String = trimmed.chars().take(100).collect();
-                if seen.insert(key) {
-                    unique_errors.push(trimmed.to_string());
-                }
-            }
-        }
-    }
-
-    let mut output = String::new();
-    if unique_errors.len() > 1 {
-        output.push_str(&format!(
-            "[{} unique errors — fix ALL before re-running build:]\n",
-            unique_errors.len()
-        ));
-        for (i, err) in unique_errors.iter().take(15).enumerate() {
-            output.push_str(&format!("  {}. {}\n", i + 1, err));
-        }
-        output.push('\n');
-    }
-
-    output.push_str(&assemble_important_lines(lines, &important));
-    output.push_str(&format!(
-        "\n[{} lines of build output compressed to {} lines — showing errors only]",
-        lines.len(),
-        important_count,
-    ));
-    Some(output)
-}
-
-/// Assemble output from lines marked as important, collapsing unimportant runs
-/// into `[... N lines skipped ...]` markers.
-fn assemble_important_lines(lines: &[&str], important: &[bool]) -> String {
-    let mut output = String::with_capacity(lines.len() * 40);
-    let mut skipping = false;
-    let mut skip_count = 0usize;
-
-    for (i, line) in lines.iter().enumerate() {
-        if important[i] {
-            if skipping {
-                output.push_str(&format!("\n[... {} lines skipped ...]\n", skip_count));
-                skipping = false;
-                skip_count = 0;
-            }
-            if !output.is_empty() {
-                output.push('\n');
-            }
-            output.push_str(line);
-        } else {
-            skipping = true;
-            skip_count += 1;
-        }
-    }
-    if skipping {
-        output.push_str(&format!("\n[... {} lines skipped ...]", skip_count));
-    }
-
-    output
-}
+// truncate_bash + try_compress_compile_errors + assemble_important_lines
+// were removed 2026-04-22 (~250 lines) to enforce technology-stack
+// neutrality. See comment at top of `truncate_output` for why.
 
 // truncate_read_file: DELETED.
 // read_file truncation is now handled exclusively by Layer A (auto_skeleton)
@@ -344,12 +107,7 @@ fn assemble_important_lines(lines: &[&str], important: &[bool]) -> String {
 // which one actually controlled the output.
 
 /// Generic truncation: head + tail, skipping middle.
-pub(crate) fn truncate_generic(
-    result: &mut ToolResult,
-    max_lines: usize,
-    head: usize,
-    tail: usize,
-) {
+pub(crate) fn truncate_generic(result: &mut ToolResult, max_lines: usize, head: usize, tail: usize) {
     let lines: Vec<&str> = result.output.lines().collect();
     if lines.len() > max_lines {
         let head_part: String = lines[..head].join("\n");
@@ -378,11 +136,33 @@ pub fn post_process_tool_results(
     let len = messages.len();
     let start = len.saturating_sub(tool_count);
 
-    // Pass 1: per-result truncation
+    // Build call_id → real tool_name lookup so each ToolResult is
+    // truncated by the rules of the tool that actually produced it.
+    // Without this a mixed-tool turn (e.g. read_file → bash) would
+    // truncate every result under whichever tool ran last
+    // (`current_tool_name`), which inverts read_file's cap exemption
+    // and shrinks file contents to ~30 lines.
+    let mut call_id_to_tool: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for msg in messages.iter() {
+        if let MessageContent::AssistantWithToolCalls { tool_calls, .. } = &msg.content {
+            for tc in tool_calls {
+                call_id_to_tool.insert(tc.id.clone(), tc.name.clone());
+            }
+        }
+    }
+
+    // Pass 1: per-result truncation, keyed by each result's real tool.
+    // `current_tool_name` is the fallback for results with no paired
+    // ATC in the message vec (e.g. orphaned test fixtures).
     for i in start..len {
         if let MessageContent::ToolResult(ref r) = messages[i].content {
+            let tool_name = call_id_to_tool
+                .get(&r.call_id)
+                .map(|s| s.as_str())
+                .unwrap_or(current_tool_name);
             let mut result = r.clone();
-            truncate_output(&mut result, current_tool_name, context_window);
+            truncate_output(&mut result, tool_name, context_window);
             messages[i].content = MessageContent::ToolResult(result);
         }
     }
@@ -412,8 +192,7 @@ pub fn post_process_tool_results(
                     let head = target * 2 / 3;
                     let tail = target / 3;
                     let head_part: String = chars[..head.min(chars.len())].iter().collect();
-                    let tail_part: String =
-                        chars[chars.len().saturating_sub(tail)..].iter().collect();
+                    let tail_part: String = chars[chars.len().saturating_sub(tail)..].iter().collect();
                     result.output = format!(
                         "{}\n[... trimmed to fit turn budget ...]\n{}",
                         head_part, tail_part,
@@ -428,8 +207,8 @@ pub fn post_process_tool_results(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tool::{ToolCall, ToolResult};
     use crate::conversation::message::{Message, MessageContent, Role};
-    use crate::tool::ToolResult;
 
     fn make_result(output: &str) -> ToolResult {
         ToolResult {
@@ -446,44 +225,76 @@ mod tests {
         }
     }
 
-    // --- truncate_bash tests ---
+    fn make_atc(call_id: &str, tool_name: &str) -> Message {
+        Message {
+            role: Role::Assistant,
+            content: MessageContent::AssistantWithToolCalls {
+                text: None,
+                tool_calls: vec![ToolCall {
+                    id: call_id.to_string(),
+                    name: tool_name.to_string(),
+                    arguments: String::new(),
+                }],
+                reasoning_content: None,
+            },
+        }
+    }
+
+    fn make_tool_result_with_id(call_id: &str, output: &str) -> Message {
+        Message {
+            role: Role::Tool,
+            content: MessageContent::ToolResult(ToolResult {
+                call_id: call_id.to_string(),
+                output: output.to_string(),
+                success: true,
+            }),
+        }
+    }
+
+    // --- bash truncation tests (A1, 2026-04-22) ---
+    //
+    // bash has no per-tool truncation — relies entirely on the universal
+    // line/char caps in `truncate_output`. These tests lock in that
+    // behavior so future refactors don't silently reintroduce pattern-based
+    // extraction.
 
     #[test]
-    fn truncate_bash_short_output_unchanged() {
-        let output = "line1\nline2\nline3\n";
-        let mut result = make_result(output);
-        truncate_bash(&mut result);
-        assert_eq!(result.output, output);
+    fn bash_short_output_passes_through_verbatim() {
+        let output: String = (0..100).map(|i| format!("line {}", i)).collect::<Vec<_>>().join("\n");
+        let mut result = make_result(&output);
+        truncate_output(&mut result, "bash", 64_000);
+        assert_eq!(result.output, output, "bash output under 300 lines must not be touched");
     }
 
     #[test]
-    fn truncate_bash_preserves_error_lines() {
-        // Create output with >80 lines, including an error line
-        let mut lines: Vec<String> = (0..100).map(|i| format!("normal line {}", i)).collect();
-        lines[50] = "error: something went wrong".to_string();
-        let output = lines.join("\n");
+    fn bash_huge_output_hits_universal_line_cap_only() {
+        // 500 lines > UNIVERSAL_MAX_LINES (300) → head 50 + tail 50 + marker.
+        // Purely numeric — no English error-keyword heuristic fires.
+        let output: String = (0..500).map(|i| format!("line {}", i)).collect::<Vec<_>>().join("\n");
         let mut result = make_result(&output);
-        truncate_bash(&mut result);
-        // Error line and context should be preserved
-        assert!(result.output.contains("error: something went wrong"));
+        truncate_output(&mut result, "bash", 64_000);
+        assert!(result.output.contains("line 0"), "head must be preserved");
+        assert!(result.output.contains("line 499"), "tail must be preserved");
+        assert!(result.output.contains("lines omitted"), "omission marker required");
+        assert!(result.output.lines().count() <= 110);
     }
 
     #[test]
-    fn truncate_bash_build_output_compression() {
-        // Build output with BUILD SUCCESS keyword
-        let mut lines: Vec<String> = (0..200)
-            .map(|i| format!("verbose build line {}", i))
-            .collect();
-        lines[10] = "[INFO] BUILD SUCCESS".to_string();
-        lines[11] = "error: compilation failed".to_string();
-        let output = lines.join("\n");
+    fn bash_chinese_stderr_survives_truncation() {
+        // Regression test for the 2026-04-22 forensic finding: the old
+        // pattern-based `truncate_bash` collapsed any line not matching
+        // English `error`/`Error`/`FAILED`/`panic` into
+        // `[... N lines skipped ...]`. A 50-line Chinese compiler trace
+        // was reduced to head+tail-only with every middle line dropped.
+        // Under A1 the output passes through verbatim (below universal
+        // caps).
+        let output: String = (0..50)
+            .map(|_| "编译失败：找不到符号".to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
         let mut result = make_result(&output);
-        truncate_bash(&mut result);
-        // Should be compressed significantly
-        assert!(result.output.len() < output.len());
-        // Should contain BUILD SUCCESS and error lines
-        assert!(result.output.contains("BUILD SUCCESS"));
-        assert!(result.output.contains("error: compilation failed"));
+        truncate_output(&mut result, "bash", 64_000);
+        assert_eq!(result.output.matches("编译失败").count(), 50);
     }
 
     // truncate_read_file tests: DELETED (function removed, Layer A in read.rs handles it)
@@ -522,33 +333,18 @@ mod tests {
         let mut result = make_result(&output);
         truncate_output(&mut result, "unknown_tool", 16000);
         // Result should be at most ~8000 chars + omission marker.
-        assert!(
-            result.output.len() <= 8_500,
-            "got {} chars",
-            result.output.len()
-        );
-        assert!(
-            result.output.contains("chars omitted"),
-            "got: {}",
-            result.output
-        );
+        assert!(result.output.len() <= 8_500, "got {} chars", result.output.len());
+        assert!(result.output.contains("chars omitted"), "got: {}", result.output);
     }
 
     #[test]
     fn truncate_output_universal_line_cap() {
         // 500-line output should get capped to ~100 lines (50 head + 50 tail) + markers.
-        let output: String = (0..500)
-            .map(|i| format!("line {}", i))
-            .collect::<Vec<_>>()
-            .join("\n");
+        let output: String = (0..500).map(|i| format!("line {}", i)).collect::<Vec<_>>().join("\n");
         let mut result = make_result(&output);
         truncate_output(&mut result, "unknown_tool", 64_000);
         let line_count = result.output.lines().count();
-        assert!(
-            line_count <= 110,
-            "got {} lines, expected ≤ 110",
-            line_count
-        );
+        assert!(line_count <= 110, "got {} lines, expected ≤ 110", line_count);
         assert!(result.output.contains("lines omitted"));
     }
 
@@ -558,11 +354,7 @@ mod tests {
         let output = "x".repeat(200_000);
         let mut result = make_result(&output);
         truncate_output(&mut result, "unknown_tool", 1_000_000);
-        assert!(
-            result.output.len() <= 33_000,
-            "single tool output should never exceed 32K chars, got {}",
-            result.output.len()
-        );
+        assert!(result.output.len() <= 33_000, "single tool output should never exceed 32K chars, got {}", result.output.len());
     }
 
     // --- post_process_tool_results tests ---
@@ -588,6 +380,47 @@ mod tests {
         assert!(matches!(messages[0].content, MessageContent::ToolResult(_)));
         if let MessageContent::ToolResult(ref r) = messages[0].content {
             assert_eq!(r.output, "short output");
+        }
+    }
+
+    /// Regression: in a mixed-tool turn, each ToolResult must be truncated
+    /// using the rules of the tool that actually produced it — looked up
+    /// via call_id → ATC.name — NOT `current_tool_name` (which only
+    /// reflects whichever tool ran last). Without this, a `read_file`
+    /// result in a `read_file → bash` turn loses its hard-char-limit
+    /// exemption and gets shrunk to bash's HEAD+TAIL, defeating the
+    /// file-content preservation invariant.
+    #[test]
+    fn post_process_keys_truncation_by_each_result_tool_not_current() {
+        // 400-line "file content" — would trip bash's HEAD 10 + TAIL 20
+        // and the universal 300-line cap if keyed as bash, but read_file
+        // is explicitly exempt from both.
+        let file_content: String = (0..400)
+            .map(|i| format!("line {}", i))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let original_line_count = file_content.lines().count();
+
+        let mut messages = vec![
+            make_atc("rf1", "read_file"),
+            make_tool_result_with_id("rf1", &file_content),
+        ];
+
+        // current_tool_name="bash" as if bash ran last in this turn.
+        // The read_file result must still be recognized as read_file.
+        post_process_tool_results(&mut messages, 2, "bash", 128_000);
+
+        if let MessageContent::ToolResult(ref r) = messages[1].content {
+            assert_eq!(
+                r.output.lines().count(),
+                original_line_count,
+                "read_file content must stay intact when current_tool_name \
+                 is a different tool — got {} lines (expected {})",
+                r.output.lines().count(),
+                original_line_count,
+            );
+        } else {
+            panic!("expected ToolResult at index 1");
         }
     }
 }

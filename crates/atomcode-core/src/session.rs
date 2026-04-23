@@ -3,9 +3,9 @@
 //! Each session represents an independent conversation with its own message history,
 //! associated with a specific working directory.
 
-use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::conversation::message::Message;
@@ -18,8 +18,8 @@ impl SessionId {
     pub fn new() -> Self {
         Self(Uuid::new_v4().to_string())
     }
-
-    pub fn as_str(&self) -> &str {
+    
+pub fn as_str(&self) -> &str {
         &self.0
     }
 
@@ -71,7 +71,7 @@ impl Session {
             messages: Vec::new(),
         }
     }
-
+    
     /// Create a default session (used on first launch).
     pub fn default_session(working_dir: PathBuf) -> Self {
         Self {
@@ -83,18 +83,18 @@ impl Session {
             messages: Vec::new(),
         }
     }
-
+    
     /// Update the session's name.
     pub fn rename(&mut self, name: String) {
         self.name = name;
         self.touch();
     }
-
+    
     /// Update the last modified timestamp.
     pub fn touch(&mut self) {
         self.updated_at = current_timestamp();
     }
-
+    
     /// Get a short display ID (first 8 chars of UUID).
     pub fn short_id(&self) -> &str {
         &self.id.0[..8]
@@ -146,7 +146,7 @@ impl SessionManager {
             .join(".atomcode")
             .join("sessions")
     }
-
+    
     /// Get the legacy sessions directory (used on macOS before v4.16).
     /// Returns None on non-macOS platforms.
     fn legacy_sessions_dir() -> Option<PathBuf> {
@@ -156,7 +156,7 @@ impl SessionManager {
             None
         }
     }
-
+    
     /// Migrate sessions from legacy location to new location.
     /// This is a no-op if:
     /// - Not on macOS
@@ -166,23 +166,22 @@ impl SessionManager {
         let Some(legacy_dir) = Self::legacy_sessions_dir() else {
             return; // Not macOS, no migration needed
         };
-
+        
         if !legacy_dir.exists() {
             return; // No legacy data
         }
-
+        
         let new_dir = Self::sessions_root_dir();
-        if new_dir.exists() && std::fs::read_dir(&new_dir).map_or(false, |mut d| d.next().is_some())
-        {
+        if new_dir.exists() && std::fs::read_dir(&new_dir).map_or(false, |mut d| d.next().is_some()) {
             return; // New location already has data, skip migration
         }
-
+        
         // Perform migration
         if let Err(e) = std::fs::create_dir_all(&new_dir) {
             eprintln!("[session] Failed to create sessions dir: {}", e);
             return;
         }
-
+        
         match std::fs::read_dir(&legacy_dir) {
             Ok(entries) => {
                 let mut migrated = 0;
@@ -208,10 +207,7 @@ impl SessionManager {
                     }
                 }
                 if migrated > 0 {
-                    eprintln!(
-                        "[session] Migrated {} session(s) from legacy location",
-                        migrated
-                    );
+                    eprintln!("[session] Migrated {} session(s) from legacy location", migrated);
                 }
             }
             Err(e) => {
@@ -219,31 +215,31 @@ impl SessionManager {
             }
         }
     }
-
+    
     /// Create a new session manager for the given working directory.
     pub fn new(working_dir: &Path) -> Self {
         // Auto-migrate from legacy location on first use
         Self::migrate_from_legacy();
-
+        
         let sessions_dir = Self::sessions_root_dir();
         let project_hash = hash_path(working_dir);
-
+        
         Self {
             sessions_dir,
             project_hash,
         }
     }
-
+    
     /// Get the directory for this project's sessions.
     fn project_dir(&self) -> PathBuf {
         self.sessions_dir.join(&self.project_hash)
     }
-
+    
     /// Ensure the project session directory exists.
     fn ensure_dir(&self) -> std::io::Result<()> {
         std::fs::create_dir_all(self.project_dir())
     }
-
+    
     /// Save a session to disk.
     pub fn save(&self, session: &Session) -> std::io::Result<()> {
         self.ensure_dir()?;
@@ -252,21 +248,22 @@ impl SessionManager {
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
         std::fs::write(path, json)
     }
-
+    
     /// Load a session by ID.
     pub fn load(&self, id: &SessionId) -> std::io::Result<Session> {
         let path = self.project_dir().join(format!("{}.json", id));
         let json = std::fs::read_to_string(path)?;
-        serde_json::from_str(&json).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+        serde_json::from_str(&json)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
     }
-
+    
     /// List all sessions for this project (metadata only).
     pub fn list(&self) -> std::io::Result<Vec<SessionMeta>> {
         let project_dir = self.project_dir();
         if !project_dir.exists() {
             return Ok(Vec::new());
         }
-
+        
         let mut sessions = Vec::new();
         for entry in std::fs::read_dir(project_dir)? {
             let entry = entry?;
@@ -282,25 +279,24 @@ impl SessionManager {
                 }
             }
         }
-
+        
         // Sort by updated_at descending (most recent first)
         sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
         Ok(sessions)
     }
-
+    
     /// Delete a session by ID.
     pub fn delete(&self, id: &SessionId) -> std::io::Result<()> {
         let path = self.project_dir().join(format!("{}.json", id));
         std::fs::remove_file(path)
     }
-
+    
     /// Check if any sessions exist for this project.
     pub fn has_sessions(&self) -> bool {
         let project_dir = self.project_dir();
-        project_dir.exists()
-            && std::fs::read_dir(project_dir).map_or(false, |mut d| d.next().is_some())
+        project_dir.exists() && std::fs::read_dir(project_dir).map_or(false, |mut d| d.next().is_some())
     }
-
+    
     /// Get the most recently updated session.
     pub fn latest(&self) -> std::io::Result<Option<Session>> {
         let metas = self.list()?;
@@ -312,12 +308,42 @@ impl SessionManager {
 }
 
 /// Generate a hash for a path (used as directory name).
+/// 
+/// Normalizes the path before hashing to ensure consistent results across:
+/// - Different path separators (Windows: `\` vs `/`)
+/// - Case sensitivity (Windows paths are case-insensitive)
+/// - Trailing slashes
 fn hash_path(path: &Path) -> String {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
 
+    // Normalize the path:
+    // 1. Convert to string representation
+    // 2. Replace backslashes with forward slashes (Windows)
+    // 3. Remove trailing slash (but keep root "/" or "C:/")
+    // 4. Lowercase on Windows (case-insensitive filesystem)
+    let normalized = path.to_string_lossy();
+    let mut normalized = normalized.replace('\\', "/");
+
+    if normalized.len() > 1 && normalized.ends_with('/') {
+        normalized.pop();
+    }
+
+    #[cfg(windows)]
+    let normalized = normalized.to_lowercase();
+
+    // IMPORTANT: hash through `Path::hash`, not `str::hash`. `Path`
+    // hashes its components with length prefixes, which is NOT the
+    // same as hashing the whole string. All sessions saved before
+    // the normalization pass was added went into buckets keyed by
+    // `Path::hash`; feeding the normalized string back through a
+    // `PathBuf` keeps us on that same bucket so /resume still finds
+    // legacy sessions. Hashing the raw `&str` here would silently
+    // orphan every pre-normalization session — see the "where did
+    // my /resume history go?" regression.
     let mut hasher = DefaultHasher::new();
-    path.hash(&mut hasher);
+    let p: PathBuf = PathBuf::from(normalized);
+    p.hash(&mut hasher);
     format!("{:016x}", hasher.finish())
 }
 
@@ -332,31 +358,28 @@ fn current_timestamp() -> u64 {
 /// Format timestamp as YYYYMMDD-HHMMSS.
 fn format_timestamp(ts: u64) -> String {
     use chrono::{TimeZone, Utc};
-    let dt = Utc
-        .timestamp_opt(ts as i64, 0)
-        .single()
-        .unwrap_or_else(|| Utc::now());
+    let dt = Utc.timestamp_opt(ts as i64, 0).single().unwrap_or_else(|| Utc::now());
     dt.format("%Y%m%d-%H%M%S").to_string()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
+    
     #[test]
     fn test_session_id_is_unique() {
         let id1 = SessionId::new();
         let id2 = SessionId::new();
         assert_ne!(id1, id2);
     }
-
+    
     #[test]
     fn test_session_new() {
         let session = Session::new(PathBuf::from("/tmp/test"));
         assert!(!session.id.0.is_empty());
         assert!(session.name.starts_with("session-"));
     }
-
+    
     #[test]
     fn test_hash_path_consistent() {
         let path = Path::new("/Users/test/project");
@@ -364,5 +387,47 @@ mod tests {
         let hash2 = hash_path(path);
         assert_eq!(hash1, hash2);
         assert_eq!(hash1.len(), 16);
+    }
+    
+    #[test]
+    fn test_hash_path_normalized() {
+        // Same path with different representations should produce the same hash
+        // Note: on non-Windows, case sensitivity is preserved
+        
+        // Test trailing slash normalization
+        let path1 = Path::new("/Users/test/project");
+        let path2 = Path::new("/Users/test/project/");
+        assert_eq!(hash_path(path1), hash_path(path2), 
+            "Trailing slash should not affect hash");
+        
+        // Test backslash normalization (Windows-style paths)
+        let path3 = Path::new("C:\\Users\\test\\project");
+        let path4 = Path::new("C:/Users/test/project");
+        assert_eq!(hash_path(path3), hash_path(path4),
+            "Backslashes should be normalized to forward slashes");
+        
+        // Test combined: backslash + trailing slash
+        let path5 = Path::new("C:\\Users\\test\\project\\");
+        assert_eq!(hash_path(path4), hash_path(path5),
+            "Backslashes and trailing slash should both be normalized");
+    }
+
+    #[test]
+    fn hash_path_matches_legacy_path_hash_on_unix() {
+        // Regression guard: the pre-normalization implementation just did
+        // `path.hash(&mut hasher)`. Every session saved before the
+        // normalization pass lives in a bucket keyed by that hash. If
+        // `hash_path` stops matching `Path::hash` for a plain-ASCII Unix
+        // path with no trailing slash / backslashes, every legacy
+        // `/resume` session becomes invisible. See the "where did my
+        // /resume history go?" regression.
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let p = Path::new("/Users/theo/Documents/workspace/atomcode");
+        let mut expected = DefaultHasher::new();
+        p.hash(&mut expected);
+        let legacy = format!("{:016x}", expected.finish());
+        assert_eq!(hash_path(p), legacy);
     }
 }

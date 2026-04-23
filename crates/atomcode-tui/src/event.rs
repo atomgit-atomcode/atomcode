@@ -2,7 +2,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crossterm::event::{poll, Event, KeyEvent, MouseEvent};
+use crossterm::execute;
+use crossterm::event::{Event, KeyEvent, MouseEvent, poll};
+use crossterm::event::{DisableFocusChange, EnableFocusChange};
 use std::io::{self, Write};
 use tokio::sync::mpsc;
 
@@ -34,14 +36,22 @@ pub fn disable_mouse_scroll_only() {
     let _ = stdout.flush();
 }
 
+fn terminal_supports_focus_tracking() -> bool {
+    let term_program = std::env::var("TERM_PROGRAM").unwrap_or_default();
+    let lc_terminal = std::env::var("LC_TERMINAL").unwrap_or_default();
+    term_program == "iTerm.app"
+        || term_program.eq_ignore_ascii_case("iTerm2")
+        || lc_terminal.eq_ignore_ascii_case("iTerm2")
+}
+
 #[derive(Debug)]
 pub enum AppEvent {
     Key(KeyEvent),
     Mouse(MouseEvent),
-    Paste(String), // Bracketed paste content
+    Paste(String),          // Bracketed paste content
     Resize(u16, u16),
     Tick,
-    IssueCreated { success: bool, message: String }, // Issue creation result
+    IssueCreated { success: bool, message: String },  // Issue creation result
 }
 
 pub struct EventLoop {
@@ -78,6 +88,10 @@ impl EventLoop {
         // Enable scroll-only mouse reporting (mode 1000 + 1006, no 1002 drag tracking).
         // Goal: get wheel scroll events in-app while preserving native click-drag selection.
         enable_mouse_scroll_only();
+        if terminal_supports_focus_tracking() {
+            let _ = execute!(io::stdout(), EnableFocusChange);
+            atomcode_core::notify::set_terminal_focus_state(Some(true));
+        }
 
         // Start keyboard/mouse reader in a dedicated thread (not tokio task)
         // This gives us more control over the input stream
@@ -105,13 +119,20 @@ impl EventLoop {
                                         // 1. When capture is disabled, terminals convert scroll wheel to Up/Down keys
                                         // 2. This would incorrectly trigger history navigation in Input Box
                                         // 3. Text selection still works via terminal's native selection (shift+click or drag)
-
+                                        
                                         // Just forward all mouse events to the app
                                         AppEvent::Mouse(mouse)
                                     }
                                     Event::Paste(text) => AppEvent::Paste(text),
                                     Event::Resize(w, h) => AppEvent::Resize(w, h),
-                                    _ => continue,
+                                    Event::FocusGained => {
+                                        atomcode_core::notify::set_terminal_focus_state(Some(true));
+                                        continue;
+                                    }
+                                    Event::FocusLost => {
+                                        atomcode_core::notify::set_terminal_focus_state(Some(false));
+                                        continue;
+                                    }
                                 };
                                 if tx.send(app_event).is_err() {
                                     break;
@@ -151,6 +172,10 @@ impl EventLoop {
     pub fn stop(&mut self) {
         // Signal threads to stop
         self.stop_flag.store(true, Ordering::SeqCst);
+        if terminal_supports_focus_tracking() {
+            let _ = execute!(io::stdout(), DisableFocusChange);
+            atomcode_core::notify::set_terminal_focus_state(None);
+        }
 
         // Wait for input thread to finish (it should exit quickly due to timeout)
         if let Some(handle) = self.input_thread.take() {

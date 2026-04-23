@@ -21,27 +21,30 @@ pub struct CommandEntry {
 /// Ordered by importance: core features first, utilities second, help/config last.
 pub const BUILTIN_COMMANDS: &[(&str, &str)] = &[
     // === Core features ===
-    ("/resume", "Resume or switch session"),
-    ("/session", "Create a new session"),
+    ("/resume",   "Resume or switch session"),
+    ("/session",  "Create a new session"),
     ("/provider", "Manage providers"),
-    ("/model", "Switch model/provider"),
-    ("/login", "Login with AtomGit OAuth"),
+    ("/model",    "Switch model/provider"),
+    ("/login",    "Login with AtomGit OAuth"),
     // ("/login-with-sso", "Login via SSO"), // hidden
-    ("/cd", "Change working directory"),
+    ("/cd",       "Change working directory"),
+    
     // === Utilities ===
-    ("/plan", "Toggle plan mode (read-only analysis)"),
-    ("/undo", "Undo last turn's edits"),
-    ("/diff", "Show git diff of current changes"),
-    ("/cost", "Show token usage for this session"),
-    ("/copy", "Copy last AI response"),
-    ("/clear", "Clear conversation"),
-    ("/issue", "Create issue on AtomGit"),
+    ("/plan",     "Toggle plan mode (read-only analysis)"),
+    ("/undo",     "Undo last turn's edits"),
+    ("/compact",  "Compact conversation history"),
+    ("/diff",     "Show git diff of current changes"),
+    ("/cost",     "Show token usage for this session"),
+    ("/copy",     "Copy last AI response"),
+    ("/clear",    "Clear conversation"),
+    ("/issue",    "Create issue on AtomGit"),
+    
     // === Config & Help ===
-    ("/config", "Show config file path"),
-    ("/status", "Show login status and model info"),
-    ("/logout", "Logout from AtomGit"),
-    ("/help", "Show commands & shortcuts"),
-    ("/quit", "Exit (or Ctrl+C x2)"),
+    ("/config",   "Show config file path"),
+    ("/status",   "Show login status and model info"),
+    ("/logout",   "Logout from AtomGit"),
+    ("/help",     "Show commands & shortcuts"),
+    ("/quit",     "Exit (or Ctrl+C x2)"),
 ];
 
 /// Build the command list with only built-in commands.

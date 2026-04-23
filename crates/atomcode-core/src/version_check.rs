@@ -52,7 +52,7 @@ fn format_version(v: (u64, u64, u64)) -> String {
 pub async fn check_latest(current: &str) -> Option<String> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
-        .user_agent(format!("atomcode-version-check/{}", current))
+        .user_agent(crate::ATOMCODE_USER_AGENT)
         .build()
         .ok()?;
     let resp = client.get(MANIFEST_URL).send().await.ok()?;

@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tokio::sync::RwLock;
+use tokio_util::sync::CancellationToken;
 
 use atomcode_core::graph::{
     indexer::GraphIndexer, persist, resolve, CodeGraph, Edge, EdgeKind, SymbolKind, SymbolNode,
@@ -272,7 +273,7 @@ async fn test_indexer_indexes_rust_files() {
     let graph = Arc::new(RwLock::new(CodeGraph::new()));
     let mut indexer = GraphIndexer::new(graph.clone(), dir.to_path_buf());
 
-    indexer.index_all().await;
+    indexer.index_all(CancellationToken::new()).await;
 
     let g = graph.read().await;
 
@@ -320,7 +321,7 @@ async fn test_indexer_incremental_update() {
     let graph = Arc::new(RwLock::new(CodeGraph::new()));
     let mut indexer = GraphIndexer::new(graph.clone(), dir.to_path_buf());
 
-    indexer.index_all().await;
+    indexer.index_all(CancellationToken::new()).await;
 
     let count_after_first = {
         let g = graph.read().await;
@@ -340,7 +341,7 @@ fn gamma() {}
     )
     .unwrap();
 
-    indexer.index_all().await;
+    indexer.index_all(CancellationToken::new()).await;
 
     let count_after_second = {
         let g = graph.read().await;
@@ -505,7 +506,7 @@ pub fn fetch_data() -> String {
 
     let graph = Arc::new(RwLock::new(CodeGraph::new()));
     let mut indexer = GraphIndexer::new(graph.clone(), dir.path().to_path_buf());
-    indexer.index_all().await;
+    indexer.index_all(CancellationToken::new()).await;
 
     let g = graph.read().await;
 
@@ -803,11 +804,11 @@ async fn test_indexer_deleted_file() {
 
     let graph = Arc::new(RwLock::new(CodeGraph::new()));
     let mut indexer = GraphIndexer::new(graph.clone(), dir.path().to_path_buf());
-    indexer.index_all().await;
+    indexer.index_all(CancellationToken::new()).await;
     assert!(!graph.read().await.find_by_name("remove").is_empty());
 
     std::fs::remove_file(dir.path().join("remove.rs")).unwrap();
-    indexer.index_all().await;
+    indexer.index_all(CancellationToken::new()).await;
     assert!(graph.read().await.find_by_name("remove").is_empty());
     assert!(!graph.read().await.find_by_name("keep").is_empty());
 }
@@ -823,7 +824,7 @@ async fn test_indexer_python_files() {
 
     let graph = Arc::new(RwLock::new(CodeGraph::new()));
     let mut indexer = GraphIndexer::new(graph.clone(), dir.path().to_path_buf());
-    indexer.index_all().await;
+    indexer.index_all(CancellationToken::new()).await;
 
     let g = graph.read().await;
     assert!(!g.find_by_name("main").is_empty());
