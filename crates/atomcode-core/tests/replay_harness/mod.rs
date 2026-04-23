@@ -12,5 +12,7 @@
 //! replay_provider scaffolded. Still to build: mock_tools, minimal
 //! agent_builder, actual end-to-end replay test.
 
+pub mod agent_builder;
 pub mod fixture_loader;
+pub mod mock_tools;
 pub mod replay_provider;
