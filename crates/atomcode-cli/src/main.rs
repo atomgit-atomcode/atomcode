@@ -634,21 +634,28 @@ async fn run() -> Result<i32> {
         }
     };
 
+    // Build a placeholder ProviderConfig that `create_provider()` can
+    // always turn into a valid (but non-functional) LlmProvider. Used
+    // whenever the real config would require credentials we don't have
+    // yet — keeps the TUI startable so the Welcome flow / status-row
+    // hint can guide the user to `/login` or `/codingplan` instead of
+    // bailing at the prompt.
+    let dummy_provider = || ProviderConfig {
+        provider_type: "openai".to_string(),
+        api_key: Some("not-configured".to_string()),
+        model: String::new(),
+        base_url: Some("http://localhost:1".to_string()),
+        system_prompt: None,
+        user_agent: None,
+        context_window: default_context_window_for("openai"),
+        max_tokens: None,
+        ephemeral: false,
+    };
+
     let (provider_config, model_name) = if config.providers.is_empty() {
         // No providers configured yet — Welcome screen handles setup.
-        // Use a dummy provider; AgentLoop won't be called until user configures one.
-        let dummy = ProviderConfig {
-            provider_type: "openai".to_string(),
-            api_key: Some("not-configured".to_string()),
-            model: String::new(),
-            base_url: Some("http://localhost:1".to_string()),
-            system_prompt: None,
-            user_agent: None,
-            context_window: default_context_window_for("openai"),
-            max_tokens: None,
-            ephemeral: false,
-        };
-        (dummy, String::new())
+        // AgentLoop won't be called until the user configures one.
+        (dummy_provider(), String::new())
     } else {
         if let Some(ref model) = cli.model {
             let provider_name = cli.provider.as_deref().unwrap_or(&config.default_provider);
@@ -656,20 +663,48 @@ async fn run() -> Result<i32> {
                 p.model = model.clone();
             }
         }
-        // Provide a dummy api_key to prevent create_provider from attempting
-        // auth-token loading (which would fail if not logged in).  The real
-        // provider is rebuilt later via rebuild_provider() once the user has
-        // configured credentials.
+        // Keep api_key as None here so `create_provider()` auto-loads
+        // from `~/.atomcode/auth.toml`. Setting "not-configured" would
+        // bypass that path and force the user to manually provide a key.
         let pc = config.active_provider(cli.provider.as_deref())?.clone();
         let name = pc.model.clone();
-        // 注意：如果api_key为None，保持为None不要设置"not-configured"。
-        // 这样可以让create_provider()检测到None并从auth.toml自动加载token。
-        // 设置"not-configured"会绕过create_provider()中的自动加载逻辑，导致OAuth登录后
-        // 重启程序时无法获取token而报404错误。
         (pc, name)
     };
 
-    let provider = create_provider(&provider_config)?;
+    // `create_provider` may need to load an OAuth token from
+    // `~/.atomcode/auth.toml`. Pre-v4.20 this was a fatal startup
+    // error — if the user had a config.toml with an `AtomGit*` entry
+    // (from an older `/login` that auto-registered one) but no
+    // auth.toml (fresh machine, or auth.toml was deleted), the CLI
+    // bailed before the TUI could load, leaving the user stuck:
+    // they wanted to `/login` but couldn't start the app to run it.
+    //
+    // Graceful fallback: if provider construction fails because the
+    // token is unavailable, swap in the same dummy used on first-run
+    // so the TUI boots. The Welcome-wizard / status-row hints will
+    // nudge the user to `/login` or `/codingplan`, and a successful
+    // auth flow rebuilds the real provider via `rebuild_provider`.
+    let (provider, model_name) = match create_provider(&provider_config) {
+        Ok(p) => (p, model_name),
+        Err(e) => {
+            let msg = format!("{:#}", e);
+            let is_auth_gap = msg.contains("Not logged in")
+                || msg.contains("Invalid auth.toml")
+                || msg.contains("Token expired");
+            if is_auth_gap {
+                eprintln!(
+                    "Note: provider credentials not available ({}). \
+                     Launching TUI in onboarding mode — use /login or /codingplan to set up.",
+                    msg
+                );
+                let p = create_provider(&dummy_provider())
+                    .expect("dummy provider with inline api_key must always build");
+                (p, String::new())
+            } else {
+                return Err(e);
+            }
+        }
+    };
 
     let working_dir = resolve_working_dir(cli.dir.clone());
 
