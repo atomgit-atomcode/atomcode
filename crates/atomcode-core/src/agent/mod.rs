@@ -308,10 +308,6 @@ pub struct AgentLoop {
     /// Name of the tool currently being executed (for smart truncation).
     current_tool_name: String,
 
-    /// Files edited in the previous turn — injected into system prompt so the model
-    /// knows where to start when the user reports the same issue again.
-    prev_turn_edited_files: Vec<String>,
-
     /// Last git checkpoint ref (SHA) for /undo rollback.
     pub last_checkpoint: Option<String>,
 
@@ -542,7 +538,6 @@ impl AgentLoop {
             files_edited_this_turn: Vec::new(),
             current_task: String::new(),
             current_tool_name: String::new(),
-            prev_turn_edited_files: Vec::new(),
             last_checkpoint: None,
             active_file: None,
             pending_input: None,
@@ -801,8 +796,6 @@ impl AgentLoop {
         self.turn_count = 0;
         self.retry_count = 0;
         self.discipline_state.recent_calls.clear();
-        // Save current turn's edits before clearing — used in next turn's system prompt
-        self.prev_turn_edited_files = self.files_edited_this_turn.clone();
         self.files_read_this_turn.clear();
         self.files_edited_this_turn.clear();
         self.turn_runner.recently_edited_files.clear();
@@ -927,9 +920,9 @@ impl AgentLoop {
             // the prompt guides the model to work efficiently.
 
             let system_prompt = self.build_system_prompt();
-            let turn_reminder = self
-                .ctx
-                .render_turn_reminder(&self.prev_turn_edited_files, &self.current_task);
+            // Per-turn reminder removed: verbatim task now rides on the cadence
+            // reflection checkpoint — see agent::discipline::reflection_prompt.
+            let turn_reminder = String::new();
             let cancel = self.cancel_token.clone();
 
             // Context compression: when > 70% budget, pause and compress

@@ -69,26 +69,6 @@ pub trait CtxBuilder: Send + Sync {
         turn_reminder: &str,
     ) -> (Vec<Message>, ContextStats);
 
-    /// Render the per-turn dynamic reminder from agent state.
-    ///
-    /// Inputs are agent-owned facts about the current turn:
-    /// - `prev_edited_files`: files this loop touched on the previous turn
-    /// - `current_task`: the active user task (verbatim, may be empty)
-    ///
-    /// Returned string is consumed by [`Self::build_messages`] as
-    /// `turn_reminder` and by `TurnRunner` for the actual send. Empty
-    /// string means "no reminder this turn" — callers should skip
-    /// injection entirely (don't insert empty system-reminders).
-    ///
-    /// Default impl uses [`crate::ctx::render::render_turn_reminder`]
-    /// (one-line hint + CURRENT TASK block). Override to:
-    /// - Drop the reminder for small-window models (save tokens)
-    /// - Re-format for cache-sensitive models
-    /// - Insert provider-specific markers
-    fn render_turn_reminder(&self, prev_edited_files: &[String], current_task: &str) -> String {
-        crate::ctx::render::render_turn_reminder(prev_edited_files, current_task)
-    }
-
     /// Whether the conversation should be compressed. Default: never.
     fn needs_compression(&self, _conv: &Conversation, _system_tokens: usize) -> bool {
         false
