@@ -1454,12 +1454,13 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
     fn pop_approval_prompt(&mut self) {
         // Approval rows are the only body rows whose col-0 cell is
         // '▶' (the prompt glyph we emit in the ApprovalPrompt arm).
-        // Other body lines lead with '▸' (tool call), '❯' (user turn),
-        // '─' (rule), whitespace (assistant prose, errors, cmd output,
-        // turn separator at col 2), or '    ⎿' (tool result, col 4) —
-        // none of them match. Checking the tail is safe because the
-        // agent doesn't append further body rows between
-        // `ApprovalNeeded` and the user's Y/A/N reply.
+        // Other symbol rows hold '▸' (tool call) or '❯' (user turn)
+        // at col 0 — distinct glyphs. All remaining body rows
+        // (assistant prose, errors, cmd output, diff, turn separator
+        // with '─' at col 2, tool result with '⎿' at col 4) have
+        // whitespace at col 0. None match '▶'. Checking the tail is
+        // safe because the agent doesn't append further body rows
+        // between `ApprovalNeeded` and the user's Y/A/N reply.
         let is_approval = self
             .body_lines
             .last()
