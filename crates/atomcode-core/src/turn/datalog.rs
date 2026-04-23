@@ -278,13 +278,47 @@ impl DatalogWriter {
     }
 
     /// Log final assistant text output (response/summary).
-    pub fn log_text(&mut self, text: &str) {
+    ///
+    /// Writes the text to the md file AND appends a jsonl event that
+    /// includes the full post-response conversation (the Assistant
+    /// message for the final turn is already in `messages` because
+    /// `Conversation::finalize_stream` commits it before this runs).
+    /// The pre-2026-04-23 behavior only wrote markdown; replay harnesses
+    /// couldn't see the final turn's response, so they'd terminate one
+    /// turn early. The extra jsonl line closes that gap.
+    pub fn log_text(
+        &mut self,
+        text: &str,
+        messages: &[crate::conversation::message::Message],
+    ) {
         if !self.active { return; }
         if text.trim().is_empty() { return; }
         let _ = writeln!(&mut self.buf, "**Response:**");
         let _ = writeln!(&mut self.buf, "{}", text.trim());
         let _ = writeln!(&mut self.buf);
         self.flush();
+
+        // Append jsonl event mirroring the log_llm_dump schema but tagged
+        // with `final_response: true` so loaders can distinguish it from
+        // regular request snapshots if they want to.
+        let Some(ref path) = self.file_path.as_ref().map(|p| p.with_extension("jsonl")) else { return };
+        let msgs_json = serde_json::to_value(messages).unwrap_or(serde_json::json!([]));
+        let total_tokens: usize = messages.iter().map(|m| m.estimate_tokens()).sum();
+        let dump = serde_json::json!({
+            "step": self.step,
+            "final_response": true,
+            "message_count": messages.len(),
+            "estimated_tokens": total_tokens,
+            "messages": msgs_json,
+        });
+        if let Ok(json_line) = serde_json::to_string(&dump) {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true).append(true).open(path)
+            {
+                let _ = writeln!(f, "{}", json_line);
+            }
+        }
     }
 
     /// Log an error.
@@ -474,7 +508,7 @@ mod tests {
         let mut log = DatalogWriter::new(&dir, &cfg);
         log.begin_turn("hello", "m", 1000);
         log.log_llm_call();
-        log.log_text("response");
+        log.log_text("response", &[]);
         log.end_turn(0, 0);
         assert!(log.file_path.is_none());
         assert!(!dir.join("datalog").exists());

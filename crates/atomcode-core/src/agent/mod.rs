@@ -1138,7 +1138,13 @@ impl AgentLoop {
                     // Log the final assistant text to datalog (TUI used to do this —
                     // absorbed here now that TUI's duplicate TurnLog was removed).
                     if !text.trim().is_empty() {
-                        self.datalog.log_text(text);
+                        // conversation.finalize_stream (inside TurnRunner) has already
+                        // committed the final Assistant message into
+                        // conversation.messages by this point, so passing
+                        // &self.conversation.messages lets datalog capture the post-
+                        // response state into jsonl — required for replay harnesses
+                        // to see the final turn's response (2026-04-23 fix).
+                        self.datalog.log_text(text, &self.conversation.messages);
                     }
 
                     // ATLAS subtask extraction: if model just output a plan (FeatureDev,
