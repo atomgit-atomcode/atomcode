@@ -2,6 +2,8 @@
 /target
 /runs
 
+.env/
+
 # Git worktrees (used by superpowers:using-git-worktrees)
 /.worktrees/
 
