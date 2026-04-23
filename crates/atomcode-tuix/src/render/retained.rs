@@ -1358,13 +1358,14 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                     format!("✗ {}", safe)
                 };
                 let body_style = if success { muted.clone() } else { error };
-                // Indent result lines 4 cols past the tool-call row.
-                let row_w = (self.screen.width() as usize).saturating_sub(PAD_COL * 2 + 6);
+                // Indent result rows 4 cols past the tool-call row at
+                // col 0: "    ⎿ " is 4 spaces + glyph + space, so ⎿
+                // lands at col 4. Width reserves PAD_COL for the right
+                // gutter + 6 for "    ⎿ ".
+                let row_w = (self.screen.width() as usize).saturating_sub(PAD_COL + 6);
                 for phys in body_str.split('\n') {
                     for chunk in crate::width::wrap_line_to_width(phys, row_w.max(1)) {
                         let mut row = Vec::new();
-                        let pad = CellStyle::default();
-                        push_str_cells(&mut row, &" ".repeat(PAD_COL), &pad);
                         push_str_cells(&mut row, "    ⎿ ", &muted);
                         push_str_cells(&mut row, &chunk, &body_style);
                         self.push_body_row(row);
