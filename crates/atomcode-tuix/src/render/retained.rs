@@ -2624,6 +2624,36 @@ mod tests {
         assert!(found, "user echo missing\ndump:\n{}", vterm.dump());
     }
 
+    /// User-echo chevron must sit at col 0 — the same column as the
+    /// input-box chevron below — so history symbols align with the
+    /// live prompt.
+    #[test]
+    fn retained_user_echo_chevron_at_col_0() {
+        let (mut r, buf) = new_capturing(80, 24);
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+        let status = status_basic();
+        r.render(UiLine::User("hello".into()));
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        let row_idx = (0..vterm.height() as usize)
+            .find(|&i| vterm.row_text(i).contains('\u{276f}') && vterm.row_text(i).contains("hello"))
+            .unwrap_or_else(|| panic!("user echo row missing\ndump:\n{}", vterm.dump()));
+        assert_eq!(
+            vterm.cell_at(row_idx, 0).ch,
+            '\u{276f}',
+            "user-echo chevron must land at col 0, got row: {:?}\ndump:\n{}",
+            vterm.row_text(row_idx),
+            vterm.dump()
+        );
+    }
+
     /// ToolCall: `▸ name(detail)` formatted. Grid-verifies the
     /// marker + name + parens appear together on one row.
     #[test]
