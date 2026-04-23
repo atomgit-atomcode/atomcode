@@ -44,7 +44,7 @@ echo ""
 
 # --- macOS ARM (Apple Silicon) ---
 TARGET_ARM="aarch64-apple-darwin"
-echo "[1/5] Building ${TARGET_ARM}..."
+echo "[1/6] Building ${TARGET_ARM}..."
 rustup target add "$TARGET_ARM" 2>/dev/null || true
 cargo build --release --target "$TARGET_ARM"
 cp "target/${TARGET_ARM}/release/atomcode" "${DIST}/atomcode-${VERSION}-darwin-arm64"
@@ -54,7 +54,7 @@ echo "  -> ${DIST}/atomcode-daemon-${VERSION}-darwin-arm64"
 
 # --- macOS Intel ---
 TARGET_X86="x86_64-apple-darwin"
-echo "[2/5] Building ${TARGET_X86}..."
+echo "[2/6] Building ${TARGET_X86}..."
 rustup target add "$TARGET_X86" 2>/dev/null || true
 cargo build --release --target "$TARGET_X86"
 cp "target/${TARGET_X86}/release/atomcode" "${DIST}/atomcode-${VERSION}-darwin-x64"
@@ -64,7 +64,7 @@ echo "  -> ${DIST}/atomcode-daemon-${VERSION}-darwin-x64"
 
 # --- Linux x64 (cross-compile with musl) ---
 TARGET_LINUX="x86_64-unknown-linux-musl"
-echo "[3/5] Building ${TARGET_LINUX}..."
+echo "[3/6] Building ${TARGET_LINUX}..."
 rustup target add "$TARGET_LINUX" 2>/dev/null || true
 if command -v x86_64-linux-musl-gcc &>/dev/null; then
     export CC_x86_64_unknown_linux_musl=x86_64-linux-musl-gcc
@@ -78,9 +78,25 @@ else
     echo "  !! Skipped: musl-cross not installed (brew install FiloSottile/musl-cross/musl-cross)"
 fi
 
+# --- Linux ARM64 (cross-compile with musl) ---
+TARGET_LINUX_ARM="aarch64-unknown-linux-musl"
+echo "[4/6] Building ${TARGET_LINUX_ARM}..."
+rustup target add "$TARGET_LINUX_ARM" 2>/dev/null || true
+if command -v aarch64-linux-musl-gcc &>/dev/null; then
+    export CC_aarch64_unknown_linux_musl=aarch64-linux-musl-gcc
+    export CFLAGS_aarch64_unknown_linux_musl="-fPIC"
+    cargo build --release --target "$TARGET_LINUX_ARM"
+    cp "target/${TARGET_LINUX_ARM}/release/atomcode" "${DIST}/atomcode-${VERSION}-linux-arm64"
+    cp "target/${TARGET_LINUX_ARM}/release/atomcode-daemon" "${DIST}/atomcode-daemon-${VERSION}-linux-arm64"
+    echo "  -> ${DIST}/atomcode-${VERSION}-linux-arm64"
+    echo "  -> ${DIST}/atomcode-daemon-${VERSION}-linux-arm64"
+else
+    echo "  !! Skipped: aarch64 musl-cross not installed (brew reinstall FiloSottile/musl-cross/musl-cross --with-aarch64)"
+fi
+
 # --- Windows x64 (cross-compile) ---
 TARGET_WIN="x86_64-pc-windows-gnu"
-echo "[4/5] Building ${TARGET_WIN}..."
+echo "[5/6] Building ${TARGET_WIN}..."
 rustup target add "$TARGET_WIN" 2>/dev/null || true
 if command -v x86_64-w64-mingw32-gcc &>/dev/null; then
     cargo build --release --target "$TARGET_WIN"
@@ -94,7 +110,7 @@ fi
 
 # --- Windows ARM64 (cross-compile) ---
 TARGET_WIN_ARM="aarch64-pc-windows-gnullvm"
-echo "[5/5] Building ${TARGET_WIN_ARM}..."
+echo "[6/6] Building ${TARGET_WIN_ARM}..."
 rustup target add "$TARGET_WIN_ARM" 2>/dev/null || true
 if command -v aarch64-w64-mingw32-gcc &>/dev/null; then
     cargo build --release --target "$TARGET_WIN_ARM"
@@ -165,6 +181,7 @@ emit_entry() {
         "darwin-arm64:atomcode-${VERSION}-darwin-arm64" \
         "darwin-x64:atomcode-${VERSION}-darwin-x64" \
         "linux-x64:atomcode-${VERSION}-linux-x64" \
+        "linux-arm64:atomcode-${VERSION}-linux-arm64" \
         "windows-x64:atomcode-${VERSION}-windows-x64.exe" \
         "windows-arm64:atomcode-${VERSION}-windows-arm64.exe"
     do
