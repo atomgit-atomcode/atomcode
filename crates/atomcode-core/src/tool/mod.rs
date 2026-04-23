@@ -175,29 +175,56 @@ pub fn resolve_workspace_path(raw_path: &str, working_dir: &Path) -> Result<Path
 }
 
 fn is_sensitive_path(path: &Path) -> bool {
-    const SENSITIVE_ABS_PREFIXES: &[&str] = &["/etc"];
-    const SENSITIVE_HOME_DIRS: &[&str] = &[".ssh", ".aws", ".gnupg", ".config"];
-    const SENSITIVE_FILE_NAMES: &[&str] = &[
+    const SYSTEM_PROTECTED_PREFIXES: &[&str] = &[
+        "/System",
+        "/bin",
+        "/sbin",
+        "/usr",
+        "/var",
+        "/private/etc",
+        "/private/var",
+        "/etc",
+        "/root",
+        "/var/root",
+        "/private/var/root",
+    ];
+    const SYSTEM_PROTECTED_EXCEPTIONS: &[&str] = &[
+        "/usr/local",
+        "/private/usr/local",
+        "/Applications",
+        "/Library",
+        "/var/folders",
+        "/private/var/folders",
+        "/var/tmp",
+        "/private/var/tmp",
+    ];
+    const SECRET_HOME_DIRS: &[&str] = &[".ssh", ".aws", ".gnupg", ".config"];
+    const SECRET_FILE_NAMES: &[&str] = &[
         ".bashrc", ".bash_profile", ".zshrc", ".zprofile", ".zshenv",
         ".npmrc", ".pypirc", ".env", ".env.local", "credentials", "config",
         "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519",
     ];
-    const SENSITIVE_EXTS: &[&str] = &["pem", "key", "p12", "pfx", "der", "crt", "cer"];
+    const SECRET_EXTS: &[&str] = &["pem", "key", "p12", "pfx", "der", "crt", "cer"];
 
-    for prefix in SENSITIVE_ABS_PREFIXES {
-        if path.starts_with(prefix) {
-            return true;
-        }
+    let has_protected_prefix = SYSTEM_PROTECTED_PREFIXES.iter().any(|prefix| {
+        path == Path::new(prefix) || path.starts_with(prefix)
+    });
+    let has_exception_prefix = SYSTEM_PROTECTED_EXCEPTIONS.iter().any(|prefix| {
+        path == Path::new(prefix) || path.starts_with(prefix)
+    });
+
+    if has_protected_prefix && !has_exception_prefix {
+        return true;
     }
 
     if let Some(home) = dirs::home_dir() {
-        for dir in SENSITIVE_HOME_DIRS {
+        for dir in SECRET_HOME_DIRS {
             if path.starts_with(home.join(dir)) {
                 return true;
             }
         }
 
-        for file in SENSITIVE_FILE_NAMES {
+        for file in SECRET_FILE_NAMES {
             if path == home.join(file) {
                 return true;
             }
@@ -205,14 +232,14 @@ fn is_sensitive_path(path: &Path) -> bool {
     }
 
     if path.file_name().and_then(|n| n.to_str()).is_some_and(|name| {
-        SENSITIVE_FILE_NAMES.contains(&name)
+        SECRET_FILE_NAMES.contains(&name)
     }) {
         return true;
     }
 
     path.extension()
         .and_then(|ext| ext.to_str())
-        .is_some_and(|ext| SENSITIVE_EXTS.iter().any(|candidate| ext.eq_ignore_ascii_case(candidate)))
+        .is_some_and(|ext| SECRET_EXTS.iter().any(|candidate| ext.eq_ignore_ascii_case(candidate)))
 }
 
 pub fn approval_for_path(
@@ -692,6 +719,26 @@ mod tests {
     }
 
     #[test]
+    fn approval_for_system_protected_prefix_requires_always() {
+        assert!(is_sensitive_path(Path::new("/System/Library/CoreServices/boot.efi")));
+    }
+
+    #[test]
+    fn approval_for_usr_local_exception_is_not_sensitive() {
+        assert!(!is_sensitive_path(Path::new("/usr/local/bin/tool")));
+    }
+
+    #[test]
+    fn approval_for_private_var_prefix_requires_always() {
+        assert!(is_sensitive_path(Path::new("/private/var/db/config")));
+    }
+
+    #[test]
+    fn approval_for_private_var_folders_exception_is_not_sensitive() {
+        assert!(!is_sensitive_path(Path::new("/private/var/folders/xx/yy/T/file.txt")));
+    }
+
+    #[test]
     fn approval_for_write_outside_workspace_requires_always() {
         let workspace = TempDir::new().unwrap();
         let outside = TempDir::new().unwrap();
@@ -738,7 +785,7 @@ mod tests {
 
         assert!(matches!(
             tool.approval_with_context(&args, &ctx),
-            ApprovalRequirement::RequireApproval(_)
+            ApprovalRequirement::RequireApprovalAlways(_)
         ));
     }
 

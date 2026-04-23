@@ -99,6 +99,36 @@ impl Tool for BashTool {
         ApprovalRequirement::AutoApprove
     }
 
+    fn approval_with_context(&self, args: &str, ctx: &ToolContext) -> ApprovalRequirement {
+        let base = self.approval(args);
+        let parsed = match serde_json::from_str::<BashArgs>(args) {
+            Ok(p) => p,
+            Err(_) => return base,
+        };
+        let working_dir = match ctx.working_dir.try_read() {
+            Ok(wd) => wd.clone(),
+            Err(_) => return base,
+        };
+        if let Some(path_approval) = approval_for_command_paths(&parsed.command, &working_dir) {
+            return match (base, path_approval) {
+                (ApprovalRequirement::RequireApprovalAlways(reason), _) => {
+                    ApprovalRequirement::RequireApprovalAlways(reason)
+                }
+                (_, ApprovalRequirement::RequireApprovalAlways(reason)) => {
+                    ApprovalRequirement::RequireApprovalAlways(reason)
+                }
+                (ApprovalRequirement::RequireApproval(reason), _) => {
+                    ApprovalRequirement::RequireApproval(reason)
+                }
+                (_, ApprovalRequirement::RequireApproval(reason)) => {
+                    ApprovalRequirement::RequireApproval(reason)
+                }
+                _ => ApprovalRequirement::AutoApprove,
+            };
+        }
+        base
+    }
+
     async fn execute(&self, args: &str, ctx: &ToolContext) -> Result<ToolResult> {
         // Capture workspace state before exec. If the command later turns out
         // to have modified files, we surface the list to the agent so it can
@@ -1343,7 +1373,8 @@ error: could not compile `hermes-tauri` (bin \"hermes-tauri\") due to 1 previous
 
 #[cfg(test)]
 mod sanitize_tests {
-    use super::{check_destructive_command, sanitize_terminal_output};
+    use super::{approval_for_command_paths, check_destructive_command, sanitize_terminal_output, BashTool};
+    use crate::tool::{ApprovalRequirement, Tool, ToolContext};
 
     #[test]
     fn strips_csi_color_sequences() {
@@ -1450,6 +1481,70 @@ mod sanitize_tests {
         assert!(check_destructive_command("curl -L https://example.com/archive.tar.gz -o /tmp/archive.tar.gz").is_none());
         assert!(check_destructive_command("nc localhost 5432").is_none());
     }
+
+    #[test]
+    fn bash_path_guard_requires_confirmation_for_workspace_escape_reads() {
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("notes.txt");
+        std::fs::write(&target, "secret").unwrap();
+
+        let approval = approval_for_command_paths(
+            &format!("cat {}", target.display()),
+            workspace.path(),
+        );
+
+        assert!(matches!(approval, Some(ApprovalRequirement::RequireApproval(_))));
+    }
+
+    #[test]
+    fn bash_path_guard_requires_always_for_sensitive_reads() {
+        let workspace = tempfile::tempdir().unwrap();
+
+        let approval = approval_for_command_paths("cat /etc/hosts", workspace.path());
+
+        assert!(matches!(approval, Some(ApprovalRequirement::RequireApprovalAlways(_))));
+    }
+
+    #[tokio::test]
+    async fn bash_tool_sensitive_paths_are_not_bypassed_by_session_allow() {
+        let workspace = tempfile::tempdir().unwrap();
+        let ctx = ToolContext::new(workspace.path().to_path_buf());
+        let tool = BashTool;
+        let args = r#"{"command":"cat /etc/hosts"}"#;
+
+        assert!(matches!(
+            tool.approval_with_context(args, &ctx),
+            ApprovalRequirement::RequireApprovalAlways(_)
+        ));
+    }
+
+    #[test]
+    fn bash_path_guard_follows_shell_wrapper() {
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("notes.txt");
+        std::fs::write(&target, "secret").unwrap();
+
+        let approval = approval_for_command_paths(
+            &format!("bash -lc \"cat {}\"", target.display()),
+            workspace.path(),
+        );
+
+        assert!(matches!(approval, Some(ApprovalRequirement::RequireApproval(_))));
+    }
+
+    #[test]
+    fn bash_path_guard_ignores_python_embedded_file_reads() {
+        let workspace = tempfile::tempdir().unwrap();
+
+        let approval = approval_for_command_paths(
+            r#"python -c "print(open('/etc/hosts').read())""#,
+            workspace.path(),
+        );
+
+        assert!(approval.is_none());
+    }
 }
 
 // ───────────────────────────────────────────────────────────────────
@@ -1514,4 +1609,222 @@ mod exec_tests {
         assert!(!result.success,
             "`false` must report success=false, got output: {}", result.output);
     }
+}
+
+/// Check whether a bash command touches paths that should inherit the same
+/// approval policy as the dedicated file tools.
+fn approval_for_command_paths(
+    command: &str,
+    working_dir: &std::path::Path,
+) -> Option<ApprovalRequirement> {
+    use std::path::{Path, PathBuf};
+
+    fn expand_path(arg: &str, working_dir: &Path) -> Option<std::path::PathBuf> {
+        if arg.contains("://") {
+            return None;
+        }
+        let expanded = if arg.starts_with('~') {
+            // Expand ~/path
+            dirs::home_dir().map(|h| {
+                let rest = arg.strip_prefix('~').unwrap_or(arg);
+                let rest = rest.strip_prefix('/').unwrap_or(rest);
+                h.join(rest)
+            })
+        } else if arg.starts_with('/') {
+            // Absolute path
+            Some(PathBuf::from(arg))
+        } else {
+            // Relative path - resolve against working directory
+            Some(working_dir.join(arg))
+        };
+        expanded.and_then(|p| p.canonicalize().ok().or(Some(p)))
+    }
+
+    fn strongest(
+        current: Option<ApprovalRequirement>,
+        next: ApprovalRequirement,
+    ) -> Option<ApprovalRequirement> {
+        match (current, next) {
+            (Some(ApprovalRequirement::RequireApprovalAlways(reason)), _) => {
+                Some(ApprovalRequirement::RequireApprovalAlways(reason))
+            }
+            (_, ApprovalRequirement::RequireApprovalAlways(reason)) => {
+                Some(ApprovalRequirement::RequireApprovalAlways(reason))
+            }
+            (Some(ApprovalRequirement::RequireApproval(reason)), _) => {
+                Some(ApprovalRequirement::RequireApproval(reason))
+            }
+            (_, ApprovalRequirement::RequireApproval(reason)) => {
+                Some(ApprovalRequirement::RequireApproval(reason))
+            }
+            (current, ApprovalRequirement::AutoApprove) => current,
+        }
+    }
+
+    fn shell_words(raw: &str) -> Vec<String> {
+        raw.split_whitespace()
+            .map(|token| {
+                token.trim_matches(|c| {
+                    matches!(c, '"' | '\'' | '`' | '(' | ')' | '[' | ']' | '{' | '}' | ',')
+                })
+            })
+            .filter(|token| !token.is_empty())
+            .map(|token| token.to_string())
+            .collect()
+    }
+
+    fn is_path_like(token: &str) -> bool {
+        token.starts_with('~')
+            || token.starts_with('/')
+            || token.starts_with("./")
+            || token.starts_with("../")
+            || token.contains('/')
+    }
+
+    fn extract_path_candidates(token: &str) -> Vec<String> {
+        let chars: Vec<char> = token.chars().collect();
+        let mut out = Vec::new();
+        let mut i = 0;
+
+        while i < chars.len() {
+            let starts_path = chars[i] == '/'
+                || chars[i] == '~'
+                || (chars[i] == '.' && i + 1 < chars.len() && chars[i + 1] == '/')
+                || (chars[i] == '.'
+                    && i + 2 < chars.len()
+                    && chars[i + 1] == '.'
+                    && chars[i + 2] == '/');
+
+            if !starts_path {
+                i += 1;
+                continue;
+            }
+
+            let start = i;
+            let mut end = i + 1;
+            while end < chars.len() {
+                let ch = chars[end];
+                if ch.is_whitespace() || matches!(ch, '"' | '\'' | '`' | ')' | '(' | '[' | ']' | '{' | '}' | ',' | ';' | '<' | '>' | '|') {
+                    break;
+                }
+                end += 1;
+            }
+
+            let candidate: String = chars[start..end].iter().collect();
+            if is_path_like(&candidate) {
+                out.push(candidate);
+            }
+            i = end;
+        }
+
+        out
+    }
+
+    fn primary_action(command_name: &str) -> Option<super::ExternalPathAction> {
+        let cmd = command_name.to_ascii_lowercase();
+        let read_cmds = [
+            "cat", "head", "tail", "less", "more", "bat", "hexdump", "xxd", "strings",
+            "file", "stat", "grep", "sed", "awk", "cut", "sort", "uniq", "wc", "diff",
+            "patch", "tar", "unzip", "gunzip", "source", ".",
+        ];
+        let enumerate_cmds = ["ls", "dir", "tree", "find"];
+        let write_cmds = [
+            "cp", "mv", "touch", "mkdir", "rmdir", "rm", "chmod", "chown", "tee", "install",
+        ];
+
+        if read_cmds.contains(&cmd.as_str()) {
+            Some(super::ExternalPathAction::Read)
+        } else if enumerate_cmds.contains(&cmd.as_str()) {
+            Some(super::ExternalPathAction::Enumerate)
+        } else if write_cmds.contains(&cmd.as_str()) {
+            Some(super::ExternalPathAction::Write)
+        } else {
+            None
+        }
+    }
+
+    fn analyze_tokens(tokens: &[String], working_dir: &Path) -> Option<ApprovalRequirement> {
+        if tokens.is_empty() {
+            return None;
+        }
+
+        let mut approval = None;
+        let command_name = tokens[0].as_str();
+        let action = primary_action(command_name);
+
+        if matches!(command_name, "bash" | "sh" | "zsh" | "dash" | "ash" | "ksh") {
+            if let Some(idx) = tokens.iter().position(|t| t == "-c" || t == "-lc") {
+                if idx + 1 < tokens.len() {
+                    let inner = tokens[idx + 1..].join(" ");
+                    if let Some(next) = approval_for_command_paths(&inner, working_dir) {
+                        approval = strongest(approval, next);
+                    }
+                }
+            }
+        }
+
+        let mut i = 1;
+        while i < tokens.len() {
+            let token = tokens[i].as_str();
+
+            if matches!(token, "&&" | "||" | ";" | "|" | "&" | "2>&1") {
+                i += 1;
+                continue;
+            }
+
+            if matches!(token, ">" | ">>") {
+                if let Some(target) = tokens.get(i + 1).filter(|t| is_path_like(t)) {
+                    if let Ok(next) = super::approval_for_path(
+                        target,
+                        working_dir,
+                        super::ExternalPathAction::Write,
+                    ) {
+                        approval = strongest(approval, next);
+                    }
+                }
+                i += 2;
+                continue;
+            }
+
+            if token == "<" {
+                if let Some(target) = tokens.get(i + 1).filter(|t| is_path_like(t)) {
+                    if let Ok(next) = super::approval_for_path(
+                        target,
+                        working_dir,
+                        super::ExternalPathAction::Read,
+                    ) {
+                        approval = strongest(approval, next);
+                    }
+                }
+                i += 2;
+                continue;
+            }
+
+            if token.starts_with('-') {
+                i += 1;
+                continue;
+            }
+
+            let Some(action) = action else {
+                i += 1;
+                continue;
+            };
+
+            for candidate in extract_path_candidates(token) {
+                if expand_path(&candidate, working_dir).is_none() {
+                    continue;
+                }
+                let next = super::approval_for_path(&candidate, working_dir, action);
+                if let Ok(next) = next {
+                    approval = strongest(approval, next);
+                }
+            }
+
+            i += 1;
+        }
+
+        approval
+    }
+
+    analyze_tokens(&shell_words(command), working_dir)
 }
