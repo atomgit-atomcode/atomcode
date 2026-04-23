@@ -304,12 +304,31 @@ pub async fn run(
         session_manager,
         current_session,
         update_hint,
+        monitor_warning: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        monitor_last_check_at: None,
         wake_rx,
+        wake_tx: wake_tx.clone(),
         reader: reader_handle,
         upgrade_tx,
         upgrade_rx,
         pending_new_issue: None,
+        pending_run_login: false,
+        pending_open_provider_wizard: false,
     };
+
+    // CodingPlan drift monitor — kick off a startup check if the current
+    // default provider is CodingPlan-managed. Non-CodingPlan users skip
+    // this entirely (no HTTP, no state touched). Check runs in the
+    // background via tokio::spawn → the warning shows up on the next
+    // footer repaint once it resolves.
+    if event_loop::monitor::is_codingplan_provider(&ctx.config.default_provider) {
+        event_loop::monitor::spawn_check(
+            ctx.config.clone(),
+            ctx.model_name.clone(),
+            ctx.monitor_warning.clone(),
+            ctx.wake_tx.clone(),
+        );
+    }
 
     let result = run_loop(ctx, renderer.as_mut()).await;
 

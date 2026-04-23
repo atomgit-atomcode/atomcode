@@ -61,3 +61,4 @@ backend.log
 # but never ships.
 scripts/eval/
 dist/
+docs/superpowers

@@ -61,6 +61,7 @@ impl CommandRegistry {
 }
 
 const BUILTIN_COMMANDS: &[Command] = &[
+    Command { name: "codingplan", desc: "Claim CodingPlan + set up models from the plan's model list", needs_args: false },
     Command { name: "resume",  desc: "Resume a previous session", needs_args: false },
     Command { name: "login",   desc: "Sign in with AtomGit OAuth", needs_args: false },
     Command { name: "logout",  desc: "Sign out of AtomGit", needs_args: false },

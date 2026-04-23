@@ -26,9 +26,11 @@ pub trait LlmProvider: Send + Sync {
 }
 
 /// Shared HTTP client with common timeouts and User-Agent.
-/// `ua_override` comes from `ProviderConfig::user_agent`; falls back to `atomcode/<version>`.
+/// `ua_override` comes from `ProviderConfig::user_agent`; falls back to the
+/// workspace-wide `ATOMCODE_USER_AGENT` (`AtomCode/<version>`), required by
+/// AtomGit's API gateway — see the constant's doc-comment.
 pub(super) fn build_http_client(ua_override: Option<&str>) -> reqwest::Client {
-    let ua = ua_override.unwrap_or(concat!("atomcode/", env!("CARGO_PKG_VERSION")));
+    let ua = ua_override.unwrap_or(crate::ATOMCODE_USER_AGENT);
     reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(30))
         .timeout(std::time::Duration::from_secs(300))

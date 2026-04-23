@@ -38,6 +38,13 @@ bincode = "1"
 encoding_rs = "0.8"
 sha2 = "0.10"
 
+# Non-blocking poll on stdin in the OAuth callback path so the stdin
+# reader thread can exit cleanly when the HTTP listener wins — otherwise
+# it stays blocked in read_line() and steals the user's first keystroke
+# after login returns.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tempfile = "3"
 wiremock = "0.6"

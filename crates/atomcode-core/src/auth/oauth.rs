@@ -41,6 +41,17 @@ pub const AUTHORIZE_URL: &str = "https://atomgit.com/oauth/authorize";
 pub const TOKEN_URL: &str = "https://atomgit.com/oauth/token";
 pub const USER_URL: &str = "https://atomgit.com/api/v5/user";
 
+/// Blocking HTTP client pre-configured with `ATOMCODE_USER_AGENT`. Every
+/// OAuth-side request must carry the token or AtomGit's gate rejects it.
+/// Centralized so a future UA format change (e.g. append install-id)
+/// happens in one spot rather than at each `Client::new()` site.
+fn blocking_client() -> reqwest::blocking::Client {
+    reqwest::blocking::Client::builder()
+        .user_agent(crate::ATOMCODE_USER_AGENT)
+        .build()
+        .unwrap_or_else(|_| reqwest::blocking::Client::new())
+}
+
 /// OAuth scopes needed
 pub const SCOPES: &str = "user_info projects";
 
@@ -248,24 +259,29 @@ fn await_callback(port: u16) -> Result<(String, String)> {
     // no stdin reader spawned the user's pasted URL went nowhere and the
     // whole login hung forever.
     //
+    // Must be cancellable: previous revisions used a blocking
+    // `stdin.lock().read_line()` + a "zombie thread is harmless" comment.
+    // It wasn't harmless — FD 0 and /dev/tty point to the same terminal
+    // device on Unix, so the kernel's line discipline delivers each byte
+    // to whichever reader calls `read` first. When the listener won the
+    // race, the zombie `read_line` was still blocked; the user's first
+    // keystroke after login got read by the zombie (parsed as a bad
+    // callback URL, dropped) instead of by crossterm's /dev/tty reader.
+    // Reported as "Chinese IME commits need two attempts to land".
+    //
+    // Fix: poll(2)-based loop that checks the `stop` AtomicBool between
+    // 100 ms timeouts, so when the listener wins we set `stop=true` and
+    // the stdin thread exits before the user types anything.
+    //
     // Windows is still gated off because its stdin `read_line` blocks on
-    // a console handle that can't be cancelled from another thread; when
-    // the listener wins the race the stdin thread sticks around as a
-    // zombie that eats keystrokes after raw mode comes back. On Unix,
-    // crossterm reads from `/dev/tty` rather than stdin FD 0, so a
-    // zombie stdin reader can't steal input — it just sits on FD 0
-    // harmlessly until process exit.
+    // a console handle that can't be cancelled from another thread and
+    // doesn't have an equivalent poll(2) path.
     #[cfg(not(target_os = "windows"))]
     {
         let tx_stdin = tx.clone();
+        let stop_stdin = Arc::clone(&stop);
         thread::spawn(move || {
-            let stdin = io::stdin();
-            let mut line = String::new();
-            let r = match stdin.lock().read_line(&mut line) {
-                Ok(0) => Err(anyhow::anyhow!("stdin closed")),
-                Ok(_) => parse_pasted_callback(&line),
-                Err(e) => Err(anyhow::Error::new(e).context("Failed to read from stdin")),
-            };
+            let r = read_callback_from_stdin_until_stopped(&stop_stdin);
             let _ = tx_stdin.send(r);
         });
     }
@@ -297,6 +313,97 @@ fn await_callback(port: u16) -> Result<(String, String)> {
 }
 
 /// Accept a single OAuth callback on an already-bound listener, polling a
+/// Poll stdin for a pasted callback URL, checking `stop` every 100 ms so
+/// the caller can cancel (e.g. when the listener won the race). Returns
+/// `Err("stdin cancelled")` on stop, `Err(...)` on a read error or a line
+/// that doesn't parse as a callback URL, `Ok((code, state))` on success.
+///
+/// Uses `poll(2)` + non-blocking reads so we never sit inside a blocking
+/// `read_line()` — that was the bug behind "first keystroke after login
+/// goes to a zombie stdin thread instead of crossterm". On macOS / Linux,
+/// FD 0 (this thread's read) and /dev/tty (crossterm's read) point to
+/// the same terminal device; whichever syscall lands on a byte first
+/// gets it, and a blocked `read_line` stays in line for the next input.
+#[cfg(not(target_os = "windows"))]
+fn read_callback_from_stdin_until_stopped(
+    stop: &AtomicBool,
+) -> Result<(String, String)> {
+    use std::os::unix::io::AsRawFd;
+
+    let stdin = io::stdin();
+    let fd = stdin.as_raw_fd();
+
+    // Save original flags so we restore them on exit — leaving stdin
+    // non-blocking after login would break subsequent code that expects
+    // the normal blocking shape (e.g. any future CLI prompt helper).
+    let orig_flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if orig_flags >= 0 {
+        unsafe {
+            libc::fcntl(fd, libc::F_SETFL, orig_flags | libc::O_NONBLOCK);
+        }
+    }
+
+    // RAII guard: restore flags on any exit path (stop, error, parse fail).
+    struct FlagGuard {
+        fd: std::os::unix::io::RawFd,
+        orig_flags: i32,
+    }
+    impl Drop for FlagGuard {
+        fn drop(&mut self) {
+            if self.orig_flags >= 0 {
+                unsafe {
+                    libc::fcntl(self.fd, libc::F_SETFL, self.orig_flags);
+                }
+            }
+        }
+    }
+    let _guard = FlagGuard { fd, orig_flags };
+
+    let mut line = String::new();
+    let mut buf = [0u8; 256];
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            anyhow::bail!("stdin cancelled");
+        }
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let poll_rc = unsafe { libc::poll(&mut pfd, 1, 100) };
+        if poll_rc < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(anyhow::Error::new(err).context("poll(stdin)"));
+        }
+        if poll_rc == 0 {
+            continue; // timeout — re-check stop, re-poll
+        }
+        // Data available; drain what's there. read(2) in non-blocking
+        // mode returns up to one pipe buffer in a single call.
+        let n =
+            unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+        if n < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::WouldBlock || err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(anyhow::Error::new(err).context("read(stdin)"));
+        }
+        if n == 0 {
+            anyhow::bail!("stdin closed");
+        }
+        // Append as UTF-8 (lossy — pasted URLs are ASCII; any weird
+        // bytes in a URL would fail `parse_pasted_callback` anyway).
+        line.push_str(&String::from_utf8_lossy(&buf[..n as usize]));
+        if line.contains('\n') {
+            return parse_pasted_callback(&line);
+        }
+    }
+}
+
 /// `stop` flag every 200ms so the caller can cancel (e.g. when the paste
 /// path won the race).
 fn accept_callback_until_stopped(
@@ -408,7 +515,7 @@ fn urlencoding_decode(s: &str) -> String {
 
 /// Exchange authorization code for access token
 fn exchange_code_for_token(code: &str) -> Result<TokenResponse> {
-    let client = reqwest::blocking::Client::new();
+    let client = blocking_client();
 
     let params = [
         ("client_id", CLIENT_ID),
@@ -437,7 +544,7 @@ fn exchange_code_for_token(code: &str) -> Result<TokenResponse> {
 
 /// Get user information using access token
 fn get_user_info(access_token: &str) -> Result<UserResponse> {
-    let client = reqwest::blocking::Client::new();
+    let client = blocking_client();
 
     let response = client
         .get(USER_URL)
@@ -465,7 +572,7 @@ pub fn refresh_access_token(auth: &AuthInfo) -> Result<AuthInfo> {
         .as_deref()
         .context("No refresh_token available — please /login again")?;
 
-    let client = reqwest::blocking::Client::new();
+    let client = blocking_client();
     let params = [
         ("client_id", CLIENT_ID),
         ("client_secret", CLIENT_SECRET),

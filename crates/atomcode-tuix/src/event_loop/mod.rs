@@ -14,6 +14,7 @@
 // Buffer); modal overlays already live in `crate::modals`.
 
 pub(crate) mod commands;
+pub(crate) mod monitor;
 use commands::execute_slash_command;
 
 use std::collections::VecDeque;
@@ -62,11 +63,29 @@ pub struct LoopCtx {
     /// on each redraw. `None` = no hint (either check still pending,
     /// network failed silently, or already up to date).
     pub update_hint: std::sync::Arc<std::sync::Mutex<Option<String>>>,
-    /// Wake signal from the version-check task — one `()` sent when the
-    /// task resolves with a positive result. The event loop selects on
-    /// `wake_rx` and triggers an idle redraw so the hint appears without
-    /// waiting for the user's next keystroke.
+    /// Shared CodingPlan drift-monitor warning slot. Written by the
+    /// detached check task (see `monitor::spawn_check`); read by
+    /// `build_status` on each redraw. Takes precedence over `update_hint`
+    /// so a drift warning isn't buried by an upgrade banner. Cleared
+    /// when `/codingplan` persists a fresh config (re-sync resets the
+    /// hint state).
+    pub monitor_warning:
+        std::sync::Arc<std::sync::Mutex<Option<monitor::CodingPlanWarning>>>,
+    /// Last time a monitor check was fired this session. Pre-turn
+    /// triggers respect `monitor::CHECK_COOLDOWN` (15 min) against this
+    /// timestamp; startup + `/model` switch bypass the cooldown.
+    /// `None` = no check has run yet this session.
+    pub monitor_last_check_at: Option<std::time::Instant>,
+    /// Wake signal from background tasks (version check + CodingPlan
+    /// drift monitor). One `()` sent when any task needs the event loop
+    /// to repaint so a freshly-computed hint/warning appears without
+    /// waiting for the user's next keystroke. Bounded at 1 — overlapping
+    /// wakes coalesce since the redraw is idempotent.
     pub wake_rx: mpsc::Receiver<()>,
+    /// Sender side of `wake_rx`. Cloned into every spawned check task
+    /// so `/model` switches, pre-turn triggers, and the like can wake
+    /// the event loop after updating `monitor_warning`.
+    pub wake_tx: mpsc::Sender<()>,
     /// Control handle for the crossterm reader thread — `Some` in raw-mode
     /// TTY sessions, `None` in pipe mode. Used by child-process handoffs
     /// (OAuth login, future `/shell`) to pause+resume event consumption
@@ -87,6 +106,16 @@ pub struct LoopCtx {
     /// branch POSTs the issue to AtomGit and echoes the URL of the
     /// newly-created issue back into the conversation.
     pub pending_new_issue: Option<NewIssueDraft>,
+    /// Set by `WelcomeWizard` when the user picks option 0 (Login with
+    /// AtomGit). The event loop drains this on modal close and runs the
+    /// OAuth flow — which needs raw-mode suspend/resume, something modals
+    /// can't drive themselves. Same pattern as `pending_new_issue`.
+    pub pending_run_login: bool,
+    /// Set by `WelcomeWizard` when the user picks option 1 (Configure
+    /// manually). The event loop drains this on modal close and swaps in
+    /// `ProviderWizard::MainMenu` — a Modal-to-Modal transition that
+    /// needs mutable `active_modal` access only the event loop has.
+    pub pending_open_provider_wizard: bool,
 }
 
 /// What the `/issue` wizard hands back to the event loop after the user
@@ -698,13 +727,46 @@ pub async fn run_loop(
             prev, current
         )));
     }
-    renderer.render(UiLine::InputPrompt {
-        buf: String::new(),
-        cursor_byte: 0,
-        menu: None,
-        status: build_status(&app.state, &ctx),
-    });
-    renderer.flush();
+    // Same env-var handoff from `atomcode codingplan` (see CLI `run()`):
+    // the subcommand stashes its rendered SetupReport here instead of
+    // printing to stdout, so the user sees the ✔/✘ lines in the chat
+    // scrollback rather than scrolled off above the welcome banner.
+    if let Ok(report) = std::env::var("ATOMCODE_CODINGPLAN_REPORT") {
+        std::env::remove_var("ATOMCODE_CODINGPLAN_REPORT");
+        if !report.is_empty() {
+            renderer.render(UiLine::CommandOutput(report));
+        }
+    }
+
+    // First-run onboarding: no providers configured AND no OAuth login
+    // on disk means the user has never set this up. Show the legacy-tui
+    // 3-choice wizard (Login / Configure manually / Skip) as a modal —
+    // same mechanism as /resume, /provider, etc. Users with a config or
+    // prior OAuth auth are never shown this and boot straight to idle.
+    let is_first_run = ctx.config.providers.is_empty()
+        && atomcode_core::auth::get_stored_auth().is_none();
+    if is_first_run {
+        // Body-side guide — pushed to scrollback above the footer menu,
+        // gives the user context before they navigate the MenuPayload.
+        // Kept compact (5 lines) so on small terminals the menu still
+        // fits without scrolling the welcome banner off-screen.
+        renderer.render(UiLine::CommandOutput(
+            "\n  Welcome to AtomCode. Pick an option to get started:\n  \
+             (↑↓ to navigate, Enter to confirm, Esc to skip)\n\n".into(),
+        ));
+        app.active_modal = Some(Box::new(crate::modals::WelcomeWizard::new()));
+        if let Some(m) = app.active_modal.as_mut() {
+            m.draw(&app.buf, &app.state, &ctx, renderer);
+        }
+    } else {
+        renderer.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: build_status(&app.state, &ctx),
+        });
+        renderer.flush();
+    }
 
     // Spinner tick channel — a background task fires a tick every 100ms
     // into a bounded (cap 1) mpsc. The main loop recv's this in the
@@ -1099,6 +1161,26 @@ fn handle_input(
                             }
                             renderer.flush();
                         }
+                        // WelcomeWizard signals its follow-up via two bool
+                        // flags. Drain one, execute it here — OAuth login
+                        // needs suspend/resume of raw mode (only event-loop
+                        // scope can drive that safely), and opening
+                        // ProviderWizard is a Modal-to-Modal swap that
+                        // needs mutable `active_modal` access the modals
+                        // themselves don't have.
+                        if std::mem::take(&mut ctx.pending_run_login) {
+                            crate::event_loop::commands::run_login_flow(renderer, ctx)?;
+                        }
+                        if std::mem::take(&mut ctx.pending_open_provider_wizard) {
+                            let pw = crate::modals::ProviderWizard::MainMenu { selected: 0 };
+                            app.active_modal = Some(Box::new(pw));
+                            if let Some(m) = app.active_modal.as_mut() {
+                                m.draw(&app.buf, &app.state, ctx, renderer);
+                            }
+                            // ProviderWizard owns the next frame now; skip
+                            // the idle redraw below so we don't clobber it.
+                            return Ok(());
+                        }
                         redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
                     }
                     return Ok(());
@@ -1309,6 +1391,25 @@ let result = app.buf.apply(action, ctx.history.entries(), &ctx.commands);
                 ctx.history.push(line.clone());
                 ctx.agent.cmd_tx.send(AgentCommand::SendMessage(expanded)).ok();
                 app.state.on_submit();
+                // CodingPlan drift check — fire before every turn sent
+                // to a CodingPlan-managed provider, gated by a 15-min
+                // cooldown so rapid-fire messages don't spam the API.
+                // Non-CodingPlan users skip entirely (zero network).
+                if monitor::is_codingplan_provider(&ctx.config.default_provider) {
+                    let cooled = ctx
+                        .monitor_last_check_at
+                        .map(|t| t.elapsed() >= monitor::CHECK_COOLDOWN)
+                        .unwrap_or(true);
+                    if cooled {
+                        ctx.monitor_last_check_at = Some(std::time::Instant::now());
+                        monitor::spawn_check(
+                            ctx.config.clone(),
+                            ctx.model_name.clone(),
+                            ctx.monitor_warning.clone(),
+                            ctx.wake_tx.clone(),
+                        );
+                    }
+                }
             }
         }
         BufferResult::Exit => {
@@ -1944,14 +2045,61 @@ fn persist_current_session(
 /// collapsed to `~`), and running token count from state.
 pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::StatusLine {
     let cwd = crate::platform::collapse_home(&ctx.working_dir.to_string_lossy());
-    let hint = ctx
-        .update_hint
+    // Priority:
+    //   1. No provider configured + not logged in — show "configure" nudge.
+    //      This wins over the upgrade hint because without a provider the
+    //      app literally cannot answer any message; the user needs to know
+    //      why before they're told to upgrade.
+    //   2. Upgrade-available hint (existing behavior).
+    //   3. None.
+    let no_provider = ctx.config.providers.is_empty()
+        && atomcode_core::auth::get_stored_auth().is_none();
+    // Priority: no-provider (Warning red) > CodingPlan drift monitor
+    // (ModelMissing = Warning, StaleList = Info) > upgrade banner (Info).
+    // Only one hint can render at a time (right-aligned on the status row).
+    let hint: Option<(String, crate::render::HintSeverity)> = if no_provider {
+        Some((
+            "no provider · /provider to configure".into(),
+            crate::render::HintSeverity::Warning,
+        ))
+    } else if let Some(warning) = ctx
+        .monitor_warning
         .lock()
         .ok()
         .and_then(|g| g.clone())
-        .map(|v| format!("↑ {} 使用/upgrade升级", v));
+    {
+        let severity = match &warning {
+            crate::event_loop::monitor::CodingPlanWarning::ModelMissing(_) => {
+                crate::render::HintSeverity::Warning
+            }
+            crate::event_loop::monitor::CodingPlanWarning::StaleList => {
+                crate::render::HintSeverity::Info
+            }
+        };
+        Some((warning.display_text(), severity))
+    } else {
+        ctx.update_hint
+            .lock()
+            .ok()
+            .and_then(|g| g.clone())
+            .map(|v| {
+                (
+                    format!("↑ {} 使用/upgrade升级", v),
+                    crate::render::HintSeverity::Info,
+                )
+            })
+    };
+    // Pre-configure, `ctx.model_name` is a dummy from the startup fallback
+    // (empty string or "not-configured") — showing that raw in the status
+    // line reads as a glitch. Replace with an explicit placeholder so the
+    // user sees the state, not a rendering artifact.
+    let model = if no_provider {
+        "(not configured)".to_string()
+    } else {
+        ctx.model_name.clone()
+    };
     crate::render::StatusLine {
-        model: ctx.model_name.clone(),
+        model,
         cwd,
         total_tokens: state.total_tokens,
         hint,

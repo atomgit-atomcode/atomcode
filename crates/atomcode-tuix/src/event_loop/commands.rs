@@ -17,8 +17,6 @@ use std::path::PathBuf;
 use anyhow::Result;
 use atomcode_core::agent::AgentCommand;
 use atomcode_core::config::Config;
-use atomcode_core::config::provider::ProviderConfig;
-
 use super::{save_and_reload, LoopCtx};
 use crate::modals::{DirPicker, IssueWizard, Modal, ModelPicker, ProviderWizard, SessionPicker};
 use crate::render::{Renderer, UiLine};
@@ -27,8 +25,10 @@ use crate::state::UiState;
 /// Maximum recent project dirs we keep in memory + persist to disk.
 const MAX_RECENT_DIRS: usize = 5;
 
-/// Provider name used for the AtomGit OAuth provider entry in config.
-const OAUTH_PROVIDER_NAME: &str = "AtomGit";
+// Historical note: there was a `const OAUTH_PROVIDER_NAME = "AtomGit"`
+// and a `build_oauth_provider` helper here. Both are owned by
+// `coding_plan::setup` now — `/login` is identity-only, provider
+// registration is the job of `/codingplan`.
 
 pub(super) fn execute_slash_command(
     cmd: &str,
@@ -197,13 +197,14 @@ pub(super) fn execute_slash_command(
             renderer.flush();
         }
         "status" => {
-            let txt = format!(
+            let mut txt = format!(
                 "  Model:  {}\n  Dir:    {}\n  Config: {}\n  Tokens: {}\n",
                 ctx.model_name,
                 ctx.working_dir.display(),
                 Config::default_path().display(),
                 state.total_tokens,
             );
+            txt.push_str(&render_codingplan_status_for_status_cmd());
             renderer.render(UiLine::CommandOutput(txt));
             renderer.flush();
         }
@@ -263,6 +264,9 @@ pub(super) fn execute_slash_command(
         }
         "login" => {
             run_login_flow(renderer, ctx)?;
+        }
+        "codingplan" => {
+            run_codingplan_flow(renderer, ctx)?;
         }
         "logout" => {
             match atomcode_core::auth::logout() {
@@ -451,6 +455,57 @@ pub(super) fn execute_slash_command(
 /// asserted on directly.
 fn render_context_report(state: &UiState, ctx: &LoopCtx, show_prompt: bool) -> String {
     format_context_report(state.last_context.as_ref(), &ctx.model_name, show_prompt)
+}
+
+/// Fetch + format the CodingPlan section appended to `/status`. Runs a
+/// blocking HTTP call (~100–500ms) against `/coding-plan/status` — same
+/// endpoint as the `/codingplan` flow's step 4. Falls back to a one-line
+/// hint when the user isn't signed in, has no active plan, or the API
+/// call fails. Never panics and never returns an error: `/status` is a
+/// quick-glance command, so any fetch problem degrades into a visible
+/// note instead of aborting the whole command.
+fn render_codingplan_status_for_status_cmd() -> String {
+    use atomcode_core::coding_plan::client::Client;
+
+    let client = match Client::from_stored_auth() {
+        Ok(c) => c,
+        Err(_) => {
+            return "  CodingPlan: (not signed in — run /codingplan to set up)\n".into();
+        }
+    };
+    let status = match client.status() {
+        Ok(s) => s,
+        Err(e) => {
+            return format!("  CodingPlan: (status fetch failed — {:#})\n", e);
+        }
+    };
+    let plan = match &status.codingplan_free {
+        Some(p) => p,
+        None => {
+            return "  CodingPlan: (no active plan — run /codingplan)\n".into();
+        }
+    };
+
+    let mut out = format!(
+        "  CodingPlan: {}  ·  expires {} ({}d/{}d)\n",
+        plan.plan_name, plan.expires_at, plan.remaining_days, plan.total_days,
+    );
+    if let Some(u) = &status.current_usage {
+        out.push_str(&format!(
+            "  Usage: {}  ·  resets {} (in {}s)\n",
+            u.display_desc(),
+            u.reset_at_display,
+            u.seconds_until_reset,
+        ));
+    }
+    if status.window_quota_exhausted {
+        if let Some(hint) = &status.window_quota_hint {
+            out.push_str(&format!("  ⚠ {}\n", hint));
+        } else {
+            out.push_str("  ⚠ Current window quota exhausted\n");
+        }
+    }
+    out
 }
 
 /// Pure-function core of `/context` — testable without constructing
@@ -712,28 +767,12 @@ fn resolve_cd(
     Ok(canon)
 }
 
-/// Build the AtomGit OAuth ProviderConfig. api_key is intentionally None —
-/// it's loaded from auth.toml at runtime by `create_provider()`.
-fn build_oauth_provider() -> ProviderConfig {
-    ProviderConfig {
-        provider_type: "openai".to_string(),
-        api_key: None,
-        model: "MiniMax-M2.7".to_string(),
-        base_url: Some("https://api-ai.gitcode.com/v1".to_string()),
-        system_prompt: None,
-        user_agent: None,
-        context_window: 64000,
-        max_tokens: None,
-        ephemeral: false,
-    }
-}
-
 /// Drop out of raw mode, run the (blocking) OAuth login flow so the user
 /// can interact with the browser callback in a normal terminal, then
 /// re-enter raw mode and redraw the welcome screen. OAuth uses stdout
 /// prints + opens a browser — mixing that with our footer-managing
 /// raw-mode renderer would collide on stdin/stdout, so we suspend.
-fn run_login_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx) -> Result<()> {
+pub(crate) fn run_login_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx) -> Result<()> {
     // Pause the reader thread BEFORE disabling raw mode so it stops
     // calling `event::poll` / `event::read`. Without this, the reader
     // would keep consuming bytes from stdin in cooked mode (keystrokes
@@ -772,19 +811,11 @@ fn run_login_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx) -> Result<()> 
 
     match result {
         Ok(auth) => {
-            // Register the AtomGit OAuth provider and switch to it so the
-            // freshly logged-in token is actually used. Without this the
-            // status bar / next turn would keep using whatever provider was
-            // active before login.
-            let provider = build_oauth_provider();
-            let model = provider.model.clone();
-            ctx.config
-                .providers
-                .insert(OAUTH_PROVIDER_NAME.to_string(), provider);
-            ctx.config.default_provider = OAUTH_PROVIDER_NAME.to_string();
-            ctx.model_name = model.clone();
-            save_and_reload(ctx, renderer);
-
+            // /login is identity-only. Provider / model setup lives in
+            // /codingplan — that flow pulls the authoritative model list
+            // from the CodingPlan API and writes matching providers.
+            // Conflating the two paths was the source of a stale
+            // MiniMax-M2.7 entry being hardcoded here.
             let name = auth
                 .user
                 .name
@@ -792,13 +823,77 @@ fn run_login_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx) -> Result<()> 
                 .unwrap_or(&auth.user.username)
                 .to_string();
             renderer.render(UiLine::CommandOutput(format!(
-                "  Signed in as {} ({}). Model switched to {}.\n",
-                name, auth.user.username, model
+                "  Signed in as {} ({}). Run /codingplan to set up model access.\n",
+                name, auth.user.username
             )));
             renderer.flush();
         }
         Err(e) => {
             renderer.render(UiLine::Error(format!("login failed: {}", e)));
+            renderer.flush();
+        }
+    }
+    Ok(())
+}
+
+/// Run the full CodingPlan setup flow: login (if needed) → claim →
+/// fetch models + register providers → fetch status. Shares the
+/// orchestrator with `atomcode codingplan` (CLI). Suspends raw mode so
+/// the OAuth browser callback and any stdout from `auth::login()` don't
+/// collide with the footer-managing renderer.
+pub(crate) fn run_codingplan_flow(
+    renderer: &mut dyn Renderer,
+    ctx: &mut LoopCtx,
+) -> Result<()> {
+    // Same pause / suspend / resume / unpause choreography as /login —
+    // the orchestrator may call `auth::login()` which prints to stdout
+    // and spawns a browser; that needs cooked stdout + no reader racing
+    // for stdin. We suspend unconditionally here (even when already
+    // logged in) because the tiny cost of the raw-mode cycle is
+    // invisible to the user next to the HTTP round-trips that follow.
+    if let Some(reader) = ctx.reader.as_ref() {
+        let _ = reader.pause_blocking();
+    }
+    renderer.suspend_for_external();
+
+    let report = atomcode_core::coding_plan::run(&mut ctx.config);
+
+    renderer.resume_from_external();
+    if let Some(reader) = ctx.reader.as_ref() {
+        reader.resume();
+    }
+
+    match report {
+        Ok(report) => {
+            if report.should_persist_config() {
+                // Config mutation only persists when critical steps passed —
+                // don't write a half-set-up config if login or models failed.
+                save_and_reload(ctx, renderer);
+                // Stamp the drift-monitor sync marker alongside the config
+                // write. Failures are non-fatal: at worst the 24h staleness
+                // hint mis-fires once.
+                let _ = atomcode_core::coding_plan::write_last_sync_now();
+                // Sync ctx.model_name with the freshly-picked default so the
+                // status line and the next turn use the right model without
+                // requiring a /reload.
+                if let Some(p) = ctx.config.providers.get(&ctx.config.default_provider) {
+                    ctx.model_name = p.model.clone();
+                }
+                // Clear any stale drift warning now that we've just
+                // re-synced. Also reset the cooldown so the next
+                // pre-turn trigger (if conditions change) can fire
+                // immediately — no need to wait 15 min after a manual
+                // refresh.
+                if let Ok(mut g) = ctx.monitor_warning.lock() {
+                    *g = None;
+                }
+                ctx.monitor_last_check_at = None;
+            }
+            renderer.render(UiLine::CommandOutput(report.render()));
+            renderer.flush();
+        }
+        Err(e) => {
+            renderer.render(UiLine::Error(format!("codingplan setup failed: {:#}", e)));
             renderer.flush();
         }
     }
@@ -1057,15 +1152,4 @@ mod tests {
             "empty cached prompt must show an explanation, got: {}", out);
     }
 
-    #[test]
-    fn build_oauth_provider_has_expected_defaults() {
-        // Guardrail against accidental edits to the OAuth-provider
-        // seed values (api_key must be None; base_url must point to
-        // the AtomGit gateway).
-        let p = build_oauth_provider();
-        assert_eq!(p.provider_type, "openai");
-        assert!(p.api_key.is_none(), "api_key must be None — loaded from auth.toml");
-        assert_eq!(p.base_url.as_deref(), Some("https://api-ai.gitcode.com/v1"));
-        assert!(p.context_window > 0);
-    }
 }

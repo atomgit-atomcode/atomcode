@@ -149,6 +149,7 @@ dependencies = [
  "encoding_rs",
  "futures",
  "ignore",
+ "libc",
  "regex",
  "reqwest",
  "serde",

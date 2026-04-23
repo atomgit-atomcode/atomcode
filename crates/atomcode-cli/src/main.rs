@@ -410,6 +410,10 @@ enum Commands {
         /// Full issue URL, e.g. https://atomgit.com/owner/repo/issues/42
         url: String,
     },
+    /// Claim CodingPlan and set up provider/model config from its model list.
+    /// Runs: login (if not already) → claim → fetch models → write providers
+    /// → fetch status. Reports each step and exits.
+    Codingplan,
 }
 
 /// Environment variable set by this process for its re-exec'd child, so
@@ -554,6 +558,22 @@ async fn run() -> Result<i32> {
                 let auth = auth::login()?;
                 auth::save_auth(&auth)?;
                 println!("  Login successful! Starting AtomCode...\n");
+                HEADLESS_MODE.store(false, Ordering::Relaxed);
+                // Fall through to TUI startup below
+            }
+            Commands::Codingplan => {
+                // Mirror /login: run the setup flow headless (so any
+                // auth::login() browser prompt lands cleanly), then
+                // fall through to TUI startup so the user lands in
+                // the chat with their fresh providers already
+                // configured. The rendered report is stashed into
+                // ATOMCODE_CODINGPLAN_REPORT so the TUI can surface
+                // it as a body line on startup — same pattern as
+                // ATOMCODE_UPGRADED_FROM for post-upgrade notices.
+                HEADLESS_MODE.store(true, Ordering::Relaxed);
+                let report = run_codingplan_core()?;
+                std::env::set_var("ATOMCODE_CODINGPLAN_REPORT", report);
+                println!("  Starting AtomCode...\n");
                 HEADLESS_MODE.store(false, Ordering::Relaxed);
                 // Fall through to TUI startup below
             }
@@ -1020,6 +1040,14 @@ async fn handle_command(cmd: Commands) -> Result<()> {
         Commands::Fixissue { .. } => {
             unreachable!("Fixissue is handled inline in run() before handle_command")
         }
+        Commands::Codingplan => {
+            // Kept as a handle_command arm for completeness, but `run()`
+            // now intercepts Codingplan before reaching here so the flow
+            // falls through to TUI startup. This branch is effectively
+            // dead unless a future caller dispatches Codingplan directly
+            // via handle_command (e.g. a test).
+            run_codingplan_cli()
+        }
     }
 }
 
@@ -1111,6 +1139,58 @@ fn run_rollback_cli() -> Result<()> {
         summary.backup.display()
     );
     println!("  Run `atomcode` to start the rolled-back version.");
+    Ok(())
+}
+
+/// Core CodingPlan flow shared by CLI-exit and CLI→TUI paths. Loads
+/// the config (or starts from defaults if missing), runs the shared
+/// `coding_plan::setup` orchestrator, persists the config on success,
+/// and returns the rendered human-readable report — the caller decides
+/// whether to print it to stdout or stash it for the TUI to surface.
+fn run_codingplan_core() -> Result<String> {
+    let path = Config::default_path();
+    // Missing config is legitimate on first install — start from defaults
+    // so the flow can still add AtomGit providers to a fresh config.toml.
+    let mut config = match Config::load(&path) {
+        Ok(c) => c,
+        Err(_) => Config {
+            default_provider: String::new(),
+            default_workdir: None,
+            providers: std::collections::HashMap::new(),
+            datalog: Default::default(),
+            auto_update: true,
+            reflection_cadence: 7,
+        },
+    };
+
+    let report = atomcode_core::coding_plan::run(&mut config)?;
+
+    if report.should_persist_config() {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Err(e) = config.save(&path) {
+            eprintln!("  ⚠ Failed to save config to {}: {:#}", path.display(), e);
+        }
+        // Stamp the sync marker alongside the config write. The drift
+        // monitor on the TUI side reads this to decide whether to warn
+        // about stale provider lists (> 24h + server drift). A failed
+        // marker write is non-fatal — the config already landed; only
+        // the 24h hint would be miscounted, which self-corrects on the
+        // next successful run.
+        if let Err(e) = atomcode_core::coding_plan::write_last_sync_now() {
+            eprintln!("  ⚠ Failed to write codingplan sync marker: {:#}", e);
+        }
+    }
+
+    Ok(report.render())
+}
+
+/// `atomcode codingplan` entry point for the CLI-exit path — runs the
+/// core flow and prints the report to stdout.
+fn run_codingplan_cli() -> Result<()> {
+    let report = run_codingplan_core()?;
+    print!("{}", report);
     Ok(())
 }
 

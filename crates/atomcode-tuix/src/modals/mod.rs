@@ -24,11 +24,13 @@ pub mod issue_wizard;
 pub mod model_picker;
 pub mod provider_wizard;
 pub mod session_picker;
+pub mod welcome_wizard;
 pub use dir_picker::DirPicker;
 pub use issue_wizard::IssueWizard;
 pub use model_picker::ModelPicker;
 pub use provider_wizard::ProviderWizard;
 pub use session_picker::SessionPicker;
+pub use welcome_wizard::WelcomeWizard;
 
 /// Result of a modal consuming one key event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -18,7 +18,10 @@
 
 use std::io::{BufWriter, Stdout, Write};
 
-use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
+use crossterm::event::{
+    DisableBracketedPaste, EnableBracketedPaste, KeyboardEnhancementFlags,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+};
 use crossterm::execute;
 
 use super::cell::{push_str_cells, serialize_row, Cell, CellStyle};
@@ -171,7 +174,6 @@ pub struct RetainedRenderer<W: Write + Send> {
     // ── widget state ──
     input_buf: String,
     input_cursor_byte: usize,
-    spinner: Option<(String, String)>,
     menu: Option<MenuPayload>,
     status: StatusLine,
     // ── body history ──
@@ -230,6 +232,14 @@ pub struct RetainedRenderer<W: Write + Send> {
     /// Number of rows occupied by the welcome banner prefix in
     /// `body_lines`.
     welcome_line_count: usize,
+    /// True when `body_lines.last()` is a LIVE spinner row (the
+    /// emoji/label pair emitted by `UiLine::Spinner` /
+    /// `UiLine::StreamingBox`). A live row gets in-place re-emitted
+    /// on each subsequent spinner tick so body_lines doesn't grow
+    /// one entry per frame. Any non-spinner body push finalises
+    /// the row (flag flips to false) so the last animation frame
+    /// stays frozen as a historical paragraph header.
+    live_spinner_active: bool,
 }
 
 impl RetainedRenderer<BufWriter<Stdout>> {
@@ -247,7 +257,6 @@ impl<W: Write + Send> RetainedRenderer<W> {
             screen: Screen::new(w, h),
             input_buf: String::new(),
             input_cursor_byte: 0,
-            spinner: None,
             menu: None,
             status: StatusLine::default(),
             body_lines: Vec::new(),
@@ -259,6 +268,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             skip_next_body_scroll: false,
             welcome_banner: None,
             welcome_line_count: 0,
+            live_spinner_active: false,
         }
     }
 
@@ -289,17 +299,18 @@ impl<W: Write + Send> RetainedRenderer<W> {
         }
     }
 
-    fn build_spinner_row(&self) -> Vec<Cell> {
+    /// Build the cells for a spinner body row: `<frame> <label>`,
+    /// flush-left at col 0 (no PAD_COL indent) so the frame glyph
+    /// aligns with `❯` user echoes and `▸` tool calls in the same
+    /// column. Used by the live spinner path to paint / re-paint
+    /// the "in-progress" row each tick.
+    fn build_spinner_body_row(&self, frame: &str, label: &str) -> Vec<Cell> {
         let mut row = Vec::new();
-        let pad = CellStyle::default();
-        push_str_cells(&mut row, &" ".repeat(PAD_COL), &pad);
-        if let Some((frame, label)) = self.spinner.as_ref() {
-            let brand = self.style_for(Role::Brand);
-            push_str_cells(&mut row, frame, &brand);
-            push_str_cells(&mut row, " ", &pad);
-            let label_style = self.style_bold(Role::Secondary);
-            push_str_cells(&mut row, &scrub_controls(label), &label_style);
-        }
+        let frame_style = self.style_for(Role::Brand);
+        push_str_cells(&mut row, frame, &frame_style);
+        push_str_cells(&mut row, " ", &CellStyle::default());
+        let label_style = self.style_bold(Role::Secondary);
+        push_str_cells(&mut row, &scrub_controls(label), &label_style);
         row
     }
 
@@ -416,9 +427,13 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let left = parts.join(" · ");
         let max = rule_width.max(1);
 
-        if let Some(raw_hint) = status.hint.as_deref() {
+        if let Some((raw_hint, severity)) = status.hint.as_ref() {
             let hint = scrub_controls(raw_hint);
             let hint_w = crate::width::display_width(&hint);
+            let hint_style = match severity {
+                crate::render::HintSeverity::Warning => error,
+                crate::render::HintSeverity::Info => muted.clone(),
+            };
             if hint_w + 1 < max {
                 let left_budget = max - hint_w - 1;
                 let left_truncated = crate::width::truncate_to_width(&left, left_budget);
@@ -426,7 +441,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 let pad_w = max - left_w - hint_w;
                 push_str_cells(&mut row, &left_truncated, &muted);
                 push_str_cells(&mut row, &" ".repeat(pad_w), &pad);
-                push_str_cells(&mut row, &hint, &error);
+                push_str_cells(&mut row, &hint, &hint_style);
             } else {
                 let truncated = crate::width::truncate_to_width(&left, max);
                 push_str_cells(&mut row, &truncated, &muted);
@@ -507,22 +522,18 @@ impl<W: Write + Send> RetainedRenderer<W> {
             (Vec::new(), None)
         };
 
-        // Spinner only when menu not open (same rule as AnsiRenderer).
-        let show_spinner = self.spinner.is_some() && self.menu.is_none();
+        // Spinner moved to body as a live paragraph row — footer no
+        // longer reserves a spinner slot. Footer layout:
+        //   top_rule / middle... / bot_rule / menu... / status
         let menu_rows = menu_items.len().min(4);
         let has_status = !self.status.model.is_empty()
             || !self.status.cwd.is_empty()
             || self.status.hint.is_some();
         let status_rows = if has_status { 1 } else { 0 };
-        let total_rows = 1 + 1 + middle_rows + 1 + menu_rows + status_rows;
+        let total_rows = 1 + middle_rows + 1 + menu_rows + status_rows;
         let footer_top = h.saturating_sub(total_rows);
 
         // Pre-build every row vector (immutable borrows of self).
-        let spin_row = if show_spinner {
-            Some(self.build_spinner_row())
-        } else {
-            None
-        };
         let top_rule = self.build_rule_row(input_rule_width);
         let middle_cells: Vec<Vec<Cell>> = lines
             .iter()
@@ -548,24 +559,18 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // Mutate screen (now &mut self). Every footer row is padded to
         // screen width before emit so blank cells overwrite any stale
         // body content still showing from earlier frames (see
-        // `pad_row_to_width` for full rationale). When the spinner slot
-        // is empty (turn idle), we still emit a blank row there so the
-        // spinner position from the previous turn is actively cleared.
-        let mut sr = spin_row.unwrap_or_default();
-        Self::pad_row_to_width(&mut sr, w);
-        self.screen.draw_row(footer_top, 0, &sr);
-
+        // `pad_row_to_width` for full rationale).
         let mut top_rule = top_rule;
         Self::pad_row_to_width(&mut top_rule, w);
-        self.screen.draw_row(footer_top + 1, 0, &top_rule);
+        self.screen.draw_row(footer_top, 0, &top_rule);
 
         for (i, r) in middle_cells.into_iter().enumerate() {
             let mut padded = r;
             Self::pad_row_to_width(&mut padded, w);
-            self.screen.draw_row(footer_top + 2 + i, 0, &padded);
+            self.screen.draw_row(footer_top + 1 + i, 0, &padded);
         }
 
-        let bot_rule_row = footer_top + 2 + middle_rows;
+        let bot_rule_row = footer_top + 1 + middle_rows;
         let mut bot_rule = bot_rule;
         Self::pad_row_to_width(&mut bot_rule, w);
         self.screen.draw_row(bot_rule_row, 0, &bot_rule);
@@ -585,7 +590,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // Cursor park — 1-indexed, inside middle row at the input cell.
         // Input row is flush-left (no PAD_COL); "> " prefix is 2 cols.
         // Symbol-bearing body rows share this col-0 baseline.
-        let cursor_abs_row = (footer_top + 2 + cursor_row_in_middle + 1) as u16;
+        // Middle row lives at `footer_top + 1 + cursor_row_in_middle`
+        // (0-indexed); +1 more to convert to the 1-indexed form the
+        // cursor-set helper expects.
+        let cursor_abs_row = (footer_top + 1 + cursor_row_in_middle + 1) as u16;
         let cursor_abs_col = (2 + cursor_col_in_row + 1) as u16;
         self.screen.set_cursor(cursor_abs_row, cursor_abs_col);
     }
@@ -613,8 +621,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
             || !self.status.cwd.is_empty()
             || self.status.hint.is_some();
         let status_rows = if has_status { 1 } else { 0 };
-        // 1 spinner + 1 top rule + middle + 1 bot rule + menu + status
-        1 + 1 + middle_rows + 1 + menu_rows + status_rows
+        // 1 top rule + middle + 1 bot rule + menu + status.
+        // (Spinner used to reserve a row here but now lives in body as
+        // a live paragraph — see `push_or_update_live_spinner`.)
+        1 + middle_rows + 1 + menu_rows + status_rows
     }
 
     /// Single-entry-point for painting a full frame. Body is already
@@ -842,11 +852,53 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let _ = self.out.write_all(&bytes);
     }
 
+    /// Erase the live spinner if one is active: pop the transient
+    /// last row from `body_lines`, wipe its cells from the terminal
+    /// at `body_bottom`, and clear the active flag. Returns true iff
+    /// a clear actually happened, so callers (e.g. `push_body_row`)
+    /// can arrange for their replacement row to overwrite in-place
+    /// instead of scrolling.
+    ///
+    /// The spinner is treated as an in-progress indicator, not a
+    /// historical paragraph header: any transition away from it
+    /// (assistant text arriving, tool call pushing, user returning
+    /// to the input prompt) means the row's purpose is done and it
+    /// should disappear without residue — that matches what users
+    /// expected from the old footer-based spinner (cell diff
+    /// naturally cleared it on the next frame).
+    fn clear_live_spinner(&mut self) -> bool {
+        if !self.live_spinner_active {
+            return false;
+        }
+        self.live_spinner_active = false;
+        self.body_lines.pop();
+        self.ensure_scroll_region();
+        let bottom = self.body_bottom_row();
+        if bottom > 0 {
+            let seq = format!("\x1b[{};1H\x1b[K", bottom);
+            let _ = self.out.write_all(seq.as_bytes());
+        }
+        true
+    }
+
     /// Append a fully-cell-formatted body row to history AND emit it
     /// immediately so it enters terminal scrollback. Trims oldest
     /// `body_lines` when over the retention cap (memory-only — rows
     /// already pushed to scrollback live on in the terminal's buffer).
+    ///
+    /// If a live spinner row is currently sitting at `body_bottom`,
+    /// erase it first and overwrite in-place: the spinner is
+    /// transient, the new row takes its slot without scrolling other
+    /// history up by one.
     fn push_body_row(&mut self, row: Vec<Cell>) {
+        if self.clear_live_spinner() {
+            // In-place overwrite at `body_bottom` — `emit_body_line_inner`
+            // honours this flag to skip its LF and just CUP+EL+write at
+            // the current bottom row. That way the slot previously held
+            // by the spinner becomes the slot for this new body row,
+            // with no intervening blank line.
+            self.skip_next_body_scroll = true;
+        }
         // Region might be stale (first call after resume, or footer
         // just changed); sync before emit so the LF in emit_body_line
         // scrolls only within the body strip.
@@ -860,6 +912,35 @@ impl<W: Write + Send> RetainedRenderer<W> {
         if self.body_lines.len() > max_keep {
             let drain = self.body_lines.len() - max_keep;
             self.body_lines.drain(0..drain);
+        }
+    }
+
+    /// Push or update the live spinner body row. On the first call of a
+    /// run it pushes fresh via `push_body_row` and marks the row live.
+    /// On subsequent calls (every tick), it REPLACES `body_lines.last()`
+    /// and re-emits at absolute `body_bottom_row()` without the
+    /// `\n`-scroll — that way 80ms animation frames don't each push a
+    /// new row into scrollback and don't scroll the user's real history
+    /// off-screen.
+    fn push_or_update_live_spinner(&mut self, row_cells: Vec<Cell>) {
+        if self.live_spinner_active {
+            if let Some(last) = self.body_lines.last_mut() {
+                *last = row_cells.clone();
+            }
+            self.ensure_scroll_region();
+            let bottom = self.body_bottom_row();
+            if bottom > 0 {
+                let seq = format!("\x1b[{};1H\x1b[K", bottom);
+                let _ = self.out.write_all(seq.as_bytes());
+                let bytes = serialize_row(&row_cells);
+                let _ = self.out.write_all(&bytes);
+            }
+        } else {
+            // `push_body_row` clears `live_spinner_active`; set it back
+            // afterwards so the next tick takes the update-in-place
+            // branch above.
+            self.push_body_row(row_cells);
+            self.live_spinner_active = true;
         }
     }
 
@@ -1230,7 +1311,11 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 menu,
                 status,
             } => {
-                self.spinner = None;
+                // Returning to idle input: the spinner row served its
+                // purpose — clear it from both body history and the
+                // terminal so the user sees a clean input prompt, not
+                // a stale `⠋ Pondering…` row above the input box.
+                self.clear_live_spinner();
                 self.input_buf = buf;
                 self.input_cursor_byte = cursor_byte;
                 self.menu = menu;
@@ -1244,14 +1329,21 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 status,
                 menu,
             } => {
-                self.spinner = Some((frame.to_string(), label));
+                // Input box / status / menu still belong in the footer.
                 self.input_buf = buf;
                 self.input_cursor_byte = cursor_byte;
                 self.menu = menu;
                 self.status = status;
+                // Spinner (frame + label) goes into body as the live
+                // paragraph header — each tick replaces the same row
+                // via `push_or_update_live_spinner`, so animation
+                // doesn't push a new row every 80ms.
+                let cells = self.build_spinner_body_row(frame, &label);
+                self.push_or_update_live_spinner(cells);
             }
             UiLine::Spinner { frame, label } => {
-                self.spinner = Some((frame.to_string(), label));
+                let cells = self.build_spinner_body_row(frame, &label);
+                self.push_or_update_live_spinner(cells);
             }
             UiLine::ClearTransient | UiLine::InputCommit => {
                 // No-op in retained mode.
@@ -1572,6 +1664,17 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         let _ = self.out.write_all(b"\x1b[r\x1b[?7h\r\n");
         self.scroll_region_bottom = None;
         let _ = self.out.flush();
+        // Pop Kitty keyboard enhancement flags if they were pushed at
+        // startup. Without this, the child (OAuth browser output, a
+        // shell prompt) runs in a terminal whose key-reporting mode
+        // was modified by us — and on some terminals the non-standard
+        // CSI u sequences bleed through as unexpected bytes on stdin
+        // that the cooked-mode child process then echoes back as
+        // gibberish. `execute!` is best-effort — terminals that never
+        // accepted the push silently ignore the pop.
+        if self.caps.tty {
+            let _ = execute!(self.out, PopKeyboardEnhancementFlags);
+        }
         if self.caps.bracketed_paste {
             let _ = execute!(self.out, DisableBracketedPaste);
         }
@@ -1586,6 +1689,22 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         }
         if self.caps.bracketed_paste {
             let _ = execute!(self.out, EnableBracketedPaste);
+        }
+        // Re-push Kitty keyboard enhancement flags (mirror of the pop in
+        // suspend_for_external, and the initial push in TerminalGuard).
+        // Without this, post-OAuth the terminal is in a different
+        // key-reporting mode than we initialised with — autorepeat stops
+        // coming as `Repeat`, Shift+Enter stops carrying SHIFT, and any
+        // other logic that depended on CSI u event types silently
+        // degrades. Same flag set as `TerminalGuard::activate`.
+        if self.caps.tty {
+            let _ = execute!(
+                self.out,
+                PushKeyboardEnhancementFlags(
+                    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                        | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+                )
+            );
         }
         // Wipe terminal + invalidate Screen + reset region state so
         // the next widget draw is a cold-start full repaint and the
@@ -1627,6 +1746,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 self.emit_body_line_inner(row, bottom);
             }
         }
+        let _ = self.out.flush();
     }
 
     fn flush_deferred(&mut self) {
@@ -2929,12 +3049,14 @@ mod tests {
         );
     }
 
-    /// StreamingBox: spinner frame + label above the input rule.
-    /// During streaming the footer shows the active model status
-    /// with a cycling dot animation — verify the frame char lands
-    /// at col 2 (PAD_COL) of the spinner row.
+    /// StreamingBox / Spinner: the `frame + label` pair now lives in
+    /// the BODY (not the footer) as an animated "live" row at
+    /// body_bottom. The emoji/frame is flush-left at col 0 — same
+    /// gutter as `▸` tool calls and `❯` user echoes — because the
+    /// previous footer position (col 2, inside PAD_COL margin) left
+    /// it visually misaligned with surrounding body paragraphs.
     #[test]
-    fn retained_streaming_box_spinner_via_vterm() {
+    fn retained_spinner_renders_as_body_row_flush_left() {
         let (mut r, buf) = new_capturing(80, 24);
         let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
         let status = status_basic();
@@ -2948,13 +3070,282 @@ mod tests {
         });
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
-        // Footer 5 rows on h=24 → spinner row at 19 (footer_top).
-        // Layout: row 19 spinner, 20 top rule, 21 middle, 22 bot rule, 23 status.
-        let row = vterm.row_text(19);
+
+        // Spinner must appear on the LAST body row (just above the
+        // footer's top_rule), with the frame at col 0.
+        // Footer with 4 rows on h=24 → top_rule at row 20 (0-idx),
+        // so last body row = 0-idx row 19.
+        let spinner_row = vterm.row_text(19);
         assert!(
-            row.contains("⠋") && row.contains("Thinking"),
-            "spinner row missing: {:?}\ndump:\n{}",
-            row,
+            spinner_row.contains("⠋") && spinner_row.contains("Thinking"),
+            "spinner not found on last body row (got {:?}):\n{}",
+            spinner_row,
+            vterm.dump()
+        );
+        // Frame glyph at absolute col 0 — flush-left with body paragraphs.
+        assert_eq!(
+            vterm.cell_at(19, 0).ch,
+            '⠋',
+            "expected frame at col 0, found {:?}:\n{}",
+            vterm.cell_at(19, 0).ch,
+            vterm.dump()
+        );
+
+        // Footer no longer hosts the spinner — the row right above
+        // top_rule (which USED to be the spinner slot) must be empty
+        // of any spinner glyphs. With the new footer geometry
+        // (4 rows: top_rule / middle / bot_rule / status on h=24),
+        // row 20 is top_rule and the ex-spinner slot no longer exists.
+        let top_rule_row = vterm.row_text(20);
+        assert!(
+            !top_rule_row.contains("Thinking"),
+            "footer row still carries spinner label: {:?}:\n{}",
+            top_rule_row,
+            vterm.dump()
+        );
+    }
+
+    /// Consecutive Spinner ticks must UPDATE the same body row
+    /// in-place (animation), not push a new row each tick — otherwise
+    /// 100ms of animation at 80ms/frame would accumulate 1 row per
+    /// frame and scroll the user's actual history off-screen in
+    /// seconds.
+    #[test]
+    fn retained_consecutive_spinner_ticks_update_same_body_row() {
+        let (mut r, _buf) = new_capturing(80, 24);
+        let status = status_basic();
+        r.render(UiLine::StreamingBox {
+            buf: String::new(),
+            cursor_byte: 0,
+            frame: "⠋",
+            label: "Thinking".into(),
+            status: status.clone(),
+            menu: None,
+        });
+        let after_first = r.body_lines.len();
+        assert!(
+            after_first >= 1,
+            "spinner event must push at least 1 body row (got {})",
+            after_first
+        );
+
+        // 9 more spinner frames — the usual Braille cycle.
+        for frame in ["⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"] {
+            r.render(UiLine::StreamingBox {
+                buf: String::new(),
+                cursor_byte: 0,
+                frame,
+                label: "Thinking".into(),
+                status: status.clone(),
+                menu: None,
+            });
+        }
+        assert_eq!(
+            r.body_lines.len(),
+            after_first,
+            "spinner ticks grew body_lines from {} to {} — each tick \
+             must update the same row, not append",
+            after_first,
+            r.body_lines.len()
+        );
+    }
+
+    /// AssistantText arriving after a live spinner COVERS the
+    /// spinner row (it's a transient indicator, not a historical
+    /// paragraph header). Answer text appears exactly where
+    /// `⠋ Pondering…` was, no stacked ghost, no scrollback pollution.
+    #[test]
+    fn retained_assistant_text_covers_spinner_row() {
+        let (mut r, buf) = new_capturing(80, 24);
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+        let status = status_basic();
+        r.render(UiLine::StreamingBox {
+            buf: String::new(),
+            cursor_byte: 0,
+            frame: "⠋",
+            label: "Pondering".into(),
+            status: status.clone(),
+            menu: None,
+        });
+        r.render(UiLine::AssistantText("Hello world\n".into()));
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // Spinner must be GONE from the visible grid — assistant
+        // text has overwritten its row.
+        let has_spinner =
+            vterm.any_row(|row| row.contains("⠋") && row.contains("Pondering"));
+        let has_text = vterm.any_row(|row| row.contains("Hello world"));
+        assert!(
+            !has_spinner,
+            "spinner still visible after AssistantText — it must be \
+             covered, not frozen:\n{}",
+            vterm.dump()
+        );
+        assert!(has_text, "assistant text missing:\n{}", vterm.dump());
+
+        // And removed from history: body_lines should not carry a
+        // lingering spinner entry that would re-surface on
+        // ensure_scroll_region repaints or resize.
+        let spinner_in_history = r.body_lines.iter().any(|row| {
+            let text: String = row.iter().map(|c| c.ch).collect();
+            text.contains("Pondering")
+        });
+        assert!(
+            !spinner_in_history,
+            "spinner row still in body_lines — it must be popped when \
+             covered"
+        );
+    }
+
+    /// Realistic flow: user sends a message → spinner shows →
+    /// assistant text streams in. The assistant text must land on
+    /// EXACTLY the spinner's row (no empty row between spinner's
+    /// former slot and the new text). User-message blank spacer is
+    /// still there (it lives above the spinner's slot), but no
+    /// additional blank gets introduced by clear_live_spinner.
+    #[test]
+    fn retained_spinner_replacement_leaves_no_extra_blank() {
+        let (mut r, buf) = new_capturing(80, 24);
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+        let status = status_basic();
+
+        r.render(UiLine::User("hi-from-user".into()));
+        r.render(UiLine::StreamingBox {
+            buf: String::new(),
+            cursor_byte: 0,
+            frame: "⠋",
+            label: "Pondering".into(),
+            status: status.clone(),
+            menu: None,
+        });
+        r.render(UiLine::AssistantText("Hello world\n".into()));
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // Find the rows that carry our 3 markers.
+        let user_row = (0..24)
+            .find(|r| vterm.row_text(*r).contains("hi-from-user"))
+            .unwrap_or_else(|| panic!("user echo row missing:\n{}", vterm.dump()));
+        let hello_row = (0..24)
+            .find(|r| vterm.row_text(*r).contains("Hello world"))
+            .unwrap_or_else(|| panic!("assistant text row missing:\n{}", vterm.dump()));
+
+        // Expected layout (bottom-anchored):
+        //   <user_row>:     "> 你好啊"
+        //   <user_row + 1>: blank (UiLine::User's spacer)
+        //   <user_row + 2>: "Hello world"  ← replaced spinner in-place
+        //
+        // Critical invariant: exactly ONE blank row between them.
+        // No extra gap would mean 2 consecutive blanks.
+        assert_eq!(
+            hello_row - user_row,
+            2,
+            "expected 1 spacer row between user and assistant, got {} \
+             rows gap:\n{}",
+            hello_row.saturating_sub(user_row).saturating_sub(1),
+            vterm.dump()
+        );
+    }
+
+    /// Diagnostic: realistic flow — User → idle InputPrompt (sent
+    /// BEFORE the first spinner tick to mirror the on_submit
+    /// transition) → multiple spinner ticks → assertion on grid
+    /// layout. User reported TWO blanks between `> 你好` and
+    /// `● Pondering` — spec says there should be exactly ONE.
+    #[test]
+    fn retained_user_then_spinner_has_exactly_one_blank_between() {
+        let (mut r, buf) = new_capturing(80, 24);
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+        let status = status_basic();
+
+        r.render(UiLine::User("hi-from-user".into()));
+        // on_submit in the real app triggers a render pass before
+        // the first spinner tick lands — simulate that here.
+        r.flush_deferred();
+        r.render(UiLine::StreamingBox {
+            buf: String::new(),
+            cursor_byte: 0,
+            frame: "⠋",
+            label: "Pondering".into(),
+            status: status.clone(),
+            menu: None,
+        });
+        // Several animation ticks, then a final flush.
+        for frame in ["⠙", "⠹", "⠸", "⠼"] {
+            r.render(UiLine::StreamingBox {
+                buf: String::new(),
+                cursor_byte: 0,
+                frame,
+                label: "Pondering".into(),
+                status: status.clone(),
+                menu: None,
+            });
+        }
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        let user_row = (0..24)
+            .find(|r| vterm.row_text(*r).contains("hi-from-user"))
+            .unwrap_or_else(|| panic!("user echo missing:\n{}", vterm.dump()));
+        let spin_row = (0..24)
+            .find(|r| vterm.row_text(*r).contains("Pondering"))
+            .unwrap_or_else(|| panic!("spinner missing:\n{}", vterm.dump()));
+
+        assert_eq!(
+            spin_row - user_row,
+            2,
+            "expected exactly 1 blank row between user message and \
+             spinner, got {} blank row(s):\n{}",
+            spin_row.saturating_sub(user_row).saturating_sub(1),
+            vterm.dump()
+        );
+    }
+
+    /// If the turn ends with NO text output (just an empty input
+    /// prompt arrives after the spinner), the spinner must also
+    /// disappear. User's view: the in-progress indicator was
+    /// transient; once the render state moves on, no residue remains.
+    #[test]
+    fn retained_input_prompt_clears_live_spinner() {
+        let (mut r, buf) = new_capturing(80, 24);
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+        let status = status_basic();
+        r.render(UiLine::StreamingBox {
+            buf: String::new(),
+            cursor_byte: 0,
+            frame: "⠋",
+            label: "Pondering".into(),
+            status: status.clone(),
+            menu: None,
+        });
+        // Directly back to input with no assistant output between.
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        let has_spinner =
+            vterm.any_row(|row| row.contains("⠋") && row.contains("Pondering"));
+        assert!(
+            !has_spinner,
+            "spinner still visible after returning to input prompt:\n{}",
             vterm.dump()
         );
     }
@@ -3078,12 +3469,13 @@ mod tests {
         let h = r.screen.height() as usize;
         let footer_rows = r.current_footer_rows();
         let footer_top = h - footer_rows;
-        // Layout: spinner + top_rule + middle×N + bot_rule + status.
-        // With 2-row middle: bot_rule at footer_top + 2 + 2 = footer_top + 4
+        // Layout: top_rule + middle×N + bot_rule + status (spinner no
+        // longer reserves a footer row — lives in body now).
+        // With 2-row middle: bot_rule at footer_top + 1 + 2 = footer_top + 3
         // text_budget = w - 2 ("> " prefix) = 38 for w=40.
         let (lines, _, _) = crate::width::wrap_with_cursor(&long, 40 - 2, long.len());
         assert!(lines.len() >= 2, "test setup: expected wrap");
-        let bot_rule_row = footer_top + 2 + lines.len();
+        let bot_rule_row = footer_top + 1 + lines.len();
         let prev_cells = r.screen.prev_cells_for_test();
         let row_cells = &prev_cells[bot_rule_row];
 
@@ -3141,8 +3533,9 @@ mod tests {
         // body area overlaps the multi-row middle.
         assert_eq!(
             r.current_footer_rows(),
-            // 1 spinner + 1 top rule + lines.len() + 1 bot rule + 0 menu + status(1)
-            1 + 1 + lines.len() + 1 + 1,
+            // 1 top rule + lines.len() + 1 bot rule + 0 menu + status(1)
+            // (spinner moved to body — no longer reserves a footer row)
+            1 + lines.len() + 1 + 1,
             "footer_rows must account for wrapped middle row count"
         );
     }
@@ -3453,8 +3846,9 @@ mod tests {
         let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
         let status = status_basic();
 
-        // Initial welcome (no menu). Welcome 6 rows bottom-anchored
-        // above a 5-row footer → rows 13..=18.
+        // Initial welcome (no menu). Footer = 4 rows (top_rule /
+        // middle / bot_rule / status). Welcome 6 rows bottom-anchored
+        // at rows 14..=19 (0-idx).
         r.render(UiLine::Welcome {
             model: "glm-5".into(),
             working_dir: "~/project/atomcode".into(),
@@ -3468,8 +3862,8 @@ mod tests {
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
 
-        // Open menu ("/" pressed). Footer grows by 4 rows (menu) so
-        // welcome now paints at rows 9..=14.
+        // Open menu ("/" pressed). Footer grows by 4 rows (menu) →
+        // 8 rows. Welcome paints at 0-idx rows 10..=15.
         let items: Vec<(String, String)> = vec![
             ("model".into(), "Switch model".into()),
             ("provider".into(), "Add provider".into()),
@@ -3488,13 +3882,9 @@ mod tests {
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
 
-        // With the scrollback-push body model the menu-open state
-        // doesn't reflow old body rows upward — footer grows and
-        // simply occludes bottom body rows. Skip the mid-state
-        // assertion; the post-close check below is what matters.
-
-        // Close menu (Esc). Footer shrinks back to 5 rows, welcome
-        // re-paints via `ensure_scroll_region`'s grew branch.
+        // Close menu (Esc). Footer shrinks back to 4, welcome
+        // re-paints via `ensure_scroll_region`'s grew branch →
+        // back to 0-idx rows 14..=19.
         r.render(UiLine::InputPrompt {
             buf: String::new(),
             cursor_byte: 0,
@@ -3504,24 +3894,23 @@ mod tests {
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
 
-        // Welcome brand must now live at row 13 AND must no longer
-        // appear at row 9 — that row went back into the blank
-        // above-body region. If row 9 still shows "AtomCode" the
-        // diff failed to erase the pre-close paint.
+        // Welcome brand at row 14 post-close. Row 10 (where brand
+        // lived mid-menu) must be blank now — the zombie-zone erase
+        // must have cleaned it.
         assert!(
-            vterm.row_text(13).contains("AtomCode"),
-            "menu-close: welcome brand missing at row 13:\n{}",
+            vterm.row_text(14).contains("AtomCode"),
+            "menu-close: welcome brand missing at row 14:\n{}",
             vterm.dump()
         );
         assert!(
-            !vterm.row_text(9).contains("AtomCode"),
-            "menu-close: row 9 still shows ghost welcome brand:\n{}",
+            !vterm.row_text(10).contains("AtomCode"),
+            "menu-close: row 10 still shows ghost welcome brand:\n{}",
             vterm.dump()
         );
-        // Same for cwd row (was row 10, moves to row 14).
+        // Same for cwd row (was 0-idx row 11 mid-menu, moves to 15).
         assert!(
-            !vterm.row_text(10).contains("project"),
-            "menu-close: row 10 still shows ghost cwd:\n{}",
+            !vterm.row_text(11).contains("project"),
+            "menu-close: row 11 still shows ghost cwd:\n{}",
             vterm.dump()
         );
     }
