@@ -19,7 +19,8 @@ impl AgentLoop {
         // Parse lsof output. Each line looks like:
         // node    80162 yubangxu   23u  IPv4 0x... TCP 127.0.0.1:3004 (LISTEN)
         // java    79842 yubangxu   45u  IPv6 0x... TCP *:8080 (LISTEN)
-        for line in stdout.lines().skip(1) { // skip header
+        for line in stdout.lines().skip(1) {
+            // skip header
             let parts: Vec<&str> = line.split_whitespace().collect();
             if parts.len() < 9 {
                 continue;
@@ -27,11 +28,15 @@ impl AgentLoop {
             let process = parts[0].to_lowercase();
             // Find the TCP address:port part
             // Match any TCP address:port — localhost, 127.0.0.1, [::1], *:
-            let addr_part = parts.iter()
-                .find(|p| p.contains(':') && (
-                    p.contains("localhost") || p.contains("127.0.0.1")
-                    || p.contains("[::1]") || p.starts_with("*:")
-                ))
+            let addr_part = parts
+                .iter()
+                .find(|p| {
+                    p.contains(':')
+                        && (p.contains("localhost")
+                            || p.contains("127.0.0.1")
+                            || p.contains("[::1]")
+                            || p.starts_with("*:"))
+                })
                 .copied()
                 .unwrap_or("");
 
@@ -56,7 +61,8 @@ impl AgentLoop {
                 .unwrap_or_else(|| std::path::PathBuf::from(path))
         } else {
             let wd: PathBuf = self
-                .turn_runner.context
+                .turn_runner
+                .context
                 .working_dir
                 .try_read()
                 .map(|g| g.clone())
@@ -75,6 +81,10 @@ impl AgentLoop {
             self.conversation.messages.clear();
             self.conversation.turn_tracker = crate::conversation::turn::TurnTracker::new();
             self.session_files.clear();
+            // Refresh env snapshot for the new directory. The old git
+            // branch / status belongs to the previous repo; keeping it
+            // would lie to the model.
+            self.env_snapshot = crate::ctx::EnvSnapshot::capture(&resolved);
             // Reload skills for the new working directory (project-level skills may differ)
             if let Ok(mut reg) = self.skill_registry.write() {
                 reg.reload(&resolved);
@@ -87,19 +97,42 @@ impl AgentLoop {
                 let mut g = self.turn_runner.context.graph.write().await;
                 *g = new_graph;
             }
-            // Spawn new indexer for the new project
-            let graph_clone = self.turn_runner.context.graph.clone();
-            let wd_for_indexer = resolved.clone();
-            tokio::spawn(async move {
-                let mut indexer = crate::graph::indexer::GraphIndexer::new(
-                    graph_clone.clone(), wd_for_indexer.clone(),
-                );
-                indexer.index_all().await;
-                let gp = wd_for_indexer.join(".atomcode").join("graph.bin");
-                if let Ok(g) = graph_clone.try_read() {
-                    let _ = crate::graph::persist::save(&g, &gp);
-                }
-            });
+            // Cancel the previous indexer so rapid `/cd` chains don't
+            // stack parallel parses. Replace the token so the new spawn
+            // below gets a fresh one; the old spawn cooperatively
+            // exits at its next cancel check.
+            self.indexer_cancel.cancel();
+            self.indexer_cancel = CancellationToken::new();
+
+            // Spawn new indexer — but only if the new dir is a real
+            // project root. `/cd ~/project` (umbrella of many repos)
+            // and `/cd ~` without markers would otherwise trigger a
+            // multi-MB tree-sitter walk pegging CPU for minutes.
+            // `should_index` covers $HOME / `/` / umbrella cases.
+            if crate::graph::indexer::should_index(&resolved) {
+                let graph_clone = self.turn_runner.context.graph.clone();
+                let wd_for_indexer = resolved.clone();
+                let cancel = self.indexer_cancel.clone();
+                tokio::spawn(async move {
+                    let mut indexer = crate::graph::indexer::GraphIndexer::new(
+                        graph_clone.clone(),
+                        wd_for_indexer.clone(),
+                    );
+                    indexer.index_all(cancel).await;
+                    let gp = wd_for_indexer.join(".atomcode").join("graph.bin");
+                    if let Ok(g) = graph_clone.try_read() {
+                        let _ = crate::graph::persist::save(&g, &gp);
+                    }
+                });
+            } else {
+                let _ = self.event_tx.send(AgentEvent::TextDelta(
+                    "[skipped code graph index: directory has no project marker \
+                     (.git / Cargo.toml / package.json / pyproject.toml / go.mod / \
+                     pom.xml / build.gradle) and looks like a parent of multiple \
+                     projects. `cd` into a specific project to enable symbol search.]\n"
+                        .to_string(),
+                ));
+            }
             let _ = self
                 .event_tx
                 .send(AgentEvent::WorkingDirChanged(resolved));
@@ -123,21 +156,31 @@ pub(crate) fn extract_service_urls(
             let start = i + pos;
             let after = start + "http://localhost:".len();
             // Extract port digits.
-            let port_end = output[after..].find(|c: char| !c.is_ascii_digit())
+            let port_end = output[after..]
+                .find(|c: char| !c.is_ascii_digit())
                 .map(|p| after + p)
                 .unwrap_or(output.len());
             if port_end > after {
                 let url = &output[start..port_end];
                 // Guess label from the command.
                 let cmd_lower = cmd.to_lowercase();
-                let label = if cmd_lower.contains("vite") || cmd_lower.contains("npm run dev")
-                    || cmd_lower.contains("next") || cmd_lower.contains("webpack")
-                    || cmd_lower.contains("frontend") || cmd_lower.contains("yarn dev") {
+                let label = if cmd_lower.contains("vite")
+                    || cmd_lower.contains("npm run dev")
+                    || cmd_lower.contains("next")
+                    || cmd_lower.contains("webpack")
+                    || cmd_lower.contains("frontend")
+                    || cmd_lower.contains("yarn dev")
+                {
                     "frontend"
-                } else if cmd_lower.contains("spring") || cmd_lower.contains("mvn")
-                    || cmd_lower.contains("gradle") || cmd_lower.contains("flask")
-                    || cmd_lower.contains("uvicorn") || cmd_lower.contains("backend")
-                    || cmd_lower.contains("cargo run") || cmd_lower.contains("go run") {
+                } else if cmd_lower.contains("spring")
+                    || cmd_lower.contains("mvn")
+                    || cmd_lower.contains("gradle")
+                    || cmd_lower.contains("flask")
+                    || cmd_lower.contains("uvicorn")
+                    || cmd_lower.contains("backend")
+                    || cmd_lower.contains("cargo run")
+                    || cmd_lower.contains("go run")
+                {
                     "backend"
                 } else {
                     "service"

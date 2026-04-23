@@ -231,7 +231,7 @@ impl From<&atomcode_core::conversation::message::Message> for MessageInfo {
                 // No artifacts from plain text messages (code blocks not extracted)
                 (s.clone(), None, None, None)
             }
-            atomcode_core::conversation::message::MessageContent::AssistantWithToolCalls { text, tool_calls } => {
+            atomcode_core::conversation::message::MessageContent::AssistantWithToolCalls { text, tool_calls, .. } => {
                 let calls: Vec<ToolCallInfo> = tool_calls.iter()
                     .map(|tc| ToolCallInfo {
                         id: tc.id.clone(),
@@ -574,8 +574,24 @@ fn hash_path(path: &std::path::Path) -> String {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     
+    // Normalize the path before hashing to ensure consistent results across:
+    // - Different path separators (Windows: `\` vs `/`)
+    // - Case sensitivity (Windows paths are case-insensitive)
+    // - Trailing slashes
+    let normalized = path.to_string_lossy();
+    let mut normalized = normalized.replace('\\', "/");
+    
+    // Remove trailing slash (but keep root "/" or "C:/")
+    if normalized.len() > 1 && normalized.ends_with('/') {
+        normalized.pop();
+    }
+    
+    // On Windows, paths are case-insensitive
+    #[cfg(windows)]
+    let normalized = normalized.to_lowercase();
+    
     let mut hasher = DefaultHasher::new();
-    path.hash(&mut hasher);
+    normalized.hash(&mut hasher);
     format!("{:016x}", hasher.finish())
 }
 
@@ -1577,37 +1593,63 @@ let session_manager = SessionManager::new(&working_dir);
     // Build tool registry and context
     let tool_context = ToolContext::new(working_dir.clone());
     let mut tool_registry = ToolRegistry::new();
-    tool_registry.register(Box::new(ReadFileTool));
-    tool_registry.register(Box::new(WriteFileTool));
-    tool_registry.register(Box::new(EditFileTool));
-    tool_registry.register(Box::new(BashTool));
-    tool_registry.register(Box::new(GrepTool));
-    tool_registry.register(Box::new(GlobTool));
-    tool_registry.register(Box::new(ListDirTool));
-    tool_registry.register(Box::new(WebSearchTool));
-    tool_registry.register(Box::new(WebFetchTool));
-    tool_registry.register(Box::new(SearchReplaceTool));
-    
+    // Honour ATOMCODE_DISABLE_TOOLS env var at daemon startup too, matching
+    // the CLI's --disable-tools behaviour. Comma-separated tool names.
+    let disabled_tools: std::collections::HashSet<String> = std::env::var("ATOMCODE_DISABLE_TOOLS")
+        .ok()
+        .map(|v| v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
+        .unwrap_or_default();
+    let enabled = |name: &str| !disabled_tools.contains(name);
+    if enabled("read_file") { tool_registry.register(Box::new(ReadFileTool)); }
+    if enabled("write_file") { tool_registry.register(Box::new(WriteFileTool)); }
+    if enabled("edit_file") { tool_registry.register(Box::new(EditFileTool)); }
+    if enabled("bash") { tool_registry.register(Box::new(BashTool)); }
+    if enabled("grep") { tool_registry.register(Box::new(GrepTool)); }
+    if enabled("glob") { tool_registry.register(Box::new(GlobTool)); }
+    if enabled("list_directory") { tool_registry.register(Box::new(ListDirTool)); }
+    if enabled("web_search") { tool_registry.register(Box::new(WebSearchTool)); }
+    if enabled("web_fetch") { tool_registry.register(Box::new(WebFetchTool)); }
+    if enabled("search_replace") { tool_registry.register(Box::new(SearchReplaceTool)); }
+
     // Load skills and register use_skill tool
     let mut skill_registry = atomcode_core::skill::SkillRegistry::new();
     skill_registry.reload(&working_dir);
     let has_skills = !skill_registry.is_empty();
     let skill_registry = Arc::new(std::sync::RwLock::new(skill_registry));
-    if has_skills {
-        tool_registry.register(Box::new(atomcode_core::tool::use_skill::UseSkillTool { 
-            registry: skill_registry.clone() 
+    if has_skills && enabled("use_skill") {
+        tool_registry.register(Box::new(atomcode_core::tool::use_skill::UseSkillTool {
+            registry: skill_registry.clone()
         }));
     }
-    
+
     let shared_tools = Arc::new(tool_registry);
     
     // Create turn runner with auto-bypass permission (API mode - no interactive approval)
     let permission = Box::new(AutoPermissionDecider::new(AutoPermissionMode::BypassAll));
+    // Same ctx selection as interactive AgentLoop: walk config.providers
+    // for the active provider, fallback to synthetic 128K config if absent.
+    let daemon_ctx = match config.providers.get(&config.default_provider) {
+        Some(pc) => atomcode_core::ctx::for_provider(pc),
+        None => atomcode_core::ctx::for_provider(&atomcode_core::config::provider::ProviderConfig {
+            provider_type: String::new(),
+            api_key: None,
+            model: String::new(),
+            base_url: None,
+            system_prompt: None,
+            user_agent: None,
+            context_window: 128_000,
+            max_tokens: None,
+            thinking_type: None,
+            thinking_keep: None,
+            ephemeral: true,
+        }),
+    };
     let mut turn_runner = TurnRunner {
         provider: provider.into(),
         tools: shared_tools,
         context: tool_context,
         config: config.clone(),
+        ctx: daemon_ctx,
         permission,
         recently_edited_files: Vec::new(),
         recent_calls: Vec::new(),
@@ -1638,15 +1680,16 @@ let session_manager = SessionManager::new(&working_dir);
         // Loop until LLM produces text without tool calls
         loop {
             let result = turn_runner.run(&mut conv, &system_prompt, &turn_tx, cancel_token.clone()).await;
-            
+
             match result {
                 TurnResult::Responded { .. } => {
                     // LLM produced text, turn is complete
                     break;
                 }
                 TurnResult::UsedTools { .. } => {
-                    // Tools were executed, continue to next LLM call
-                    // The tool results are already added to conversation
+                    // Truncation of tool outputs is handled inside
+                    // TurnRunner::run_with_filter now. Nothing to do
+                    // here — just loop back for the next LLM call.
                     continue;
                 }
                 TurnResult::Failed(e) => {

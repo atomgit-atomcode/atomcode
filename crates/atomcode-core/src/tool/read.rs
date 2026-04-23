@@ -5,6 +5,12 @@ use serde_json::json;
 
 use super::{ApprovalRequirement, Tool, ToolContext, ToolDef, ToolResult};
 
+/// Files with more lines than this return a skeleton (structure overview)
+/// instead of full content when read without offset/limit. GLM-5 gets lost
+/// in the middle at ~685 lines — 300 is the safe full-content ceiling.
+/// Shared with `agent::tool_dispatch` so its first-read heuristic stays aligned.
+pub(crate) const SKELETON_LINE_THRESHOLD: usize = 300;
+
 pub struct ReadFileTool;
 
 /// Deserialize a number that may arrive as a float string (weak models often send "50.0" instead of 50).
@@ -65,9 +71,35 @@ impl Tool for ReadFileTool {
         ApprovalRequirement::AutoApprove
     }
 
+    fn approval_with_context(&self, args: &str, ctx: &ToolContext) -> ApprovalRequirement {
+        let parsed = match serde_json::from_str::<ReadFileArgs>(args) {
+            Ok(parsed) => parsed,
+            Err(_) => return self.approval(args),
+        };
+        let working_dir = match ctx.working_dir.try_read() {
+            Ok(wd) => wd.clone(),
+            Err(_) => return self.approval(args),
+        };
+        match super::approval_for_path(&parsed.file_path, &working_dir, super::ExternalPathAction::Read) {
+            Ok(approval) => approval,
+            Err(_) => self.approval(args),
+        }
+    }
+
     async fn execute(&self, args: &str, ctx: &ToolContext) -> Result<ToolResult> {
         let parsed: ReadFileArgs = serde_json::from_str(args)?;
-        let path = std::path::Path::new(&parsed.file_path);
+        let working_dir = ctx.working_dir.read().await.clone();
+        let path = match super::inspect_path_access(&parsed.file_path, &working_dir) {
+            Ok(access) => access.path,
+            Err(err) => {
+                return Ok(ToolResult {
+                    call_id: String::new(),
+                    output: err.to_string(),
+                    success: false,
+                });
+            }
+        };
+        let path_ref = path.as_path();
 
         // ── Read cache: performance optimization only, NOT a STUB gate ──
         // Cache stores (mtime, rendered_output). If mtime matches, skip disk read +
@@ -76,11 +108,11 @@ impl Tool for ReadFileTool {
         // legitimate re-reads and doesn't prevent short-distance duplicates
         // (model ignores STUB text due to lost-at-the-end attention).
         let cache_key: crate::tool::ReadCacheKey = (
-            path.to_path_buf(),
+            path.clone(),
             parsed.offset,
             parsed.limit,
         );
-        let disk_mtime = tokio::fs::metadata(&parsed.file_path).await.ok()
+        let disk_mtime = tokio::fs::metadata(&path).await.ok()
             .and_then(|m| m.modified().ok());
         if let Some(mtime) = disk_mtime {
             if let Some((cached_mtime, cached_output)) = ctx.read_cache.read().await.get(&cache_key).cloned() {
@@ -95,9 +127,9 @@ impl Tool for ReadFileTool {
         }
 
         // Auto-recover: if the path is a directory, return a listing instead of an error.
-        if path.is_dir() {
+        if path_ref.is_dir() {
             let mut entries: Vec<String> = Vec::new();
-            if let Ok(mut rd) = tokio::fs::read_dir(path).await {
+            if let Ok(mut rd) = tokio::fs::read_dir(path_ref).await {
                 while let Ok(Some(entry)) = rd.next_entry().await {
                     let name = entry.file_name().to_string_lossy().to_string();
                     let is_dir = entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false);
@@ -118,16 +150,27 @@ impl Tool for ReadFileTool {
 
         // If file doesn't exist, auto-find similar filenames and suggest.
         // Saves 2-3 turns of path guessing (7% of sessions hit this).
-        if !path.exists() {
-            let filename = path.file_name()
+        //
+        // 2026-04-22: collect up to 20 candidates then rank by path-prefix
+        // similarity to what the agent asked for, show top 5. Without the
+        // prefix ranking, a random match in an unrelated subtree (e.g. the
+        // first `index.html` the walk hit) could outrank the correct one in
+        // the requested project — agent ignored the suggestion and started
+        // manual `ls` (see 426-atom 2026-04-21 session).
+        if !path_ref.exists() {
+            let filename = path_ref.file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_default();
             if !filename.is_empty() {
-                let wd = ctx.working_dir.read().await;
-                // Quick find: walk up to 5 levels deep for matching filename
                 let mut matches: Vec<String> = Vec::new();
-                fn find_file(dir: &std::path::Path, target: &str, depth: usize, max_depth: usize, results: &mut Vec<String>) {
-                    if depth > max_depth || results.len() >= 5 { return; }
+                fn find_file(
+                    dir: &std::path::Path,
+                    target: &str,
+                    depth: usize,
+                    max_depth: usize,
+                    results: &mut Vec<String>,
+                ) {
+                    if depth > max_depth || results.len() >= 20 { return; }
                     if let Ok(entries) = std::fs::read_dir(dir) {
                         for entry in entries.flatten() {
                             let name = entry.file_name().to_string_lossy().to_string();
@@ -141,14 +184,19 @@ impl Tool for ReadFileTool {
                         }
                     }
                 }
-                find_file(&wd, &filename, 0, 7, &mut matches);
+                find_file(&working_dir, &filename, 0, 7, &mut matches);
                 if !matches.is_empty() {
+                    // Rank by shared-path-prefix length with the requested path.
+                    // The correct match almost always shares the most segments
+                    // with what the agent asked for.
+                    matches.sort_by_key(|m| std::cmp::Reverse(super::shared_prefix_len(&parsed.file_path, m)));
+                    let shown: Vec<String> = matches.iter().take(5).map(|m| format!("  {}", m)).collect();
                     return Ok(ToolResult {
                         call_id: String::new(),
                         output: format!(
                             "Error: No such file: {}\n\nDid you mean:\n{}",
                             parsed.file_path,
-                            matches.iter().map(|m| format!("  {}", m)).collect::<Vec<_>>().join("\n")
+                            shown.join("\n")
                         ),
                         success: false,
                     });
@@ -156,20 +204,20 @@ impl Tool for ReadFileTool {
             }
         }
 
-        let bytes = tokio::fs::read(&parsed.file_path).await?;
+        let bytes = tokio::fs::read(&path).await?;
 
         // Decode: UTF-8 first (the vast majority of text files), then GBK
         // fallback for plain-text extensions (Chinese Windows legacy files
         // that fail UTF-8 validation), then declare binary.
         let content = match String::from_utf8(bytes.clone()) {
             Ok(s) => s,
-            Err(_) => match decode_non_utf8_text(path, &bytes) {
+            Err(_) => match decode_non_utf8_text(path_ref, &bytes) {
                 Some(s) => s,
                 None => {
                     let output = format!(
                         "Binary file ({} bytes), cannot display as text.{}",
                         bytes.len(),
-                        binary_recovery_hint(path, &parsed.file_path),
+                        binary_recovery_hint(path_ref, &parsed.file_path),
                     );
                     if let Some(mtime) = disk_mtime {
                         ctx.read_cache.write().await.insert(cache_key.clone(), (mtime, output.clone()));
@@ -182,20 +230,21 @@ impl Tool for ReadFileTool {
         let lines: Vec<&str> = content.lines().collect();
         let total_lines = lines.len();
 
-        // ── Layer A: full content default, skeleton for large files (>300 lines) ──
-        // Skeleton is the FALLBACK, not the default. ≤300 lines return full content
-        // so the model can grep→old_string→edit in 2 steps. >300 lines return
-        // skeleton because GLM-5 gets lost in the middle at ~685 lines.
+        // ── Layer A: full content default, skeleton for large files ──
+        // Skeleton is the FALLBACK, not the default. Files at or below the
+        // threshold return full content so the model can grep→old_string→edit
+        // in 2 steps. Above the threshold we return a skeleton (GLM-5 gets
+        // lost in the middle at ~685 lines).
         // With offset/limit: always return exact content (model chose a range).
-        let auto_skeleton = total_lines > 300
+        let auto_skeleton = total_lines > SKELETON_LINE_THRESHOLD
             && parsed.offset.is_none()
             && parsed.limit.is_none();
 
         if auto_skeleton {
             let mut searcher = ctx.semantic.lock().await;
-            let skeleton = if let Some(symbols) = searcher.list_symbols(path) {
-                let fname = path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
-                let mut skel = format!("[File skeleton: {} ({} lines). Use read_file with offset and limit to read specific sections.]\n\n",
+            let skeleton = if let Some(symbols) = searcher.list_symbols(path_ref) {
+                let fname = path_ref.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
+                let mut skel = format!("[File skeleton: {} ({} lines). Each symbol line ends with the exact offset/limit to read it — copy those into read_file, don't recompute.]\n\n",
                     fname, total_lines);
                 // Skeleton is fully driven by semantic layer's list_symbols().
                 // For Vue/Svelte, list_symbols already includes <template>/<style> sections
@@ -233,8 +282,9 @@ impl Tool for ReadFileTool {
                         sig.to_string()
                     };
 
+                    let body_len = s.end_line.saturating_sub(s.start_line) + 1;
                     if expand_candidates.iter().any(|c| c.start_line == s.start_line && c.name == s.name) {
-                        // Auto-expand: show full body
+                        // Auto-expand: show full body (no read-params needed — already visible)
                         skel.push_str(&format!("{:>4}| {}  (L{}-{}) [auto-expanded]\n",
                             s.start_line, sig_short, s.start_line, s.end_line));
                         let start = s.start_line.saturating_sub(1);
@@ -245,8 +295,9 @@ impl Tool for ReadFileTool {
                             }
                         }
                     } else {
-                        skel.push_str(&format!("{:>4}| {}  (L{}-{})\n",
-                            s.start_line, sig_short, s.start_line, s.end_line));
+                        skel.push_str(&format!("{:>4}| {}  (L{}-{}, read offset={} limit={})\n",
+                            s.start_line, sig_short, s.start_line, s.end_line,
+                            s.start_line, body_len));
                     }
                 }
                 skel
@@ -300,7 +351,7 @@ impl Tool for ReadFileTool {
             // Model reads 51 lines but file has 600 — skeleton shows
             // what functions exist in the other 549 lines with line numbers.
             let mut searcher = ctx.semantic.lock().await;
-            let skeleton = if let Some(symbols) = searcher.list_symbols(path) {
+            let skeleton = if let Some(symbols) = searcher.list_symbols(path_ref) {
                 let unseen: Vec<String> = symbols.iter()
                     .filter(|s| s.start_line < offset + 1 || s.start_line > end)
                     .map(|s| {
@@ -308,7 +359,10 @@ impl Tool for ReadFileTool {
                             .map(|l| l.trim())
                             .unwrap_or(&s.name);
                         let sig_short: String = sig.chars().take(70).collect();
-                        format!("{:>4}| {}  (L{}-{})", s.start_line, sig_short, s.start_line, s.end_line)
+                        let body_len = s.end_line.saturating_sub(s.start_line) + 1;
+                        format!("{:>4}| {}  (L{}-{}, read offset={} limit={})",
+                            s.start_line, sig_short, s.start_line, s.end_line,
+                            s.start_line, body_len)
                     })
                     .collect();
                 if !unseen.is_empty() {
@@ -568,5 +622,80 @@ mod tests {
         assert_eq!(shell_quote("abc"), "'abc'");
         assert_eq!(shell_quote("a'b"), r"'a'\''b'");
         assert_eq!(shell_quote("/tmp/file with spaces.doc"), "'/tmp/file with spaces.doc'");
+    }
+
+    /// Skeleton symbol lines carry ready-to-copy offset/limit values so the
+    /// model doesn't have to compute body length from the L{start}-{end} span.
+    #[tokio::test]
+    async fn skeleton_includes_read_offset_limit_hints() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("big.rs");
+
+        // Build >SKELETON_LINE_THRESHOLD lines of Rust with one recognizable
+        // fn that is long enough to survive the auto-expand filter (>50 body
+        // lines → stays collapsed → should get the read-params hint).
+        let mut content = String::new();
+        content.push_str("pub fn save_session(id: &str) -> Result<()> {\n");
+        for i in 0..80 {
+            content.push_str(&format!("    let _x{} = {};\n", i, i));
+        }
+        content.push_str("    Ok(())\n");
+        content.push_str("}\n");
+        for i in 0..(SKELETON_LINE_THRESHOLD + 20) {
+            content.push_str(&format!("// filler {}\n", i));
+        }
+        std::fs::write(&path, &content).unwrap();
+
+        let ctx = ToolContext::new(dir.path().to_path_buf());
+        let tool = ReadFileTool;
+        let args = format!(r#"{{"file_path":"{}"}}"#, path.display());
+
+        let r = tool.execute(&args, &ctx).await.unwrap();
+        assert!(r.success);
+        assert!(r.output.contains("[File skeleton:"), "expected skeleton output, got:\n{}", r.output);
+        // A collapsed symbol line must carry the pre-computed read params.
+        assert!(
+            r.output.contains("read offset=1 limit="),
+            "skeleton should expose offset=1 limit=<body_len> for save_session\nGot:\n{}",
+            r.output
+        );
+    }
+
+    /// P0 #4: when a 404 recovery has multiple candidates, the one sharing
+    /// the most path prefix with the requested path must come first.
+    /// Regression for 426-atom 2026-04-21 session where agent asked for
+    /// `/proj/A/index.html` and a wrong-project `index.html` outranked the
+    /// correct one.
+    #[tokio::test]
+    async fn read_404_ranks_by_shared_path_prefix() {
+        let dir = TempDir::new().unwrap();
+        // Two projects with a same-named file. The one sharing more of the
+        // requested path must be listed first.
+        std::fs::create_dir_all(dir.path().join("proj-wanted").join("presentation")).unwrap();
+        std::fs::create_dir_all(dir.path().join("proj-other")).unwrap();
+        std::fs::write(
+            dir.path().join("proj-wanted/presentation/index.html"),
+            "<html></html>",
+        ).unwrap();
+        std::fs::write(dir.path().join("proj-other/index.html"), "<html></html>").unwrap();
+
+        let ctx = ToolContext::new(dir.path().to_path_buf());
+        let tool = ReadFileTool;
+        // Ask for a wrong path in proj-wanted — 404, both candidates found.
+        let asked = dir.path().join("proj-wanted/index.html");
+        let args = format!(r#"{{"file_path":"{}"}}"#, asked.display());
+
+        let r = tool.execute(&args, &ctx).await.unwrap();
+        assert!(!r.success);
+        assert!(r.output.contains("Did you mean"));
+        // The correct candidate (inside proj-wanted/) must appear before the
+        // cross-project noise (inside proj-other/).
+        let wanted_pos = r.output.find("proj-wanted/presentation/index.html").unwrap();
+        let other_pos = r.output.find("proj-other/index.html").unwrap();
+        assert!(
+            wanted_pos < other_pos,
+            "proj-wanted match must rank above proj-other. output:\n{}",
+            r.output
+        );
     }
 }

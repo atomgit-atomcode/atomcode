@@ -2,6 +2,8 @@
 /target
 /runs
 
+.env/
+
 # Git worktrees (used by superpowers:using-git-worktrees)
 /.worktrees/
 
@@ -61,3 +63,4 @@ backend.log
 # but never ships.
 scripts/eval/
 dist/
+docs/superpowers

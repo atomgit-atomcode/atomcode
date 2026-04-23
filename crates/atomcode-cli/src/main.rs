@@ -17,7 +17,7 @@ use atomcode_core::agent::{AgentCommand, AgentEvent, AgentLoop};
 use atomcode_core::config::provider::{ProviderConfig, default_context_window_for};
 use atomcode_core::config::Config;
 use atomcode_core::conversation::Conversation;
-use atomcode_core::provider::create_provider;
+use atomcode_core::provider::{create_provider, unavailable_provider};
 use atomcode_core::session::SessionManager;
 use atomcode_core::tool::{ToolContext, ToolRegistry};
 use atomcode_core::tool::read::ReadFileTool;
@@ -370,6 +370,13 @@ struct Cli {
     #[arg(long)]
     max_turns: Option<usize>,
 
+    /// Inject a "restate goal / what ruled out / next output" reflection
+    /// prompt every N tool calls. 0 disables the checkpoint entirely.
+    /// Overrides the value in config.toml for this run. Default: use
+    /// config.toml's reflection_cadence (which itself defaults to 10).
+    #[arg(long, value_name = "N")]
+    reflection_cadence: Option<usize>,
+
     /// Comma-separated list of tool names to exclude from the registry.
     /// Use this to disable tools that are useless or harmful in a particular
     /// environment — e.g. `--disable-tools bash,web_fetch` for SWE-bench eval
@@ -397,6 +404,16 @@ enum Commands {
     },
     /// Roll back to the previous version (swap with .bak on disk)
     Rollback,
+    /// Fetch an AtomGit issue assigned to you and let the agent fix it
+    /// in the current project (no commit, no push — edits local files only).
+    Fixissue {
+        /// Full issue URL, e.g. https://atomgit.com/owner/repo/issues/42
+        url: String,
+    },
+    /// Claim CodingPlan and set up provider/model config from its model list.
+    /// Runs: login (if not already) → claim → fetch models → write providers
+    /// → fetch status. Reports each step and exits.
+    Codingplan,
 }
 
 /// Environment variable set by this process for its re-exec'd child, so
@@ -520,11 +537,23 @@ async fn main() {
 async fn run() -> Result<i32> {
     let cli = Cli::parse();
 
-    // Handle subcommands
+    // Handle subcommands. Most are self-contained (`handle_command` runs
+    // and exits); `Login` falls through to the TUI, and `Fixissue` is
+    // like headless `-p` but with the prompt synthesised from a remote
+    // issue payload — so we resolve it here and hand it to the agent
+    // loop via `fixissue_prompt` below.
+    let mut fixissue_prompt: Option<String> = None;
+    // Saved when fixissue is parsed, so after the agent finishes we can
+    // POST the summary back to AtomGit as a comment + add the `fixed`
+    // label. `None` = not a fixissue run, skip the post-back step.
+    let mut fixissue_ref: Option<atomcode_core::atomgit::IssueRef> = None;
+    // `fixissue` is an interactive-feeling structured workflow (the user
+    // is watching progress, not piping output). Force verbose so they see
+    // tool calls / edits instead of long silences while the agent works.
+    let mut force_verbose = false;
     if let Some(cmd) = cli.command {
-        match &cmd {
+        match cmd {
             Commands::Login => {
-                // Login, then fall through to start TUI
                 HEADLESS_MODE.store(true, Ordering::Relaxed);
                 let auth = auth::login()?;
                 auth::save_auth(&auth)?;
@@ -532,8 +561,45 @@ async fn run() -> Result<i32> {
                 HEADLESS_MODE.store(false, Ordering::Relaxed);
                 // Fall through to TUI startup below
             }
-            _ => {
-                return handle_command(cmd).await.map(|_| 0);
+            Commands::Codingplan => {
+                // Mirror /login: run the setup flow headless (so any
+                // auth::login() browser prompt lands cleanly), then
+                // fall through to TUI startup so the user lands in
+                // the chat with their fresh providers already
+                // configured. The rendered report is stashed into
+                // ATOMCODE_CODINGPLAN_REPORT so the TUI can surface
+                // it as a body line on startup — same pattern as
+                // ATOMCODE_UPGRADED_FROM for post-upgrade notices.
+                HEADLESS_MODE.store(true, Ordering::Relaxed);
+                let report = run_codingplan_core()?;
+                std::env::set_var("ATOMCODE_CODINGPLAN_REPORT", report);
+                println!("  Starting AtomCode...\n");
+                HEADLESS_MODE.store(false, Ordering::Relaxed);
+                // Fall through to TUI startup below
+            }
+            Commands::Fixissue { url } => {
+                HEADLESS_MODE.store(true, Ordering::Relaxed);
+                let cwd = cli.dir.clone().unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+                match atomcode_core::atomgit::fixissue::prepare(&url, &cwd) {
+                    Ok(atomcode_core::atomgit::fixissue::Prepared::Run { prompt, issue_title, issue_number, issue_ref }) => {
+                        eprintln!("[fixissue] issue #{}: {}", issue_number, issue_title);
+                        fixissue_prompt = Some(prompt);
+                        fixissue_ref = Some(issue_ref);
+                        force_verbose = true;
+                        // Fall through: agent loop will run this as a headless prompt.
+                    }
+                    Ok(atomcode_core::atomgit::fixissue::Prepared::Skip { reason }) => {
+                        eprintln!("{}", reason);
+                        return Ok(0);
+                    }
+                    Err(e) => {
+                        eprintln!("fixissue failed: {:#}", e);
+                        return Ok(1);
+                    }
+                }
+            }
+            other => {
+                return handle_command(other).await.map(|_| 0);
             }
         }
     }
@@ -550,7 +616,9 @@ async fn run() -> Result<i32> {
                 default_workdir: None,
                 providers: HashMap::new(),
                 datalog: Default::default(),
+                notifications: Default::default(),
                 auto_update: true,
+                reflection_cadence: 7,
             }
         })
     } else {
@@ -560,25 +628,35 @@ async fn run() -> Result<i32> {
             default_workdir: None,
             providers: HashMap::new(),
             datalog: Default::default(),
+            notifications: Default::default(),
             auto_update: true,
+            reflection_cadence: 7,
         }
     };
 
-    let (provider_config, model_name) = if config.providers.is_empty() {
-        // No providers configured yet — Welcome screen handles setup.
-        // Use a dummy provider; AgentLoop won't be called until user configures one.
-        let dummy = ProviderConfig {
-            provider_type: "openai".to_string(),
-            api_key: Some("not-configured".to_string()),
-            model: String::new(),
-            base_url: Some("http://localhost:1".to_string()),
-            system_prompt: None,
-            user_agent: None,
-            context_window: default_context_window_for("openai"),
-            max_tokens: None,
-            ephemeral: false,
-        };
-        (dummy, String::new())
+    let unavailable_reason = if config.providers.is_empty() {
+        Some("未配置 provider。请使用 /provider 添加 provider 后再试。".to_string())
+    } else {
+        None
+    };
+
+    let (provider_config, model_name) = if unavailable_reason.is_some() {
+        (
+            ProviderConfig {
+                provider_type: "openai".to_string(),
+                api_key: Some("unavailable".to_string()),
+                model: String::new(),
+                base_url: None,
+                system_prompt: None,
+                user_agent: None,
+                context_window: default_context_window_for("openai"),
+                max_tokens: None,
+                thinking_type: None,
+                thinking_keep: None,
+                ephemeral: false,
+            },
+            String::new(),
+        )
     } else {
         if let Some(ref model) = cli.model {
             let provider_name = cli.provider.as_deref().unwrap_or(&config.default_provider);
@@ -586,20 +664,56 @@ async fn run() -> Result<i32> {
                 p.model = model.clone();
             }
         }
-        // Provide a dummy api_key to prevent create_provider from attempting
-        // auth-token loading (which would fail if not logged in).  The real
-        // provider is rebuilt later via rebuild_provider() once the user has
-        // configured credentials.
+        // Keep api_key as None here so `create_provider()` auto-loads
+        // from `~/.atomcode/auth.toml`. Setting "not-configured" would
+        // bypass that path and force the user to manually provide a key.
         let pc = config.active_provider(cli.provider.as_deref())?.clone();
         let name = pc.model.clone();
-        // 注意：如果api_key为None，保持为None不要设置"not-configured"。
-        // 这样可以让create_provider()检测到None并从auth.toml自动加载token。
-        // 设置"not-configured"会绕过create_provider()中的自动加载逻辑，导致OAuth登录后
-        // 重启程序时无法获取token而报404错误。
         (pc, name)
     };
 
-    let provider = create_provider(&provider_config)?;
+    // `create_provider` may need to load an OAuth token from
+    // `~/.atomcode/auth.toml`. Pre-v4.20 this was a fatal startup
+    // error — if the user had a config.toml with an `AtomGit*` entry
+    // (from an older `/login` that auto-registered one) but no
+    // auth.toml (fresh machine, or auth.toml was deleted), the CLI
+    // bailed before the TUI could load, leaving the user stuck:
+    // they wanted to `/login` but couldn't start the app to run it.
+    //
+    // Graceful fallback: if provider construction fails because the
+    // token is unavailable, swap in the same dummy used on first-run
+    // so the TUI boots. The Welcome-wizard / status-row hints will
+    // nudge the user to `/login` or `/codingplan`, and a successful
+    // auth flow rebuilds the real provider via `rebuild_provider`.
+    let (provider, model_name) = if let Some(reason) = unavailable_reason {
+        (unavailable_provider(reason), model_name)
+    } else {
+        match create_provider(&provider_config) {
+            Ok(p) => (p, model_name),
+            Err(e) => {
+                let msg = format!("{:#}", e);
+                let is_auth_gap = msg.contains("Not logged in")
+                    || msg.contains("Invalid auth.toml")
+                    || msg.contains("Token expired");
+                if is_auth_gap {
+                    eprintln!(
+                        "Note: provider credentials not available ({}). \
+                         Launching TUI in onboarding mode — use /login or /codingplan to set up.",
+                        msg
+                    );
+                    (
+                        unavailable_provider(format!(
+                            "Provider 凭证不可用：{}。请使用 /login 或 /codingplan 完成配置后再试。",
+                            msg
+                        )),
+                        String::new(),
+                    )
+                } else {
+                    return Err(e);
+                }
+            }
+        }
+    };
 
     let working_dir = resolve_working_dir(cli.dir.clone());
 
@@ -661,27 +775,84 @@ async fn run() -> Result<i32> {
         conversation,
     );
     agent_loop.set_max_turns(cli.max_turns);
+    // CLI override for the cadence reflection knob. Matches the max_turns
+    // pattern — leave unset to honor config.toml; explicitly pass to force.
+    if let Some(n) = cli.reflection_cadence {
+        agent_loop.config.reflection_cadence = n;
+    }
 
-    // Resolve effective prompt: --prompt-file reads from disk; -p is inline.
-    // clap's conflicts_with ensures only one can be given at a time.
-    let effective_prompt: Option<String> = match (cli.prompt.as_ref(), cli.prompt_file.as_ref()) {
-        (Some(p), None) => Some(p.clone()),
-        (None, Some(path)) => {
-            match std::fs::read_to_string(path) {
-                Ok(s) => Some(s),
-                Err(e) => {
-                    eprintln!("error: failed to read --prompt-file {}: {}", path.display(), e);
-                    std::process::exit(2);
+    // Resolve effective prompt: --prompt-file reads from disk; -p is inline;
+    // `fixissue` synthesises one from the AtomGit issue body. fixissue takes
+    // precedence — when it's set we've already committed to headless mode.
+    // clap's conflicts_with ensures `-p` and `--prompt-file` can't both be given.
+    let effective_prompt: Option<String> = if let Some(p) = fixissue_prompt.take() {
+        Some(p)
+    } else {
+        match (cli.prompt.as_ref(), cli.prompt_file.as_ref()) {
+            (Some(p), None) => Some(p.clone()),
+            (None, Some(path)) => {
+                match std::fs::read_to_string(path) {
+                    Ok(s) => Some(s),
+                    Err(e) => {
+                        eprintln!("error: failed to read --prompt-file {}: {}", path.display(), e);
+                        std::process::exit(2);
+                    }
                 }
             }
+            (None, None) => None,
+            (Some(_), Some(_)) => unreachable!("clap conflicts_with prevents this"),
         }
-        (None, None) => None,
-        (Some(_), Some(_)) => unreachable!("clap conflicts_with prevents this"),
     };
 
     // Headless mode: -p / --prompt-file triggers non-interactive execution.
+    // `fixissue` also sets `force_verbose` so tool activity is visible — the
+    // user is watching a single long-running task, not feeding a pipe.
     if let Some(prompt) = effective_prompt {
-        return run_headless(agent_loop, agent_handle, prompt, cli.provider.as_deref(), cli.verbose).await;
+        let verbose = cli.verbose || force_verbose;
+        // Capture the assistant's streamed text only when we need to post
+        // it back to AtomGit (fixissue). Plain `-p` stays zero-alloc.
+        let capture = fixissue_ref.is_some();
+        let (exit_code, captured) = run_headless(
+            agent_loop,
+            agent_handle,
+            prompt,
+            cli.provider.as_deref(),
+            verbose,
+            capture,
+            working_dir.clone(),
+        )
+        .await?;
+
+        // Post-run side effects for fixissue: only on clean completion
+        // (exit 0 = TurnComplete Natural; 1 = error; 2 = denial; 130 = cancel).
+        // On non-zero we leave the issue alone — the user can retry.
+        if let Some(issue_ref) = fixissue_ref {
+            if exit_code == 0 {
+                if let Some(summary) = captured.filter(|s| !s.trim().is_empty()) {
+                    match atomcode_core::atomgit::fixissue::post_completion(&issue_ref, &summary) {
+                        Ok(()) => eprintln!(
+                            "[fixissue] ✔ posted summary + applied 'fixed' label to issue #{}",
+                            issue_ref.number
+                        ),
+                        Err(e) => eprintln!(
+                            "[fixissue] ✗ post-back failed (local fix is still saved): {:#}",
+                            e
+                        ),
+                    }
+                } else {
+                    eprintln!(
+                        "[fixissue] agent produced no text; skipping comment + label on issue #{}",
+                        issue_ref.number
+                    );
+                }
+            } else {
+                eprintln!(
+                    "[fixissue] agent exited non-zero ({}); skipping comment + label on issue #{}",
+                    exit_code, issue_ref.number
+                );
+            }
+        }
+        return Ok(exit_code);
     }
 
     // Fire-and-forget: spawn a setsid'd subprocess to stage the next
@@ -721,11 +892,14 @@ async fn run_headless(
     prompt: String,
     _provider_name: Option<&str>,
     verbose: bool,
-) -> Result<i32> {
+    capture: bool,
+    working_dir: PathBuf,
+) -> Result<(i32, Option<String>)> {
     // Tell the panic hook / error path to skip TUI cleanup — we never enter
     // the alternate screen here, so LeaveAlternateScreen would corrupt stdout.
     HEADLESS_MODE.store(true, Ordering::Relaxed);
 
+    let notifications = agent_loop.config.notifications.clone();
     let (cmd_tx, mut event_rx) = {
         let handle = agent_handle;
         (handle.cmd_tx, handle.event_rx)
@@ -737,12 +911,19 @@ async fn run_headless(
     let mut exit_code: i32 = 0;
     let mut had_denial = false;
     let mut last_text_ended_with_newline = true;
+    // When `capture` is set, we also buffer every TextDelta the agent
+    // emits so the caller (e.g. the fixissue workflow) can post the
+    // full assistant output back to AtomGit as an issue comment.
+    let mut captured: Option<String> = if capture { Some(String::new()) } else { None };
 
     while let Some(event) = event_rx.recv().await {
         match event {
             AgentEvent::TextDelta(text) => {
                 if !text.is_empty() {
                     last_text_ended_with_newline = text.ends_with('\n');
+                }
+                if let Some(buf) = captured.as_mut() {
+                    buf.push_str(&text);
                 }
                 print!("{}", text);
                 io::stdout().flush()?;
@@ -792,7 +973,18 @@ async fn run_headless(
             AgentEvent::PhaseChange(_) => {
                 // Silent in headless mode (in both default and verbose).
             }
-            AgentEvent::TurnComplete { duration, total_tokens, turn_count, tool_call_count, stop_reason } => {
+            AgentEvent::TurnComplete { duration, total_tokens, turn_count, tool_call_count, stop_reason, messages: _ } => {
+                atomcode_core::notify::notify_turn_finished(
+                    &notifications,
+                    atomcode_core::notify::TurnNotification {
+                        duration,
+                        turn_count,
+                        tool_call_count,
+                        total_tokens: Some(total_tokens),
+                        stop_reason,
+                        working_dir: Some(&working_dir),
+                    },
+                );
                 // Always ensure stdout ends with a newline so downstream parsers see a clean line.
                 if !last_text_ended_with_newline {
                     println!();
@@ -849,7 +1041,7 @@ AgentEvent::SubAgentProgress { file, status } => {
         exit_code = 2;
     }
 
-    Ok(exit_code)
+    Ok((exit_code, captured))
 }
 
 /// Handle subcommands (login, logout, status)
@@ -889,6 +1081,17 @@ async fn handle_command(cmd: Commands) -> Result<()> {
         }
         Commands::Upgrade { force } => run_upgrade_cli(force).await,
         Commands::Rollback => run_rollback_cli(),
+        Commands::Fixissue { .. } => {
+            unreachable!("Fixissue is handled inline in run() before handle_command")
+        }
+        Commands::Codingplan => {
+            // Kept as a handle_command arm for completeness, but `run()`
+            // now intercepts Codingplan before reaching here so the flow
+            // falls through to TUI startup. This branch is effectively
+            // dead unless a future caller dispatches Codingplan directly
+            // via handle_command (e.g. a test).
+            run_codingplan_cli()
+        }
     }
 }
 
@@ -980,6 +1183,59 @@ fn run_rollback_cli() -> Result<()> {
         summary.backup.display()
     );
     println!("  Run `atomcode` to start the rolled-back version.");
+    Ok(())
+}
+
+/// Core CodingPlan flow shared by CLI-exit and CLI→TUI paths. Loads
+/// the config (or starts from defaults if missing), runs the shared
+/// `coding_plan::setup` orchestrator, persists the config on success,
+/// and returns the rendered human-readable report — the caller decides
+/// whether to print it to stdout or stash it for the TUI to surface.
+fn run_codingplan_core() -> Result<String> {
+    let path = Config::default_path();
+    // Missing config is legitimate on first install — start from defaults
+    // so the flow can still add AtomGit providers to a fresh config.toml.
+    let mut config = match Config::load(&path) {
+        Ok(c) => c,
+        Err(_) => Config {
+            default_provider: String::new(),
+            default_workdir: None,
+            providers: std::collections::HashMap::new(),
+            datalog: Default::default(),
+            auto_update: true,
+            reflection_cadence: 7,
+            notifications: Default::default(),
+        },
+    };
+
+    let report = atomcode_core::coding_plan::run(&mut config)?;
+
+    if report.should_persist_config() {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Err(e) = config.save(&path) {
+            eprintln!("  ⚠ Failed to save config to {}: {:#}", path.display(), e);
+        }
+        // Stamp the sync marker alongside the config write. The drift
+        // monitor on the TUI side reads this to decide whether to warn
+        // about stale provider lists (> 24h + server drift). A failed
+        // marker write is non-fatal — the config already landed; only
+        // the 24h hint would be miscounted, which self-corrects on the
+        // next successful run.
+        if let Err(e) = atomcode_core::coding_plan::write_last_sync_now() {
+            eprintln!("  ⚠ Failed to write codingplan sync marker: {:#}", e);
+        }
+    }
+
+    Ok(report.render())
+}
+
+/// `atomcode codingplan` entry point for the CLI-exit path — runs the
+/// core flow and prints the report to stdout.
+fn run_codingplan_cli() -> Result<()> {
+    let report = run_codingplan_core()?;
+    print!("{}", report);
     Ok(())
 }
 

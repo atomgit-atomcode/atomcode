@@ -100,6 +100,20 @@ pub struct VirtualTerminal {
     /// scrollback-push path).
     scroll_top: u16,
     scroll_bottom: u16,
+    /// Rows that scrolled off the top of the DECSTBM region — these
+    /// would live in the real terminal's scrollback buffer. Oldest
+    /// first. Only grows when `scroll_top == 0` (region anchored to
+    /// screen top, which is retained's shape), mirroring xterm: a
+    /// non-top-anchored region drops exiting lines instead of
+    /// promoting them to scrollback. Also grows via `ed_promotes_to_scrollback`.
+    scrollback: Vec<Vec<GridCell>>,
+    /// Model the macOS Terminal.app / iTerm2 style "ED copies visible
+    /// content to scrollback before clearing" behaviour: `\x1b[2J`
+    /// promotes every non-blank row into scrollback before blanking
+    /// the grid. Flip on to reproduce the "welcome ends up in
+    /// scrollback after footer-height transitions" user report.
+    /// Default is off (matches xterm).
+    ed_promotes_to_scrollback: bool,
 }
 
 impl VirtualTerminal {
@@ -116,19 +130,34 @@ impl VirtualTerminal {
             style: Style::default(),
             scroll_top: 0,
             scroll_bottom: height.saturating_sub(1),
+            scrollback: Vec::new(),
+            ed_promotes_to_scrollback: false,
         }
     }
 
+    /// Opt into the Terminal.app / iTerm2 "ED promotes to scrollback"
+    /// behaviour. Call once after construction. Used by regression
+    /// tests that need to reproduce behaviour-sensitive bugs like the
+    /// 2J-on-footer-transition scrollback pollution.
+    pub fn set_ed_promotes_to_scrollback(&mut self, on: bool) {
+        self.ed_promotes_to_scrollback = on;
+    }
+
     /// Scroll the current DECSTBM region up by one line: the row at
-    /// `scroll_top` is discarded (its contents would normally enter
-    /// the terminal's scrollback buffer; we don't model that), the
-    /// rows below shift up one position, and `scroll_bottom` becomes
-    /// blank. Cursor stays put.
+    /// `scroll_top` shifts out of the region. When the region is
+    /// anchored to the screen top (`scroll_top == 0`) — xterm's
+    /// contract and retained's exclusive shape — the exiting row is
+    /// promoted to scrollback so tests can assert on duplicate or
+    /// lost history. Other configurations drop the row, matching
+    /// real terminal behaviour for mid-screen regions.
     fn scroll_region_up(&mut self) {
         let top = self.scroll_top as usize;
         let bot = self.scroll_bottom as usize;
         if top >= bot || bot >= self.grid.len() {
             return;
+        }
+        if top == 0 {
+            self.scrollback.push(self.grid[0].clone());
         }
         for r in top..bot {
             self.grid[r] = self.grid[r + 1].clone();
@@ -191,6 +220,32 @@ impl VirtualTerminal {
     /// body content should be present on-screen somewhere.
     pub fn any_row<F: FnMut(&str) -> bool>(&self, mut f: F) -> bool {
         (0..self.height as usize).any(|r| f(&self.row_text(r)))
+    }
+
+    /// Trailing-trimmed text of each row that has been pushed into
+    /// scrollback (oldest first). Blank rows are preserved so row
+    /// counts match what the terminal actually scrolled off — tests
+    /// that care only about content can `.filter(|s| !s.is_empty())`.
+    pub fn scrollback_texts(&self) -> Vec<String> {
+        self.scrollback
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|c| c.ch)
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// Total rows that have ever scrolled off the top of the DECSTBM
+    /// region. Grows monotonically; used by regression tests that
+    /// need to bound how many rows a footer-geometry change is
+    /// allowed to push into scrollback (answer should be 0 — the
+    /// repaint path must not re-scroll cached body rows).
+    pub fn scrollback_len(&self) -> usize {
+        self.scrollback.len()
     }
 
     /// Handy multi-line dump of the whole grid — useful inside
@@ -363,6 +418,18 @@ impl Perform for VirtualTerminal {
                 let mode =
                     params.iter().next().and_then(|p| p.first().copied()).unwrap_or(0);
                 if mode == 2 {
+                    if self.ed_promotes_to_scrollback {
+                        // Terminal.app / iTerm2 style: copy every
+                        // non-blank visible row into scrollback before
+                        // blanking. Preserves oldest-first order.
+                        for row in &self.grid {
+                            let non_blank =
+                                row.iter().any(|c| c.ch != ' ');
+                            if non_blank {
+                                self.scrollback.push(row.clone());
+                            }
+                        }
+                    }
                     let blank_row = vec![GridCell::default(); self.width as usize];
                     for row in &mut self.grid {
                         *row = blank_row.clone();
@@ -500,5 +567,60 @@ mod tests {
         assert!(!vt.cursor_visible());
         vt.feed(b"\x1b[?25h");
         assert!(vt.cursor_visible());
+    }
+
+    /// Rows that scroll off the top of a top-anchored DECSTBM region
+    /// are promoted to scrollback in oldest-first order. Retained's
+    /// body emit path relies on this exact shape: the whole screen
+    /// region (or `\x1b[1;Nr`) with LF at the bottom scrolling the
+    /// top row into the real terminal's scrollback.
+    #[test]
+    fn vt_scrollback_captures_rows_exiting_top_anchored_region() {
+        let mut vt = VirtualTerminal::new(6, 3);
+        // Default region is full screen (top-anchored at row 0).
+        // Fill 3 rows, then LF at bottom twice to push 2 more.
+        vt.feed(b"row0\r\nrow1\r\nrow2");
+        assert_eq!(vt.scrollback_len(), 0, "no scroll yet");
+        // Cursor is at end of row2; LF at scroll_bottom triggers
+        // scroll-up, pushing row0 into scrollback.
+        vt.feed(b"\x1b[3;1H\nrow3");
+        vt.feed(b"\x1b[3;1H\nrow4");
+        let sb = vt.scrollback_texts();
+        assert_eq!(sb, vec!["row0", "row1"]);
+    }
+
+    /// Mid-screen regions (`\x1b[2;5r`) don't promote exiting rows
+    /// to scrollback — that matches xterm: only the screen-top region
+    /// feeds the scrollback buffer.
+    #[test]
+    fn vt_scrollback_ignored_for_non_top_anchored_region() {
+        let mut vt = VirtualTerminal::new(6, 5);
+        vt.feed(b"\x1b[2;4r"); // region rows 2..4, not anchored at row 1
+        vt.feed(b"\x1b[4;1H\n");
+        vt.feed(b"\x1b[4;1H\n");
+        assert_eq!(vt.scrollback_len(), 0);
+    }
+
+    /// Terminal.app / iTerm2 style ED promotion: opting in makes
+    /// `\x1b[2J` copy every non-blank visible row into scrollback
+    /// before clearing. Default (off) leaves scrollback untouched —
+    /// this is the switch regression tests use to model the specific
+    /// terminal behaviour that caused the "first-startup welcome
+    /// appears twice" user report.
+    #[test]
+    fn vt_ed_promotes_visible_rows_to_scrollback_when_enabled() {
+        let mut vt = VirtualTerminal::new(6, 3);
+        vt.set_ed_promotes_to_scrollback(true);
+        vt.feed(b"abc\r\nxyz");
+        assert_eq!(vt.scrollback_len(), 0, "no ED yet");
+        vt.feed(b"\x1b[2J");
+        assert_eq!(
+            vt.scrollback_texts(),
+            vec!["abc", "xyz"],
+            "ED should have promoted both non-blank rows"
+        );
+        // Grid is blank after the clear.
+        assert!(vt.row_text(0).chars().all(|c| c == ' '));
+        assert!(vt.row_text(1).chars().all(|c| c == ' '));
     }
 }

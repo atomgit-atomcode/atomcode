@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tokio::sync::RwLock;
+use tokio_util::sync::CancellationToken;
 
 use ignore::WalkBuilder;
 use tree_sitter::{Parser, Query, QueryCursor, StreamingIterator};
@@ -56,18 +57,28 @@ impl GraphIndexer {
     /// 3. Detect deleted files — remove from graph
     /// 4. Parse dirty files, extract symbols and calls
     /// 5. Resolve calls to edges
-    pub async fn index_all(&mut self) {
-        // Refuse to index obvious non-projects. Walking $HOME (or /) pulls
-        // in Library/, Downloads/, Documents/ trees with hundreds of
-        // thousands of paths — the sync walk then pegs a tokio worker
-        // thread for seconds, starving the TUI event loop (the 5 ms
-        // deferred-render-tick stops firing, so typed characters don't
-        // show up until something else wakes the runtime). If someone
-        // really does keep code at $HOME, they can drop a `.git` in there
-        // and it'll be treated as a project again (see `looks_like_project`).
-        if is_home_or_root(&self.project_dir) && !looks_like_project(&self.project_dir) {
+    ///
+    /// `cancel` is checked at every point where abandoning is cheap: top
+    /// of the fn, between parse-file iterations (the expensive step),
+    /// and before the final write-lock mutation block. Cancellation is
+    /// cooperative — the sync `WalkBuilder` inside `spawn_blocking`
+    /// cannot itself be interrupted, so best we can do is skip the
+    /// parsing and mutation phases if cancel fires mid-walk. Rapid `/cd`
+    /// chains depend on this: without it, each cd spawns a fresh
+    /// indexer and all of them parse in parallel.
+    pub async fn index_all(&mut self, cancel: CancellationToken) {
+        // Refuse to index obvious non-projects. See `should_index`:
+        // guards against $HOME / `/` and "umbrella" directories whose
+        // children are themselves projects (e.g. `~/project` that
+        // contains dozens of repos). Without the umbrella guard a
+        // single `/cd ~/project` spawns a full tree-sitter parse of
+        // every indexed file across every child repo — pegs CPU and
+        // starves the TUI event loop.
+        if !should_index(&self.project_dir) {
             return;
         }
+
+        if cancel.is_cancelled() { return; }
 
         // Walk + stat the tree on the blocking-thread pool rather than on
         // an async worker. `WalkBuilder` is pure sync I/O; leaving it on
@@ -99,16 +110,43 @@ impl GraphIndexer {
         // Read lock released here.
 
         // Parse dirty files OUTSIDE the lock (CPU-intensive, no graph access needed).
+        //
+        // Two concerns stack on this loop and both fixes apply:
+        // 1. **CPU throttle** — tree-sitter parse per file is sync CPU work.
+        //    Running it in a tight loop inside an async task pegs one core
+        //    at ~99% for the whole initial index, which reads as "atomcode
+        //    hogs CPU at startup" on the user's Activity Monitor. Yield
+        //    after each file so the runtime can service UI renders / agent
+        //    events between parses; sleep briefly every CHUNK files so
+        //    cumulative CPU use stays moderate. Total added wall-clock
+        //    is tiny (~5 ms × N/CHUNK).
+        // 2. **Cancellation** — a stale indexer spawned by a previous
+        //    working-dir can burn minutes of CPU after the user has
+        //    already `/cd`'d elsewhere. The rapid-cd case spawns a fresh
+        //    indexer per cd and without this check they'd all parse in
+        //    parallel. Bail at the top of every iteration.
+        const CPU_BREATHE_CHUNK: usize = 16;
+        const CPU_BREATHE_MS: u64 = 5;
         let mut all_results: Vec<(PathBuf, u64, FileParseResult)> = Vec::new();
-        for (path, mtime) in dirty_files {
+        for (i, (path, mtime)) in dirty_files.into_iter().enumerate() {
+            if cancel.is_cancelled() { return; }
             if let Some(result) = self.parse_file(&path) {
                 all_results.push((path, mtime, result));
+            }
+            tokio::task::yield_now().await;
+            if i > 0 && i % CPU_BREATHE_CHUNK == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(CPU_BREATHE_MS)).await;
             }
         }
 
         if deleted.is_empty() && all_results.is_empty() {
             return; // Nothing to update
         }
+
+        // Final cancel check: skip the write-lock critical section if
+        // a newer indexer has been spawned. Contention on graph.write()
+        // would otherwise delay the new indexer's own write.
+        if cancel.is_cancelled() { return; }
 
         // Single write lock for ALL mutations — atomic from readers' perspective.
         // Grep/trace_callees will block briefly here but never see partial state.
@@ -419,6 +457,33 @@ fn classify_symbol_kind(ts_kind: &str) -> SymbolKind {
 
 /// True when `path` is the user's HOME directory or the filesystem root.
 /// Either one hosts a massive tree the indexer should never walk in full.
+/// Policy: should the indexer walk this directory?
+///
+/// Used both internally (`index_all` top guard) and externally by
+/// `agent/services.rs` to decide whether to even spawn the indexer
+/// task after a `/cd`. Returns `false` for:
+///
+/// - `$HOME` or `/` — walking pulls in Library / Downloads / Documents
+///   trees with hundreds of thousands of paths.
+/// - "Umbrella" dirs — the target itself has no project marker but
+///   three or more of its immediate child dirs are projects (e.g.
+///   `~/project` with 30+ repos inside). Indexing walks every child.
+///
+/// The escape hatch is [`looks_like_project`]: drop a `.atomcode`
+/// (or any other marker) at the root and indexing kicks in.
+pub fn should_index(project_dir: &Path) -> bool {
+    if looks_like_project(project_dir) {
+        return true;
+    }
+    if is_home_or_root(project_dir) {
+        return false;
+    }
+    if is_umbrella_dir(project_dir) {
+        return false;
+    }
+    true
+}
+
 fn is_home_or_root(path: &Path) -> bool {
     if path == Path::new("/") {
         return true;
@@ -431,14 +496,42 @@ fn is_home_or_root(path: &Path) -> bool {
     false
 }
 
-/// Cheap "is this a project?" heuristic — checks for a project-marker
-/// file or directory at the root. Used as an escape hatch for users who
-/// *do* keep code at $HOME: if a marker is present, the indexer walks it
-/// even though the path would otherwise look like a non-project.
+/// Detect an "umbrella" directory: the target itself has no project
+/// marker, but 3+ of its immediate child directories are projects.
+/// Covers the common `~/project/` or `~/code/` layout where the user
+/// keeps many repos side-by-side. Indexing such a dir walks every
+/// child — full tree-sitter parse across dozens of repos, minutes of
+/// CPU, starved TUI event loop.
+///
+/// Scan is capped at 200 immediate entries so the guard itself stays
+/// cheap. Returns on the third match.
+fn is_umbrella_dir(dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else { return false; };
+    let mut project_children = 0;
+    for entry in entries.flatten().take(200) {
+        let p = entry.path();
+        if p.is_dir() && looks_like_project(&p) {
+            project_children += 1;
+            if project_children >= 3 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Cheap "is this a project?" heuristic — checks for a user-maintained
+/// project-marker file or directory at the root.
+///
+/// `.atomcode` is intentionally NOT in this list even though atomcode
+/// writes `.atomcode/graph.bin` there: using atomcode's own storage
+/// dir as a "user opt-in" marker is self-fulfilling — the very first
+/// `/cd` to any directory creates `.atomcode/` and pins that dir as
+/// "project" forever, defeating the umbrella / $HOME guards. Only
+/// user-placed markers count.
 fn looks_like_project(dir: &Path) -> bool {
     const MARKERS: &[&str] = &[
         ".git",
-        ".atomcode",
         "Cargo.toml",
         "package.json",
         "pyproject.toml",
@@ -496,4 +589,120 @@ fn collect_files_sync(project_dir: &Path) -> Vec<(PathBuf, u64)> {
     }
 
     files
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mk(parent: &Path, name: &str, markers: &[&str]) {
+        let p = parent.join(name);
+        std::fs::create_dir_all(&p).unwrap();
+        for m in markers {
+            std::fs::write(p.join(m), "").unwrap();
+        }
+    }
+
+    #[test]
+    fn should_index_accepts_marked_project() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("Cargo.toml"), "[package]").unwrap();
+        assert!(should_index(tmp.path()));
+    }
+
+    #[test]
+    fn should_index_refuses_umbrella_dir_with_many_child_projects() {
+        // Layout: umbrella/{a,b,c,d}/ each with .git — no marker at umbrella root.
+        let tmp = tempfile::TempDir::new().unwrap();
+        mk(tmp.path(), "a", &[".git"]);
+        mk(tmp.path(), "b", &[".git"]);
+        mk(tmp.path(), "c", &["package.json"]);
+        mk(tmp.path(), "d", &["Cargo.toml"]);
+        assert!(!should_index(tmp.path()),
+            "umbrella of 4 projects without own marker must be skipped");
+    }
+
+    #[test]
+    fn should_index_accepts_umbrella_with_real_marker() {
+        // Umbrella layout, but the umbrella itself also has a real
+        // user-placed marker (e.g. a root Cargo workspace). Under those
+        // circumstances indexing is intentional.
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("Cargo.toml"), "[workspace]").unwrap();
+        mk(tmp.path(), "a", &[".git"]);
+        mk(tmp.path(), "b", &[".git"]);
+        mk(tmp.path(), "c", &[".git"]);
+        assert!(should_index(tmp.path()),
+            "user-placed marker must override umbrella detection");
+    }
+
+    /// Regression: `.atomcode` is atomcode's own storage dir (it gets
+    /// created by `graph::persist::save` on every successful index).
+    /// Using it as a project-marker is self-fulfilling — the very first
+    /// /cd to ~/project writes ~/project/.atomcode/graph.bin, and from
+    /// then on ~/project looks "marked" and the umbrella guard
+    /// never fires again. User-reported: `/cd ~/project` still spiked
+    /// CPU after the umbrella guard landed, because an earlier run
+    /// had already planted .atomcode there.
+    #[test]
+    fn should_index_refuses_umbrella_with_only_atomcode_storage_dir() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Simulate the state left by a prior indexer run.
+        std::fs::create_dir_all(tmp.path().join(".atomcode")).unwrap();
+        std::fs::write(tmp.path().join(".atomcode").join("graph.bin"), b"x").unwrap();
+        // And the umbrella shape.
+        mk(tmp.path(), "a", &[".git"]);
+        mk(tmp.path(), "b", &[".git"]);
+        mk(tmp.path(), "c", &[".git"]);
+        assert!(
+            !should_index(tmp.path()),
+            ".atomcode dir must not rescue an umbrella from the guard"
+        );
+    }
+
+    #[test]
+    fn should_index_accepts_dir_with_fewer_than_3_child_projects() {
+        // Two child projects doesn't qualify as umbrella — could be a
+        // monorepo with a couple of sub-packages.
+        let tmp = tempfile::TempDir::new().unwrap();
+        mk(tmp.path(), "a", &[".git"]);
+        mk(tmp.path(), "b", &[".git"]);
+        mk(tmp.path(), "other", &[]); // not a project
+        assert!(should_index(tmp.path()),
+            "2 child projects < umbrella threshold");
+    }
+
+    /// Regression: a pre-cancelled token must cause index_all to bail
+    /// before doing any parse / write-lock work. This is the guarantee
+    /// that makes rapid `/cd` chains cheap — each new /cd cancels the
+    /// prior indexer, which then cooperatively exits at its next
+    /// cancel check (top of fn / between parses / before write-lock).
+    #[tokio::test]
+    async fn index_all_bails_on_cancelled_token() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Marker so should_index returns true (we want the cancel
+        // check to be what stops us, not the umbrella guard).
+        std::fs::write(tmp.path().join(".atomcode"), "").unwrap();
+        // Drop a Rust source so there'd be real work if we proceeded.
+        std::fs::write(
+            tmp.path().join("lib.rs"),
+            "pub fn foo() {}\npub fn bar() {}\n",
+        )
+        .unwrap();
+
+        let graph = Arc::new(RwLock::new(super::super::CodeGraph::default()));
+        let mut indexer = GraphIndexer::new(graph.clone(), tmp.path().to_path_buf());
+
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        indexer.index_all(cancel).await;
+
+        // Graph must be untouched — cancel fired before any symbol
+        // insertion.
+        let g = graph.read().await;
+        assert!(
+            g.file_mtimes.is_empty(),
+            "cancelled indexer must not mutate graph"
+        );
+    }
 }

@@ -5,42 +5,86 @@ impl AgentLoop {
     /// and append them to the user message. The model starts Turn 1 with the real error.
     pub(crate) async fn auto_diagnose_errors(&self, content: &str) -> String {
         let lower = content.to_lowercase();
-        let has_error_keyword = ["错误", "报错", "失败", "error", "500", "404", "crash",
-            "异常", "exception", "内部错误", "not work", "不行", "不好使", "bug",
-            "不对", "有问题", "不正确", "不应该", "还是不行", "没有用", "没效果",
-            "显示错误", "返回错误", "结果不对", "broken", "wrong", "incorrect"]
-            .iter().any(|k| lower.contains(k));
+        let has_error_keyword = [
+            "错误",
+            "报错",
+            "失败",
+            "error",
+            "500",
+            "404",
+            "crash",
+            "异常",
+            "exception",
+            "内部错误",
+            "not work",
+            "不行",
+            "不好使",
+            "bug",
+            "不对",
+            "有问题",
+            "不正确",
+            "不应该",
+            "还是不行",
+            "没有用",
+            "没效果",
+            "显示错误",
+            "返回错误",
+            "结果不对",
+            "broken",
+            "wrong",
+            "incorrect",
+        ]
+        .iter()
+        .any(|k| lower.contains(k));
 
         if !has_error_keyword {
             return content.to_string();
         }
 
-        let wd: PathBuf = self.turn_runner.context.working_dir.try_read()
+        let wd: PathBuf = self
+            .turn_runner
+            .context
+            .working_dir
+            .try_read()
             .map(|g| g.clone())
             .unwrap_or_default();
 
         // Find log files: *.log in project root and common subdirs
-        let log_candidates = ["backend.log", "server.log", "app.log", "nohup.out",
-            "backend/backend.log", "backend/nohup.out",
-            "logs/app.log", "log/development.log"];
+        let log_candidates = [
+            "backend.log",
+            "server.log",
+            "app.log",
+            "nohup.out",
+            "backend/backend.log",
+            "backend/nohup.out",
+            "logs/app.log",
+            "log/development.log",
+        ];
 
         let mut diagnostics = Vec::new();
 
         for log_name in &log_candidates {
             let log_path = wd.join(log_name);
-            if !log_path.exists() { continue; }
+            if !log_path.exists() {
+                continue;
+            }
 
             // Check if log is stale (mtime > 5 min ago).
             // Stale logs contain only old startup output, not the runtime error
             // the user is reporting. Still scan but tag as stale.
-            let is_stale = std::fs::metadata(&log_path).ok()
+            let is_stale = std::fs::metadata(&log_path)
+                .ok()
                 .and_then(|m| m.modified().ok())
                 .map(|mtime| mtime.elapsed().unwrap_or_default().as_secs() > 300)
                 .unwrap_or(false);
 
             if let Ok(output) = tokio::process::Command::new("grep")
-                .args(&["-i", "-E", "error|exception|fail|caused by",
-                    &log_path.to_string_lossy()])
+                .args(&[
+                    "-i",
+                    "-E",
+                    "error|exception|fail|caused by",
+                    &log_path.to_string_lossy(),
+                ])
                 .output()
                 .await
             {
@@ -61,21 +105,25 @@ impl AgentLoop {
 
         // Fallback: if all logs are stale or empty, try to capture live output
         // from running Java/Node processes via their recent stderr.
-        let all_stale_or_empty = diagnostics.is_empty()
-            || diagnostics.iter().all(|d| d.contains("STALE"));
+        let all_stale_or_empty =
+            diagnostics.is_empty() || diagnostics.iter().all(|d| d.contains("STALE"));
         if all_stale_or_empty {
             // Try Spring Boot default log location
             let spring_log = wd.join("backend/logs/spring.log");
             if spring_log.exists() {
                 if let Ok(output) = tokio::process::Command::new("tail")
                     .args(&["-50", &spring_log.to_string_lossy()])
-                    .output().await
+                    .output()
+                    .await
                 {
                     let stdout = String::from_utf8_lossy(&output.stdout);
-                    let error_lines: Vec<&str> = stdout.lines()
+                    let error_lines: Vec<&str> = stdout
+                        .lines()
                         .filter(|l| {
                             let low = l.to_lowercase();
-                            low.contains("error") || low.contains("exception") || low.contains("caused by")
+                            low.contains("error")
+                                || low.contains("exception")
+                                || low.contains("caused by")
                         })
                         .collect();
                     if !error_lines.is_empty() {
@@ -100,13 +148,16 @@ impl AgentLoop {
         let mut searcher = self.turn_runner.context.semantic.lock().await;
 
         // Match patterns like "FileName.java:45" or "file.py:123" or "file.rs:45"
-        let file_line_re = regex::Regex::new(r"(\w+\.\w+):(\d+)").unwrap_or_else(|_| regex::Regex::new(".^").unwrap());
+        let file_line_re = regex::Regex::new(r"(\w+\.\w+):(\d+)")
+            .unwrap_or_else(|_| regex::Regex::new(".^").unwrap());
         let mut seen_files = std::collections::HashSet::new();
 
         for cap in file_line_re.captures_iter(&diag_text) {
             let filename = &cap[1];
             let line_no: usize = cap[2].parse().unwrap_or(0);
-            if line_no == 0 || seen_files.contains(filename) { continue; }
+            if line_no == 0 || seen_files.contains(filename) {
+                continue;
+            }
 
             // Find the actual file path in the project
             let file_path = Self::find_file_in_project(&wd, filename);
@@ -114,7 +165,10 @@ impl AgentLoop {
                 seen_files.insert(filename.to_string());
                 // Use tree-sitter to find the enclosing function at this line
                 if let Some(symbols) = searcher.list_symbols(fp) {
-                    if let Some(sym) = symbols.iter().find(|s| line_no >= s.start_line && line_no <= s.end_line) {
+                    if let Some(sym) = symbols
+                        .iter()
+                        .find(|s| line_no >= s.start_line && line_no <= s.end_line)
+                    {
                         // Extract the function code
                         if let Some(slice) = searcher.extract_symbol(fp, &sym.name) {
                             let mut code = format!(
@@ -125,7 +179,9 @@ impl AgentLoop {
                                 code.push_str(&format!("{:4}| {}\n", slice.start_line + i, line));
                             }
                             extracted_code.push(code);
-                            if extracted_code.len() >= 2 { break; } // Max 2 functions
+                            if extracted_code.len() >= 2 {
+                                break;
+                            } // Max 2 functions
                         }
                     }
                 }
@@ -151,7 +207,9 @@ impl AgentLoop {
             for obj_name in &objects_to_scan {
                 for fp in &seen_files {
                     if let Some(file_path) = Self::find_file_in_project(&wd, fp) {
-                        if let Some(call_list) = searcher.find_similar_calls(&file_path, &obj_name.to_lowercase()) {
+                        if let Some(call_list) =
+                            searcher.find_similar_calls(&file_path, &obj_name.to_lowercase())
+                        {
                             extracted_code.push(format!(
                                 "\n[All {} calls in this file — fix ALL at once:]\n{}",
                                 obj_name, call_list
@@ -184,7 +242,8 @@ impl AgentLoop {
                     .unwrap_or_else(|_| regex::Regex::new(".^").unwrap());
                 for cap in fn_re.captures_iter(content) {
                     let name = &cap[1];
-                    if !graph.find_by_name(name).is_empty() && !fn_names.contains(&name.to_string()) {
+                    if !graph.find_by_name(name).is_empty() && !fn_names.contains(&name.to_string())
+                    {
                         fn_names.push(name.to_string());
                     }
                 }
@@ -207,7 +266,8 @@ impl AgentLoop {
         // Extract exception signature (e.g. "TransactionRequiredException") for recurrence detection.
         let exception_re = regex::Regex::new(r"(\w+Exception|\w+Error)")
             .unwrap_or_else(|_| regex::Regex::new(".^").unwrap());
-        let current_exception = exception_re.captures_iter(&diag_text)
+        let current_exception = exception_re
+            .captures_iter(&diag_text)
             .next()
             .map(|c| c[1].to_string())
             .unwrap_or_default();
@@ -216,7 +276,9 @@ impl AgentLoop {
 
         // If the same exception recurs after a previous fix attempt, tell the model
         // its approach isn't working and it needs a different strategy.
-        if !current_exception.is_empty() && current_exception == self.discipline_state.last_diagnosed_error {
+        if !current_exception.is_empty()
+            && current_exception == self.discipline_state.last_diagnosed_error
+        {
             result.push_str(&format!(
                 "\n\n[RECURRING ERROR: {} appeared again after your previous fix. \
                  Your last approach did not resolve it. Try a fundamentally different fix — \
@@ -231,16 +293,22 @@ impl AgentLoop {
         }
 
         if !extracted_code.is_empty() {
-            result.push_str("\n\n[Relevant source code from stack trace — you can edit directly:]\n");
+            result
+                .push_str("\n\n[Relevant source code from stack trace — you can edit directly:]\n");
             result.push_str(&extracted_code.join("\n"));
         }
         result
     }
 
     /// Find a file by name in the project directory (searches up to 4 levels deep).
-    pub(crate) fn find_file_in_project(wd: &std::path::Path, filename: &str) -> Option<std::path::PathBuf> {
+    pub(crate) fn find_file_in_project(
+        wd: &std::path::Path,
+        filename: &str,
+    ) -> Option<std::path::PathBuf> {
         fn walk(dir: &std::path::Path, target: &str, depth: usize) -> Option<std::path::PathBuf> {
-            if depth > 4 { return None; }
+            if depth > 4 {
+                return None;
+            }
             let entries = std::fs::read_dir(dir).ok()?;
             for entry in entries.flatten() {
                 let name = entry.file_name();
@@ -260,5 +328,4 @@ impl AgentLoop {
         }
         walk(wd, filename, 0)
     }
-
 }

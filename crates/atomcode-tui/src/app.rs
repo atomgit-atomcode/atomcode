@@ -354,8 +354,7 @@ impl App {
            total_tokens: 0,
            turn_tokens: 0,
            ctx_used_tokens: 0,
-           context_window: config.providers.get(&config.default_provider)
-               .map(|p| p.context_window).unwrap_or(128000),
+           context_window: config.default_context_window(),
            render_cache: Vec::new(),
            render_cache_msg_count: 0,
            selection: TextSelection::new(),
@@ -377,6 +376,8 @@ impl App {
                    user_agent: None,
                    context_window: atomcode_core::config::provider::default_context_window_for("openai"),
                    max_tokens: None,
+                   thinking_type: None,
+                   thinking_keep: None,
                    ephemeral: false,
                }).unwrap_or_else(|_| {
                    // Fallback: should never reach production path since AgentLoop handles LLM
@@ -633,7 +634,7 @@ impl App {
                     arguments: arguments.clone(),
                 };
                 self.executing_tool_info = format_tool_info(&call);
-                self.conversation.finalize_stream_with_tool_call(call);
+                self.conversation.finalize_stream_with_tool_call(call, None);
                 self.render_cache_msg_count = 0;
                 self.mode = AppMode::ToolExecuting;
                 self.tool_start = Some(Instant::now());
@@ -669,7 +670,15 @@ impl App {
                 self.render_cache_msg_count = 0;
                 self.at_bottom = true;
             }
-            AgentEvent::ApprovalNeeded { tool_name: _, reason: _, call } => {
+            AgentEvent::ApprovalNeeded { tool_name, reason, call } => {
+                atomcode_core::notify::notify(
+                    &self.config.notifications,
+                    atomcode_core::notify::NotificationEvent::ApprovalNeeded(atomcode_core::notify::ApprovalNotification {
+                        tool_name: &tool_name,
+                        detail: Some(if reason.trim().is_empty() { &call.arguments } else { &reason }),
+                        working_dir: Some(&self.working_dir),
+                    }),
+                );
                 self.mode = AppMode::WaitingApproval(call);
             }
             AgentEvent::PhaseChange(phase) => {
@@ -706,7 +715,18 @@ impl App {
                     }
                 }
             }
-            AgentEvent::TurnComplete { duration, total_tokens: _, turn_count: _, tool_call_count: _, stop_reason: _ } => {
+            AgentEvent::TurnComplete { duration, total_tokens: _, turn_count: _, tool_call_count: _, stop_reason, messages: _ } => {
+                atomcode_core::notify::notify(
+                    &self.config.notifications,
+                    atomcode_core::notify::NotificationEvent::TurnFinished(atomcode_core::notify::TurnNotification {
+                        duration,
+                        turn_count: self.current_step_count,
+                        tool_call_count: self.current_tool_call_count,
+                        total_tokens: Some(self.turn_tokens),
+                        stop_reason,
+                        working_dir: Some(&self.working_dir),
+                    }),
+                );
                 // Clear any lingering streaming tool state — turn is over.
                 self.streaming_tool_name = None;
                 self.streaming_tools.clear();
@@ -792,6 +812,17 @@ impl App {
                 }
             }
             AgentEvent::TurnCancelled { messages } => {
+                atomcode_core::notify::notify(
+                    &self.config.notifications,
+                    atomcode_core::notify::NotificationEvent::TurnFinished(atomcode_core::notify::TurnNotification {
+                        duration: self.turn_start.map(|t| t.elapsed()).unwrap_or_default(),
+                        turn_count: self.current_step_count,
+                        tool_call_count: self.current_tool_call_count,
+                        total_tokens: Some(self.turn_tokens),
+                        stop_reason: atomcode_core::agent::TurnStopReason::Cancelled,
+                        working_dir: Some(&self.working_dir),
+                    }),
+                );
                 // User cancelled - sync the cleaned conversation from agent
                 self.conversation.messages = messages;
                 self.conversation.stream_buffer = None; // Clear any partial stream
@@ -847,7 +878,7 @@ impl App {
                 self.config.default_workdir = Some(new_dir.to_string_lossy().to_string());
                 let _ = self.config.save(&Config::default_path());
             }
-            AgentEvent::ContextStats { system_tokens, sent_tokens, dropped_tokens: _, working_set_tokens: _, total_messages: _ } => {
+            AgentEvent::ContextStats { system_tokens, sent_tokens, .. } => {
                 self.ctx_used_tokens = system_tokens + sent_tokens;
             }
             AgentEvent::SubAgentProgress { file, status } => {
@@ -1047,7 +1078,10 @@ impl App {
             self.last_ctrl_c = Some(now);
 
             if double_press {
-                // Double Ctrl+C: exit
+                // Double Ctrl+C: exit — save session before exiting
+                if !self.current_session.messages.is_empty() {
+                    let _ = self.session_manager.save(&self.current_session);
+                }
                 self.mode = AppMode::Exiting;
                 return;
             }
@@ -2195,6 +2229,16 @@ impl App {
                 }
                 return true;
             }
+            cmd if cmd == "/compact" || cmd.starts_with("/compact ") => {
+                let arg = cmd.strip_prefix("/compact").unwrap().trim();
+                let prompt = (!arg.is_empty()).then(|| arg.to_string());
+                // Agent emits the result as a TextDelta ("nothing to compact"
+                // or "compacted — dropped N messages"). No UI-local placeholder
+                // — a premature "compacting…" line could contradict the actual
+                // outcome when the conversation is too short to compact.
+                let _ = self.agent_handle.cmd_tx.send(AgentCommand::Compact { prompt });
+                return true;
+            }
             "/undo" => {
                 if let Some(ref checkpoint) = self.last_checkpoint.clone() {
                     let (ok, msg) = atomcode_core::agent::git_checkpoint::restore_checkpoint(
@@ -3136,7 +3180,7 @@ async fn refresh_gitcode_token() -> Result<String, String> {
         id, username
     ));
 
-    std::fs::write(&auth_path, new_content)
+    atomcode_core::auth::write_auth_file_secure(&auth_path, &new_content)
         .map_err(|e| format!("Failed to write auth.toml: {}", e))?;
 
     Ok(new_access_token)

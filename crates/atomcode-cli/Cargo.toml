@@ -33,3 +33,12 @@ libc = "0.2"
 [target.'cfg(target_os = "windows")'.dependencies]
 mimalloc = { version = "0.1", default-features = false }
 windows-sys = { version = "0.61", features = ["Win32_System_Console", "Win32_Globalization"] }
+
+# Build-dep for embedding the app icon into atomcode.exe resource section.
+# Gated at runtime in build.rs via CARGO_CFG_TARGET_OS so it only fires
+# when the *target* is Windows — cross-compile from macOS is the primary
+# case. Needs `*-w64-mingw32-windres` on PATH (already required by the
+# existing mingw-w64 cross-compile toolchain). The crate is tiny and pure
+# Rust, so pulling it in unconditionally on the host side costs ~nothing.
+[build-dependencies]
+winresource = "0.1"

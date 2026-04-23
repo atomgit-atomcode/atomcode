@@ -196,10 +196,7 @@ pub fn ensure_writable(exe: &Path) -> Result<()> {
 pub async fn fetch_manifest() -> Result<Manifest> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
-        .user_agent(format!(
-            "atomcode-self-update/{}",
-            env!("CARGO_PKG_VERSION")
-        ))
+        .user_agent(crate::ATOMCODE_USER_AGENT)
         .build()?;
     let resp = client
         .get(MANIFEST_URL)
@@ -249,10 +246,7 @@ async fn download_and_verify(
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(600))
-        .user_agent(format!(
-            "atomcode-self-update/{}",
-            env!("CARGO_PKG_VERSION")
-        ))
+        .user_agent(crate::ATOMCODE_USER_AGENT)
         .build()?;
     let resp = client
         .get(url)

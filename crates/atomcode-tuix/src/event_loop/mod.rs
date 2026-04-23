@@ -14,6 +14,7 @@
 // Buffer); modal overlays already live in `crate::modals`.
 
 pub(crate) mod commands;
+pub(crate) mod monitor;
 use commands::execute_slash_command;
 
 use std::collections::VecDeque;
@@ -51,16 +52,49 @@ pub struct LoopCtx {
     pub input_rx: mpsc::UnboundedReceiver<InputEvent>,
     pub commands: CommandRegistry,
     pub session_manager: SessionManager,
+    /// Session actively being accumulated. Updated on TurnComplete /
+    /// TurnCancelled (both carry the latest `messages` slice), saved to
+    /// disk via `session_manager` on the same events so `/resume` after
+    /// a quit sees the conversation. Replaced wholesale when the user
+    /// resumes another session via `/resume` + SessionPicker.
+    pub current_session: atomcode_core::session::Session,
     /// Shared "new version available" hint. Populated by the detached
     /// version-check task spawned from `run()`; read by `build_status`
     /// on each redraw. `None` = no hint (either check still pending,
     /// network failed silently, or already up to date).
     pub update_hint: std::sync::Arc<std::sync::Mutex<Option<String>>>,
-    /// Wake signal from the version-check task — one `()` sent when the
-    /// task resolves with a positive result. The event loop selects on
-    /// `wake_rx` and triggers an idle redraw so the hint appears without
-    /// waiting for the user's next keystroke.
+    /// Shared CodingPlan drift-monitor warning slot. Written by the
+    /// detached check task (see `monitor::spawn_check`); read by
+    /// `build_status` on each redraw. Takes precedence over `update_hint`
+    /// so a drift warning isn't buried by an upgrade banner. Cleared
+    /// when `/codingplan` persists a fresh config (re-sync resets the
+    /// hint state).
+    pub monitor_warning:
+        std::sync::Arc<std::sync::Mutex<Option<monitor::CodingPlanWarning>>>,
+    /// Last time a monitor check was fired this session. Pre-turn
+    /// triggers respect `monitor::CHECK_COOLDOWN` (15 min) against this
+    /// timestamp; startup + `/model` switch bypass the cooldown.
+    /// `None` = no check has run yet this session.
+    pub monitor_last_check_at: Option<std::time::Instant>,
+    /// Last-observed timestamp from the shared CodingPlan sync marker
+    /// (`~/.atomcode/codingplan_sync.json`). On every user input we
+    /// re-read it; a change means ANOTHER atomcode process (e.g. a
+    /// second terminal) just ran `/codingplan` and the server is now
+    /// in sync with the on-disk config. We then hot-reload config
+    /// from disk + clear the stale drift warning. Without this,
+    /// Terminal A's "CodingPlan 模型列表更新" hint would stick forever
+    /// after Terminal B ran the fix.
+    pub monitor_last_sync_seen: Option<std::time::SystemTime>,
+    /// Wake signal from background tasks (version check + CodingPlan
+    /// drift monitor). One `()` sent when any task needs the event loop
+    /// to repaint so a freshly-computed hint/warning appears without
+    /// waiting for the user's next keystroke. Bounded at 1 — overlapping
+    /// wakes coalesce since the redraw is idempotent.
     pub wake_rx: mpsc::Receiver<()>,
+    /// Sender side of `wake_rx`. Cloned into every spawned check task
+    /// so `/model` switches, pre-turn triggers, and the like can wake
+    /// the event loop after updating `monitor_warning`.
+    pub wake_tx: mpsc::Sender<()>,
     /// Control handle for the crossterm reader thread — `Some` in raw-mode
     /// TTY sessions, `None` in pipe mode. Used by child-process handoffs
     /// (OAuth login, future `/shell`) to pause+resume event consumption
@@ -74,6 +108,36 @@ pub struct LoopCtx {
     /// Consumed in the main `select!` so upgrade progress is rendered
     /// alongside agent events.
     pub upgrade_rx: mpsc::UnboundedReceiver<atomcode_core::self_update::UpgradeEvent>,
+    /// Signal channel from the `/issue` wizard modal back to the event
+    /// loop. The wizard's Enter handler can't touch `App` directly
+    /// (modals only see `LoopCtx`), so it stores the collected title +
+    /// body here, returns `Close`, and the event loop's post-close
+    /// branch POSTs the issue to AtomGit and echoes the URL of the
+    /// newly-created issue back into the conversation.
+    pub pending_new_issue: Option<NewIssueDraft>,
+    /// Set by `WelcomeWizard` when the user picks option 0 (Set up
+    /// CodingPlan). The event loop drains this on modal close and
+    /// runs the full CodingPlan setup flow (login if needed → claim →
+    /// fetch models → register providers). Needs raw-mode
+    /// suspend/resume, something modals can't drive themselves. Same
+    /// pattern as `pending_new_issue`.
+    pub pending_run_codingplan: bool,
+    /// Set by `WelcomeWizard` when the user picks option 1 (Configure
+    /// manually). The event loop drains this on modal close and swaps in
+    /// `ProviderWizard::MainMenu` — a Modal-to-Modal transition that
+    /// needs mutable `active_modal` access only the event loop has.
+    pub pending_open_provider_wizard: bool,
+}
+
+/// What the `/issue` wizard hands back to the event loop after the user
+/// finishes step 2. The event loop turns this into a `POST /repos/.../issues`
+/// API call and echoes the resulting issue URL into scrollback.
+#[derive(Debug, Clone)]
+pub struct NewIssueDraft {
+    pub owner: String,
+    pub repo: String,
+    pub title: String,
+    pub body: String,
 }
 
 /// Line-edit buffer for input composition. Byte-indexed cursor.
@@ -612,6 +676,16 @@ pub struct App {
     /// Requires a second press within `CTRL_C_EXIT_WINDOW` to actually
     /// exit — protects against accidental single-tap exits.
     pub exit_pending: Option<std::time::Instant>,
+    /// Set by `/fixissue <url>` while the agent is resolving that issue.
+    /// On `TurnComplete` the text buffered in `fixissue_buffer` is posted
+    /// back as an issue comment + the `fixed` label is applied. Cleared
+    /// on TurnComplete / TurnCancelled / Error so a subsequent normal
+    /// message doesn't accidentally trigger a post-back.
+    pub fixissue_pending: Option<atomcode_core::atomgit::IssueRef>,
+    /// Accumulates every visible `AssistantText` delta produced during a
+    /// fixissue turn, verbatim. Sent as the AtomGit comment body on
+    /// successful completion.
+    pub fixissue_buffer: String,
 }
 
 /// How long the "press Ctrl+C again to exit" confirmation stays armed.
@@ -628,6 +702,8 @@ impl App {
             think: ThinkStripper::new(),
             pending_tools: std::collections::HashMap::new(),
             exit_pending: None,
+            fixissue_pending: None,
+            fixissue_buffer: String::new(),
         }
     }
 }
@@ -662,13 +738,78 @@ pub async fn run_loop(
             prev, current
         )));
     }
-    renderer.render(UiLine::InputPrompt {
-        buf: String::new(),
-        cursor_byte: 0,
-        menu: None,
-        status: build_status(&app.state, &ctx),
-    });
-    renderer.flush();
+    // Same env-var handoff from `atomcode codingplan` (see CLI `run()`):
+    // the subcommand stashes its rendered SetupReport here instead of
+    // printing to stdout, so the user sees the ✔/✘ lines in the chat
+    // scrollback rather than scrolled off above the welcome banner.
+    if let Ok(report) = std::env::var("ATOMCODE_CODINGPLAN_REPORT") {
+        std::env::remove_var("ATOMCODE_CODINGPLAN_REPORT");
+        if !report.is_empty() {
+            renderer.render(UiLine::CommandOutput(report));
+        }
+    }
+
+    // First-run onboarding: no providers configured AND no OAuth login
+    // on disk means the user has never set this up. Show the legacy-tui
+    // 3-choice wizard (Login / Configure manually / Skip) as a modal —
+    // same mechanism as /resume, /provider, etc. Users with a config or
+    // prior OAuth auth are never shown this and boot straight to idle.
+    let is_first_run = ctx.config.providers.is_empty()
+        && atomcode_core::auth::get_stored_auth().is_none();
+    if is_first_run {
+        // Body-side guide — pushed to scrollback above the footer menu,
+        // gives the user context before they navigate the MenuPayload.
+        // Kept compact (5 lines) so on small terminals the menu still
+        // fits without scrolling the welcome banner off-screen.
+        renderer.render(UiLine::CommandOutput(
+            "\n  Welcome to AtomCode. Pick an option to get started:\n  \
+             (↑↓ to navigate, Enter to confirm, Esc to skip)\n\n".into(),
+        ));
+        app.active_modal = Some(Box::new(crate::modals::WelcomeWizard::new()));
+        if let Some(m) = app.active_modal.as_mut() {
+            m.draw(&app.buf, &app.state, &ctx, renderer);
+        }
+    } else {
+        renderer.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: build_status(&app.state, &ctx),
+        });
+        renderer.flush();
+    }
+
+    // Startup CodingPlan drift check. Without this, a user who ran
+    // `/codingplan` days ago and now sees a new model in the plan lineup
+    // wouldn't learn until they typed a message — the mid-turn trigger
+    // at the submit-path only fires on user action. Gating:
+    //
+    //   * Only when the active provider is an AtomGit* (CodingPlan)
+    //     provider — non-CodingPlan users do zero network work on boot.
+    //   * Still respects the 15-min cooldown against `monitor_last_check_at`
+    //     so rapid restarts (e.g. crash-loop during development) don't
+    //     spam the API gateway.
+    //
+    // The check itself is fully async (`spawn_check` returns immediately
+    // and runs on a tokio task); the event loop entering its main tick
+    // loop below isn't blocked, and the warning — when it arrives a
+    // second or two later — wakes the loop via `wake_tx` so the status
+    // row repaints without the user needing to press a key.
+    if monitor::is_codingplan_provider(&ctx.config.default_provider) {
+        let cooled = ctx
+            .monitor_last_check_at
+            .map(|t| t.elapsed() >= monitor::CHECK_COOLDOWN)
+            .unwrap_or(true);
+        if cooled {
+            ctx.monitor_last_check_at = Some(std::time::Instant::now());
+            monitor::spawn_check(
+                ctx.config.clone(),
+                ctx.model_name.clone(),
+                ctx.monitor_warning.clone(),
+                ctx.wake_tx.clone(),
+            );
+        }
+    }
 
     // Spinner tick channel — a background task fires a tick every 100ms
     // into a bounded (cap 1) mpsc. The main loop recv's this in the
@@ -805,7 +946,7 @@ pub async fn run_loop(
             maybe = ctx.agent.event_rx.recv() => {
                 let Some(ev) = maybe else { break };
                 let pre_phase = app.state.phase;
-                handle_agent_event(ev, &mut app.state, &mut app.think, renderer, &mut app.pending_tools, &mut ctx);
+                handle_agent_event(ev, &mut app.state, &mut app.think, renderer, &mut app.pending_tools, &mut ctx, &mut app.fixissue_pending, &mut app.fixissue_buffer);
                 if pre_phase != app.state.phase {
                     crate::tuix_trace!("PH", "{:?} -> {:?}", pre_phase, app.state.phase);
                 }
@@ -910,7 +1051,7 @@ pub async fn run_loop(
             maybe = ctx.agent.event_rx.recv() => {
                 let Some(ev) = maybe else { break };
                 let pre_phase = app.state.phase;
-                handle_agent_event(ev, &mut app.state, &mut app.think, renderer, &mut app.pending_tools, &mut ctx);
+                handle_agent_event(ev, &mut app.state, &mut app.think, renderer, &mut app.pending_tools, &mut ctx, &mut app.fixissue_pending, &mut app.fixissue_buffer);
                 if pre_phase != app.state.phase {
                     crate::tuix_trace!("PH", "{:?} -> {:?}", pre_phase, app.state.phase);
                 }
@@ -950,6 +1091,50 @@ pub async fn run_loop(
     Ok(())
 }
 
+/// If another atomcode process just ran `/codingplan` (i.e. the shared
+/// sync marker file advanced since we last looked), pull the fresh
+/// config from disk, clear our stale drift warning, and hand the new
+/// config to the agent. Cheap on every keystroke: a single file-read
+/// + serde parse. Idempotent — when no other process has synced, the
+/// early return skips all work.
+fn refresh_after_cross_process_codingplan_sync(ctx: &mut LoopCtx) {
+    let current = atomcode_core::coding_plan::read_last_sync();
+    let advanced = match (current, ctx.monitor_last_sync_seen) {
+        (Some(new), Some(old)) => new > old,
+        (Some(_), None) => true, // marker just appeared
+        _ => false,
+    };
+    if !advanced {
+        return;
+    }
+    ctx.monitor_last_sync_seen = current;
+
+    // Hot-reload the config file. Fail silently: if the other process
+    // wrote a malformed config (shouldn't happen — it would have
+    // rejected its own reload), leave our in-memory snapshot alone.
+    let path = atomcode_core::config::Config::default_path();
+    if let Ok(fresh) = atomcode_core::config::Config::load(&path) {
+        ctx.config = fresh;
+        if let Some(p) = ctx.config.providers.get(&ctx.config.default_provider) {
+            ctx.model_name = p.model.clone();
+        }
+        let _ = ctx
+            .agent
+            .cmd_tx
+            .send(AgentCommand::ReloadConfig(ctx.config.clone()));
+    }
+
+    // Sync marker = another process just reconciled config with
+    // server, so any drift warning we're still showing is stale by
+    // definition. Reset the cooldown too so the next drift check
+    // (if needed) fires immediately instead of waiting 15 min from
+    // whenever we last checked.
+    if let Ok(mut g) = ctx.monitor_warning.lock() {
+        *g = None;
+    }
+    ctx.monitor_last_check_at = None;
+}
+
 fn handle_input(
     app: &mut App,
     ctx: &mut LoopCtx,
@@ -957,6 +1142,11 @@ fn handle_input(
     ev: InputEvent,
 ) -> Result<()> {
     use crate::modals::ModalAction;
+
+    // Pick up any cross-process `/codingplan` that ran since the last
+    // input — hot-reloads config + clears stale drift hint before we
+    // act on the current keystroke.
+    refresh_after_cross_process_codingplan_sync(ctx);
 
     crate::tuix_trace!(
         "IN",
@@ -1032,6 +1222,59 @@ fn handle_input(
                     )?;
                     if matches!(action, ModalAction::Close) {
                         app.active_modal = None;
+                        // IssueWizard signals a staged title+body via
+                        // `ctx.pending_new_issue`. Drain + POST to the
+                        // AtomGit API here and echo the created-issue
+                        // URL into scrollback. Blocking call — the
+                        // wizard is modal so UI freezing briefly is
+                        // expected / acceptable.
+                        if let Some(draft) = ctx.pending_new_issue.take() {
+                            match atomcode_core::atomgit::Client::from_stored_auth()
+                                .and_then(|c| c.create_issue(&draft.owner, &draft.repo, &draft.title, &draft.body))
+                            {
+                                Ok(created) => {
+                                    let shown_url = created.html_url.clone().unwrap_or_else(|| {
+                                        format!(
+                                            "https://atomgit.com/{}/{}/issues/{}",
+                                            draft.owner, draft.repo, created.number
+                                        )
+                                    });
+                                    renderer.render(UiLine::CommandOutput(format!(
+                                        "  [issue] ✔ created #{}: {}\n  {}\n",
+                                        created.number, created.title, shown_url,
+                                    )));
+                                }
+                                Err(e) => {
+                                    renderer.render(UiLine::CommandOutput(format!(
+                                        "  [issue] ✗ create failed: {:#}\n",
+                                        e
+                                    )));
+                                }
+                            }
+                            renderer.flush();
+                        }
+                        // WelcomeWizard signals its follow-up via two bool
+                        // flags. Drain one, execute it here — the
+                        // CodingPlan flow (which internally handles
+                        // OAuth login when needed) needs suspend/resume
+                        // of raw mode (only event-loop scope can drive
+                        // that safely), and opening ProviderWizard is a
+                        // Modal-to-Modal swap that needs mutable
+                        // `active_modal` access the modals themselves
+                        // don't have.
+                        if std::mem::take(&mut ctx.pending_run_codingplan) {
+                            crate::event_loop::commands::run_codingplan_flow(renderer, ctx)?;
+                        }
+                        if std::mem::take(&mut ctx.pending_open_provider_wizard) {
+                            let pw = crate::modals::ProviderWizard::MainMenu { selected: 0 };
+                            app.active_modal = Some(Box::new(pw));
+                            if let Some(m) = app.active_modal.as_mut() {
+                                m.draw(&app.buf, &app.state, ctx, renderer);
+                            }
+                            // ProviderWizard owns the next frame now; skip
+                            // the idle redraw below so we don't clobber it.
+                            return Ok(());
+                        }
                         redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
                     }
                     return Ok(());
@@ -1127,17 +1370,41 @@ fn handle_idle_key(
                 return Ok(());
             }
             (KeyCode::Enter, m) if !m.contains(crossterm::event::KeyModifiers::SHIFT) => {
-                // Accept the highlighted command as the committed line.
+                // Accept the highlighted command. Two shapes:
+                //   * arg-less commands (e.g. /help, /quit, /login) → execute
+                //     immediately on Enter, as before.
+                //   * commands that require an arg (e.g. /fixissue <url>) →
+                //     auto-complete the name + trailing space and park the
+                //     cursor so the user types the arg next. A SECOND Enter
+                //     (once the arg is filled in) commits normally through
+                //     the regular BufferResult::Commit → execute_slash_command
+                //     path at the bottom of this function.
                 let name = items[app.menu.selected].0.clone();
-                let committed = format!("/{}", name);
+                let needs_args = ctx
+                    .commands
+                    .find(&name)
+                    .map(|c| c.needs_args)
+                    .unwrap_or(false);
                 app.menu.selected = 0;
-                // Simulate a commit path.
+
+                if needs_args {
+                    // Rewrite buffer to `/name ` and park cursor at the end.
+                    // Menu rebuilds on next keystroke — with the trailing
+                    // space parse_slash_line returns `Some(("name", ""))`
+                    // so build_menu_items correctly hides the menu.
+                    app.buf.text = format!("/{} ", name);
+                    app.buf.cursor = app.buf.text.len();
+                    redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+                    return Ok(());
+                }
+
+                let committed = format!("/{}", name);
                 renderer.render(UiLine::ClearTransient);
                 renderer.render(UiLine::User(committed.clone()));
                 app.buf.text.clear();
                 app.buf.cursor = 0;
                 if let Some((cmd, arg)) = parse_slash_line(&committed) {
-                    execute_slash_command(cmd, arg, &mut app.state, ctx, renderer, &mut app.active_modal)?;
+                    execute_slash_command(cmd, arg, &mut app.state, ctx, renderer, &mut app.active_modal, &mut app.fixissue_pending, &mut app.fixissue_buffer)?;
                     if matches!(app.state.phase, UiPhase::Idle) {
                         redraw_after_slash(&app.buf, &app.state, ctx, &app.active_modal, renderer);
                     }
@@ -1157,7 +1424,7 @@ fn handle_idle_key(
     }
 
     let action = classify(code, modifiers);
-    let result = app.buf.apply(action, ctx.history.entries(), &ctx.commands);
+let result = app.buf.apply(action, ctx.history.entries(), &ctx.commands);
     crate::tuix_trace!(
         "KEY",
         "idle result={} buf_len={} cursor={}",
@@ -1210,14 +1477,38 @@ fn handle_idle_key(
             let as_slash = parse_slash_line(&line)
                 .filter(|(cmd, _)| ctx.commands.find(cmd).is_some());
             if let Some((cmd, arg)) = as_slash {
-                execute_slash_command(cmd, arg, &mut app.state, ctx, renderer, &mut app.active_modal)?;
+                execute_slash_command(cmd, arg, &mut app.state, ctx, renderer, &mut app.active_modal, &mut app.fixissue_pending, &mut app.fixissue_buffer)?;
                 if matches!(app.state.phase, UiPhase::Idle) {
                     redraw_after_slash(&app.buf, &app.state, ctx, &app.active_modal, renderer);
                 }
             } else {
                 ctx.history.push(line.clone());
+                // Cache the full expanded form before dispatch. If the
+                // user hits Ctrl+C / Esc mid-stream, `handle_streaming_key`
+                // takes this Option and restores it to `app.buf.text`
+                // so the cancelled message can be edited and resent.
+                app.state.last_submitted_message = Some(expanded.clone());
                 ctx.agent.cmd_tx.send(AgentCommand::SendMessage(expanded)).ok();
                 app.state.on_submit();
+                // CodingPlan drift check — fire before every turn sent
+                // to a CodingPlan-managed provider, gated by a 15-min
+                // cooldown so rapid-fire messages don't spam the API.
+                // Non-CodingPlan users skip entirely (zero network).
+                if monitor::is_codingplan_provider(&ctx.config.default_provider) {
+                    let cooled = ctx
+                        .monitor_last_check_at
+                        .map(|t| t.elapsed() >= monitor::CHECK_COOLDOWN)
+                        .unwrap_or(true);
+                    if cooled {
+                        ctx.monitor_last_check_at = Some(std::time::Instant::now());
+                        monitor::spawn_check(
+                            ctx.config.clone(),
+                            ctx.model_name.clone(),
+                            ctx.monitor_warning.clone(),
+                            ctx.wake_tx.clone(),
+                        );
+                    }
+                }
             }
         }
         BufferResult::Exit => {
@@ -1319,6 +1610,39 @@ pub(crate) fn save_and_reload(ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
     }
 }
 
+/// On Ctrl+C / Esc during streaming, pull the running message back
+/// into the input buffer so the user can edit and resend without
+/// re-typing. Also drops any type-ahead queue entries: a user
+/// pulling the escape cord doesn't want queued messages to
+/// auto-fire after the current one dies. The actual `TurnCancelled`
+/// event (plus the flip back to Idle + footer redraw) arrives later
+/// via the agent round-trip — but the spinner tick at 80ms+ redraws
+/// the StreamingBox with `buf.text`, so the restored message shows
+/// up within a frame.
+fn restore_cancelled_message_to_buf(
+    app: &mut App,
+    renderer: &mut dyn Renderer,
+    ctx: &LoopCtx,
+) {
+    app.message_queue.clear();
+    if let Some(msg) = app.state.last_submitted_message.take() {
+        app.buf.text = msg;
+        app.buf.cursor = app.buf.text.len();
+        app.menu.selected = 0;
+        // Force an immediate StreamingBox repaint so the restored
+        // text shows in the input box on this frame, not the next
+        // spinner tick.
+        draw_spinner_now(
+            &mut app.state,
+            &app.buf,
+            ctx,
+            renderer,
+            app.message_queue.len(),
+            app.menu.selected,
+        );
+    }
+}
+
 fn handle_streaming_key(
     app: &mut App,
     ctx: &mut LoopCtx,
@@ -1327,9 +1651,12 @@ fn handle_streaming_key(
     modifiers: crossterm::event::KeyModifiers,
 ) -> Result<()> {
     // Ctrl+C always cancels the running turn — highest priority so
-    // users have a reliable escape hatch even mid-edit.
+    // users have a reliable escape hatch even mid-edit. Also drops
+    // the type-ahead queue: a user yanking the escape cord doesn't
+    // want queued messages to auto-fire after the current one dies.
     if code == KeyCode::Char('c') && modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
         ctx.agent.cmd_tx.send(AgentCommand::Cancel).ok();
+        restore_cancelled_message_to_buf(app, renderer, ctx);
         return Ok(());
     }
 
@@ -1339,6 +1666,7 @@ fn handle_streaming_key(
     // not "clear an unsubmitted slash token" (users can Ctrl+U for that).
     if code == KeyCode::Esc {
         ctx.agent.cmd_tx.send(AgentCommand::Cancel).ok();
+        restore_cancelled_message_to_buf(app, renderer, ctx);
         return Ok(());
     }
 
@@ -1376,7 +1704,7 @@ fn handle_streaming_key(
     }
 
     let action = classify(code, modifiers);
-    match app.buf.apply(action, ctx.history.entries(), &ctx.commands) {
+match app.buf.apply(action, ctx.history.entries(), &ctx.commands) {
         BufferResult::NoOp => {}
         BufferResult::Redraw => {
             // Menu shape may have changed — reset selection if it
@@ -1428,6 +1756,7 @@ fn handle_streaming_key(
             // Ctrl+C on empty buf during streaming — treat as cancel
             // (consistent with the explicit Ctrl+C branch above).
             ctx.agent.cmd_tx.send(AgentCommand::Cancel).ok();
+            restore_cancelled_message_to_buf(app, renderer, ctx);
         }
     }
     Ok(())
@@ -1538,11 +1867,16 @@ fn handle_agent_event(
     renderer: &mut dyn Renderer,
     pending_tools: &mut std::collections::HashMap<String, (String, String, bool)>,
     ctx: &mut LoopCtx,
+    fixissue_pending: &mut Option<atomcode_core::atomgit::IssueRef>,
+    fixissue_buffer: &mut String,
 ) {
     match ev {
         AgentEvent::TextDelta(text) => {
             let visible = think.feed(&text);
             if !visible.is_empty() {
+                if fixissue_pending.is_some() {
+                    fixissue_buffer.push_str(&visible);
+                }
                 renderer.render(UiLine::AssistantText(visible));
                 renderer.flush();
             }
@@ -1652,6 +1986,14 @@ fn handle_agent_event(
                 detail,
             });
             renderer.flush();
+            atomcode_core::notify::notify(
+                &ctx.config.notifications,
+                atomcode_core::notify::NotificationEvent::ApprovalNeeded(atomcode_core::notify::ApprovalNotification {
+                    tool_name: &display_tool_name(&tool_name),
+                    detail: Some(&format_tool_detail(&tool_name, &call.arguments)),
+                    working_dir: Some(&ctx.working_dir),
+                }),
+            );
             state.on_approval_needed(&tool_name);
         }
         AgentEvent::PhaseChange(AgentPhase::Thinking) => state.on_thinking(),
@@ -1659,20 +2001,81 @@ fn handle_agent_event(
             state.on_tool_call_streaming(&display_tool_name(&name));
         }
         AgentEvent::PhaseChange(_) => {}
-        AgentEvent::TurnComplete { duration, total_tokens, turn_count, tool_call_count, .. } => {
+        AgentEvent::TurnComplete { duration, total_tokens, turn_count, tool_call_count, stop_reason, messages } => {
+            atomcode_core::notify::notify(
+                &ctx.config.notifications,
+                atomcode_core::notify::NotificationEvent::TurnFinished(atomcode_core::notify::TurnNotification {
+                    duration,
+                    turn_count,
+                    tool_call_count,
+                    total_tokens: Some(total_tokens),
+                    stop_reason,
+                    working_dir: Some(&ctx.working_dir),
+                }),
+            );
             renderer.render(UiLine::AssistantLineBreak);
             pending_tools.clear();
             let done = state.next_done_label();
             let dur = crate::render::fmt_dur(duration);
             let label = format!(
-                "✓ {} · {} rounds · {} tools · {} · {} tok",
+                "✓ {} · {} rounds · {} tools · {} · {} tokens",
                 done, turn_count, tool_call_count, dur, total_tokens
             );
             renderer.render(UiLine::TurnSeparator { label });
             renderer.flush();
             state.on_turn_complete();
+
+            // Reset the think stripper between turns. If the previous turn
+            // left an unclosed `<think>` in flight (cancelled mid-stream,
+            // model never emitted `</think>`, provider switch that doesn't
+            // use `<think>` tags like Kimi thinking-mode via reasoning_content),
+            // the stripper stays `inside=true` and silently swallows every
+            // TextDelta of the NEXT turn — user sees blank assistant bubbles
+            // while datalog proves the model did return text.
+            think.reset();
+
+            // Persist session after every completed turn so /resume can
+            // find it after a clean exit — the whole point of sessions.
+            persist_current_session(ctx, messages);
+
+            // fixissue post-run side effects — only on successful TurnComplete
+            // (TurnCancelled / Error arms below clear `fixissue_pending`
+            // without posting). Takes the IssueRef out so only this turn's
+            // completion triggers the post-back.
+            if let Some(issue_ref) = fixissue_pending.take() {
+                let body = std::mem::take(fixissue_buffer);
+                if body.trim().is_empty() {
+                    renderer.render(UiLine::CommandOutput(format!(
+                        "  [fixissue] agent produced no text; skipping comment + label on issue #{}\n",
+                        issue_ref.number
+                    )));
+                } else {
+                    match atomcode_core::atomgit::fixissue::post_completion(&issue_ref, &body) {
+                        Ok(()) => renderer.render(UiLine::CommandOutput(format!(
+                            "  [fixissue] ✔ posted summary + applied 'fixed' label to issue #{}\n",
+                            issue_ref.number
+                        ))),
+                        Err(e) => renderer.render(UiLine::CommandOutput(format!(
+                            "  [fixissue] ✗ post-back failed (local fix still saved): {:#}\n",
+                            e
+                        ))),
+                    }
+                }
+                renderer.flush();
+            }
         }
-        AgentEvent::TurnCancelled { .. } => {
+        AgentEvent::TurnCancelled { messages } => {
+            atomcode_core::notify::notify(
+                &ctx.config.notifications,
+                atomcode_core::notify::NotificationEvent::TurnFinished(atomcode_core::notify::TurnNotification {
+                    duration: state.turn_elapsed().unwrap_or_default(),
+                    turn_count: 0,
+                    tool_call_count: pending_tools.len(),
+                    total_tokens: None,
+                    stop_reason: atomcode_core::agent::TurnStopReason::Cancelled,
+                    working_dir: Some(&ctx.working_dir),
+                }),
+            );
             // Render any in-flight tool calls that never got a result
             // as "(cancelled)" so the user sees what was mid-flight.
             for (_id, (name, detail, call_rendered)) in pending_tools.drain() {
@@ -1688,11 +2091,27 @@ fn handle_agent_event(
             renderer.render(UiLine::TurnCancelled);
             renderer.flush();
             state.on_turn_cancelled();
+            // Cancellation = agent didn't finish; don't post a comment
+            // against an incomplete "fix".
+            fixissue_pending.take();
+            fixissue_buffer.clear();
+            // Same reset rationale as TurnComplete: a cancelled turn is the
+            // single most common way for `<think>` to go unclosed, so this
+            // branch is even more important for the stripper's hygiene.
+            think.reset();
+            // Save what we did have — a user who Ctrl+C'd mid-stream
+            // should still be able to /resume the cleaned conversation.
+            persist_current_session(ctx, messages);
         }
         AgentEvent::Error(e) => {
             renderer.render(UiLine::Error(e));
             renderer.flush();
+            fixissue_pending.take();
+            fixissue_buffer.clear();
             state.on_error();
+            // Same reset rationale as TurnComplete / TurnCancelled — an
+            // aborted turn is another way to leave `<think>` half-open.
+            think.reset();
         }
         AgentEvent::TokenUsage(u) => {
             state.total_tokens += u.completion_tokens;
@@ -1709,25 +2128,133 @@ fn handle_agent_event(
                 commands::push_recent_dir(&mut ctx.recent_dirs, new_dir);
             }
         }
-        AgentEvent::ContextStats { .. }
-        | AgentEvent::SubAgentProgress { .. } => {}
+        AgentEvent::ContextStats {
+            system_tokens,
+            sent_tokens,
+            dropped_tokens: _,
+            working_set_tokens: _,
+            total_messages,
+            tool_defs_tokens,
+            cold_zone_tokens,
+            ctx_window,
+            ctx_name,
+            system_prompt,
+        } => {
+            state.on_context_stats(
+                system_tokens,
+                sent_tokens,
+                tool_defs_tokens,
+                cold_zone_tokens,
+                total_messages,
+                ctx_window,
+                &ctx_name,
+                &system_prompt,
+            );
+        }
+        AgentEvent::SubAgentProgress { .. } => {}
     }
 }
 
+
+/// Copy the latest conversation into `ctx.current_session`, auto-name
+/// the session from the first user message when it's still at its
+/// default label, and write the session file to disk. Called on every
+/// TurnComplete and TurnCancelled so `/resume` can find the
+/// conversation after a quit. No-op when the conversation is empty
+/// (don't save a blank session).
+fn persist_current_session(
+    ctx: &mut LoopCtx,
+    messages: Vec<atomcode_core::conversation::message::Message>,
+) {
+    if messages.is_empty() {
+        return;
+    }
+    ctx.current_session.messages = messages;
+    ctx.current_session.touch();
+    // Rename from the generated default (`default` or `session-<ts>`)
+    // to the first user message's first line, truncated. Keeps the
+    // `/resume` picker scannable.
+    let should_rename = ctx.current_session.name == "default"
+        || ctx.current_session.name.starts_with("session-");
+    if should_rename {
+        use atomcode_core::conversation::message::Role;
+        if let Some(first_user) = ctx
+            .current_session
+            .messages
+            .iter()
+            .find(|m| matches!(m.role, Role::User))
+        {
+            if let Some(text) = first_user.text() {
+                let name: String = text
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .chars()
+                    .take(40)
+                    .collect();
+                if !name.is_empty() {
+                    ctx.current_session.name = name;
+                }
+            }
+        }
+    }
+    let _ = ctx.session_manager.save(&ctx.current_session);
+}
 
 /// Build the persistent status line shown directly below the input box.
 /// Pulls model name from ctx, cwd from ctx.working_dir (with $HOME
 /// collapsed to `~`), and running token count from state.
 pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::StatusLine {
     let cwd = crate::platform::collapse_home(&ctx.working_dir.to_string_lossy());
-    let hint = ctx
-        .update_hint
+    // Priority:
+    //   1. No provider configured + not logged in — show "configure" nudge.
+    //      This wins over the upgrade hint because without a provider the
+    //      app literally cannot answer any message; the user needs to know
+    //      why before they're told to upgrade.
+    //   2. Upgrade-available hint (existing behavior).
+    //   3. None.
+    let no_provider = ctx.config.providers.is_empty()
+        && atomcode_core::auth::get_stored_auth().is_none();
+    // Priority: no-provider (Warning red) > CodingPlan drift monitor
+    // (both ModelMissing and StaleList render as Warning red — model
+    // list drift is an actionable UX event worth the same visual weight
+    // as "active model gone") > upgrade banner (Info dim).
+    // Only one hint can render at a time (right-aligned on the status row).
+    let hint: Option<(String, crate::render::HintSeverity)> = if no_provider {
+        Some((
+            "no provider · /provider to configure".into(),
+            crate::render::HintSeverity::Warning,
+        ))
+    } else if let Some(warning) = ctx
+        .monitor_warning
         .lock()
         .ok()
         .and_then(|g| g.clone())
-        .map(|v| format!("↑ {} 使用/upgrade升级", v));
+    {
+        Some((warning.display_text(), crate::render::HintSeverity::Warning))
+    } else {
+        ctx.update_hint
+            .lock()
+            .ok()
+            .and_then(|g| g.clone())
+            .map(|v| {
+                (
+                    format!("↑ {} 使用/upgrade升级", v),
+                    crate::render::HintSeverity::Info,
+                )
+            })
+    };
+    // Pre-configure, `ctx.model_name` is a dummy from the startup fallback
+    // (empty string or "not-configured") — showing that raw in the status
+    // line reads as a glitch. Replace with an explicit placeholder so the
+    // user sees the state, not a rendering artifact.
+    let model = if no_provider {
+        "(not configured)".to_string()
+    } else {
+        ctx.model_name.clone()
+    };
     crate::render::StatusLine {
-        model: ctx.model_name.clone(),
+        model,
         cwd,
         total_tokens: state.total_tokens,
         hint,

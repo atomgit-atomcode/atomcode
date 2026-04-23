@@ -49,7 +49,7 @@
 
     <main class="prose-docs min-w-0">
       <h1>斜杠命令</h1>
-      <p class="lede">在 TUI 输入框中以 <code>/</code> 开头即可触发命令,并获得自动补全菜单。按功能分类的 17 个内置命令如下。</p>
+      <p class="lede">在 TUI 输入框中以 <code>/</code> 开头即可触发命令,并获得自动补全菜单。按功能分类的 23 个内置命令如下。</p>
 
       <h2>核心功能</h2>
       <table>
@@ -57,11 +57,12 @@
           <tr><th>命令</th><th>作用</th></tr>
         </thead>
         <tbody>
+          <tr><td><code>/codingplan</code></td><td><strong>推荐</strong> — 一条命令登录 + 申领 AtomGit CodingPlan 免费额度 + 自动根据额度模型列表写好 provider 配置。首次启动最省事的入口</td></tr>
+          <tr><td><code>/login</code></td><td>仅完成 AtomGit OAuth 身份认证,<strong>不动 provider 配置</strong>(给已有 API Key 但想用 <code>/issue</code> 等 AtomGit 集成的用户)</td></tr>
           <tr><td><code>/resume</code></td><td>打开会话选择器,恢复任意一个之前的持久化会话(含消息、目录和模型状态)</td></tr>
           <tr><td><code>/session</code></td><td>创建一个全新的、干净的会话</td></tr>
           <tr><td><code>/provider</code></td><td>打开 provider 管理界面,增删改切换</td></tr>
           <tr><td><code>/model</code></td><td>在当前 provider 下切换模型,或跨 provider 切换</td></tr>
-          <tr><td><code>/login</code></td><td>通过 AtomGit OAuth 登录,配置自动持久化到 config.toml</td></tr>
           <tr><td><code>/cd</code></td><td>切换工作目录,并写回 <code>default_workdir</code>。也可以直接输入 <code>cd /path</code>(无需斜杠前缀)</td></tr>
         </tbody>
       </table>
@@ -72,14 +73,14 @@
           <tr><th>命令</th><th>作用</th></tr>
         </thead>
         <tbody>
-          <tr><td><code>/plan</code></td><td>进入 Plan 模式(只读分析,不修改代码)。AI 会先调研、制定方案,确认后再执行</td></tr>
           <tr><td><code>/undo</code></td><td>回滚上一轮 AI 对本地文件的所有编辑,基于 file-history 快照</td></tr>
           <tr><td><code>/diff</code></td><td>显示当前工作目录未提交改动的 git diff</td></tr>
-          <tr><td><code>/cost</code></td><td>展示当前会话输出 token 数和上下文用量。不支持 usage 报告的 API 会自动估算</td></tr>
-          <tr><td><code>/copy</code></td><td>将 AI 最后一条回复复制到系统剪贴板</td></tr>
-          <tr><td><code>/clear</code></td><td>清空当前会话的消息(保留工作目录和模型)</td></tr>
+          <tr><td><code>/cost</code></td><td>展示当前会话输出 token 数。不支持 usage 报告的 API 会自动估算</td></tr>
+          <tr><td><code>/context</code></td><td>显示本轮上下文预算分解:系统提示、工具定义、冷区压缩、总消息数、context window 占用</td></tr>
           <tr><td><code>/compact</code></td><td>压缩历史消息,把早期对话压缩成摘要以腾出上下文预算</td></tr>
-          <tr><td><code>/issue</code></td><td>在 AtomGit 仓库上创建一个 issue(需先 OAuth 登录)</td></tr>
+          <tr><td><code>/clear</code></td><td>清空当前会话的消息(保留工作目录和模型)</td></tr>
+          <tr><td><code>/issue</code></td><td>交互式向导:在当前 git 仓库对应的 AtomGit 仓库创建一个新 issue(需先 OAuth 登录,cwd 必须是 atomgit.com 仓库的 clone)</td></tr>
+          <tr><td><code>/fixissue &lt;url&gt;</code></td><td>拉取一条指派给你的 AtomGit issue,让 agent 自动修复。完成后会把答复作为评论回写到 issue,并打上 <code>fixed</code> 标签</td></tr>
         </tbody>
       </table>
 
@@ -89,9 +90,12 @@
           <tr><th>命令</th><th>作用</th></tr>
         </thead>
         <tbody>
-          <tr><td><code>/config</code></td><td>用默认编辑器打开 <code>~/.atomcode/config.toml</code></td></tr>
-          <tr><td><code>/status</code></td><td>显示登录状态、当前 provider、模型、上下文预算等信息</td></tr>
-          <tr><td><code>/logout</code></td><td>退出 AtomGit 登录</td></tr>
+          <tr><td><code>/status</code></td><td>显示登录状态、当前 provider、模型、上下文预算、CodingPlan 用量和重置时间</td></tr>
+          <tr><td><code>/whoami</code></td><td>显示当前 AtomGit 登录用户的用户名 / 邮箱</td></tr>
+          <tr><td><code>/config</code></td><td>显示 <code>~/.atomcode/config.toml</code> 的路径</td></tr>
+          <tr><td><code>/reload</code></td><td>从磁盘热加载 <code>~/.atomcode/config.toml</code>,不需要重启 atomcode 就能让外部修改(或另一个终端的 <code>/codingplan</code> 带来的变更)生效</td></tr>
+          <tr><td><code>/logout</code></td><td>清除 AtomGit OAuth token</td></tr>
+          <tr><td><code>/upgrade</code></td><td>自动升级到最新版本;子命令 <code>/upgrade rollback</code> 回滚到上一个版本</td></tr>
           <tr><td><code>/help</code></td><td>展示命令和快捷键参考</td></tr>
           <tr><td><code>/quit</code></td><td>退出 atomcode(也可以连按两次 <code>Ctrl+C</code>)</td></tr>
         </tbody>
@@ -106,6 +110,14 @@
       </ul>
 
       <h2>典型工作流</h2>
+
+      <h3>第一次启动 — 一键接入</h3>
+      <pre><code>&gt; /codingplan
+  ✔ Logged in as alice (alice, alice@example.com)
+  ✔ CodingPlan claimed — CodingPlan Free · expires 2026-05-22 (29d / 30d)
+  ✔ 3 models registered as AtomGit-* providers
+  ✔ Default provider set to AtomGit-GLM
+&gt; 你好</code></pre>
 
       <h3>做完一件事前把成本看一眼</h3>
       <pre><code>&gt; 重构 src/db 使用连接池

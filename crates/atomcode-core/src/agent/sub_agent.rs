@@ -50,10 +50,13 @@ impl SubAgentTask {
     ) -> SubAgentResult {
         // 1. Build minimal system prompt
         let rules = crate::config::prompt_sections::build_rules();
-        let vue_warning = if self.file_path.ends_with(".vue") || self.file_path.ends_with(".svelte") {
+        let vue_warning = if self.file_path.ends_with(".vue") || self.file_path.ends_with(".svelte")
+        {
             "\nCRITICAL: This is a Vue SFC. Edit <script> and <template> in SEPARATE edit_file calls. \
              Use old_string/new_string for each edit. Keep each edit focused on one region."
-        } else { "" };
+        } else {
+            ""
+        };
 
         let system_prompt = format!(
             "{}\n\n## SUB-AGENT RULES\n\
@@ -78,14 +81,37 @@ impl SubAgentTask {
         conversation.add_user_message(&user_message);
 
         // 3. Create isolated ToolContext + TurnRunner
-        let ctx = ToolContext::new(working_dir.to_path_buf());
+        let tool_ctx = ToolContext::new(working_dir.to_path_buf());
         let permission = Box::new(AutoPermissionDecider::new(AutoPermissionMode::BypassAll));
+
+        // Pick the same ctx strategy the parent AgentLoop would. Sub-agents
+        // run on the same provider, so `for_provider` returns the matching
+        // builder (DefaultCtx / OllamaCtx / future per-model strategies).
+        // Falls back to a synthetic 128K-window config if the provider name
+        // isn't in the config — matches AgentLoop::new's fallback.
+        let build_ctx = match config.providers.get(&config.default_provider) {
+            Some(pc) => crate::ctx::for_provider(pc),
+            None => crate::ctx::for_provider(&crate::config::provider::ProviderConfig {
+                provider_type: String::new(),
+                api_key: None,
+                model: String::new(),
+                base_url: None,
+                system_prompt: None,
+                user_agent: None,
+                context_window: 128_000,
+                max_tokens: None,
+                thinking_type: None,
+                thinking_keep: None,
+                ephemeral: true,
+            }),
+        };
 
         let mut runner = TurnRunner {
             provider,
             tools,
-            context: ctx,
+            context: tool_ctx,
             config: config.clone(),
+            ctx: build_ctx,
             permission,
             recently_edited_files: Vec::new(),
             recent_calls: Vec::new(),
@@ -103,7 +129,9 @@ impl SubAgentTask {
 
         for _ in 0..max_turns {
             turns_used += 1;
-            let result = runner.run(&mut conversation, &system_prompt, &event_tx, cancel.clone()).await;
+            let result = runner
+                .run(&mut conversation, &system_prompt, &event_tx, cancel.clone())
+                .await;
 
             // Drain events
             while event_rx.try_recv().is_ok() {}

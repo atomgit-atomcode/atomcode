@@ -27,17 +27,26 @@ impl AgentLoop {
         let mut last_tool_name = String::new();
         let mut last_result_success = true;
         for msg in self.conversation.messages.iter().rev() {
-            if let (Some(success), Some(output)) = (msg.tool_result_success(), msg.tool_result_output()) {
+            if let (Some(success), Some(output)) =
+                (msg.tool_result_success(), msg.tool_result_output())
+            {
                 if last_tool_name.is_empty() {
                     last_result_success = success;
                     // Also check output for build failure keywords
                     let out = output.to_lowercase();
-                    if out.contains("build failed") || out.contains("error") || out.contains("failed") {
+                    if out.contains("build failed")
+                        || out.contains("error")
+                        || out.contains("failed")
+                    {
                         last_result_success = false;
                     }
                 }
             }
-            if let crate::conversation::message::MessageContent::AssistantWithToolCalls { tool_calls, .. } = &msg.content {
+            if let crate::conversation::message::MessageContent::AssistantWithToolCalls {
+                tool_calls,
+                ..
+            } = &msg.content
+            {
                 if let Some(last_tc) = tool_calls.last() {
                     if last_tool_name.is_empty() {
                         last_tool_name = last_tc.name.clone();
@@ -94,8 +103,13 @@ impl AgentLoop {
     /// Called for non-compiled projects as an auto-compile equivalent.
     #[allow(dead_code)]
     pub(crate) async fn syntax_check_edited_files(&mut self) {
-        let wd = self.turn_runner.context.working_dir.try_read()
-            .map(|g| g.clone()).unwrap_or_default();
+        let wd = self
+            .turn_runner
+            .context
+            .working_dir
+            .try_read()
+            .map(|g| g.clone())
+            .unwrap_or_default();
 
         let mut warnings: Vec<String> = Vec::new();
         let mut searcher = self.turn_runner.context.semantic.lock().await;
@@ -110,7 +124,8 @@ impl AgentLoop {
             if let Ok(content) = std::fs::read_to_string(&path) {
                 let (errors, lines) = searcher.count_syntax_errors(&content, &path);
                 if errors > 0 {
-                    let lines_str = lines.iter()
+                    let lines_str = lines
+                        .iter()
                         .map(|l| format!("L{}", l))
                         .collect::<Vec<_>>()
                         .join(", ");
@@ -135,11 +150,19 @@ impl AgentLoop {
     /// Snapshot dev server log sizes before an edit, so we can diff after.
     #[allow(dead_code)]
     pub(crate) fn snapshot_devserver_log_sizes(&self) -> std::collections::HashMap<String, u64> {
-        let wd = self.turn_runner.context.working_dir.try_read()
-            .map(|g| g.clone()).unwrap_or_default();
+        let wd = self
+            .turn_runner
+            .context
+            .working_dir
+            .try_read()
+            .map(|g| g.clone())
+            .unwrap_or_default();
         let candidates = [
-            "frontend.log", "backend.log", "server.log",
-            "frontend/frontend.log", "backend/backend.log",
+            "frontend.log",
+            "backend.log",
+            "server.log",
+            "frontend/frontend.log",
+            "backend/backend.log",
         ];
         let mut sizes = std::collections::HashMap::new();
         for name in &candidates {
@@ -154,9 +177,17 @@ impl AgentLoop {
     /// Check dev server logs for NEW errors after editing frontend/backend files.
     /// Only reads lines appended AFTER `pre_sizes` snapshot, ignoring stale errors.
     #[allow(dead_code)]
-    pub(crate) async fn check_devserver_logs(&mut self, pre_sizes: &std::collections::HashMap<String, u64>) {
-        let wd = self.turn_runner.context.working_dir.try_read()
-            .map(|g| g.clone()).unwrap_or_default();
+    pub(crate) async fn check_devserver_logs(
+        &mut self,
+        pre_sizes: &std::collections::HashMap<String, u64>,
+    ) {
+        let wd = self
+            .turn_runner
+            .context
+            .working_dir
+            .try_read()
+            .map(|g| g.clone())
+            .unwrap_or_default();
 
         // Small delay to let HMR process the file change
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -168,7 +199,9 @@ impl AgentLoop {
                 Err(_) => continue,
             };
             // No new content since edit → skip
-            if new_size <= old_size { continue; }
+            if new_size <= old_size {
+                continue;
+            }
 
             // Read only the NEW bytes
             let content = match tokio::fs::read_to_string(&log_path).await {
@@ -180,21 +213,29 @@ impl AgentLoop {
             } else {
                 // Approximate: skip old_size bytes (may split a UTF-8 char, but log lines are mostly ASCII)
                 let skip = old_size as usize;
-                if skip < content.len() { &content[skip..] } else { continue; }
+                if skip < content.len() {
+                    &content[skip..]
+                } else {
+                    continue;
+                }
             };
 
             // Look for error patterns in the new content only
-            let error_lines: Vec<&str> = new_content.lines()
+            let error_lines: Vec<&str> = new_content
+                .lines()
                 .filter(|l| {
                     let lower = l.to_lowercase();
-                    (lower.contains("error") || lower.contains("failed") || lower.contains("syntaxerror"))
+                    (lower.contains("error")
+                        || lower.contains("failed")
+                        || lower.contains("syntaxerror"))
                         && !lower.contains("0 error")
                         && !lower.contains("error overlay")
                 })
                 .collect();
 
             if !error_lines.is_empty() {
-                let errors: String = error_lines.iter()
+                let errors: String = error_lines
+                    .iter()
                     .take(5)
                     .map(|l| l.to_string())
                     .collect::<Vec<_>>()
