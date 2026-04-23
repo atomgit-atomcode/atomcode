@@ -1,5 +1,22 @@
 use super::*;
 
+/// Bug-report reproduction directive, prepended to enriched user message
+/// when `auto_diagnose_errors` detects error keywords (P1 #10, 2026-04-23).
+///
+/// Tech-neutral: doesn't mention `cargo` / `npm` / `pytest` etc. — model
+/// figures out the right reproduction command from project context.
+/// Specifically calls out the post-fix re-run because weak models default
+/// to "compile passes → done" which doesn't prove a runtime bug is fixed.
+const REPRODUCE_DIRECTIVE: &str = "\
+    [BUG REPORT — REPRODUCE BEFORE READING CODE]\n\
+    Before exploring the codebase, FIRST run the command/scenario that \
+    triggered the failure (curl, the failing test, the script the user \
+    ran, etc.) and observe the actual output. Without reproducing, you \
+    have no way to verify a fix works. After fixing, RE-RUN the same \
+    command to confirm the original failure is gone — `cargo check` / \
+    `tsc --noEmit` style compile passes prove the code parses, not that \
+    the bug is fixed.";
+
 impl AgentLoop {
     /// Auto-diagnose: when user mentions error keywords, scan log files for recent errors
     /// and append them to the user message. The model starts Turn 1 with the real error.
@@ -89,8 +106,12 @@ impl AgentLoop {
             }
         }
 
+        // P1 #10: even when no log files were found, the user reported a
+        // bug (has_error_keyword == true). The reproduce-first directive
+        // is still valuable — without log diagnostics the model needs the
+        // nudge even MORE because it has nothing else to anchor against.
         if diagnostics.is_empty() {
-            return content.to_string();
+            return format!("{}\n\n{}", content, REPRODUCE_DIRECTIVE);
         }
 
         // Phase 2: Parse stack traces for file:line references, extract function code via tree-sitter.
@@ -212,7 +233,12 @@ impl AgentLoop {
             .map(|c| c[1].to_string())
             .unwrap_or_default();
 
-        let mut result = format!("{}\n\n{}", content, diagnostics.join("\n\n"));
+        let mut result = format!(
+            "{}\n\n{}\n\n{}",
+            content,
+            REPRODUCE_DIRECTIVE,
+            diagnostics.join("\n\n"),
+        );
 
         // If the same exception recurs after a previous fix attempt, tell the model
         // its approach isn't working and it needs a different strategy.
@@ -261,4 +287,32 @@ impl AgentLoop {
         walk(wd, filename, 0)
     }
 
+}
+
+#[cfg(test)]
+mod tests {
+    use super::REPRODUCE_DIRECTIVE;
+
+    /// Lock in the shape of the bug-report reproduce directive. If someone
+    /// removes or waters down this text (e.g. deletes "RE-RUN" so compile
+    /// passes are taken as proof of fix), the test fails. Covers the P1 #10
+    /// invariant set in 2026-04-23.
+    #[test]
+    fn reproduce_directive_keeps_critical_phrases() {
+        let d = REPRODUCE_DIRECTIVE;
+        assert!(!d.is_empty(), "directive silently emptied");
+        assert!(d.len() > 200, "directive suspiciously short ({} chars) — likely truncated", d.len());
+        // Must tell the model to reproduce BEFORE reading code.
+        assert!(d.contains("BEFORE") || d.contains("Before"), "missing before-reading-code guidance");
+        assert!(d.contains("REPRODUCE") || d.contains("reproduce"), "missing reproduce verb");
+        // Must tell the model to RE-RUN after fixing — the key insight
+        // that compile-pass != bug-fixed.
+        assert!(d.contains("RE-RUN") || d.contains("re-run"), "missing post-fix re-run guidance");
+        // Must call out that `cargo check` / compile passes don't prove
+        // the runtime bug is fixed.
+        assert!(
+            d.contains("compile") || d.contains("cargo check"),
+            "missing compile-pass-isn't-proof-of-fix callout"
+        );
+    }
 }
