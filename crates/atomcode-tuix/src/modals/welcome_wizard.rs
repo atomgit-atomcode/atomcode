@@ -1,25 +1,31 @@
 // crates/atomcode-tuix/src/modals/welcome_wizard.rs
 //
-// First-run onboarding modal. Mirrors the 3-option layout from the legacy
-// `atomcode-tui` setup wizard (see `atomcode-tui/src/ui/welcome.rs:render_setup`):
+// First-run onboarding modal. 3 options:
 //
-//   ▸ Login with AtomGit     OAuth · recommended
+//   ▸ Set up CodingPlan      Free tokens · recommended
 //     Configure manually     API key
 //     Skip for now           explore first
 //
-// Opens at startup when `providers.is_empty() && no stored OAuth auth` — users
-// with a config or prior OAuth login are never shown this. The Welcome banner
-// itself is still pushed to scrollback by the event-loop's startup path; this
-// modal adds a "Get started:" guide line pair into body, plus the 3-choice
-// menu rendered through the standard `MenuPayload` footer (same mechanism as
-// the slash-command palette).
+// Option 0 was "Login with AtomGit" up to v4.19 — it triggered a pure OAuth
+// flow and left the user stuck at "signed in but no provider" until they
+// found `/codingplan` themselves. v4.20+ routes option 0 straight into the
+// CodingPlan setup flow, which does login-if-needed → claim free plan →
+// register plan-eligible providers in one shot. Users who want identity
+// without the plan can still use `/login` after skipping.
 //
-// Side-channel: the modal cannot directly open the OAuth login flow or swap
+// Opens at startup when `providers.is_empty() && no stored OAuth auth` —
+// users with a config or prior OAuth auth are never shown this. The Welcome
+// banner itself is still pushed to scrollback by the event-loop's startup
+// path; this modal adds a "Get started:" guide line pair into body, plus
+// the 3-choice menu rendered through the standard `MenuPayload` footer
+// (same mechanism as the slash-command palette).
+//
+// Side-channel: the modal cannot directly run the CodingPlan flow or swap
 // itself for `ProviderWizard::MainMenu` (both need `active_modal` mutation
-// and suspend/resume of raw mode, neither of which `LoopCtx` exposes). So it
-// sets one of two flags on `LoopCtx` and returns `Close`; the event loop's
-// post-close branch reads the flag and drives the follow-up action. This
-// matches the pattern already used by `IssueWizard` → `pending_new_issue`.
+// and suspend/resume of raw mode, neither of which `LoopCtx` exposes). So
+// it sets one of two flags on `LoopCtx` and returns `Close`; the event
+// loop's post-close branch reads the flag and drives the follow-up action.
+// This matches the pattern already used by `IssueWizard` → `pending_new_issue`.
 
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyModifiers};
@@ -40,10 +46,10 @@ impl WelcomeWizard {
         Self { selected: 0 }
     }
 
-    /// Stable option list. Mirrors the legacy tui order.
+    /// Stable option list.
     fn options() -> [(&'static str, &'static str); 3] {
         [
-            ("Login with AtomGit", "OAuth · recommended"),
+            ("Set up CodingPlan", "Free tokens · recommended"),
             ("Configure manually", "API key"),
             ("Skip for now", "explore first"),
         ]
@@ -89,7 +95,7 @@ impl Modal for WelcomeWizard {
             }
             KeyCode::Enter => {
                 match self.selected {
-                    0 => ctx.pending_run_login = true,
+                    0 => ctx.pending_run_codingplan = true,
                     1 => ctx.pending_open_provider_wizard = true,
                     // 2 = Skip — no side effect; event loop's Close branch
                     // will redraw idle with the "no provider" status hint
@@ -140,15 +146,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn new_starts_on_login() {
+    fn new_starts_on_codingplan() {
         let w = WelcomeWizard::new();
         assert_eq!(w.selected, 0);
     }
 
+    /// Option 0 is CodingPlan setup — the recommended first-run
+    /// action (login + claim + register plan providers in one shot).
+    /// Option 1 falls back to manual provider config; option 2 skips
+    /// setup entirely. Label text is also pinned here so a rename
+    /// has to go through a test update.
     #[test]
-    fn options_match_legacy_tui_order() {
+    fn options_put_codingplan_first() {
         let opts = WelcomeWizard::options();
-        assert_eq!(opts[0].0, "Login with AtomGit");
+        assert_eq!(opts[0].0, "Set up CodingPlan");
+        assert_eq!(opts[0].1, "Free tokens · recommended");
         assert_eq!(opts[1].0, "Configure manually");
         assert_eq!(opts[2].0, "Skip for now");
     }
@@ -186,7 +198,7 @@ mod tests {
         let p = build_menu_payload(&w);
         assert_eq!(p.selected, 1);
         assert_eq!(p.items.len(), 3);
-        assert_eq!(p.items[0].0, "Login with AtomGit");
-        assert_eq!(p.items[0].1, "OAuth · recommended");
+        assert_eq!(p.items[0].0, "Set up CodingPlan");
+        assert_eq!(p.items[0].1, "Free tokens · recommended");
     }
 }

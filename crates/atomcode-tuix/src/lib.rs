@@ -312,7 +312,7 @@ pub async fn run(
         upgrade_tx,
         upgrade_rx,
         pending_new_issue: None,
-        pending_run_login: false,
+        pending_run_codingplan: false,
         pending_open_provider_wizard: false,
     };
 

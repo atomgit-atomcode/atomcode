@@ -106,11 +106,13 @@ pub struct LoopCtx {
     /// branch POSTs the issue to AtomGit and echoes the URL of the
     /// newly-created issue back into the conversation.
     pub pending_new_issue: Option<NewIssueDraft>,
-    /// Set by `WelcomeWizard` when the user picks option 0 (Login with
-    /// AtomGit). The event loop drains this on modal close and runs the
-    /// OAuth flow — which needs raw-mode suspend/resume, something modals
-    /// can't drive themselves. Same pattern as `pending_new_issue`.
-    pub pending_run_login: bool,
+    /// Set by `WelcomeWizard` when the user picks option 0 (Set up
+    /// CodingPlan). The event loop drains this on modal close and
+    /// runs the full CodingPlan setup flow (login if needed → claim →
+    /// fetch models → register providers). Needs raw-mode
+    /// suspend/resume, something modals can't drive themselves. Same
+    /// pattern as `pending_new_issue`.
+    pub pending_run_codingplan: bool,
     /// Set by `WelcomeWizard` when the user picks option 1 (Configure
     /// manually). The event loop drains this on modal close and swaps in
     /// `ProviderWizard::MainMenu` — a Modal-to-Modal transition that
@@ -1194,14 +1196,16 @@ fn handle_input(
                             renderer.flush();
                         }
                         // WelcomeWizard signals its follow-up via two bool
-                        // flags. Drain one, execute it here — OAuth login
-                        // needs suspend/resume of raw mode (only event-loop
-                        // scope can drive that safely), and opening
-                        // ProviderWizard is a Modal-to-Modal swap that
-                        // needs mutable `active_modal` access the modals
-                        // themselves don't have.
-                        if std::mem::take(&mut ctx.pending_run_login) {
-                            crate::event_loop::commands::run_login_flow(renderer, ctx)?;
+                        // flags. Drain one, execute it here — the
+                        // CodingPlan flow (which internally handles
+                        // OAuth login when needed) needs suspend/resume
+                        // of raw mode (only event-loop scope can drive
+                        // that safely), and opening ProviderWizard is a
+                        // Modal-to-Modal swap that needs mutable
+                        // `active_modal` access the modals themselves
+                        // don't have.
+                        if std::mem::take(&mut ctx.pending_run_codingplan) {
+                            crate::event_loop::commands::run_codingplan_flow(renderer, ctx)?;
                         }
                         if std::mem::take(&mut ctx.pending_open_provider_wizard) {
                             let pw = crate::modals::ProviderWizard::MainMenu { selected: 0 };
