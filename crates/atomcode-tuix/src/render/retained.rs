@@ -2678,6 +2678,38 @@ mod tests {
         assert!(found, "tool call missing\ndump:\n{}", vterm.dump());
     }
 
+    /// ToolCall arrow `▸` must sit at col 0, same baseline as user
+    /// echo and input chevron.
+    #[test]
+    fn retained_tool_call_arrow_at_col_0() {
+        let (mut r, buf) = new_capturing(80, 24);
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+        let status = status_basic();
+        r.render(UiLine::ToolCall {
+            name: "bash".into(),
+            detail: "ls -la".into(),
+        });
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        let row_idx = (0..vterm.height() as usize)
+            .find(|&i| vterm.row_text(i).contains("▸") && vterm.row_text(i).contains("bash"))
+            .unwrap_or_else(|| panic!("tool call row missing\ndump:\n{}", vterm.dump()));
+        assert_eq!(
+            vterm.cell_at(row_idx, 0).ch,
+            '▸',
+            "tool-call arrow must land at col 0, got row: {:?}\ndump:\n{}",
+            vterm.row_text(row_idx),
+            vterm.dump()
+        );
+    }
+
     /// ToolResult success: `⎿ summary` + blank spacer; failure
     /// prepends `✗ `. We test success path here; the error styling
     /// (Role::Error red) is a cell-style detail not asserted in
