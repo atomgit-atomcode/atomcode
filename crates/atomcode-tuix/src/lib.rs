@@ -306,6 +306,10 @@ pub async fn run(
         update_hint,
         monitor_warning: std::sync::Arc::new(std::sync::Mutex::new(None)),
         monitor_last_check_at: None,
+        // Seed with whatever's on disk now — any NEWER mtime observed
+        // later means another atomcode process resynced and our drift
+        // warning (if any) is stale.
+        monitor_last_sync_seen: atomcode_core::coding_plan::read_last_sync(),
         wake_rx,
         wake_tx: wake_tx.clone(),
         reader: reader_handle,

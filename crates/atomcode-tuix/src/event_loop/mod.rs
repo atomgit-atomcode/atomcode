@@ -76,6 +76,15 @@ pub struct LoopCtx {
     /// timestamp; startup + `/model` switch bypass the cooldown.
     /// `None` = no check has run yet this session.
     pub monitor_last_check_at: Option<std::time::Instant>,
+    /// Last-observed timestamp from the shared CodingPlan sync marker
+    /// (`~/.atomcode/codingplan_sync.json`). On every user input we
+    /// re-read it; a change means ANOTHER atomcode process (e.g. a
+    /// second terminal) just ran `/codingplan` and the server is now
+    /// in sync with the on-disk config. We then hot-reload config
+    /// from disk + clear the stale drift warning. Without this,
+    /// Terminal A's "CodingPlan 模型列表更新" hint would stick forever
+    /// after Terminal B ran the fix.
+    pub monitor_last_sync_seen: Option<std::time::SystemTime>,
     /// Wake signal from background tasks (version check + CodingPlan
     /// drift monitor). One `()` sent when any task needs the event loop
     /// to repaint so a freshly-computed hint/warning appears without
@@ -1082,6 +1091,50 @@ pub async fn run_loop(
     Ok(())
 }
 
+/// If another atomcode process just ran `/codingplan` (i.e. the shared
+/// sync marker file advanced since we last looked), pull the fresh
+/// config from disk, clear our stale drift warning, and hand the new
+/// config to the agent. Cheap on every keystroke: a single file-read
+/// + serde parse. Idempotent — when no other process has synced, the
+/// early return skips all work.
+fn refresh_after_cross_process_codingplan_sync(ctx: &mut LoopCtx) {
+    let current = atomcode_core::coding_plan::read_last_sync();
+    let advanced = match (current, ctx.monitor_last_sync_seen) {
+        (Some(new), Some(old)) => new > old,
+        (Some(_), None) => true, // marker just appeared
+        _ => false,
+    };
+    if !advanced {
+        return;
+    }
+    ctx.monitor_last_sync_seen = current;
+
+    // Hot-reload the config file. Fail silently: if the other process
+    // wrote a malformed config (shouldn't happen — it would have
+    // rejected its own reload), leave our in-memory snapshot alone.
+    let path = atomcode_core::config::Config::default_path();
+    if let Ok(fresh) = atomcode_core::config::Config::load(&path) {
+        ctx.config = fresh;
+        if let Some(p) = ctx.config.providers.get(&ctx.config.default_provider) {
+            ctx.model_name = p.model.clone();
+        }
+        let _ = ctx
+            .agent
+            .cmd_tx
+            .send(AgentCommand::ReloadConfig(ctx.config.clone()));
+    }
+
+    // Sync marker = another process just reconciled config with
+    // server, so any drift warning we're still showing is stale by
+    // definition. Reset the cooldown too so the next drift check
+    // (if needed) fires immediately instead of waiting 15 min from
+    // whenever we last checked.
+    if let Ok(mut g) = ctx.monitor_warning.lock() {
+        *g = None;
+    }
+    ctx.monitor_last_check_at = None;
+}
+
 fn handle_input(
     app: &mut App,
     ctx: &mut LoopCtx,
@@ -1089,6 +1142,11 @@ fn handle_input(
     ev: InputEvent,
 ) -> Result<()> {
     use crate::modals::ModalAction;
+
+    // Pick up any cross-process `/codingplan` that ran since the last
+    // input — hot-reloads config + clears stale drift hint before we
+    // act on the current keystroke.
+    refresh_after_cross_process_codingplan_sync(ctx);
 
     crate::tuix_trace!(
         "IN",

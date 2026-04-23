@@ -873,6 +873,11 @@ pub(crate) fn run_codingplan_flow(
                 // write. Failures are non-fatal: at worst the 24h staleness
                 // hint mis-fires once.
                 let _ = atomcode_core::coding_plan::write_last_sync_now();
+                // Also bump our own last-seen timestamp so the cross-process
+                // sync-check on the next keystroke doesn't redundantly
+                // reload the config we just saved ourselves.
+                ctx.monitor_last_sync_seen =
+                    atomcode_core::coding_plan::read_last_sync();
                 // Sync ctx.model_name with the freshly-picked default so the
                 // status line and the next turn use the right model without
                 // requiring a /reload.
