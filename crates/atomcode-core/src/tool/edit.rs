@@ -1184,13 +1184,27 @@ fn try_fuzzy_replace(
         return None; // caller will handle the "multiple matches" error
     }
 
-    // Compute the base indent of new_string (to preserve relative indentation)
+    // Compute the base indent of new_string used as the re-anchor point.
+    //
+    // 2026-04-23 (P1 #14c+11): changed from `.min()` to "first non-empty
+    // line's indent".
+    //
+    // BUG the old `.min()` version caused (hermes session 2026-04-22_21-06):
+    //   Model's new_string had 4 lines — `.run(...)` at 9 spaces,
+    //   `.expect(...)` at 9 spaces, `}` at 0 spaces, `marker()` at 0 spaces.
+    //   `.min()` picked 0 (from the outdented `}`). Then `.run(...)` got
+    //   `relative = 9 - 0 = 9`, added to the file's 8-space prefix → output
+    //   at 17 spaces. Next fuzzy edit on that corrupted file repeated the
+    //   shift → 17 → 26 → accumulating indent drift.
+    //
+    // NEW ANCHOR semantics: the model's first non-empty line in new_string
+    // represents the OUTER indent the model intended to match in old_string.
+    // Relative differences (lines indented more OR less than the anchor)
+    // are preserved as signed offsets from the file's actual indent.
     let new_lines: Vec<&str> = new_string.lines().collect();
-    let new_base_indent = new_lines
-        .iter()
-        .filter(|l| !l.trim().is_empty())
+    let new_base_indent = new_lines.iter()
+        .find(|l| !l.trim().is_empty())
         .map(|l| l.len() - l.trim_start().len())
-        .min()
         .unwrap_or(0);
 
     let mut result_lines: Vec<String> = content_lines.iter().map(|l| l.to_string()).collect();
@@ -1207,20 +1221,30 @@ fn try_fuzzy_replace(
         let file_indent = original_line.len() - original_line.trim_start().len();
         let file_indent_str: String = original_line.chars().take(file_indent).collect();
 
-        // Build replacement preserving RELATIVE indentation from new_string
-        let replacement: Vec<String> = new_lines
-            .iter()
-            .map(|l| {
-                if l.trim().is_empty() {
-                    String::new()
+        // Build replacement preserving RELATIVE indentation from new_string,
+        // supporting both deeper-than-anchor (add spaces) and outdented-from-
+        // anchor (trim the file's indent prefix) cases.
+        let replacement: Vec<String> = new_lines.iter().map(|l| {
+            if l.trim().is_empty() {
+                String::new()
+            } else {
+                let line_indent = l.len() - l.trim_start().len();
+                let signed_relative = line_indent as isize - new_base_indent as isize;
+                let total_indent = if signed_relative >= 0 {
+                    // Same or deeper than anchor — keep file's indent prefix
+                    // (preserves tabs/spaces mix) and extend with plain spaces.
+                    format!("{}{}", file_indent_str, " ".repeat(signed_relative as usize))
                 } else {
-                    let line_indent = l.len() - l.trim_start().len();
-                    let relative = line_indent.saturating_sub(new_base_indent);
-                    let total_indent = format!("{}{}", file_indent_str, " ".repeat(relative));
-                    format!("{}{}", total_indent, l.trim())
-                }
-            })
-            .collect();
+                    // Outdented from anchor — drop `abs(signed_relative)`
+                    // chars from the tail of file_indent_str. Preserves the
+                    // leading whitespace semantics up to the needed depth.
+                    let drop = (-signed_relative) as usize;
+                    let keep = file_indent.saturating_sub(drop);
+                    file_indent_str.chars().take(keep).collect()
+                };
+                format!("{}{}", total_indent, l.trim())
+            }
+        }).collect();
 
         result_lines.splice(start..end, replacement);
     }
