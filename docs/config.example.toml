@@ -17,3 +17,17 @@ context_window = 64000
 [datalog]
 enabled = true
 # dir = "~/.atomcode/datalog"  # example: uncomment to redirect
+
+# Long-running task completion notifications.
+# Strategy: terminal-native notifications first (kitty / WezTerm / iTerm2),
+# then OS-native fallback when available (macOS osascript, Linux notify-send).
+# Windows mainly relies on BEL + terminal attention/taskbar flash.
+# `background_only` is best-effort: focus-aware terminal protocols honor it,
+# while some OS fallbacks may still notify even if AtomCode is focused.
+[notifications]
+enabled = true
+min_duration_secs = 8
+terminal = true
+system = true
+bell = true
+background_only = true

@@ -1483,6 +1483,19 @@ mod sanitize_tests {
     }
 
     #[test]
+    fn bash_path_guard_auto_approves_workspace_relative_reads() {
+        let workspace = tempfile::tempdir().unwrap();
+        let nested = workspace.path().join("crates/atomcode-core/src");
+        std::fs::create_dir_all(&nested).unwrap();
+        let target = nested.join("notify.rs");
+        std::fs::write(&target, "pub fn notify() {}").unwrap();
+
+        let approval = approval_for_command_paths("cat crates/atomcode-core/src/notify.rs", workspace.path());
+
+        assert!(approval.is_none());
+    }
+
+    #[test]
     fn bash_path_guard_requires_confirmation_for_workspace_escape_reads() {
         let workspace = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
@@ -1682,12 +1695,21 @@ fn approval_for_command_paths(
     }
 
     fn extract_path_candidates(token: &str) -> Vec<String> {
+        if is_path_like(token) {
+            return vec![token.to_string()];
+        }
+
         let chars: Vec<char> = token.chars().collect();
         let mut out = Vec::new();
         let mut i = 0;
 
         while i < chars.len() {
-            let starts_path = chars[i] == '/'
+            let starts_path = (chars[i] == '/'
+                && (i == 0
+                    || matches!(
+                        chars[i - 1],
+                        '"' | '\'' | '`' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';' | '<' | '>' | '|'
+                    )))
                 || chars[i] == '~'
                 || (chars[i] == '.' && i + 1 < chars.len() && chars[i + 1] == '/')
                 || (chars[i] == '.'

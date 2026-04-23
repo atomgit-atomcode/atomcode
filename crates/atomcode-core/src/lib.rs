@@ -6,6 +6,7 @@ pub mod conversation;
 pub mod ctx;
 pub mod graph;
 pub mod input_history;
+pub mod notify;
 pub mod project_context;
 pub mod provider;
 pub mod semantic;

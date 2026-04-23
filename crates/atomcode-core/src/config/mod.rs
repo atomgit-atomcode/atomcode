@@ -59,6 +59,10 @@ pub struct Config {
     /// without needing to know the field names in advance.
     #[serde(default, skip_serializing)]
     pub datalog: DatalogConfig,
+    /// Task-finished notifications. Saved manually with help comments so users
+    /// can discover the terminal-first strategy and platform fallbacks.
+    #[serde(default, skip_serializing)]
+    pub notifications: NotificationConfig,
     /// When true (default), atomcode polls for new releases every hour
     /// while running and stages any newer version it finds. The stage is
     /// applied on the next startup (see `self_update::apply_pending_upgrade`).
@@ -91,12 +95,49 @@ pub struct DatalogConfig {
     pub dir: Option<String>,
 }
 
+/// Controls long-running task completion notifications.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotificationConfig {
+    /// Master switch for all completion notifications.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Only notify when the turn runs for at least this many seconds.
+    #[serde(default = "default_notification_min_duration_secs")]
+    pub min_duration_secs: u64,
+    /// Try terminal-native notification escape sequences first.
+    #[serde(default = "default_true")]
+    pub terminal: bool,
+    /// Fall back to OS-native notifications when terminal protocols are unavailable.
+    #[serde(default = "default_true")]
+    pub system: bool,
+    /// Emit BEL so terminals can play a sound or request attention.
+    #[serde(default = "default_true")]
+    pub bell: bool,
+    /// Best-effort background-only behavior where the terminal protocol supports it.
+    #[serde(default = "default_true")]
+    pub background_only: bool,
+}
+
 fn default_true() -> bool { true }
 fn default_reflection_cadence() -> usize { 7 }
+fn default_notification_min_duration_secs() -> u64 { 8 }
 
 impl Default for DatalogConfig {
     fn default() -> Self {
         Self { enabled: true, dir: None }
+    }
+}
+
+impl Default for NotificationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            min_duration_secs: default_notification_min_duration_secs(),
+            terminal: true,
+            system: true,
+            bell: true,
+            background_only: true,
+        }
     }
 }
 
@@ -126,6 +167,24 @@ fn render_datalog_section(cfg: &DatalogConfig) -> String {
             out.push_str("# dir = \"~/.atomcode/datalog\"  # example: uncomment to redirect\n");
         }
     }
+    out
+}
+
+fn render_notifications_section(cfg: &NotificationConfig) -> String {
+    let mut out = String::new();
+    out.push_str("\n# Long-running task completion notifications.\n");
+    out.push_str("# Strategy: terminal-native notifications first (kitty / WezTerm / iTerm2),\n");
+    out.push_str("# then OS-native fallback when available (macOS osascript, Linux notify-send).\n");
+    out.push_str("# Windows mainly relies on BEL + terminal attention/taskbar flash.\n");
+    out.push_str("# `background_only` is best-effort: focus-aware terminal protocols honor it,\n");
+    out.push_str("# while some OS fallbacks may still notify even if AtomCode is focused.\n");
+    out.push_str("[notifications]\n");
+    out.push_str(&format!("enabled = {}\n", cfg.enabled));
+    out.push_str(&format!("min_duration_secs = {}\n", cfg.min_duration_secs));
+    out.push_str(&format!("terminal = {}\n", cfg.terminal));
+    out.push_str(&format!("system = {}\n", cfg.system));
+    out.push_str(&format!("bell = {}\n", cfg.bell));
+    out.push_str(&format!("background_only = {}\n", cfg.background_only));
     out
 }
 
@@ -165,6 +224,7 @@ impl Config {
         }
         let mut content = toml::to_string_pretty(&persistent)?;
         content.push_str(&render_datalog_section(&self.datalog));
+        content.push_str(&render_notifications_section(&self.notifications));
         std::fs::write(path, content)?;
         Ok(())
     }
@@ -316,6 +376,7 @@ mod tests {
             default_workdir: None,
             providers: HashMap::new(),
             datalog: DatalogConfig { enabled: false, dir: Some("/var/log/ac".to_string()) },
+            notifications: NotificationConfig::default(),
             auto_update: true,
             reflection_cadence: 7,
         };
@@ -338,7 +399,17 @@ mod tests {
         let reloaded = Config::load(&tmp).unwrap();
         assert!(!reloaded.datalog.enabled);
         assert_eq!(reloaded.datalog.dir.as_deref(), Some("/var/log/ac"));
+        assert!(reloaded.notifications.enabled);
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn render_notifications_section_emits_defaults() {
+        let rendered = render_notifications_section(&NotificationConfig::default());
+        assert!(rendered.contains("[notifications]"));
+        assert!(rendered.contains("enabled = true"));
+        assert!(rendered.contains("min_duration_secs = 8"));
+        assert!(rendered.contains("background_only = true"));
     }
 
     #[test]
@@ -396,5 +467,20 @@ reflection_cadence = 7
 "#;
         let cfg: Config = toml::from_str(toml_text).expect("parses");
         assert_eq!(cfg.reflection_cadence, 7);
+    }
+
+    #[test]
+    fn notifications_default_when_missing_from_toml() {
+        let toml_text = r#"
+default_provider = "claude"
+[providers]
+"#;
+        let cfg: Config = toml::from_str(toml_text).expect("parses config");
+        assert!(cfg.notifications.enabled);
+        assert_eq!(cfg.notifications.min_duration_secs, 8);
+        assert!(cfg.notifications.terminal);
+        assert!(cfg.notifications.system);
+        assert!(cfg.notifications.bell);
+        assert!(cfg.notifications.background_only);
     }
 }

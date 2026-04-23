@@ -596,6 +596,7 @@ async fn run() -> Result<i32> {
                 default_workdir: None,
                 providers: HashMap::new(),
                 datalog: Default::default(),
+                notifications: Default::default(),
                 auto_update: true,
                 reflection_cadence: 7,
             }
@@ -607,6 +608,7 @@ async fn run() -> Result<i32> {
             default_workdir: None,
             providers: HashMap::new(),
             datalog: Default::default(),
+            notifications: Default::default(),
             auto_update: true,
             reflection_cadence: 7,
         }
@@ -746,8 +748,16 @@ async fn run() -> Result<i32> {
         // Capture the assistant's streamed text only when we need to post
         // it back to AtomGit (fixissue). Plain `-p` stays zero-alloc.
         let capture = fixissue_ref.is_some();
-        let (exit_code, captured) =
-            run_headless(agent_loop, agent_handle, prompt, cli.provider.as_deref(), verbose, capture).await?;
+        let (exit_code, captured) = run_headless(
+            agent_loop,
+            agent_handle,
+            prompt,
+            cli.provider.as_deref(),
+            verbose,
+            capture,
+            working_dir.clone(),
+        )
+        .await?;
 
         // Post-run side effects for fixissue: only on clean completion
         // (exit 0 = TurnComplete Natural; 1 = error; 2 = denial; 130 = cancel).
@@ -819,11 +829,13 @@ async fn run_headless(
     _provider_name: Option<&str>,
     verbose: bool,
     capture: bool,
+    working_dir: PathBuf,
 ) -> Result<(i32, Option<String>)> {
     // Tell the panic hook / error path to skip TUI cleanup — we never enter
     // the alternate screen here, so LeaveAlternateScreen would corrupt stdout.
     HEADLESS_MODE.store(true, Ordering::Relaxed);
 
+    let notifications = agent_loop.config.notifications.clone();
     let (cmd_tx, mut event_rx) = {
         let handle = agent_handle;
         (handle.cmd_tx, handle.event_rx)
@@ -898,6 +910,17 @@ async fn run_headless(
                 // Silent in headless mode (in both default and verbose).
             }
             AgentEvent::TurnComplete { duration, total_tokens, turn_count, tool_call_count, stop_reason, messages: _ } => {
+                atomcode_core::notify::notify_turn_finished(
+                    &notifications,
+                    atomcode_core::notify::TurnNotification {
+                        duration,
+                        turn_count,
+                        tool_call_count,
+                        total_tokens: Some(total_tokens),
+                        stop_reason,
+                        working_dir: Some(&working_dir),
+                    },
+                );
                 // Always ensure stdout ends with a newline so downstream parsers see a clean line.
                 if !last_text_ended_with_newline {
                     println!();

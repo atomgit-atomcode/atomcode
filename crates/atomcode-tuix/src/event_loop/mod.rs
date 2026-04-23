@@ -1755,7 +1755,18 @@ fn handle_agent_event(
             state.on_tool_call_streaming(&display_tool_name(&name));
         }
         AgentEvent::PhaseChange(_) => {}
-        AgentEvent::TurnComplete { duration, total_tokens, turn_count, tool_call_count, messages, .. } => {
+        AgentEvent::TurnComplete { duration, total_tokens, turn_count, tool_call_count, stop_reason, messages } => {
+            atomcode_core::notify::notify_turn_finished(
+                &ctx.config.notifications,
+                atomcode_core::notify::TurnNotification {
+                    duration,
+                    turn_count,
+                    tool_call_count,
+                    total_tokens: Some(total_tokens),
+                    stop_reason,
+                    working_dir: Some(&ctx.working_dir),
+                },
+            );
             renderer.render(UiLine::AssistantLineBreak);
             pending_tools.clear();
             let done = state.next_done_label();
@@ -1799,6 +1810,17 @@ fn handle_agent_event(
             }
         }
         AgentEvent::TurnCancelled { messages } => {
+            atomcode_core::notify::notify_turn_finished(
+                &ctx.config.notifications,
+                atomcode_core::notify::TurnNotification {
+                    duration: state.turn_elapsed().unwrap_or_default(),
+                    turn_count: 0,
+                    tool_call_count: pending_tools.len(),
+                    total_tokens: None,
+                    stop_reason: atomcode_core::agent::TurnStopReason::Cancelled,
+                    working_dir: Some(&ctx.working_dir),
+                },
+            );
             // Render any in-flight tool calls that never got a result
             // as "(cancelled)" so the user sees what was mid-flight.
             for (_id, (name, detail, call_rendered)) in pending_tools.drain() {

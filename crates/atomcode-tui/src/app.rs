@@ -705,7 +705,18 @@ impl App {
                     }
                 }
             }
-            AgentEvent::TurnComplete { duration, total_tokens: _, turn_count: _, tool_call_count: _, stop_reason: _, messages: _ } => {
+            AgentEvent::TurnComplete { duration, total_tokens: _, turn_count: _, tool_call_count: _, stop_reason, messages: _ } => {
+                atomcode_core::notify::notify_turn_finished(
+                    &self.config.notifications,
+                    atomcode_core::notify::TurnNotification {
+                        duration,
+                        turn_count: self.current_step_count,
+                        tool_call_count: self.current_tool_call_count,
+                        total_tokens: Some(self.turn_tokens),
+                        stop_reason,
+                        working_dir: Some(&self.working_dir),
+                    },
+                );
                 // Clear any lingering streaming tool state — turn is over.
                 self.streaming_tool_name = None;
                 self.streaming_tools.clear();
@@ -791,6 +802,17 @@ impl App {
                 }
             }
             AgentEvent::TurnCancelled { messages } => {
+                atomcode_core::notify::notify_turn_finished(
+                    &self.config.notifications,
+                    atomcode_core::notify::TurnNotification {
+                        duration: self.turn_start.map(|t| t.elapsed()).unwrap_or_default(),
+                        turn_count: self.current_step_count,
+                        tool_call_count: self.current_tool_call_count,
+                        total_tokens: Some(self.turn_tokens),
+                        stop_reason: atomcode_core::agent::TurnStopReason::Cancelled,
+                        working_dir: Some(&self.working_dir),
+                    },
+                );
                 // User cancelled - sync the cleaned conversation from agent
                 self.conversation.messages = messages;
                 self.conversation.stream_buffer = None; // Clear any partial stream

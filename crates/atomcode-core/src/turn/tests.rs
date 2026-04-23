@@ -207,6 +207,7 @@ fn test_config() -> Config {
         default_workdir: None,
         providers,
         datalog: Default::default(),
+        notifications: Default::default(),
         auto_update: false,
         reflection_cadence: 7,
     }
