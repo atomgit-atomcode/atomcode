@@ -250,6 +250,17 @@ pub(super) fn execute_slash_command(
             ));
             renderer.flush();
         }
+        "compact" => {
+            let prompt = (!arg.trim().is_empty()).then(|| arg.trim().to_string());
+            // Agent streams the authoritative result back as TextDelta
+            // ("nothing to compact" / "compacted — dropped N messages").
+            // Don't pre-render a placeholder — the agent's reply could
+            // contradict it when the conversation is too short.
+            ctx.agent
+                .cmd_tx
+                .send(AgentCommand::Compact { prompt })
+                .ok();
+        }
         "login" => {
             run_login_flow(renderer, ctx)?;
         }

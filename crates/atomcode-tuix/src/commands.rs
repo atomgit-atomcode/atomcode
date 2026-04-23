@@ -76,6 +76,7 @@ const BUILTIN_COMMANDS: &[Command] = &[
     Command { name: "session", desc: "Start a new session (clears conversation)", needs_args: false },
     Command { name: "cost",    desc: "Show token cost", needs_args: false },
     Command { name: "context", desc: "Show context budget breakdown", needs_args: false },
+    Command { name: "compact", desc: "Compact conversation history", needs_args: false },
     Command { name: "undo",    desc: "Undo last change (not yet supported)", needs_args: false },
     Command { name: "upgrade", desc: "Upgrade atomcode to latest (subcommand: rollback)", needs_args: false },
     Command { name: "fixissue", desc: "Fetch an AtomGit issue (must be assigned to you) and let the agent fix it", needs_args: true },

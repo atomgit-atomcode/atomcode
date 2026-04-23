@@ -58,6 +58,10 @@ pub enum AgentCommand {
     SetMessages(Vec<crate::conversation::message::Message>),
     /// Set plan mode (read-only exploration, no edits).
     SetPlanMode(bool),
+    /// Manually compact conversation history. `prompt` is accepted for
+    /// forward-compat with an eventual LLM-backed summarize-with-instruction
+    /// path; currently unused — this is the mechanical path only.
+    Compact { prompt: Option<String> },
     /// Shutdown the agent.
     Shutdown,
 }
@@ -684,6 +688,9 @@ impl AgentLoop {
                 }
                 AgentCommand::SetPlanMode(enabled) => {
                     self.plan_mode = enabled;
+                }
+                AgentCommand::Compact { prompt } => {
+                    self.run_compact(prompt);
                 }
                 AgentCommand::Shutdown => break,
             }
@@ -1750,37 +1757,53 @@ impl AgentLoop {
         }
 
         self.conversation.apply_compression(n_turns, summary);
+        self.inject_post_compress_state();
+    }
 
-        // Post-compression task state restoration:
-        // After compression, the model loses track of what it was doing.
-        // Inject a brief status message so it can resume without re-exploring.
-        let mut state_parts: Vec<String> = Vec::new();
-        if !self.current_task.is_empty() {
-            let task_short: String = self.current_task.chars().take(200).collect();
-            state_parts.push(format!("TASK: {}", task_short));
+    /// Post-compression task state restoration. After compression the model
+    /// loses track of what it was doing — inject a short status so it can
+    /// resume without re-exploring. Shared by auto-compact (threshold-driven
+    /// in `maybe_compress_history`) and manual `/compact`.
+    fn inject_post_compress_state(&mut self) {
+        if let Some(msg) = build_post_compress_state(
+            &self.current_task,
+            &self.files_edited_this_turn,
+            &self.files_read_this_turn,
+        ) {
+            self.conversation.add_user_message(&msg);
         }
-        if !self.files_edited_this_turn.is_empty() {
-            state_parts.push(format!(
-                "FILES EDITED: {}",
-                self.files_edited_this_turn.join(", ")
+    }
+
+    /// Manual `/compact` entry point. Mechanical only — reuses the active
+    /// ctx strategy's `compression_plan` (same path as the task-boundary
+    /// cleanup in `handle_send_message`) so behavior stays consistent with
+    /// the rest of the codebase. `_prompt` is accepted for forward-compat
+    /// with a future LLM-guided summarize path and ignored today.
+    fn run_compact(&mut self, prompt: Option<String>) {
+        if prompt.is_some() {
+            let _ = self.event_tx.send(AgentEvent::TextDelta(
+                "(note: custom compaction prompt accepted but not yet implemented — running mechanical compact)\n"
+                    .to_string(),
             ));
         }
-        if !self.files_read_this_turn.is_empty() {
-            let recent: Vec<&str> = self
-                .files_read_this_turn
-                .iter()
-                .rev()
-                .take(5)
-                .map(|s| s.as_str())
-                .collect();
-            state_parts.push(format!("RECENTLY READ: {}", recent.join(", ")));
-        }
-        if !state_parts.is_empty() {
-            self.conversation.add_user_message(&format!(
-                "[Context was compressed. Here is your current state:]\n{}",
-                state_parts.join("\n")
+        let before = self.conversation.messages.len();
+        let Some((content, n_msgs)) = self.ctx.compression_plan(&self.conversation) else {
+            let _ = self.event_tx.send(AgentEvent::TextDelta(
+                "(nothing to compact — conversation is short)\n".to_string(),
             ));
-        }
+            return;
+        };
+        self.conversation.apply_compression(n_msgs, content);
+        self.inject_post_compress_state();
+        // Report the actually-removed count measured from before/after,
+        // not from n_msgs, so the UI count stays accurate if
+        // apply_compression's clamping or retention policy changes.
+        let removed = before.saturating_sub(self.conversation.messages.len());
+        let _ = self.event_tx.send(AgentEvent::TextDelta(format!(
+            "(compacted — dropped {} message{})\n",
+            removed,
+            if removed == 1 { "" } else { "s" },
+        )));
     }
 
     fn finish_turn(&mut self, stop_reason: TurnStopReason) {
@@ -2230,6 +2253,41 @@ fn public_error_message(e: &str) -> String {
     }
 }
 
+/// Build the post-compaction status note injected into the conversation so
+/// the model can resume without re-exploring. Returns `None` when there is
+/// nothing worth saying (all inputs empty) — caller skips the injection then.
+///
+/// Extracted as a free function so the truncation / formatting is testable
+/// without building a full `AgentLoop`.
+fn build_post_compress_state(
+    current_task: &str,
+    files_edited: &[String],
+    files_read: &[String],
+) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    if !current_task.is_empty() {
+        // chars().take — must be char-boundary safe for multi-byte (CJK)
+        // user messages. A byte-slice truncation here would panic or
+        // produce invalid UTF-8.
+        let task_short: String = current_task.chars().take(200).collect();
+        parts.push(format!("TASK: {}", task_short));
+    }
+    if !files_edited.is_empty() {
+        parts.push(format!("FILES EDITED: {}", files_edited.join(", ")));
+    }
+    if !files_read.is_empty() {
+        let recent: Vec<&str> = files_read.iter().rev().take(5).map(|s| s.as_str()).collect();
+        parts.push(format!("RECENTLY READ: {}", recent.join(", ")));
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "[Context was compressed. Here is your current state:]\n{}",
+        parts.join("\n")
+    ))
+}
+
 #[cfg(test)]
 mod classifier_tests {
     use super::{
@@ -2305,5 +2363,86 @@ mod classifier_tests {
         let raw = "API error (400 Bad Request) at `https://x`:\nstack=secret detail";
         assert_eq!(public_error_reason(raw), "请求参数无效");
         assert!(!public_error_message(raw).contains("secret detail"));
+    }
+}
+
+#[cfg(test)]
+mod post_compress_state_tests {
+    use super::build_post_compress_state;
+
+    #[test]
+    fn empty_inputs_return_none() {
+        assert!(build_post_compress_state("", &[], &[]).is_none());
+    }
+
+    #[test]
+    fn task_only() {
+        let out = build_post_compress_state("fix login bug", &[], &[]).unwrap();
+        assert!(out.starts_with("[Context was compressed. Here is your current state:]\n"));
+        assert!(out.contains("TASK: fix login bug"));
+        assert!(!out.contains("FILES EDITED"));
+        assert!(!out.contains("RECENTLY READ"));
+    }
+
+    #[test]
+    fn task_exact_200_is_unchanged() {
+        // chars().take(200) on an exactly-200-char input must pass through.
+        let exact: String = "字".repeat(200);
+        let out = build_post_compress_state(&exact, &[], &[]).unwrap();
+        let line = out.lines().find(|l| l.starts_with("TASK: ")).unwrap();
+        let payload = &line["TASK: ".len()..];
+        assert_eq!(payload.chars().count(), 200);
+        assert_eq!(payload, exact);
+    }
+
+    #[test]
+    fn task_201_drops_exactly_one_char() {
+        // Boundary: 201 → 200, and must land on a char boundary (not split
+        // the last 3-byte "字").
+        let over: String = "字".repeat(201);
+        let out = build_post_compress_state(&over, &[], &[]).unwrap();
+        let line = out.lines().find(|l| l.starts_with("TASK: ")).unwrap();
+        let payload = &line["TASK: ".len()..];
+        assert_eq!(payload.chars().count(), 200);
+        assert!(payload.is_char_boundary(payload.len()));
+    }
+
+    #[test]
+    fn task_long_multibyte_truncates_safely() {
+        // Regression guard: byte-slicing here would panic mid-codepoint.
+        let long: String = "字".repeat(500);
+        let out = build_post_compress_state(&long, &[], &[]).unwrap();
+        let line = out.lines().find(|l| l.starts_with("TASK: ")).unwrap();
+        let payload = &line["TASK: ".len()..];
+        assert_eq!(payload.chars().count(), 200);
+    }
+
+    #[test]
+    fn files_edited_comma_joined() {
+        let edited = vec!["a.rs".to_string(), "b.rs".to_string()];
+        let out = build_post_compress_state("", &edited, &[]).unwrap();
+        assert!(out.contains("FILES EDITED: a.rs, b.rs"));
+    }
+
+    #[test]
+    fn files_read_last_five_reversed() {
+        // rev().take(5) → newest first, at most 5.
+        let read: Vec<String> = (1..=8).map(|i| format!("f{}.rs", i)).collect();
+        let out = build_post_compress_state("", &[], &read).unwrap();
+        let line = out.lines().find(|l| l.starts_with("RECENTLY READ: ")).unwrap();
+        assert_eq!(line, "RECENTLY READ: f8.rs, f7.rs, f6.rs, f5.rs, f4.rs");
+    }
+
+    #[test]
+    fn all_three_parts_combined() {
+        let out = build_post_compress_state(
+            "task x",
+            &["a.rs".to_string()],
+            &["b.rs".to_string()],
+        )
+        .unwrap();
+        assert!(out.contains("TASK: task x"));
+        assert!(out.contains("FILES EDITED: a.rs"));
+        assert!(out.contains("RECENTLY READ: b.rs"));
     }
 }

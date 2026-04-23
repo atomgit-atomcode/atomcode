@@ -2219,6 +2219,16 @@ impl App {
                 }
                 return true;
             }
+            cmd if cmd == "/compact" || cmd.starts_with("/compact ") => {
+                let arg = cmd.strip_prefix("/compact").unwrap().trim();
+                let prompt = (!arg.is_empty()).then(|| arg.to_string());
+                // Agent emits the result as a TextDelta ("nothing to compact"
+                // or "compacted — dropped N messages"). No UI-local placeholder
+                // — a premature "compacting…" line could contradict the actual
+                // outcome when the conversation is too short to compact.
+                let _ = self.agent_handle.cmd_tx.send(AgentCommand::Compact { prompt });
+                return true;
+            }
             "/undo" => {
                 if let Some(ref checkpoint) = self.last_checkpoint.clone() {
                     let (ok, msg) = atomcode_core::agent::git_checkpoint::restore_checkpoint(
