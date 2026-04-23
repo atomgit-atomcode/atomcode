@@ -46,7 +46,15 @@ pub const USER_URL: &str = "https://atomgit.com/api/v5/user";
 /// Centralized so a future UA format change (e.g. append install-id)
 /// happens in one spot rather than at each `Client::new()` site.
 fn blocking_client() -> reqwest::blocking::Client {
+    // Hard timeouts here too — the `get_valid_token` path calls
+    // `refresh_access_token` synchronously whenever a stored token
+    // looks expired, and that runs on the main TUI thread (via
+    // `Client::from_stored_auth` → `/status`, drift monitor, etc.).
+    // Without a cap, a slow or unreachable OAuth server would hang
+    // the UI indefinitely. Same budget as the coding-plan client.
     reqwest::blocking::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(10))
         .user_agent(crate::ATOMCODE_USER_AGENT)
         .build()
         .unwrap_or_else(|_| reqwest::blocking::Client::new())
@@ -652,14 +660,19 @@ pub fn get_valid_token() -> Result<String> {
     Ok(auth.access_token)
 }
 
-/// Logout - clear stored auth
+/// Logout - clear stored auth.
+///
+/// Core-layer function: does the filesystem work and returns. User-facing
+/// messaging is the caller's job — this was previously `println!`-ing
+/// "Logged out successfully" directly, which bypassed the TUI renderer
+/// and bled into the input box area on next repaint, and also produced
+/// a duplicate line in CLI mode where `handle_command` prints its own
+/// confirmation. No `Err` distinguishes "file absent" from "file removed" —
+/// both are success from the user's perspective ("you're logged out").
 pub fn logout() -> Result<()> {
     let auth_path = auth_file_path();
     if auth_path.exists() {
         std::fs::remove_file(&auth_path).context("Failed to remove auth file")?;
-        println!("  Logged out successfully.\n");
-    } else {
-        println!("  No active session found.\n");
     }
     Ok(())
 }

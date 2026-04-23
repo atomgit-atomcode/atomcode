@@ -15,11 +15,7 @@ use anyhow::{anyhow, Context, Result};
 use super::types::{ClaimResponse, ModelEntry, StatusResponse};
 use crate::auth;
 
-/// Pre-prod base URL. Production (`api.gitcode.com/api/v5`) is still
-/// serving 404s for these endpoints; move back once the prod rollout
-/// lands. Path structure (`/api/v5/coding-plan/*`) matches what the
-/// backend reports in its Spring-style 404 body's `path` field.
-pub const API_BASE: &str = "https://pre-api.gitcode.com/api/v5";
+pub const API_BASE: &str = "https://api.gitcode.com/api/v5";
 
 /// Token-authenticated blocking REST client for CodingPlan endpoints.
 pub struct Client {
@@ -39,7 +35,17 @@ impl Client {
         }
         let token = auth::get_valid_token()
             .context("failed to load OAuth token (try `atomcode login` again)")?;
+        // Timeouts are critical here: `/status` and the background drift
+        // monitor both call these endpoints synchronously from the TUI
+        // event loop, and without a cap a slow / unreachable gateway
+        // hangs the entire UI until the OS eventually gives up (minutes
+        // on a VPN flap). 5s connect + 10s total covers every realistic
+        // latency for a healthy path and fails fast otherwise — the
+        // error surfaces as a benign "status fetch failed" line next to
+        // the rest of the status report.
         let http = reqwest::blocking::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .timeout(std::time::Duration::from_secs(10))
             .user_agent(crate::ATOMCODE_USER_AGENT)
             .build()
             .unwrap_or_else(|_| reqwest::blocking::Client::new());

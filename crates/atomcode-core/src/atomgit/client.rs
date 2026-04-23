@@ -28,7 +28,7 @@ impl Client {
         let token = auth::get_valid_token()
             .context("failed to load OAuth token (try `atomcode login` again)")?;
         // Default reqwest UA (`reqwest/<ver>`) is rejected by AtomGit's gate
-        // — every request here must carry `AtomCode/<ver>`. Builder() with
+        // — every request here must carry `atomcode/<ver>`. Builder() with
         // `.user_agent(...)` is the blocking-client equivalent of what
         // `provider/mod.rs::build_http_client` does.
         let http = reqwest::blocking::Client::builder()

@@ -230,7 +230,27 @@ impl Config {
     }
 
     pub fn active_provider(&self, override_name: Option<&str>) -> Result<&ProviderConfig> {
-        let name = override_name.unwrap_or(&self.default_provider);
+        // Defence against an accidentally-empty `default_provider` (e.g.
+        // an older /logout path wrote "" back to config.toml). Rather
+        // than looking up the empty key and failing at startup, fall
+        // back to a lexicographically-first provider so the TUI still
+        // boots and the user can self-correct via /provider.
+        let name: &str = override_name
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&self.default_provider);
+        let name: &str = if name.is_empty() {
+            self.providers
+                .keys()
+                .min()
+                .map(String::as_str)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "No providers configured — run /codingplan or /provider"
+                    )
+                })?
+        } else {
+            name
+        };
         self.providers
             .get(name)
             .with_context(|| format!("Provider '{}' not found in config", name))
@@ -432,6 +452,59 @@ mod tests {
         let config: Config = toml::from_str(toml_str).unwrap();
         let provider = config.active_provider(Some("openai")).unwrap();
         assert_eq!(provider.model, "gpt-4o");
+    }
+
+    #[test]
+    fn active_provider_falls_back_when_default_is_empty() {
+        // Guards against the /logout bug where default_provider got
+        // written back as "" — startup must still succeed by falling
+        // back to a lexicographically-first provider instead of
+        // failing with "Provider '' not found".
+        let toml_str = r#"
+            default_provider = ""
+
+            [providers.zeta]
+            type = "openai"
+            api_key = "sk-z"
+            model = "gpt-4o"
+
+            [providers.alpha]
+            type = "claude"
+            api_key = "sk-a"
+            model = "claude-opus-4-6"
+        "#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        let provider = config.active_provider(None).unwrap();
+        assert_eq!(provider.model, "claude-opus-4-6");
+    }
+
+    #[test]
+    fn active_provider_ignores_empty_override() {
+        let toml_str = r#"
+            default_provider = "claude"
+
+            [providers.claude]
+            type = "claude"
+            api_key = "sk-ant-test"
+            model = "claude-opus-4-6"
+        "#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        let provider = config.active_provider(Some("")).unwrap();
+        assert_eq!(provider.model, "claude-opus-4-6");
+    }
+
+    #[test]
+    fn active_provider_errors_with_no_providers_and_empty_default() {
+        let toml_str = r#"
+            default_provider = ""
+            [providers]
+        "#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        let err = config.active_provider(None).unwrap_err();
+        assert!(
+            err.to_string().contains("No providers configured"),
+            "unexpected error: {err}"
+        );
     }
 }
 

@@ -10,7 +10,7 @@
 // `atomgit.com` where the OAuth flow runs; same backend — the token
 // obtained from atomgit OAuth authenticates both). The shared UA
 // (`ATOMCODE_USER_AGENT`) is honoured by every request so AtomGit's
-// API gateway sees a consistent `AtomCode/<ver>` identifier.
+// API gateway sees a consistent `atomcode/<ver>` identifier.
 
 pub mod client;
 pub mod setup;

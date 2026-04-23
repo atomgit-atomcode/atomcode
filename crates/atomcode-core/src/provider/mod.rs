@@ -66,8 +66,8 @@ pub trait LlmProvider: Send + Sync {
 
 /// Shared HTTP client with common timeouts and User-Agent.
 /// `ua_override` comes from `ProviderConfig::user_agent`; falls back to the
-/// workspace-wide `ATOMCODE_USER_AGENT` (`AtomCode/<version>`), required by
-/// AtomGit's API gateway — see the constant's doc-comment.
+/// workspace-wide `ATOMCODE_USER_AGENT` (`atomcode/<version>`) — see the
+/// constant's doc-comment for why lowercasing matters on the LLM gateway.
 pub(super) fn build_http_client(ua_override: Option<&str>) -> reqwest::Client {
     let ua = ua_override.unwrap_or(crate::ATOMCODE_USER_AGENT);
     reqwest::Client::builder()
@@ -215,7 +215,14 @@ fn load_auth_token() -> Result<String> {
 
 /// Exchange refresh_token for a new access_token, save updated auth.toml.
 fn refresh_and_save(refresh_token: &str, auth_path: &std::path::Path) -> Result<String> {
-    let client = reqwest::blocking::Client::new();
+    // Same 5s/10s budget as `auth::oauth::blocking_client` — this runs on
+    // the TUI thread via `get_valid_token`, so an unreachable OAuth host
+    // must never hang the UI.
+    let client = reqwest::blocking::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .unwrap_or_else(|_| reqwest::blocking::Client::new());
     let builder = client
         .post(OAUTH_TOKEN_URL)
         .form(&[

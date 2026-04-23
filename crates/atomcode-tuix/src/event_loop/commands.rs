@@ -286,6 +286,12 @@ pub(super) fn execute_slash_command(
             run_codingplan_flow(renderer, ctx)?;
         }
         "logout" => {
+            // /logout only invalidates the OAuth token on disk.
+            // Provider config is a user asset and stays in config.toml
+            // untouched — if the user's default is an AtomGit* provider,
+            // the next LLM request fails with a "re-run /codingplan"
+            // hint instead of the TUI crashing on next startup because
+            // `default_provider` got cleared.
             match atomcode_core::auth::logout() {
                 Ok(()) => {
                     let _ = ctx

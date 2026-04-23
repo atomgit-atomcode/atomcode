@@ -21,10 +21,14 @@ pub mod version_check;
 
 /// User-Agent identifier for every outbound HTTP request the app makes.
 ///
-/// AtomGit's API gateway filters requests by User-Agent; missing the
-/// `AtomCode` token gets the request rejected at the edge (LLM calls,
-/// OAuth token exchange, issue REST, self-update downloads — every
-/// atomgit.com endpoint). Routing all HTTP clients through this single
-/// constant means adding the token (or future changes like appending an
-/// install-id) happens in one place, not five.
-pub const ATOMCODE_USER_AGENT: &str = concat!("AtomCode/", env!("CARGO_PKG_VERSION"));
+/// Lowercase `atomcode/<version>` is deliberate. The LLM gateway at
+/// `api-ai.gitcode.com` has a UA filter that silently hijacks any
+/// request whose UA starts with capital-A `AtomCode` and replies
+/// with a 200 + single SSE chunk containing the literal string
+/// "参数错误", no `[DONE]` frame — which surfaces in the TUI as a
+/// 4-token assistant reply rather than an error. The other
+/// atomgit.com / gitcode.com endpoints (CodingPlan, user REST,
+/// self-update) accept either case, so normalising to lowercase
+/// avoids the LLM-path hijack without breaking the rest. Revisit
+/// once the gateway filter is removed upstream.
+pub const ATOMCODE_USER_AGENT: &str = concat!("atomcode/", env!("CARGO_PKG_VERSION"));

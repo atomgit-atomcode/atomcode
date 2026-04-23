@@ -658,7 +658,7 @@ impl AgentLoop {
                         self.session_files.clear();
                     }
 
-                    if let Some(provider_config) = self.config.providers.get(&new_provider_name) {
+if let Some(provider_config) = self.config.providers.get(&new_provider_name) {
                         // Rebuild the context strategy for the new provider.
                         // Selected once per provider; per-model customizations
                         // (e.g. Ollama schema trimming, Claude cache markers)

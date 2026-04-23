@@ -133,9 +133,12 @@
       <!-- Center: Navigation Links (Desktop) -->
       <div class="hidden md:flex flex-1 items-center justify-center gap-6 lg:gap-8 text-sm text-slate-400">
         <a href="#features" class="hover:text-white transition" data-i18n="nav.features">功能特性</a>
-        <a href="#comparison" class="hover:text-white transition" data-i18n="nav.comparison">对比 Claude Code</a>
         <a href="#install" class="hover:text-white transition" data-i18n="nav.install">安装指南</a>
         <a href="./docs/index.html" class="hover:text-white transition" data-i18n="nav.docs">使用指南</a>
+        <a href="https://ai.atomgit.com/serverless-api" target="_blank" class="hover:text-white transition flex items-center gap-1.5">
+          <span data-i18n="nav.codingplan">CodingPlan</span>
+          <span class="text-[10px] font-semibold leading-none px-1.5 py-0.5 rounded-full bg-rose-500/15 text-rose-400 tracking-wider">FREE</span>
+        </a>
         <a href="https://atomgit.com/atomgit_atomcode/atomcode" target="_blank" class="hover:text-white transition flex items-center gap-1.5">
           <img src="https://cdn-static.gitcode.host/static/images/logo-favicon.png" alt="AtomGit" class="w-4 h-4">
           <span data-i18n="nav.repo">开源仓库</span>
@@ -208,9 +211,12 @@
         <!-- Navigation Links -->
         <div class="flex flex-col border-b border-white/5">
           <a href="#features" class="mobile-nav-link px-4 py-3 text-base text-slate-300 hover:text-white hover:bg-white/5 transition border-b border-white/5" data-i18n="nav.features">功能特性</a>
-          <a href="#comparison" class="mobile-nav-link px-4 py-3 text-base text-slate-300 hover:text-white hover:bg-white/5 transition border-b border-white/5" data-i18n="nav.comparison">对比 Claude Code</a>
           <a href="#install" class="mobile-nav-link px-4 py-3 text-base text-slate-300 hover:text-white hover:bg-white/5 transition border-b border-white/5" data-i18n="nav.install">安装指南</a>
           <a href="./docs/index.html" class="mobile-nav-link px-4 py-3 text-base text-slate-300 hover:text-white hover:bg-white/5 transition border-b border-white/5" data-i18n="nav.docs">使用指南</a>
+          <a href="https://ai.atomgit.com/serverless-api" target="_blank" class="mobile-nav-link px-4 py-3 text-base text-slate-300 hover:text-white hover:bg-white/5 transition border-b border-white/5 flex items-center gap-2">
+            <span data-i18n="nav.codingplan">CodingPlan</span>
+            <span class="text-[10px] font-semibold leading-none px-1.5 py-0.5 rounded-full bg-rose-500/15 text-rose-400 tracking-wider">FREE</span>
+          </a>
           <a href="https://atomgit.com/atomgit_atomcode/atomcode" target="_blank" class="mobile-nav-link px-4 py-3 text-base text-slate-300 hover:text-white hover:bg-white/5 transition flex items-center gap-2">
             <img src="https://cdn-static.gitcode.host/static/images/logo-favicon.png" alt="AtomGit" class="w-5 h-5">
             <span data-i18n="nav.repo">开源仓库</span>
@@ -589,7 +595,7 @@ cp target/release/atomcode ~/.local/bin/</pre>
     // i18n translations
     const i18n = {
       zh: {
-        'nav.features': '功能特性', 'nav.comparison': '对比 Claude Code', 'nav.install': '安装指南', 'nav.docs': '使用指南', 'nav.repo': '开源仓库', 'nav.settings': '设置',
+        'nav.features': '功能特性', 'nav.install': '安装指南', 'nav.docs': '使用指南', 'nav.codingplan': 'CodingPlan', 'nav.repo': '开源仓库', 'nav.settings': '设置',
         'settings.language': '语言', 'settings.theme': '主题', 'theme.light': '日间', 'theme.dark': '夜间',
         'hero.badge': '开源 · 多模型支持 · Rust', 'hero.title1': 'AI 编程助手', 'hero.title2': '在你的终端中运行',
         'hero.desc': 'Claude Code 的开源替代方案。连接任意大模型，编辑代码，运行命令，自动验证 — 全自动执行。用 Rust 构建，极致性能。',
@@ -629,7 +635,7 @@ cp target/release/atomcode ~/.local/bin/</pre>
         'footer.tagline': 'AtomCode · 开源终端 AI 编码助手', 'footer.license': 'MIT 许可证', 'footer.rust': '用 Rust 构建'
       },
       en: {
-        'nav.features': 'Features', 'nav.comparison': 'vs Claude Code', 'nav.install': 'Install', 'nav.docs': 'Docs', 'nav.repo': 'Repository', 'nav.settings': 'Settings',
+        'nav.features': 'Features', 'nav.install': 'Install', 'nav.docs': 'Docs', 'nav.codingplan': 'CodingPlan', 'nav.repo': 'Repository', 'nav.settings': 'Settings',
         'settings.language': 'Language', 'settings.theme': 'Theme', 'theme.light': 'Light', 'theme.dark': 'Dark',
         'hero.badge': 'Open Source · Multi-Provider · Rust', 'hero.title1': 'AI Coding Agent', 'hero.title2': 'in Your Terminal',
         'hero.desc': "An open-source alternative to Claude Code. Connect any LLM, edit code, run commands, and verify changes — autonomously. Built in Rust for speed.",
