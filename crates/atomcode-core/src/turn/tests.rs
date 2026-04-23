@@ -199,6 +199,8 @@ fn test_config() -> Config {
             user_agent: None,
             context_window: 16000,
             max_tokens: None,
+            thinking_type: None,
+            thinking_keep: None,
             ephemeral: false,
         },
     );
@@ -229,6 +231,8 @@ fn make_runner(provider: MockProvider, tools: ToolRegistry, permission: Box<dyn 
         user_agent: None,
         context_window: 128_000,
         max_tokens: None,
+        thinking_type: None,
+        thinking_keep: None,
         ephemeral: true,
     };
     let test_ctx: std::sync::Arc<dyn crate::ctx::CtxBuilder> =
@@ -795,7 +799,7 @@ async fn test_tool_result_content_in_llm_context() {
     assert_eq!(provider_msgs[1].text(), Some("search for foo"));
 
     // 3. Assistant message with tool call — call_id and arguments preserved
-    if let crate::conversation::message::MessageContent::AssistantWithToolCalls { text: _, ref tool_calls } = provider_msgs[2].content {
+    if let crate::conversation::message::MessageContent::AssistantWithToolCalls { text: _, ref tool_calls, .. } = provider_msgs[2].content {
         assert_eq!(tool_calls.len(), 1);
         assert_eq!(tool_calls[0].name, "grep");
         assert_eq!(tool_calls[0].arguments, r#"{"pattern":"foo"}"#);

@@ -389,6 +389,8 @@ mod tests {
             user_agent: None,
             context_window: 16000,
             max_tokens: None,
+            thinking_type: None,
+            thinking_keep: None,
             ephemeral: false,
         });
         cfg.save(&tmp).unwrap();

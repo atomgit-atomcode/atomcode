@@ -149,6 +149,8 @@ mod tests {
             user_agent: None,
             context_window: ctx,
             max_tokens: None,
+            thinking_type: None,
+            thinking_keep: None,
             ephemeral: false,
         }
     }
@@ -241,7 +243,7 @@ mod tests {
         let mut conv = Conversation::new();
         for i in 0..8 {
             conv.add_user_message(&format!("user turn {} with moderate content", i));
-            conv.add_assistant_tool_calls(Some(&format!("some assistant reasoning for turn {}", i)), vec![]);
+            conv.add_assistant_tool_calls(Some(&format!("some assistant reasoning for turn {}", i)), vec![], None);
         }
         // 16 条消息,每条 ~10-15 tokens → 总 ~200 tokens,低于 35%,不压
         assert!(!o.needs_compression(&conv, 50));
@@ -252,6 +254,7 @@ mod tests {
             conv.add_assistant_tool_calls(
                 Some(&"dolor sit amet ".repeat(50)),
                 vec![],
+                None,
             );
         }
         // 此时总 tokens 远超 2800

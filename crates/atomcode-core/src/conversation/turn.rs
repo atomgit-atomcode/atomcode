@@ -265,6 +265,7 @@ mod tests {
                         name: "bash".into(),
                         arguments: "{}".into(),
                     }],
+                    reasoning_content: None,
                 },
             });
             msgs.push(Message {

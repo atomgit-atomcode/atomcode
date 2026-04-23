@@ -376,6 +376,8 @@ impl App {
                    user_agent: None,
                    context_window: atomcode_core::config::provider::default_context_window_for("openai"),
                    max_tokens: None,
+                   thinking_type: None,
+                   thinking_keep: None,
                    ephemeral: false,
                }).unwrap_or_else(|_| {
                    // Fallback: should never reach production path since AgentLoop handles LLM
@@ -632,7 +634,7 @@ impl App {
                     arguments: arguments.clone(),
                 };
                 self.executing_tool_info = format_tool_info(&call);
-                self.conversation.finalize_stream_with_tool_call(call);
+                self.conversation.finalize_stream_with_tool_call(call, None);
                 self.render_cache_msg_count = 0;
                 self.mode = AppMode::ToolExecuting;
                 self.tool_start = Some(Instant::now());

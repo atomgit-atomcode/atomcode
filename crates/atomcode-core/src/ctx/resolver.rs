@@ -61,6 +61,8 @@ mod tests {
             user_agent: None,
             context_window: ctx,
             max_tokens: None,
+            thinking_type: None,
+            thinking_keep: None,
             ephemeral: false,
         }
     }

@@ -196,6 +196,8 @@ fn build_oauth_provider() -> ProviderConfig {
         user_agent: None,
         context_window: 64000,
         max_tokens: None,
+        thinking_type: None,
+        thinking_keep: None,
         ephemeral: false,
     }
 }
@@ -212,6 +214,8 @@ fn build_wecom_provider(creds: &wecom_login::BrokerCreds) -> ProviderConfig {
         user_agent: None,
         context_window: 64000,
         max_tokens: None,
+        thinking_type: None,
+        thinking_keep: None,
         ephemeral: true,
     }
 }

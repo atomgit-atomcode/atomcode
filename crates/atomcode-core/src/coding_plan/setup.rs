@@ -431,6 +431,8 @@ fn build_codingplan_provider(model: &str) -> ProviderConfig {
         user_agent: None,
         context_window: CONTEXT_WINDOW,
         max_tokens: None,
+        thinking_type: None,
+        thinking_keep: None,
         ephemeral: false,
     }
 }

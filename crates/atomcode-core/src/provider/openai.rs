@@ -13,7 +13,7 @@ use crate::conversation::message::{Message, MessageContent, Role};
 use crate::stream::StreamEvent;
 use crate::tool::ToolDef;
 
-use super::LlmProvider;
+use super::{LlmProvider, ReasoningPolicy};
 
 pub struct OpenAiProvider {
     client: Client,
@@ -21,6 +21,12 @@ pub struct OpenAiProvider {
     model: String,
     base_url: String,
     max_tokens: usize,
+    /// Kimi-family thinking knob: `thinking.type` in the request body.
+    /// Only emitted when the user configures it — other OpenAI-compatible
+    /// gateways may reject unknown top-level fields.
+    thinking_type: Option<String>,
+    /// Kimi K2.6 Preserved Thinking: `thinking.keep` in the request body.
+    thinking_keep: Option<String>,
 }
 
 impl OpenAiProvider {
@@ -40,10 +46,53 @@ impl OpenAiProvider {
             // Cap at 16K: prevents models from spending 250s on thinking
             // with zero visible output. CC uses fixed 16-32K, not proportional.
             max_tokens: config.max_tokens.unwrap_or((config.context_window / 4).clamp(8_000, 16_384)),
+            thinking_type: config.thinking_type.clone(),
+            thinking_keep: config.thinking_keep.clone(),
         })
     }
 
-    fn format_messages(messages: &[Message]) -> Vec<serde_json::Value> {
+    /// Derive the reasoning echo policy from model name / base_url.
+    /// - `kimi-*` / base_url contains `moonshot` → Include (Moonshot requires
+    ///   reasoning_content on every assistant tool_call or returns 400).
+    /// - `deepseek-reasoner` / `deepseek-r1` → Exclude (DeepSeek rejects the
+    ///   request if reasoning_content is echoed back).
+    /// - Other OpenAI-compatible endpoints → Exclude (safe default; normal
+    ///   OpenAI models don't emit reasoning_content, so there's nothing to
+    ///   strip, and non-thinking models typically ignore the field).
+    fn derive_reasoning_policy(model: &str, base_url: &str) -> ReasoningPolicy {
+        let m = model.to_ascii_lowercase();
+        let u = base_url.to_ascii_lowercase();
+        if m.contains("deepseek-reasoner") || m.contains("deepseek-r1") {
+            return ReasoningPolicy::Exclude;
+        }
+        if m.starts_with("kimi-") || m.starts_with("moonshot") || u.contains("moonshot") || u.contains("kimi") {
+            return ReasoningPolicy::Include;
+        }
+        ReasoningPolicy::Exclude
+    }
+
+    /// Build Kimi's `thinking` request-body object from the two flat
+    /// config fields. Returns `None` when both are unset so the caller
+    /// omits the whole key — safer for non-Kimi gateways that might
+    /// error on an unknown top-level `thinking`.
+    fn thinking_body_value(
+        thinking_type: Option<&str>,
+        thinking_keep: Option<&str>,
+    ) -> Option<serde_json::Value> {
+        if thinking_type.is_none() && thinking_keep.is_none() {
+            return None;
+        }
+        let mut obj = serde_json::Map::new();
+        if let Some(t) = thinking_type {
+            obj.insert("type".into(), json!(t));
+        }
+        if let Some(k) = thinking_keep {
+            obj.insert("keep".into(), json!(k));
+        }
+        Some(serde_json::Value::Object(obj))
+    }
+
+    fn format_messages(messages: &[Message], reasoning_policy: ReasoningPolicy) -> Vec<serde_json::Value> {
         messages
             .iter()
             .filter_map(|m| {
@@ -65,7 +114,7 @@ impl OpenAiProvider {
                         }
                         Some(json!({"role": role, "content": s}))
                     }
-                    MessageContent::AssistantWithToolCalls { text, tool_calls } => {
+                    MessageContent::AssistantWithToolCalls { text, tool_calls, reasoning_content } => {
                         if tool_calls.is_empty() {
                             // No tool calls — send as plain assistant text
                             let t = text.as_deref().unwrap_or("");
@@ -76,6 +125,16 @@ impl OpenAiProvider {
                         // Always include content field — some APIs (DeepSeek/SiliconFlow)
                         // reject messages without it even when tool_calls is present.
                         msg["content"] = json!(text.as_deref().unwrap_or(""));
+                        // Thinking-model providers (Moonshot Kimi K2-thinking/K2.6)
+                        // require reasoning_content to appear on every assistant
+                        // tool_call message in history. Emit an empty string when
+                        // we don't have stored reasoning (old session, None, etc.)
+                        // — the field must exist as a key or the provider treats
+                        // it as "missing" and 400s. DeepSeek does the opposite,
+                        // so this whole block is gated on policy.
+                        if matches!(reasoning_policy, ReasoningPolicy::Include) {
+                            msg["reasoning_content"] = json!(reasoning_content.as_deref().unwrap_or(""));
+                        }
                         msg["tool_calls"] = json!(tool_calls.iter().map(|tc| {
                             // Ensure arguments is valid JSON — some APIs reject invalid JSON strings.
                             let args = if serde_json::from_str::<serde_json::Value>(&tc.arguments).is_ok() {
@@ -212,7 +271,7 @@ impl LlmProvider for OpenAiProvider {
         let url = normalize_base_url(&self.base_url);
         let mut body = json!({
             "model": self.model,
-            "messages": Self::format_messages(messages),
+            "messages": Self::format_messages(messages, self.reasoning_history_policy()),
             "stream": true,
             "stream_options": { "include_usage": true },
             "max_tokens": self.max_tokens,
@@ -230,6 +289,16 @@ impl LlmProvider for OpenAiProvider {
                 })).collect::<Vec<_>>());
                 // Allow the model to decide whether to call multiple tools in parallel
             }
+        }
+
+        // Kimi K2.5 / K2.6 top-level `thinking` object. Only sent when the
+        // user configured it — other OpenAI-compatible gateways may reject
+        // unknown fields, and omitting lets Kimi's default behavior apply.
+        if let Some(th) = Self::thinking_body_value(
+            self.thinking_type.as_deref(),
+            self.thinking_keep.as_deref(),
+        ) {
+            body["thinking"] = th;
         }
 
         let request = self
@@ -463,6 +532,10 @@ impl LlmProvider for OpenAiProvider {
     fn model_name(&self) -> &str {
         &self.model
     }
+
+    fn reasoning_history_policy(&self) -> ReasoningPolicy {
+        Self::derive_reasoning_policy(&self.model, &self.base_url)
+    }
 }
 
 /// Repair common JSON issues in tool call arguments from weak models.
@@ -608,5 +681,164 @@ mod tests {
     #[test]
     fn sample_for_error_flattens_newlines() {
         assert_eq!(sample_for_error("a\nb"), "a\\nb");
+    }
+
+    // ── ReasoningPolicy: model / base_url routing ──
+
+    #[test]
+    fn reasoning_policy_moonshot_kimi_routes_to_include() {
+        use super::{OpenAiProvider, ReasoningPolicy};
+        assert_eq!(
+            OpenAiProvider::derive_reasoning_policy("kimi-k2-thinking", "https://api.moonshot.cn/v1"),
+            ReasoningPolicy::Include,
+        );
+        assert_eq!(
+            OpenAiProvider::derive_reasoning_policy("kimi-k2.6", "https://api.kimi.com/v1"),
+            ReasoningPolicy::Include,
+        );
+    }
+
+    #[test]
+    fn reasoning_policy_deepseek_reasoner_routes_to_exclude() {
+        use super::{OpenAiProvider, ReasoningPolicy};
+        // DeepSeek-R1 rejects the request if reasoning_content is echoed back.
+        assert_eq!(
+            OpenAiProvider::derive_reasoning_policy("deepseek-reasoner", "https://api.deepseek.com/v1"),
+            ReasoningPolicy::Exclude,
+        );
+        assert_eq!(
+            OpenAiProvider::derive_reasoning_policy("deepseek-r1", "https://api.deepseek.com/v1"),
+            ReasoningPolicy::Exclude,
+        );
+    }
+
+    #[test]
+    fn reasoning_policy_default_is_exclude() {
+        use super::{OpenAiProvider, ReasoningPolicy};
+        // Unknown OpenAI-compatible endpoint → safe default: don't emit.
+        assert_eq!(
+            OpenAiProvider::derive_reasoning_policy("gpt-4o", "https://api.openai.com/v1"),
+            ReasoningPolicy::Exclude,
+        );
+        assert_eq!(
+            OpenAiProvider::derive_reasoning_policy("some-custom-model", "https://example.com/v1"),
+            ReasoningPolicy::Exclude,
+        );
+    }
+
+    // ── format_messages: reasoning_content emission per policy ──
+
+    fn atc_message(reasoning: Option<&str>) -> crate::conversation::message::Message {
+        use crate::conversation::message::{Message, MessageContent, Role};
+        use crate::tool::ToolCall;
+        Message {
+            role: Role::Assistant,
+            content: MessageContent::AssistantWithToolCalls {
+                text: Some("ok".into()),
+                tool_calls: vec![ToolCall {
+                    id: "c1".into(),
+                    name: "bash".into(),
+                    arguments: "{}".into(),
+                }],
+                reasoning_content: reasoning.map(|s| s.to_string()),
+            },
+        }
+    }
+
+    #[test]
+    fn format_messages_include_with_some_reasoning_emits_field() {
+        use super::{OpenAiProvider, ReasoningPolicy};
+        let msgs = vec![atc_message(Some("thinking text"))];
+        let out = OpenAiProvider::format_messages(&msgs, ReasoningPolicy::Include);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["reasoning_content"], "thinking text");
+    }
+
+    #[test]
+    fn format_messages_include_with_none_reasoning_emits_empty_string() {
+        // Moonshot's check is "field missing" — an empty string is accepted,
+        // a missing key is not. When we have no stored reasoning (old session,
+        // first tool_call in history that preceded thinking enablement, etc.)
+        // we MUST still emit the key to avoid 400.
+        use super::{OpenAiProvider, ReasoningPolicy};
+        let msgs = vec![atc_message(None)];
+        let out = OpenAiProvider::format_messages(&msgs, ReasoningPolicy::Include);
+        assert_eq!(out[0]["reasoning_content"], "");
+    }
+
+    #[test]
+    fn format_messages_exclude_omits_reasoning_content_key() {
+        // DeepSeek-R1 rejects the request if reasoning_content key is present,
+        // so under Exclude we must NOT emit the key even when we have a value.
+        use super::{OpenAiProvider, ReasoningPolicy};
+        let msgs = vec![atc_message(Some("should be stripped"))];
+        let out = OpenAiProvider::format_messages(&msgs, ReasoningPolicy::Exclude);
+        assert!(
+            out[0].as_object().unwrap().get("reasoning_content").is_none(),
+            "reasoning_content key must be absent under Exclude, got: {}",
+            out[0]
+        );
+    }
+
+    // ── thinking config → request body ──
+
+    #[test]
+    fn thinking_body_none_when_both_unset() {
+        use super::OpenAiProvider;
+        // Unset = don't emit the key at all. Some OpenAI-compatible gateways
+        // 400 on unknown top-level fields, so missing is safer than `{}`.
+        assert!(OpenAiProvider::thinking_body_value(None, None).is_none());
+    }
+
+    #[test]
+    fn thinking_body_disabled_emits_type_only() {
+        use super::OpenAiProvider;
+        let out = OpenAiProvider::thinking_body_value(Some("disabled"), None).unwrap();
+        assert_eq!(out, serde_json::json!({"type": "disabled"}));
+    }
+
+    #[test]
+    fn thinking_body_enabled_with_keep_all() {
+        use super::OpenAiProvider;
+        // K2.6 Preserved Thinking: the reference combination from Kimi docs.
+        let out = OpenAiProvider::thinking_body_value(Some("enabled"), Some("all")).unwrap();
+        assert_eq!(out, serde_json::json!({"type": "enabled", "keep": "all"}));
+    }
+
+    #[test]
+    fn thinking_fields_roundtrip_via_toml_provider_config() {
+        // The TOML shape users will write in config.toml — flat, with a
+        // `thinking_` prefix so each field's purpose is obvious on its own.
+        use crate::config::provider::ProviderConfig;
+        let toml = r#"
+            type = "openai"
+            model = "kimi-k2.6"
+            base_url = "https://api.moonshot.cn/v1"
+            api_key = "sk-x"
+            thinking_type = "enabled"
+            thinking_keep = "all"
+        "#;
+        let cfg: ProviderConfig = toml::from_str(toml).expect("TOML parse");
+        assert_eq!(cfg.thinking_type.as_deref(), Some("enabled"));
+        assert_eq!(cfg.thinking_keep.as_deref(), Some("all"));
+    }
+
+    // ── serde backward compat for old session jsonl ──
+
+    #[test]
+    fn old_jsonl_without_reasoning_content_still_deserializes() {
+        // Session jsonl written before this field existed must still load.
+        // `#[serde(default)]` on the field makes this work.
+        use crate::conversation::message::MessageContent;
+        let old = r#"{"AssistantWithToolCalls":{"text":"hi","tool_calls":[]}}"#;
+        let parsed: MessageContent = serde_json::from_str(old)
+            .expect("old-format AssistantWithToolCalls should deserialize");
+        match parsed {
+            MessageContent::AssistantWithToolCalls { text, reasoning_content, .. } => {
+                assert_eq!(text.as_deref(), Some("hi"));
+                assert!(reasoning_content.is_none());
+            }
+            other => panic!("unexpected variant: {:?}", other),
+        }
     }
 }

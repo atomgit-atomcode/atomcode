@@ -36,6 +36,8 @@ fn build_oauth_provider() -> ProviderConfig {
         user_agent: None,
         context_window: 64_000,
         max_tokens: None,
+        thinking_type: None,
+        thinking_keep: None,
         ephemeral: false,
     }
 }

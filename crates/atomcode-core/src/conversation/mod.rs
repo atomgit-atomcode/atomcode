@@ -164,13 +164,19 @@ impl Conversation {
         }
     }
 
-    pub fn add_assistant_tool_calls(&mut self, text: Option<&str>, tool_calls: Vec<ToolCall>) {
+    pub fn add_assistant_tool_calls(
+        &mut self,
+        text: Option<&str>,
+        tool_calls: Vec<ToolCall>,
+        reasoning: Option<&str>,
+    ) {
         let idx = self.messages.len();
         self.messages.push(Message {
             role: Role::Assistant,
             content: MessageContent::AssistantWithToolCalls {
                 text: text.map(|s| s.to_string()),
                 tool_calls,
+                reasoning_content: reasoning.map(|s| s.to_string()),
             },
         });
         self.turn_tracker.on_message_added(idx);
@@ -185,15 +191,26 @@ impl Conversation {
         self.turn_tracker.on_message_added(idx);
     }
 
-    pub fn finalize_stream_with_tool_call(&mut self, tool_call: ToolCall) {
+    pub fn finalize_stream_with_tool_call(
+        &mut self,
+        tool_call: ToolCall,
+        reasoning: Option<&str>,
+    ) {
         let text = self.stream_buffer.take();
-        self.add_assistant_tool_calls(text.as_deref(), vec![tool_call]);
+        self.add_assistant_tool_calls(text.as_deref(), vec![tool_call], reasoning);
     }
 
     /// Finalize the current stream buffer with multiple tool calls at once (multi-tool support).
-    pub fn finalize_stream_with_tool_calls(&mut self, tool_calls: &[ToolCall]) {
+    /// `reasoning` carries thinking-model reasoning_content accumulated during the stream;
+    /// it's stored on the message so the send-side policy can echo it back when the
+    /// provider demands (see `ReasoningPolicy`).
+    pub fn finalize_stream_with_tool_calls(
+        &mut self,
+        tool_calls: &[ToolCall],
+        reasoning: Option<&str>,
+    ) {
         let text = self.stream_buffer.take();
-        self.add_assistant_tool_calls(text.as_deref(), tool_calls.to_vec());
+        self.add_assistant_tool_calls(text.as_deref(), tool_calls.to_vec(), reasoning);
     }
 
     pub fn to_provider_messages(&self, system_prompt: &str) -> Vec<Message> {
@@ -481,10 +498,10 @@ mod tests {
             name: "read_file".to_string(),
             arguments: r#"{"file_path":"/tmp/test"}"#.to_string(),
         };
-        conv.add_assistant_tool_calls(Some("Let me read that file."), vec![call]);
+        conv.add_assistant_tool_calls(Some("Let me read that file."), vec![call], None);
         assert_eq!(conv.messages.len(), 2);
         match &conv.messages[1].content {
-            MessageContent::AssistantWithToolCalls { text, tool_calls } => {
+            MessageContent::AssistantWithToolCalls { text, tool_calls, .. } => {
                 assert_eq!(text.as_deref(), Some("Let me read that file."));
                 assert_eq!(tool_calls.len(), 1);
             }
@@ -516,11 +533,11 @@ mod tests {
             name: "read_file".to_string(),
             arguments: "{}".to_string(),
         };
-        conv.finalize_stream_with_tool_call(call);
+        conv.finalize_stream_with_tool_call(call, None);
         assert!(conv.stream_buffer.is_none());
         assert_eq!(conv.messages.len(), 1);
         match &conv.messages[0].content {
-            MessageContent::AssistantWithToolCalls { text, tool_calls } => {
+            MessageContent::AssistantWithToolCalls { text, tool_calls, .. } => {
                 assert_eq!(text.as_deref(), Some("Let me check..."));
                 assert_eq!(tool_calls.len(), 1);
             }

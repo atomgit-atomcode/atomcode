@@ -15,6 +15,16 @@ pub enum MessageContent {
     AssistantWithToolCalls {
         text: Option<String>,
         tool_calls: Vec<ToolCall>,
+        /// Thinking-model reasoning captured alongside the tool_calls. Some
+        /// provider APIs (Moonshot Kimi K2-thinking / K2.6, MiniMax-M2 when
+        /// `reasoning_split` is on) require the historical `reasoning_content`
+        /// to be echoed back on every assistant tool_call message or they
+        /// reject the next request with a 400. DeepSeek-R1 is the opposite —
+        /// it rejects the request if this field is echoed back. The send-side
+        /// `ReasoningPolicy` (per-provider) decides whether to emit.
+        /// Always captured on the receive side so we don't lose data.
+        #[serde(default)]
+        reasoning_content: Option<String>,
     },
     ToolResult(ToolResult),
     /// Lightweight reference to a tool result whose full output is cached on disk.
@@ -50,13 +60,14 @@ impl Message {
     pub fn estimate_tokens(&self) -> usize {
         let char_count = match &self.content {
             MessageContent::Text(s) => s.len(),
-            MessageContent::AssistantWithToolCalls { text, tool_calls } => {
+            MessageContent::AssistantWithToolCalls { text, tool_calls, reasoning_content } => {
                 let text_len = text.as_ref().map_or(0, |t| t.len());
                 let calls_len: usize = tool_calls
                     .iter()
                     .map(|tc| tc.name.len() + tc.arguments.len() + 20)
                     .sum();
-                text_len + calls_len
+                let reasoning_len = reasoning_content.as_ref().map_or(0, |r| r.len());
+                text_len + calls_len + reasoning_len
             }
             MessageContent::ToolResult(r) => r.output.len() + 10,
             // ToolResultRef: kept for backward compat (loading old conversations).

@@ -218,7 +218,7 @@ fn replay_session(renderer: &mut dyn Renderer, session: &Session) {
                     renderer.render(UiLine::AssistantLineBreak);
                 }
             }
-            (Role::Assistant, MessageContent::AssistantWithToolCalls { text, tool_calls }) => {
+            (Role::Assistant, MessageContent::AssistantWithToolCalls { text, tool_calls, .. }) => {
                 if let Some(t) = text {
                     if !t.is_empty() {
                         renderer.render(UiLine::AssistantText(t.clone()));

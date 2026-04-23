@@ -14,6 +14,33 @@ use crate::conversation::message::Message;
 use crate::stream::StreamEvent;
 use crate::tool::ToolDef;
 
+/// Per-provider strategy for echoing back `reasoning_content` from historical
+/// assistant tool_call messages on subsequent requests.
+///
+/// Different thinking-model APIs contradict each other:
+/// - **Moonshot Kimi K2-thinking / K2.5 / K2.6** — MUST echo reasoning_content
+///   on every assistant tool_call message in history; otherwise returns 400
+///   with "thinking is enabled but reasoning_content is missing in assistant
+///   tool call message at index N".
+/// - **DeepSeek-R1 / deepseek-reasoner** — MUST NOT include reasoning_content
+///   in subsequent requests; returns 400 if present.
+/// - **MiniMax-M2 (default)** — thinking is embedded in content as
+///   `<think>...</think>`, goes through the plain-text path; no separate field
+///   handling needed.
+/// - **Anthropic** — uses a different `thinking` block structure in its own
+///   messages format; not affected by this policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReasoningPolicy {
+    /// Echo the stored reasoning_content back on every assistant tool_call
+    /// message. When the stored value is None, emit an empty string so the
+    /// field is always present (some providers treat a missing field as
+    /// "field absent" and error out even with empty content).
+    Include,
+    /// Strip reasoning_content — never emit the field in outbound requests,
+    /// even if we captured it from the stream. This is the safe default.
+    Exclude,
+}
+
 #[async_trait]
 pub trait LlmProvider: Send + Sync {
     fn chat_stream(
@@ -26,6 +53,14 @@ pub trait LlmProvider: Send + Sync {
 
     fn availability_error(&self) -> Option<&str> {
         None
+    }
+
+    /// Whether historical `reasoning_content` should be echoed back to the
+    /// provider on subsequent requests. Default `Exclude` (safe for all
+    /// providers that don't demand it). Providers that hit a thinking-model
+    /// API should override.
+    fn reasoning_history_policy(&self) -> ReasoningPolicy {
+        ReasoningPolicy::Exclude
     }
 }
 
@@ -259,6 +294,8 @@ mod tests {
             user_agent: None,
             context_window: 8000,
             max_tokens: None,
+            thinking_type: None,
+            thinking_keep: None,
             ephemeral: false,
         }
     }

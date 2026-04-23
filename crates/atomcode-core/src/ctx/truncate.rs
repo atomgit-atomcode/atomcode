@@ -235,6 +235,7 @@ mod tests {
                     name: tool_name.to_string(),
                     arguments: String::new(),
                 }],
+                reasoning_content: None,
             },
         }
     }

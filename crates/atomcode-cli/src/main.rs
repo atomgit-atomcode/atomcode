@@ -651,6 +651,8 @@ async fn run() -> Result<i32> {
                 user_agent: None,
                 context_window: default_context_window_for("openai"),
                 max_tokens: None,
+                thinking_type: None,
+                thinking_keep: None,
                 ephemeral: false,
             },
             String::new(),

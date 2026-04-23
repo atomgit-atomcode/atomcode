@@ -231,7 +231,7 @@ impl From<&atomcode_core::conversation::message::Message> for MessageInfo {
                 // No artifacts from plain text messages (code blocks not extracted)
                 (s.clone(), None, None, None)
             }
-            atomcode_core::conversation::message::MessageContent::AssistantWithToolCalls { text, tool_calls } => {
+            atomcode_core::conversation::message::MessageContent::AssistantWithToolCalls { text, tool_calls, .. } => {
                 let calls: Vec<ToolCallInfo> = tool_calls.iter()
                     .map(|tc| ToolCallInfo {
                         id: tc.id.clone(),
@@ -1627,6 +1627,8 @@ let session_manager = SessionManager::new(&working_dir);
             user_agent: None,
             context_window: 128_000,
             max_tokens: None,
+            thinking_type: None,
+            thinking_keep: None,
             ephemeral: true,
         }),
     };

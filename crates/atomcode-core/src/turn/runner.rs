@@ -380,9 +380,24 @@ _ = cancel.cancelled() => {
                                 });
                             }
 
-                            // Finalize conversation state
+                            // Finalize conversation state. Pass the accumulated
+                            // reasoning_buf so thinking-model providers (Moonshot
+                            // Kimi K2-thinking/K2.6, etc.) can echo it back on
+                            // the next request — without this the provider 400s
+                            // with "reasoning_content is missing in assistant
+                            // tool call message". The send-side ReasoningPolicy
+                            // (per-provider) decides whether the field actually
+                            // reaches the wire.
                             if !tool_calls_buf.is_empty() {
-                                conversation.finalize_stream_with_tool_calls(&tool_calls_buf);
+                                let reasoning = if reasoning_buf.trim().is_empty() {
+                                    None
+                                } else {
+                                    Some(reasoning_buf.as_str())
+                                };
+                                conversation.finalize_stream_with_tool_calls(
+                                    &tool_calls_buf,
+                                    reasoning,
+                                );
                             } else {
                                 conversation.finalize_stream();
                             }
@@ -419,6 +434,7 @@ _ = cancel.cancelled() => {
             pending_request_log,
             &text_buf,
             &tool_calls_buf,
+            &reasoning_buf,
             self.provider.model_name(),
             0, // step is set by caller
             response_duration,

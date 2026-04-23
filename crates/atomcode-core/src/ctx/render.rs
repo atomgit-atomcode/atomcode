@@ -456,7 +456,7 @@ fn compress_turn(turn_num: usize, turn_msgs: &[Message]) -> String {
                     };
                 }
             }
-            (_, MessageContent::AssistantWithToolCalls { text, tool_calls }) => {
+            (_, MessageContent::AssistantWithToolCalls { text, tool_calls, .. }) => {
                 // Preserve assistant's diagnostic conclusion (first 80 chars).
                 if let Some(t) = text {
                     let trimmed = t.trim();
@@ -950,7 +950,7 @@ mod tests {
                 name: "read_file".to_string(),
                 arguments: format!(r#"{{"file_path":"/tmp/file_{}.rs"}}"#, turn),
             };
-            conv.add_assistant_tool_calls(None, vec![call]);
+            conv.add_assistant_tool_calls(None, vec![call], None);
             conv.add_tool_result(ToolResult {
                 call_id: format!("call_{}", turn),
                 output: "short result".to_string(),
@@ -985,7 +985,7 @@ mod tests {
                     name: "read_file".to_string(),
                     arguments: format!(r#"{{"file_path":"/tmp/file_{}.rs"}}"#, idx),
                 };
-                conv.add_assistant_tool_calls(None, vec![call]);
+                conv.add_assistant_tool_calls(None, vec![call], None);
                 conv.add_tool_result(ToolResult {
                     call_id: format!("call_{}", idx),
                     output: "x".repeat(2000),
@@ -1017,7 +1017,7 @@ mod tests {
             name: "bash".to_string(),
             arguments: "{}".to_string(),
         };
-        conv.add_assistant_tool_calls(Some("running..."), vec![call]);
+        conv.add_assistant_tool_calls(Some("running..."), vec![call], None);
         conv.add_tool_result(ToolResult {
             call_id: "c0".to_string(),
             output: "z".repeat(50000),
@@ -1050,7 +1050,7 @@ mod tests {
                 name: "bash".to_string(),
                 arguments: "{}".to_string(),
             };
-            conv.add_assistant_tool_calls(Some("ok"), vec![call]);
+            conv.add_assistant_tool_calls(Some("ok"), vec![call], None);
             conv.add_tool_result(ToolResult {
                 call_id: format!("c{}", i),
                 output: "x".repeat(500),
@@ -1065,7 +1065,7 @@ mod tests {
             name: "bash".to_string(),
             arguments: "{}".to_string(),
         };
-        conv.add_assistant_tool_calls(Some("finding..."), vec![call]);
+        conv.add_assistant_tool_calls(Some("finding..."), vec![call], None);
         conv.add_tool_result(ToolResult {
             call_id: "c5".to_string(),
             output: "z".repeat(200_000), // huge
@@ -1098,7 +1098,7 @@ mod tests {
                 id: format!("c{}", i),
                 name: "bash".to_string(),
                 arguments: "{}".to_string(),
-            }]);
+            }], None);
             conv.add_tool_result(ToolResult {
                 call_id: format!("c{}", i),
                 output: "y".repeat(10_000),
@@ -1125,7 +1125,7 @@ mod tests {
                 name: "bash".to_string(),
                 arguments: "{}".to_string(),
             };
-            conv.add_assistant_tool_calls(Some("ok"), vec![call]);
+            conv.add_assistant_tool_calls(Some("ok"), vec![call], None);
             conv.add_tool_result(ToolResult {
                 call_id: format!("c{}", turn),
                 output: "x".repeat(100),
@@ -1163,7 +1163,7 @@ mod tests {
                 name: "bash".to_string(),
                 arguments: "{}".to_string(),
             };
-            conv.add_assistant_tool_calls(Some("ok"), vec![call]);
+            conv.add_assistant_tool_calls(Some("ok"), vec![call], None);
             conv.add_tool_result(ToolResult {
                 call_id: format!("c{}", turn),
                 output: "x".repeat(4000),
@@ -1204,7 +1204,7 @@ mod tests {
                 id: format!("c{}", turn),
                 name: "bash".to_string(),
                 arguments: "{}".to_string(),
-            }]);
+            }], None);
             conv.add_tool_result(ToolResult {
                 call_id: format!("c{}", turn),
                 output: "x".repeat(6000),
@@ -1291,6 +1291,7 @@ mod tests {
                         name: "bash".to_string(),
                         arguments: "{}".to_string(),
                     }],
+                    reasoning_content: None,
                 },
             },
             Message {
@@ -1334,6 +1335,7 @@ mod tests {
                             name: "bash".to_string(),
                             arguments: "{}".to_string(),
                         }],
+                        reasoning_content: None,
                     },
                 });
                 msgs.push(Message {
@@ -1422,7 +1424,7 @@ mod tests {
                 id: "call_would_orphan".to_string(),
                 name: "bash".to_string(),
                 arguments: "{}".to_string(),
-            }]);
+            }], None);
             conv.add_tool_result(ToolResult {                        // msg[22]
                 call_id: "call_would_orphan".to_string(),
                 output: "tool output that must not be lost".to_string(),

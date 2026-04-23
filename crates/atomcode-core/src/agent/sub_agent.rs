@@ -100,6 +100,8 @@ impl SubAgentTask {
                 user_agent: None,
                 context_window: 128_000,
                 max_tokens: None,
+                thinking_type: None,
+                thinking_keep: None,
                 ephemeral: true,
             }),
         };

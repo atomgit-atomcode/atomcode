@@ -91,6 +91,7 @@ pub fn log_llm_response(
     pending_request: Option<PathBuf>,
     text: &str,
     tool_calls: &[ToolCall],
+    reasoning: &str,
     model: &str,
     step: usize,
     duration_ms: u64,
@@ -111,9 +112,14 @@ pub fn log_llm_response(
             "arguments": tc.arguments,
         })
     }).collect();
+    // Record reasoning_content emitted by thinking models (Moonshot Kimi,
+    // DeepSeek-R1, MiniMax-M2, etc.). Without this, bugs like issue #165
+    // ("reasoning_content missing in assistant tool call message") are
+    // impossible to diagnose from datalog alone.
     let response_value = serde_json::json!({
         "duration_ms": duration_ms,
         "text": text,
+        "reasoning_content": reasoning,
         "tool_calls": tools_json,
     });
 
@@ -207,6 +213,7 @@ mod tests {
                 name: "bash".into(),
                 arguments: "{}".into(),
             }],
+            "",
             "test-model",
             3,
             123,
@@ -240,7 +247,7 @@ mod tests {
     fn test_orphan_response_when_no_matching_request() {
         let tmp = tempfile::TempDir::new().unwrap();
 
-        log_llm_response(tmp.path(), None, "bare text", &[], "solo-model", 7, 50, true);
+        log_llm_response(tmp.path(), None, "bare text", &[], "", "solo-model", 7, 50, true);
 
         let log_dir = tmp.path().join("datalog").join("llm");
         let orphans: Vec<_> = std::fs::read_dir(&log_dir).unwrap()
@@ -268,8 +275,8 @@ mod tests {
         // that would corrupt results under the old static-Mutex design.
         let pending_a = log_llm_request(tmp_a.path(), &msgs_a, &[], "model-a", 16000, 0, true);
         let pending_b = log_llm_request(tmp_b.path(), &msgs_b, &[], "model-b", 16000, 0, true);
-        log_llm_response(tmp_a.path(), pending_a, "reply-A", &[], "model-a", 0, 10, true);
-        log_llm_response(tmp_b.path(), pending_b, "reply-B", &[], "model-b", 0, 20, true);
+        log_llm_response(tmp_a.path(), pending_a, "reply-A", &[], "", "model-a", 0, 10, true);
+        log_llm_response(tmp_b.path(), pending_b, "reply-B", &[], "", "model-b", 0, 20, true);
 
         let read_merged = |dir: &Path| -> serde_json::Value {
             let log_dir = dir.join("datalog").join("llm");
