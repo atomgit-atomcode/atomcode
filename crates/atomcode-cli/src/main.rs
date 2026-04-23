@@ -17,7 +17,7 @@ use atomcode_core::agent::{AgentCommand, AgentEvent, AgentLoop};
 use atomcode_core::config::provider::{ProviderConfig, default_context_window_for};
 use atomcode_core::config::Config;
 use atomcode_core::conversation::Conversation;
-use atomcode_core::provider::create_provider;
+use atomcode_core::provider::{create_provider, unavailable_provider};
 use atomcode_core::session::SessionManager;
 use atomcode_core::tool::{ToolContext, ToolRegistry};
 use atomcode_core::tool::read::ReadFileTool;
@@ -634,28 +634,27 @@ async fn run() -> Result<i32> {
         }
     };
 
-    // Build a placeholder ProviderConfig that `create_provider()` can
-    // always turn into a valid (but non-functional) LlmProvider. Used
-    // whenever the real config would require credentials we don't have
-    // yet — keeps the TUI startable so the Welcome flow / status-row
-    // hint can guide the user to `/login` or `/codingplan` instead of
-    // bailing at the prompt.
-    let dummy_provider = || ProviderConfig {
-        provider_type: "openai".to_string(),
-        api_key: Some("not-configured".to_string()),
-        model: String::new(),
-        base_url: Some("http://localhost:1".to_string()),
-        system_prompt: None,
-        user_agent: None,
-        context_window: default_context_window_for("openai"),
-        max_tokens: None,
-        ephemeral: false,
+    let unavailable_reason = if config.providers.is_empty() {
+        Some("未配置 provider。请使用 /provider 添加 provider 后再试。".to_string())
+    } else {
+        None
     };
 
-    let (provider_config, model_name) = if config.providers.is_empty() {
-        // No providers configured yet — Welcome screen handles setup.
-        // AgentLoop won't be called until the user configures one.
-        (dummy_provider(), String::new())
+    let (provider_config, model_name) = if unavailable_reason.is_some() {
+        (
+            ProviderConfig {
+                provider_type: "openai".to_string(),
+                api_key: Some("unavailable".to_string()),
+                model: String::new(),
+                base_url: None,
+                system_prompt: None,
+                user_agent: None,
+                context_window: default_context_window_for("openai"),
+                max_tokens: None,
+                ephemeral: false,
+            },
+            String::new(),
+        )
     } else {
         if let Some(ref model) = cli.model {
             let provider_name = cli.provider.as_deref().unwrap_or(&config.default_provider);
@@ -684,24 +683,32 @@ async fn run() -> Result<i32> {
     // so the TUI boots. The Welcome-wizard / status-row hints will
     // nudge the user to `/login` or `/codingplan`, and a successful
     // auth flow rebuilds the real provider via `rebuild_provider`.
-    let (provider, model_name) = match create_provider(&provider_config) {
-        Ok(p) => (p, model_name),
-        Err(e) => {
-            let msg = format!("{:#}", e);
-            let is_auth_gap = msg.contains("Not logged in")
-                || msg.contains("Invalid auth.toml")
-                || msg.contains("Token expired");
-            if is_auth_gap {
-                eprintln!(
-                    "Note: provider credentials not available ({}). \
-                     Launching TUI in onboarding mode — use /login or /codingplan to set up.",
-                    msg
-                );
-                let p = create_provider(&dummy_provider())
-                    .expect("dummy provider with inline api_key must always build");
-                (p, String::new())
-            } else {
-                return Err(e);
+    let (provider, model_name) = if let Some(reason) = unavailable_reason {
+        (unavailable_provider(reason), model_name)
+    } else {
+        match create_provider(&provider_config) {
+            Ok(p) => (p, model_name),
+            Err(e) => {
+                let msg = format!("{:#}", e);
+                let is_auth_gap = msg.contains("Not logged in")
+                    || msg.contains("Invalid auth.toml")
+                    || msg.contains("Token expired");
+                if is_auth_gap {
+                    eprintln!(
+                        "Note: provider credentials not available ({}). \
+                         Launching TUI in onboarding mode — use /login or /codingplan to set up.",
+                        msg
+                    );
+                    (
+                        unavailable_provider(format!(
+                            "Provider 凭证不可用：{}。请使用 /login 或 /codingplan 完成配置后再试。",
+                            msg
+                        )),
+                        String::new(),
+                    )
+                } else {
+                    return Err(e);
+                }
             }
         }
     };

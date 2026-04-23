@@ -657,12 +657,34 @@ impl AgentLoop {
                                 self.turn_runner.config = self.config.clone();
                             }
                             Err(e) => {
-                                let _ = self.event_tx.send(AgentEvent::TextDelta(format!(
-                                    "**Warning: failed to reload provider: {}**\n\n",
-                                    e
-                                )));
+                                let msg = format!("{:#}", e);
+                                let is_auth_gap = msg.contains("Not logged in")
+                                    || msg.contains("Invalid auth.toml")
+                                    || msg.contains("Token expired")
+                                    || msg.contains("Token refresh failed");
+                                if is_auth_gap {
+                                    self.turn_runner.provider = std::sync::Arc::from(
+                                        crate::provider::unavailable_provider(format!(
+                                            "Provider 凭证不可用：{}。请使用 /login 或 /codingplan 完成配置后再试。",
+                                            msg
+                                        )),
+                                    );
+                                    self.turn_runner.config = self.config.clone();
+                                } else {
+                                    let _ = self.event_tx.send(AgentEvent::TextDelta(format!(
+                                        "**Warning: failed to reload provider: {}**\n\n",
+                                        e
+                                    )));
+                                }
                             }
                         }
+                    } else {
+                        self.turn_runner.provider = std::sync::Arc::from(
+                            crate::provider::unavailable_provider(
+                                "未配置 provider。请使用 /provider 添加 provider 后再试。"
+                            ),
+                        );
+                        self.turn_runner.config = self.config.clone();
                     }
                 }
                 AgentCommand::ChangeDir(path) => {
@@ -703,6 +725,12 @@ impl AgentLoop {
 
     async fn handle_send_message(&mut self, content: String) {
         self.current_task = content.clone();
+
+        if let Some(reason) = self.turn_runner.provider.availability_error() {
+            let _ = self.event_tx.send(AgentEvent::Error(reason.to_string()));
+            self.finish_turn(TurnStopReason::Error);
+            return;
+        }
 
         // Detect negative feedback — user is unhappy with previous turn's work.
         let lower = content.to_lowercase();
@@ -1583,7 +1611,7 @@ impl AgentLoop {
                         let wait = (self.retry_count as u64 * 3).min(15);
                         let reason = public_error_reason(&e);
                         let _ = self.event_tx.send(AgentEvent::TextDelta(format!(
-                            "\n[API error{}，{} 秒后重试（{}/3）...]\n",
+                            "\n[API error {}，{} 秒后重试({}/3)...]\n",
                             reason, wait, self.retry_count
                         )));
                         tokio::time::sleep(Duration::from_secs(wait)).await;
@@ -2195,9 +2223,9 @@ fn is_auth_error(e: &str) -> bool {
 }
 
 fn should_show_raw_api_error() -> bool {
-    matches!(
+    !matches!(
         std::env::var("ATOMCODE_SHOW_RAW_API_ERROR").as_deref(),
-        Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
+        Ok("0") | Ok("false") | Ok("FALSE") | Ok("no") | Ok("NO")
     )
 }
 
@@ -2364,9 +2392,27 @@ mod classifier_tests {
 
     #[test]
     fn invalid_request_is_summarized_without_raw_body() {
+        let old = std::env::var("ATOMCODE_SHOW_RAW_API_ERROR").ok();
+        unsafe { std::env::set_var("ATOMCODE_SHOW_RAW_API_ERROR", "0") };
         let raw = "API error (400 Bad Request) at `https://x`:\nstack=secret detail";
         assert_eq!(public_error_reason(raw), "请求参数无效");
         assert!(!public_error_message(raw).contains("secret detail"));
+        if let Some(v) = old {
+            unsafe { std::env::set_var("ATOMCODE_SHOW_RAW_API_ERROR", v) };
+        } else {
+            unsafe { std::env::remove_var("ATOMCODE_SHOW_RAW_API_ERROR") };
+        }
+    }
+
+    #[test]
+    fn raw_error_is_shown_by_default() {
+        let old = std::env::var("ATOMCODE_SHOW_RAW_API_ERROR").ok();
+        unsafe { std::env::remove_var("ATOMCODE_SHOW_RAW_API_ERROR") };
+        let raw = "API error (400 Bad Request) at `https://x`:\nstack=secret detail";
+        assert_eq!(public_error_message(raw), raw);
+        if let Some(v) = old {
+            unsafe { std::env::set_var("ATOMCODE_SHOW_RAW_API_ERROR", v) };
+        }
     }
 }
 

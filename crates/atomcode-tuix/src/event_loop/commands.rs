@@ -21,9 +21,24 @@ use super::{save_and_reload, LoopCtx};
 use crate::modals::{DirPicker, IssueWizard, Modal, ModelPicker, ProviderWizard, SessionPicker};
 use crate::render::{Renderer, UiLine};
 use crate::state::UiState;
+use atomcode_core::config::provider::ProviderConfig;
 
 /// Maximum recent project dirs we keep in memory + persist to disk.
 const MAX_RECENT_DIRS: usize = 5;
+
+fn build_oauth_provider() -> ProviderConfig {
+    ProviderConfig {
+        provider_type: "openai".to_string(),
+        api_key: None,
+        model: "MiniMax-M2.7".to_string(),
+        base_url: Some("https://api-ai.gitcode.com/v1".to_string()),
+        system_prompt: None,
+        user_agent: None,
+        context_window: 64_000,
+        max_tokens: None,
+        ephemeral: false,
+    }
+}
 
 // Historical note: there was a `const OAUTH_PROVIDER_NAME = "AtomGit"`
 // and a `build_oauth_provider` helper here. Both are owned by
@@ -271,8 +286,12 @@ pub(super) fn execute_slash_command(
         "logout" => {
             match atomcode_core::auth::logout() {
                 Ok(()) => {
+                    let _ = ctx
+                        .agent
+                        .cmd_tx
+                        .send(AgentCommand::ReloadConfig(ctx.config.clone()));
                     renderer.render(UiLine::CommandOutput(
-                        "  Signed out of AtomGit.\n".into(),
+                        "  Signed out of AtomGit. Permissions refreshed.\n".into(),
                     ));
                 }
                 Err(e) => {
@@ -822,8 +841,26 @@ pub(crate) fn run_login_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx) -> 
                 .as_deref()
                 .unwrap_or(&auth.user.username)
                 .to_string();
+            let had_provider = !ctx.config.providers.is_empty()
+                && ctx.config.providers.contains_key(&ctx.config.default_provider);
+            if !had_provider {
+                let provider_name = "AtomGit".to_string();
+                let provider = build_oauth_provider();
+                ctx.model_name = provider.model.clone();
+                ctx.config.providers.insert(provider_name.clone(), provider);
+                ctx.config.default_provider = provider_name;
+                save_and_reload(ctx, renderer);
+            } else {
+                if let Some(provider) = ctx.config.providers.get(&ctx.config.default_provider) {
+                    ctx.model_name = provider.model.clone();
+                }
+                let _ = ctx
+                    .agent
+                    .cmd_tx
+                    .send(AgentCommand::ReloadConfig(ctx.config.clone()));
+            }
             renderer.render(UiLine::CommandOutput(format!(
-                "  Signed in as {} ({}). Run /codingplan to set up model access.\n",
+                "  Signed in as {} ({}). You can chat now; run /codingplan to sync the latest model access.\n",
                 name, auth.user.username
             )));
             renderer.flush();

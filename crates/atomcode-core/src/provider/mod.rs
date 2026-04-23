@@ -23,6 +23,10 @@ pub trait LlmProvider: Send + Sync {
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>>;
 
     fn model_name(&self) -> &str;
+
+    fn availability_error(&self) -> Option<&str> {
+        None
+    }
 }
 
 /// Shared HTTP client with common timeouts and User-Agent.
@@ -85,6 +89,35 @@ pub fn create_provider(config: &ProviderConfig) -> Result<Box<dyn LlmProvider>> 
         "openai" => Ok(Box::new(openai::OpenAiProvider::new(&config)?)),
         "ollama" => Ok(Box::new(ollama::OllamaProvider::new(&config)?)),
         other => anyhow::bail!("Unknown provider type: {}", other),
+    }
+}
+
+pub fn unavailable_provider(reason: impl Into<String>) -> Box<dyn LlmProvider> {
+    Box::new(UnavailableProvider {
+        reason: reason.into(),
+    })
+}
+
+struct UnavailableProvider {
+    reason: String,
+}
+
+#[async_trait]
+impl LlmProvider for UnavailableProvider {
+    fn chat_stream(
+        &self,
+        _messages: &[Message],
+        _tools: Option<&[ToolDef]>,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
+        anyhow::bail!("{}", self.reason);
+    }
+
+    fn model_name(&self) -> &str {
+        ""
+    }
+
+    fn availability_error(&self) -> Option<&str> {
+        Some(&self.reason)
     }
 }
 
@@ -190,6 +223,8 @@ fn refresh_and_save(refresh_token: &str, auth_path: &std::path::Path) -> Result<
 
 #[cfg(test)]
 mod tests {
+    use super::unavailable_provider;
+
     /// Test that auth token is loaded from the correct unified path.
     /// This prevents regressions where OAuth login token persistence breaks
     /// after program restart due to path mismatch.
@@ -226,6 +261,13 @@ mod tests {
             max_tokens: None,
             ephemeral: false,
         }
+    }
+
+    #[test]
+    fn unavailable_provider_reports_reason() {
+        let provider = unavailable_provider("未配置 provider");
+        assert_eq!(provider.model_name(), "");
+        assert_eq!(provider.availability_error(), Some("未配置 provider"));
     }
 
     /// INTERNAL control characters (vs surrounding whitespace, which
