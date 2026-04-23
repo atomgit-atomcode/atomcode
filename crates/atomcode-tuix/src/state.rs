@@ -96,6 +96,13 @@ pub struct UiState {
     /// `AgentEvent::ContextStats` — `/context` renders this. `None`
     /// before the first turn completes.
     pub last_context: Option<ContextSnapshot>,
+    /// Verbatim text of the message that is currently running. Set
+    /// on every submit, cleared on turn-complete. When the user hits
+    /// Ctrl+C / Esc mid-stream the streaming-key handler takes this
+    /// and restores it to the input buffer so the cancelled message
+    /// can be edited + resent without re-typing. `None` between
+    /// turns and after any successful completion.
+    pub last_submitted_message: Option<String>,
 }
 
 impl Default for UiState {
@@ -115,6 +122,7 @@ impl UiState {
             thinking_idx: 0,
             turn_started_at: None,
             last_context: None,
+            last_submitted_message: None,
         }
     }
 
@@ -174,6 +182,12 @@ impl UiState {
         self.phase = UiPhase::Idle;
         self.spinner_label.clear();
         self.turn_started_at = None;
+        // Turn finished normally — no need to offer resubmit of the
+        // message any more. (On cancel, the streaming-key handler
+        // already took() the Option before the TurnCancelled event
+        // reaches here, so the cancelled path naturally leaves this
+        // None too.)
+        self.last_submitted_message = None;
     }
 
     pub fn on_turn_cancelled(&mut self) {

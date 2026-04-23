@@ -1421,6 +1421,11 @@ let result = app.buf.apply(action, ctx.history.entries(), &ctx.commands);
                 }
             } else {
                 ctx.history.push(line.clone());
+                // Cache the full expanded form before dispatch. If the
+                // user hits Ctrl+C / Esc mid-stream, `handle_streaming_key`
+                // takes this Option and restores it to `app.buf.text`
+                // so the cancelled message can be edited and resent.
+                app.state.last_submitted_message = Some(expanded.clone());
                 ctx.agent.cmd_tx.send(AgentCommand::SendMessage(expanded)).ok();
                 app.state.on_submit();
                 // CodingPlan drift check — fire before every turn sent
@@ -1543,6 +1548,39 @@ pub(crate) fn save_and_reload(ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
     }
 }
 
+/// On Ctrl+C / Esc during streaming, pull the running message back
+/// into the input buffer so the user can edit and resend without
+/// re-typing. Also drops any type-ahead queue entries: a user
+/// pulling the escape cord doesn't want queued messages to
+/// auto-fire after the current one dies. The actual `TurnCancelled`
+/// event (plus the flip back to Idle + footer redraw) arrives later
+/// via the agent round-trip — but the spinner tick at 80ms+ redraws
+/// the StreamingBox with `buf.text`, so the restored message shows
+/// up within a frame.
+fn restore_cancelled_message_to_buf(
+    app: &mut App,
+    renderer: &mut dyn Renderer,
+    ctx: &LoopCtx,
+) {
+    app.message_queue.clear();
+    if let Some(msg) = app.state.last_submitted_message.take() {
+        app.buf.text = msg;
+        app.buf.cursor = app.buf.text.len();
+        app.menu.selected = 0;
+        // Force an immediate StreamingBox repaint so the restored
+        // text shows in the input box on this frame, not the next
+        // spinner tick.
+        draw_spinner_now(
+            &mut app.state,
+            &app.buf,
+            ctx,
+            renderer,
+            app.message_queue.len(),
+            app.menu.selected,
+        );
+    }
+}
+
 fn handle_streaming_key(
     app: &mut App,
     ctx: &mut LoopCtx,
@@ -1551,9 +1589,12 @@ fn handle_streaming_key(
     modifiers: crossterm::event::KeyModifiers,
 ) -> Result<()> {
     // Ctrl+C always cancels the running turn — highest priority so
-    // users have a reliable escape hatch even mid-edit.
+    // users have a reliable escape hatch even mid-edit. Also drops
+    // the type-ahead queue: a user yanking the escape cord doesn't
+    // want queued messages to auto-fire after the current one dies.
     if code == KeyCode::Char('c') && modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
         ctx.agent.cmd_tx.send(AgentCommand::Cancel).ok();
+        restore_cancelled_message_to_buf(app, renderer, ctx);
         return Ok(());
     }
 
@@ -1563,6 +1604,7 @@ fn handle_streaming_key(
     // not "clear an unsubmitted slash token" (users can Ctrl+U for that).
     if code == KeyCode::Esc {
         ctx.agent.cmd_tx.send(AgentCommand::Cancel).ok();
+        restore_cancelled_message_to_buf(app, renderer, ctx);
         return Ok(());
     }
 
@@ -1652,6 +1694,7 @@ match app.buf.apply(action, ctx.history.entries(), &ctx.commands) {
             // Ctrl+C on empty buf during streaming — treat as cancel
             // (consistent with the explicit Ctrl+C branch above).
             ctx.agent.cmd_tx.send(AgentCommand::Cancel).ok();
+            restore_cancelled_message_to_buf(app, renderer, ctx);
         }
     }
     Ok(())
