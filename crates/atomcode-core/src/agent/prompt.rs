@@ -104,6 +104,27 @@ impl AgentLoop {
             ));
         }
 
+        // Available skills — inject skill descriptions so LLM knows what skills exist.
+        // Only inject skills that allow model invocation (disable_model_invocation = false).
+        if let Ok(registry) = self.skill_registry.read() {
+            let skills: Vec<String> = registry
+                .invocable_by_llm()
+                .map(|s| {
+                    let hint = s.argument_hint
+                        .as_ref()
+                        .map(|h| format!(" {}", h))
+                        .unwrap_or_default();
+                    format!("- /{}{}: {}", s.name, hint, s.description)
+                })
+                .collect();
+            if !skills.is_empty() {
+                prompt.push_str("\n=== AVAILABLE SKILLS ===\n");
+                prompt.push_str("Use the `use_skill` tool to invoke a skill when relevant to the task.\n");
+                prompt.push_str(&skills.join("\n"));
+                prompt.push('\n');
+            }
+        }
+
         // Plan mode: inject planning-only instructions before rules.
         if self.plan_mode {
             prompt.push_str(
