@@ -198,6 +198,7 @@ fn build_oauth_provider() -> ProviderConfig {
         max_tokens: None,
         thinking_type: None,
         thinking_keep: None,
+            reasoning_history: None,
         ephemeral: false,
     }
 }
@@ -216,6 +217,7 @@ fn build_wecom_provider(creds: &wecom_login::BrokerCreds) -> ProviderConfig {
         max_tokens: None,
         thinking_type: None,
         thinking_keep: None,
+            reasoning_history: None,
         ephemeral: true,
     }
 }

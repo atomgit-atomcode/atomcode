@@ -653,6 +653,7 @@ async fn run() -> Result<i32> {
                 max_tokens: None,
                 thinking_type: None,
                 thinking_keep: None,
+            reasoning_history: None,
                 ephemeral: false,
             },
             String::new(),

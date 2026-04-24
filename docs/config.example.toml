@@ -6,6 +6,12 @@ api_key = "sk-..."
 model = "deepseek-chat"
 base_url = "https://api.deepseek.com/v1"
 context_window = 64000
+# Override the reasoning_content history-echo policy. Unset = auto-detect
+# from model name (deepseek-v4* → include, deepseek-reasoner/r1 → exclude,
+# kimi-* / moonshot → include, rest → exclude). Set explicitly when hitting
+# a 400 like "reasoning_content ... must be passed back to the API" or
+# "reasoning_content is missing in assistant tool call message".
+# reasoning_history = "include"  # or "exclude"
 
 # Per-turn datalog settings. Each turn writes a markdown file
 # (plus a .jsonl of raw LLM requests) into `dir`.
