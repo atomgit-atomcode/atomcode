@@ -55,7 +55,14 @@ fn strip_emoji(s: &str) -> String {
           (0x1FA00..=0x1FA6F).contains(&cp) ||    // Chess Symbols
           (0x1FA70..=0x1FAFF).contains(&cp) ||    // Symbols Extended-A
           (0x2700..=0x27BF).contains(&cp) ||       // Dingbats (✅❌⚡ etc.)
-          (0x2600..=0x26FF).contains(&cp))         // Misc Symbols (⚠️☁️ etc.)
+          (0x2600..=0x26FF).contains(&cp) ||       // Misc Symbols (⚠️☁️ etc.)
+          // Combining adjuncts to emoji. Without their base codepoint they
+          // have no glyph and Windows conhost paints them as a tofu — which
+          // is why a stripped `✅️` (U+2705 U+FE0F) left a `☐`-shaped box
+          // in the status column of every markdown table row.
+          (0xFE00..=0xFE0F).contains(&cp) ||       // Variation Selectors 1–16
+          cp == 0x200D ||                          // Zero-Width Joiner
+          (0x1F3FB..=0x1F3FF).contains(&cp))       // Fitzpatrick skin tones
     }).collect()
 }
 
@@ -565,5 +572,24 @@ mod tests {
     fn test_empty_input() {
         let lines = render_markdown("");
         assert!(lines.is_empty() || lines.len() == 1);
+    }
+
+    /// Regression: emoji + VS-16 combos like `✅️` (U+2705 U+FE0F) lost
+    /// their base codepoint to `strip_emoji` but left U+FE0F behind.
+    /// A lone variation selector has no glyph — renders as a tofu box
+    /// on Windows conhost, which is what the user saw in a markdown-
+    /// table status column.
+    #[test]
+    fn strip_emoji_drops_orphan_variation_selector() {
+        let out = strip_emoji("done \u{2705}\u{FE0F}");
+        assert!(!out.chars().any(|c| c as u32 == 0xFE0F),
+            "orphan VS-16 must not survive strip_emoji; got {:?}", out);
+    }
+
+    #[test]
+    fn strip_emoji_drops_orphan_zwj_and_skin_tone() {
+        let out = strip_emoji("\u{1F469}\u{1F3FD}\u{200D}\u{1F4BB}");
+        assert!(out.is_empty(),
+            "ZWJ sequence with skin-tone must fully strip; got {:?}", out);
     }
 }
