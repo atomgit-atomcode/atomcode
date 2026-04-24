@@ -130,6 +130,9 @@ pub struct LoopCtx {
     /// MCP server registry for `/mcp` status display. `None` when no MCP
     /// servers are configured or all failed to connect.
     pub mcp_registry: Option<std::sync::Arc<atomcode_core::mcp::McpRegistry>>,
+    /// Channel for receiving MCP connection status events (Connected/Failed).
+    /// Events are rendered into scrollback as they arrive during startup.
+    pub mcp_connect_rx: Option<tokio::sync::mpsc::UnboundedReceiver<atomcode_core::mcp::McpConnectEvent>>,
 }
 
 /// What the `/issue` wizard hands back to the event loop after the user
@@ -929,6 +932,32 @@ pub async fn run_loop(
                 redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
             }
 
+            // ── MCP connection events ──
+            // Render connection success/failure into scrollback as they arrive.
+            // Also register tools dynamically when servers connect.
+            Some(ev) = ctx.mcp_connect_rx.as_mut().unwrap().recv(), if ctx.mcp_connect_rx.is_some() => {
+                use atomcode_core::mcp::{McpConnectEvent, register_mcp_tools_async};
+                match &ev {
+                    McpConnectEvent::Connected { name } => {
+                        renderer.render(UiLine::CommandOutput(format!("✓ MCP server '{}' connected", name)));
+                        // Register tools from this newly connected server
+                        if let Some(registry) = &ctx.mcp_registry {
+                            let tools = registry.list_all_tools().await;
+                            let server_tools: Vec<_> = tools.into_iter()
+                                .filter(|t| &t.server_name == name)
+                                .collect();
+                            if !server_tools.is_empty() {
+                                register_mcp_tools_async(&ctx.agent.tool_registry, registry.clone(), server_tools).await;
+                            }
+                        }
+                    }
+                    McpConnectEvent::Failed { name, error } => {
+                        renderer.render(UiLine::Error(format!("✗ MCP server '{}' failed: {}", name, error)));
+                    }
+                }
+                renderer.flush();
+            }
+
             // ── /upgrade progress ──
             Some(ev) = ctx.upgrade_rx.recv() => {
                 handle_upgrade_event(ev, &mut upgrade_last_pct, &mut upgrade_done, &mut ctx, renderer);
@@ -1032,6 +1061,32 @@ pub async fn run_loop(
             // ── Version-check wake ──
             Some(()) = ctx.wake_rx.recv(), if matches!(app.state.phase, UiPhase::Idle) => {
                 redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
+            }
+
+            // ── MCP connection events ──
+            // Render connection success/failure into scrollback as they arrive.
+            // Also register tools dynamically when servers connect.
+            Some(ev) = ctx.mcp_connect_rx.as_mut().unwrap().recv(), if ctx.mcp_connect_rx.is_some() => {
+                use atomcode_core::mcp::{McpConnectEvent, register_mcp_tools_async};
+                match &ev {
+                    McpConnectEvent::Connected { name } => {
+                        renderer.render(UiLine::CommandOutput(format!("✓ MCP server '{}' connected", name)));
+                        // Register tools from this newly connected server
+                        if let Some(registry) = &ctx.mcp_registry {
+                            let tools = registry.list_all_tools().await;
+                            let server_tools: Vec<_> = tools.into_iter()
+                                .filter(|t| &t.server_name == name)
+                                .collect();
+                            if !server_tools.is_empty() {
+                                register_mcp_tools_async(&ctx.agent.tool_registry, registry.clone(), server_tools).await;
+                            }
+                        }
+                    }
+                    McpConnectEvent::Failed { name, error } => {
+                        renderer.render(UiLine::Error(format!("✗ MCP server '{}' failed: {}", name, error)));
+                    }
+                }
+                renderer.flush();
             }
 
             // ── /upgrade progress ──

@@ -1556,16 +1556,16 @@ let session_manager = SessionManager::new(&working_dir);
         .map(|v| v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
         .unwrap_or_default();
     let enabled = |name: &str| !disabled_tools.contains(name);
-    if enabled("read_file") { tool_registry.register(Box::new(ReadFileTool)); }
-    if enabled("write_file") { tool_registry.register(Box::new(WriteFileTool)); }
-    if enabled("edit_file") { tool_registry.register(Box::new(EditFileTool)); }
-    if enabled("bash") { tool_registry.register(Box::new(BashTool)); }
-    if enabled("grep") { tool_registry.register(Box::new(GrepTool)); }
-    if enabled("glob") { tool_registry.register(Box::new(GlobTool)); }
-    if enabled("list_directory") { tool_registry.register(Box::new(ListDirTool)); }
-    if enabled("web_search") { tool_registry.register(Box::new(WebSearchTool)); }
-    if enabled("web_fetch") { tool_registry.register(Box::new(WebFetchTool)); }
-    if enabled("search_replace") { tool_registry.register(Box::new(SearchReplaceTool)); }
+    if enabled("read_file") { tool_registry.register_sync(Box::new(ReadFileTool)); }
+    if enabled("write_file") { tool_registry.register_sync(Box::new(WriteFileTool)); }
+    if enabled("edit_file") { tool_registry.register_sync(Box::new(EditFileTool)); }
+    if enabled("bash") { tool_registry.register_sync(Box::new(BashTool)); }
+    if enabled("grep") { tool_registry.register_sync(Box::new(GrepTool)); }
+    if enabled("glob") { tool_registry.register_sync(Box::new(GlobTool)); }
+    if enabled("list_directory") { tool_registry.register_sync(Box::new(ListDirTool)); }
+    if enabled("web_search") { tool_registry.register_sync(Box::new(WebSearchTool)); }
+    if enabled("web_fetch") { tool_registry.register_sync(Box::new(WebFetchTool)); }
+    if enabled("search_replace") { tool_registry.register_sync(Box::new(SearchReplaceTool)); }
 
     // Load skills and register use_skill tool
     let mut skill_registry = atomcode_core::skill::SkillRegistry::new();
@@ -1573,7 +1573,7 @@ let session_manager = SessionManager::new(&working_dir);
     let has_skills = !skill_registry.is_empty();
     let skill_registry = Arc::new(std::sync::RwLock::new(skill_registry));
     if has_skills && enabled("use_skill") {
-        tool_registry.register(Box::new(atomcode_core::tool::use_skill::UseSkillTool {
+        tool_registry.register_sync(Box::new(atomcode_core::tool::use_skill::UseSkillTool {
             registry: skill_registry.clone()
         }));
     }

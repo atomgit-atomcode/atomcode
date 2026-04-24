@@ -733,27 +733,47 @@ async fn run() -> Result<i32> {
     let enabled = |name: &str| !disabled_tools.contains(name);
 
     let mut tool_registry = ToolRegistry::new();
-    if enabled("read_file")      { tool_registry.register(Box::new(ReadFileTool)); }
-    if enabled("write_file")     { tool_registry.register(Box::new(WriteFileTool)); }
-    if enabled("edit_file")      { tool_registry.register(Box::new(EditFileTool)); }
-    if enabled("bash")           { tool_registry.register(Box::new(BashTool)); }
-    if enabled("change_dir")     { tool_registry.register(Box::new(CdTool)); }
-    if enabled("grep")           { tool_registry.register(Box::new(GrepTool)); }
-    if enabled("glob")           { tool_registry.register(Box::new(GlobTool)); }
-    if enabled("list_directory") { tool_registry.register(Box::new(ListDirTool)); }
-    if enabled("web_search")     { tool_registry.register(Box::new(WebSearchTool)); }
-    if enabled("web_fetch")      { tool_registry.register(Box::new(WebFetchTool)); }
-    if enabled("search_replace") { tool_registry.register(Box::new(SearchReplaceTool)); }
+    if enabled("read_file")      { tool_registry.register_sync(Box::new(ReadFileTool)); }
+    if enabled("write_file")     { tool_registry.register_sync(Box::new(WriteFileTool)); }
+    if enabled("edit_file")      { tool_registry.register_sync(Box::new(EditFileTool)); }
+    if enabled("bash")           { tool_registry.register_sync(Box::new(BashTool)); }
+    if enabled("change_dir")     { tool_registry.register_sync(Box::new(CdTool)); }
+    if enabled("grep")           { tool_registry.register_sync(Box::new(GrepTool)); }
+    if enabled("glob")           { tool_registry.register_sync(Box::new(GlobTool)); }
+    if enabled("list_directory") { tool_registry.register_sync(Box::new(ListDirTool)); }
+    if enabled("web_search")     { tool_registry.register_sync(Box::new(WebSearchTool)); }
+    if enabled("web_fetch")      { tool_registry.register_sync(Box::new(WebFetchTool)); }
+    if enabled("search_replace") { tool_registry.register_sync(Box::new(SearchReplaceTool)); }
 
-    // Load MCP tools from .mcp.json (project) and ~/.atomcode/mcp.json (user)
-    let mcp_registry = McpRegistry::from_config(&working_dir).await;
-    let mcp_tools = mcp_registry.list_all_tools().await;
-    let mcp_registry = if !mcp_tools.is_empty() {
-        let mcp_registry = std::sync::Arc::new(mcp_registry);
-        register_mcp_tools(&mut tool_registry, mcp_registry.clone(), mcp_tools);
-        Some(mcp_registry)
+    // Determine if we're running in headless mode BEFORE loading MCP.
+    // Headless mode requires MCP tools immediately; TUI can load them in background.
+    let is_headless = cli.prompt.is_some() || cli.prompt_file.is_some() || fixissue_prompt.is_some();
+
+    // Load MCP tools from .mcp.json (project) and ~/.atomcode/mcp.json (user).
+    // For TUI mode, start connections in background to avoid blocking startup.
+    // For headless mode (-p/--prompt-file/fixissue), wait for connections since tools
+    // are needed immediately.
+    let (mcp_registry, mcp_connect_rx) = if is_headless {
+        // Headless: need tools right now, wait for connections
+        let registry = McpRegistry::from_config(&working_dir).await;
+        let mcp_tools = registry.list_all_tools().await;
+        let mcp_registry = if !mcp_tools.is_empty() {
+            let mcp_registry = std::sync::Arc::new(registry);
+            register_mcp_tools(&mut tool_registry, mcp_registry.clone(), mcp_tools);
+            Some(mcp_registry)
+        } else {
+            None
+        };
+        (mcp_registry, None)
     } else {
-        None
+        // TUI: start in background, tools populate as servers connect
+        // Create event channel so TUI can display connection status in scrollback
+        use atomcode_core::mcp::McpConnectEvent;
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<McpConnectEvent>();
+        let registry = McpRegistry::from_config_background_with_events(&working_dir, Some(tx));
+        let mcp_registry = std::sync::Arc::new(registry);
+        // Don't wait for tools - they'll be registered dynamically as servers connect
+        (Some(mcp_registry), Some(rx))
     };
 
     let tool_context = ToolContext::new(working_dir.clone());
@@ -876,7 +896,7 @@ async fn run() -> Result<i32> {
     }
 
     tokio::spawn(agent_loop.run());
-    atomcode_tuix::run(config, model_name, agent_handle, tool_context, working_dir, session_to_continue, mcp_registry).await?;
+    atomcode_tuix::run(config, model_name, agent_handle, tool_context, working_dir, session_to_continue, mcp_registry, mcp_connect_rx).await?;
     Ok(0)
 }
 

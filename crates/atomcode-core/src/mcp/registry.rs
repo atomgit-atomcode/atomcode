@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use anyhow::Result;
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, RwLock};
 
 use super::client::{McpClient, McpToolInfo};
 use super::config::{load_mcp_config, McpServerConfig};
@@ -12,9 +12,20 @@ use super::transport_stdio::StdioClient;
 use super::transport_http::HttpClient;
 use super::types::ServerStatus;
 
+/// Connection status event sent to listeners when servers connect or fail.
+#[derive(Debug, Clone)]
+pub enum McpConnectEvent {
+    /// Server connected successfully.
+    Connected { name: String },
+    /// Server connection failed.
+    Failed { name: String, error: String },
+}
+
 /// Registry of connected MCP servers.
 pub struct McpRegistry {
     servers: Arc<RwLock<BTreeMap<String, Box<dyn McpClient>>>>,
+    /// Channel for connection status events (used by TUI to display in scrollback).
+    connect_events: Option<mpsc::UnboundedSender<McpConnectEvent>>,
 }
 
 impl McpRegistry {
@@ -22,10 +33,121 @@ impl McpRegistry {
     pub fn new() -> Self {
         Self {
             servers: Arc::new(RwLock::new(BTreeMap::new())),
+            connect_events: None,
         }
     }
 
-    /// Load MCP configuration and connect to all servers.
+    /// Create a registry with a channel for connection events.
+    pub fn with_event_channel() -> (Self, mpsc::UnboundedReceiver<McpConnectEvent>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        (
+            Self {
+                servers: Arc::new(RwLock::new(BTreeMap::new())),
+                connect_events: Some(tx),
+            },
+            rx,
+        )
+    }
+
+    /// Load MCP configuration and start connecting to servers in the background.
+    /// Returns immediately with an empty registry; servers are added as they connect.
+    /// Connection status events are sent through the internal channel if configured.
+    pub fn from_config_background(project_dir: &std::path::Path) -> Self {
+        Self::from_config_background_with_events(project_dir, None)
+    }
+
+    /// Load MCP configuration and start connecting to servers in the background,
+    /// with an external event channel for TUI status display.
+    pub fn from_config_background_with_events(
+        project_dir: &std::path::Path,
+        event_tx: Option<mpsc::UnboundedSender<McpConnectEvent>>,
+    ) -> Self {
+        let registry = Self::new();
+        // Merge external channel with internal one
+        let combined_tx = event_tx.or(registry.connect_events.clone());
+
+        let configs = match load_mcp_config(project_dir) {
+            Ok(c) => c,
+            Err(e) => {
+                if let Some(tx) = &combined_tx {
+                    let _ = tx.send(McpConnectEvent::Failed {
+                        name: "config".to_string(),
+                        error: format!("Failed to load config: {}", e),
+                    });
+                }
+                return registry;
+            }
+        };
+
+        if !configs.is_empty() {
+            let servers = registry.servers.clone();
+            tokio::spawn(async move {
+                // Connect servers in parallel
+                let tasks: Vec<_> = configs
+                    .into_iter()
+                    .map(|config| {
+                        let servers = servers.clone();
+                        let tx = combined_tx.clone();
+                        async move {
+                            let name = config.name.clone();
+                            let mut client: Box<dyn McpClient> = match &config.config {
+                                super::config::McpTransportConfig::Stdio {
+                                    command,
+                                    args,
+                                    env,
+                                    timeout_ms,
+                                } => Box::new(StdioClient::new(
+                                    name.clone(),
+                                    command.clone(),
+                                    args.clone(),
+                                    env.clone(),
+                                    *timeout_ms,
+                                )),
+                                super::config::McpTransportConfig::Http {
+                                    url,
+                                    headers,
+                                    timeout_ms,
+                                } => Box::new(HttpClient::new(
+                                    name.clone(),
+                                    url.clone(),
+                                    headers.clone(),
+                                    *timeout_ms,
+                                )),
+                            };
+
+                            match client.initialize().await {
+                                Ok(_result) => {
+                                    let mut servers = servers.write().await;
+                                    servers.insert(name.clone(), client);
+                                    if let Some(tx) = tx {
+                                        let _ = tx.send(McpConnectEvent::Connected {
+                                            name: name.clone(),
+                                        });
+                                    }
+                                }
+                                Err(e) => {
+                                    if let Some(tx) = tx {
+                                        let _ = tx.send(McpConnectEvent::Failed {
+                                            name: name.clone(),
+                                            error: format!("{}", e),
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    })
+                    .collect();
+
+                // Wait for all connections to complete (each has its own timeout)
+                futures::future::join_all(tasks).await;
+            });
+        }
+
+        registry
+    }
+
+    /// Load MCP configuration and connect to all servers (blocking).
+    /// Prefer `from_config_background` for non-blocking startup.
     pub async fn from_config(project_dir: &std::path::Path) -> Self {
         let registry = Self::new();
 
@@ -152,6 +274,7 @@ impl McpRegistry {
     pub fn share(&self) -> Arc<Self> {
         Arc::new(Self {
             servers: self.servers.clone(),
+            connect_events: self.connect_events.clone(),
         })
     }
 }

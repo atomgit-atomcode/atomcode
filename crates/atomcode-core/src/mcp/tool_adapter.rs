@@ -81,7 +81,8 @@ impl Tool for McpToolAdapter {
     }
 }
 
-/// Register all MCP tools from a registry into a ToolRegistry.
+/// Register all MCP tools from a registry into a ToolRegistry (sync version).
+/// Use this at startup when you have mutable access to the registry.
 pub fn register_mcp_tools(
     registry: &mut crate::tool::ToolRegistry,
     mcp_registry: std::sync::Arc<McpRegistry>,
@@ -89,6 +90,19 @@ pub fn register_mcp_tools(
 ) {
     for info in tools {
         let adapter = McpToolAdapter::new(mcp_registry.clone(), info);
-        registry.register(Box::new(adapter));
+        registry.register_sync(Box::new(adapter));
+    }
+}
+
+/// Register all MCP tools from a registry into a ToolRegistry (async version).
+/// Use this when registering tools dynamically after startup.
+pub async fn register_mcp_tools_async(
+    registry: &crate::tool::ToolRegistry,
+    mcp_registry: std::sync::Arc<McpRegistry>,
+    tools: Vec<McpToolInfo>,
+) {
+    for info in tools {
+        let adapter = McpToolAdapter::new(mcp_registry.clone(), info);
+        registry.register(Box::new(adapter)).await;
     }
 }

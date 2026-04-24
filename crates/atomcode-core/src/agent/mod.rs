@@ -377,6 +377,8 @@ pub struct AgentLoop {
 pub struct AgentHandle {
     pub cmd_tx: mpsc::UnboundedSender<AgentCommand>,
     pub event_rx: mpsc::UnboundedReceiver<AgentEvent>,
+    /// Shared tool registry for dynamic MCP tool registration.
+    pub tool_registry: std::sync::Arc<ToolRegistry>,
 }
 
 impl AgentLoop {
@@ -426,7 +428,7 @@ impl AgentLoop {
         let internal_enabled = |name: &str| !disabled_internal.contains(name);
 
         if has_skills && internal_enabled("use_skill") {
-            tool_registry.register(Box::new(UseSkillTool {
+            tool_registry.register_sync(Box::new(UseSkillTool {
                 registry: skill_registry.clone(),
             }));
         }
@@ -441,19 +443,19 @@ impl AgentLoop {
             .unwrap_or(false)
         {
             if internal_enabled("trace_callers") {
-                tool_registry.register(Box::new(crate::tool::trace_callers::TraceCallersTool));
+                tool_registry.register_sync(Box::new(crate::tool::trace_callers::TraceCallersTool));
             }
             if internal_enabled("trace_callees") {
-                tool_registry.register(Box::new(crate::tool::trace_callees::TraceCalleesTool));
+                tool_registry.register_sync(Box::new(crate::tool::trace_callees::TraceCalleesTool));
             }
             if internal_enabled("trace_chain") {
-                tool_registry.register(Box::new(crate::tool::trace_chain::TraceChainTool));
+                tool_registry.register_sync(Box::new(crate::tool::trace_chain::TraceChainTool));
             }
             if internal_enabled("file_dependencies") {
-                tool_registry.register(Box::new(crate::tool::file_deps::FileDependenciesTool));
+                tool_registry.register_sync(Box::new(crate::tool::file_deps::FileDependenciesTool));
             }
             if internal_enabled("blast_radius") {
-                tool_registry.register(Box::new(crate::tool::blast_radius::BlastRadiusTool));
+                tool_registry.register_sync(Box::new(crate::tool::blast_radius::BlastRadiusTool));
             }
         }
         // Build approval channels for interactive permission flow
@@ -524,7 +526,7 @@ impl AgentLoop {
 
         let agent = Self {
             conversation,
-            tool_registry: shared_tools,
+            tool_registry: shared_tools.clone(),
             turn_runner,
             permission_store,
             config,
@@ -567,7 +569,11 @@ impl AgentLoop {
             event_tx,
         };
 
-        let handle = AgentHandle { cmd_tx, event_rx };
+        let handle = AgentHandle {
+            cmd_tx,
+            event_rx,
+            tool_registry: shared_tools.clone(),
+        };
 
         (agent, handle)
     }
@@ -733,14 +739,14 @@ if let Some(provider_config) = self.config.providers.get(&new_provider_name) {
                     self.plan_mode = enabled;
                 }
                 AgentCommand::Compact { prompt } => {
-                    self.run_compact(prompt);
+                    self.run_compact(prompt).await;
                 }
                 AgentCommand::RefreshContextStats => {
                     let system_prompt = self.build_system_prompt();
                     let (msgs, _) = self
                         .ctx
                         .build_messages(&self.conversation, &system_prompt, "");
-                    self.emit_rich_context_stats(&self.conversation, &msgs);
+                    self.emit_rich_context_stats(&self.conversation, &msgs).await;
                 }
                 AgentCommand::Shutdown => break,
             }
@@ -1021,7 +1027,7 @@ if let Some(provider_config) = self.config.providers.get(&new_provider_name) {
                 let (msgs, _) = self
                     .ctx
                     .build_messages(&conv, &system_prompt, &turn_reminder);
-                let tool_defs = self.turn_runner.tools.get_definitions();
+                let tool_defs = self.turn_runner.tools.get_definitions().await;
                 // Dump request to datalog for inline debugging
                 self.datalog.log_llm_dump(
                     &msgs,
@@ -1030,7 +1036,7 @@ if let Some(provider_config) = self.config.providers.get(&new_provider_name) {
                     context_window,
                 );
 
-                self.emit_rich_context_stats(&conv, &msgs);
+                self.emit_rich_context_stats(&conv, &msgs).await;
             }
 
             // Run the turn in a scoped block so all borrows of self.turn_runner
@@ -1766,12 +1772,12 @@ if let Some(provider_config) = self.config.providers.get(&new_provider_name) {
     /// both `handle_send_message` (once per turn, post-build_messages) and
     /// `run_compact` (to refresh the cached stats TUI reads for `/context`
     /// after an out-of-turn compaction).
-    fn emit_rich_context_stats(
+    async fn emit_rich_context_stats(
         &self,
         conv: &Conversation,
         msgs: &[crate::conversation::message::Message],
     ) {
-        let tool_defs = self.turn_runner.tools.get_definitions();
+        let tool_defs = self.turn_runner.tools.get_definitions().await;
         let tool_defs_tokens: usize = tool_defs
             .iter()
             .map(|d| {
@@ -1840,7 +1846,7 @@ if let Some(provider_config) = self.config.providers.get(&new_provider_name) {
     /// operation didn't actually shrink the wire payload. Analytical
     /// projection was tried first but too many render-pipeline branches
     /// made it unreliable.
-    fn run_compact(&mut self, prompt: Option<String>) {
+    async fn run_compact(&mut self, prompt: Option<String>) {
         if prompt.is_some() {
             let _ = self.event_tx.send(AgentEvent::TextDelta(
                 "(note: custom compaction prompt accepted but not yet implemented — running mechanical compact)\n"
@@ -1897,7 +1903,7 @@ if let Some(provider_config) = self.config.providers.get(&new_provider_name) {
             let (msgs, _) =
                 self.ctx
                     .build_messages(&self.conversation, &system_prompt, "");
-            self.emit_rich_context_stats(&self.conversation, &msgs);
+            self.emit_rich_context_stats(&self.conversation, &msgs).await;
             return;
         }
 
@@ -1919,7 +1925,7 @@ if let Some(provider_config) = self.config.providers.get(&new_provider_name) {
         let (msgs, _) = self
             .ctx
             .build_messages(&self.conversation, &system_prompt, "");
-        self.emit_rich_context_stats(&self.conversation, &msgs);
+        self.emit_rich_context_stats(&self.conversation, &msgs).await;
     }
 
     fn finish_turn(&mut self, stop_reason: TurnStopReason) {

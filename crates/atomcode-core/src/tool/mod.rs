@@ -540,42 +540,53 @@ pub struct ToolRegistry {
     // BTreeMap ensures stable iteration order (sorted by name),
     // which keeps tool definitions in a consistent order across turns.
     // This is important for OpenAI/DeepSeek auto prefix caching.
-    tools: BTreeMap<String, Arc<dyn Tool>>,
+    // RwLock allows async registration from MCP connection events.
+    tools: tokio::sync::RwLock<BTreeMap<String, Arc<dyn Tool>>>,
 }
 
 impl ToolRegistry {
     pub fn new() -> Self {
         Self {
-            tools: BTreeMap::new(),
+            tools: tokio::sync::RwLock::new(BTreeMap::new()),
         }
     }
 
-    pub fn register(&mut self, tool: Box<dyn Tool>) {
+    /// Register a tool (async, acquires write lock).
+    pub async fn register(&self, tool: Box<dyn Tool>) {
         let name = tool.definition().name.to_string();
-        self.tools.insert(name, Arc::from(tool));
+        let mut tools = self.tools.write().await;
+        tools.insert(name, Arc::from(tool));
     }
 
-    pub fn get_definitions(&self) -> Vec<ToolDef> {
-        self.tools.values().map(|t| t.definition()).collect()
+    /// Register a tool synchronously (for use during startup when we have exclusive access).
+    /// This bypasses the RwLock by using `get_mut()` which requires `&mut self`.
+    pub fn register_sync(&mut self, tool: Box<dyn Tool>) {
+        let name = tool.definition().name.to_string();
+        self.tools.get_mut().insert(name, Arc::from(tool));
     }
 
-    pub fn get(&self, name: &str) -> Option<&dyn Tool> {
-        self.tools.get(name).map(|t| t.as_ref())
+    /// Get all tool definitions (async, acquires read lock).
+    pub async fn get_definitions(&self) -> Vec<ToolDef> {
+        let tools = self.tools.read().await;
+        tools.values().map(|t| t.definition()).collect()
     }
 
-    /// Get an Arc clone of a tool by name (for sending across threads).
-    pub fn get_arc(&self, name: &str) -> Option<Arc<dyn Tool>> {
-        self.tools.get(name).cloned()
+    /// Get a tool by name (async, acquires read lock).
+    pub async fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
+        let tools = self.tools.read().await;
+        tools.get(name).cloned()
+    }
+
+    /// Iterate over all registered tools (async, acquires read lock).
+    pub async fn iter(&self) -> impl Iterator<Item = (String, Arc<dyn Tool>)> {
+        let tools = self.tools.read().await;
+        tools.iter().map(|(k, v)| (k.clone(), v.clone())).collect::<Vec<_>>().into_iter()
     }
 
     /// Register a tool from an Arc (for building filtered registries from parent).
-    pub fn register_arc(&mut self, name: String, tool: Arc<dyn Tool>) {
-        self.tools.insert(name, tool);
-    }
-
-    /// Iterate over all registered tools.
-    pub fn iter(&self) -> impl Iterator<Item = (&str, &Arc<dyn Tool>)> {
-        self.tools.iter().map(|(k, v)| (k.as_str(), v))
+    pub async fn register_arc(&self, name: String, tool: Arc<dyn Tool>) {
+        let mut tools = self.tools.write().await;
+        tools.insert(name, tool);
     }
 }
 
@@ -612,19 +623,19 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_registry_register_and_get() {
-        let mut reg = ToolRegistry::new();
-        reg.register(Box::new(DummyTool));
-        assert!(reg.get("dummy").is_some());
-        assert!(reg.get("nonexistent").is_none());
+    #[tokio::test]
+    async fn test_registry_register_and_get() {
+        let reg = ToolRegistry::new();
+        reg.register(Box::new(DummyTool)).await;
+        assert!(reg.get("dummy").await.is_some());
+        assert!(reg.get("nonexistent").await.is_none());
     }
 
-    #[test]
-    fn test_registry_definitions() {
-        let mut reg = ToolRegistry::new();
-        reg.register(Box::new(DummyTool));
-        let defs = reg.get_definitions();
+    #[tokio::test]
+    async fn test_registry_definitions() {
+        let reg = ToolRegistry::new();
+        reg.register(Box::new(DummyTool)).await;
+        let defs = reg.get_definitions().await;
         assert_eq!(defs.len(), 1);
         assert_eq!(defs[0].name, "dummy");
     }
@@ -861,24 +872,24 @@ mod tests {
         assert_eq!(original_wd, PathBuf::from("/original"));
     }
 
-    #[test]
-    fn test_registry_iter() {
-        let mut reg = ToolRegistry::new();
-        reg.register(Box::new(DummyTool));
-        let items: Vec<_> = reg.iter().collect();
+    #[tokio::test]
+    async fn test_registry_iter() {
+        let reg = ToolRegistry::new();
+        reg.register(Box::new(DummyTool)).await;
+        let items: Vec<_> = reg.iter().await.collect();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].0, "dummy");
     }
 
-    #[test]
-    fn test_registry_register_arc() {
-        let mut reg1 = ToolRegistry::new();
-        reg1.register(Box::new(DummyTool));
-        let mut reg2 = ToolRegistry::new();
-        for (name, arc) in reg1.iter() {
-            reg2.register_arc(name.to_string(), arc.clone());
+    #[tokio::test]
+    async fn test_registry_register_arc() {
+        let reg1 = ToolRegistry::new();
+        reg1.register(Box::new(DummyTool)).await;
+        let reg2 = ToolRegistry::new();
+        for (name, arc) in reg1.iter().await {
+            reg2.register(arc).await;
         }
-        assert!(reg2.get("dummy").is_some());
+        assert!(reg2.get("dummy").await.is_some());
     }
 
     #[test]

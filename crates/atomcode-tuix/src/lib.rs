@@ -161,6 +161,7 @@ pub async fn run(
     working_dir: std::path::PathBuf,
     _session_to_continue: Option<atomcode_core::session::Session>,
     mcp_registry: Option<std::sync::Arc<atomcode_core::mcp::McpRegistry>>,
+    mcp_connect_rx: Option<tokio::sync::mpsc::UnboundedReceiver<atomcode_core::mcp::McpConnectEvent>>,
 ) -> Result<()> {
     let caps = TerminalCaps::probe();
     let _guard = TerminalGuard::activate(caps)?;
@@ -320,6 +321,7 @@ pub async fn run(
         pending_run_codingplan: false,
         pending_open_provider_wizard: false,
         mcp_registry,
+        mcp_connect_rx,
     };
 
     // CodingPlan drift monitor — kick off a startup check if the current

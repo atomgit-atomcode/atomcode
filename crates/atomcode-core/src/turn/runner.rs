@@ -125,7 +125,7 @@ impl TurnRunner {
         });
 
         // 3. Get tool definitions for the LLM
-        let all_tool_defs = self.tools.get_definitions();
+        let all_tool_defs = self.tools.get_definitions().await;
         let mut tool_defs: Vec<_> = if let Some(filter) = allowed_tools {
             all_tool_defs.into_iter()
                 .filter(|d| filter.contains(&d.name))
@@ -672,27 +672,27 @@ _ = cancel.cancelled() => {
         };
         let corrected_name = if corrected_name.is_empty() {
             // No alias match — try case-insensitive lookup in registry
-            if self.tools.get(&call.name).is_some() {
-                call.name.as_str()
-            } else if let Some(name) = self.tools.iter()
+            if self.tools.get(&call.name).await.is_some() {
+                call.name.clone()
+            } else if let Some(name) = self.tools.iter().await
                 .find(|(k, _)| k.eq_ignore_ascii_case(&call.name))
-                .map(|(k, _)| k.as_ref())
+                .map(|(k, _)| k)
             {
                 name
             } else {
-                call.name.as_str()
+                call.name.clone()
             }
         } else {
-            corrected_name
+            corrected_name.to_string()
         };
         // Clone the Arc so the borrow of `self.tools` ends here — we need to
         // call `self.detect_call_loop(..)` mutably below.
-        let tool = match self.tools.get_arc(corrected_name) {
+        let tool = match self.tools.get(&corrected_name).await {
             Some(t) => t,
             None => {
-                let available: String = self.tools.iter()
-                    .map(|(name, _)| name.as_ref())
-                    .collect::<Vec<&str>>()
+                let available: String = self.tools.iter().await
+                    .map(|(name, _)| name)
+                    .collect::<Vec<String>>()
                     .join(", ");
                 let hint = match call.name.as_str() {
                     "create_file" => "\nDid you mean write_file? create_file was renamed to write_file.",
@@ -723,7 +723,7 @@ _ = cancel.cancelled() => {
         // on max_tokens cutoff mid-arguments). Running the repair chain here means
         // tool implementations see valid JSON whenever we can salvage anything,
         // and surface deterministic errors when we can't.
-        let repaired_args = super::json_repair::repair_tool_args(corrected_name, &call.arguments);
+        let repaired_args = super::json_repair::repair_tool_args(&corrected_name, &call.arguments);
 
         // Use corrected name and repaired args for all subsequent checks
         let owned_call;
