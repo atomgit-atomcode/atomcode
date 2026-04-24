@@ -139,14 +139,38 @@ impl OpenAiProvider {
                         if s.trim().is_empty() {
                             return None;
                         }
-                        Some(json!({"role": role, "content": s}))
+                        let mut obj = json!({"role": role, "content": s});
+                        // DeepSeek V4 tool-call round: per official docs, when a
+                        // turn had tool_calls ANYWHERE, ALL reasoning_content from
+                        // that turn (including the final-answer text's reasoning)
+                        // must be echoed in every subsequent request — 400
+                        // otherwise. Our Text variant doesn't persist per-turn
+                        // reasoning, so emit a placeholder under Include. The
+                        // no-tool-call case (image: 思维链 dropped) is a "may be
+                        // sent, will be ignored" spec, not a rejection — safe to
+                        // always emit. Kimi only validates tool_call messages, so
+                        // the extra key on Text is accepted there too.
+                        if matches!(m.role, Role::Assistant)
+                            && matches!(reasoning_policy, ReasoningPolicy::Include)
+                        {
+                            obj["reasoning_content"] = json!("(no reasoning recorded)");
+                        }
+                        Some(obj)
                     }
                     MessageContent::AssistantWithToolCalls { text, tool_calls, reasoning_content } => {
                         if tool_calls.is_empty() {
                             // No tool calls — send as plain assistant text
                             let t = text.as_deref().unwrap_or("");
                             if t.is_empty() { return None; }
-                            return Some(json!({"role": "assistant", "content": t}));
+                            let mut obj = json!({"role": "assistant", "content": t});
+                            if matches!(reasoning_policy, ReasoningPolicy::Include) {
+                                let echo = reasoning_content
+                                    .as_deref()
+                                    .filter(|s| !s.is_empty())
+                                    .unwrap_or("(no reasoning recorded)");
+                                obj["reasoning_content"] = json!(echo);
+                            }
+                            return Some(obj);
                         }
                         let mut msg = json!({"role": "assistant"});
                         // Always include content field — some APIs (DeepSeek/SiliconFlow)
@@ -887,6 +911,39 @@ mod tests {
         let out = OpenAiProvider::format_messages(&msgs, ReasoningPolicy::Include);
         let rc = out[0]["reasoning_content"].as_str().unwrap();
         assert!(!rc.is_empty(), "placeholder must be non-empty for DeepSeek V4");
+    }
+
+    #[test]
+    fn format_messages_include_assistant_text_emits_reasoning_content() {
+        // DeepSeek V4 tool-call round contract (per official docs): in every
+        // subsequent request, ALL reasoning_content from the tool-call turn
+        // must be echoed — including the reasoning for the FINAL TEXT answer
+        // (思维链1.3 → 回答1 in the docs diagram). Our Text variant doesn't
+        // persist per-turn reasoning, so under Include we emit a placeholder.
+        // Regression for the "second prompt 400" bug.
+        use super::{OpenAiProvider, ReasoningPolicy};
+        use crate::conversation::message::{Message, MessageContent, Role};
+        let msgs = vec![Message {
+            role: Role::Assistant,
+            content: MessageContent::Text("当前系统时间是 …".into()),
+        }];
+        let out = OpenAiProvider::format_messages(&msgs, ReasoningPolicy::Include);
+        assert_eq!(out.len(), 1);
+        let rc = out[0]["reasoning_content"].as_str();
+        assert!(
+            rc.map_or(false, |s| !s.is_empty()),
+            "assistant Text under Include must carry a non-empty reasoning_content, got: {}",
+            out[0]
+        );
+
+        // Under Exclude (V3/default) the key must NOT appear on Text — sending
+        // it would regress V3 R1 which rejects any reasoning_content echo.
+        let out_ex = OpenAiProvider::format_messages(&msgs, ReasoningPolicy::Exclude);
+        assert!(
+            out_ex[0].as_object().unwrap().get("reasoning_content").is_none(),
+            "Exclude must not add reasoning_content to assistant Text, got: {}",
+            out_ex[0]
+        );
     }
 
     #[test]

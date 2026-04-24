@@ -132,13 +132,16 @@ fn build_notification_plan(
         }
     };
 
+    // Windows 上系统通知走 PowerShell NotifyIcon，实测会让 TUI 闪退，整条通道关掉。
+    let emit_system = cfg.system && !cfg!(target_os = "windows");
+
     Some(NotificationPlan {
         title,
         body,
         terminal_id,
         visibility,
         emit_terminal: cfg.terminal,
-        emit_system: cfg.system,
+        emit_system,
         emit_bell: cfg.bell,
     })
 }
