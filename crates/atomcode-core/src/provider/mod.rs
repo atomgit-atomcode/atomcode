@@ -22,8 +22,12 @@ use crate::tool::ToolDef;
 ///   on every assistant tool_call message in history; otherwise returns 400
 ///   with "thinking is enabled but reasoning_content is missing in assistant
 ///   tool call message at index N".
-/// - **DeepSeek-R1 / deepseek-reasoner** — MUST NOT include reasoning_content
-///   in subsequent requests; returns 400 if present.
+/// - **DeepSeek-R1 / deepseek-reasoner (V3 family)** — MUST NOT include
+///   reasoning_content in subsequent requests; returns 400 if present.
+/// - **DeepSeek V4 family (`deepseek-v4*`, thinking mode)** — opposite of V3:
+///   MUST echo reasoning_content on every assistant tool_call message, or the
+///   API returns 400 "The `reasoning_content` in the thinking mode must be
+///   passed back to the API".
 /// - **MiniMax-M2 (default)** — thinking is embedded in content as
 ///   `<think>...</think>`, goes through the plain-text path; no separate field
 ///   handling needed.
@@ -303,6 +307,7 @@ mod tests {
             max_tokens: None,
             thinking_type: None,
             thinking_keep: None,
+            reasoning_history: None,
             ephemeral: false,
         }
     }

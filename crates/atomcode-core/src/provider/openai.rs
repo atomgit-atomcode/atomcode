@@ -27,6 +27,11 @@ pub struct OpenAiProvider {
     thinking_type: Option<String>,
     /// Kimi K2.6 Preserved Thinking: `thinking.keep` in the request body.
     thinking_keep: Option<String>,
+    /// User-provided override for the reasoning-history echo policy. When
+    /// `Some`, bypasses the auto-detect heuristic entirely. Parsed from
+    /// `ProviderConfig::reasoning_history` at construction so bad values
+    /// fail early at load time with a clear error, not silently mid-turn.
+    reasoning_history_override: Option<ReasoningPolicy>,
 }
 
 impl OpenAiProvider {
@@ -35,6 +40,18 @@ impl OpenAiProvider {
             .api_key
             .clone()
             .context("OpenAI provider requires an api_key")?;
+        let reasoning_history_override = match config.reasoning_history.as_deref() {
+            None => None,
+            Some(s) => match s.trim().to_ascii_lowercase().as_str() {
+                "include" => Some(ReasoningPolicy::Include),
+                "exclude" => Some(ReasoningPolicy::Exclude),
+                other => anyhow::bail!(
+                    "Invalid `reasoning_history` value {:?} for provider type '{}' — \
+                     expected \"include\" or \"exclude\" (unset = use auto-detect)",
+                    other, config.provider_type,
+                ),
+            },
+        };
         Ok(Self {
             client: super::build_http_client(config.user_agent.as_deref()),
             api_key,
@@ -48,14 +65,21 @@ impl OpenAiProvider {
             max_tokens: config.max_tokens.unwrap_or((config.context_window / 4).clamp(8_000, 16_384)),
             thinking_type: config.thinking_type.clone(),
             thinking_keep: config.thinking_keep.clone(),
+            reasoning_history_override,
         })
     }
 
     /// Derive the reasoning echo policy from model name / base_url.
     /// - `kimi-*` / base_url contains `moonshot` → Include (Moonshot requires
     ///   reasoning_content on every assistant tool_call or returns 400).
-    /// - `deepseek-reasoner` / `deepseek-r1` → Exclude (DeepSeek rejects the
-    ///   request if reasoning_content is echoed back).
+    /// - `deepseek-reasoner` / `deepseek-r1` (V3 family) → Exclude (DeepSeek
+    ///   V3 rejects the request if reasoning_content is echoed back).
+    /// - `deepseek-v4*` (V4 family thinking mode) → Include. DeepSeek flipped
+    ///   the contract in V4: thinking-mode requests with tool calls now
+    ///   REQUIRE reasoning_content on every historical assistant tool_call
+    ///   message, or the API returns 400 "The `reasoning_content` in the
+    ///   thinking mode must be passed back to the API". See
+    ///   <https://api-docs.deepseek.com/zh-cn/guides/thinking_mode>.
     /// - Other OpenAI-compatible endpoints → Exclude (safe default; normal
     ///   OpenAI models don't emit reasoning_content, so there's nothing to
     ///   strip, and non-thinking models typically ignore the field).
@@ -64,6 +88,9 @@ impl OpenAiProvider {
         let u = base_url.to_ascii_lowercase();
         if m.contains("deepseek-reasoner") || m.contains("deepseek-r1") {
             return ReasoningPolicy::Exclude;
+        }
+        if m.contains("deepseek-v4") {
+            return ReasoningPolicy::Include;
         }
         if m.starts_with("kimi-") || m.starts_with("moonshot") || u.contains("moonshot") || u.contains("kimi") {
             return ReasoningPolicy::Include;
@@ -534,6 +561,12 @@ impl LlmProvider for OpenAiProvider {
     }
 
     fn reasoning_history_policy(&self) -> ReasoningPolicy {
+        // Explicit user override wins over the name/url heuristic so a new
+        // provider quirk can be worked around via config.toml without a
+        // code change.
+        if let Some(p) = self.reasoning_history_override {
+            return p;
+        }
         Self::derive_reasoning_policy(&self.model, &self.base_url)
     }
 }
@@ -709,6 +742,88 @@ mod tests {
         assert_eq!(
             OpenAiProvider::derive_reasoning_policy("deepseek-r1", "https://api.deepseek.com/v1"),
             ReasoningPolicy::Exclude,
+        );
+    }
+
+    #[test]
+    fn reasoning_policy_deepseek_v4_routes_to_include() {
+        use super::{OpenAiProvider, ReasoningPolicy};
+        // DeepSeek V4 thinking mode requires reasoning_content echoed back on
+        // assistant tool_call messages — opposite of V3/R1.
+        assert_eq!(
+            OpenAiProvider::derive_reasoning_policy("deepseek-v4-pro", "https://api.deepseek.com"),
+            ReasoningPolicy::Include,
+        );
+        assert_eq!(
+            OpenAiProvider::derive_reasoning_policy("deepseek-v4", "https://api.deepseek.com"),
+            ReasoningPolicy::Include,
+        );
+    }
+
+    #[test]
+    fn reasoning_history_config_override_wins_over_heuristic() {
+        // `reasoning_history = "exclude"` forces Exclude even on a model that
+        // the heuristic would route to Include (deepseek-v4-pro).
+        use super::OpenAiProvider;
+        use crate::config::provider::ProviderConfig;
+        use crate::provider::{LlmProvider, ReasoningPolicy};
+        let cfg = ProviderConfig {
+            provider_type: "openai".into(),
+            api_key: Some("sk-test".into()),
+            model: "deepseek-v4-pro".into(),
+            base_url: Some("https://api.deepseek.com".into()),
+            system_prompt: None,
+            user_agent: None,
+            context_window: 128_000,
+            max_tokens: None,
+            thinking_type: None,
+            thinking_keep: None,
+            reasoning_history: Some("exclude".into()),
+            ephemeral: false,
+        };
+        let p = OpenAiProvider::new(&cfg).expect("provider builds");
+        assert_eq!(p.reasoning_history_policy(), ReasoningPolicy::Exclude);
+
+        // And vice versa: "include" on a plain OpenAI model (heuristic = Exclude)
+        // forces Include — lets users unblock new providers without a code change.
+        let cfg_inc = ProviderConfig {
+            model: "gpt-4o".into(),
+            base_url: Some("https://api.openai.com/v1".into()),
+            reasoning_history: Some("include".into()),
+            ..cfg
+        };
+        let p2 = OpenAiProvider::new(&cfg_inc).expect("provider builds");
+        assert_eq!(p2.reasoning_history_policy(), ReasoningPolicy::Include);
+    }
+
+    #[test]
+    fn reasoning_history_config_invalid_value_fails_fast() {
+        // Typos in config should surface at load time with a clear error,
+        // not a silent policy-mismatch 400 mid-turn.
+        use super::OpenAiProvider;
+        use crate::config::provider::ProviderConfig;
+        let cfg = ProviderConfig {
+            provider_type: "openai".into(),
+            api_key: Some("sk-test".into()),
+            model: "gpt-4o".into(),
+            base_url: Some("https://api.openai.com/v1".into()),
+            system_prompt: None,
+            user_agent: None,
+            context_window: 128_000,
+            max_tokens: None,
+            thinking_type: None,
+            thinking_keep: None,
+            reasoning_history: Some("always".into()),
+            ephemeral: false,
+        };
+        let err = match OpenAiProvider::new(&cfg) {
+            Err(e) => e,
+            Ok(_) => panic!("bad reasoning_history value must reject"),
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("reasoning_history") && msg.contains("always"),
+            "error must name the bad field and value, got: {msg}"
         );
     }
 

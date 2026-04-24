@@ -98,6 +98,7 @@ impl DraftProvider {
             max_tokens: None,
             thinking_type: None,
             thinking_keep: None,
+            reasoning_history: None,
             ephemeral: false,
         }
     }

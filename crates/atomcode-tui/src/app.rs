@@ -378,6 +378,7 @@ impl App {
                    max_tokens: None,
                    thinking_type: None,
                    thinking_keep: None,
+            reasoning_history: None,
                    ephemeral: false,
                }).unwrap_or_else(|_| {
                    // Fallback: should never reach production path since AgentLoop handles LLM

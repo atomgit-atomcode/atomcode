@@ -201,6 +201,7 @@ fn test_config() -> Config {
             max_tokens: None,
             thinking_type: None,
             thinking_keep: None,
+            reasoning_history: None,
             ephemeral: false,
         },
     );
@@ -233,6 +234,7 @@ fn make_runner(provider: MockProvider, tools: ToolRegistry, permission: Box<dyn 
         max_tokens: None,
         thinking_type: None,
         thinking_keep: None,
+            reasoning_history: None,
         ephemeral: true,
     };
     let test_ctx: std::sync::Arc<dyn crate::ctx::CtxBuilder> =

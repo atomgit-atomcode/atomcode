@@ -1641,6 +1641,7 @@ let session_manager = SessionManager::new(&working_dir);
             max_tokens: None,
             thinking_type: None,
             thinking_keep: None,
+            reasoning_history: None,
             ephemeral: true,
         }),
     };
