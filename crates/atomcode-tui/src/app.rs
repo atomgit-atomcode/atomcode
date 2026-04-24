@@ -354,8 +354,7 @@ impl App {
            total_tokens: 0,
            turn_tokens: 0,
            ctx_used_tokens: 0,
-           context_window: config.providers.get(&config.default_provider)
-               .map(|p| p.context_window).unwrap_or(128000),
+           context_window: config.default_context_window(),
            render_cache: Vec::new(),
            render_cache_msg_count: 0,
            selection: TextSelection::new(),
@@ -377,6 +376,9 @@ impl App {
                    user_agent: None,
                    context_window: atomcode_core::config::provider::default_context_window_for("openai"),
                    max_tokens: None,
+                   thinking_type: None,
+                   thinking_keep: None,
+            reasoning_history: None,
                    ephemeral: false,
                }).unwrap_or_else(|_| {
                    // Fallback: should never reach production path since AgentLoop handles LLM
@@ -633,7 +635,7 @@ impl App {
                     arguments: arguments.clone(),
                 };
                 self.executing_tool_info = format_tool_info(&call);
-                self.conversation.finalize_stream_with_tool_call(call);
+                self.conversation.finalize_stream_with_tool_call(call, None);
                 self.render_cache_msg_count = 0;
                 self.mode = AppMode::ToolExecuting;
                 self.tool_start = Some(Instant::now());
@@ -669,7 +671,15 @@ impl App {
                 self.render_cache_msg_count = 0;
                 self.at_bottom = true;
             }
-            AgentEvent::ApprovalNeeded { tool_name: _, reason: _, call } => {
+            AgentEvent::ApprovalNeeded { tool_name, reason, call } => {
+                atomcode_core::notify::notify(
+                    &self.config.notifications,
+                    atomcode_core::notify::NotificationEvent::ApprovalNeeded(atomcode_core::notify::ApprovalNotification {
+                        tool_name: &tool_name,
+                        detail: Some(if reason.trim().is_empty() { &call.arguments } else { &reason }),
+                        working_dir: Some(&self.working_dir),
+                    }),
+                );
                 self.mode = AppMode::WaitingApproval(call);
             }
             AgentEvent::PhaseChange(phase) => {
@@ -706,7 +716,18 @@ impl App {
                     }
                 }
             }
-            AgentEvent::TurnComplete { duration, total_tokens: _, turn_count: _, tool_call_count: _, stop_reason: _ } => {
+            AgentEvent::TurnComplete { duration, total_tokens: _, turn_count: _, tool_call_count: _, stop_reason, messages: _ } => {
+                atomcode_core::notify::notify(
+                    &self.config.notifications,
+                    atomcode_core::notify::NotificationEvent::TurnFinished(atomcode_core::notify::TurnNotification {
+                        duration,
+                        turn_count: self.current_step_count,
+                        tool_call_count: self.current_tool_call_count,
+                        total_tokens: Some(self.turn_tokens),
+                        stop_reason,
+                        working_dir: Some(&self.working_dir),
+                    }),
+                );
                 // Clear any lingering streaming tool state — turn is over.
                 self.streaming_tool_name = None;
                 self.streaming_tools.clear();
@@ -755,10 +776,6 @@ impl App {
                 self.last_turn_duration = Some(duration);
                 self.turn_start = None;
                 self.render_cache_msg_count = 0; // Invalidate cache
-                // Drop queued append previews — the next turn (if any) will pick
-                // these up from the agent's pending_input and render them as real
-                // user messages, so the previews would duplicate otherwise.
-                self.pending_appends.clear();
                 self.at_bottom = true;
                 // Auto-save session after each turn
                 self.current_session.messages = self.conversation.messages.clone();
@@ -787,8 +804,26 @@ impl App {
                 if !self.current_session.messages.is_empty() {
                     let _ = self.session_manager.save(&self.current_session);
                 }
+                // Type-ahead drain: if the user queued messages during this turn,
+                // pop the oldest and fire it as a fresh turn. Remaining queued
+                // entries drain one-at-a-time on subsequent TurnComplete events.
+                if !self.pending_appends.is_empty() {
+                    let queued = self.pending_appends.remove(0);
+                    self.submit_queued(queued);
+                }
             }
             AgentEvent::TurnCancelled { messages } => {
+                atomcode_core::notify::notify(
+                    &self.config.notifications,
+                    atomcode_core::notify::NotificationEvent::TurnFinished(atomcode_core::notify::TurnNotification {
+                        duration: self.turn_start.map(|t| t.elapsed()).unwrap_or_default(),
+                        turn_count: self.current_step_count,
+                        tool_call_count: self.current_tool_call_count,
+                        total_tokens: Some(self.turn_tokens),
+                        stop_reason: atomcode_core::agent::TurnStopReason::Cancelled,
+                        working_dir: Some(&self.working_dir),
+                    }),
+                );
                 // User cancelled - sync the cleaned conversation from agent
                 self.conversation.messages = messages;
                 self.conversation.stream_buffer = None; // Clear any partial stream
@@ -830,7 +865,9 @@ impl App {
                 }
             }
             AgentEvent::WorkingDirChanged(new_dir) => {
-                // Only /cd (user command) triggers this — LLM tools cannot change working dir.
+                // Fires for both user `/cd` and LLM tool-driven cd (change_dir
+                // tool or a `bash` call starting with `cd`). Idempotent — if
+                // nothing changed we still rewrite the same path.
                 self.previous_working_dir = Some(self.working_dir.clone());
                 self.working_dir = new_dir.clone();
                 self.project_context_cache = None;
@@ -842,7 +879,7 @@ impl App {
                 self.config.default_workdir = Some(new_dir.to_string_lossy().to_string());
                 let _ = self.config.save(&Config::default_path());
             }
-            AgentEvent::ContextStats { system_tokens, sent_tokens, dropped_tokens: _, working_set_tokens: _, total_messages: _ } => {
+            AgentEvent::ContextStats { system_tokens, sent_tokens, .. } => {
                 self.ctx_used_tokens = system_tokens + sent_tokens;
             }
             AgentEvent::SubAgentProgress { file, status } => {
@@ -906,6 +943,29 @@ impl App {
                         self.flush_rapid_buf();
                     }
                     self.rapid_streak = 0;
+                }
+
+                // PASTE FALLBACK for Enter: when the terminal delivered a paste
+                // as a raw key burst (bracketed paste unsupported, or stripped
+                // by tmux/screen/SSH), the first Enter arrives before the
+                // streak reaches RAPID_PASTE_THRESHOLD and would submit the
+                // prompt prematurely. No human types two keys inside 50ms, so
+                // treat a hot-Enter as a newline and keep the streak alive so
+                // the remainder of the burst enters buffer mode.
+                if paste_eligible
+                    && matches!(key.code, KeyCode::Enter)
+                    && key.modifiers == KeyModifiers::NONE
+                    && interval_ms < 50
+                {
+                    if self.rapid_streak >= RAPID_PASTE_THRESHOLD {
+                        self.rapid_buf.push('\n');
+                    } else {
+                        self.input.insert_newline();
+                        // Force the next key into buffer mode regardless of
+                        // its timing — we already know this is a paste burst.
+                        self.rapid_streak = RAPID_PASTE_THRESHOLD;
+                    }
+                    return;
                 }
 
                 // Once the streak crosses the threshold, divert the current key
@@ -1019,7 +1079,10 @@ impl App {
             self.last_ctrl_c = Some(now);
 
             if double_press {
-                // Double Ctrl+C: exit
+                // Double Ctrl+C: exit — save session before exiting
+                if !self.current_session.messages.is_empty() {
+                    let _ = self.session_manager.save(&self.current_session);
+                }
                 self.mode = AppMode::Exiting;
                 return;
             }
@@ -1104,11 +1167,8 @@ impl App {
                     if self.slash_menu.visible {
                         // Slash menu is open — close it instead of cancelling the agent
                         self.slash_menu.close();
-                    } else if !self.input.is_empty() {
-                        // Clear input instead of cancelling
-                        self.input.clear();
                     } else {
-                        // Esc cancels the operation
+                        // Esc cancels the operation, preserving user input
                         let _ = self.agent_handle.cmd_tx.send(AgentCommand::Cancel);
                         self.cancel_token.cancel();
                         self.conversation.stream_buffer = None;
@@ -1121,18 +1181,22 @@ impl App {
                     }
                 } else if (key.code == KeyCode::Enter && key.modifiers == KeyModifiers::NONE)
                     || (key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('j')) {
-                    // During streaming: queue user input for AFTER the current turn ends.
-                    // Do NOT inject into assistant stream — that mixes roles and causes
-                    // the model to treat user input as its own reasoning (e.g., auto-selecting
-                    // options without waiting for confirmation).
+                    // During streaming: queue user input locally for AFTER the current
+                    // turn ends. Drained one-at-a-time on TurnComplete into a fresh
+                    // SendMessage — each queued entry becomes its own new turn, matching
+                    // CC's type-ahead behavior and what the "will send after this turn"
+                    // UI hint promises.
+                    //
+                    // Prior impl sent AgentCommand::AppendInput, which stuffed the text
+                    // into agent.pending_input. But pending_input is only consumed at
+                    // the start of a run_turn_loop iteration — a clean finish_turn
+                    // (Natural stop) returns before pending_input is checked again,
+                    // leaving Q2 stuck. The next user SendMessage (Q3) then starts a
+                    // new run_turn_loop, which picks up stale Q2 as "[Additional
+                    // context]" inside Q3's turn — so Q2 effectively fired together
+                    // with Q3 instead of auto-triggering after Q1.
                     let content = self.input.content();
                     if !content.trim().is_empty() {
-                        let _ = self.agent_handle.cmd_tx.send(
-                            atomcode_core::agent::AgentCommand::AppendInput(content.clone())
-                        );
-                        // Mirror the queue locally so the chat panel can show a
-                        // "queued" preview — without this, Enter during streaming
-                        // gives zero visual feedback and looks broken.
                         self.pending_appends.push(content);
                         self.input.clear();
                         self.render_cache_msg_count = 0;
@@ -1692,7 +1756,8 @@ impl App {
             // Enter handling:
             // - Plain Enter (no modifiers) = send message
             // - Any modifier + Enter (Shift/Ctrl/Alt) = newline
-            // - Rapid Enter (<50ms since last key) = newline (paste fallback)
+            // - Rapid Enter (<50ms since last key) = newline (paste fallback,
+            //   handled earlier in `handle_input_event` before reaching here).
             (KeyModifiers::NONE, KeyCode::Enter) => {
                 // Backslash at end of line = insert newline instead of sending
                 // (fallback for terminals that can't distinguish Shift+Enter)
@@ -1716,17 +1781,8 @@ impl App {
                 self.send_message(event_tx);
             }
             (_, KeyCode::Esc) => {
-                if !self.pasted_blocks.is_empty() {
-                    // Esc peels off one paste block at a time so users can undo
-                    // an accidental extra paste without losing the rest.
-                    self.pasted_blocks.pop();
-                } else if !self.attached_files.is_empty() {
-                    // Then peel off attached files one at a time
-                    self.attached_files.pop();
-                } else if !self.input.is_empty() {
-                    self.input.clear();
-                    self.slash_menu.close();
-                }
+                // In Normal mode, Esc does not clear input or attachments
+                // Users can continue typing without losing their work
             }
             // Ctrl+L: clear conversation (like Claude Code)
             (KeyModifiers::CONTROL, KeyCode::Char('l')) => {
@@ -2172,6 +2228,16 @@ impl App {
                     self.last_checkpoint = atomcode_core::agent::git_checkpoint::create_checkpoint(&self.working_dir);
                     let _ = self.agent_handle.cmd_tx.send(AgentCommand::SendMessage(msg));
                 }
+                return true;
+            }
+            cmd if cmd == "/compact" || cmd.starts_with("/compact ") => {
+                let arg = cmd.strip_prefix("/compact").unwrap().trim();
+                let prompt = (!arg.is_empty()).then(|| arg.to_string());
+                // Agent emits the result as a TextDelta ("nothing to compact"
+                // or "compacted — dropped N messages"). No UI-local placeholder
+                // — a premature "compacting…" line could contradict the actual
+                // outcome when the conversation is too short to compact.
+                let _ = self.agent_handle.cmd_tx.send(AgentCommand::Compact { prompt });
                 return true;
             }
             "/undo" => {
@@ -2717,6 +2783,37 @@ impl App {
         let _ = self.agent_handle.cmd_tx.send(AgentCommand::SendMessage(full_content));
     }
 
+    /// Submit a pre-resolved queued message as a fresh turn. Called by the
+    /// TurnComplete drain — the content was already finalized when the user
+    /// queued it mid-stream, so we bypass the input/paste/attachment merging
+    /// that send_message does (those belong to whatever the user is typing
+    /// NOW, not to the queued message).
+    fn submit_queued(&mut self, content: String) {
+        self.input_history.push(content.clone());
+        InputHistory::append(&content);
+        if self.input_history.len() > 1000 {
+            self.input_history.drain(..self.input_history.len() - 1000);
+        }
+        self.history_index = None;
+        self.history_stash = None;
+        self.turn_tokens = 0;
+        self.last_sent_input = Some(content.clone());
+        self.conversation.add_user_message(&content);
+        self.at_bottom = true;
+        self.current_step_count = 0;
+        self.current_tool_call_count = 0;
+        self.turn_start = Some(Instant::now());
+        self.first_token_ms = None;
+        self.llm_call_start = Some(Instant::now());
+        self.last_completed_tool = String::new();
+        self.last_turn_duration = None;
+        self.last_checkpoint = atomcode_core::agent::git_checkpoint::create_checkpoint(
+            &self.working_dir,
+        );
+        self.mode = AppMode::Streaming;
+        let _ = self.agent_handle.cmd_tx.send(AgentCommand::SendMessage(content));
+    }
+
 }
 
 /// Format tool info for display (called once, cached in App).
@@ -3084,7 +3181,7 @@ async fn refresh_gitcode_token() -> Result<String, String> {
         id, username
     ));
 
-    std::fs::write(&auth_path, new_content)
+    atomcode_core::auth::write_auth_file_secure(&auth_path, &new_content)
         .map_err(|e| format!("Failed to write auth.toml: {}", e))?;
 
     Ok(new_access_token)

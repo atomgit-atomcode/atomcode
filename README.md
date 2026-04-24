@@ -29,7 +29,10 @@
   <img src="https://img.shields.io/badge/version-4.18.1-blue" alt="version">
   <img src="https://img.shields.io/badge/rust-1.75%2B-orange" alt="rust">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="license">
-  <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey" alt="platform">
+  <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20HarmonyOS PC%20%7C%20Windows-lightgrey" alt="platform">
+  <a href="https://atomgit.com/atomgit_atomcode/atomcode" target="_blank">
+    <img src="https://atomgit.com/atomgit_atomcode/atomcode/star/badge.svg" alt="AtomGit Star"/>
+  </a>
 </p>
 
 ---
@@ -109,10 +112,14 @@ Connect to any LLM that supports OpenAI's function-calling API:
 ### Safety
 
 - **Destructive command detection** — `rm -rf`, `git push --force`, `DROP TABLE`, etc. require explicit approval
-- **Sensitive file protection** — writes to `/etc`, `~/.ssh`, shell configs require approval
+- **Path-aware confirmations** — external reads, sensitive paths, and all writes outside the workspace can require confirmation depending on risk level
+- **Sensitive file protection** — protected system paths, credential directories, shell configs, `.env` files, and key/cert files receive stronger confirmation rules
+- **Shell bypass protection** — common shell file commands like `cat`, `head`, `ls`, `cp`, `mv`, and `tee` inherit the same path approval model as file tools
 - **Per-session permission grants** — approve once per tool pattern, or always-allow
 - **Source file deletion requires approval** — `rm` on code files is never auto-approved
 - **Undo** — `/undo` rolls back the last turn's file edits via file-history snapshots
+
+See [Permission Model](./docs/security/permission-model.md) for the full design and current boundaries.
 
 ## Installation
 
@@ -125,7 +132,7 @@ cargo install --path crates/atomcode-cli --locked
 ```
 
 The binary will be generated at `target/release/atomcode` and installed to
-`~/.cargo/bin/atomcode` for macOS / Linux and `$env:USERPROFILE/.cargo/bin/atomcode.exe`
+`~/.cargo/bin/atomcode` for macOS / Linux / HarmonyOS PC and `$env:USERPROFILE/.cargo/bin/atomcode.exe`
 for Windows. Make sure that `~/.cargo/bin` (or `%USERPROFILE%\.cargo\bin` on Windows) is
 in your `PATH`.
 

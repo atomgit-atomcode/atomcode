@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::time::Duration;
 
 /// Low-level events emitted by TurnRunner during execution.
@@ -40,6 +41,10 @@ pub enum TurnEvent {
         working_set_tokens: usize,
         total_messages: usize,
     },
+    /// Emitted when a tool mutated `ctx.working_dir` (e.g. `change_dir`
+    /// or a `bash` call starting with `cd`). Lets the TUI footer track
+    /// the current cwd without polling the shared `Arc<RwLock<PathBuf>>`.
+    WorkingDirChanged(PathBuf),
 }
 
 /// Result of a single turn execution

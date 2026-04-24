@@ -1,47 +1,18 @@
 use super::*;
 
 impl AgentLoop {
-    /// Graph-driven preread: identify call chain files from user message,
-    /// read their key functions, and inject into system prompt.
-    ///
-    /// Build a per-turn reminder string injected into the conversation.
-    /// Currently returns empty — reserved for future per-turn context injection.
-    pub(crate) fn build_turn_reminder(&self) -> String {
-        let mut parts = Vec::new();
-
-        // Previous turn's edited files — helps model avoid re-exploring
-        if !self.prev_turn_edited_files.is_empty() {
-            let files = self.prev_turn_edited_files.join(", ");
-            parts.push(format!(
-                "[Previous turn: you edited {}. If the user reports the same issue, start from these files.]",
-                files
-            ));
-        }
-
-        // Current task at the very end (recency bias)
-        if !self.current_task.is_empty() {
-            let task_short = if self.current_task.chars().count() > 300 {
-                format!("{}...", self.current_task.chars().take(297).collect::<String>())
-            } else {
-                self.current_task.clone()
-            };
-            parts.push(format!(
-                "=== CURRENT TASK ===\n{}\nAct on this task directly. Do NOT search for files you already know about.",
-                task_short
-            ));
-        }
-
-        if parts.is_empty() {
-            String::new()
-        } else {
-            parts.join("\n\n")
-        }
-    }
+    // NOTE: the per-turn dynamic reminder mechanism (a string injected
+    // before each LLM turn containing CURRENT TASK + prev edited files)
+    // has been removed. The verbatim user task now rides on the cadence
+    // reflection checkpoint instead — see
+    // `agent::discipline::reflection_prompt`.
 
     pub(crate) fn build_system_prompt(&mut self) -> String {
         // Dynamic rules: select prompt sections based on task type.
         // If user has a custom system_prompt in config, use that instead (override).
-        let rules = if let Some(custom) = self.config.providers
+        let rules = if let Some(custom) = self
+            .config
+            .providers
             .get(&self.config.default_provider)
             .and_then(|p| p.system_prompt.as_deref())
         {
@@ -51,7 +22,8 @@ impl AgentLoop {
         };
 
         let wd: PathBuf = self
-            .turn_runner.context
+            .turn_runner
+            .context
             .working_dir
             .try_read()
             .map(|g| g.clone())
@@ -72,19 +44,12 @@ impl AgentLoop {
         } else {
             std::env::var("SHELL").unwrap_or_else(|_| "bash".into())
         };
-        let env_info = format!(
-            "Platform: {} | Shell: {}",
-            std::env::consts::OS, shell,
-        );
-
-        // Model identity — needed for language discipline.
-        let model_id = self.config.providers
-            .get(&self.config.default_provider)
-            .map(|p| p.model.to_lowercase())
-            .unwrap_or_default();
+        let env_info = format!("Platform: {} | Shell: {}", std::env::consts::OS, shell,);
 
         // Identity: inject model name so the model correctly identifies itself.
-        let model_display = self.config.providers
+        let model_display = self
+            .config
+            .providers
             .get(&self.config.default_provider)
             .map(|p| p.model.as_str())
             .unwrap_or("unknown");
@@ -104,6 +69,32 @@ impl AgentLoop {
             ));
         }
 
+        // Available skills — inject skill descriptions so LLM knows what skills exist.
+        // Only inject skills that allow model invocation (disable_model_invocation = false).
+        if let Ok(registry) = self.skill_registry.read() {
+            let skills: Vec<String> = registry
+                .invocable_by_llm()
+                .map(|s| {
+                    let hint = s.argument_hint
+                        .as_ref()
+                        .map(|h| format!(" {}", h))
+                        .unwrap_or_default();
+                    format!("- /{}{}: {}", s.name, hint, s.description)
+                })
+                .collect();
+            if !skills.is_empty() {
+                prompt.push_str("\n=== AVAILABLE SKILLS ===\n");
+                prompt.push_str("Use the `use_skill` tool to invoke a skill when relevant to the task.\n");
+                prompt.push_str(&skills.join("\n"));
+                prompt.push('\n');
+            }
+        }
+
+        // Git snapshot (branch / HEAD / status) captured at session start.
+        // Empty string when `wd` isn't a git repo — push is a no-op.
+        // See `ctx::env` for the snapshot / disclaimer rationale.
+        prompt.push_str(&self.env_snapshot.as_prompt_section());
+
         // Plan mode: inject planning-only instructions before rules.
         if self.plan_mode {
             prompt.push_str(
@@ -120,19 +111,9 @@ impl AgentLoop {
 
         // RULES GO LAST — recency effect ensures the model remembers these
         // when it starts generating tool calls.
-        prompt.push_str(&format!("\n=== RULES (follow these strictly) ===\n{rules}\n"));
-
-        // Language discipline: some models (MiniMax, Qwen, DeepSeek) default to
-        // English chain-of-thought even when the user speaks Chinese.
-        let needs_cn_lock = model_id.contains("minimax")
-            || model_id.contains("qwen")
-            || model_id.contains("deepseek")
-            || model_id.contains("kimi");
-        if needs_cn_lock {
-            prompt.push_str(
-                "\n用户可见的输出请用中文。工具调用和代码保持原样。\n"
-            );
-        }
+        prompt.push_str(&format!(
+            "\n=== RULES (follow these strictly) ===\n{rules}\n"
+        ));
 
         // Platform-specific rules — only injected on the target OS.
         let platform = crate::config::platform_rules();
@@ -141,16 +122,13 @@ impl AgentLoop {
             prompt.push('\n');
         }
 
-        // MiniMax thinking discipline — inline as a rule, not a <system-reminder>
-        if model_id.contains("minimax") {
-            prompt.push_str(
-                "\n## THINKING 纪律:\n\
-                 内部思考（<think> 块）必须极简，只写必要的决策线索，\
-                 不要复述工具结果、不要分点展开、不要自问自答。目标 ≤ 3 句话。\n"
-            );
-        }
+        // NOTE: model-specific directives (CJK language lock for MiniMax/
+        // Qwen/DeepSeek/Kimi, MiniMax thinking discipline) were here but
+        // moved to `ctx::render::apply_model_directives`, invoked by each
+        // CtxBuilder impl in `build_messages`. Keeping them out of this
+        // function keeps agent::prompt free of `if model_id.contains(...)`
+        // branches — per-model customization now lives in ctx.
 
         prompt
     }
-
 }

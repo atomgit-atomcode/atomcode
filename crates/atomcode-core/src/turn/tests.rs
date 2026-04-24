@@ -77,6 +77,12 @@ impl MockProvider {
             events: vec![StreamEvent::Error(msg.to_string())],
         }
     }
+
+    fn empty() -> Self {
+        Self {
+            events: vec![StreamEvent::Done { truncated: false }],
+        }
+    }
 }
 
 #[async_trait]
@@ -149,6 +155,33 @@ impl Tool for DangerousTool {
     }
 }
 
+/// A tool that only requires approval when it can inspect the current context.
+struct ContextDangerousTool;
+
+#[async_trait]
+impl Tool for ContextDangerousTool {
+    fn definition(&self) -> ToolDef {
+        ToolDef {
+            name: "context_dangerous",
+            description: "Requires context-aware approval".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+        }
+    }
+    fn approval(&self, _args: &str) -> ApprovalRequirement {
+        ApprovalRequirement::AutoApprove
+    }
+    fn approval_with_context(&self, _args: &str, _ctx: &ToolContext) -> ApprovalRequirement {
+        ApprovalRequirement::RequireApproval("Needs context-aware confirmation".to_string())
+    }
+    async fn execute(&self, _args: &str, _ctx: &ToolContext) -> Result<ToolResult> {
+        Ok(ToolResult {
+            call_id: String::new(),
+            output: "context-aware action done".to_string(),
+            success: true,
+        })
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Test helpers: Config / Context
 // ---------------------------------------------------------------------------
@@ -166,6 +199,9 @@ fn test_config() -> Config {
             user_agent: None,
             context_window: 16000,
             max_tokens: None,
+            thinking_type: None,
+            thinking_keep: None,
+            reasoning_history: None,
             ephemeral: false,
         },
     );
@@ -174,6 +210,9 @@ fn test_config() -> Config {
         default_workdir: None,
         providers,
         datalog: Default::default(),
+        notifications: Default::default(),
+        auto_update: false,
+        reflection_cadence: 7,
     }
 }
 
@@ -182,13 +221,35 @@ fn test_context() -> ToolContext {
 }
 
 fn make_runner(provider: MockProvider, tools: ToolRegistry, permission: Box<dyn super::permission::PermissionDecider>) -> TurnRunner {
+    // Tests don't set up real ProviderConfig, so construct a DefaultCtx
+    // directly with a generous window (matches test_config's implicit budget).
+    let test_provider = crate::config::provider::ProviderConfig {
+        provider_type: "test".into(),
+        api_key: None,
+        model: "test-model".into(),
+        base_url: None,
+        system_prompt: None,
+        user_agent: None,
+        context_window: 128_000,
+        max_tokens: None,
+        thinking_type: None,
+        thinking_keep: None,
+            reasoning_history: None,
+        ephemeral: true,
+    };
+    let test_ctx: std::sync::Arc<dyn crate::ctx::CtxBuilder> =
+        std::sync::Arc::new(crate::ctx::DefaultCtx::new(&test_provider));
+
     TurnRunner {
         provider: std::sync::Arc::new(provider),
         tools: std::sync::Arc::new(tools),
         context: test_context(),
         config: test_config(),
+        ctx: test_ctx,
         permission,
         recently_edited_files: Vec::new(),
+        recent_calls: Vec::new(),
+        file_read_counts: std::collections::HashMap::new(),
     }
 }
 
@@ -219,6 +280,23 @@ async fn test_turn_runner_text_only_response() {
             assert!(tokens > 0);
         }
         other => panic!("Expected Responded, got {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn test_turn_runner_empty_response_is_failure() {
+    let mut runner = make_runner(MockProvider::empty(), ToolRegistry::new(), auto_bypass());
+    let mut conv = Conversation::new();
+    conv.add_user_message("Hi");
+    let (tx, _rx) = mpsc::unbounded_channel();
+
+    let result = runner.run(&mut conv, "system", &tx, CancellationToken::new()).await;
+
+    match result {
+        TurnResult::Failed(msg) => {
+            assert!(msg.contains("empty response"));
+        }
+        other => panic!("Expected Failed, got {:?}", other),
     }
 }
 
@@ -497,6 +575,33 @@ async fn test_turn_runner_interactive_approval_deny() {
     }
 }
 
+#[tokio::test]
+async fn test_turn_runner_uses_context_aware_approval() {
+    let mut tools = ToolRegistry::new();
+    tools.register(Box::new(ContextDangerousTool));
+
+    let provider = MockProvider::with_tool_call("context_dangerous", "{}");
+    let mut runner = make_runner(provider, tools, auto_deny());
+    let mut conv = Conversation::new();
+    conv.add_user_message("do it");
+    let (tx, _rx) = mpsc::unbounded_channel();
+
+    let result = runner.run(&mut conv, "system", &tx, CancellationToken::new()).await;
+
+    match result {
+        TurnResult::UsedTools { .. } => {
+            let last = conv.messages.last().unwrap();
+            if let crate::conversation::message::MessageContent::ToolResult(ref r) = last.content {
+                assert!(!r.success, "Tool should have been denied");
+                assert!(r.output.contains("denied"));
+            } else {
+                panic!("Expected ToolResult");
+            }
+        }
+        other => panic!("Expected UsedTools, got {:?}", other),
+    }
+}
+
 // ===========================================================================
 // 3. Discipline logic tests (step limit, reminders)
 // ===========================================================================
@@ -696,7 +801,7 @@ async fn test_tool_result_content_in_llm_context() {
     assert_eq!(provider_msgs[1].text(), Some("search for foo"));
 
     // 3. Assistant message with tool call — call_id and arguments preserved
-    if let crate::conversation::message::MessageContent::AssistantWithToolCalls { text: _, ref tool_calls } = provider_msgs[2].content {
+    if let crate::conversation::message::MessageContent::AssistantWithToolCalls { text: _, ref tool_calls, .. } = provider_msgs[2].content {
         assert_eq!(tool_calls.len(), 1);
         assert_eq!(tool_calls[0].name, "grep");
         assert_eq!(tool_calls[0].arguments, r#"{"pattern":"foo"}"#);
@@ -902,4 +1007,91 @@ fn test_rules_no_dynamic_content() {
     assert!(!rules.contains("Date:"), "Rules should not contain date");
     assert!(!rules.contains("Git:"), "Rules should not contain git status");
     assert!(!rules.contains("Recent activity"), "Rules should not contain recent activity");
+}
+
+// ===========================================================================
+// detect_call_loop — Pattern 1 (per-region read saturation) integration tests
+// ===========================================================================
+
+/// Scanning 5 distinct regions of a large file must NOT trip the cap.
+/// This was the regression captured in the v4.20 screenshot: the model read
+/// multiple function bodies of a 1592-line render.rs with correct offsets and
+/// hit the region cap on the Nth read even though every region was different.
+#[test]
+fn detect_call_loop_does_not_block_scanning_distinct_regions() {
+    let mut runner = make_runner(MockProvider::text_only(""), ToolRegistry::new(), auto_bypass());
+
+    // Five reads with offsets spaced well apart (>> READ_REGION_BUCKET).
+    let offsets = [1, 200, 400, 700, 1000];
+    for off in offsets {
+        let args = format!(r#"{{"file_path":"/p/render.rs","offset":{},"limit":50}}"#, off);
+        let verdict = runner.detect_call_loop("read_file", &args);
+        assert!(
+            verdict.is_none(),
+            "offset {} should not block — it's a new region\nGot: {:?}",
+            off,
+            verdict
+        );
+    }
+}
+
+/// Re-reading the SAME region 3 times MUST trip Pattern 1. Each call tweaks
+/// `limit` so the exact-args Pattern 2 guard does NOT fire first — this
+/// isolates Pattern 1's semantics ("same bucket, any args"). The realistic
+/// triggering pattern is the model cycling limit on an unreadable file
+/// trying to coax different output from the same slice.
+#[test]
+fn detect_call_loop_blocks_three_reads_of_same_region() {
+    let mut runner = make_runner(MockProvider::text_only(""), ToolRegistry::new(), auto_bypass());
+
+    // Same offset → same bucket, but varying limit so args_hash differs and
+    // Pattern 2 (identical-args) stays dormant.
+    for i in 1..=2 {
+        let args = format!(r#"{{"file_path":"/p/doc.docx","offset":1,"limit":{}}}"#, 40 + i * 10);
+        assert!(
+            runner.detect_call_loop("read_file", &args).is_none(),
+            "call #{} of same region should not block yet",
+            i
+        );
+    }
+    // 3rd read still in the same bucket → Pattern 1 fires.
+    let third = r#"{"file_path":"/p/doc.docx","offset":1,"limit":95}"#;
+    let blocked = runner.detect_call_loop("read_file", third);
+    let msg = blocked.expect("3rd call to same region must be blocked by Pattern 1");
+    assert!(
+        msg.contains("SAME region"),
+        "block message must mention 'SAME region' so the model understands why\nGot: {}",
+        msg
+    );
+    assert!(msg.contains("doc.docx"), "block message must name the file");
+}
+
+/// A successful edit on the same file clears every region's counter so
+/// post-edit verification reads aren't blocked even if some region was near
+/// the cap pre-edit.
+#[test]
+fn detect_call_loop_edit_resets_all_regions_for_file() {
+    let mut runner = make_runner(MockProvider::text_only(""), ToolRegistry::new(), auto_bypass());
+
+    // Two reads of the same bucket (one shy of the 3-call cap, varying limit
+    // so Pattern 2 stays dormant).
+    for i in 1..=2 {
+        let args = format!(r#"{{"file_path":"/p/x.rs","offset":1,"limit":{}}}"#, 30 + i * 10);
+        assert!(runner.detect_call_loop("read_file", &args).is_none());
+    }
+
+    // Edit on the same file → reset all region counts for x.rs.
+    let edit_args = r#"{"file_path":"/p/x.rs","old_string":"a","new_string":"b"}"#;
+    assert!(runner.detect_call_loop("edit_file", edit_args).is_none());
+
+    // The previously-hot bucket should now be freshly empty; 2 more reads
+    // stay unblocked post-edit (verifying the `retain` cleared the entry).
+    for i in 1..=2 {
+        let args = format!(r#"{{"file_path":"/p/x.rs","offset":1,"limit":{}}}"#, 100 + i * 10);
+        assert!(
+            runner.detect_call_loop("read_file", &args).is_none(),
+            "post-edit read #{} should not be blocked — edit reset the counter",
+            i
+        );
+    }
 }

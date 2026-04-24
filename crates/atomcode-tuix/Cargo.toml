@@ -16,3 +16,4 @@ dirs = "6"
 
 [dev-dependencies]
 tempfile = "3"
+vte = "0.15.0"

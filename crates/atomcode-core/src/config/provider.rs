@@ -24,6 +24,25 @@ pub struct ProviderConfig {
     /// If not set, defaults to context_window / 4.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<usize>,
+    /// Kimi K2.5 / K2.6 thinking control — emitted as `thinking.type`
+    /// in the request body. `"enabled"` | `"disabled"`. K2-thinking is
+    /// always on and ignores this. Unset = don't forward the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_type: Option<String>,
+    /// Kimi K2.6 Preserved Thinking — emitted as `thinking.keep` in the
+    /// request body. `"all"` to have the server reprocess historical
+    /// reasoning_content (more expensive). Unset = default behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_keep: Option<String>,
+    /// Override the history-echo policy for `reasoning_content` on
+    /// historical assistant tool_call messages. `"include"` = always echo
+    /// the stored reasoning back (required by Moonshot Kimi K2 thinking,
+    /// DeepSeek V4 thinking mode); `"exclude"` = never echo (required by
+    /// DeepSeek V3 R1, safe default for plain OpenAI). Unset = use the
+    /// built-in auto-detect heuristic based on model name / base_url.
+    /// Lets users work around new provider quirks without a code change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_history: Option<String>,
     /// If true, this provider was added at runtime (e.g. OAuth /login)
     /// and should NOT be persisted to config.toml on save.
     #[serde(skip)]

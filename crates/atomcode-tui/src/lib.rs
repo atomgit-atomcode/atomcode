@@ -196,6 +196,9 @@ fn build_oauth_provider() -> ProviderConfig {
         user_agent: None,
         context_window: 64000,
         max_tokens: None,
+        thinking_type: None,
+        thinking_keep: None,
+            reasoning_history: None,
         ephemeral: false,
     }
 }
@@ -212,6 +215,9 @@ fn build_wecom_provider(creds: &wecom_login::BrokerCreds) -> ProviderConfig {
         user_agent: None,
         context_window: 64000,
         max_tokens: None,
+        thinking_type: None,
+        thinking_keep: None,
+            reasoning_history: None,
         ephemeral: true,
     }
 }
@@ -473,9 +479,6 @@ fn run_oauth_login() -> anyhow::Result<AuthInfo> {
 
     // Save auth.toml (credentials only, not written to config.toml)
     let auth_path = atomcode_core::config::Config::config_dir().join("auth.toml");
-    if let Some(parent) = auth_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -497,7 +500,7 @@ fn run_oauth_login() -> anyhow::Result<AuthInfo> {
         auth_content.push_str(&format!("name = \"{}\"\n", name));
     }
 
-    match std::fs::write(&auth_path, &auth_content) {
+    match atomcode_core::auth::write_auth_file_secure(&auth_path, &auth_content) {
         Ok(_) => println!("  Auth saved to: {}\n", auth_path.display()),
         Err(e) => println!("  Warning: failed to save auth.toml: {}\n", e),
     }

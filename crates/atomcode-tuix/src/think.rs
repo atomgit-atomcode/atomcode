@@ -27,6 +27,17 @@ impl ThinkStripper {
         self.carry.len()
     }
 
+    /// Reset to the pristine state. Call between turns — otherwise an
+    /// unclosed `<think>` from a previous turn (model got cancelled, got
+    /// an error mid-stream, switched provider, etc.) leaves `inside=true`
+    /// and silently swallows every TextDelta of the next turn. Symptom:
+    /// user sees blank assistant bubbles even though the provider returned
+    /// normal text.
+    pub fn reset(&mut self) {
+        self.carry.clear();
+        self.inside = false;
+    }
+
     /// Feed a chunk, return the visible portion (outside of think blocks).
     pub fn feed(&mut self, delta: &str) -> String {
         // Enforce cap: if carry + delta would exceed THINK_BUF_MAX,
@@ -240,5 +251,55 @@ mod tests {
     fn multiple_blocks() {
         let mut s = ThinkStripper::new();
         assert_eq!(s.feed("a<think>x</think>b<think>y</think>c"), "abc");
+    }
+
+    /// Regression: an unclosed `<think>` from a previous turn would leave
+    /// `inside=true` and swallow the entire next turn's text. The real-world
+    /// trigger is a provider switch mid-turn (e.g. GLM → Kimi): GLM embeds
+    /// thinking as `<think>…</think>` in content, Kimi routes it through
+    /// `reasoning_content` (plain content with no `<think>` tag). If the
+    /// GLM turn cancels with an open tag and no one calls `reset()`, every
+    /// Kimi TextDelta afterward disappears — user sees blank assistant
+    /// bubbles while datalog shows the LLM actually returned text.
+    #[test]
+    fn reset_clears_stuck_inside_state() {
+        let mut s = ThinkStripper::new();
+        // Turn 1: opens a think block but never closes it (stream ended /
+        // got cancelled).
+        let _ = s.feed("prefix <think>still thinking when we got cut");
+        // Turn 2 from a different provider that doesn't use <think> tags.
+        // Without reset, this text gets swallowed.
+        assert_eq!(
+            s.feed("hello from the next model"),
+            "",
+            "without reset, text leaks through the stuck inside=true state",
+        );
+        // Apply the fix.
+        s.reset();
+        // Turn 3: now the stripper is pristine and plain text passes.
+        assert_eq!(s.feed("hello from the next model"), "hello from the next model");
+    }
+
+    #[test]
+    fn reset_from_pristine_state_is_a_noop() {
+        // Calling reset on a fresh stripper shouldn't break subsequent feeds.
+        let mut s = ThinkStripper::new();
+        s.reset();
+        assert_eq!(s.feed("plain text"), "plain text");
+    }
+
+    #[test]
+    fn reset_clears_partial_carry_at_feed_boundary() {
+        // A feed that ends mid-tag leaves bytes in `carry` awaiting the
+        // rest of the tag. Reset should flush that too so the next turn
+        // starts clean.
+        let mut s = ThinkStripper::new();
+        assert_eq!(s.feed("hello <thi"), "hello "); // carry now holds "<thi"
+        assert!(s.buffered_bytes() > 0);
+        s.reset();
+        assert_eq!(s.buffered_bytes(), 0);
+        // Without reset the next feed would try to complete the tag;
+        // with reset, "<think>" is treated as the start of a new block.
+        assert_eq!(s.feed("not a tag: <3"), "not a tag: <3");
     }
 }

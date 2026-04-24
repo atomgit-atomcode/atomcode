@@ -414,6 +414,9 @@ impl ProviderManager {
                             user_agent: None,
                             context_window: atomcode_core::config::provider::default_context_window_for(&self.new_type),
                             max_tokens: None,
+                            thinking_type: None,
+                            thinking_keep: None,
+            reasoning_history: None,
                             ephemeral: false,
                         };
                         return Some(ManagerAction::Add(self.new_name.clone(), provider));

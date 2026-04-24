@@ -634,3 +634,66 @@ async fn delta_multi_edit_on_broken_file_accepted() {
     assert!(after.contains("New Title"));
     cleanup(&path);
 }
+
+/// Regression for hermes 2026-04-22_20-41-00 session: `find_closest_match`
+/// used to return `Closest match near line 3` when line 3 was a blank
+/// line, because `first_line_trimmed.contains("")` is always true so every
+/// blank line in the file became a substring "candidate". The bogus
+/// closest-match pointed the agent's attention at the wrong section of
+/// the file (lines 1-16 dumped as recovery hint) and prevented any real
+/// recovery. Fixed by requiring both sides of the substring match to
+/// carry ≥ 4 chars of signal.
+#[tokio::test]
+async fn edit_404_does_not_point_at_blank_line_as_closest_match() {
+    // File has blank lines scattered throughout (typical Rust/Python/JS)
+    // plus a real target at the tail that the agent's (wrongly-cased)
+    // old_string won't match.
+    let content = "\
+use std::path::PathBuf;
+
+struct Foo {
+    bar: i32,
+}
+
+impl Foo {
+    fn new() -> Self {
+        Self { bar: 0 }
+    }
+}
+
+fn main() {
+    let app = builder()
+        .run(context!());
+}
+";
+    let path = create_test_file(content);
+    let ctx = test_context();
+    let tool = atomcode_core::tool::edit::EditFileTool;
+
+    // Miscased old_string — model "remembered" `.Run` but file has `.run`.
+    let args = serde_json::json!({
+        "file_path": path,
+        "old_string": "        .Run(context!());\n}",
+        "new_string": "        .run(context!());\n    extra();\n}"
+    });
+    let r: ToolResult = tool.execute(&args.to_string(), &ctx).await.unwrap();
+
+    assert!(!r.success);
+    // The bug: output contained "Closest match found near line 3" (a
+    // blank line). After fix, either no closest-match is reported, or if
+    // one is reported, it must NOT point at a blank line.
+    if let Some(idx) = r.output.find("Closest match found near line ") {
+        let tail = &r.output[idx + "Closest match found near line ".len()..];
+        let line_num_str: String = tail.chars().take_while(|c| c.is_ascii_digit()).collect();
+        let line_num: usize = line_num_str.parse().expect("line number in closest-match");
+        let file_lines: Vec<&str> = content.lines().collect();
+        let target = file_lines.get(line_num - 1).copied().unwrap_or("");
+        assert!(
+            !target.trim().is_empty(),
+            "closest-match must not point at a blank line (line {}). output:\n{}",
+            line_num,
+            r.output
+        );
+    }
+    cleanup(&path);
+}

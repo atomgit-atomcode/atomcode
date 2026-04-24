@@ -19,6 +19,7 @@ pub struct ClaudeProvider {
     client: Client,
     api_key: String,
     model: String,
+    base_url: String,
     max_tokens: usize,
 }
 
@@ -32,6 +33,10 @@ impl ClaudeProvider {
             client: super::build_http_client(config.user_agent.as_deref()),
             api_key,
             model: config.model.clone(),
+            base_url: config
+                .base_url
+                .clone()
+                .unwrap_or_else(|| "https://api.anthropic.com".to_string()),
             max_tokens: config.max_tokens.unwrap_or((config.context_window / 4).clamp(8_000, 16_384)),
         })
     }
@@ -64,7 +69,7 @@ impl ClaudeProvider {
                                 "content": [{"type": "text", "text": s}]
                             }));
                         }
-                        MessageContent::AssistantWithToolCalls { text, tool_calls } => {
+                        MessageContent::AssistantWithToolCalls { text, tool_calls, .. } => {
                             let mut parts: Vec<serde_json::Value> = Vec::new();
                             if let Some(t) = text {
                                 if !t.is_empty() {
@@ -227,20 +232,26 @@ impl LlmProvider for ClaudeProvider {
         let (system, msgs) = Self::format_messages(messages);
         let body = Self::build_request_body(&self.model, self.max_tokens, system, msgs, tools);
 
+        let url = normalize_claude_base_url(&self.base_url);
+        // Local Claude-compatible servers (e.g. oMLX) sometimes authenticate via
+        // the OpenAI-style `Authorization: Bearer` header instead of `x-api-key`.
+        // Anthropic's official endpoint ignores unknown headers, so sending both
+        // is safe and unblocks local deployments without a separate provider type.
         let request = self
             .client
-            .post("https://api.anthropic.com/v1/messages")
+            .post(&url)
             .header("x-api-key", &self.api_key)
+            .header("authorization", format!("Bearer {}", self.api_key))
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json")
             .json(&body);
 
-        let response_future = request.send();
+        let policy = crate::provider::retry::RetryPolicy::default_policy();
 
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
         tokio::spawn(async move {
-            let response = match response_future.await {
+            let response = match crate::provider::retry::send_with_retry(request, &policy).await {
                 Ok(resp) => resp,
                 Err(e) => {
                     let _ = tx.send(Ok(StreamEvent::Error(format!("Connection failed: {}", e))));
@@ -397,10 +408,66 @@ impl LlmProvider for ClaudeProvider {
     }
 }
 
+/// Normalize a user-provided base_url to always end with `/v1/messages`.
+///
+/// Handles the same three cases as the OpenAI equivalent:
+///   - Already complete: `http://host/v1/messages` → kept as-is
+///   - Has `/v1`: `http://host/v1` or `http://host/v1/` → `http://host/v1/messages`
+///   - Bare host: `http://host:8000` → `http://host:8000/v1/messages`
+///
+/// This lets local Claude-compatible servers (e.g. oMLX) work without forcing
+/// the user to type the full path in the config.
+fn normalize_claude_base_url(base: &str) -> String {
+    let base = base.trim_end_matches('/');
+    if base.ends_with("/v1/messages") {
+        base.to_string()
+    } else if base.ends_with("/v1") {
+        format!("{}/messages", base)
+    } else {
+        format!("{}/v1/messages", base)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn normalize_claude_base_url_bare_host() {
+        assert_eq!(
+            normalize_claude_base_url("http://127.0.0.1:8000"),
+            "http://127.0.0.1:8000/v1/messages"
+        );
+    }
+
+    #[test]
+    fn normalize_claude_base_url_v1_suffix() {
+        assert_eq!(
+            normalize_claude_base_url("http://127.0.0.1:8000/v1"),
+            "http://127.0.0.1:8000/v1/messages"
+        );
+        assert_eq!(
+            normalize_claude_base_url("http://127.0.0.1:8000/v1/"),
+            "http://127.0.0.1:8000/v1/messages"
+        );
+    }
+
+    #[test]
+    fn normalize_claude_base_url_full_path_preserved() {
+        assert_eq!(
+            normalize_claude_base_url("https://api.anthropic.com/v1/messages"),
+            "https://api.anthropic.com/v1/messages"
+        );
+    }
+
+    #[test]
+    fn normalize_claude_base_url_official_default() {
+        assert_eq!(
+            normalize_claude_base_url("https://api.anthropic.com"),
+            "https://api.anthropic.com/v1/messages"
+        );
+    }
 
     #[test]
     fn test_system_prompt_has_cache_control() {

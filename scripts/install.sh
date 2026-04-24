@@ -1,15 +1,16 @@
 #!/bin/sh
 # AtomCode installer — curl | sh
 #
-#   curl -fsSL https://atomgit.com/atomgit_atomcode/atomcode-release/raw/main/install.sh | sh
+#   curl -fsSL https://atomgit.com/atomgit_atomcode/atomcode/raw/main/install.sh | sh
 #
 # Env overrides:
-#   ATOMCODE_VERSION   release tag to install (default: v4.15.1)
-#   ATOMCODE_PREFIX    install dir (default: /usr/local/bin, falls back to ~/.local/bin)
+#   ATOMCODE_VERSION   release tag to install (default: v4.20.3)
+#   ATOMCODE_PREFIX    install dir (absolute path; default: /usr/local/bin if writable,
+#                        else ~/.local/bin). On HarmonyOS as non-root, default is ~/.local/bin.
 set -eu
 
-VERSION="${ATOMCODE_VERSION:-v4.18.1}"
-REPO_BASE="https://atomgit.com/atomgit_atomcode/atomcode-release/releases/download"
+VERSION="${ATOMCODE_VERSION:-v4.20.3}"
+REPO_BASE="https://atomgit.com/atomgit_atomcode/atomcode/releases/download"
 
 # --- detect platform ---
 uname_s=$(uname -s)
@@ -18,6 +19,7 @@ uname_m=$(uname -m)
 case "$uname_s" in
     Darwin) os="darwin" ;;
     Linux)  os="linux"  ;;
+    HarmonyOS) os="ohos" ;;
     *) echo "Unsupported OS: $uname_s (Windows users: download the zip from the release page)"; exit 1 ;;
 esac
 
@@ -39,6 +41,8 @@ URL="${REPO_BASE}/${VERSION}/${BIN_NAME}"
 # --- pick install dir ---
 if [ -n "${ATOMCODE_PREFIX:-}" ]; then
     PREFIX="$ATOMCODE_PREFIX"
+elif [ "$os" = "ohos" ]; then
+    PREFIX="$HOME/.local/bin"
 elif [ -w /usr/local/bin ] 2>/dev/null; then
     PREFIX="/usr/local/bin"
 elif [ "$(id -u)" -eq 0 ]; then

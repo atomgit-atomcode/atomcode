@@ -22,9 +22,23 @@ serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 dirs = "6"
 
+# setsid() for the detached upgrade-prep subprocess. Unix-only — Windows
+# uses DETACHED_PROCESS creation flags instead (see main.rs).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 # Windows-only: default HeapAlloc is 3-5x slower than Linux glibc for the
 # small-string/Line-clone heavy render loop. mimalloc cuts per-frame alloc
 # cost enough to make typing feel smooth again on Windows Terminal / ConHost.
 [target.'cfg(target_os = "windows")'.dependencies]
 mimalloc = { version = "0.1", default-features = false }
 windows-sys = { version = "0.61", features = ["Win32_System_Console", "Win32_Globalization"] }
+
+# Build-dep for embedding the app icon into atomcode.exe resource section.
+# Gated at runtime in build.rs via CARGO_CFG_TARGET_OS so it only fires
+# when the *target* is Windows — cross-compile from macOS is the primary
+# case. Needs `*-w64-mingw32-windres` on PATH (already required by the
+# existing mingw-w64 cross-compile toolchain). The crate is tiny and pure
+# Rust, so pulling it in unconditionally on the host side costs ~nothing.
+[build-dependencies]
+winresource = "0.1"

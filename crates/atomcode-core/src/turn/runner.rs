@@ -30,9 +30,47 @@ pub struct TurnRunner {
     pub tools: std::sync::Arc<ToolRegistry>,
     pub context: ToolContext,
     pub config: Config,
+    /// Context construction strategy. Shared with the parent
+    /// `AgentLoop::ctx` (same `Arc`) so the turn's actual send and
+    /// the agent's datalog snapshot go through one ctx — per-model
+    /// logic like `apply_model_directives` lands on both paths.
+    /// Rebuilt on `AgentCommand::ReloadConfig` alongside the agent's
+    /// clone.
+    pub ctx: std::sync::Arc<dyn crate::ctx::CtxBuilder>,
     pub permission: Box<dyn PermissionDecider>,
     /// Files edited during the current session (tracked for context awareness).
     pub recently_edited_files: Vec<String>,
+    /// Rolling history of `(tool_name, args_hash)` pairs — used to detect tool
+    /// call loops (same tool + same args repeated without any edit in between).
+    /// Bounded to 20 entries to keep memory flat. For `read_file` the hash
+    /// covers `(file_path, offset, limit)` so paginating through distinct
+    /// regions is not treated as a repeat; see `loop_args_hash`.
+    pub recent_calls: Vec<(String, u64)>,
+    /// Per-region read counter, keyed by `(basename, offset / READ_REGION_BUCKET)`.
+    /// The region bucket means "scanning different parts of a large file" counts
+    /// as separate keys — only reading the *same* region 3+ times in a turn is
+    /// treated as a panic loop (typical of Office binaries, encoding mismatches,
+    /// or the model cycling offset/limit on an unreadable file).
+    pub file_read_counts: std::collections::HashMap<(String, u64), u32>,
+}
+
+/// Line-granularity of the read-region bucket used in `file_read_counts`.
+/// A single function body typically fits in one bucket (most are < 50 lines),
+/// so reading different functions of a large file produces different keys
+/// and doesn't cap. Shared so `DisciplineState` and the agent loop write
+/// counts under the same key the guard will read back.
+pub(crate) const READ_REGION_BUCKET: u64 = 50;
+
+/// Extract the region-bucket key for a `read_file` call so that writers
+/// (agent loop, discipline) and readers (loop guard) agree on the key shape.
+/// `short` is the file basename (not full path). Missing / malformed offset
+/// → bucket 0 (which is also the bucket for "whole-file" reads).
+pub(crate) fn read_region_key(short: &str, args: &str) -> (String, u64) {
+    let offset = serde_json::from_str::<serde_json::Value>(args)
+        .ok()
+        .and_then(|v| v.get("offset").and_then(|x| x.as_u64()))
+        .unwrap_or(0);
+    (short.to_string(), offset / READ_REGION_BUCKET)
 }
 
 impl TurnRunner {
@@ -60,31 +98,15 @@ impl TurnRunner {
         cancel: CancellationToken,
         allowed_tools: Option<&[&str]>,
     ) -> TurnResult {
-        // 1. Build messages within token budget
-        let context_window = self
-            .config
-            .providers
-            .get(&self.config.default_provider)
-            .map(|p| p.context_window)
-            .unwrap_or(128000);
+        // 1. Build messages within token budget.
+        // Goes through `self.ctx.build_messages` (trait dispatch), NOT
+        // `ctx::render::build_messages` (free fn) — otherwise per-model
+        // logic like `apply_model_directives` only lands in datalog and
+        // the actually-sent messages diverge from what we logged.
+        let context_window = self.ctx.ctx_window();
 
-        let (mut messages, ctx_stats) =
-            conversation.to_provider_messages_budgeted(system_prompt, context_window);
-
-        // Inject turn reminder into the last user message.
-        // This keeps system prompt stable (cacheable) while providing
-        // per-turn dynamic context (previous session, current task, etc.).
-        if !turn_reminder.is_empty() {
-            // Find the last User message and prepend the reminder
-            for msg in messages.iter_mut().rev() {
-                if matches!(msg.role, crate::conversation::message::Role::User) {
-                    if let crate::conversation::message::MessageContent::Text(ref mut text) = msg.content {
-                        *text = format!("{}\n{}", turn_reminder, text);
-                        break;
-                    }
-                }
-            }
-        }
+        let (messages, ctx_stats) =
+            self.ctx.build_messages(conversation, system_prompt, turn_reminder);
 
         let actual_tokens: usize = messages.iter().map(|m| m.estimate_tokens()).sum();
 
@@ -151,6 +173,26 @@ impl TurnRunner {
                 }
             }
         }
+
+        // Log the request to <working_dir>/datalog/llm/<ts>.json right
+        // before send. `pending_request_log` holds the path so the
+        // response call below can merge into the same file — passed
+        // explicitly to avoid the old process-wide-static approach that
+        // bled across concurrent daemon sessions.
+        let pending_request_log = {
+            let wd = self.context.working_dir
+                .try_read().map(|g| g.clone()).unwrap_or_default();
+            super::log::log_llm_request(
+                &wd,
+                &messages,
+                &tool_defs,
+                self.provider.model_name(),
+                context_window,
+                0, // step — always 0 in calls.log today; step param
+                   // kept for future per-tool-call correlation.
+                self.config.datalog.enabled,
+            )
+        };
 
         // 3. Start streaming
         let stream_start = std::time::Instant::now();
@@ -338,9 +380,24 @@ _ = cancel.cancelled() => {
                                 });
                             }
 
-                            // Finalize conversation state
+                            // Finalize conversation state. Pass the accumulated
+                            // reasoning_buf so thinking-model providers (Moonshot
+                            // Kimi K2-thinking/K2.6, etc.) can echo it back on
+                            // the next request — without this the provider 400s
+                            // with "reasoning_content is missing in assistant
+                            // tool call message". The send-side ReasoningPolicy
+                            // (per-provider) decides whether the field actually
+                            // reaches the wire.
                             if !tool_calls_buf.is_empty() {
-                                conversation.finalize_stream_with_tool_calls(&tool_calls_buf);
+                                let reasoning = if reasoning_buf.trim().is_empty() {
+                                    None
+                                } else {
+                                    Some(reasoning_buf.as_str())
+                                };
+                                conversation.finalize_stream_with_tool_calls(
+                                    &tool_calls_buf,
+                                    reasoning,
+                                );
                             } else {
                                 conversation.finalize_stream();
                             }
@@ -374,13 +431,21 @@ _ = cancel.cancelled() => {
             .try_read().map(|g| g.clone()).unwrap_or_default();
         super::log::log_llm_response(
             &wd,
+            pending_request_log,
             &text_buf,
             &tool_calls_buf,
+            &reasoning_buf,
             self.provider.model_name(),
             0, // step is set by caller
             response_duration,
             self.config.datalog.enabled,
         );
+
+        if tool_calls_buf.is_empty() && text_buf.trim().is_empty() {
+            return TurnResult::Failed(
+                "Provider returned an empty response (no text, no tool calls).".to_string(),
+            );
+        }
 
         // 5. If no tool calls, we're done — LLM produced text only
         if tool_calls_buf.is_empty() {
@@ -482,7 +547,7 @@ _ = cancel.cancelled() => {
                 });
                 conversation.add_tool_result(result);
             } else {
-                let result = self.execute_single_tool(call, event_tx).await;
+                let result = self.execute_single_tool(call, event_tx, &cancel).await;
 
                 // Track files edited for read interception (batch + cross-turn)
                 // Use full file path as key to avoid basename collisions
@@ -504,6 +569,21 @@ _ = cancel.cancelled() => {
                 conversation.add_tool_result(result);
             }
         }
+
+        // Truncate oversized tool outputs before returning. Without this,
+        // a single `ls -la node_modules` / wide `find` dump (multi-MB)
+        // stays raw in `conversation.messages` and the NEXT LLM call
+        // blows the upstream context limit. Every caller of TurnRunner
+        // used to have to remember to invoke this — daemon didn't, which
+        // was the root of the 738K-token 400 bug. Making runner own it
+        // removes the implicit contract.
+        crate::ctx::truncate::post_process_tool_results(
+            &mut conversation.messages,
+            tool_count,
+            "", // fallback only — each result is keyed by its own
+                // call_id → ATC.tool_name lookup (see ctx::truncate).
+            context_window,
+        );
 
         TurnResult::UsedTools {
             text: if text_buf.is_empty() {
@@ -567,10 +647,16 @@ _ = cancel.cancelled() => {
     }
 
     /// Execute a single tool call with permission checking.
+    ///
+    /// `cancel` is polled while the tool future runs so Ctrl+C interrupts
+    /// mid-execution — without this, long-running tools (deep `glob`, slow
+    /// `grep`, network calls) complete before the turn-level cancel check
+    /// runs on the next iteration, and the user sees an unresponsive UI.
     async fn execute_single_tool(
-        &self,
+        &mut self,
         call: &ToolCall,
         event_tx: &mpsc::UnboundedSender<TurnEvent>,
+        cancel: &CancellationToken,
     ) -> ToolResult {
         // Auto-fix common tool name aliases (models trained on other agents use different names)
         // Case-insensitive matching: models may output "Run", "Bash", "Edit_File", etc.
@@ -599,7 +685,9 @@ _ = cancel.cancelled() => {
         } else {
             corrected_name
         };
-        let tool = match self.tools.get(corrected_name) {
+        // Clone the Arc so the borrow of `self.tools` ends here — we need to
+        // call `self.detect_call_loop(..)` mutably below.
+        let tool = match self.tools.get_arc(corrected_name) {
             Some(t) => t,
             None => {
                 let available: String = self.tools.iter()
@@ -630,22 +718,52 @@ _ = cancel.cancelled() => {
             }
         };
 
-        // Use corrected name for all subsequent checks
-        let call = if corrected_name != call.name.as_str() {
-            &ToolCall {
+        // Repair malformed JSON args before approval and execution.
+        // Providers sometimes emit truncated / unescaped / fenced JSON (especially
+        // on max_tokens cutoff mid-arguments). Running the repair chain here means
+        // tool implementations see valid JSON whenever we can salvage anything,
+        // and surface deterministic errors when we can't.
+        let repaired_args = super::json_repair::repair_tool_args(corrected_name, &call.arguments);
+
+        // Use corrected name and repaired args for all subsequent checks
+        let owned_call;
+        let call = if corrected_name != call.name.as_str() || repaired_args != call.arguments {
+            owned_call = ToolCall {
                 id: call.id.clone(),
                 name: corrected_name.to_string(),
-                arguments: call.arguments.clone(),
-            }
+                arguments: repaired_args,
+            };
+            &owned_call
         } else {
             call
         };
 
+        // Loop detection: block before we even ask for approval. Without this,
+        // models that get stuck (e.g. re-reading a binary Office file with
+        // different offset/limit values) can burn 30+ turns on the same call.
+        // Returns a user-facing message when blocked; the tool never runs.
+        if let Some(msg) = self.detect_call_loop(&call.name, &call.arguments) {
+            let _ = event_tx.send(TurnEvent::ToolCallResult {
+                call_id: call.id.clone(),
+                name: call.name.clone(),
+                output: msg.clone(),
+                success: false,
+                duration: std::time::Duration::ZERO,
+            });
+            return ToolResult {
+                call_id: call.id.clone(),
+                output: msg,
+                success: false,
+            };
+        }
+
         // Check permission via the injected PermissionDecider.
         // AutoApprove tools execute immediately; RequireApproval tools go through
         // the decider which handles interactive prompts or automatic policy.
-        let approval = tool.approval(&call.arguments);
-        if let crate::tool::ApprovalRequirement::RequireApproval(ref reason) = approval {
+        let approval = tool.approval_with_context(&call.arguments, &self.context);
+        if let crate::tool::ApprovalRequirement::RequireApproval(ref reason)
+            | crate::tool::ApprovalRequirement::RequireApprovalAlways(ref reason) = approval
+        {
             let decision = self.permission.decide(call, reason).await;
             if !matches!(decision, PermissionDecision::Allow) {
                 let output = format!("Tool '{}' was denied by the user.", call.name);
@@ -664,10 +782,49 @@ _ = cancel.cancelled() => {
             }
         }
 
-        // Execute the tool
+        // Snapshot the shared working directory before executing. Tools like
+        // `change_dir` and `bash` (when the command starts with `cd`) mutate
+        // `ctx.working_dir` in place; we compare before/after to emit a
+        // `WorkingDirChanged` event so the TUI footer can track the cwd
+        // without polling the `Arc<RwLock<PathBuf>>` every frame.
+        let wd_before = self.context.working_dir.read().await.clone();
+
+        // Execute the tool. Race against `cancel` so Ctrl+C aborts a
+        // long-running tool future instead of waiting for it to finish.
+        // Dropping the tool future is safe for read-only tools (glob /
+        // grep / read_file); mutating tools (write_file / edit_file /
+        // bash) finish fast enough that interrupting them mid-execution
+        // is acceptable — user pressed Ctrl+C knowing they want to stop.
         let start = Instant::now();
-        let result = tool.execute(&call.arguments, &self.context).await;
+        let result = tokio::select! {
+            r = tool.execute(&call.arguments, &self.context) => r,
+            _ = cancel.cancelled() => {
+                let duration = start.elapsed();
+                let output = "[Cancelled by user]".to_string();
+                let _ = event_tx.send(TurnEvent::ToolCallResult {
+                    call_id: call.id.clone(),
+                    name: call.name.clone(),
+                    output: output.clone(),
+                    success: false,
+                    duration,
+                });
+                return ToolResult {
+                    call_id: call.id.clone(),
+                    output,
+                    success: false,
+                };
+            }
+        };
         let duration = start.elapsed();
+
+        // If the tool mutated the shared working directory, surface it as
+        // a TurnEvent so the TUI layer can keep its footer in sync. Emit
+        // before ToolCallResult so consumers that redraw on result see
+        // the new cwd in the same frame.
+        let wd_after = self.context.working_dir.read().await.clone();
+        if wd_after != wd_before {
+            let _ = event_tx.send(TurnEvent::WorkingDirChanged(wd_after));
+        }
 
         let tool_result = match result {
             Ok(mut r) => {
@@ -691,6 +848,138 @@ _ = cancel.cancelled() => {
 
         tool_result
     }
+
+    /// Detect tool-call loops and return a recovery message when one should be
+    /// blocked. Also updates the rolling call history as a side effect.
+    ///
+    /// Two patterns are caught:
+    ///
+    /// 1. **Per-region read saturation** (`read_file` specific):
+    ///    3 unbroken `read_file` calls against the *same region* of a file
+    ///    (basename + offset bucket). Paginating through distinct regions of
+    ///    a large file produces different keys and does NOT trip — this
+    ///    specifically targets the panic loop where the model re-reads the
+    ///    same slice hoping for different content (Office binary, encoding
+    ///    mismatch, etc.). Reset by a successful `edit_file` / `write_file`
+    ///    targeting the same file (clears ALL regions for that file).
+    ///
+    /// 2. **Exact repeats** (any tool): 3 calls with identical `(tool_name,
+    ///    args_hash)` and no intervening `edit_file` / `write_file`. Means
+    ///    the model re-issued the same command without reacting to the
+    ///    previous failure.
+    ///
+    /// For `read_file`, the hash covers `(file_path, offset, limit)` so that
+    /// paginating through distinct regions of a large file does NOT count as
+    /// a loop — only literal re-reads do.
+    pub(super) fn detect_call_loop(&mut self, tool_name: &str, args: &str) -> Option<String> {
+        // --- Pattern 1: per-region read saturation ----------------------------
+        if tool_name == "read_file" {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(args) {
+                if let Some(fp) = v.get("file_path").and_then(|v| v.as_str()) {
+                    let short = std::path::Path::new(fp)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| fp.to_string());
+                    let key = read_region_key(&short, args);
+                    let count = self.file_read_counts.entry(key).or_insert(0);
+                    *count += 1;
+                    if *count >= 3 {
+                        return Some(format!(
+                            "BLOCKED: read_file '{}' hit its {}-call cap for the SAME region of this file. \
+                             You keep requesting the same slice and getting the same output. \
+                             If you need more of this file, pass a different offset to jump elsewhere. \
+                             If you're stuck because the file is unreadable (Office binary, PDF, \
+                             encoding mismatch), switch to a bash converter \
+                             (pandoc / pdftotext / antiword / unzip for .docx) or tell the user \
+                             the format isn't supported. \
+                             Do not re-read this region again in this turn.",
+                            short, count
+                        ));
+                    }
+                }
+            }
+        }
+
+        // A successful edit on a file clears ALL of that file's region counts,
+        // so post-edit verification reads (potentially covering different parts)
+        // aren't blocked. `edit_file` / `write_file` also clear the global
+        // recent-repeat list further down.
+        if matches!(tool_name, "edit_file" | "write_file" | "create_file") {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(args) {
+                if let Some(fp) = v.get("file_path").and_then(|v| v.as_str()) {
+                    let short = std::path::Path::new(fp)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| fp.to_string());
+                    self.file_read_counts.retain(|(file, _), _| file != &short);
+                }
+            }
+        }
+
+        // --- Pattern 2: exact-repeat across any tool --------------------------
+        let args_hash = loop_args_hash(tool_name, args);
+        let sig = (tool_name.to_string(), args_hash);
+
+        // Count repeats of this exact signature *since the last edit*. An edit
+        // breaks the streak — re-issuing the same read/grep after fixing the
+        // file is legitimate and must not be blocked.
+        let mut repeats = 1usize; // including the current call
+        for prev in self.recent_calls.iter().rev() {
+            if matches!(prev.0.as_str(), "edit_file" | "write_file" | "create_file") {
+                break;
+            }
+            if *prev == sig {
+                repeats += 1;
+            }
+        }
+
+        self.recent_calls.push(sig);
+        if self.recent_calls.len() > 20 {
+            self.recent_calls.remove(0);
+        }
+
+        if repeats >= 3 {
+            return Some(format!(
+                "BLOCKED: {} was called with identical arguments {} times in a row \
+                 without any intervening edit. This is a loop. Read the previous error \
+                 message — it explains why the call is failing. Fix the underlying \
+                 problem (wrong path, wrong format, missing dependency) before retrying, \
+                 or tell the user the step can't proceed.",
+                tool_name, repeats
+            ));
+        }
+        None
+    }
+}
+
+/// Hash a tool call for exact-repeat loop detection.
+///
+/// For `read_file` we hash `(file_path, offset, limit)` — paginating through
+/// different regions of the same large file must NOT collapse to one hash
+/// (that was the historical behavior and it tripped the 3-repeat guard on
+/// legitimate scans). Missing `offset` / `limit` normalize to 0 so the hash
+/// is stable whether the model omits the field or sends it as `null`.
+///
+/// For every other tool we hash the whole `args` string.
+fn loop_args_hash(tool_name: &str, args: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    if tool_name == "read_file" {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(args) {
+            if let Some(fp) = v.get("file_path").and_then(|v| v.as_str()) {
+                fp.hash(&mut h);
+                v.get("offset").and_then(|x| x.as_u64()).unwrap_or(0).hash(&mut h);
+                v.get("limit").and_then(|x| x.as_u64()).unwrap_or(0).hash(&mut h);
+                return h.finish();
+            }
+        }
+        // Malformed args or missing file_path — hash raw so identical bad
+        // calls still collapse and trip the loop detector.
+        args.hash(&mut h);
+    } else {
+        args.hash(&mut h);
+    }
+    h.finish()
 }
 
 /// Strip model-internal reasoning tags from streaming output.
@@ -869,4 +1158,110 @@ fn merge_edit_calls(calls: &mut Vec<ToolCall>) -> Vec<String> {
     }
 
     removed_ids
+}
+
+#[cfg(test)]
+mod loop_hash_tests {
+    use super::{loop_args_hash, read_region_key, READ_REGION_BUCKET};
+
+    // Using a separate module name to avoid conflicting with the sibling
+    // `turn::tests` integration-style test module.
+
+    #[test]
+    fn read_file_hash_distinguishes_different_windows() {
+        // The core fix: hashing must make paginated reads appear as distinct
+        // calls, otherwise the 3-repeat guard fires on legitimate scans of a
+        // single large file. If this test fails, the model is about to be
+        // blocked after 3 offsets.
+        let a = loop_args_hash("read_file", r#"{"file_path":"/a.rs","offset":1,"limit":60}"#);
+        let b = loop_args_hash("read_file", r#"{"file_path":"/a.rs","offset":100,"limit":60}"#);
+        assert_ne!(a, b, "offsets 1 vs 100 must hash differently");
+
+        let c = loop_args_hash("read_file", r#"{"file_path":"/a.rs","offset":1,"limit":60}"#);
+        let d = loop_args_hash("read_file", r#"{"file_path":"/a.rs","offset":1,"limit":120}"#);
+        assert_ne!(c, d, "limit 60 vs 120 must hash differently");
+
+        let e = loop_args_hash("read_file", r#"{"file_path":"/a.rs","offset":1,"limit":60}"#);
+        let f = loop_args_hash("read_file", r#"{"file_path":"/a.rs","offset":1,"limit":60}"#);
+        assert_eq!(e, f, "identical args must hash identically");
+
+        let g = loop_args_hash("read_file", r#"{"file_path":"/a.rs","offset":1,"limit":60}"#);
+        let h = loop_args_hash("read_file", r#"{"file_path":"/b.rs","offset":1,"limit":60}"#);
+        assert_ne!(g, h, "different files must hash differently");
+    }
+
+    #[test]
+    fn missing_offset_and_limit_normalize_to_zero() {
+        // `{path}` and `{path, offset:0, limit:0}` must hash the same — otherwise
+        // the model can evade the loop guard just by toggling the field's presence.
+        let bare = loop_args_hash("read_file", r#"{"file_path":"/a.rs"}"#);
+        let zeros = loop_args_hash(
+            "read_file",
+            r#"{"file_path":"/a.rs","offset":0,"limit":0}"#,
+        );
+        assert_eq!(bare, zeros);
+    }
+
+    #[test]
+    fn other_tools_hash_full_args() {
+        // Non-read tools keep full-args hashing so changing any field (path,
+        // pattern, command) is correctly treated as a different call.
+        let a = loop_args_hash("grep", r#"{"pattern":"foo","path":"/x"}"#);
+        let b = loop_args_hash("grep", r#"{"pattern":"foo","path":"/y"}"#);
+        assert_ne!(a, b);
+
+        let s1 = loop_args_hash("bash", r#"{"command":"ls"}"#);
+        let s2 = loop_args_hash("bash", r#"{"command":"ls"}"#);
+        assert_eq!(s1, s2);
+    }
+
+    #[test]
+    fn region_key_buckets_are_per_file() {
+        // Same file, same bucket regardless of how offset rounds down.
+        let a = read_region_key("render.rs", r#"{"file_path":"/x/render.rs","offset":100,"limit":50}"#);
+        let b = read_region_key("render.rs", r#"{"file_path":"/x/render.rs","offset":130,"limit":50}"#);
+        assert_eq!(a, b, "offsets 100 and 130 both land in bucket {}", 100 / READ_REGION_BUCKET);
+
+        // Jump by one full bucket → different key.
+        let far = read_region_key(
+            "render.rs",
+            &format!(r#"{{"file_path":"/x/render.rs","offset":{},"limit":50}}"#, READ_REGION_BUCKET + 200),
+        );
+        assert_ne!(a, far, "offsets across bucket boundaries must differ");
+
+        // Whole-file read and `offset=0` both normalize to bucket 0.
+        let full = read_region_key("render.rs", r#"{"file_path":"/x/render.rs"}"#);
+        let zero = read_region_key("render.rs", r#"{"file_path":"/x/render.rs","offset":0}"#);
+        assert_eq!(full, zero);
+        assert_eq!(full.1, 0);
+
+        // Different files are different keys even at the same offset bucket.
+        let other = read_region_key("mod.rs", r#"{"file_path":"/x/mod.rs","offset":100}"#);
+        assert_ne!(a, other);
+    }
+
+    #[test]
+    fn region_key_handles_malformed_args() {
+        // Garbage in → bucket 0 (same as no-offset), so at worst we over-count
+        // a single bucket and the model gets a helpful block message instead
+        // of a mis-routed one.
+        let bad = read_region_key("x.rs", "not json");
+        assert_eq!(bad, ("x.rs".to_string(), 0));
+    }
+
+    #[test]
+    fn malformed_read_args_fall_back_to_raw_hash() {
+        // If args aren't valid JSON or lack file_path, still produce a stable
+        // hash from the raw string so the loop detector at least collapses
+        // exact duplicate bad calls.
+        let a = loop_args_hash("read_file", "not json at all");
+        let b = loop_args_hash("read_file", "not json at all");
+        assert_eq!(a, b);
+
+        let c = loop_args_hash("read_file", r#"{"no_file_path":"oops"}"#);
+        let d = loop_args_hash("read_file", r#"{"no_file_path":"oops"}"#);
+        assert_eq!(c, d);
+
+        assert_ne!(a, c, "different malformed inputs still differ");
+    }
 }

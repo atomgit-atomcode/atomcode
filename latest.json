@@ -1,0 +1,11 @@
+{
+  "version": "v4.20.3",
+  "released_at": "2026-04-24T07:38:24Z",
+  "binaries": {
+    "darwin-arm64": { "sha256": "a2768d3d9fe7788c7b08a06b578658a4ad7b434f5268e2f6f54c5c99a8dfe187", "size": 14659120 },
+    "darwin-x64": { "sha256": "849dfc904fad84cbed859234511de1c303c44bc654c17d54cf05ecd15a3f0be9", "size": 15806592 },
+    "linux-x64": { "sha256": "bdb6fa2c7d2d8a6d26c624d9e49595b5622fbb4bc0a05fb5f3ca59378ec5bb2d", "size": 17138688 },
+    "linux-arm64": { "sha256": "687c9f3979fdf63a4b988515f5f8497e0417a412c8a1532cc38cb52492f1e209", "size": 15560936 },
+    "windows-x64": { "sha256": "77080de19034594c4f9e6f8d5f0f6b296bf0ec32cbb8057dfdaeefcfff5f0f71", "size": 16278528 }
+  }
+}

@@ -91,16 +91,70 @@ impl Tool for WriteFileTool {
         ApprovalRequirement::AutoApprove
     }
 
+    fn approval_with_context(&self, args: &str, ctx: &ToolContext) -> ApprovalRequirement {
+        let base = self.approval(args);
+        let parsed = match serde_json::from_str::<WriteFileArgs>(args) {
+            Ok(parsed) => parsed,
+            Err(_) => return base,
+        };
+        let working_dir = match ctx.working_dir.try_read() {
+            Ok(wd) => wd.clone(),
+            Err(_) => return base,
+        };
+        match super::approval_for_path(&parsed.file_path, &working_dir, super::ExternalPathAction::Write) {
+            Ok(ApprovalRequirement::RequireApprovalAlways(reason)) => ApprovalRequirement::RequireApprovalAlways(reason),
+            Ok(ApprovalRequirement::RequireApproval(reason)) => ApprovalRequirement::RequireApproval(reason),
+            Ok(ApprovalRequirement::AutoApprove) => match base {
+                ApprovalRequirement::RequireApproval(reason) => ApprovalRequirement::RequireApprovalAlways(reason),
+                other => other,
+            },
+            Err(_) => base,
+        }
+    }
+
     async fn execute(&self, args: &str, ctx: &ToolContext) -> Result<ToolResult> {
-        let parsed: WriteFileArgs = serde_json::from_str(args)?;
-        let path = std::path::Path::new(&parsed.file_path);
+        // Parse args defensively. Providers occasionally emit empty ({}) or
+        // truncated tool-call arguments on max_tokens cutoff; surfacing the raw
+        // serde error ("missing field `file_path` at line 1 column 2") tells
+        // the model nothing actionable. Return a success=false result with a
+        // recovery hint instead, so the next turn can re-issue the call properly.
+        let parsed: WriteFileArgs = match serde_json::from_str(args) {
+            Ok(p) => p,
+            Err(e) => {
+                let hint = if args.trim().is_empty() || args.trim() == "{}" {
+                    "tool call arrived with no arguments — likely truncated by max_tokens. \
+                     Re-issue write_file with both `file_path` (absolute) and `content`, \
+                     or switch to edit_file for targeted changes."
+                } else {
+                    "could not parse write_file arguments. Re-issue with a valid JSON object \
+                     containing `file_path` (absolute) and `content`. For large files, \
+                     prefer edit_file to avoid hitting the output token limit."
+                };
+                return Ok(ToolResult {
+                    call_id: String::new(),
+                    output: format!("Error: {}. {}", e, hint),
+                    success: false,
+                });
+            }
+        };
+        let working_dir = ctx.working_dir.read().await.clone();
+        let path = match super::inspect_path_access(&parsed.file_path, &working_dir) {
+            Ok(access) => access.path,
+            Err(err) => {
+                return Ok(ToolResult {
+                    call_id: String::new(),
+                    output: err.to_string(),
+                    success: false,
+                });
+            }
+        };
 
         // Backup before write (git checkpoint + file-level backup)
-        ctx.file_history.lock().await.backup_before_write(&parsed.file_path).await;
+        ctx.file_history.lock().await.backup_before_write(&path.to_string_lossy()).await;
 
         // Check if overwriting existing file — build appropriate output message
         let overwrite_info = if path.exists() {
-            let old_lines = std::fs::read_to_string(path)
+            let old_lines = std::fs::read_to_string(&path)
                 .map(|c| c.lines().count())
                 .unwrap_or(0);
             Some(old_lines)
@@ -114,14 +168,14 @@ impl Tool for WriteFileTool {
 
         let new_lines = parsed.content.lines().count();
         let bytes = parsed.content.len();
-        tokio::fs::write(&parsed.file_path, &parsed.content).await?;
+        tokio::fs::write(&path, &parsed.content).await?;
 
         let output = if let Some(old_lines) = overwrite_info {
             let diff = new_lines as i64 - old_lines as i64;
             let sign = if diff >= 0 { "+" } else { "" };
             let mut msg = format!(
                 "Overwrote {} (was {} lines, now {} lines, {}{})",
-                parsed.file_path, old_lines, new_lines, sign, diff
+                path.display(), old_lines, new_lines, sign, diff
             );
             // Warn if significant content reduction (might have lost code)
             if old_lines > 20 && new_lines < old_lines / 2 {
@@ -132,7 +186,7 @@ impl Tool for WriteFileTool {
             }
             msg
         } else {
-            format!("Created new file {} ({} bytes, {} lines)", parsed.file_path, bytes, new_lines)
+            format!("Created new file {} ({} bytes, {} lines)", path.display(), bytes, new_lines)
         };
 
         Ok(ToolResult {

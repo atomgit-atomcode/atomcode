@@ -19,12 +19,18 @@ use crate::event_loop::{Buffer, LoopCtx};
 use crate::render::Renderer;
 use crate::state::UiState;
 
+pub mod dir_picker;
+pub mod issue_wizard;
 pub mod model_picker;
 pub mod provider_wizard;
 pub mod session_picker;
+pub mod welcome_wizard;
+pub use dir_picker::DirPicker;
+pub use issue_wizard::IssueWizard;
 pub use model_picker::ModelPicker;
 pub use provider_wizard::ProviderWizard;
 pub use session_picker::SessionPicker;
+pub use welcome_wizard::WelcomeWizard;
 
 /// Result of a modal consuming one key event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,4 +72,22 @@ pub trait Modal: Send {
         ctx: &LoopCtx,
         renderer: &mut dyn Renderer,
     );
+
+    /// Handle a bracketed-paste payload while the modal is active.
+    /// Default: append the text to `buf` (so text-input wizard steps
+    /// naturally accept URL / API-key paste) and redraw. Modals that
+    /// only present pickers (no text input) can leave the default —
+    /// buf updates are harmless when the modal isn't displaying it.
+    fn handle_paste(
+        &mut self,
+        text: &str,
+        buf: &mut Buffer,
+        state: &mut UiState,
+        ctx: &mut LoopCtx,
+        renderer: &mut dyn Renderer,
+    ) -> Result<ModalAction> {
+        buf.insert_paste(text.to_string());
+        self.draw(buf, state, ctx, renderer);
+        Ok(ModalAction::Continue)
+    }
 }
