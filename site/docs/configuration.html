@@ -5,8 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>配置文件 · AtomCode 文档</title>
   <link rel="icon" type="image/png" href="https://cdn-static.gitcode.host/static/images/logo-favicon.png">
-  <script src="https://cdn.tailwindcss.com"></script>
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../dist.css">
   <link rel="stylesheet" href="./docs.css">
   <script>(function(){var t=localStorage.getItem('atomcode-theme')||'dark';document.documentElement.setAttribute('data-theme',t);})();</script>
 </head>
@@ -14,7 +13,7 @@
   <nav class="docs-nav fixed top-0 w-full z-50 border-b border-white/5">
     <div class="max-w-7xl mx-auto px-4 md:px-6 h-14 md:h-16 flex items-center justify-between">
       <a href="../index.html" class="flex items-center gap-2 md:gap-3">
-        <img src="https://cdn-news.gitcode.com/news/atomcode-icon.png" alt="AtomCode" class="w-7 h-7 md:w-8 md:h-8 rounded-lg">
+        <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode" class="w-7 h-7 md:w-8 md:h-8 rounded-lg">
         <span class="text-base md:text-lg font-semibold tracking-tight">AtomCode</span>
         <span class="text-xs text-slate-500 hidden sm:inline">· 使用指南</span>
       </a>
@@ -55,7 +54,7 @@
       <h2>配置文件位置</h2>
       <p>默认路径:</p>
       <ul>
-        <li>macOS / Linux:<code>~/.atomcode/config.toml</code></li>
+        <li>macOS / Linux / HarmonyOS PC:<code>~/.atomcode/config.toml</code></li>
         <li>Windows:<code>%USERPROFILE%\.atomcode\config.toml</code></li>
       </ul>
       <p>也可以通过 <code>--config /path/to/config.toml</code> 指定任意路径。首次运行时,若该文件不存在,欢迎界面会引导你完成初始化。</p>
@@ -93,7 +92,7 @@ context_window = 64000</code></pre>
           <tr><td><code>type</code></td><td>string</td><td>是</td><td>provider 协议类型,目前支持 <code>openai</code>、<code>claude</code>、<code>ollama</code></td></tr>
           <tr><td><code>api_key</code></td><td>string?</td><td>视情况</td><td>API Key。<code>ollama</code> 可不填。OAuth 登录的 provider 不含此字段,token 从 <code>~/.atomcode/auth.toml</code> 自动读取</td></tr>
           <tr><td><code>model</code></td><td>string</td><td>是</td><td>模型名,比如 <code>deepseek-chat</code>、<code>gpt-4o</code>、<code>claude-sonnet-4-6</code></td></tr>
-          <tr><td><code>base_url</code></td><td>string?</td><td>否</td><td>API 基地址。<code>openai</code> 类型需要指向实际接口,留空使用 OpenAI 官方</td></tr>
+          <tr><td><code>base_url</code></td><td>string</td><td>是</td><td>API 基地址,需指向实际接口。例:<code>https://api.deepseek.com/v1</code>、<code>http://localhost:11434</code></td></tr>
           <tr><td><code>context_window</code></td><td>integer</td><td>否</td><td>模型上下文窗口(tokens),默认 64000。<code>ollama</code> 默认 8000</td></tr>
           <tr><td><code>max_tokens</code></td><td>integer?</td><td>否</td><td>单次响应的最大输出 token 数。留空则使用 <code>context_window / 4</code></td></tr>
           <tr><td><code>system_prompt</code></td><td>string?</td><td>否</td><td>覆盖默认系统提示。大多数场景不需要</td></tr>

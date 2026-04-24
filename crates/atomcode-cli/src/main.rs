@@ -17,13 +17,14 @@ use atomcode_core::agent::{AgentCommand, AgentEvent, AgentLoop};
 use atomcode_core::config::provider::{ProviderConfig, default_context_window_for};
 use atomcode_core::config::Config;
 use atomcode_core::conversation::Conversation;
-use atomcode_core::provider::create_provider;
+use atomcode_core::provider::{create_provider, unavailable_provider};
 use atomcode_core::session::SessionManager;
 use atomcode_core::tool::{ToolContext, ToolRegistry};
 use atomcode_core::tool::read::ReadFileTool;
 use atomcode_core::tool::write::WriteFileTool;
 use atomcode_core::tool::edit::EditFileTool;
 use atomcode_core::tool::bash::BashTool;
+use atomcode_core::tool::cd::CdTool;
 use atomcode_core::tool::grep::GrepTool;
 use atomcode_core::tool::glob::GlobTool;
 use atomcode_core::tool::list_dir::ListDirTool;
@@ -85,6 +86,230 @@ fn truncate_log_line(s: &str, max_chars: usize) -> String {
     }
 }
 
+/// True when the currently-running binary's filename ends in `.bak`.
+/// `self_update::replace_binary` renames the previous version to
+/// `atomcode.bak` (or `atomcode.exe.bak`) during an upgrade so the user
+/// can roll back. Running that backup must NOT auto-upgrade — otherwise
+/// rolling back is impossible: any launch of `.bak` would just overwrite
+/// itself with the latest version again.
+///
+/// Defensive: if we can't read `current_exe()` for any reason, assume
+/// we're the live binary (not backup) so auto-upgrade still works for
+/// the common case.
+fn is_running_as_backup() -> bool {
+    std::env::current_exe()
+        .ok()
+        .as_deref()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .map(|n| n.ends_with(".bak"))
+        .unwrap_or(false)
+}
+
+/// Decide whether the startup-time synchronous upgrade path should fire.
+/// Returns false when any of these hold:
+///   * We're running as `atomcode.bak` → user wants the old binary,
+///     don't silently swap it back to latest.
+///   * `-p` / `--prompt` / `--prompt-file` is in argv → headless script run,
+///     shouldn't stall 5-20 s on a network download for a 2 s task.
+///   * A subcommand (login, logout, status, upgrade, rollback) is in argv
+///     → those have their own flows and don't want a surprise re-exec.
+///   * Config has `auto_update = false` → user explicitly opted out.
+/// Anything else (including missing config) → true, because fresh installs
+/// that haven't written a config yet are exactly the case we want to help.
+///
+/// Deliberately scans argv by hand — clap hasn't parsed yet at this point
+/// in main(), and we need to decide before any slower setup happens.
+fn should_try_sync_upgrade() -> bool {
+    if is_running_as_backup() {
+        return false;
+    }
+
+    let args: Vec<String> = std::env::args().collect();
+    let any = |needle: &[&str]| args.iter().skip(1).any(|a| needle.iter().any(|n| a == n || a.starts_with(&format!("{}=", n))));
+
+    if any(&["-p", "--prompt", "--prompt-file"]) {
+        return false;
+    }
+    if args.iter().skip(1).any(|a| matches!(a.as_str(),
+        "login" | "logout" | "status" | "upgrade" | "rollback" | "--version" | "-V" | "--help" | "-h")) {
+        return false;
+    }
+
+    // Load just enough of the config to honor `auto_update = false`.
+    // Failure to load = assume default (true) — fresh installs benefit.
+    let path = atomcode_core::config::Config::default_path();
+    if path.exists() {
+        if let Ok(cfg) = atomcode_core::config::Config::load(&path) {
+            if !cfg.auto_update {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Startup-time synchronous upgrade. Fetches the manifest, and if a newer
+/// release exists, downloads + verifies + stages + applies it in-line,
+/// then re-execs into the new binary. Progress is printed to stderr so
+/// the user sees something happen during the 5-20 s window (as opposed
+/// to a silent hang). Anything that fails → fall through; the parent's
+/// `main` continues with the current binary, and the detached worker
+/// spawned later (`spawn_detached_upgrade_prep`) is still there as a
+/// second chance for the next session.
+///
+/// Bounded by an overall 120 s timeout so a slow mirror / hung DNS can't
+/// wedge startup forever.
+async fn sync_stage_and_apply_if_newer() {
+    use atomcode_core::self_update::{self, UpgradeEvent};
+
+    let current = format!("v{}", env!("CARGO_PKG_VERSION"));
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<UpgradeEvent>();
+
+    // Progress consumer: renders ManifestFetched / Downloading / Verifying
+    // as a single-line updating status on stderr. Percent-debounced so a
+    // 15 MB download at 64 KiB chunks doesn't flood the terminal.
+    let progress = tokio::spawn(async move {
+        use std::io::Write;
+        let mut last_pct: i32 = -1;
+        while let Some(ev) = rx.recv().await {
+            match ev {
+                UpgradeEvent::ManifestFetched { version } => {
+                    eprintln!("✨ New version available: {}", version);
+                }
+                UpgradeEvent::Downloading { bytes, total } => {
+                    let pct = if total == 0 { 0 } else { ((bytes * 100) / total) as i32 };
+                    if pct != last_pct {
+                        eprint!("\r   Downloading {}% ({:.1} / {:.1} MB)      ",
+                                pct,
+                                bytes as f64 / 1_048_576.0,
+                                total as f64 / 1_048_576.0);
+                        let _ = std::io::stderr().flush();
+                        last_pct = pct;
+                    }
+                }
+                UpgradeEvent::Verifying => {
+                    eprintln!("\n✓ Verifying sha256");
+                }
+                _ => {}
+            }
+        }
+    });
+
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        self_update::prepare_deferred_upgrade(&current, tx),
+    )
+    .await;
+
+    // Wait briefly for the progress consumer to drain — it closes when
+    // the sender drops at the end of prepare_deferred_upgrade.
+    let _ = progress.await;
+
+    match outcome {
+        Ok(Ok(Some(_staged))) => {
+            // Staged successfully. Apply right now so the user gets the new
+            // binary on this same invocation.
+            match self_update::apply_pending_upgrade() {
+                Ok(Some(applied)) => {
+                    eprintln!("✓ Upgrading to {}...", applied.version);
+                    // Save the CURRENT version (before upgrade) so TUI can show "Upgraded old → new"
+                    std::env::set_var(UPGRADED_FROM_ENV, &current);
+                    match self_update::re_exec_self() {
+                        Ok(_infallible) => unreachable!("re_exec_self returned Ok"),
+                        Err(e) => {
+                            eprintln!(
+                                "Upgrade applied but re-exec failed ({}). The new version will be used on the next launch.",
+                                e
+                            );
+                            std::env::remove_var(UPGRADED_FROM_ENV);
+                        }
+                    }
+                }
+                _ => {
+                    // Stage succeeded but apply didn't — weird, just continue.
+                }
+            }
+        }
+        Ok(Ok(None)) => {
+            // Already latest, no-op.
+        }
+        Ok(Err(_)) | Err(_) => {
+            // Network error or 120 s timeout. Don't spam the user —
+            // `/upgrade` will surface the real error if they ask.
+            eprintln!("Note: could not check for updates at startup (will retry in background).");
+        }
+    }
+}
+
+/// Body of the detached upgrade-prep worker. One call to
+/// `prepare_deferred_upgrade` (which fetches the manifest, downloads the
+/// next version's binary if newer, verifies sha256, and writes
+/// `pending.json`). On success the next parent-atomcode start will pick
+/// up `pending.json` and apply. Silent: stdout/stderr are already /dev/null
+/// (see `spawn_detached_upgrade_prep`), so any output would be discarded.
+async fn run_prepare_upgrade_worker() -> i32 {
+    let current = format!("v{}", env!("CARGO_PKG_VERSION"));
+    // UpgradeEvent stream is per-byte progress; we don't surface it here
+    // (parent is gone), so drain to /dev/null.
+    let (tx, mut rx) =
+        tokio::sync::mpsc::unbounded_channel::<atomcode_core::self_update::UpgradeEvent>();
+    tokio::spawn(async move { while rx.recv().await.is_some() {} });
+
+    match atomcode_core::self_update::prepare_deferred_upgrade(&current, tx).await {
+        Ok(_) => 0,
+        Err(_) => 1,
+    }
+}
+
+/// Spawn a detached copy of this binary that runs the upgrade-prep worker
+/// and exits. "Detached" means:
+///   * New session on Unix (`setsid`) — parent's Ctrl+C goes to parent's
+///     foreground process group only; the child is in its own and ignores it.
+///   * `CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS` on Windows, same idea.
+///   * stdin/stdout/stderr → /dev/null so the child can't scribble over the
+///     parent's terminal and has no reason to stay attached to it.
+///
+/// Does NOT wait for the child (we intentionally don't — that would recreate
+/// the cancel-on-exit problem we're trying to solve). If spawning fails we
+/// just drop the error; auto-upgrade is best-effort.
+fn spawn_detached_upgrade_prep() {
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.env(INTERNAL_PREPARE_UPGRADE_ENV, "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            cmd.pre_exec(|| {
+                // Detach from parent's controlling terminal / process group.
+                // Return value ignored — setsid only fails when caller is
+                // already a process group leader (not our case post-fork).
+                libc::setsid();
+                Ok(())
+            });
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
+        const DETACHED_PROCESS: u32 = 0x00000008;
+        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
+    }
+
+    let _ = cmd.spawn();
+}
+
 const VERSION: &str = concat!(
     env!("CARGO_PKG_VERSION"),
     " (",
@@ -128,10 +353,10 @@ struct Cli {
     #[arg(long, value_name = "PATH", conflicts_with = "prompt")]
     prompt_file: Option<std::path::PathBuf>,
 
-    /// Use the CC-style normal-mode TUI (atomcode-tuix).
-    /// Default is the ratatui alternate-screen TUI (atomcode-tui).
+    /// Fall back to the legacy ratatui alternate-screen TUI (atomcode-tui).
+    /// Default is the CC-style normal-mode TUI (atomcode-tuix).
     #[arg(long)]
-    tuix: bool,
+    tui: bool,
 
     /// Show tool calls, token usage, and turn summary on stderr (headless mode only).
     /// Without this flag, headless output is the assistant reply only — Claude Code -p style.
@@ -144,6 +369,13 @@ struct Cli {
     /// no tool calls or when the step budget (tool-call cap) is reached.
     #[arg(long)]
     max_turns: Option<usize>,
+
+    /// Inject a "restate goal / what ruled out / next output" reflection
+    /// prompt every N tool calls. 0 disables the checkpoint entirely.
+    /// Overrides the value in config.toml for this run. Default: use
+    /// config.toml's reflection_cadence (which itself defaults to 10).
+    #[arg(long, value_name = "N")]
+    reflection_cadence: Option<usize>,
 
     /// Comma-separated list of tool names to exclude from the registry.
     /// Use this to disable tools that are useless or harmful in a particular
@@ -164,7 +396,38 @@ enum Commands {
     Logout,
     /// Show current login status
     Status,
+    /// Upgrade atomcode in-place to the latest released version
+    Upgrade {
+        /// Reinstall even when already on the latest version
+        #[arg(long)]
+        force: bool,
+    },
+    /// Roll back to the previous version (swap with .bak on disk)
+    Rollback,
+    /// Fetch an AtomGit issue assigned to you and let the agent fix it
+    /// in the current project (no commit, no push — edits local files only).
+    Fixissue {
+        /// Full issue URL, e.g. https://atomgit.com/owner/repo/issues/42
+        url: String,
+    },
+    /// Claim CodingPlan and set up provider/model config from its model list.
+    /// Runs: login (if not already) → claim → fetch models → write providers
+    /// → fetch status. Reports each step and exits.
+    Codingplan,
 }
+
+/// Environment variable set by this process for its re-exec'd child, so
+/// the child knows which version it was just upgraded from and can show
+/// a one-time "✓ Upgraded to vX.Y.Z" banner on the welcome screen.
+/// The child clears this env var after reading it so grandchildren
+/// (spawned tools, subprocesses) don't inherit a stale hint.
+const UPGRADED_FROM_ENV: &str = "ATOMCODE_UPGRADED_FROM";
+
+/// Env var the parent sets when spawning a detached upgrade-prep worker.
+/// The child detects it at the very top of `main` and runs one
+/// `prepare_deferred_upgrade` cycle in its own session (setsid'd) so the
+/// parent can be Ctrl+C'd without cancelling the download.
+const INTERNAL_PREPARE_UPGRADE_ENV: &str = "ATOMCODE_INTERNAL_PREPARE_UPGRADE";
 
 #[tokio::main]
 async fn main() {
@@ -179,6 +442,77 @@ async fn main() {
             SetConsoleCP(CP_UTF8);
         }
     }
+
+    // Detached upgrade-prep worker mode. The parent atomcode spawns a
+    // subprocess with this env var set; that subprocess does one full
+    // download + verify + `pending.json` write, then exits. Because the
+    // subprocess is setsid'd (see `spawn_detached_upgrade_prep`), it
+    // survives Ctrl+C / quit in the parent — which is the whole point,
+    // since the previous in-process download was tied to the parent's
+    // tokio runtime and got cancelled on any quick exit.
+    if std::env::var(INTERNAL_PREPARE_UPGRADE_ENV).is_ok() {
+        let code = run_prepare_upgrade_worker().await;
+        std::process::exit(code);
+    }
+
+    // If this invocation is the `.bak` backup binary (left behind by a
+    // previous upgrade), skip all upgrade bootstrapping. `apply_pending_upgrade`
+    // would rewrite ourselves with the latest version and destroy the
+    // rollback target; the whole point of keeping `.bak` is for the user
+    // to be able to run / keep the old version. The only upgrade path
+    // still reachable from a `.bak` launch is the explicit `/upgrade`
+    // slash command inside the TUI — that's user-initiated and fine.
+    let is_backup = is_running_as_backup();
+
+    // Bootstrap: if a prior session staged an upgrade, apply it NOW — before
+    // we spin up tokio, the TUI, or any other heavy state. On success we
+    // re-exec the new binary (Unix: same PID; Windows: child+exit). The user
+    // sees one continuous "atomcode" invocation, just 100-300ms longer than
+    // normal. On failure we log and carry on with the current binary; the
+    // circuit-breaker in `apply_pending_upgrade` ensures a broken release
+    // can't wedge this loop indefinitely.
+    if !is_backup {
+    // Capture current version BEFORE applying upgrade, so we can pass it to the re-exec'd child
+    let current_version = format!("v{}", env!("CARGO_PKG_VERSION"));
+    match atomcode_core::self_update::apply_pending_upgrade() {
+        Ok(Some(applied)) => {
+            eprintln!("✓ Upgrading to {}...", applied.version);
+            // Pass the CURRENT version (before upgrade) to the re-exec'd child so the TUI
+            // can surface a welcome-screen confirmation exactly once.
+            std::env::set_var(UPGRADED_FROM_ENV, &current_version);
+            match atomcode_core::self_update::re_exec_self() {
+                Ok(_infallible) => unreachable!("re_exec_self returned Ok"),
+                Err(e) => {
+                    eprintln!(
+                        "Upgrade applied but re-exec failed ({}). The new version will be used on the next launch.",
+                        e
+                    );
+                    std::env::remove_var(UPGRADED_FROM_ENV);
+                    std::process::exit(1);
+                }
+            }
+        }
+        Ok(None) => {
+            // No pre-staged upgrade. If the user isn't passing `-p` /
+            // `--prompt-file` (headless one-shots shouldn't pay the network
+            // tax) and auto_update isn't disabled, try to fetch + stage +
+            // apply v_next right here. This is the "user launched atomcode,
+            // wants it upgraded NOW" path — single invocation instead of
+            // the stage-on-session-N / apply-on-session-N+1 dance.
+            //
+            // Anything goes wrong (offline, timeout, sha mismatch, no
+            // newer release) → silently fall through and continue with
+            // the current binary. The `/upgrade` slash command is still
+            // there as the explicit/loud alternative.
+            if should_try_sync_upgrade() {
+                sync_stage_and_apply_if_newer().await;
+            }
+        }
+        Err(e) => {
+            eprintln!("Note: pending upgrade could not be applied ({}). Continuing with current version.", e);
+        }
+    }
+    } // end `if !is_backup`
 
     // Set panic hook to show errors cleanly
     std::panic::set_hook(Box::new(|info| {
@@ -203,11 +537,23 @@ async fn main() {
 async fn run() -> Result<i32> {
     let cli = Cli::parse();
 
-    // Handle subcommands
+    // Handle subcommands. Most are self-contained (`handle_command` runs
+    // and exits); `Login` falls through to the TUI, and `Fixissue` is
+    // like headless `-p` but with the prompt synthesised from a remote
+    // issue payload — so we resolve it here and hand it to the agent
+    // loop via `fixissue_prompt` below.
+    let mut fixissue_prompt: Option<String> = None;
+    // Saved when fixissue is parsed, so after the agent finishes we can
+    // POST the summary back to AtomGit as a comment + add the `fixed`
+    // label. `None` = not a fixissue run, skip the post-back step.
+    let mut fixissue_ref: Option<atomcode_core::atomgit::IssueRef> = None;
+    // `fixissue` is an interactive-feeling structured workflow (the user
+    // is watching progress, not piping output). Force verbose so they see
+    // tool calls / edits instead of long silences while the agent works.
+    let mut force_verbose = false;
     if let Some(cmd) = cli.command {
-        match &cmd {
+        match cmd {
             Commands::Login => {
-                // Login, then fall through to start TUI
                 HEADLESS_MODE.store(true, Ordering::Relaxed);
                 let auth = auth::login()?;
                 auth::save_auth(&auth)?;
@@ -215,8 +561,45 @@ async fn run() -> Result<i32> {
                 HEADLESS_MODE.store(false, Ordering::Relaxed);
                 // Fall through to TUI startup below
             }
-            _ => {
-                return handle_command(cmd).await.map(|_| 0);
+            Commands::Codingplan => {
+                // Mirror /login: run the setup flow headless (so any
+                // auth::login() browser prompt lands cleanly), then
+                // fall through to TUI startup so the user lands in
+                // the chat with their fresh providers already
+                // configured. The rendered report is stashed into
+                // ATOMCODE_CODINGPLAN_REPORT so the TUI can surface
+                // it as a body line on startup — same pattern as
+                // ATOMCODE_UPGRADED_FROM for post-upgrade notices.
+                HEADLESS_MODE.store(true, Ordering::Relaxed);
+                let report = run_codingplan_core()?;
+                std::env::set_var("ATOMCODE_CODINGPLAN_REPORT", report);
+                println!("  Starting AtomCode...\n");
+                HEADLESS_MODE.store(false, Ordering::Relaxed);
+                // Fall through to TUI startup below
+            }
+            Commands::Fixissue { url } => {
+                HEADLESS_MODE.store(true, Ordering::Relaxed);
+                let cwd = cli.dir.clone().unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+                match atomcode_core::atomgit::fixissue::prepare(&url, &cwd) {
+                    Ok(atomcode_core::atomgit::fixissue::Prepared::Run { prompt, issue_title, issue_number, issue_ref }) => {
+                        eprintln!("[fixissue] issue #{}: {}", issue_number, issue_title);
+                        fixissue_prompt = Some(prompt);
+                        fixissue_ref = Some(issue_ref);
+                        force_verbose = true;
+                        // Fall through: agent loop will run this as a headless prompt.
+                    }
+                    Ok(atomcode_core::atomgit::fixissue::Prepared::Skip { reason }) => {
+                        eprintln!("{}", reason);
+                        return Ok(0);
+                    }
+                    Err(e) => {
+                        eprintln!("fixissue failed: {:#}", e);
+                        return Ok(1);
+                    }
+                }
+            }
+            other => {
+                return handle_command(other).await.map(|_| 0);
             }
         }
     }
@@ -233,6 +616,9 @@ async fn run() -> Result<i32> {
                 default_workdir: None,
                 providers: HashMap::new(),
                 datalog: Default::default(),
+                notifications: Default::default(),
+                auto_update: true,
+                reflection_cadence: 7,
             }
         })
     } else {
@@ -242,24 +628,36 @@ async fn run() -> Result<i32> {
             default_workdir: None,
             providers: HashMap::new(),
             datalog: Default::default(),
+            notifications: Default::default(),
+            auto_update: true,
+            reflection_cadence: 7,
         }
     };
 
-    let (provider_config, model_name) = if config.providers.is_empty() {
-        // No providers configured yet — Welcome screen handles setup.
-        // Use a dummy provider; AgentLoop won't be called until user configures one.
-        let dummy = ProviderConfig {
-            provider_type: "openai".to_string(),
-            api_key: Some("not-configured".to_string()),
-            model: String::new(),
-            base_url: Some("http://localhost:1".to_string()),
-            system_prompt: None,
-            user_agent: None,
-            context_window: default_context_window_for("openai"),
-            max_tokens: None,
-            ephemeral: false,
-        };
-        (dummy, String::new())
+    let unavailable_reason = if config.providers.is_empty() {
+        Some("未配置 provider。请使用 /provider 添加 provider 后再试。".to_string())
+    } else {
+        None
+    };
+
+    let (provider_config, model_name) = if unavailable_reason.is_some() {
+        (
+            ProviderConfig {
+                provider_type: "openai".to_string(),
+                api_key: Some("unavailable".to_string()),
+                model: String::new(),
+                base_url: None,
+                system_prompt: None,
+                user_agent: None,
+                context_window: default_context_window_for("openai"),
+                max_tokens: None,
+                thinking_type: None,
+                thinking_keep: None,
+            reasoning_history: None,
+                ephemeral: false,
+            },
+            String::new(),
+        )
     } else {
         if let Some(ref model) = cli.model {
             let provider_name = cli.provider.as_deref().unwrap_or(&config.default_provider);
@@ -267,20 +665,56 @@ async fn run() -> Result<i32> {
                 p.model = model.clone();
             }
         }
-        // Provide a dummy api_key to prevent create_provider from attempting
-        // auth-token loading (which would fail if not logged in).  The real
-        // provider is rebuilt later via rebuild_provider() once the user has
-        // configured credentials.
+        // Keep api_key as None here so `create_provider()` auto-loads
+        // from `~/.atomcode/auth.toml`. Setting "not-configured" would
+        // bypass that path and force the user to manually provide a key.
         let pc = config.active_provider(cli.provider.as_deref())?.clone();
         let name = pc.model.clone();
-        // 注意：如果api_key为None，保持为None不要设置"not-configured"。
-        // 这样可以让create_provider()检测到None并从auth.toml自动加载token。
-        // 设置"not-configured"会绕过create_provider()中的自动加载逻辑，导致OAuth登录后
-        // 重启程序时无法获取token而报404错误。
         (pc, name)
     };
 
-    let provider = create_provider(&provider_config)?;
+    // `create_provider` may need to load an OAuth token from
+    // `~/.atomcode/auth.toml`. Pre-v4.20 this was a fatal startup
+    // error — if the user had a config.toml with an `AtomGit*` entry
+    // (from an older `/login` that auto-registered one) but no
+    // auth.toml (fresh machine, or auth.toml was deleted), the CLI
+    // bailed before the TUI could load, leaving the user stuck:
+    // they wanted to `/login` but couldn't start the app to run it.
+    //
+    // Graceful fallback: if provider construction fails because the
+    // token is unavailable, swap in the same dummy used on first-run
+    // so the TUI boots. The Welcome-wizard / status-row hints will
+    // nudge the user to `/login` or `/codingplan`, and a successful
+    // auth flow rebuilds the real provider via `rebuild_provider`.
+    let (provider, model_name) = if let Some(reason) = unavailable_reason {
+        (unavailable_provider(reason), model_name)
+    } else {
+        match create_provider(&provider_config) {
+            Ok(p) => (p, model_name),
+            Err(e) => {
+                let msg = format!("{:#}", e);
+                let is_auth_gap = msg.contains("Not logged in")
+                    || msg.contains("Invalid auth.toml")
+                    || msg.contains("Token expired");
+                if is_auth_gap {
+                    eprintln!(
+                        "Note: provider credentials not available ({}). \
+                         Launching TUI in onboarding mode — use /login or /codingplan to set up.",
+                        msg
+                    );
+                    (
+                        unavailable_provider(format!(
+                            "Provider 凭证不可用：{}。请使用 /login 或 /codingplan 完成配置后再试。",
+                            msg
+                        )),
+                        String::new(),
+                    )
+                } else {
+                    return Err(e);
+                }
+            }
+        }
+    };
 
     let working_dir = resolve_working_dir(cli.dir.clone());
 
@@ -307,6 +741,7 @@ async fn run() -> Result<i32> {
     if enabled("write_file")     { tool_registry.register(Box::new(WriteFileTool)); }
     if enabled("edit_file")      { tool_registry.register(Box::new(EditFileTool)); }
     if enabled("bash")           { tool_registry.register(Box::new(BashTool)); }
+    if enabled("change_dir")     { tool_registry.register(Box::new(CdTool)); }
     if enabled("grep")           { tool_registry.register(Box::new(GrepTool)); }
     if enabled("glob")           { tool_registry.register(Box::new(GlobTool)); }
     if enabled("list_directory") { tool_registry.register(Box::new(ListDirTool)); }
@@ -341,34 +776,102 @@ async fn run() -> Result<i32> {
         conversation,
     );
     agent_loop.set_max_turns(cli.max_turns);
+    // CLI override for the cadence reflection knob. Matches the max_turns
+    // pattern — leave unset to honor config.toml; explicitly pass to force.
+    if let Some(n) = cli.reflection_cadence {
+        agent_loop.config.reflection_cadence = n;
+    }
 
-    // Resolve effective prompt: --prompt-file reads from disk; -p is inline.
-    // clap's conflicts_with ensures only one can be given at a time.
-    let effective_prompt: Option<String> = match (cli.prompt.as_ref(), cli.prompt_file.as_ref()) {
-        (Some(p), None) => Some(p.clone()),
-        (None, Some(path)) => {
-            match std::fs::read_to_string(path) {
-                Ok(s) => Some(s),
-                Err(e) => {
-                    eprintln!("error: failed to read --prompt-file {}: {}", path.display(), e);
-                    std::process::exit(2);
+    // Resolve effective prompt: --prompt-file reads from disk; -p is inline;
+    // `fixissue` synthesises one from the AtomGit issue body. fixissue takes
+    // precedence — when it's set we've already committed to headless mode.
+    // clap's conflicts_with ensures `-p` and `--prompt-file` can't both be given.
+    let effective_prompt: Option<String> = if let Some(p) = fixissue_prompt.take() {
+        Some(p)
+    } else {
+        match (cli.prompt.as_ref(), cli.prompt_file.as_ref()) {
+            (Some(p), None) => Some(p.clone()),
+            (None, Some(path)) => {
+                match std::fs::read_to_string(path) {
+                    Ok(s) => Some(s),
+                    Err(e) => {
+                        eprintln!("error: failed to read --prompt-file {}: {}", path.display(), e);
+                        std::process::exit(2);
+                    }
                 }
             }
+            (None, None) => None,
+            (Some(_), Some(_)) => unreachable!("clap conflicts_with prevents this"),
         }
-        (None, None) => None,
-        (Some(_), Some(_)) => unreachable!("clap conflicts_with prevents this"),
     };
 
     // Headless mode: -p / --prompt-file triggers non-interactive execution.
+    // `fixissue` also sets `force_verbose` so tool activity is visible — the
+    // user is watching a single long-running task, not feeding a pipe.
     if let Some(prompt) = effective_prompt {
-        return run_headless(agent_loop, agent_handle, prompt, cli.provider.as_deref(), cli.verbose).await;
+        let verbose = cli.verbose || force_verbose;
+        // Capture the assistant's streamed text only when we need to post
+        // it back to AtomGit (fixissue). Plain `-p` stays zero-alloc.
+        let capture = fixissue_ref.is_some();
+        let (exit_code, captured) = run_headless(
+            agent_loop,
+            agent_handle,
+            prompt,
+            cli.provider.as_deref(),
+            verbose,
+            capture,
+            working_dir.clone(),
+        )
+        .await?;
+
+        // Post-run side effects for fixissue: only on clean completion
+        // (exit 0 = TurnComplete Natural; 1 = error; 2 = denial; 130 = cancel).
+        // On non-zero we leave the issue alone — the user can retry.
+        if let Some(issue_ref) = fixissue_ref {
+            if exit_code == 0 {
+                if let Some(summary) = captured.filter(|s| !s.trim().is_empty()) {
+                    match atomcode_core::atomgit::fixissue::post_completion(&issue_ref, &summary) {
+                        Ok(()) => eprintln!(
+                            "[fixissue] ✔ posted summary + applied 'fixed' label to issue #{}",
+                            issue_ref.number
+                        ),
+                        Err(e) => eprintln!(
+                            "[fixissue] ✗ post-back failed (local fix is still saved): {:#}",
+                            e
+                        ),
+                    }
+                } else {
+                    eprintln!(
+                        "[fixissue] agent produced no text; skipping comment + label on issue #{}",
+                        issue_ref.number
+                    );
+                }
+            } else {
+                eprintln!(
+                    "[fixissue] agent exited non-zero ({}); skipping comment + label on issue #{}",
+                    exit_code, issue_ref.number
+                );
+            }
+        }
+        return Ok(exit_code);
+    }
+
+    // Fire-and-forget: spawn a setsid'd subprocess to stage the next
+    // release if one is out. Detached so a Ctrl+C in this parent doesn't
+    // also kill the download — that was the whole reason "exit and come
+    // back" wasn't picking up v_next on short sessions. Only armed when
+    // the user hasn't opted out via `auto_update = false` AND we're not
+    // running as `atomcode.bak` (backup should stay pinned; see the
+    // `is_running_as_backup` guard up top).
+    if config.auto_update && !is_running_as_backup() {
+        spawn_detached_upgrade_prep();
     }
 
     tokio::spawn(agent_loop.run());
-    if cli.tuix {
-        atomcode_tuix::run(config, model_name, agent_handle, tool_context, working_dir, session_to_continue).await?;
-    } else {
+    if cli.tui {
         atomcode_tui::run(config, model_name, agent_handle, tool_context, working_dir, session_to_continue).await?;
+    } else {
+        atomcode_tuix::run(config, model_name, agent_handle, tool_context, working_dir, session_to_continue).await?;
     }
     Ok(0)
 }
@@ -390,11 +893,14 @@ async fn run_headless(
     prompt: String,
     _provider_name: Option<&str>,
     verbose: bool,
-) -> Result<i32> {
+    capture: bool,
+    working_dir: PathBuf,
+) -> Result<(i32, Option<String>)> {
     // Tell the panic hook / error path to skip TUI cleanup — we never enter
     // the alternate screen here, so LeaveAlternateScreen would corrupt stdout.
     HEADLESS_MODE.store(true, Ordering::Relaxed);
 
+    let notifications = agent_loop.config.notifications.clone();
     let (cmd_tx, mut event_rx) = {
         let handle = agent_handle;
         (handle.cmd_tx, handle.event_rx)
@@ -406,12 +912,19 @@ async fn run_headless(
     let mut exit_code: i32 = 0;
     let mut had_denial = false;
     let mut last_text_ended_with_newline = true;
+    // When `capture` is set, we also buffer every TextDelta the agent
+    // emits so the caller (e.g. the fixissue workflow) can post the
+    // full assistant output back to AtomGit as an issue comment.
+    let mut captured: Option<String> = if capture { Some(String::new()) } else { None };
 
     while let Some(event) = event_rx.recv().await {
         match event {
             AgentEvent::TextDelta(text) => {
                 if !text.is_empty() {
                     last_text_ended_with_newline = text.ends_with('\n');
+                }
+                if let Some(buf) = captured.as_mut() {
+                    buf.push_str(&text);
                 }
                 print!("{}", text);
                 io::stdout().flush()?;
@@ -461,7 +974,18 @@ async fn run_headless(
             AgentEvent::PhaseChange(_) => {
                 // Silent in headless mode (in both default and verbose).
             }
-            AgentEvent::TurnComplete { duration, total_tokens, turn_count, tool_call_count, stop_reason } => {
+            AgentEvent::TurnComplete { duration, total_tokens, turn_count, tool_call_count, stop_reason, messages: _ } => {
+                atomcode_core::notify::notify_turn_finished(
+                    &notifications,
+                    atomcode_core::notify::TurnNotification {
+                        duration,
+                        turn_count,
+                        tool_call_count,
+                        total_tokens: Some(total_tokens),
+                        stop_reason,
+                        working_dir: Some(&working_dir),
+                    },
+                );
                 // Always ensure stdout ends with a newline so downstream parsers see a clean line.
                 if !last_text_ended_with_newline {
                     println!();
@@ -518,7 +1042,7 @@ AgentEvent::SubAgentProgress { file, status } => {
         exit_code = 2;
     }
 
-    Ok(exit_code)
+    Ok((exit_code, captured))
 }
 
 /// Handle subcommands (login, logout, status)
@@ -556,7 +1080,164 @@ async fn handle_command(cmd: Commands) -> Result<()> {
             }
             Ok(())
         }
+        Commands::Upgrade { force } => run_upgrade_cli(force).await,
+        Commands::Rollback => run_rollback_cli(),
+        Commands::Fixissue { .. } => {
+            unreachable!("Fixissue is handled inline in run() before handle_command")
+        }
+        Commands::Codingplan => {
+            // Kept as a handle_command arm for completeness, but `run()`
+            // now intercepts Codingplan before reaching here so the flow
+            // falls through to TUI startup. This branch is effectively
+            // dead unless a future caller dispatches Codingplan directly
+            // via handle_command (e.g. a test).
+            run_codingplan_cli()
+        }
     }
+}
+
+/// CLI (non-TUI) upgrade driver — prints progress to stdout and
+/// success/error messages the same way `install.sh` does.
+async fn run_upgrade_cli(force: bool) -> Result<()> {
+    use atomcode_core::self_update::{self, UpgradeEvent, ALREADY_LATEST};
+
+    let current = format!("v{}", env!("CARGO_PKG_VERSION"));
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<UpgradeEvent>();
+
+    // Spawn the driver; consume events on the main task so stdout
+    // writes don't interleave unpredictably with the upgrade work.
+    let driver = tokio::spawn(self_update::run_upgrade(current.clone(), force, tx));
+
+    let mut last_pct: i32 = -1;
+    while let Some(ev) = rx.recv().await {
+        match ev {
+            UpgradeEvent::ManifestFetched { version } => {
+                println!("==> Latest: {}", version);
+            }
+            UpgradeEvent::Downloading { bytes, total } => {
+                // Debounce to whole percents so we don't spam stdout —
+                // piping the CLI through `tee` with 10k updates is no
+                // fun for anyone.
+                let pct = if total == 0 {
+                    0
+                } else {
+                    ((bytes * 100) / total) as i32
+                };
+                if pct != last_pct {
+                    print!("\r    downloading {}% ({} / {} bytes)   ", pct, bytes, total);
+                    io::stdout().flush().ok();
+                    last_pct = pct;
+                }
+            }
+            UpgradeEvent::Verifying => {
+                println!("\n==> Verifying SHA256");
+            }
+            UpgradeEvent::Replacing => {
+                println!("==> Replacing binary");
+            }
+            UpgradeEvent::Done { version, backup } => {
+                println!(
+                    "\n✓ Upgraded to {} (previous version kept at {})",
+                    version,
+                    backup.display()
+                );
+                println!("  Run `atomcode` to start the new version.");
+            }
+            // CLI path never spawns a rollback via this channel and the
+            // driver below translates errors into the returned Result
+            // (not a Failed event) — these arms exist only to keep the
+            // match exhaustive if the TUI path ever reuses this code.
+            UpgradeEvent::Failed(msg) => {
+                eprintln!("\nupgrade failed: {}", msg);
+            }
+            UpgradeEvent::RolledBack { exe, backup } => {
+                println!(
+                    "\n✓ Rolled back. exe={}, backup={}",
+                    exe.display(),
+                    backup.display()
+                );
+            }
+        }
+    }
+
+    match driver.await {
+        Ok(Ok(_summary)) => Ok(()),
+        Ok(Err(e)) => {
+            let msg = format!("{:#}", e);
+            if msg.contains(ALREADY_LATEST) {
+                // Friendly path — not an error, just "nothing to do".
+                println!("  {}", msg.replace(&format!("{}: ", ALREADY_LATEST), ""));
+                Ok(())
+            } else {
+                Err(e)
+            }
+        }
+        Err(e) => Err(anyhow::anyhow!("upgrade task panicked: {}", e)),
+    }
+}
+
+fn run_rollback_cli() -> Result<()> {
+    let summary = atomcode_core::self_update::run_rollback()?;
+    println!(
+        "✓ Rolled back. Previous binary is now at {}, other version saved at {}",
+        summary.exe.display(),
+        summary.backup.display()
+    );
+    println!("  Run `atomcode` to start the rolled-back version.");
+    Ok(())
+}
+
+/// Core CodingPlan flow shared by CLI-exit and CLI→TUI paths. Loads
+/// the config (or starts from defaults if missing), runs the shared
+/// `coding_plan::setup` orchestrator, persists the config on success,
+/// and returns the rendered human-readable report — the caller decides
+/// whether to print it to stdout or stash it for the TUI to surface.
+fn run_codingplan_core() -> Result<String> {
+    let path = Config::default_path();
+    // Missing config is legitimate on first install — start from defaults
+    // so the flow can still add AtomGit providers to a fresh config.toml.
+    let mut config = match Config::load(&path) {
+        Ok(c) => c,
+        Err(_) => Config {
+            default_provider: String::new(),
+            default_workdir: None,
+            providers: std::collections::HashMap::new(),
+            datalog: Default::default(),
+            auto_update: true,
+            reflection_cadence: 7,
+            notifications: Default::default(),
+        },
+    };
+
+    let report = atomcode_core::coding_plan::run(&mut config)?;
+
+    if report.should_persist_config() {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Err(e) = config.save(&path) {
+            eprintln!("  ⚠ Failed to save config to {}: {:#}", path.display(), e);
+        }
+        // Stamp the sync marker alongside the config write. The drift
+        // monitor on the TUI side reads this to decide whether to warn
+        // about stale provider lists (> 24h + server drift). A failed
+        // marker write is non-fatal — the config already landed; only
+        // the 24h hint would be miscounted, which self-corrects on the
+        // next successful run.
+        if let Err(e) = atomcode_core::coding_plan::write_last_sync_now() {
+            eprintln!("  ⚠ Failed to write codingplan sync marker: {:#}", e);
+        }
+    }
+
+    Ok(report.render())
+}
+
+/// `atomcode codingplan` entry point for the CLI-exit path — runs the
+/// core flow and prints the report to stdout.
+fn run_codingplan_cli() -> Result<()> {
+    let report = run_codingplan_core()?;
+    print!("{}", report);
+    Ok(())
 }
 
 #[cfg(test)]

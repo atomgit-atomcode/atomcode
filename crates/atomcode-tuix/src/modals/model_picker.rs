@@ -74,6 +74,25 @@ impl Modal for ModelPicker {
                 // the switch lives only in memory and the next startup
                 // reverts to whatever was last saved.
                 save_and_reload(ctx, renderer);
+                // Clear any stale drift warning tied to the PREVIOUS
+                // active provider — if the new provider is also CodingPlan,
+                // the re-fire below will repopulate the slot with a
+                // correct warning (or leave it clean).
+                if let Ok(mut g) = ctx.monitor_warning.lock() {
+                    *g = None;
+                }
+                // Re-fire the drift check if the new provider is also
+                // CodingPlan-managed. Bypasses the 15-min cooldown on
+                // purpose — explicit user action deserves a fresh read.
+                if crate::event_loop::monitor::is_codingplan_provider(&chosen) {
+                    ctx.monitor_last_check_at = Some(std::time::Instant::now());
+                    crate::event_loop::monitor::spawn_check(
+                        ctx.config.clone(),
+                        ctx.model_name.clone(),
+                        ctx.monitor_warning.clone(),
+                        ctx.wake_tx.clone(),
+                    );
+                }
                 renderer.render(UiLine::CommandOutput(format!(
                     "  Switched to {} · {}\n",
                     chosen, display

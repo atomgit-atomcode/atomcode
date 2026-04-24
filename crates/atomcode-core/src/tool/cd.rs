@@ -37,6 +37,21 @@ impl Tool for CdTool {
         ApprovalRequirement::AutoApprove
     }
 
+    fn approval_with_context(&self, args: &str, ctx: &ToolContext) -> ApprovalRequirement {
+        let parsed = match serde_json::from_str::<CdArgs>(args) {
+            Ok(parsed) => parsed,
+            Err(_) => return self.approval(args),
+        };
+        let working_dir = match ctx.working_dir.try_read() {
+            Ok(wd) => wd.clone(),
+            Err(_) => return self.approval(args),
+        };
+        match super::approval_for_path(&parsed.path, &working_dir, super::ExternalPathAction::Enumerate) {
+            Ok(approval) => approval,
+            Err(_) => self.approval(args),
+        }
+    }
+
     async fn execute(&self, args: &str, ctx: &ToolContext) -> Result<ToolResult> {
         let parsed: CdArgs = serde_json::from_str(args)?;
         let path = parsed.path.as_str();

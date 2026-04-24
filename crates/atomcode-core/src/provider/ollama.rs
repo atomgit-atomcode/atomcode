@@ -156,12 +156,12 @@ impl LlmProvider for OllamaProvider {
             .header("Content-Type", "application/json")
             .json(&body);
 
-        let response_future = request.send();
+        let policy = crate::provider::retry::RetryPolicy::default_policy();
 
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
         tokio::spawn(async move {
-            let response = match response_future.await {
+            let response = match crate::provider::retry::send_with_retry(request, &policy).await {
                 Ok(resp) => resp,
                 Err(e) => {
                     let _ = tx.send(Ok(StreamEvent::Error(format!("Connection failed: {}", e))));

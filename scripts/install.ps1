@@ -1,15 +1,15 @@
 # AtomCode installer for Windows — PowerShell
 #
-#   irm https://atomgit.com/atomgit_atomcode/atomcode-release/raw/main/install.ps1 | iex
+#   irm https://atomgit.com/atomgit_atomcode/atomcode/raw/main/install.ps1 | iex
 #
 # Env overrides:
-#   $env:ATOMCODE_VERSION   release tag to install (default: v4.18.1)
+#   $env:ATOMCODE_VERSION   release tag to install (default: v4.20.3)
 #   $env:ATOMCODE_PREFIX    install dir (default: %LOCALAPPDATA%\AtomCode)
 
 $ErrorActionPreference = "Stop"
 
-$Version = if ($env:ATOMCODE_VERSION) { $env:ATOMCODE_VERSION } else { "v4.18.1" }
-$RepoBase = "https://atomgit.com/atomgit_atomcode/atomcode-release/releases/download"
+$Version = if ($env:ATOMCODE_VERSION) { $env:ATOMCODE_VERSION } else { "v4.20.3" }
+$RepoBase = "https://atomgit.com/atomgit_atomcode/atomcode/releases/download"
 
 # --- detect arch ---
 # Prefer PROCESSOR_ARCHITEW6432 (set only when a 32-bit process runs on a 64-bit
@@ -73,8 +73,23 @@ if ([char]$Header[0] -eq '<') {
 }
 
 # --- install ---
+# Move-Item -Force is unreliable on Windows PowerShell 5.1 when the destination
+# already exists (see: fails with "当文件已存在时，无法创建该文件"). Do an explicit
+# Remove-Item first, and surface a clear message if the old binary is locked
+# (atomcode.exe still running in another terminal).
 Write-Host "==> Installing to $Dest"
-Move-Item -Path $TmpFile -Destination $Dest -Force
+if (Test-Path $Dest) {
+    try {
+        Remove-Item $Dest -Force -ErrorAction Stop
+    } catch {
+        Write-Host "Error: cannot replace existing $Dest" -ForegroundColor Red
+        Write-Host "       It may be in use. Close any running atomcode.exe and re-run this installer." -ForegroundColor Red
+        Write-Host "       $_" -ForegroundColor Red
+        Remove-Item $TmpFile -Force -ErrorAction SilentlyContinue
+        exit 1
+    }
+}
+Move-Item -Path $TmpFile -Destination $Dest
 
 # --- add to PATH ---
 $UserPath = [Environment]::GetEnvironmentVariable("Path", "User")

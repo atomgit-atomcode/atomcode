@@ -29,7 +29,10 @@
   <img src="https://img.shields.io/badge/version-4.18.1-blue" alt="version">
   <img src="https://img.shields.io/badge/rust-1.75%2B-orange" alt="rust">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="license">
-  <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey" alt="platform">
+  <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20HarmonyOS PC%20%7C%20Windows-lightgrey" alt="platform">
+    <a href="https://atomgit.com/atomgit_atomcode/atomcode" target="_blank">
+    <img src="https://atomgit.com/atomgit_atomcode/atomcode/star/badge.svg" alt="AtomGit Star"/>
+  </a>
 </p>
 
 ---
@@ -100,6 +103,7 @@ AtomCode 是一款住在你终端里的 AI 编码助手。用自然语言给它�
 - **实时流式输出** —— Markdown 渲染 + 语法高亮
 - **代码块** —— 语言标签、行号、`base16-ocean.dark` 主题
 - **多行输入** —— Shift+Enter 换行、高度自适应、历史记录
+- **任务完成通知** —— 长任务结束后优先走终端原生通知协议，必要时回退到系统通知
 - **文本选择** —— 鼠标拖选、自动滚动、复制到剪贴板
 - **斜杠命令** —— `/model`、`/provider`、`/resume`、`/diff`、`/undo`、`/cost`、`/clear`、`/compact` 等（完整列表见下）
 - **文件附加** —— 粘贴文件路径即可把内容作为上下文带入
@@ -109,10 +113,14 @@ AtomCode 是一款住在你终端里的 AI 编码助手。用自然语言给它�
 ### 安全性
 
 - **破坏性命令检测** —— `rm -rf`、`git push --force`、`DROP TABLE` 等需要显式确认
-- **敏感文件保护** —— 写入 `/etc`、`~/.ssh`、shell 配置文件需要确认
+- **按路径分层确认** —— 工作区外读取、敏感路径访问、以及所有工作区外写入会按风险等级请求确认
+- **敏感文件保护** —— 系统保护路径、凭证目录、shell 配置、`.env` 文件、密钥/证书文件会触发更强的确认规则
+- **Shell 绕过防护** —— `cat`、`head`、`ls`、`cp`、`mv`、`tee` 等常见 shell 文件命令会继承和文件工具一致的路径审批模型
 - **按会话的权限授予** —— 单条工具模式一次授权，或设为始终允许
 - **源码文件删除必须确认** —— 对代码文件执行 `rm` 从不自动放行
 - **撤销** —— `/undo` 通过文件历史快照回滚上一轮的所有文件编辑
+
+完整设计与当前边界见 [权限模型](./docs/security/permission-model.md)。
 
 ## 安装
 
@@ -124,7 +132,7 @@ cd atomcode
 cargo install --path crates/atomcode-cli --locked
 ```
 
-编译产物位于 `target/release/atomcode`。在 macOS / Linux 其被安装到 `~/.cargo/bin/atomcode`，
+编译产物位于 `target/release/atomcode`。在 macOS / Linux / HarmonyOS PC 其被安装到 `~/.cargo/bin/atomcode`，
 在 Windows 系统上其被安装到 `$env:USERPROFILE/.cargo/bin/atomcode.exe`。请确保 `~/.cargo/bin`
 （或 `%USERPROFILE%\.cargo\bin`）已经被添加到 `PATH` 环境变量中。
 

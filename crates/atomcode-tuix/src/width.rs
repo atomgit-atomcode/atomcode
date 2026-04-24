@@ -158,6 +158,24 @@ pub fn truncate_to_width(s: &str, max_cols: usize) -> String {
     acc
 }
 
+/// Truncate `s` to `max_cols` display columns, appending `…` when
+/// truncation happened so the reader sees a visible "there was more"
+/// marker instead of a silent cut mid-word. Reserves 1 column for the
+/// ellipsis, so the actual content slice is `max_cols - 1` cols wide.
+/// Strings that already fit are returned unchanged.
+pub fn truncate_with_ellipsis(s: &str, max_cols: usize) -> String {
+    if max_cols == 0 {
+        return String::new();
+    }
+    if display_width(s) <= max_cols {
+        return s.to_string();
+    }
+    let budget = max_cols.saturating_sub(1).max(1);
+    let mut acc = truncate_to_width(s, budget);
+    acc.push('…');
+    acc
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

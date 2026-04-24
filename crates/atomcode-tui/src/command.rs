@@ -32,6 +32,7 @@ pub const BUILTIN_COMMANDS: &[(&str, &str)] = &[
     // === Utilities ===
     ("/plan",     "Toggle plan mode (read-only analysis)"),
     ("/undo",     "Undo last turn's edits"),
+    ("/compact",  "Compact conversation history"),
     ("/diff",     "Show git diff of current changes"),
     ("/cost",     "Show token usage for this session"),
     ("/copy",     "Copy last AI response"),

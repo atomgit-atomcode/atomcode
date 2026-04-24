@@ -29,10 +29,23 @@ tree-sitter-go = "0.25"
 tree-sitter-java = "0.23"
 tree-sitter-c = "0.24"
 tree-sitter-cpp = "0.23"
+tree-sitter-c-sharp = "0.23"
 tree-sitter-html = "0.23"
 ignore = "0.4"
 regex = "1"
 bincode = "1"
+# Decode Chinese Windows text files (GBK/GB18030) that fail UTF-8 validation.
+# Used by read_file's fallback path.
+encoding_rs = "0.8"
+sha2 = "0.10"
+
+# Non-blocking poll on stdin in the OAuth callback path so the stdin
+# reader thread can exit cleanly when the HTTP listener wins — otherwise
+# it stays blocked in read_line() and steals the user's first keystroke
+# after login returns.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
+wiremock = "0.6"

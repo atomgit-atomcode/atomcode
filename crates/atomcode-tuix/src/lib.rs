@@ -10,6 +10,8 @@ pub mod render;
 pub mod sanitize;
 pub mod state;
 pub mod terminal;
+#[cfg(test)]
+pub mod test_term;
 pub mod think;
 pub mod trace;
 pub mod width;
@@ -18,7 +20,13 @@ use anyhow::Result;
 use atomcode_core::agent::AgentHandle;
 use atomcode_core::config::Config;
 use atomcode_core::tool::ToolContext;
-use crossterm::{execute, event::{EnableBracketedPaste, DisableBracketedPaste}};
+use crossterm::{
+    execute,
+    event::{
+        DisableBracketedPaste, EnableBracketedPaste, KeyboardEnhancementFlags,
+        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    },
+};
 use std::io;
 use tokio::sync::mpsc;
 
@@ -34,6 +42,10 @@ use crate::terminal::TerminalCaps;
 struct TerminalGuard {
     raw_enabled: bool,
     paste_enabled: bool,
+    /// Set when the Kitty keyboard protocol (CSI u) was successfully
+    /// pushed. Guards the matching pop in Drop so we don't send a stray
+    /// pop sequence on terminals that rejected the push.
+    kbd_flags_pushed: bool,
 }
 
 impl TerminalGuard {
@@ -42,6 +54,7 @@ impl TerminalGuard {
         let mut g = Self {
             raw_enabled: false,
             paste_enabled: false,
+            kbd_flags_pushed: false,
         };
         if caps.raw_mode {
             crossterm::terminal::enable_raw_mode()?;
@@ -50,6 +63,36 @@ impl TerminalGuard {
         if caps.bracketed_paste {
             execute!(io::stdout(), EnableBracketedPaste)?;
             g.paste_enabled = true;
+        }
+        // Enable Kitty keyboard protocol (CSI u / progressive enhancement)
+        // so terminals that support it report modifier+Enter as a distinct
+        // key event instead of collapsing Shift+Enter to plain Enter. Without
+        // this, crossterm sees `Enter, NONE` on both Enter and Shift+Enter
+        // and the input box can't insert a newline.
+        //
+        // `REPORT_EVENT_TYPES` is the second bit of the protocol and is what
+        // actually makes OS key autorepeat distinguishable from fresh presses:
+        // without it, every 30ms autorepeat tick reports as `KeyEventKind::Press`,
+        // so holding Shift+Enter for a normal 150ms press-down inserts 5-10
+        // newlines instead of one. With it enabled, autorepeats report as
+        // `KeyEventKind::Repeat` and are filtered out in `event_loop/mod.rs`.
+        //
+        // `execute!` is best-effort — terminals that don't support CSI u
+        // (notably Apple Terminal.app) ignore the sequence; we just don't
+        // set `kbd_flags_pushed` and Drop won't try to pop. Terminals that
+        // support DISAMBIGUATE but not REPORT_EVENT_TYPES ignore the extra
+        // bit silently — this never makes things worse than before.
+        if caps.tty
+            && execute!(
+                io::stdout(),
+                PushKeyboardEnhancementFlags(
+                    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                        | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+                )
+            )
+            .is_ok()
+        {
+            g.kbd_flags_pushed = true;
         }
         // FIXED-FOOTER via DECSTBM. Scroll region `[1, H - footer_rows]`
         // is set by `AnsiRenderer` the first time it paints the footer;
@@ -62,7 +105,21 @@ impl TerminalGuard {
         if caps.tty {
             let stdout = io::stdout();
             let mut out = stdout.lock();
-            let _ = write!(out, "\x1b[2J\x1b[H");
+            // Per-row CUP+EL instead of `\x1b[2J` — iTerm2 3.5+ ignores
+            // ED under some states; the renderer paths (reset / resize
+            // / resume) all now use EL, so keep startup consistent.
+            // Fall back to 24 rows if crossterm can't query size (very
+            // rare; a wrong guess just under-clears a few trailing rows
+            // at startup — the renderer will paint over anything below
+            // that anyway).
+            let (_, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+            use std::fmt::Write as _;
+            let mut seq = String::with_capacity((rows as usize) * 8 + 4);
+            for row in 1..=(rows as usize) {
+                let _ = write!(seq, "\x1b[{};1H\x1b[K", row);
+            }
+            seq.push_str("\x1b[H");
+            let _ = out.write_all(seq.as_bytes());
             let _ = out.flush();
         }
         Ok(g)
@@ -84,6 +141,9 @@ impl Drop for TerminalGuard {
         let mut out = stdout.lock();
         let _ = write!(out, "\x1b[?7h\x1b[r\r\n");
         let _ = out.flush();
+        if self.kbd_flags_pushed {
+            let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
+        }
         if self.paste_enabled {
             let _ = execute!(io::stdout(), DisableBracketedPaste);
         }
@@ -165,6 +225,8 @@ pub async fn run(
         .unwrap_or_else(|| History::load(crate::platform::history_path()));
 
     let session_manager = atomcode_core::session::SessionManager::new(&working_dir);
+    // Fresh session by default; `/resume` replaces this on load.
+    let current_session = atomcode_core::session::Session::default_session(working_dir.clone());
 
     // Passive "new version available" check. Detached — never blocks
     // startup; on any error returns None silently. On a positive hit
@@ -173,18 +235,61 @@ pub async fn run(
     // instead of waiting for the user's next keystroke.
     let update_hint = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
     let (wake_tx, wake_rx) = tokio::sync::mpsc::channel::<()>(1);
+
+    // Seed the hint from any prior-session staged upgrade so the user
+    // sees the pending status on the very first frame rather than
+    // waiting for the next poll to rediscover it.
+    if let Ok(Some(pending)) = atomcode_core::self_update::read_pending() {
+        if let Ok(mut g) = update_hint.lock() {
+            *g = Some(pending.version);
+        }
+    }
+
     {
         let slot = update_hint.clone();
+        let wake = wake_tx.clone();
         tokio::spawn(async move {
             let current = format!("v{}", env!("CARGO_PKG_VERSION"));
             if let Some(latest) = atomcode_core::version_check::check_latest(&current).await {
                 if let Ok(mut g) = slot.lock() {
                     *g = Some(latest);
                 }
-                let _ = wake_tx.try_send(());
+                let _ = wake.try_send(());
             }
         });
     }
+
+    // NOTE: the in-process deferred-upgrade poll used to live here. It
+    // was moved out into a detached setsid'd subprocess spawned from
+    // `main.rs` (see `spawn_detached_upgrade_prep`). Rationale: the old
+    // task was tied to this tokio runtime, so any Ctrl+C / quick exit
+    // cancelled the download mid-flight and `pending.json` was never
+    // written — making "exit and restart to auto-upgrade" silently do
+    // nothing. The detached subprocess survives parent exits. Running
+    // both would race on `staged_path` (no temp-rename in
+    // `download_and_verify`), so the in-process copy is gone entirely.
+    //
+    // Trade-off: a session that runs through a whole release cycle
+    // (>1 h) won't re-stage the newer version mid-session. We accept
+    // that — `/upgrade` still works manually, and the update hint from
+    // the one-shot `version_check` above still surfaces the availability.
+
+    // Long-lived progress channel for /upgrade. The sender is cloned
+    // into each spawned upgrade task; the receiver stays in the event
+    // loop's select!. Unbounded because progress events are tiny and
+    // we never want the upgrade task to block on UI backpressure.
+    let (upgrade_tx, upgrade_rx) =
+        tokio::sync::mpsc::unbounded_channel::<atomcode_core::self_update::UpgradeEvent>();
+
+    // Seed the recent-project-dirs ring from disk and guarantee the
+    // current working dir sits at index 0 so the `/cd` picker always
+    // has at least one entry (the dir the user just launched into).
+    let recent_dirs = {
+        let mut dirs = event_loop::commands::load_recent_dirs();
+        event_loop::commands::push_recent_dir(&mut dirs, working_dir.clone());
+        event_loop::commands::save_recent_dirs(&dirs);
+        dirs
+    };
 
     let ctx = LoopCtx {
         config,
@@ -192,14 +297,42 @@ pub async fn run(
         agent: agent_handle,
         working_dir,
         previous_dir: None,
+        recent_dirs,
         history,
         input_rx,
         commands: CommandRegistry::builtin(),
         session_manager,
+        current_session,
         update_hint,
+        monitor_warning: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        monitor_last_check_at: None,
+        // Seed with whatever's on disk now — any NEWER mtime observed
+        // later means another atomcode process resynced and our drift
+        // warning (if any) is stale.
+        monitor_last_sync_seen: atomcode_core::coding_plan::read_last_sync(),
         wake_rx,
+        wake_tx: wake_tx.clone(),
         reader: reader_handle,
+        upgrade_tx,
+        upgrade_rx,
+        pending_new_issue: None,
+        pending_run_codingplan: false,
+        pending_open_provider_wizard: false,
     };
+
+    // CodingPlan drift monitor — kick off a startup check if the current
+    // default provider is CodingPlan-managed. Non-CodingPlan users skip
+    // this entirely (no HTTP, no state touched). Check runs in the
+    // background via tokio::spawn → the warning shows up on the next
+    // footer repaint once it resolves.
+    if event_loop::monitor::is_codingplan_provider(&ctx.config.default_provider) {
+        event_loop::monitor::spawn_check(
+            ctx.config.clone(),
+            ctx.model_name.clone(),
+            ctx.monitor_warning.clone(),
+            ctx.wake_tx.clone(),
+        );
+    }
 
     let result = run_loop(ctx, renderer.as_mut()).await;
 

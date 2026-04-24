@@ -162,7 +162,7 @@ impl SessionManager {
     /// - Not on macOS
     /// - Legacy directory doesn't exist
     /// - New directory already has sessions
-    fn migrate_from_legacy() {
+    pub fn migrate_from_legacy() {
         let Some(legacy_dir) = Self::legacy_sessions_dir() else {
             return; // Not macOS, no migration needed
         };
@@ -308,12 +308,42 @@ impl SessionManager {
 }
 
 /// Generate a hash for a path (used as directory name).
+/// 
+/// Normalizes the path before hashing to ensure consistent results across:
+/// - Different path separators (Windows: `\` vs `/`)
+/// - Case sensitivity (Windows paths are case-insensitive)
+/// - Trailing slashes
 fn hash_path(path: &Path) -> String {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
-    
+
+    // Normalize the path:
+    // 1. Convert to string representation
+    // 2. Replace backslashes with forward slashes (Windows)
+    // 3. Remove trailing slash (but keep root "/" or "C:/")
+    // 4. Lowercase on Windows (case-insensitive filesystem)
+    let normalized = path.to_string_lossy();
+    let mut normalized = normalized.replace('\\', "/");
+
+    if normalized.len() > 1 && normalized.ends_with('/') {
+        normalized.pop();
+    }
+
+    #[cfg(windows)]
+    let normalized = normalized.to_lowercase();
+
+    // IMPORTANT: hash through `Path::hash`, not `str::hash`. `Path`
+    // hashes its components with length prefixes, which is NOT the
+    // same as hashing the whole string. All sessions saved before
+    // the normalization pass was added went into buckets keyed by
+    // `Path::hash`; feeding the normalized string back through a
+    // `PathBuf` keeps us on that same bucket so /resume still finds
+    // legacy sessions. Hashing the raw `&str` here would silently
+    // orphan every pre-normalization session — see the "where did
+    // my /resume history go?" regression.
     let mut hasher = DefaultHasher::new();
-    path.hash(&mut hasher);
+    let p: PathBuf = PathBuf::from(normalized);
+    p.hash(&mut hasher);
     format!("{:016x}", hasher.finish())
 }
 
@@ -357,5 +387,47 @@ mod tests {
         let hash2 = hash_path(path);
         assert_eq!(hash1, hash2);
         assert_eq!(hash1.len(), 16);
+    }
+    
+    #[test]
+    fn test_hash_path_normalized() {
+        // Same path with different representations should produce the same hash
+        // Note: on non-Windows, case sensitivity is preserved
+        
+        // Test trailing slash normalization
+        let path1 = Path::new("/Users/test/project");
+        let path2 = Path::new("/Users/test/project/");
+        assert_eq!(hash_path(path1), hash_path(path2), 
+            "Trailing slash should not affect hash");
+        
+        // Test backslash normalization (Windows-style paths)
+        let path3 = Path::new("C:\\Users\\test\\project");
+        let path4 = Path::new("C:/Users/test/project");
+        assert_eq!(hash_path(path3), hash_path(path4),
+            "Backslashes should be normalized to forward slashes");
+        
+        // Test combined: backslash + trailing slash
+        let path5 = Path::new("C:\\Users\\test\\project\\");
+        assert_eq!(hash_path(path4), hash_path(path5),
+            "Backslashes and trailing slash should both be normalized");
+    }
+
+    #[test]
+    fn hash_path_matches_legacy_path_hash_on_unix() {
+        // Regression guard: the pre-normalization implementation just did
+        // `path.hash(&mut hasher)`. Every session saved before the
+        // normalization pass lives in a bucket keyed by that hash. If
+        // `hash_path` stops matching `Path::hash` for a plain-ASCII Unix
+        // path with no trailing slash / backslashes, every legacy
+        // `/resume` session becomes invisible. See the "where did my
+        // /resume history go?" regression.
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let p = Path::new("/Users/theo/Documents/workspace/atomcode");
+        let mut expected = DefaultHasher::new();
+        p.hash(&mut expected);
+        let legacy = format!("{:016x}", expected.finish());
+        assert_eq!(hash_path(p), legacy);
     }
 }

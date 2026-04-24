@@ -231,7 +231,7 @@ impl From<&atomcode_core::conversation::message::Message> for MessageInfo {
                 // No artifacts from plain text messages (code blocks not extracted)
                 (s.clone(), None, None, None)
             }
-            atomcode_core::conversation::message::MessageContent::AssistantWithToolCalls { text, tool_calls } => {
+            atomcode_core::conversation::message::MessageContent::AssistantWithToolCalls { text, tool_calls, .. } => {
                 let calls: Vec<ToolCallInfo> = tool_calls.iter()
                     .map(|tc| ToolCallInfo {
                         id: tc.id.clone(),
@@ -569,22 +569,35 @@ fn short_path(path: &str) -> String {
     }
 }
 
-fn sessions_dir() -> PathBuf {
-    SessionManager::sessions_root_dir()
-}
 
 fn hash_path(path: &std::path::Path) -> String {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     
+    // Normalize the path before hashing to ensure consistent results across:
+    // - Different path separators (Windows: `\` vs `/`)
+    // - Case sensitivity (Windows paths are case-insensitive)
+    // - Trailing slashes
+    let normalized = path.to_string_lossy();
+    let mut normalized = normalized.replace('\\', "/");
+    
+    // Remove trailing slash (but keep root "/" or "C:/")
+    if normalized.len() > 1 && normalized.ends_with('/') {
+        normalized.pop();
+    }
+    
+    // On Windows, paths are case-insensitive
+    #[cfg(windows)]
+    let normalized = normalized.to_lowercase();
+    
     let mut hasher = DefaultHasher::new();
-    path.hash(&mut hasher);
+    normalized.hash(&mut hasher);
     format!("{:016x}", hasher.finish())
 }
 
 /// List all projects (scans sessions directory)
 fn list_projects() -> std::io::Result<Vec<ProjectInfo>> {
-    let sessions_root = sessions_dir();
+    let sessions_root = SessionManager::sessions_root_dir();
     let mut projects = Vec::new();
     
     if !sessions_root.exists() {
@@ -659,7 +672,7 @@ pub struct SessionMetaWithProject {
 
 /// List sessions for a project
 fn list_sessions(project_hash: &str) -> std::io::Result<Vec<SessionMeta>> {
-    let project_dir = sessions_dir().join(project_hash);
+    let project_dir = SessionManager::sessions_root_dir().join(project_hash);
     if !project_dir.exists() {
         return Ok(Vec::new());
     }
@@ -693,7 +706,7 @@ fn list_sessions(project_hash: &str) -> std::io::Result<Vec<SessionMeta>> {
 
 /// List all sessions across all projects
 fn list_all_sessions() -> std::io::Result<Vec<SessionMetaWithProject>> {
-    let sessions_root = sessions_dir();
+    let sessions_root = SessionManager::sessions_root_dir();
     if !sessions_root.exists() {
         return Ok(Vec::new());
     }
@@ -741,7 +754,7 @@ fn list_all_sessions() -> std::io::Result<Vec<SessionMetaWithProject>> {
 
 /// Load a specific session
 fn load_session(project_hash: &str, session_id: &str) -> std::io::Result<Session> {
-    let path = sessions_dir()
+    let path = SessionManager::sessions_root_dir()
         .join(project_hash)
         .join(format!("{}.json", session_id));
     
@@ -991,7 +1004,7 @@ async fn create_session(
 
 /// Search sessions by name across all projects
 fn search_sessions_by_name(keyword: &str) -> std::io::Result<Vec<SessionMetaWithProject>> {
-    let sessions_root = sessions_dir();
+    let sessions_root = SessionManager::sessions_root_dir();
     if !sessions_root.exists() {
         return Ok(Vec::new());
     }
@@ -1056,7 +1069,7 @@ async fn search_sessions(Query(query): Query<SearchQuery>) -> impl IntoResponse 
 
 /// Delete a session file
 fn delete_session_file(project_hash: &str, session_id: &str) -> std::io::Result<()> {
-    let path = sessions_dir()
+    let path = SessionManager::sessions_root_dir()
         .join(project_hash)
         .join(format!("{}.json", session_id));
     
@@ -1094,7 +1107,7 @@ pub struct RenameRequest {
 
 /// Rename a session
 fn rename_session_file(project_hash: &str, session_id: &str, new_name: &str) -> std::io::Result<()> {
-    let path = sessions_dir()
+    let path = SessionManager::sessions_root_dir()
         .join(project_hash)
         .join(format!("{}.json", session_id));
     
@@ -1580,36 +1593,79 @@ let session_manager = SessionManager::new(&working_dir);
     // Build tool registry and context
     let tool_context = ToolContext::new(working_dir.clone());
     let mut tool_registry = ToolRegistry::new();
-    tool_registry.register(Box::new(ReadFileTool));
-    tool_registry.register(Box::new(WriteFileTool));
-    tool_registry.register(Box::new(EditFileTool));
-    tool_registry.register(Box::new(BashTool));
-    tool_registry.register(Box::new(GrepTool));
-    tool_registry.register(Box::new(GlobTool));
-    tool_registry.register(Box::new(ListDirTool));
-    tool_registry.register(Box::new(WebSearchTool));
-    tool_registry.register(Box::new(WebFetchTool));
-    tool_registry.register(Box::new(SearchReplaceTool));
+    // Honour ATOMCODE_DISABLE_TOOLS env var at daemon startup too, matching
+    // the CLI's --disable-tools behaviour. Comma-separated tool names.
+    let disabled_tools: std::collections::HashSet<String> = std::env::var("ATOMCODE_DISABLE_TOOLS")
+        .ok()
+        .map(|v| v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
+        .unwrap_or_default();
+    let enabled = |name: &str| !disabled_tools.contains(name);
+    if enabled("read_file") { tool_registry.register(Box::new(ReadFileTool)); }
+    if enabled("write_file") { tool_registry.register(Box::new(WriteFileTool)); }
+    if enabled("edit_file") { tool_registry.register(Box::new(EditFileTool)); }
+    if enabled("bash") { tool_registry.register(Box::new(BashTool)); }
+    if enabled("grep") { tool_registry.register(Box::new(GrepTool)); }
+    if enabled("glob") { tool_registry.register(Box::new(GlobTool)); }
+    if enabled("list_directory") { tool_registry.register(Box::new(ListDirTool)); }
+    if enabled("web_search") { tool_registry.register(Box::new(WebSearchTool)); }
+    if enabled("web_fetch") { tool_registry.register(Box::new(WebFetchTool)); }
+    if enabled("search_replace") { tool_registry.register(Box::new(SearchReplaceTool)); }
+
+    // Load skills and register use_skill tool
+    let mut skill_registry = atomcode_core::skill::SkillRegistry::new();
+    skill_registry.reload(&working_dir);
+    let has_skills = !skill_registry.is_empty();
+    let skill_registry = Arc::new(std::sync::RwLock::new(skill_registry));
+    if has_skills && enabled("use_skill") {
+        tool_registry.register(Box::new(atomcode_core::tool::use_skill::UseSkillTool {
+            registry: skill_registry.clone()
+        }));
+    }
+
     let shared_tools = Arc::new(tool_registry);
     
     // Create turn runner with auto-bypass permission (API mode - no interactive approval)
     let permission = Box::new(AutoPermissionDecider::new(AutoPermissionMode::BypassAll));
+    // Same ctx selection as interactive AgentLoop: walk config.providers
+    // for the active provider, fallback to synthetic 128K config if absent.
+    let daemon_ctx = match config.providers.get(&config.default_provider) {
+        Some(pc) => atomcode_core::ctx::for_provider(pc),
+        None => atomcode_core::ctx::for_provider(&atomcode_core::config::provider::ProviderConfig {
+            provider_type: String::new(),
+            api_key: None,
+            model: String::new(),
+            base_url: None,
+            system_prompt: None,
+            user_agent: None,
+            context_window: 128_000,
+            max_tokens: None,
+            thinking_type: None,
+            thinking_keep: None,
+            reasoning_history: None,
+            ephemeral: true,
+        }),
+    };
     let mut turn_runner = TurnRunner {
         provider: provider.into(),
         tools: shared_tools,
         context: tool_context,
         config: config.clone(),
+        ctx: daemon_ctx,
         permission,
         recently_edited_files: Vec::new(),
+        recent_calls: Vec::new(),
+        file_read_counts: std::collections::HashMap::new(),
     };
     
     // Build system prompt (minimal for API)
-    let system_prompt = build_api_system_prompt(&working_dir);
+    let system_prompt = build_api_system_prompt(&working_dir, &skill_registry);
     // Create turn event channel
     let (turn_tx, mut turn_rx) = mpsc::unbounded_channel::<TurnEvent>();
     
     // Check if session was stopped before we started
-    if stopped_sessions.read().await.contains(&req.session_id.clone().unwrap_or_default()) {
+    // If so, clear the stopped marker and return - allows next chat to proceed normally
+    let session_id_str = req.session_id.clone().unwrap_or_default();
+    if stopped_sessions.write().await.take(&session_id_str).is_some() {
         let _ = event_tx.send(ChatEvent::Stopped);
         let _ = event_tx.send(ChatEvent::Done { tokens: 0, tool_calls: 0 });
         return Ok(());
@@ -1625,15 +1681,16 @@ let session_manager = SessionManager::new(&working_dir);
         // Loop until LLM produces text without tool calls
         loop {
             let result = turn_runner.run(&mut conv, &system_prompt, &turn_tx, cancel_token.clone()).await;
-            
+
             match result {
                 TurnResult::Responded { .. } => {
                     // LLM produced text, turn is complete
                     break;
                 }
                 TurnResult::UsedTools { .. } => {
-                    // Tools were executed, continue to next LLM call
-                    // The tool results are already added to conversation
+                    // Truncation of tool outputs is handled inside
+                    // TurnRunner::run_with_filter now. Nothing to do
+                    // here — just loop back for the next LLM call.
                     continue;
                 }
                 TurnResult::Failed(e) => {
@@ -1726,6 +1783,11 @@ let session_manager = SessionManager::new(&working_dir);
                 // Daemon/HTTP mode doesn't surface the "tool name streaming" phase —
                 // API clients receive the complete ToolCallStarted event when args are ready.
             }
+            TurnEvent::WorkingDirChanged(_) => {
+                // Daemon/HTTP mode doesn't maintain a TUI footer; the shared
+                // `ctx.working_dir` was already updated in the tool. Clients
+                // that need the cwd can read it from subsequent tool output.
+            }
         }
     }
     
@@ -1764,9 +1826,9 @@ let session_manager = SessionManager::new(&working_dir);
 }
 
 /// Build minimal system prompt for API mode
-fn build_api_system_prompt(working_dir: &PathBuf) -> String {
+fn build_api_system_prompt(working_dir: &PathBuf, skill_registry: &Arc<std::sync::RwLock<atomcode_core::skill::SkillRegistry>>) -> String {
     let cwd = working_dir.to_string_lossy();
-    format!(
+    let mut prompt = format!(
         r#"You are AtomCode, an expert coding agent. You solve tasks efficiently with minimal tool calls.
 
 ## WORKING DIRECTORY
@@ -1784,7 +1846,29 @@ fn build_api_system_prompt(working_dir: &PathBuf) -> String {
 4. VERIFY: After EACH edit, compile/build. Fix errors before moving on.
 5. SUMMARIZE: Tell the user what you changed.
 "#
-    )
+    );
+    
+    // Inject available skills into system prompt
+    if let Ok(registry) = skill_registry.read() {
+        let skills: Vec<String> = registry
+            .invocable_by_llm()
+            .map(|s| {
+                let hint = s.argument_hint
+                    .as_ref()
+                    .map(|h| format!(" {}", h))
+                    .unwrap_or_default();
+                format!("- /{}{}: {}", s.name, hint, s.description)
+            })
+            .collect();
+        if !skills.is_empty() {
+            prompt.push_str("\n## AVAILABLE SKILLS\n");
+            prompt.push_str("Use the `use_skill` tool to invoke a skill when relevant to the task.\n");
+            prompt.push_str(&skills.join("\n"));
+            prompt.push('\n');
+        }
+    }
+    
+    prompt
 }
 
 /// Request to stop a chat session
@@ -1827,7 +1911,11 @@ async fn stop_chat(
 #[tokio::main]
 async fn main() {
     use axum::routing::patch;
-    
+
+    // Ensure legacy sessions (macOS pre-v4.16 ~/Library/Application Support/atomcode/sessions)
+    // are migrated to the canonical location (~/.atomcode/sessions) before any handler reads it.
+    SessionManager::migrate_from_legacy();
+
     let state = AppState {
         sessions: Arc::new(RwLock::new(std::collections::HashMap::new())),
         project: Arc::new(RwLock::new(init_project_state())),

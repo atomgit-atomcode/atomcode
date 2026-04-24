@@ -1,0 +1,1017 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>ctx 模块 — atomcode 上下文管理架构</title>
+<style>
+  :root {
+    --bg: #fafafa;
+    --panel: #ffffff;
+    --ink: #1a1a1a;
+    --muted: #666;
+    --line: #e5e5e5;
+    --line-strong: #bbb;
+    --accent: #0066cc;
+    --warn: #c25;
+    --green: #2a7;
+    --red: #c33;
+    --code-bg: #f4f4f4;
+    --added: #e6f4e6;
+    --removed: #fde;
+    --changed: #fff4d6;
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI",
+                 "Helvetica Neue", "PingFang SC", "Hiragino Sans GB",
+                 "Microsoft YaHei", sans-serif;
+    line-height: 1.65;
+    color: var(--ink);
+    background: var(--bg);
+    margin: 0;
+    padding: 0;
+    font-size: 15px;
+  }
+  .container {
+    max-width: 1080px;
+    margin: 0 auto;
+    padding: 36px 48px 80px;
+  }
+  header {
+    border-bottom: 3px solid var(--ink);
+    padding-bottom: 20px;
+    margin-bottom: 36px;
+  }
+  header h1 {
+    margin: 0 0 8px;
+    font-size: 30px;
+    letter-spacing: -0.02em;
+  }
+  header .sub {
+    color: var(--muted);
+    font-size: 14px;
+  }
+  header .sub code {
+    background: var(--code-bg);
+    padding: 1px 6px;
+    border-radius: 3px;
+    font-size: 13px;
+  }
+  nav {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    padding: 14px 20px;
+    margin-bottom: 40px;
+    border-radius: 4px;
+    font-size: 14px;
+  }
+  nav ol {
+    margin: 0;
+    padding-left: 20px;
+    columns: 2;
+    column-gap: 24px;
+  }
+  nav a { color: var(--accent); text-decoration: none; }
+  nav a:hover { text-decoration: underline; }
+
+  h2 {
+    font-size: 24px;
+    margin-top: 44px;
+    margin-bottom: 14px;
+    padding-bottom: 8px;
+    border-bottom: 2px solid var(--line-strong);
+  }
+  h3 {
+    font-size: 18px;
+    margin-top: 28px;
+    margin-bottom: 10px;
+  }
+  h4 {
+    font-size: 14px;
+    margin-top: 18px;
+    margin-bottom: 8px;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    font-weight: 600;
+  }
+  p { margin: 12px 0; }
+
+  code {
+    font-family: "SF Mono", Menlo, Consolas, monospace;
+    font-size: 13px;
+    background: var(--code-bg);
+    padding: 1px 5px;
+    border-radius: 3px;
+  }
+  pre {
+    background: #1e1e1e;
+    color: #d4d4d4;
+    padding: 14px 18px;
+    border-radius: 6px;
+    overflow-x: auto;
+    font-size: 13px;
+    line-height: 1.55;
+    margin: 14px 0;
+  }
+  pre code {
+    background: none;
+    padding: 0;
+    color: inherit;
+  }
+  .kw { color: #569cd6; }
+  .ty { color: #4ec9b0; }
+  .fn { color: #dcdcaa; }
+  .cm { color: #6a9955; }
+  .st { color: #ce9178; }
+  .nm { color: #d4d4d4; }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 14px 0;
+    font-size: 14px;
+  }
+  table th {
+    background: #f0f0f0;
+    text-align: left;
+    padding: 9px 12px;
+    border-bottom: 2px solid var(--line-strong);
+    font-weight: 600;
+  }
+  table td {
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--line);
+    vertical-align: top;
+  }
+  table tr:nth-child(even) { background: #fafafa; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+
+  .tag {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 3px;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.03em;
+    text-transform: uppercase;
+    margin-right: 4px;
+  }
+  .tag.new     { background: #d4f4d4; color: #060; }
+  .tag.move    { background: #fff4d6; color: #840; }
+  .tag.modify  { background: #eef5ff; color: #036; }
+  .tag.delete  { background: #fde; color: #800; }
+
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 16px 20px;
+    margin: 14px 0;
+  }
+  .panel.info    { background: #eef5ff; border-left: 4px solid var(--accent); }
+  .panel.ok      { background: #e9f7e9; border-left: 4px solid var(--green); }
+  .panel.warn    { background: #fff8e6; border-left: 4px solid var(--warn); }
+
+  .callout {
+    background: #fff8e6;
+    border-left: 4px solid var(--warn);
+    padding: 12px 16px;
+    margin: 18px 0;
+    border-radius: 0 4px 4px 0;
+    font-size: 14px;
+  }
+  .callout .label {
+    font-weight: 600;
+    color: var(--warn);
+    text-transform: uppercase;
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    margin-right: 6px;
+  }
+
+  .seq {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 18px 16px;
+    margin: 18px 0;
+    overflow-x: auto;
+  }
+  .seq svg { display: block; margin: 0 auto; }
+  .seq .caption {
+    font-size: 13px;
+    color: var(--muted);
+    text-align: center;
+    margin-top: 10px;
+  }
+
+  .twocol {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 18px;
+    margin: 16px 0;
+  }
+
+  footer {
+    margin-top: 70px;
+    padding-top: 20px;
+    border-top: 1px solid var(--line);
+    font-size: 13px;
+    color: var(--muted);
+  }
+  footer a { color: var(--accent); text-decoration: none; }
+
+  @media print {
+    body { font-size: 11px; }
+    nav { break-after: page; }
+    h2 { break-before: page; }
+  }
+</style>
+</head>
+<body>
+<div class="container">
+
+<header>
+  <h1>ctx 模块</h1>
+  <div class="sub">
+    atomcode 上下文管理架构 · 分支 <code>feat/ctx-module</code>
+    · <code>crates/atomcode-core/src/ctx/</code>
+  </div>
+</header>
+
+<nav>
+  <ol>
+    <li><a href="#arch">架构设计</a></li>
+    <li><a href="#modules">模块结构</a></li>
+    <li><a href="#sequences">关键时序</a></li>
+    <li><a href="#examples">实例：加自定义 ctx</a></li>
+  </ol>
+</nav>
+
+<!-- ================================================ -->
+<h2 id="arch">1. 架构设计</h2>
+
+<h3>1.1 一句话</h3>
+
+<p><strong>所有模型共享一个 trait <code>CtxBuilder</code>，每个模型可选择实现自己的 context 构造逻辑；没实现 → 走 <code>DefaultCtx</code>。</strong></p>
+
+<h3>1.2 设计原则</h3>
+
+<table>
+  <tr>
+    <th style="width: 140px;">原则</th>
+    <th>含义</th>
+  </tr>
+  <tr>
+    <td><strong>单一 trait</strong></td>
+    <td>不拆 role、不做 facade 聚合。<code>CtxBuilder</code> 5 个方法，一个 impl 一套完整行为</td>
+  </tr>
+  <tr>
+    <td><strong>impl 自主</strong></td>
+    <td>trait 只定接口、不强制流程。<code>build_messages</code> 里爱怎么构造消息都行——改 system prompt、砍 tool schema、自定义 turn_reminder、自创压缩规则</td>
+  </tr>
+  <tr>
+    <td><strong>默认兜底</strong></td>
+    <td><code>DefaultCtx</code> 完全等价原有 <code>Conversation::to_provider_messages_budgeted</code> 行为。规则表未命中的模型永远走它</td>
+  </tr>
+  <tr>
+    <td><strong>YAGNI</strong></td>
+    <td>trait 只有 5 个方法、数据契约只返回 <code>(Vec&lt;Message&gt;, ContextStats)</code>。不预留字段、不预留枚举变体，等真需要再加</td>
+  </tr>
+  <tr>
+    <td><strong>按 provider 构造</strong></td>
+    <td>注册入口 <code>for_provider(&ProviderConfig)</code>，impl 从 config 里捕获 ctx_window / max_tokens / base_url 等所需字段</td>
+  </tr>
+  <tr>
+    <td><strong>跟随模型切换</strong></td>
+    <td><code>ReloadConfig</code> 重建 ctx；<code>build_system_prompt()</code> 已经每轮重建、按 provider 读字段——两层自然协同，无需特殊握手</td>
+  </tr>
+</table>
+
+<h3>1.3 Trait 长这样</h3>
+
+<pre><code><span class="kw">pub trait</span> <span class="ty">CtxBuilder</span>: <span class="ty">Send</span> + <span class="ty">Sync</span> {
+    <span class="cm">/// 构造这一轮发送给 LLM 的消息数组 + 统计。</span>
+    <span class="cm">/// impl 完全自主决定怎么组装——system prompt 要不要变、</span>
+    <span class="cm">/// tool_result 要不要压、turn_reminder 要不要注入。</span>
+    <span class="kw">fn</span> <span class="fn">build_messages</span>(
+        &<span class="kw">self</span>,
+        conv: &<span class="ty">Conversation</span>,
+        system_prompt: &<span class="kw">str</span>,
+    ) -> (<span class="ty">Vec</span>&lt;<span class="ty">Message</span>&gt;, <span class="ty">ContextStats</span>);
+
+    <span class="cm">/// 是否触发压缩(每轮末检查)。默认：不压。</span>
+    <span class="kw">fn</span> <span class="fn">needs_compression</span>(&<span class="kw">self</span>, _: &<span class="ty">Conversation</span>, _: <span class="kw">usize</span>) -> <span class="kw">bool</span> { <span class="kw">false</span> }
+
+    <span class="cm">/// 压缩计划(待摘要文本, 删几条)；None = 不压。</span>
+    <span class="kw">fn</span> <span class="fn">compression_plan</span>(&<span class="kw">self</span>, _: &<span class="ty">Conversation</span>) -> <span class="ty">Option</span>&lt;(<span class="ty">String</span>, <span class="kw">usize</span>)&gt; { <span class="kw">None</span> }
+
+    <span class="cm">/// 单条 tool 输出截断。</span>
+    <span class="kw">fn</span> <span class="fn">truncate_tool_output</span>(&<span class="kw">self</span>, result: &<span class="kw">mut</span> <span class="ty">ToolResult</span>, tool_name: &<span class="kw">str</span>);
+
+    <span class="cm">/// 策略名(日志/调试)。</span>
+    <span class="kw">fn</span> <span class="fn">name</span>(&<span class="kw">self</span>) -> &<span class="st">'static</span> <span class="kw">str</span>;
+}</code></pre>
+
+<div class="panel info">
+  <strong>为什么 <code>build_messages</code> 一个方法就够</strong>——
+  它直接拿到 <code>system_prompt: &str</code>（来自 agent::prompt 层，已按
+  provider 重建）。impl 想改 system prompt 自己变换即可；想自定义
+  tool_result 压缩、turn_reminder 注入时机、replace_stale_reads 策略，
+  全部在 <code>build_messages</code> 函数体内决定。<br><br>
+  <strong>不需要</strong>额外的 <code>transform_system_prompt</code> /
+  <code>build_cold_zone</code> / <code>build_hot_history</code> 钩子——
+  那些都是没证据支撑的过度设计。真需要时再加。
+</div>
+
+<h3>1.4 注册入口</h3>
+
+<pre><code><span class="cm">/// 给定 provider config 返回对应 CtxBuilder。</span>
+<span class="cm">/// 添加自定义模型：在 match 里加一条 arm。</span>
+<span class="cm">/// 没命中 → DefaultCtx(保留当前行为)。</span>
+<span class="kw">pub fn</span> <span class="fn">for_provider</span>(provider: &<span class="ty">ProviderConfig</span>) -> <span class="ty">Box</span>&lt;<span class="kw">dyn</span> <span class="ty">CtxBuilder</span>&gt; {
+    <span class="cm">// 自定义规则示例(目前 feat/ctx-module 上是空的)：</span>
+    <span class="cm">//   if provider.provider_type == "ollama" {</span>
+    <span class="cm">//       return Box::new(OllamaCtx::new(provider));</span>
+    <span class="cm">//   }</span>
+    <span class="cm">//   if provider.model.starts_with("claude-") {</span>
+    <span class="cm">//       return Box::new(ClaudeCtx::new(provider));</span>
+    <span class="cm">//   }</span>
+
+    <span class="ty">Box</span>::<span class="fn">new</span>(<span class="ty">DefaultCtx</span>::<span class="fn">new</span>(provider))
+}</code></pre>
+
+<!-- ================================================ -->
+<h2 id="modules">2. 模块结构</h2>
+
+<h3>2.1 文件布局</h3>
+
+<pre><code>crates/atomcode-core/src/
+├── ctx/                              <span class="cm">← 新增模块</span>
+│   ├── mod.rs             <span class="cm">── CtxBuilder trait + re-exports</span>
+│   ├── resolver.rs        <span class="cm">── for_provider() 规则表</span>
+│   ├── render.rs          <span class="cm">── 默认 render / compression 策略</span>
+│   ├── default.rs         <span class="cm">── DefaultCtx = ctx::render 薄封装</span>
+│   ├── ollama.rs          <span class="cm">── OllamaCtx 小窗口本地模型</span>
+│   └── truncate.rs        <span class="cm">── 从 turn/truncation.rs 迁入</span>
+│
+├── conversation/mod.rs    <span class="cm">── 纯数据层(add_* / apply_compression + 字段)</span>
+├── agent/mod.rs           <span class="cm">── AgentLoop 加 ctx 字段 + 4 call site 改走 self.ctx.*</span>
+├── config/mod.rs          <span class="cm">── Config::default_context_window() helper</span>
+└── turn/
+    ├── mod.rs             <span class="cm">── 去掉 pub mod truncation</span>
+    └── runner.rs          <span class="cm">── 调 ctx::render::build_messages</span></code></pre>
+
+<div class="panel info">
+<strong>依赖方向(严格 DAG)</strong>: <code>agent / turn</code> → <code>ctx::{default, ollama, resolver, render, truncate}</code> → <code>conversation</code>(叶子)。<code>conversation</code> 不反向引用 <code>ctx</code>,生产和测试代码都是(grep 验证)。
+</div>
+
+<h3>2.2 新增 / 修改详情</h3>
+
+<table>
+  <tr>
+    <th>文件</th>
+    <th>类型</th>
+    <th>职责</th>
+    <th class="num">代码量</th>
+  </tr>
+  <tr>
+    <td><code>ctx/mod.rs</code></td>
+    <td><span class="tag new">new</span></td>
+    <td>CtxBuilder trait 定义 + re-exports(routing 逻辑在 resolver.rs)</td>
+    <td class="num">~75 行</td>
+  </tr>
+  <tr>
+    <td><code>ctx/resolver.rs</code></td>
+    <td><span class="tag new">new</span></td>
+    <td><code>for_provider</code> 规则表,添加新模型在此登记</td>
+    <td class="num">~90 行</td>
+  </tr>
+  <tr>
+    <td><code>ctx/render.rs</code></td>
+    <td><span class="tag new">new</span></td>
+    <td>默认 render 管道:build_messages / needs_compression / build_compression_content + 4 个私有 helper (microcompact / replace_stale_reads / clean_message_pipeline / sanitize_messages),从 Conversation impl 搬出</td>
+    <td class="num">~720 行(含测试)</td>
+  </tr>
+  <tr>
+    <td><code>ctx/default.rs</code></td>
+    <td><span class="tag new">new</span></td>
+    <td><code>DefaultCtx</code> 薄封装(全部 delegate 到 ctx::render) + 基础测试</td>
+    <td class="num">~115 行</td>
+  </tr>
+  <tr>
+    <td><code>ctx/ollama.rs</code></td>
+    <td><span class="tag new">new</span></td>
+    <td><code>OllamaCtx</code> 小窗口优化:35% 压缩阈值 + 工具输出 2K-6K 字节 belt + UTF-8 安全截断</td>
+    <td class="num">~260 行</td>
+  </tr>
+  <tr>
+    <td><code>ctx/truncate.rs</code></td>
+    <td><span class="tag move">moved</span></td>
+    <td>per-tool 截断（整体 git rename，内容不变）</td>
+    <td class="num">521 行</td>
+  </tr>
+  <tr>
+    <td><code>conversation/mod.rs</code></td>
+    <td><span class="tag modify">modified</span></td>
+    <td>删 dead summary 4 方法 + render 3 方法 + 4 个 helper → 迁到 ctx::render; 保留 add_* / apply_compression / 字段 / KEEP_MESSAGES pub(crate) const</td>
+    <td class="num">≈ 2000 → 715 行</td>
+  </tr>
+  <tr>
+    <td><code>agent/mod.rs</code></td>
+    <td><span class="tag modify">modified</span></td>
+    <td>加 <code>ctx</code> 字段 · <code>AgentLoop::new</code> 初始化 · <code>ReloadConfig</code> 同步重建 · 4 处 call site 改走 <code>self.ctx.*</code> · 删 <code>maybe_summarize_old_turns</code></td>
+    <td class="num">+43 / −70</td>
+  </tr>
+  <tr>
+    <td><code>config/mod.rs</code></td>
+    <td><span class="tag modify">modified</span></td>
+    <td>加 <code>Config::default_context_window()</code> helper</td>
+    <td class="num">+11</td>
+  </tr>
+  <tr>
+    <td><code>turn/truncation.rs</code></td>
+    <td><span class="tag delete">deleted</span></td>
+    <td>整体迁到 <code>ctx/truncate.rs</code></td>
+    <td class="num">−524</td>
+  </tr>
+  <tr>
+    <td><code>agent/tool_dispatch.rs</code></td>
+    <td><span class="tag modify">modified</span></td>
+    <td>import 改走 <code>ctx::truncate</code> + DRY context_window</td>
+    <td class="num">±3</td>
+  </tr>
+  <tr>
+    <td><code>turn/runner.rs</code></td>
+    <td><span class="tag modify">modified</span></td>
+    <td>DRY context_window lookup</td>
+    <td class="num">±5</td>
+  </tr>
+  <tr>
+    <td><code>atomcode-tui/src/app.rs</code></td>
+    <td><span class="tag modify">modified</span></td>
+    <td>DRY context_window lookup</td>
+    <td class="num">±1</td>
+  </tr>
+  <tr style="border-top: 2px solid var(--line-strong); font-weight: 600;">
+    <td colspan="3">净变化</td>
+    <td class="num">+354 / −268</td>
+  </tr>
+</table>
+
+<h3>2.3 公共 API</h3>
+
+<h4>导出(<code>crates/atomcode-core/src/ctx/mod.rs</code>)</h4>
+
+<pre><code><span class="cm">// 类型</span>
+<span class="kw">pub trait</span> <span class="ty">CtxBuilder</span> { ... }      <span class="cm">// 单一 trait</span>
+<span class="kw">pub use</span> default::<span class="ty">DefaultCtx</span>;        <span class="cm">// 默认实现</span>
+
+<span class="cm">// 入口函数</span>
+<span class="kw">pub fn</span> <span class="fn">for_provider</span>(provider: &<span class="ty">ProviderConfig</span>) -> <span class="ty">Box</span>&lt;<span class="kw">dyn</span> <span class="ty">CtxBuilder</span>&gt;;
+
+<span class="cm">// 子模块</span>
+<span class="kw">pub mod</span> truncate;                  <span class="cm">// 搬家来的截断工具函数</span></code></pre>
+
+<h4>AgentLoop 字段</h4>
+
+<pre><code><span class="kw">pub struct</span> <span class="ty">AgentLoop</span> {
+    <span class="cm">// ... 原有字段 ...</span>
+    <span class="kw">pub</span> config: <span class="ty">Config</span>,
+    <span class="kw">pub</span> ctx: <span class="ty">Box</span>&lt;<span class="kw">dyn</span> crate::ctx::<span class="ty">CtxBuilder</span>&gt;,  <span class="cm">// ← 新字段</span>
+    <span class="cm">// ...</span>
+}</code></pre>
+
+<!-- ================================================ -->
+<h2 id="sequences">3. 关键时序</h2>
+
+<h3>3.1 启动：config → CtxBuilder</h3>
+
+<div class="seq">
+<svg width="780" height="250" xmlns="http://www.w3.org/2000/svg" font-family="SF Mono, Menlo, monospace" font-size="11">
+  <g stroke="#bbb" stroke-width="1">
+    <line x1="90" y1="40" x2="90" y2="230"/>
+    <line x1="260" y1="40" x2="260" y2="230"/>
+    <line x1="440" y1="40" x2="440" y2="230"/>
+    <line x1="640" y1="40" x2="640" y2="230"/>
+  </g>
+  <g fill="#eef5ff" stroke="#036">
+    <rect x="35" y="16" width="110" height="28" rx="3"/>
+    <rect x="205" y="16" width="110" height="28" rx="3"/>
+    <rect x="385" y="16" width="110" height="28" rx="3"/>
+    <rect x="585" y="16" width="110" height="28" rx="3"/>
+  </g>
+  <g fill="#036" text-anchor="middle" font-weight="600">
+    <text x="90" y="34">CLI / TUI</text>
+    <text x="260" y="34">AgentLoop::new</text>
+    <text x="440" y="34">ctx::for_provider</text>
+    <text x="640" y="34">DefaultCtx::new</text>
+  </g>
+
+  <g fill="#1a1a1a">
+    <line x1="90" y1="70" x2="258" y2="70" stroke="#1a1a1a" stroke-width="1.2" marker-end="url(#arr)"/>
+    <text x="174" y="65">AgentLoop::new(config, provider, tools, ...)</text>
+
+    <line x1="260" y1="105" x2="438" y2="105" stroke="#1a1a1a" stroke-width="1.2" marker-end="url(#arr)"/>
+    <text x="349" y="100">for_provider(&amp;provider_config)</text>
+
+    <text x="450" y="128" fill="#666">match 规则表(当前空) → fallthrough</text>
+
+    <line x1="440" y1="158" x2="638" y2="158" stroke="#1a1a1a" stroke-width="1.2" marker-end="url(#arr)"/>
+    <text x="540" y="153">DefaultCtx::new(provider)</text>
+
+    <line x1="638" y1="188" x2="442" y2="188" stroke="#2a7" stroke-width="1.2" stroke-dasharray="4 3" marker-end="url(#arrG)"/>
+    <text x="540" y="183" fill="#2a7">DefaultCtx { ctx_window: 128_000 }</text>
+
+    <line x1="438" y1="215" x2="262" y2="215" stroke="#2a7" stroke-width="1.2" stroke-dasharray="4 3" marker-end="url(#arrG)"/>
+    <text x="350" y="210" fill="#2a7">Box&lt;dyn CtxBuilder&gt;</text>
+  </g>
+
+  <defs>
+    <marker id="arr" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#1a1a1a"/>
+    </marker>
+    <marker id="arrG" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#2a7"/>
+    </marker>
+  </defs>
+</svg>
+<div class="caption">图 3.1 — <code>AgentLoop::new</code> 只调一次 <code>for_provider</code>，拿到 <code>Box&lt;dyn CtxBuilder&gt;</code> 存在 <code>self.ctx</code>。整个 session 期间除非 <code>ReloadConfig</code>，否则不再换。</div>
+</div>
+
+<h3>3.2 每轮：render 与 LLM 调用</h3>
+
+<div class="seq">
+<svg width="820" height="310" xmlns="http://www.w3.org/2000/svg" font-family="SF Mono, Menlo, monospace" font-size="11">
+  <g stroke="#bbb" stroke-width="1">
+    <line x1="80" y1="40" x2="80" y2="290"/>
+    <line x1="230" y1="40" x2="230" y2="290"/>
+    <line x1="400" y1="40" x2="400" y2="290"/>
+    <line x1="560" y1="40" x2="560" y2="290"/>
+    <line x1="720" y1="40" x2="720" y2="290"/>
+  </g>
+  <g fill="#eef5ff" stroke="#036">
+    <rect x="30" y="16" width="100" height="28" rx="3"/>
+    <rect x="175" y="16" width="110" height="28" rx="3"/>
+    <rect x="340" y="16" width="120" height="28" rx="3"/>
+    <rect x="505" y="16" width="110" height="28" rx="3"/>
+    <rect x="665" y="16" width="110" height="28" rx="3"/>
+  </g>
+  <g fill="#036" text-anchor="middle" font-weight="600">
+    <text x="80" y="34">user input</text>
+    <text x="230" y="34">AgentLoop</text>
+    <text x="400" y="34">self.ctx</text>
+    <text x="560" y="34">TurnRunner</text>
+    <text x="720" y="34">LlmProvider</text>
+  </g>
+
+  <g fill="#1a1a1a">
+    <line x1="80" y1="68" x2="228" y2="68" stroke="#1a1a1a" stroke-width="1.2" marker-end="url(#arr2)"/>
+    <text x="154" y="63">run_turn()</text>
+
+    <text x="240" y="90" fill="#666">system_prompt = build_system_prompt()  <span class="cm">// 已按 provider 重建</span></text>
+
+    <line x1="230" y1="115" x2="398" y2="115" stroke="#1a1a1a" stroke-width="1.2" marker-end="url(#arr2)"/>
+    <text x="314" y="110">build_messages(&amp;conv, &amp;system_prompt)</text>
+
+    <g fill="#666" font-size="10">
+      <text x="408" y="135">── DefaultCtx: 透传 conv.to_provider_messages_budgeted</text>
+      <text x="408" y="148">── 自定义 impl: 自由变换 system_prompt + 组装 messages</text>
+    </g>
+
+    <line x1="398" y1="168" x2="232" y2="168" stroke="#2a7" stroke-width="1.2" stroke-dasharray="4 3" marker-end="url(#arrG2)"/>
+    <text x="314" y="163" fill="#2a7">(Vec&lt;Message&gt;, ContextStats)</text>
+
+    <line x1="230" y1="195" x2="558" y2="195" stroke="#1a1a1a" stroke-width="1.2" marker-end="url(#arr2)"/>
+    <text x="394" y="190">turn_runner.run(messages, ...)</text>
+
+    <line x1="560" y1="222" x2="718" y2="222" stroke="#1a1a1a" stroke-width="1.2" marker-end="url(#arr2)"/>
+    <text x="639" y="217">chat_stream(messages)</text>
+
+    <line x1="718" y1="249" x2="562" y2="249" stroke="#2a7" stroke-width="1.2" stroke-dasharray="4 3" marker-end="url(#arrG2)"/>
+    <text x="639" y="244" fill="#2a7">StreamEvent::Delta / ToolCall ...</text>
+
+    <line x1="560" y1="278" x2="402" y2="278" stroke="#1a1a1a" stroke-width="1.2" marker-end="url(#arr2)"/>
+    <text x="481" y="273">truncate_tool_output(&amp;mut r, name)</text>
+  </g>
+
+  <defs>
+    <marker id="arr2" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#1a1a1a"/>
+    </marker>
+    <marker id="arrG2" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#2a7"/>
+    </marker>
+  </defs>
+</svg>
+<div class="caption">图 3.2 — AgentLoop 每轮：先让 agent::prompt 构 base system_prompt（已按当前 provider），再交给 <code>self.ctx.build_messages</code> 组装最终消息数组。TurnRunner 拿结果跑 LLM。工具结果回流走 <code>self.ctx.truncate_tool_output</code>。</div>
+</div>
+
+<h3>3.3 压缩：策略决策 + 数据层应用</h3>
+
+<div class="seq">
+<svg width="820" height="300" xmlns="http://www.w3.org/2000/svg" font-family="SF Mono, Menlo, monospace" font-size="11">
+  <g stroke="#bbb" stroke-width="1">
+    <line x1="90" y1="40" x2="90" y2="280"/>
+    <line x1="260" y1="40" x2="260" y2="280"/>
+    <line x1="440" y1="40" x2="440" y2="280"/>
+    <line x1="620" y1="40" x2="620" y2="280"/>
+  </g>
+  <g fill="#eef5ff" stroke="#036">
+    <rect x="40" y="16" width="100" height="28" rx="3"/>
+    <rect x="210" y="16" width="100" height="28" rx="3"/>
+    <rect x="385" y="16" width="110" height="28" rx="3"/>
+    <rect x="565" y="16" width="110" height="28" rx="3"/>
+  </g>
+  <g fill="#036" text-anchor="middle" font-weight="600">
+    <text x="90" y="34">AgentLoop</text>
+    <text x="260" y="34">self.ctx</text>
+    <text x="440" y="34">Conversation</text>
+    <text x="620" y="34">LlmProvider</text>
+  </g>
+
+  <g fill="#1a1a1a">
+    <line x1="90" y1="68" x2="258" y2="68" stroke="#1a1a1a" stroke-width="1.2" marker-end="url(#arr3)"/>
+    <text x="174" y="63">needs_compression(&amp;conv, sys_tok)</text>
+    <line x1="258" y1="92" x2="92" y2="92" stroke="#2a7" stroke-width="1.2" stroke-dasharray="4 3" marker-end="url(#arrG3)"/>
+    <text x="174" y="87" fill="#2a7">true</text>
+
+    <line x1="90" y1="118" x2="258" y2="118" stroke="#1a1a1a" stroke-width="1.2" marker-end="url(#arr3)"/>
+    <text x="174" y="113">compression_plan(&amp;conv)</text>
+    <line x1="258" y1="142" x2="92" y2="142" stroke="#2a7" stroke-width="1.2" stroke-dasharray="4 3" marker-end="url(#arrG3)"/>
+    <text x="174" y="137" fill="#2a7">Some((待摘要文本, 删 N 条))</text>
+
+    <line x1="90" y1="170" x2="618" y2="170" stroke="#1a1a1a" stroke-width="1.2" marker-end="url(#arr3)"/>
+    <text x="354" y="165">chat_stream(summarize prompt)</text>
+    <line x1="618" y1="194" x2="92" y2="194" stroke="#2a7" stroke-width="1.2" stroke-dasharray="4 3" marker-end="url(#arrG3)"/>
+    <text x="354" y="189" fill="#2a7">summary(失败时 fallback 到机械)</text>
+
+    <line x1="90" y1="224" x2="438" y2="224" stroke="#1a1a1a" stroke-width="1.2" marker-end="url(#arr3)"/>
+    <text x="264" y="219">apply_compression(N, summary)</text>
+
+    <g fill="#666" font-size="10">
+      <text x="450" y="242">├─ drain 最早 N 条</text>
+      <text x="450" y="258">├─ cold_summaries FIFO push</text>
+      <text x="450" y="274">└─ turn_tracker 重索引</text>
+    </g>
+  </g>
+
+  <defs>
+    <marker id="arr3" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#1a1a1a"/>
+    </marker>
+    <marker id="arrG3" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#2a7"/>
+    </marker>
+  </defs>
+</svg>
+<div class="caption">图 3.3 — 压缩分两步：<strong>ctx 决策</strong>（是否压、压什么 content、删几条）+ <strong>agent 执行</strong>（真调 LLM 摘要 + Conversation 应用变更）。关键分工：ctx 不调 LLM 不动数据，Conversation 不懂策略。</div>
+</div>
+
+<h3>3.4 切模型：ReloadConfig 同步重建 ctx</h3>
+
+<div class="seq">
+<svg width="800" height="270" xmlns="http://www.w3.org/2000/svg" font-family="SF Mono, Menlo, monospace" font-size="11">
+  <g stroke="#bbb" stroke-width="1">
+    <line x1="100" y1="40" x2="100" y2="250"/>
+    <line x1="280" y1="40" x2="280" y2="250"/>
+    <line x1="480" y1="40" x2="480" y2="250"/>
+    <line x1="660" y1="40" x2="660" y2="250"/>
+  </g>
+  <g fill="#fff4d6" stroke="#840">
+    <rect x="45" y="16" width="110" height="28" rx="3"/>
+    <rect x="225" y="16" width="110" height="28" rx="3"/>
+    <rect x="425" y="16" width="110" height="28" rx="3"/>
+    <rect x="605" y="16" width="110" height="28" rx="3"/>
+  </g>
+  <g fill="#840" text-anchor="middle" font-weight="600">
+    <text x="100" y="34">TUI /model</text>
+    <text x="280" y="34">AgentLoop</text>
+    <text x="480" y="34">ctx::for_provider</text>
+    <text x="660" y="34">build_system_prompt</text>
+  </g>
+
+  <g fill="#1a1a1a">
+    <line x1="100" y1="68" x2="278" y2="68" stroke="#1a1a1a" stroke-width="1.2" marker-end="url(#arr4)"/>
+    <text x="189" y="63">AgentCommand::ReloadConfig(new_config)</text>
+
+    <g fill="#666" font-size="10">
+      <text x="290" y="90">旧 provider ≠ 新 → clear conversation</text>
+      <text x="290" y="104">替换 turn_runner.provider / config</text>
+    </g>
+
+    <line x1="280" y1="126" x2="478" y2="126" stroke="#1a1a1a" stroke-width="1.2" marker-end="url(#arr4)"/>
+    <text x="379" y="121">for_provider(&amp;new_provider)</text>
+
+    <line x1="478" y1="148" x2="282" y2="148" stroke="#2a7" stroke-width="1.2" stroke-dasharray="4 3" marker-end="url(#arrG4)"/>
+    <text x="380" y="143" fill="#2a7">Box&lt;dyn CtxBuilder&gt;(新模型的)</text>
+
+    <text x="290" y="170" fill="#666">self.ctx = &lt;新的 Box&gt;</text>
+
+    <text x="100" y="204" fill="#666">...下一轮 turn...</text>
+
+    <line x1="280" y1="228" x2="658" y2="228" stroke="#1a1a1a" stroke-width="1.2" marker-end="url(#arr4)"/>
+    <text x="469" y="223">build_system_prompt() <span class="cm">// 读新 provider</span></text>
+  </g>
+
+  <defs>
+    <marker id="arr4" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#1a1a1a"/>
+    </marker>
+    <marker id="arrG4" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#2a7"/>
+    </marker>
+  </defs>
+</svg>
+<div class="caption">图 3.4 — 用户 <code>/model</code> 切模型时：<code>AgentLoop</code> 一行 <code>self.ctx = for_provider(...)</code> 完成策略层切换。下一轮 turn 开始时 <code>build_system_prompt()</code> 本来就是每轮重建的，自然读到新 provider。两层自动协同。</div>
+</div>
+
+<!-- ================================================ -->
+<h2 id="examples">4. 实例：如何加自定义 ctx</h2>
+
+<p>本节 3 个真实例子，展示不同粒度的定制。全部可复制粘贴。</p>
+
+<h3>4.1 例：OllamaCtx — 小窗口激进截断</h3>
+
+<p><strong>需求</strong>：本地 llama3/qwen 在 8K 窗口下跑。标准 tool schema 太长（占 2K+），bash 输出占 32K 上限太宽松。需要整体裁。</p>
+
+<h4>步骤 1：新建 <code>crates/atomcode-core/src/ctx/ollama.rs</code></h4>
+
+<pre><code><span class="kw">use super</span>::<span class="ty">CtxBuilder</span>;
+<span class="kw">use crate</span>::config::provider::<span class="ty">ProviderConfig</span>;
+<span class="kw">use crate</span>::conversation::{<span class="ty">ContextStats</span>, <span class="ty">Conversation</span>};
+<span class="kw">use crate</span>::conversation::message::<span class="ty">Message</span>;
+<span class="kw">use crate</span>::tool::<span class="ty">ToolResult</span>;
+
+<span class="kw">pub struct</span> <span class="ty">OllamaCtx</span> {
+    ctx_window: <span class="kw">usize</span>,
+}
+
+<span class="kw">impl</span> <span class="ty">OllamaCtx</span> {
+    <span class="kw">pub fn</span> <span class="fn">new</span>(p: &<span class="ty">ProviderConfig</span>) -> <span class="ty">Self</span> {
+        <span class="ty">Self</span> { ctx_window: p.context_window.<span class="fn">max</span>(<span class="nm">4000</span>) }
+    }
+}
+
+<span class="kw">impl</span> <span class="ty">CtxBuilder</span> <span class="kw">for</span> <span class="ty">OllamaCtx</span> {
+    <span class="kw">fn</span> <span class="fn">build_messages</span>(
+        &<span class="kw">self</span>,
+        conv: &<span class="ty">Conversation</span>,
+        system_prompt: &<span class="kw">str</span>,
+    ) -> (<span class="ty">Vec</span>&lt;<span class="ty">Message</span>&gt;, <span class="ty">ContextStats</span>) {
+        <span class="cm">// 1. 砍 system prompt 里的 tool schema 长描述(每个工具只留名称+一行 usage)</span>
+        <span class="kw">let</span> trimmed = <span class="fn">strip_verbose_tool_schemas</span>(system_prompt);
+
+        <span class="cm">// 2. 调 legacy 底层走窗口裁切，拿到基础消息数组</span>
+        conv.<span class="fn">to_provider_messages_budgeted</span>(&trimmed, <span class="nm">self</span>.ctx_window)
+    }
+
+    <span class="kw">fn</span> <span class="fn">needs_compression</span>(&<span class="kw">self</span>, conv: &<span class="ty">Conversation</span>, sys_tokens: <span class="kw">usize</span>) -> <span class="kw">bool</span> {
+        <span class="cm">// 小窗口更激进：40% 就触发(默认 50%)</span>
+        <span class="kw">let</span> total: <span class="kw">usize</span> = sys_tokens
+            + conv.messages.<span class="fn">iter</span>().<span class="fn">map</span>(|m| m.<span class="fn">estimate_tokens</span>()).<span class="fn">sum</span>::&lt;<span class="kw">usize</span>&gt;();
+        total > <span class="nm">self</span>.ctx_window * <span class="nm">40</span> / <span class="nm">100</span>
+    }
+
+    <span class="kw">fn</span> <span class="fn">compression_plan</span>(&<span class="kw">self</span>, conv: &<span class="ty">Conversation</span>) -> <span class="ty">Option</span>&lt;(<span class="ty">String</span>, <span class="kw">usize</span>)&gt; {
+        <span class="kw">let</span> (content, n) = conv.<span class="fn">build_compression_content</span>();
+        <span class="kw">if</span> content.<span class="fn">is_empty</span>() || n == <span class="nm">0</span> { <span class="kw">return</span> <span class="kw">None</span>; }
+        <span class="ty">Some</span>((content, n))
+    }
+
+    <span class="kw">fn</span> <span class="fn">truncate_tool_output</span>(&<span class="kw">self</span>, result: &<span class="kw">mut</span> <span class="ty">ToolResult</span>, tool_name: &<span class="kw">str</span>) {
+        <span class="cm">// Ollama 下 tool_result 更紧：4K 字节上限(DefaultCtx 是 32K)</span>
+        <span class="kw">super</span>::truncate::<span class="fn">truncate_output</span>(result, tool_name, <span class="nm">self</span>.ctx_window);
+        <span class="kw">const</span> SMALL_CAP: <span class="kw">usize</span> = <span class="nm">4000</span>;
+        <span class="kw">if</span> result.output.<span class="fn">len</span>() > SMALL_CAP {
+            <span class="kw">let</span> <span class="kw">mut</span> cap = SMALL_CAP;
+            <span class="kw">while</span> cap > <span class="nm">0</span> && !result.output.<span class="fn">is_char_boundary</span>(cap) { cap -= <span class="nm">1</span>; }
+            result.output.<span class="fn">truncate</span>(cap);
+            result.output.<span class="fn">push_str</span>(<span class="st">"\n[... truncated by OllamaCtx ...]"</span>);
+        }
+    }
+
+    <span class="kw">fn</span> <span class="fn">name</span>(&<span class="kw">self</span>) -> &<span class="st">'static</span> <span class="kw">str</span> { <span class="st">"ollama"</span> }
+}
+
+<span class="kw">fn</span> <span class="fn">strip_verbose_tool_schemas</span>(sys: &<span class="kw">str</span>) -> <span class="ty">String</span> {
+    <span class="cm">// 业务实现：按正则砍掉 === TOOL SCHEMAS === 到下一个 === 之间的大段文字，</span>
+    <span class="cm">// 只保留每个工具名 + 一行 usage。具体取决于 system prompt 模板结构。</span>
+    sys.<span class="fn">to_string</span>()   <span class="cm">// 示意</span>
+}</code></pre>
+
+<h4>步骤 2：在 <code>ctx/mod.rs</code> 声明 + <code>ctx/resolver.rs</code> 注册</h4>
+
+<pre><code><span class="cm">// ctx/mod.rs: 加一行</span>
+<span class="kw">pub mod</span> ollama;
+
+<span class="cm">// ctx/resolver.rs: 在 for_provider 里加分支</span>
+<span class="kw">pub fn</span> <span class="fn">for_provider</span>(provider: &<span class="ty">ProviderConfig</span>) -> <span class="ty">Box</span>&lt;<span class="kw">dyn</span> <span class="ty">CtxBuilder</span>&gt; {
+    <span class="kw">if</span> provider.provider_type == <span class="st">"ollama"</span> {
+        <span class="kw">return</span> <span class="ty">Box</span>::<span class="fn">new</span>(super::ollama::<span class="ty">OllamaCtx</span>::<span class="fn">new</span>(provider));
+    }
+    <span class="cm">// ...其它规则...</span>
+
+    <span class="ty">Box</span>::<span class="fn">new</span>(<span class="ty">DefaultCtx</span>::<span class="fn">new</span>(provider))
+}</code></pre>
+
+<h4>就这三步。</h4>
+
+<p>用户配 <code>provider_type = "ollama"</code> → 自动走 <code>OllamaCtx</code>。其它 provider 不受影响。</p>
+
+<h3>4.2 例：ClaudeCtx — 稳定 cache 前缀</h3>
+
+<p><strong>需求</strong>：Claude 启用 prompt cache 时，希望 system + cold_zone 前缀跨轮稳定（便于 cache 命中）。需要确保 <code>build_messages</code> 永远先出 system，再出 cold_summaries 作为连续 System 消息，再出 hot messages。</p>
+
+<pre><code><span class="kw">pub struct</span> <span class="ty">ClaudeCtx</span> {
+    ctx_window: <span class="kw">usize</span>,
+    max_output_tokens: <span class="ty">Option</span>&lt;<span class="kw">usize</span>&gt;,
+}
+
+<span class="kw">impl</span> <span class="ty">ClaudeCtx</span> {
+    <span class="kw">pub fn</span> <span class="fn">new</span>(p: &<span class="ty">ProviderConfig</span>) -> <span class="ty">Self</span> {
+        <span class="ty">Self</span> {
+            ctx_window: p.context_window.<span class="fn">max</span>(<span class="nm">128_000</span>),
+            max_output_tokens: p.max_tokens,
+        }
+    }
+}
+
+<span class="kw">impl</span> <span class="ty">CtxBuilder</span> <span class="kw">for</span> <span class="ty">ClaudeCtx</span> {
+    <span class="kw">fn</span> <span class="fn">build_messages</span>(
+        &<span class="kw">self</span>,
+        conv: &<span class="ty">Conversation</span>,
+        system_prompt: &<span class="kw">str</span>,
+    ) -> (<span class="ty">Vec</span>&lt;<span class="ty">Message</span>&gt;, <span class="ty">ContextStats</span>) {
+        <span class="cm">// Claude 下 ctx_window 够大，直接用 legacy 窗口裁切</span>
+        <span class="kw">let</span> (<span class="kw">mut</span> messages, stats) =
+            conv.<span class="fn">to_provider_messages_budgeted</span>(system_prompt, <span class="nm">self</span>.ctx_window);
+
+        <span class="cm">// 将来 provider 层想读 cache 位置时可以这样:</span>
+        <span class="cm">// 1. 找 messages 里最后一条 System(system + cold_zone 块末尾)</span>
+        <span class="cm">// 2. 这个位置就是 cache_control: ephemeral 该插的地方</span>
+        <span class="cm">// 3. Claude provider payload assembler 自己去定位即可,不需要 ctx 返</span>
+
+        (messages, stats)
+    }
+
+    <span class="kw">fn</span> <span class="fn">needs_compression</span>(&<span class="kw">self</span>, conv: &<span class="ty">Conversation</span>, sys_tokens: <span class="kw">usize</span>) -> <span class="kw">bool</span> {
+        conv.<span class="fn">needs_compression</span>(sys_tokens, <span class="nm">self</span>.ctx_window)
+    }
+    <span class="kw">fn</span> <span class="fn">compression_plan</span>(&<span class="kw">self</span>, conv: &<span class="ty">Conversation</span>) -> <span class="ty">Option</span>&lt;(<span class="ty">String</span>, <span class="kw">usize</span>)&gt; {
+        <span class="kw">let</span> (c, n) = conv.<span class="fn">build_compression_content</span>();
+        <span class="kw">if</span> c.<span class="fn">is_empty</span>() || n == <span class="nm">0</span> { <span class="kw">None</span> } <span class="kw">else</span> { <span class="ty">Some</span>((c, n)) }
+    }
+    <span class="kw">fn</span> <span class="fn">truncate_tool_output</span>(&<span class="kw">self</span>, r: &<span class="kw">mut</span> <span class="ty">ToolResult</span>, name: &<span class="kw">str</span>) {
+        <span class="kw">super</span>::truncate::<span class="fn">truncate_output</span>(r, name, <span class="nm">self</span>.ctx_window);
+    }
+    <span class="kw">fn</span> <span class="fn">name</span>(&<span class="kw">self</span>) -> &<span class="st">'static</span> <span class="kw">str</span> { <span class="st">"claude"</span> }
+}</code></pre>
+
+<p>注册：</p>
+
+<pre><code><span class="kw">if</span> provider.model.<span class="fn">starts_with</span>(<span class="st">"claude-"</span>) {
+    <span class="kw">return</span> <span class="ty">Box</span>::<span class="fn">new</span>(claude::<span class="ty">ClaudeCtx</span>::<span class="fn">new</span>(provider));
+}</code></pre>
+
+<h3>4.3 例：CustomFineTunedCtx — 完全替换 system prompt</h3>
+
+<p><strong>需求</strong>：用户有个微调模型，训练时 system prompt 用的是自定义模板（比如 <code>&lt;|im_start|&gt;system\n...&lt;|im_end|&gt;</code>）。atomcode 默认的 system prompt 不能直接用，得替换。</p>
+
+<pre><code><span class="kw">pub struct</span> <span class="ty">CustomFineTunedCtx</span> {
+    ctx_window: <span class="kw">usize</span>,
+}
+
+<span class="kw">impl</span> <span class="ty">CtxBuilder</span> <span class="kw">for</span> <span class="ty">CustomFineTunedCtx</span> {
+    <span class="kw">fn</span> <span class="fn">build_messages</span>(
+        &<span class="kw">self</span>,
+        conv: &<span class="ty">Conversation</span>,
+        _base_system: &<span class="kw">str</span>,   <span class="cm">// ← 忽略传入的 base</span>
+    ) -> (<span class="ty">Vec</span>&lt;<span class="ty">Message</span>&gt;, <span class="ty">ContextStats</span>) {
+        <span class="cm">// 完全替换成训练时匹配的模板</span>
+        <span class="kw">const</span> MY_TEMPLATE: &<span class="kw">str</span> = <span class="st">"&lt;|im_start|&gt;system\n\
+            You are a helpful coding assistant. Tools: read_file, edit_file, bash.\n\
+            Respond with JSON tool calls.\
+            &lt;|im_end|&gt;"</span>;
+        conv.<span class="fn">to_provider_messages_budgeted</span>(MY_TEMPLATE, <span class="nm">self</span>.ctx_window)
+    }
+
+    <span class="cm">// ... 其他方法用默认 / 透传到 Conversation ...</span>
+    <span class="kw">fn</span> <span class="fn">truncate_tool_output</span>(&<span class="kw">self</span>, r: &<span class="kw">mut</span> <span class="ty">ToolResult</span>, name: &<span class="kw">str</span>) {
+        <span class="kw">super</span>::truncate::<span class="fn">truncate_output</span>(r, name, <span class="nm">self</span>.ctx_window);
+    }
+    <span class="kw">fn</span> <span class="fn">name</span>(&<span class="kw">self</span>) -> &<span class="st">'static</span> <span class="kw">str</span> { <span class="st">"custom-finetuned"</span> }
+}</code></pre>
+
+<p>注册：</p>
+
+<pre><code><span class="kw">if</span> provider.model == <span class="st">"my-finetune-v1"</span> {
+    <span class="kw">return</span> <span class="ty">Box</span>::<span class="fn">new</span>(custom_ft::<span class="ty">CustomFineTunedCtx</span>::<span class="fn">new</span>(provider));
+}</code></pre>
+
+<h3>4.4 约定总结</h3>
+
+<table>
+  <tr>
+    <th style="width: 30%;">要定制的维度</th>
+    <th style="width: 35%;">在 impl 里改</th>
+    <th>例</th>
+  </tr>
+  <tr>
+    <td>system prompt 文本变换</td>
+    <td><code>build_messages</code> 开头变换 <code>system_prompt</code> 参数</td>
+    <td>OllamaCtx 砍工具 schema</td>
+  </tr>
+  <tr>
+    <td>system prompt 完全替换</td>
+    <td><code>build_messages</code> 忽略参数、用自己模板</td>
+    <td>CustomFineTunedCtx 训练格式</td>
+  </tr>
+  <tr>
+    <td>触发压缩的阈值</td>
+    <td>重写 <code>needs_compression</code></td>
+    <td>OllamaCtx 40% 阈值</td>
+  </tr>
+  <tr>
+    <td>压缩后保留多少 / 怎么摘要</td>
+    <td>重写 <code>compression_plan</code></td>
+    <td>自定义保留策略</td>
+  </tr>
+  <tr>
+    <td>工具输出裁切强度</td>
+    <td>重写 <code>truncate_tool_output</code></td>
+    <td>OllamaCtx 4K 上限</td>
+  </tr>
+  <tr>
+    <td>消息层直接定制（加入额外 marker、调顺序）</td>
+    <td><code>build_messages</code> 拿到 legacy 输出后再处理</td>
+    <td>ClaudeCtx 未来加 cache breakpoint 元数据</td>
+  </tr>
+  <tr>
+    <td>工具集按模型筛选</td>
+    <td>目前不在 ctx 范围（在 <code>ToolRegistry</code> 层）</td>
+    <td>—</td>
+  </tr>
+</table>
+
+<div class="panel ok">
+  <strong>一致性保证</strong>：未命中任何规则的 provider 走 <code>DefaultCtx</code>，后者完全委托给 <code>ctx::render</code>——与重构前行为一致(render 模块的代码就是 2026-04 从 <code>Conversation</code> impl 平移出来的,byte-equivalent)。<code>ctx/render.rs</code> 里搬过来的 12 个 budgeted/sanitize 回归测试直接守护这层行为。</div>
+
+<!-- ================================================ -->
+<h2 id="tests">附录 · 测试覆盖</h2>
+
+<table>
+  <tr>
+    <th>文件</th>
+    <th>测试</th>
+    <th style="width: 60px;">数量</th>
+  </tr>
+  <tr>
+    <td><code>ctx/default.rs</code></td>
+    <td>name / ctx_window clamp / empty conv render / compression None</td>
+    <td class="num">4</td>
+  </tr>
+  <tr>
+    <td><code>ctx/ollama.rs</code></td>
+    <td>name / ctx clamp / tool_output_cap 公式 / 截断生效 / CJK boundary / 35% 阈值早触发 / compression None / 非空渲染</td>
+    <td class="num">7</td>
+  </tr>
+  <tr>
+    <td><code>ctx/render.rs</code></td>
+    <td>budgeted 路径 10 项(empty / recent / under_80pct / drops_oldest / keeps_latest / never_system_only / emergency / drops_no_summary / preserves_order / cold_zone_compression) + sanitize 2 项</td>
+    <td class="num">12</td>
+  </tr>
+  <tr>
+    <td><code>ctx/resolver.rs</code></td>
+    <td>ollama 命中 / unknown 回 default / 任意 model 配 ollama provider 都走 OllamaCtx</td>
+    <td class="num">3</td>
+  </tr>
+  <tr>
+    <td><code>ctx/truncate.rs</code></td>
+    <td>原 <code>turn/truncation.rs</code> 单测整体迁入</td>
+    <td class="num">10</td>
+  </tr>
+  <tr style="font-weight: 600;">
+    <td colspan="2">合计</td>
+    <td class="num">36</td>
+  </tr>
+</table>
+
+<p>整 lib 套件 <code>cargo test -p atomcode-core --lib</code>: <strong>310 passed</strong>, 1 pre-existing fail (<code>self_update::is_newer_semver</code>, 与 ctx 无关)。</p>
+
+<footer>
+  <p>
+    <strong>关联文档</strong><br>
+    · <code>docs/architecture.md</code> — atomcode 整体架构<br>
+    · 源码入口 <code>crates/atomcode-core/src/ctx/mod.rs</code><br>
+    · 源码 <code>crates/atomcode-core/src/ctx/</code> on branch <code>feat/ctx-module</code>
+  </p>
+  <p>
+    文档生成于 2026-04-20 · atomcode v4.19.0
+  </p>
+</footer>
+
+</div>
+</body>
+</html>

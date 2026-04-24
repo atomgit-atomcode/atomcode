@@ -3,6 +3,13 @@
 pub struct Command {
     pub name: &'static str,
     pub desc: &'static str,
+    /// Commands that are *useless* without an argument (e.g. `/fixissue <url>`).
+    /// When the slash-menu Enter handler sees one, it auto-completes the name
+    /// with a trailing space and leaves the cursor parked for the user to
+    /// type the argument — instead of firing a bad invocation immediately.
+    /// Commands that do something sensible with no arg (e.g. `/cd` opens the
+    /// recent-dirs picker, `/help` prints help) leave this `false`.
+    pub needs_args: bool,
 }
 
 pub struct CommandRegistry {
@@ -19,13 +26,21 @@ impl CommandRegistry {
     }
 
     pub fn find(&self, name: &str) -> Option<Command> {
-        self.commands.iter().find(|c| c.name == name).copied()
+        // Built-in command names are all ASCII, so an ASCII
+        // case-insensitive match is equivalent to a Unicode-correct
+        // one here. `/SESSION` resolves to the same `session` entry
+        // as `/session`.
+        self.commands
+            .iter()
+            .find(|c| c.name.eq_ignore_ascii_case(name))
+            .copied()
     }
 
     pub fn matching_prefix(&self, prefix: &str) -> Vec<Command> {
+        let prefix_lower = prefix.to_ascii_lowercase();
         self.commands
             .iter()
-            .filter(|c| c.name.starts_with(prefix))
+            .filter(|c| c.name.starts_with(prefix_lower.as_str()))
             .copied()
             .collect()
     }
@@ -46,23 +61,29 @@ impl CommandRegistry {
 }
 
 const BUILTIN_COMMANDS: &[Command] = &[
-    Command { name: "resume",  desc: "Resume a previous session" },
-    Command { name: "login",   desc: "Sign in with AtomGit OAuth" },
-    Command { name: "logout",  desc: "Sign out of AtomGit" },
-    Command { name: "whoami",  desc: "Show current logged-in user" },
-    Command { name: "model",   desc: "Switch provider / model" },
-    Command { name: "provider", desc: "Manage providers (add / edit / delete)" },
-    Command { name: "status",  desc: "Show session status" },
-    Command { name: "config",  desc: "Show config path" },
-    Command { name: "reload",  desc: "Reload ~/.atomcode/config.toml from disk" },
-    Command { name: "cd",      desc: "Change working directory" },
-    Command { name: "diff",    desc: "Show git diff" },
-    Command { name: "clear",   desc: "Clear screen" },
-    Command { name: "session", desc: "Start a new session (clears conversation)" },
-    Command { name: "cost",    desc: "Show token cost" },
-    Command { name: "undo",    desc: "Undo last change (not yet supported)" },
-    Command { name: "help",    desc: "Show this help" },
-    Command { name: "quit",    desc: "Exit AtomCode" },
+    Command { name: "codingplan", desc: "Claim CodingPlan + set up models from the plan's model list", needs_args: false },
+    Command { name: "resume",  desc: "Resume a previous session", needs_args: false },
+    Command { name: "login",   desc: "Sign in with AtomGit OAuth", needs_args: false },
+    Command { name: "logout",  desc: "Sign out of AtomGit", needs_args: false },
+    Command { name: "whoami",  desc: "Show current logged-in user", needs_args: false },
+    Command { name: "model",   desc: "Switch provider / model", needs_args: false },
+    Command { name: "provider", desc: "Manage providers (add / edit / delete)", needs_args: false },
+    Command { name: "status",  desc: "Show session status", needs_args: false },
+    Command { name: "config",  desc: "Show config path", needs_args: false },
+    Command { name: "reload",  desc: "Reload ~/.atomcode/config.toml from disk", needs_args: false },
+    Command { name: "cd",      desc: "Change working directory", needs_args: false },
+    Command { name: "diff",    desc: "Show git diff", needs_args: false },
+    Command { name: "clear",   desc: "Clear screen", needs_args: false },
+    Command { name: "session", desc: "Start a new session (clears conversation)", needs_args: false },
+    Command { name: "cost",    desc: "Show token cost", needs_args: false },
+    Command { name: "context", desc: "Show context budget breakdown", needs_args: false },
+    Command { name: "compact", desc: "Compact conversation history", needs_args: false },
+    Command { name: "undo",    desc: "Undo last change (not yet supported)", needs_args: false },
+    Command { name: "upgrade", desc: "Upgrade atomcode to latest (subcommand: rollback)", needs_args: false },
+    Command { name: "fixissue", desc: "Fetch an AtomGit issue (must be assigned to you) and let the agent fix it", needs_args: true },
+    Command { name: "issue",   desc: "Interactive wizard — prompts for issue URL, then runs fixissue", needs_args: false },
+    Command { name: "help",    desc: "Show this help", needs_args: false },
+    Command { name: "quit",    desc: "Exit AtomCode", needs_args: false },
 ];
 
 /// Parse `"/cmd args..."` into `(cmd, args)` when the leading `/` is a
@@ -158,6 +179,27 @@ mod tests {
         let (cmd, arg) = parse_slash_line("/cd /tmp/x").unwrap();
         assert_eq!(cmd, "cd");
         assert_eq!(arg, "/tmp/x");
+    }
+
+    #[test]
+    fn parse_rejects_cjk_touching_command_name() {
+        // `/session是干什么的` — the user is asking the agent "what
+        // does /session do", NOT invoking /session. A CJK char
+        // directly after the command name (no whitespace) means it's
+        // prose, so parse_slash_line must return None and the line
+        // reaches the agent verbatim.
+        assert!(parse_slash_line("/session是干什么的").is_none());
+        assert!(parse_slash_line("/quit退出吗").is_none());
+        assert!(parse_slash_line("/model模型").is_none());
+    }
+
+    #[test]
+    fn parse_accepts_command_with_cjk_arg_after_space() {
+        // Whitespace separates cmd from args, so `/session 是干什么的`
+        // IS an invocation (with CJK-tail arg).
+        let (cmd, arg) = parse_slash_line("/session 是干什么的").unwrap();
+        assert_eq!(cmd, "session");
+        assert_eq!(arg, "是干什么的");
     }
 
     #[test]

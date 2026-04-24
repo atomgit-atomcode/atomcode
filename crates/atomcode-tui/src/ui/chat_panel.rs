@@ -143,7 +143,7 @@ pub fn render(
                     Role::Assistant => render_assistant(render_cache, text, term_width),
                     _ => {}
                 },
-                MessageContent::AssistantWithToolCalls { text, tool_calls } => {
+                MessageContent::AssistantWithToolCalls { text, tool_calls, .. } => {
                     if let Some(t) = text {
                         if !t.trim().is_empty() {
                             render_assistant(render_cache, t, term_width);
@@ -1143,7 +1143,7 @@ pub fn total_lines(conversation: &Conversation) -> usize {
                 Role::Assistant => count += render_markdown(text).len(),
                 _ => {}
             },
-            MessageContent::AssistantWithToolCalls { text, tool_calls } => {
+            MessageContent::AssistantWithToolCalls { text, tool_calls, .. } => {
                 if let Some(t) = text { count += render_markdown(t).len(); }
                 count += tool_calls.len();
             }

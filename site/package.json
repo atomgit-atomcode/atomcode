@@ -3,6 +3,8 @@
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
+    "build:css": "tailwindcss -c tailwind.config.js -i input.css -o dist.css --minify",
+    "watch:css": "tailwindcss -c tailwind.config.js -i input.css -o dist.css --watch",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
@@ -10,7 +12,6 @@
   "license": "ISC",
   "description": "",
   "dependencies": {
-    "@tailwindcss/cli": "^4.2.2",
     "puppeteer": "^24.40.0",
     "tailwindcss": "^3.4.19"
   }

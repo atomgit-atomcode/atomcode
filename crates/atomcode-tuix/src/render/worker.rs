@@ -53,6 +53,8 @@ enum RenderCmd {
     /// Terminal resize — fire-and-forget, the worker updates its
     /// internal DECSTBM region and repaints the footer.
     Resize(u16, u16),
+    /// Remove the tail ApprovalPrompt body row (fire-and-forget).
+    PopApprovalPrompt,
     /// Lifecycle operation requiring an ACK — the worker performs the
     /// op then sends `()` back so the caller can proceed.
     Ack {
@@ -97,9 +99,18 @@ impl TaskRenderer {
         }
     }
 
-    /// Send an ACK op and block until the worker reports done. 2s bound
-    /// keeps us from hanging forever if the worker ever wedges (it
-    /// shouldn't — but a bounded wait beats an infinite one for UX).
+    /// Send an ACK op and block until the worker reports done. 10s
+    /// bound keeps us from hanging forever if the worker ever wedges,
+    /// while giving slow CI machines / thermal-throttled laptops /
+    /// debug builds enough headroom that routine lifecycle ops don't
+    /// spuriously timeout.
+    ///
+    /// 2s was the original budget — a worker processing `Shutdown`
+    /// normally takes < 1ms, so 2s felt like plenty. But on a loaded
+    /// CI runner mid-cargo-test, a few tests would sporadically fail
+    /// on the timeout line because the OS hadn't scheduled the worker
+    /// thread fast enough. CC-style TUI harnesses use ~10s for the
+    /// same reason.
     fn ack(&self, op: AckOp) {
         let (ack_tx, ack_rx) = mpsc::channel();
         if self
@@ -110,7 +121,7 @@ impl TaskRenderer {
             // Worker is gone (already shut down) — nothing to do.
             return;
         }
-        let _ = ack_rx.recv_timeout(Duration::from_secs(2));
+        let _ = ack_rx.recv_timeout(Duration::from_secs(10));
     }
 }
 
@@ -149,6 +160,10 @@ impl Renderer for TaskRenderer {
 
     fn on_resize(&mut self, cols: u16, rows: u16) {
         let _ = self.cmd_tx.send(RenderCmd::Resize(cols, rows));
+    }
+
+    fn pop_approval_prompt(&mut self) {
+        let _ = self.cmd_tx.send(RenderCmd::PopApprovalPrompt);
     }
 }
 
@@ -209,6 +224,9 @@ fn run_worker(mut inner: Box<dyn Renderer>, cmd_rx: mpsc::Receiver<RenderCmd>) {
                     rows,
                     t0.elapsed().as_micros()
                 );
+            }
+            RenderCmd::PopApprovalPrompt => {
+                inner.pop_approval_prompt();
             }
             RenderCmd::Ack { op, ack } => {
                 let t0 = Instant::now();
