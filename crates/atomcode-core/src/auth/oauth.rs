@@ -30,11 +30,13 @@ fn urlencoding_encode(s: &str) -> String {
     url::form_urlencoded::byte_serialize(s.as_bytes()).collect()
 }
 
-/// AtomGit OAuth configuration
-pub const CLIENT_ID: &str = "b9956e5327e544578128af8979ba3ccb";
-pub const CLIENT_SECRET: &str = "756ef00061884c7aa1ac64bd4eae3be7";
-pub const REDIRECT_PORT: u16 = 8765;
-pub const REDIRECT_URI: &str = "http://127.0.0.1:8765/callback";
+/// Platform OAuth Broker URL (client_secret is kept on the broker)
+pub const PLATFORM_BROKER_URL: &str = "https://acs.atomgit.com";
+pub const PLATFORM_LOGIN_URL: &str = "https://acs.atomgit.com/auth/login";
+pub const PLATFORM_CHECK_URL: &str = "https://acs.atomgit.com/auth/check";
+pub const PLATFORM_TOKEN_URL: &str = "https://acs.atomgit.com/auth/token";
+pub const PLATFORM_EXCHANGE_URL: &str = "https://acs.atomgit.com/oauth/exchange";
+pub const PLATFORM_REFRESH_URL: &str = "https://acs.atomgit.com/oauth/refresh";
 
 /// AtomGit OAuth endpoints
 pub const AUTHORIZE_URL: &str = "https://atomgit.com/oauth/authorize";
@@ -59,9 +61,6 @@ fn blocking_client() -> reqwest::blocking::Client {
         .build()
         .unwrap_or_else(|_| reqwest::blocking::Client::new())
 }
-
-/// OAuth scopes needed
-pub const SCOPES: &str = "user_info projects";
 
 /// Stored authentication data
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -103,53 +102,100 @@ struct UserResponse {
     avatar_url: Option<String>,
 }
 
-/// Perform OAuth login flow
+// ============================================================================
+// Platform API types
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+struct PlatformLoginResponse {
+    login_url: String,
+    state: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct PlatformCheckResponse {
+    valid: bool,
+    user: Option<PlatformUserInfo>,
+    sid: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PlatformUserInfo {
+    id: String,
+    username: String,
+    name: Option<String>,
+    email: Option<String>,
+    avatar_url: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PlatformTokenResponse {
+    access_token: String,
+    token_type: String,
+    expires_in: Option<i64>,
+    refresh_token: Option<String>,
+    user: PlatformUserInfo,
+}
+
+/// Perform OAuth login flow via Platform broker
 pub fn login() -> Result<AuthInfo> {
-    println!("\n  AtomCode Login");
-    println!("  ==============\n");
+    // println!("\n  AtomCode Login");
+    // println!("  ==============\n");
 
-    // Generate random state for CSRF protection
-    let state = generate_state();
+    let client = reqwest::blocking::Client::new();
 
-    // Build authorization URL
-    let auth_url = format!(
-        "{}?client_id={}&redirect_uri={}&response_type=code&state={}&scope={}",
-        AUTHORIZE_URL,
-        urlencoding_encode(CLIENT_ID),
-        urlencoding_encode(REDIRECT_URI),
-        state,
-        urlencoding_encode(SCOPES),
-    );
+    // Step 1: Call Platform /auth/login to get the authorization URL
+    let login_resp: PlatformLoginResponse = client
+        .get(PLATFORM_LOGIN_URL)
+        .query(&[("provider", "atomgit")])
+        .send()
+        .context("Failed to call /auth/login")?
+        .json()
+        .context("Failed to parse /auth/login response")?;
 
-    println!("  Opening browser for authorization...");
-    println!("  If browser doesn't open, visit this URL:\n");
-    println!("  {}\n", auth_url);
+    // println!("  Opening browser for authorization...");
+    // println!("  If browser doesn't open, visit this URL:\n");
+    // println!("  {}\n", login_resp.login_url);
 
-    // Open browser (best-effort — paste path below covers headless / WSL).
-    if let Err(e) = open_browser(&auth_url) {
+    // Open browser (best-effort)
+    if let Err(e) = open_browser(&login_resp.login_url) {
         println!("  Failed to open browser: {}", e);
-        println!("  (paste path below will still work)\n");
+        println!("  (please open the URL above manually)\n");
     }
 
-    let (code, returned_state) = await_callback(REDIRECT_PORT)?;
+    // Step 2: Poll /auth/check until login is complete
+    // println!("  Waiting for authorization (open browser if it didn't open)...\n");
 
-    // Verify state. Most common cause of mismatch in practice is the user
-    // pasting a callback URL left over from an earlier /login attempt;
-    // re-running /login regenerates state and fixes it.
-    if returned_state != state {
-        anyhow::bail!(
-            "OAuth state mismatch — the pasted URL likely came from an earlier \
-            /login attempt. Re-run /login and paste the newly-authorized URL."
-        );
-    }
+    let check_resp = loop {
+        // Poll /auth/check
+        let resp = client
+            .get(PLATFORM_CHECK_URL)
+            .query(&[("state", &login_resp.state)])
+            .send()
+            .context("Failed to call /auth/check")?;
 
-    println!("  Authorization received, exchanging token...\n");
+        if resp.status().is_success() {
+            if let Ok(check) = resp.json::<PlatformCheckResponse>() {
+                if check.valid {
+                    break login_resp.state;
+                }
+            }
+        }
 
-    // Exchange code for token
-    let token = exchange_code_for_token(&code)?;
+        // println!("  Waiting for browser authorization...");
+        thread::sleep(Duration::from_secs(2));
+    };
 
-    // Get user info
-    let user = get_user_info(&token.access_token)?;
+    // Step 3: Get token from Platform
+    // println!("  Authorization complete, fetching token...\n");
+
+    let token_resp: PlatformTokenResponse = client
+        .get(PLATFORM_TOKEN_URL)
+        .query(&[("state", &check_resp)])
+        .send()
+        .context("Failed to call /auth/token")?
+        .json()
+        .context("Failed to parse /auth/token response")?;
 
     let created_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -157,29 +203,47 @@ pub fn login() -> Result<AuthInfo> {
         .as_secs() as i64;
 
     let auth_info = AuthInfo {
-        access_token: token.access_token,
-        refresh_token: token.refresh_token,
-        token_type: token.token_type.unwrap_or_else(|| "Bearer".to_string()),
-        expires_in: token.expires_in,
+        access_token: token_resp.access_token,
+        refresh_token: token_resp.refresh_token,
+        token_type: token_resp.token_type,
+        expires_in: token_resp.expires_in,
         created_at,
         user: UserInfo {
-            id: user.id,
-            username: user.login,
-            name: user.name,
-            email: user.email,
-            avatar_url: user.avatar_url,
+            id: token_resp.user.id,
+            username: token_resp.user.username,
+            name: token_resp.user.name,
+            email: token_resp.user.email,
+            avatar_url: token_resp.user.avatar_url,
         },
     };
 
-    println!(
-        "  Logged in as: {} ({})\n",
-        auth_info.user.username, auth_info.user.id
-    );
+    // println!(
+    //     "  Logged in as: {} ({})\n",
+    //     auth_info.user.username, auth_info.user.id
+    // );
 
     Ok(auth_info)
 }
 
+/// Extract state from a pasted callback URL (kept for potential future fallback use)
+#[allow(dead_code)]
+fn pasted_state(url: &str) -> Option<String> {
+    url.split('?')
+        .nth(1)?
+        .split('&')
+        .filter_map(|pair| {
+            let mut parts = pair.splitn(2, '=');
+            if parts.next()? == "state" {
+                Some(urlencoding_decode(parts.next()?))
+            } else {
+                None
+            }
+        })
+        .next()
+}
+
 /// Generate random state string for CSRF protection
+#[allow(dead_code)]
 fn generate_state() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let timestamp = SystemTime::now()
@@ -521,23 +585,17 @@ fn urlencoding_decode(s: &str) -> String {
     result
 }
 
-/// Exchange authorization code for access token
+/// Exchange authorization code for access token via Platform Broker
 fn exchange_code_for_token(code: &str) -> Result<TokenResponse> {
     let client = blocking_client();
 
-    let params = [
-        ("client_id", CLIENT_ID),
-        ("client_secret", CLIENT_SECRET),
-        ("code", code),
-        ("redirect_uri", REDIRECT_URI),
-        ("grant_type", "authorization_code"),
-    ];
-
+    // Call Platform Broker API instead of directly calling AtomGit
+    // This keeps client_secret on the broker side
     let response = client
-        .post(TOKEN_URL)
-        .form(&params)
+        .post(PLATFORM_EXCHANGE_URL)
+        .json(&serde_json::json!({ "code": code }))
         .send()
-        .context("Failed to send token request")?;
+        .context("Failed to send token request to broker")?;
 
     if !response.status().is_success() {
         let status = response.status();
@@ -545,9 +603,25 @@ fn exchange_code_for_token(code: &str) -> Result<TokenResponse> {
         anyhow::bail!("Token request failed ({}): {}", status, body);
     }
 
-    response
-        .json::<TokenResponse>()
-        .context("Failed to parse token response")
+    // Parse broker response
+    #[derive(Deserialize)]
+    struct BrokerResponse {
+        access_token: String,
+        token_type: Option<String>,
+        expires_in: Option<i64>,
+        refresh_token: Option<String>,
+    }
+
+    let broker_resp: BrokerResponse = response
+        .json()
+        .context("Failed to parse broker response")?;
+
+    Ok(TokenResponse {
+        access_token: broker_resp.access_token,
+        refresh_token: broker_resp.refresh_token,
+        token_type: broker_resp.token_type,
+        expires_in: broker_resp.expires_in,
+    })
 }
 
 /// Get user information using access token
@@ -571,7 +645,7 @@ fn get_user_info(access_token: &str) -> Result<UserResponse> {
         .context("Failed to parse user response")
 }
 
-/// Refresh the access token using the stored refresh_token.
+/// Refresh the access token using the stored refresh_token via Platform Broker.
 /// Returns updated AuthInfo with new tokens, and saves it to disk.
 pub fn refresh_access_token(auth: &AuthInfo) -> Result<AuthInfo> {
     let refresh_token = auth
@@ -580,18 +654,13 @@ pub fn refresh_access_token(auth: &AuthInfo) -> Result<AuthInfo> {
         .context("No refresh_token available — please /login again")?;
 
     let client = blocking_client();
-    let params = [
-        ("client_id", CLIENT_ID),
-        ("client_secret", CLIENT_SECRET),
-        ("refresh_token", refresh_token),
-        ("grant_type", "refresh_token"),
-    ];
 
+    // Call Platform Broker API for refresh
     let response = client
-        .post(TOKEN_URL)
-        .form(&params)
+        .post(PLATFORM_REFRESH_URL)
+        .json(&serde_json::json!({ "refresh_token": refresh_token }))
         .send()
-        .context("Failed to send refresh token request")?;
+        .context("Failed to send refresh token request to broker")?;
 
     if !response.status().is_success() {
         let status = response.status();
@@ -603,9 +672,18 @@ pub fn refresh_access_token(auth: &AuthInfo) -> Result<AuthInfo> {
         );
     }
 
-    let token: TokenResponse = response
+    #[derive(Deserialize)]
+    struct BrokerResponse {
+        access_token: String,
+        token_type: Option<String>,
+        expires_in: Option<i64>,
+        refresh_token: Option<String>,
+        user: Option<PlatformUserInfo>,
+    }
+
+    let broker_resp: BrokerResponse = response
         .json()
-        .context("Failed to parse refresh token response")?;
+        .context("Failed to parse broker response")?;
 
     let created_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -613,12 +691,18 @@ pub fn refresh_access_token(auth: &AuthInfo) -> Result<AuthInfo> {
         .as_secs() as i64;
 
     let new_auth = AuthInfo {
-        access_token: token.access_token,
-        refresh_token: token.refresh_token.or_else(|| auth.refresh_token.clone()),
-        token_type: token.token_type.unwrap_or_else(|| auth.token_type.clone()),
-        expires_in: token.expires_in.or(auth.expires_in),
+        access_token: broker_resp.access_token,
+        refresh_token: broker_resp.refresh_token.or_else(|| auth.refresh_token.clone()),
+        token_type: broker_resp.token_type.unwrap_or_else(|| auth.token_type.clone()),
+        expires_in: broker_resp.expires_in.or(auth.expires_in),
         created_at,
-        user: auth.user.clone(),
+        user: broker_resp.user.map(|u| UserInfo {
+            id: u.id,
+            username: u.username,
+            name: u.name,
+            email: u.email,
+            avatar_url: u.avatar_url,
+        }).unwrap_or_else(|| auth.user.clone()),
     };
 
     save_auth(&new_auth)?;
