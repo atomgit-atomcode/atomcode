@@ -802,6 +802,7 @@ mod tests {
         assert_eq!(LanguageRegistry::detect(Path::new("App.java")), Some(Lang::Java));
         assert_eq!(LanguageRegistry::detect(Path::new("main.c")), Some(Lang::C));
         assert_eq!(LanguageRegistry::detect(Path::new("main.cpp")), Some(Lang::Cpp));
+        assert_eq!(LanguageRegistry::detect(Path::new("Program.cs")), Some(Lang::CSharp));
         assert_eq!(LanguageRegistry::detect(Path::new("readme.md")), None);
     }
 
@@ -892,6 +893,31 @@ class Calculator:
         let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
         assert!(names.contains(&"greet"), "symbols: {:?}", names);
         assert!(names.contains(&"Calculator"), "symbols: {:?}", names);
+    }
+
+    #[test]
+    fn test_list_symbols_csharp() {
+        let mut searcher = SemanticSearcher::new();
+        let source = r#"
+class Program {
+    Program() {}
+
+    public static void Main(string[] args) {
+    }
+}
+
+interface IGreeter {
+    void Greet();
+}
+"#;
+        let mut tmp = tempfile::NamedTempFile::with_suffix(".cs").unwrap();
+        tmp.write_all(source.as_bytes()).unwrap();
+
+        let symbols = searcher.list_symbols(tmp.path()).unwrap();
+        let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"Program"), "symbols: {:?}", names);
+        assert!(names.contains(&"Main"), "symbols: {:?}", names);
+        assert!(names.contains(&"IGreeter"), "symbols: {:?}", names);
     }
 
     #[test]
