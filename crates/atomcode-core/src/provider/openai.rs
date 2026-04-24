@@ -152,15 +152,22 @@ impl OpenAiProvider {
                         // Always include content field — some APIs (DeepSeek/SiliconFlow)
                         // reject messages without it even when tool_calls is present.
                         msg["content"] = json!(text.as_deref().unwrap_or(""));
-                        // Thinking-model providers (Moonshot Kimi K2-thinking/K2.6)
-                        // require reasoning_content to appear on every assistant
-                        // tool_call message in history. Emit an empty string when
-                        // we don't have stored reasoning (old session, None, etc.)
-                        // — the field must exist as a key or the provider treats
-                        // it as "missing" and 400s. DeepSeek does the opposite,
-                        // so this whole block is gated on policy.
+                        // Thinking-model providers require reasoning_content to
+                        // appear on every assistant tool_call message in history.
+                        // Kimi only checks the key is present (empty ok). DeepSeek
+                        // V4 additionally rejects an empty string ("must be passed
+                        // back to the API"), so when we have no captured reasoning
+                        // — cross-provider handoff (glm→deepseek), pre-fix session,
+                        // or a non-thinking model that still tool-called — we emit
+                        // a short non-empty placeholder. Both APIs accept any
+                        // non-empty string, DeepSeek does the opposite of Kimi for
+                        // Exclude so this block is gated on policy.
                         if matches!(reasoning_policy, ReasoningPolicy::Include) {
-                            msg["reasoning_content"] = json!(reasoning_content.as_deref().unwrap_or(""));
+                            let echo = reasoning_content
+                                .as_deref()
+                                .filter(|s| !s.is_empty())
+                                .unwrap_or("(no reasoning recorded)");
+                            msg["reasoning_content"] = json!(echo);
                         }
                         msg["tool_calls"] = json!(tool_calls.iter().map(|tc| {
                             // Ensure arguments is valid JSON — some APIs reject invalid JSON strings.
@@ -870,15 +877,29 @@ mod tests {
     }
 
     #[test]
-    fn format_messages_include_with_none_reasoning_emits_empty_string() {
-        // Moonshot's check is "field missing" — an empty string is accepted,
-        // a missing key is not. When we have no stored reasoning (old session,
-        // first tool_call in history that preceded thinking enablement, etc.)
-        // we MUST still emit the key to avoid 400.
+    fn format_messages_include_with_none_reasoning_emits_placeholder() {
+        // Kimi's check is "field missing" (empty ok). DeepSeek V4's check is
+        // stricter — rejects an empty string on tool_call messages. When we
+        // have no stored reasoning (cross-provider session, old jsonl before
+        // capture was wired, non-thinking model that tool-called anyway), emit
+        // a short non-empty placeholder so BOTH providers accept the message.
         use super::{OpenAiProvider, ReasoningPolicy};
         let msgs = vec![atc_message(None)];
         let out = OpenAiProvider::format_messages(&msgs, ReasoningPolicy::Include);
-        assert_eq!(out[0]["reasoning_content"], "");
+        let rc = out[0]["reasoning_content"].as_str().unwrap();
+        assert!(!rc.is_empty(), "placeholder must be non-empty for DeepSeek V4");
+    }
+
+    #[test]
+    fn format_messages_include_with_empty_string_reasoning_emits_placeholder() {
+        // Same reason as `_none_reasoning_emits_placeholder`: an empty-string
+        // reasoning (either stored as "" or decayed from serde) must still be
+        // replaced with the non-empty placeholder before sending.
+        use super::{OpenAiProvider, ReasoningPolicy};
+        let msgs = vec![atc_message(Some(""))];
+        let out = OpenAiProvider::format_messages(&msgs, ReasoningPolicy::Include);
+        let rc = out[0]["reasoning_content"].as_str().unwrap();
+        assert!(!rc.is_empty(), "placeholder must replace empty-string reasoning");
     }
 
     #[test]
