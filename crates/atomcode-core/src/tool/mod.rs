@@ -27,7 +27,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 /// Directories to skip when scanning file trees (build artifacts, caches, VCS).
-/// Used by glob, list_dir, project_context, and collect_project_files.
+/// Used by glob, list_dir, and collect_project_files.
 pub const SKIP_DIRS: &[&str] = &[
     "node_modules", ".git", "target", "__pycache__", ".next",
     "dist", "build", ".cache", "vendor", ".venv", "venv",

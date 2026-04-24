@@ -1,4 +1,4 @@
-use atomcode_core::tool::{Tool, ToolContext, ToolResult};
+use atomcode_core::tool::{Tool, ToolContext};
 use atomcode_core::tool::write::WriteFileTool;
 use serde_json::json;
 

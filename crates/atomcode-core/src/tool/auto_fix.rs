@@ -59,30 +59,6 @@ pub async fn validate_and_fix(content: &str, _file_path: &str, _new_string: &str
     }
 }
 
-/// Compute a numeric "balance score" for HTML tags in a file.
-/// Score = negative sum of absolute imbalances across all tracked tags.
-/// A perfectly balanced file scores 0. Each unmatched tag subtracts 1.
-/// Used for delta validation: reject edit only if score got worse.
-pub fn html_balance_score(content: &str, file_path: &str) -> i64 {
-    let ext = file_path.rsplit('.').next().unwrap_or("");
-    let check_content = if ext == "vue" {
-        if let Some(start) = content.find("<template") {
-            if let Some(end) = content.rfind("</template>") {
-                &content[start..end]
-            } else { content }
-        } else { return 0; }
-    } else { content };
-
-    let tags = ["div", "section", "main", "aside", "article", "nav", "header", "footer", "form"];
-    let mut score: i64 = 0;
-    for tag in &tags {
-        let opens = check_content.matches(&format!("<{}", tag)).count() as i64;
-        let closes = check_content.matches(&format!("</{}>", tag)).count() as i64;
-        score -= (opens - closes).abs();
-    }
-    score
-}
-
 /// Post-edit syntax check for common file types.
 /// Runs a fast, non-destructive check and returns a warning if syntax is broken.
 /// This needs the file to be on disk — call AFTER writing.

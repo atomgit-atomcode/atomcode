@@ -3,11 +3,8 @@
 //! via channels. Decoupled from any TUI concerns.
 
 pub mod git_checkpoint;
-// pub mod knowledge; // removed: low-value cross-session memory, see git history
 pub mod sub_agent;
 pub mod subtask_driver;
-// task_classifier removed — replaced by state-based decisions in handle_send_message.
-// pub mod task_classifier;
 
 mod diagnose;
 mod discipline;
