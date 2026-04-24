@@ -53,7 +53,7 @@ impl OllamaProvider {
                         }
                         Some(json!({"role": role, "content": s}))
                     }
-                    MessageContent::AssistantWithToolCalls { text, tool_calls } => {
+                    MessageContent::AssistantWithToolCalls { text, tool_calls, .. } => {
                         if tool_calls.is_empty() {
                             let t = text.as_deref().unwrap_or("");
                             if t.is_empty() { return None; }
