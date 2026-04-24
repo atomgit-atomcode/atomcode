@@ -176,17 +176,6 @@ struct StoredAuth {
     created_at: i64,
 }
 
-/// Token endpoint response.
-#[derive(serde::Deserialize)]
-struct RefreshResponse {
-    #[serde(alias = "access_token", alias = "accessToken")]
-    access_token: Option<String>,
-    #[serde(default)]
-    refresh_token: Option<String>,
-    #[serde(default)]
-    expires_in: Option<i64>,
-}
-
 /// Read a valid access token from `~/.atomcode/auth.toml`.
 /// Automatically refreshes expired tokens via the OAuth refresh_token flow.
 fn load_auth_token() -> Result<String> {

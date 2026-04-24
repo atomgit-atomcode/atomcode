@@ -1940,8 +1940,23 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
             };
             let _ = write!(self.out, "\x1b[1;{}r", bottom);
             self.scroll_region_bottom = Some(bottom);
-            for row in &tail {
-                self.emit_body_line_inner(row, bottom);
+            // Direct CUP per row instead of `emit_body_line_inner`'s
+            // LF-at-bottom scroll. LF inside the DECSTBM `[1, bottom]`
+            // region pushes the top row out — and since we just erased
+            // every row, that top row is blank. A full tail-repaint
+            // would therefore inject `tail.len() - 1` blank rows into
+            // scrollback. User symptom: after resizing smaller, the
+            // scrollback above the current page fills with empty rows
+            // for every resize event. Positioning absolutely with
+            // `\x1b[row;1H` skips the scroll entirely and leaves
+            // scrollback untouched.
+            let n = tail.len() as u16;
+            let first_row = bottom.saturating_sub(n) + 1;
+            for (i, row) in tail.iter().enumerate() {
+                let seq = format!("\x1b[{};1H\x1b[K", first_row + i as u16);
+                let _ = self.out.write_all(seq.as_bytes());
+                let bytes = serialize_row(row);
+                let _ = self.out.write_all(&bytes);
             }
         }
         self.paint_frame();
@@ -2286,6 +2301,110 @@ mod tests {
         r.flush_deferred();
         let idle_bytes = sample(&counter) - before_idle;
         assert_eq!(idle_bytes, 0, "idle tick should emit 0 bytes");
+    }
+
+    /// Regression: user reported that after resizing the terminal
+    /// smaller, scrolling up in the terminal revealed many blank rows
+    /// above the current page. Root cause: `on_resize` repainted the
+    /// body tail via `emit_body_line_inner`, which uses `\n` inside
+    /// the DECSTBM `[1, bottom]` region to place each row. Since the
+    /// just-cleared top-row of that region gets pushed to scrollback
+    /// on every `\n`, a full tail-repaint injected `tail.len() - 1`
+    /// blank rows into scrollback for every resize event.
+    ///
+    /// Fix: position each tail row with absolute CUP + EL instead of
+    /// LF-scrolling, so scrollback is never touched during resize.
+    #[test]
+    fn retained_resize_does_not_pollute_scrollback_with_blanks() {
+        let (mut r, buf) = new_capturing(80, 24);
+        let status = status_basic();
+
+        // Seed some body content so there's a tail to re-emit.
+        r.render(UiLine::User("first".into()));
+        r.render(UiLine::User("second".into()));
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+        });
+        r.flush_deferred();
+
+        // Baseline: feed everything so far into the vterm and record
+        // how many rows have scrolled off the top.
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+        drain_into_vterm(&buf, &mut vterm);
+        let baseline_scrollback = vterm.scrollback_len();
+
+        // Now trigger resize-smaller. All bytes emitted by the resize
+        // path go to `buf`; feed them alone into the vterm to measure
+        // the resize's contribution to scrollback in isolation.
+        r.on_resize(60, 16);
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+        });
+        r.flush_deferred();
+        let mut vterm_after = crate::test_term::VirtualTerminal::new(60, 16);
+        drain_into_vterm(&buf, &mut vterm_after);
+
+        // Scrollback from the RESIZE alone (vterm_after starts fresh).
+        // Before the fix, on_resize emitted `tail.len() - 1` blank
+        // rows into scrollback; after the fix it must emit zero.
+        assert_eq!(
+            vterm_after.scrollback_len(),
+            0,
+            "resize pushed {} rows into scrollback; expected 0 \
+             (baseline before resize: {})",
+            vterm_after.scrollback_len(),
+            baseline_scrollback
+        );
+    }
+
+    /// Regression: user showed a 5-column CJK table with long cells
+    /// overflowing past the terminal's right edge — `flush_aligned_table`
+    /// was ignoring terminal width. This test verifies the full pipeline
+    /// (streamed assistant text → `render_line_with_width` → body_lines)
+    /// keeps every rendered body row within screen width.
+    #[test]
+    fn retained_wide_table_truncated_to_screen_width() {
+        let term_w: u16 = 100;
+        let (mut r, _buf) = new_capturing(term_w, 30);
+        let status = status_basic();
+
+        let table = "\
+| 特性 | 免费版 | 专业版 | 企业版 | 旗舰版 |
+|------|--------|--------|--------|--------|
+| 价格 | 完全免费，适合个人开发者和学生群体使用 | 每月 $9.9，适合小型团队和独立开发者 | 每月 $49，适合中型企业和专业团队 | 每月 $199，适合大型企业和需要高级功能的用户 |
+| 支持语言 | 支持 Python、JavaScript、TypeScript 三种主流编程语言 | 支持所有主流编程语言，包括但不限于 Python、JavaScript、TypeScript、Java、Kotlin、Swift、Rust、Go 等 20+ 种语言 | 支持所有编程语言，无任何限制 | 支持所有已知编程语言 |
+
+尾部文本触发表格 flush。
+";
+        for line in table.lines() {
+            r.render(UiLine::AssistantText(format!("{}\n", line)));
+        }
+        r.render(UiLine::AssistantLineBreak);
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status,
+        });
+        r.flush_deferred();
+
+        // Body rows carry styling + 2-col PAD_COL indent. Strip ANSI and
+        // check the display width of each cached body row.
+        for (i, row) in r.body_lines.iter().enumerate() {
+            let w: usize = row.iter().map(|c| c.width as usize).sum();
+            assert!(
+                w <= term_w as usize,
+                "body row {} has display width {} > terminal {}; \
+                 table rendered without width-aware truncation",
+                i, w, term_w
+            );
+        }
     }
 
     /// Regression: user reported that after a terminal resize two

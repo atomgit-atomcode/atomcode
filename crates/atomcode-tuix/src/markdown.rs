@@ -557,21 +557,43 @@ mod tests {
     /// text with no upper bound. Long CJK rows produced lines far wider than
     /// the terminal, which `wrap_cells_to_width` downstream chopped mid-border
     /// — same structural-corruption class as the atomcode-tui table bug.
+    ///
+    /// Also prints a visual demo of a very long table so the developer can
+    /// eyeball the box-drawing alignment in a narrow panel.
     #[test]
     fn table_fits_within_narrow_panel_width() {
+        // ---- visual demo ----
+        let demo_rows = vec![
+            "| 功能模块 | 核心描述 | 技术栈 | 状态 | 优先级 | 负责人 |".to_string(),
+            "|------|------|------|------|------|------|".to_string(),
+            "| 用户认证系统 | 支持手机号验证码登录、邮箱密码登录、第三方 OAuth2 集成（微信、钉钉、Google）、JWT Token 自动续期、多端设备管理与会话锁定、密码策略配置与强制改密功能 | Rust + Actix-web + Redis + PostgreSQL | 开发中 | P0 | 张三 |".to_string(),
+            "| 权限管理系统 | RBAC 模型实现、细粒度资源级权限控制、数据行级访问控制、动态角色分配与审批流程、权限变更实时审计与日志追踪、组织架构同步与部门级权限继承 | Rust + PostgreSQL + Redis | 已上线 | P0 | 李四 |".to_string(),
+            "| 消息推送中心 | WebSocket 实时消息通道、FCM/APNs 推送、邮件模板引擎、短信网关集成、消息重试与死信队列、阅读状态回执与未读计数、批量推送任务调度与进度监控 | Rust + RabbitMQ + Redis + FCM | 规划中 | P1 | 王五 |".to_string(),
+            "| 文件存储服务 | 分片上传与断点续传、图片自动缩放与水印、PDF 在线预览、病毒扫描集成、CDN 加速与缓存策略、存储配额与用量统计、版本控制与回溯、大文件秒传（MD5 校验） | Rust + MinIO + Cloudflare R2 | 开发中 | P1 | 赵六 |".to_string(),
+            "| 数据分析面板 | 多维度数据聚合查询、自定义仪表盘与 Widget 布局、时间序列数据可视化、数据导出为 Excel/PDF、定时报表生成与邮件分发、实时数据大屏模式 | Rust + ClickHouse + Chart.js | 规划中 | P2 | 孙七 |".to_string(),
+            "| 工作流引擎 | 可视化流程编排与拖拽设计器、条件分支与并行网关、人工任务审批流、定时触发与延迟节点、流程版本管理与灰度发布、执行日志追踪与失败重试 | Rust + PostgreSQL + Redis | 规划中 | P2 | 周八 |".to_string(),
+            "| API 网关 | 限流与熔断、请求路由与负载均衡、身份认证与签名验证、请求响应转换、CORS 预检处理、API 文档自动生成、灰度发布与 A/B 测试、流量镜像与影子测试 | Rust + OpenResty + Lua | 已上线 | P0 | 吴九 |".to_string(),
+            "| 国际化支持 | 多语言资源文件管理与翻译工作流、RTL 右向左语言适配、时区与日期格式本地化、多货币与税务规则、区域性功能开关与特性路由、A/B 测试地域定向 | Rust + i18n-next | 开发中 | P2 | 郑十 |".to_string(),
+        ];
+        let max_w = 80;
+        println!("\n=== Rendered table demo (max_width={}) ===", max_w);
+        let rendered = flush_aligned_table_with_width(&demo_rows, plain_caps(), max_w);
+        print!("{}", rendered);
+        println!("=== End ===\n");
+
+        // ---- regression check ----
         let rows = vec![
             "| 功能 | 描述 | 状态 |".to_string(),
             "|------|------|------|".to_string(),
             "| 用户认证系统 | 支持手机号验证码登录、邮箱密码登录、第三方 OAuth2 集成（微信、钉钉、Google）、JWT Token 自动续期 | 开发中 |".to_string(),
             "| 权限管理系统 | RBAC 模型实现、细粒度资源级权限控制、数据行级访问控制、动态角色分配与审批流程 | 已上线 |".to_string(),
         ];
-        let max_width = 80;
-        let out = flush_aligned_table_with_width(&rows, plain_caps(), max_width);
+        let out = flush_aligned_table_with_width(&rows, plain_caps(), max_w);
         for (i, line) in out.lines().enumerate() {
             let w = crate::width::display_width(line);
-            assert!(w <= max_width,
+            assert!(w <= max_w,
                 "line {} rendered at {} cols — exceeds max_width {}",
-                i, w, max_width);
+                i, w, max_w);
         }
     }
 }

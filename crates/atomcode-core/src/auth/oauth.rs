@@ -76,8 +76,6 @@ struct PlatformLoginResponse {
 #[derive(Debug, Deserialize)]
 struct PlatformCheckResponse {
     valid: bool,
-    user: Option<PlatformUserInfo>,
-    sid: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -253,6 +251,10 @@ fn open_browser(_url: &str) -> Result<()> {
 /// where the browser hits `127.0.0.1:8765`; stdin path handles WSL /
 /// headless Linux where the user copies the callback URL from their
 /// browser's address bar and pastes it in.
+///
+/// Kept for potential future fallback use — the platform-broker flow in
+/// `login()` is the active callback path now.
+#[allow(dead_code)]
 fn await_callback(port: u16) -> Result<(String, String)> {
     let listener = match TcpListener::bind(("127.0.0.1", port)) {
         Ok(l) => Some(l),
@@ -358,6 +360,7 @@ fn await_callback(port: u16) -> Result<(String, String)> {
 /// the same terminal device; whichever syscall lands on a byte first
 /// gets it, and a blocked `read_line` stays in line for the next input.
 #[cfg(not(target_os = "windows"))]
+#[allow(dead_code)]
 fn read_callback_from_stdin_until_stopped(
     stop: &AtomicBool,
 ) -> Result<(String, String)> {
@@ -439,6 +442,7 @@ fn read_callback_from_stdin_until_stopped(
 
 /// `stop` flag every 200ms so the caller can cancel (e.g. when the paste
 /// path won the race).
+#[allow(dead_code)]
 fn accept_callback_until_stopped(
     listener: TcpListener,
     stop: &AtomicBool,
@@ -725,6 +729,7 @@ pub fn current_user() -> Option<UserInfo> {
 /// Accepts any URL with a query string containing `code` and `state`.
 /// Rejects raw `code` without URL context — state validation is CSRF
 /// protection and we want the full round-trip, not a manually typed code.
+#[allow(dead_code)]
 fn parse_pasted_callback(input: &str) -> Result<(String, String)> {
     // Defensively strip bracketed-paste markers. The TUI disables DECSET
     // 2004 before calling us, but a user pasting into a terminal we didn't
