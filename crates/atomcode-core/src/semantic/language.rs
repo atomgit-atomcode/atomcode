@@ -13,6 +13,7 @@ pub enum Lang {
     Java,
     C,
     Cpp,
+    CSharp,
     Html,
     /// Vue SFC — dual parser: <script> as TypeScript, <template> as HTML.
     Vue,
@@ -31,6 +32,7 @@ impl Lang {
             Lang::Java => tree_sitter_java::LANGUAGE.into(),
             Lang::C => tree_sitter_c::LANGUAGE.into(),
             Lang::Cpp => tree_sitter_cpp::LANGUAGE.into(),
+            Lang::CSharp => tree_sitter_c_sharp::LANGUAGE.into(),
             Lang::Html => tree_sitter_html::LANGUAGE.into(),
             Lang::Vue => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
         }
@@ -47,6 +49,7 @@ impl Lang {
             Lang::Java => include_str!("queries/java.scm"),
             Lang::C => include_str!("queries/c.scm"),
             Lang::Cpp => include_str!("queries/cpp.scm"),
+            Lang::CSharp => include_str!("queries/csharp.scm"),
             Lang::Html => include_str!("queries/html.scm"),
             Lang::Vue => include_str!("queries/typescript.scm"),
         }
@@ -62,7 +65,7 @@ impl Lang {
             }
             Lang::Java => Some(include_str!("../graph/queries/java_calls.scm")),
             Lang::Go => Some(include_str!("../graph/queries/go_calls.scm")),
-            Lang::C | Lang::Cpp => None,
+            Lang::C | Lang::Cpp | Lang::CSharp => None,
             Lang::Html => None,
         }
     }
@@ -95,6 +98,7 @@ impl LanguageRegistry {
             "java" => Some(Lang::Java),
             "c" | "h" => Some(Lang::C),
             "cc" | "cpp" | "cxx" | "hh" | "hpp" | "hxx" => Some(Lang::Cpp),
+            "cs" => Some(Lang::CSharp),
             "html" | "htm" => Some(Lang::Html),
             "vue" | "svelte" => Some(Lang::Vue),
             _ => None,
