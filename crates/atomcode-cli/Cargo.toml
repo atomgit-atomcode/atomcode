@@ -10,7 +10,6 @@ path = "src/main.rs"
 
 [dependencies]
 atomcode-core = { path = "../atomcode-core" }
-atomcode-tui = { path = "../atomcode-tui" }
 atomcode-tuix = { path = "../atomcode-tuix" }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }

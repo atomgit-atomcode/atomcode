@@ -158,7 +158,7 @@ impl LlmProvider for UnavailableProvider {
 
 // ── auth.toml token loading ──
 
-/// OAuth constants (shared with atomcode-tui / atomcode-cli).
+/// OAuth constants (shared with atomcode-cli).
 const OAUTH_CLIENT_ID: &str = "b9956e5327e544578128af8979ba3ccb";
 const OAUTH_CLIENT_SECRET: &str = "756ef00061884c7aa1ac64bd4eae3be7";
 const OAUTH_TOKEN_URL: &str = "https://atomgit.com/oauth/token";

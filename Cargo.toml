@@ -2,7 +2,6 @@
 resolver = "2"
 members = [
     "crates/atomcode-core",
-    "crates/atomcode-tui",
     "crates/atomcode-tuix",
     "crates/atomcode-cli",
     "crates/atomcode-daemon",
