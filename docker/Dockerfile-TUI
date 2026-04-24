@@ -3,13 +3,13 @@
 #
 # 构建步骤:
 #   1. ./scripts/release.sh  # 生成 Linux 二进制到 dist/ 目录
-#   2. docker build -t atomcode-tui -f docker/Dockerfile-TUI .
+#   2. docker build -t atomcode -f docker/Dockerfile-TUI .
 #
 # 运行方式:
 #   docker run --rm -it \
 #     -v ~/.atomcode:/root/.atomcode \
 #     -v $(pwd):/workspace \
-#     atomcode-tui
+#     atomcode
 
 FROM debian:bookworm-slim
 

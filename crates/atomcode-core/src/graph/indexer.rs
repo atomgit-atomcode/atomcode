@@ -246,14 +246,6 @@ impl GraphIndexer {
         }
     }
 
-    /// Walk the project directory, returning (path, mtime) for indexable files.
-    /// Kept as a method for legacy callers / tests; dispatches to the free
-    /// function so `index_all` can run the same logic on a blocking thread.
-    #[allow(dead_code)]
-    fn collect_files(&self) -> Vec<(PathBuf, u64)> {
-        collect_files_sync(&self.project_dir)
-    }
-
     /// Parse a single file: extract symbols and raw calls.
     fn parse_file(&mut self, path: &Path) -> Option<FileParseResult> {
         let source = std::fs::read_to_string(path).ok()?;

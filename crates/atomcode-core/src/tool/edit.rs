@@ -879,7 +879,6 @@ fn find_text_line_range(content: &str, needle: &str) -> Option<(usize, usize)> {
 
 /// Try fuzzy matching: normalize whitespace (trim each line) and try to match.
 /// `replace_all` controls whether all matches or just a unique one should be replaced.
-#[allow(dead_code)]
 fn try_fuzzy_replace(
     content: &str,
     old_string: &str,
@@ -966,104 +965,6 @@ fn try_fuzzy_replace(
 
     let count = if replace_all { matches.len() } else { 1 };
     Some((result, count))
-}
-
-/// Post-edit info: file outline for navigation.
-#[allow(dead_code)]
-fn post_edit_info(new_content: &str, _new_string: &str) -> String {
-    file_outline(new_content)
-}
-
-/// Post-edit context: give the model the file's current state so it doesn't re-read.
-///
-/// - Files <= 500 lines: return the FULL file with line numbers.
-///   This eliminates re-reads entirely — the model has everything in the latest message.
-/// - Files > 500 lines: return outline + 40 lines of surrounding context around the edit.
-#[allow(dead_code)]
-fn post_edit_context(new_content: &str, new_string: &str) -> String {
-    let lines: Vec<&str> = new_content.lines().collect();
-
-    if lines.len() <= 500 {
-        // Full file — model has zero reason to re-read.
-        let mut out = format!(
-            "\n[Full file after edit ({} lines) — do NOT re-read this file:]\n",
-            lines.len()
-        );
-        for (i, line) in lines.iter().enumerate() {
-            out.push_str(&format!("{:>4}| {}\n", i + 1, line));
-        }
-        return out;
-    }
-
-    // Large file: surrounding context around the edit location.
-
-    // Find where the new content was inserted.
-    let new_first = new_string.lines().next().unwrap_or("").trim();
-    let center = if !new_first.is_empty() {
-        lines.iter().position(|l| l.trim().contains(new_first)).unwrap_or(0)
-    } else {
-        0
-    };
-
-    let start = center.saturating_sub(20);
-    let end = (center + 20).min(lines.len());
-
-    let mut ctx = format!(
-        "\n[File after edit ({} lines). Context around edit (lines {}-{}):]:\n",
-        lines.len(), start + 1, end
-    );
-    for i in start..end {
-        ctx.push_str(&format!("{:>4}| {}\n", i + 1, lines[i]));
-    }
-    if end < lines.len() {
-        ctx.push_str(&format!("     ... ({} more lines)\n", lines.len() - end));
-    }
-
-    ctx
-}
-
-/// Build a structural outline of the file after edit.
-/// Shows top-level lines (indent 0-1) with line numbers so the model
-/// knows the file's structure and can plan its next edit without re-reading.
-/// Only generated for files > 100 lines (small files don't need it).
-#[allow(dead_code)]
-fn file_outline(content: &str) -> String {
-    let lines: Vec<&str> = content.lines().collect();
-    if lines.len() <= 20 {
-        return String::new(); // Small file — diff is enough context.
-    }
-
-    let mut outline = format!("[File outline ({} lines) — do NOT re-read this file:]\n", lines.len());
-    let mut count = 0;
-    let max_outline_lines = 30;
-
-    for (i, line) in lines.iter().enumerate() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let indent = line.len() - line.trim_start().len();
-        // Indent 0-1 = top-level declaration. Also include <template>, <script>, <style> tags.
-        if indent <= 1 || trimmed.starts_with('<') && (
-            trimmed.starts_with("<template") || trimmed.starts_with("</template")
-            || trimmed.starts_with("<script") || trimmed.starts_with("</script")
-            || trimmed.starts_with("<style") || trimmed.starts_with("</style")
-        ) {
-            // Truncate long lines for the outline
-            let display = if trimmed.chars().count() > 60 {
-                format!("{}...", trimmed.chars().take(57).collect::<String>())
-            } else {
-                trimmed.to_string()
-            };
-            outline.push_str(&format!("{:>4}| {}\n", i + 1, display));
-            count += 1;
-            if count >= max_outline_lines {
-                outline.push_str(&format!("     ... ({} more lines)\n", lines.len() - i - 1));
-                break;
-            }
-        }
-    }
-    outline
 }
 
 /// Build a compact diff showing removed/added lines (max 8 lines total).

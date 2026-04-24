@@ -123,8 +123,6 @@ impl ClaudeProvider {
 struct ClaudeSSE {
     #[serde(rename = "type")]
     event_type: String,
-    #[allow(dead_code)]
-    index: Option<usize>,
     content_block: Option<ContentBlock>,
     delta: Option<ClaudeDelta>,
     usage: Option<ClaudeUsage>,
@@ -152,8 +150,6 @@ struct ContentBlock {
     block_type: String,
     id: Option<String>,
     name: Option<String>,
-    #[allow(dead_code)]
-    text: Option<String>,
 }
 
 #[derive(Deserialize)]

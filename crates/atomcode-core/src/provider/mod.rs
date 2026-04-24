@@ -160,7 +160,6 @@ impl LlmProvider for UnavailableProvider {
 
 /// Platform OAuth refresh endpoint
 const PLATFORM_REFRESH_URL: &str = "https://acs.atomgit.com/oauth/refresh";
-
 /// Minimal auth.toml representation.
 #[derive(serde::Deserialize)]
 struct StoredAuth {

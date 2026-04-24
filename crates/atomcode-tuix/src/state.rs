@@ -103,6 +103,14 @@ pub struct UiState {
     /// can be edited + resent without re-typing. `None` between
     /// turns and after any successful completion.
     pub last_submitted_message: Option<String>,
+    /// `/context` dispatched a `RefreshContextStats` command and is
+    /// waiting for the resulting rich ContextStats event to render the
+    /// report. `Some(show_prompt)` until the next rich emission lands;
+    /// cleared after the render fires. Prevents stale-cache renders
+    /// without forcing /context to block synchronously on the agent
+    /// loop. The bool is the `prompt` sub-arg (include full system
+    /// prompt body).
+    pub pending_context_render: Option<bool>,
 }
 
 impl Default for UiState {
@@ -123,6 +131,7 @@ impl UiState {
             turn_started_at: None,
             last_context: None,
             last_submitted_message: None,
+            pending_context_render: None,
         }
     }
 

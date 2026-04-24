@@ -5,10 +5,6 @@
 // Lists the up-to-5 most recently visited project directories from
 // `ctx.recent_dirs` (backed by `~/.atomcode/recent_dirs.txt`). Up/Down
 // navigates, Enter commits the cd via `apply_cd`, Esc cancels.
-//
-// This replaces the equivalent `dir_selector` flow that existed in the
-// legacy `atomcode-tui` crate — porting the feature was missed when the
-// new tuix TUI was introduced.
 
 use std::path::PathBuf;
 

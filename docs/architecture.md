@@ -1,15 +1,13 @@
 # AtomCode Architecture — Module Map
 
-> 26,019 lines Rust | 4 crates | 70+ source files
-
 ## Crate Overview
 
-| Crate | Lines | Role |
-|-------|:-----:|------|
-| **atomcode-core** | 16,843 | Agent 引擎 — 工具、上下文、语义分析、LLM 通信 |
-| **atomcode-tui** | 7,793 | 终端 UI — 渲染、输入、主题、session 管理 |
-| **atomcode-cli** | 736 | CLI 入口 — 参数解析、OAuth 登录 |
-| **atomcode-daemon** | 647 | 后台服务 — HTTP API 服务（独立部署） |
+| Crate | Role |
+|-------|------|
+| **atomcode-core** | Agent 引擎 — 工具、上下文、语义分析、LLM 通信 |
+| **atomcode-tuix** | 终端 UI — retained-mode 渲染、input、modal 选择器、命令分发 |
+| **atomcode-cli** | CLI 入口 — 参数解析、OAuth 登录 |
+| **atomcode-daemon** | 后台服务 — HTTP API 服务（独立部署） |
 
 ---
 
@@ -93,28 +91,22 @@
 
 ---
 
-## atomcode-tui 模块
+## atomcode-tuix 模块
 
-| 模块 | 行数 | 职责 |
-|------|:----:|------|
-| `app.rs` | 2486 | **应用状态** — AppMode、事件处理、AgentEvent 转发、消息管理、命令分发 |
-| `lib.rs` | 516 | **TUI 启动** — ratatui 初始化、主循环、OAuth 处理 |
-| `ui/mod.rs` | ~100 | **布局编排** — 三区布局（status bar + chat + input） |
-| `ui/chat_panel.rs` | 821 | **聊天渲染** — 消息显示、工具图标、diff 高亮、工具展开/折叠、spinner |
-| `ui/markdown.rs` | 541 | **Markdown 渲染** — pulldown-cmark + syntect 语法高亮 + CJK 间距 |
-| `ui/input_box.rs` | ~200 | **输入框** — 多行编辑、自动换行、粘贴检测 |
-| `ui/status_bar.rs` | ~140 | **状态栏** — build ID、目录、session 名、turn 数、耗时、ctx 用量、模型名 |
-| `ui/theme.rs` | ~200 | **主题** — Dark/Light 双主题 + $COLORFGBG 自动检测 |
-| `ui/welcome.rs` | 267 | **欢迎页** — 首次启动引导 |
-| `ui/provider_panel.rs` | 417 | **Provider 管理** — 添加/编辑/删除 provider |
-| `ui/model_selector.rs` | ~100 | **模型选择** — 运行时切换模型 |
-| `ui/session_selector.rs` | ~100 | **会话选择** — /resume 恢复历史会话 |
-| `ui/slash_menu.rs` | ~80 | **斜杠命令菜单** — /clear /model /cd 等 |
-| `turn_log.rs` | 408 | **Datalog 记录** — 每轮对话写 Markdown 到 datalog/ 目录 |
-| `provider_manager.rs` | 495 | **Provider 向导** — 添加 provider 的交互式步骤 |
-| `command.rs` | ~80 | **命令定义** — 斜杠命令注册 |
-| `event.rs` | ~50 | **终端事件** — 键盘/鼠标/resize 事件封装 |
-| `file_attach.rs` | 264 | **文件附件** — 拖拽/粘贴文件到输入框 |
+> CC 风格的 normal-mode TUI（不进 alternate screen），retained-mode 渲染器（cell-level diff + 16ms tick）。详细设计见 `docs/superpowers/plans/2026-04-19-tuix-retained-mode-rewrite.md`。
+
+| 模块 | 职责 |
+|------|------|
+| `lib.rs` | TUI 入口 — `run()` 启动事件循环、初始化 renderer |
+| `event_loop/` | 主循环 — 事件分发、命令处理、buffer 管理、Modal 调度 |
+| `render/` | 渲染层 — Cell/Screen buffer、diff、retained-mode 帧循环、theme |
+| `modals/` | Modal 选择器 — dir/model/session/provider/issue/welcome 向导 |
+| `input/` | 输入处理 — key action 映射、history、reader |
+| `markdown.rs` | Markdown 渲染 — pulldown-cmark + syntect + CJK 间距 |
+| `commands.rs` | 斜杠命令注册与分发 |
+| `think.rs` | reasoning_content 流式渲染 |
+| `state.rs` | UiState — 全局 UI 状态机 |
+| `trace.rs` | datalog 记录 — 每轮对话写 Markdown |
 
 ---
 

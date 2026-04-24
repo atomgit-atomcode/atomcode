@@ -250,7 +250,6 @@ impl VirtualTerminal {
 
     /// Handy multi-line dump of the whole grid — useful inside
     /// assertion error messages so failures show what was painted.
-    #[allow(dead_code)]
     pub fn dump(&self) -> String {
         self.grid
             .iter()

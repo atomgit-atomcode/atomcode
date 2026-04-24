@@ -2150,6 +2150,21 @@ fn handle_agent_event(
                 &ctx_name,
                 &system_prompt,
             );
+            // If `/context` is waiting for fresh stats, the rich emission
+            // (ctx_window > 0) is the signal to render. Narrow emissions
+            // from TurnRunner leave ctx_window at 0 and must not trigger
+            // a report render (they'd race ahead of the pending refresh
+            // and print partial data). Clears the flag on fire so a
+            // single dispatch yields a single render even when multiple
+            // rich emissions follow (e.g. inside a long multi-round turn).
+            if ctx_window > 0 {
+                if let Some(show_prompt) = state.pending_context_render.take() {
+                    renderer.render(UiLine::CommandOutput(
+                        commands::render_context_report(state, ctx, show_prompt),
+                    ));
+                    renderer.flush();
+                }
+            }
         }
         AgentEvent::SubAgentProgress { .. } => {}
     }
