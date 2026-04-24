@@ -773,8 +773,28 @@ pub fn get_stored_auth() -> Option<AuthInfo> {
 /// Save auth info to file
 pub fn save_auth(auth: &AuthInfo) -> Result<()> {
     let auth_path = auth_file_path();
+
+    // Ensure parent directory exists
+    if let Some(parent) = auth_path.parent() {
+        std::fs::create_dir_all(parent).context("Failed to create auth directory")?;
+        // Set directory permissions to 0o700 (owner only) on Unix
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+
     let content = toml::to_string_pretty(auth).context("Failed to serialize auth info")?;
     super::write_auth_file_secure(&auth_path, &content).context("Failed to write auth file")?;
+
+    // Set file permissions to 0o600 (owner read/write only) on Unix
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&auth_path, std::fs::Permissions::from_mode(0o600))
+            .context("Failed to set auth file permissions")?;
+    }
 
     println!("  Auth saved to: {}\n", auth_path.display());
 
