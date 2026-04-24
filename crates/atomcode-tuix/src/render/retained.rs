@@ -116,6 +116,37 @@ fn parse_markdown_to_cells(s: &str) -> Vec<Vec<Cell>> {
     lines
 }
 
+/// Clip a cell row to at most `max_cols` display columns. Drops
+/// trailing cells (including their continuation cells) so the total
+/// `cell.width` sum of the returned row is ≤ `max_cols`. A wide
+/// glyph that straddles `max_cols` is dropped whole — we never emit
+/// the left half without its continuation, which would leak into
+/// the next line on real terminals once auto-wrap kicks in.
+///
+/// Used on the resize path to make cached `body_lines` (built for
+/// the OLD screen width) safe to re-emit against a narrower new
+/// terminal. Without this, `serialize_row` would emit glyphs past
+/// the right edge; the terminal's own auto-wrap then spills them
+/// into the next row — which is the footer strip or a phantom body
+/// row — producing the "everything shifted by one column and the
+/// footer has garbage in it" symptom after a resize-smaller drag.
+fn clip_cells_to_width(cells: &[Cell], max_cols: usize) -> Vec<Cell> {
+    if max_cols == 0 {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(cells.len().min(max_cols));
+    let mut used = 0usize;
+    for cell in cells {
+        let w = cell.width as usize;
+        if w > 0 && used + w > max_cols {
+            break;
+        }
+        out.push(cell.clone());
+        used += w;
+    }
+    out
+}
+
 /// Cell-based wrap: splits a cell sequence into chunks whose sum
 /// of `cell.width` stays ≤ `max_cols`. Continuation cells (width 0)
 /// travel with their preceding real cell — the combined "grapheme"
@@ -1021,12 +1052,13 @@ impl<W: Write + Send> RetainedRenderer<W> {
         if !self.assistant_line_buf.contains('\n') {
             return;
         }
+        let md_width = (self.screen.width() as usize).saturating_sub(PAD_COL * 2);
         let mut completed: Vec<String> = Vec::new();
         while let Some(nl) = self.assistant_line_buf.find('\n') {
             let line: String = self.assistant_line_buf.drain(..=nl).collect();
             let content = line[..line.len() - 1].to_string();
             if let Some(rendered) =
-                crate::markdown::render_line(&content, &mut self.md_state, self.caps)
+                crate::markdown::render_line_with_width(&content, &mut self.md_state, self.caps, md_width)
             {
                 completed.push(rendered);
             }
@@ -1041,15 +1073,16 @@ impl<W: Write + Send> RetainedRenderer<W> {
     /// Also drains any trailing markdown block buffer (tables that
     /// ended without a following non-table line).
     fn flush_assistant_remainder(&mut self) {
+        let md_width = (self.screen.width() as usize).saturating_sub(PAD_COL * 2);
         if !self.assistant_line_buf.is_empty() {
             let line = std::mem::take(&mut self.assistant_line_buf);
             if let Some(rendered) =
-                crate::markdown::render_line(&line, &mut self.md_state, self.caps)
+                crate::markdown::render_line_with_width(&line, &mut self.md_state, self.caps, md_width)
             {
                 self.push_markdown_body(&rendered);
             }
         }
-        if let Some(block) = crate::markdown::finalize(&mut self.md_state, self.caps) {
+        if let Some(block) = crate::markdown::finalize_with_width(&mut self.md_state, self.caps, md_width) {
             self.push_markdown_body(&block);
         }
     }
@@ -1884,13 +1917,25 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         self.reflow_welcome_prefix();
         // Re-emit body tail into the new region so the view matches
         // memory. Set region first so LFs scroll only within body.
+        //
+        // Cached `body_lines` cells were built against the OLD screen
+        // width — after a resize-smaller drag, rows may exceed the new
+        // terminal width. `serialize_row` writes every real cell, so
+        // overflow would trigger the terminal's own auto-wrap; the
+        // wrapped remainder lands on the next row, which on a fresh
+        // DECSTBM region is either the footer strip or the next body
+        // slot. Symptom the user sees: content shifted by a column and
+        // junk in the footer strip. Clip each row to the new width
+        // before handing it to `emit_body_line_inner` so we never
+        // rely on the terminal to hide our overflow.
         let bottom = self.body_bottom_row();
         if bottom > 0 {
+            let screen_w = self.screen.width() as usize;
             let tail: Vec<Vec<Cell>> = {
                 let n = self.body_lines.len().min(bottom as usize);
                 self.body_lines[self.body_lines.len() - n..]
                     .iter()
-                    .cloned()
+                    .map(|row| clip_cells_to_width(row, screen_w))
                     .collect()
             };
             let _ = write!(self.out, "\x1b[1;{}r", bottom);
@@ -2681,6 +2726,94 @@ mod tests {
             brand_row,
             version_row
         );
+    }
+
+    /// Regression: after a resize-smaller drag, cached `body_lines` rows
+    /// built against the OLD terminal width were re-emitted verbatim. Rows
+    /// wider than the new width triggered the real terminal's auto-wrap;
+    /// the wrapped tail spilled into footer / scroll-region rows, producing
+    /// the visible "everything shifted and the footer has garbage in it"
+    /// glitch users reported after dragging the window narrower.
+    ///
+    /// `VirtualTerminal::put_char` silently drops cells past the grid's
+    /// right edge (no auto-wrap modelled), so we can't observe the bug
+    /// at the grid level. Assert on the emitted byte stream instead:
+    /// between any two cursor-positioning CSIs, the printable payload
+    /// must fit within the new `screen.width()`.
+    #[test]
+    fn retained_resize_clips_wide_body_rows_to_new_width() {
+        let (mut r, buf) = new_capturing(120, 24);
+
+        // Seed body with a long tool call: a `▸ Name(payload)` row whose
+        // display width far exceeds any sane "shrink-to" target.
+        r.render(UiLine::ToolCall {
+            name: "Bash".into(),
+            detail: "X".repeat(100),
+        });
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status_basic(),
+        });
+        r.flush_deferred();
+        // Discard pre-resize bytes — this test only asserts on what
+        // `on_resize` emits at the narrower width.
+        buf.lock().unwrap().clear();
+
+        let new_w: u16 = 40;
+        r.on_resize(new_w, 16);
+
+        // Parse the emitted stream: CSI sequences delimit "runs" of
+        // printable bytes. Every run must fit within the new width.
+        // `\n` also delimits (emit_body_line_inner uses raw LF to scroll
+        // the DECSTBM region).
+        let bytes = buf.lock().unwrap().clone();
+        let text = String::from_utf8_lossy(&bytes);
+        let mut runs: Vec<String> = vec![String::new()];
+        let mut chars = text.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' {
+                // CSI / ESC dispatch — eat until the final byte. The
+                // final byte delimits the current run from the next.
+                runs.push(String::new());
+                if chars.peek() == Some(&'[') {
+                    chars.next();
+                    while let Some(&p) = chars.peek() {
+                        chars.next();
+                        if p.is_ascii_alphabetic() || p == '~' {
+                            break;
+                        }
+                    }
+                } else if chars.peek() == Some(&']') {
+                    // OSC — eat until ST (BEL or ESC\)
+                    while let Some(&p) = chars.peek() {
+                        chars.next();
+                        if p == '\x07' {
+                            break;
+                        }
+                    }
+                }
+                continue;
+            }
+            if c == '\n' || c == '\r' {
+                runs.push(String::new());
+                continue;
+            }
+            runs.last_mut().unwrap().push(c);
+        }
+
+        for run in &runs {
+            let w = crate::width::display_width(run);
+            assert!(
+                w <= new_w as usize,
+                "body re-emit produced a {}-col run on a {}-col terminal: {:?}\n\
+                 (clip_cells_to_width should have trimmed this before emit)",
+                w,
+                new_w,
+                run,
+            );
+        }
     }
 
     #[test]

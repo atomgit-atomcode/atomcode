@@ -33,6 +33,19 @@ impl MdState {
 /// Returns None if the line should be omitted from output (e.g., a fence
 /// marker ``` that toggles code-block state but isn't itself visible text).
 pub fn render_line(line: &str, state: &mut MdState, caps: TerminalCaps) -> Option<String> {
+    render_line_with_width(line, state, caps, 0)
+}
+
+/// Width-aware variant of [`render_line`]. When `max_width > 0`, a flushed
+/// table's column widths are capped so every line fits the budget — otherwise
+/// `wrap_cells_to_width` downstream chops long rows and shatters the table's
+/// border structure. `max_width = 0` keeps legacy behaviour.
+pub fn render_line_with_width(
+    line: &str,
+    state: &mut MdState,
+    caps: TerminalCaps,
+    max_width: usize,
+) -> Option<String> {
     let trimmed = line.trim();
 
     // Table row: buffer and defer emit until block ends.
@@ -43,7 +56,7 @@ pub fn render_line(line: &str, state: &mut MdState, caps: TerminalCaps) -> Optio
 
     // Non-table line arriving after buffered rows: flush as aligned block.
     let prefix = if !state.table_buf.is_empty() {
-        let t = flush_aligned_table(&state.table_buf, caps);
+        let t = flush_aligned_table_with_width(&state.table_buf, caps, max_width);
         state.table_buf.clear();
         Some(t)
     } else {
@@ -114,10 +127,19 @@ pub fn render_line(line: &str, state: &mut MdState, caps: TerminalCaps) -> Optio
 /// Emit any still-buffered block (e.g., a table that ended without a
 /// following non-table line). Call at stream end.
 pub fn finalize(state: &mut MdState, caps: TerminalCaps) -> Option<String> {
+    finalize_with_width(state, caps, 0)
+}
+
+/// Width-aware variant of [`finalize`]. See [`render_line_with_width`].
+pub fn finalize_with_width(
+    state: &mut MdState,
+    caps: TerminalCaps,
+    max_width: usize,
+) -> Option<String> {
     if state.table_buf.is_empty() {
         return None;
     }
-    let t = flush_aligned_table(&state.table_buf, caps);
+    let t = flush_aligned_table_with_width(&state.table_buf, caps, max_width);
     state.table_buf.clear();
     Some(t)
 }
@@ -127,6 +149,17 @@ pub fn finalize(state: &mut MdState, caps: TerminalCaps) -> Option<String> {
 /// `│`/`┼`/`─` box chars in muted gray. Inline markdown inside cells is
 /// honoured.
 pub fn flush_aligned_table(rows: &[String], caps: TerminalCaps) -> String {
+    flush_aligned_table_with_width(rows, caps, 0)
+}
+
+/// Width-aware variant. When `max_width > 0`, column widths are capped so
+/// each rendered row fits within the budget (line = `1 + ncols·(w+3)`); cells
+/// that exceed the cap are truncated with `…`. `max_width = 0` = no cap.
+pub fn flush_aligned_table_with_width(
+    rows: &[String],
+    caps: TerminalCaps,
+    max_width: usize,
+) -> String {
     // Parse each row: strip leading/trailing '|', split by '|', trim cells.
     let parsed: Vec<Vec<String>> = rows
         .iter()
@@ -166,6 +199,18 @@ pub fn flush_aligned_table(rows: &[String], caps: TerminalCaps) -> String {
         }
     }
 
+    // Cap per-column width so the full row fits: line = 1 (left `│`) +
+    // ncols · (w + 3). Lower bound 6 keeps cells legible; upper bound 40
+    // matches atomcode-tui so short tables don't waste horizontal space.
+    if max_width > 0 {
+        let overhead = 1 + 3 * ncols;
+        let budget = max_width.saturating_sub(overhead);
+        let cap = (budget / ncols.max(1)).clamp(6, 40);
+        for w in col_widths.iter_mut() {
+            *w = (*w).min(cap);
+        }
+    }
+
     let border_on = if caps.colors { "\x1b[90m" } else { "" };
     let border_off = if caps.colors { "\x1b[39m" } else { "" };
 
@@ -201,11 +246,22 @@ pub fn flush_aligned_table(rows: &[String], caps: TerminalCaps) -> String {
         out.push_str(border_off);
         for (j, w) in col_widths.iter().enumerate() {
             let cell = row.get(j).map(|s| s.as_str()).unwrap_or("");
-            let plain_w = crate::width::display_width(&strip_md_for_width(cell));
-            let rendered = render_inline(cell, caps);
+            let plain = strip_md_for_width(cell);
+            let plain_w = crate::width::display_width(&plain);
+            // Truncate overlong cells to fit the column cap. Inline markdown
+            // (`**bold**`, backticks) is dropped on the truncated form — the
+            // alternative (truncating the raw string) risks unterminated
+            // `**` markers that poison the rest of the line.
+            let (body, body_w) = if plain_w > *w {
+                let t = crate::width::truncate_with_ellipsis(&plain, *w);
+                let tw = crate::width::display_width(&t);
+                (t, tw)
+            } else {
+                (render_inline(cell, caps), plain_w)
+            };
             out.push(' ');
-            out.push_str(&rendered);
-            let pad = w.saturating_sub(plain_w);
+            out.push_str(&body);
+            let pad = w.saturating_sub(body_w);
             for _ in 0..pad {
                 out.push(' ');
             }
@@ -495,5 +551,27 @@ mod tests {
     #[test]
     fn cjk_bold() {
         assert_eq!(render_inline_line("**你好**", caps()), "\x1b[1m你好\x1b[22m");
+    }
+
+    /// Regression: `flush_aligned_table` computed col widths from raw cell
+    /// text with no upper bound. Long CJK rows produced lines far wider than
+    /// the terminal, which `wrap_cells_to_width` downstream chopped mid-border
+    /// — same structural-corruption class as the atomcode-tui table bug.
+    #[test]
+    fn table_fits_within_narrow_panel_width() {
+        let rows = vec![
+            "| 功能 | 描述 | 状态 |".to_string(),
+            "|------|------|------|".to_string(),
+            "| 用户认证系统 | 支持手机号验证码登录、邮箱密码登录、第三方 OAuth2 集成（微信、钉钉、Google）、JWT Token 自动续期 | 开发中 |".to_string(),
+            "| 权限管理系统 | RBAC 模型实现、细粒度资源级权限控制、数据行级访问控制、动态角色分配与审批流程 | 已上线 |".to_string(),
+        ];
+        let max_width = 80;
+        let out = flush_aligned_table_with_width(&rows, plain_caps(), max_width);
+        for (i, line) in out.lines().enumerate() {
+            let w = crate::width::display_width(line);
+            assert!(w <= max_width,
+                "line {} rendered at {} cols — exceeds max_width {}",
+                i, w, max_width);
+        }
     }
 }

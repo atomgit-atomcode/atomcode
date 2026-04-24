@@ -1358,14 +1358,19 @@ fn handle_idle_key(
         }
         match (code, modifiers) {
             (KeyCode::Up, _) => {
-                app.menu.selected = app.menu.selected.saturating_sub(1);
+                // Wrap: Up at the top jumps to the last item. `items` is
+                // guaranteed non-empty — `build_menu_items` returns None
+                // when there are no matches, so we don't reach this arm.
+                app.menu.selected = if app.menu.selected == 0 {
+                    items.len() - 1
+                } else {
+                    app.menu.selected - 1
+                };
                 redraw_with_menu(&app.buf, items, app.menu.selected, &app.state, ctx, renderer);
                 return Ok(());
             }
             (KeyCode::Down, _) => {
-                if app.menu.selected + 1 < items.len() {
-                    app.menu.selected += 1;
-                }
+                app.menu.selected = (app.menu.selected + 1) % items.len();
                 redraw_with_menu(&app.buf, items, app.menu.selected, &app.state, ctx, renderer);
                 return Ok(());
             }
