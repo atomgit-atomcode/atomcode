@@ -617,13 +617,14 @@ pub async fn prepare_deferred_upgrade(
     })?;
 
     let manifest = fetch_manifest().await?;
-    let _ = tx.send(UpgradeEvent::ManifestFetched {
-        version: manifest.version.clone(),
-    });
 
     if !is_newer(&manifest.version, current_version) {
         return Ok(None);
     }
+
+    let _ = tx.send(UpgradeEvent::ManifestFetched {
+        version: manifest.version.clone(),
+    });
 
     // If a staged upgrade for this exact version already exists and the
     // on-disk bytes still match the manifest's sha256, reuse it. Saves a

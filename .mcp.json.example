@@ -1,0 +1,9 @@
+{
+  "servers": {
+    "test-echo": {
+      "command": "cargo",
+      "args": ["run", "--release", "--bin", "mcp-test-server", "--manifest-path", "."],
+      "disabled": true
+    }
+  }
+}

@@ -65,3 +65,4 @@ backend.log
 scripts/eval/
 dist/
 docs/superpowers
+.mcp.json

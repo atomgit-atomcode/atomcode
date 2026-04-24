@@ -17,6 +17,7 @@ use atomcode_core::agent::{AgentCommand, AgentEvent, AgentLoop};
 use atomcode_core::config::provider::{ProviderConfig, default_context_window_for};
 use atomcode_core::config::Config;
 use atomcode_core::conversation::Conversation;
+use atomcode_core::mcp::{McpRegistry, register_mcp_tools};
 use atomcode_core::provider::{create_provider, unavailable_provider};
 use atomcode_core::session::SessionManager;
 use atomcode_core::tool::{ToolContext, ToolRegistry};
@@ -743,6 +744,15 @@ async fn run() -> Result<i32> {
     if enabled("web_search")     { tool_registry.register(Box::new(WebSearchTool)); }
     if enabled("web_fetch")      { tool_registry.register(Box::new(WebFetchTool)); }
     if enabled("search_replace") { tool_registry.register(Box::new(SearchReplaceTool)); }
+
+    // Load MCP tools from .mcp.json (project) and ~/.atomcode/mcp.json (user)
+    let mcp_registry = McpRegistry::from_config(&working_dir).await;
+    let mcp_tools = mcp_registry.list_all_tools().await;
+    if !mcp_tools.is_empty() {
+        let mcp_registry = std::sync::Arc::new(mcp_registry);
+        register_mcp_tools(&mut tool_registry, mcp_registry, mcp_tools);
+    }
+
     let tool_context = ToolContext::new(working_dir.clone());
 
     // Auto-continue the latest session for this working directory.
