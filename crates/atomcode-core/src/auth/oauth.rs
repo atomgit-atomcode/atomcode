@@ -679,11 +679,12 @@ pub fn refresh_access_token(auth: &AuthInfo) -> Result<AuthInfo> {
         token_type: Option<String>,
         expires_in: Option<i64>,
         refresh_token: Option<String>,
+        user: Option<PlatformUserInfo>,
     }
 
     let broker_resp: BrokerResponse = response
         .json()
-        .context("Failed to parse refresh response")?;
+        .context("Failed to parse broker response")?;
 
     let created_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -696,7 +697,13 @@ pub fn refresh_access_token(auth: &AuthInfo) -> Result<AuthInfo> {
         token_type: broker_resp.token_type.unwrap_or_else(|| auth.token_type.clone()),
         expires_in: broker_resp.expires_in.or(auth.expires_in),
         created_at,
-        user: auth.user.clone(),
+        user: broker_resp.user.map(|u| UserInfo {
+            id: u.id,
+            username: u.username,
+            name: u.name,
+            email: u.email,
+            avatar_url: u.avatar_url,
+        }).unwrap_or_else(|| auth.user.clone()),
     };
 
     save_auth(&new_auth)?;

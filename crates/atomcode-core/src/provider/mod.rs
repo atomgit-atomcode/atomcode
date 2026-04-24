@@ -236,13 +236,32 @@ fn refresh_and_save(refresh_token: &str, auth_path: &std::path::Path) -> Result<
     struct RefreshedAuth {
         access_token: String,
         #[serde(default)]
+        token_type: Option<String>,
+        #[serde(default)]
         refresh_token: Option<String>,
         #[serde(default)]
         expires_in: Option<i64>,
+        #[serde(default)]
+        user: Option<RefreshedUser>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct RefreshedUser {
+        id: String,
+        username: String,
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        email: Option<String>,
+        #[serde(default)]
+        avatar_url: Option<String>,
     }
 
     let token: RefreshedAuth = resp.json()
         .map_err(|e| anyhow::anyhow!("Token refresh parse error: {} — please /login", e))?;
+
+    // Preserve original token_type or use default
+    let token_type = token.token_type.as_deref().unwrap_or("Bearer");
 
     // Save updated auth.toml
     let now = std::time::SystemTime::now()
@@ -256,6 +275,22 @@ fn refresh_and_save(refresh_token: &str, auth_path: &std::path::Path) -> Result<
     );
     if let Some(e) = token.expires_in {
         content.push_str(&format!("expires_in = {}\n", e));
+    }
+    content.push_str(&format!("token_type = \"{}\"\n", token_type));
+    if let Some(user) = token.user {
+        content.push_str(&format!(
+            "\n[user]\nid = \"{}\"\nusername = \"{}\"\n",
+            user.id, user.username,
+        ));
+        if let Some(name) = user.name {
+            content.push_str(&format!("name = \"{}\"\n", name));
+        }
+        if let Some(email) = user.email {
+            content.push_str(&format!("email = \"{}\"\n", email));
+        }
+        if let Some(avatar_url) = user.avatar_url {
+            content.push_str(&format!("avatar_url = \"{}\"\n", avatar_url));
+        }
     }
     let _ = crate::auth::write_auth_file_secure(auth_path, &content);
 
