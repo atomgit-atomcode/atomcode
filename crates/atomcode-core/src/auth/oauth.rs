@@ -7,28 +7,7 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use serde::{Deserialize, Deserializer, Serialize};
-
-/// Deserialize an ID that may be a string or a number into a String.
-fn deserialize_id_as_string<'de, D: Deserializer<'de>>(
-    deserializer: D,
-) -> std::result::Result<String, D::Error> {
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum StringOrNum {
-        Str(String),
-        Int(i64),
-    }
-    match StringOrNum::deserialize(deserializer)? {
-        StringOrNum::Str(s) => Ok(s),
-        StringOrNum::Int(n) => Ok(n.to_string()),
-    }
-}
-
-/// URL encode a string
-fn urlencoding_encode(s: &str) -> String {
-    url::form_urlencoded::byte_serialize(s.as_bytes()).collect()
-}
+use serde::{Deserialize, Serialize};
 
 /// Platform OAuth Broker URL (client_secret is kept on the broker)
 pub const PLATFORM_BROKER_URL: &str = "https://acs.atomgit.com";
@@ -82,24 +61,6 @@ pub struct UserInfo {
     pub name: Option<String>,
     pub email: Option<String>,
     pub avatar_url: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct TokenResponse {
-    access_token: String,
-    refresh_token: Option<String>,
-    token_type: Option<String>,
-    expires_in: Option<i64>,
-}
-
-#[derive(Debug, Deserialize)]
-struct UserResponse {
-    #[serde(deserialize_with = "deserialize_id_as_string")]
-    id: String,
-    login: String,
-    name: Option<String>,
-    email: Option<String>,
-    avatar_url: Option<String>,
 }
 
 // ============================================================================
@@ -583,66 +544,6 @@ fn urlencoding_decode(s: &str) -> String {
     }
 
     result
-}
-
-/// Exchange authorization code for access token via Platform Broker
-fn exchange_code_for_token(code: &str) -> Result<TokenResponse> {
-    let client = blocking_client();
-
-    // Call Platform Broker API instead of directly calling AtomGit
-    // This keeps client_secret on the broker side
-    let response = client
-        .post(PLATFORM_EXCHANGE_URL)
-        .json(&serde_json::json!({ "code": code }))
-        .send()
-        .context("Failed to send token request to broker")?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().unwrap_or_default();
-        anyhow::bail!("Token request failed ({}): {}", status, body);
-    }
-
-    // Parse broker response
-    #[derive(Deserialize)]
-    struct BrokerResponse {
-        access_token: String,
-        token_type: Option<String>,
-        expires_in: Option<i64>,
-        refresh_token: Option<String>,
-    }
-
-    let broker_resp: BrokerResponse = response
-        .json()
-        .context("Failed to parse broker response")?;
-
-    Ok(TokenResponse {
-        access_token: broker_resp.access_token,
-        refresh_token: broker_resp.refresh_token,
-        token_type: broker_resp.token_type,
-        expires_in: broker_resp.expires_in,
-    })
-}
-
-/// Get user information using access token
-fn get_user_info(access_token: &str) -> Result<UserResponse> {
-    let client = blocking_client();
-
-    let response = client
-        .get(USER_URL)
-        .bearer_auth(access_token)
-        .send()
-        .context("Failed to get user info")?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().unwrap_or_default();
-        anyhow::bail!("User info request failed ({}): {}", status, body);
-    }
-
-    response
-        .json::<UserResponse>()
-        .context("Failed to parse user response")
 }
 
 /// Refresh the access token using the stored refresh_token via Platform Broker.
