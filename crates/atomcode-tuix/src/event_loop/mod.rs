@@ -127,6 +127,9 @@ pub struct LoopCtx {
     /// `ProviderWizard::MainMenu` — a Modal-to-Modal transition that
     /// needs mutable `active_modal` access only the event loop has.
     pub pending_open_provider_wizard: bool,
+    /// MCP server registry for `/mcp` status display. `None` when no MCP
+    /// servers are configured or all failed to connect.
+    pub mcp_registry: Option<std::sync::Arc<atomcode_core::mcp::McpRegistry>>,
 }
 
 /// What the `/issue` wizard hands back to the event loop after the user

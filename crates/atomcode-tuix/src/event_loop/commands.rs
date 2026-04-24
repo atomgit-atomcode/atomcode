@@ -478,6 +478,29 @@ pub(super) fn execute_slash_command(
             }
             renderer.flush();
         }
+        "mcp" => {
+            if let Some(registry) = &ctx.mcp_registry {
+                let statuses = tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(registry.server_statuses())
+                });
+                if statuses.is_empty() {
+                    renderer.render(UiLine::CommandOutput(
+                        "  No MCP servers configured.\n".into(),
+                    ));
+                } else {
+                    let mut txt = String::from("  MCP Servers:\n");
+                    for (name, status) in statuses {
+                        txt.push_str(&format!("    {}  {}\n", name, status));
+                    }
+                    renderer.render(UiLine::CommandOutput(txt));
+                }
+            } else {
+                renderer.render(UiLine::CommandOutput(
+                    "  No MCP servers configured.\n".into(),
+                ));
+            }
+            renderer.flush();
+        }
         other => {
             renderer.render(UiLine::Error(format!("Unknown command: /{}", other)));
             renderer.flush();

@@ -748,10 +748,13 @@ async fn run() -> Result<i32> {
     // Load MCP tools from .mcp.json (project) and ~/.atomcode/mcp.json (user)
     let mcp_registry = McpRegistry::from_config(&working_dir).await;
     let mcp_tools = mcp_registry.list_all_tools().await;
-    if !mcp_tools.is_empty() {
+    let mcp_registry = if !mcp_tools.is_empty() {
         let mcp_registry = std::sync::Arc::new(mcp_registry);
-        register_mcp_tools(&mut tool_registry, mcp_registry, mcp_tools);
-    }
+        register_mcp_tools(&mut tool_registry, mcp_registry.clone(), mcp_tools);
+        Some(mcp_registry)
+    } else {
+        None
+    };
 
     let tool_context = ToolContext::new(working_dir.clone());
 
@@ -873,7 +876,7 @@ async fn run() -> Result<i32> {
     }
 
     tokio::spawn(agent_loop.run());
-    atomcode_tuix::run(config, model_name, agent_handle, tool_context, working_dir, session_to_continue).await?;
+    atomcode_tuix::run(config, model_name, agent_handle, tool_context, working_dir, session_to_continue, mcp_registry).await?;
     Ok(0)
 }
 
