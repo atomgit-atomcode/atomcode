@@ -23,7 +23,7 @@ const DEFAULT_TIMEOUT_SECS: u64 = 60;
 /// patterns benefits. Tradeoff: genuine deadlocks wait 60s longer than before.
 const SILENT_KILL_SECS: u64 = 90;
 
-/// Deserialize a u64 that may arrive as a JSON string (weak models often quote integers).
+/// Deserialize an optional u64 that may arrive as a JSON string (weak models often quote integers).
 fn deserialize_lenient_u64<'de, D>(deserializer: D) -> std::result::Result<Option<u64>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -41,14 +41,17 @@ where
         fn visit_unit<E: de::Error>(self) -> std::result::Result<Self::Value, E> { Ok(None) }
         fn visit_u64<E: de::Error>(self, v: u64) -> std::result::Result<Self::Value, E> { Ok(Some(v)) }
         fn visit_i64<E: de::Error>(self, v: i64) -> std::result::Result<Self::Value, E> {
-            if v >= 0 { Ok(Some(v as u64)) } else { Err(de::Error::custom("negative timeout")) }
+            if v >= 0 { Ok(Some(v as u64)) } else { Err(de::Error::custom("negative value not allowed")) }
         }
         fn visit_f64<E: de::Error>(self, v: f64) -> std::result::Result<Self::Value, E> { Ok(Some(v as u64)) }
         fn visit_str<E: de::Error>(self, v: &str) -> std::result::Result<Self::Value, E> {
             let s = v.trim();
+            if s.is_empty() {
+                return Ok(None);
+            }
             // Try u64 first, then f64 (models often send "60.0" instead of 60)
             s.parse::<u64>().map(Some)
-                .or_else(|_| s.parse::<f64>().map(|f| Some(f as u64)))
+                .or_else(|_| s.parse::<f64>().map(|f| Some(f.ceil() as u64)))
                 .map_err(de::Error::custom)
         }
     }
@@ -308,7 +311,7 @@ async fn bash_execute(args: &str, ctx: &ToolContext) -> Result<ToolResult> {
         // Platform-aware shell: cmd.exe on Windows, bash on Unix
         #[cfg(target_os = "windows")]
         let mut child = Command::new("cmd.exe")
-            .args(&["/C", &parsed.command])
+            .args(["/C", &parsed.command])
             .current_dir(&wd)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
@@ -391,7 +394,7 @@ async fn bash_execute(args: &str, ctx: &ToolContext) -> Result<ToolResult> {
                                 }
                                 Ok(Err(_)) => break,
                                 Err(_) => {
-                                    // No new stdout for 3s — if we have ANY output, break
+                                    // No new stdout for SILENT_KILL_SECS — if we have ANY output, break
                                     if has_out_1.load(std::sync::atomic::Ordering::Relaxed) {
                                         break;
                                     }
@@ -595,7 +598,7 @@ fn check_destructive_command(command: &str) -> Option<String> {
         ("rm -rf", "Recursive force delete"),
         ("rm -r ", "Recursive delete"),
         ("rm -fr", "Recursive force delete"),
-        ("rmdir", "Directory removal"),
+        ("rmdir ", "Directory removal"),
         (" drop ", "SQL DROP statement"),
         ("drop table", "SQL DROP TABLE"),
         ("drop database", "SQL DROP DATABASE"),
@@ -850,7 +853,7 @@ fn detect_cd_target(cmd: &str) -> Option<String> {
     }
     // Extract the path after `cd `, stopping at `&&`, `;`, `||`, `|`, or end.
     let after_cd = trimmed[3..].trim_start();
-    let end = after_cd.find(|c: char| c == '&' || c == ';' || c == '|')
+    let end = after_cd.find(['&', ';', '|'])
         .unwrap_or(after_cd.len());
     let path = after_cd[..end].trim().trim_matches('"').trim_matches('\'');
     if path.is_empty() {
