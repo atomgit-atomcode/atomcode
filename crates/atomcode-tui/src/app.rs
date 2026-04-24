@@ -3102,10 +3102,8 @@ impl InputState {
     }
 }
 
-/// GitCode OAuth constants (must match atomcode-cli/src/auth/oauth.rs)
-const GITCODE_TOKEN_URL: &str = "https://atomgit.com/oauth/token";
-const GITCODE_CLIENT_ID: &str = "b9956e5327e544578128af8979ba3ccb";
-const GITCODE_CLIENT_SECRET: &str = "756ef00061884c7aa1ac64bd4eae3be7";
+/// Platform OAuth refresh endpoint (client_secret is kept on the broker)
+const PLATFORM_REFRESH_URL: &str = "https://acs.atomgit.com/oauth/refresh";
 
 /// Read a value from auth.toml by key (line-based parsing, tolerates malformed TOML).
 fn read_auth_field(content: &str, key: &str) -> Option<String> {
@@ -3115,7 +3113,7 @@ fn read_auth_field(content: &str, key: &str) -> Option<String> {
         .map(|s| s.trim().trim_matches('"').to_string())
 }
 
-/// Try to refresh the access_token using the refresh_token stored in auth.toml.
+/// Try to refresh the access_token using the refresh_token stored in auth.toml via Platform.
 /// On success, updates auth.toml and returns the new access_token.
 async fn refresh_gitcode_token() -> Result<String, String> {
     let auth_path = dirs::home_dir()
@@ -3130,13 +3128,8 @@ async fn refresh_gitcode_token() -> Result<String, String> {
 
     let client = reqwest::Client::new();
     let response = client
-        .post(GITCODE_TOKEN_URL)
-        .form(&[
-            ("client_id", GITCODE_CLIENT_ID),
-            ("client_secret", GITCODE_CLIENT_SECRET),
-            ("refresh_token", refresh_token.as_str()),
-            ("grant_type", "refresh_token"),
-        ])
+        .post(PLATFORM_REFRESH_URL)
+        .json(&serde_json::json!({ "refresh_token": refresh_token, "provider": "atomgit" }))
         .send()
         .await
         .map_err(|e| format!("Refresh request failed: {}", e))?;
@@ -3147,19 +3140,21 @@ async fn refresh_gitcode_token() -> Result<String, String> {
         return Err(format!("Token refresh failed ({}): {} — please /login again", status, body));
     }
 
-    let token_resp: serde_json::Value = response.json().await
-        .map_err(|e| format!("Failed to parse refresh response: {}", e))?;
+    #[derive(serde::Deserialize)]
+    struct RefreshedAuth {
+        access_token: String,
+        #[serde(default)]
+        refresh_token: Option<String>,
+        #[serde(default)]
+        expires_in: Option<i64>,
+    }
 
-    let new_access_token = token_resp["access_token"].as_str()
-        .ok_or("No access_token in refresh response")?
-        .to_string();
+    let token_resp: RefreshedAuth = response.json().await
+        .map_err(|e| format!("Failed to parse refresh response: {}", e))?;
 
     // Rebuild auth.toml with updated tokens, preserving user section
     let username = read_auth_field(&content, "username").unwrap_or_default();
     let id = read_auth_field(&content, "id").unwrap_or_default();
-    let new_refresh = token_resp["refresh_token"].as_str()
-        .map(|s| s.to_string())
-        .or(Some(refresh_token));
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -3167,12 +3162,14 @@ async fn refresh_gitcode_token() -> Result<String, String> {
 
     let mut new_content = format!(
         "access_token = \"{}\"\ncreated_at = {}\n",
-        new_access_token, now
+        token_resp.access_token, now
     );
-    if let Some(rt) = &new_refresh {
+    if let Some(ref rt) = token_resp.refresh_token {
         new_content.push_str(&format!("refresh_token = \"{}\"\n", rt));
+    } else {
+        new_content.push_str(&format!("refresh_token = \"{}\"\n", refresh_token));
     }
-    if let Some(exp) = token_resp["expires_in"].as_i64() {
+    if let Some(exp) = token_resp.expires_in {
         new_content.push_str(&format!("expires_in = {}\n", exp));
     }
     new_content.push_str(&format!(
@@ -3183,7 +3180,7 @@ async fn refresh_gitcode_token() -> Result<String, String> {
     atomcode_core::auth::write_auth_file_secure(&auth_path, &new_content)
         .map_err(|e| format!("Failed to write auth.toml: {}", e))?;
 
-    Ok(new_access_token)
+    Ok(token_resp.access_token)
 }
 
 /// Submit an issue to GitCode API. Automatically refreshes token on 401.

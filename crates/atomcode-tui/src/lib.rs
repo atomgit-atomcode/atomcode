@@ -11,7 +11,7 @@ pub mod wecom_login;
 
 use std::io::Write;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use crossterm::{
     execute,
     event::{
@@ -137,14 +137,10 @@ use event::{AppEvent, EventLoop};
 
 /// OAuth login configuration
 mod oauth {
-    pub const CLIENT_ID: &str = "b9956e5327e544578128af8979ba3ccb";
-    pub const CLIENT_SECRET: &str = "756ef00061884c7aa1ac64bd4eae3be7";
-    pub const REDIRECT_PORT: u16 = 8765;
-    pub const REDIRECT_URI: &str = "http://127.0.0.1:8765/callback";
-    pub const AUTHORIZE_URL: &str = "https://atomgit.com/oauth/authorize";
-    pub const TOKEN_URL: &str = "https://atomgit.com/oauth/token";
-    pub const USER_URL: &str = "https://atomgit.com/api/v5/user";
-    pub const SCOPES: &str = "user_info projects";
+    pub const PLATFORM_BROKER_URL: &str = "https://acs.atomgit.com";
+    pub const PLATFORM_LOGIN_URL: &str = "https://acs.atomgit.com/auth/login";
+    pub const PLATFORM_CHECK_URL: &str = "https://acs.atomgit.com/auth/check";
+    pub const PLATFORM_TOKEN_URL: &str = "https://acs.atomgit.com/auth/token";
 }
 
 #[derive(Debug, Clone)]
@@ -171,16 +167,6 @@ struct TokenResponse {
     expires_in: Option<i64>,
     #[serde(default)]
     refresh_token: Option<String>,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct UserResponse {
-    #[serde(alias = "id", alias = "user_id")]
-    id: Option<String>,
-    #[serde(alias = "login", alias = "username")]
-    login: Option<String>,
-    #[serde(default)]
-    name: Option<String>,
 }
 
 /// Build an OAuth ProviderConfig for AtomGit.
@@ -242,236 +228,111 @@ fn parse_callback_params(url: &str) -> anyhow::Result<std::collections::HashMap<
 
 /// Run OAuth login flow (blocking)
 fn run_oauth_login() -> anyhow::Result<AuthInfo> {
-    use std::io::{BufRead, Write};
-    use std::net::TcpListener;
+    let client = reqwest::blocking::Client::new();
 
+    // Step 1: Call Platform /auth/login to get authorization URL
+    #[derive(serde::Deserialize)]
+    struct PlatformLoginResponse {
+        login_url: String,
+        state: String,
+    }
 
-    // Generate state for CSRF protection
-    let state = format!("atomcode_{}", std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)?
-        .as_nanos());
+    let login_resp: PlatformLoginResponse = client
+        .post(oauth::PLATFORM_LOGIN_URL)
+        .json(&serde_json::json!({ "provider": "atomgit" }))
+        .send()
+        .context("Failed to call /auth/login")?
+        .json()
+        .context("Failed to parse /auth/login response")?;
 
-
-    // Build authorization URL
-    let auth_url = format!(
-        "{}?client_id={}&redirect_uri={}&response_type=code&state={}&scope={}",
-        oauth::AUTHORIZE_URL,
-        url::form_urlencoded::byte_serialize(oauth::CLIENT_ID.as_bytes()).collect::<String>(),
-        url::form_urlencoded::byte_serialize(oauth::REDIRECT_URI.as_bytes()).collect::<String>(),
-        state,
-        url::form_urlencoded::byte_serialize(oauth::SCOPES.as_bytes()).collect::<String>(),
-    );
+    println!("  Opening browser for authorization...");
 
     // Try to open browser
     let browser_opened = {
         #[cfg(target_os = "macos")]
-        { std::process::Command::new("open").arg(&auth_url).spawn().is_ok() }
+        { std::process::Command::new("open").arg(&login_resp.login_url).spawn().is_ok() }
         #[cfg(target_os = "linux")]
-        { std::process::Command::new("xdg-open").arg(&auth_url).spawn().is_ok() }
+        { std::process::Command::new("xdg-open").arg(&login_resp.login_url).spawn().is_ok() }
         #[cfg(target_os = "windows")]
         {
             use std::os::windows::process::CommandExt;
             std::process::Command::new("cmd")
-                .raw_arg(format!("/C start \"\" \"{}\"", auth_url))
+                .raw_arg(format!("/C start \"\" \"{}\"", login_resp.login_url))
                 .spawn().is_ok()
         }
         #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
         { false }
     };
 
-    if browser_opened {
-        println!("  Opening browser for authorization...");
-        println!("  If browser doesn't open, visit the URL below.\n");
-    } else {
-        println!("  Could not open browser automatically.\n");
-    }
-    println!("  {}\n", auth_url);
-
-    // Try to bind local callback server
-    let listener = TcpListener::bind(("127.0.0.1", oauth::REDIRECT_PORT)).ok();
-    if let Some(ref l) = listener {
-        let _ = l.set_nonblocking(true);
+    if !browser_opened {
+        println!("  Browser did not open. Visit:\n");
+        println!("  {}\n", login_resp.login_url);
     }
 
-    let has_listener = listener.is_some();
+    println!("  Waiting for authorization...\n");
 
-    println!("  Press Esc or Ctrl+C to cancel.\n");
-    if has_listener {
-        println!("  Waiting for callback on port {}...", oauth::REDIRECT_PORT);
-        println!("  If you're on a remote server, paste the callback URL below instead.\n");
-    } else {
-        println!("  Cannot listen on port {} (already in use?).", oauth::REDIRECT_PORT);
-        println!("  After authorizing, paste the callback URL from your browser below.\n");
-    }
-    println!("  Paste Callback URL: ");
-
-    // Wait for either: (1) local callback, or (2) user pastes callback URL
-    // User input is collected character by character in raw mode.
-    crossterm::terminal::enable_raw_mode()?;
-
-    let mut url_input = String::new();
-
-    enum CallbackResult {
-        FromServer(std::net::TcpStream),
-        FromPaste(String), // the full callback URL
+    // Step 2: Poll /auth/check until login is complete
+    #[derive(serde::Deserialize)]
+    struct PlatformCheckResponse {
+        valid: bool,
     }
 
-    let callback_result: anyhow::Result<CallbackResult> = loop {
-        // Poll for keypresses or paste events
-        if crossterm::event::poll(std::time::Duration::from_millis(200)).unwrap_or(false) {
-            match crossterm::event::read() {
-                Ok(crossterm::event::Event::Key(key)) => {
-                    // Ctrl+H → Backspace (Linux terminal compat)
-                    let code = if key.modifiers == crossterm::event::KeyModifiers::CONTROL
-                        && key.code == crossterm::event::KeyCode::Char('h')
-                    { crossterm::event::KeyCode::Backspace } else { key.code };
+    let checked_state = loop {
+        std::thread::sleep(std::time::Duration::from_secs(2));
 
-                    match code {
-                        crossterm::event::KeyCode::Esc => {
-                            break Err(anyhow::anyhow!("Login cancelled by user"));
-                        }
-                        crossterm::event::KeyCode::Char('c')
-                            if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) =>
-                        {
-                            break Err(anyhow::anyhow!("Login cancelled by user"));
-                        }
-                        crossterm::event::KeyCode::Enter => {
-                            if url_input.contains("code=") {
-                                break Ok(CallbackResult::FromPaste(url_input.clone()));
-                            }
-                        }
-                        crossterm::event::KeyCode::Char(c) => {
-                            url_input.push(c);
-                            let mut buf = [0u8; 4];
-                            let s = c.encode_utf8(&mut buf);
-                            let _ = std::io::stdout().write_all(s.as_bytes());
-                            let _ = std::io::stdout().flush();
-                        }
-                        crossterm::event::KeyCode::Backspace => {
-                            if !url_input.is_empty() {
-                                url_input.pop();
-                                let _ = std::io::stdout().write_all(b"\x08 \x08");
-                                let _ = std::io::stdout().flush();
-                            }
-                        }
-                        _ => {}
+        let resp = client
+            .get(oauth::PLATFORM_CHECK_URL)
+            .query(&[("state", &login_resp.state)])
+            .send();
+
+        match resp {
+            Ok(r) if r.status().is_success() => {
+                if let Ok(check) = r.json::<PlatformCheckResponse>() {
+                    if check.valid {
+                        break login_resp.state;
                     }
                 }
-                Ok(crossterm::event::Event::Paste(text)) => {
-                    url_input.push_str(&text);
-                    let _ = std::io::stdout().write_all(text.as_bytes());
-                    let _ = std::io::stdout().flush();
-                    if url_input.contains("code=") {
-                        break Ok(CallbackResult::FromPaste(url_input.clone()));
-                    }
-                }
-                _ => {}
             }
+            _ => {}
         }
-        // Also check local server
-        if let Some(ref listener) = listener {
-            match listener.accept() {
-                Ok((stream, _)) => break Ok(CallbackResult::FromServer(stream)),
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(e) => break Err(e.into()),
-            }
-        }
+        println!("  Waiting for browser authorization...");
     };
 
-    crossterm::terminal::disable_raw_mode()?;
-    println!(); // newline after input
+    println!("  Authorization received, fetching token...\n");
 
-    // Parse the callback — either from HTTP request or pasted URL
-    let (code, returned_state) = match callback_result? {
-        CallbackResult::FromServer(mut stream) => {
-            stream.set_nonblocking(false)?;
-            let mut reader = std::io::BufReader::new(&mut stream);
-            let mut request_line = String::new();
-            reader.read_line(&mut request_line)?;
-
-            let url: String = request_line.split_whitespace().nth(1)
-                .ok_or_else(|| anyhow::anyhow!("Invalid HTTP request"))?
-                .to_string();
-
-            let params = parse_callback_params(&url)?;
-
-            if let Some(error) = params.get("error") {
-                let response = "HTTP/1.1 302 Found\r\nLocation: https://atomgit.com\r\n\r\n";
-                let _ = stream.write_all(response.as_bytes());
-                let _ = stream.flush();
-                anyhow::bail!("OAuth error: {}", error);
-            }
-
-            // Send success page
-            let response = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n\r\n\
-                <html><head><style>body{font-family:system-ui;display:flex;justify-content:center;align-items:center;height:100vh;margin:0;background:#1a1a2e;color:#eee}\
-                .container{text-align:center}h1{color:#7c3aed}.success{color:#22c55e;font-size:4rem}</style></head>\
-                <body><div class=\"container\"><div class=\"success\">✓</div><h1>Authorization Successful</h1>\
-                <p>You can close this window and return to AtomCode.</p></div></body></html>";
-            let _ = stream.write_all(response.as_bytes());
-            let _ = stream.flush();
-
-            let code = params.get("code").ok_or_else(|| anyhow::anyhow!("No code in callback"))?.clone();
-            let st = params.get("state").cloned().unwrap_or_default();
-            (code, st)
-        }
-        CallbackResult::FromPaste(url) => {
-            let params = parse_callback_params(&url)?;
-            if let Some(error) = params.get("error") {
-                anyhow::bail!("OAuth error: {}", error);
-            }
-            let code = params.get("code").ok_or_else(|| anyhow::anyhow!("No code in pasted URL"))?.clone();
-            let st = params.get("state").cloned().unwrap_or_default();
-            (code, st)
-        }
-    };
-
-    if returned_state != state {
-        anyhow::bail!("OAuth state mismatch");
+    // Step 3: Get token from Platform
+    #[derive(serde::Deserialize)]
+    struct PlatformTokenResponse {
+        access_token: String,
+        token_type: String,
+        expires_in: Option<i64>,
+        refresh_token: Option<String>,
+        user: PlatformUser,
     }
 
-    println!("  Authorization received, exchanging token...\n");
+    #[derive(serde::Deserialize)]
+    struct PlatformUser {
+        id: String,
+        username: String,
+        name: Option<String>,
+    }
 
-    // Exchange code for token
-    let client = reqwest::blocking::Client::new();
-    let response = client
-        .post(oauth::TOKEN_URL)
-        .form(&[
-            ("client_id", oauth::CLIENT_ID),
-            ("client_secret", oauth::CLIENT_SECRET),
-            ("code", &code),
-            ("redirect_uri", oauth::REDIRECT_URI),
-            ("grant_type", "authorization_code"),
-        ])
-        .send()?;
+    let token_resp: PlatformTokenResponse = client
+        .get(oauth::PLATFORM_TOKEN_URL)
+        .query(&[("state", &checked_state)])
+        .send()
+        .context("Failed to call /auth/token")?
+        .json()
+        .context("Failed to parse /auth/token response")?;
 
-    let response_text = response.text()?;
-    println!("  Token response: {}\n", response_text);
-    
-    let token_resp: TokenResponse = serde_json::from_str(&response_text)
-        .map_err(|e| anyhow::anyhow!("Failed to parse token response: {} - body: {}", e, response_text))?;
-    
-    let access_token = token_resp.access_token
-        .ok_or_else(|| anyhow::anyhow!("No access_token in response"))?;
-
-    // Get user info
-    let user_response = client
-        .get(oauth::USER_URL)
-        .bearer_auth(&access_token)
-        .send()?;
-    
-    let user_text = user_response.text()?;
-    println!("  User response: {}\n", user_text);
-    
-    let user_resp: UserResponse = serde_json::from_str(&user_text)
-        .map_err(|e| anyhow::anyhow!("Failed to parse user response: {} - body: {}", e, user_text))?;
+    let access_token = token_resp.access_token;
 
     let auth_info = AuthInfo {
         access_token: access_token.clone(),
         user: UserInfo {
-            id: user_resp.id.unwrap_or_default(),
-            username: user_resp.login.clone().unwrap_or_else(|| "unknown".to_string()),
-            name: user_resp.name,
+            id: token_resp.user.id,
+            username: token_resp.user.username,
+            name: token_resp.user.name,
         },
     };
 
