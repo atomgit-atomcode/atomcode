@@ -62,6 +62,12 @@ pub enum AgentCommand {
     /// forward-compat with an eventual LLM-backed summarize-with-instruction
     /// path; currently unused — this is the mechanical path only.
     Compact { prompt: Option<String> },
+    /// Recompute and re-emit a rich ContextStats snapshot. `/context` sends
+    /// this before rendering so the user never sees a stale cache — the
+    /// cache is only refreshed on LLM round-trips, so between turns (or
+    /// after out-of-turn mutations like `inject_post_compress_state`) the
+    /// snapshot can lag the actual conversation state.
+    RefreshContextStats,
     /// Shutdown the agent.
     Shutdown,
 }
@@ -730,6 +736,13 @@ if let Some(provider_config) = self.config.providers.get(&new_provider_name) {
                 }
                 AgentCommand::Compact { prompt } => {
                     self.run_compact(prompt);
+                }
+                AgentCommand::RefreshContextStats => {
+                    let system_prompt = self.build_system_prompt();
+                    let (msgs, _) = self
+                        .ctx
+                        .build_messages(&self.conversation, &system_prompt, "");
+                    self.emit_rich_context_stats(&self.conversation, &msgs);
                 }
                 AgentCommand::Shutdown => break,
             }
@@ -1819,6 +1832,16 @@ if let Some(provider_config) = self.config.providers.get(&new_provider_name) {
     /// cleanup in `handle_send_message`) so behavior stays consistent with
     /// the rest of the codebase. `_prompt` is accepted for forward-compat
     /// with a future LLM-guided summarize path and ignored today.
+    ///
+    /// Net-savings guard: on terse conversations the cold-zone summary
+    /// header + `inject_post_compress_state` inject can weigh more than
+    /// the dropped messages, so compaction would silently inflate the
+    /// prompt. We measure before/after token totals via `build_messages`
+    /// (post all render-pipeline effects — `clean_message_pipeline`,
+    /// microcompact, etc.) and roll the conversation back if the
+    /// operation didn't actually shrink the wire payload. Analytical
+    /// projection was tried first but too many render-pipeline branches
+    /// made it unreliable.
     fn run_compact(&mut self, prompt: Option<String>) {
         if prompt.is_some() {
             let _ = self.event_tx.send(AgentEvent::TextDelta(
@@ -1826,29 +1849,75 @@ if let Some(provider_config) = self.config.providers.get(&new_provider_name) {
                     .to_string(),
             ));
         }
-        let before = self.conversation.messages.len();
+        let system_prompt = self.build_system_prompt();
+        let before_msg_count = self.conversation.messages.len();
+        let before_tokens: usize = self
+            .ctx
+            .build_messages(&self.conversation, &system_prompt, "")
+            .0
+            .iter()
+            .map(|m| m.estimate_tokens())
+            .sum();
         let Some((content, n_msgs)) = self.ctx.compression_plan(&self.conversation) else {
             let _ = self.event_tx.send(AgentEvent::TextDelta(
                 "(nothing to compact — conversation is short)\n".to_string(),
             ));
             return;
         };
+
+        // Rollback snapshot. Only the three fields `apply_compression` +
+        // `inject_post_compress_state` mutate need to survive — the
+        // stream / tool_call buffers are ephemeral and always None
+        // between turns, so we skip them.
+        let msgs_snapshot = self.conversation.messages.clone();
+        let cold_snapshot = self.conversation.cold_summaries.clone();
+        let turns_snapshot = self.conversation.turn_tracker.clone();
+
         self.conversation.apply_compression(n_msgs, content);
         self.inject_post_compress_state();
+
+        let after_tokens: usize = self
+            .ctx
+            .build_messages(&self.conversation, &system_prompt, "")
+            .0
+            .iter()
+            .map(|m| m.estimate_tokens())
+            .sum();
+
+        if after_tokens >= before_tokens {
+            self.conversation.messages = msgs_snapshot;
+            self.conversation.cold_summaries = cold_snapshot;
+            self.conversation.turn_tracker = turns_snapshot;
+            let _ = self.event_tx.send(AgentEvent::TextDelta(format!(
+                "(nothing to compact — would not save tokens: {} → {})\n",
+                fmt_k_tokens(before_tokens),
+                fmt_k_tokens(after_tokens),
+            )));
+            // Still refresh stats so `/context` reports the current
+            // (unchanged, now-correct) state and the user doesn't think
+            // the abort left them with stale numbers.
+            let (msgs, _) =
+                self.ctx
+                    .build_messages(&self.conversation, &system_prompt, "");
+            self.emit_rich_context_stats(&self.conversation, &msgs);
+            return;
+        }
+
         // Report the actually-removed count measured from before/after,
         // not from n_msgs, so the UI count stays accurate if
         // apply_compression's clamping or retention policy changes.
-        let removed = before.saturating_sub(self.conversation.messages.len());
+        let removed = before_msg_count.saturating_sub(self.conversation.messages.len());
         let _ = self.event_tx.send(AgentEvent::TextDelta(format!(
-            "(compacted — dropped {} message{})\n",
+            "(compacted — dropped {} message{}, {} → {} tokens)\n",
             removed,
             if removed == 1 { "" } else { "s" },
+            fmt_k_tokens(before_tokens),
+            fmt_k_tokens(after_tokens),
         )));
 
         // Refresh the cached ContextStats so `/context` reflects the new
         // post-compaction shape. Without this, TUI still shows the
         // pre-compact numbers until the next user turn fires build_messages.
-        let system_prompt = self.build_system_prompt();
         let (msgs, _) = self
             .ctx
             .build_messages(&self.conversation, &system_prompt, "");
@@ -2369,6 +2438,18 @@ fn build_post_compress_state(
     ))
 }
 
+/// Format a token count for user-facing banners: `9800` → `"9.8K"`,
+/// `137` → `"137"`. Mirrors the `k(...)` closure in the TUI's
+/// `format_context_report` so `/compact` output reads the same units
+/// as `/context`.
+fn fmt_k_tokens(t: usize) -> String {
+    if t >= 1000 {
+        format!("{:.1}K", t as f64 / 1000.0)
+    } else {
+        format!("{}", t)
+    }
+}
+
 #[cfg(test)]
 mod classifier_tests {
     use super::{
@@ -2602,5 +2683,25 @@ mod post_compress_state_tests {
         assert!(out.contains("TASK: task x"));
         assert!(out.contains("FILES EDITED: a.rs"));
         assert!(out.contains("RECENTLY READ: b.rs"));
+    }
+}
+
+#[cfg(test)]
+mod fmt_k_tokens_tests {
+    use super::fmt_k_tokens;
+
+    #[test]
+    fn under_1000_no_suffix() {
+        assert_eq!(fmt_k_tokens(0), "0");
+        assert_eq!(fmt_k_tokens(137), "137");
+        assert_eq!(fmt_k_tokens(999), "999");
+    }
+
+    #[test]
+    fn one_thousand_and_above_use_k_suffix_with_one_decimal() {
+        assert_eq!(fmt_k_tokens(1000), "1.0K");
+        assert_eq!(fmt_k_tokens(3700), "3.7K");
+        assert_eq!(fmt_k_tokens(9800), "9.8K");
+        assert_eq!(fmt_k_tokens(64000), "64.0K");
     }
 }
