@@ -174,13 +174,10 @@ fn init_project_state() -> ProjectState {
 }
 /// Artifact info for API response
 #[derive(Debug, Serialize, Clone)]
-#[allow(dead_code)]
 pub struct ArtifactInfo {
     pub id: String,
-    #[allow(dead_code)]
     pub artifact_type: String,  // "html", "svg", "mermaid", "code"
     pub title: Option<String>,
-    #[allow(dead_code)]
     pub language: Option<String>,
     pub content: String,
 }
@@ -266,42 +263,6 @@ impl From<&atomcode_core::conversation::message::Message> for MessageInfo {
         
         Self { role: role.to_string(), content, tool_calls, tool_result, artifacts }
     }
-}
-
-/// Extract code blocks from text content as artifacts
-#[allow(dead_code)]
-fn extract_code_blocks(text: &str) -> Option<Vec<ArtifactInfo>> {
-    let mut artifacts = Vec::new();
-    let mut id_counter = 0;
-    
-    // Match code blocks: ```language\ncontent\n```
-    let re = regex::Regex::new(r"```(\w+)\n([\s\S]*?)```").ok()?;
-    
-    for cap in re.captures_iter(text) {
-        let language = cap.get(1)?.as_str().to_string();
-        let content = cap.get(2)?.as_str().to_string();
-        
-        // Determine artifact type based on language
-        let artifact_type = match language.as_str() {
-            "html" | "htm" => "html",
-            "svg" => "svg",
-            "mermaid" => "mermaid",
-            "markdown" | "md" => "markdown",
-            "javascript" | "typescript" | "python" | "rust" | "java" => "code",
-            _ => continue,  // Skip other languages
-        };
-        
-        id_counter += 1;
-        artifacts.push(ArtifactInfo {
-            id: format!("block-{}", id_counter),
-            artifact_type: artifact_type.to_string(),
-            title: None,
-            language: Some(language),
-            content,
-        });
-    }
-    
-    if artifacts.is_empty() { None } else { Some(artifacts) }
 }
 
 /// Extract artifacts from tool calls (e.g., write_file creating HTML files)
@@ -1251,15 +1212,12 @@ struct ArtifactDetector {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 enum ArtifactDetectorState {
     /// Normal text output
     Normal,
     /// Inside a code block, collecting content
     InCodeBlock {
         id: String,
-        language: String,
-        artifact_type: String,
         content: String,
     },
     /// Inside HTML block (detected by <html>, <!DOCTYPE, or substantial HTML tags)
@@ -1333,8 +1291,6 @@ impl ArtifactDetector {
                     
                     self.state = ArtifactDetectorState::InCodeBlock {
                         id,
-                        language,
-                        artifact_type: "code".to_string(),
                         content: String::new(),
                     };
                 }
@@ -1381,7 +1337,7 @@ impl ArtifactDetector {
                     events.push(ChatEvent::TextDelta { content: text.to_string() });
                 }
             }
-            ArtifactDetectorState::InCodeBlock { id, language: _, artifact_type: _, content } => {
+            ArtifactDetectorState::InCodeBlock { id, content } => {
                 // Check for code block end
                 if text.trim() == "```" {
                     // Emit the accumulated content

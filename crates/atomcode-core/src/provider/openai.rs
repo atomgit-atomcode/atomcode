@@ -230,7 +230,6 @@ struct ChunkDelta {
 
 #[derive(Deserialize)]
 struct DeltaToolCall {
-    #[allow(dead_code)]
     index: Option<usize>,
     id: Option<String>,
     function: Option<DeltaFunction>,

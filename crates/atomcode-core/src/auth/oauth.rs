@@ -573,7 +573,6 @@ fn get_user_info(access_token: &str) -> Result<UserResponse> {
 
 /// Refresh the access token using the stored refresh_token.
 /// Returns updated AuthInfo with new tokens, and saves it to disk.
-#[allow(dead_code)]
 pub fn refresh_access_token(auth: &AuthInfo) -> Result<AuthInfo> {
     let refresh_token = auth
         .refresh_token
@@ -628,7 +627,6 @@ pub fn refresh_access_token(auth: &AuthInfo) -> Result<AuthInfo> {
 
 /// Get a valid access token, refreshing automatically if expired.
 /// Returns the access token string ready to use.
-#[allow(dead_code)]
 pub fn get_valid_token() -> Result<String> {
     let auth = get_stored_auth().context("Not logged in — please use /login first")?;
 
@@ -708,13 +706,11 @@ pub fn auth_file_path() -> std::path::PathBuf {
 }
 
 /// Check if user is logged in
-#[allow(dead_code)]
 pub fn is_logged_in() -> bool {
     get_stored_auth().is_some()
 }
 
 /// Get current user info (if logged in)
-#[allow(dead_code)]
 pub fn current_user() -> Option<UserInfo> {
     get_stored_auth().map(|auth| auth.user)
 }

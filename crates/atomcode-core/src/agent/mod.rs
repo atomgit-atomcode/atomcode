@@ -1968,7 +1968,6 @@ if let Some(provider_config) = self.config.providers.get(&new_provider_name) {
     // store_tool_result → tool_dispatch.rs
 
     // detect_running_services → services.rs
-    // extract_service_urls → services.rs
     // change_dir → services.rs
 
     /// Try to dispatch sub-agents for parallel multi-file editing.
