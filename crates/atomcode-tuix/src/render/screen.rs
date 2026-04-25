@@ -117,6 +117,15 @@ impl Screen {
         self.cursor = Some((row, col));
     }
 
+    /// Toggle DECTCEM cursor visibility for the next `render_diff`.
+    /// Used to hide the cursor while a live body spinner is animating
+    /// (otherwise it sits at the end of "Pondering… · 5s" and blinks).
+    /// `render_diff` re-emits this every frame, so flipping the flag
+    /// once is enough — every subsequent paint reasserts it.
+    pub fn set_cursor_visible(&mut self, visible: bool) {
+        self.cursor_visible = visible;
+    }
+
     /// Scroll the top `bottom` rows up by `n`. Rows `[0..n)` are
     /// dropped; rows `[n..bottom)` slide to `[0..bottom-n)`; rows
     /// `[bottom-n..bottom)` become blank, ready for new content.

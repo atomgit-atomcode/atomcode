@@ -405,38 +405,26 @@ pub(super) fn execute_slash_command(
             }
         }
         "issue" => {
-            // Two-step wizard to create a NEW issue on AtomGit in the
-            // current repo. Step 1 collects a title (required), step 2
-            // collects a description (required, Shift+Enter for
-            // newlines). On submit the event loop's post-close branch
-            // POSTs `/repos/{owner}/{repo}/issues` and echoes the new
-            // issue URL into scrollback.
+            // Two-step wizard to file a NEW issue against the **atomcode
+            // upstream repo** (atomgit_atomcode/atomcode), NOT against
+            // the user's current working project. Use case is in-tool
+            // bug reports / feature requests for atomcode itself; using
+            // cwd would be confusing (a user reporting an atomcode bug
+            // while in some unrelated repo would land their issue in
+            // the wrong place, or get blocked by cwd validation).
             //
-            // cwd must be an atomgit.com checkout — otherwise we have
-            // no way to know which repo to file the issue against.
-            // Abort early with a clear message rather than opening the
-            // wizard and then failing at the POST step.
+            // Step 1 collects a title (required), step 2 collects a
+            // description (required, Shift+Enter for newlines). On
+            // submit the event loop's post-close branch POSTs
+            // `/repos/atomgit_atomcode/atomcode/issues` and echoes the
+            // new issue URL into scrollback.
             let _ = arg; // reserved for future options (e.g. --template)
-            match atomcode_core::atomgit::url::detect_cwd_atomgit_repo(&ctx.working_dir) {
-                Ok(Some(repo)) => {
-                    let mut wiz = IssueWizard::open(repo.owner, repo.repo);
-                    wiz.emit_prompt(renderer);
-                    *active_modal = Some(Box::new(wiz));
-                }
-                Ok(None) => {
-                    renderer.render(UiLine::CommandOutput(
-                        "  /issue needs cwd to be a clone of an atomgit.com repo (origin remote).\n  cd into one first, or create the issue via the web UI.\n".into(),
-                    ));
-                    renderer.flush();
-                }
-                Err(e) => {
-                    renderer.render(UiLine::CommandOutput(format!(
-                        "  /issue failed to detect repo: {:#}\n",
-                        e
-                    )));
-                    renderer.flush();
-                }
-            }
+            let mut wiz = IssueWizard::open(
+                atomcode_core::atomgit::UPSTREAM_OWNER.to_string(),
+                atomcode_core::atomgit::UPSTREAM_REPO.to_string(),
+            );
+            wiz.emit_prompt(renderer);
+            *active_modal = Some(Box::new(wiz));
         }
         "cd" => {
             // Bare `/cd` — open the interactive history picker (matches legacy

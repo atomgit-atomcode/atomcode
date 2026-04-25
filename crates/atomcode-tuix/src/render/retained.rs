@@ -271,13 +271,6 @@ pub struct RetainedRenderer<W: Write + Send> {
     /// the row (flag flips to false) so the last animation frame
     /// stays frozen as a historical paragraph header.
     live_spinner_active: bool,
-
-    /// Whether the terminal cursor is currently hidden (DECTCEM off).
-    /// We hide it while a live spinner is animating in the body so the
-    /// blinking cursor doesn't sit at the end of "Pondering… · 5s".
-    /// Toggled exactly twice per turn — on entering streaming and on
-    /// returning to idle — so escape sequences don't pile up.
-    cursor_hidden: bool,
 }
 
 impl RetainedRenderer<BufWriter<Stdout>> {
@@ -307,7 +300,6 @@ impl<W: Write + Send> RetainedRenderer<W> {
             welcome_banner: None,
             welcome_line_count: 0,
             live_spinner_active: false,
-            cursor_hidden: false,
         }
     }
 
@@ -644,6 +636,11 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let cursor_abs_row = (footer_top + 1 + cursor_row_in_middle + 1) as u16;
         let cursor_abs_col = (2 + cursor_col_in_row + 1) as u16;
         self.screen.set_cursor(cursor_abs_row, cursor_abs_col);
+        // Hide the terminal cursor while the body spinner is animating.
+        // Otherwise it sits at the end of "Pondering… · 5s" and blinks.
+        // render_diff reasserts DECTCEM every frame, so this single flip
+        // propagates correctly until the spinner clears.
+        self.screen.set_cursor_visible(!self.live_spinner_active);
     }
 
     /// Footer total height — mirrors the computation inside
@@ -919,13 +916,8 @@ impl<W: Write + Send> RetainedRenderer<W> {
             return false;
         }
         self.live_spinner_active = false;
-        // Counterpart to the hide in push_or_update_live_spinner —
-        // restore the cursor as we leave streaming. paint_footer will
-        // re-park it in the input box on the next frame.
-        if self.cursor_hidden {
-            let _ = self.out.write_all(b"\x1b[?25h");
-            self.cursor_hidden = false;
-        }
+        // The cursor will be re-shown on the next paint_footer (which
+        // sees live_spinner_active=false and calls set_cursor_visible(true)).
         self.body_lines.pop();
         self.ensure_scroll_region();
         let bottom = self.body_bottom_row();
@@ -997,16 +989,11 @@ impl<W: Write + Send> RetainedRenderer<W> {
             self.push_body_row(row_cells);
             self.live_spinner_active = true;
         }
-        // Hide the terminal cursor for the duration of the spinner.
-        // Without this, the cursor sits at the end of the spinner row
-        // (where push_or_update_live_spinner just wrote) and blinks
-        // there because flush() doesn't repaint the footer (which is
-        // what would otherwise re-park the cursor in the input box).
-        // Restored on clear_live_spinner / shutdown.
-        if !self.cursor_hidden {
-            let _ = self.out.write_all(b"\x1b[?25l");
-            self.cursor_hidden = true;
-        }
+        // Cursor visibility is driven by `paint_footer` reading
+        // `live_spinner_active` — see set_cursor_visible call there.
+        // No direct DECTCEM write here, otherwise the next render_diff
+        // would re-emit \x1b[?25h based on screen.cursor_visible and
+        // visually undo our hide on a 5ms cadence.
     }
 
     /// Wrap `text` to content width and push each wrapped chunk as
