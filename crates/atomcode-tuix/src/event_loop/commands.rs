@@ -481,7 +481,30 @@ pub(super) fn execute_slash_command(
         "mcp" => {
             let sub = arg.trim();
             if sub.eq_ignore_ascii_case("reload") {
-                renderer.render(UiLine::CommandOutput("  Reloading MCP servers...\n".into()));
+                // Preflight: parse merged MCP config so we can show progress immediately.
+                // (Connection attempts happen in background and may take up to timeout_ms.)
+                let configs = match atomcode_core::mcp::load_mcp_config(&ctx.working_dir) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        renderer.render(UiLine::Error(format!(
+                            "mcp reload failed: failed to load .mcp.json / ~/.atomcode/mcp.json: {:#}",
+                            e
+                        )));
+                        renderer.flush();
+                        return Ok(());
+                    }
+                };
+
+                let mut header = format!("  Reloading MCP servers... ({} configured)\n", configs.len());
+                if !configs.is_empty() {
+                    header.push_str("  Connecting:\n");
+                    for c in &configs {
+                        header.push_str(&format!("    - {}  connecting...\n", c.name));
+                    }
+                } else {
+                    header.push_str("  (no MCP servers configured)\n");
+                }
+                renderer.render(UiLine::CommandOutput(header));
                 renderer.flush();
 
                 // 1) Drop all previously-registered MCP tools so any adapters holding the
@@ -495,6 +518,26 @@ pub(super) fn execute_slash_command(
                 // 2) Drop old registry + event receiver (stop consuming old events).
                 ctx.mcp_connect_rx = None;
                 ctx.mcp_registry = None;
+                ctx.mcp_reload = None;
+
+                // If no servers are configured, we're done after cleanup.
+                if configs.is_empty() {
+                    renderer.render(UiLine::CommandOutput(format!(
+                        "  ✓ Cleared {} MCP tools. No servers to connect.\n",
+                        removed
+                    )));
+                    renderer.flush();
+                    return Ok(());
+                }
+
+                // 2.5) Arm progress tracker (event loop prints a summary once all results land).
+                ctx.mcp_reload = Some(super::McpReloadProgress {
+                    total: configs.len(),
+                    done: 0,
+                    connected: 0,
+                    failed: 0,
+                    started_at: std::time::Instant::now(),
+                });
 
                 // 3) Recreate registry and event channel. Connections happen in background
                 // and will stream Connected/Failed events into scrollback (event loop select!).
@@ -508,7 +551,7 @@ pub(super) fn execute_slash_command(
                 ctx.mcp_connect_rx = Some(rx);
 
                 renderer.render(UiLine::CommandOutput(format!(
-                    "  ✓ Cleared {} MCP tools, reconnecting...\n",
+                    "  ✓ Cleared {} MCP tools. Reconnecting in background...\n",
                     removed
                 )));
                 renderer.flush();

@@ -8,6 +8,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use tokio::sync::Mutex;
+use tokio::time::timeout;
 
 use super::client::McpClient;
 use super::types::{CallToolResult, InitializeResult, ListToolsResult, ServerStatus};
@@ -73,9 +74,15 @@ impl HttpClient {
             req = req.header(key, value);
         }
 
-        let response = req
-            .send()
+        let timeout_duration = Duration::from_millis(self.timeout_ms);
+        let response = timeout(timeout_duration, req.send())
             .await
+            .with_context(|| {
+                format!(
+                    "HTTP request to MCP server {} timed out after {}ms",
+                    self.server_name, self.timeout_ms
+                )
+            })?
             .with_context(|| format!("HTTP request to MCP server {} failed", self.server_name))?;
 
         if !response.status().is_success() {

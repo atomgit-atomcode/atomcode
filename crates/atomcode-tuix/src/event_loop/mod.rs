@@ -36,6 +36,15 @@ use crate::render::{Renderer, UiLine};
 use crate::state::{UiPhase, UiState};
 use crate::think::ThinkStripper;
 
+#[derive(Debug, Clone)]
+pub struct McpReloadProgress {
+    pub total: usize,
+    pub done: usize,
+    pub connected: usize,
+    pub failed: usize,
+    pub started_at: std::time::Instant,
+}
+
 /// Bag of handles passed into the loop.
 pub struct LoopCtx {
     pub config: Config,
@@ -133,6 +142,9 @@ pub struct LoopCtx {
     /// Channel for receiving MCP connection status events (Connected/Failed).
     /// Events are rendered into scrollback as they arrive during startup.
     pub mcp_connect_rx: Option<tokio::sync::mpsc::UnboundedReceiver<atomcode_core::mcp::McpConnectEvent>>,
+    /// When `/mcp reload` is invoked, we track progress until every configured
+    /// server reports Connected/Failed, then emit a one-line summary.
+    pub mcp_reload: Option<McpReloadProgress>,
 }
 
 /// What the `/issue` wizard hands back to the event loop after the user
@@ -953,6 +965,24 @@ pub async fn run_loop(
                     }
                     McpConnectEvent::Failed { name, error } => {
                         renderer.render(UiLine::Error(format!("✗ MCP server '{}' failed: {}", name, error)));
+                    }
+                }
+
+                // `/mcp reload` progress: once every configured server has reported a
+                // terminal state (Connected/Failed), emit a summary line.
+                if let Some(p) = ctx.mcp_reload.as_mut() {
+                    p.done = p.done.saturating_add(1);
+                    match &ev {
+                        McpConnectEvent::Connected { .. } => p.connected = p.connected.saturating_add(1),
+                        McpConnectEvent::Failed { .. } => p.failed = p.failed.saturating_add(1),
+                    }
+                    if p.done >= p.total {
+                        let elapsed_ms = p.started_at.elapsed().as_millis();
+                        renderer.render(UiLine::CommandOutput(format!(
+                            "  MCP reload complete: {} connected, {} failed ({}ms)\n",
+                            p.connected, p.failed, elapsed_ms
+                        )));
+                        ctx.mcp_reload = None;
                     }
                 }
                 renderer.flush();

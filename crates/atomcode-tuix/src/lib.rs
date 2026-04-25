@@ -322,6 +322,7 @@ pub async fn run(
         pending_open_provider_wizard: false,
         mcp_registry,
         mcp_connect_rx,
+        mcp_reload: None,
     };
 
     // CodingPlan drift monitor — kick off a startup check if the current
