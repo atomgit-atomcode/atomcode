@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::JoinHandle;
 use tokio::time::interval;
 use tracing::warn;
@@ -103,9 +103,8 @@ pub struct Telemetry {
     arch: &'static str,
     locale: String,
     started: Instant,
-    queue: Option<Arc<Mutex<Queue>>>,
-    #[allow(dead_code)] // held for JoinHandle lifetime; dropped on Arc release
     sender_task: Mutex<Option<JoinHandle<()>>>,
+    shutdown_tx: Mutex<Option<oneshot::Sender<()>>>,
     pub counters: Arc<Counters>,
     health_path: Option<PathBuf>,
 }
@@ -129,8 +128,8 @@ impl Telemetry {
                 arch,
                 locale,
                 started: Instant::now(),
-                queue: None,
                 sender_task: Mutex::new(None),
+                shutdown_tx: Mutex::new(None),
                 counters: Arc::new(Counters::default()),
                 health_path: None,
             });
@@ -159,14 +158,15 @@ impl Telemetry {
                     arch,
                     locale,
                     started: Instant::now(),
-                    queue: None,
                     sender_task: Mutex::new(None),
+                    shutdown_tx: Mutex::new(None),
                     counters: Arc::new(Counters::default()),
                     health_path: None,
                 });
             }
         };
         let (tx, rx) = mpsc::channel::<Record>(1024);
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let http = HttpSender::new(cfg.endpoint.clone(), app_version.clone());
         let counters = Arc::new(Counters::default());
         let health_path = cfg.atomcode_dir.join("telemetry/health.json");
@@ -178,7 +178,7 @@ impl Telemetry {
         );
         let queue_task = queue.clone();
         let handle = tokio::spawn(async move {
-            run_sender(rx, rt, queue_task).await;
+            run_sender(rx, rt, queue_task, shutdown_rx).await;
         });
 
         tracing::info!("telemetry initialized (enabled)");
@@ -194,8 +194,8 @@ impl Telemetry {
             arch,
             locale,
             started: Instant::now(),
-            queue: Some(queue),
             sender_task: Mutex::new(Some(handle)),
+            shutdown_tx: Mutex::new(Some(shutdown_tx)),
             counters,
             health_path: Some(health_path),
         })
@@ -247,21 +247,24 @@ impl Telemetry {
         }
     }
 
-    /// Give the background task a short window to drain mpsc→disk, then force-roll
-    /// the current segment so no in-flight write is lost. Does NOT wait for POSTs
-    /// to complete; any un-POSTed segments will be picked up by the next process.
+    /// Signal the sender task to drain mpsc→disk, force-roll the current segment,
+    /// and attempt **one** HTTP send before the process exits. The whole operation
+    /// is bounded by `timeout` (default exit budget is 500ms); if the network call
+    /// outruns the budget the future is cancelled and the segment stays on disk
+    /// for the next process to pick up.
     ///
     /// We intentionally do *not* close the mpsc channel: `self.tx` is shared
-    /// (`Arc<Telemetry>`), and closing would race with concurrent callers. On
-    /// process exit, the task is cancelled when the tokio runtime drops.
+    /// (`Arc<Telemetry>`), and closing would race with concurrent callers.
+    /// Instead we use a oneshot to ask the task to exit cleanly.
     pub async fn shutdown(&self, timeout: Duration) {
-        // Sender task keeps running on the runtime during this sleep, so pending
-        // mpsc messages drain to disk. This is the intended "best-effort" shape.
-        tokio::time::sleep(timeout).await;
-        if let Some(q) = &self.queue {
-            let _ = q.lock().await.force_roll();
+        if let Some(tx) = self.shutdown_tx.lock().await.take() {
+            let _ = tx.send(());
         }
-        // Persist final health snapshot.
+        let handle = self.sender_task.lock().await.take();
+        if let Some(h) = handle {
+            let _ = tokio::time::timeout(timeout, h).await;
+        }
+        // Persist final health snapshot regardless of send outcome.
         self.persist_health();
         tracing::info!("telemetry shutdown complete");
     }
@@ -326,8 +329,8 @@ impl Telemetry {
             arch: arch_str(),
             locale: "en-US".into(),
             started: Instant::now(),
-            queue: None,
             sender_task: Mutex::new(None),
+            shutdown_tx: Mutex::new(None),
             counters: Arc::new(Counters::default()),
             health_path: None,
         });
@@ -335,11 +338,32 @@ impl Telemetry {
     }
 }
 
-async fn run_sender(mut rx: mpsc::Receiver<Record>, rt: SenderRuntime, queue: Arc<Mutex<Queue>>) {
+async fn run_sender(
+    mut rx: mpsc::Receiver<Record>,
+    rt: SenderRuntime,
+    queue: Arc<Mutex<Queue>>,
+    shutdown: oneshot::Receiver<()>,
+) {
     let mut tick = interval(Duration::from_secs(60));
     tick.tick().await; // consume the immediate first tick
+    let mut shutdown = shutdown;
     loop {
         tokio::select! {
+            biased;
+            _ = &mut shutdown => {
+                // Pull anything still sitting in mpsc into the active segment.
+                while let Ok(r) = rx.try_recv() {
+                    let mut q = queue.lock().await;
+                    if let Err(e) = q.append(&r) { warn!(?e, "telemetry append failed"); }
+                }
+                { let mut q = queue.lock().await; let _ = q.force_roll(); }
+                // One send attempt only — caller (Telemetry::shutdown) caps the
+                // total time; backoff loop would defeat the budget.
+                if let Err(e) = rt.flush_one().await {
+                    warn!(?e, "telemetry shutdown flush failed; segment retained");
+                }
+                break;
+            }
             maybe = rx.recv() => {
                 match maybe {
                     Some(r) => {
