@@ -1,57 +1,6 @@
 use super::*;
 
 impl AgentLoop {
-    /// Detect already-running dev servers by probing common ports.
-    /// Runs once at startup to populate active_services.
-    /// Detect running services via `lsof` — shows actual listening ports with process names.
-    /// No hardcoded ports. The process name (java/node/python) is the label.
-    pub(crate) async fn detect_running_services(&mut self) {
-        let output = tokio::process::Command::new("lsof")
-            .args(&["-i", "-P", "-n", "-sTCP:LISTEN"])
-            .output()
-            .await;
-
-        let stdout = match output {
-            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
-            _ => return, // lsof not available or failed — skip silently
-        };
-
-        // Parse lsof output. Each line looks like:
-        // node    80162 yubangxu   23u  IPv4 0x... TCP 127.0.0.1:3004 (LISTEN)
-        // java    79842 yubangxu   45u  IPv6 0x... TCP *:8080 (LISTEN)
-        for line in stdout.lines().skip(1) {
-            // skip header
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() < 9 {
-                continue;
-            }
-            let process = parts[0].to_lowercase();
-            // Find the TCP address:port part
-            // Match any TCP address:port — localhost, 127.0.0.1, [::1], *:
-            let addr_part = parts
-                .iter()
-                .find(|p| {
-                    p.contains(':')
-                        && (p.contains("localhost")
-                            || p.contains("127.0.0.1")
-                            || p.contains("[::1]")
-                            || p.starts_with("*:"))
-                })
-                .copied()
-                .unwrap_or("");
-
-            if let Some(colon) = addr_part.rfind(':') {
-                if let Ok(port) = addr_part[colon + 1..].parse::<u16>() {
-                    if port >= 1024 {
-                        let url = format!("http://localhost:{}", port);
-                        let label = format!("{} ({})", process, port);
-                        self.active_services.insert(label, url);
-                    }
-                }
-            }
-        }
-    }
-
     pub(crate) async fn change_dir(&mut self, path: &str) {
         let new_path = if path.starts_with('/') {
             std::path::PathBuf::from(path)

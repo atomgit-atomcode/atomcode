@@ -374,11 +374,6 @@ pub struct AgentLoop {
     #[allow(dead_code)]
     last_turn_tools_all_success: bool,
 
-    /// Discovered service URLs extracted from tool outputs (e.g., "http://localhost:3002").
-    /// Persisted across turns so the model knows which ports are active.
-    /// Key: label (e.g., "frontend", "backend"), Value: URL.
-    active_services: std::collections::HashMap<String, String>,
-
     // Skill registry — provides descriptions for system prompt and powers use_skill tool
     skill_registry: std::sync::Arc<std::sync::RwLock<SkillRegistry>>,
 
@@ -582,7 +577,6 @@ impl AgentLoop {
             subtask_driver: subtask_driver::SubtaskDriver::new(),
             plan_text: None,
             session_files: std::collections::HashMap::new(),
-            active_services: std::collections::HashMap::new(),
             skill_registry,
             reindex_tx: None,
             datalog,
@@ -610,9 +604,6 @@ impl AgentLoop {
     /// Run the agent loop. This is the main entry point — call from a tokio task.
     /// The loop processes commands from the UI and emits events back.
     pub async fn run(mut self) {
-        // Detect already-running dev servers on startup.
-        self.detect_running_services().await;
-
         // Spawn background code graph indexer
         {
             let working_dir = self.turn_runner.context.working_dir.read().await.clone();
@@ -2021,7 +2012,6 @@ impl AgentLoop {
 
     // store_tool_result → tool_dispatch.rs
 
-    // detect_running_services → services.rs
     // change_dir → services.rs
 
     /// Try to dispatch sub-agents for parallel multi-file editing.
