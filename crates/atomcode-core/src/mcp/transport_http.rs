@@ -65,12 +65,18 @@ impl HttpClient {
     ) -> Result<serde_json::Value> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
 
-        let request = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": method,
-            "params": params
-        });
+        // IMPORTANT: omit `params` when it's None.
+        //
+        // Some MCP servers (notably JS SDK-based) can hang when they receive `"params": null`
+        // for methods where params should be absent (e.g. tools/list).
+        let mut request = serde_json::Map::new();
+        request.insert("jsonrpc".to_string(), serde_json::Value::String("2.0".to_string()));
+        request.insert("id".to_string(), serde_json::Value::Number(id.into()));
+        request.insert("method".to_string(), serde_json::Value::String(method.to_string()));
+        if let Some(p) = params {
+            request.insert("params".to_string(), p);
+        }
+        let request = serde_json::Value::Object(request);
 
         let mut req = self.client.post(&self.url).json(&request);
 

@@ -34,6 +34,12 @@ pub struct StdioClient {
     reader: Arc<Mutex<Option<BufReader<ChildStdout>>>>,
     /// First response line peeked during startup drain (NDJSON or `Content-Length:`), not yet consumed.
     preread_line: Arc<Mutex<Option<String>>>,
+    /// Serialize request/response round-trips.
+    ///
+    /// MCP over stdio is a single ordered byte stream. Allowing concurrent
+    /// in-flight requests can lead to response mix-ups or one caller
+    /// consuming the other's response, causing timeouts.
+    request_lock: Arc<Mutex<()>>,
 }
 
 impl StdioClient {
@@ -57,6 +63,7 @@ impl StdioClient {
             stdin: Arc::new(Mutex::new(None)),
             reader: Arc::new(Mutex::new(None)),
             preread_line: Arc::new(Mutex::new(None)),
+            request_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -93,18 +100,25 @@ impl StdioClient {
         method: &str,
         params: Option<serde_json::Value>,
     ) -> Result<serde_json::Value> {
+        let _req_guard = self.request_lock.lock().await;
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
 
-        let request = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": method,
-            "params": params
-        });
+        // IMPORTANT: omit `params` when it's None.
+        //
+        // The official JS MCP SDK's stdio transport can hang when it receives
+        // `"params": null` for methods that expect params to be absent.
+        let mut request = serde_json::Map::new();
+        request.insert("jsonrpc".to_string(), serde_json::Value::String("2.0".to_string()));
+        request.insert("id".to_string(), serde_json::Value::Number(id.into()));
+        request.insert("method".to_string(), serde_json::Value::String(method.to_string()));
+        if let Some(p) = params {
+            request.insert("params".to_string(), p);
+        }
+        let request = serde_json::Value::Object(request);
 
         let timeout = Duration::from_millis(self.timeout_ms);
 
-        // Write request
+        // Write request (NDJSON).
         {
             let mut stdin = self.stdin.lock().await;
             let stdin = stdin

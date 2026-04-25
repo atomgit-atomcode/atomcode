@@ -977,8 +977,26 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<(
                             let registry = registry.clone();
                             let tools = ctx.agent.tool_registry.clone();
                             let name = name.clone();
+                            let tx = registry.event_sender();
                             tokio::spawn(async move {
-                                let server_tools = registry.list_tools_for_server(&name).await;
+                                let server_tools = match tokio::time::timeout(
+                                    Duration::from_secs(15),
+                                    registry.list_tools_for_server(&name),
+                                )
+                                .await
+                                {
+                                    Ok(v) => v,
+                                    Err(_) => {
+                                        if let Some(tx) = tx {
+                                            let _ = tx.send(McpConnectEvent::Warning {
+                                                name,
+                                                message: "tools/list timed out after 15s during auto-registration"
+                                                    .to_string(),
+                                            });
+                                        }
+                                        return;
+                                    }
+                                };
                                 if !server_tools.is_empty() {
                                     register_mcp_tools_async(&tools, registry, server_tools).await;
                                 }
@@ -1146,8 +1164,26 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<(
                             let registry = registry.clone();
                             let tools = ctx.agent.tool_registry.clone();
                             let name = name.clone();
+                            let tx = registry.event_sender();
                             tokio::spawn(async move {
-                                let server_tools = registry.list_tools_for_server(&name).await;
+                                let server_tools = match tokio::time::timeout(
+                                    Duration::from_secs(15),
+                                    registry.list_tools_for_server(&name),
+                                )
+                                .await
+                                {
+                                    Ok(v) => v,
+                                    Err(_) => {
+                                        if let Some(tx) = tx {
+                                            let _ = tx.send(McpConnectEvent::Warning {
+                                                name,
+                                                message: "tools/list timed out after 15s during auto-registration"
+                                                    .to_string(),
+                                            });
+                                        }
+                                        return;
+                                    }
+                                };
                                 if !server_tools.is_empty() {
                                     register_mcp_tools_async(&tools, registry, server_tools).await;
                                 }

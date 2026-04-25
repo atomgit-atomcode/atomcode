@@ -25,7 +25,7 @@ pub enum McpConnectEvent {
 
 /// Registry of connected MCP servers.
 pub struct McpRegistry {
-    servers: Arc<RwLock<BTreeMap<String, Box<dyn McpClient>>>>,
+    servers: Arc<RwLock<BTreeMap<String, Arc<dyn McpClient>>>>,
     /// Channel for connection status events (used by TUI to display in scrollback).
     connect_events: Option<mpsc::UnboundedSender<McpConnectEvent>>,
 }
@@ -49,6 +49,11 @@ impl McpRegistry {
             },
             rx,
         )
+    }
+
+    /// Get a clone of the event sender, if configured.
+    pub fn event_sender(&self) -> Option<mpsc::UnboundedSender<McpConnectEvent>> {
+        self.connect_events.clone()
     }
 
     /// Load MCP configuration and start connecting to servers in the background.
@@ -121,7 +126,7 @@ impl McpRegistry {
                             match client.initialize().await {
                                 Ok(_result) => {
                                     let mut servers = servers.write().await;
-                                    servers.insert(name.clone(), client);
+                                    servers.insert(name.clone(), Arc::from(client));
                                     if let Some(tx) = tx {
                                         let _ = tx.send(McpConnectEvent::Connected {
                                             name: name.clone(),
@@ -201,17 +206,25 @@ impl McpRegistry {
         client.initialize().await?;
 
         let mut servers = self.servers.write().await;
-        servers.insert(config.name.clone(), client);
+        servers.insert(config.name.clone(), Arc::from(client));
 
         Ok(())
     }
 
     /// Get all available tools from all connected servers.
     pub async fn list_all_tools(&self) -> Vec<McpToolInfo> {
-        let servers = self.servers.read().await;
+        // Never hold the registry lock across an .await: list_tools can be slow and
+        // status/reload should remain responsive.
+        let server_snapshot: Vec<(String, Arc<dyn McpClient>)> = {
+            let servers = self.servers.read().await;
+            servers
+                .iter()
+                .map(|(name, client)| (name.clone(), Arc::clone(client)))
+                .collect()
+        };
         let mut all_tools = Vec::new();
 
-        for (server_name, client) in servers.iter() {
+        for (server_name, client) in server_snapshot {
             match client.list_tools().await {
                 Ok(result) => {
                     for tool in result.tools {
@@ -241,8 +254,11 @@ impl McpRegistry {
 
     /// Get tools from a single connected server.
     pub async fn list_tools_for_server(&self, server_name: &str) -> Vec<McpToolInfo> {
-        let servers = self.servers.read().await;
-        let Some(client) = servers.get(server_name) else {
+        let client = {
+            let servers = self.servers.read().await;
+            servers.get(server_name).map(Arc::clone)
+        };
+        let Some(client) = client else {
             if let Some(tx) = &self.connect_events {
                 let _ = tx.send(McpConnectEvent::Warning {
                     name: server_name.to_string(),

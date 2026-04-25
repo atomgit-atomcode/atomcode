@@ -600,6 +600,70 @@ pub(super) fn execute_slash_command(
                 return Ok(());
             }
 
+            // `/mcp tools <server>`: list remote tool names for a connected server.
+            // This is intentionally separate from a global `/tools` so we keep the surface minimal.
+            if let Some(rest) = sub.strip_prefix("tools") {
+                let server = rest.trim();
+                if server.is_empty() {
+                    renderer.render(UiLine::CommandOutput(
+                        "  Usage: /mcp tools <server>\n  Example: /mcp tools filesystem\n".into(),
+                    ));
+                    renderer.flush();
+                    return Ok(());
+                }
+                if let Some(registry) = &ctx.mcp_registry {
+                    let server = server.to_string();
+                    let server_for_msg = server.clone();
+                    let registry = registry.clone();
+                    let tx = registry.event_sender();
+                    tokio::spawn(async move {
+                        let tools = match tokio::time::timeout(
+                            std::time::Duration::from_secs(15),
+                            registry.list_tools_for_server(&server),
+                        )
+                        .await
+                        {
+                            Ok(v) => v,
+                            Err(_) => {
+                                if let Some(tx) = &tx {
+                                    let _ = tx.send(atomcode_core::mcp::McpConnectEvent::Warning {
+                                        name: server.clone(),
+                                        message:
+                                            "tools/list timed out after 15s (server connected but tools not listed yet)"
+                                                .to_string(),
+                                    });
+                                }
+                                return;
+                            }
+                        };
+                        let mut msg = format!("tools:\n");
+                        if tools.is_empty() {
+                            msg.push_str("  (none — tools/list may have failed, timed out, or returned empty)\n");
+                        } else {
+                            for t in tools {
+                                msg.push_str(&format!("  - mcp__{}__{}\n", server, t.tool_name));
+                            }
+                        }
+                        if let Some(tx) = tx {
+                            let _ = tx.send(atomcode_core::mcp::McpConnectEvent::Warning {
+                                name: server,
+                                message: msg.trim_end().to_string(),
+                            });
+                        }
+                    });
+                    renderer.render(UiLine::CommandOutput(format!(
+                        "  Listing MCP tools for '{}'...\n",
+                        server_for_msg
+                    )));
+                } else {
+                    renderer.render(UiLine::CommandOutput(
+                        "  No MCP registry loaded. Run /mcp reload first.\n".into(),
+                    ));
+                }
+                renderer.flush();
+                return Ok(());
+            }
+
             // Default: show status.
             if let Some(registry) = &ctx.mcp_registry {
                 let statuses = tokio::task::block_in_place(|| {
