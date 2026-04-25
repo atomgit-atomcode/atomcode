@@ -19,6 +19,8 @@ pub enum McpConnectEvent {
     Connected { name: String },
     /// Server connection failed.
     Failed { name: String, error: String },
+    /// Non-fatal warning (e.g. tools/list failed after connect).
+    Warning { name: String, message: String },
 }
 
 /// Registry of connected MCP servers.
@@ -62,9 +64,10 @@ impl McpRegistry {
         project_dir: &std::path::Path,
         event_tx: Option<mpsc::UnboundedSender<McpConnectEvent>>,
     ) -> Self {
-        let registry = Self::new();
+        let mut registry = Self::new();
         // Merge external channel with internal one
         let combined_tx = event_tx.or(registry.connect_events.clone());
+        registry.connect_events = combined_tx.clone();
 
         let configs = match load_mcp_config(project_dir) {
             Ok(c) => c,
@@ -221,12 +224,57 @@ impl McpRegistry {
                     }
                 }
                 Err(e) => {
-                    eprintln!("[mcp] Failed to list tools from {}: {}", server_name, e);
+                    if let Some(tx) = &self.connect_events {
+                        let _ = tx.send(McpConnectEvent::Warning {
+                            name: server_name.clone(),
+                            message: format!("tools/list failed: {}", e),
+                        });
+                    } else {
+                        eprintln!("[mcp] Failed to list tools from {}: {}", server_name, e);
+                    }
                 }
             }
         }
 
         all_tools
+    }
+
+    /// Get tools from a single connected server.
+    pub async fn list_tools_for_server(&self, server_name: &str) -> Vec<McpToolInfo> {
+        let servers = self.servers.read().await;
+        let Some(client) = servers.get(server_name) else {
+            if let Some(tx) = &self.connect_events {
+                let _ = tx.send(McpConnectEvent::Warning {
+                    name: server_name.to_string(),
+                    message: "tools/list skipped: server not found".to_string(),
+                });
+            }
+            return Vec::new();
+        };
+
+        match client.list_tools().await {
+            Ok(result) => result
+                .tools
+                .into_iter()
+                .map(|tool| McpToolInfo {
+                    server_name: server_name.to_string(),
+                    tool_name: tool.name,
+                    description: tool.description,
+                    input_schema: tool.input_schema,
+                })
+                .collect(),
+            Err(e) => {
+                if let Some(tx) = &self.connect_events {
+                    let _ = tx.send(McpConnectEvent::Warning {
+                        name: server_name.to_string(),
+                        message: format!("tools/list failed: {}", e),
+                    });
+                } else {
+                    eprintln!("[mcp] Failed to list tools from {}: {}", server_name, e);
+                }
+                Vec::new()
+            }
+        }
     }
 
     /// Call a tool on a specific server.

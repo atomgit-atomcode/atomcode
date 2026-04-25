@@ -10,14 +10,14 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 use atomcode_core::agent::{AgentCommand, AgentEvent, AgentLoop};
 use atomcode_core::config::provider::{ProviderConfig, default_context_window_for};
 use atomcode_core::config::Config;
 use atomcode_core::conversation::Conversation;
-use atomcode_core::mcp::{McpRegistry, register_mcp_tools};
+use atomcode_core::mcp::{merge_stdio_mcp_server_into_json_file, McpRegistry, register_mcp_tools};
 use atomcode_core::provider::{create_provider, unavailable_provider};
 use atomcode_core::session::SessionManager;
 use atomcode_core::tool::{ToolContext, ToolRegistry};
@@ -113,7 +113,7 @@ fn is_running_as_backup() -> bool {
 ///     don't silently swap it back to latest.
 ///   * `-p` / `--prompt` / `--prompt-file` is in argv → headless script run,
 ///     shouldn't stall 5-20 s on a network download for a 2 s task.
-///   * A subcommand (login, logout, status, upgrade, rollback) is in argv
+///   * A subcommand (login, logout, status, upgrade, rollback, mcp) is in argv
 ///     → those have their own flows and don't want a surprise re-exec.
 ///   * Config has `auto_update = false` → user explicitly opted out.
 /// Anything else (including missing config) → true, because fresh installs
@@ -133,7 +133,7 @@ fn should_try_sync_upgrade() -> bool {
         return false;
     }
     if args.iter().skip(1).any(|a| matches!(a.as_str(),
-        "login" | "logout" | "status" | "upgrade" | "rollback" | "--version" | "-V" | "--help" | "-h")) {
+        "login" | "logout" | "status" | "upgrade" | "rollback" | "mcp" | "--version" | "-V" | "--help" | "-h")) {
         return false;
     }
 
@@ -410,6 +410,27 @@ enum Commands {
     /// Runs: login (if not already) → claim → fetch models → write providers
     /// → fetch status. Reports each step and exits.
     Codingplan,
+    /// Manage MCP server entries in `.mcp.json` (similar to `claude mcp add`)
+    #[command(subcommand)]
+    Mcp(McpCli),
+}
+
+#[derive(Subcommand)]
+enum McpCli {
+    /// Add or replace a stdio MCP server (`mcpServers.<name>` with `command` + `args`)
+    Add {
+        /// Server key (tools appear as `mcp__<name>__…`)
+        name: String,
+        /// Executable and arguments, e.g. `npx @playwright/mcp@latest`
+        #[arg(required = true, num_args = 1..)]
+        command: Vec<String>,
+        /// Write `~/.atomcode/mcp.json` instead of `<dir>/.mcp.json`
+        #[arg(long)]
+        global: bool,
+        /// Directory for project `.mcp.json` (defaults to current directory)
+        #[arg(short = 'C', long)]
+        dir: Option<PathBuf>,
+    },
 }
 
 /// Environment variable set by this process for its re-exec'd child, so
@@ -1116,6 +1137,34 @@ async fn handle_command(cmd: Commands) -> Result<()> {
             // dead unless a future caller dispatches Codingplan directly
             // via handle_command (e.g. a test).
             run_codingplan_cli()
+        }
+        Commands::Mcp(McpCli::Add {
+            name,
+            command,
+            global,
+            dir,
+        }) => {
+            let base = resolve_working_dir(dir);
+            let path = if global {
+                let home = dirs::home_dir().context("Cannot resolve home directory for --global")?;
+                home.join(".atomcode").join("mcp.json")
+            } else {
+                base.join(".mcp.json")
+            };
+            let program = command
+                .first()
+                .expect("clap ensures at least one command token")
+                .clone();
+            let args: Vec<String> = command.into_iter().skip(1).collect();
+            merge_stdio_mcp_server_into_json_file(&path, &name, &program, &args)?;
+            println!(
+                "  Added MCP server {:?} → {} (stdio: {} + {} arg(s))",
+                name,
+                path.display(),
+                program,
+                args.len()
+            );
+            Ok(())
         }
     }
 }

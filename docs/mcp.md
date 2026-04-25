@@ -8,8 +8,8 @@
 
 ### 1.1 已实现
 
-- **配置**：项目根 `.mcp.json` 与用户目录 `~/.atomcode/mcp.json`；同名 server **项目覆盖用户**；支持 `disabled`；字符串中 `${VAR}`、`${VAR:-default}` 展开。
-- **传输**：`stdio`（`command` + `args` + `env`）、`HTTP`（`url` + `headers`）；默认超时 30s，可用 `timeout_ms` 覆盖。
+- **配置**：项目根 `.mcp.json` 与用户目录 `~/.atomcode/mcp.json`；顶层键 **`mcpServers`**（与 Cursor 等一致）；旧键 `servers` 仍可解析；同名 server **项目覆盖用户**；支持 `disabled`；字符串中 `${VAR}`、`${VAR:-default}` 展开。
+- **传输**：`stdio`（`command` + `args` + `env`）、`HTTP`（`url` + `headers`）；默认超时 30s，可用 `timeout_ms` 覆盖。HTTP 请求在未自定义 `Accept` 时默认带 `Accept: application/json, text/event-stream`（与 Playwright 等要求 Streamable HTTP / SSE 协商的端点一致）。**stdio 消息格式**与 MCP 规范一致：每条 JSON-RPC 为 **一行 NDJSON**（末尾换行）；仍兼容读取旧式 **`Content-Length:` + 正文** 的服务端响应。
 - **协议**：JSON-RPC；`initialize`、`tools/list`、`tools/call`；`initialize` 结果里解析 `capabilities`（当前仅用到 tools 能力标记）。
 - **工具注册**：每个远端 tool 映射为 `mcp__{server_key}__{tool_name}`，经 `McpToolAdapter` 注册到 `ToolRegistry`。
 - **权限**：MCP 适配器对每次调用返回 `RequireApproval`（说明里带 server / tool / 参数摘要），走现有交互式审批；`PermissionStore` 的 session grant / override 按键为 **完整工具名** `mcp__...`（与内建工具相同），**不是** `mcp:server:tool` 形式。
@@ -56,8 +56,8 @@ CLI 入口（`crates/atomcode-cli/src/main.rs`）根据是否无头选择阻塞�
 
 ## 4. 工具命名与执行路径
 
-- **对外工具名**：`mcp__{servers 映射中的 key}__{远端 tool name}`  
-  例：配置里 `"servers": { "github": { ... } }` 且远端有 `get_issue` → `mcp__github__get_issue`。
+- **对外工具名**：`mcp__{mcpServers 映射中的 key}__{远端 tool name}`  
+  例：配置里 `"mcpServers": { "github": { ... } }` 且远端有 `get_issue` → `mcp__github__get_issue`。
 - **执行**：`TurnRunner` 分发到适配器 → `McpRegistry::call_tool` → 对应 transport 的 `tools/call`。
 - **禁用工具**：与其它工具相同，可使用 `--disable-tools` 或环境变量 `ATOMCODE_DISABLE_TOOLS`（逗号分隔），传入完整名如 `mcp__github__get_issue`。
 
@@ -67,7 +67,7 @@ CLI 入口（`crates/atomcode-cli/src/main.rs`）根据是否无头选择阻塞�
 
 ### 5.1 Schema 要点
 
-顶层为 `{ "servers": { "<name>": { ... } } }`。每个 server **必须**二选一：
+顶层为 `{ "mcpServers": { "<name>": { ... } } }`（亦兼容旧键 `"servers"`）。每个 server **必须**二选一：
 
 - **stdio**：`command`（必填）+ 可选 `args`、`env`、`timeout_ms`、`disabled`
 - **HTTP**：`url`（必填）+ 可选 `headers`、`timeout_ms`、`disabled`
@@ -76,7 +76,7 @@ CLI 入口（`crates/atomcode-cli/src/main.rs`）根据是否无头选择阻塞�
 
 ```json
 {
-  "servers": {
+  "mcpServers": {
     "github": {
       "url": "https://api.github.com/mcp/",
       "headers": {
@@ -99,6 +99,27 @@ CLI 入口（`crates/atomcode-cli/src/main.rs`）根据是否无头选择阻塞�
 ### 5.3 用户级配置
 
 路径：`~/.atomcode/mcp.json`，字段相同。**同名 server 以项目级为准**（后写入的 project 配置覆盖 user）。
+
+### 5.4 CLI：`atomcode mcp add`（类 Claude `mcp add`）
+
+向 **stdio** 配置写入 `mcpServers.<name>`（`command` + `args`），无需手改 JSON：
+
+```bash
+# 项目根 .mcp.json（默认当前目录）
+atomcode mcp add playwright npx @playwright/mcp@latest
+
+# 用户级 ~/.atomcode/mcp.json
+atomcode mcp add playwright npx @playwright/mcp@latest --global
+
+# 指定项目目录
+atomcode mcp add playwright npx @playwright/mcp@latest -C /path/to/repo
+```
+
+说明：
+
+- 与 `claude mcp add <name> <command> [args…]` 同一思路：首参为 server 键名，其后为可执行文件及参数。
+- **同名会整段覆盖**该键（仅写入 `command` / `args`，不保留该键下原 `env` 等字段）；HTTP 型 `url` 条目请仍用手写 JSON 或编辑器。
+- 合并时会读入已有 `servers` + `mcpServers`，写回时只保留 **`mcpServers`**（去掉顶层 `servers`）。
 
 ---
 
@@ -158,7 +179,7 @@ cargo build --release -p atomcode-core --bin mcp-test-server
 
 ```json
 {
-  "servers": {
+  "mcpServers": {
     "test-server": {
       "command": "target/release/mcp-test-server",
       "args": [],
@@ -185,7 +206,7 @@ cargo run --release -p atomcode
 ```bash
 cat > ~/.atomcode/mcp.json << 'EOF'
 {
-  "servers": {
+  "mcpServers": {
     "filesystem": {
       "command": "npx",
       "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"],
@@ -206,4 +227,4 @@ EOF
 | Cursor | `.mcp.json` | stdio/HTTP | roots、elicitation 等 |
 | Codex | CLI 添加 | stdio/HTTP | OpenAI 生态 |
 
-AtomCode 使用常见 **`.mcp.json` 的 `servers` 块**，便于复用现有 MCP server 配置思路；具体能力与上表「未实现」一节以本仓库代码为准。
+AtomCode 使用 **`.mcp.json` 的 `mcpServers` 块**（与 Cursor 等一致，并兼容旧 `servers` 键），便于复用现有 MCP server 配置；具体能力与上表「未实现」一节以本仓库代码为准。

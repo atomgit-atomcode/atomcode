@@ -32,6 +32,8 @@ pub struct StdioClient {
     process: Arc<Mutex<Option<Child>>>,
     stdin: Arc<Mutex<Option<ChildStdin>>>,
     reader: Arc<Mutex<Option<BufReader<ChildStdout>>>>,
+    /// First response line peeked during startup drain (NDJSON or `Content-Length:`), not yet consumed.
+    preread_line: Arc<Mutex<Option<String>>>,
 }
 
 impl StdioClient {
@@ -54,6 +56,7 @@ impl StdioClient {
             process: Arc::new(Mutex::new(None)),
             stdin: Arc::new(Mutex::new(None)),
             reader: Arc::new(Mutex::new(None)),
+            preread_line: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -108,23 +111,16 @@ impl StdioClient {
                 .as_mut()
                 .context("MCP server not connected (stdin)")?;
 
-            let body = serde_json::to_vec(&request)?;
-            stdin.write_all(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes()).await?;
+            let mut body = serde_json::to_vec(&request)?;
+            body.push(b'\n');
             stdin.write_all(&body).await?;
             stdin.flush().await?;
         }
 
         // Read response with timeout
-        let result = tokio::time::timeout(timeout, async {
-            let mut reader = self.reader.lock().await;
-            let reader = reader
-                .as_mut()
-                .context("MCP server not connected (reader)")?;
-
-            read_jsonrpc_response(reader).await
-        })
-        .await
-        .with_context(|| format!("MCP request {} timed out after {}ms", method, self.timeout_ms))??;
+        let result = tokio::time::timeout(timeout, self.recv_jsonrpc_response())
+            .await
+            .with_context(|| format!("MCP request {} timed out after {}ms", method, self.timeout_ms))??;
 
         if let Some(error) = result.error {
             bail!(
@@ -178,10 +174,8 @@ impl McpClient for StdioClient {
                     "jsonrpc": "2.0",
                     "method": "notifications/initialized"
                 });
-                let body = serde_json::to_vec(&notification)?;
-                stdin
-                    .write_all(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes())
-                    .await?;
+                let mut body = serde_json::to_vec(&notification)?;
+                body.push(b'\n');
                 stdin.write_all(&body).await?;
                 stdin.flush().await?;
             }
@@ -221,65 +215,122 @@ impl McpClient for StdioClient {
 }
 
 impl StdioClient {
-    /// Drain any startup messages the server writes before JSON-RPC begins.
-    ///
-    /// Many MCP servers (especially in development mode) write startup logs,
-    /// banners, or debug messages before entering JSON-RPC mode. These would
-    /// break our framing parser, so we need to consume them.
-    async fn drain_startup_messages(&self) -> Result<()> {
-        let timeout = Duration::from_millis(500); // short drain window
+    /// Read one JSON-RPC response (NDJSON per MCP stdio spec, or legacy `Content-Length` framing).
+    async fn recv_jsonrpc_response(&self) -> Result<super::types::JsonRpcResponse> {
+        let mut reader = self.reader.lock().await;
+        let reader = reader
+            .as_mut()
+            .context("MCP server not connected (reader)")?;
 
-        let result = tokio::time::timeout(timeout, async {
-            let mut reader = self.reader.lock().await;
-            let reader = match reader.as_mut() {
-                Some(r) => r,
-                None => return Ok::<(), anyhow::Error>(()),
-            };
-
-            // Use a non-blocking approach: try to read with a very short timeout
+        let line = if let Some(s) = self.preread_line.lock().await.take() {
+            s
+        } else {
+            let mut buf = String::new();
             loop {
-                match tokio::time::timeout(Duration::from_millis(10), reader.fill_buf()).await {
-                    Ok(Ok(slice)) => {
-                        if slice.is_empty() {
-                            // EOF - server closed
-                            return Ok(());
+                buf.clear();
+                let n = reader.read_line(&mut buf).await?;
+                if n == 0 {
+                    bail!("MCP server closed connection");
+                }
+                if !buf.trim().is_empty() {
+                    break;
+                }
+            }
+            buf
+        };
+
+        let body = line.trim_end_matches(['\r', '\n']).trim_start();
+        if body.starts_with('{') || body.starts_with('[') {
+            return serde_json::from_str(body)
+                .context("Failed to parse NDJSON MCP message as JSON-RPC");
+        }
+        if strip_prefix_ci(body, "content-length:").is_some() {
+            return read_content_length_message(reader, line).await;
+        }
+        bail!(
+            "Unexpected MCP stdio line (expected NDJSON or Content-Length): {}",
+            body.chars().take(160).collect::<String>()
+        );
+    }
+
+    /// Drain non-protocol lines the server may print to stdout before the first MCP message.
+    ///
+    /// Lines that look like NDJSON or `Content-Length` are **not** consumed; they are moved to
+    /// [`Self::preread_line`] for [`Self::recv_jsonrpc_response`].
+    async fn drain_startup_messages(&self) -> Result<()> {
+        let _ = tokio::time::timeout(Duration::from_millis(500), async {
+            loop {
+                let mut line = String::new();
+                let mut reader = self.reader.lock().await;
+                let Some(r) = reader.as_mut() else {
+                    return;
+                };
+                let read_res =
+                    tokio::time::timeout(Duration::from_millis(80), r.read_line(&mut line)).await;
+                drop(reader);
+
+                match read_res {
+                    Err(_) | Ok(Err(_)) | Ok(Ok(0)) => return,
+                    Ok(Ok(_)) => {
+                        let t = line.trim();
+                        if t.is_empty() {
+                            continue;
                         }
-                        // Check if we see the start of a JSON-RPC frame
-                        if slice.starts_with(b"Content-Length:") || slice.starts_with(b"Content-Length ") {
-                            // Found the start of a proper frame, don't consume
-                            return Ok(());
+                        let js = t.trim_start();
+                        if js.starts_with('{')
+                            || js.starts_with('[')
+                            || strip_prefix_ci(js, "content-length:").is_some()
+                        {
+                            *self.preread_line.lock().await = Some(line);
+                            return;
                         }
-                        // It's startup noise - consume one line
-                        let mut line = String::new();
-                        let bytes_read = reader.read_line(&mut line).await;
-                        match bytes_read {
-                            Ok(0) => return Ok(()), // EOF
-                            Ok(_) => {
-                                // Drained startup line - continue
-                                continue;
-                            }
-                            Err(_) => {
-                                return Ok(());
-                            }
-                        }
-                    }
-                    Ok(Err(_)) => {
-                        return Ok(());
-                    }
-                    Err(_) => {
-                        // Timeout - no startup messages
-                        return Ok(());
                     }
                 }
             }
         })
         .await;
 
-        // Ignore timeout errors during drain
-        let _ = result;
-
         Ok(())
     }
+}
+
+/// `prefix_lower` must be ASCII lower case.
+fn strip_prefix_ci<'a>(s: &'a str, prefix_lower: &'static str) -> Option<&'a str> {
+    let b = s.as_bytes();
+    let p = prefix_lower.as_bytes();
+    if b.len() < p.len() {
+        return None;
+    }
+    if !b[..p.len()].eq_ignore_ascii_case(p) {
+        return None;
+    }
+    Some(&s[p.len()..])
+}
+
+async fn read_content_length_message(
+    reader: &mut BufReader<ChildStdout>,
+    mut line: String,
+) -> Result<super::types::JsonRpcResponse> {
+    let mut content_length: Option<usize> = None;
+    loop {
+        let t = line.trim_end_matches(['\r', '\n']).trim();
+        if t.is_empty() {
+            break;
+        }
+        if let Some(rest) = strip_prefix_ci(t, "content-length:") {
+            content_length = Some(rest.trim().parse().context("Invalid Content-Length")?);
+        }
+        line.clear();
+        let n = reader.read_line(&mut line).await?;
+        if n == 0 {
+            bail!("MCP server closed connection while reading headers");
+        }
+    }
+
+    let length = content_length.context("Missing Content-Length header")?;
+    let mut body = vec![0u8; length];
+    reader.read_exact(&mut body).await?;
+    serde_json::from_slice(&body).context("Failed to parse JSON-RPC response")
 }
 
 impl Drop for StdioClient {
@@ -291,38 +342,4 @@ impl Drop for StdioClient {
             }
         }
     }
-}
-
-/// Read a JSON-RPC response frame.
-async fn read_jsonrpc_response(
-    reader: &mut BufReader<ChildStdout>,
-) -> Result<super::types::JsonRpcResponse> {
-    let mut content_length: Option<usize> = None;
-
-    // Read headers
-    loop {
-        let mut line = String::new();
-        let bytes = reader.read_line(&mut line).await?;
-        if bytes == 0 {
-            bail!("MCP server closed connection");
-        }
-
-        let line = line.trim();
-        if line.is_empty() {
-            break; // End of headers
-        }
-
-        if let Some(value) = line.strip_prefix("Content-Length:") {
-            let value = value.trim();
-            content_length = Some(value.parse().context("Invalid Content-Length")?);
-        }
-    }
-
-    let length = content_length.context("Missing Content-Length header")?;
-
-    // Read body
-    let mut body = vec![0u8; length];
-    reader.read_exact(&mut body).await?;
-
-    serde_json::from_slice(&body).context("Failed to parse JSON-RPC response")
 }

@@ -1,4 +1,4 @@
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 
 fn main() -> io::Result<()> {
     let stdin = io::stdin();
@@ -99,18 +99,17 @@ fn main() -> io::Result<()> {
     }
 }
 
+/// MCP stdio: newline-delimited JSON (NDJSON).
 fn write_frame<W: Write>(writer: &mut W, payload: &serde_json::Value) -> io::Result<()> {
-    let body = serde_json::to_vec(payload)?;
-    write!(writer, "Content-Length: {}\r\n\r\n", body.len())?;
-    writer.write_all(&body)?;
+    writeln!(writer, "{}", serde_json::to_string(payload).map_err(io::Error::other)?)?;
     writer.flush()?;
     Ok(())
 }
 
-fn read_frame<R: BufRead>(reader: &mut R) -> io::Result<serde_json::Value> {
-    let mut content_length: Option<usize> = None;
+fn read_frame<R: BufRead + Read>(reader: &mut R) -> io::Result<serde_json::Value> {
+    let mut line = String::new();
     loop {
-        let mut line = String::new();
+        line.clear();
         let bytes = reader.read_line(&mut line)?;
         if bytes == 0 {
             return Err(io::Error::new(
@@ -118,17 +117,56 @@ fn read_frame<R: BufRead>(reader: &mut R) -> io::Result<serde_json::Value> {
                 "stdin closed",
             ));
         }
-        if line == "\r\n" {
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        if t.starts_with('{') || t.starts_with('[') {
+            return serde_json::from_str(t).map_err(io::Error::other);
+        }
+        if strip_prefix_ci(t, "content-length:").is_some() {
+            return read_content_length_body(reader, &line);
+        }
+        return Err(io::Error::other(format!(
+            "expected NDJSON or Content-Length, got: {}",
+            t.chars().take(80).collect::<String>()
+        )));
+    }
+}
+
+fn strip_prefix_ci<'a>(s: &'a str, prefix_lower: &'static str) -> Option<&'a str> {
+    let b = s.as_bytes();
+    let p = prefix_lower.as_bytes();
+    if b.len() < p.len() || !b[..p.len()].eq_ignore_ascii_case(p) {
+        return None;
+    }
+    Some(&s[p.len()..])
+}
+
+fn read_content_length_body<R: BufRead + Read>(
+    reader: &mut R,
+    first: &str,
+) -> io::Result<serde_json::Value> {
+    let mut line = first.to_string();
+    let mut content_length: Option<usize> = None;
+    loop {
+        let t = line.trim_end_matches(['\r', '\n']).trim();
+        if t.is_empty() {
             break;
         }
-        if let Some(value) = line.strip_prefix("Content-Length:") {
-            content_length = Some(value.trim().parse().map_err(io::Error::other)?);
+        if let Some(rest) = strip_prefix_ci(t, "content-length:") {
+            content_length = Some(rest.trim().parse().map_err(io::Error::other)?);
+        }
+        line.clear();
+        let n = reader.read_line(&mut line)?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "stdin closed in headers",
+            ));
         }
     }
-
-    let length = content_length.ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidData, "missing Content-Length header")
-    })?;
+    let length = content_length.ok_or_else(|| io::Error::other("missing Content-Length"))?;
     let mut body = vec![0u8; length];
     reader.read_exact(&mut body)?;
     serde_json::from_slice(&body).map_err(io::Error::other)

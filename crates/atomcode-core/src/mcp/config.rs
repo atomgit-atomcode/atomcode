@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
+use serde_json::{Map, Value, json};
 
 /// MCP server transport configuration.
 #[derive(Debug, Clone)]
@@ -39,12 +40,17 @@ pub enum McpConfigSource {
 /// Raw MCP config file format (for deserialization).
 #[derive(Debug, Deserialize)]
 struct McpConfigFile {
-    #[serde(default)]
-    servers: BTreeMap<String, McpServerEntry>,
+    /// JSON key `mcpServers`（与 Cursor 等工具一致）；`servers` 仍可作为别名读取旧配置。
+    #[serde(default, rename = "mcpServers", alias = "servers")]
+    mcp_servers: BTreeMap<String, McpServerEntry>,
 }
 
 #[derive(Debug, Deserialize)]
 struct McpServerEntry {
+    /// Ignored for transport selection (stdio vs HTTP is inferred from `command` vs `url`).
+    /// Accepted so configs copied from Claude / Cursor validate.
+    #[serde(default, rename = "type")]
+    _transport_hint: Option<String>,
     #[serde(default)]
     disabled: bool,
     #[serde(default)]
@@ -109,7 +115,7 @@ fn load_config_file(path: &Path, _source: McpConfigSource) -> Result<Vec<McpServ
 
     let mut configs = Vec::new();
 
-    for (name, entry) in raw.servers {
+    for (name, entry) in raw.mcp_servers {
         let config = server_entry_to_config(&name, entry)?;
         configs.push(config);
     }
@@ -158,6 +164,78 @@ fn server_entry_to_config(name: &str, entry: McpServerEntry) -> Result<McpServer
         disabled: entry.disabled,
         config: transport,
     })
+}
+
+fn collect_merged_mcp_server_maps(root: &Map<String, Value>) -> Map<String, Value> {
+    let mut out = Map::new();
+    if let Some(Value::Object(m)) = root.get("servers") {
+        for (k, v) in m {
+            out.insert(k.clone(), v.clone());
+        }
+    }
+    if let Some(Value::Object(m)) = root.get("mcpServers") {
+        for (k, v) in m {
+            out.insert(k.clone(), v.clone());
+        }
+    }
+    out
+}
+
+/// Add or replace a **stdio** MCP server entry in a JSON config file (`.mcp.json` or `~/.atomcode/mcp.json`).
+///
+/// Merges existing `servers` and `mcpServers` maps, then writes a single `mcpServers` object (drops the legacy
+/// `servers` key). Other top-level JSON keys are preserved.
+pub fn merge_stdio_mcp_server_into_json_file(
+    path: &Path,
+    server_key: &str,
+    program: &str,
+    args: &[String],
+) -> Result<()> {
+    if server_key.is_empty() {
+        bail!("MCP server name must not be empty");
+    }
+    if program.is_empty() {
+        bail!("command must not be empty");
+    }
+
+    let mut root: Value = if path.exists() {
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("Failed to read MCP config from {}", path.display()))?;
+        serde_json::from_str(&text)
+            .with_context(|| format!("Failed to parse MCP config JSON from {}", path.display()))?
+    } else {
+        json!({})
+    };
+
+    let root_obj = root
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("MCP config root must be a JSON object"))?;
+
+    let mut servers = collect_merged_mcp_server_maps(root_obj);
+    let entry = json!({
+        "command": program,
+        "args": args,
+    });
+    servers.insert(server_key.to_string(), entry);
+    root_obj.insert("mcpServers".to_string(), Value::Object(servers));
+    root_obj.remove("servers");
+
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "Failed to create parent directory for {}",
+                    path.display()
+                )
+            })?;
+        }
+    }
+
+    let text = serde_json::to_string_pretty(&root).context("Failed to serialize MCP config")?;
+    std::fs::write(path, format!("{text}\n"))
+        .with_context(|| format!("Failed to write MCP config to {}", path.display()))?;
+
+    Ok(())
 }
 
 /// Expand environment variables in a string.
@@ -213,6 +291,7 @@ fn expand_env_vars(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value;
 
     #[test]
     fn test_expand_env_vars_simple() {
@@ -248,5 +327,53 @@ mod tests {
         std::env::set_var("VAR2", "b");
         let result = expand_env_vars("prefix_${VAR1}_middle_${VAR2}_suffix");
         assert_eq!(result, "prefix_a_middle_b_suffix");
+    }
+
+    #[test]
+    fn mcp_config_file_accepts_mcp_servers_key() {
+        let raw: McpConfigFile = serde_json::from_str(
+            r#"{"mcpServers":{"a":{"command":"echo","args":[]}}}"#,
+        )
+        .unwrap();
+        assert!(raw.mcp_servers.contains_key("a"));
+    }
+
+    #[test]
+    fn mcp_config_file_accepts_servers_alias() {
+        let raw: McpConfigFile =
+            serde_json::from_str(r#"{"servers":{"b":{"command":"echo","args":[]}}}"#).unwrap();
+        assert!(raw.mcp_servers.contains_key("b"));
+    }
+
+    #[test]
+    fn merge_stdio_creates_mcp_servers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp.json");
+        merge_stdio_mcp_server_into_json_file(&path, "p", "npx", &["@x/y".to_string()])
+            .unwrap();
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let p = v["mcpServers"]["p"].as_object().unwrap();
+        assert_eq!(p["command"].as_str(), Some("npx"));
+        assert_eq!(
+            p["args"].as_array().unwrap()[0].as_str(),
+            Some("@x/y")
+        );
+    }
+
+    #[test]
+    fn merge_stdio_preserves_other_top_level_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp.json");
+        std::fs::write(
+            &path,
+            r#"{"note":"keep","mcpServers":{"old":{"command":"true","args":[]}}}"#,
+        )
+        .unwrap();
+        merge_stdio_mcp_server_into_json_file(&path, "new", "uv", &[]).unwrap();
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(v.get("note").and_then(|x| x.as_str()), Some("keep"));
+        let m = v.get("mcpServers").unwrap().as_object().unwrap();
+        assert!(m.contains_key("old"));
+        assert!(m.contains_key("new"));
     }
 }

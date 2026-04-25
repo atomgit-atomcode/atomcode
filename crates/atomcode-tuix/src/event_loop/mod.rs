@@ -958,29 +958,45 @@ pub async fn run_loop(
                 match &ev {
                     McpConnectEvent::Connected { name } => {
                         renderer.render(UiLine::CommandOutput(format!("✓ MCP server '{}' connected", name)));
-                        // Register tools from this newly connected server
+                        // Register tools from this newly connected server.
+                        // Important: do this in a background task so a slow `tools/list`
+                        // can't block the TUI event loop and freeze input.
                         if let Some(registry) = &ctx.mcp_registry {
-                            let tools = registry.list_all_tools().await;
-                            let server_tools: Vec<_> = tools.into_iter()
-                                .filter(|t| &t.server_name == name)
-                                .collect();
-                            if !server_tools.is_empty() {
-                                register_mcp_tools_async(&ctx.agent.tool_registry, registry.clone(), server_tools).await;
-                            }
+                            let registry = registry.clone();
+                            let tools = ctx.agent.tool_registry.clone();
+                            let name = name.clone();
+                            tokio::spawn(async move {
+                                let server_tools = registry.list_tools_for_server(&name).await;
+                                if !server_tools.is_empty() {
+                                    register_mcp_tools_async(&tools, registry, server_tools).await;
+                                }
+                            });
                         }
                     }
                     McpConnectEvent::Failed { name, error } => {
                         renderer.render(UiLine::Error(format!("✗ MCP server '{}' failed: {}", name, error)));
+                    }
+                    McpConnectEvent::Warning { name, message } => {
+                        renderer.render(UiLine::CommandOutput(format!(
+                            "! MCP server '{}' warning: {}",
+                            name, message
+                        )));
                     }
                 }
 
                 // `/mcp reload` progress: once every configured server has reported a
                 // terminal state (Connected/Failed), emit a summary line.
                 if let Some(p) = ctx.mcp_reload.as_mut() {
-                    p.done = p.done.saturating_add(1);
                     match &ev {
-                        McpConnectEvent::Connected { .. } => p.connected = p.connected.saturating_add(1),
-                        McpConnectEvent::Failed { .. } => p.failed = p.failed.saturating_add(1),
+                        McpConnectEvent::Connected { .. } => {
+                            p.done = p.done.saturating_add(1);
+                            p.connected = p.connected.saturating_add(1)
+                        }
+                        McpConnectEvent::Failed { .. } => {
+                            p.done = p.done.saturating_add(1);
+                            p.failed = p.failed.saturating_add(1)
+                        }
+                        McpConnectEvent::Warning { .. } => {}
                     }
                     if p.done >= p.total {
                         let elapsed_ms = p.started_at.elapsed().as_millis();
@@ -1113,29 +1129,43 @@ pub async fn run_loop(
                 match &ev {
                     McpConnectEvent::Connected { name } => {
                         renderer.render(UiLine::CommandOutput(format!("✓ MCP server '{}' connected", name)));
-                        // Register tools from this newly connected server
+                        // Register tools from this newly connected server (backgrounded).
                         if let Some(registry) = &ctx.mcp_registry {
-                            let tools = registry.list_all_tools().await;
-                            let server_tools: Vec<_> = tools.into_iter()
-                                .filter(|t| &t.server_name == name)
-                                .collect();
-                            if !server_tools.is_empty() {
-                                register_mcp_tools_async(&ctx.agent.tool_registry, registry.clone(), server_tools).await;
-                            }
+                            let registry = registry.clone();
+                            let tools = ctx.agent.tool_registry.clone();
+                            let name = name.clone();
+                            tokio::spawn(async move {
+                                let server_tools = registry.list_tools_for_server(&name).await;
+                                if !server_tools.is_empty() {
+                                    register_mcp_tools_async(&tools, registry, server_tools).await;
+                                }
+                            });
                         }
                     }
                     McpConnectEvent::Failed { name, error } => {
                         renderer.render(UiLine::Error(format!("✗ MCP server '{}' failed: {}", name, error)));
+                    }
+                    McpConnectEvent::Warning { name, message } => {
+                        renderer.render(UiLine::CommandOutput(format!(
+                            "! MCP server '{}' warning: {}",
+                            name, message
+                        )));
                     }
                 }
 
                 // `/mcp reload` progress: once every configured server has reported a
                 // terminal state (Connected/Failed), emit a summary line.
                 if let Some(p) = ctx.mcp_reload.as_mut() {
-                    p.done = p.done.saturating_add(1);
                     match &ev {
-                        McpConnectEvent::Connected { .. } => p.connected = p.connected.saturating_add(1),
-                        McpConnectEvent::Failed { .. } => p.failed = p.failed.saturating_add(1),
+                        McpConnectEvent::Connected { .. } => {
+                            p.done = p.done.saturating_add(1);
+                            p.connected = p.connected.saturating_add(1)
+                        }
+                        McpConnectEvent::Failed { .. } => {
+                            p.done = p.done.saturating_add(1);
+                            p.failed = p.failed.saturating_add(1)
+                        }
+                        McpConnectEvent::Warning { .. } => {}
                     }
                     if p.done >= p.total {
                         let elapsed_ms = p.started_at.elapsed().as_millis();

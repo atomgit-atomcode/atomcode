@@ -16,6 +16,10 @@ use super::types::{CallToolResult, InitializeResult, ListToolsResult, ServerStat
 /// Default timeout for HTTP operations (30 seconds).
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 
+/// Streamable HTTP / SSE-style MCP endpoints (e.g. Playwright) reject requests unless
+/// `Accept` advertises both JSON and event-stream; see MCP HTTP transport guidance.
+const MCP_HTTP_ACCEPT: &str = "application/json, text/event-stream";
+
 /// HTTP-based MCP client.
 pub struct HttpClient {
     server_name: String,
@@ -69,6 +73,14 @@ impl HttpClient {
         });
 
         let mut req = self.client.post(&self.url).json(&request);
+
+        let user_has_accept = self
+            .headers
+            .keys()
+            .any(|k| k.eq_ignore_ascii_case("accept"));
+        if !user_has_accept {
+            req = req.header("Accept", MCP_HTTP_ACCEPT);
+        }
 
         for (key, value) in &self.headers {
             req = req.header(key, value);
