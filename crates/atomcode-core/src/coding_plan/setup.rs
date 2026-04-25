@@ -264,7 +264,7 @@ pub fn run(
     tel: Option<&Arc<atomcode_telemetry::Telemetry>>,
 ) -> Result<SetupReport> {
     // Step 1: login
-    let login = step_login();
+    let login = step_login(tel);
     if login.is_err() {
         // No point continuing — every downstream call needs a token.
         if let Some(t) = tel {
@@ -343,7 +343,7 @@ pub fn run(
 /// failure line above already explains why nothing came after it.
 const CASCADE_FROM_UPSTREAM_FAIL: &str = "__cascade_upstream_fail__";
 
-fn step_login() -> StepResult<LoginInfo> {
+fn step_login(tel: Option<&Arc<atomcode_telemetry::Telemetry>>) -> StepResult<LoginInfo> {
     if auth::is_logged_in() {
         // Already authed — surface the stored identity so the report
         // shows *who* we're running as, not a bare "skipped". When
@@ -365,7 +365,7 @@ fn step_login() -> StepResult<LoginInfo> {
     // Not logged in — run OAuth. This prints to stdout + opens a browser.
     // Callers in TUI context must have already suspended raw mode before
     // calling `run`.
-    match auth::login(None).and_then(|a| auth::save_auth(&a).map(|_| a)) {
+    match auth::login(tel).and_then(|a| auth::save_auth(&a).map(|_| a)) {
         Ok(auth_info) => StepResult::Ok(LoginInfo {
             username: auth_info.user.username.clone(),
             display_name: auth_info.user.name.clone(),

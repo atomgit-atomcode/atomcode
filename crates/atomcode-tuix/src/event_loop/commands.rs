@@ -1066,7 +1066,7 @@ pub(crate) fn run_login_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx) -> 
     // The OAuth flow owns the terminal until it returns.
     renderer.suspend_for_external();
 
-    let result = atomcode_core::auth::login(None)
+    let result = atomcode_core::auth::login(Some(&ctx.telemetry))
         .and_then(|auth| atomcode_core::auth::save_auth(&auth).map(|()| auth));
 
     // Resume: re-enable raw + bracketed-paste AND reset cached state
