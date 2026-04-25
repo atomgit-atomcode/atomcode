@@ -588,6 +588,24 @@ impl ToolRegistry {
         let mut tools = self.tools.write().await;
         tools.insert(name, tool);
     }
+
+    /// Unregister all tools whose names start with `prefix`.
+    ///
+    /// Used by `/mcp reload` to drop all previously registered MCP tools
+    /// (`mcp__{server}__{tool}`) before reconnecting/re-registering.
+    pub async fn unregister_prefix(&self, prefix: &str) -> usize {
+        let mut tools = self.tools.write().await;
+        let to_remove: Vec<String> = tools
+            .keys()
+            .filter(|k| k.starts_with(prefix))
+            .cloned()
+            .collect();
+        let n = to_remove.len();
+        for k in to_remove {
+            tools.remove(&k);
+        }
+        n
+    }
 }
 
 #[cfg(test)]

@@ -479,6 +479,43 @@ pub(super) fn execute_slash_command(
             renderer.flush();
         }
         "mcp" => {
+            let sub = arg.trim();
+            if sub.eq_ignore_ascii_case("reload") {
+                renderer.render(UiLine::CommandOutput("  Reloading MCP servers...\n".into()));
+                renderer.flush();
+
+                // 1) Drop all previously-registered MCP tools so any adapters holding the
+                // old registry Arc are released and stdio child processes can be killed.
+                let removed = tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(async {
+                        ctx.agent.tool_registry.unregister_prefix("mcp__").await
+                    })
+                });
+
+                // 2) Drop old registry + event receiver (stop consuming old events).
+                ctx.mcp_connect_rx = None;
+                ctx.mcp_registry = None;
+
+                // 3) Recreate registry and event channel. Connections happen in background
+                // and will stream Connected/Failed events into scrollback (event loop select!).
+                use atomcode_core::mcp::McpConnectEvent;
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<McpConnectEvent>();
+                let registry = atomcode_core::mcp::McpRegistry::from_config_background_with_events(
+                    &ctx.working_dir,
+                    Some(tx),
+                );
+                ctx.mcp_registry = Some(std::sync::Arc::new(registry));
+                ctx.mcp_connect_rx = Some(rx);
+
+                renderer.render(UiLine::CommandOutput(format!(
+                    "  ✓ Cleared {} MCP tools, reconnecting...\n",
+                    removed
+                )));
+                renderer.flush();
+                return Ok(());
+            }
+
+            // Default: show status.
             if let Some(registry) = &ctx.mcp_registry {
                 let statuses = tokio::task::block_in_place(|| {
                     tokio::runtime::Handle::current().block_on(registry.server_statuses())
