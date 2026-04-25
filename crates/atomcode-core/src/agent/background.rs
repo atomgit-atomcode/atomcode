@@ -3,12 +3,12 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Result;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
 use crate::conversation::Conversation;
+use crate::ctx::CtxBuilder;
 use crate::provider::LlmProvider;
 use crate::tool::{ToolContext, ToolRegistry};
 use crate::turn::event::TurnResult;
@@ -30,11 +30,12 @@ pub async fn run_background_task(
     tools: Arc<ToolRegistry>,
     context: ToolContext,
     config: Config,
+    ctx: Arc<dyn CtxBuilder>,
     _progress_tx: mpsc::UnboundedSender<AgentEvent>,
 ) -> AgentEvent {
     match tokio::time::timeout(
         BACKGROUND_TIMEOUT,
-        run_background_inner(task, provider, tools, context, config),
+        run_background_inner(task, provider, tools, context, config, ctx),
     )
     .await
     {
@@ -54,8 +55,9 @@ async fn run_background_inner(
     tools: Arc<ToolRegistry>,
     context: ToolContext,
     config: Config,
+    ctx: Arc<dyn CtxBuilder>,
 ) -> AgentEvent {
-    let ctx = context.isolate().await;
+    let bg_context = context.isolate().await;
     let permission = Box::new(AutoPermissionDecider::new(AutoPermissionMode::AcceptEdits));
 
     // Build a minimal tool registry for background tasks — only file I/O tools.
@@ -63,22 +65,22 @@ async fn run_background_inner(
     // The full Config is passed (not stripped) because the provider needs
     // api_key, base_url, model, and context_window from it. Only the tool
     // set is restricted; config fields are read-only and pose no risk.
-    let mut bg_tools = crate::tool::ToolRegistry::new();
+    let bg_tools = crate::tool::ToolRegistry::new();
     let essential = ["read_file", "write_file", "edit_file", "glob", "grep", "list_directory", "search_replace"];
     for name in &essential {
-        if let Some(tool) = tools.get_arc(name) {
-            bg_tools.register_arc(name.to_string(), tool);
+        if let Some(tool) = tools.get(name).await {
+            bg_tools.register_arc(name.to_string(), tool).await;
         }
     }
 
     let mut runner = TurnRunner {
         provider,
         tools: Arc::new(bg_tools),
-        context: ctx,
+        context: bg_context,
         config,
+        ctx,
         permission,
         recently_edited_files: Vec::new(),
-        settings: None,
         recent_calls: Vec::new(),
         file_read_counts: std::collections::HashMap::new(),
     };

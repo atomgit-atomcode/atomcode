@@ -302,7 +302,18 @@ _ = cancel.cancelled() => {
                             }
                         }
 
-                        Some(Ok(StreamEvent::ToolCallDone(call))) => {
+                        Some(Ok(StreamEvent::ToolCallDone(mut call))) => {
+                            // DeepSeek-V4-Flash and some Qwen variants
+                            // occasionally wrap args as {"arguments":{...}}
+                            // instead of the flat schema-shaped object.
+                            // Unwrap once so downstream tools, discipline
+                            // tracking, and the TUI display all see the
+                            // corrected form.
+                            if let Some(unwrapped) =
+                                crate::tool::unwrap_doubly_nested_args(&call.arguments)
+                            {
+                                call.arguments = unwrapped;
+                            }
                             conversation.tool_call_buffer = None;
                             let _ = event_tx.send(TurnEvent::ToolCallStarted {
                                 id: call.id.clone(),

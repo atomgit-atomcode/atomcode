@@ -78,12 +78,16 @@ pub fn render_line_with_width(
         return prefix_only();
     }
 
-    // Inside code block: render in bright cyan (SGR 96) with no inline
+    // Inside code block: render in bright cyan + bold (SGR 96 + 1) with
+    // no inline
     // parsing. Bright cyan is the conventional "code" tone across themes
     // and reads vividly on both light and dark backgrounds.
     if state.in_code_block {
         let body = if caps.colors {
-            format!("\x1b[96m{}\x1b[39m", line)
+            // Bold + bright cyan: bold compensates for the low contrast
+            // bright cyan can have on pastel light themes (e.g. iTerm2's
+            // default light preset where SGR 96 is a washed-out teal).
+            format!("\x1b[1;96m{}\x1b[22;39m", line)
         } else {
             line.to_string()
         };
@@ -97,18 +101,19 @@ pub fn render_line_with_width(
         return Some(prepend(String::new()));
     }
 
-    // Heading — express hierarchy with SGR weight (bold) rather than
-    // specific colours. Top levels stay in the terminal's default
-    // foreground (always readable); lower levels drop to muted grey.
+    // Heading — express hierarchy with SGR weight (bold) and italic
+    // rather than coloured greys. SGR 90 (bright-black) renders at near-
+    // invisible contrast on several iTerm2 dark presets; italic keeps
+    // H4+ visually distinct from H1-3 without relying on a colour that
+    // can disappear into the background.
     if let Some((level, rest)) = parse_heading(line) {
         let inner = render_inline(rest, caps);
         let body = if !caps.colors {
             format!("{} {}", "#".repeat(level as usize), inner)
         } else {
             match level {
-                1 | 2 => format!("\x1b[1m{}\x1b[22m", inner),
-                3 => format!("\x1b[1m{}\x1b[22m", inner),
-                _ => format!("\x1b[90m{}\x1b[39m", inner),
+                1 | 2 | 3 => format!("\x1b[1m{}\x1b[22m", inner),
+                _ => format!("\x1b[3m{}\x1b[23m", inner),
             }
         };
         return Some(prepend(body));
@@ -211,7 +216,10 @@ pub fn flush_aligned_table_with_width(
         }
     }
 
-    let border_on = if caps.colors { "\x1b[90m" } else { "" };
+    // Cyan (SGR 96) instead of bright-black (SGR 90) — matches
+    // theme::Palette::BORDER. Table borders are structural; if they
+    // collapse into the bg the column boundaries become unreadable.
+    let border_on = if caps.colors { "\x1b[96m" } else { "" };
     let border_off = if caps.colors { "\x1b[39m" } else { "" };
 
     // Draw a horizontal rule row with given connector characters.
@@ -367,9 +375,12 @@ fn render_inline(line: &str, caps: TerminalCaps) -> String {
                     inner.push(p);
                 }
                 if closed && !inner.is_empty() {
-                    out.push_str("\x1b[96m"); // bright cyan (SGR 96) — inline code
+                    // Bold + bright cyan — bold helps the inline code
+                    // span stay visible on light themes where SGR 96
+                    // can render as a low-contrast pastel.
+                    out.push_str("\x1b[1;96m");
                     out.push_str(&inner);
-                    out.push_str("\x1b[39m");
+                    out.push_str("\x1b[22;39m");
                 } else {
                     out.push('`');
                     out.push_str(&inner);
@@ -483,9 +494,10 @@ mod tests {
 
     #[test]
     fn inline_code() {
-        // Inline code uses SGR 96 (bright cyan) — reads vividly on both
-        // light and dark terminal themes.
-        assert!(render_inline_line("`x`", caps()).contains("\x1b[96mx"));
+        // Inline code uses SGR 1+96 (bold + bright cyan) — bold helps
+        // it stay readable on light themes where SGR 96 alone can render
+        // as a low-contrast pastel teal.
+        assert!(render_inline_line("`x`", caps()).contains("\x1b[1;96mx"));
     }
 
     #[test]

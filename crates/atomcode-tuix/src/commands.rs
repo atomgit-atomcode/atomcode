@@ -3,7 +3,7 @@
 pub struct Command {
     pub name: &'static str,
     pub desc: &'static str,
-    /// Commands that are *useless* without an argument (e.g. `/fixissue <url>`).
+    /// Commands that are *useless* without an argument (e.g. `/background <task>`).
     /// When the slash-menu Enter handler sees one, it auto-completes the name
     /// with a trailing space and leaves the cursor parked for the user to
     /// type the argument — instead of firing a bad invocation immediately.
@@ -72,6 +72,8 @@ const BUILTIN_COMMANDS: &[Command] = &[
     Command { name: "config",  desc: "Show config path", needs_args: false },
     Command { name: "reload",  desc: "Reload ~/.atomcode/config.toml from disk", needs_args: false },
     Command { name: "cd",      desc: "Change working directory", needs_args: false },
+    Command { name: "init",    desc: "Generate .atomcode.md project instructions from the working directory", needs_args: false },
+    Command { name: "background", desc: "Run a one-shot task in an isolated background context (read-only-ish tool subset)", needs_args: true },
     Command { name: "diff",    desc: "Show git diff", needs_args: false },
     Command { name: "clear",   desc: "Clear screen", needs_args: false },
     Command { name: "session", desc: "Start a new session (clears conversation)", needs_args: false },
@@ -81,8 +83,7 @@ const BUILTIN_COMMANDS: &[Command] = &[
     Command { name: "mcp",     desc: "Show MCP server status (subcommand: reload)", needs_args: false },
     Command { name: "undo",    desc: "Undo last change (not yet supported)", needs_args: false },
     Command { name: "upgrade", desc: "Upgrade atomcode to latest (subcommand: rollback)", needs_args: false },
-    Command { name: "fixissue", desc: "Fetch an AtomGit issue (must be assigned to you) and let the agent fix it", needs_args: true },
-    Command { name: "issue",   desc: "Interactive wizard — prompts for issue URL, then runs fixissue", needs_args: false },
+    Command { name: "issue",   desc: "Create a new issue on AtomGit (interactive wizard)", needs_args: false },
     Command { name: "help",    desc: "Show this help", needs_args: false },
     Command { name: "quit",    desc: "Exit AtomCode", needs_args: false },
 ];

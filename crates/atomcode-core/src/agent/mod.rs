@@ -2,6 +2,7 @@
 //! calls LLM providers, executes tools, and communicates with the UI
 //! via channels. Decoupled from any TUI concerns.
 
+pub mod background;
 pub mod git_checkpoint;
 pub mod sub_agent;
 pub mod subtask_driver;
@@ -15,6 +16,7 @@ mod tool_dispatch;
 mod verify;
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
@@ -59,6 +61,10 @@ pub enum AgentCommand {
     /// forward-compat with an eventual LLM-backed summarize-with-instruction
     /// path; currently unused — this is the mechanical path only.
     Compact { prompt: Option<String> },
+    /// Run a one-shot task in an isolated background context (read-only-ish
+    /// tool subset, independent conversation, capped turns + timeout).
+    /// Result is returned via `AgentEvent::BackgroundComplete`.
+    Background { task: String },
     /// Recompute and re-emit a rich ContextStats snapshot. `/context` sends
     /// this before rendering so the user never sees a stale cache — the
     /// cache is only refreshed on LLM round-trips, so between turns (or
@@ -160,6 +166,14 @@ pub enum AgentEvent {
     Error(String),
     /// Sub-agent progress (real-time parallel task display).
     SubAgentProgress { file: String, status: String },
+    /// `/background` task finished. `summary` is the final assistant text
+    /// (truncated if long). `success` is false on error / timeout / cancel.
+    BackgroundComplete {
+        summary: String,
+        files_edited: Vec<String>,
+        turns: usize,
+        success: bool,
+    },
     /// Working directory changed.
     WorkingDirChanged(PathBuf),
     /// Context budget stats — piped into datalog and cached by the TUI
@@ -300,6 +314,12 @@ pub struct AgentLoop {
     /// Fresh-cancelled-then-rebuilt on every `/cd` so a prior indexer
     /// (still parsing files) yields CPU instead of racing the new one.
     indexer_cancel: CancellationToken,
+
+    /// Guard against concurrent `/background` tasks. Set on dispatch,
+    /// cleared by the spawned task when it completes. Acquire/Release
+    /// ordering so the cleared write is visible to the next dispatcher
+    /// check on a different thread.
+    background_running: std::sync::Arc<AtomicBool>,
 
     /// Discipline tracking — all counters for loop detection, stagnation,
     /// error streaks, and tool usage patterns. Extracted from AgentLoop to
@@ -545,6 +565,7 @@ impl AgentLoop {
             last_approval_request: None,
             cancel_token: CancellationToken::new(),
             indexer_cancel: CancellationToken::new(),
+            background_running: std::sync::Arc::new(AtomicBool::new(false)),
             discipline_state: DisciplineState::default(),
             files_read_this_turn: Vec::new(),
             files_edited_this_turn: Vec::new(),
@@ -740,6 +761,37 @@ if let Some(provider_config) = self.config.providers.get(&new_provider_name) {
                 }
                 AgentCommand::Compact { prompt } => {
                     self.run_compact(prompt).await;
+                }
+                AgentCommand::Background { task } => {
+                    // AcqRel: pair with the spawned task's Release store on
+                    // completion so the next dispatcher sees the cleared flag.
+                    if self.background_running.swap(true, Ordering::AcqRel) {
+                        let _ = self.event_tx.send(AgentEvent::Error(
+                            "A background task is already running. Wait for it to finish.".to_string(),
+                        ));
+                    } else {
+                        let provider = self.turn_runner.provider.clone();
+                        let tools = self.turn_runner.tools.clone();
+                        let context = self.turn_runner.context.clone();
+                        let config = self.config.clone();
+                        let ctx = self.ctx.clone();
+                        let event_tx = self.event_tx.clone();
+                        let flag = self.background_running.clone();
+                        tokio::spawn(async move {
+                            let result = background::run_background_task(
+                                &task,
+                                provider,
+                                tools,
+                                context,
+                                config,
+                                ctx,
+                                event_tx.clone(),
+                            )
+                            .await;
+                            let _ = event_tx.send(result);
+                            flag.store(false, Ordering::Release);
+                        });
+                    }
                 }
                 AgentCommand::RefreshContextStats => {
                     let system_prompt = self.build_system_prompt();

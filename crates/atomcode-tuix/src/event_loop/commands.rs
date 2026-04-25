@@ -58,6 +58,15 @@ pub(super) fn execute_slash_command(
     fixissue_pending: &mut Option<atomcode_core::atomgit::IssueRef>,
     fixissue_buffer: &mut String,
 ) -> Result<()> {
+    // `fixissue_pending` / `fixissue_buffer` no longer have a slash-command
+    // entry that consumes them (the `/fixissue` arm was removed; the
+    // `atomcode fixissue` CLI subcommand seeds these via cli/main.rs and
+    // event_loop/mod.rs's AgentEvent handler still drains them on
+    // TurnComplete). They stay in the signature so callers don't have to
+    // change, and so a future restoration of the slash command is a
+    // one-arm-add rather than a refactor.
+    let _ = (&fixissue_pending, &fixissue_buffer);
+
     // Built-in commands are all lowercase ASCII; normalise the user's
     // input so `/SESSION`, `/Session`, `/sEssIon` all hit the same arm
     // as `/session`. `arg` is left untouched — paths / URLs are
@@ -395,21 +404,6 @@ pub(super) fn execute_slash_command(
                 });
             }
         }
-        "fixissue" => {
-            // `/fixissue <url>` — fetch the issue via AtomGit API (blocking,
-            // ~1s), verify the current user is the assignee, then inject a
-            // synthesised prompt into the agent as if the user typed it.
-            // Not-assigned / fetch-fail paths print the reason and stay Idle.
-            let url = arg.trim();
-            if url.is_empty() {
-                renderer.render(UiLine::CommandOutput(
-                    "  Usage: /fixissue <issue-url>\n  Example: /fixissue https://atomgit.com/owner/repo/issues/42\n  Or use the interactive wizard: /issue\n".into(),
-                ));
-                renderer.flush();
-            } else {
-                launch_fixissue(url, state, ctx, renderer, fixissue_pending, fixissue_buffer);
-            }
-        }
         "issue" => {
             // Two-step wizard to create a NEW issue on AtomGit in the
             // current repo. Step 1 collects a title (required), step 2
@@ -474,6 +468,55 @@ pub(super) fn execute_slash_command(
                 }
                 Err(e) => {
                     renderer.render(UiLine::Error(e));
+                }
+            }
+            renderer.flush();
+        }
+        "background" => {
+            // Send the task to the agent loop; result comes back as
+            // AgentEvent::BackgroundComplete (rendered in event_loop/mod.rs).
+            // The agent loop guards against concurrent background tasks via
+            // an AtomicBool — second invocation while one is running gets
+            // an Error event back.
+            let task = arg.trim();
+            if task.is_empty() {
+                renderer.render(UiLine::CommandOutput(
+                    "  Usage: /background <task description>\n".to_string(),
+                ));
+                renderer.flush();
+                return Ok(());
+            }
+            ctx.agent
+                .cmd_tx
+                .send(AgentCommand::Background { task: task.to_string() })
+                .ok();
+        }
+        "init" => {
+            // Generate .atomcode.md from project structure. Refuses to
+            // overwrite by default — `/init --force` opts in. The file is
+            // picked up by agent::prompt next time the system prompt is
+            // built; in-flight turns finish on the old prompt.
+            let target = ctx.working_dir.join(".atomcode.md");
+            let force = matches!(arg.trim(), "--force" | "force");
+            if target.exists() && !force {
+                renderer.render(UiLine::CommandOutput(format!(
+                    "  {} already exists. Use `/init --force` to overwrite.\n",
+                    target.display()
+                )));
+                renderer.flush();
+                return Ok(());
+            }
+            let content = atomcode_core::init::generate_project_instructions(&ctx.working_dir);
+            match std::fs::write(&target, &content) {
+                Ok(()) => {
+                    renderer.render(UiLine::CommandOutput(format!(
+                        "  Wrote {} ({} bytes). Edit to customise; takes effect on next session.\n",
+                        target.display(),
+                        content.len()
+                    )));
+                }
+                Err(e) => {
+                    renderer.render(UiLine::Error(format!("  /init failed: {}\n", e)));
                 }
             }
             renderer.flush();
@@ -779,6 +822,13 @@ fn format_context_report(
 /// Run it arms the post-completion hook (`fixissue_pending` +
 /// `fixissue_buffer`), sends `AgentCommand::SendMessage`, and flips
 /// UiState to Streaming via `state.on_submit()`.
+/// Currently unused — the `/fixissue` slash command was removed from
+/// the menu and dispatcher. Kept (with `#[allow(dead_code)]`) so that
+/// a future restoration of the slash command can re-add a one-line
+/// dispatcher arm without re-implementing this whole flow. The
+/// `atomcode fixissue` CLI subcommand uses `atomcode_core::atomgit::fixissue`
+/// directly and does not depend on this function.
+#[allow(dead_code)]
 pub(crate) fn launch_fixissue(
     url: &str,
     state: &mut UiState,

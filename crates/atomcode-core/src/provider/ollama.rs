@@ -39,9 +39,8 @@ impl OllamaProvider {
             .filter_map(|m| {
                 match &m.content {
                     MessageContent::Text(s) => {
-                        if matches!(m.role, Role::Tool) {
-                            return None;
-                        }
+                        // Tool role with plain Text is invalid for the tool-call
+                        // protocol — tool results must use MessageContent::ToolResult.
                         let role = match m.role {
                             Role::System => "system",
                             Role::User => "user",

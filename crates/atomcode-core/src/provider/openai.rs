@@ -125,10 +125,8 @@ impl OpenAiProvider {
             .filter_map(|m| {
                 match &m.content {
                     MessageContent::Text(s) => {
-                        // Skip Tool role with plain Text (invalid for OpenAI API)
-                        if matches!(m.role, Role::Tool) {
-                            return None;
-                        }
+                        // Tool role with plain Text is invalid for the OpenAI API —
+                        // tool results must use MessageContent::ToolResult.
                         let role = match m.role {
                             Role::System => "system",
                             Role::User => "user",

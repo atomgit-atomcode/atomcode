@@ -28,8 +28,8 @@ pub fn classify(code: KeyCode, modifiers: KeyModifiers) -> Action {
     let alt = modifiers.contains(KeyModifiers::ALT);
 
     match (code, ctrl) {
-        (KeyCode::Enter, false) if shift || alt => Action::InsertNewline,
-        (KeyCode::Enter, false) => Action::Submit,
+        (KeyCode::Enter, ctrl) if ctrl || shift || alt => Action::InsertNewline,
+        (KeyCode::Enter, _) => Action::Submit,
         (KeyCode::Char('c'), true) => Action::Cancel,
         (KeyCode::Char('u'), true) => Action::ClearLine,
         (KeyCode::Char('w'), true) => Action::DeleteWordBackward,

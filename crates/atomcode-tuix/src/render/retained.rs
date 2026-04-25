@@ -419,7 +419,13 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 reverse: true,
             }
         } else {
-            self.style_for(Role::Muted)
+            // Use terminal default fg (Secondary) instead of Muted
+            // (SGR 90 / DarkGrey). Several iTerm2 dark presets render
+            // bright-black at near-zero contrast against the bg, which
+            // makes the entire menu list invisible. Visual hierarchy
+            // here comes from the ▸ arrow + reverse-video on the
+            // selected row, not from a colour-contrast distinction.
+            self.style_for(Role::Secondary)
         };
         push_str_cells(&mut row, &content, &style);
 
@@ -442,7 +448,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let pad = CellStyle::default();
         push_str_cells(&mut row, &" ".repeat(PAD_COL), &pad);
 
-        let muted = self.style_for(Role::Muted);
+        // Status row carries load-bearing info (model / cwd / token count)
+        // and live hints. Use terminal default fg, not Muted — bright-black
+        // (SGR 90) lands at sub-WCAG contrast on several iTerm2 dark presets.
+        let secondary = self.style_for(Role::Secondary);
         let error = self.style_for(Role::Error);
 
         let mut parts: Vec<String> = Vec::with_capacity(3);
@@ -463,23 +472,23 @@ impl<W: Write + Send> RetainedRenderer<W> {
             let hint_w = crate::width::display_width(&hint);
             let hint_style = match severity {
                 crate::render::HintSeverity::Warning => error,
-                crate::render::HintSeverity::Info => muted.clone(),
+                crate::render::HintSeverity::Info => secondary.clone(),
             };
             if hint_w + 1 < max {
                 let left_budget = max - hint_w - 1;
                 let left_truncated = crate::width::truncate_to_width(&left, left_budget);
                 let left_w = crate::width::display_width(&left_truncated);
                 let pad_w = max - left_w - hint_w;
-                push_str_cells(&mut row, &left_truncated, &muted);
+                push_str_cells(&mut row, &left_truncated, &secondary);
                 push_str_cells(&mut row, &" ".repeat(pad_w), &pad);
                 push_str_cells(&mut row, &hint, &hint_style);
             } else {
                 let truncated = crate::width::truncate_to_width(&left, max);
-                push_str_cells(&mut row, &truncated, &muted);
+                push_str_cells(&mut row, &truncated, &secondary);
             }
         } else {
             let truncated = crate::width::truncate_to_width(&left, max);
-            push_str_cells(&mut row, &truncated, &muted);
+            push_str_cells(&mut row, &truncated, &secondary);
         }
         row
     }
@@ -1298,14 +1307,18 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // Blank separator.
         rows.push(Vec::new());
 
-        // Hint rows.
-        let accent_dim = self.style_for(Role::AccentDim);
+        // Hint rows. The prose around the slash shortcuts is onboarding-
+        // critical text — first thing a new user reads. Use Secondary
+        // (default fg), not AccentDim → DarkGrey, which can render
+        // invisible against several iTerm2 dark presets. Slash shortcuts
+        // themselves stay accent_bold (cyan) for visual emphasis.
+        let hint_text = self.style_for(Role::Secondary);
         let accent_bold = self.style_bold(Role::Accent);
         rows.extend(self.build_wrapped_text_rows(
             &[
-                ("type something, or press  ", accent_dim.clone()),
+                ("type something, or press  ", hint_text.clone()),
                 ("/", accent_bold.clone()),
-                ("  to browse commands", accent_dim.clone()),
+                ("  to browse commands", hint_text.clone()),
             ],
             content_w,
         ));
@@ -1313,7 +1326,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         rows.extend(self.build_wrapped_text_rows(
             &[
                 ("/provider", accent_bold),
-                ("  to add a custom model", accent_dim),
+                ("  to add a custom model", hint_text),
             ],
             content_w,
         ));
@@ -1422,11 +1435,14 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 let mut row = Vec::new();
                 let pad = CellStyle::default();
                 push_str_cells(&mut row, &" ".repeat(PAD_COL), &pad);
-                let muted = self.style_for(Role::Muted);
+                // Border (cyan) instead of Muted — separator rule needs
+                // to remain visible on dark themes where SGR 90 collapses
+                // into the background.
+                let rule = self.style_for(Role::Border);
                 for _ in 0..left {
                     row.push(Cell {
                         ch: '─',
-                        style: muted.clone(),
+                        style: rule.clone(),
                         width: 1,
                     });
                 }
@@ -1436,7 +1452,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 for _ in 0..right {
                     row.push(Cell {
                         ch: '─',
-                        style: muted.clone(),
+                        style: rule.clone(),
                         width: 1,
                     });
                 }
@@ -1458,8 +1474,10 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
             }
             UiLine::TurnCancelled => {
                 self.flush_assistant_remainder();
-                let muted = self.style_for(Role::Muted);
-                self.push_body_text("(cancelled)", &muted);
+                // (cancelled) is a state-change marker — must remain
+                // visible. Default fg, not Muted.
+                let label = self.style_for(Role::Secondary);
+                self.push_body_text("(cancelled)", &label);
             }
 
             // ── body: tools & diffs ──
@@ -1488,7 +1506,12 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
             }
             UiLine::ToolResult { success, summary } => {
                 self.flush_assistant_remainder();
-                let muted = self.style_for(Role::Muted);
+                // Tool result is conversation content; success path used
+                // to render Muted (SGR 90) which becomes invisible on
+                // some iTerm2 dark presets. Use default fg for success;
+                // failure stays Error red so the success/failure split
+                // is still clear.
+                let ok_style = self.style_for(Role::Secondary);
                 let error = self.style_for(Role::Error);
                 let safe = scrub_controls(&summary);
                 let body_str = if success {
@@ -1496,16 +1519,17 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 } else {
                     format!("✗ {}", safe)
                 };
-                let body_style = if success { muted.clone() } else { error };
+                let body_style = if success { ok_style.clone() } else { error };
                 // Indent result rows 4 cols past the tool-call row at
                 // col 0: "    ⎿ " is 4 spaces + glyph + space, so ⎿
                 // lands at col 4. Width reserves PAD_COL for the right
                 // gutter + 6 for "    ⎿ ".
                 let row_w = (self.screen.width() as usize).saturating_sub(PAD_COL + 6);
+                let prefix_style = self.style_for(Role::Secondary);
                 for phys in body_str.split('\n') {
                     for chunk in crate::width::wrap_line_to_width(phys, row_w.max(1)) {
                         let mut row = Vec::new();
-                        push_str_cells(&mut row, "    ⎿ ", &muted);
+                        push_str_cells(&mut row, "    ⎿ ", &prefix_style);
                         push_str_cells(&mut row, &chunk, &body_style);
                         self.push_body_row(row);
                     }
@@ -1543,8 +1567,15 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 // The preceding ToolCall body row already shows
                 // `▸ name(detail)`, so this row is a pure action prompt
                 // with colour-chip key hints (legacy-tuix style).
+                //
+                // Header was Role::Warning (SGR 93 / yellow) — invisible
+                // on light themes (#fce94f-class pastels on white). It's
+                // semantically a blocking state ("must act before
+                // continuing"), so Error red + bold is more appropriate
+                // and reads on every theme. The ▶ glyph keeps it
+                // visually distinct from regular Error rows.
                 let _ = (tool, detail);
-                let warn = self.style_for(Role::Warning);
+                let warn = self.style_bold(Role::Error);
                 let plain = CellStyle::default();
                 let chip = |c: Color| CellStyle {
                     fg: Some(c),

@@ -1079,6 +1079,13 @@ AgentEvent::SubAgentProgress { file, status } => {
                     eprintln!("[sub-agent] {} {}", file, status);
                 }
             }
+            AgentEvent::BackgroundComplete { summary, files_edited, turns, success } => {
+                let status = if success { "ok" } else { "fail" };
+                eprintln!("[background {} turns={}] {}", status, turns, summary);
+                if verbose && !files_edited.is_empty() {
+                    eprintln!("[background files={}]", files_edited.join(","));
+                }
+            }
         }
     }
 

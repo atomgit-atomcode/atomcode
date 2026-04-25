@@ -6,6 +6,7 @@ pub mod config;
 pub mod conversation;
 pub mod ctx;
 pub mod graph;
+pub mod init;
 pub mod input_history;
 pub mod mcp;
 pub mod notify;

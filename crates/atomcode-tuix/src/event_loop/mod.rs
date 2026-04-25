@@ -1526,7 +1526,7 @@ fn handle_idle_key(
                 // Accept the highlighted command. Two shapes:
                 //   * arg-less commands (e.g. /help, /quit, /login) → execute
                 //     immediately on Enter, as before.
-                //   * commands that require an arg (e.g. /fixissue <url>) →
+                //   * commands that require an arg (e.g. /background <task>) →
                 //     auto-complete the name + trailing space and park the
                 //     cursor so the user types the arg next. A SECOND Enter
                 //     (once the arg is filled in) commits normally through
@@ -2320,6 +2320,31 @@ fn handle_agent_event(
             }
         }
         AgentEvent::SubAgentProgress { .. } => {}
+        AgentEvent::BackgroundComplete { summary, files_edited, turns, success } => {
+            let header = if success {
+                format!("  Background task complete ({} turn{}):\n", turns, if turns == 1 { "" } else { "s" })
+            } else {
+                format!("  Background task failed after {} turn{}:\n", turns, if turns == 1 { "" } else { "s" })
+            };
+            let mut body = String::from(&header);
+            body.push_str("  ");
+            body.push_str(&summary);
+            if !body.ends_with('\n') {
+                body.push('\n');
+            }
+            if !files_edited.is_empty() {
+                body.push_str("  Files edited:\n");
+                for f in &files_edited {
+                    body.push_str(&format!("    - {}\n", f));
+                }
+            }
+            if success {
+                renderer.render(UiLine::CommandOutput(body));
+            } else {
+                renderer.render(UiLine::Error(body));
+            }
+            renderer.flush();
+        }
     }
 }
 

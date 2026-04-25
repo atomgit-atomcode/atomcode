@@ -608,6 +608,30 @@ impl ToolRegistry {
     }
 }
 
+/// Defensive unwrap for a known model-output quirk: deepseek-v4-flash and
+/// some qwen variants occasionally wrap tool arguments in an extra
+/// `{"arguments": {...}}` envelope, even though the OpenAI tool-call
+/// protocol's `function.arguments` field is already supposed to carry the
+/// flat schema-shaped object directly. When that happens, every tool
+/// dispatch fails with `missing field 'X'` and the model loops on the same
+/// bad payload until our identical-args guard blocks it.
+///
+/// Returns `Some(unwrapped_json_string)` when `raw` is a single-key object
+/// `{"arguments": {object}}`, else `None`. No tool's legitimate schema uses
+/// `arguments` as a top-level field name, so the heuristic is safe.
+pub fn unwrap_doubly_nested_args(raw: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let map = value.as_object()?;
+    if map.len() != 1 {
+        return None;
+    }
+    let inner = map.get("arguments")?;
+    if !inner.is_object() {
+        return None;
+    }
+    serde_json::to_string(inner).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -917,5 +941,49 @@ mod tests {
         // Other tools are unaffected.
         let decision = store.check("create_file", &ApprovalRequirement::RequireApproval("write".into()));
         assert!(matches!(decision, PermissionDecision::Ask(_)));
+    }
+
+    #[test]
+    fn test_unwrap_doubly_nested_args_unwraps_wrapped_object() {
+        let raw = r#"{"arguments":{"file_path":"/tmp/x.rs"}}"#;
+        let unwrapped = unwrap_doubly_nested_args(raw).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&unwrapped).unwrap();
+        assert_eq!(parsed["file_path"], "/tmp/x.rs");
+    }
+
+    #[test]
+    fn test_unwrap_doubly_nested_args_passes_flat_object_through() {
+        // Already flat — must not unwrap.
+        let raw = r#"{"file_path":"/tmp/x.rs"}"#;
+        assert!(unwrap_doubly_nested_args(raw).is_none());
+    }
+
+    #[test]
+    fn test_unwrap_doubly_nested_args_ignores_other_single_keys() {
+        // A legitimate single-key object whose key happens to be something else.
+        let raw = r#"{"command":"ls -la"}"#;
+        assert!(unwrap_doubly_nested_args(raw).is_none());
+    }
+
+    #[test]
+    fn test_unwrap_doubly_nested_args_ignores_multi_key_with_arguments() {
+        // Multiple keys including 'arguments' — not the wrapper pattern,
+        // could be a legitimate tool that happens to have an 'arguments' field.
+        let raw = r#"{"arguments":{"x":1},"other":"y"}"#;
+        assert!(unwrap_doubly_nested_args(raw).is_none());
+    }
+
+    #[test]
+    fn test_unwrap_doubly_nested_args_ignores_string_arguments_value() {
+        // Only object-valued 'arguments' is unwrapped; string would be
+        // ambiguous (could be a legitimate field carrying free-form text).
+        let raw = r#"{"arguments":"some string"}"#;
+        assert!(unwrap_doubly_nested_args(raw).is_none());
+    }
+
+    #[test]
+    fn test_unwrap_doubly_nested_args_ignores_malformed_json() {
+        assert!(unwrap_doubly_nested_args("not json").is_none());
+        assert!(unwrap_doubly_nested_args("").is_none());
     }
 }

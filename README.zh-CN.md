@@ -234,6 +234,7 @@ atomcode --prompt-file task.md
 |-----|--------|
 | `Enter` | 发送消息 |
 | `Shift+Enter` | 换行 |
+| `Alt+Enter` / `Ctrl+Enter` | 换行 |
 | `Esc` | 清空输入 / 取消流式输出 |
 | `Up/Down` | 浏览输入历史 |
 | `Tab` | 接受补全 |
