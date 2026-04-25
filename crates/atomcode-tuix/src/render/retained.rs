@@ -319,6 +319,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             fg: role(self.caps, r),
             bold: false,
             reverse: false,
+            faint: false,
         }
     }
 
@@ -327,6 +328,22 @@ impl<W: Write + Send> RetainedRenderer<W> {
             fg: role(self.caps, r),
             bold: true,
             reverse: false,
+            faint: false,
+        }
+    }
+
+    /// Theme-aware muting via SGR 2 (faint). Renders the role's fg
+    /// at ~50% intensity so secondary text reads as "subordinate"
+    /// without picking a fixed gray that may collide with the user's
+    /// terminal palette. Pair with `Role::Secondary` (no fg) to dim
+    /// the terminal default fg — the canonical "muted hint" look that
+    /// adapts across light/dark themes.
+    fn style_faint(&self, r: Role) -> CellStyle {
+        CellStyle {
+            fg: role(self.caps, r),
+            bold: false,
+            reverse: false,
+            faint: true,
         }
     }
 
@@ -417,6 +434,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 fg: None,
                 bold: true,
                 reverse: true,
+                faint: false,
             }
         } else {
             // Use terminal default fg (Secondary) instead of Muted
@@ -449,9 +467,12 @@ impl<W: Write + Send> RetainedRenderer<W> {
         push_str_cells(&mut row, &" ".repeat(PAD_COL), &pad);
 
         // Status row carries load-bearing info (model / cwd / token count)
-        // and live hints. Use terminal default fg, not Muted — bright-black
-        // (SGR 90) lands at sub-WCAG contrast on several iTerm2 dark presets.
-        let secondary = self.style_for(Role::Secondary);
+        // and live hints. Use faint (SGR 2) over the terminal default fg:
+        // theme-aware muting that reads as subordinate without picking a
+        // fixed gray (DarkGrey collides with several iTerm2 light presets;
+        // unmuted default fg made the status row compete with primary
+        // body content on dark presets — see screenshot regression).
+        let secondary = self.style_faint(Role::Secondary);
         let error = self.style_for(Role::Error);
 
         let mut parts: Vec<String> = Vec::with_capacity(3);
@@ -1328,11 +1349,13 @@ impl<W: Write + Send> RetainedRenderer<W> {
         rows.push(Vec::new());
 
         // Hint rows. The prose around the slash shortcuts is onboarding-
-        // critical text — first thing a new user reads. Use Secondary
-        // (default fg), not AccentDim → DarkGrey, which can render
-        // invisible against several iTerm2 dark presets. Slash shortcuts
-        // themselves stay accent_bold (cyan) for visual emphasis.
-        let hint_text = self.style_for(Role::Secondary);
+        // critical text — first thing a new user reads. Use faint
+        // (SGR 2) over the terminal's default fg so the hint reads as
+        // subordinate to primary content without picking a fixed gray
+        // (DarkGrey would vanish on some iTerm2 light presets, default
+        // fg unmuted competes with the user's input on dark presets).
+        // Slash shortcuts stay accent_bold (cyan) for visual emphasis.
+        let hint_text = self.style_faint(Role::Secondary);
         let accent_bold = self.style_bold(Role::Accent);
         rows.extend(self.build_wrapped_text_rows(
             &[
@@ -1455,10 +1478,14 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 let mut row = Vec::new();
                 let pad = CellStyle::default();
                 push_str_cells(&mut row, &" ".repeat(PAD_COL), &pad);
-                // Border (cyan) instead of Muted — separator rule needs
-                // to remain visible on dark themes where SGR 90 collapses
-                // into the background.
-                let rule = self.style_for(Role::Border);
+                // Muted gray (SGR 90 / DarkGrey) for the per-turn rule
+                // and summary text. The input box border below uses full
+                // cyan; making this rule cyan too produced three
+                // identical bright-cyan rules in one viewport (see
+                // screenshot regression). Gray is the historically
+                // expected look — quiet historical separator that
+                // doesn't compete with the live input chrome.
+                let rule = self.style_for(Role::Muted);
                 for _ in 0..left {
                     row.push(Cell {
                         ch: '─',
@@ -1467,7 +1494,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                     });
                 }
                 push_str_cells(&mut row, " ", &pad);
-                push_str_cells(&mut row, &safe, &self.style_for(Role::Secondary));
+                push_str_cells(&mut row, &safe, &self.style_for(Role::Muted));
                 push_str_cells(&mut row, " ", &pad);
                 for _ in 0..right {
                     row.push(Cell {
@@ -1614,12 +1641,18 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 // and reads on every theme. The ▶ glyph keeps it
                 // visually distinct from regular Error rows.
                 let _ = (tool, detail);
-                let warn = self.style_bold(Role::Error);
+                // "Waiting for approval" is a pending action, not a
+                // failure — using Role::Error (red) made it read as a
+                // tool failure and collide with real Error rows nearby.
+                // Warning (yellow) restores the pending/attention-needed
+                // semantic and keeps red reserved for actual errors.
+                let warn = self.style_bold(Role::Warning);
                 let plain = CellStyle::default();
                 let chip = |c: Color| CellStyle {
                     fg: Some(c),
                     bold: true,
                     reverse: true,
+                    faint: false,
                 };
                 let chip_y = chip(Color::Green);
                 let chip_a = chip(Color::Cyan);
