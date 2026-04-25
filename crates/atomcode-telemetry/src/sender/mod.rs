@@ -39,8 +39,10 @@ impl SenderRuntime {
     pub async fn flush_one(&self) -> Result<Option<PathBuf>, SendError> {
         let (seg, dropped) = {
             let q = self.queue.lock().await;
-            let segs = q.segments_sorted().map_err(|_| SendError::Other)?;
-            (segs.first().cloned(), q.dropped)
+            (
+                q.claim_oldest_segment().map_err(|_| SendError::Other)?,
+                q.dropped,
+            )
         };
         let seg = match seg {
             Some(s) => s,
@@ -55,11 +57,25 @@ impl SenderRuntime {
         // Read segment size before deleting it.
         let bytes = std::fs::metadata(&seg).map(|m| m.len()).unwrap_or(0);
 
-        self.http.send_segment(&seg, dropped).await?;
+        match self.http.send_segment(&seg, dropped).await {
+            Ok(()) => {}
+            Err(SendError::BadRequest) => {
+                let q = self.queue.lock().await;
+                q.complete_claim(&seg).map_err(|_| SendError::Other)?;
+                return Err(SendError::BadRequest);
+            }
+            Err(e) => {
+                let q = self.queue.lock().await;
+                if let Err(restore_err) = q.restore_claim(&seg) {
+                    warn!(?restore_err, segment = %seg.display(), "telemetry segment restore failed");
+                }
+                return Err(e);
+            }
+        }
 
         {
             let q = self.queue.lock().await;
-            if let Err(e) = q.delete(&seg) {
+            if let Err(e) = q.complete_claim(&seg) {
                 warn!(?e, "delete segment failed");
             }
         }
@@ -112,14 +128,8 @@ impl SenderRuntime {
                     attempt = 0;
                 }
                 Err(SendError::BadRequest) => {
-                    // Corrupt segment — drop oldest + move on.
-                    warn!("telemetry 400 — dropping oldest segment");
-                    let q = self.queue.lock().await;
-                    if let Ok(segs) = q.segments_sorted() {
-                        if let Some(s) = segs.first() {
-                            let _ = q.delete(s);
-                        }
-                    }
+                    // Corrupt segment was already claimed and deleted by flush_one.
+                    warn!("telemetry 400 — dropped claimed segment");
                     attempt = 0;
                 }
                 Err(SendError::RateLimited(Some(d))) => {

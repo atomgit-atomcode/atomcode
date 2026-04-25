@@ -5,9 +5,13 @@ pub mod roll;
 use crate::event::Record;
 use anyhow::{Context, Result};
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufWriter, Write};
+use std::io::{BufWriter, ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
+
+const READY_EXT: &str = "ndjson";
+const PARTIAL_EXT: &str = "partial";
+const SENDING_MARKER: &str = ".sending-";
 
 pub struct Queue {
     dir: PathBuf,
@@ -18,13 +22,14 @@ pub struct Queue {
 
 pub struct Segment {
     pub path: PathBuf,
+    ready_path: PathBuf,
     writer: BufWriter<File>,
     events: u32,
     bytes: u64,
 }
 
 impl Segment {
-    fn new(path: PathBuf) -> Result<Self> {
+    fn new(path: PathBuf, ready_path: PathBuf) -> Result<Self> {
         let f = OpenOptions::new()
             .create_new(true)
             .append(true)
@@ -32,6 +37,7 @@ impl Segment {
             .with_context(|| format!("creating segment {}", path.display()))?;
         Ok(Self {
             path,
+            ready_path,
             writer: BufWriter::new(f),
             events: 0,
             bytes: 0,
@@ -51,6 +57,21 @@ impl Segment {
         self.writer.flush()?;
         self.writer.get_ref().sync_all()?;
         Ok(())
+    }
+
+    fn finish(mut self) -> Result<PathBuf> {
+        self.fsync()?;
+        let partial_path = self.path.clone();
+        let ready_path = self.ready_path.clone();
+        drop(self.writer);
+        fs::rename(&partial_path, &ready_path).with_context(|| {
+            format!(
+                "rolling segment {} -> {}",
+                partial_path.display(),
+                ready_path.display()
+            )
+        })?;
+        Ok(ready_path)
     }
 }
 
@@ -82,25 +103,79 @@ impl Queue {
     /// Force roll even if segment isn't full (used on tick flush).
     /// Returns `Ok(None)` if nothing to roll.
     pub fn force_roll(&mut self) -> Result<Option<PathBuf>> {
-        if let Some(mut seg) = self.current.take() {
+        if let Some(seg) = self.current.take() {
             if seg.events == 0 {
                 // empty: drop the file
+                let path = seg.path.clone();
                 drop(seg.writer);
-                let _ = fs::remove_file(&seg.path);
+                let _ = fs::remove_file(path);
                 return Ok(None);
             }
-            seg.fsync()?;
-            let p = seg.path.clone();
+            let p = seg.finish()?;
             self.enforce_cap()?;
             return Ok(Some(p));
         }
         Ok(None)
     }
 
+    /// Closed, immutable segments ready to be sent.
+    pub fn ready_segments_sorted(&self) -> Result<Vec<PathBuf>> {
+        self.segments_with_extension(READY_EXT)
+    }
+
     pub fn segments_sorted(&self) -> Result<Vec<PathBuf>> {
+        self.ready_segments_sorted()
+    }
+
+    pub fn claim_oldest_segment(&self) -> Result<Option<PathBuf>> {
+        for ready in self.ready_segments_sorted()? {
+            let Some(name) = ready.file_name().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let claimed = ready.with_file_name(format!(
+                "{}{}{}-{}",
+                name,
+                SENDING_MARKER,
+                std::process::id(),
+                Uuid::new_v4()
+            ));
+            match fs::rename(&ready, &claimed) {
+                Ok(()) => return Ok(Some(claimed)),
+                Err(e) if e.kind() == ErrorKind::NotFound => continue,
+                Err(e) => {
+                    return Err(e).with_context(|| {
+                        format!(
+                            "claiming segment {} -> {}",
+                            ready.display(),
+                            claimed.display()
+                        )
+                    });
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    pub fn complete_claim(&self, path: &Path) -> Result<()> {
+        self.delete(path)
+    }
+
+    pub fn restore_claim(&self, path: &Path) -> Result<Option<PathBuf>> {
+        if !path.exists() {
+            return Ok(None);
+        }
+        let Some(ready) = ready_path_for_claim(path) else {
+            return Ok(None);
+        };
+        fs::rename(path, &ready)
+            .with_context(|| format!("restoring claimed segment {}", path.display()))?;
+        Ok(Some(ready))
+    }
+
+    fn segments_with_extension(&self, ext: &str) -> Result<Vec<PathBuf>> {
         let mut v: Vec<PathBuf> = fs::read_dir(&self.dir)?
             .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("ndjson"))
+            .filter(|p| p.extension().and_then(|s| s.to_str()) == Some(ext))
             .collect();
         v.sort();
         Ok(v)
@@ -132,8 +207,10 @@ impl Queue {
 
     fn start_new_segment(&mut self) -> Result<()> {
         let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S");
-        let path = self.dir.join(format!("{}-{}.ndjson", ts, Uuid::new_v4()));
-        self.current = Some(Segment::new(path)?);
+        let id = Uuid::new_v4();
+        let path = self.dir.join(format!("{}-{}.{}", ts, id, PARTIAL_EXT));
+        let ready_path = self.dir.join(format!("{}-{}.{}", ts, id, READY_EXT));
+        self.current = Some(Segment::new(path, ready_path)?);
         Ok(())
     }
 
@@ -173,6 +250,13 @@ pub struct QueueStats {
     pub total_bytes: u64,
     pub total_events: u64,
     pub oldest: Option<PathBuf>,
+}
+
+fn ready_path_for_claim(path: &Path) -> Option<PathBuf> {
+    let name = path.file_name()?.to_str()?;
+    let marker_start = name.rfind(SENDING_MARKER)?;
+    let ready_name = &name[..marker_start];
+    Some(path.with_file_name(ready_name))
 }
 
 #[cfg(test)]
@@ -217,6 +301,24 @@ mod tests {
     }
 
     #[test]
+    fn active_partial_segment_is_not_ready() {
+        let d = TempDir::new().unwrap();
+        let mut q = Queue::open(d.path().to_path_buf()).unwrap();
+        q.append(&rec()).unwrap();
+
+        assert!(
+            q.ready_segments_sorted().unwrap().is_empty(),
+            "active .partial segment must not be visible to senders"
+        );
+        let partials: Vec<_> = fs::read_dir(d.path())
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().and_then(|s| s.to_str()) == Some(PARTIAL_EXT))
+            .collect();
+        assert_eq!(partials.len(), 1);
+    }
+
+    #[test]
     fn force_roll_empty_is_noop() {
         let d = TempDir::new().unwrap();
         let mut q = Queue::open(d.path().to_path_buf()).unwrap();
@@ -230,9 +332,46 @@ mod tests {
         q.append(&rec()).unwrap();
         let p = q.force_roll().unwrap().unwrap();
         assert!(p.exists(), "rolled segment should remain");
+        assert_eq!(p.extension().and_then(|s| s.to_str()), Some(READY_EXT));
+        let c = fs::read_to_string(&p).unwrap();
+        assert!(
+            c.contains(r#""event_id":"open_atomcode""#),
+            "rolled segment should contain appended event"
+        );
         assert!(
             q.force_roll().unwrap().is_none(),
             "no current segment after roll"
         );
+    }
+
+    #[test]
+    fn claim_oldest_segment_is_exclusive() {
+        let d = TempDir::new().unwrap();
+        let mut q1 = Queue::open(d.path().to_path_buf()).unwrap();
+        q1.append(&rec()).unwrap();
+        q1.force_roll().unwrap();
+
+        let q2 = Queue::open(d.path().to_path_buf()).unwrap();
+        let claimed = q1.claim_oldest_segment().unwrap();
+        assert!(claimed.is_some(), "first claimant should get the segment");
+        assert!(
+            q2.claim_oldest_segment().unwrap().is_none(),
+            "second claimant should not see the claimed segment"
+        );
+    }
+
+    #[test]
+    fn restore_claim_makes_segment_ready_again() {
+        let d = TempDir::new().unwrap();
+        let mut q = Queue::open(d.path().to_path_buf()).unwrap();
+        q.append(&rec()).unwrap();
+        q.force_roll().unwrap();
+
+        let claimed = q.claim_oldest_segment().unwrap().unwrap();
+        assert!(q.ready_segments_sorted().unwrap().is_empty());
+
+        let restored = q.restore_claim(&claimed).unwrap().unwrap();
+        assert!(restored.exists());
+        assert_eq!(q.ready_segments_sorted().unwrap(), vec![restored]);
     }
 }

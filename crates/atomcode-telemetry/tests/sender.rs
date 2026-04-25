@@ -85,6 +85,42 @@ async fn sender_drops_segment_on_400() {
     assert!(q.lock().await.segments_sorted().unwrap().is_empty());
 }
 
+#[tokio::test]
+async fn only_one_sender_can_claim_a_ready_segment() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/events"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let d = TempDir::new().unwrap();
+    let mut q = Queue::open(d.path().to_path_buf()).unwrap();
+    q.append(&rec()).unwrap();
+    q.force_roll().unwrap();
+
+    let q1 = Arc::new(Mutex::new(Queue::open(d.path().to_path_buf()).unwrap()));
+    let q2 = Arc::new(Mutex::new(Queue::open(d.path().to_path_buf()).unwrap()));
+    let counters1 = Arc::new(atomcode_telemetry::Counters::default());
+    let counters2 = Arc::new(atomcode_telemetry::Counters::default());
+    let rt1 = SenderRuntime::new(
+        q1,
+        HttpSender::new(format!("{}/v1/events", server.uri()), "test".into()),
+        counters1,
+        d.path().join("health-1.json"),
+    );
+    let rt2 = SenderRuntime::new(
+        q2,
+        HttpSender::new(format!("{}/v1/events", server.uri()), "test".into()),
+        counters2,
+        d.path().join("health-2.json"),
+    );
+
+    assert!(rt1.flush_one().await.unwrap().is_some());
+    assert!(rt2.flush_one().await.unwrap().is_none());
+}
+
 use atomcode_telemetry::config::{ResolvedConfig, TelemetryState};
 use atomcode_telemetry::Telemetry;
 

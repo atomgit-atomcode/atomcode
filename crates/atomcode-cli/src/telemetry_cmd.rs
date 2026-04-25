@@ -115,7 +115,7 @@ pub fn dump(atomcode_dir: &std::path::Path, last: usize, pretty: bool) -> Result
         return Ok(());
     }
     let q = Queue::open(qdir)?;
-    let segs = q.segments_sorted()?;
+    let segs = q.ready_segments_sorted()?;
     let mut all_lines: Vec<String> = Vec::new();
     for p in segs {
         let c = std::fs::read_to_string(&p)?;
