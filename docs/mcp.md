@@ -11,18 +11,19 @@
 - **配置**：项目根 `.mcp.json` 与用户目录 `~/.atomcode/mcp.json`；顶层键 **`mcpServers`**（与 Cursor 等一致）；旧键 `servers` 仍可解析；同名 server **项目覆盖用户**；支持 `disabled`；字符串中 `${VAR}`、`${VAR:-default}` 展开。
 - **传输**：`stdio`（`command` + `args` + `env`）、`HTTP`（`url` + `headers`）；默认超时 30s，可用 `timeout_ms` 覆盖。HTTP 请求在未自定义 `Accept` 时默认带 `Accept: application/json, text/event-stream`（与 Playwright 等要求 Streamable HTTP / SSE 协商的端点一致）。**stdio 消息格式**与 MCP 规范一致：每条 JSON-RPC 为 **一行 NDJSON**（末尾换行）；仍兼容读取旧式 **`Content-Length:` + 正文** 的服务端响应。
 - **协议**：JSON-RPC；`initialize`、`tools/list`、`tools/call`；`initialize` 结果里解析 `capabilities`（当前仅用到 tools 能力标记）。
+- **兼容性细节**：当某个请求不需要参数时，客户端会**省略** `params` 字段（不会发送 `"params": null`），避免部分 JS SDK 服务端在收到 `null` 时卡住（例如 `tools/list`）。
 - **工具注册**：每个远端 tool 映射为 `mcp__{server_key}__{tool_name}`，经 `McpToolAdapter` 注册到 `ToolRegistry`。
 - **权限**：MCP 适配器对每次调用返回 `RequireApproval`（说明里带 server / tool / 参数摘要），走现有交互式审批；`PermissionStore` 的 session grant / override 按键为 **完整工具名** `mcp__...`（与内建工具相同），**不是** `mcp:server:tool` 形式。
 - **无头模式**（`-p` / `--prompt-file` / `fixissue`）：启动时 **`McpRegistry::from_config` 同步连接**所有 server，连接成功后再 `list_tools` 并一次性注册 MCP 工具。
 - **TUI 模式**：**后台并行连接**（`from_config_background_with_events`），不阻塞进入界面；连接成功或失败通过 `McpConnectEvent` 写入会话区；**每连上一个 server 就 `register_mcp_tools_async` 动态追加**该 server 的工具。
-- **`/mcp`**：列出当前 registry 中 **已成功 `initialize` 并入表** 的 server 及其 `ServerStatus`（见下节限制）；`/mcp reload` 重新加载 `.mcp.json` / `~/.atomcode/mcp.json` 并后台重连。
+- **`/mcp`**：列出当前 registry 中 **已成功 `initialize` 并入表** 的 server 及其 `ServerStatus`（见下节限制）；`/mcp reload` 重新加载 `.mcp.json` / `~/.atomcode/mcp.json` 并后台重连；`/mcp tools <server>` 异步列出该 server 的远端 tools（若超时/失败会提示）。
 
 ### 1.2 未实现 / 限制（与代码一致）
 
 - **Resources / Prompts**：无 `list_mcp_resources`、`read_mcp_resource`，无 MCP prompt → slash command。
 - **HTTP 自动重连**：无指数退避；stdio 子进程无自动重启。
 - **`tools/list` 变更**：无 `list_changed` 动态刷新。
-- **`/mcp` 展示**：失败或未连上的 server **不会**出现在列表中（失败仅通过启动时的会话行 `✗ MCP server '…' failed: …` 可见）；正在连接中的 server 在连上之前也不会出现在 `/mcp` 列表中。
+- **`/mcp` 展示**：registry 里**只保存连接成功**（`initialize` 成功）的 server，因此 `/mcp` 只会展示**已连接**的 server；失败/未连上/正在连接的 server **不会**出现在列表中（失败仅通过会话行 `✗ MCP server '…' failed: …` 可见）。
 - **工具结果内容**：`call_tool` 仅将 **text** 类型 content 块拼接为字符串；image/resource 块当前不参与输出。
 - **OAuth / roots / elicitation**、daemon 侧 MCP API、插件捆绑 server：未实现。
 

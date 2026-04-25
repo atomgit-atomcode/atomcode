@@ -1007,9 +1007,23 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<(
                         renderer.render(UiLine::Error(format!("✗ MCP server '{}' failed: {}", name, error)));
                     }
                     McpConnectEvent::Warning { name, message } => {
-                        // Don't pollute the chat scrollback with MCP startup/runtime noise.
-                        // Route to the opt-in tuix trace log instead (safe for raw-mode TUI).
-                        crate::tuix_trace!("MCP", "server='{}' warning: {}", name, message);
+                        // Default: keep MCP startup/runtime noise out of scrollback.
+                        //
+                        // Exception: `/mcp tools <server>` uses Warning events to return the tool list
+                        // (and related timeouts) from a background task. Those should be user-visible.
+                        if message.starts_with("tools:\n")
+                            || message.contains("tools/list timed out")
+                            || message.contains("tools/list failed")
+                        {
+                            renderer.render(UiLine::CommandOutput(format!(
+                                "  [mcp:{}] {}\n",
+                                name,
+                                message.trim_end()
+                            )));
+                        } else {
+                            // Route to the opt-in tuix trace log instead (safe for raw-mode TUI).
+                            crate::tuix_trace!("MCP", "server='{}' warning: {}", name, message);
+                        }
                     }
                 }
 
@@ -1193,9 +1207,23 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<(
                         renderer.render(UiLine::Error(format!("✗ MCP server '{}' failed: {}", name, error)));
                     }
                     McpConnectEvent::Warning { name, message } => {
-                        // Don't pollute the chat scrollback with MCP startup/runtime noise.
-                        // Route to the opt-in tuix trace log instead (safe for raw-mode TUI).
-                        crate::tuix_trace!("MCP", "server='{}' warning: {}", name, message);
+                        // Default: keep MCP startup/runtime noise out of scrollback.
+                        //
+                        // Exception: `/mcp tools <server>` uses Warning events to return the tool list
+                        // (and related timeouts) from a background task. Those should be user-visible.
+                        if message.starts_with("tools:\n")
+                            || message.contains("tools/list timed out")
+                            || message.contains("tools/list failed")
+                        {
+                            renderer.render(UiLine::CommandOutput(format!(
+                                "  [mcp:{}] {}\n",
+                                name,
+                                message.trim_end()
+                            )));
+                        } else {
+                            // Route to the opt-in tuix trace log instead (safe for raw-mode TUI).
+                            crate::tuix_trace!("MCP", "server='{}' warning: {}", name, message);
+                        }
                     }
                 }
 
