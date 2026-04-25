@@ -174,7 +174,22 @@ pub async fn run(
     // TTY → retained-mode Ink-style cell-diff renderer.
     // Non-TTY (pipe, CI, dumb terminal) → PlainRenderer, which
     // just writes plain text without ANSI cursor positioning.
-    let inner: Box<dyn Renderer> = if caps.tty {
+    //
+    // `ATOMCODE_PLAIN=1` (or any non-empty value) forces PlainRenderer
+    // even on a TTY — escape hatch for terminals where the retained
+    // path's DECSTBM scroll region / cursor positioning misbehaves
+    // (notably reported on legacy Windows conhost: the fixed footer
+    // scrolls off-screen, content appears duplicated, viewport drifts
+    // upward on each redraw). PlainRenderer does no cursor positioning
+    // and no scroll-region tricks, so it works on any terminal that
+    // can print bytes — at the cost of losing the pinned input box,
+    // live spinner, and slash-menu palette. All commands and agent
+    // functionality are unchanged.
+    let force_plain = std::env::var("ATOMCODE_PLAIN")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .is_some();
+    let inner: Box<dyn Renderer> = if caps.tty && !force_plain {
         Box::new(RetainedRenderer::new(caps))
     } else {
         Box::new(PlainRenderer::new())

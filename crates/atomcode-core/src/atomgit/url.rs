@@ -69,7 +69,8 @@ pub fn parse_repo_url(url: &str) -> Option<RepoRef> {
 
     // SSH shorthand: `git@host:owner/repo.git`
     if let Some(rest) = trimmed.strip_prefix("git@") {
-        let (host, path) = rest.split_once(':')?;
+        let (host_with_port, path) = rest.split_once(':')?;
+        let host = strip_port(host_with_port);
         if !is_atomgit_host(host) {
             return None;
         }
@@ -82,17 +83,40 @@ pub fn parse_repo_url(url: &str) -> Option<RepoRef> {
     } else if let Some(rest) = trimmed.strip_prefix("http://") {
         rest
     } else if let Some(rest) = trimmed.strip_prefix("ssh://") {
-        // Drop optional `git@` userinfo.
-        rest.strip_prefix("git@").unwrap_or(rest)
+        rest
     } else {
         return None;
     };
 
-    let (host, path) = without_scheme.split_once('/')?;
+    // Strip optional userinfo (`user[:password]@`). Git for Windows
+    // credential helpers rewrite origin to embed the OAuth token, e.g.
+    // `https://oauth2:TOKEN@atomgit.com/owner/repo.git`; without this,
+    // the host check sees `oauth2:TOKEN@atomgit.com` and /issue /
+    // /fixissue both fail with "needs cwd to be a clone of an
+    // atomgit.com repo" even though the underlying repo IS atomgit.
+    // Same path also handles ssh://git@host/... (the leading `git@`
+    // is just userinfo here, no need for a separate strip).
+    //
+    // The `userinfo.contains('/')` guard ensures we only strip when
+    // the `@` appears in authority — a defensive parse for the rare
+    // case of `@` inside a path segment.
+    let after_userinfo = match without_scheme.split_once('@') {
+        Some((userinfo, rest)) if !userinfo.contains('/') => rest,
+        _ => without_scheme,
+    };
+
+    let (host_with_port, path) = after_userinfo.split_once('/')?;
+    let host = strip_port(host_with_port);
     if !is_atomgit_host(host) {
         return None;
     }
     split_owner_repo(path)
+}
+
+/// Strip an optional `:port` suffix from an authority component.
+/// `atomgit.com:443` → `atomgit.com`; `atomgit.com` → `atomgit.com`.
+fn strip_port(host: &str) -> &str {
+    host.split_once(':').map(|(h, _)| h).unwrap_or(host)
 }
 
 fn split_owner_repo(path: &str) -> Option<RepoRef> {
@@ -263,6 +287,58 @@ mod tests {
     fn parse_repo_url_rejects_non_atomgit() {
         assert!(parse_repo_url("https://github.com/foo/bar.git").is_none());
         assert!(parse_repo_url("git@github.com:foo/bar.git").is_none());
+    }
+
+    #[test]
+    fn parse_repo_url_strips_oauth_userinfo() {
+        // Git for Windows credential helper rewrites origin URLs to
+        // include the OAuth token in the userinfo segment after the
+        // user runs `git push` once. Before the fix, /issue / /fixissue
+        // both failed with "needs cwd to be a clone of an atomgit.com
+        // repo" because the host check saw `oauth2:TOKEN@atomgit.com`.
+        let r = parse_repo_url("https://oauth2:abc123token@atomgit.com/owner/repo.git").unwrap();
+        assert_eq!(r.owner, "owner");
+        assert_eq!(r.repo, "repo");
+    }
+
+    #[test]
+    fn parse_repo_url_strips_basic_auth_userinfo() {
+        // `https://user:password@host/...` — basic auth, also rewritten
+        // by some helpers. Same fix should cover it.
+        let r = parse_repo_url("https://user:password@atomgit.com/owner/repo.git").unwrap();
+        assert_eq!(r.owner, "owner");
+        assert_eq!(r.repo, "repo");
+    }
+
+    #[test]
+    fn parse_repo_url_strips_user_only_userinfo() {
+        // `https://user@host/...` — username with no password.
+        let r = parse_repo_url("https://alice@gitcode.com/atomgit_atomcode/atomcode").unwrap();
+        assert_eq!(r.owner, "atomgit_atomcode");
+        assert_eq!(r.repo, "atomcode");
+    }
+
+    #[test]
+    fn parse_repo_url_strips_host_port() {
+        // `https://atomgit.com:443/...` — explicit port, legal but rare.
+        let r = parse_repo_url("https://atomgit.com:443/owner/repo.git").unwrap();
+        assert_eq!(r.owner, "owner");
+        assert_eq!(r.repo, "repo");
+    }
+
+    #[test]
+    fn parse_repo_url_ssh_with_port() {
+        // `ssh://git@atomgit.com:22/...`.
+        let r = parse_repo_url("ssh://git@atomgit.com:22/owner/repo.git").unwrap();
+        assert_eq!(r.owner, "owner");
+        assert_eq!(r.repo, "repo");
+    }
+
+    #[test]
+    fn parse_repo_url_oauth_token_does_not_match_non_atomgit() {
+        // Defensive: an oauth-rewritten URL pointing at github.com is
+        // still not atomgit. The fix must not introduce a false positive.
+        assert!(parse_repo_url("https://oauth2:TOKEN@github.com/foo/bar.git").is_none());
     }
 
     #[test]

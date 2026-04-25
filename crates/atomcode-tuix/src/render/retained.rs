@@ -271,6 +271,13 @@ pub struct RetainedRenderer<W: Write + Send> {
     /// the row (flag flips to false) so the last animation frame
     /// stays frozen as a historical paragraph header.
     live_spinner_active: bool,
+
+    /// Whether the terminal cursor is currently hidden (DECTCEM off).
+    /// We hide it while a live spinner is animating in the body so the
+    /// blinking cursor doesn't sit at the end of "Pondering… · 5s".
+    /// Toggled exactly twice per turn — on entering streaming and on
+    /// returning to idle — so escape sequences don't pile up.
+    cursor_hidden: bool,
 }
 
 impl RetainedRenderer<BufWriter<Stdout>> {
@@ -300,6 +307,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             welcome_banner: None,
             welcome_line_count: 0,
             live_spinner_active: false,
+            cursor_hidden: false,
         }
     }
 
@@ -911,6 +919,13 @@ impl<W: Write + Send> RetainedRenderer<W> {
             return false;
         }
         self.live_spinner_active = false;
+        // Counterpart to the hide in push_or_update_live_spinner —
+        // restore the cursor as we leave streaming. paint_footer will
+        // re-park it in the input box on the next frame.
+        if self.cursor_hidden {
+            let _ = self.out.write_all(b"\x1b[?25h");
+            self.cursor_hidden = false;
+        }
         self.body_lines.pop();
         self.ensure_scroll_region();
         let bottom = self.body_bottom_row();
@@ -981,6 +996,16 @@ impl<W: Write + Send> RetainedRenderer<W> {
             // branch above.
             self.push_body_row(row_cells);
             self.live_spinner_active = true;
+        }
+        // Hide the terminal cursor for the duration of the spinner.
+        // Without this, the cursor sits at the end of the spinner row
+        // (where push_or_update_live_spinner just wrote) and blinks
+        // there because flush() doesn't repaint the footer (which is
+        // what would otherwise re-park the cursor in the input box).
+        // Restored on clear_live_spinner / shutdown.
+        if !self.cursor_hidden {
+            let _ = self.out.write_all(b"\x1b[?25l");
+            self.cursor_hidden = true;
         }
     }
 
@@ -1673,7 +1698,11 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         // `reset()` / `on_resize()` — iTerm2 3.5+ ignores ED under
         // certain states (see `reset()` rationale). EL is row-local
         // and unambiguous. Scrollback is preserved either way.
-        let _ = self.out.write_all(b"\x1b[?7h\x1b[r");
+        //
+        // Also force-restore cursor visibility — if we exit while a
+        // spinner is hidden (e.g. SIGINT mid-turn), DECTCEM off would
+        // persist into the parent shell and break their prompt cursor.
+        let _ = self.out.write_all(b"\x1b[?25h\x1b[?7h\x1b[r");
         let h = self.screen.height() as usize;
         let mut seq = String::with_capacity(h * 8 + 8);
         for row in 1..=h {
