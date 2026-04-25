@@ -1526,31 +1526,50 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
             }
             UiLine::ToolResult { success, summary } => {
                 self.flush_assistant_remainder();
-                // Tool result is conversation content; success path used
-                // to render Muted (SGR 90) which becomes invisible on
-                // some iTerm2 dark presets. Use default fg for success;
-                // failure stays Error red so the success/failure split
-                // is still clear.
+                // Style policy:
+                //   * success body — default fg everywhere (Secondary)
+                //   * failure header line — bold red (Error) so the
+                //     "✗ ..." stays unmistakable
+                //   * failure continuation lines — default fg, NOT red
+                //
+                // Why split the failure case: when an edit_file error
+                // includes quoted code (e.g. "Partial match at lines
+                // 760-779" + the actual file lines), painting the whole
+                // block red made it visually identical to a Diff block
+                // (also red, also indented), and users couldn't tell
+                // "code change" from "error message" at a glance. The
+                // bold-red header keeps the urgency signal; the body
+                // reverts to default fg so the quoted code reads like
+                // normal terminal output.
                 let ok_style = self.style_for(Role::Secondary);
-                let error = self.style_for(Role::Error);
+                let error_header = self.style_bold(Role::Error);
                 let safe = scrub_controls(&summary);
                 let body_str = if success {
                     safe
                 } else {
                     format!("✗ {}", safe)
                 };
-                let body_style = if success { ok_style.clone() } else { error };
                 // Indent result rows 4 cols past the tool-call row at
                 // col 0: "    ⎿ " is 4 spaces + glyph + space, so ⎿
                 // lands at col 4. Width reserves PAD_COL for the right
                 // gutter + 6 for "    ⎿ ".
                 let row_w = (self.screen.width() as usize).saturating_sub(PAD_COL + 6);
                 let prefix_style = self.style_for(Role::Secondary);
-                for phys in body_str.split('\n') {
+                for (line_idx, phys) in body_str.split('\n').enumerate() {
+                    // First physical line of a failure body is the
+                    // header. Wrapped continuation chunks of that same
+                    // physical line stay header-styled (a long error
+                    // message like "✗ no rows matched: ...stuff..."
+                    // shouldn't fade to default mid-sentence).
+                    let line_style = if !success && line_idx == 0 {
+                        &error_header
+                    } else {
+                        &ok_style
+                    };
                     for chunk in crate::width::wrap_line_to_width(phys, row_w.max(1)) {
                         let mut row = Vec::new();
                         push_str_cells(&mut row, "    ⎿ ", &prefix_style);
-                        push_str_cells(&mut row, &chunk, &body_style);
+                        push_str_cells(&mut row, &chunk, line_style);
                         self.push_body_row(row);
                     }
                 }
@@ -3225,6 +3244,65 @@ mod tests {
                 vterm.cell_at(row_idx, c).ch,
             );
         }
+    }
+
+    /// Failure ToolResult: header line is bold red (so users still get
+    /// the "this is bad" signal) but continuation lines fall back to
+    /// default fg (so quoted code in error messages — common with
+    /// edit_file's "old_string not found" path — doesn't blend visually
+    /// with diff-remove blocks. See retained.rs UiLine::ToolResult arm.
+    #[test]
+    fn retained_tool_result_failure_header_red_body_default() {
+        let (mut r, buf) = new_capturing(120, 24);
+        let mut vterm = crate::test_term::VirtualTerminal::new(120, 24);
+        let status = status_basic();
+        // Multi-line failure body: header + quoted-code detail.
+        r.render(UiLine::ToolResult {
+            success: false,
+            summary: "old_string not found in foo.rs\n759| line content\n760| more code".into(),
+        });
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // Header row: contains the ✗ glyph, cells must be bold + red.
+        let header_idx = (0..vterm.height() as usize)
+            .find(|&i| vterm.row_text(i).contains("✗") && vterm.row_text(i).contains("not found"))
+            .unwrap_or_else(|| panic!("header row missing\ndump:\n{}", vterm.dump()));
+        let header_text = vterm.row_text(header_idx);
+        let glyph_col = header_text.find('✗').unwrap();
+        let header_cell = vterm.cell_at(header_idx, glyph_col);
+        assert_eq!(
+            header_cell.fg,
+            Some(crossterm::style::Color::Red),
+            "header `✗` must be red, got {:?}",
+            header_cell,
+        );
+        assert!(
+            header_cell.bold,
+            "header `✗` must be bold, got {:?}",
+            header_cell,
+        );
+
+        // Continuation row: contains the quoted code "759|"; must NOT
+        // be red (so it stops looking like a diff-remove block).
+        let cont_idx = (0..vterm.height() as usize)
+            .find(|&i| vterm.row_text(i).contains("759|"))
+            .unwrap_or_else(|| panic!("continuation row missing\ndump:\n{}", vterm.dump()));
+        let cont_text = vterm.row_text(cont_idx);
+        let digit_col = cont_text.find("759|").unwrap();
+        let cont_cell = vterm.cell_at(cont_idx, digit_col);
+        assert_ne!(
+            cont_cell.fg,
+            Some(crossterm::style::Color::Red),
+            "continuation row must NOT be red (would alias visually with diff-remove): {:?}",
+            cont_cell,
+        );
     }
 
     /// DiffBlock: multiple added/removed lines, each with its own
