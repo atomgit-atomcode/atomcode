@@ -357,10 +357,20 @@ async fn run_sender(
                     if let Err(e) = q.append(&r) { warn!(?e, "telemetry append failed"); }
                 }
                 { let mut q = queue.lock().await; let _ = q.force_roll(); }
-                // One send attempt only — caller (Telemetry::shutdown) caps the
-                // total time; backoff loop would defeat the budget.
-                if let Err(e) = rt.flush_one().await {
-                    warn!(?e, "telemetry shutdown flush failed; segment retained");
+                // Drain ALL pending segments (oldest first). flush_one only
+                // dispatches the oldest, so a single call would skip the just-
+                // rolled current segment whenever historical segments are
+                // present. No backoff: caller (Telemetry::shutdown) bounds
+                // total time via tokio::time::timeout on the JoinHandle.
+                loop {
+                    match rt.flush_one().await {
+                        Ok(None) => break,
+                        Ok(Some(_)) => continue,
+                        Err(e) => {
+                            warn!(?e, "telemetry shutdown flush failed; remaining segments retained");
+                            break;
+                        }
+                    }
                 }
                 break;
             }
