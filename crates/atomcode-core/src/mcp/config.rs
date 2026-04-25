@@ -126,12 +126,12 @@ fn load_config_file(path: &Path, _source: McpConfigSource) -> Result<Vec<McpServ
 fn server_entry_to_config(name: &str, entry: McpServerEntry) -> Result<McpServerConfig> {
     let transport = if let Some(command) = entry.command {
         McpTransportConfig::Stdio {
-            command: expand_env_vars(&command),
+            command: expand_tilde(&expand_env_vars(&command)),
             args: entry
                 .args
                 .unwrap_or_default()
                 .into_iter()
-                .map(|a| expand_env_vars(&a))
+                .map(|a| expand_tilde(&expand_env_vars(&a)))
                 .collect(),
             env: entry
                 .env
@@ -143,7 +143,7 @@ fn server_entry_to_config(name: &str, entry: McpServerEntry) -> Result<McpServer
         }
     } else if let Some(url) = entry.url {
         McpTransportConfig::Http {
-            url: expand_env_vars(&url),
+            url: expand_tilde(&expand_env_vars(&url)),
             headers: entry
                 .headers
                 .unwrap_or_default()
@@ -288,6 +288,26 @@ fn expand_env_vars(s: &str) -> String {
     result
 }
 
+/// Expand a leading `~` (home) in a string.
+///
+/// - `~/path` → `$HOME/path`
+/// - `~` → `$HOME`
+/// - Other forms (e.g. `~user/...`) are left unchanged.
+fn expand_tilde(s: &str) -> String {
+    if s == "~" {
+        return dirs::home_dir()
+            .map(|h| h.to_string_lossy().to_string())
+            .unwrap_or_else(|| s.to_string());
+    }
+    let Some(rest) = s.strip_prefix("~/") else {
+        return s.to_string();
+    };
+    let Some(home) = dirs::home_dir() else {
+        return s.to_string();
+    };
+    home.join(rest).to_string_lossy().to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -327,6 +347,31 @@ mod tests {
         std::env::set_var("VAR2", "b");
         let result = expand_env_vars("prefix_${VAR1}_middle_${VAR2}_suffix");
         assert_eq!(result, "prefix_a_middle_b_suffix");
+    }
+
+    #[test]
+    fn test_expand_tilde_home_only() {
+        let Some(home) = dirs::home_dir() else {
+            return;
+        };
+        assert_eq!(expand_tilde("~"), home.to_string_lossy());
+    }
+
+    #[test]
+    fn test_expand_tilde_home_prefix() {
+        let Some(home) = dirs::home_dir() else {
+            return;
+        };
+        assert_eq!(
+            expand_tilde("~/x/y"),
+            home.join("x/y").to_string_lossy().to_string()
+        );
+    }
+
+    #[test]
+    fn test_expand_tilde_does_not_expand_other_forms() {
+        assert_eq!(expand_tilde("~someone/x"), "~someone/x");
+        assert_eq!(expand_tilde("/abs/path"), "/abs/path");
     }
 
     #[test]
