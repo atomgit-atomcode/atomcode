@@ -212,10 +212,12 @@ pub fn flush_aligned_table_with_width(
         }
     }
 
-    // Cyan (SGR 96) instead of bright-black (SGR 90) — matches
-    // theme::Palette::BORDER. Table borders are structural; if they
-    // collapse into the bg the column boundaries become unreadable.
-    let border_on = if caps.colors { "\x1b[96m" } else { "" };
+    // Bright-black / DarkGrey (SGR 90) — table borders are chrome,
+    // not content. Cyan (SGR 96) made them collide with the input
+    // box separator and the inline-code colour, collapsing the
+    // visual hierarchy. Gray reads as quiet structure and lets
+    // header text + cell content carry the visual weight.
+    let border_on = if caps.colors { "\x1b[90m" } else { "" };
     let border_off = if caps.colors { "\x1b[39m" } else { "" };
 
     // Draw a horizontal rule row with given connector characters.

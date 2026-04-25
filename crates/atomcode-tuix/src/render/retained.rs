@@ -1553,24 +1553,45 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
             }
             UiLine::ToolResult { success, summary } => {
                 self.flush_assistant_remainder();
-                // Style policy:
-                //   * success body — default fg everywhere (Secondary)
-                //   * failure header line — bold red (Error) so the
-                //     "✗ ..." stays unmistakable
-                //   * failure continuation lines — default fg, NOT red
+                // Style policy (header line of a failure body):
+                //   * `Error: ...` — bold red. Tool-dispatch failures
+                //     (bad JSON args, unknown tool name, etc.) are real
+                //     bugs that need attention.
+                //   * `[elapsed: ...exit: N...]` — bold yellow. Bash
+                //     exit-code failures are frequently recovered by
+                //     the agent on the next turn (e.g. `git push`
+                //     rejected → next turn `git pull --rebase &&
+                //     git push`). Painting them red made transient
+                //     hiccups visually identical to real failures.
+                // Continuation lines (and success bodies) — default fg.
                 //
-                // Why split the failure case: when an edit_file error
-                // includes quoted code (e.g. "Partial match at lines
-                // 760-779" + the actual file lines), painting the whole
-                // block red made it visually identical to a Diff block
-                // (also red, also indented), and users couldn't tell
-                // "code change" from "error message" at a glance. The
-                // bold-red header keeps the urgency signal; the body
-                // reverts to default fg so the quoted code reads like
-                // normal terminal output.
-                let ok_style = self.style_for(Role::Secondary);
+                // Why split header vs continuation: when an edit_file
+                // error includes quoted code (e.g. "Partial match at
+                // lines 760-779" + actual file lines), painting the
+                // whole block red made it visually identical to a Diff
+                // block. Header keeps the urgency signal; body reverts
+                // to default fg so quoted code reads like normal output.
+                // Three style buckets:
+                //   * summary_style — line 0 of a success body, e.g.
+                //     `⎿ [elapsed: 0.0s, exit: 0] (4 lines)`. Muted gray
+                //     because it's per-call metadata, visually
+                //     subordinate to assistant text and tool-call
+                //     headers above.
+                //   * continuation_style — line ≥ 1 of any body and any
+                //     line of multi-line success output. Default fg so
+                //     quoted code (edit_file errors) and stderr (bash
+                //     failure body) stay readable.
+                //   * error_header / warn_header — line 0 of a failure
+                //     body, see B-discriminated logic below.
+                let summary_style = self.style_for(Role::Muted);
+                let continuation_style = self.style_for(Role::Secondary);
                 let error_header = self.style_bold(Role::Error);
+                let warn_header = self.style_bold(Role::Warning);
                 let safe = scrub_controls(&summary);
+                // Discriminate before `safe` is moved into body_str.
+                // Bash exit-code failures always start with the
+                // `format_exit_marker` prefix from bash.rs:578.
+                let is_exit_code_failure = !success && safe.starts_with("[elapsed:");
                 let body_str = if success {
                     safe
                 } else {
@@ -1588,10 +1609,18 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                     // physical line stay header-styled (a long error
                     // message like "✗ no rows matched: ...stuff..."
                     // shouldn't fade to default mid-sentence).
-                    let line_style = if !success && line_idx == 0 {
-                        &error_header
+                    let line_style = if line_idx == 0 {
+                        if !success {
+                            if is_exit_code_failure {
+                                &warn_header
+                            } else {
+                                &error_header
+                            }
+                        } else {
+                            &summary_style
+                        }
                     } else {
-                        &ok_style
+                        &continuation_style
                     };
                     for chunk in crate::width::wrap_line_to_width(phys, row_w.max(1)) {
                         let mut row = Vec::new();
