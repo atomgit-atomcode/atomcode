@@ -91,7 +91,11 @@ impl TerminalCaps {
     /// ASCII fallback. Both are exactly 2 display columns, so layout
     /// math (`text_budget = w - 2`) stays identical in both branches.
     pub fn prompt_chevron(&self) -> &'static str {
-        if self.unicode_symbols { "\u{276f} " } else { "> " }
+        if self.unicode_symbols {
+            "\u{276f} "
+        } else {
+            "> "
+        }
     }
 }
 

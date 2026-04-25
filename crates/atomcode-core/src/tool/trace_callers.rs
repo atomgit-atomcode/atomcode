@@ -18,8 +18,18 @@ fn shorten_path(path: &std::path::Path) -> String {
     if components.len() <= 3 {
         return path.display().to_string();
     }
-    let last3: Vec<_> = components[components.len() - 3..].iter().map(|c| c.as_os_str()).collect();
-    format!(".../{}", last3.iter().map(|s| s.to_string_lossy()).collect::<Vec<_>>().join("/"))
+    let last3: Vec<_> = components[components.len() - 3..]
+        .iter()
+        .map(|c| c.as_os_str())
+        .collect();
+    format!(
+        ".../{}",
+        last3
+            .iter()
+            .map(|s| s.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/")
+    )
 }
 
 #[async_trait]
@@ -30,7 +40,8 @@ impl Tool for TraceCallersTool {
             description: "Trace all callers of a symbol (reverse call graph). Uses BFS to find \
                 functions/methods that directly or transitively call the given symbol.\n\
                 Returns a tree showing caller chains up to the specified depth.\n\
-                Example: {\"symbol\": \"process_data\", \"depth\": 3}".to_string(),
+                Example: {\"symbol\": \"process_data\", \"depth\": 3}"
+                .to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -56,7 +67,8 @@ impl Tool for TraceCallersTool {
             return Ok(ToolResult {
                 call_id: String::new(),
                 output: "Code graph is not yet indexed. The graph will be available after the \
-                    background indexer completes. Try again shortly.".to_string(),
+                    background indexer completes. Try again shortly."
+                    .to_string(),
                 success: false,
             });
         }
@@ -65,16 +77,23 @@ impl Tool for TraceCallersTool {
         if matches.is_empty() {
             return Ok(ToolResult {
                 call_id: String::new(),
-                output: format!("Symbol '{}' not found in code graph ({} symbols indexed).",
-                    parsed.symbol, graph.node_count()),
+                output: format!(
+                    "Symbol '{}' not found in code graph ({} symbols indexed).",
+                    parsed.symbol,
+                    graph.node_count()
+                ),
                 success: false,
             });
         }
 
         let mut out = String::new();
         for sym in &matches {
-            out.push_str(&format!("Callers of {} ({:?}) in {}:\n",
-                sym.name, sym.kind, shorten_path(&sym.file)));
+            out.push_str(&format!(
+                "Callers of {} ({:?}) in {}:\n",
+                sym.name,
+                sym.kind,
+                shorten_path(&sym.file)
+            ));
 
             let callers = graph.trace_callers(sym.id, depth);
             if callers.is_empty() {
@@ -83,8 +102,14 @@ impl Tool for TraceCallersTool {
                 for (caller_id, d) in &callers {
                     if let Some(node) = graph.node(*caller_id) {
                         let indent = "  ".repeat(*d);
-                        out.push_str(&format!("{}[depth {}] {} ({:?}) — {}\n",
-                            indent, d, node.name, node.kind, shorten_path(&node.file)));
+                        out.push_str(&format!(
+                            "{}[depth {}] {} ({:?}) — {}\n",
+                            indent,
+                            d,
+                            node.name,
+                            node.kind,
+                            shorten_path(&node.file)
+                        ));
                     }
                 }
             }

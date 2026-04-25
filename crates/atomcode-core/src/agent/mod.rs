@@ -2,12 +2,10 @@
 //! calls LLM providers, executes tools, and communicates with the UI
 //! via channels. Decoupled from any TUI concerns.
 
+pub mod background;
 pub mod git_checkpoint;
-// pub mod knowledge; // removed: low-value cross-session memory, see git history
 pub mod sub_agent;
 pub mod subtask_driver;
-// task_classifier removed — replaced by state-based decisions in handle_send_message.
-// pub mod task_classifier;
 
 mod diagnose;
 mod discipline;
@@ -18,6 +16,7 @@ mod tool_dispatch;
 mod verify;
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
@@ -62,6 +61,16 @@ pub enum AgentCommand {
     /// forward-compat with an eventual LLM-backed summarize-with-instruction
     /// path; currently unused — this is the mechanical path only.
     Compact { prompt: Option<String> },
+    /// Run a one-shot task in an isolated background context (read-only-ish
+    /// tool subset, independent conversation, capped turns + timeout).
+    /// Result is returned via `AgentEvent::BackgroundComplete`.
+    Background { task: String },
+    /// Recompute and re-emit a rich ContextStats snapshot. `/context` sends
+    /// this before rendering so the user never sees a stale cache — the
+    /// cache is only refreshed on LLM round-trips, so between turns (or
+    /// after out-of-turn mutations like `inject_post_compress_state`) the
+    /// snapshot can lag the actual conversation state.
+    RefreshContextStats,
     /// Shutdown the agent.
     Shutdown,
 }
@@ -157,6 +166,14 @@ pub enum AgentEvent {
     Error(String),
     /// Sub-agent progress (real-time parallel task display).
     SubAgentProgress { file: String, status: String },
+    /// `/background` task finished. `summary` is the final assistant text
+    /// (truncated if long). `success` is false on error / timeout / cancel.
+    BackgroundComplete {
+        summary: String,
+        files_edited: Vec<String>,
+        turns: usize,
+        success: bool,
+    },
     /// Working directory changed.
     WorkingDirChanged(PathBuf),
     /// Context budget stats — piped into datalog and cached by the TUI
@@ -298,6 +315,12 @@ pub struct AgentLoop {
     /// (still parsing files) yields CPU instead of racing the new one.
     indexer_cancel: CancellationToken,
 
+    /// Guard against concurrent `/background` tasks. Set on dispatch,
+    /// cleared by the spawned task when it completes. Acquire/Release
+    /// ordering so the cleared write is visible to the next dispatcher
+    /// check on a different thread.
+    background_running: std::sync::Arc<AtomicBool>,
+
     /// Discipline tracking — all counters for loop detection, stagnation,
     /// error streaks, and tool usage patterns. Extracted from AgentLoop to
     /// reduce God Object complexity (was 22 fields inline).
@@ -351,11 +374,6 @@ pub struct AgentLoop {
     #[allow(dead_code)]
     last_turn_tools_all_success: bool,
 
-    /// Discovered service URLs extracted from tool outputs (e.g., "http://localhost:3002").
-    /// Persisted across turns so the model knows which ports are active.
-    /// Key: label (e.g., "frontend", "backend"), Value: URL.
-    active_services: std::collections::HashMap<String, String>,
-
     // Skill registry — provides descriptions for system prompt and powers use_skill tool
     skill_registry: std::sync::Arc<std::sync::RwLock<SkillRegistry>>,
 
@@ -374,6 +392,8 @@ pub struct AgentLoop {
 pub struct AgentHandle {
     pub cmd_tx: mpsc::UnboundedSender<AgentCommand>,
     pub event_rx: mpsc::UnboundedReceiver<AgentEvent>,
+    /// Shared tool registry for dynamic MCP tool registration.
+    pub tool_registry: std::sync::Arc<ToolRegistry>,
 }
 
 impl AgentLoop {
@@ -423,7 +443,7 @@ impl AgentLoop {
         let internal_enabled = |name: &str| !disabled_internal.contains(name);
 
         if has_skills && internal_enabled("use_skill") {
-            tool_registry.register(Box::new(UseSkillTool {
+            tool_registry.register_sync(Box::new(UseSkillTool {
                 registry: skill_registry.clone(),
             }));
         }
@@ -438,19 +458,19 @@ impl AgentLoop {
             .unwrap_or(false)
         {
             if internal_enabled("trace_callers") {
-                tool_registry.register(Box::new(crate::tool::trace_callers::TraceCallersTool));
+                tool_registry.register_sync(Box::new(crate::tool::trace_callers::TraceCallersTool));
             }
             if internal_enabled("trace_callees") {
-                tool_registry.register(Box::new(crate::tool::trace_callees::TraceCalleesTool));
+                tool_registry.register_sync(Box::new(crate::tool::trace_callees::TraceCalleesTool));
             }
             if internal_enabled("trace_chain") {
-                tool_registry.register(Box::new(crate::tool::trace_chain::TraceChainTool));
+                tool_registry.register_sync(Box::new(crate::tool::trace_chain::TraceChainTool));
             }
             if internal_enabled("file_dependencies") {
-                tool_registry.register(Box::new(crate::tool::file_deps::FileDependenciesTool));
+                tool_registry.register_sync(Box::new(crate::tool::file_deps::FileDependenciesTool));
             }
             if internal_enabled("blast_radius") {
-                tool_registry.register(Box::new(crate::tool::blast_radius::BlastRadiusTool));
+                tool_registry.register_sync(Box::new(crate::tool::blast_radius::BlastRadiusTool));
             }
         }
         // Build approval channels for interactive permission flow
@@ -496,7 +516,7 @@ impl AgentLoop {
                     max_tokens: None,
                     thinking_type: None,
                     thinking_keep: None,
-            reasoning_history: None,
+                    reasoning_history: None,
                     ephemeral: true,
                 }),
             };
@@ -521,7 +541,7 @@ impl AgentLoop {
 
         let agent = Self {
             conversation,
-            tool_registry: shared_tools,
+            tool_registry: shared_tools.clone(),
             turn_runner,
             permission_store,
             config,
@@ -540,6 +560,7 @@ impl AgentLoop {
             last_approval_request: None,
             cancel_token: CancellationToken::new(),
             indexer_cancel: CancellationToken::new(),
+            background_running: std::sync::Arc::new(AtomicBool::new(false)),
             discipline_state: DisciplineState::default(),
             files_read_this_turn: Vec::new(),
             files_edited_this_turn: Vec::new(),
@@ -556,7 +577,6 @@ impl AgentLoop {
             subtask_driver: subtask_driver::SubtaskDriver::new(),
             plan_text: None,
             session_files: std::collections::HashMap::new(),
-            active_services: std::collections::HashMap::new(),
             skill_registry,
             reindex_tx: None,
             datalog,
@@ -564,7 +584,11 @@ impl AgentLoop {
             event_tx,
         };
 
-        let handle = AgentHandle { cmd_tx, event_rx };
+        let handle = AgentHandle {
+            cmd_tx,
+            event_rx,
+            tool_registry: shared_tools.clone(),
+        };
 
         (agent, handle)
     }
@@ -580,9 +604,6 @@ impl AgentLoop {
     /// Run the agent loop. This is the main entry point — call from a tokio task.
     /// The loop processes commands from the UI and emits events back.
     pub async fn run(mut self) {
-        // Detect already-running dev servers on startup.
-        self.detect_running_services().await;
-
         // Spawn background code graph indexer
         {
             let working_dir = self.turn_runner.context.working_dir.read().await.clone();
@@ -659,7 +680,7 @@ impl AgentLoop {
                         self.session_files.clear();
                     }
 
-if let Some(provider_config) = self.config.providers.get(&new_provider_name) {
+                    if let Some(provider_config) = self.config.providers.get(&new_provider_name) {
                         // Rebuild the context strategy for the new provider.
                         // Selected once per provider; per-model customizations
                         // (e.g. Ollama schema trimming, Claude cache markers)
@@ -697,11 +718,10 @@ if let Some(provider_config) = self.config.providers.get(&new_provider_name) {
                             }
                         }
                     } else {
-                        self.turn_runner.provider = std::sync::Arc::from(
-                            crate::provider::unavailable_provider(
-                                "未配置 provider。请使用 /provider 添加 provider 后再试。"
-                            ),
-                        );
+                        self.turn_runner.provider =
+                            std::sync::Arc::from(crate::provider::unavailable_provider(
+                                "未配置 provider。请使用 /provider 添加 provider 后再试。",
+                            ));
                         self.turn_runner.config = self.config.clone();
                     }
                 }
@@ -730,7 +750,45 @@ if let Some(provider_config) = self.config.providers.get(&new_provider_name) {
                     self.plan_mode = enabled;
                 }
                 AgentCommand::Compact { prompt } => {
-                    self.run_compact(prompt);
+                    self.run_compact(prompt).await;
+                }
+                AgentCommand::Background { task } => {
+                    // AcqRel: pair with the spawned task's Release store on
+                    // completion so the next dispatcher sees the cleared flag.
+                    if self.background_running.swap(true, Ordering::AcqRel) {
+                        let _ = self.event_tx.send(AgentEvent::Error(
+                            "A background task is already running. Wait for it to finish.".to_string(),
+                        ));
+                    } else {
+                        let provider = self.turn_runner.provider.clone();
+                        let tools = self.turn_runner.tools.clone();
+                        let context = self.turn_runner.context.clone();
+                        let config = self.config.clone();
+                        let ctx = self.ctx.clone();
+                        let event_tx = self.event_tx.clone();
+                        let flag = self.background_running.clone();
+                        tokio::spawn(async move {
+                            let result = background::run_background_task(
+                                &task,
+                                provider,
+                                tools,
+                                context,
+                                config,
+                                ctx,
+                                event_tx.clone(),
+                            )
+                            .await;
+                            let _ = event_tx.send(result);
+                            flag.store(false, Ordering::Release);
+                        });
+                    }
+                }
+                AgentCommand::RefreshContextStats => {
+                    let system_prompt = self.build_system_prompt();
+                    let (msgs, _) = self
+                        .ctx
+                        .build_messages(&self.conversation, &system_prompt, "");
+                    self.emit_rich_context_stats(&self.conversation, &msgs).await;
                 }
                 AgentCommand::Shutdown => break,
             }
@@ -1011,7 +1069,7 @@ if let Some(provider_config) = self.config.providers.get(&new_provider_name) {
                 let (msgs, _) = self
                     .ctx
                     .build_messages(&conv, &system_prompt, &turn_reminder);
-                let tool_defs = self.turn_runner.tools.get_definitions();
+                let tool_defs = self.turn_runner.tools.get_definitions().await;
                 // Dump request to datalog for inline debugging
                 self.datalog.log_llm_dump(
                     &msgs,
@@ -1020,7 +1078,7 @@ if let Some(provider_config) = self.config.providers.get(&new_provider_name) {
                     context_window,
                 );
 
-                self.emit_rich_context_stats(&conv, &msgs);
+                self.emit_rich_context_stats(&conv, &msgs).await;
             }
 
             // Run the turn in a scoped block so all borrows of self.turn_runner
@@ -1756,12 +1814,12 @@ if let Some(provider_config) = self.config.providers.get(&new_provider_name) {
     /// both `handle_send_message` (once per turn, post-build_messages) and
     /// `run_compact` (to refresh the cached stats TUI reads for `/context`
     /// after an out-of-turn compaction).
-    fn emit_rich_context_stats(
+    async fn emit_rich_context_stats(
         &self,
         conv: &Conversation,
         msgs: &[crate::conversation::message::Message],
     ) {
-        let tool_defs = self.turn_runner.tools.get_definitions();
+        let tool_defs = self.turn_runner.tools.get_definitions().await;
         let tool_defs_tokens: usize = tool_defs
             .iter()
             .map(|d| {
@@ -1769,8 +1827,7 @@ if let Some(provider_config) = self.config.providers.get(&new_provider_name) {
                 (d.name.len() + d.description.len() + params.len()) / 4
             })
             .sum();
-        let cold_zone_tokens: usize =
-            conv.cold_summaries.iter().map(|s| s.len() / 4 + 4).sum();
+        let cold_zone_tokens: usize = conv.cold_summaries.iter().map(|s| s.len() / 4 + 4).sum();
         let actual_system_prompt = msgs
             .iter()
             .find(|m| matches!(m.role, crate::conversation::message::Role::System))
@@ -1820,40 +1877,96 @@ if let Some(provider_config) = self.config.providers.get(&new_provider_name) {
     /// cleanup in `handle_send_message`) so behavior stays consistent with
     /// the rest of the codebase. `_prompt` is accepted for forward-compat
     /// with a future LLM-guided summarize path and ignored today.
-    fn run_compact(&mut self, prompt: Option<String>) {
+    ///
+    /// Net-savings guard: on terse conversations the cold-zone summary
+    /// header + `inject_post_compress_state` inject can weigh more than
+    /// the dropped messages, so compaction would silently inflate the
+    /// prompt. We measure before/after token totals via `build_messages`
+    /// (post all render-pipeline effects — `clean_message_pipeline`,
+    /// microcompact, etc.) and roll the conversation back if the
+    /// operation didn't actually shrink the wire payload. Analytical
+    /// projection was tried first but too many render-pipeline branches
+    /// made it unreliable.
+    async fn run_compact(&mut self, prompt: Option<String>) {
         if prompt.is_some() {
             let _ = self.event_tx.send(AgentEvent::TextDelta(
                 "(note: custom compaction prompt accepted but not yet implemented — running mechanical compact)\n"
                     .to_string(),
             ));
         }
-        let before = self.conversation.messages.len();
+        let system_prompt = self.build_system_prompt();
+        let before_msg_count = self.conversation.messages.len();
+        let before_tokens: usize = self
+            .ctx
+            .build_messages(&self.conversation, &system_prompt, "")
+            .0
+            .iter()
+            .map(|m| m.estimate_tokens())
+            .sum();
         let Some((content, n_msgs)) = self.ctx.compression_plan(&self.conversation) else {
             let _ = self.event_tx.send(AgentEvent::TextDelta(
                 "(nothing to compact — conversation is short)\n".to_string(),
             ));
             return;
         };
+
+        // Rollback snapshot. Only the three fields `apply_compression` +
+        // `inject_post_compress_state` mutate need to survive — the
+        // stream / tool_call buffers are ephemeral and always None
+        // between turns, so we skip them.
+        let msgs_snapshot = self.conversation.messages.clone();
+        let cold_snapshot = self.conversation.cold_summaries.clone();
+        let turns_snapshot = self.conversation.turn_tracker.clone();
+
         self.conversation.apply_compression(n_msgs, content);
         self.inject_post_compress_state();
+
+        let after_tokens: usize = self
+            .ctx
+            .build_messages(&self.conversation, &system_prompt, "")
+            .0
+            .iter()
+            .map(|m| m.estimate_tokens())
+            .sum();
+
+        if after_tokens >= before_tokens {
+            self.conversation.messages = msgs_snapshot;
+            self.conversation.cold_summaries = cold_snapshot;
+            self.conversation.turn_tracker = turns_snapshot;
+            let _ = self.event_tx.send(AgentEvent::TextDelta(format!(
+                "(nothing to compact — would not save tokens: {} → {})\n",
+                fmt_k_tokens(before_tokens),
+                fmt_k_tokens(after_tokens),
+            )));
+            // Still refresh stats so `/context` reports the current
+            // (unchanged, now-correct) state and the user doesn't think
+            // the abort left them with stale numbers.
+            let (msgs, _) =
+                self.ctx
+                    .build_messages(&self.conversation, &system_prompt, "");
+            self.emit_rich_context_stats(&self.conversation, &msgs).await;
+            return;
+        }
+
         // Report the actually-removed count measured from before/after,
         // not from n_msgs, so the UI count stays accurate if
         // apply_compression's clamping or retention policy changes.
-        let removed = before.saturating_sub(self.conversation.messages.len());
+        let removed = before_msg_count.saturating_sub(self.conversation.messages.len());
         let _ = self.event_tx.send(AgentEvent::TextDelta(format!(
-            "(compacted — dropped {} message{})\n",
+            "(compacted — dropped {} message{}, {} → {} tokens)\n",
             removed,
             if removed == 1 { "" } else { "s" },
+            fmt_k_tokens(before_tokens),
+            fmt_k_tokens(after_tokens),
         )));
 
         // Refresh the cached ContextStats so `/context` reflects the new
         // post-compaction shape. Without this, TUI still shows the
         // pre-compact numbers until the next user turn fires build_messages.
-        let system_prompt = self.build_system_prompt();
         let (msgs, _) = self
             .ctx
             .build_messages(&self.conversation, &system_prompt, "");
-        self.emit_rich_context_stats(&self.conversation, &msgs);
+        self.emit_rich_context_stats(&self.conversation, &msgs).await;
     }
 
     fn finish_turn(&mut self, stop_reason: TurnStopReason) {
@@ -1899,8 +2012,6 @@ if let Some(provider_config) = self.config.providers.get(&new_provider_name) {
 
     // store_tool_result → tool_dispatch.rs
 
-    // detect_running_services → services.rs
-    // extract_service_urls → services.rs
     // change_dir → services.rs
 
     /// Try to dispatch sub-agents for parallel multi-file editing.
@@ -2358,7 +2469,12 @@ fn build_post_compress_state(
         parts.push(format!("FILES EDITED: {}", files_edited.join(", ")));
     }
     if !files_read.is_empty() {
-        let recent: Vec<&str> = files_read.iter().rev().take(5).map(|s| s.as_str()).collect();
+        let recent: Vec<&str> = files_read
+            .iter()
+            .rev()
+            .take(5)
+            .map(|s| s.as_str())
+            .collect();
         parts.push(format!("RECENTLY READ: {}", recent.join(", ")));
     }
     if parts.is_empty() {
@@ -2368,6 +2484,18 @@ fn build_post_compress_state(
         "[Context was compressed. Here is your current state:]\n{}",
         parts.join("\n")
     ))
+}
+
+/// Format a token count for user-facing banners: `9800` → `"9.8K"`,
+/// `137` → `"137"`. Mirrors the `k(...)` closure in the TUI's
+/// `format_context_report` so `/compact` output reads the same units
+/// as `/context`.
+fn fmt_k_tokens(t: usize) -> String {
+    if t >= 1000 {
+        format!("{:.1}K", t as f64 / 1000.0)
+    } else {
+        format!("{}", t)
+    }
 }
 
 #[cfg(test)]
@@ -2588,20 +2716,39 @@ mod post_compress_state_tests {
         // rev().take(5) → newest first, at most 5.
         let read: Vec<String> = (1..=8).map(|i| format!("f{}.rs", i)).collect();
         let out = build_post_compress_state("", &[], &read).unwrap();
-        let line = out.lines().find(|l| l.starts_with("RECENTLY READ: ")).unwrap();
+        let line = out
+            .lines()
+            .find(|l| l.starts_with("RECENTLY READ: "))
+            .unwrap();
         assert_eq!(line, "RECENTLY READ: f8.rs, f7.rs, f6.rs, f5.rs, f4.rs");
     }
 
     #[test]
     fn all_three_parts_combined() {
-        let out = build_post_compress_state(
-            "task x",
-            &["a.rs".to_string()],
-            &["b.rs".to_string()],
-        )
-        .unwrap();
+        let out = build_post_compress_state("task x", &["a.rs".to_string()], &["b.rs".to_string()])
+            .unwrap();
         assert!(out.contains("TASK: task x"));
         assert!(out.contains("FILES EDITED: a.rs"));
         assert!(out.contains("RECENTLY READ: b.rs"));
+    }
+}
+
+#[cfg(test)]
+mod fmt_k_tokens_tests {
+    use super::fmt_k_tokens;
+
+    #[test]
+    fn under_1000_no_suffix() {
+        assert_eq!(fmt_k_tokens(0), "0");
+        assert_eq!(fmt_k_tokens(137), "137");
+        assert_eq!(fmt_k_tokens(999), "999");
+    }
+
+    #[test]
+    fn one_thousand_and_above_use_k_suffix_with_one_decimal() {
+        assert_eq!(fmt_k_tokens(1000), "1.0K");
+        assert_eq!(fmt_k_tokens(3700), "3.7K");
+        assert_eq!(fmt_k_tokens(9800), "9.8K");
+        assert_eq!(fmt_k_tokens(64000), "64.0K");
     }
 }

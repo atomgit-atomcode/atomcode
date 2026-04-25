@@ -1,7 +1,7 @@
 //! Edit tool tests — surrounding context, file_history backup, line-number mode, text-match mode.
 
-use std::path::PathBuf;
 use atomcode_core::tool::{Tool, ToolContext, ToolResult};
+use std::path::PathBuf;
 
 fn test_context() -> ToolContext {
     ToolContext::new(PathBuf::from("/tmp"))
@@ -14,8 +14,15 @@ fn create_test_file(content: &str) -> String {
     let dir = std::env::temp_dir().join("atomcode_edit_test");
     let _ = std::fs::create_dir_all(&dir);
     let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let id = format!("{}_{}_{}", std::process::id(), std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos(), seq);
+    let id = format!(
+        "{}_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos(),
+        seq
+    );
     let path = dir.join(format!("test_{}.vue", id));
     std::fs::write(&path, content).unwrap();
     path.to_string_lossy().to_string()
@@ -31,7 +38,10 @@ fn cleanup(path: &str) {
 
 #[tokio::test]
 async fn edit_line_mode_includes_surrounding_context() {
-    let content = (1..=50).map(|i| format!("line {}", i)).collect::<Vec<_>>().join("\n");
+    let content = (1..=50)
+        .map(|i| format!("line {}", i))
+        .collect::<Vec<_>>()
+        .join("\n");
     let path = create_test_file(&content);
     let ctx = test_context();
 
@@ -46,7 +56,11 @@ async fn edit_line_mode_includes_surrounding_context() {
     let result = tool.execute(&args.to_string(), &ctx).await.unwrap();
     assert!(result.success, "Edit should succeed: {}", result.output);
     // Verify edit was applied (concise output, no surrounding context)
-    assert!(result.output.contains("Edited"), "Should confirm edit: {}", result.output);
+    assert!(
+        result.output.contains("Edited"),
+        "Should confirm edit: {}",
+        result.output
+    );
 
     cleanup(&path);
 }
@@ -67,7 +81,11 @@ async fn edit_text_match_includes_surrounding_context() {
     let result = tool.execute(&args.to_string(), &ctx).await.unwrap();
     assert!(result.success, "Edit should succeed: {}", result.output);
 
-    assert!(result.output.contains("Edited"), "Should confirm edit: {}", result.output);
+    assert!(
+        result.output.contains("Edited"),
+        "Should confirm edit: {}",
+        result.output
+    );
 
     cleanup(&path);
 }
@@ -160,7 +178,10 @@ async fn edit_creates_file_history_backup() {
     // Verify backup exists (file_history should have created one)
     let fh = ctx.file_history.lock().await;
     let latest = fh.latest_version(&path);
-    assert!(latest.is_some(), "file_history should have a backup version");
+    assert!(
+        latest.is_some(),
+        "file_history should have a backup version"
+    );
 
     cleanup(&path);
 }
@@ -213,13 +234,27 @@ function increment() { count.value++ }
     });
 
     let result = tool.execute(&args.to_string(), &ctx).await.unwrap();
-    assert!(result.success, "Multi-edit should succeed: {}", result.output);
-    assert!(result.output.contains("3 edits applied"), "Should report 3 edits: {}", result.output);
+    assert!(
+        result.success,
+        "Multi-edit should succeed: {}",
+        result.output
+    );
+    assert!(
+        result.output.contains("3 edits applied"),
+        "Should report 3 edits: {}",
+        result.output
+    );
 
     let new_content = std::fs::read_to_string(&path).unwrap();
     assert!(new_content.contains("useStore"), "Should have new import");
-    assert!(new_content.contains("computed(() =>"), "Should have computed");
-    assert!(new_content.contains("Store loaded"), "Should have new template element");
+    assert!(
+        new_content.contains("computed(() =>"),
+        "Should have computed"
+    );
+    assert!(
+        new_content.contains("Store loaded"),
+        "Should have new template element"
+    );
 
     cleanup(&path);
 }
@@ -250,19 +285,32 @@ function main() { console.log(hello(), world()); }
     });
 
     let result = tool.execute(&args.to_string(), &ctx).await.unwrap();
-    assert!(result.success, "Multi-edit text match should succeed: {}", result.output);
+    assert!(
+        result.success,
+        "Multi-edit text match should succeed: {}",
+        result.output
+    );
 
     let new_content = std::fs::read_to_string(&path).unwrap();
     assert!(new_content.contains("'hi'"), "Should have replaced hello");
-    assert!(new_content.contains("'earth'"), "Should have replaced world");
-    assert!(new_content.contains("console.log"), "Untouched code should remain");
+    assert!(
+        new_content.contains("'earth'"),
+        "Should have replaced world"
+    );
+    assert!(
+        new_content.contains("console.log"),
+        "Untouched code should remain"
+    );
 
     cleanup(&path);
 }
 
 #[tokio::test]
 async fn multi_edit_overlap_detection() {
-    let content = (1..=20).map(|i| format!("line {}", i)).collect::<Vec<_>>().join("\n");
+    let content = (1..=20)
+        .map(|i| format!("line {}", i))
+        .collect::<Vec<_>>()
+        .join("\n");
     let path = create_test_file(&content);
     let ctx = test_context();
     let tool = atomcode_core::tool::edit::EditFileTool;
@@ -278,14 +326,18 @@ async fn multi_edit_overlap_detection() {
     let result = tool.execute(&args.to_string(), &ctx).await.unwrap();
     // Overlapping edits are auto-merged: second edit (8-15) extends beyond
     // first (5-10), so the merged range is 5-15 with second edit's content.
-    assert!(result.success, "Overlapping edits should be auto-merged, got: {}", result.output);
+    assert!(
+        result.success,
+        "Overlapping edits should be auto-merged, got: {}",
+        result.output
+    );
 
     // Verify the merge result: lines 5-15 replaced with "b" (second edit wins)
     let after = std::fs::read_to_string(&path).unwrap();
     let after_lines: Vec<&str> = after.lines().collect();
     assert_eq!(after_lines[0], "line 1"); // untouched
     assert_eq!(after_lines[3], "line 4"); // untouched
-    assert_eq!(after_lines[4], "b");      // merged edit
+    assert_eq!(after_lines[4], "b"); // merged edit
     assert_eq!(after_lines[5], "line 16"); // after the merged range
 
     cleanup(&path);
@@ -322,11 +374,18 @@ export default App
     });
 
     let result = tool.execute(&args.to_string(), &ctx).await.unwrap();
-    assert!(result.success, "Mixed-mode multi-edit should succeed: {}", result.output);
+    assert!(
+        result.success,
+        "Mixed-mode multi-edit should succeed: {}",
+        result.output
+    );
 
     let new_content = std::fs::read_to_string(&path).unwrap();
     assert!(new_content.contains("useState"), "Import should be updated");
-    assert!(new_content.contains("useState('new')"), "State hook should be added");
+    assert!(
+        new_content.contains("useState('new')"),
+        "State hook should be added"
+    );
 
     cleanup(&path);
 }
@@ -345,11 +404,21 @@ async fn multi_edit_string_line_numbers() {
     );
 
     let result = tool.execute(&args, &ctx).await.unwrap();
-    assert!(result.success, "String line numbers should work via lenient parsing: {}", result.output);
+    assert!(
+        result.success,
+        "String line numbers should work via lenient parsing: {}",
+        result.output
+    );
 
     let new_content = std::fs::read_to_string(&path).unwrap();
-    assert!(new_content.contains("replaced"), "Edit should have been applied");
-    assert!(!new_content.contains("line 2"), "Old content should be gone");
+    assert!(
+        new_content.contains("replaced"),
+        "Edit should have been applied"
+    );
+    assert!(
+        !new_content.contains("line 2"),
+        "Old content should be gone"
+    );
 
     cleanup(&path);
 }
@@ -372,8 +441,11 @@ async fn edit_empty_old_string_returns_error() {
 
     let result = tool.execute(&args.to_string(), &ctx).await.unwrap();
     assert!(!result.success, "Should fail when old_string is empty");
-    assert!(result.output.contains("old_string is required"),
-        "Should tell model old_string is required: {}", result.output);
+    assert!(
+        result.output.contains("old_string is required"),
+        "Should tell model old_string is required: {}",
+        result.output
+    );
 
     // File should NOT be modified
     let after = std::fs::read_to_string(&path).unwrap();
@@ -410,8 +482,15 @@ function main() {}
     assert!(result.success);
 
     let new_content = std::fs::read_to_string(&path).unwrap();
-    let c_count = new_content.lines().filter(|l| l.trim() == "const c = ref(0)").count();
-    assert_eq!(c_count, 1, "const c should appear exactly once (boundary auto-corrected), got:\n{}", new_content);
+    let c_count = new_content
+        .lines()
+        .filter(|l| l.trim() == "const c = ref(0)")
+        .count();
+    assert_eq!(
+        c_count, 1,
+        "const c should appear exactly once (boundary auto-corrected), got:\n{}",
+        new_content
+    );
 
     cleanup(&path);
 }
@@ -448,14 +527,35 @@ function setup() {}
     });
 
     let result = tool.execute(&args.to_string(), &ctx).await.unwrap();
-    assert!(result.success, "Multi-edit should succeed: {}", result.output);
+    assert!(
+        result.success,
+        "Multi-edit should succeed: {}",
+        result.output
+    );
 
     let new_content = std::fs::read_to_string(&path).unwrap();
-    let liked_count = new_content.lines().filter(|l| l.trim() == "const isLiked = ref(false)").count();
-    let count_count = new_content.lines().filter(|l| l.trim() == "const count = ref(0)").count();
-    assert_eq!(liked_count, 1, "isLiked should appear once (no duplicate), got:\n{}", new_content);
-    assert_eq!(count_count, 1, "count should appear once (boundary corrected), got:\n{}", new_content);
-    assert!(new_content.contains("showBackToTop"), "New code should be present");
+    let liked_count = new_content
+        .lines()
+        .filter(|l| l.trim() == "const isLiked = ref(false)")
+        .count();
+    let count_count = new_content
+        .lines()
+        .filter(|l| l.trim() == "const count = ref(0)")
+        .count();
+    assert_eq!(
+        liked_count, 1,
+        "isLiked should appear once (no duplicate), got:\n{}",
+        new_content
+    );
+    assert_eq!(
+        count_count, 1,
+        "count should appear once (boundary corrected), got:\n{}",
+        new_content
+    );
+    assert!(
+        new_content.contains("showBackToTop"),
+        "New code should be present"
+    );
 
     cleanup(&path);
 }
@@ -488,8 +588,15 @@ function main() {}
     assert!(result.success);
 
     let new_content = std::fs::read_to_string(&path).unwrap();
-    let tab_count = new_content.lines().filter(|l| l.trim() == "const activeTab = ref('profile')").count();
-    assert_eq!(tab_count, 1, "activeTab should appear exactly once (leading boundary corrected), got:\n{}", new_content);
+    let tab_count = new_content
+        .lines()
+        .filter(|l| l.trim() == "const activeTab = ref('profile')")
+        .count();
+    assert_eq!(
+        tab_count, 1,
+        "activeTab should appear exactly once (leading boundary corrected), got:\n{}",
+        new_content
+    );
     assert!(new_content.contains("theme"), "New code should be present");
 
     cleanup(&path);
@@ -530,13 +637,31 @@ const active = ref(true)
     });
 
     let result = tool.execute(&args.to_string(), &ctx).await.unwrap();
-    assert!(result.success, "Multi-edit should succeed: {}", result.output);
+    assert!(
+        result.success,
+        "Multi-edit should succeed: {}",
+        result.output
+    );
 
     let new_content = std::fs::read_to_string(&path).unwrap();
-    let import_ref_count = new_content.lines().filter(|l| l.trim() == "import { ref } from 'vue'").count();
-    let div_count = new_content.lines().filter(|l| l.trim() == "<div>{{ name }}</div>").count();
-    assert_eq!(import_ref_count, 1, "import ref should appear once (leading corrected), got:\n{}", new_content);
-    assert_eq!(div_count, 1, "div should appear once (leading corrected), got:\n{}", new_content);
+    let import_ref_count = new_content
+        .lines()
+        .filter(|l| l.trim() == "import { ref } from 'vue'")
+        .count();
+    let div_count = new_content
+        .lines()
+        .filter(|l| l.trim() == "<div>{{ name }}</div>")
+        .count();
+    assert_eq!(
+        import_ref_count, 1,
+        "import ref should appear once (leading corrected), got:\n{}",
+        new_content
+    );
+    assert_eq!(
+        div_count, 1,
+        "div should appear once (leading corrected), got:\n{}",
+        new_content
+    );
 
     cleanup(&path);
 }
@@ -563,7 +688,11 @@ async fn delta_correct_edit_on_broken_file_accepted() {
     });
 
     let result = tool.execute(&args.to_string(), &ctx).await.unwrap();
-    assert!(result.success, "Edit on broken file should be accepted if it doesn't worsen balance: {}", result.output);
+    assert!(
+        result.success,
+        "Edit on broken file should be accepted if it doesn't worsen balance: {}",
+        result.output
+    );
     cleanup(&path);
 }
 
@@ -584,7 +713,11 @@ async fn delta_bad_edit_on_good_file_accepted() {
     });
 
     let result = tool.execute(&args.to_string(), &ctx).await.unwrap();
-    assert!(result.success, "Edit should be accepted (auto-compile catches structural issues): {}", result.output);
+    assert!(
+        result.success,
+        "Edit should be accepted (auto-compile catches structural issues): {}",
+        result.output
+    );
     cleanup(&path);
 }
 
@@ -604,7 +737,11 @@ async fn delta_fix_edit_on_broken_file_accepted() {
     });
 
     let result = tool.execute(&args.to_string(), &ctx).await.unwrap();
-    assert!(result.success, "Fix edit should be accepted: {}", result.output);
+    assert!(
+        result.success,
+        "Fix edit should be accepted: {}",
+        result.output
+    );
     cleanup(&path);
 }
 
@@ -627,7 +764,11 @@ async fn delta_multi_edit_on_broken_file_accepted() {
     });
 
     let result = tool.execute(&args.to_string(), &ctx).await.unwrap();
-    assert!(result.success, "Multi-edit that doesn't worsen balance should be accepted: {}", result.output);
+    assert!(
+        result.success,
+        "Multi-edit that doesn't worsen balance should be accepted: {}",
+        result.output
+    );
 
     let after = std::fs::read_to_string(&path).unwrap();
     assert!(after.contains("ref(42)"));

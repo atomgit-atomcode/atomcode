@@ -23,7 +23,9 @@ pub enum Prepared {
         /// when the agent finishes successfully — without re-parsing the URL.
         issue_ref: IssueRef,
     },
-    Skip { reason: String },
+    Skip {
+        reason: String,
+    },
 }
 
 /// Post-run side effects on the issue: comment with the agent's repair
@@ -34,10 +36,7 @@ pub enum Prepared {
 /// Ordering: comment first (the big artifact the user cares about), label
 /// second. If the comment succeeds but label add fails, the user at least
 /// has the repair record on the issue.
-pub fn post_completion(
-    issue_ref: &IssueRef,
-    summary: &str,
-) -> anyhow::Result<()> {
+pub fn post_completion(issue_ref: &IssueRef, summary: &str) -> anyhow::Result<()> {
     let client = Client::from_stored_auth()?;
     client.post_issue_comment(issue_ref, summary)?;
     client.add_issue_label(issue_ref, FIXED_LABEL)?;
@@ -145,7 +144,12 @@ fn build_prompt(
 
     let with_body: Vec<&Comment> = comments
         .iter()
-        .filter(|c| c.body.as_deref().map(|b| !b.trim().is_empty()).unwrap_or(false))
+        .filter(|c| {
+            c.body
+                .as_deref()
+                .map(|b| !b.trim().is_empty())
+                .unwrap_or(false)
+        })
         .collect();
     if !with_body.is_empty() {
         out.push_str(&format!("\n### 评论 ({})\n", with_body.len()));

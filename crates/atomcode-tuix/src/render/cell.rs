@@ -39,6 +39,13 @@ pub struct CellStyle {
     /// SGR reverse video (`\x1b[7m` / `\x1b[27m`). Used for the
     /// highlighted menu row.
     pub reverse: bool,
+    /// SGR faint / decreased intensity (`\x1b[2m`). Renders the current
+    /// fg at ~50% intensity — terminal-theme-aware muting that adapts
+    /// to both light and dark schemes (unlike a fixed DarkGrey which
+    /// vanishes on some palettes). Toggled off via SGR 22, which is the
+    /// shared "normal intensity" reset for both bold and faint, so the
+    /// transition path goes through full reset when faint→off.
+    pub faint: bool,
 }
 
 /// One screen cell: glyph + its visual attributes. Cell equality is
@@ -307,15 +314,25 @@ fn emit_sgr_transition(out: &mut Vec<u8>, from: Option<&CellStyle>, to: &CellSty
     // additive, use targeted enables.
     let bold_off = from.bold && !to.bold;
     let reverse_off = from.reverse && !to.reverse;
+    // SGR 22 ("normal intensity") clears both bold AND faint — there is
+    // no per-attribute toggle for faint. So a faint→off transition
+    // always goes through full reset to avoid clobbering bold state.
+    let faint_off = from.faint && !to.faint;
     let fg_change = from.fg != to.fg;
 
-    let needs_reset = bold_off || reverse_off || (from.fg.is_some() && to.fg.is_none());
+    let needs_reset = bold_off
+        || reverse_off
+        || faint_off
+        || (from.fg.is_some() && to.fg.is_none());
 
     if needs_reset {
         out.extend_from_slice(b"\x1b[0m");
         // After reset, nothing is on — apply `to`'s positive attrs.
         if to.bold {
             out.extend_from_slice(b"\x1b[1m");
+        }
+        if to.faint {
+            out.extend_from_slice(b"\x1b[2m");
         }
         if to.reverse {
             out.extend_from_slice(b"\x1b[7m");
@@ -328,6 +345,9 @@ fn emit_sgr_transition(out: &mut Vec<u8>, from: Option<&CellStyle>, to: &CellSty
         // `to` adds.
         if !from.bold && to.bold {
             out.extend_from_slice(b"\x1b[1m");
+        }
+        if !from.faint && to.faint {
+            out.extend_from_slice(b"\x1b[2m");
         }
         if !from.reverse && to.reverse {
             out.extend_from_slice(b"\x1b[7m");
@@ -356,6 +376,7 @@ mod tests {
             fg: Some(cyan()),
             bold: true,
             reverse: false,
+            faint: false,
         }
     }
 
@@ -395,7 +416,11 @@ mod tests {
     fn diff_cell_frames_produces_one_indexed_coords() {
         let row: Vec<Cell> = "ab"
             .chars()
-            .map(|ch| Cell { ch, style: Default::default(), width: 1 })
+            .map(|ch| Cell {
+                ch,
+                style: Default::default(),
+                width: 1,
+            })
             .collect();
         let mut changed = row.clone();
         changed[0].ch = 'X';
@@ -421,11 +446,19 @@ mod tests {
         // blanking patches so leftover glyphs get overwritten.
         let prev_row: Vec<Cell> = "hello"
             .chars()
-            .map(|ch| Cell { ch, style: Default::default(), width: 1 })
+            .map(|ch| Cell {
+                ch,
+                style: Default::default(),
+                width: 1,
+            })
             .collect();
         let next_row: Vec<Cell> = "he"
             .chars()
-            .map(|ch| Cell { ch, style: Default::default(), width: 1 })
+            .map(|ch| Cell {
+                ch,
+                style: Default::default(),
+                width: 1,
+            })
             .collect();
         let prev = vec![prev_row];
         let next = vec![next_row];
@@ -487,12 +520,20 @@ mod tests {
         let p1 = Patch {
             row: 5,
             col: 1,
-            cell: Cell { ch: 'a', style: Default::default(), width: 1 },
+            cell: Cell {
+                ch: 'a',
+                style: Default::default(),
+                width: 1,
+            },
         };
         let p2 = Patch {
             row: 5,
             col: 2,
-            cell: Cell { ch: 'b', style: Default::default(), width: 1 },
+            cell: Cell {
+                ch: 'b',
+                style: Default::default(),
+                width: 1,
+            },
         };
         let bytes = serialize_patches(&[p1, p2]);
         let s = String::from_utf8(bytes).unwrap();
@@ -507,20 +548,97 @@ mod tests {
         let p1 = Patch {
             row: 5,
             col: 1,
-            cell: Cell { ch: 'a', style: Default::default(), width: 1 },
+            cell: Cell {
+                ch: 'a',
+                style: Default::default(),
+                width: 1,
+            },
         };
         let p2 = Patch {
             row: 5,
             col: 2,
             cell: Cell {
                 ch: 'b',
-                style: CellStyle { fg: None, bold: true, reverse: false },
+                style: CellStyle {
+                    fg: None,
+                    bold: true,
+                    reverse: false,
+                    faint: false,
+                },
                 width: 1,
             },
         };
         let bytes = serialize_patches(&[p1, p2]);
         let s = String::from_utf8(bytes).unwrap();
         assert!(s.contains("\x1b[1m"), "expected bold SGR, got: {:?}", s);
+    }
+
+    /// Faint cells emit SGR 2 — theme-aware muting for hint/status text.
+    /// Final reset must close the run because faint is "sticky" until
+    /// SGR 22 / SGR 0 clears it.
+    #[test]
+    fn serialize_faint_emits_sgr_two_and_final_reset() {
+        let p = Patch {
+            row: 1,
+            col: 1,
+            cell: Cell {
+                ch: 'h',
+                style: CellStyle {
+                    fg: None,
+                    bold: false,
+                    reverse: false,
+                    faint: true,
+                },
+                width: 1,
+            },
+        };
+        let bytes = serialize_patches(std::slice::from_ref(&p));
+        let s = String::from_utf8(bytes).unwrap();
+        assert!(s.contains("\x1b[2m"), "expected faint SGR, got: {:?}", s);
+        assert!(s.ends_with("\x1b[0m"), "faint cell must close with reset");
+    }
+
+    /// Faint→non-faint transition routes through full reset (SGR 0)
+    /// rather than per-attribute toggle, because SGR 22 ("normal
+    /// intensity") would also clobber bold if present. Reset path is
+    /// what `emit_sgr_transition` already uses for bold-off and
+    /// reverse-off — extending to faint-off keeps the invariant.
+    #[test]
+    fn serialize_faint_off_goes_through_reset() {
+        let faint = Patch {
+            row: 1,
+            col: 1,
+            cell: Cell {
+                ch: 'a',
+                style: CellStyle {
+                    fg: None,
+                    bold: false,
+                    reverse: false,
+                    faint: true,
+                },
+                width: 1,
+            },
+        };
+        let plain = Patch {
+            row: 1,
+            col: 2,
+            cell: Cell {
+                ch: 'b',
+                style: CellStyle::default(),
+                width: 1,
+            },
+        };
+        let bytes = serialize_patches(&[faint, plain]);
+        let s = String::from_utf8(bytes).unwrap();
+        // \x1b[2m for faint cell → \x1b[0m before the plain cell.
+        assert!(s.contains("\x1b[2m"));
+        // The plain cell must be preceded by a reset, not just \x1b[22m.
+        let reset_idx = s
+            .match_indices("\x1b[0m")
+            .map(|(i, _)| i)
+            .find(|&i| i < s.find('b').unwrap())
+            .expect("expected mid-stream reset before plain cell");
+        let _ = reset_idx;
     }
 
     // ── Unicode edge-case regression tests ─────────────────────────
@@ -631,7 +749,8 @@ mod tests {
         let real_cells = row.iter().filter(|c| c.width > 0).count();
         eprintln!(
             "[UNICODE DIAG] skin-tone emoji: real={} cells total={}",
-            real_cells, row.len()
+            real_cells,
+            row.len()
         );
         // 2 real cells, each advancing cursor by 2 = 4 cols model.
         // Terminal advances 2. Drift = 2.
@@ -732,16 +851,34 @@ mod tests {
     #[test]
     fn unicode_diff_narrow_to_wide_at_same_position() {
         let prev_row: Vec<Cell> = vec![
-            Cell { ch: 'a', style: CellStyle::default(), width: 1 },
-            Cell { ch: 'b', style: CellStyle::default(), width: 1 },
+            Cell {
+                ch: 'a',
+                style: CellStyle::default(),
+                width: 1,
+            },
+            Cell {
+                ch: 'b',
+                style: CellStyle::default(),
+                width: 1,
+            },
         ];
         let next_row: Vec<Cell> = vec![
-            Cell { ch: '你', style: CellStyle::default(), width: 2 },
+            Cell {
+                ch: '你',
+                style: CellStyle::default(),
+                width: 2,
+            },
             Cell::continuation(),
         ];
         // Row 9 in the slice (index) → ANSI row 10 in the patch.
-        let prev: Vec<Vec<Cell>> = (0..9).map(|_| Vec::new()).chain(std::iter::once(prev_row)).collect();
-        let next: Vec<Vec<Cell>> = (0..9).map(|_| Vec::new()).chain(std::iter::once(next_row)).collect();
+        let prev: Vec<Vec<Cell>> = (0..9)
+            .map(|_| Vec::new())
+            .chain(std::iter::once(prev_row))
+            .collect();
+        let next: Vec<Vec<Cell>> = (0..9)
+            .map(|_| Vec::new())
+            .chain(std::iter::once(next_row))
+            .collect();
 
         let patches = diff_cell_frames(&prev, &next);
         assert_eq!(patches.len(), 2, "both cols changed");
@@ -764,15 +901,33 @@ mod tests {
     #[test]
     fn unicode_diff_wide_to_narrow_erases_right_half() {
         let prev_row: Vec<Cell> = vec![
-            Cell { ch: '你', style: CellStyle::default(), width: 2 },
+            Cell {
+                ch: '你',
+                style: CellStyle::default(),
+                width: 2,
+            },
             Cell::continuation(),
         ];
         let next_row: Vec<Cell> = vec![
-            Cell { ch: 'a', style: CellStyle::default(), width: 1 },
-            Cell { ch: 'b', style: CellStyle::default(), width: 1 },
+            Cell {
+                ch: 'a',
+                style: CellStyle::default(),
+                width: 1,
+            },
+            Cell {
+                ch: 'b',
+                style: CellStyle::default(),
+                width: 1,
+            },
         ];
-        let prev: Vec<Vec<Cell>> = (0..4).map(|_| Vec::new()).chain(std::iter::once(prev_row)).collect();
-        let next: Vec<Vec<Cell>> = (0..4).map(|_| Vec::new()).chain(std::iter::once(next_row)).collect();
+        let prev: Vec<Vec<Cell>> = (0..4)
+            .map(|_| Vec::new())
+            .chain(std::iter::once(prev_row))
+            .collect();
+        let next: Vec<Vec<Cell>> = (0..4)
+            .map(|_| Vec::new())
+            .chain(std::iter::once(next_row))
+            .collect();
 
         let patches = diff_cell_frames(&prev, &next);
         assert_eq!(patches.len(), 2);

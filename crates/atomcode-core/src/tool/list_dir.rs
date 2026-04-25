@@ -14,8 +14,9 @@ struct ListDirArgs {
     depth: usize,
 }
 
-fn default_depth() -> usize { 2 }
-
+fn default_depth() -> usize {
+    2
+}
 
 #[async_trait]
 impl Tool for ListDirTool {
@@ -51,7 +52,8 @@ impl Tool for ListDirTool {
             Err(_) => return self.approval(args),
         };
         let raw_path = parsed.path.as_deref().unwrap_or(".");
-        match super::approval_for_path(raw_path, &working_dir, super::ExternalPathAction::Enumerate) {
+        match super::approval_for_path(raw_path, &working_dir, super::ExternalPathAction::Enumerate)
+        {
             Ok(approval) => approval,
             Err(_) => self.approval(args),
         }
@@ -98,7 +100,9 @@ impl Tool for ListDirTool {
 }
 
 fn scan_dir(lines: &mut Vec<String>, dir: &std::path::Path, depth: usize, max_depth: usize) {
-    if depth > max_depth { return; }
+    if depth > max_depth {
+        return;
+    }
 
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,

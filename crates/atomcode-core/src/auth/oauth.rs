@@ -7,34 +7,17 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 
-/// Deserialize an ID that may be a string or a number into a String.
-fn deserialize_id_as_string<'de, D: Deserializer<'de>>(
-    deserializer: D,
-) -> std::result::Result<String, D::Error> {
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum StringOrNum {
-        Str(String),
-        Int(i64),
-    }
-    match StringOrNum::deserialize(deserializer)? {
-        StringOrNum::Str(s) => Ok(s),
-        StringOrNum::Int(n) => Ok(n.to_string()),
-    }
-}
+use atomcode_telemetry::{Event, Telemetry};
 
-/// URL encode a string
-fn urlencoding_encode(s: &str) -> String {
-    url::form_urlencoded::byte_serialize(s.as_bytes()).collect()
-}
-
-/// AtomGit OAuth configuration
-pub const CLIENT_ID: &str = "b9956e5327e544578128af8979ba3ccb";
-pub const CLIENT_SECRET: &str = "756ef00061884c7aa1ac64bd4eae3be7";
-pub const REDIRECT_PORT: u16 = 8765;
-pub const REDIRECT_URI: &str = "http://127.0.0.1:8765/callback";
+/// Platform OAuth Broker URL (client_secret is kept on the broker)
+pub const PLATFORM_BROKER_URL: &str = "https://acs.atomgit.com";
+pub const PLATFORM_LOGIN_URL: &str = "https://acs.atomgit.com/auth/login";
+pub const PLATFORM_CHECK_URL: &str = "https://acs.atomgit.com/auth/check";
+pub const PLATFORM_TOKEN_URL: &str = "https://acs.atomgit.com/auth/token";
+pub const PLATFORM_EXCHANGE_URL: &str = "https://acs.atomgit.com/oauth/exchange";
+pub const PLATFORM_REFRESH_URL: &str = "https://acs.atomgit.com/oauth/refresh";
 
 /// AtomGit OAuth endpoints
 pub const AUTHORIZE_URL: &str = "https://atomgit.com/oauth/authorize";
@@ -60,9 +43,6 @@ fn blocking_client() -> reqwest::blocking::Client {
         .unwrap_or_else(|_| reqwest::blocking::Client::new())
 }
 
-/// OAuth scopes needed
-pub const SCOPES: &str = "user_info projects";
-
 /// Stored authentication data
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthInfo {
@@ -85,71 +65,102 @@ pub struct UserInfo {
     pub avatar_url: Option<String>,
 }
 
+// ============================================================================
+// Platform API types
+// ============================================================================
+
 #[derive(Debug, Deserialize)]
-struct TokenResponse {
-    access_token: String,
-    refresh_token: Option<String>,
-    token_type: Option<String>,
-    expires_in: Option<i64>,
+struct PlatformLoginResponse {
+    login_url: String,
+    state: String,
 }
 
 #[derive(Debug, Deserialize)]
-struct UserResponse {
-    #[serde(deserialize_with = "deserialize_id_as_string")]
+struct PlatformCheckResponse {
+    valid: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct PlatformUserInfo {
     id: String,
-    login: String,
+    username: String,
     name: Option<String>,
     email: Option<String>,
     avatar_url: Option<String>,
 }
 
-/// Perform OAuth login flow
-pub fn login() -> Result<AuthInfo> {
-    println!("\n  AtomCode Login");
-    println!("  ==============\n");
+#[derive(Debug, Deserialize)]
+struct PlatformTokenResponse {
+    access_token: String,
+    token_type: String,
+    expires_in: Option<i64>,
+    refresh_token: Option<String>,
+    user: PlatformUserInfo,
+}
 
-    // Generate random state for CSRF protection
-    let state = generate_state();
+/// Perform OAuth login flow via Platform broker.
+///
+/// `tel` is optional so non-CLI callers (TUI `/login`, coding_plan setup,
+/// tests) can pass `None` when they don't hold a telemetry handle. The CLI
+/// main path passes `Some(&telemetry)` to emit `login_success` once.
+pub fn login(tel: Option<&Arc<Telemetry>>) -> Result<AuthInfo> {
+    // println!("\n  AtomCode Login");
+    // println!("  ==============\n");
 
-    // Build authorization URL
-    let auth_url = format!(
-        "{}?client_id={}&redirect_uri={}&response_type=code&state={}&scope={}",
-        AUTHORIZE_URL,
-        urlencoding_encode(CLIENT_ID),
-        urlencoding_encode(REDIRECT_URI),
-        state,
-        urlencoding_encode(SCOPES),
-    );
+    let client = reqwest::blocking::Client::new();
 
-    println!("  Opening browser for authorization...");
-    println!("  If browser doesn't open, visit this URL:\n");
-    println!("  {}\n", auth_url);
+    // Step 1: Call Platform /auth/login to get the authorization URL
+    let login_resp: PlatformLoginResponse = client
+        .get(PLATFORM_LOGIN_URL)
+        .query(&[("provider", "atomgit")])
+        .send()
+        .context("Failed to call /auth/login")?
+        .json()
+        .context("Failed to parse /auth/login response")?;
 
-    // Open browser (best-effort — paste path below covers headless / WSL).
-    if let Err(e) = open_browser(&auth_url) {
+    // println!("  Opening browser for authorization...");
+    // println!("  If browser doesn't open, visit this URL:\n");
+    // println!("  {}\n", login_resp.login_url);
+
+    // Open browser (best-effort)
+    if let Err(e) = open_browser(&login_resp.login_url) {
         println!("  Failed to open browser: {}", e);
-        println!("  (paste path below will still work)\n");
+        println!("  (please open the URL above manually)\n");
     }
 
-    let (code, returned_state) = await_callback(REDIRECT_PORT)?;
+    // Step 2: Poll /auth/check until login is complete
+    // println!("  Waiting for authorization (open browser if it didn't open)...\n");
 
-    // Verify state. Most common cause of mismatch in practice is the user
-    // pasting a callback URL left over from an earlier /login attempt;
-    // re-running /login regenerates state and fixes it.
-    if returned_state != state {
-        anyhow::bail!(
-            "OAuth state mismatch — the pasted URL likely came from an earlier \
-            /login attempt. Re-run /login and paste the newly-authorized URL."
-        );
-    }
+    let check_resp = loop {
+        // Poll /auth/check
+        let resp = client
+            .get(PLATFORM_CHECK_URL)
+            .query(&[("state", &login_resp.state)])
+            .send()
+            .context("Failed to call /auth/check")?;
 
-    println!("  Authorization received, exchanging token...\n");
+        if resp.status().is_success() {
+            if let Ok(check) = resp.json::<PlatformCheckResponse>() {
+                if check.valid {
+                    break login_resp.state;
+                }
+            }
+        }
 
-    // Exchange code for token
-    let token = exchange_code_for_token(&code)?;
+        // println!("  Waiting for browser authorization...");
+        thread::sleep(Duration::from_secs(2));
+    };
 
-    // Get user info
-    let user = get_user_info(&token.access_token)?;
+    // Step 3: Get token from Platform
+    // println!("  Authorization complete, fetching token...\n");
+
+    let token_resp: PlatformTokenResponse = client
+        .get(PLATFORM_TOKEN_URL)
+        .query(&[("state", &check_resp)])
+        .send()
+        .context("Failed to call /auth/token")?
+        .json()
+        .context("Failed to parse /auth/token response")?;
 
     let created_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -157,29 +168,51 @@ pub fn login() -> Result<AuthInfo> {
         .as_secs() as i64;
 
     let auth_info = AuthInfo {
-        access_token: token.access_token,
-        refresh_token: token.refresh_token,
-        token_type: token.token_type.unwrap_or_else(|| "Bearer".to_string()),
-        expires_in: token.expires_in,
+        access_token: token_resp.access_token,
+        refresh_token: token_resp.refresh_token,
+        token_type: token_resp.token_type,
+        expires_in: token_resp.expires_in,
         created_at,
         user: UserInfo {
-            id: user.id,
-            username: user.login,
-            name: user.name,
-            email: user.email,
-            avatar_url: user.avatar_url,
+            id: token_resp.user.id,
+            username: token_resp.user.username,
+            name: token_resp.user.name,
+            email: token_resp.user.email,
+            avatar_url: token_resp.user.avatar_url,
         },
     };
 
-    println!(
-        "  Logged in as: {} ({})\n",
-        auth_info.user.username, auth_info.user.id
-    );
+    // println!(
+    //     "  Logged in as: {} ({})\n",
+    //     auth_info.user.username, auth_info.user.id
+    // );
+
+    if let Some(t) = tel {
+        t.track(Event::LoginSuccess);
+    }
 
     Ok(auth_info)
 }
 
+/// Extract state from a pasted callback URL (kept for potential future fallback use)
+#[allow(dead_code)]
+fn pasted_state(url: &str) -> Option<String> {
+    url.split('?')
+        .nth(1)?
+        .split('&')
+        .filter_map(|pair| {
+            let mut parts = pair.splitn(2, '=');
+            if parts.next()? == "state" {
+                Some(urlencoding_decode(parts.next()?))
+            } else {
+                None
+            }
+        })
+        .next()
+}
+
 /// Generate random state string for CSRF protection
+#[allow(dead_code)]
 fn generate_state() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let timestamp = SystemTime::now()
@@ -228,6 +261,10 @@ fn open_browser(_url: &str) -> Result<()> {
 /// where the browser hits `127.0.0.1:8765`; stdin path handles WSL /
 /// headless Linux where the user copies the callback URL from their
 /// browser's address bar and pastes it in.
+///
+/// Kept for potential future fallback use — the platform-broker flow in
+/// `login()` is the active callback path now.
+#[allow(dead_code)]
 fn await_callback(port: u16) -> Result<(String, String)> {
     let listener = match TcpListener::bind(("127.0.0.1", port)) {
         Ok(l) => Some(l),
@@ -333,9 +370,8 @@ fn await_callback(port: u16) -> Result<(String, String)> {
 /// the same terminal device; whichever syscall lands on a byte first
 /// gets it, and a blocked `read_line` stays in line for the next input.
 #[cfg(not(target_os = "windows"))]
-fn read_callback_from_stdin_until_stopped(
-    stop: &AtomicBool,
-) -> Result<(String, String)> {
+#[allow(dead_code)]
+fn read_callback_from_stdin_until_stopped(stop: &AtomicBool) -> Result<(String, String)> {
     use std::os::unix::io::AsRawFd;
 
     let stdin = io::stdin();
@@ -391,8 +427,7 @@ fn read_callback_from_stdin_until_stopped(
         }
         // Data available; drain what's there. read(2) in non-blocking
         // mode returns up to one pipe buffer in a single call.
-        let n =
-            unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+        let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
         if n < 0 {
             let err = io::Error::last_os_error();
             if err.kind() == io::ErrorKind::WouldBlock || err.kind() == io::ErrorKind::Interrupted {
@@ -414,6 +449,7 @@ fn read_callback_from_stdin_until_stopped(
 
 /// `stop` flag every 200ms so the caller can cancel (e.g. when the paste
 /// path won the race).
+#[allow(dead_code)]
 fn accept_callback_until_stopped(
     listener: TcpListener,
     stop: &AtomicBool,
@@ -521,59 +557,8 @@ fn urlencoding_decode(s: &str) -> String {
     result
 }
 
-/// Exchange authorization code for access token
-fn exchange_code_for_token(code: &str) -> Result<TokenResponse> {
-    let client = blocking_client();
-
-    let params = [
-        ("client_id", CLIENT_ID),
-        ("client_secret", CLIENT_SECRET),
-        ("code", code),
-        ("redirect_uri", REDIRECT_URI),
-        ("grant_type", "authorization_code"),
-    ];
-
-    let response = client
-        .post(TOKEN_URL)
-        .form(&params)
-        .send()
-        .context("Failed to send token request")?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().unwrap_or_default();
-        anyhow::bail!("Token request failed ({}): {}", status, body);
-    }
-
-    response
-        .json::<TokenResponse>()
-        .context("Failed to parse token response")
-}
-
-/// Get user information using access token
-fn get_user_info(access_token: &str) -> Result<UserResponse> {
-    let client = blocking_client();
-
-    let response = client
-        .get(USER_URL)
-        .bearer_auth(access_token)
-        .send()
-        .context("Failed to get user info")?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().unwrap_or_default();
-        anyhow::bail!("User info request failed ({}): {}", status, body);
-    }
-
-    response
-        .json::<UserResponse>()
-        .context("Failed to parse user response")
-}
-
-/// Refresh the access token using the stored refresh_token.
+/// Refresh the access token using the stored refresh_token via Platform Broker.
 /// Returns updated AuthInfo with new tokens, and saves it to disk.
-#[allow(dead_code)]
 pub fn refresh_access_token(auth: &AuthInfo) -> Result<AuthInfo> {
     let refresh_token = auth
         .refresh_token
@@ -581,18 +566,13 @@ pub fn refresh_access_token(auth: &AuthInfo) -> Result<AuthInfo> {
         .context("No refresh_token available — please /login again")?;
 
     let client = blocking_client();
-    let params = [
-        ("client_id", CLIENT_ID),
-        ("client_secret", CLIENT_SECRET),
-        ("refresh_token", refresh_token),
-        ("grant_type", "refresh_token"),
-    ];
 
+    // Call Platform Broker API for refresh
     let response = client
-        .post(TOKEN_URL)
-        .form(&params)
+        .post(PLATFORM_REFRESH_URL)
+        .json(&serde_json::json!({ "refresh_token": refresh_token }))
         .send()
-        .context("Failed to send refresh token request")?;
+        .context("Failed to send refresh token request to broker")?;
 
     if !response.status().is_success() {
         let status = response.status();
@@ -604,9 +584,16 @@ pub fn refresh_access_token(auth: &AuthInfo) -> Result<AuthInfo> {
         );
     }
 
-    let token: TokenResponse = response
-        .json()
-        .context("Failed to parse refresh token response")?;
+    #[derive(Deserialize)]
+    struct BrokerResponse {
+        access_token: String,
+        token_type: Option<String>,
+        expires_in: Option<i64>,
+        refresh_token: Option<String>,
+        user: Option<PlatformUserInfo>,
+    }
+
+    let broker_resp: BrokerResponse = response.json().context("Failed to parse broker response")?;
 
     let created_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -614,12 +601,25 @@ pub fn refresh_access_token(auth: &AuthInfo) -> Result<AuthInfo> {
         .as_secs() as i64;
 
     let new_auth = AuthInfo {
-        access_token: token.access_token,
-        refresh_token: token.refresh_token.or_else(|| auth.refresh_token.clone()),
-        token_type: token.token_type.unwrap_or_else(|| auth.token_type.clone()),
-        expires_in: token.expires_in.or(auth.expires_in),
+        access_token: broker_resp.access_token,
+        refresh_token: broker_resp
+            .refresh_token
+            .or_else(|| auth.refresh_token.clone()),
+        token_type: broker_resp
+            .token_type
+            .unwrap_or_else(|| auth.token_type.clone()),
+        expires_in: broker_resp.expires_in.or(auth.expires_in),
         created_at,
-        user: auth.user.clone(),
+        user: broker_resp
+            .user
+            .map(|u| UserInfo {
+                id: u.id,
+                username: u.username,
+                name: u.name,
+                email: u.email,
+                avatar_url: u.avatar_url,
+            })
+            .unwrap_or_else(|| auth.user.clone()),
     };
 
     save_auth(&new_auth)?;
@@ -628,7 +628,6 @@ pub fn refresh_access_token(auth: &AuthInfo) -> Result<AuthInfo> {
 
 /// Get a valid access token, refreshing automatically if expired.
 /// Returns the access token string ready to use.
-#[allow(dead_code)]
 pub fn get_valid_token() -> Result<String> {
     let auth = get_stored_auth().context("Not logged in — please use /login first")?;
 
@@ -691,8 +690,28 @@ pub fn get_stored_auth() -> Option<AuthInfo> {
 /// Save auth info to file
 pub fn save_auth(auth: &AuthInfo) -> Result<()> {
     let auth_path = auth_file_path();
+
+    // Ensure parent directory exists
+    if let Some(parent) = auth_path.parent() {
+        std::fs::create_dir_all(parent).context("Failed to create auth directory")?;
+        // Set directory permissions to 0o700 (owner only) on Unix
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+
     let content = toml::to_string_pretty(auth).context("Failed to serialize auth info")?;
     super::write_auth_file_secure(&auth_path, &content).context("Failed to write auth file")?;
+
+    // Set file permissions to 0o600 (owner read/write only) on Unix
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&auth_path, std::fs::Permissions::from_mode(0o600))
+            .context("Failed to set auth file permissions")?;
+    }
 
     println!("  Auth saved to: {}\n", auth_path.display());
 
@@ -708,13 +727,11 @@ pub fn auth_file_path() -> std::path::PathBuf {
 }
 
 /// Check if user is logged in
-#[allow(dead_code)]
 pub fn is_logged_in() -> bool {
     get_stored_auth().is_some()
 }
 
 /// Get current user info (if logged in)
-#[allow(dead_code)]
 pub fn current_user() -> Option<UserInfo> {
     get_stored_auth().map(|auth| auth.user)
 }
@@ -724,6 +741,7 @@ pub fn current_user() -> Option<UserInfo> {
 /// Accepts any URL with a query string containing `code` and `state`.
 /// Rejects raw `code` without URL context — state validation is CSRF
 /// protection and we want the full round-trip, not a manually typed code.
+#[allow(dead_code)]
 fn parse_pasted_callback(input: &str) -> Result<(String, String)> {
     // Defensively strip bracketed-paste markers. The TUI disables DECSET
     // 2004 before calling us, but a user pasting into a terminal we didn't

@@ -19,7 +19,9 @@ struct WebFetchArgs {
     max_chars: usize,
 }
 
-fn default_max_chars() -> usize { 20000 }
+fn default_max_chars() -> usize {
+    20000
+}
 
 /// Hard cap on the raw response bytes we'll buffer before bailing. Keeps a
 /// hostile server from exhausting memory by streaming indefinitely within the
@@ -40,24 +42,37 @@ const CONNECT_TIMEOUT_SECS: u64 = 5;
 /// attacker-controlled URLs. Keeping the allowlist documentation-focused
 /// matches the tool's stated use case (reading READMEs, API references).
 const AUTO_APPROVE_DOMAINS: &[&str] = &[
-    "github.com", "raw.githubusercontent.com", "gist.githubusercontent.com",
-    "docs.rs", "crates.io", "doc.rust-lang.org", "rust-lang.org",
+    "github.com",
+    "raw.githubusercontent.com",
+    "gist.githubusercontent.com",
+    "docs.rs",
+    "crates.io",
+    "doc.rust-lang.org",
+    "rust-lang.org",
     "developer.mozilla.org",
-    "docs.python.org", "pypi.org",
-    "nodejs.org", "npmjs.com",
-    "go.dev", "pkg.go.dev", "golang.org",
+    "docs.python.org",
+    "pypi.org",
+    "nodejs.org",
+    "npmjs.com",
+    "go.dev",
+    "pkg.go.dev",
+    "golang.org",
     "docs.oracle.com",
-    "kubernetes.io", "docker.com",
+    "kubernetes.io",
+    "docker.com",
     // Chinese dev ecosystem — AtomGit's own platform and frequently-used
     // knowledge sources (code-hosting, tech blogs, open-source foundations).
-    "atomgit.com", "gitcode.com", "csdn.net", "openatom.cn",
+    "atomgit.com",
+    "gitcode.com",
+    "csdn.net",
+    "openatom.cn",
 ];
 
 fn host_is_auto_approved(host: &str) -> bool {
     let host = host.trim_end_matches('.').to_ascii_lowercase();
-    AUTO_APPROVE_DOMAINS.iter().any(|allowed| {
-        host == *allowed || host.ends_with(&format!(".{}", allowed))
-    })
+    AUTO_APPROVE_DOMAINS
+        .iter()
+        .any(|allowed| host == *allowed || host.ends_with(&format!(".{}", allowed)))
 }
 
 fn validate_scheme(url: &Url) -> Result<(), String> {
@@ -75,35 +90,67 @@ fn validate_scheme(url: &Url) -> Result<(), String> {
 /// (169.254.169.254 AWS/GCP/Azure metadata), CGNAT, reserved ranges, IPv6
 /// ULA, IPv6 link-local, and IPv4-mapped v6 whose underlying v4 is unsafe.
 fn is_safe_ip(ip: IpAddr) -> Result<(), String> {
-    let reject = |category: &str| Err(format!(
-        "refusing to connect to {ip} ({category}) — SSRF protection"
-    ));
+    let reject = |category: &str| {
+        Err(format!(
+            "refusing to connect to {ip} ({category}) — SSRF protection"
+        ))
+    };
     match ip {
         IpAddr::V4(v4) => {
-            if v4.is_loopback() { return reject("loopback 127.0.0.0/8"); }
-            if v4.is_private() { return reject("private network"); }
-            if v4.is_link_local() { return reject("link-local / cloud metadata"); }
-            if v4.is_broadcast() { return reject("broadcast"); }
-            if v4.is_multicast() { return reject("multicast"); }
-            if v4.is_unspecified() { return reject("unspecified 0.0.0.0"); }
+            if v4.is_loopback() {
+                return reject("loopback 127.0.0.0/8");
+            }
+            if v4.is_private() {
+                return reject("private network");
+            }
+            if v4.is_link_local() {
+                return reject("link-local / cloud metadata");
+            }
+            if v4.is_broadcast() {
+                return reject("broadcast");
+            }
+            if v4.is_multicast() {
+                return reject("multicast");
+            }
+            if v4.is_unspecified() {
+                return reject("unspecified 0.0.0.0");
+            }
             let o = v4.octets();
-            if o[0] == 0 { return reject("reserved 0.0.0.0/8"); }
-            if o[0] >= 240 { return reject("reserved 240.0.0.0/4"); }
+            if o[0] == 0 {
+                return reject("reserved 0.0.0.0/8");
+            }
+            if o[0] >= 240 {
+                return reject("reserved 240.0.0.0/4");
+            }
             // CGNAT 100.64.0.0/10 — commonly used as carrier private space
-            if o[0] == 100 && (o[1] & 0xc0) == 64 { return reject("CGNAT 100.64/10"); }
+            if o[0] == 100 && (o[1] & 0xc0) == 64 {
+                return reject("CGNAT 100.64/10");
+            }
             // Benchmarking 198.18.0.0/15
-            if o[0] == 198 && (o[1] == 18 || o[1] == 19) { return reject("benchmark 198.18/15"); }
+            if o[0] == 198 && (o[1] == 18 || o[1] == 19) {
+                return reject("benchmark 198.18/15");
+            }
             Ok(())
         }
         IpAddr::V6(v6) => {
-            if v6.is_loopback() { return reject("loopback ::1"); }
-            if v6.is_unspecified() { return reject("unspecified ::"); }
-            if v6.is_multicast() { return reject("multicast"); }
+            if v6.is_loopback() {
+                return reject("loopback ::1");
+            }
+            if v6.is_unspecified() {
+                return reject("unspecified ::");
+            }
+            if v6.is_multicast() {
+                return reject("multicast");
+            }
             let first = v6.segments()[0];
             // Unique local addresses fc00::/7
-            if (first & 0xfe00) == 0xfc00 { return reject("unique-local fc00::/7"); }
+            if (first & 0xfe00) == 0xfc00 {
+                return reject("unique-local fc00::/7");
+            }
             // Link-local fe80::/10 — includes IPv6 metadata endpoints
-            if (first & 0xffc0) == 0xfe80 { return reject("link-local fe80::/10"); }
+            if (first & 0xffc0) == 0xfe80 {
+                return reject("link-local fe80::/10");
+            }
             // IPv4-mapped ::ffff:a.b.c.d — unwrap and re-check against v4 rules
             if let Some(mapped) = v6.to_ipv4_mapped() {
                 return is_safe_ip(IpAddr::V4(mapped));
@@ -124,7 +171,8 @@ fn is_safe_ip(ip: IpAddr) -> Result<(), String> {
 /// eliminates the 99% of SSRF attempts that rely on literal-IP or static-DNS
 /// targets (file://, localhost, 169.254.169.254, fixed internal hostnames).
 async fn validate_host(url: &Url) -> Result<(), String> {
-    let host = url.host_str()
+    let host = url
+        .host_str()
         .ok_or_else(|| format!("URL has no host: {}", url))?;
     // Literal IP in URL: check directly, bypass DNS.
     if let Ok(ip) = host.parse::<IpAddr>() {
@@ -181,26 +229,29 @@ impl Tool for WebFetchTool {
         // Fail-closed on malformed input: a broken arg can't be auto-approved.
         let Ok(parsed) = serde_json::from_str::<WebFetchArgs>(args) else {
             return ApprovalRequirement::RequireApproval(
-                "web_fetch called with malformed arguments".into()
+                "web_fetch called with malformed arguments".into(),
             );
         };
         let Ok(url) = Url::parse(&parsed.url) else {
-            return ApprovalRequirement::RequireApproval(
-                format!("web_fetch: unparseable URL `{}`", parsed.url)
-            );
+            return ApprovalRequirement::RequireApproval(format!(
+                "web_fetch: unparseable URL `{}`",
+                parsed.url
+            ));
         };
         if validate_scheme(&url).is_err() {
-            return ApprovalRequirement::RequireApproval(
-                format!("web_fetch: non-http(s) scheme `{}` — will be denied", url.scheme())
-            );
+            return ApprovalRequirement::RequireApproval(format!(
+                "web_fetch: non-http(s) scheme `{}` — will be denied",
+                url.scheme()
+            ));
         }
         if let Some(host) = url.host_str() {
             if host_is_auto_approved(host) {
                 return ApprovalRequirement::AutoApprove;
             }
-            return ApprovalRequirement::RequireApproval(
-                format!("web_fetch: {} (not in documentation allowlist)", host)
-            );
+            return ApprovalRequirement::RequireApproval(format!(
+                "web_fetch: {} (not in documentation allowlist)",
+                host
+            ));
         }
         ApprovalRequirement::RequireApproval(format!("web_fetch: {}", url))
     }
@@ -208,9 +259,12 @@ impl Tool for WebFetchTool {
     async fn execute(&self, args: &str, _ctx: &ToolContext) -> Result<ToolResult> {
         let parsed: WebFetchArgs = match serde_json::from_str(args) {
             Ok(p) => p,
-            Err(e) => return Ok(err_result(format!(
-                "Invalid web_fetch arguments: {}. Provide {{\"url\":\"https://...\"}}.", e
-            ))),
+            Err(e) => {
+                return Ok(err_result(format!(
+                    "Invalid web_fetch arguments: {}. Provide {{\"url\":\"https://...\"}}.",
+                    e
+                )))
+            }
         };
         let max = parsed.max_chars.min(50000);
 
@@ -244,9 +298,7 @@ impl Tool for WebFetchTool {
 
             let resp = match client.get(url.clone()).send().await {
                 Ok(r) => r,
-                Err(e) => return Ok(err_result(format!(
-                    "Failed to fetch {}: {}", url, e
-                ))),
+                Err(e) => return Ok(err_result(format!("Failed to fetch {}: {}", url, e))),
             };
 
             if !resp.status().is_redirection() {
@@ -254,7 +306,8 @@ impl Tool for WebFetchTool {
             }
             if hops >= MAX_REDIRECTS {
                 return Ok(err_result(format!(
-                    "Too many redirects (>{}) starting from {}", MAX_REDIRECTS, parsed.url
+                    "Too many redirects (>{}) starting from {}",
+                    MAX_REDIRECTS, parsed.url
                 )));
             }
             let Some(loc) = resp.headers().get(reqwest::header::LOCATION) else {
@@ -264,16 +317,22 @@ impl Tool for WebFetchTool {
             };
             let loc_str = match loc.to_str() {
                 Ok(s) => s,
-                Err(_) => return Ok(err_result(format!(
-                    "Redirect from {} has non-ASCII Location header", url
-                ))),
+                Err(_) => {
+                    return Ok(err_result(format!(
+                        "Redirect from {} has non-ASCII Location header",
+                        url
+                    )))
+                }
             };
             // Location may be relative — resolve against current URL.
             url = match url.join(loc_str) {
                 Ok(u) => u,
-                Err(e) => return Ok(err_result(format!(
-                    "Bad redirect target `{}` from {}: {}", loc_str, url, e
-                ))),
+                Err(e) => {
+                    return Ok(err_result(format!(
+                        "Bad redirect target `{}` from {}: {}",
+                        loc_str, url, e
+                    )))
+                }
             };
             hops += 1;
         };
@@ -282,17 +341,21 @@ impl Tool for WebFetchTool {
         let status = response.status();
         if !status.is_success() {
             return Ok(err_result(format!(
-                "HTTP {} from {}", status.as_u16(), final_url
+                "HTTP {} from {}",
+                status.as_u16(),
+                final_url
             )));
         }
 
-        let ct_header = response.headers()
+        let ct_header = response
+            .headers()
             .get(reqwest::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_ascii_lowercase());
-        let ct_is_html = ct_header.as_deref().map(|s|
-            s.contains("text/html") || s.contains("application/xhtml")
-        ).unwrap_or(false);
+        let ct_is_html = ct_header
+            .as_deref()
+            .map(|s| s.contains("text/html") || s.contains("application/xhtml"))
+            .unwrap_or(false);
 
         // Stream with a byte cap. Prevents OOM on an endless slow-serve attack
         // that would otherwise creep under the per-request timeout.
@@ -302,9 +365,12 @@ impl Tool for WebFetchTool {
         while let Some(chunk) = stream.next().await {
             let chunk = match chunk {
                 Ok(c) => c,
-                Err(e) => return Ok(err_result(format!(
-                    "Failed mid-stream for {}: {}", final_url, e
-                ))),
+                Err(e) => {
+                    return Ok(err_result(format!(
+                        "Failed mid-stream for {}: {}",
+                        final_url, e
+                    )))
+                }
             };
             if buf.len() + chunk.len() > MAX_RESPONSE_BYTES {
                 let remaining = MAX_RESPONSE_BYTES - buf.len();
@@ -331,19 +397,28 @@ impl Tool for WebFetchTool {
             while end > 0 && !text.is_char_boundary(end) {
                 end -= 1;
             }
-            format!("{}\n\n[Truncated at {} chars, {} total]", &text[..end], max, text.len())
+            format!(
+                "{}\n\n[Truncated at {} chars, {} total]",
+                &text[..end],
+                max,
+                text.len()
+            )
         } else {
             text
         };
 
         if output.trim().is_empty() {
             return Ok(err_result(format!(
-                "Page fetched but no readable text content found at {}", final_url
+                "Page fetched but no readable text content found at {}",
+                final_url
             )));
         }
 
         let cap_note = if hit_cap {
-            format!("\n\n[Response exceeded {} bytes — content was truncated before text extraction]", MAX_RESPONSE_BYTES)
+            format!(
+                "\n\n[Response exceeded {} bytes — content was truncated before text extraction]",
+                MAX_RESPONSE_BYTES
+            )
         } else {
             String::new()
         };
@@ -368,8 +443,25 @@ fn html_to_text(html: &str) -> String {
 
     // Phase 2: Convert block elements to newlines
     let mut result = cleaned.clone();
-    for tag in &["p", "div", "br", "li", "tr", "h1", "h2", "h3", "h4", "h5", "h6",
-                  "article", "section", "blockquote", "pre", "dd", "dt"] {
+    for tag in &[
+        "p",
+        "div",
+        "br",
+        "li",
+        "tr",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "article",
+        "section",
+        "blockquote",
+        "pre",
+        "dd",
+        "dt",
+    ] {
         // Opening tags → newline
         result = replace_tag_with(&result, tag, "\n");
     }
@@ -416,8 +508,12 @@ fn html_to_text(html: &str) -> String {
     }
 
     // Remove leading/trailing blank lines
-    while lines.first() == Some(&"") { lines.remove(0); }
-    while lines.last() == Some(&"") { lines.pop(); }
+    while lines.first() == Some(&"") {
+        lines.remove(0);
+    }
+    while lines.last() == Some(&"") {
+        lines.pop();
+    }
 
     lines.join("\n")
 }
@@ -520,7 +616,8 @@ mod tests {
     fn is_safe_ip_accepts_public_v4() {
         assert!(is_safe_ip(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))).is_ok());
         assert!(is_safe_ip(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))).is_ok());
-        assert!(is_safe_ip(IpAddr::V4(Ipv4Addr::new(140, 82, 112, 3))).is_ok()); // github.com range
+        assert!(is_safe_ip(IpAddr::V4(Ipv4Addr::new(140, 82, 112, 3))).is_ok());
+        // github.com range
     }
 
     #[test]
@@ -616,35 +713,53 @@ mod tests {
     fn approval_requires_confirm_for_localhost_literal() {
         let tool = WebFetchTool;
         let args = r#"{"url":"http://127.0.0.1:8080/"}"#;
-        assert!(matches!(tool.approval(args), ApprovalRequirement::RequireApproval(_)));
+        assert!(matches!(
+            tool.approval(args),
+            ApprovalRequirement::RequireApproval(_)
+        ));
     }
 
     #[test]
     fn approval_requires_confirm_for_file_scheme() {
         let tool = WebFetchTool;
         let args = r#"{"url":"file:///etc/passwd"}"#;
-        assert!(matches!(tool.approval(args), ApprovalRequirement::RequireApproval(_)));
+        assert!(matches!(
+            tool.approval(args),
+            ApprovalRequirement::RequireApproval(_)
+        ));
     }
 
     #[test]
     fn approval_auto_approves_github() {
         let tool = WebFetchTool;
         let args = r#"{"url":"https://github.com/rust-lang/rust"}"#;
-        assert!(matches!(tool.approval(args), ApprovalRequirement::AutoApprove));
+        assert!(matches!(
+            tool.approval(args),
+            ApprovalRequirement::AutoApprove
+        ));
     }
 
     #[test]
     fn approval_requires_confirm_for_unknown_domain() {
         let tool = WebFetchTool;
         let args = r#"{"url":"https://example.com/"}"#;
-        assert!(matches!(tool.approval(args), ApprovalRequirement::RequireApproval(_)));
+        assert!(matches!(
+            tool.approval(args),
+            ApprovalRequirement::RequireApproval(_)
+        ));
     }
 
     #[test]
     fn approval_requires_confirm_on_malformed_args() {
         let tool = WebFetchTool;
-        assert!(matches!(tool.approval("{}"), ApprovalRequirement::RequireApproval(_)));
-        assert!(matches!(tool.approval(""), ApprovalRequirement::RequireApproval(_)));
+        assert!(matches!(
+            tool.approval("{}"),
+            ApprovalRequirement::RequireApproval(_)
+        ));
+        assert!(matches!(
+            tool.approval(""),
+            ApprovalRequirement::RequireApproval(_)
+        ));
     }
 
     // ── execute() SSRF smoke tests ─────────────────────────────────────────
@@ -656,8 +771,11 @@ mod tests {
         let args = r#"{"url":"file:///etc/passwd"}"#;
         let r = tool.execute(args, &ctx).await.unwrap();
         assert!(!r.success, "file:// must fail");
-        assert!(r.output.contains("scheme") || r.output.contains("Blocked"),
-            "unexpected error: {}", r.output);
+        assert!(
+            r.output.contains("scheme") || r.output.contains("Blocked"),
+            "unexpected error: {}",
+            r.output
+        );
     }
 
     #[tokio::test]
@@ -667,8 +785,11 @@ mod tests {
         let args = r#"{"url":"http://127.0.0.1:1/"}"#;
         let r = tool.execute(args, &ctx).await.unwrap();
         assert!(!r.success, "127.0.0.1 must fail");
-        assert!(r.output.contains("Blocked") || r.output.contains("SSRF"),
-            "unexpected error: {}", r.output);
+        assert!(
+            r.output.contains("Blocked") || r.output.contains("SSRF"),
+            "unexpected error: {}",
+            r.output
+        );
     }
 
     #[tokio::test]
@@ -678,8 +799,11 @@ mod tests {
         let args = r#"{"url":"http://169.254.169.254/latest/meta-data/"}"#;
         let r = tool.execute(args, &ctx).await.unwrap();
         assert!(!r.success, "cloud metadata must fail");
-        assert!(r.output.contains("Blocked") || r.output.contains("SSRF"),
-            "unexpected error: {}", r.output);
+        assert!(
+            r.output.contains("Blocked") || r.output.contains("SSRF"),
+            "unexpected error: {}",
+            r.output
+        );
     }
 
     #[tokio::test]
@@ -701,7 +825,10 @@ mod tests {
         let args = r#"{"url":"-K/etc/passwd"}"#;
         let r = tool.execute(args, &ctx).await.unwrap();
         assert!(!r.success);
-        assert!(r.output.contains("Invalid URL") || r.output.contains("scheme"),
-            "unexpected error: {}", r.output);
+        assert!(
+            r.output.contains("Invalid URL") || r.output.contains("scheme"),
+            "unexpected error: {}",
+            r.output
+        );
     }
 }

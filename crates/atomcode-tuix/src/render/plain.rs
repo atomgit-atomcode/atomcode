@@ -26,7 +26,10 @@ impl Default for PlainRenderer<BufWriter<Stdout>> {
 
 impl<W: Write + Send> PlainRenderer<W> {
     pub fn with_writer(out: W) -> Self {
-        Self { out, last_prompt_written: false }
+        Self {
+            out,
+            last_prompt_written: false,
+        }
     }
 }
 
@@ -34,8 +37,12 @@ impl<W: Write + Send> Renderer for PlainRenderer<W> {
     fn render(&mut self, line: UiLine) {
         match line {
             UiLine::Welcome { model, working_dir } => {
-                let _ = writeln!(self.out, "AtomCode  {}  {}",
-                    scrub_controls(&model), scrub_controls(&working_dir));
+                let _ = writeln!(
+                    self.out,
+                    "AtomCode  {}  {}",
+                    scrub_controls(&model),
+                    scrub_controls(&working_dir)
+                );
             }
             UiLine::User(text) => {
                 let _ = writeln!(self.out, "> {}", scrub_controls(&text));
@@ -72,7 +79,8 @@ impl<W: Write + Send> Renderer for PlainRenderer<W> {
                 let _ = writeln!(
                     self.out,
                     "Allow {}({})? [Y]es / [N]o / [A]lways",
-                    scrub_controls(&tool), scrub_controls(&detail)
+                    scrub_controls(&tool),
+                    scrub_controls(&detail)
                 );
             }
             UiLine::Error(msg) => {
@@ -84,9 +92,7 @@ impl<W: Write + Send> Renderer for PlainRenderer<W> {
             UiLine::TurnComplete => {
                 let _ = self.out.write_all(b"\n");
             }
-            UiLine::Spinner { .. }
-            | UiLine::StreamingBox { .. }
-            | UiLine::ClearTransient => {
+            UiLine::Spinner { .. } | UiLine::StreamingBox { .. } | UiLine::ClearTransient => {
                 // no-op in plain mode
             }
             UiLine::TurnSeparator { label } => {
@@ -154,8 +160,14 @@ mod tests {
     fn no_sgr_bytes_emitted() {
         let mut buf = Vec::new();
         let mut r = PlainRenderer::with_writer(&mut buf);
-        r.render(UiLine::ToolCall { name: "read_file".into(), detail: "x.rs".into() });
-        r.render(UiLine::ToolResult { success: true, summary: "done".into() });
+        r.render(UiLine::ToolCall {
+            name: "read_file".into(),
+            detail: "x.rs".into(),
+        });
+        r.render(UiLine::ToolResult {
+            success: true,
+            summary: "done".into(),
+        });
         r.flush();
         let s = String::from_utf8(buf).unwrap();
         assert!(!s.contains('\x1b'));
@@ -167,7 +179,10 @@ mod tests {
     fn spinner_becomes_no_op_in_plain_mode() {
         let mut buf = Vec::new();
         let mut r = PlainRenderer::with_writer(&mut buf);
-        r.render(UiLine::Spinner { frame: "⠋", label: "Thinking...".into() });
+        r.render(UiLine::Spinner {
+            frame: "⠋",
+            label: "Thinking...".into(),
+        });
         r.flush();
         let s = String::from_utf8(buf).unwrap();
         assert!(s.is_empty());

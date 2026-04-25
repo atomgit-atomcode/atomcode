@@ -122,6 +122,10 @@ AtomCode 是一款住在你终端里的 AI 编码助手。用自然语言给它�
 
 完整设计与当前边界见 [权限模型](./docs/security/permission-model.md)。
 
+### 隐私
+
+- 📊 匿名遥测（默认开启，可关闭）— 详见 [docs/telemetry.md](docs/telemetry.md)
+
 ## 安装
 
 ### 从源码构建（推荐）
@@ -234,6 +238,7 @@ atomcode --prompt-file task.md
 |-----|--------|
 | `Enter` | 发送消息 |
 | `Shift+Enter` | 换行 |
+| `Alt+Enter` / `Ctrl+Enter` | 换行 |
 | `Esc` | 清空输入 / 取消流式输出 |
 | `Up/Down` | 浏览输入历史 |
 | `Tab` | 接受补全 |
@@ -290,9 +295,10 @@ atomcode/
       session/         # 持久化会话
       skill.rs         # 用户自定义 skill
 
-    atomcode-tui/      # 终端 UI（ratatui + crossterm）
-      app.rs           # App 状态机
-      ui/              # 渲染：聊天、输入、状态栏、Markdown
+    atomcode-tuix/     # 终端 UI — retained-mode 渲染器（CC 风格 normal mode）
+      event_loop/      # App 状态机、命令分发
+      render/          # cell-level 渲染器、diff、retained-mode 帧循环
+      modals/          # 各种 picker（dir、model、session、provider、issue）
 
     atomcode-cli/      # 可执行入口（TUI + headless -p 模式）
       main.rs          # CLI 参数、首次运行向导、启动
@@ -373,7 +379,7 @@ cargo test
 
 # 运行指定 crate 的测试
 cargo test -p atomcode-core
-cargo test -p atomcode-tui
+cargo test -p atomcode-tuix
 
 # 运行指定的用例
 cargo test -p atomcode-core test_name
@@ -447,7 +453,7 @@ cargo install --path crates/atomcode-cli
 
 - **新增工具** —— 在 `crates/atomcode-core/src/tool/` 下实现 `Tool` trait
 - **新增模型提供方** —— 在 `crates/atomcode-core/src/provider/` 下实现 `LlmProvider`
-- **改进 UI** —— 渲染相关代码在 `crates/atomcode-tui/src/ui/`
+- **改进 UI** —— 渲染相关代码在 `crates/atomcode-tuix/src/render/`
 - **修 Bug** —— 到 [Issues](https://atomgit.com/atomgit_atomcode/atomcode/issues) 上挑一个
 
 ## 许可证

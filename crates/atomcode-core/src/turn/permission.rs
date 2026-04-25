@@ -1,6 +1,6 @@
+use crate::tool::{PermissionDecision, ToolCall};
 use async_trait::async_trait;
 use tokio::sync::mpsc;
-use crate::tool::{PermissionDecision, ToolCall};
 
 /// Permission decision interface. TurnRunner calls this when a tool requires approval.
 /// Different implementations support interactive (main agent) and automatic (subagent) modes.
@@ -115,40 +115,63 @@ mod tests {
     use super::*;
 
     fn make_call(name: &str) -> ToolCall {
-        ToolCall { id: "test".into(), name: name.into(), arguments: "{}".into() }
+        ToolCall {
+            id: "test".into(),
+            name: name.into(),
+            arguments: "{}".into(),
+        }
     }
 
     #[tokio::test]
     async fn test_auto_bypass_allows_all() {
         let d = AutoPermissionDecider::new(AutoPermissionMode::BypassAll);
-        assert!(matches!(d.decide(&make_call("bash"), "dangerous").await, PermissionDecision::Allow));
+        assert!(matches!(
+            d.decide(&make_call("bash"), "dangerous").await,
+            PermissionDecision::Allow
+        ));
     }
 
     #[tokio::test]
     async fn test_auto_deny_denies_all() {
         let d = AutoPermissionDecider::new(AutoPermissionMode::DenyAll);
-        assert!(matches!(d.decide(&make_call("bash"), "dangerous").await, PermissionDecision::Deny));
+        assert!(matches!(
+            d.decide(&make_call("bash"), "dangerous").await,
+            PermissionDecision::Deny
+        ));
     }
 
     #[tokio::test]
     async fn test_auto_accept_edits_allows_write() {
         let d = AutoPermissionDecider::new(AutoPermissionMode::AcceptEdits);
-        assert!(matches!(d.decide(&make_call("create_file"), "write").await, PermissionDecision::Allow));
-        assert!(matches!(d.decide(&make_call("edit_file"), "edit").await, PermissionDecision::Allow));
-        assert!(matches!(d.decide(&make_call("search_replace"), "sr").await, PermissionDecision::Allow));
+        assert!(matches!(
+            d.decide(&make_call("create_file"), "write").await,
+            PermissionDecision::Allow
+        ));
+        assert!(matches!(
+            d.decide(&make_call("edit_file"), "edit").await,
+            PermissionDecision::Allow
+        ));
+        assert!(matches!(
+            d.decide(&make_call("search_replace"), "sr").await,
+            PermissionDecision::Allow
+        ));
     }
 
     #[tokio::test]
     async fn test_auto_accept_edits_denies_bash() {
         let d = AutoPermissionDecider::new(AutoPermissionMode::AcceptEdits);
-        assert!(matches!(d.decide(&make_call("bash"), "dangerous").await, PermissionDecision::Deny));
+        assert!(matches!(
+            d.decide(&make_call("bash"), "dangerous").await,
+            PermissionDecision::Deny
+        ));
     }
 
     #[tokio::test]
     async fn test_interactive_allow() {
         let (req_tx, mut req_rx) = mpsc::unbounded_channel();
         let (resp_tx, resp_rx) = mpsc::unbounded_channel();
-        let store = std::sync::Arc::new(std::sync::RwLock::new(crate::tool::PermissionStore::new()));
+        let store =
+            std::sync::Arc::new(std::sync::RwLock::new(crate::tool::PermissionStore::new()));
         let d = InteractivePermissionDecider::new(req_tx, resp_rx, store);
 
         let call = make_call("bash");
@@ -166,7 +189,8 @@ mod tests {
     async fn test_interactive_deny() {
         let (req_tx, mut req_rx) = mpsc::unbounded_channel();
         let (resp_tx, resp_rx) = mpsc::unbounded_channel();
-        let store = std::sync::Arc::new(std::sync::RwLock::new(crate::tool::PermissionStore::new()));
+        let store =
+            std::sync::Arc::new(std::sync::RwLock::new(crate::tool::PermissionStore::new()));
         let d = InteractivePermissionDecider::new(req_tx, resp_rx, store);
 
         let call = make_call("bash");
@@ -184,19 +208,24 @@ mod tests {
     async fn test_interactive_channel_closed_returns_deny() {
         let (req_tx, req_rx) = mpsc::unbounded_channel();
         let (_resp_tx, resp_rx) = mpsc::unbounded_channel();
-        let store = std::sync::Arc::new(std::sync::RwLock::new(crate::tool::PermissionStore::new()));
+        let store =
+            std::sync::Arc::new(std::sync::RwLock::new(crate::tool::PermissionStore::new()));
         let d = InteractivePermissionDecider::new(req_tx, resp_rx, store);
 
         drop(req_rx); // close request channel
         let call = make_call("bash");
-        assert!(matches!(d.decide(&call, "dangerous").await, PermissionDecision::Deny));
+        assert!(matches!(
+            d.decide(&call, "dangerous").await,
+            PermissionDecision::Deny
+        ));
     }
 
     #[tokio::test]
     async fn test_interactive_session_grant_skips_channel() {
         let (req_tx, _req_rx) = mpsc::unbounded_channel();
         let (_resp_tx, resp_rx) = mpsc::unbounded_channel();
-        let store = std::sync::Arc::new(std::sync::RwLock::new(crate::tool::PermissionStore::new()));
+        let store =
+            std::sync::Arc::new(std::sync::RwLock::new(crate::tool::PermissionStore::new()));
 
         // Grant session permission for "bash" BEFORE creating the decider
         store.write().unwrap().grant_session("bash");

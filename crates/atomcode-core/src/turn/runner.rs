@@ -4,6 +4,8 @@ use futures::StreamExt;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+use atomcode_telemetry::{CurrentContext, Event as TelemetryEvent};
+
 use crate::config::Config;
 use crate::conversation::Conversation;
 use crate::provider::LlmProvider;
@@ -82,7 +84,8 @@ impl TurnRunner {
         event_tx: &mpsc::UnboundedSender<TurnEvent>,
         cancel: CancellationToken,
     ) -> TurnResult {
-        self.run_with_filter(conversation, system_prompt, "", event_tx, cancel, None).await
+        self.run_with_filter(conversation, system_prompt, "", event_tx, cancel, None)
+            .await
     }
 
     /// Run with optional tool filter and turn reminder.
@@ -98,6 +101,27 @@ impl TurnRunner {
         cancel: CancellationToken,
         allowed_tools: Option<&[&str]>,
     ) -> TurnResult {
+        // Telemetry: build a per-turn context carrying turn_id / provider / model.
+        // Emitted on every exit path via the `tel_return!` macro below.
+        let turn_id = uuid::Uuid::new_v4();
+        let parent = CurrentContext::current();
+        // model_name() returns the model string (e.g. "claude-opus-4-7"). We use
+        // it for both provider and model fields since LlmProvider has no separate
+        // provider_id() accessor yet. TODO(telemetry): add provider_id() to
+        // LlmProvider so the two fields can be filled independently.
+        let scope_ctx = CurrentContext {
+            turn_id: Some(turn_id),
+            provider: parent
+                .provider
+                .clone()
+                .or_else(|| Some(self.provider.model_name().to_string())),
+            model: parent
+                .model
+                .clone()
+                .or_else(|| Some(self.provider.model_name().to_string())),
+            ..parent
+        };
+        let turn_started = std::time::Instant::now();
         // 1. Build messages within token budget.
         // Goes through `self.ctx.build_messages` (trait dispatch), NOT
         // `ctx::render::build_messages` (free fn) — otherwise per-model
@@ -106,7 +130,8 @@ impl TurnRunner {
         let context_window = self.ctx.ctx_window();
 
         let (messages, ctx_stats) =
-            self.ctx.build_messages(conversation, system_prompt, turn_reminder);
+            self.ctx
+                .build_messages(conversation, system_prompt, turn_reminder);
 
         let actual_tokens: usize = messages.iter().map(|m| m.estimate_tokens()).sum();
 
@@ -125,9 +150,10 @@ impl TurnRunner {
         });
 
         // 3. Get tool definitions for the LLM
-        let all_tool_defs = self.tools.get_definitions();
+        let all_tool_defs = self.tools.get_definitions().await;
         let mut tool_defs: Vec<_> = if let Some(filter) = allowed_tools {
-            all_tool_defs.into_iter()
+            all_tool_defs
+                .into_iter()
                 .filter(|d| filter.contains(&d.name))
                 .collect()
         } else {
@@ -140,10 +166,16 @@ impl TurnRunner {
             let mut known_files: Vec<String> = self.recently_edited_files.clone();
             // Extract read files from conversation tool calls
             for msg in &messages {
-                if let crate::conversation::message::MessageContent::AssistantWithToolCalls { tool_calls, .. } = &msg.content {
+                if let crate::conversation::message::MessageContent::AssistantWithToolCalls {
+                    tool_calls,
+                    ..
+                } = &msg.content
+                {
                     for call in tool_calls {
                         if call.name == "read_file" {
-                            if let Ok(args) = serde_json::from_str::<serde_json::Value>(&call.arguments) {
+                            if let Ok(args) =
+                                serde_json::from_str::<serde_json::Value>(&call.arguments)
+                            {
                                 if let Some(fp) = args.get("file_path").and_then(|v| v.as_str()) {
                                     let short = fp.rsplit('/').next().unwrap_or(fp).to_string();
                                     if !known_files.contains(&short) {
@@ -158,13 +190,18 @@ impl TurnRunner {
             if !known_files.is_empty() {
                 if let Some(wf) = tool_defs.iter_mut().find(|d| d.name == "create_file") {
                     // Display basenames for readability in tool description
-                    let display_names: Vec<&str> = known_files.iter()
+                    let display_names: Vec<&str> = known_files
+                        .iter()
                         .map(|p| p.rsplit('/').next().unwrap_or(p.as_str()))
                         .collect();
                     let list = if display_names.len() <= 6 {
                         display_names.join(", ")
                     } else {
-                        format!("{}, ... ({} files)", display_names[..5].join(", "), display_names.len())
+                        format!(
+                            "{}, ... ({} files)",
+                            display_names[..5].join(", "),
+                            display_names.len()
+                        )
                     };
                     wf.description.push_str(&format!(
                         "\nThese files ALREADY EXIST — use edit_file instead: {}",
@@ -180,8 +217,12 @@ impl TurnRunner {
         // explicitly to avoid the old process-wide-static approach that
         // bled across concurrent daemon sessions.
         let pending_request_log = {
-            let wd = self.context.working_dir
-                .try_read().map(|g| g.clone()).unwrap_or_default();
+            let wd = self
+                .context
+                .working_dir
+                .try_read()
+                .map(|g| g.clone())
+                .unwrap_or_default();
             super::log::log_llm_request(
                 &wd,
                 &messages,
@@ -189,7 +230,7 @@ impl TurnRunner {
                 self.provider.model_name(),
                 context_window,
                 0, // step — always 0 in calls.log today; step param
-                   // kept for future per-tool-call correlation.
+                // kept for future per-tool-call correlation.
                 self.config.datalog.enabled,
             )
         };
@@ -197,10 +238,6 @@ impl TurnRunner {
         // 3. Start streaming
         let stream_start = std::time::Instant::now();
         let stream_result = self.provider.chat_stream(&messages, Some(&tool_defs));
-        let mut stream = match stream_result {
-            Ok(s) => s,
-            Err(e) => return TurnResult::Failed(e.to_string()),
-        };
 
         // 4. Process stream events
         let mut tool_calls_buf: Vec<ToolCall> = Vec::new();
@@ -213,7 +250,85 @@ impl TurnRunner {
         // and without the fallback we'd return a silent 0-token "Nailed it".
         let mut reasoning_buf = String::new();
         let mut total_tokens: usize = 0;
+        // Telemetry: per-turn token counters populated from StreamEvent::Usage.
+        let mut tel_input_tokens: u32 = 0;
+        let mut tel_output_tokens: u32 = 0;
+        let mut tel_cached_tokens: u32 = 0;
         let mut got_usage = false;
+
+        // Telemetry helper: emit LlmChat (with turn_id/provider/model in scope)
+        // and return the given result. `scope_ctx` is cloned for each emission so
+        // the task-local is properly set when `track` reads `CurrentContext::current()`.
+        macro_rules! tel_return {
+            ($result:expr, $tool_count:expr, $conv:expr) => {{
+                let result = $result;
+                let messages_count = $conv.messages.len() as u32;
+                // system_tokens: estimate from the system prompt string
+                let system_tokens: u32 =
+                    crate::conversation::message::Message::new(
+                        crate::conversation::message::Role::System,
+                        system_prompt,
+                    ).estimate_tokens() as u32;
+                // tool_def_tokens: direct measurement from tool definitions sent to the LLM.
+                // Each ToolDef contributes name + description + JSON-serialized parameters.
+                let tool_def_tokens: u32 = tool_defs
+                    .iter()
+                    .map(|d| {
+                        let params_len = d.parameters.to_string().len();
+                        // name + description + serialized params, ~4 chars/token, +4 overhead
+                        (d.name.len() + d.description.len() + params_len) / 4 + 4
+                    })
+                    .sum::<usize>() as u32;
+                // tool_result_tokens: sum of estimates for Role::Tool messages in conversation
+                let tool_result_tokens: u32 = $conv
+                    .messages
+                    .iter()
+                    .filter(|m| matches!(m.role, crate::conversation::message::Role::Tool))
+                    .map(|m| m.estimate_tokens() as u32)
+                    .sum();
+                // message_tokens: sum of estimates for Role::User + Role::Assistant messages
+                let message_tokens: u32 = $conv
+                    .messages
+                    .iter()
+                    .filter(|m| matches!(
+                        m.role,
+                        crate::conversation::message::Role::User
+                            | crate::conversation::message::Role::Assistant
+                    ))
+                    .map(|m| m.estimate_tokens() as u32)
+                    .sum();
+                let event = TelemetryEvent::LlmChat {
+                    duration_ms: turn_started.elapsed().as_millis() as u32,
+                    tool_calls_count: $tool_count as u32,
+                    input_tokens: tel_input_tokens,
+                    output_tokens: tel_output_tokens,
+                    cached_tokens: tel_cached_tokens,
+                    had_error: result.is_failed(),
+                    context_window: context_window as u32,
+                    system_tokens,
+                    tool_def_tokens,
+                    tool_result_tokens,
+                    message_tokens,
+                    messages_count,
+                };
+                let tel = self.context.telemetry.clone();
+                let emit_ctx = scope_ctx.clone();
+                CurrentContext::scope(emit_ctx, || async move {
+                    tel.track(event);
+                })
+                .await;
+                return result;
+            }};
+            // Variant for early-exit paths where conversation is not available.
+            ($result:expr, $tool_count:expr) => {
+                tel_return!($result, $tool_count, conversation)
+            };
+        }
+
+        let mut stream = match stream_result {
+            Ok(s) => s,
+            Err(e) => tel_return!(TurnResult::Failed(e.to_string()), 0u32),
+        };
         let mut got_any_event = false;
         let mut was_truncated = false;
 
@@ -234,201 +349,224 @@ impl TurnRunner {
         let stream_timeout = timeout_from_env("ATOMCODE_STREAM_TIMEOUT_SECS", 300);
 
         loop {
-            let timeout = if got_any_event { stream_timeout } else { first_token_timeout };
+            let timeout = if got_any_event {
+                stream_timeout
+            } else {
+                first_token_timeout
+            };
             tokio::select! {
-                biased;
+                            biased;
 
-_ = cancel.cancelled() => {
-                    conversation.finalize_stream();
-                    return TurnResult::Cancelled;
-                }
-
-                _ = tokio::time::sleep(timeout) => {
-                    conversation.finalize_stream();
-                    return TurnResult::Failed(format!(
-                        "Stream timeout: no event for {:?}",
-                        timeout
-                    ));
-                }
-
-                event = stream.next() => {
-                    match event {
-                        Some(Ok(StreamEvent::Delta(text))) => {
-                            got_any_event = true;
-                            // Strip model-internal tags (DeepSeek </think>`, QwQ, etc.)
-                            let text = strip_model_tags(&text);
-                            if !text.is_empty() {
-                                conversation.push_delta(&text);
-                                text_buf.push_str(&text);
-                                let _ = event_tx.send(TurnEvent::TextDelta(text));
+            _ = cancel.cancelled() => {
+                                conversation.finalize_stream();
+                                tel_return!(TurnResult::Cancelled, 0u32);
                             }
-                        }
-                        Some(Ok(StreamEvent::Reasoning(text))) => {
-                            got_any_event = true;
-                            // Accumulate only. Don't push into conversation / emit
-                            // TextDelta here — default UX is to hide reasoning.
-                            // If `content` ends up empty, the `Done` arm below
-                            // promotes `reasoning_buf` to the answer.
-                            reasoning_buf.push_str(&text);
-                        }
-                        Some(Ok(StreamEvent::ToolCallStart { id, name })) => {
-                            got_any_event = true;
-                            // Surface the tool name to UI immediately — otherwise users see
-                            // "Generating…" for the entire args-streaming window (can be 30s+
-                            // for large write_file calls).
-                            let _ = event_tx.send(TurnEvent::ToolCallStreaming { name: name.clone(), hint: String::new() });
-                            conversation.tool_call_buffer = Some(ToolCallBuffer {
-                                id,
-                                name,
-                                arguments: String::new(),
-                                hint_sent: false,
-                            });
-                        }
 
-                        Some(Ok(StreamEvent::ToolCallDelta(args))) => {
-                            got_any_event = true;
-                            if let Some(ref mut buf) = conversation.tool_call_buffer {
-                                buf.arguments.push_str(&args);
-                                // Extract file_path from partial args (once only).
-                                if !buf.hint_sent && buf.arguments.len() < 300 {
-                                    if let Some(hint) = extract_path_hint(&buf.arguments) {
-                                        buf.hint_sent = true;
-                                        let _ = event_tx.send(TurnEvent::ToolCallStreaming {
-                                            name: buf.name.clone(),
-                                            hint,
+                            _ = tokio::time::sleep(timeout) => {
+                                conversation.finalize_stream();
+                                tel_return!(TurnResult::Failed(format!(
+                                    "Stream timeout: no event for {:?}",
+                                    timeout
+                                )), 0u32);
+                            }
+
+                            event = stream.next() => {
+                                match event {
+                                    Some(Ok(StreamEvent::Delta(text))) => {
+                                        got_any_event = true;
+                                        // Strip model-internal tags (DeepSeek </think>`, QwQ, etc.)
+                                        let text = strip_model_tags(&text);
+                                        if !text.is_empty() {
+                                            conversation.push_delta(&text);
+                                            text_buf.push_str(&text);
+                                            let _ = event_tx.send(TurnEvent::TextDelta(text));
+                                        }
+                                    }
+                                    Some(Ok(StreamEvent::Reasoning(text))) => {
+                                        got_any_event = true;
+                                        // Accumulate only. Don't push into conversation / emit
+                                        // TextDelta here — default UX is to hide reasoning.
+                                        // If `content` ends up empty, the `Done` arm below
+                                        // promotes `reasoning_buf` to the answer.
+                                        reasoning_buf.push_str(&text);
+                                    }
+                                    Some(Ok(StreamEvent::ToolCallStart { id, name })) => {
+                                        got_any_event = true;
+                                        // Surface the tool name to UI immediately — otherwise users see
+                                        // "Generating…" for the entire args-streaming window (can be 30s+
+                                        // for large write_file calls).
+                                        let _ = event_tx.send(TurnEvent::ToolCallStreaming { name: name.clone(), hint: String::new() });
+                                        conversation.tool_call_buffer = Some(ToolCallBuffer {
+                                            id,
+                                            name,
+                                            arguments: String::new(),
+                                            hint_sent: false,
                                         });
+                                    }
+
+                                    Some(Ok(StreamEvent::ToolCallDelta(args))) => {
+                                        got_any_event = true;
+                                        if let Some(ref mut buf) = conversation.tool_call_buffer {
+                                            buf.arguments.push_str(&args);
+                                            // Extract file_path from partial args (once only).
+                                            if !buf.hint_sent && buf.arguments.len() < 300 {
+                                                if let Some(hint) = extract_path_hint(&buf.arguments) {
+                                                    buf.hint_sent = true;
+                                                    let _ = event_tx.send(TurnEvent::ToolCallStreaming {
+                                                        name: buf.name.clone(),
+                                                        hint,
+                                                    });
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    Some(Ok(StreamEvent::ToolCallDone(mut call))) => {
+                                        // DeepSeek-V4-Flash and some Qwen variants
+                                        // occasionally wrap args as {"arguments":{...}}
+                                        // instead of the flat schema-shaped object.
+                                        // Unwrap once so downstream tools, discipline
+                                        // tracking, and the TUI display all see the
+                                        // corrected form.
+                                        if let Some(unwrapped) =
+                                            crate::tool::unwrap_doubly_nested_args(&call.arguments)
+                                        {
+                                            call.arguments = unwrapped;
+                                        }
+                                        conversation.tool_call_buffer = None;
+                                        let _ = event_tx.send(TurnEvent::ToolCallStarted {
+                                            id: call.id.clone(),
+                                            name: call.name.clone(),
+                                            arguments: call.arguments.clone(),
+                                        });
+                                        tool_calls_buf.push(call);
+                                    }
+
+                                    Some(Ok(StreamEvent::Usage(usage))) => {
+                                        total_tokens += usage.completion_tokens;
+                                        // Telemetry: accumulate per-turn token counters.
+                                        tel_input_tokens = tel_input_tokens.saturating_add(usage.prompt_tokens as u32);
+                                        tel_output_tokens = tel_output_tokens.saturating_add(usage.completion_tokens as u32);
+                                        tel_cached_tokens = tel_cached_tokens.saturating_add(usage.cached_tokens as u32);
+                                        got_usage = true;
+                                        let _ = event_tx.send(TurnEvent::TokenUsage {
+                                            prompt_tokens: usage.prompt_tokens,
+                                            completion_tokens: usage.completion_tokens,
+                                            total_tokens: usage.prompt_tokens + usage.completion_tokens,
+                                            cached_tokens: usage.cached_tokens,
+                                        });
+                                    }
+
+                                    Some(Ok(StreamEvent::Done { truncated: is_truncated })) => {
+                                        // Reasoning-only fallback: some gateways route the
+                                        // entire response through `reasoning_content` for
+                                        // reasoning models (MiniMax-M2.7, DeepSeek-R1). If
+                                        // we end up here with empty `content`, empty
+                                        // tool_calls, but a non-empty reasoning buffer, treat
+                                        // the reasoning as the answer — otherwise the agent's
+                                        // empty-response retry loop fires twice, sleeps 4s,
+                                        // and finally reports a silent "Nailed it · 0 tok".
+                                        //
+                                        // Rescue runs before this so real tool-call-in-text
+                                        // escapes still take priority.
+                                        let rescued_tools = if tool_calls_buf.is_empty() {
+                                            let rescued = rescue_text_tool_calls(&text_buf);
+                                            if !rescued.is_empty() {
+                                                conversation.clear_stream_buffer();
+                                                tool_calls_buf.extend(rescued);
+                                                true
+                                            } else {
+                                                false
+                                            }
+                                        } else {
+                                            false
+                                        };
+
+                                        if text_buf.trim().is_empty()
+                                            && tool_calls_buf.is_empty()
+                                            && !rescued_tools
+                                            && !reasoning_buf.trim().is_empty()
+                                        {
+                                            let promoted = std::mem::take(&mut reasoning_buf);
+                                            conversation.push_delta(&promoted);
+                                            text_buf.push_str(&promoted);
+                                            let _ = event_tx.send(TurnEvent::TextDelta(promoted));
+                                        }
+
+                                        // Fallback: if the provider didn't report usage (many
+                                        // OpenAI-compatible APIs ignore stream_options), estimate
+                                        // output tokens from the streamed text + tool call args.
+                                        if !got_usage {
+                                            let mut output_chars = text_buf.len();
+                                            for tc in &tool_calls_buf {
+                                                output_chars += tc.arguments.len();
+                                            }
+                                            // Rough heuristic: ~2 chars per token for mixed
+                                            // Chinese/English, ~4 for pure English. Use 3 as a
+                                            // middle ground since most users mix both.
+                                            let estimated = (output_chars / 3).max(1);
+                                            total_tokens += estimated;
+                                            let _ = event_tx.send(TurnEvent::TokenUsage {
+                                                prompt_tokens: 0,
+                                                completion_tokens: estimated,
+                                                total_tokens: estimated,
+                                                cached_tokens: 0,
+                                            });
+                                        }
+
+                                        // Finalize conversation state. Pass the accumulated
+                                        // reasoning_buf so thinking-model providers (Moonshot
+                                        // Kimi K2-thinking/K2.6, etc.) can echo it back on
+                                        // the next request — without this the provider 400s
+                                        // with "reasoning_content is missing in assistant
+                                        // tool call message". The send-side ReasoningPolicy
+                                        // (per-provider) decides whether the field actually
+                                        // reaches the wire.
+                                        if !tool_calls_buf.is_empty() {
+                                            let reasoning = if reasoning_buf.trim().is_empty() {
+                                                None
+                                            } else {
+                                                Some(reasoning_buf.as_str())
+                                            };
+                                            conversation.finalize_stream_with_tool_calls(
+                                                &tool_calls_buf,
+                                                reasoning,
+                                            );
+                                        } else {
+                                            conversation.finalize_stream();
+                                        }
+                                        was_truncated = is_truncated;
+                                        break;
+                                    }
+
+                                    Some(Ok(StreamEvent::Error(e))) => {
+                                        conversation.finalize_stream();
+                                        tel_return!(TurnResult::Failed(e), 0u32);
+                                    }
+
+                                    Some(Err(e)) => {
+                                        conversation.finalize_stream();
+                                        tel_return!(TurnResult::Failed(e.to_string()), 0u32);
+                                    }
+
+                                    None => {
+                                        // Stream ended without Done event
+                                        conversation.finalize_stream();
+                                        break;
                                     }
                                 }
                             }
                         }
-
-                        Some(Ok(StreamEvent::ToolCallDone(call))) => {
-                            conversation.tool_call_buffer = None;
-                            let _ = event_tx.send(TurnEvent::ToolCallStarted {
-                                id: call.id.clone(),
-                                name: call.name.clone(),
-                                arguments: call.arguments.clone(),
-                            });
-                            tool_calls_buf.push(call);
-                        }
-
-                        Some(Ok(StreamEvent::Usage(usage))) => {
-                            total_tokens += usage.completion_tokens;
-                            got_usage = true;
-                            let _ = event_tx.send(TurnEvent::TokenUsage {
-                                prompt_tokens: usage.prompt_tokens,
-                                completion_tokens: usage.completion_tokens,
-                                total_tokens: usage.prompt_tokens + usage.completion_tokens,
-                                cached_tokens: usage.cached_tokens,
-                            });
-                        }
-
-                        Some(Ok(StreamEvent::Done { truncated: is_truncated })) => {
-                            // Reasoning-only fallback: some gateways route the
-                            // entire response through `reasoning_content` for
-                            // reasoning models (MiniMax-M2.7, DeepSeek-R1). If
-                            // we end up here with empty `content`, empty
-                            // tool_calls, but a non-empty reasoning buffer, treat
-                            // the reasoning as the answer — otherwise the agent's
-                            // empty-response retry loop fires twice, sleeps 4s,
-                            // and finally reports a silent "Nailed it · 0 tok".
-                            //
-                            // Rescue runs before this so real tool-call-in-text
-                            // escapes still take priority.
-                            let rescued_tools = if tool_calls_buf.is_empty() {
-                                let rescued = rescue_text_tool_calls(&text_buf);
-                                if !rescued.is_empty() {
-                                    conversation.clear_stream_buffer();
-                                    tool_calls_buf.extend(rescued);
-                                    true
-                                } else {
-                                    false
-                                }
-                            } else {
-                                false
-                            };
-
-                            if text_buf.trim().is_empty()
-                                && tool_calls_buf.is_empty()
-                                && !rescued_tools
-                                && !reasoning_buf.trim().is_empty()
-                            {
-                                let promoted = std::mem::take(&mut reasoning_buf);
-                                conversation.push_delta(&promoted);
-                                text_buf.push_str(&promoted);
-                                let _ = event_tx.send(TurnEvent::TextDelta(promoted));
-                            }
-
-                            // Fallback: if the provider didn't report usage (many
-                            // OpenAI-compatible APIs ignore stream_options), estimate
-                            // output tokens from the streamed text + tool call args.
-                            if !got_usage {
-                                let mut output_chars = text_buf.len();
-                                for tc in &tool_calls_buf {
-                                    output_chars += tc.arguments.len();
-                                }
-                                // Rough heuristic: ~2 chars per token for mixed
-                                // Chinese/English, ~4 for pure English. Use 3 as a
-                                // middle ground since most users mix both.
-                                let estimated = (output_chars / 3).max(1);
-                                total_tokens += estimated;
-                                let _ = event_tx.send(TurnEvent::TokenUsage {
-                                    prompt_tokens: 0,
-                                    completion_tokens: estimated,
-                                    total_tokens: estimated,
-                                    cached_tokens: 0,
-                                });
-                            }
-
-                            // Finalize conversation state. Pass the accumulated
-                            // reasoning_buf so thinking-model providers (Moonshot
-                            // Kimi K2-thinking/K2.6, etc.) can echo it back on
-                            // the next request — without this the provider 400s
-                            // with "reasoning_content is missing in assistant
-                            // tool call message". The send-side ReasoningPolicy
-                            // (per-provider) decides whether the field actually
-                            // reaches the wire.
-                            if !tool_calls_buf.is_empty() {
-                                let reasoning = if reasoning_buf.trim().is_empty() {
-                                    None
-                                } else {
-                                    Some(reasoning_buf.as_str())
-                                };
-                                conversation.finalize_stream_with_tool_calls(
-                                    &tool_calls_buf,
-                                    reasoning,
-                                );
-                            } else {
-                                conversation.finalize_stream();
-                            }
-                            was_truncated = is_truncated;
-                            break;
-                        }
-
-                        Some(Ok(StreamEvent::Error(e))) => {
-                            conversation.finalize_stream();
-                            return TurnResult::Failed(e);
-                        }
-
-                        Some(Err(e)) => {
-                            conversation.finalize_stream();
-                            return TurnResult::Failed(e.to_string());
-                        }
-
-                        None => {
-                            // Stream ended without Done event
-                            conversation.finalize_stream();
-                            break;
-                        }
-                    }
-                }
-            }
         }
 
         // Log LLM response (text + tool calls) to <working_dir>/datalog/llm/
         let response_duration = stream_start.elapsed().as_millis() as u64;
-        let wd = self.context.working_dir
-            .try_read().map(|g| g.clone()).unwrap_or_default();
+        let wd = self
+            .context
+            .working_dir
+            .try_read()
+            .map(|g| g.clone())
+            .unwrap_or_default();
         super::log::log_llm_response(
             &wd,
             pending_request_log,
@@ -442,18 +580,24 @@ _ = cancel.cancelled() => {
         );
 
         if tool_calls_buf.is_empty() && text_buf.trim().is_empty() {
-            return TurnResult::Failed(
-                "Provider returned an empty response (no text, no tool calls).".to_string(),
+            tel_return!(
+                TurnResult::Failed(
+                    "Provider returned an empty response (no text, no tool calls).".to_string(),
+                ),
+                0u32
             );
         }
 
         // 5. If no tool calls, we're done — LLM produced text only
         if tool_calls_buf.is_empty() {
-            return TurnResult::Responded {
-                text: text_buf,
-                tokens: total_tokens,
-                truncated: was_truncated,
-            };
+            tel_return!(
+                TurnResult::Responded {
+                    text: text_buf,
+                    tokens: total_tokens,
+                    truncated: was_truncated,
+                },
+                0u32
+            );
         }
 
         // 6. Auto-merge multiple edit_file calls on the same file into one multi-edit.
@@ -480,11 +624,15 @@ _ = cancel.cancelled() => {
         // turn share the budget fairly — 1 read gets 20%, 3 reads get 6.7% each.
         // read.rs Layer A checks file_tokens against this to decide full vs skeleton.
         {
-            let num_reads = tool_calls_buf.iter()
+            let num_reads = tool_calls_buf
+                .iter()
                 .filter(|c| c.name == "read_file")
                 .count()
                 .max(1); // avoid division by zero
-            let budget = self.context.ctx_budget_hint.load(std::sync::atomic::Ordering::Relaxed);
+            let budget = self
+                .context
+                .ctx_budget_hint
+                .load(std::sync::atomic::Ordering::Relaxed);
             let per_file = budget / (5 * num_reads);
             self.context.read_budget_tokens.store(
                 per_file.max(2000), // floor: ~170 lines always get full content
@@ -493,7 +641,8 @@ _ = cancel.cancelled() => {
         }
 
         let tool_count = tool_calls_buf.len();
-        let mut seen_calls: std::collections::HashMap<(String, String), usize> = std::collections::HashMap::new();
+        let mut seen_calls: std::collections::HashMap<(String, String), usize> =
+            std::collections::HashMap::new();
         let mut is_dup: Vec<bool> = vec![false; tool_calls_buf.len()];
         for (i, call) in tool_calls_buf.iter().enumerate() {
             let key = (call.name.clone(), call.arguments.clone());
@@ -506,7 +655,7 @@ _ = cancel.cancelled() => {
         let mut files_edited_this_batch: Vec<String> = Vec::new();
         for (i, call) in tool_calls_buf.iter().enumerate() {
             if cancel.is_cancelled() {
-                return TurnResult::Cancelled;
+                tel_return!(TurnResult::Cancelled, tool_count);
             }
             // Enforce tool filter at execution time — LLM may call tools
             // not in the provided tool_defs (e.g., during diagnosis read-only phase).
@@ -581,19 +730,22 @@ _ = cancel.cancelled() => {
             &mut conversation.messages,
             tool_count,
             "", // fallback only — each result is keyed by its own
-                // call_id → ATC.tool_name lookup (see ctx::truncate).
+            // call_id → ATC.tool_name lookup (see ctx::truncate).
             context_window,
         );
 
-        TurnResult::UsedTools {
-            text: if text_buf.is_empty() {
-                None
-            } else {
-                Some(text_buf)
+        tel_return!(
+            TurnResult::UsedTools {
+                text: if text_buf.is_empty() {
+                    None
+                } else {
+                    Some(text_buf)
+                },
+                tool_count,
+                tokens: total_tokens,
             },
-            tool_count,
-            tokens: total_tokens,
-        }
+            tool_count
+        );
     }
 
     /// EXECUTE mode: run one LLM turn with minimal context.
@@ -634,14 +786,16 @@ _ = cancel.cancelled() => {
         let execute_tools = &["edit_file"];
 
         // 4. Run the LLM turn with filtered tools
-        let result = self.run_with_filter(
-            &mut mini_conv,
-            system_prompt,
-            "",
-            event_tx,
-            cancel,
-            Some(execute_tools),
-        ).await;
+        let result = self
+            .run_with_filter(
+                &mut mini_conv,
+                system_prompt,
+                "",
+                event_tx,
+                cancel,
+                Some(execute_tools),
+            )
+            .await;
 
         result
     }
@@ -664,35 +818,35 @@ _ = cancel.cancelled() => {
         let corrected_name = match name_lower.as_str() {
             "create_file" => "write_file",
             "find" | "find_files" => "glob",
-            "run" | "run_command" | "run_server" | "run_shell" | "run_app"
-                | "execute" | "shell" | "terminal" => "bash",
+            "run" | "run_command" | "run_server" | "run_shell" | "run_app" | "execute"
+            | "shell" | "terminal" => "bash",
             "list_files" | "ls" => "list_directory",
             "search" => "grep",
             _ => "",
         };
         let corrected_name = if corrected_name.is_empty() {
             // No alias match — try case-insensitive lookup in registry
-            if self.tools.get(&call.name).is_some() {
-                call.name.as_str()
-            } else if let Some(name) = self.tools.iter()
+            if self.tools.get(&call.name).await.is_some() {
+                call.name.clone()
+            } else if let Some(name) = self.tools.iter().await
                 .find(|(k, _)| k.eq_ignore_ascii_case(&call.name))
-                .map(|(k, _)| k.as_ref())
+                .map(|(k, _)| k)
             {
                 name
             } else {
-                call.name.as_str()
+                call.name.clone()
             }
         } else {
-            corrected_name
+            corrected_name.to_string()
         };
         // Clone the Arc so the borrow of `self.tools` ends here — we need to
         // call `self.detect_call_loop(..)` mutably below.
-        let tool = match self.tools.get_arc(corrected_name) {
+        let tool = match self.tools.get(&corrected_name).await {
             Some(t) => t,
             None => {
-                let available: String = self.tools.iter()
-                    .map(|(name, _)| name.as_ref())
-                    .collect::<Vec<&str>>()
+                let available: String = self.tools.iter().await
+                    .map(|(name, _)| name)
+                    .collect::<Vec<String>>()
                     .join(", ");
                 let hint = match call.name.as_str() {
                     "create_file" => "\nDid you mean write_file? create_file was renamed to write_file.",
@@ -723,7 +877,7 @@ _ = cancel.cancelled() => {
         // on max_tokens cutoff mid-arguments). Running the repair chain here means
         // tool implementations see valid JSON whenever we can salvage anything,
         // and surface deterministic errors when we can't.
-        let repaired_args = super::json_repair::repair_tool_args(corrected_name, &call.arguments);
+        let repaired_args = super::json_repair::repair_tool_args(&corrected_name, &call.arguments);
 
         // Use corrected name and repaired args for all subsequent checks
         let owned_call;
@@ -762,7 +916,7 @@ _ = cancel.cancelled() => {
         // the decider which handles interactive prompts or automatic policy.
         let approval = tool.approval_with_context(&call.arguments, &self.context);
         if let crate::tool::ApprovalRequirement::RequireApproval(ref reason)
-            | crate::tool::ApprovalRequirement::RequireApprovalAlways(ref reason) = approval
+        | crate::tool::ApprovalRequirement::RequireApprovalAlways(ref reason) = approval
         {
             let decision = self.permission.decide(call, reason).await;
             if !matches!(decision, PermissionDecision::Allow) {
@@ -968,8 +1122,14 @@ fn loop_args_hash(tool_name: &str, args: &str) -> u64 {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(args) {
             if let Some(fp) = v.get("file_path").and_then(|v| v.as_str()) {
                 fp.hash(&mut h);
-                v.get("offset").and_then(|x| x.as_u64()).unwrap_or(0).hash(&mut h);
-                v.get("limit").and_then(|x| x.as_u64()).unwrap_or(0).hash(&mut h);
+                v.get("offset")
+                    .and_then(|x| x.as_u64())
+                    .unwrap_or(0)
+                    .hash(&mut h);
+                v.get("limit")
+                    .and_then(|x| x.as_u64())
+                    .unwrap_or(0)
+                    .hash(&mut h);
                 return h.finish();
             }
         }
@@ -1036,7 +1196,8 @@ fn rescue_text_tool_calls(text: &str) -> Vec<ToolCall> {
 
     while let Some(start) = remaining.find("<tool_call>") {
         let after_tag = &remaining[start + "<tool_call>".len()..];
-        let end = after_tag.find("</tool_call>")
+        let end = after_tag
+            .find("</tool_call>")
             .or_else(|| after_tag.find('\n'))
             .unwrap_or(after_tag.len());
         let body = after_tag[..end].trim();
@@ -1059,8 +1220,13 @@ fn rescue_text_tool_calls(text: &str) -> Vec<ToolCall> {
                             let k = part[..eq].trim();
                             let v = part[eq + 1..].trim();
                             // Quote the value if not already quoted
-                            let v_quoted = if v.starts_with('"') || v.starts_with('{') || v.starts_with('[')
-                                || v == "true" || v == "false" || v.parse::<f64>().is_ok() {
+                            let v_quoted = if v.starts_with('"')
+                                || v.starts_with('{')
+                                || v.starts_with('[')
+                                || v == "true"
+                                || v == "false"
+                                || v.parse::<f64>().is_ok()
+                            {
                                 v.to_string()
                             } else {
                                 format!("\"{}\"", v.replace('\\', "\\\\").replace('"', "\\\""))
@@ -1101,25 +1267,41 @@ fn merge_edit_calls(calls: &mut Vec<ToolCall>) -> Vec<String> {
     let mut file_groups: HashMap<String, Vec<usize>> = HashMap::new();
     let mut file_order: Vec<String> = Vec::new();
     for (i, call) in calls.iter().enumerate() {
-        if call.name != "edit_file" { continue; }
-        let fp = serde_json::from_str::<serde_json::Value>(&call.arguments).ok()
-            .and_then(|a| a.get("file_path").and_then(|v| v.as_str()).map(String::from));
+        if call.name != "edit_file" {
+            continue;
+        }
+        let fp = serde_json::from_str::<serde_json::Value>(&call.arguments)
+            .ok()
+            .and_then(|a| {
+                a.get("file_path")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+            });
         if let Some(fp) = fp {
             let entry = file_groups.entry(fp.clone()).or_default();
-            if entry.is_empty() { file_order.push(fp); }
+            if entry.is_empty() {
+                file_order.push(fp);
+            }
             entry.push(i);
         }
     }
 
     // Only merge groups with 2+ calls
-    let merge_targets: Vec<(String, Vec<usize>)> = file_order.into_iter()
+    let merge_targets: Vec<(String, Vec<usize>)> = file_order
+        .into_iter()
         .filter_map(|fp| {
             let indices = file_groups.remove(&fp)?;
-            if indices.len() >= 2 { Some((fp, indices)) } else { None }
+            if indices.len() >= 2 {
+                Some((fp, indices))
+            } else {
+                None
+            }
         })
         .collect();
 
-    if merge_targets.is_empty() { return Vec::new(); }
+    if merge_targets.is_empty() {
+        return Vec::new();
+    }
 
     let mut remove_indices: Vec<usize> = Vec::new();
     let mut removed_ids: Vec<String> = Vec::new();
@@ -1127,13 +1309,21 @@ fn merge_edit_calls(calls: &mut Vec<ToolCall>) -> Vec<String> {
         // Build edits array from individual calls
         let mut edits: Vec<serde_json::Value> = Vec::new();
         for &idx in indices {
-            let args: serde_json::Value = serde_json::from_str(&calls[idx].arguments)
-                .unwrap_or_default();
+            let args: serde_json::Value =
+                serde_json::from_str(&calls[idx].arguments).unwrap_or_default();
             let mut edit = serde_json::Map::new();
-            if let Some(v) = args.get("old_string") { edit.insert("old_string".into(), v.clone()); }
-            if let Some(v) = args.get("new_string") { edit.insert("new_string".into(), v.clone()); }
-            if let Some(v) = args.get("start_line") { edit.insert("start_line".into(), v.clone()); }
-            if let Some(v) = args.get("end_line") { edit.insert("end_line".into(), v.clone()); }
+            if let Some(v) = args.get("old_string") {
+                edit.insert("old_string".into(), v.clone());
+            }
+            if let Some(v) = args.get("new_string") {
+                edit.insert("new_string".into(), v.clone());
+            }
+            if let Some(v) = args.get("start_line") {
+                edit.insert("start_line".into(), v.clone());
+            }
+            if let Some(v) = args.get("end_line") {
+                edit.insert("end_line".into(), v.clone());
+            }
             edits.push(serde_json::Value::Object(edit));
         }
 
@@ -1173,20 +1363,44 @@ mod loop_hash_tests {
         // calls, otherwise the 3-repeat guard fires on legitimate scans of a
         // single large file. If this test fails, the model is about to be
         // blocked after 3 offsets.
-        let a = loop_args_hash("read_file", r#"{"file_path":"/a.rs","offset":1,"limit":60}"#);
-        let b = loop_args_hash("read_file", r#"{"file_path":"/a.rs","offset":100,"limit":60}"#);
+        let a = loop_args_hash(
+            "read_file",
+            r#"{"file_path":"/a.rs","offset":1,"limit":60}"#,
+        );
+        let b = loop_args_hash(
+            "read_file",
+            r#"{"file_path":"/a.rs","offset":100,"limit":60}"#,
+        );
         assert_ne!(a, b, "offsets 1 vs 100 must hash differently");
 
-        let c = loop_args_hash("read_file", r#"{"file_path":"/a.rs","offset":1,"limit":60}"#);
-        let d = loop_args_hash("read_file", r#"{"file_path":"/a.rs","offset":1,"limit":120}"#);
+        let c = loop_args_hash(
+            "read_file",
+            r#"{"file_path":"/a.rs","offset":1,"limit":60}"#,
+        );
+        let d = loop_args_hash(
+            "read_file",
+            r#"{"file_path":"/a.rs","offset":1,"limit":120}"#,
+        );
         assert_ne!(c, d, "limit 60 vs 120 must hash differently");
 
-        let e = loop_args_hash("read_file", r#"{"file_path":"/a.rs","offset":1,"limit":60}"#);
-        let f = loop_args_hash("read_file", r#"{"file_path":"/a.rs","offset":1,"limit":60}"#);
+        let e = loop_args_hash(
+            "read_file",
+            r#"{"file_path":"/a.rs","offset":1,"limit":60}"#,
+        );
+        let f = loop_args_hash(
+            "read_file",
+            r#"{"file_path":"/a.rs","offset":1,"limit":60}"#,
+        );
         assert_eq!(e, f, "identical args must hash identically");
 
-        let g = loop_args_hash("read_file", r#"{"file_path":"/a.rs","offset":1,"limit":60}"#);
-        let h = loop_args_hash("read_file", r#"{"file_path":"/b.rs","offset":1,"limit":60}"#);
+        let g = loop_args_hash(
+            "read_file",
+            r#"{"file_path":"/a.rs","offset":1,"limit":60}"#,
+        );
+        let h = loop_args_hash(
+            "read_file",
+            r#"{"file_path":"/b.rs","offset":1,"limit":60}"#,
+        );
         assert_ne!(g, h, "different files must hash differently");
     }
 
@@ -1195,10 +1409,7 @@ mod loop_hash_tests {
         // `{path}` and `{path, offset:0, limit:0}` must hash the same — otherwise
         // the model can evade the loop guard just by toggling the field's presence.
         let bare = loop_args_hash("read_file", r#"{"file_path":"/a.rs"}"#);
-        let zeros = loop_args_hash(
-            "read_file",
-            r#"{"file_path":"/a.rs","offset":0,"limit":0}"#,
-        );
+        let zeros = loop_args_hash("read_file", r#"{"file_path":"/a.rs","offset":0,"limit":0}"#);
         assert_eq!(bare, zeros);
     }
 
@@ -1218,14 +1429,28 @@ mod loop_hash_tests {
     #[test]
     fn region_key_buckets_are_per_file() {
         // Same file, same bucket regardless of how offset rounds down.
-        let a = read_region_key("render.rs", r#"{"file_path":"/x/render.rs","offset":100,"limit":50}"#);
-        let b = read_region_key("render.rs", r#"{"file_path":"/x/render.rs","offset":130,"limit":50}"#);
-        assert_eq!(a, b, "offsets 100 and 130 both land in bucket {}", 100 / READ_REGION_BUCKET);
+        let a = read_region_key(
+            "render.rs",
+            r#"{"file_path":"/x/render.rs","offset":100,"limit":50}"#,
+        );
+        let b = read_region_key(
+            "render.rs",
+            r#"{"file_path":"/x/render.rs","offset":130,"limit":50}"#,
+        );
+        assert_eq!(
+            a,
+            b,
+            "offsets 100 and 130 both land in bucket {}",
+            100 / READ_REGION_BUCKET
+        );
 
         // Jump by one full bucket → different key.
         let far = read_region_key(
             "render.rs",
-            &format!(r#"{{"file_path":"/x/render.rs","offset":{},"limit":50}}"#, READ_REGION_BUCKET + 200),
+            &format!(
+                r#"{{"file_path":"/x/render.rs","offset":{},"limit":50}}"#,
+                READ_REGION_BUCKET + 200
+            ),
         );
         assert_ne!(a, far, "offsets across bucket boundaries must differ");
 

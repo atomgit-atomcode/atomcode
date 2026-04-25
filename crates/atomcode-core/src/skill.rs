@@ -271,7 +271,11 @@ fn parse_skill_file(path: &Path, namespace: Option<&str>) -> anyhow::Result<Skil
 
 /// Parse a directory-style skill: name = directory name (or frontmatter `name`).
 /// The entry point file is `<skill_dir>/SKILL.md`.
-fn parse_skill_dir(skill_dir: &Path, skill_md: &Path, namespace: Option<&str>) -> anyhow::Result<Skill> {
+fn parse_skill_dir(
+    skill_dir: &Path,
+    skill_md: &Path,
+    namespace: Option<&str>,
+) -> anyhow::Result<Skill> {
     let dir_name = skill_dir
         .file_name()
         .and_then(|s| s.to_str())
@@ -307,7 +311,10 @@ fn validate_skill_name(name: &str) -> anyhow::Result<()> {
     if name.is_empty() || name.len() > 64 {
         anyhow::bail!("skill name '{}' must be 1-64 characters", name);
     }
-    if !name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-') {
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    {
         anyhow::bail!(
             "skill name '{}' must contain only lowercase letters, digits, and hyphens",
             name
@@ -372,7 +379,7 @@ impl SkillRegistry {
 
         // System home directory (for Claude Code compat paths)
         let system_home = dirs::home_dir();
-        
+
         // AtomCode home directory (respects ATOMCODE_HOME env var)
         let atomcode_home: Option<PathBuf> = std::env::var("ATOMCODE_HOME")
             .ok()
@@ -566,10 +573,7 @@ mod tests {
     fn test_expand_skill_dir() {
         let mut s = make_skill("dir=${CLAUDE_SKILL_DIR}");
         s.skill_dir = PathBuf::from("/home/user/.claude/skills/my-skill");
-        assert_eq!(
-            s.expand("", ""),
-            "dir=/home/user/.claude/skills/my-skill"
-        );
+        assert_eq!(s.expand("", ""), "dir=/home/user/.claude/skills/my-skill");
     }
 
     // --- frontmatter ---
@@ -608,7 +612,10 @@ mod tests {
     #[test]
     fn test_description_fallback_to_first_paragraph() {
         // The fallback is tested via first_paragraph directly
-        assert_eq!(first_paragraph("# Title\n\nActual description."), "Actual description.");
+        assert_eq!(
+            first_paragraph("# Title\n\nActual description."),
+            "Actual description."
+        );
         assert_eq!(first_paragraph("  text  "), "text");
         assert_eq!(first_paragraph("# Heading"), ""); // heading skipped
     }

@@ -116,6 +116,37 @@ fn parse_markdown_to_cells(s: &str) -> Vec<Vec<Cell>> {
     lines
 }
 
+/// Clip a cell row to at most `max_cols` display columns. Drops
+/// trailing cells (including their continuation cells) so the total
+/// `cell.width` sum of the returned row is ≤ `max_cols`. A wide
+/// glyph that straddles `max_cols` is dropped whole — we never emit
+/// the left half without its continuation, which would leak into
+/// the next line on real terminals once auto-wrap kicks in.
+///
+/// Used on the resize path to make cached `body_lines` (built for
+/// the OLD screen width) safe to re-emit against a narrower new
+/// terminal. Without this, `serialize_row` would emit glyphs past
+/// the right edge; the terminal's own auto-wrap then spills them
+/// into the next row — which is the footer strip or a phantom body
+/// row — producing the "everything shifted by one column and the
+/// footer has garbage in it" symptom after a resize-smaller drag.
+fn clip_cells_to_width(cells: &[Cell], max_cols: usize) -> Vec<Cell> {
+    if max_cols == 0 {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(cells.len().min(max_cols));
+    let mut used = 0usize;
+    for cell in cells {
+        let w = cell.width as usize;
+        if w > 0 && used + w > max_cols {
+            break;
+        }
+        out.push(cell.clone());
+        used += w;
+    }
+    out
+}
+
 /// Cell-based wrap: splits a cell sequence into chunks whose sum
 /// of `cell.width` stays ≤ `max_cols`. Continuation cells (width 0)
 /// travel with their preceding real cell — the combined "grapheme"
@@ -288,6 +319,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             fg: role(self.caps, r),
             bold: false,
             reverse: false,
+            faint: false,
         }
     }
 
@@ -296,6 +328,22 @@ impl<W: Write + Send> RetainedRenderer<W> {
             fg: role(self.caps, r),
             bold: true,
             reverse: false,
+            faint: false,
+        }
+    }
+
+    /// Theme-aware muting via SGR 2 (faint). Renders the role's fg
+    /// at ~50% intensity so secondary text reads as "subordinate"
+    /// without picking a fixed gray that may collide with the user's
+    /// terminal palette. Pair with `Role::Secondary` (no fg) to dim
+    /// the terminal default fg — the canonical "muted hint" look that
+    /// adapts across light/dark themes.
+    fn style_faint(&self, r: Role) -> CellStyle {
+        CellStyle {
+            fg: role(self.caps, r),
+            bold: false,
+            reverse: false,
+            faint: true,
         }
     }
 
@@ -386,9 +434,16 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 fg: None,
                 bold: true,
                 reverse: true,
+                faint: false,
             }
         } else {
-            self.style_for(Role::Muted)
+            // Use terminal default fg (Secondary) instead of Muted
+            // (SGR 90 / DarkGrey). Several iTerm2 dark presets render
+            // bright-black at near-zero contrast against the bg, which
+            // makes the entire menu list invisible. Visual hierarchy
+            // here comes from the ▸ arrow + reverse-video on the
+            // selected row, not from a colour-contrast distinction.
+            self.style_for(Role::Secondary)
         };
         push_str_cells(&mut row, &content, &style);
 
@@ -411,7 +466,13 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let pad = CellStyle::default();
         push_str_cells(&mut row, &" ".repeat(PAD_COL), &pad);
 
-        let muted = self.style_for(Role::Muted);
+        // Status row carries load-bearing info (model / cwd / token count)
+        // and live hints. Use faint (SGR 2) over the terminal default fg:
+        // theme-aware muting that reads as subordinate without picking a
+        // fixed gray (DarkGrey collides with several iTerm2 light presets;
+        // unmuted default fg made the status row compete with primary
+        // body content on dark presets — see screenshot regression).
+        let secondary = self.style_faint(Role::Secondary);
         let error = self.style_for(Role::Error);
 
         let mut parts: Vec<String> = Vec::with_capacity(3);
@@ -432,23 +493,23 @@ impl<W: Write + Send> RetainedRenderer<W> {
             let hint_w = crate::width::display_width(&hint);
             let hint_style = match severity {
                 crate::render::HintSeverity::Warning => error,
-                crate::render::HintSeverity::Info => muted.clone(),
+                crate::render::HintSeverity::Info => secondary.clone(),
             };
             if hint_w + 1 < max {
                 let left_budget = max - hint_w - 1;
                 let left_truncated = crate::width::truncate_to_width(&left, left_budget);
                 let left_w = crate::width::display_width(&left_truncated);
                 let pad_w = max - left_w - hint_w;
-                push_str_cells(&mut row, &left_truncated, &muted);
+                push_str_cells(&mut row, &left_truncated, &secondary);
                 push_str_cells(&mut row, &" ".repeat(pad_w), &pad);
                 push_str_cells(&mut row, &hint, &hint_style);
             } else {
                 let truncated = crate::width::truncate_to_width(&left, max);
-                push_str_cells(&mut row, &truncated, &muted);
+                push_str_cells(&mut row, &truncated, &secondary);
             }
         } else {
             let truncated = crate::width::truncate_to_width(&left, max);
-            push_str_cells(&mut row, &truncated, &muted);
+            push_str_cells(&mut row, &truncated, &secondary);
         }
         row
     }
@@ -596,6 +657,11 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let cursor_abs_row = (footer_top + 1 + cursor_row_in_middle + 1) as u16;
         let cursor_abs_col = (2 + cursor_col_in_row + 1) as u16;
         self.screen.set_cursor(cursor_abs_row, cursor_abs_col);
+        // Hide the terminal cursor while the body spinner is animating.
+        // Otherwise it sits at the end of "Pondering… · 5s" and blinks.
+        // render_diff reasserts DECTCEM every frame, so this single flip
+        // propagates correctly until the spinner clears.
+        self.screen.set_cursor_visible(!self.live_spinner_active);
     }
 
     /// Footer total height — mirrors the computation inside
@@ -871,6 +937,8 @@ impl<W: Write + Send> RetainedRenderer<W> {
             return false;
         }
         self.live_spinner_active = false;
+        // The cursor will be re-shown on the next paint_footer (which
+        // sees live_spinner_active=false and calls set_cursor_visible(true)).
         self.body_lines.pop();
         self.ensure_scroll_region();
         let bottom = self.body_bottom_row();
@@ -942,6 +1010,11 @@ impl<W: Write + Send> RetainedRenderer<W> {
             self.push_body_row(row_cells);
             self.live_spinner_active = true;
         }
+        // Cursor visibility is driven by `paint_footer` reading
+        // `live_spinner_active` — see set_cursor_visible call there.
+        // No direct DECTCEM write here, otherwise the next render_diff
+        // would re-emit \x1b[?25h based on screen.cursor_visible and
+        // visually undo our hide on a 5ms cadence.
     }
 
     /// Wrap `text` to content width and push each wrapped chunk as
@@ -1021,13 +1094,17 @@ impl<W: Write + Send> RetainedRenderer<W> {
         if !self.assistant_line_buf.contains('\n') {
             return;
         }
+        let md_width = (self.screen.width() as usize).saturating_sub(PAD_COL * 2);
         let mut completed: Vec<String> = Vec::new();
         while let Some(nl) = self.assistant_line_buf.find('\n') {
             let line: String = self.assistant_line_buf.drain(..=nl).collect();
             let content = line[..line.len() - 1].to_string();
-            if let Some(rendered) =
-                crate::markdown::render_line(&content, &mut self.md_state, self.caps)
-            {
+            if let Some(rendered) = crate::markdown::render_line_with_width(
+                &content,
+                &mut self.md_state,
+                self.caps,
+                md_width,
+            ) {
                 completed.push(rendered);
             }
         }
@@ -1041,15 +1118,21 @@ impl<W: Write + Send> RetainedRenderer<W> {
     /// Also drains any trailing markdown block buffer (tables that
     /// ended without a following non-table line).
     fn flush_assistant_remainder(&mut self) {
+        let md_width = (self.screen.width() as usize).saturating_sub(PAD_COL * 2);
         if !self.assistant_line_buf.is_empty() {
             let line = std::mem::take(&mut self.assistant_line_buf);
-            if let Some(rendered) =
-                crate::markdown::render_line(&line, &mut self.md_state, self.caps)
-            {
+            if let Some(rendered) = crate::markdown::render_line_with_width(
+                &line,
+                &mut self.md_state,
+                self.caps,
+                md_width,
+            ) {
                 self.push_markdown_body(&rendered);
             }
         }
-        if let Some(block) = crate::markdown::finalize(&mut self.md_state, self.caps) {
+        if let Some(block) =
+            crate::markdown::finalize_with_width(&mut self.md_state, self.caps, md_width)
+        {
             self.push_markdown_body(&block);
         }
     }
@@ -1265,14 +1348,20 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // Blank separator.
         rows.push(Vec::new());
 
-        // Hint rows.
-        let accent_dim = self.style_for(Role::AccentDim);
+        // Hint rows. The prose around the slash shortcuts is onboarding-
+        // critical text — first thing a new user reads. Use faint
+        // (SGR 2) over the terminal's default fg so the hint reads as
+        // subordinate to primary content without picking a fixed gray
+        // (DarkGrey would vanish on some iTerm2 light presets, default
+        // fg unmuted competes with the user's input on dark presets).
+        // Slash shortcuts stay accent_bold (cyan) for visual emphasis.
+        let hint_text = self.style_faint(Role::Secondary);
         let accent_bold = self.style_bold(Role::Accent);
         rows.extend(self.build_wrapped_text_rows(
             &[
-                ("type something, or press  ", accent_dim.clone()),
+                ("type something, or press  ", hint_text.clone()),
                 ("/", accent_bold.clone()),
-                ("  to browse commands", accent_dim.clone()),
+                ("  to browse commands", hint_text.clone()),
             ],
             content_w,
         ));
@@ -1280,7 +1369,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         rows.extend(self.build_wrapped_text_rows(
             &[
                 ("/provider", accent_bold),
-                ("  to add a custom model", accent_dim),
+                ("  to add a custom model", hint_text),
             ],
             content_w,
         ));
@@ -1389,21 +1478,28 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 let mut row = Vec::new();
                 let pad = CellStyle::default();
                 push_str_cells(&mut row, &" ".repeat(PAD_COL), &pad);
-                let muted = self.style_for(Role::Muted);
+                // Muted gray (SGR 90 / DarkGrey) for the per-turn rule
+                // and summary text. The input box border below uses full
+                // cyan; making this rule cyan too produced three
+                // identical bright-cyan rules in one viewport (see
+                // screenshot regression). Gray is the historically
+                // expected look — quiet historical separator that
+                // doesn't compete with the live input chrome.
+                let rule = self.style_for(Role::Muted);
                 for _ in 0..left {
                     row.push(Cell {
                         ch: '─',
-                        style: muted.clone(),
+                        style: rule.clone(),
                         width: 1,
                     });
                 }
                 push_str_cells(&mut row, " ", &pad);
-                push_str_cells(&mut row, &safe, &self.style_for(Role::Secondary));
+                push_str_cells(&mut row, &safe, &self.style_for(Role::Muted));
                 push_str_cells(&mut row, " ", &pad);
                 for _ in 0..right {
                     row.push(Cell {
                         ch: '─',
-                        style: muted.clone(),
+                        style: rule.clone(),
                         width: 1,
                     });
                 }
@@ -1425,8 +1521,10 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
             }
             UiLine::TurnCancelled => {
                 self.flush_assistant_remainder();
-                let muted = self.style_for(Role::Muted);
-                self.push_body_text("(cancelled)", &muted);
+                // (cancelled) is a state-change marker — must remain
+                // visible. Default fg, not Muted.
+                let label = self.style_for(Role::Secondary);
+                self.push_body_text("(cancelled)", &label);
             }
 
             // ── body: tools & diffs ──
@@ -1455,25 +1553,81 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
             }
             UiLine::ToolResult { success, summary } => {
                 self.flush_assistant_remainder();
-                let muted = self.style_for(Role::Muted);
-                let error = self.style_for(Role::Error);
+                // Style policy (header line of a failure body):
+                //   * `Error: ...` — bold red. Tool-dispatch failures
+                //     (bad JSON args, unknown tool name, etc.) are real
+                //     bugs that need attention.
+                //   * `[elapsed: ...exit: N...]` — bold yellow. Bash
+                //     exit-code failures are frequently recovered by
+                //     the agent on the next turn (e.g. `git push`
+                //     rejected → next turn `git pull --rebase &&
+                //     git push`). Painting them red made transient
+                //     hiccups visually identical to real failures.
+                // Continuation lines (and success bodies) — default fg.
+                //
+                // Why split header vs continuation: when an edit_file
+                // error includes quoted code (e.g. "Partial match at
+                // lines 760-779" + actual file lines), painting the
+                // whole block red made it visually identical to a Diff
+                // block. Header keeps the urgency signal; body reverts
+                // to default fg so quoted code reads like normal output.
+                // Three style buckets:
+                //   * summary_style — line 0 of a success body, e.g.
+                //     `⎿ [elapsed: 0.0s, exit: 0] (4 lines)`. Muted gray
+                //     because it's per-call metadata, visually
+                //     subordinate to assistant text and tool-call
+                //     headers above.
+                //   * continuation_style — line ≥ 1 of any body and any
+                //     line of multi-line success output. Default fg so
+                //     quoted code (edit_file errors) and stderr (bash
+                //     failure body) stay readable.
+                //   * error_header / warn_header — line 0 of a failure
+                //     body, see B-discriminated logic below.
+                let summary_style = self.style_for(Role::Muted);
+                let continuation_style = self.style_for(Role::Secondary);
+                let error_header = self.style_bold(Role::Error);
+                let warn_header = self.style_bold(Role::Warning);
                 let safe = scrub_controls(&summary);
+                // Discriminate before `safe` is moved into body_str.
+                // Bash exit-code failures always start with the
+                // `format_exit_marker` prefix from bash.rs:578.
+                let is_exit_code_failure = !success && safe.starts_with("[elapsed:");
                 let body_str = if success {
                     safe
                 } else {
                     format!("✗ {}", safe)
                 };
-                let body_style = if success { muted.clone() } else { error };
                 // Indent result rows 4 cols past the tool-call row at
                 // col 0: "    ⎿ " is 4 spaces + glyph + space, so ⎿
                 // lands at col 4. Width reserves PAD_COL for the right
                 // gutter + 6 for "    ⎿ ".
                 let row_w = (self.screen.width() as usize).saturating_sub(PAD_COL + 6);
-                for phys in body_str.split('\n') {
+                // Muted (dim gray) for the result prefix — visually subordinate
+                // to the tool-call header above (▸ ToolName).
+                let prefix_style = self.style_for(Role::Muted);
+                for (line_idx, phys) in body_str.split('\n').enumerate() {
+                    // First physical line of a failure body is the
+                    // header. Wrapped continuation chunks of that same
+                    // physical line stay header-styled (a long error
+                    // message like "✗ no rows matched: ...stuff..."
+                    // shouldn't fade to default mid-sentence).
+                    let line_style = if line_idx == 0 {
+                        if !success {
+                            if is_exit_code_failure {
+                                &warn_header
+                            } else {
+                                &error_header
+                            }
+                        } else {
+                            &summary_style
+                        }
+                    } else {
+                        &continuation_style
+                    };
                     for chunk in crate::width::wrap_line_to_width(phys, row_w.max(1)) {
                         let mut row = Vec::new();
-                        push_str_cells(&mut row, "    ⎿ ", &muted);
-                        push_str_cells(&mut row, &chunk, &body_style);
+                        push_str_cells(&mut row, "    ⎿ ", &prefix_style);
+                        push_str_cells(&mut row, &chunk, line_style);
                         self.push_body_row(row);
                     }
                 }
@@ -1510,13 +1664,26 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 // The preceding ToolCall body row already shows
                 // `▸ name(detail)`, so this row is a pure action prompt
                 // with colour-chip key hints (legacy-tuix style).
+                //
+                // Header was Role::Warning (SGR 93 / yellow) — invisible
+                // on light themes (#fce94f-class pastels on white). It's
+                // semantically a blocking state ("must act before
+                // continuing"), so Error red + bold is more appropriate
+                // and reads on every theme. The ▶ glyph keeps it
+                // visually distinct from regular Error rows.
                 let _ = (tool, detail);
-                let warn = self.style_for(Role::Warning);
+                // "Waiting for approval" is a pending action, not a
+                // failure — using Role::Error (red) made it read as a
+                // tool failure and collide with real Error rows nearby.
+                // Warning (yellow) restores the pending/attention-needed
+                // semantic and keeps red reserved for actual errors.
+                let warn = self.style_bold(Role::Warning);
                 let plain = CellStyle::default();
                 let chip = |c: Color| CellStyle {
                     fg: Some(c),
                     bold: true,
                     reverse: true,
+                    faint: false,
                 };
                 let chip_y = chip(Color::Green);
                 let chip_a = chip(Color::Cyan);
@@ -1609,7 +1776,11 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         // `reset()` / `on_resize()` — iTerm2 3.5+ ignores ED under
         // certain states (see `reset()` rationale). EL is row-local
         // and unambiguous. Scrollback is preserved either way.
-        let _ = self.out.write_all(b"\x1b[?7h\x1b[r");
+        //
+        // Also force-restore cursor visibility — if we exit while a
+        // spinner is hidden (e.g. SIGINT mid-turn), DECTCEM off would
+        // persist into the parent shell and break their prompt cursor.
+        let _ = self.out.write_all(b"\x1b[?25h\x1b[?7h\x1b[r");
         let h = self.screen.height() as usize;
         let mut seq = String::with_capacity(h * 8 + 8);
         for row in 1..=h {
@@ -1884,19 +2055,46 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         self.reflow_welcome_prefix();
         // Re-emit body tail into the new region so the view matches
         // memory. Set region first so LFs scroll only within body.
+        //
+        // Cached `body_lines` cells were built against the OLD screen
+        // width — after a resize-smaller drag, rows may exceed the new
+        // terminal width. `serialize_row` writes every real cell, so
+        // overflow would trigger the terminal's own auto-wrap; the
+        // wrapped remainder lands on the next row, which on a fresh
+        // DECSTBM region is either the footer strip or the next body
+        // slot. Symptom the user sees: content shifted by a column and
+        // junk in the footer strip. Clip each row to the new width
+        // before handing it to `emit_body_line_inner` so we never
+        // rely on the terminal to hide our overflow.
         let bottom = self.body_bottom_row();
         if bottom > 0 {
+            let screen_w = self.screen.width() as usize;
             let tail: Vec<Vec<Cell>> = {
                 let n = self.body_lines.len().min(bottom as usize);
                 self.body_lines[self.body_lines.len() - n..]
                     .iter()
-                    .cloned()
+                    .map(|row| clip_cells_to_width(row, screen_w))
                     .collect()
             };
             let _ = write!(self.out, "\x1b[1;{}r", bottom);
             self.scroll_region_bottom = Some(bottom);
-            for row in &tail {
-                self.emit_body_line_inner(row, bottom);
+            // Direct CUP per row instead of `emit_body_line_inner`'s
+            // LF-at-bottom scroll. LF inside the DECSTBM `[1, bottom]`
+            // region pushes the top row out — and since we just erased
+            // every row, that top row is blank. A full tail-repaint
+            // would therefore inject `tail.len() - 1` blank rows into
+            // scrollback. User symptom: after resizing smaller, the
+            // scrollback above the current page fills with empty rows
+            // for every resize event. Positioning absolutely with
+            // `\x1b[row;1H` skips the scroll entirely and leaves
+            // scrollback untouched.
+            let n = tail.len() as u16;
+            let first_row = bottom.saturating_sub(n) + 1;
+            for (i, row) in tail.iter().enumerate() {
+                let seq = format!("\x1b[{};1H\x1b[K", first_row + i as u16);
+                let _ = self.out.write_all(seq.as_bytes());
+                let bytes = serialize_row(row);
+                let _ = self.out.write_all(&bytes);
             }
         }
         self.paint_frame();
@@ -2241,6 +2439,112 @@ mod tests {
         r.flush_deferred();
         let idle_bytes = sample(&counter) - before_idle;
         assert_eq!(idle_bytes, 0, "idle tick should emit 0 bytes");
+    }
+
+    /// Regression: user reported that after resizing the terminal
+    /// smaller, scrolling up in the terminal revealed many blank rows
+    /// above the current page. Root cause: `on_resize` repainted the
+    /// body tail via `emit_body_line_inner`, which uses `\n` inside
+    /// the DECSTBM `[1, bottom]` region to place each row. Since the
+    /// just-cleared top-row of that region gets pushed to scrollback
+    /// on every `\n`, a full tail-repaint injected `tail.len() - 1`
+    /// blank rows into scrollback for every resize event.
+    ///
+    /// Fix: position each tail row with absolute CUP + EL instead of
+    /// LF-scrolling, so scrollback is never touched during resize.
+    #[test]
+    fn retained_resize_does_not_pollute_scrollback_with_blanks() {
+        let (mut r, buf) = new_capturing(80, 24);
+        let status = status_basic();
+
+        // Seed some body content so there's a tail to re-emit.
+        r.render(UiLine::User("first".into()));
+        r.render(UiLine::User("second".into()));
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+        });
+        r.flush_deferred();
+
+        // Baseline: feed everything so far into the vterm and record
+        // how many rows have scrolled off the top.
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+        drain_into_vterm(&buf, &mut vterm);
+        let baseline_scrollback = vterm.scrollback_len();
+
+        // Now trigger resize-smaller. All bytes emitted by the resize
+        // path go to `buf`; feed them alone into the vterm to measure
+        // the resize's contribution to scrollback in isolation.
+        r.on_resize(60, 16);
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+        });
+        r.flush_deferred();
+        let mut vterm_after = crate::test_term::VirtualTerminal::new(60, 16);
+        drain_into_vterm(&buf, &mut vterm_after);
+
+        // Scrollback from the RESIZE alone (vterm_after starts fresh).
+        // Before the fix, on_resize emitted `tail.len() - 1` blank
+        // rows into scrollback; after the fix it must emit zero.
+        assert_eq!(
+            vterm_after.scrollback_len(),
+            0,
+            "resize pushed {} rows into scrollback; expected 0 \
+             (baseline before resize: {})",
+            vterm_after.scrollback_len(),
+            baseline_scrollback
+        );
+    }
+
+    /// Regression: user showed a 5-column CJK table with long cells
+    /// overflowing past the terminal's right edge — `flush_aligned_table`
+    /// was ignoring terminal width. This test verifies the full pipeline
+    /// (streamed assistant text → `render_line_with_width` → body_lines)
+    /// keeps every rendered body row within screen width.
+    #[test]
+    fn retained_wide_table_truncated_to_screen_width() {
+        let term_w: u16 = 100;
+        let (mut r, _buf) = new_capturing(term_w, 30);
+        let status = status_basic();
+
+        let table = "\
+| 特性 | 免费版 | 专业版 | 企业版 | 旗舰版 |
+|------|--------|--------|--------|--------|
+| 价格 | 完全免费，适合个人开发者和学生群体使用 | 每月 $9.9，适合小型团队和独立开发者 | 每月 $49，适合中型企业和专业团队 | 每月 $199，适合大型企业和需要高级功能的用户 |
+| 支持语言 | 支持 Python、JavaScript、TypeScript 三种主流编程语言 | 支持所有主流编程语言，包括但不限于 Python、JavaScript、TypeScript、Java、Kotlin、Swift、Rust、Go 等 20+ 种语言 | 支持所有编程语言，无任何限制 | 支持所有已知编程语言 |
+
+尾部文本触发表格 flush。
+";
+        for line in table.lines() {
+            r.render(UiLine::AssistantText(format!("{}\n", line)));
+        }
+        r.render(UiLine::AssistantLineBreak);
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status,
+        });
+        r.flush_deferred();
+
+        // Body rows carry styling + 2-col PAD_COL indent. Strip ANSI and
+        // check the display width of each cached body row.
+        for (i, row) in r.body_lines.iter().enumerate() {
+            let w: usize = row.iter().map(|c| c.width as usize).sum();
+            assert!(
+                w <= term_w as usize,
+                "body row {} has display width {} > terminal {}; \
+                 table rendered without width-aware truncation",
+                i,
+                w,
+                term_w
+            );
+        }
     }
 
     /// Regression: user reported that after a terminal resize two
@@ -2683,6 +2987,94 @@ mod tests {
         );
     }
 
+    /// Regression: after a resize-smaller drag, cached `body_lines` rows
+    /// built against the OLD terminal width were re-emitted verbatim. Rows
+    /// wider than the new width triggered the real terminal's auto-wrap;
+    /// the wrapped tail spilled into footer / scroll-region rows, producing
+    /// the visible "everything shifted and the footer has garbage in it"
+    /// glitch users reported after dragging the window narrower.
+    ///
+    /// `VirtualTerminal::put_char` silently drops cells past the grid's
+    /// right edge (no auto-wrap modelled), so we can't observe the bug
+    /// at the grid level. Assert on the emitted byte stream instead:
+    /// between any two cursor-positioning CSIs, the printable payload
+    /// must fit within the new `screen.width()`.
+    #[test]
+    fn retained_resize_clips_wide_body_rows_to_new_width() {
+        let (mut r, buf) = new_capturing(120, 24);
+
+        // Seed body with a long tool call: a `▸ Name(payload)` row whose
+        // display width far exceeds any sane "shrink-to" target.
+        r.render(UiLine::ToolCall {
+            name: "Bash".into(),
+            detail: "X".repeat(100),
+        });
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status_basic(),
+        });
+        r.flush_deferred();
+        // Discard pre-resize bytes — this test only asserts on what
+        // `on_resize` emits at the narrower width.
+        buf.lock().unwrap().clear();
+
+        let new_w: u16 = 40;
+        r.on_resize(new_w, 16);
+
+        // Parse the emitted stream: CSI sequences delimit "runs" of
+        // printable bytes. Every run must fit within the new width.
+        // `\n` also delimits (emit_body_line_inner uses raw LF to scroll
+        // the DECSTBM region).
+        let bytes = buf.lock().unwrap().clone();
+        let text = String::from_utf8_lossy(&bytes);
+        let mut runs: Vec<String> = vec![String::new()];
+        let mut chars = text.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' {
+                // CSI / ESC dispatch — eat until the final byte. The
+                // final byte delimits the current run from the next.
+                runs.push(String::new());
+                if chars.peek() == Some(&'[') {
+                    chars.next();
+                    while let Some(&p) = chars.peek() {
+                        chars.next();
+                        if p.is_ascii_alphabetic() || p == '~' {
+                            break;
+                        }
+                    }
+                } else if chars.peek() == Some(&']') {
+                    // OSC — eat until ST (BEL or ESC\)
+                    while let Some(&p) = chars.peek() {
+                        chars.next();
+                        if p == '\x07' {
+                            break;
+                        }
+                    }
+                }
+                continue;
+            }
+            if c == '\n' || c == '\r' {
+                runs.push(String::new());
+                continue;
+            }
+            runs.last_mut().unwrap().push(c);
+        }
+
+        for run in &runs {
+            let w = crate::width::display_width(run);
+            assert!(
+                w <= new_w as usize,
+                "body re-emit produced a {}-col run on a {}-col terminal: {:?}\n\
+                 (clip_cells_to_width should have trimmed this before emit)",
+                w,
+                new_w,
+                run,
+            );
+        }
+    }
+
     #[test]
     fn retained_welcome_reflows_path_model_and_hints_on_narrow_terminal() {
         let (mut r, buf) = new_capturing(22, 20);
@@ -2783,7 +3175,9 @@ mod tests {
         drain_into_vterm(&buf, &mut vterm);
 
         let row_idx = (0..vterm.height() as usize)
-            .find(|&i| vterm.row_text(i).contains('\u{276f}') && vterm.row_text(i).contains("hello"))
+            .find(|&i| {
+                vterm.row_text(i).contains('\u{276f}') && vterm.row_text(i).contains("hello")
+            })
             .unwrap_or_else(|| panic!("user echo row missing\ndump:\n{}", vterm.dump()));
         assert_eq!(
             vterm.cell_at(row_idx, 0).ch,
@@ -2914,6 +3308,65 @@ mod tests {
                 vterm.cell_at(row_idx, c).ch,
             );
         }
+    }
+
+    /// Failure ToolResult: header line is bold red (so users still get
+    /// the "this is bad" signal) but continuation lines fall back to
+    /// default fg (so quoted code in error messages — common with
+    /// edit_file's "old_string not found" path — doesn't blend visually
+    /// with diff-remove blocks. See retained.rs UiLine::ToolResult arm.
+    #[test]
+    fn retained_tool_result_failure_header_red_body_default() {
+        let (mut r, buf) = new_capturing(120, 24);
+        let mut vterm = crate::test_term::VirtualTerminal::new(120, 24);
+        let status = status_basic();
+        // Multi-line failure body: header + quoted-code detail.
+        r.render(UiLine::ToolResult {
+            success: false,
+            summary: "old_string not found in foo.rs\n759| line content\n760| more code".into(),
+        });
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // Header row: contains the ✗ glyph, cells must be bold + red.
+        let header_idx = (0..vterm.height() as usize)
+            .find(|&i| vterm.row_text(i).contains("✗") && vterm.row_text(i).contains("not found"))
+            .unwrap_or_else(|| panic!("header row missing\ndump:\n{}", vterm.dump()));
+        let header_text = vterm.row_text(header_idx);
+        let glyph_col = header_text.find('✗').unwrap();
+        let header_cell = vterm.cell_at(header_idx, glyph_col);
+        assert_eq!(
+            header_cell.fg,
+            Some(crossterm::style::Color::Red),
+            "header `✗` must be red, got {:?}",
+            header_cell,
+        );
+        assert!(
+            header_cell.bold,
+            "header `✗` must be bold, got {:?}",
+            header_cell,
+        );
+
+        // Continuation row: contains the quoted code "759|"; must NOT
+        // be red (so it stops looking like a diff-remove block).
+        let cont_idx = (0..vterm.height() as usize)
+            .find(|&i| vterm.row_text(i).contains("759|"))
+            .unwrap_or_else(|| panic!("continuation row missing\ndump:\n{}", vterm.dump()));
+        let cont_text = vterm.row_text(cont_idx);
+        let digit_col = cont_text.find("759|").unwrap();
+        let cont_cell = vterm.cell_at(cont_idx, digit_col);
+        assert_ne!(
+            cont_cell.fg,
+            Some(crossterm::style::Color::Red),
+            "continuation row must NOT be red (would alias visually with diff-remove): {:?}",
+            cont_cell,
+        );
     }
 
     /// DiffBlock: multiple added/removed lines, each with its own
@@ -3190,8 +3643,7 @@ mod tests {
 
         // Spinner must be GONE from the visible grid — assistant
         // text has overwritten its row.
-        let has_spinner =
-            vterm.any_row(|row| row.contains("⠋") && row.contains("Pondering"));
+        let has_spinner = vterm.any_row(|row| row.contains("⠋") && row.contains("Pondering"));
         let has_text = vterm.any_row(|row| row.contains("Hello world"));
         assert!(
             !has_spinner,
@@ -3404,8 +3856,7 @@ mod tests {
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
 
-        let has_spinner =
-            vterm.any_row(|row| row.contains("⠋") && row.contains("Pondering"));
+        let has_spinner = vterm.any_row(|row| row.contains("⠋") && row.contains("Pondering"));
         assert!(
             !has_spinner,
             "spinner still visible after returning to input prompt:\n{}",

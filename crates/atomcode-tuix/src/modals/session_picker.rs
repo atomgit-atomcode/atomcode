@@ -13,9 +13,7 @@ use atomcode_core::session::{Session, SessionMeta};
 use crossterm::event::{KeyCode, KeyModifiers};
 
 use super::{Modal, ModalAction};
-use crate::event_loop::{
-    build_status, format_tool_detail, summarise, Buffer, LoopCtx,
-};
+use crate::event_loop::{build_status, format_tool_detail, summarise, Buffer, LoopCtx};
 use crate::render::{MenuPayload, Renderer, UiLine};
 use crate::state::UiState;
 
@@ -123,6 +121,10 @@ impl Modal for SessionPicker {
                         // file — future TurnComplete saves overwrite it
                         // instead of leaving the old snapshot + creating
                         // a new one beside it.
+                        // Bind telemetry session_id to the resumed session's UUID.
+                        if let Ok(uuid) = uuid::Uuid::parse_str(session.id.as_str()) {
+                            ctx.telemetry.set_session_id(uuid);
+                        }
                         ctx.current_session = session;
                         state.on_turn_complete();
                         Ok(ModalAction::Close)
@@ -139,13 +141,7 @@ impl Modal for SessionPicker {
         }
     }
 
-    fn draw(
-        &self,
-        buf: &Buffer,
-        state: &UiState,
-        ctx: &LoopCtx,
-        renderer: &mut dyn Renderer,
-    ) {
+    fn draw(&self, buf: &Buffer, state: &UiState, ctx: &LoopCtx, renderer: &mut dyn Renderer) {
         let payload = build_menu_payload(self);
         renderer.render(UiLine::InputPrompt {
             buf: buf.text.clone(),
@@ -218,7 +214,12 @@ fn replay_session(renderer: &mut dyn Renderer, session: &Session) {
                     renderer.render(UiLine::AssistantLineBreak);
                 }
             }
-            (Role::Assistant, MessageContent::AssistantWithToolCalls { text, tool_calls, .. }) => {
+            (
+                Role::Assistant,
+                MessageContent::AssistantWithToolCalls {
+                    text, tool_calls, ..
+                },
+            ) => {
                 if let Some(t) = text {
                     if !t.is_empty() {
                         renderer.render(UiLine::AssistantText(t.clone()));
@@ -309,8 +310,7 @@ mod tests {
 
     #[test]
     fn update_filter_resets_selection_to_zero() {
-        let mut p =
-            SessionPicker::open(vec![meta("one", 1), meta("two", 1), meta("three", 1)]);
+        let mut p = SessionPicker::open(vec![meta("one", 1), meta("two", 1), meta("three", 1)]);
         p.selected = 2;
         p.query = "on".to_string();
         p.update_filter();

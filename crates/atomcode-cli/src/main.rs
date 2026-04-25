@@ -10,29 +10,37 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
+mod telemetry_cmd;
+
 use atomcode_core::agent::{AgentCommand, AgentEvent, AgentLoop};
-use atomcode_core::config::provider::{ProviderConfig, default_context_window_for};
+use atomcode_core::config::provider::{default_context_window_for, ProviderConfig};
 use atomcode_core::config::Config;
 use atomcode_core::conversation::Conversation;
+use atomcode_core::mcp::{merge_stdio_mcp_server_into_json_file, McpRegistry, register_mcp_tools};
 use atomcode_core::provider::{create_provider, unavailable_provider};
 use atomcode_core::session::SessionManager;
-use atomcode_core::tool::{ToolContext, ToolRegistry};
-use atomcode_core::tool::read::ReadFileTool;
-use atomcode_core::tool::write::WriteFileTool;
-use atomcode_core::tool::edit::EditFileTool;
 use atomcode_core::tool::bash::BashTool;
 use atomcode_core::tool::cd::CdTool;
-use atomcode_core::tool::grep::GrepTool;
+use atomcode_core::tool::edit::EditFileTool;
 use atomcode_core::tool::glob::GlobTool;
+use atomcode_core::tool::grep::GrepTool;
 use atomcode_core::tool::list_dir::ListDirTool;
-use atomcode_core::tool::web_search::WebSearchTool;
-use atomcode_core::tool::web_fetch::WebFetchTool;
+use atomcode_core::tool::read::ReadFileTool;
 use atomcode_core::tool::search_replace::SearchReplaceTool;
+use atomcode_core::tool::web_fetch::WebFetchTool;
+use atomcode_core::tool::web_search::WebSearchTool;
+use atomcode_core::tool::write::WriteFileTool;
+use atomcode_core::tool::{ToolContext, ToolRegistry};
 
 use atomcode_core::auth;
+use atomcode_telemetry::{
+    config::{resolve, ProcessEnv},
+    event::SessionMode,
+    notice, CliOverride, CurrentContext, Event, Telemetry,
+};
 
 /// Set to `true` at the start of `run_headless` so the panic hook and the
 /// top-level error handler can skip TUI cleanup. In headless mode we never
@@ -47,10 +55,7 @@ fn restore_terminal_if_tui() {
         return;
     }
     let _ = crossterm::terminal::disable_raw_mode();
-    let _ = crossterm::execute!(
-        std::io::stdout(),
-        crossterm::terminal::LeaveAlternateScreen,
-    );
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen,);
 }
 
 /// Resolve the working directory at startup. **Always** uses the current
@@ -112,7 +117,7 @@ fn is_running_as_backup() -> bool {
 ///     don't silently swap it back to latest.
 ///   * `-p` / `--prompt` / `--prompt-file` is in argv → headless script run,
 ///     shouldn't stall 5-20 s on a network download for a 2 s task.
-///   * A subcommand (login, logout, status, upgrade, rollback) is in argv
+///   * A subcommand (login, logout, status, upgrade, rollback, mcp) is in argv
 ///     → those have their own flows and don't want a surprise re-exec.
 ///   * Config has `auto_update = false` → user explicitly opted out.
 /// Anything else (including missing config) → true, because fresh installs
@@ -126,13 +131,33 @@ fn should_try_sync_upgrade() -> bool {
     }
 
     let args: Vec<String> = std::env::args().collect();
-    let any = |needle: &[&str]| args.iter().skip(1).any(|a| needle.iter().any(|n| a == n || a.starts_with(&format!("{}=", n))));
+    let any = |needle: &[&str]| {
+        args.iter().skip(1).any(|a| {
+            needle
+                .iter()
+                .any(|n| a == n || a.starts_with(&format!("{}=", n)))
+        })
+    };
 
     if any(&["-p", "--prompt", "--prompt-file"]) {
         return false;
     }
-    if args.iter().skip(1).any(|a| matches!(a.as_str(),
-        "login" | "logout" | "status" | "upgrade" | "rollback" | "--version" | "-V" | "--help" | "-h")) {
+    if args.iter().skip(1).any(|a| {
+        matches!(
+            a.as_str(),
+            "login"
+                | "logout"
+                | "status"
+                | "upgrade"
+                | "rollback"
+                | "mcp"
+                | "telemetry"
+                | "--version"
+                | "-V"
+                | "--help"
+                | "-h"
+        )
+    }) {
         return false;
     }
 
@@ -178,12 +203,18 @@ async fn sync_stage_and_apply_if_newer() {
                     eprintln!("✨ New version available: {}", version);
                 }
                 UpgradeEvent::Downloading { bytes, total } => {
-                    let pct = if total == 0 { 0 } else { ((bytes * 100) / total) as i32 };
+                    let pct = if total == 0 {
+                        0
+                    } else {
+                        ((bytes * 100) / total) as i32
+                    };
                     if pct != last_pct {
-                        eprint!("\r   Downloading {}% ({:.1} / {:.1} MB)      ",
-                                pct,
-                                bytes as f64 / 1_048_576.0,
-                                total as f64 / 1_048_576.0);
+                        eprint!(
+                            "\r   Downloading {}% ({:.1} / {:.1} MB)      ",
+                            pct,
+                            bytes as f64 / 1_048_576.0,
+                            total as f64 / 1_048_576.0
+                        );
                         let _ = std::io::stderr().flush();
                         last_pct = pct;
                     }
@@ -353,11 +384,6 @@ struct Cli {
     #[arg(long, value_name = "PATH", conflicts_with = "prompt")]
     prompt_file: Option<std::path::PathBuf>,
 
-    /// Fall back to the legacy ratatui alternate-screen TUI (atomcode-tui).
-    /// Default is the CC-style normal-mode TUI (atomcode-tuix).
-    #[arg(long)]
-    tui: bool,
-
     /// Show tool calls, token usage, and turn summary on stderr (headless mode only).
     /// Without this flag, headless output is the assistant reply only — Claude Code -p style.
     #[arg(short = 'v', long)]
@@ -386,6 +412,10 @@ struct Cli {
     /// retry against a permanently-blocked tool.
     #[arg(long, value_delimiter = ',', value_name = "NAMES")]
     disable_tools: Vec<String>,
+
+    /// Disable telemetry for this invocation.
+    #[arg(long = "no-telemetry", default_value_t = false, global = true)]
+    pub no_telemetry: bool,
 }
 
 #[derive(Subcommand)]
@@ -414,6 +444,51 @@ enum Commands {
     /// Runs: login (if not already) → claim → fetch models → write providers
     /// → fetch status. Reports each step and exits.
     Codingplan,
+    /// Manage MCP server entries in `.mcp.json` (similar to `claude mcp add`)
+    #[command(subcommand)]
+    Mcp(McpCli),
+    /// Telemetry controls
+    Telemetry {
+        #[command(subcommand)]
+        action: TelemetryAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum McpCli {
+    /// Add or replace a stdio MCP server (`mcpServers.<name>` with `command` + `args`)
+    Add {
+        /// Server key (tools appear as `mcp__<name>__…`)
+        name: String,
+        /// Executable and arguments, e.g. `npx @playwright/mcp@latest`
+        #[arg(required = true, num_args = 1..)]
+        command: Vec<String>,
+        /// Write `~/.atomcode/mcp.json` instead of `<dir>/.mcp.json`
+        #[arg(long)]
+        global: bool,
+        /// Directory for project `.mcp.json` (defaults to current directory)
+        #[arg(short = 'C', long)]
+        dir: Option<PathBuf>,
+    },
+}
+
+#[derive(clap::Subcommand)]
+pub enum TelemetryAction {
+    /// Show current telemetry state and queue stats
+    Status,
+    /// Enable telemetry (writes to ~/.atomcode/config.toml)
+    Enable,
+    /// Disable telemetry (writes to ~/.atomcode/config.toml)
+    Disable,
+    /// Print pending queued events (never-sent)
+    Dump {
+        #[arg(long, default_value_t = 50)]
+        last: usize,
+        #[arg(long)]
+        pretty: bool,
+    },
+    /// Clear queued events (does not change enabled state)
+    Clear,
 }
 
 /// Environment variable set by this process for its re-exec'd child, so
@@ -435,8 +510,8 @@ async fn main() {
     // render correctly instead of showing garbled output (mojibake).
     #[cfg(target_os = "windows")]
     {
-        use windows_sys::Win32::System::Console::{SetConsoleOutputCP, SetConsoleCP};
         use windows_sys::Win32::Globalization::CP_UTF8;
+        use windows_sys::Win32::System::Console::{SetConsoleCP, SetConsoleOutputCP};
         unsafe {
             SetConsoleOutputCP(CP_UTF8);
             SetConsoleCP(CP_UTF8);
@@ -472,54 +547,59 @@ async fn main() {
     // circuit-breaker in `apply_pending_upgrade` ensures a broken release
     // can't wedge this loop indefinitely.
     if !is_backup {
-    // Capture current version BEFORE applying upgrade, so we can pass it to the re-exec'd child
-    let current_version = format!("v{}", env!("CARGO_PKG_VERSION"));
-    match atomcode_core::self_update::apply_pending_upgrade() {
-        Ok(Some(applied)) => {
-            eprintln!("✓ Upgrading to {}...", applied.version);
-            // Pass the CURRENT version (before upgrade) to the re-exec'd child so the TUI
-            // can surface a welcome-screen confirmation exactly once.
-            std::env::set_var(UPGRADED_FROM_ENV, &current_version);
-            match atomcode_core::self_update::re_exec_self() {
-                Ok(_infallible) => unreachable!("re_exec_self returned Ok"),
-                Err(e) => {
-                    eprintln!(
+        // Capture current version BEFORE applying upgrade, so we can pass it to the re-exec'd child
+        let current_version = format!("v{}", env!("CARGO_PKG_VERSION"));
+        match atomcode_core::self_update::apply_pending_upgrade() {
+            Ok(Some(applied)) => {
+                eprintln!("✓ Upgrading to {}...", applied.version);
+                // Pass the CURRENT version (before upgrade) to the re-exec'd child so the TUI
+                // can surface a welcome-screen confirmation exactly once.
+                std::env::set_var(UPGRADED_FROM_ENV, &current_version);
+                match atomcode_core::self_update::re_exec_self() {
+                    Ok(_infallible) => unreachable!("re_exec_self returned Ok"),
+                    Err(e) => {
+                        eprintln!(
                         "Upgrade applied but re-exec failed ({}). The new version will be used on the next launch.",
                         e
                     );
-                    std::env::remove_var(UPGRADED_FROM_ENV);
-                    std::process::exit(1);
+                        std::env::remove_var(UPGRADED_FROM_ENV);
+                        std::process::exit(1);
+                    }
                 }
             }
-        }
-        Ok(None) => {
-            // No pre-staged upgrade. If the user isn't passing `-p` /
-            // `--prompt-file` (headless one-shots shouldn't pay the network
-            // tax) and auto_update isn't disabled, try to fetch + stage +
-            // apply v_next right here. This is the "user launched atomcode,
-            // wants it upgraded NOW" path — single invocation instead of
-            // the stage-on-session-N / apply-on-session-N+1 dance.
-            //
-            // Anything goes wrong (offline, timeout, sha mismatch, no
-            // newer release) → silently fall through and continue with
-            // the current binary. The `/upgrade` slash command is still
-            // there as the explicit/loud alternative.
-            if should_try_sync_upgrade() {
-                sync_stage_and_apply_if_newer().await;
+            Ok(None) => {
+                // No pre-staged upgrade. If the user isn't passing `-p` /
+                // `--prompt-file` (headless one-shots shouldn't pay the network
+                // tax) and auto_update isn't disabled, try to fetch + stage +
+                // apply v_next right here. This is the "user launched atomcode,
+                // wants it upgraded NOW" path — single invocation instead of
+                // the stage-on-session-N / apply-on-session-N+1 dance.
+                //
+                // Anything goes wrong (offline, timeout, sha mismatch, no
+                // newer release) → silently fall through and continue with
+                // the current binary. The `/upgrade` slash command is still
+                // there as the explicit/loud alternative.
+                if should_try_sync_upgrade() {
+                    sync_stage_and_apply_if_newer().await;
+                }
+            }
+            Err(e) => {
+                eprintln!("Note: pending upgrade could not be applied ({}). Continuing with current version.", e);
             }
         }
-        Err(e) => {
-            eprintln!("Note: pending upgrade could not be applied ({}). Continuing with current version.", e);
-        }
-    }
     } // end `if !is_backup`
 
-    // Set panic hook to show errors cleanly
+    // Set a minimal pre-telemetry panic hook (replaced after telemetry init in run()).
     std::panic::set_hook(Box::new(|info| {
         restore_terminal_if_tui();
         eprintln!("\nAtomCode crashed: {}", info);
         if let Some(location) = info.location() {
-            eprintln!("  at {}:{}:{}", location.file(), location.line(), location.column());
+            eprintln!(
+                "  at {}:{}:{}",
+                location.file(),
+                location.line(),
+                location.column()
+            );
         }
         eprintln!("\nPlease report this at: https://atomgit.com/atomgit_atomcode/atomcode/issues");
     }));
@@ -536,6 +616,40 @@ async fn main() {
 
 async fn run() -> Result<i32> {
     let cli = Cli::parse();
+
+    // ── Telemetry init ────────────────────────────────────────────────────────
+    // Load config early (before subcommand dispatch) so we can read the
+    // [telemetry] section. Failure to load config is non-fatal; telemetry
+    // will operate on defaults (enabled, built-in endpoint).
+    let config_path_for_tel = cli.config.clone().unwrap_or_else(Config::default_path);
+    let telemetry_cfg = if config_path_for_tel.exists() {
+        Config::load(&config_path_for_tel)
+            .map(|c| c.telemetry)
+            .unwrap_or_default()
+    } else {
+        Default::default()
+    };
+    let atomcode_dir = dirs::home_dir().unwrap_or_default().join(".atomcode");
+    let cli_override = CliOverride {
+        disabled: cli.no_telemetry,
+    };
+    let resolved = resolve(
+        &telemetry_cfg,
+        &cli_override,
+        atomcode_dir.clone(),
+        &ProcessEnv,
+    );
+
+    // First-run notice: only show when telemetry would be active.
+    if resolved.state.is_enabled() {
+        if let Ok(true) = notice::should_show_and_mark(&resolved.atomcode_dir) {
+            eprintln!("{}", notice::NOTICE_TEXT);
+        }
+    }
+
+    let telemetry = Telemetry::init(resolved, env!("CARGO_PKG_VERSION").into());
+    install_panic_hook(telemetry.clone());
+    // ── End telemetry init ────────────────────────────────────────────────────
 
     // Handle subcommands. Most are self-contained (`handle_command` runs
     // and exits); `Login` falls through to the TUI, and `Fixissue` is
@@ -555,33 +669,58 @@ async fn run() -> Result<i32> {
         match cmd {
             Commands::Login => {
                 HEADLESS_MODE.store(true, Ordering::Relaxed);
-                let auth = auth::login()?;
+                let auth = auth::login(Some(&telemetry))?;
                 auth::save_auth(&auth)?;
                 println!("  Login successful! Starting AtomCode...\n");
                 HEADLESS_MODE.store(false, Ordering::Relaxed);
                 // Fall through to TUI startup below
             }
             Commands::Codingplan => {
-                // Mirror /login: run the setup flow headless (so any
-                // auth::login() browser prompt lands cleanly), then
-                // fall through to TUI startup so the user lands in
-                // the chat with their fresh providers already
-                // configured. The rendered report is stashed into
-                // ATOMCODE_CODINGPLAN_REPORT so the TUI can surface
-                // it as a body line on startup — same pattern as
-                // ATOMCODE_UPGRADED_FROM for post-upgrade notices.
+                // Headless: run the codingplan setup flow and exit.
+                // Emits open_atomcode (mode=headless) then take_codingplan
+                // (emitted internally by run_codingplan_core via coding_plan::run).
                 HEADLESS_MODE.store(true, Ordering::Relaxed);
-                let report = run_codingplan_core()?;
-                std::env::set_var("ATOMCODE_CODINGPLAN_REPORT", report);
-                println!("  Starting AtomCode...\n");
-                HEADLESS_MODE.store(false, Ordering::Relaxed);
-                // Fall through to TUI startup below
+                let repo = atomcode_core::telemetry_bootstrap::detect_repo_origin(
+                    &std::env::current_dir().unwrap_or_default(),
+                );
+                let account_id = auth::get_stored_auth().map(|a| a.user.id.to_string());
+                let scope_ctx = CurrentContext {
+                    repo_origin: Some(repo),
+                    account_id,
+                    mode: Some(SessionMode::Headless),
+                    ..CurrentContext::current()
+                };
+                let exit_code = CurrentContext::scope(scope_ctx, || async {
+                    telemetry.track(Event::OpenAtomcode);
+                    let result = run_codingplan_core(Some(&telemetry));
+                    match result {
+                        Ok(report) => {
+                            print!("{}", report);
+                            telemetry.shutdown(std::time::Duration::from_millis(500)).await;
+                            Ok::<i32, anyhow::Error>(0)
+                        }
+                        Err(e) => {
+                            eprintln!("codingplan failed: {:#}", e);
+                            telemetry.shutdown(std::time::Duration::from_millis(500)).await;
+                            Ok(1)
+                        }
+                    }
+                })
+                .await?;
+                return Ok(exit_code);
             }
             Commands::Fixissue { url } => {
                 HEADLESS_MODE.store(true, Ordering::Relaxed);
-                let cwd = cli.dir.clone().unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+                let cwd = cli.dir.clone().unwrap_or_else(|| {
+                    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+                });
                 match atomcode_core::atomgit::fixissue::prepare(&url, &cwd) {
-                    Ok(atomcode_core::atomgit::fixissue::Prepared::Run { prompt, issue_title, issue_number, issue_ref }) => {
+                    Ok(atomcode_core::atomgit::fixissue::Prepared::Run {
+                        prompt,
+                        issue_title,
+                        issue_number,
+                        issue_ref,
+                    }) => {
                         eprintln!("[fixissue] issue #{}: {}", issue_number, issue_title);
                         fixissue_prompt = Some(prompt);
                         fixissue_ref = Some(issue_ref);
@@ -597,6 +736,22 @@ async fn run() -> Result<i32> {
                         return Ok(1);
                     }
                 }
+            }
+            Commands::Telemetry { action } => {
+                HEADLESS_MODE.store(true, Ordering::Relaxed);
+                let config_file_path = atomcode_dir.join("config.toml");
+                match action {
+                    TelemetryAction::Status => {
+                        telemetry_cmd::status(&atomcode_dir, &telemetry_cfg)?
+                    }
+                    TelemetryAction::Enable => telemetry_cmd::enable(&config_file_path)?,
+                    TelemetryAction::Disable => telemetry_cmd::disable(&config_file_path, &telemetry).await?,
+                    TelemetryAction::Dump { last, pretty } => {
+                        telemetry_cmd::dump(&atomcode_dir, last, pretty)?
+                    }
+                    TelemetryAction::Clear => telemetry_cmd::clear(&atomcode_dir)?,
+                }
+                return Ok(0);
             }
             other => {
                 return handle_command(other).await.map(|_| 0);
@@ -619,6 +774,7 @@ async fn run() -> Result<i32> {
                 notifications: Default::default(),
                 auto_update: true,
                 reflection_cadence: 7,
+                telemetry: Default::default(),
             }
         })
     } else {
@@ -631,6 +787,7 @@ async fn run() -> Result<i32> {
             notifications: Default::default(),
             auto_update: true,
             reflection_cadence: 7,
+            telemetry: Default::default(),
         }
     };
 
@@ -653,7 +810,7 @@ async fn run() -> Result<i32> {
                 max_tokens: None,
                 thinking_type: None,
                 thinking_keep: None,
-            reasoning_history: None,
+                reasoning_history: None,
                 ephemeral: false,
             },
             String::new(),
@@ -722,33 +879,82 @@ async fn run() -> Result<i32> {
     // ATOMCODE_DISABLE_TOOLS env var. The env var allows the SWE-bench
     // harness to opt-out of bash without rebuilding atomcode or threading a
     // CLI flag through every shell wrapper.
-    let mut disabled_tools: std::collections::HashSet<String> =
-        cli.disable_tools.iter().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+    let mut disabled_tools: std::collections::HashSet<String> = cli
+        .disable_tools
+        .iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
     if let Ok(env_list) = std::env::var("ATOMCODE_DISABLE_TOOLS") {
-        for name in env_list.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        for name in env_list
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+        {
             disabled_tools.insert(name.to_string());
         }
     }
     if !disabled_tools.is_empty() {
         let mut sorted: Vec<&String> = disabled_tools.iter().collect();
         sorted.sort();
-        eprintln!("[atomcode] tools disabled: {}", sorted.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "));
+        eprintln!(
+            "[atomcode] tools disabled: {}",
+            sorted
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
     }
     let enabled = |name: &str| !disabled_tools.contains(name);
 
     let mut tool_registry = ToolRegistry::new();
-    if enabled("read_file")      { tool_registry.register(Box::new(ReadFileTool)); }
-    if enabled("write_file")     { tool_registry.register(Box::new(WriteFileTool)); }
-    if enabled("edit_file")      { tool_registry.register(Box::new(EditFileTool)); }
-    if enabled("bash")           { tool_registry.register(Box::new(BashTool)); }
-    if enabled("change_dir")     { tool_registry.register(Box::new(CdTool)); }
-    if enabled("grep")           { tool_registry.register(Box::new(GrepTool)); }
-    if enabled("glob")           { tool_registry.register(Box::new(GlobTool)); }
-    if enabled("list_directory") { tool_registry.register(Box::new(ListDirTool)); }
-    if enabled("web_search")     { tool_registry.register(Box::new(WebSearchTool)); }
-    if enabled("web_fetch")      { tool_registry.register(Box::new(WebFetchTool)); }
-    if enabled("search_replace") { tool_registry.register(Box::new(SearchReplaceTool)); }
-    let tool_context = ToolContext::new(working_dir.clone());
+    if enabled("read_file")      { tool_registry.register_sync(Box::new(ReadFileTool)); }
+    if enabled("write_file")     { tool_registry.register_sync(Box::new(WriteFileTool)); }
+    if enabled("edit_file")      { tool_registry.register_sync(Box::new(EditFileTool)); }
+    if enabled("bash")           { tool_registry.register_sync(Box::new(BashTool)); }
+    if enabled("change_dir")     { tool_registry.register_sync(Box::new(CdTool)); }
+    if enabled("grep")           { tool_registry.register_sync(Box::new(GrepTool)); }
+    if enabled("glob")           { tool_registry.register_sync(Box::new(GlobTool)); }
+    if enabled("list_directory") { tool_registry.register_sync(Box::new(ListDirTool)); }
+    if enabled("web_search")     { tool_registry.register_sync(Box::new(WebSearchTool)); }
+    if enabled("web_fetch")      { tool_registry.register_sync(Box::new(WebFetchTool)); }
+    if enabled("search_replace") { tool_registry.register_sync(Box::new(SearchReplaceTool)); }
+
+    // Determine if we're running in headless mode BEFORE loading MCP.
+    // Headless mode requires MCP tools immediately; TUI can load them in background.
+    let is_headless = cli.prompt.is_some() || cli.prompt_file.is_some() || fixissue_prompt.is_some();
+
+    // Load MCP tools from .mcp.json (project) and ~/.atomcode/mcp.json (user).
+    // For TUI mode, start connections in background to avoid blocking startup.
+    // For headless mode (-p/--prompt-file/fixissue), wait for connections since tools
+    // are needed immediately.
+    let (mcp_registry, mcp_connect_rx) = if is_headless {
+        // Headless: need tools right now, wait for connections
+        let registry = McpRegistry::from_config(&working_dir).await;
+        let mcp_tools = registry.list_all_tools().await;
+        let mcp_registry = if !mcp_tools.is_empty() {
+            let mcp_registry = std::sync::Arc::new(registry);
+            register_mcp_tools(&mut tool_registry, mcp_registry.clone(), mcp_tools);
+            Some(mcp_registry)
+        } else {
+            None
+        };
+        (mcp_registry, None)
+    } else {
+        // TUI: start in background, tools populate as servers connect
+        // Create event channel so TUI can display connection status in scrollback
+        use atomcode_core::mcp::McpConnectEvent;
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<McpConnectEvent>();
+        let registry = McpRegistry::from_config_background_with_events(&working_dir, Some(tx));
+        let mcp_registry = std::sync::Arc::new(registry);
+        // Don't wait for tools - they'll be registered dynamically as servers connect
+        (Some(mcp_registry), Some(rx))
+    };
+
+    // Pass the already-initialized telemetry handle into ToolContext.
+    let tool_context =
+        ToolContext::with_telemetry(working_dir.clone(), "default", telemetry.clone());
 
     // Auto-continue the latest session for this working directory.
     // Same behavior as Claude Code: re-entering a project resumes where you left off.
@@ -791,89 +997,134 @@ async fn run() -> Result<i32> {
     } else {
         match (cli.prompt.as_ref(), cli.prompt_file.as_ref()) {
             (Some(p), None) => Some(p.clone()),
-            (None, Some(path)) => {
-                match std::fs::read_to_string(path) {
-                    Ok(s) => Some(s),
-                    Err(e) => {
-                        eprintln!("error: failed to read --prompt-file {}: {}", path.display(), e);
-                        std::process::exit(2);
-                    }
+            (None, Some(path)) => match std::fs::read_to_string(path) {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    eprintln!(
+                        "error: failed to read --prompt-file {}: {}",
+                        path.display(),
+                        e
+                    );
+                    std::process::exit(2);
                 }
-            }
+            },
             (None, None) => None,
             (Some(_), Some(_)) => unreachable!("clap conflicts_with prevents this"),
         }
     };
 
-    // Headless mode: -p / --prompt-file triggers non-interactive execution.
-    // `fixissue` also sets `force_verbose` so tool activity is visible — the
-    // user is watching a single long-running task, not feeding a pipe.
-    if let Some(prompt) = effective_prompt {
-        let verbose = cli.verbose || force_verbose;
-        // Capture the assistant's streamed text only when we need to post
-        // it back to AtomGit (fixissue). Plain `-p` stays zero-alloc.
-        let capture = fixissue_ref.is_some();
-        let (exit_code, captured) = run_headless(
-            agent_loop,
-            agent_handle,
-            prompt,
-            cli.provider.as_deref(),
-            verbose,
-            capture,
-            working_dir.clone(),
-        )
-        .await?;
+    // Build the session-scope context: repo_origin, account_id, mode.
+    // session_id is now managed on Telemetry directly via set_session_id().
+    // account_id is seeded from stored auth so events from this session are
+    // correlated to the user even before any explicit login action this run.
+    // mode: Headless when a prompt is supplied (-p / --prompt-file / fixissue);
+    //       Tui when the user launches the interactive terminal UI.
+    let repo = atomcode_core::telemetry_bootstrap::detect_repo_origin(
+        &std::env::current_dir().unwrap_or_else(|_| working_dir.clone()),
+    );
+    let account_id = auth::get_stored_auth().map(|a| a.user.id.to_string());
+    let session_mode = if effective_prompt.is_some() {
+        SessionMode::Headless
+    } else {
+        SessionMode::Tui
+    };
+    // Bind telemetry session_id to the AtomCode session's UUID (if a session is available).
+    // This means events from this process run are correlated to the actual session file.
+    // If no session exists yet, session_id stays as launch_id (the default).
+    if let Some(ref s) = session_to_continue {
+        if let Ok(uuid) = uuid::Uuid::parse_str(s.id.as_str()) {
+            telemetry.set_session_id(uuid);
+        }
+    }
+    let scope_ctx = CurrentContext {
+        repo_origin: Some(repo),
+        account_id,
+        mode: Some(session_mode),
+        ..CurrentContext::current()
+    };
 
-        // Post-run side effects for fixissue: only on clean completion
-        // (exit 0 = TurnComplete Natural; 1 = error; 2 = denial; 130 = cancel).
-        // On non-zero we leave the issue alone — the user can retry.
-        if let Some(issue_ref) = fixissue_ref {
-            if exit_code == 0 {
-                if let Some(summary) = captured.filter(|s| !s.trim().is_empty()) {
-                    match atomcode_core::atomgit::fixissue::post_completion(&issue_ref, &summary) {
-                        Ok(()) => eprintln!(
-                            "[fixissue] ✔ posted summary + applied 'fixed' label to issue #{}",
+    let result = CurrentContext::scope(scope_ctx, || async {
+        // Emit open_atomcode once at agent-flow entry. Meta-commands
+        // (--version, --help, --update, login, logout, status, upgrade,
+        // rollback, telemetry) return via handle_command before reaching
+        // this point and must NOT emit open_atomcode.
+        telemetry.track(Event::OpenAtomcode);
+
+        // Headless mode: -p / --prompt-file triggers non-interactive execution.
+        // `fixissue` also sets `force_verbose` so tool activity is visible — the
+        // user is watching a single long-running task, not feeding a pipe.
+        let exit_code = if let Some(prompt) = effective_prompt {
+            let verbose = cli.verbose || force_verbose;
+            // Capture the assistant's streamed text only when we need to post
+            // it back to AtomGit (fixissue). Plain `-p` stays zero-alloc.
+            let capture = fixissue_ref.is_some();
+            let (ec, captured) = run_headless(
+                agent_loop,
+                agent_handle,
+                prompt,
+                cli.provider.as_deref(),
+                verbose,
+                capture,
+                working_dir.clone(),
+            )
+            .await?;
+
+            // Post-run side effects for fixissue: only on clean completion
+            // (exit 0 = TurnComplete Natural; 1 = error; 2 = denial; 130 = cancel).
+            // On non-zero we leave the issue alone — the user can retry.
+            if let Some(issue_ref) = fixissue_ref {
+                if ec == 0 {
+                    if let Some(summary) = captured.filter(|s| !s.trim().is_empty()) {
+                        match atomcode_core::atomgit::fixissue::post_completion(&issue_ref, &summary) {
+                            Ok(()) => eprintln!(
+                                "[fixissue] ✔ posted summary + applied 'fixed' label to issue #{}",
+                                issue_ref.number
+                            ),
+                            Err(e) => eprintln!(
+                                "[fixissue] ✗ post-back failed (local fix is still saved): {:#}",
+                                e
+                            ),
+                        }
+                    } else {
+                        eprintln!(
+                            "[fixissue] agent produced no text; skipping comment + label on issue #{}",
                             issue_ref.number
-                        ),
-                        Err(e) => eprintln!(
-                            "[fixissue] ✗ post-back failed (local fix is still saved): {:#}",
-                            e
-                        ),
+                        );
                     }
                 } else {
                     eprintln!(
-                        "[fixissue] agent produced no text; skipping comment + label on issue #{}",
-                        issue_ref.number
+                        "[fixissue] agent exited non-zero ({}); skipping comment + label on issue #{}",
+                        ec, issue_ref.number
                     );
                 }
-            } else {
-                eprintln!(
-                    "[fixissue] agent exited non-zero ({}); skipping comment + label on issue #{}",
-                    exit_code, issue_ref.number
-                );
             }
-        }
-        return Ok(exit_code);
-    }
+            Ok::<i32, anyhow::Error>(ec)
+        } else {
+            // Fire-and-forget: spawn a setsid'd subprocess to stage the next
+            // release if one is out. Detached so a Ctrl+C in this parent doesn't
+            // also kill the download — that was the whole reason "exit and come
+            // back" wasn't picking up v_next on short sessions. Only armed when
+            // the user hasn't opted out via `auto_update = false` AND we're not
+            // running as `atomcode.bak` (backup should stay pinned; see the
+            // `is_running_as_backup` guard up top).
+            if config.auto_update && !is_running_as_backup() {
+                spawn_detached_upgrade_prep();
+            }
 
-    // Fire-and-forget: spawn a setsid'd subprocess to stage the next
-    // release if one is out. Detached so a Ctrl+C in this parent doesn't
-    // also kill the download — that was the whole reason "exit and come
-    // back" wasn't picking up v_next on short sessions. Only armed when
-    // the user hasn't opted out via `auto_update = false` AND we're not
-    // running as `atomcode.bak` (backup should stay pinned; see the
-    // `is_running_as_backup` guard up top).
-    if config.auto_update && !is_running_as_backup() {
-        spawn_detached_upgrade_prep();
-    }
+            let ctx = atomcode_telemetry::CurrentContext::current();
+            tokio::spawn(async move {
+                atomcode_telemetry::CurrentContext::scope(ctx, || agent_loop.run()).await
+            });
+            atomcode_tuix::run(config, model_name, agent_handle, tool_context, working_dir, session_to_continue, mcp_registry, mcp_connect_rx, telemetry.clone()).await?;
+            Ok(0)
+        };
 
-    tokio::spawn(agent_loop.run());
-    if cli.tui {
-        atomcode_tui::run(config, model_name, agent_handle, tool_context, working_dir, session_to_continue).await?;
-    } else {
-        atomcode_tuix::run(config, model_name, agent_handle, tool_context, working_dir, session_to_continue).await?;
-    }
-    Ok(0)
+        telemetry.shutdown(std::time::Duration::from_millis(500)).await;
+        exit_code
+    })
+    .await;
+
+    result
 }
 
 /// Run agent in headless mode (pipe-friendly: stdout = LLM text only,
@@ -906,7 +1157,10 @@ async fn run_headless(
         (handle.cmd_tx, handle.event_rx)
     };
 
-    tokio::spawn(agent_loop.run());
+    let ctx = atomcode_telemetry::CurrentContext::current();
+    tokio::spawn(async move {
+        atomcode_telemetry::CurrentContext::scope(ctx, || agent_loop.run()).await
+    });
     cmd_tx.send(AgentCommand::SendMessage(prompt))?;
 
     let mut exit_code: i32 = 0;
@@ -931,17 +1185,31 @@ async fn run_headless(
             }
             AgentEvent::ToolCallStreaming { name, hint } => {
                 if verbose {
-                    let detail = if hint.is_empty() { String::new() } else { format!(" → {}", hint) };
+                    let detail = if hint.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" → {}", hint)
+                    };
                     eprintln!("[tool-streaming← {}{}]", name, detail);
                 }
             }
-            AgentEvent::ToolCallStarted { id: _, name, arguments } => {
+            AgentEvent::ToolCallStarted {
+                id: _,
+                name,
+                arguments,
+            } => {
                 if verbose {
                     let args = truncate_log_line(&arguments, 200);
                     eprintln!("[tool→ {} args={}]", name, args);
                 }
             }
-            AgentEvent::ToolCallResult { call_id: _, name, output, success, duration } => {
+            AgentEvent::ToolCallResult {
+                call_id: _,
+                name,
+                output,
+                success,
+                duration,
+            } => {
                 if verbose {
                     let status = if success { "OK" } else { "FAILED" };
                     let dur_ms = duration.as_millis();
@@ -954,7 +1222,9 @@ async fn run_headless(
                     }
                 }
             }
-            AgentEvent::ApprovalNeeded { tool_name, reason, .. } => {
+            AgentEvent::ApprovalNeeded {
+                tool_name, reason, ..
+            } => {
                 if tool_name == "bash" {
                     // -p / headless cannot prompt; user opts in by using non-interactive mode.
                     eprintln!("[headless] auto-approved bash: {}", reason);
@@ -968,13 +1238,23 @@ async fn run_headless(
             }
             AgentEvent::TokenUsage(usage) => {
                 if verbose {
-                    eprintln!("[tokens] prompt={} completion={}", usage.prompt_tokens, usage.completion_tokens);
+                    eprintln!(
+                        "[tokens] prompt={} completion={}",
+                        usage.prompt_tokens, usage.completion_tokens
+                    );
                 }
             }
             AgentEvent::PhaseChange(_) => {
                 // Silent in headless mode (in both default and verbose).
             }
-            AgentEvent::TurnComplete { duration, total_tokens, turn_count, tool_call_count, stop_reason, messages: _ } => {
+            AgentEvent::TurnComplete {
+                duration,
+                total_tokens,
+                turn_count,
+                tool_call_count,
+                stop_reason,
+                messages: _,
+            } => {
                 atomcode_core::notify::notify_turn_finished(
                     &notifications,
                     atomcode_core::notify::TurnNotification {
@@ -1001,8 +1281,14 @@ async fn run_headless(
                         atomcode_core::agent::TurnStopReason::Natural => String::new(),
                         other => format!(" stopped={}", other.as_tag()),
                     };
-                    eprintln!("[done] {:.1}s tokens={} turns={} tool_calls={}{}",
-                        duration.as_secs_f64(), total_tokens, turn_count, tool_call_count, suffix);
+                    eprintln!(
+                        "[done] {:.1}s tokens={} turns={} tool_calls={}{}",
+                        duration.as_secs_f64(),
+                        total_tokens,
+                        turn_count,
+                        tool_call_count,
+                        suffix
+                    );
                 }
                 let _ = cmd_tx.send(AgentCommand::Shutdown);
                 break;
@@ -1029,9 +1315,16 @@ async fn run_headless(
             AgentEvent::ContextStats { .. } => {
                 // Silent in headless mode
             }
-AgentEvent::SubAgentProgress { file, status } => {
+            AgentEvent::SubAgentProgress { file, status } => {
                 if verbose {
                     eprintln!("[sub-agent] {} {}", file, status);
+                }
+            }
+            AgentEvent::BackgroundComplete { summary, files_edited, turns, success } => {
+                let status = if success { "ok" } else { "fail" };
+                eprintln!("[background {} turns={}] {}", status, turns, summary);
+                if verbose && !files_edited.is_empty() {
+                    eprintln!("[background files={}]", files_edited.join(","));
                 }
             }
         }
@@ -1054,7 +1347,9 @@ async fn handle_command(cmd: Commands) -> Result<()> {
 
     match cmd {
         Commands::Login => {
-            let auth = auth::login()?;
+            // handle_command is for the standalone `atomcode login` exit path —
+            // no telemetry handle available here; login_success is not emitted.
+            let auth = auth::login(None)?;
             auth::save_auth(&auth)?;
             println!("  Login successful! You can now use AtomCode.");
             Ok(())
@@ -1066,7 +1361,10 @@ async fn handle_command(cmd: Commands) -> Result<()> {
         }
         Commands::Status => {
             if let Some(auth) = auth::get_stored_auth() {
-                println!("\n  Logged in as: {} ({})", auth.user.username, auth.user.id);
+                println!(
+                    "\n  Logged in as: {} ({})",
+                    auth.user.username, auth.user.id
+                );
                 if let Some(name) = auth.user.name {
                     println!("  Name: {}", name);
                 }
@@ -1086,12 +1384,40 @@ async fn handle_command(cmd: Commands) -> Result<()> {
             unreachable!("Fixissue is handled inline in run() before handle_command")
         }
         Commands::Codingplan => {
-            // Kept as a handle_command arm for completeness, but `run()`
-            // now intercepts Codingplan before reaching here so the flow
-            // falls through to TUI startup. This branch is effectively
-            // dead unless a future caller dispatches Codingplan directly
-            // via handle_command (e.g. a test).
-            run_codingplan_cli()
+            // `run()` intercepts Codingplan before handle_command is called,
+            // so this arm is effectively unreachable in normal execution.
+            unreachable!("Codingplan is handled inline in run() before handle_command")
+        }
+        Commands::Telemetry { .. } => {
+            unreachable!("Telemetry is handled inline in run() before handle_command")
+        }
+        Commands::Mcp(McpCli::Add {
+            name,
+            command,
+            global,
+            dir,
+        }) => {
+            let base = resolve_working_dir(dir);
+            let path = if global {
+                let home = dirs::home_dir().context("Cannot resolve home directory for --global")?;
+                home.join(".atomcode").join("mcp.json")
+            } else {
+                base.join(".mcp.json")
+            };
+            let program = command
+                .first()
+                .expect("clap ensures at least one command token")
+                .clone();
+            let args: Vec<String> = command.into_iter().skip(1).collect();
+            merge_stdio_mcp_server_into_json_file(&path, &name, &program, &args)?;
+            println!(
+                "  Added MCP server {:?} → {} (stdio: {} + {} arg(s))",
+                name,
+                path.display(),
+                program,
+                args.len()
+            );
+            Ok(())
         }
     }
 }
@@ -1124,7 +1450,10 @@ async fn run_upgrade_cli(force: bool) -> Result<()> {
                     ((bytes * 100) / total) as i32
                 };
                 if pct != last_pct {
-                    print!("\r    downloading {}% ({} / {} bytes)   ", pct, bytes, total);
+                    print!(
+                        "\r    downloading {}% ({} / {} bytes)   ",
+                        pct, bytes, total
+                    );
                     io::stdout().flush().ok();
                     last_pct = pct;
                 }
@@ -1192,7 +1521,9 @@ fn run_rollback_cli() -> Result<()> {
 /// `coding_plan::setup` orchestrator, persists the config on success,
 /// and returns the rendered human-readable report — the caller decides
 /// whether to print it to stdout or stash it for the TUI to surface.
-fn run_codingplan_core() -> Result<String> {
+fn run_codingplan_core(
+    telemetry: Option<&std::sync::Arc<atomcode_telemetry::Telemetry>>,
+) -> Result<String> {
     let path = Config::default_path();
     // Missing config is legitimate on first install — start from defaults
     // so the flow can still add AtomGit providers to a fresh config.toml.
@@ -1206,10 +1537,11 @@ fn run_codingplan_core() -> Result<String> {
             auto_update: true,
             reflection_cadence: 7,
             notifications: Default::default(),
+            telemetry: Default::default(),
         },
     };
 
-    let report = atomcode_core::coding_plan::run(&mut config)?;
+    let report = atomcode_core::coding_plan::run(&mut config, telemetry)?;
 
     if report.should_persist_config() {
         if let Some(parent) = path.parent() {
@@ -1232,12 +1564,42 @@ fn run_codingplan_core() -> Result<String> {
     Ok(report.render())
 }
 
-/// `atomcode codingplan` entry point for the CLI-exit path — runs the
-/// core flow and prints the report to stdout.
-fn run_codingplan_cli() -> Result<()> {
-    let report = run_codingplan_core()?;
-    print!("{}", report);
-    Ok(())
+/// Install the telemetry-aware panic hook. Replaces the minimal pre-init hook
+/// set in `main()` so panics are both reported cleanly to the terminal AND
+/// sent as a `Panic` telemetry event before the process exits.
+fn install_panic_hook(telemetry: std::sync::Arc<atomcode_telemetry::Telemetry>) {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        restore_terminal_if_tui();
+        let home = dirs::home_dir();
+        let cwd = std::env::current_dir().ok();
+        let loc = info
+            .location()
+            .map(|l| format!("{}:{}", l.file(), l.line()))
+            .unwrap_or_else(|| "unknown".into());
+        let msg = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_default();
+        let bt = std::backtrace::Backtrace::force_capture().to_string();
+        let scrubbed_loc =
+            atomcode_telemetry::scrub::scrub_path(&loc, home.as_deref(), cwd.as_deref());
+        let scrubbed_msg = atomcode_telemetry::scrub::truncate_head(
+            &atomcode_telemetry::scrub::scrub_path(&msg, home.as_deref(), cwd.as_deref()),
+            atomcode_telemetry::scrub::HEAD_MAX,
+        );
+        let frames =
+            atomcode_telemetry::scrub::backtrace_top_k(&bt, 5, home.as_deref(), cwd.as_deref());
+        telemetry.track(atomcode_telemetry::Event::Panic {
+            location: scrubbed_loc,
+            message_head: scrubbed_msg,
+            thread: std::thread::current().name().unwrap_or("unknown").into(),
+            backtrace_top_5: frames,
+        });
+        default_hook(info);
+    }));
 }
 
 #[cfg(test)]
@@ -1318,7 +1680,9 @@ mod tests {
         }
         let read_back = std::fs::read_to_string(&path).unwrap();
         std::fs::remove_file(&path).ok();
-        assert_eq!(read_back, content,
-            "--prompt-file must preserve trailing newline (unlike bash $(...))");
+        assert_eq!(
+            read_back, content,
+            "--prompt-file must preserve trailing newline (unlike bash $(...))"
+        );
     }
 }

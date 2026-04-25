@@ -162,11 +162,8 @@ impl LlmProvider for UnavailableProvider {
 
 // ── auth.toml token loading ──
 
-/// OAuth constants (shared with atomcode-tui / atomcode-cli).
-const OAUTH_CLIENT_ID: &str = "b9956e5327e544578128af8979ba3ccb";
-const OAUTH_CLIENT_SECRET: &str = "756ef00061884c7aa1ac64bd4eae3be7";
-const OAUTH_TOKEN_URL: &str = "https://atomgit.com/oauth/token";
-
+/// Platform OAuth refresh endpoint
+const PLATFORM_REFRESH_URL: &str = "https://acs.atomgit.com/oauth/refresh";
 /// Minimal auth.toml representation.
 #[derive(serde::Deserialize)]
 struct StoredAuth {
@@ -177,17 +174,6 @@ struct StoredAuth {
     expires_in: Option<i64>,
     #[serde(default)]
     created_at: i64,
-}
-
-/// Token endpoint response.
-#[derive(serde::Deserialize)]
-struct RefreshResponse {
-    #[serde(alias = "access_token", alias = "accessToken")]
-    access_token: Option<String>,
-    #[serde(default)]
-    refresh_token: Option<String>,
-    #[serde(default)]
-    expires_in: Option<i64>,
 }
 
 /// Read a valid access token from `~/.atomcode/auth.toml`.
@@ -217,7 +203,7 @@ fn load_auth_token() -> Result<String> {
     Ok(auth.access_token)
 }
 
-/// Exchange refresh_token for a new access_token, save updated auth.toml.
+/// Exchange refresh_token for a new access_token via Platform, save updated auth.toml.
 fn refresh_and_save(refresh_token: &str, auth_path: &std::path::Path) -> Result<String> {
     // Same 5s/10s budget as `auth::oauth::blocking_client` — this runs on
     // the TUI thread via `get_valid_token`, so an unreachable OAuth host
@@ -228,13 +214,8 @@ fn refresh_and_save(refresh_token: &str, auth_path: &std::path::Path) -> Result<
         .build()
         .unwrap_or_else(|_| reqwest::blocking::Client::new());
     let builder = client
-        .post(OAUTH_TOKEN_URL)
-        .form(&[
-            ("client_id", OAUTH_CLIENT_ID),
-            ("client_secret", OAUTH_CLIENT_SECRET),
-            ("refresh_token", refresh_token),
-            ("grant_type", "refresh_token"),
-        ]);
+        .post(PLATFORM_REFRESH_URL)
+        .json(&serde_json::json!({ "refresh_token": refresh_token, "provider": "atomgit" }));
     let policy = crate::provider::retry::RetryPolicy::default_policy();
     let resp = crate::provider::retry::send_with_retry_blocking(builder, &policy)
         .map_err(|e| anyhow::anyhow!("Token refresh failed: {} — please /login", e))?;
@@ -243,11 +224,37 @@ fn refresh_and_save(refresh_token: &str, auth_path: &std::path::Path) -> Result<
         anyhow::bail!("Token refresh failed ({}) — please /login", resp.status());
     }
 
-    let token: RefreshResponse = resp.json()
+    #[derive(serde::Deserialize)]
+    struct RefreshedAuth {
+        access_token: String,
+        #[serde(default)]
+        token_type: Option<String>,
+        #[serde(default)]
+        refresh_token: Option<String>,
+        #[serde(default)]
+        expires_in: Option<i64>,
+        #[serde(default)]
+        user: Option<RefreshedUser>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct RefreshedUser {
+        id: String,
+        username: String,
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        email: Option<String>,
+        #[serde(default)]
+        avatar_url: Option<String>,
+    }
+
+    let token: RefreshedAuth = resp
+        .json()
         .map_err(|e| anyhow::anyhow!("Token refresh parse error: {} — please /login", e))?;
 
-    let access_token = token.access_token
-        .ok_or_else(|| anyhow::anyhow!("Refresh response missing access_token — please /login"))?;
+    // Preserve original token_type or use default
+    let token_type = token.token_type.as_deref().unwrap_or("Bearer");
 
     // Save updated auth.toml
     let now = std::time::SystemTime::now()
@@ -257,14 +264,30 @@ fn refresh_and_save(refresh_token: &str, auth_path: &std::path::Path) -> Result<
     let new_rt = token.refresh_token.as_deref().unwrap_or(refresh_token);
     let mut content = format!(
         "access_token = \"{}\"\ncreated_at = {}\nrefresh_token = \"{}\"\n",
-        access_token, now, new_rt,
+        token.access_token, now, new_rt,
     );
     if let Some(e) = token.expires_in {
         content.push_str(&format!("expires_in = {}\n", e));
     }
+    content.push_str(&format!("token_type = \"{}\"\n", token_type));
+    if let Some(user) = token.user {
+        content.push_str(&format!(
+            "\n[user]\nid = \"{}\"\nusername = \"{}\"\n",
+            user.id, user.username,
+        ));
+        if let Some(name) = user.name {
+            content.push_str(&format!("name = \"{}\"\n", name));
+        }
+        if let Some(email) = user.email {
+            content.push_str(&format!("email = \"{}\"\n", email));
+        }
+        if let Some(avatar_url) = user.avatar_url {
+            content.push_str(&format!("avatar_url = \"{}\"\n", avatar_url));
+        }
+    }
     let _ = crate::auth::write_auth_file_secure(auth_path, &content);
 
-    Ok(access_token)
+    Ok(token.access_token)
 }
 
 #[cfg(test)]
@@ -283,14 +306,18 @@ mod tests {
             .join(".atomcode")
             .join("auth.toml");
 
-        assert_eq!(auth_module_path, expected_path,
-            "auth_file_path() should always return ~/.atomcode/auth.toml");
+        assert_eq!(
+            auth_module_path, expected_path,
+            "auth_file_path() should always return ~/.atomcode/auth.toml"
+        );
 
         // Verify the path ends with the expected directory structure
-        assert!(auth_module_path.ends_with(".atomcode/auth.toml") ||
-                auth_module_path.ends_with(".atomcode\\auth.toml"), // Windows compatibility
-                "Path should end with .atomcode/auth.toml, got: {}",
-                auth_module_path.display());
+        assert!(
+            auth_module_path.ends_with(".atomcode/auth.toml")
+                || auth_module_path.ends_with(".atomcode\\auth.toml"), // Windows compatibility
+            "Path should end with .atomcode/auth.toml, got: {}",
+            auth_module_path.display()
+        );
     }
 
     use crate::config::provider::ProviderConfig;

@@ -9,17 +9,25 @@ use super::{ApprovalRequirement, Tool, ToolContext, ToolDef, ToolResult};
 /// Clamp a byte index to the nearest valid UTF-8 char boundary (forward).
 /// Prevents panics when slicing strings that contain multi-byte characters.
 fn ceil_char_boundary(s: &str, index: usize) -> usize {
-    if index >= s.len() { return s.len(); }
+    if index >= s.len() {
+        return s.len();
+    }
     let mut i = index;
-    while i < s.len() && !s.is_char_boundary(i) { i += 1; }
+    while i < s.len() && !s.is_char_boundary(i) {
+        i += 1;
+    }
     i
 }
 
 /// Clamp a byte index to the nearest valid UTF-8 char boundary (backward).
 fn floor_char_boundary(s: &str, index: usize) -> usize {
-    if index >= s.len() { return s.len(); }
+    if index >= s.len() {
+        return s.len();
+    }
     let mut i = index;
-    while i > 0 && !s.is_char_boundary(i) { i -= 1; }
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
     i
 }
 
@@ -32,7 +40,9 @@ struct WebSearchArgs {
     max_results: usize,
 }
 
-fn default_max() -> usize { 8 }
+fn default_max() -> usize {
+    8
+}
 
 #[async_trait]
 impl Tool for WebSearchTool {
@@ -45,7 +55,8 @@ impl Tool for WebSearchTool {
                 Examples:\n\
                 - {\"query\": \"openclaw github\"}\n\
                 - {\"query\": \"tailwindcss v4 installation guide\"}\n\
-                - {\"query\": \"rust reqwest POST example\"}".to_string(),
+                - {\"query\": \"rust reqwest POST example\"}"
+                .to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -68,7 +79,11 @@ impl Tool for WebSearchTool {
         // Use curl for the HTTP request — reqwest gets blocked by DuckDuckGo's
         // TLS fingerprint detection, but curl works reliably.
         let query_encoded = parsed.query.replace(' ', "+");
-        let curl_bin = if cfg!(target_os = "windows") { "curl.exe" } else { "curl" };
+        let curl_bin = if cfg!(target_os = "windows") {
+            "curl.exe"
+        } else {
+            "curl"
+        };
         let output = Command::new(curl_bin)
             .args(&[
                 "-s", "-X", "POST",
@@ -105,7 +120,11 @@ impl Tool for WebSearchTool {
         if results.is_empty() {
             return Ok(ToolResult {
                 call_id: String::new(),
-                output: format!("No results found for '{}' ({} bytes received)", parsed.query, html.len()),
+                output: format!(
+                    "No results found for '{}' ({} bytes received)",
+                    parsed.query,
+                    html.len()
+                ),
                 success: false,
             });
         }
@@ -114,7 +133,10 @@ impl Tool for WebSearchTool {
         for (i, r) in results.iter().enumerate() {
             out.push_str(&format!(
                 "{}. {}\n   {}\n   {}\n\n",
-                i + 1, r.title, r.url, r.snippet
+                i + 1,
+                r.title,
+                r.url,
+                r.snippet
             ));
         }
 
@@ -152,7 +174,8 @@ fn parse_ddg_results(html: &str, max: usize) -> Vec<SearchResult> {
         // Find the opening '<a' of this tag (search backwards from marker)
         let tag_start = html[..marker_pos].rfind('<').unwrap_or(marker_pos);
         // The entire <a ...>title</a> region
-        let tag_end = html[after_marker..].find("</a>")
+        let tag_end = html[after_marker..]
+            .find("</a>")
             .map(|p| after_marker + p)
             .unwrap_or(after_marker);
 
@@ -170,7 +193,8 @@ fn parse_ddg_results(html: &str, max: usize) -> Vec<SearchResult> {
         };
 
         // Extract title — text content between > (after all attributes) and </a>
-        let content_start = html[after_marker..tag_end].find('>')
+        let content_start = html[after_marker..tag_end]
+            .find('>')
             .map(|p| after_marker + p + 1)
             .unwrap_or(after_marker);
         let safe_content_start = ceil_char_boundary(html, content_start);
@@ -187,9 +211,25 @@ fn parse_ddg_results(html: &str, max: usize) -> Vec<SearchResult> {
         let safe_tag_end2 = ceil_char_boundary(html, tag_end);
         let snippet = if let Some(sp) = html[safe_tag_end2..search_end].find(snippet_marker) {
             let snippet_pos = safe_tag_end2 + sp;
-            let s_start = ceil_char_boundary(html, html[snippet_pos..].find('>').map(|p| snippet_pos + p + 1).unwrap_or(snippet_pos));
-            let s_end = floor_char_boundary(html, html[s_start..].find("</a>").map(|p| s_start + p).unwrap_or(s_start));
-            if s_start <= s_end { strip_html_tags(&html[s_start..s_end]) } else { String::new() }
+            let s_start = ceil_char_boundary(
+                html,
+                html[snippet_pos..]
+                    .find('>')
+                    .map(|p| snippet_pos + p + 1)
+                    .unwrap_or(snippet_pos),
+            );
+            let s_end = floor_char_boundary(
+                html,
+                html[s_start..]
+                    .find("</a>")
+                    .map(|p| s_start + p)
+                    .unwrap_or(s_start),
+            );
+            if s_start <= s_end {
+                strip_html_tags(&html[s_start..s_end])
+            } else {
+                String::new()
+            }
         } else {
             String::new()
         };
@@ -213,7 +253,10 @@ fn extract_ddg_url(raw: &str) -> String {
     // DDG format: //duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com&...
     if let Some(uddg_pos) = raw.find("uddg=") {
         let start = uddg_pos + 5;
-        let end = raw[start..].find('&').map(|e| start + e).unwrap_or(raw.len());
+        let end = raw[start..]
+            .find('&')
+            .map(|e| start + e)
+            .unwrap_or(raw.len());
         let encoded = &raw[start..end];
         url_decode(encoded)
     } else if raw.starts_with("http") {

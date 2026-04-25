@@ -48,7 +48,8 @@ impl OpenAiProvider {
                 other => anyhow::bail!(
                     "Invalid `reasoning_history` value {:?} for provider type '{}' — \
                      expected \"include\" or \"exclude\" (unset = use auto-detect)",
-                    other, config.provider_type,
+                    other,
+                    config.provider_type,
                 ),
             },
         };
@@ -62,7 +63,9 @@ impl OpenAiProvider {
                 .unwrap_or_else(|| "https://api.openai.com/v1".to_string()),
             // Cap at 16K: prevents models from spending 250s on thinking
             // with zero visible output. CC uses fixed 16-32K, not proportional.
-            max_tokens: config.max_tokens.unwrap_or((config.context_window / 4).clamp(8_000, 16_384)),
+            max_tokens: config
+                .max_tokens
+                .unwrap_or((config.context_window / 4).clamp(8_000, 16_384)),
             thinking_type: config.thinking_type.clone(),
             thinking_keep: config.thinking_keep.clone(),
             reasoning_history_override,
@@ -92,7 +95,11 @@ impl OpenAiProvider {
         if m.contains("deepseek-v4") {
             return ReasoningPolicy::Include;
         }
-        if m.starts_with("kimi-") || m.starts_with("moonshot") || u.contains("moonshot") || u.contains("kimi") {
+        if m.starts_with("kimi-")
+            || m.starts_with("moonshot")
+            || u.contains("moonshot")
+            || u.contains("kimi")
+        {
             return ReasoningPolicy::Include;
         }
         ReasoningPolicy::Exclude
@@ -119,16 +126,17 @@ impl OpenAiProvider {
         Some(serde_json::Value::Object(obj))
     }
 
-    fn format_messages(messages: &[Message], reasoning_policy: ReasoningPolicy) -> Vec<serde_json::Value> {
+    fn format_messages(
+        messages: &[Message],
+        reasoning_policy: ReasoningPolicy,
+    ) -> Vec<serde_json::Value> {
         messages
             .iter()
             .filter_map(|m| {
                 match &m.content {
                     MessageContent::Text(s) => {
-                        // Skip Tool role with plain Text (invalid for OpenAI API)
-                        if matches!(m.role, Role::Tool) {
-                            return None;
-                        }
+                        // Tool role with plain Text is invalid for the OpenAI API —
+                        // tool results must use MessageContent::ToolResult.
                         let role = match m.role {
                             Role::System => "system",
                             Role::User => "user",
@@ -157,11 +165,17 @@ impl OpenAiProvider {
                         }
                         Some(obj)
                     }
-                    MessageContent::AssistantWithToolCalls { text, tool_calls, reasoning_content } => {
+                    MessageContent::AssistantWithToolCalls {
+                        text,
+                        tool_calls,
+                        reasoning_content,
+                    } => {
                         if tool_calls.is_empty() {
                             // No tool calls — send as plain assistant text
                             let t = text.as_deref().unwrap_or("");
-                            if t.is_empty() { return None; }
+                            if t.is_empty() {
+                                return None;
+                            }
                             let mut obj = json!({"role": "assistant", "content": t});
                             if matches!(reasoning_policy, ReasoningPolicy::Include) {
                                 let echo = reasoning_content
@@ -193,28 +207,36 @@ impl OpenAiProvider {
                                 .unwrap_or("(no reasoning recorded)");
                             msg["reasoning_content"] = json!(echo);
                         }
-                        msg["tool_calls"] = json!(tool_calls.iter().map(|tc| {
-                            // Ensure arguments is valid JSON — some APIs reject invalid JSON strings.
-                            let args = if serde_json::from_str::<serde_json::Value>(&tc.arguments).is_ok() {
-                                tc.arguments.clone()
-                            } else {
-                                // Try repair; if still invalid, wrap as a simple object
-                                let repaired = repair_tool_args(&tc.arguments);
-                                if serde_json::from_str::<serde_json::Value>(&repaired).is_ok() {
-                                    repaired
-                                } else {
-                                    json!({"input": tc.arguments}).to_string()
-                                }
-                            };
-                            json!({
-                                "id": tc.id,
-                                "type": "function",
-                                "function": {
-                                    "name": tc.name,
-                                    "arguments": args,
-                                }
+                        msg["tool_calls"] = json!(tool_calls
+                            .iter()
+                            .map(|tc| {
+                                // Ensure arguments is valid JSON — some APIs reject invalid JSON strings.
+                                let args =
+                                    if serde_json::from_str::<serde_json::Value>(&tc.arguments)
+                                        .is_ok()
+                                    {
+                                        tc.arguments.clone()
+                                    } else {
+                                        // Try repair; if still invalid, wrap as a simple object
+                                        let repaired = repair_tool_args(&tc.arguments);
+                                        if serde_json::from_str::<serde_json::Value>(&repaired)
+                                            .is_ok()
+                                        {
+                                            repaired
+                                        } else {
+                                            json!({"input": tc.arguments}).to_string()
+                                        }
+                                    };
+                                json!({
+                                    "id": tc.id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": tc.name,
+                                        "arguments": args,
+                                    }
+                                })
                             })
-                        }).collect::<Vec<_>>());
+                            .collect::<Vec<_>>());
                         Some(msg)
                     }
                     MessageContent::ToolResult(r) => {
@@ -288,7 +310,6 @@ struct ChunkDelta {
 
 #[derive(Deserialize)]
 struct DeltaToolCall {
-    #[allow(dead_code)]
     index: Option<usize>,
     id: Option<String>,
     function: Option<DeltaFunction>,
@@ -337,14 +358,17 @@ impl LlmProvider for OpenAiProvider {
 
         if let Some(tool_defs) = tools {
             if !tool_defs.is_empty() {
-                body["tools"] = json!(tool_defs.iter().map(|td| json!({
-                    "type": "function",
-                    "function": {
-                        "name": td.name,
-                        "description": td.description,
-                        "parameters": td.parameters,
-                    }
-                })).collect::<Vec<_>>());
+                body["tools"] = json!(tool_defs
+                    .iter()
+                    .map(|td| json!({
+                        "type": "function",
+                        "function": {
+                            "name": td.name,
+                            "description": td.description,
+                            "parameters": td.parameters,
+                        }
+                    }))
+                    .collect::<Vec<_>>());
                 // Allow the model to decide whether to call multiple tools in parallel
             }
         }
@@ -352,10 +376,9 @@ impl LlmProvider for OpenAiProvider {
         // Kimi K2.5 / K2.6 top-level `thinking` object. Only sent when the
         // user configured it — other OpenAI-compatible gateways may reject
         // unknown fields, and omitting lets Kimi's default behavior apply.
-        if let Some(th) = Self::thinking_body_value(
-            self.thinking_type.as_deref(),
-            self.thinking_keep.as_deref(),
-        ) {
+        if let Some(th) =
+            Self::thinking_body_value(self.thinking_type.as_deref(), self.thinking_keep.as_deref())
+        {
             body["thinking"] = th;
         }
 
@@ -383,9 +406,10 @@ impl LlmProvider for OpenAiProvider {
                 let status = response.status();
                 let resp_url = response.url().to_string();
                 let body = response.text().await.unwrap_or_default();
-                let _ = tx.send(Ok(StreamEvent::Error(
-                    format!("API error ({}) at `{}`:\n{}", status, resp_url, body),
-                )));
+                let _ = tx.send(Ok(StreamEvent::Error(format!(
+                    "API error ({}) at `{}`:\n{}",
+                    status, resp_url, body
+                ))));
                 return;
             }
 
@@ -405,12 +429,14 @@ impl LlmProvider for OpenAiProvider {
                 let chunk = match tokio::time::timeout(
                     std::time::Duration::from_secs(120),
                     byte_stream.next(),
-                ).await {
+                )
+                .await
+                {
                     Ok(Some(chunk)) => chunk,
                     Ok(None) => break, // stream ended
                     Err(_) => {
                         let _ = tx.send(Ok(StreamEvent::Error(
-                            "Stream timeout: no data received for 120 seconds".to_string()
+                            "Stream timeout: no data received for 120 seconds".to_string(),
                         )));
                         return;
                     }
@@ -446,10 +472,15 @@ impl LlmProvider for OpenAiProvider {
                             // usage in multiple chunks; we only want the final value.
                             if let Some(usage) = &chunk.usage {
                                 // Extract cached tokens from whichever field the provider uses
-                                let cached = usage.prompt_cache_hit_tokens
+                                let cached = usage
+                                    .prompt_cache_hit_tokens
                                     .or(usage.cached_tokens)
-                                    .or_else(|| usage.prompt_tokens_details.as_ref()
-                                        .and_then(|d| d.cached_tokens))
+                                    .or_else(|| {
+                                        usage
+                                            .prompt_tokens_details
+                                            .as_ref()
+                                            .and_then(|d| d.cached_tokens)
+                                    })
                                     .unwrap_or(0);
                                 last_usage = Some(crate::stream::TokenUsage {
                                     prompt_tokens: usage.prompt_tokens.unwrap_or(0),
@@ -473,7 +504,11 @@ impl LlmProvider for OpenAiProvider {
                                         let idx = tc.index.unwrap_or(0);
                                         // Grow the vec if this is a new tool call index
                                         while tool_calls.len() <= idx {
-                                            tool_calls.push((String::new(), String::new(), String::new()));
+                                            tool_calls.push((
+                                                String::new(),
+                                                String::new(),
+                                                String::new(),
+                                            ));
                                         }
                                         let entry = &mut tool_calls[idx];
                                         if let Some(id) = &tc.id {
@@ -489,7 +524,9 @@ impl LlmProvider for OpenAiProvider {
                                         if let Some(func) = &tc.function {
                                             if let Some(args) = &func.arguments {
                                                 entry.2.push_str(args);
-                                                let _ = tx.send(Ok(StreamEvent::ToolCallDelta(args.clone())));
+                                                let _ = tx.send(Ok(StreamEvent::ToolCallDelta(
+                                                    args.clone(),
+                                                )));
                                             }
                                         }
                                     }
@@ -508,11 +545,12 @@ impl LlmProvider for OpenAiProvider {
                                                         id: id.clone(),
                                                         name: name.clone(),
                                                         arguments: args.clone(),
-                                                    }
+                                                    },
                                                 )));
                                             }
                                             tool_calls.clear();
-                                            let _ = tx.send(Ok(StreamEvent::Done { truncated: false }));
+                                            let _ =
+                                                tx.send(Ok(StreamEvent::Done { truncated: false }));
                                             return;
                                         }
                                         "length" | "max_tokens" => {
@@ -529,20 +567,22 @@ impl LlmProvider for OpenAiProvider {
                                                         id: id.clone(),
                                                         name: name.clone(),
                                                         arguments: args.clone(),
-                                                    }
+                                                    },
                                                 )));
                                             }
                                             tool_calls.clear();
-                                            let _ = tx.send(Ok(StreamEvent::Done { truncated: true }));
+                                            let _ =
+                                                tx.send(Ok(StreamEvent::Done { truncated: true }));
                                             return;
                                         }
                                         "stop" | _ => {
-                                            let _ = tx.send(Ok(StreamEvent::Done { truncated: false }));
+                                            let _ =
+                                                tx.send(Ok(StreamEvent::Done { truncated: false }));
                                             return;
-                                        }
                                         }
                                     }
                                 }
+                            }
                         } else if invalid_chunk_samples.len() < 3 && !data.is_empty() {
                             invalid_chunk_samples.push(sample_for_error(data));
                         }
@@ -584,7 +624,9 @@ impl LlmProvider for OpenAiProvider {
             let _ = tx.send(Ok(StreamEvent::Done { truncated: false }));
         });
 
-        Ok(Box::pin(tokio_stream::wrappers::UnboundedReceiverStream::new(rx)))
+        Ok(Box::pin(
+            tokio_stream::wrappers::UnboundedReceiverStream::new(rx),
+        ))
     }
 
     fn model_name(&self) -> &str {
@@ -618,7 +660,9 @@ fn repair_tool_args(s: &str) -> String {
     loop {
         let before = r.clone();
         r = r.replace(",}", "}").replace(",]", "]");
-        if r == before { break; }
+        if r == before {
+            break;
+        }
     }
 
     // Ensure wrapped in braces
@@ -655,9 +699,15 @@ fn parse_nonstream_response(body: &str) -> Option<Vec<StreamEvent>> {
     let mut events = Vec::new();
 
     if let Some(usage) = response.usage {
-        let cached = usage.prompt_cache_hit_tokens
+        let cached = usage
+            .prompt_cache_hit_tokens
             .or(usage.cached_tokens)
-            .or_else(|| usage.prompt_tokens_details.as_ref().and_then(|d| d.cached_tokens))
+            .or_else(|| {
+                usage
+                    .prompt_tokens_details
+                    .as_ref()
+                    .and_then(|d| d.cached_tokens)
+            })
             .unwrap_or(0);
         events.push(StreamEvent::Usage(crate::stream::TokenUsage {
             prompt_tokens: usage.prompt_tokens.unwrap_or(0),
@@ -753,7 +803,10 @@ mod tests {
     fn reasoning_policy_moonshot_kimi_routes_to_include() {
         use super::{OpenAiProvider, ReasoningPolicy};
         assert_eq!(
-            OpenAiProvider::derive_reasoning_policy("kimi-k2-thinking", "https://api.moonshot.cn/v1"),
+            OpenAiProvider::derive_reasoning_policy(
+                "kimi-k2-thinking",
+                "https://api.moonshot.cn/v1"
+            ),
             ReasoningPolicy::Include,
         );
         assert_eq!(
@@ -767,7 +820,10 @@ mod tests {
         use super::{OpenAiProvider, ReasoningPolicy};
         // DeepSeek-R1 rejects the request if reasoning_content is echoed back.
         assert_eq!(
-            OpenAiProvider::derive_reasoning_policy("deepseek-reasoner", "https://api.deepseek.com/v1"),
+            OpenAiProvider::derive_reasoning_policy(
+                "deepseek-reasoner",
+                "https://api.deepseek.com/v1"
+            ),
             ReasoningPolicy::Exclude,
         );
         assert_eq!(
@@ -911,7 +967,10 @@ mod tests {
         let msgs = vec![atc_message(None)];
         let out = OpenAiProvider::format_messages(&msgs, ReasoningPolicy::Include);
         let rc = out[0]["reasoning_content"].as_str().unwrap();
-        assert!(!rc.is_empty(), "placeholder must be non-empty for DeepSeek V4");
+        assert!(
+            !rc.is_empty(),
+            "placeholder must be non-empty for DeepSeek V4"
+        );
     }
 
     #[test]
@@ -941,7 +1000,11 @@ mod tests {
         // it would regress V3 R1 which rejects any reasoning_content echo.
         let out_ex = OpenAiProvider::format_messages(&msgs, ReasoningPolicy::Exclude);
         assert!(
-            out_ex[0].as_object().unwrap().get("reasoning_content").is_none(),
+            out_ex[0]
+                .as_object()
+                .unwrap()
+                .get("reasoning_content")
+                .is_none(),
             "Exclude must not add reasoning_content to assistant Text, got: {}",
             out_ex[0]
         );
@@ -956,7 +1019,10 @@ mod tests {
         let msgs = vec![atc_message(Some(""))];
         let out = OpenAiProvider::format_messages(&msgs, ReasoningPolicy::Include);
         let rc = out[0]["reasoning_content"].as_str().unwrap();
-        assert!(!rc.is_empty(), "placeholder must replace empty-string reasoning");
+        assert!(
+            !rc.is_empty(),
+            "placeholder must replace empty-string reasoning"
+        );
     }
 
     #[test]
@@ -967,7 +1033,11 @@ mod tests {
         let msgs = vec![atc_message(Some("should be stripped"))];
         let out = OpenAiProvider::format_messages(&msgs, ReasoningPolicy::Exclude);
         assert!(
-            out[0].as_object().unwrap().get("reasoning_content").is_none(),
+            out[0]
+                .as_object()
+                .unwrap()
+                .get("reasoning_content")
+                .is_none(),
             "reasoning_content key must be absent under Exclude, got: {}",
             out[0]
         );
@@ -1027,7 +1097,11 @@ mod tests {
         let parsed: MessageContent = serde_json::from_str(old)
             .expect("old-format AssistantWithToolCalls should deserialize");
         match parsed {
-            MessageContent::AssistantWithToolCalls { text, reasoning_content, .. } => {
+            MessageContent::AssistantWithToolCalls {
+                text,
+                reasoning_content,
+                ..
+            } => {
                 assert_eq!(text.as_deref(), Some("hi"));
                 assert!(reasoning_content.is_none());
             }

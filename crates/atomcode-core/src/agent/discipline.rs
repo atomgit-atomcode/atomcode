@@ -161,10 +161,7 @@ pub(crate) fn reflection_prompt(delta: usize, current_task: &str) -> String {
         } else {
             current_task.to_string()
         };
-        out.push_str(&format!(
-            "\n=== ORIGINAL TASK ===\n{}\n\n",
-            task_short
-        ));
+        out.push_str(&format!("\n=== ORIGINAL TASK ===\n{}\n\n", task_short));
         out.push_str("Before the next tool call, answer:\n");
         out.push_str(&format!(
             "1. Does your current plan still match the task above? If not, correct course now.\n\
@@ -233,31 +230,45 @@ mod reflection_tests {
         // checkpoint.
         let msg = reflection_prompt(12, "");
 
-        assert!(msg.contains("12"), "prompt must include delta count, got: {}", msg);
+        assert!(
+            msg.contains("12"),
+            "prompt must include delta count, got: {}",
+            msg
+        );
 
         assert!(
             !msg.to_lowercase().contains("error"),
-            "prompt must not frame as error, got: {}", msg
+            "prompt must not frame as error, got: {}",
+            msg
         );
         assert!(
             !msg.to_lowercase().contains("blocked"),
-            "prompt must not look like a BLOCKED guard, got: {}", msg
+            "prompt must not look like a BLOCKED guard, got: {}",
+            msg
         );
 
         // Empty-task branch falls back to the recall question.
         assert!(
-            msg.contains("original task") || msg.contains("original goal") || msg.contains("restate"),
-            "empty-task prompt must ask to restate the task/goal, got: {}", msg
+            msg.contains("original task")
+                || msg.contains("original goal")
+                || msg.contains("restate"),
+            "empty-task prompt must ask to restate the task/goal, got: {}",
+            msg
         );
         assert!(
-            msg.contains("rule out") || msg.contains("ruled out")
-                || msg.contains("prove") || msg.contains("proved") || msg.contains("proven")
+            msg.contains("rule out")
+                || msg.contains("ruled out")
+                || msg.contains("prove")
+                || msg.contains("proved")
+                || msg.contains("proven")
                 || msg.contains("learned"),
-            "prompt must ask what was learned/ruled out, got: {}", msg
+            "prompt must ask what was learned/ruled out, got: {}",
+            msg
         );
         assert!(
             msg.contains("next") && msg.contains("concrete"),
-            "prompt must ask for the next concrete step, got: {}", msg
+            "prompt must ask for the next concrete step, got: {}",
+            msg
         );
 
         assert!(!msg.to_lowercase().contains("cargo"));
@@ -270,7 +281,8 @@ mod reflection_tests {
         let msg = reflection_prompt(5, "");
         assert!(
             msg.contains("not a user message") || msg.contains("System meta"),
-            "prompt must self-flag as system meta / non-user, got: {}", msg
+            "prompt must self-flag as system meta / non-user, got: {}",
+            msg
         );
     }
 
@@ -279,11 +291,13 @@ mod reflection_tests {
         let msg = reflection_prompt(5, "").to_lowercase();
         assert!(
             !msg.contains("answer in plain text"),
-            "prompt must not repeat the verbose original phrasing, got: {}", msg
+            "prompt must not repeat the verbose original phrasing, got: {}",
+            msg
         );
         assert!(
             !msg.contains("answer these"),
-            "prompt must not repeat the verbose original phrasing, got: {}", msg
+            "prompt must not repeat the verbose original phrasing, got: {}",
+            msg
         );
     }
 
@@ -295,11 +309,13 @@ mod reflection_tests {
         let msg = reflection_prompt(7, "fix the auth token refresh loop");
         assert!(
             msg.contains("ORIGINAL TASK"),
-            "task branch must carry an ORIGINAL TASK marker, got: {}", msg
+            "task branch must carry an ORIGINAL TASK marker, got: {}",
+            msg
         );
         assert!(
             msg.contains("fix the auth token refresh loop"),
-            "verbatim task must appear, got: {}", msg
+            "verbatim task must appear, got: {}",
+            msg
         );
     }
 
@@ -311,12 +327,14 @@ mod reflection_tests {
         let msg = reflection_prompt(3, "refactor the cache layer").to_lowercase();
         assert!(
             msg.contains("current plan") && msg.contains("match"),
-            "task branch Q1 must ask whether the plan still matches the task, got: {}", msg
+            "task branch Q1 must ask whether the plan still matches the task, got: {}",
+            msg
         );
         // And MUST NOT ask the model to restate what's already in front of it.
         assert!(
             !msg.contains("restate"),
-            "task branch must not ask the model to restate a visible task, got: {}", msg
+            "task branch must not ask the model to restate a visible task, got: {}",
+            msg
         );
     }
 
@@ -330,7 +348,8 @@ mod reflection_tests {
         assert!(msg.contains("xxx..."), "truncation marker missing: {}", msg);
         assert!(
             !msg.contains(&"x".repeat(400)),
-            "prompt must not carry 400+ contiguous x's (truncation failed): {}", msg
+            "prompt must not carry 400+ contiguous x's (truncation failed): {}",
+            msg
         );
     }
 
@@ -341,7 +360,8 @@ mod reflection_tests {
         let msg = reflection_prompt(5, "");
         assert!(
             !msg.contains("ORIGINAL TASK"),
-            "empty-task prompt must omit the task block, got: {}", msg
+            "empty-task prompt must omit the task block, got: {}",
+            msg
         );
     }
 
@@ -359,11 +379,13 @@ mod reflection_tests {
             let msg = reflection_prompt(5, task).to_lowercase();
             assert!(
                 !msg.contains("how close"),
-                "Q3 must not ask 'how close' — termination bias, got: {}", msg
+                "Q3 must not ask 'how close' — termination bias, got: {}",
+                msg
             );
             assert!(
                 msg.contains("next concrete step"),
-                "Q3 must ask for the next concrete step, got: {}", msg
+                "Q3 must ask for the next concrete step, got: {}",
+                msg
             );
         }
     }

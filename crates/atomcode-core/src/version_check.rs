@@ -100,14 +100,26 @@ mod tests {
 
     #[test]
     fn same_version_returns_none() {
-        assert_eq!(parse_and_compare("v4.15.3", &manifest_body("v4.15.3")), None);
+        assert_eq!(
+            parse_and_compare("v4.15.3", &manifest_body("v4.15.3")),
+            None
+        );
     }
 
     #[test]
     fn older_version_returns_none() {
-        assert_eq!(parse_and_compare("v4.15.3", &manifest_body("v4.15.2")), None);
-        assert_eq!(parse_and_compare("v4.15.3", &manifest_body("v4.14.99")), None);
-        assert_eq!(parse_and_compare("v4.15.3", &manifest_body("v3.99.99")), None);
+        assert_eq!(
+            parse_and_compare("v4.15.3", &manifest_body("v4.15.2")),
+            None
+        );
+        assert_eq!(
+            parse_and_compare("v4.15.3", &manifest_body("v4.14.99")),
+            None
+        );
+        assert_eq!(
+            parse_and_compare("v4.15.3", &manifest_body("v3.99.99")),
+            None
+        );
     }
 
     #[test]
@@ -128,13 +140,19 @@ mod tests {
 
     #[test]
     fn non_numeric_segment_returns_none() {
-        assert_eq!(parse_and_compare("v4.15.3", &manifest_body("v4.15.x")), None);
+        assert_eq!(
+            parse_and_compare("v4.15.3", &manifest_body("v4.15.x")),
+            None
+        );
         assert_eq!(parse_and_compare("v4.15.3", &manifest_body("vX.Y.Z")), None);
     }
 
     #[test]
     fn too_many_components_returns_none() {
-        assert_eq!(parse_and_compare("v4.15.3", &manifest_body("v4.15.4.1")), None);
+        assert_eq!(
+            parse_and_compare("v4.15.3", &manifest_body("v4.15.4.1")),
+            None
+        );
     }
 
     #[test]

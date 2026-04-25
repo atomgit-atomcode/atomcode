@@ -141,8 +141,8 @@ pub fn spawn_check(
         // Blocking HTTP client lives in a spawn_blocking thread so we
         // don't stall the tokio runtime's worker pool.
         let fetch: Result<Vec<String>, ()> = tokio::task::spawn_blocking(move || {
-            let client = atomcode_core::coding_plan::client::Client::from_stored_auth()
-                .map_err(|_| ())?;
+            let client =
+                atomcode_core::coding_plan::client::Client::from_stored_auth().map_err(|_| ())?;
             let models = client.list_models().map_err(|_| ())?;
             Ok(models.into_iter().map(|m| m.display_model_name).collect())
         })

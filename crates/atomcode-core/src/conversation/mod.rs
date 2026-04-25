@@ -48,7 +48,6 @@ impl Default for Conversation {
     }
 }
 
-
 impl Conversation {
     pub fn new() -> Self {
         Self::default()
@@ -147,8 +146,10 @@ impl Conversation {
         if let Some(content) = self.stream_buffer.take() {
             // Clean up model artifacts
             let content = content
-                .replace("<think>", "").replace("</think>", "")
-                .replace("<|im_start|>", "").replace("<|im_end|>", "");
+                .replace("<think>", "")
+                .replace("</think>", "")
+                .replace("<|im_start|>", "")
+                .replace("<|im_end|>", "");
             // Strip leaked reasoning: MiniMax/DeepSeek sometimes output
             // reasoning as plain text (no <think> tag) followed by the
             // actual response. Detect by looking for the pattern:
@@ -157,7 +158,9 @@ impl Conversation {
             let content = dedup_trailing_repeat(&content);
             // Skip empty/whitespace-only assistant messages — they waste a message
             // slot in context without carrying information (common after <think> stripping).
-            if content.trim().is_empty() { return; }
+            if content.trim().is_empty() {
+                return;
+            }
             let idx = self.messages.len();
             self.messages.push(Message::new(Role::Assistant, content));
             self.turn_tracker.on_message_added(idx);
@@ -191,11 +194,7 @@ impl Conversation {
         self.turn_tracker.on_message_added(idx);
     }
 
-    pub fn finalize_stream_with_tool_call(
-        &mut self,
-        tool_call: ToolCall,
-        reasoning: Option<&str>,
-    ) {
+    pub fn finalize_stream_with_tool_call(&mut self, tool_call: ToolCall, reasoning: Option<&str>) {
         let text = self.stream_buffer.take();
         self.add_assistant_tool_calls(text.as_deref(), vec![tool_call], reasoning);
     }
@@ -223,7 +222,11 @@ impl Conversation {
     /// Like to_provider_messages but only sends the last `window` messages.
     /// Ensures the window starts at a valid boundary — never in the middle
     /// of a tool_call/tool_result pair (which causes API "messages illegal" errors).
-    pub fn to_provider_messages_windowed(&self, system_prompt: &str, window: usize) -> Vec<Message> {
+    pub fn to_provider_messages_windowed(
+        &self,
+        system_prompt: &str,
+        window: usize,
+    ) -> Vec<Message> {
         let mut start = self.messages.len().saturating_sub(window);
 
         // Scan forward to find a valid start position:
@@ -260,7 +263,6 @@ impl Conversation {
         msgs
     }
 
-
     /// Apply compression: store summary in cold zone, remove old messages.
     /// `remove_count` = number of messages from the front to remove.
     /// (Changed from turn-based to message-based to support single-user-message
@@ -273,7 +275,9 @@ impl Conversation {
     /// - All surviving turns must have: msg_count > 0
     /// These invariants prevent underflow in on_user_message(msg_idx).
     pub fn apply_compression(&mut self, remove_count: usize, summary: String) {
-        if remove_count == 0 || summary.is_empty() { return; }
+        if remove_count == 0 || summary.is_empty() {
+            return;
+        }
 
         // Add to cold zone (FIFO, max 3)
         self.cold_summaries.push(summary);
@@ -334,7 +338,6 @@ impl Conversation {
 
         self.turn_tracker.turns = surviving_turns;
     }
-
 }
 
 /// Strip trailing duplicate content from model output.
@@ -352,7 +355,8 @@ fn strip_leaked_reasoning(text: &str) -> String {
     }
 
     // Split into paragraphs (separated by blank lines)
-    let paragraphs: Vec<&str> = trimmed.split("\n\n")
+    let paragraphs: Vec<&str> = trimmed
+        .split("\n\n")
         .map(|p| p.trim())
         .filter(|p| !p.is_empty())
         .collect();
@@ -364,11 +368,24 @@ fn strip_leaked_reasoning(text: &str) -> String {
     // Check if first paragraph is reasoning (self-analysis patterns)
     let first = paragraphs[0];
     let reasoning_markers = [
-        "要求", "需要", "这个问题", "用户", "根据规则", "我应该",
-        "让我", "分析", "涉及到", "敏感", "回避",
-        "I need to", "I should", "Let me", "The user",
+        "要求",
+        "需要",
+        "这个问题",
+        "用户",
+        "根据规则",
+        "我应该",
+        "让我",
+        "分析",
+        "涉及到",
+        "敏感",
+        "回避",
+        "I need to",
+        "I should",
+        "Let me",
+        "The user",
     ];
-    let is_reasoning = reasoning_markers.iter()
+    let is_reasoning = reasoning_markers
+        .iter()
         .any(|m| first.starts_with(m) || first.contains(m));
 
     if is_reasoning {
@@ -376,7 +393,9 @@ fn strip_leaked_reasoning(text: &str) -> String {
         // Find the first paragraph that doesn't look like reasoning
         let mut start = paragraphs.len() - 1;
         for (i, p) in paragraphs.iter().enumerate().skip(1) {
-            let still_reasoning = reasoning_markers.iter().any(|m| p.starts_with(m) || p.contains(m));
+            let still_reasoning = reasoning_markers
+                .iter()
+                .any(|m| p.starts_with(m) || p.contains(m));
             if !still_reasoning {
                 start = i;
                 break;
@@ -392,10 +411,14 @@ fn strip_leaked_reasoning(text: &str) -> String {
 /// Strategy: find a repeated heading/marker line and truncate at the second occurrence.
 fn dedup_trailing_repeat(text: &str) -> String {
     let text = text.trim_end();
-    if text.len() < 100 { return text.to_string(); }
+    if text.len() < 100 {
+        return text.to_string();
+    }
 
     let lines: Vec<&str> = text.lines().collect();
-    if lines.len() < 6 { return text.to_string(); }
+    if lines.len() < 6 {
+        return text.to_string();
+    }
 
     // Look for repeated marker lines: headings (**, ##) or key phrases.
     // If a distinctive line appears twice, the second occurrence starts the duplicate.
@@ -404,17 +427,25 @@ fn dedup_trailing_repeat(text: &str) -> String {
     for i in 0..half {
         let line = lines[i].trim();
         // Must be a "distinctive" line (heading, bold marker, numbered item header)
-        if line.len() < 8 { continue; }
-        let is_marker = line.starts_with("**") || line.starts_with("##")
-            || line.starts_with("1.") || line.starts_with("1、");
-        if !is_marker { continue; }
+        if line.len() < 8 {
+            continue;
+        }
+        let is_marker = line.starts_with("**")
+            || line.starts_with("##")
+            || line.starts_with("1.")
+            || line.starts_with("1、");
+        if !is_marker {
+            continue;
+        }
 
         // Look for this same line in the second half
         for j in half..lines.len() {
             let other = lines[j].trim();
             if other == line {
                 // Found repeat marker. Verify: at least 3 lines after j should ~match lines after i.
-                let match_count = lines[i..].iter().zip(lines[j..].iter())
+                let match_count = lines[i..]
+                    .iter()
+                    .zip(lines[j..].iter())
                     .filter(|(a, b)| a.trim() == b.trim())
                     .count();
                 let remaining = lines.len() - j;
@@ -501,7 +532,9 @@ mod tests {
         conv.add_assistant_tool_calls(Some("Let me read that file."), vec![call], None);
         assert_eq!(conv.messages.len(), 2);
         match &conv.messages[1].content {
-            MessageContent::AssistantWithToolCalls { text, tool_calls, .. } => {
+            MessageContent::AssistantWithToolCalls {
+                text, tool_calls, ..
+            } => {
                 assert_eq!(text.as_deref(), Some("Let me read that file."));
                 assert_eq!(tool_calls.len(), 1);
             }
@@ -537,7 +570,9 @@ mod tests {
         assert!(conv.stream_buffer.is_none());
         assert_eq!(conv.messages.len(), 1);
         match &conv.messages[0].content {
-            MessageContent::AssistantWithToolCalls { text, tool_calls, .. } => {
+            MessageContent::AssistantWithToolCalls {
+                text, tool_calls, ..
+            } => {
                 assert_eq!(text.as_deref(), Some("Let me check..."));
                 assert_eq!(tool_calls.len(), 1);
             }
@@ -588,8 +623,14 @@ mod tests {
 
         // Verify state before compression
         assert_eq!(conv.messages.len(), 4);
-        assert_eq!(conv.turn_tracker.turns[0].status, turn::TurnStatus::Completed);
-        assert_eq!(conv.turn_tracker.turns[1].status, turn::TurnStatus::Completed);
+        assert_eq!(
+            conv.turn_tracker.turns[0].status,
+            turn::TurnStatus::Completed
+        );
+        assert_eq!(
+            conv.turn_tracker.turns[1].status,
+            turn::TurnStatus::Completed
+        );
         assert_eq!(conv.turn_tracker.turns[0].msg_count, 2);
         assert_eq!(conv.turn_tracker.turns[1].msg_count, 2);
 
@@ -609,7 +650,10 @@ mod tests {
         // Verify final state
         assert_eq!(conv.messages.len(), 3);
         assert_eq!(conv.turn_tracker.turns.len(), 2);
-        assert_eq!(conv.turn_tracker.turns[0].status, turn::TurnStatus::Completed);
+        assert_eq!(
+            conv.turn_tracker.turns[0].status,
+            turn::TurnStatus::Completed
+        );
         assert_eq!(conv.turn_tracker.turns[0].msg_count, 2);
         assert_eq!(conv.turn_tracker.turns[1].status, turn::TurnStatus::Active);
         assert_eq!(conv.turn_tracker.turns[1].start_idx, 2);

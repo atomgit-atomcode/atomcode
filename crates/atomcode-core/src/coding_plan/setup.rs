@@ -30,6 +30,7 @@
 //   - `default_provider` is set to the first model in the API order.
 
 use anyhow::Result;
+use std::sync::Arc;
 
 use super::client::Client;
 use super::types::StatusResponse;
@@ -107,8 +108,15 @@ impl SetupReport {
             StepResult::Ok(info) => {
                 out.push_str(&format!(
                     "  ✔ CodingPlan claimed — {}\n",
-                    if info.message.is_empty() { "success" } else { &info.message },
+                    if info.message.is_empty() {
+                        "success"
+                    } else {
+                        &info.message
+                    },
                 ));
+            }
+            StepResult::Skipped(reason) if reason == CASCADE_FROM_UPSTREAM_FAIL => {
+                // Cascade from login failure — suppressed.
             }
             StepResult::Skipped(reason) => {
                 out.push_str(&format!("  ✔ CodingPlan already claimed — {}\n", reason));
@@ -118,13 +126,20 @@ impl SetupReport {
             }
         }
 
-        // Step 3: models
+        // Step 3: models. When the cascade marker is present (claim
+        // failed upstream), skip the row entirely — printing
+        // "Models step skipped — claim failed" right after the claim
+        // failure line is just noise. Same for the status row below.
         match &self.models {
             StepResult::Ok(info) => {
                 out.push_str(&format!(
                     "  ✔ Added {} provider{}:\n",
                     info.provider_names.len(),
-                    if info.provider_names.len() == 1 { "" } else { "s" },
+                    if info.provider_names.len() == 1 {
+                        ""
+                    } else {
+                        "s"
+                    },
                 ));
                 for (pname, model) in info.provider_names.iter().zip(info.display_names.iter()) {
                     let suffix = if pname == &info.default_provider {
@@ -134,6 +149,9 @@ impl SetupReport {
                     };
                     out.push_str(&format!("      • {}  →  {}{}\n", pname, model, suffix));
                 }
+            }
+            StepResult::Skipped(reason) if reason == CASCADE_FROM_UPSTREAM_FAIL => {
+                // Suppress — claim failure line above is the explanation.
             }
             StepResult::Skipped(reason) => {
                 out.push_str(&format!("  ✔ Models step skipped — {}\n", reason));
@@ -155,10 +173,10 @@ impl SetupReport {
                 }
                 if let Some(u) = &s.current_usage {
                     out.push_str(&format!(
-                        "      Usage: {}  ·  resets {} (in {}s)\n",
+                        "      Usage: {}  ·  resets {} (in {})\n",
                         u.display_desc(),
                         u.reset_at_display,
-                        u.seconds_until_reset,
+                        format_duration_secs(u.seconds_until_reset),
                     ));
                 }
                 if s.window_quota_exhausted {
@@ -169,11 +187,22 @@ impl SetupReport {
                     }
                 }
             }
+            StepResult::Skipped(reason) if reason == CASCADE_FROM_UPSTREAM_FAIL => {
+                // Suppress — cascade from claim failure.
+            }
             StepResult::Skipped(reason) => {
                 out.push_str(&format!("  ⚠ Status fetch skipped — {}\n", reason));
             }
             StepResult::Err(msg) => {
-                out.push_str(&format!("  ⚠ Status fetch failed (non-fatal) — {}\n", msg));
+                // Truncate the error chain so a server-side parse failure
+                // doesn't dump the entire response body inline. The cause
+                // chain commonly includes the raw JSON via anyhow's
+                // `with_context(format!("(body: {})", body))`, easily
+                // 200+ chars; the diagnostic value beyond ~150 is low.
+                out.push_str(&format!(
+                    "  ⚠ Status fetch failed (non-fatal) — {}\n",
+                    truncate_inline(msg, 150),
+                ));
             }
         }
 
@@ -228,35 +257,77 @@ pub struct ModelsInfo {
 /// the caller is responsible for persisting it to disk after a successful
 /// run. This keeps the core free of I/O concerns — tests can call `run`
 /// against a `Config::default()` without touching the filesystem.
-pub fn run(config: &mut Config) -> Result<SetupReport> {
+///
+/// Emits exactly one `TakeCodingplan { Success | Fail }` event at each exit path.
+pub fn run(
+    config: &mut Config,
+    tel: Option<&Arc<atomcode_telemetry::Telemetry>>,
+) -> Result<SetupReport> {
     // Step 1: login
-    let login = step_login();
+    let login = step_login(tel);
     if login.is_err() {
         // No point continuing — every downstream call needs a token.
+        if let Some(t) = tel {
+            t.track(atomcode_telemetry::Event::TakeCodingplan {
+                type_: atomcode_telemetry::CodingplanResult::Fail,
+            });
+        }
+        // Use the cascade sentinel so format() suppresses the three
+        // "Foo failed — skipped: login failed" rows that used to spam
+        // the report. The login-failure line above is the only thing
+        // worth showing; the rest is implied.
         return Ok(SetupReport {
             login,
-            claim: StepResult::Err("skipped: login failed".into()),
-            models: StepResult::Err("skipped: login failed".into()),
-            status: StepResult::Err("skipped: login failed".into()),
+            claim: StepResult::Skipped(CASCADE_FROM_UPSTREAM_FAIL.into()),
+            models: StepResult::Skipped(CASCADE_FROM_UPSTREAM_FAIL.into()),
+            status: StepResult::Skipped(CASCADE_FROM_UPSTREAM_FAIL.into()),
         });
     }
 
     // Step 2: claim
     let claim = step_claim();
+    if claim.is_err() {
+        // Claim failed — adding providers / fetching status both make
+        // no sense without an active plan. Bail with cascade markers
+        // (rendered as no-op in format() so the report stays focused
+        // on the actual problem instead of three identical "skipped:
+        // claim failed" lines).
+        return Ok(SetupReport {
+            login,
+            claim,
+            models: StepResult::Skipped(CASCADE_FROM_UPSTREAM_FAIL.into()),
+            status: StepResult::Skipped(CASCADE_FROM_UPSTREAM_FAIL.into()),
+        });
+    }
 
     // Step 3: models — critical. Without models there's nothing to set up.
     let models = step_models_and_register(config);
     if models.is_err() {
+        if let Some(t) = tel {
+            t.track(atomcode_telemetry::Event::TakeCodingplan {
+                type_: atomcode_telemetry::CodingplanResult::Fail,
+            });
+        }
+        // Same cascade pattern: the models-failure line above is the
+        // explanation; "Status fetch failed — skipped: models step
+        // failed" adds nothing.
         return Ok(SetupReport {
             login,
             claim,
             models,
-            status: StepResult::Err("skipped: models step failed".into()),
+            status: StepResult::Skipped(CASCADE_FROM_UPSTREAM_FAIL.into()),
         });
     }
 
     // Step 4: status — warn-only.
     let status = step_status();
+
+    // All critical steps (login + models) succeeded. Emit success event.
+    if let Some(t) = tel {
+        t.track(atomcode_telemetry::Event::TakeCodingplan {
+            type_: atomcode_telemetry::CodingplanResult::Success,
+        });
+    }
 
     Ok(SetupReport {
         login,
@@ -266,7 +337,13 @@ pub fn run(config: &mut Config) -> Result<SetupReport> {
     })
 }
 
-fn step_login() -> StepResult<LoginInfo> {
+/// Sentinel reason used when downstream steps are skipped because an
+/// earlier required step failed (login / claim / models). `format()`
+/// recognises this exact string and renders nothing — the upstream
+/// failure line above already explains why nothing came after it.
+const CASCADE_FROM_UPSTREAM_FAIL: &str = "__cascade_upstream_fail__";
+
+fn step_login(tel: Option<&Arc<atomcode_telemetry::Telemetry>>) -> StepResult<LoginInfo> {
     if auth::is_logged_in() {
         // Already authed — surface the stored identity so the report
         // shows *who* we're running as, not a bare "skipped". When
@@ -288,7 +365,7 @@ fn step_login() -> StepResult<LoginInfo> {
     // Not logged in — run OAuth. This prints to stdout + opens a browser.
     // Callers in TUI context must have already suspended raw mode before
     // calling `run`.
-    match auth::login().and_then(|a| auth::save_auth(&a).map(|_| a)) {
+    match auth::login(tel).and_then(|a| auth::save_auth(&a).map(|_| a)) {
         Ok(auth_info) => StepResult::Ok(LoginInfo {
             username: auth_info.user.username.clone(),
             display_name: auth_info.user.name.clone(),
@@ -391,6 +468,43 @@ fn step_status() -> StepResult<StatusResponse> {
     }
 }
 
+/// Truncate a single-line message to at most `max` chars, appending `…`
+/// when shortened. Char-boundary safe (won't split a UTF-8 codepoint).
+/// Used when rendering error messages whose source includes a server
+/// response body — useful diagnostic prefix, useless multi-KB tail.
+fn truncate_inline(msg: &str, max: usize) -> String {
+    if msg.chars().count() <= max {
+        return msg.to_string();
+    }
+    let mut out: String = msg.chars().take(max).collect();
+    out.push('…');
+    out
+}
+
+/// Format a duration in seconds as a short human-readable label —
+/// `90s`, `5m`, `2h 30m`, `3d 4h`. Replaces the previous "{N}s" which
+/// was unreadable for anything past a minute (e.g. "in 86340s" instead
+/// of "in 23h 59m").
+fn format_duration_secs(secs: i64) -> String {
+    if secs < 0 {
+        return "—".into();
+    }
+    let s = secs as u64;
+    if s < 60 {
+        return format!("{}s", s);
+    }
+    let (m, sr) = (s / 60, s % 60);
+    if m < 60 {
+        return if sr == 0 { format!("{}m", m) } else { format!("{}m {}s", m, sr) };
+    }
+    let (h, mr) = (m / 60, m % 60);
+    if h < 24 {
+        return if mr == 0 { format!("{}h", h) } else { format!("{}h {}m", h, mr) };
+    }
+    let (d, hr) = (h / 24, h % 24);
+    if hr == 0 { format!("{}d", d) } else { format!("{}d {}h", d, hr) }
+}
+
 /// Decide the config-key name for each model. Single model → bare
 /// `AtomGit` (keeps the name tidy for the common case); 2+ models →
 /// `AtomGit-{name with / replaced by -}`.
@@ -433,7 +547,7 @@ fn build_codingplan_provider(model: &str) -> ProviderConfig {
         max_tokens: None,
         thinking_type: None,
         thinking_keep: None,
-            reasoning_history: None,
+        reasoning_history: None,
         ephemeral: false,
     }
 }
@@ -452,6 +566,7 @@ mod tests {
             auto_update: true,
             reflection_cadence: 7,
             notifications: Default::default(),
+            telemetry: Default::default(),
         }
     }
 
@@ -533,14 +648,25 @@ mod tests {
         }
         let provider_names = provider_names_for(&names);
         for (pname, m) in provider_names.iter().zip(names.iter()) {
-            config.providers.insert(pname.clone(), build_codingplan_provider(m));
+            config
+                .providers
+                .insert(pname.clone(), build_codingplan_provider(m));
         }
         config.default_provider = provider_names[0].clone();
 
         assert_eq!(config.providers.len(), 2, "claude + one fresh AtomGit");
-        assert!(config.providers.contains_key("claude"), "unrelated entry kept");
-        assert!(config.providers.contains_key("AtomGit"), "fresh AtomGit added");
-        assert!(!config.providers.contains_key("AtomGit-legacy"), "stale removed");
+        assert!(
+            config.providers.contains_key("claude"),
+            "unrelated entry kept"
+        );
+        assert!(
+            config.providers.contains_key("AtomGit"),
+            "fresh AtomGit added"
+        );
+        assert!(
+            !config.providers.contains_key("AtomGit-legacy"),
+            "stale removed"
+        );
         let fresh = &config.providers["AtomGit"];
         assert_eq!(fresh.model, "meta-llama/Llama-3-70B");
         assert_eq!(fresh.base_url.as_deref(), Some(LLM_BASE_URL));
@@ -554,7 +680,10 @@ mod tests {
         assert_eq!(p.provider_type, "openai");
         assert_eq!(p.base_url.as_deref(), Some("https://api-ai.gitcode.com/v1"));
         assert_eq!(p.context_window, 64_000);
-        assert!(p.api_key.is_none(), "token loaded at runtime from auth.toml");
+        assert!(
+            p.api_key.is_none(),
+            "token loaded at runtime from auth.toml"
+        );
         assert!(!p.ephemeral);
     }
 
@@ -642,19 +771,28 @@ mod tests {
         assert!(report.should_persist_config());
     }
 
-    /// Render exercise: login failed. Every later step is pre-marked
-    /// "skipped: login failed"; config must NOT be persisted.
+    /// Render exercise: login failed. Downstream steps are pre-marked
+    /// with the cascade sentinel; format() suppresses them so only the
+    /// login-failure line appears. Config must NOT be persisted.
     #[test]
-    fn render_login_failed_blocks_persist() {
+    fn render_login_failed_blocks_persist_and_suppresses_cascade() {
         let report = SetupReport {
             login: StepResult::Err("browser handshake timed out".into()),
-            claim: StepResult::Err("skipped: login failed".into()),
-            models: StepResult::Err("skipped: login failed".into()),
-            status: StepResult::Err("skipped: login failed".into()),
+            claim: StepResult::Skipped(CASCADE_FROM_UPSTREAM_FAIL.into()),
+            models: StepResult::Skipped(CASCADE_FROM_UPSTREAM_FAIL.into()),
+            status: StepResult::Skipped(CASCADE_FROM_UPSTREAM_FAIL.into()),
         };
         let out = report.render();
         assert!(out.contains("✘ Login failed"));
-        assert!(!report.should_persist_config(), "don't write config on login failure");
+        // Cascade rows must NOT appear.
+        assert!(!out.contains("CodingPlan claim"), "no cascade claim row on login fail");
+        assert!(!out.contains("Models step"), "no cascade models row on login fail");
+        assert!(!out.contains("Status fetch"), "no cascade status row on login fail");
+        // Login Err ⇒ should_persist_config = false (login.is_ok_or_skipped() is false).
+        assert!(
+            !report.should_persist_config(),
+            "don't write config on login failure"
+        );
     }
 
     /// Render exercise: multi-model report. Verifies each provider
@@ -684,8 +822,114 @@ mod tests {
         };
         let out = report.render();
         assert!(out.contains("Added 3 providers"));
-        assert!(out.contains("AtomGit-moonshotai-Kimi-K2-Instruct  →  moonshotai/Kimi-K2-Instruct  (default)"));
-        assert!(out.contains("AtomGit-anthropic-claude-3.5-sonnet  →  anthropic/claude-3.5-sonnet\n"));
-        assert!(!out.contains("anthropic/claude-3.5-sonnet  (default)"), "only first is default");
+        assert!(out.contains(
+            "AtomGit-moonshotai-Kimi-K2-Instruct  →  moonshotai/Kimi-K2-Instruct  (default)"
+        ));
+        assert!(
+            out.contains("AtomGit-anthropic-claude-3.5-sonnet  →  anthropic/claude-3.5-sonnet\n")
+        );
+        assert!(
+            !out.contains("anthropic/claude-3.5-sonnet  (default)"),
+            "only first is default"
+        );
+    }
+
+    /// Render exercise: claim failed. The cascade markers on models +
+    /// status must render as nothing — the claim-failed line is the
+    /// explanation, repeating it twice more is noise.
+    #[test]
+    fn render_claim_failed_suppresses_cascade_rows() {
+        let report = SetupReport {
+            login: StepResult::Skipped("already logged in as theo".into()),
+            claim: StepResult::Err("今日codingplan申请额度已满，请明天再试".into()),
+            models: StepResult::Skipped(CASCADE_FROM_UPSTREAM_FAIL.into()),
+            status: StepResult::Skipped(CASCADE_FROM_UPSTREAM_FAIL.into()),
+        };
+        let out = report.render();
+        assert!(out.contains("✘ CodingPlan claim failed"));
+        assert!(out.contains("今日codingplan申请额度已满"));
+        // The cascade rows must NOT appear.
+        assert!(!out.contains("Models step skipped"), "no cascade row for models");
+        assert!(!out.contains("Status fetch skipped"), "no cascade row for status");
+        assert!(!out.contains("Added "), "must not say 'Added N providers' on claim fail");
+        // The huge JSON body that used to leak through here must NOT appear.
+        assert!(!out.contains("invalid type: null"));
+        assert!(!out.contains("plan_name"));
+    }
+
+    /// Non-cascade Skipped reasons still render — only the sentinel
+    /// (`__cascade_upstream_fail__`) is suppressed.
+    #[test]
+    fn render_skipped_with_non_cascade_reason_still_shows() {
+        let report = SetupReport {
+            login: StepResult::Skipped("already logged in as theo".into()),
+            claim: StepResult::Skipped("already claimed".into()),
+            models: StepResult::Skipped("models cached locally".into()),
+            status: StepResult::Skipped("server returned 503; using cached".into()),
+        };
+        let out = report.render();
+        assert!(out.contains("Models step skipped — models cached locally"));
+        assert!(out.contains("Status fetch skipped — server returned 503"));
+    }
+
+    /// Render exercise: status fetch failed with a multi-KB body chain.
+    /// Output must be truncated to keep the report readable.
+    #[test]
+    fn render_status_error_truncates_long_message() {
+        let huge = format!(
+            "status: parse status response (body: {}): invalid type",
+            "x".repeat(1000),
+        );
+        let report = SetupReport {
+            login: StepResult::Skipped("already logged in".into()),
+            claim: StepResult::Ok(ClaimInfo {
+                message: "ok".into(),
+                duplicate: false,
+            }),
+            models: StepResult::Ok(ModelsInfo {
+                display_names: vec!["a/b".into()],
+                provider_names: vec!["AtomGit".into()],
+                default_provider: "AtomGit".into(),
+            }),
+            status: StepResult::Err(huge),
+        };
+        let out = report.render();
+        // Find the status line and check its length is bounded.
+        let line = out.lines().find(|l| l.contains("Status fetch failed")).unwrap();
+        // 150 chars + ellipsis + prefix + leading spaces ⇒ comfortably under 250.
+        assert!(line.chars().count() < 250, "line still ~{} chars long", line.chars().count());
+        assert!(line.contains('…'), "truncation marker present");
+    }
+
+    #[test]
+    fn format_duration_secs_human_readable() {
+        assert_eq!(format_duration_secs(0), "0s");
+        assert_eq!(format_duration_secs(45), "45s");
+        assert_eq!(format_duration_secs(60), "1m");
+        assert_eq!(format_duration_secs(90), "1m 30s");
+        assert_eq!(format_duration_secs(3600), "1h");
+        assert_eq!(format_duration_secs(3660), "1h 1m");
+        assert_eq!(format_duration_secs(86400), "1d");
+        assert_eq!(format_duration_secs(90060), "1d 1h");
+        assert_eq!(format_duration_secs(-1), "—");
+    }
+
+    #[test]
+    fn truncate_inline_passes_short_strings_through() {
+        assert_eq!(truncate_inline("short", 10), "short");
+        assert_eq!(truncate_inline("exactly_ten", 11), "exactly_ten");
+    }
+
+    #[test]
+    fn truncate_inline_appends_ellipsis_when_long() {
+        let r = truncate_inline("abcdefghijklmnop", 5);
+        assert_eq!(r, "abcde…");
+    }
+
+    #[test]
+    fn truncate_inline_handles_unicode_safely() {
+        // 5 CJK chars = 5 chars (regardless of byte count). No char-boundary panic.
+        let r = truncate_inline("一二三四五六七八", 5);
+        assert_eq!(r, "一二三四五…");
     }
 }

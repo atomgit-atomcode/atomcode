@@ -110,7 +110,10 @@ mod tests {
         h.save().unwrap();
 
         let h2 = History::load(&path);
-        assert_eq!(h2.entries(), &vec!["1\n2\n3".to_string(), "next".to_string()]);
+        assert_eq!(
+            h2.entries(),
+            &vec!["1\n2\n3".to_string(), "next".to_string()]
+        );
     }
 
     #[test]

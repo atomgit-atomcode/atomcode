@@ -97,10 +97,6 @@ pub fn notify_turn_finished(cfg: &NotificationConfig, turn: TurnNotification<'_>
     notify(cfg, NotificationEvent::TurnFinished(turn));
 }
 
-pub fn notify_approval_needed(cfg: &NotificationConfig, approval: ApprovalNotification<'_>) {
-    notify(cfg, NotificationEvent::ApprovalNeeded(approval));
-}
-
 fn build_notification_plan(
     cfg: &NotificationConfig,
     event: NotificationEvent<'_>,
@@ -245,7 +241,9 @@ fn build_system_notification_text(turn: &TurnNotification<'_>) -> (Cow<'static, 
     build_turn_system_notification_text(turn)
 }
 
-fn build_approval_notification_text(approval: &ApprovalNotification<'_>) -> (Cow<'static, str>, String) {
+fn build_approval_notification_text(
+    approval: &ApprovalNotification<'_>,
+) -> (Cow<'static, str>, String) {
     let title = Cow::Borrowed("AtomCode approval needed");
     let mut body = format!("{} is waiting for Y/A/N", approval.tool_name);
     if let Some(scope) = approval
@@ -677,10 +675,22 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_terminal_bundle_ids_match_supported_terminals() {
-        assert_eq!(macos_terminal_bundle_id(Some(TerminalApp::AppleTerminal)), Some("com.apple.Terminal"));
-        assert_eq!(macos_terminal_bundle_id(Some(TerminalApp::ITerm2)), Some("com.googlecode.iterm2"));
-        assert_eq!(macos_terminal_bundle_id(Some(TerminalApp::WezTerm)), Some("com.github.wez.wezterm"));
-        assert_eq!(macos_terminal_bundle_id(Some(TerminalApp::Kitty)), Some("net.kovidgoyal.kitty"));
+        assert_eq!(
+            macos_terminal_bundle_id(Some(TerminalApp::AppleTerminal)),
+            Some("com.apple.Terminal")
+        );
+        assert_eq!(
+            macos_terminal_bundle_id(Some(TerminalApp::ITerm2)),
+            Some("com.googlecode.iterm2")
+        );
+        assert_eq!(
+            macos_terminal_bundle_id(Some(TerminalApp::WezTerm)),
+            Some("com.github.wez.wezterm")
+        );
+        assert_eq!(
+            macos_terminal_bundle_id(Some(TerminalApp::Kitty)),
+            Some("net.kovidgoyal.kitty")
+        );
     }
 
     #[test]

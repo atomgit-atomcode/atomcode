@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use tokio::sync::RwLock;
@@ -210,9 +210,7 @@ fn test_rust_call_query() {
     let mut cursor = tree_sitter::QueryCursor::new();
 
     let mut matches = cursor.matches(&query, tree.root_node(), &source[..]);
-    let callee_idx = query
-        .capture_index_for_name("callee")
-        .unwrap();
+    let callee_idx = query.capture_index_for_name("callee").unwrap();
 
     let mut callees: Vec<String> = Vec::new();
     while let Some(m) = matches.next() {
@@ -224,10 +222,27 @@ fn test_rust_call_query() {
         }
     }
 
-    assert!(callees.contains(&"foo".to_string()), "missing foo: {:?}", callees);
-    assert!(callees.contains(&"baz".to_string()), "missing baz: {:?}", callees);
-    assert!(callees.contains(&"method".to_string()), "missing method: {:?}", callees);
-    assert_eq!(callees.len(), 3, "expected exactly 3 callees: {:?}", callees);
+    assert!(
+        callees.contains(&"foo".to_string()),
+        "missing foo: {:?}",
+        callees
+    );
+    assert!(
+        callees.contains(&"baz".to_string()),
+        "missing baz: {:?}",
+        callees
+    );
+    assert!(
+        callees.contains(&"method".to_string()),
+        "missing method: {:?}",
+        callees
+    );
+    assert_eq!(
+        callees.len(),
+        3,
+        "expected exactly 3 callees: {:?}",
+        callees
+    );
 }
 
 #[tokio::test]
@@ -310,7 +325,10 @@ async fn test_indexer_incremental_update() {
 
     let count_after_first = {
         let g = graph.read().await;
-        assert!(g.node_count() >= 1, "should have at least 1 symbol after first index");
+        assert!(
+            g.node_count() >= 1,
+            "should have at least 1 symbol after first index"
+        );
         g.node_count()
     };
 
@@ -353,8 +371,22 @@ fn make_chain_graph() -> (CodeGraph, u64, u64, u64) {
     graph.add_symbol(sym_a);
     graph.add_symbol(sym_b);
     graph.add_symbol(sym_c);
-    graph.add_edge(id_a, Edge { to: id_b, kind: EdgeKind::Calls, line: 3 });
-    graph.add_edge(id_b, Edge { to: id_c, kind: EdgeKind::Calls, line: 12 });
+    graph.add_edge(
+        id_a,
+        Edge {
+            to: id_b,
+            kind: EdgeKind::Calls,
+            line: 3,
+        },
+    );
+    graph.add_edge(
+        id_b,
+        Edge {
+            to: id_c,
+            kind: EdgeKind::Calls,
+            line: 12,
+        },
+    );
     (graph, id_a, id_b, id_c)
 }
 
@@ -418,7 +450,14 @@ fn test_file_dependents() {
 
     graph.add_symbol(widget_sym);
     graph.add_symbol(use_widget_sym);
-    graph.add_edge(use_widget_id, Edge { to: widget_id, kind: EdgeKind::Calls, line: 3 });
+    graph.add_edge(
+        use_widget_id,
+        Edge {
+            to: widget_id,
+            kind: EdgeKind::Calls,
+            line: 3,
+        },
+    );
 
     let dependents = graph.file_dependents(std::path::Path::new("widget.rs"), 3);
     assert_eq!(dependents.len(), 1);
@@ -429,14 +468,20 @@ fn test_file_dependents() {
 async fn test_full_pipeline_index_and_query() {
     let dir = tempfile::tempdir().unwrap();
 
-    std::fs::write(dir.path().join("main.rs"), r#"
+    std::fs::write(
+        dir.path().join("main.rs"),
+        r#"
 fn main() {
     let result = handle_request();
     println!("{}", result);
 }
-"#).unwrap();
+"#,
+    )
+    .unwrap();
 
-    std::fs::write(dir.path().join("handler.rs"), r#"
+    std::fs::write(
+        dir.path().join("handler.rs"),
+        r#"
 pub fn handle_request() -> String {
     let data = fetch_data();
     format_response(data)
@@ -445,13 +490,19 @@ pub fn handle_request() -> String {
 fn format_response(data: String) -> String {
     format!("Response: {}", data)
 }
-"#).unwrap();
+"#,
+    )
+    .unwrap();
 
-    std::fs::write(dir.path().join("fetcher.rs"), r#"
+    std::fs::write(
+        dir.path().join("fetcher.rs"),
+        r#"
 pub fn fetch_data() -> String {
     "hello".to_string()
 }
-"#).unwrap();
+"#,
+    )
+    .unwrap();
 
     let graph = Arc::new(RwLock::new(CodeGraph::new()));
     let mut indexer = GraphIndexer::new(graph.clone(), dir.path().to_path_buf());
@@ -464,30 +515,42 @@ pub fn fetch_data() -> String {
     assert!(!mains.is_empty(), "should find 'main'");
 
     let callees = g.trace_callees(mains[0].id, 3);
-    let callee_names: Vec<String> = callees.iter()
+    let callee_names: Vec<String> = callees
+        .iter()
         .filter_map(|(id, _)| g.node(*id).map(|n| n.name.clone()))
         .collect();
-    assert!(callee_names.contains(&"handle_request".to_string()),
-        "expected handle_request in callees of main: {:?}", callee_names);
+    assert!(
+        callee_names.contains(&"handle_request".to_string()),
+        "expected handle_request in callees of main: {:?}",
+        callee_names
+    );
 
     // Verify: fetch_data callers include handle_request
     let fetchers = g.find_by_name("fetch_data");
     if !fetchers.is_empty() {
         let callers = g.trace_callers(fetchers[0].id, 3);
-        let caller_names: Vec<String> = callers.iter()
+        let caller_names: Vec<String> = callers
+            .iter()
             .filter_map(|(id, _)| g.node(*id).map(|n| n.name.clone()))
             .collect();
-        assert!(caller_names.contains(&"handle_request".to_string()),
-            "expected handle_request in callers of fetch_data: {:?}", caller_names);
+        assert!(
+            caller_names.contains(&"handle_request".to_string()),
+            "expected handle_request in callers of fetch_data: {:?}",
+            caller_names
+        );
     }
 
     // Verify: blast radius of fetcher.rs includes handler.rs
     let deps = g.file_dependents(&dir.path().join("fetcher.rs"), 3);
-    let dep_names: Vec<String> = deps.iter()
+    let dep_names: Vec<String> = deps
+        .iter()
         .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
         .collect();
-    assert!(dep_names.contains(&"handler.rs".to_string()),
-        "expected handler.rs in dependents of fetcher.rs: {:?}", dep_names);
+    assert!(
+        dep_names.contains(&"handler.rs".to_string()),
+        "expected handler.rs in dependents of fetcher.rs: {:?}",
+        dep_names
+    );
 }
 
 // ── Auto-injection summary tests ──
@@ -503,7 +566,9 @@ fn test_empty_graph_queries() {
     assert_eq!(graph.trace_callers(12345, 3), vec![]);
     assert_eq!(graph.trace_callees(12345, 3), vec![]);
     assert_eq!(graph.shortest_path(1, 2), None);
-    assert!(graph.file_dependents(std::path::Path::new("x.rs"), 3).is_empty());
+    assert!(graph
+        .file_dependents(std::path::Path::new("x.rs"), 3)
+        .is_empty());
 }
 
 #[test]
@@ -519,9 +584,30 @@ fn test_cycle_detection() {
     graph.add_symbol(sym_a);
     graph.add_symbol(sym_b);
     graph.add_symbol(sym_c);
-    graph.add_edge(id_a, Edge { to: id_b, kind: EdgeKind::Calls, line: 2 });
-    graph.add_edge(id_b, Edge { to: id_c, kind: EdgeKind::Calls, line: 12 });
-    graph.add_edge(id_c, Edge { to: id_a, kind: EdgeKind::Calls, line: 22 });
+    graph.add_edge(
+        id_a,
+        Edge {
+            to: id_b,
+            kind: EdgeKind::Calls,
+            line: 2,
+        },
+    );
+    graph.add_edge(
+        id_b,
+        Edge {
+            to: id_c,
+            kind: EdgeKind::Calls,
+            line: 12,
+        },
+    );
+    graph.add_edge(
+        id_c,
+        Edge {
+            to: id_a,
+            kind: EdgeKind::Calls,
+            line: 22,
+        },
+    );
 
     let callees = graph.trace_callees(id_a, 10);
     assert_eq!(callees.len(), 2);
@@ -544,10 +630,38 @@ fn test_diamond_dependency() {
     graph.add_symbol(sym_b);
     graph.add_symbol(sym_c);
     graph.add_symbol(sym_d);
-    graph.add_edge(id_a, Edge { to: id_b, kind: EdgeKind::Calls, line: 2 });
-    graph.add_edge(id_a, Edge { to: id_c, kind: EdgeKind::Calls, line: 3 });
-    graph.add_edge(id_b, Edge { to: id_d, kind: EdgeKind::Calls, line: 12 });
-    graph.add_edge(id_c, Edge { to: id_d, kind: EdgeKind::Calls, line: 22 });
+    graph.add_edge(
+        id_a,
+        Edge {
+            to: id_b,
+            kind: EdgeKind::Calls,
+            line: 2,
+        },
+    );
+    graph.add_edge(
+        id_a,
+        Edge {
+            to: id_c,
+            kind: EdgeKind::Calls,
+            line: 3,
+        },
+    );
+    graph.add_edge(
+        id_b,
+        Edge {
+            to: id_d,
+            kind: EdgeKind::Calls,
+            line: 12,
+        },
+    );
+    graph.add_edge(
+        id_c,
+        Edge {
+            to: id_d,
+            kind: EdgeKind::Calls,
+            line: 22,
+        },
+    );
 
     let callers = graph.trace_callers(id_d, 3);
     assert_eq!(callers.len(), 3);
@@ -567,7 +681,14 @@ fn test_depth_limit_respected() {
         graph.add_symbol(sym);
     }
     for i in 0..5 {
-        graph.add_edge(ids[i], Edge { to: ids[i + 1], kind: EdgeKind::Calls, line: 2 });
+        graph.add_edge(
+            ids[i],
+            Edge {
+                to: ids[i + 1],
+                kind: EdgeKind::Calls,
+                line: 2,
+            },
+        );
     }
     let callees = graph.trace_callees(ids[0], 2);
     assert_eq!(callees.len(), 2);
@@ -584,7 +705,14 @@ fn test_serialize_roundtrip_with_edges() {
     let id_b = sym_b.id;
     graph.add_symbol(sym_a);
     graph.add_symbol(sym_b);
-    graph.add_edge(id_a, Edge { to: id_b, kind: EdgeKind::Calls, line: 5 });
+    graph.add_edge(
+        id_a,
+        Edge {
+            to: id_b,
+            kind: EdgeKind::Calls,
+            line: 5,
+        },
+    );
 
     let bytes = persist::serialize(&graph).unwrap();
     let restored = persist::deserialize(&bytes).unwrap();
@@ -609,8 +737,22 @@ fn test_file_dependency_summary() {
     graph.add_symbol(handler_sym);
     graph.add_symbol(fetcher_sym);
     graph.add_symbol(main_sym);
-    graph.add_edge(handler_id, Edge { to: fetcher_id, kind: EdgeKind::Calls, line: 3 });
-    graph.add_edge(main_id, Edge { to: handler_id, kind: EdgeKind::Calls, line: 2 });
+    graph.add_edge(
+        handler_id,
+        Edge {
+            to: fetcher_id,
+            kind: EdgeKind::Calls,
+            line: 3,
+        },
+    );
+    graph.add_edge(
+        main_id,
+        Edge {
+            to: handler_id,
+            kind: EdgeKind::Calls,
+            line: 2,
+        },
+    );
 
     let summary = graph.file_dependency_summary("handler.rs").unwrap();
     assert!(summary.contains("Graph: handler.rs"), "{}", summary);
@@ -622,8 +764,12 @@ fn test_file_dependency_summary() {
 #[test]
 fn test_call_chain_summary() {
     let mut graph = CodeGraph::new();
-    let files = [PathBuf::from("main.rs"), PathBuf::from("handler.rs"),
-                 PathBuf::from("fetcher.rs"), PathBuf::from("http.rs")];
+    let files = [
+        PathBuf::from("main.rs"),
+        PathBuf::from("handler.rs"),
+        PathBuf::from("fetcher.rs"),
+        PathBuf::from("http.rs"),
+    ];
     let names = ["main", "handle", "fetch", "http_get"];
     let mut ids = Vec::new();
     for (i, name) in names.iter().enumerate() {
@@ -632,7 +778,14 @@ fn test_call_chain_summary() {
         graph.add_symbol(sym);
     }
     for i in 0..3 {
-        graph.add_edge(ids[i], Edge { to: ids[i + 1], kind: EdgeKind::Calls, line: 5 });
+        graph.add_edge(
+            ids[i],
+            Edge {
+                to: ids[i + 1],
+                kind: EdgeKind::Calls,
+                line: 5,
+            },
+        );
     }
 
     let chain = graph.call_chain_summary("main").unwrap();
@@ -663,7 +816,11 @@ async fn test_indexer_deleted_file() {
 #[tokio::test]
 async fn test_indexer_python_files() {
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("app.py"), "def main():\n    result = process()\n\ndef process():\n    return 'done'\n").unwrap();
+    std::fs::write(
+        dir.path().join("app.py"),
+        "def main():\n    result = process()\n\ndef process():\n    return 'done'\n",
+    )
+    .unwrap();
 
     let graph = Arc::new(RwLock::new(CodeGraph::new()));
     let mut indexer = GraphIndexer::new(graph.clone(), dir.path().to_path_buf());

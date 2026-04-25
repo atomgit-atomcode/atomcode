@@ -11,9 +11,9 @@
 //! - `restore(path, version)` → copies backup back to original location
 //! - `list_versions(path)` → returns available versions with timestamps
 
-use std::path::{Path, PathBuf};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+use std::path::{Path, PathBuf};
 
 /// Per-file version tracker.
 struct FileVersions {
@@ -58,12 +58,13 @@ impl FileHistory {
             return None;
         }
 
-        let versions = self.files.entry(file_path.to_string()).or_insert_with(|| {
-            FileVersions {
+        let versions = self
+            .files
+            .entry(file_path.to_string())
+            .or_insert_with(|| FileVersions {
                 next_version: 1,
                 backups: Vec::new(),
-            }
-        });
+            });
 
         let version = versions.next_version;
         let backup_name = backup_filename(file_path, version);
@@ -75,7 +76,9 @@ impl FileHistory {
             return None;
         }
 
-        versions.backups.push((version, backup_name, std::time::SystemTime::now()));
+        versions
+            .backups
+            .push((version, backup_name, std::time::SystemTime::now()));
         versions.next_version += 1;
 
         // Evict old versions if over limit
@@ -93,21 +96,28 @@ impl FileHistory {
     /// Restore a file to a specific version.
     /// Returns Ok(version) on success, Err(message) on failure.
     pub async fn restore(&self, file_path: &str, version: Option<u32>) -> Result<u32, String> {
-        let versions = self.files.get(file_path)
+        let versions = self
+            .files
+            .get(file_path)
             .ok_or_else(|| format!("No history for {}", file_path))?;
 
         let (ver, backup_name, _) = if let Some(v) = version {
-            versions.backups.iter()
+            versions
+                .backups
+                .iter()
                 .find(|(bv, _, _)| *bv == v)
                 .ok_or_else(|| format!("Version {} not found for {}", v, file_path))?
         } else {
             // Latest version before current
-            versions.backups.last()
+            versions
+                .backups
+                .last()
                 .ok_or_else(|| format!("No backups for {}", file_path))?
         };
 
         let backup_path = self.backup_dir.join(backup_name);
-        tokio::fs::copy(&backup_path, file_path).await
+        tokio::fs::copy(&backup_path, file_path)
+            .await
             .map_err(|e| format!("Failed to restore {}: {}", file_path, e))?;
 
         Ok(*ver)
@@ -115,14 +125,16 @@ impl FileHistory {
 
     /// List all backed-up files and their version counts.
     pub fn list_files(&self) -> Vec<(String, usize)> {
-        self.files.iter()
+        self.files
+            .iter()
             .map(|(path, v)| (path.clone(), v.backups.len()))
             .collect()
     }
 
     /// Get the most recently backed-up version number for a file.
     pub fn latest_version(&self, file_path: &str) -> Option<u32> {
-        self.files.get(file_path)
+        self.files
+            .get(file_path)
             .and_then(|v| v.backups.last())
             .map(|(ver, _, _)| *ver)
     }
@@ -172,13 +184,19 @@ mod tests {
         // Restore to version 1
         let restored = fh.restore(&file_str, Some(1)).await.unwrap();
         assert_eq!(restored, 1);
-        assert_eq!(std::fs::read_to_string(&test_file).unwrap(), "version 1 content");
+        assert_eq!(
+            std::fs::read_to_string(&test_file).unwrap(),
+            "version 1 content"
+        );
 
         // Restore to latest (version 2)
         std::fs::write(&test_file, "broken again").unwrap();
         let restored = fh.restore(&file_str, None).await.unwrap();
         assert_eq!(restored, 2);
-        assert_eq!(std::fs::read_to_string(&test_file).unwrap(), "version 2 content");
+        assert_eq!(
+            std::fs::read_to_string(&test_file).unwrap(),
+            "version 2 content"
+        );
 
         // Cleanup
         fh.cleanup().await;

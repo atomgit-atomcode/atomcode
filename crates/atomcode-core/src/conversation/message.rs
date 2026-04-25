@@ -60,7 +60,11 @@ impl Message {
     pub fn estimate_tokens(&self) -> usize {
         let char_count = match &self.content {
             MessageContent::Text(s) => s.len(),
-            MessageContent::AssistantWithToolCalls { text, tool_calls, reasoning_content } => {
+            MessageContent::AssistantWithToolCalls {
+                text,
+                tool_calls,
+                reasoning_content,
+            } => {
                 let text_len = text.as_ref().map_or(0, |t| t.len());
                 let calls_len: usize = tool_calls
                     .iter()

@@ -7,8 +7,8 @@
 
 use super::CtxBuilder;
 use crate::config::provider::ProviderConfig;
-use crate::conversation::{ContextStats, Conversation};
 use crate::conversation::message::Message;
+use crate::conversation::{ContextStats, Conversation};
 use crate::tool::ToolResult;
 
 /// Fallback strategy — matches legacy behavior byte-for-byte.

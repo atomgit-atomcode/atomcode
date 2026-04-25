@@ -2,9 +2,9 @@
 use std::sync::mpsc::{self as stdmpsc, TryRecvError};
 use std::time::Duration;
 
-use crossterm::execute;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::event::{DisableFocusChange, EnableFocusChange};
+use crossterm::execute;
 use tokio::sync::mpsc;
 
 use super::InputEvent;
@@ -14,7 +14,13 @@ use super::InputEvent;
 /// itself. Modifier-carrying keys (Ctrl/Alt) and non-Press kinds are
 /// excluded — those are commands, not pasted content.
 fn paste_candidate_char(ev: &Event) -> Option<char> {
-    let Event::Key(KeyEvent { kind, code, modifiers, .. }) = ev else {
+    let Event::Key(KeyEvent {
+        kind,
+        code,
+        modifiers,
+        ..
+    }) = ev
+    else {
         return None;
     };
     if *kind != KeyEventKind::Press {
@@ -129,8 +135,7 @@ pub fn spawn(tx: mpsc::UnboundedSender<InputEvent>) -> ReaderHandle {
         let _ = execute!(std::io::stdout(), EnableFocusChange);
         atomcode_core::notify::set_terminal_focus_state(Some(true));
     }
-    let (cmd_tx, cmd_rx) =
-        stdmpsc::channel::<(ReaderCommand, Option<stdmpsc::Sender<()>>)>();
+    let (cmd_tx, cmd_rx) = stdmpsc::channel::<(ReaderCommand, Option<stdmpsc::Sender<()>>)>();
     let join = std::thread::spawn(move || run(tx, cmd_rx));
     ReaderHandle {
         join: Some(join),
@@ -261,9 +266,7 @@ fn run(
         // the input box inserts N newlines for one physical keystroke.
         // Drop same-modifier repeats that arrive within the dedup window.
         if let Event::Key(k) = &ev {
-            if k.kind == KeyEventKind::Press
-                && k.code == KeyCode::Enter
-                && !k.modifiers.is_empty()
+            if k.kind == KeyEventKind::Press && k.code == KeyCode::Enter && !k.modifiers.is_empty()
             {
                 let now = std::time::Instant::now();
                 if let Some((last_mods, last_at)) = last_mod_enter {
@@ -548,8 +551,11 @@ mod tests {
     #[test]
     fn classify_poll_ok_branches() {
         assert_eq!(classify_poll(Ok(true), false), PollAction::Read);
-        assert_eq!(classify_poll(Ok(true), true), PollAction::Read,
-            "Ok(true) always reads — caller will notice tx closed on send");
+        assert_eq!(
+            classify_poll(Ok(true), true),
+            PollAction::Read,
+            "Ok(true) always reads — caller will notice tx closed on send"
+        );
         assert_eq!(classify_poll(Ok(false), false), PollAction::Continue);
         assert_eq!(classify_poll(Ok(false), true), PollAction::Exit);
     }
@@ -572,6 +578,8 @@ mod tests {
             .expect("pause ACK");
 
         drop(cmd_tx); // Err on next recv → exit
-        worker.join().expect("paused worker joins after sender drop");
+        worker
+            .join()
+            .expect("paused worker joins after sender drop");
     }
 }

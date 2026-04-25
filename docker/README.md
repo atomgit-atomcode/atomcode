@@ -19,32 +19,32 @@ brew install FiloSottile/musl-cross/musl-cross
 ./scripts/release.sh
 
 # 2. 构建 Docker 镜像
-docker build -t atomcode-tui -f docker/Dockerfile-TUI .
+docker build -t atomcode -f docker/Dockerfile-TUI .
 ```
 
 ### 运行容器
 
 ```bash
 # 基本运行
-docker run --rm -it atomcode-tui
+docker run --rm -it atomcode
 
 # 挂载配置和项目目录
 docker run --rm -it \
   -v ~/.atomcode:/root/.atomcode \
   -v $(pwd):/workspace \
-  atomcode-tui
+  atomcode
 
 # 指定工作目录
 docker run --rm -it \
   -v ~/.atomcode:/root/.atomcode \
   -v /path/to/project:/workspace \
-  atomcode-tui
+  atomcode
 
 # 传递环境变量（API Key）
 docker run --rm -it \
   -e ANTHROPIC_API_KEY=your-api-key \
   -v ~/.atomcode:/root/.atomcode \
-  atomcode-tui
+  atomcode
 ```
 
 > **注意**: TUI 模式需要 `-it` 参数来启用交互式终端。

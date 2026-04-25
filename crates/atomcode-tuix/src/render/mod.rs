@@ -1,9 +1,9 @@
 // crates/atomcode-tuix/src/render/mod.rs
-pub mod theme;
 pub mod cell;
-pub mod screen;
 pub mod plain;
 pub mod retained;
+pub mod screen;
+pub mod theme;
 pub mod worker;
 
 use std::time::Duration;
@@ -14,13 +14,25 @@ use std::time::Duration;
 /// Error, Blank) all enter scrollback. Spinner and InputPrompt are transient.
 #[derive(Debug, Clone)]
 pub enum UiLine {
-    Welcome { model: String, working_dir: String },
+    Welcome {
+        model: String,
+        working_dir: String,
+    },
     User(String),
     AssistantText(String),
     AssistantLineBreak,
-    ToolCall { name: String, detail: String },
-    ToolResult { success: bool, summary: String },
-    DiffLine { added: bool, text: String },
+    ToolCall {
+        name: String,
+        detail: String,
+    },
+    ToolResult {
+        success: bool,
+        summary: String,
+    },
+    DiffLine {
+        added: bool,
+        text: String,
+    },
     /// A batch of diff lines emitted in a single render call. Use this
     /// instead of N individual `DiffLine` renders when a tool result
     /// carries many changed lines — each `DiffLine` triggers a full
@@ -29,14 +41,20 @@ pub enum UiLine {
     /// event loop long enough to freeze the spinner. `DiffBlock` does
     /// one erase + N writes + one redraw.
     DiffBlock(Vec<DiffEntry>),
-    ApprovalPrompt { tool: String, detail: String },
+    ApprovalPrompt {
+        tool: String,
+        detail: String,
+    },
     Error(String),
     TurnCancelled,
     TurnComplete,
     /// Legacy single-line spinner (kept for tests / PlainRenderer fallback).
     /// During Streaming the event loop emits `StreamingBox` instead so the
     /// spinner sits ABOVE the input box rather than inside it.
-    Spinner { frame: &'static str, label: String },
+    Spinner {
+        frame: &'static str,
+        label: String,
+    },
     /// Clear the current transient line (prepares for a permanent write).
     ClearTransient,
     /// Draw the input prompt "> " + current buffer (transient, idle).
@@ -69,7 +87,9 @@ pub enum UiLine {
     /// Slash-command output (arbitrary text, already sanitised by caller).
     CommandOutput(String),
     /// A visible separator between turns: `────── {label} ──────`.
-    TurnSeparator { label: String },
+    TurnSeparator {
+        label: String,
+    },
 }
 
 pub trait Renderer: Send {
@@ -157,7 +177,7 @@ pub enum HintSeverity {
 #[derive(Debug, Clone, Default)]
 pub struct StatusLine {
     pub model: String,
-    pub cwd: String,      // HOME replaced with "~"
+    pub cwd: String, // HOME replaced with "~"
     pub total_tokens: usize,
     /// Right-aligned passive hint with severity. `Warning` renders red
     /// (no-provider nudge, CodingPlan model-missing); `Info` renders

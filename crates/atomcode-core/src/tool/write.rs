@@ -33,11 +33,7 @@ fn is_sensitive_path(path: &str) -> bool {
         let bash_profile = home.join(".bash_profile");
         let zshrc = home.join(".zshrc");
         let p = std::path::Path::new(&expanded);
-        if p.starts_with(&ssh_dir)
-            || p == bashrc
-            || p == bash_profile
-            || p == zshrc
-        {
+        if p.starts_with(&ssh_dir) || p == bashrc || p == bash_profile || p == zshrc {
             return true;
         }
     }
@@ -56,10 +52,12 @@ impl Tool for WriteFileTool {
     fn definition(&self) -> ToolDef {
         ToolDef {
             name: "write_file",
-            description: "Write content to a file. Creates new files or overwrites existing ones.\n\
+            description:
+                "Write content to a file. Creates new files or overwrites existing ones.\n\
                 Use this for: creating new files, or rewriting an entire file from scratch.\n\
                 For small edits to existing files, prefer edit_file instead.\n\
-                Parent directories are auto-created if they don't exist.".to_string(),
+                Parent directories are auto-created if they don't exist."
+                    .to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -82,9 +80,10 @@ impl Tool for WriteFileTool {
             }
         };
         if is_sensitive_path(&parsed.file_path) {
-            return ApprovalRequirement::RequireApproval(
-                format!("Writing to sensitive system path: {}", parsed.file_path),
-            );
+            return ApprovalRequirement::RequireApproval(format!(
+                "Writing to sensitive system path: {}",
+                parsed.file_path
+            ));
         }
         // Overwriting existing files is blocked in execute() — no need to
         // RequireApproval here. Only new file creation is auto-approved.
@@ -101,11 +100,21 @@ impl Tool for WriteFileTool {
             Ok(wd) => wd.clone(),
             Err(_) => return base,
         };
-        match super::approval_for_path(&parsed.file_path, &working_dir, super::ExternalPathAction::Write) {
-            Ok(ApprovalRequirement::RequireApprovalAlways(reason)) => ApprovalRequirement::RequireApprovalAlways(reason),
-            Ok(ApprovalRequirement::RequireApproval(reason)) => ApprovalRequirement::RequireApproval(reason),
+        match super::approval_for_path(
+            &parsed.file_path,
+            &working_dir,
+            super::ExternalPathAction::Write,
+        ) {
+            Ok(ApprovalRequirement::RequireApprovalAlways(reason)) => {
+                ApprovalRequirement::RequireApprovalAlways(reason)
+            }
+            Ok(ApprovalRequirement::RequireApproval(reason)) => {
+                ApprovalRequirement::RequireApproval(reason)
+            }
             Ok(ApprovalRequirement::AutoApprove) => match base {
-                ApprovalRequirement::RequireApproval(reason) => ApprovalRequirement::RequireApprovalAlways(reason),
+                ApprovalRequirement::RequireApproval(reason) => {
+                    ApprovalRequirement::RequireApprovalAlways(reason)
+                }
                 other => other,
             },
             Err(_) => base,
@@ -150,7 +159,11 @@ impl Tool for WriteFileTool {
         };
 
         // Backup before write (git checkpoint + file-level backup)
-        ctx.file_history.lock().await.backup_before_write(&path.to_string_lossy()).await;
+        ctx.file_history
+            .lock()
+            .await
+            .backup_before_write(&path.to_string_lossy())
+            .await;
 
         // Check if overwriting existing file — build appropriate output message
         let overwrite_info = if path.exists() {
@@ -175,7 +188,11 @@ impl Tool for WriteFileTool {
             let sign = if diff >= 0 { "+" } else { "" };
             let mut msg = format!(
                 "Overwrote {} (was {} lines, now {} lines, {}{})",
-                path.display(), old_lines, new_lines, sign, diff
+                path.display(),
+                old_lines,
+                new_lines,
+                sign,
+                diff
             );
             // Warn if significant content reduction (might have lost code)
             if old_lines > 20 && new_lines < old_lines / 2 {
@@ -186,7 +203,12 @@ impl Tool for WriteFileTool {
             }
             msg
         } else {
-            format!("Created new file {} ({} bytes, {} lines)", path.display(), bytes, new_lines)
+            format!(
+                "Created new file {} ({} bytes, {} lines)",
+                path.display(),
+                bytes,
+                new_lines
+            )
         };
 
         Ok(ToolResult {

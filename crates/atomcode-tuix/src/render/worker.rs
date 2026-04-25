@@ -207,11 +207,7 @@ fn run_worker(mut inner: Box<dyn Renderer>, cmd_rx: mpsc::Receiver<RenderCmd>) {
                 inner.flush_deferred();
                 let d = t0.elapsed();
                 if d.as_micros() > 100 {
-                    crate::tuix_trace!(
-                        "REN",
-                        "FlushDeferred deferred={}µs",
-                        d.as_micros()
-                    );
+                    crate::tuix_trace!("REN", "FlushDeferred deferred={}µs", d.as_micros());
                 }
             }
             RenderCmd::Resize(cols, rows) => {

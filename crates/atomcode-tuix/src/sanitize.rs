@@ -22,7 +22,7 @@ pub fn scrub_controls(input: &str) -> String {
                     match chars.peek() {
                         Some(&'[') => {
                             chars.next(); // consume [
-                            // CSI: params, intermediates, final byte 0x40..=0x7E
+                                          // CSI: params, intermediates, final byte 0x40..=0x7E
                             while let Some(&p) = chars.peek() {
                                 chars.next();
                                 if ('\x40'..='\x7E').contains(&p) {
@@ -32,7 +32,7 @@ pub fn scrub_controls(input: &str) -> String {
                         }
                         Some(&']') => {
                             chars.next(); // consume ]
-                            // OSC: end on BEL (\x07) or ST (ESC \)
+                                          // OSC: end on BEL (\x07) or ST (ESC \)
                             while let Some(&p) = chars.peek() {
                                 chars.next();
                                 if p == '\x07' {

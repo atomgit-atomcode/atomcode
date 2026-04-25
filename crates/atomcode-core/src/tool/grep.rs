@@ -19,8 +19,12 @@ struct GrepArgs {
     context: usize,
 }
 
-fn default_context() -> usize { 3 }
-fn default_max_results() -> usize { 50 }
+fn default_context() -> usize {
+    3
+}
+fn default_max_results() -> usize {
+    50
+}
 
 #[async_trait]
 impl Tool for GrepTool {
@@ -136,8 +140,8 @@ impl Tool for GrepTool {
 
         // Walk files using ignore crate (respects .gitignore, skips binary, multi-threaded)
         let walker = WalkBuilder::new(&resolved)
-            .hidden(true)        // skip hidden files
-            .git_ignore(true)    // respect .gitignore
+            .hidden(true) // skip hidden files
+            .git_ignore(true) // respect .gitignore
             .git_global(true)
             .git_exclude(true)
             .build();
@@ -160,8 +164,10 @@ impl Tool for GrepTool {
 
             // Skip known noise directories/files not covered by .gitignore
             let path_str = file_path.to_string_lossy();
-            if path_str.contains("/datalog/") || path_str.ends_with(".log")
-                || path_str.contains("/target/") || path_str.contains("/dist/")
+            if path_str.contains("/datalog/")
+                || path_str.ends_with(".log")
+                || path_str.contains("/target/")
+                || path_str.contains("/dist/")
                 || path_str.contains("/node_modules/")
             {
                 continue;
@@ -192,7 +198,8 @@ impl Tool for GrepTool {
             }
 
             // Format matches with context
-            let rel_path = file_path.strip_prefix(&wd)
+            let rel_path = file_path
+                .strip_prefix(&wd)
                 .unwrap_or(file_path)
                 .to_string_lossy();
 
@@ -207,7 +214,9 @@ impl Tool for GrepTool {
                 }
 
                 for i in start..end {
-                    if shown.contains(&i) { continue; }
+                    if shown.contains(&i) {
+                        continue;
+                    }
                     shown.insert(i);
 
                     let prefix = if i == match_line {
@@ -228,7 +237,8 @@ impl Tool for GrepTool {
         // Annotate matching lines with enclosing function name (tree-sitter)
         let mut searcher = ctx.semantic.lock().await;
         let mut annotated: Vec<String> = Vec::new();
-        let mut sym_cache: std::collections::HashMap<String, Vec<crate::semantic::Symbol>> = std::collections::HashMap::new();
+        let mut sym_cache: std::collections::HashMap<String, Vec<crate::semantic::Symbol>> =
+            std::collections::HashMap::new();
 
         for line in &matches {
             let parts: Vec<&str> = line.splitn(3, ':').collect();
@@ -240,10 +250,13 @@ impl Tool for GrepTool {
                     } else {
                         wd.join(file)
                     };
-                    let symbols = sym_cache.entry(file.to_string()).or_insert_with(|| {
-                        searcher.list_symbols(&abs_file).unwrap_or_default()
-                    });
-                    if let Some(sym) = symbols.iter().find(|s| line_no >= s.start_line && line_no <= s.end_line) {
+                    let symbols = sym_cache
+                        .entry(file.to_string())
+                        .or_insert_with(|| searcher.list_symbols(&abs_file).unwrap_or_default());
+                    if let Some(sym) = symbols
+                        .iter()
+                        .find(|s| line_no >= s.start_line && line_no <= s.end_line)
+                    {
                         annotated.push(format!("{}  ← in {}()", line, sym.name));
                         continue;
                     }
@@ -261,7 +274,10 @@ impl Tool for GrepTool {
         }
 
         if annotated.is_empty() {
-            output.push_str(&format!("No matches found for '{}' in {}", parsed.pattern, path));
+            output.push_str(&format!(
+                "No matches found for '{}' in {}",
+                parsed.pattern, path
+            ));
             output.push_str(&format!(" ({} files searched)", files_searched));
         } else {
             let total = annotated.len();
@@ -300,9 +316,15 @@ impl GrepTool {
             return None;
         }
 
-        let mut out = format!("[Graph: {} definitions for '{}']\n", symbols.len(), query_word);
+        let mut out = format!(
+            "[Graph: {} definitions for '{}']\n",
+            symbols.len(),
+            query_word
+        );
         for sym in symbols.iter().take(5) {
-            let rel = sym.file.strip_prefix(wd)
+            let rel = sym
+                .file
+                .strip_prefix(wd)
                 .unwrap_or(&sym.file)
                 .to_string_lossy();
             out.push_str(&format!(
@@ -332,28 +354,43 @@ impl GrepTool {
 /// - "error.*line" → None  (too generic)
 /// - "console\\.log" → None  (too generic)
 fn extract_graph_candidates(pattern: &str) -> Option<String> {
-    let skip_keywords = ["pub", "fn", "struct", "enum", "impl", "use", "let", "const",
-        "async", "trait", "type", "mod", "crate", "self", "super", "for", "def", "class",
-        "function", "var", "import", "from", "export", "return", "match", "where",
-        "static", "mut", "ref", "true", "false", "none", "some", "null", "this",
-        "not", "and", "the", "with"];
+    let skip_keywords = [
+        "pub", "fn", "struct", "enum", "impl", "use", "let", "const", "async", "trait", "type",
+        "mod", "crate", "self", "super", "for", "def", "class", "function", "var", "import",
+        "from", "export", "return", "match", "where", "static", "mut", "ref", "true", "false",
+        "none", "some", "null", "this", "not", "and", "the", "with",
+    ];
 
     let mut best: Option<String> = None;
     let mut best_len = 0;
 
     for word in pattern.split(|c: char| !c.is_ascii_alphanumeric() && c != '_') {
         let w = word.trim();
-        if w.len() < 4 { continue; }
-        if !w.chars().next().map(|c| c.is_ascii_alphabetic() || c == '_').unwrap_or(false) { continue; }
-        if !w.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') { continue; }
-        if skip_keywords.contains(&w.to_lowercase().as_str()) { continue; }
+        if w.len() < 4 {
+            continue;
+        }
+        if !w
+            .chars()
+            .next()
+            .map(|c| c.is_ascii_alphabetic() || c == '_')
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        if !w.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            continue;
+        }
+        if skip_keywords.contains(&w.to_lowercase().as_str()) {
+            continue;
+        }
 
         let has_underscore = w.contains('_');
         // Require real CamelCase (lower→upper transition like "SearchFilter")
         // not just a capitalized word ("Structured").
-        let has_camel_transition = w.as_bytes().windows(2).any(|pair| {
-            pair[0].is_ascii_lowercase() && pair[1].is_ascii_uppercase()
-        });
+        let has_camel_transition = w
+            .as_bytes()
+            .windows(2)
+            .any(|pair| pair[0].is_ascii_lowercase() && pair[1].is_ascii_uppercase());
 
         if !has_underscore && !has_camel_transition {
             continue;
@@ -374,13 +411,22 @@ mod tests {
 
     #[test]
     fn snake_case_identifier() {
-        assert_eq!(extract_graph_candidates("fetch_weather"), Some("fetch_weather".into()));
+        assert_eq!(
+            extract_graph_candidates("fetch_weather"),
+            Some("fetch_weather".into())
+        );
     }
 
     #[test]
     fn camel_case_identifier() {
-        assert_eq!(extract_graph_candidates("SearchFilter"), Some("SearchFilter".into()));
-        assert_eq!(extract_graph_candidates("NdarrayMixin"), Some("NdarrayMixin".into()));
+        assert_eq!(
+            extract_graph_candidates("SearchFilter"),
+            Some("SearchFilter".into())
+        );
+        assert_eq!(
+            extract_graph_candidates("NdarrayMixin"),
+            Some("NdarrayMixin".into())
+        );
     }
 
     #[test]
@@ -390,7 +436,10 @@ mod tests {
 
     #[test]
     fn plain_english_rejected() {
-        assert_eq!(extract_graph_candidates("Structured ndarray gets viewed"), None);
+        assert_eq!(
+            extract_graph_candidates("Structured ndarray gets viewed"),
+            None
+        );
         assert_eq!(extract_graph_candidates("error"), None);
         assert_eq!(extract_graph_candidates("table"), None);
         assert_eq!(extract_graph_candidates("search"), None);
@@ -411,8 +460,14 @@ mod tests {
 
     #[test]
     fn keyword_then_identifier() {
-        assert_eq!(extract_graph_candidates("pub struct QueryIntent"), Some("QueryIntent".into()));
-        assert_eq!(extract_graph_candidates("def process_data"), Some("process_data".into()));
+        assert_eq!(
+            extract_graph_candidates("pub struct QueryIntent"),
+            Some("QueryIntent".into())
+        );
+        assert_eq!(
+            extract_graph_candidates("def process_data"),
+            Some("process_data".into())
+        );
     }
 
     #[test]
@@ -437,6 +492,9 @@ mod tests {
     #[test]
     fn not_prefix_rejected() {
         // "not data_is_mixin" — "not" is a keyword, "data_is_mixin" has underscore → match
-        assert_eq!(extract_graph_candidates("not data_is_mixin"), Some("data_is_mixin".into()));
+        assert_eq!(
+            extract_graph_candidates("not data_is_mixin"),
+            Some("data_is_mixin".into())
+        );
     }
 }

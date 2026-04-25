@@ -33,7 +33,8 @@ impl Tool for UseSkillTool {
                 Use this when a task matches a skill's purpose — the skill provides \
                 detailed, reusable instructions that guide how to complete the task. \
                 Available skills are listed in the system prompt under 'Available Skills'. \
-                Returns the expanded skill content for you to follow.".to_string(),
+                Returns the expanded skill content for you to follow."
+                .to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -59,7 +60,10 @@ impl Tool for UseSkillTool {
         let parsed: UseSkillArgs = serde_json::from_str(args)?;
 
         let expanded = {
-            let registry = self.registry.read().map_err(|e| anyhow::anyhow!("registry lock: {}", e))?;
+            let registry = self
+                .registry
+                .read()
+                .map_err(|e| anyhow::anyhow!("registry lock: {}", e))?;
             match registry.get(&parsed.name) {
                 Some(skill) => {
                     if skill.disable_model_invocation {

@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 atomcode-core = { path = "../atomcode-core" }
+atomcode-telemetry = { path = "../atomcode-telemetry" }
 
 # HTTP
 axum = { version = "0.7", features = ["macros"] }

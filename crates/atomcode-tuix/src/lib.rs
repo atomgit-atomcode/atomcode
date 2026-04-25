@@ -21,11 +21,11 @@ use atomcode_core::agent::AgentHandle;
 use atomcode_core::config::Config;
 use atomcode_core::tool::ToolContext;
 use crossterm::{
-    execute,
     event::{
         DisableBracketedPaste, EnableBracketedPaste, KeyboardEnhancementFlags,
         PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
+    execute,
 };
 use std::io;
 use tokio::sync::mpsc;
@@ -34,7 +34,9 @@ use crate::commands::CommandRegistry;
 use crate::event_loop::{run_loop, LoopCtx};
 use crate::input::history::History;
 use crate::input::reader;
-use crate::render::{plain::PlainRenderer, retained::RetainedRenderer, worker::TaskRenderer, Renderer};
+use crate::render::{
+    plain::PlainRenderer, retained::RetainedRenderer, worker::TaskRenderer, Renderer,
+};
 use crate::terminal::TerminalCaps;
 
 /// RAII guard: enables raw mode + bracketed paste on construction,
@@ -160,6 +162,9 @@ pub async fn run(
     _tool_context: ToolContext,
     working_dir: std::path::PathBuf,
     _session_to_continue: Option<atomcode_core::session::Session>,
+    mcp_registry: Option<std::sync::Arc<atomcode_core::mcp::McpRegistry>>,
+    mcp_connect_rx: Option<tokio::sync::mpsc::UnboundedReceiver<atomcode_core::mcp::McpConnectEvent>>,
+    telemetry: std::sync::Arc<atomcode_telemetry::Telemetry>,
 ) -> Result<()> {
     let caps = TerminalCaps::probe();
     let _guard = TerminalGuard::activate(caps)?;
@@ -172,7 +177,22 @@ pub async fn run(
     // TTY → retained-mode Ink-style cell-diff renderer.
     // Non-TTY (pipe, CI, dumb terminal) → PlainRenderer, which
     // just writes plain text without ANSI cursor positioning.
-    let inner: Box<dyn Renderer> = if caps.tty {
+    //
+    // `ATOMCODE_PLAIN=1` (or any non-empty value) forces PlainRenderer
+    // even on a TTY — escape hatch for terminals where the retained
+    // path's DECSTBM scroll region / cursor positioning misbehaves
+    // (notably reported on legacy Windows conhost: the fixed footer
+    // scrolls off-screen, content appears duplicated, viewport drifts
+    // upward on each redraw). PlainRenderer does no cursor positioning
+    // and no scroll-region tricks, so it works on any terminal that
+    // can print bytes — at the cost of losing the pinned input box,
+    // live spinner, and slash-menu palette. All commands and agent
+    // functionality are unchanged.
+    let force_plain = std::env::var("ATOMCODE_PLAIN")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .is_some();
+    let inner: Box<dyn Renderer> = if caps.tty && !force_plain {
         Box::new(RetainedRenderer::new(caps))
     } else {
         Box::new(PlainRenderer::new())
@@ -318,6 +338,10 @@ pub async fn run(
         pending_new_issue: None,
         pending_run_codingplan: false,
         pending_open_provider_wizard: false,
+        mcp_registry,
+        mcp_connect_rx,
+        mcp_reload: None,
+        telemetry,
     };
 
     // CodingPlan drift monitor — kick off a startup check if the current

@@ -121,6 +121,10 @@ Connect to any LLM that supports OpenAI's function-calling API:
 
 See [Permission Model](./docs/security/permission-model.md) for the full design and current boundaries.
 
+### Privacy
+
+- 📊 Anonymous telemetry (opt-out) — see [docs/telemetry.md](docs/telemetry.md)
+
 ## Installation
 
 ### From Source (recommended)
@@ -293,9 +297,10 @@ atomcode/
       session/         # Persistent sessions
       skill.rs         # User-defined skills
 
-    atomcode-tui/      # Terminal UI — ratatui + crossterm
-      app.rs           # App state machine
-      ui/              # Render: chat, input, status bar, markdown
+    atomcode-tuix/     # Terminal UI — retained-mode renderer (CC-style normal mode)
+      event_loop/      # App state machine, command dispatch
+      render/          # Cell-based renderer, diff, retained-mode frame loop
+      modals/          # Picker UIs (dir, model, session, provider, issue)
 
     atomcode-cli/      # Binary entry point (TUI + headless -p mode)
       main.rs          # CLI args, first-run wizard, launch
@@ -376,7 +381,7 @@ cargo test
 
 # Run tests for a specific crate
 cargo test -p atomcode-core
-cargo test -p atomcode-tui
+cargo test -p atomcode-tuix
 
 # Run a specific test
 cargo test -p atomcode-core test_name
@@ -450,7 +455,7 @@ Contributions are welcome! AtomCode is in active development.
 
 - **Add a new tool** — implement the `Tool` trait in `crates/atomcode-core/src/tool/`
 - **Add a new provider** — implement `LlmProvider` in `crates/atomcode-core/src/provider/`
-- **Improve the UI** — rendering lives in `crates/atomcode-tui/src/ui/`
+- **Improve the UI** — rendering lives in `crates/atomcode-tuix/src/render/`
 - **Fix bugs** — check [Issues](https://atomgit.com/atomgit_atomcode/atomcode/issues) for open bugs
 
 ## License

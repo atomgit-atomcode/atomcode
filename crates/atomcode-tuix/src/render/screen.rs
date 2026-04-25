@@ -117,6 +117,15 @@ impl Screen {
         self.cursor = Some((row, col));
     }
 
+    /// Toggle DECTCEM cursor visibility for the next `render_diff`.
+    /// Used to hide the cursor while a live body spinner is animating
+    /// (otherwise it sits at the end of "Pondering… · 5s" and blinks).
+    /// `render_diff` re-emits this every frame, so flipping the flag
+    /// once is enough — every subsequent paint reasserts it.
+    pub fn set_cursor_visible(&mut self, visible: bool) {
+        self.cursor_visible = visible;
+    }
+
     /// Scroll the top `bottom` rows up by `n`. Rows `[0..n)` are
     /// dropped; rows `[n..bottom)` slide to `[0..bottom-n)`; rows
     /// `[bottom-n..bottom)` become blank, ready for new content.
@@ -238,8 +247,8 @@ mod tests {
         push_str_cells(&mut cells, "x", &CellStyle::default());
         s.draw_row(0, 0, &cells);
         let _ = s.render_diff(); // first frame emits 'x'
-        // Redraw identical content — the render_diff above cleared
-        // the scratch to blank, so we need to re-push.
+                                 // Redraw identical content — the render_diff above cleared
+                                 // the scratch to blank, so we need to re-push.
         s.draw_row(0, 0, &cells);
         let bytes = s.render_diff();
         let out = String::from_utf8_lossy(&bytes);
@@ -261,7 +270,7 @@ mod tests {
         s.draw_row(0, 0, &a);
         s.draw_row(1, 0, &b);
         let _ = s.render_diff(); // swaps into prev, clears scratch
-        // Re-draw the same content then scroll.
+                                 // Re-draw the same content then scroll.
         s.draw_row(0, 0, &a);
         s.draw_row(1, 0, &b);
         s.scroll_up(2, 1);
@@ -322,10 +331,6 @@ mod tests {
         s.set_cursor(2, 5);
         let bytes = s.render_diff();
         let out = String::from_utf8_lossy(&bytes);
-        assert!(
-            out.contains("\x1b[2;5H"),
-            "cursor park missing: {:?}",
-            out
-        );
+        assert!(out.contains("\x1b[2;5H"), "cursor park missing: {:?}", out);
     }
 }

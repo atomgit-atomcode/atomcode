@@ -12,7 +12,10 @@ fn main() {
     if let Some(symbols) = s.list_symbols(path) {
         println!("list_symbols 输出 ({} 个符号):", symbols.len());
         for sym in &symbols {
-            println!("  {:30} L{}-{:>4}  ({})", sym.name, sym.start_line, sym.end_line, sym.kind);
+            println!(
+                "  {:30} L{}-{:>4}  ({})",
+                sym.name, sym.start_line, sym.end_line, sym.kind
+            );
         }
     }
 
@@ -23,7 +26,10 @@ fn main() {
     let agent_path = Path::new("crates/atomcode-core/src/tool/bash.rs");
     if let Some(slice) = s.extract_symbol(agent_path, "check_destructive_command") {
         let lines = slice.text.lines().count();
-        println!("extract_symbol 输出: {} (L{}-{}, {} 行)", slice.name, slice.start_line, slice.end_line, lines);
+        println!(
+            "extract_symbol 输出: {} (L{}-{}, {} 行)",
+            slice.name, slice.start_line, slice.end_line, lines
+        );
         println!("--- 函数体 ---");
         println!("{}", slice.text);
         println!("--- END ---");
@@ -37,7 +43,12 @@ fn main() {
     let full_lines = std::fs::read_to_string(big_path).unwrap().lines().count();
     if let Some(skel) = s.skeleton(big_path) {
         let skel_lines = skel.lines().count();
-        println!("原文件: {} 行 → Skeleton: {} 行 (压缩 {}x)", full_lines, skel_lines, full_lines / skel_lines.max(1));
+        println!(
+            "原文件: {} 行 → Skeleton: {} 行 (压缩 {}x)",
+            full_lines,
+            skel_lines,
+            full_lines / skel_lines.max(1)
+        );
         println!("{}", skel);
     }
 
@@ -46,7 +57,12 @@ fn main() {
     let full_lines = std::fs::read_to_string(agent_path).unwrap().lines().count();
     if let Some(skel) = s.skeleton(agent_path) {
         let skel_lines = skel.lines().count();
-        println!("原文件: {} 行 → Skeleton: {} 行 (压缩 {}x)", full_lines, skel_lines, full_lines / skel_lines.max(1));
+        println!(
+            "原文件: {} 行 → Skeleton: {} 行 (压缩 {}x)",
+            full_lines,
+            skel_lines,
+            full_lines / skel_lines.max(1)
+        );
         println!("{}", skel);
     }
 }

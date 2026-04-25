@@ -75,7 +75,8 @@ impl AgentLoop {
             let skills: Vec<String> = registry
                 .invocable_by_llm()
                 .map(|s| {
-                    let hint = s.argument_hint
+                    let hint = s
+                        .argument_hint
                         .as_ref()
                         .map(|h| format!(" {}", h))
                         .unwrap_or_default();
@@ -84,7 +85,9 @@ impl AgentLoop {
                 .collect();
             if !skills.is_empty() {
                 prompt.push_str("\n=== AVAILABLE SKILLS ===\n");
-                prompt.push_str("Use the `use_skill` tool to invoke a skill when relevant to the task.\n");
+                prompt.push_str(
+                    "Use the `use_skill` tool to invoke a skill when relevant to the task.\n",
+                );
                 prompt.push_str(&skills.join("\n"));
                 prompt.push('\n');
             }

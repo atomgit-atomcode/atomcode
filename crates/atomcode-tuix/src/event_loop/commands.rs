@@ -14,14 +14,14 @@
 
 use std::path::PathBuf;
 
-use anyhow::Result;
-use atomcode_core::agent::AgentCommand;
-use atomcode_core::config::Config;
 use super::{save_and_reload, LoopCtx};
 use crate::modals::{DirPicker, IssueWizard, Modal, ModelPicker, ProviderWizard, SessionPicker};
 use crate::render::{Renderer, UiLine};
 use crate::state::UiState;
+use anyhow::Result;
+use atomcode_core::agent::AgentCommand;
 use atomcode_core::config::provider::ProviderConfig;
+use atomcode_core::config::Config;
 
 /// Maximum recent project dirs we keep in memory + persist to disk.
 const MAX_RECENT_DIRS: usize = 5;
@@ -38,7 +38,7 @@ fn build_oauth_provider() -> ProviderConfig {
         max_tokens: None,
         thinking_type: None,
         thinking_keep: None,
-            reasoning_history: None,
+        reasoning_history: None,
         ephemeral: false,
     }
 }
@@ -58,12 +58,30 @@ pub(super) fn execute_slash_command(
     fixissue_pending: &mut Option<atomcode_core::atomgit::IssueRef>,
     fixissue_buffer: &mut String,
 ) -> Result<()> {
+    // `fixissue_pending` / `fixissue_buffer` no longer have a slash-command
+    // entry that consumes them (the `/fixissue` arm was removed; the
+    // `atomcode fixissue` CLI subcommand seeds these via cli/main.rs and
+    // event_loop/mod.rs's AgentEvent handler still drains them on
+    // TurnComplete). They stay in the signature so callers don't have to
+    // change, and so a future restoration of the slash command is a
+    // one-arm-add rather than a refactor.
+    let _ = (&fixissue_pending, &fixissue_buffer);
+
     // Built-in commands are all lowercase ASCII; normalise the user's
     // input so `/SESSION`, `/Session`, `/sEssIon` all hit the same arm
     // as `/session`. `arg` is left untouched — paths / URLs are
     // case-sensitive in general.
     let cmd_lower = cmd.to_ascii_lowercase();
     let cmd = cmd_lower.as_str();
+
+    // Emit use_command telemetry before dispatch so the event fires
+    // regardless of whether the command succeeds or errors out.
+    {
+        use atomcode_telemetry::Event;
+        let cmd_name = cmd.trim_start_matches('/').to_string();
+        ctx.telemetry.track(Event::UseCommand { type_: cmd_name });
+    }
+
     match cmd {
         "quit" | "exit" => {
             ctx.agent.cmd_tx.send(AgentCommand::Shutdown).ok();
@@ -163,9 +181,12 @@ pub(super) fn execute_slash_command(
             // New session = new session file on disk. Old session
             // (already saved at its last TurnComplete) stays on disk so
             // it can still be `/resume`d; we just stop writing into it.
-            ctx.current_session = atomcode_core::session::Session::default_session(
-                ctx.working_dir.clone(),
-            );
+            ctx.current_session =
+                atomcode_core::session::Session::default_session(ctx.working_dir.clone());
+            // Bind telemetry session_id to the new session's UUID.
+            if let Ok(uuid) = uuid::Uuid::parse_str(ctx.current_session.id.as_str()) {
+                ctx.telemetry.set_session_id(uuid);
+            }
             // `reset()` wipes the terminal AND the renderer's cached
             // footer/stream state, so the next Welcome renders against
             // a known (row 1, col 1) anchor. This is what makes
@@ -181,9 +202,7 @@ pub(super) fn execute_slash_command(
         }
         "model" => {
             if ctx.config.providers.is_empty() {
-                renderer.render(UiLine::CommandOutput(
-                    "  No providers configured.\n".into(),
-                ));
+                renderer.render(UiLine::CommandOutput("  No providers configured.\n".into()));
                 renderer.flush();
             } else {
                 *active_modal = Some(Box::new(ModelPicker::open(&ctx.config)));
@@ -247,7 +266,9 @@ pub(super) fn execute_slash_command(
             renderer.flush();
         }
         "undo" => {
-            renderer.render(UiLine::CommandOutput("  Undo is not yet supported.\n".into()));
+            renderer.render(UiLine::CommandOutput(
+                "  Undo is not yet supported.\n".into(),
+            ));
             renderer.flush();
         }
         "cost" => {
@@ -263,11 +284,23 @@ pub(super) fn execute_slash_command(
             // (the exact bytes the most recent turn sent). Useful when
             // the model is misbehaving and you want to verify what's
             // actually in the prompt.
+            //
+            // The cached ContextSnapshot only refreshes on LLM round-trips.
+            // Between turns — or after out-of-turn mutations like
+            // `inject_post_compress_state` — the cache lags the actual
+            // conversation. Dispatch a refresh and render when the
+            // resulting rich stats event lands (see `handle_agent_event`
+            // → `AgentEvent::ContextStats`). `pending_context_render =
+            // Some(show_prompt)` marks the pending request; cleared after
+            // the event handler fires the report. If the agent is busy
+            // in a turn, the next rich emission (at the next LLM call)
+            // serves the render — still fresh, just a tick later.
             let show_prompt = arg.trim().eq_ignore_ascii_case("prompt");
-            renderer.render(UiLine::CommandOutput(
-                render_context_report(state, ctx, show_prompt),
-            ));
-            renderer.flush();
+            state.pending_context_render = Some(show_prompt);
+            ctx.agent
+                .cmd_tx
+                .send(AgentCommand::RefreshContextStats)
+                .ok();
         }
         "compact" => {
             let prompt = (!arg.trim().is_empty()).then(|| arg.trim().to_string());
@@ -275,10 +308,7 @@ pub(super) fn execute_slash_command(
             // ("nothing to compact" / "compacted — dropped N messages").
             // Don't pre-render a placeholder — the agent's reply could
             // contradict it when the conversation is too short.
-            ctx.agent
-                .cmd_tx
-                .send(AgentCommand::Compact { prompt })
-                .ok();
+            ctx.agent.cmd_tx.send(AgentCommand::Compact { prompt }).ok();
         }
         "login" => {
             run_login_flow(renderer, ctx)?;
@@ -348,9 +378,12 @@ pub(super) fn execute_slash_command(
                         );
                     }
                     Err(e) => {
-                        let _ = ctx.upgrade_tx.send(
-                            atomcode_core::self_update::UpgradeEvent::Failed(format!("{:#}", e)),
-                        );
+                        let _ =
+                            ctx.upgrade_tx
+                                .send(atomcode_core::self_update::UpgradeEvent::Failed(format!(
+                                    "{:#}",
+                                    e
+                                )));
                     }
                 }
             } else {
@@ -363,9 +396,7 @@ pub(super) fn execute_slash_command(
                     renderer.flush();
                     return Ok(());
                 }
-                renderer.render(UiLine::CommandOutput(
-                    "  正在检查更新...\n".into(),
-                ));
+                renderer.render(UiLine::CommandOutput("  正在检查更新...\n".into()));
                 renderer.flush();
                 let current = format!("v{}", env!("CARGO_PKG_VERSION"));
                 let tx = ctx.upgrade_tx.clone();
@@ -376,61 +407,35 @@ pub(super) fn execute_slash_command(
                     if let Err(e) =
                         atomcode_core::self_update::run_upgrade(current, force, tx.clone()).await
                     {
-                        let _ = tx.send(atomcode_core::self_update::UpgradeEvent::Failed(
-                            format!("{:#}", e),
-                        ));
+                        let _ = tx.send(atomcode_core::self_update::UpgradeEvent::Failed(format!(
+                            "{:#}",
+                            e
+                        )));
                     }
                 });
             }
         }
-        "fixissue" => {
-            // `/fixissue <url>` — fetch the issue via AtomGit API (blocking,
-            // ~1s), verify the current user is the assignee, then inject a
-            // synthesised prompt into the agent as if the user typed it.
-            // Not-assigned / fetch-fail paths print the reason and stay Idle.
-            let url = arg.trim();
-            if url.is_empty() {
-                renderer.render(UiLine::CommandOutput(
-                    "  Usage: /fixissue <issue-url>\n  Example: /fixissue https://atomgit.com/owner/repo/issues/42\n  Or use the interactive wizard: /issue\n".into(),
-                ));
-                renderer.flush();
-            } else {
-                launch_fixissue(url, state, ctx, renderer, fixissue_pending, fixissue_buffer);
-            }
-        }
         "issue" => {
-            // Two-step wizard to create a NEW issue on AtomGit in the
-            // current repo. Step 1 collects a title (required), step 2
-            // collects a description (required, Shift+Enter for
-            // newlines). On submit the event loop's post-close branch
-            // POSTs `/repos/{owner}/{repo}/issues` and echoes the new
-            // issue URL into scrollback.
+            // Two-step wizard to file a NEW issue against the **atomcode
+            // upstream repo** (atomgit_atomcode/atomcode), NOT against
+            // the user's current working project. Use case is in-tool
+            // bug reports / feature requests for atomcode itself; using
+            // cwd would be confusing (a user reporting an atomcode bug
+            // while in some unrelated repo would land their issue in
+            // the wrong place, or get blocked by cwd validation).
             //
-            // cwd must be an atomgit.com checkout — otherwise we have
-            // no way to know which repo to file the issue against.
-            // Abort early with a clear message rather than opening the
-            // wizard and then failing at the POST step.
+            // Step 1 collects a title (required), step 2 collects a
+            // description (required, Shift+Enter for newlines). On
+            // submit the event loop's post-close branch POSTs
+            // `/repos/atomgit_atomcode/atomcode/issues` and echoes the
+            // new issue URL into scrollback.
             let _ = arg; // reserved for future options (e.g. --template)
-            match atomcode_core::atomgit::url::detect_cwd_atomgit_repo(&ctx.working_dir) {
-                Ok(Some(repo)) => {
-                    let mut wiz = IssueWizard::open(repo.owner, repo.repo);
-                    wiz.emit_prompt(renderer);
-                    *active_modal = Some(Box::new(wiz));
-                }
-                Ok(None) => {
-                    renderer.render(UiLine::CommandOutput(
-                        "  /issue needs cwd to be a clone of an atomgit.com repo (origin remote).\n  cd into one first, or create the issue via the web UI.\n".into(),
-                    ));
-                    renderer.flush();
-                }
-                Err(e) => {
-                    renderer.render(UiLine::CommandOutput(format!(
-                        "  /issue failed to detect repo: {:#}\n",
-                        e
-                    )));
-                    renderer.flush();
-                }
-            }
+            let mut wiz = IssueWizard::open(
+                atomcode_core::atomgit::UPSTREAM_OWNER.to_string(),
+                atomcode_core::atomgit::UPSTREAM_REPO.to_string(),
+            );
+            wiz.emit_prompt(renderer);
+            *active_modal = Some(Box::new(wiz));
         }
         "cd" => {
             // Bare `/cd` — open the interactive history picker (matches legacy
@@ -466,6 +471,222 @@ pub(super) fn execute_slash_command(
             }
             renderer.flush();
         }
+        "background" => {
+            // Send the task to the agent loop; result comes back as
+            // AgentEvent::BackgroundComplete (rendered in event_loop/mod.rs).
+            // The agent loop guards against concurrent background tasks via
+            // an AtomicBool — second invocation while one is running gets
+            // an Error event back.
+            let task = arg.trim();
+            if task.is_empty() {
+                renderer.render(UiLine::CommandOutput(
+                    "  Usage: /background <task description>\n".to_string(),
+                ));
+                renderer.flush();
+                return Ok(());
+            }
+            ctx.agent
+                .cmd_tx
+                .send(AgentCommand::Background { task: task.to_string() })
+                .ok();
+        }
+        "init" => {
+            // Generate .atomcode.md from project structure. Refuses to
+            // overwrite by default — `/init --force` opts in. The file is
+            // picked up by agent::prompt next time the system prompt is
+            // built; in-flight turns finish on the old prompt.
+            let target = ctx.working_dir.join(".atomcode.md");
+            let force = matches!(arg.trim(), "--force" | "force");
+            if target.exists() && !force {
+                renderer.render(UiLine::CommandOutput(format!(
+                    "  {} already exists. Use `/init --force` to overwrite.\n",
+                    target.display()
+                )));
+                renderer.flush();
+                return Ok(());
+            }
+            let content = atomcode_core::init::generate_project_instructions(&ctx.working_dir);
+            match std::fs::write(&target, &content) {
+                Ok(()) => {
+                    renderer.render(UiLine::CommandOutput(format!(
+                        "  Wrote {} ({} bytes). Edit to customise; takes effect on next session.\n",
+                        target.display(),
+                        content.len()
+                    )));
+                }
+                Err(e) => {
+                    renderer.render(UiLine::Error(format!("  /init failed: {}\n", e)));
+                }
+            }
+            renderer.flush();
+        }
+        "mcp" => {
+            let sub = arg.trim();
+            if sub.eq_ignore_ascii_case("reload") {
+                // Preflight: parse merged MCP config so we can show progress immediately.
+                // (Connection attempts happen in background and may take up to timeout_ms.)
+                let configs = match atomcode_core::mcp::load_mcp_config(&ctx.working_dir) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        renderer.render(UiLine::Error(format!(
+                            "mcp reload failed: failed to load .mcp.json / ~/.atomcode/mcp.json: {:#}",
+                            e
+                        )));
+                        renderer.flush();
+                        return Ok(());
+                    }
+                };
+
+                let mut header = format!("  Reloading MCP servers... ({} configured)\n", configs.len());
+                if !configs.is_empty() {
+                    header.push_str("  Connecting:\n");
+                    for c in &configs {
+                        header.push_str(&format!("    - {}  connecting...\n", c.name));
+                    }
+                } else {
+                    header.push_str("  (no MCP servers configured)\n");
+                }
+                renderer.render(UiLine::CommandOutput(header));
+                renderer.flush();
+
+                // 1) Drop all previously-registered MCP tools so any adapters holding the
+                // old registry Arc are released and stdio child processes can be killed.
+                let removed = tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(async {
+                        ctx.agent.tool_registry.unregister_prefix("mcp__").await
+                    })
+                });
+
+                // 2) Drop old registry + event receiver (stop consuming old events).
+                ctx.mcp_connect_rx = None;
+                ctx.mcp_registry = None;
+                ctx.mcp_reload = None;
+
+                // If no servers are configured, we're done after cleanup.
+                if configs.is_empty() {
+                    renderer.render(UiLine::CommandOutput(format!(
+                        "  ✓ Cleared {} MCP tools. No servers to connect.\n",
+                        removed
+                    )));
+                    renderer.flush();
+                    return Ok(());
+                }
+
+                // 2.5) Arm progress tracker (event loop prints a summary once all results land).
+                ctx.mcp_reload = Some(super::McpReloadProgress {
+                    total: configs.len(),
+                    done: 0,
+                    connected: 0,
+                    failed: 0,
+                    started_at: std::time::Instant::now(),
+                });
+
+                // 3) Recreate registry and event channel. Connections happen in background
+                // and will stream Connected/Failed events into scrollback (event loop select!).
+                use atomcode_core::mcp::McpConnectEvent;
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<McpConnectEvent>();
+                let registry = atomcode_core::mcp::McpRegistry::from_config_background_with_events(
+                    &ctx.working_dir,
+                    Some(tx),
+                );
+                ctx.mcp_registry = Some(std::sync::Arc::new(registry));
+                ctx.mcp_connect_rx = Some(rx);
+
+                renderer.render(UiLine::CommandOutput(format!(
+                    "  ✓ Cleared {} MCP tools. Reconnecting in background...\n",
+                    removed
+                )));
+                renderer.flush();
+                return Ok(());
+            }
+
+            // `/mcp tools <server>`: list remote tool names for a connected server.
+            // This is intentionally separate from a global `/tools` so we keep the surface minimal.
+            if let Some(rest) = sub.strip_prefix("tools") {
+                let server = rest.trim();
+                if server.is_empty() {
+                    renderer.render(UiLine::CommandOutput(
+                        "  Usage: /mcp tools <server>\n  Example: /mcp tools filesystem\n".into(),
+                    ));
+                    renderer.flush();
+                    return Ok(());
+                }
+                if let Some(registry) = &ctx.mcp_registry {
+                    let server = server.to_string();
+                    let server_for_msg = server.clone();
+                    let registry = registry.clone();
+                    let tx = registry.event_sender();
+                    tokio::spawn(async move {
+                        let tools = match tokio::time::timeout(
+                            std::time::Duration::from_secs(15),
+                            registry.list_tools_for_server(&server),
+                        )
+                        .await
+                        {
+                            Ok(v) => v,
+                            Err(_) => {
+                                if let Some(tx) = &tx {
+                                    let _ = tx.send(atomcode_core::mcp::McpConnectEvent::Warning {
+                                        name: server.clone(),
+                                        message:
+                                            "tools/list timed out after 15s (server connected but tools not listed yet)"
+                                                .to_string(),
+                                    });
+                                }
+                                return;
+                            }
+                        };
+                        let mut msg = format!("tools:\n");
+                        if tools.is_empty() {
+                            msg.push_str("  (none — tools/list may have failed, timed out, or returned empty)\n");
+                        } else {
+                            for t in tools {
+                                msg.push_str(&format!("  - mcp__{}__{}\n", server, t.tool_name));
+                            }
+                        }
+                        if let Some(tx) = tx {
+                            let _ = tx.send(atomcode_core::mcp::McpConnectEvent::Warning {
+                                name: server,
+                                message: msg.trim_end().to_string(),
+                            });
+                        }
+                    });
+                    renderer.render(UiLine::CommandOutput(format!(
+                        "  Listing MCP tools for '{}'...\n",
+                        server_for_msg
+                    )));
+                } else {
+                    renderer.render(UiLine::CommandOutput(
+                        "  No MCP registry loaded. Run /mcp reload first.\n".into(),
+                    ));
+                }
+                renderer.flush();
+                return Ok(());
+            }
+
+            // Default: show status.
+            if let Some(registry) = &ctx.mcp_registry {
+                let statuses = tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(registry.server_statuses())
+                });
+                if statuses.is_empty() {
+                    renderer.render(UiLine::CommandOutput(
+                        "  No MCP servers configured.\n".into(),
+                    ));
+                } else {
+                    let mut txt = String::from("  MCP Servers:\n");
+                    for (name, status) in statuses {
+                        txt.push_str(&format!("    {}  {}\n", name, status));
+                    }
+                    renderer.render(UiLine::CommandOutput(txt));
+                }
+            } else {
+                renderer.render(UiLine::CommandOutput(
+                    "  No MCP servers configured.\n".into(),
+                ));
+            }
+            renderer.flush();
+        }
         other => {
             renderer.render(UiLine::Error(format!("Unknown command: /{}", other)));
             renderer.flush();
@@ -481,7 +702,7 @@ pub(super) fn execute_slash_command(
 /// (snapshot + model name + flag) out of state/ctx. Split for
 /// unit-testability: the inner function takes plain values and can be
 /// asserted on directly.
-fn render_context_report(state: &UiState, ctx: &LoopCtx, show_prompt: bool) -> String {
+pub(super) fn render_context_report(state: &UiState, ctx: &LoopCtx, show_prompt: bool) -> String {
     format_context_report(state.last_context.as_ref(), &ctx.model_name, show_prompt)
 }
 
@@ -547,7 +768,8 @@ fn format_context_report(
         return "  Context Usage\n  \n  (run at least one turn first — stats are captured per turn)\n".into();
     };
     if snap.ctx_window == 0 {
-        return "  Context Usage\n  \n  (waiting for first complete turn — partial stats only)\n".into();
+        return "  Context Usage\n  \n  (waiting for first complete turn — partial stats only)\n"
+            .into();
     }
 
     let window = snap.ctx_window;
@@ -561,14 +783,19 @@ fn format_context_report(
     // Cold zone is injected as a System message inside `sent`, so we avoid
     // double-counting: subtract cold from sent for the "messages" bucket.
     let messages = snap.sent_tokens.saturating_sub(cold);
-    let total_used = sys.saturating_add(tools).saturating_add(cold).saturating_add(messages);
+    let total_used = sys
+        .saturating_add(tools)
+        .saturating_add(cold)
+        .saturating_add(messages);
     let free = window.saturating_sub(total_used);
 
     // Horizontal bar: 40 cells, one segment per category with a distinct glyph.
     // Terminals universally render these blocks, no ANSI color required.
     const BAR_WIDTH: usize = 40;
     let cells = |tokens: usize| -> usize {
-        if window == 0 { return 0; }
+        if window == 0 {
+            return 0;
+        }
         (tokens as u128 * BAR_WIDTH as u128 / window as u128) as usize
     };
     let sys_cells = cells(sys);
@@ -580,14 +807,16 @@ fn format_context_report(
     let free_cells = BAR_WIDTH.saturating_sub(used_cells.min(BAR_WIDTH));
 
     let mut bar = String::with_capacity(BAR_WIDTH * 3);
-    bar.push_str(&"▒".repeat(sys_cells));       // system prompt
-    bar.push_str(&"▓".repeat(tools_cells));     // tool defs
-    bar.push_str(&"░".repeat(cold_cells));      // cold zone
-    bar.push_str(&"█".repeat(msg_cells));       // messages
-    bar.push_str(&"·".repeat(free_cells));      // free
+    bar.push_str(&"▒".repeat(sys_cells)); // system prompt
+    bar.push_str(&"▓".repeat(tools_cells)); // tool defs
+    bar.push_str(&"░".repeat(cold_cells)); // cold zone
+    bar.push_str(&"█".repeat(msg_cells)); // messages
+    bar.push_str(&"·".repeat(free_cells)); // free
 
     let pct = |t: usize| -> String {
-        if window == 0 { return "  —".to_string(); }
+        if window == 0 {
+            return "  —".to_string();
+        }
         format!("{:>4.1}%", (t as f64 * 100.0) / window as f64)
     };
     let k = |t: usize| -> String {
@@ -620,12 +849,21 @@ fn format_context_report(
         window = k(window),
         used_pct = used_pct,
         model = model_name,
-        ctx_name = if snap.ctx_name.is_empty() { "default" } else { snap.ctx_name.as_str() },
-        sys_s = k(sys), sys_p = pct(sys),
-        tools_s = k(tools), tools_p = pct(tools),
-        cold_s = k(cold), cold_p = pct(cold),
-        msgs_s = k(messages), msgs_p = pct(messages),
-        free_s = k(free), free_p = pct(free),
+        ctx_name = if snap.ctx_name.is_empty() {
+            "default"
+        } else {
+            snap.ctx_name.as_str()
+        },
+        sys_s = k(sys),
+        sys_p = pct(sys),
+        tools_s = k(tools),
+        tools_p = pct(tools),
+        cold_s = k(cold),
+        cold_p = pct(cold),
+        msgs_s = k(messages),
+        msgs_p = pct(messages),
+        free_s = k(free),
+        free_p = pct(free),
         n_msgs = snap.total_messages,
     );
 
@@ -664,6 +902,13 @@ fn format_context_report(
 /// Run it arms the post-completion hook (`fixissue_pending` +
 /// `fixissue_buffer`), sends `AgentCommand::SendMessage`, and flips
 /// UiState to Streaming via `state.on_submit()`.
+/// Currently unused — the `/fixissue` slash command was removed from
+/// the menu and dispatcher. Kept (with `#[allow(dead_code)]`) so that
+/// a future restoration of the slash command can re-add a one-line
+/// dispatcher arm without re-implementing this whole flow. The
+/// `atomcode fixissue` CLI subcommand uses `atomcode_core::atomgit::fixissue`
+/// directly and does not depend on this function.
+#[allow(dead_code)]
 pub(crate) fn launch_fixissue(
     url: &str,
     state: &mut UiState,
@@ -821,7 +1066,7 @@ pub(crate) fn run_login_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx) -> 
     // The OAuth flow owns the terminal until it returns.
     renderer.suspend_for_external();
 
-    let result = atomcode_core::auth::login()
+    let result = atomcode_core::auth::login(Some(&ctx.telemetry))
         .and_then(|auth| atomcode_core::auth::save_auth(&auth).map(|()| auth));
 
     // Resume: re-enable raw + bracketed-paste AND reset cached state
@@ -851,7 +1096,10 @@ pub(crate) fn run_login_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx) -> 
                 .unwrap_or(&auth.user.username)
                 .to_string();
             let had_provider = !ctx.config.providers.is_empty()
-                && ctx.config.providers.contains_key(&ctx.config.default_provider);
+                && ctx
+                    .config
+                    .providers
+                    .contains_key(&ctx.config.default_provider);
             if !had_provider {
                 let provider_name = "AtomGit".to_string();
                 let provider = build_oauth_provider();
@@ -887,10 +1135,7 @@ pub(crate) fn run_login_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx) -> 
 /// orchestrator with `atomcode codingplan` (CLI). Suspends raw mode so
 /// the OAuth browser callback and any stdout from `auth::login()` don't
 /// collide with the footer-managing renderer.
-pub(crate) fn run_codingplan_flow(
-    renderer: &mut dyn Renderer,
-    ctx: &mut LoopCtx,
-) -> Result<()> {
+pub(crate) fn run_codingplan_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx) -> Result<()> {
     // Same pause / suspend / resume / unpause choreography as /login —
     // the orchestrator may call `auth::login()` which prints to stdout
     // and spawns a browser; that needs cooked stdout + no reader racing
@@ -902,7 +1147,7 @@ pub(crate) fn run_codingplan_flow(
     }
     renderer.suspend_for_external();
 
-    let report = atomcode_core::coding_plan::run(&mut ctx.config);
+    let report = atomcode_core::coding_plan::run(&mut ctx.config, Some(&ctx.telemetry));
 
     renderer.resume_from_external();
     if let Some(reader) = ctx.reader.as_ref() {
@@ -922,8 +1167,7 @@ pub(crate) fn run_codingplan_flow(
                 // Also bump our own last-seen timestamp so the cross-process
                 // sync-check on the next keystroke doesn't redundantly
                 // reload the config we just saved ourselves.
-                ctx.monitor_last_sync_seen =
-                    atomcode_core::coding_plan::read_last_sync();
+                ctx.monitor_last_sync_seen = atomcode_core::coding_plan::read_last_sync();
                 // Sync ctx.model_name with the freshly-picked default so the
                 // status line and the next turn use the right model without
                 // requiring a /reload.
@@ -978,8 +1222,7 @@ mod tests {
     fn absolute_path_ignores_cwd() {
         let (_tmp, _cwd, sub) = make_dirs();
         let alt_cwd = PathBuf::from("/"); // unrelated cwd
-        let got = resolve_cd(sub.to_str().unwrap(), &alt_cwd, None)
-            .expect("absolute resolves");
+        let got = resolve_cd(sub.to_str().unwrap(), &alt_cwd, None).expect("absolute resolves");
         assert_eq!(got, sub);
     }
 
@@ -1000,8 +1243,7 @@ mod tests {
     #[test]
     fn nonexistent_path_errors() {
         let (_tmp, cwd, _sub) = make_dirs();
-        let err = resolve_cd("nope-does-not-exist", &cwd, None)
-            .expect_err("nonexistent errors");
+        let err = resolve_cd("nope-does-not-exist", &cwd, None).expect_err("nonexistent errors");
         assert!(err.contains("nope-does-not-exist"), "got: {}", err);
     }
 
@@ -1010,8 +1252,7 @@ mod tests {
         let (_tmp, cwd, _sub) = make_dirs();
         let file = cwd.join("a.txt");
         std::fs::write(&file, "hi").expect("write");
-        let err = resolve_cd(file.to_str().unwrap(), &cwd, None)
-            .expect_err("file is not a dir");
+        let err = resolve_cd(file.to_str().unwrap(), &cwd, None).expect_err("file is not a dir");
         assert!(err.contains("Not a directory"), "got: {}", err);
     }
 
@@ -1058,7 +1299,7 @@ mod tests {
     fn context_report_renders_full_breakdown() {
         let snap = crate::state::ContextSnapshot {
             system_tokens: 8_000,
-            sent_tokens: 30_000,  // includes cold
+            sent_tokens: 30_000, // includes cold
             tool_defs_tokens: 14_500,
             cold_zone_tokens: 2_000,
             total_messages: 42,
@@ -1079,11 +1320,11 @@ mod tests {
         assert!(out.contains("Messages"));
         assert!(out.contains("Free"));
         // Token values (K formatting)
-        assert!(out.contains("8.0K"));   // system
-        assert!(out.contains("14.5K"));  // tool defs
-        assert!(out.contains("2.0K"));   // cold zone
+        assert!(out.contains("8.0K")); // system
+        assert!(out.contains("14.5K")); // tool defs
+        assert!(out.contains("2.0K")); // cold zone
         assert!(out.contains("128.0K")); // window
-        // Messages count
+                                         // Messages count
         assert!(out.contains("42"));
         // ctx name + model
         assert!(out.contains("default"));
@@ -1107,10 +1348,15 @@ mod tests {
         };
         let out = format_context_report(Some(&snap), "m", false);
         // Messages bucket should be 10K - 3K = 7K, not 10K.
-        let messages_line = out.lines().find(|l| l.contains("Messages"))
+        let messages_line = out
+            .lines()
+            .find(|l| l.contains("Messages"))
             .expect("messages line must exist");
-        assert!(messages_line.contains("7.0K"),
-            "expected Messages=7.0K (sent-cold), got line: {}", messages_line);
+        assert!(
+            messages_line.contains("7.0K"),
+            "expected Messages=7.0K (sent-cold), got line: {}",
+            messages_line
+        );
     }
 
     #[test]
@@ -1132,7 +1378,9 @@ mod tests {
         //      = 120_000 - (20_000 + 20_000 + 0 + 80_000) = 0
         assert!(out.contains("Free"));
         // Should not panic and should render — look for "0" tokens on the Free line
-        let free_line = out.lines().find(|l| l.contains("Free"))
+        let free_line = out
+            .lines()
+            .find(|l| l.contains("Free"))
             .expect("free line must exist");
         assert!(free_line.contains("0"), "free line: {}", free_line);
     }
@@ -1153,10 +1401,14 @@ mod tests {
             system_prompt: "You are AtomCode.\nSOME SENTINEL BYTES".into(),
         };
         let out = format_context_report(Some(&snap), "m", false);
-        assert!(!out.contains("SYSTEM PROMPT"),
-            "SYSTEM PROMPT header must not appear in default /context output");
-        assert!(!out.contains("SOME SENTINEL BYTES"),
-            "raw prompt body must not leak into default /context output");
+        assert!(
+            !out.contains("SYSTEM PROMPT"),
+            "SYSTEM PROMPT header must not appear in default /context output"
+        );
+        assert!(
+            !out.contains("SOME SENTINEL BYTES"),
+            "raw prompt body must not leak into default /context output"
+        );
     }
 
     #[test]
@@ -1175,8 +1427,10 @@ mod tests {
         assert!(out.contains("=== SYSTEM PROMPT ==="));
         // Each line indented with leading 2 spaces — verify one line
         // survives through the gutter indentation.
-        assert!(out.contains("  RULE_LINE_ABC"),
-            "prompt lines should keep content after 2-space indent");
+        assert!(
+            out.contains("  RULE_LINE_ABC"),
+            "prompt lines should keep content after 2-space indent"
+        );
         // Breakdown still present (append, not replace)
         assert!(out.contains("Context Usage"));
         assert!(out.contains("System prompt"));
@@ -1199,8 +1453,10 @@ mod tests {
         };
         let out = format_context_report(Some(&snap), "m", true);
         assert!(out.contains("=== SYSTEM PROMPT ==="));
-        assert!(out.contains("(empty"),
-            "empty cached prompt must show an explanation, got: {}", out);
+        assert!(
+            out.contains("(empty"),
+            "empty cached prompt must show an explanation, got: {}",
+            out
+        );
     }
-
 }
