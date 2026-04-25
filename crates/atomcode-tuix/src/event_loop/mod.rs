@@ -1007,10 +1007,9 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<(
                         renderer.render(UiLine::Error(format!("✗ MCP server '{}' failed: {}", name, error)));
                     }
                     McpConnectEvent::Warning { name, message } => {
-                        renderer.render(UiLine::CommandOutput(format!(
-                            "! MCP server '{}' warning: {}",
-                            name, message
-                        )));
+                        // Don't pollute the chat scrollback with MCP startup/runtime noise.
+                        // Route to the opt-in tuix trace log instead (safe for raw-mode TUI).
+                        crate::tuix_trace!("MCP", "server='{}' warning: {}", name, message);
                     }
                 }
 
@@ -1194,10 +1193,9 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<(
                         renderer.render(UiLine::Error(format!("✗ MCP server '{}' failed: {}", name, error)));
                     }
                     McpConnectEvent::Warning { name, message } => {
-                        renderer.render(UiLine::CommandOutput(format!(
-                            "! MCP server '{}' warning: {}",
-                            name, message
-                        )));
+                        // Don't pollute the chat scrollback with MCP startup/runtime noise.
+                        // Route to the opt-in tuix trace log instead (safe for raw-mode TUI).
+                        crate::tuix_trace!("MCP", "server='{}' warning: {}", name, message);
                     }
                 }
 
