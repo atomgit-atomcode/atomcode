@@ -1602,7 +1602,9 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 // lands at col 4. Width reserves PAD_COL for the right
                 // gutter + 6 for "    ⎿ ".
                 let row_w = (self.screen.width() as usize).saturating_sub(PAD_COL + 6);
-                let prefix_style = self.style_for(Role::Secondary);
+                // Muted (dim gray) for the result prefix — visually subordinate
+                // to the tool-call header above (▸ ToolName).
+                let prefix_style = self.style_for(Role::Muted);
                 for (line_idx, phys) in body_str.split('\n').enumerate() {
                     // First physical line of a failure body is the
                     // header. Wrapped continuation chunks of that same

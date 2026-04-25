@@ -1592,23 +1592,28 @@ fn handle_idle_key(
         }
         match (code, modifiers) {
             (KeyCode::Up, _) => {
-                // Wrap: Up at the top jumps to the last item. `items` is
-                // guaranteed non-empty — `build_menu_items` returns None
-                // when there are no matches, so we don't reach this arm.
-                app.menu.selected = if app.menu.selected == 0 {
-                    items.len() - 1
+                // At the top of the menu, close it and navigate history
+                // instead of wrapping to the bottom. This prevents the user
+                // from getting stuck in the slash-command menu when a
+                // partial command like `/se` is in history.
+                if app.menu.selected == 0 {
+                    // Close menu and trigger history navigation
+                    app.buf.text.clear();
+                    app.buf.cursor = 0;
+                    app.menu.selected = 0;
+                    // Fall through to normal history navigation below
                 } else {
-                    app.menu.selected - 1
-                };
-                redraw_with_menu(
-                    &app.buf,
-                    items,
-                    app.menu.selected,
-                    &app.state,
-                    ctx,
-                    renderer,
-                );
-                return Ok(());
+                    app.menu.selected -= 1;
+                    redraw_with_menu(
+                        &app.buf,
+                        items,
+                        app.menu.selected,
+                        &app.state,
+                        ctx,
+                        renderer,
+                    );
+                    return Ok(());
+                }
             }
             (KeyCode::Down, _) => {
                 app.menu.selected = (app.menu.selected + 1) % items.len();
