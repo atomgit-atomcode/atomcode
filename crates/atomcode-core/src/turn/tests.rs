@@ -323,7 +323,7 @@ async fn test_turn_runner_emits_text_delta_events() {
 #[tokio::test]
 async fn test_turn_runner_executes_tool_call() {
     let mut tools = ToolRegistry::new();
-    tools.register(Box::new(EchoTool { name: "grep" }));
+    tools.register(Box::new(EchoTool { name: "grep" })).await;
 
     let provider = MockProvider::with_tool_call("grep", r#"{"pattern":"foo"}"#);
     let mut runner = make_runner(provider, tools, auto_bypass());
@@ -351,7 +351,7 @@ async fn test_turn_runner_executes_tool_call() {
 #[tokio::test]
 async fn test_turn_runner_emits_tool_events() {
     let mut tools = ToolRegistry::new();
-    tools.register(Box::new(EchoTool { name: "grep" }));
+    tools.register(Box::new(EchoTool { name: "grep" })).await;
 
     let provider = MockProvider::with_tool_call("grep", r#"{"pattern":"foo"}"#);
     let mut runner = make_runner(provider, tools, auto_bypass());
@@ -446,7 +446,7 @@ async fn test_turn_runner_cancellation() {
 #[tokio::test]
 async fn test_turn_runner_auto_deny_blocks_dangerous_tool() {
     let mut tools = ToolRegistry::new();
-    tools.register(Box::new(DangerousTool));
+    tools.register(Box::new(DangerousTool)).await;
 
     let provider = MockProvider::with_tool_call("dangerous", "{}");
     let mut runner = make_runner(provider, tools, auto_deny());
@@ -474,7 +474,7 @@ async fn test_turn_runner_auto_deny_blocks_dangerous_tool() {
 #[tokio::test]
 async fn test_turn_runner_auto_bypass_allows_dangerous_tool() {
     let mut tools = ToolRegistry::new();
-    tools.register(Box::new(DangerousTool));
+    tools.register(Box::new(DangerousTool)).await;
 
     let provider = MockProvider::with_tool_call("dangerous", "{}");
     let mut runner = make_runner(provider, tools, auto_bypass());
@@ -501,7 +501,7 @@ async fn test_turn_runner_auto_bypass_allows_dangerous_tool() {
 #[tokio::test]
 async fn test_turn_runner_interactive_approval_allow() {
     let mut tools = ToolRegistry::new();
-    tools.register(Box::new(DangerousTool));
+    tools.register(Box::new(DangerousTool)).await;
 
     let (req_tx, mut req_rx) = mpsc::unbounded_channel();
     let (resp_tx, resp_rx) = mpsc::unbounded_channel();
@@ -539,7 +539,7 @@ async fn test_turn_runner_interactive_approval_allow() {
 #[tokio::test]
 async fn test_turn_runner_interactive_approval_deny() {
     let mut tools = ToolRegistry::new();
-    tools.register(Box::new(DangerousTool));
+    tools.register(Box::new(DangerousTool)).await;
 
     let (req_tx, mut req_rx) = mpsc::unbounded_channel();
     let (resp_tx, resp_rx) = mpsc::unbounded_channel();
@@ -578,7 +578,7 @@ async fn test_turn_runner_interactive_approval_deny() {
 #[tokio::test]
 async fn test_turn_runner_uses_context_aware_approval() {
     let mut tools = ToolRegistry::new();
-    tools.register(Box::new(ContextDangerousTool));
+    tools.register(Box::new(ContextDangerousTool)).await;
 
     let provider = MockProvider::with_tool_call("context_dangerous", "{}");
     let mut runner = make_runner(provider, tools, auto_deny());
@@ -743,7 +743,7 @@ async fn test_turn_runner_adds_assistant_message_on_text_response() {
 #[tokio::test]
 async fn test_turn_runner_adds_tool_call_and_result_messages() {
     let mut tools = ToolRegistry::new();
-    tools.register(Box::new(EchoTool { name: "grep" }));
+    tools.register(Box::new(EchoTool { name: "grep" })).await;
 
     let provider = MockProvider::with_tool_call("grep", "{}");
     let mut runner = make_runner(provider, tools, auto_bypass());
@@ -776,7 +776,7 @@ async fn test_turn_runner_adds_tool_call_and_result_messages() {
 #[tokio::test]
 async fn test_tool_result_content_in_llm_context() {
     let mut tools = ToolRegistry::new();
-    tools.register(Box::new(EchoTool { name: "grep" }));
+    tools.register(Box::new(EchoTool { name: "grep" })).await;
 
     let provider = MockProvider::with_tool_call("grep", r#"{"pattern":"foo"}"#);
     let mut runner = make_runner(provider, tools, auto_bypass());
@@ -826,8 +826,8 @@ async fn test_tool_result_content_in_llm_context() {
 #[tokio::test]
 async fn test_multiple_tool_calls_results_in_context() {
     let mut tools = ToolRegistry::new();
-    tools.register(Box::new(EchoTool { name: "grep" }));
-    tools.register(Box::new(EchoTool { name: "read_file" }));
+    tools.register(Box::new(EchoTool { name: "grep" })).await;
+    tools.register(Box::new(EchoTool { name: "read_file" })).await;
 
     // Provider returns two tool calls in sequence
     let provider = MockProvider {
@@ -893,7 +893,7 @@ async fn test_multiple_tool_calls_results_in_context() {
 #[tokio::test]
 async fn test_denied_tool_result_in_llm_context() {
     let mut tools = ToolRegistry::new();
-    tools.register(Box::new(DangerousTool));
+    tools.register(Box::new(DangerousTool)).await;
 
     let provider = MockProvider::with_tool_call("dangerous", "{}");
     let mut runner = make_runner(provider, tools, auto_deny());
@@ -957,24 +957,24 @@ async fn test_empty_turn_reminder_is_noop() {
 }
 
 /// ToolRegistry should return definitions in stable (sorted) order.
-#[test]
-fn test_tool_registry_stable_order() {
+#[tokio::test]
+async fn test_tool_registry_stable_order() {
     let mut registry = ToolRegistry::new();
     // Register in reverse alphabetical order
-    registry.register(Box::new(EchoTool { name: "write_file" }));
-    registry.register(Box::new(EchoTool { name: "bash" }));
-    registry.register(Box::new(EchoTool { name: "read_file" }));
-    registry.register(Box::new(EchoTool { name: "grep" }));
-    registry.register(Box::new(EchoTool { name: "edit_file" }));
+    registry.register(Box::new(EchoTool { name: "write_file" })).await;
+    registry.register(Box::new(EchoTool { name: "bash" })).await;
+    registry.register(Box::new(EchoTool { name: "read_file" })).await;
+    registry.register(Box::new(EchoTool { name: "grep" })).await;
+    registry.register(Box::new(EchoTool { name: "edit_file" })).await;
 
-    let defs = registry.get_definitions();
+    let defs = registry.get_definitions().await;
     let names: Vec<&str> = defs.iter().map(|d| d.name).collect();
 
     // BTreeMap should give alphabetical order regardless of insertion order
     assert_eq!(names, vec!["bash", "edit_file", "grep", "read_file", "write_file"]);
 
     // Call again — order must be identical
-    let defs2 = registry.get_definitions();
+    let defs2 = registry.get_definitions().await;
     let names2: Vec<&str> = defs2.iter().map(|d| d.name).collect();
     assert_eq!(names, names2, "Tool order must be stable across calls");
 }

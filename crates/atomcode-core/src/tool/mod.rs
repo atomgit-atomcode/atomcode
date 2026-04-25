@@ -887,7 +887,7 @@ mod tests {
         reg1.register(Box::new(DummyTool)).await;
         let reg2 = ToolRegistry::new();
         for (name, arc) in reg1.iter().await {
-            reg2.register(arc).await;
+            reg2.register_arc(name, arc).await;
         }
         assert!(reg2.get("dummy").await.is_some());
     }
