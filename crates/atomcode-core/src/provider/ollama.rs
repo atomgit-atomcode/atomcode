@@ -36,24 +36,72 @@ impl OllamaProvider {
     fn format_messages(messages: &[Message]) -> Vec<serde_json::Value> {
         messages
             .iter()
-            .map(|m| {
-                json!({
-                    "role": match m.role {
-                        Role::System => "system",
-                        Role::User => "user",
-                        Role::Assistant => "assistant",
-                        Role::Tool => "tool",
-                    },
-                    "content": match &m.content {
-                        MessageContent::Text(s) => s.as_str(),
-                        MessageContent::AssistantWithToolCalls { text, .. } => text.as_deref().unwrap_or(""),
-                        MessageContent::ToolResult(r) => &r.output,
-                        MessageContent::ToolResultRef(r) => &r.summary,
-                    },
-                })
+            .filter_map(|m| {
+                match &m.content {
+                    MessageContent::Text(s) => {
+                        if matches!(m.role, Role::Tool) {
+                            return None;
+                        }
+                        let role = match m.role {
+                            Role::System => "system",
+                            Role::User => "user",
+                            Role::Assistant => "assistant",
+                            Role::Tool => return None,
+                        };
+                        if s.trim().is_empty() {
+                            return None;
+                        }
+                        Some(json!({"role": role, "content": s}))
+                    }
+                    MessageContent::AssistantWithToolCalls { text, tool_calls, .. } => {
+                        if tool_calls.is_empty() {
+                            let t = text.as_deref().unwrap_or("");
+                            if t.is_empty() { return None; }
+                            return Some(json!({"role": "assistant", "content": t}));
+                        }
+                        let mut msg = json!({
+                            "role": "assistant",
+                            "content": text.as_deref().unwrap_or("")
+                        });
+                        msg["tool_calls"] = json!(tool_calls.iter().map(|tc| {
+                            json!({
+                                "function": {
+                                    "name": tc.name,
+                                    "arguments": serde_json::from_str::<serde_json::Value>(&tc.arguments)
+                                        .unwrap_or_else(|_| json!({"input": tc.arguments})),
+                                }
+                            })
+                        }).collect::<Vec<_>>());
+                        Some(msg)
+                    }
+                    MessageContent::ToolResult(r) => {
+                        Some(json!({
+                            "role": "tool",
+                            "content": r.output,
+                        }))
+                    }
+                    MessageContent::ToolResultRef(r) => {
+                        Some(json!({
+                            "role": "tool",
+                            "content": r.summary,
+                        }))
+                    }
+                }
             })
             .collect()
     }
+}
+
+/// A single tool call from Ollama response.
+#[derive(Deserialize, Debug)]
+struct OllamaToolCall {
+    function: OllamaFunction,
+}
+
+#[derive(Deserialize, Debug)]
+struct OllamaFunction {
+    name: String,
+    arguments: serde_json::Value,
 }
 
 #[derive(Deserialize)]
@@ -68,7 +116,10 @@ struct OllamaChunk {
 
 #[derive(Deserialize)]
 struct OllamaMessage {
+    #[serde(default)]
     content: String,
+    #[serde(default)]
+    tool_calls: Option<Vec<OllamaToolCall>>,
 }
 
 #[async_trait]
@@ -76,14 +127,28 @@ impl LlmProvider for OllamaProvider {
     fn chat_stream(
         &self,
         messages: &[Message],
-        _tools: Option<&[ToolDef]>,
+        tools: Option<&[ToolDef]>,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
         let url = format!("{}/api/chat", self.base_url);
-        let body = json!({
+        let mut body = json!({
             "model": self.model,
             "messages": Self::format_messages(messages),
             "stream": true,
         });
+
+        // Pass tool definitions to Ollama (supported since v0.3+)
+        if let Some(tool_defs) = tools {
+            if !tool_defs.is_empty() {
+                body["tools"] = json!(tool_defs.iter().map(|td| json!({
+                    "type": "function",
+                    "function": {
+                        "name": td.name,
+                        "description": td.description,
+                        "parameters": td.parameters,
+                    }
+                })).collect::<Vec<_>>());
+            }
+        }
 
         let request = self
             .client
@@ -115,6 +180,7 @@ impl LlmProvider for OllamaProvider {
 
             let mut buffer = String::new();
             let mut byte_stream = response.bytes_stream();
+            let mut tool_call_counter = 0u32;
 
             while let Some(chunk) = byte_stream.next().await {
                 let text = match chunk {
@@ -136,6 +202,30 @@ impl LlmProvider for OllamaProvider {
                     }
 
                     if let Ok(chunk) = serde_json::from_str::<OllamaChunk>(&line) {
+                        // Handle tool calls from message
+                        if let Some(ref msg) = chunk.message {
+                            if let Some(ref tcs) = msg.tool_calls {
+                                for tc in tcs {
+                                    tool_call_counter += 1;
+                                    let call_id = format!("call_{}", tool_call_counter);
+                                    let args = tc.function.arguments.to_string();
+
+                                    let _ = tx.send(Ok(StreamEvent::ToolCallStart {
+                                        id: call_id.clone(),
+                                        name: tc.function.name.clone(),
+                                    }));
+                                    let _ = tx.send(Ok(StreamEvent::ToolCallDelta(args.clone())));
+                                    let _ = tx.send(Ok(StreamEvent::ToolCallDone(
+                                        crate::tool::ToolCall {
+                                            id: call_id,
+                                            name: tc.function.name.clone(),
+                                            arguments: args,
+                                        }
+                                    )));
+                                }
+                            }
+                        }
+
                         if chunk.done {
                             if chunk.eval_count > 0 || chunk.prompt_eval_count > 0 {
                                 let _ = tx.send(Ok(StreamEvent::Usage(
@@ -149,7 +239,8 @@ impl LlmProvider for OllamaProvider {
                             let _ = tx.send(Ok(StreamEvent::Done { truncated: false }));
                             return;
                         } else if let Some(msg) = chunk.message {
-                            if !msg.content.is_empty() {
+                            // Only send text delta if no tool calls in this chunk
+                            if msg.tool_calls.is_none() && !msg.content.is_empty() {
                                 let _ = tx.send(Ok(StreamEvent::Delta(msg.content)));
                             }
                         }
