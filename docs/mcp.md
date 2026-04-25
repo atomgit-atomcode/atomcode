@@ -1,129 +1,78 @@
-# AtomCode MCP 功能设计与实施方案
+# AtomCode MCP 集成说明
 
-> 目标：为 AtomCode 实现 MCP (Model Context Protocol) 客户端能力，接入外部工具生态。
-
-## 1. 现状评估
-
-### 1.1 当前能力
-
-AtomCode 已具备接入 MCP 的基础设施：
-
-- **工具系统**：`ToolRegistry` + `Tool` trait 支持动态注册
-- **审批体系**：`PermissionStore` + `PermissionDecider` 已成熟
-- **执行链路**：`AgentLoop` / `TurnRunner` 可消费运行时生成的工具
-- **输出控制**：已有 `result_store` 和截断逻辑
-
-### 1.2 明确缺失
-
-- 没有 MCP server 配置模型
-- 没有 `stdio` / HTTP transport
-- 没有 initialize / capabilities 协商
-- 没有 tools / resources / prompts 协议抽象
-- 没有 `.mcp.json` 配置入口
-
-> **结论**：AtomCode 具备接入 MCP 的基础设施，但尚未实现 MCP 客户端。
+> AtomCode 已实现 **MCP（Model Context Protocol）客户端**：通过 `.mcp.json` / `~/.atomcode/mcp.json` 连接外部 MCP server，将其 **tools** 暴露为与普通内建工具一致的可调用工具（含审批链路）。
 
 ---
 
-## 2. 设计原则
+## 1. 当前能力概览
 
-### 2.1 Native tools first，MCP as external layer
+### 1.1 已实现
 
-MCP 不应替换现有内建工具，而是作为外部能力接入层：
-- 内建工具有更强的本地语义和稳定输出
-- MCP server 适合补充能力：GitHub、Sentry、Notion、数据库等
+- **配置**：项目根 `.mcp.json` 与用户目录 `~/.atomcode/mcp.json`；同名 server **项目覆盖用户**；支持 `disabled`；字符串中 `${VAR}`、`${VAR:-default}` 展开。
+- **传输**：`stdio`（`command` + `args` + `env`）、`HTTP`（`url` + `headers`）；默认超时 30s，可用 `timeout_ms` 覆盖。
+- **协议**：JSON-RPC；`initialize`、`tools/list`、`tools/call`；`initialize` 结果里解析 `capabilities`（当前仅用到 tools 能力标记）。
+- **工具注册**：每个远端 tool 映射为 `mcp__{server_key}__{tool_name}`，经 `McpToolAdapter` 注册到 `ToolRegistry`。
+- **权限**：MCP 适配器对每次调用返回 `RequireApproval`（说明里带 server / tool / 参数摘要），走现有交互式审批；`PermissionStore` 的 session grant / override 按键为 **完整工具名** `mcp__...`（与内建工具相同），**不是** `mcp:server:tool` 形式。
+- **无头模式**（`-p` / `--prompt-file` / `fixissue`）：启动时 **`McpRegistry::from_config` 同步连接**所有 server，连接成功后再 `list_tools` 并一次性注册 MCP 工具。
+- **TUI 模式**：**后台并行连接**（`from_config_background_with_events`），不阻塞进入界面；连接成功或失败通过 `McpConnectEvent` 写入会话区；**每连上一个 server 就 `register_mcp_tools_async` 动态追加**该 server 的工具。
+- **`/mcp`**：列出当前 registry 中 **已成功 `initialize` 并入表** 的 server 及其 `ServerStatus`（见下节限制）。
 
-### 2.2 复用现有基础设施
+### 1.2 未实现 / 限制（与代码一致）
 
-优先复用：
-- `ToolRegistry` - 工具注册
-- `PermissionStore` - 权限管理
-- `TurnRunner` - 执行链路
-- TUI 事件流 - 展示层
-
-### 2.3 兼容事实标准
-
-- 项目级 `.mcp.json`
-- 用户级 `~/.atomcode/mcp.json`
-- 环境变量展开 `${VAR}` 和 `${VAR:-default}`
-
-### 2.4 分阶段落地
-
-1. **Phase 1 (MVP)**：tools only
-2. **Phase 2**：resources / prompts
-3. **Phase 3**：OAuth / roots / elicitation
+- **Resources / Prompts**：无 `list_mcp_resources`、`read_mcp_resource`，无 MCP prompt → slash command。
+- **HTTP 自动重连**：无指数退避；stdio 子进程无自动重启。
+- **`tools/list` 变更**：无 `list_changed` 动态刷新。
+- **`/mcp` 展示**：失败或未连上的 server **不会**出现在列表中（失败仅通过启动时的会话行 `✗ MCP server '…' failed: …` 可见）；正在连接中的 server 在连上之前也不会出现在 `/mcp` 列表中。
+- **工具结果内容**：`call_tool` 仅将 **text** 类型 content 块拼接为字符串；image/resource 块当前不参与输出。
+- **OAuth / roots / elicitation**、daemon 侧 MCP API、插件捆绑 server：未实现。
 
 ---
 
-## 3. 目标架构
+## 2. 设计原则（仍适用）
 
-### 3.1 模块结构
+- **内建工具优先，MCP 作外延**：内建工具语义稳定；MCP 用于 GitHub、数据库等外部能力。
+- **复用现有栈**：`ToolRegistry`、`PermissionStore` / `InteractivePermissionDecider`、`TurnRunner`、`AgentLoop`；工具输出与其它工具一样会经过统一的 `post_process_tool_results` 等后处理路径（大输出截断策略由全局 truncate 逻辑决定，**无**单独的「MCP-only」外部化存储）。
 
-```
-crates/atomcode-core/src/mcp/
-├── mod.rs              # 模块入口
-├── config.rs           # 配置解析、scope 合并、env 展开
-├── types.rs            # MCP 数据模型 (JSON-RPC, 能力等)
-├── client.rs           # McpClient trait
-├── registry.rs         # 多 server 连接管理
-├── transport_stdio.rs  # stdio transport
-├── transport_http.rs   # HTTP transport
-└── tool_adapter.rs     # MCP tool -> Tool trait 适配
-```
+---
 
-### 3.2 分层设计
+## 3. 代码模块布局
 
-| 层级 | 职责 |
+实现位于 `crates/atomcode-core/src/mcp/`：
+
+| 文件 | 职责 |
 |------|------|
-| 配置层 | 读取 `.mcp.json`，env 展开，scope 合并 |
-| 连接层 | 启动/连接 server，initialize，capabilities |
-| 适配层 | MCP tools -> ToolRegistry |
-| 展示层 | TUI / CLI / Daemon 状态展示 |
+| `mod.rs` | 模块导出 |
+| `config.rs` | 配置反序列化、`load_mcp_config`、环境变量展开 |
+| `types.rs` | JSON-RPC、initialize/list/call 相关类型、`ServerStatus` |
+| `client.rs` | `McpClient` trait、`McpToolInfo` |
+| `registry.rs` | `McpRegistry`、后台/阻塞加载、`McpConnectEvent`、`call_tool` |
+| `transport_stdio.rs` | stdio 子进程与读写循环 |
+| `transport_http.rs` | HTTP 客户端封装 |
+| `tool_adapter.rs` | `McpToolAdapter`、`register_mcp_tools` / `register_mcp_tools_async` |
+
+CLI 入口（`crates/atomcode-cli/src/main.rs`）根据是否无头选择阻塞或后台 MCP 初始化；TUI（`crates/atomcode-tuix`）消费 `mcp_connect_rx` 并动态注册工具；斜杠命令 **`/mcp`** 在 `crates/atomcode-tuix/src/event_loop/commands.rs` 中实现。
 
 ---
 
-## 4. 能力映射
+## 4. 工具命名与执行路径
 
-### 4.1 Tools (Phase 1)
-
-**命名规则**：
-```
-mcp__{server_name}__{tool_name}
-```
-
-例如：
-- `mcp__github__get_issue`
-- `mcp__postgres__query`
-
-**执行流程**：
-1. AgentLoop 启动时连接所有 MCP servers
-2. 拉取 `tools/list`
-3. 为每个 tool 创建 `McpToolAdapter`，注册到 `ToolRegistry`
-4. 模型调用时，`TurnRunner` 分发到 adapter
-5. adapter 转发到对应 server 的 `tools/call`
-6. 输出包装为 `ToolResult`
-
-### 4.2 Resources (Phase 2)
-
-不建议自动消费所有 resources，而是提供工具：
-- `list_mcp_resources` - 列出可用资源
-- `read_mcp_resource` - 读取指定资源
-
-参数显式带 `server` 与 `uri`。
-
-### 4.3 Prompts (Phase 2)
-
-映射为 slash command：
-```
-/mcp__github__pr_review 123
-/mcp__jira__create_issue "标题" high
-```
+- **对外工具名**：`mcp__{servers 映射中的 key}__{远端 tool name}`  
+  例：配置里 `"servers": { "github": { ... } }` 且远端有 `get_issue` → `mcp__github__get_issue`。
+- **执行**：`TurnRunner` 分发到适配器 → `McpRegistry::call_tool` → 对应 transport 的 `tools/call`。
+- **禁用工具**：与其它工具相同，可使用 `--disable-tools` 或环境变量 `ATOMCODE_DISABLE_TOOLS`（逗号分隔），传入完整名如 `mcp__github__get_issue`。
 
 ---
 
-## 5. 配置设计
+## 5. 配置说明
 
-### 5.1 项目级 `.mcp.json`
+### 5.1 Schema 要点
+
+顶层为 `{ "servers": { "<name>": { ... } } }`。每个 server **必须**二选一：
+
+- **stdio**：`command`（必填）+ 可选 `args`、`env`、`timeout_ms`、`disabled`
+- **HTTP**：`url`（必填）+ 可选 `headers`、`timeout_ms`、`disabled`
+
+### 5.2 项目级 `.mcp.json` 示例
 
 ```json
 {
@@ -147,229 +96,91 @@ mcp__{server_name}__{tool_name}
 }
 ```
 
-### 5.2 用户级配置
+### 5.3 用户级配置
 
-位置：`~/.atomcode/mcp.json`
-
-与项目级同 schema，优先级低于项目级。
-
-### 5.3 支持字段
-
-| 字段 | 说明 |
-|------|------|
-| `command` | stdio 模式：可执行命令 |
-| `args` | 命令参数 |
-| `env` | 环境变量 |
-| `url` | HTTP 模式：服务端点 |
-| `headers` | HTTP 请求头 |
-| `disabled` | 禁用标记 |
-| `timeout_ms` | 超时时间 |
+路径：`~/.atomcode/mcp.json`，字段相同。**同名 server 以项目级为准**（后写入的 project 配置覆盖 user）。
 
 ---
 
-## 6. 运行时设计
+## 6. 运行时行为摘要
 
-### 6.1 启动顺序
+| 模式 | MCP 加载 | 工具出现时机 |
+|------|------------|----------------|
+| TUI | 后台 `tokio::spawn` 并行连接 | 各 server `initialize` 成功后陆续注册 |
+| 无头 | `from_config().await` 阻塞至各连接尝试结束 | 仅在至少拿到一批工具时挂载 `McpRegistry`；若全部失败则无 MCP 工具 |
 
-1. 解析 MCP 配置
-2. 建立 `McpRegistry`
-3. 连接所有启用 servers
-4. 获取 capability snapshot
-5. 注册 MCP tools 到 `ToolRegistry`
-6. 注入 `McpRegistry` 到 AgentLoop
-
-### 6.2 连接策略
-
-**stdio**：
-- Agent 启动时拉起子进程
-- 持有 stdin/stdout
-- 失败标记 disconnected，不影响主程序
-
-**HTTP**：
-- 启动即初始化
-- 便于尽早发现认证/网络问题
-
-### 6.3 重连策略
-
-- HTTP server：指数退避重连
-- stdio server：不自动重启，需手动 reload
+单个 server 连接失败 **不会**拖垮进程；错误打到 stderr 或 TUI 会话中的 `McpConnectEvent::Failed`。
 
 ---
 
-## 7. 安全设计
+## 7. 安全与审批
 
-### 7.1 权限粒度
-
-权限键格式：
-```
-mcp:{server}:{tool}
-```
-
-例如：`mcp:github:get_issue`
-
-### 7.2 审批策略
-
-- 所有 MCP tools 默认需要审批
-- 项目级 server 首次连接需额外确认
-- 认证失败 / 配置变更需重新确认
-
-### 7.3 输出控制
-
-- 单次输出 token 上限
-- 超时限制
-- 并发调用限制
-- 复用现有 `result_store` 和截断逻辑
-
-### 7.4 Prompt Injection 防护
-
-MCP 返回内容视为不可信工具输出，不得升级为 system instruction。
+- MCP 工具默认 **每次** 走 `RequireApproval`（外部不可信代码）。
+- 持久/会话放行在 `PermissionStore` 中按 **`mcp__server__tool` 全名** 记录。
+- 将 MCP 返回内容视为不可信工具输出，不得当作 system 指令升级。
 
 ---
 
-## 8. 实施任务清单
+## 8. 路线图（文档层跟踪，非代码承诺）
 
-### Phase 1: MVP
-
-**目标**：AtomCode 能使用标准 MCP tool
-
-#### Task A: 配置模型与加载器
-
-- [x] 设计 `.mcp.json` 反序列化结构
-- [x] 实现项目级与用户级配置读取
-- [x] 实现环境变量展开 `${VAR}` 和 `${VAR:-default}`
-- [x] 实现按 server name 合并与优先级覆盖
-
-**产出**：
-- `mcp/config.rs`
-- `mcp/types.rs`
-
-#### Task B: Runtime 基础类型与客户端接口
-
-- [x] 定义 `McpClient` trait
-- [x] 定义 `McpRegistry`
-- [x] 设计 server 状态结构
-
-**产出**：
-- `mcp/mod.rs`
-- `mcp/client.rs`
-- `mcp/registry.rs`
-
-#### Task C: stdio transport
-
-- [x] 启动子进程
-- [x] 建立 stdin/stdout 通信
-- [x] 实现 initialize
-- [x] 实现 `tools/list`
-- [x] 实现 `tools/call`
-- [x] 加入超时和错误包装
-- [x] 处理启动消息排水
-
-**产出**：`mcp/transport_stdio.rs`
-
-#### Task D: HTTP transport
-
-- [x] 建立 HTTP client
-- [x] 实现 initialize
-- [x] 实现 `tools/list`
-- [x] 实现 `tools/call`
-- [x] 请求超时和错误处理
-
-**产出**：`mcp/transport_http.rs`
-
-#### Task E: Tool Adapter
-
-- [x] 为每个 MCP tool 生成 adapter
-- [x] 实现 `Tool` trait
-- [x] 实现 `execute`
-- [x] 命名规则 `mcp__{server}__{tool}`
-
-**产出**：`mcp/tool_adapter.rs`
-
-#### Task F: 权限接入
-
-- [x] MCP tool 默认需审批
-- [x] 权限键扩展为 `mcp:{server}:{tool}`
-
-#### Task G: 输出控制
-
-- [ ] MCP tool 输出纳入截断体系
-- [ ] 大输出外部化
-
-#### Task H: TUI 状态展示
-
-- [ ] `/mcp` 基础命令
-- [ ] server 列表与状态
-
-### Phase 2: 增强
-
-- [ ] `list_mcp_resources` / `read_mcp_resource`
-- [ ] MCP prompts -> slash command
-- [ ] `list_changed` 动态刷新
-- [ ] HTTP 重连
-- [ ] 完整 `/mcp` 管理面板
-
-### Phase 3: 完整能力
-
-- [ ] OAuth
-- [ ] roots 协商
-- [ ] elicitation
-- [ ] daemon MCP API
-- [ ] 插件携带 MCP server
+| 阶段 | 内容 | 状态 |
+|------|------|------|
+| Phase 1 MVP | stdio/HTTP、tools、配置、审批、TUI 连接提示与 `/mcp`（已连 server） | **已落地** |
+| Phase 2 | resources/prompts 工具、动态 list_changed、HTTP 重连、更完整的 MCP 面板 | 未做 |
+| Phase 3 | OAuth、roots、elicitation、daemon MCP API、插件携带 server | 未做 |
 
 ---
 
-## 9. MVP 验收标准
+## 9. 验收参考（手工）
 
-1. 在项目根目录放入 `.mcp.json` 后，AtomCode 启动时能发现并连接 server
-2. MCP server 暴露的 tools 能出现在模型可用工具集中
-3. 模型可以正常调用 MCP tool，结果回流到对话
-4. 需要审批时，MCP tool 走现有确认链路
-5. MCP tool 大输出能被截断或外部化
-6. `/mcp` 能看到 server 名、连接状态、错误信息
-7. 某个 server 连接失败时，不影响 AtomCode 整体可用
+1. 项目根放置 `.mcp.json` 后，启动 AtomCode（TUI）可在会话区看到 MCP 连接成功/失败行。
+2. 连接成功后，对应 MCP tools 以 `mcp__...` 形式进入模型可用工具集（TUI 下可能略晚于首屏）。
+3. 模型调用 MCP tool 时走现有确认 UI；无头模式下需审批的工具策略与现有一致（如 bash 自动允许等，其它仍受审批逻辑约束）。
+4. 某一 server 失败时，其余 server 与主程序仍可用。
 
 ---
 
 ## 10. 测试方法
 
-### 10.1 内置测试服务器
+### 10.1 内置 `mcp-test-server`
 
-AtomCode 内置 `mcp-test-server` 提供测试工具：
+源码：`crates/atomcode-core/src/bin/mcp-test-server.rs`，提供 `echo` tool（参数 `message`）。
+
+在工作区根目录构建：
 
 ```bash
-cargo build --release --bin mcp-test-server
+cargo build --release -p atomcode-core --bin mcp-test-server
 ```
 
-### 10.2 配置示例
+可执行文件：`target/release/mcp-test-server`（相对仓库根）。
 
-在项目根目录创建 `.mcp.json`：
+### 10.2 `.mcp.json` 最小示例
 
 ```json
 {
   "servers": {
     "test-server": {
-      "command": "./target/release/mcp-test-server",
+      "command": "target/release/mcp-test-server",
+      "args": [],
       "timeout_ms": 5000
     }
   }
 }
 ```
 
-### 10.3 测试命令
+（路径请按本机 `target/release/...` 或绝对路径调整。）
 
-启动 AtomCode：
+### 10.3 运行与调用
+
 ```bash
-cargo run --release
+cargo run --release -p atomcode
 ```
 
-测试工具调用：
-```
-请使用 mcp__test-server__echo 工具，传入 message 参数 "Hello MCP!"
-```
+在对话中可让模型使用：`mcp__test-server__echo`，参数 JSON 含 `"message": "Hello MCP!"`。
 
-### 10.4 真实 MCP 服务器
+仓库内另有 **`.mcp.json.example`**，演示用 `cargo run ... mcp-test-server` 的方式（默认 `disabled: true`，启用前请改为 `false` 并确认 `manifest-path` 指向 **`crates/atomcode-core/Cargo.toml`** 或等价路径，否则从仓库根执行会找不到包）。
 
-安装官方 filesystem server：
+### 10.4 真实生态 Server 示例
 
 ```bash
 cat > ~/.atomcode/mcp.json << 'EOF'
@@ -389,10 +200,10 @@ EOF
 
 ## 11. 同类产品参考
 
-| 产品 | 配置格式 | Transport | 特性 |
-|------|----------|-----------|------|
-| Claude Code | `.mcp.json` | stdio/HTTP/SSE | OAuth, resources, prompts |
-| Cursor | `.mcp.json` | stdio/HTTP | roots, elicitation |
+| 产品 | 配置 | Transport | 备注 |
+|------|------|-------------|------|
+| Claude Code | `.mcp.json` | stdio/HTTP/SSE | OAuth、resources、prompts 等更全 |
+| Cursor | `.mcp.json` | stdio/HTTP | roots、elicitation 等 |
 | Codex | CLI 添加 | stdio/HTTP | OpenAI 生态 |
 
-AtomCode 兼容 `.mcp.json` 格式，可复用现有 MCP server 生态。
+AtomCode 使用常见 **`.mcp.json` 的 `servers` 块**，便于复用现有 MCP server 配置思路；具体能力与上表「未实现」一节以本仓库代码为准。
