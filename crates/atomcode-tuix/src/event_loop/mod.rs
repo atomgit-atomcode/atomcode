@@ -947,7 +947,13 @@ pub async fn run_loop(
             // ── MCP connection events ──
             // Render connection success/failure into scrollback as they arrive.
             // Also register tools dynamically when servers connect.
-            Some(ev) = ctx.mcp_connect_rx.as_mut().unwrap().recv(), if ctx.mcp_connect_rx.is_some() => {
+            Some(ev) = async {
+                if let Some(rx) = ctx.mcp_connect_rx.as_mut() {
+                    rx.recv().await
+                } else {
+                    None
+                }
+            }, if ctx.mcp_connect_rx.is_some() => {
                 use atomcode_core::mcp::{McpConnectEvent, register_mcp_tools_async};
                 match &ev {
                     McpConnectEvent::Connected { name } => {
@@ -1096,7 +1102,13 @@ pub async fn run_loop(
             // ── MCP connection events ──
             // Render connection success/failure into scrollback as they arrive.
             // Also register tools dynamically when servers connect.
-            Some(ev) = ctx.mcp_connect_rx.as_mut().unwrap().recv(), if ctx.mcp_connect_rx.is_some() => {
+            Some(ev) = async {
+                if let Some(rx) = ctx.mcp_connect_rx.as_mut() {
+                    rx.recv().await
+                } else {
+                    None
+                }
+            }, if ctx.mcp_connect_rx.is_some() => {
                 use atomcode_core::mcp::{McpConnectEvent, register_mcp_tools_async};
                 match &ev {
                     McpConnectEvent::Connected { name } => {
@@ -1114,6 +1126,24 @@ pub async fn run_loop(
                     }
                     McpConnectEvent::Failed { name, error } => {
                         renderer.render(UiLine::Error(format!("✗ MCP server '{}' failed: {}", name, error)));
+                    }
+                }
+
+                // `/mcp reload` progress: once every configured server has reported a
+                // terminal state (Connected/Failed), emit a summary line.
+                if let Some(p) = ctx.mcp_reload.as_mut() {
+                    p.done = p.done.saturating_add(1);
+                    match &ev {
+                        McpConnectEvent::Connected { .. } => p.connected = p.connected.saturating_add(1),
+                        McpConnectEvent::Failed { .. } => p.failed = p.failed.saturating_add(1),
+                    }
+                    if p.done >= p.total {
+                        let elapsed_ms = p.started_at.elapsed().as_millis();
+                        renderer.render(UiLine::CommandOutput(format!(
+                            "  MCP reload complete: {} connected, {} failed ({}ms)\n",
+                            p.connected, p.failed, elapsed_ms
+                        )));
+                        ctx.mcp_reload = None;
                     }
                 }
                 renderer.flush();
