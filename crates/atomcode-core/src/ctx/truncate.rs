@@ -87,7 +87,9 @@ pub fn truncate_output(result: &mut ToolResult, tool_name: &str, context_window:
         let head_chars = hard_char_limit * 2 / 3;
         let tail_chars = hard_char_limit / 3;
         let head_part: String = chars[..head_chars.min(chars.len())].iter().collect();
-        let tail_part: String = chars[chars.len().saturating_sub(tail_chars)..].iter().collect();
+        let tail_part: String = chars[chars.len().saturating_sub(tail_chars)..]
+            .iter()
+            .collect();
         let omitted = chars.len().saturating_sub(head_chars + tail_chars);
         result.output = format!(
             "{}\n\n[... {} chars omitted (universal {} char cap) ...]\n\n{}",
@@ -107,7 +109,12 @@ pub fn truncate_output(result: &mut ToolResult, tool_name: &str, context_window:
 // which one actually controlled the output.
 
 /// Generic truncation: head + tail, skipping middle.
-pub(crate) fn truncate_generic(result: &mut ToolResult, max_lines: usize, head: usize, tail: usize) {
+pub(crate) fn truncate_generic(
+    result: &mut ToolResult,
+    max_lines: usize,
+    head: usize,
+    tail: usize,
+) {
     let lines: Vec<&str> = result.output.lines().collect();
     if lines.len() > max_lines {
         let head_part: String = lines[..head].join("\n");
@@ -192,7 +199,8 @@ pub fn post_process_tool_results(
                     let head = target * 2 / 3;
                     let tail = target / 3;
                     let head_part: String = chars[..head.min(chars.len())].iter().collect();
-                    let tail_part: String = chars[chars.len().saturating_sub(tail)..].iter().collect();
+                    let tail_part: String =
+                        chars[chars.len().saturating_sub(tail)..].iter().collect();
                     result.output = format!(
                         "{}\n[... trimmed to fit turn budget ...]\n{}",
                         head_part, tail_part,
@@ -207,8 +215,8 @@ pub fn post_process_tool_results(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tool::{ToolCall, ToolResult};
     use crate::conversation::message::{Message, MessageContent, Role};
+    use crate::tool::{ToolCall, ToolResult};
 
     fn make_result(output: &str) -> ToolResult {
         ToolResult {
@@ -260,22 +268,34 @@ mod tests {
 
     #[test]
     fn bash_short_output_passes_through_verbatim() {
-        let output: String = (0..100).map(|i| format!("line {}", i)).collect::<Vec<_>>().join("\n");
+        let output: String = (0..100)
+            .map(|i| format!("line {}", i))
+            .collect::<Vec<_>>()
+            .join("\n");
         let mut result = make_result(&output);
         truncate_output(&mut result, "bash", 64_000);
-        assert_eq!(result.output, output, "bash output under 300 lines must not be touched");
+        assert_eq!(
+            result.output, output,
+            "bash output under 300 lines must not be touched"
+        );
     }
 
     #[test]
     fn bash_huge_output_hits_universal_line_cap_only() {
         // 500 lines > UNIVERSAL_MAX_LINES (300) → head 50 + tail 50 + marker.
         // Purely numeric — no English error-keyword heuristic fires.
-        let output: String = (0..500).map(|i| format!("line {}", i)).collect::<Vec<_>>().join("\n");
+        let output: String = (0..500)
+            .map(|i| format!("line {}", i))
+            .collect::<Vec<_>>()
+            .join("\n");
         let mut result = make_result(&output);
         truncate_output(&mut result, "bash", 64_000);
         assert!(result.output.contains("line 0"), "head must be preserved");
         assert!(result.output.contains("line 499"), "tail must be preserved");
-        assert!(result.output.contains("lines omitted"), "omission marker required");
+        assert!(
+            result.output.contains("lines omitted"),
+            "omission marker required"
+        );
         assert!(result.output.lines().count() <= 110);
     }
 
@@ -333,18 +353,33 @@ mod tests {
         let mut result = make_result(&output);
         truncate_output(&mut result, "unknown_tool", 16000);
         // Result should be at most ~8000 chars + omission marker.
-        assert!(result.output.len() <= 8_500, "got {} chars", result.output.len());
-        assert!(result.output.contains("chars omitted"), "got: {}", result.output);
+        assert!(
+            result.output.len() <= 8_500,
+            "got {} chars",
+            result.output.len()
+        );
+        assert!(
+            result.output.contains("chars omitted"),
+            "got: {}",
+            result.output
+        );
     }
 
     #[test]
     fn truncate_output_universal_line_cap() {
         // 500-line output should get capped to ~100 lines (50 head + 50 tail) + markers.
-        let output: String = (0..500).map(|i| format!("line {}", i)).collect::<Vec<_>>().join("\n");
+        let output: String = (0..500)
+            .map(|i| format!("line {}", i))
+            .collect::<Vec<_>>()
+            .join("\n");
         let mut result = make_result(&output);
         truncate_output(&mut result, "unknown_tool", 64_000);
         let line_count = result.output.lines().count();
-        assert!(line_count <= 110, "got {} lines, expected ≤ 110", line_count);
+        assert!(
+            line_count <= 110,
+            "got {} lines, expected ≤ 110",
+            line_count
+        );
         assert!(result.output.contains("lines omitted"));
     }
 
@@ -354,7 +389,11 @@ mod tests {
         let output = "x".repeat(200_000);
         let mut result = make_result(&output);
         truncate_output(&mut result, "unknown_tool", 1_000_000);
-        assert!(result.output.len() <= 33_000, "single tool output should never exceed 32K chars, got {}", result.output.len());
+        assert!(
+            result.output.len() <= 33_000,
+            "single tool output should never exceed 32K chars, got {}",
+            result.output.len()
+        );
     }
 
     // --- post_process_tool_results tests ---

@@ -90,7 +90,10 @@ pub fn repair_json(s: &str) -> String {
     // Remove leading/trailing whitespace and any markdown code fences
     result = result.trim().to_string();
     if result.starts_with("```json") {
-        result = result.strip_prefix("```json").unwrap_or(&result).to_string();
+        result = result
+            .strip_prefix("```json")
+            .unwrap_or(&result)
+            .to_string();
     }
     if result.starts_with("```") {
         result = result.strip_prefix("```").unwrap_or(&result).to_string();
@@ -119,15 +122,21 @@ pub fn repair_json(s: &str) -> String {
             let j = i + 1;
             // Skip whitespace
             let mut k = j;
-            while k < chars.len() && chars[k].is_whitespace() { k += 1; }
+            while k < chars.len() && chars[k].is_whitespace() {
+                k += 1;
+            }
             // If next non-whitespace is " and it looks like a key (followed by :), insert comma
             if k < chars.len() && chars[k] == '"' && k > j {
                 // Check if this looks like key: find the closing " then :
                 let mut q = k + 1;
-                while q < chars.len() && chars[q] != '"' { q += 1; }
+                while q < chars.len() && chars[q] != '"' {
+                    q += 1;
+                }
                 if q + 1 < chars.len() {
                     let mut r = q + 1;
-                    while r < chars.len() && chars[r].is_whitespace() { r += 1; }
+                    while r < chars.len() && chars[r].is_whitespace() {
+                        r += 1;
+                    }
                     if r < chars.len() && chars[r] == ':' {
                         // This is a missing comma: insert after position i
                         insertions.push(j);
@@ -165,15 +174,21 @@ pub fn repair_json(s: &str) -> String {
                 }
                 // Skip whitespace after key
                 let mut ki = ri;
-                while ki < rchars.len() && rchars[ki].is_whitespace() { ki += 1; }
+                while ki < rchars.len() && rchars[ki].is_whitespace() {
+                    ki += 1;
+                }
                 if ki < rchars.len() && rchars[ki] == ':' {
                     // Unquoted key — add quotes
                     fixed.push('"');
-                    for c in &rchars[key_start..ri] { fixed.push(*c); }
+                    for c in &rchars[key_start..ri] {
+                        fixed.push(*c);
+                    }
                     fixed.push('"');
                 } else {
                     // Not a key, just copy
-                    for c in &rchars[key_start..ri] { fixed.push(*c); }
+                    for c in &rchars[key_start..ri] {
+                        fixed.push(*c);
+                    }
                 }
             }
         } else {
@@ -187,7 +202,9 @@ pub fn repair_json(s: &str) -> String {
     loop {
         let before = result.clone();
         result = result.replace(",}", "}").replace(",]", "]");
-        if result == before { break; }
+        if result == before {
+            break;
+        }
     }
 
     // If it doesn't start with { or [, wrap it
@@ -219,15 +236,21 @@ pub fn extract_json_fields(s: &str) -> serde_json::Value {
             // Quoted key
             let start = i + 1;
             i = start;
-            while i < len && chars[i] != '"' { i += 1; }
-            if i >= len { break; }
+            while i < len && chars[i] != '"' {
+                i += 1;
+            }
+            if i >= len {
+                break;
+            }
             let k: String = chars[start..i].iter().collect();
             i += 1; // skip closing "
             k
         } else if chars[i].is_alphabetic() || chars[i] == '_' {
             // Bare key
             let start = i;
-            while i < len && (chars[i].is_alphanumeric() || chars[i] == '_') { i += 1; }
+            while i < len && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                i += 1;
+            }
             chars[start..i].iter().collect()
         } else {
             i += 1;
@@ -235,11 +258,19 @@ pub fn extract_json_fields(s: &str) -> serde_json::Value {
         };
 
         // Skip whitespace, expect :
-        while i < len && chars[i].is_whitespace() { i += 1; }
-        if i >= len || chars[i] != ':' { continue; }
+        while i < len && chars[i].is_whitespace() {
+            i += 1;
+        }
+        if i >= len || chars[i] != ':' {
+            continue;
+        }
         i += 1; // skip :
-        while i < len && chars[i].is_whitespace() { i += 1; }
-        if i >= len { break; }
+        while i < len && chars[i].is_whitespace() {
+            i += 1;
+        }
+        if i >= len {
+            break;
+        }
 
         // Read value
         if chars[i] == '"' {
@@ -247,31 +278,46 @@ pub fn extract_json_fields(s: &str) -> serde_json::Value {
             let start = i + 1;
             i = start;
             while i < len && chars[i] != '"' {
-                if chars[i] == '\\' { i += 1; }
+                if chars[i] == '\\' {
+                    i += 1;
+                }
                 i += 1;
             }
             let raw: String = chars[start..i.min(len)].iter().collect();
             // Unescape JSON sequences: \n → newline, \t → tab, \" → quote, \\ → backslash
-            let val = raw.replace("\\n", "\n")
-                         .replace("\\t", "\t")
-                         .replace("\\\"", "\"")
-                         .replace("\\\\", "\\");
+            let val = raw
+                .replace("\\n", "\n")
+                .replace("\\t", "\t")
+                .replace("\\\"", "\"")
+                .replace("\\\\", "\\");
             map.insert(key, serde_json::json!(val));
-            if i < len { i += 1; }
+            if i < len {
+                i += 1;
+            }
         } else if chars[i] == 't' || chars[i] == 'f' {
             // Boolean
             let start = i;
-            while i < len && chars[i].is_alphabetic() { i += 1; }
+            while i < len && chars[i].is_alphabetic() {
+                i += 1;
+            }
             let word: String = chars[start..i].iter().collect();
             match word.as_str() {
-                "true" => { map.insert(key, serde_json::json!(true)); }
-                "false" => { map.insert(key, serde_json::json!(false)); }
-                _ => { map.insert(key, serde_json::json!(word)); }
+                "true" => {
+                    map.insert(key, serde_json::json!(true));
+                }
+                "false" => {
+                    map.insert(key, serde_json::json!(false));
+                }
+                _ => {
+                    map.insert(key, serde_json::json!(word));
+                }
             }
         } else if chars[i].is_ascii_digit() || chars[i] == '-' {
             // Number
             let start = i;
-            while i < len && (chars[i].is_ascii_digit() || chars[i] == '.' || chars[i] == '-') { i += 1; }
+            while i < len && (chars[i].is_ascii_digit() || chars[i] == '.' || chars[i] == '-') {
+                i += 1;
+            }
             let num_str: String = chars[start..i].iter().collect();
             if let Ok(n) = num_str.parse::<i64>() {
                 map.insert(key, serde_json::json!(n));
@@ -281,8 +327,14 @@ pub fn extract_json_fields(s: &str) -> serde_json::Value {
         } else {
             // Unquoted string value — read until , } ]
             let start = i;
-            while i < len && !matches!(chars[i], ',' | '}' | ']' | '\n') { i += 1; }
-            let val: String = chars[start..i].iter().collect::<String>().trim().to_string();
+            while i < len && !matches!(chars[i], ',' | '}' | ']' | '\n') {
+                i += 1;
+            }
+            let val: String = chars[start..i]
+                .iter()
+                .collect::<String>()
+                .trim()
+                .to_string();
             if !val.is_empty() {
                 map.insert(key, serde_json::json!(val));
             }
@@ -299,13 +351,20 @@ pub fn extract_edit_file_args(raw: &str) -> Option<serde_json::Value> {
     let fp_marker = raw.find("\"file_path\"")?;
     let old_marker = raw.find("\"old_string\"")?;
     let new_marker = raw.find("\"new_string\"")?;
-    if old_marker <= fp_marker || new_marker <= old_marker { return None; }
+    if old_marker <= fp_marker || new_marker <= old_marker {
+        return None;
+    }
 
     // Extract file_path (simple quoted string before old_string)
     let fp_region = &raw[fp_marker + 11..old_marker];
     let fp_colon = fp_region.find(':')?;
-    let fp_val = fp_region[fp_colon + 1..].trim().trim_matches(|c| c == '"' || c == ',').trim();
-    if fp_val.is_empty() { return None; }
+    let fp_val = fp_region[fp_colon + 1..]
+        .trim()
+        .trim_matches(|c| c == '"' || c == ',')
+        .trim();
+    if fp_val.is_empty() {
+        return None;
+    }
     let file_path = fp_val.to_string();
 
     // Extract old_string: everything between "old_string": " and ", "new_string"
@@ -320,7 +379,9 @@ pub fn extract_edit_file_args(raw: &str) -> Option<serde_json::Value> {
     let new_raw = &raw[new_start..];
     let new_string = unescape_field_value_end(new_raw);
 
-    if old_string.is_empty() && new_string.is_empty() { return None; }
+    if old_string.is_empty() && new_string.is_empty() {
+        return None;
+    }
 
     let replace_all = raw.contains("\"replace_all\"")
         && raw.rfind("true").map_or(false, |t| {
@@ -339,19 +400,28 @@ fn unescape_field_value(raw: &str) -> String {
     let t = raw.trim().trim_end_matches(',').trim();
     let inner = if t.starts_with('"') { &t[1..] } else { t };
     let inner = inner.trim_end_matches('"');
-    inner.replace("\\n", "\n").replace("\\t", "\t").replace("\\\"", "\"").replace("\\\\", "\\")
+    inner
+        .replace("\\n", "\n")
+        .replace("\\t", "\t")
+        .replace("\\\"", "\"")
+        .replace("\\\\", "\\")
 }
 
 fn unescape_field_value_end(raw: &str) -> String {
     let t = raw.trim();
     let inner = if t.starts_with('"') { &t[1..] } else { t };
     // Remove trailing "} or ", "replace_all": ... }
-    let end = inner.rfind("\", \"replace_all\"")
+    let end = inner
+        .rfind("\", \"replace_all\"")
         .or_else(|| inner.rfind("\"}"))
         .or_else(|| inner.rfind("\"\n}"))
         .unwrap_or(inner.len());
     let content = &inner[..end];
-    content.replace("\\n", "\n").replace("\\t", "\t").replace("\\\"", "\"").replace("\\\\", "\\")
+    content
+        .replace("\\n", "\n")
+        .replace("\\t", "\t")
+        .replace("\\\"", "\"")
+        .replace("\\\\", "\\")
 }
 
 #[cfg(test)]
@@ -364,7 +434,8 @@ mod tests {
     fn repair_trailing_comma() {
         let input = r#"{"key": "value",}"#;
         let repaired = repair_json(input);
-        let parsed: serde_json::Value = serde_json::from_str(&repaired).expect("should be valid JSON");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&repaired).expect("should be valid JSON");
         assert_eq!(parsed["key"], "value");
     }
 
@@ -372,7 +443,8 @@ mod tests {
     fn repair_single_quotes() {
         let input = "{'key': 'value'}";
         let repaired = repair_json(input);
-        let parsed: serde_json::Value = serde_json::from_str(&repaired).expect("should be valid JSON");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&repaired).expect("should be valid JSON");
         assert_eq!(parsed["key"], "value");
     }
 
@@ -380,7 +452,8 @@ mod tests {
     fn repair_missing_closing_brace() {
         let input = r#"{"key": "value""#;
         let repaired = repair_json(input);
-        let parsed: serde_json::Value = serde_json::from_str(&repaired).expect("should be valid JSON");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&repaired).expect("should be valid JSON");
         assert_eq!(parsed["key"], "value");
     }
 
@@ -388,7 +461,8 @@ mod tests {
     fn repair_unquoted_keys() {
         let input = r#"{path: "src/main.rs"}"#;
         let repaired = repair_json(input);
-        let parsed: serde_json::Value = serde_json::from_str(&repaired).expect("should be valid JSON");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&repaired).expect("should be valid JSON");
         assert_eq!(parsed["path"], "src/main.rs");
     }
 
@@ -397,7 +471,8 @@ mod tests {
         // \. is not a valid JSON escape — should be doubled to \\.
         let input = r#"{"pattern": "app\.rs"}"#;
         let repaired = repair_json(input);
-        let parsed: serde_json::Value = serde_json::from_str(&repaired).expect("should be valid JSON after escape repair");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&repaired).expect("should be valid JSON after escape repair");
         // After repair \. becomes \\. which JSON parses as literal backslash + dot
         assert!(parsed["pattern"].as_str().unwrap().contains('.'));
     }
@@ -414,7 +489,8 @@ mod tests {
     fn repair_markdown_fence_json() {
         let input = "```json\n{\"key\": \"value\"}\n```";
         let repaired = repair_json(input);
-        let parsed: serde_json::Value = serde_json::from_str(&repaired).expect("should strip fences");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&repaired).expect("should strip fences");
         assert_eq!(parsed["key"], "value");
     }
 
@@ -422,7 +498,8 @@ mod tests {
     fn repair_markdown_fence_no_lang() {
         let input = "```\n{\"key\": \"value\"}\n```";
         let repaired = repair_json(input);
-        let parsed: serde_json::Value = serde_json::from_str(&repaired).expect("should strip fences");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&repaired).expect("should strip fences");
         assert_eq!(parsed["key"], "value");
     }
 

@@ -27,7 +27,12 @@ pub struct ValidateResult {
 /// `post_edit_syntax_check` for on-disk syntax validation.
 /// `content` is the post-edit content (what would be written to disk).
 /// `original_content` is the pre-edit content (for delta validation).
-pub async fn validate_and_fix(content: &str, _file_path: &str, _new_string: &str, _original_content: &str) -> ValidateResult {
+pub async fn validate_and_fix(
+    content: &str,
+    _file_path: &str,
+    _new_string: &str,
+    _original_content: &str,
+) -> ValidateResult {
     let warnings: Vec<String> = Vec::new();
     let current = content.to_string();
 
@@ -71,7 +76,10 @@ pub async fn post_edit_syntax_check(file_path: &str) -> String {
             return match tokio::fs::read_to_string(file_path).await {
                 Ok(content) => {
                     if serde_json::from_str::<serde_json::Value>(&content).is_err() {
-                        format!("\n\u{26a0} SYNTAX ERROR: {} is not valid JSON. Fix before proceeding.", file_path)
+                        format!(
+                            "\n\u{26a0} SYNTAX ERROR: {} is not valid JSON. Fix before proceeding.",
+                            file_path
+                        )
                     } else {
                         String::new()
                     }
@@ -113,7 +121,14 @@ pub async fn post_edit_syntax_check(file_path: &str) -> String {
             }
             return format!("\n⚠ VUE SYNTAX: {}", warnings.join("; "));
         }
-        "py" => Some(("python3", vec!["-m".to_string(), "py_compile".to_string(), file_path.to_string()])),
+        "py" => Some((
+            "python3",
+            vec![
+                "-m".to_string(),
+                "py_compile".to_string(),
+                file_path.to_string(),
+            ],
+        )),
         _ => None,
     };
 
@@ -134,4 +149,3 @@ pub async fn post_edit_syntax_check(file_path: &str) -> String {
         String::new()
     }
 }
-

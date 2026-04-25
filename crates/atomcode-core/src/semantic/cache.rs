@@ -49,11 +49,14 @@ impl ASTCache {
         let source = std::fs::read_to_string(path).ok()?;
         let tree = self.parser.parse(&source, None)?;
 
-        self.entries.insert(abs, CacheEntry {
-            tree: tree.clone(),
-            modified,
-            lang,
-        });
+        self.entries.insert(
+            abs,
+            CacheEntry {
+                tree: tree.clone(),
+                modified,
+                lang,
+            },
+        );
 
         Some((tree, lang))
     }

@@ -27,8 +27,8 @@
 
 use super::CtxBuilder;
 use crate::config::provider::ProviderConfig;
-use crate::conversation::{ContextStats, Conversation};
 use crate::conversation::message::Message;
+use crate::conversation::{ContextStats, Conversation};
 use crate::tool::ToolResult;
 
 /// 本地 Ollama 模型的上下文策略。
@@ -182,7 +182,10 @@ mod tests {
     #[test]
     fn tool_output_cap_follows_spec() {
         // ctx=8K → 8000/8=1000, 被 max(2000) 抬到 2000
-        assert_eq!(OllamaCtx::new(&ollama_provider(8_000)).tool_output_cap(), 2_000);
+        assert_eq!(
+            OllamaCtx::new(&ollama_provider(8_000)).tool_output_cap(),
+            2_000
+        );
         // ctx=16K → 16000/8=2000, 正好等于下限
         assert_eq!(
             OllamaCtx::new(&ollama_provider(16_000)).tool_output_cap(),
@@ -244,7 +247,11 @@ mod tests {
         let mut conv = Conversation::new();
         for i in 0..8 {
             conv.add_user_message(&format!("user turn {} with moderate content", i));
-            conv.add_assistant_tool_calls(Some(&format!("some assistant reasoning for turn {}", i)), vec![], None);
+            conv.add_assistant_tool_calls(
+                Some(&format!("some assistant reasoning for turn {}", i)),
+                vec![],
+                None,
+            );
         }
         // 16 条消息,每条 ~10-15 tokens → 总 ~200 tokens,低于 35%,不压
         assert!(!o.needs_compression(&conv, 50));
@@ -252,15 +259,13 @@ mod tests {
         // 再填大量长消息让总 tokens 超过 2800
         for _ in 0..20 {
             conv.add_user_message(&"lorem ipsum ".repeat(50).repeat(2)); // 每条 ~250 tokens
-            conv.add_assistant_tool_calls(
-                Some(&"dolor sit amet ".repeat(50)),
-                vec![],
-                None,
-            );
+            conv.add_assistant_tool_calls(Some(&"dolor sit amet ".repeat(50)), vec![], None);
         }
         // 此时总 tokens 远超 2800
-        assert!(o.needs_compression(&conv, 50),
-            "大对话下 OllamaCtx 应触发压缩(35% threshold)");
+        assert!(
+            o.needs_compression(&conv, 50),
+            "大对话下 OllamaCtx 应触发压缩(35% threshold)"
+        );
     }
 
     #[test]

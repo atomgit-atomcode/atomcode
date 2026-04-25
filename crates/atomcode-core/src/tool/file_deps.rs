@@ -20,8 +20,18 @@ fn shorten_path(path: &Path) -> String {
     if components.len() <= 3 {
         return path.display().to_string();
     }
-    let last3: Vec<_> = components[components.len() - 3..].iter().map(|c| c.as_os_str()).collect();
-    format!(".../{}", last3.iter().map(|s| s.to_string_lossy()).collect::<Vec<_>>().join("/"))
+    let last3: Vec<_> = components[components.len() - 3..]
+        .iter()
+        .map(|c| c.as_os_str())
+        .collect();
+    format!(
+        ".../{}",
+        last3
+            .iter()
+            .map(|s| s.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/")
+    )
 }
 
 #[async_trait]
@@ -29,10 +39,12 @@ impl Tool for FileDependenciesTool {
     fn definition(&self) -> ToolDef {
         ToolDef {
             name: "file_dependencies",
-            description: "Show file-level dependencies: which files this file USES (imports/calls into) \
+            description:
+                "Show file-level dependencies: which files this file USES (imports/calls into) \
                 and which files USE this file (depend on it).\n\
                 Accepts relative or absolute file paths.\n\
-                Example: {\"file\": \"src/agent/mod.rs\"}".to_string(),
+                Example: {\"file\": \"src/agent/mod.rs\"}"
+                    .to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -56,7 +68,11 @@ impl Tool for FileDependenciesTool {
             Ok(wd) => wd.clone(),
             Err(_) => return self.approval(args),
         };
-        match super::approval_for_path(&parsed.file, &working_dir, super::ExternalPathAction::Enumerate) {
+        match super::approval_for_path(
+            &parsed.file,
+            &working_dir,
+            super::ExternalPathAction::Enumerate,
+        ) {
             Ok(approval) => approval,
             Err(_) => self.approval(args),
         }
@@ -82,7 +98,8 @@ impl Tool for FileDependenciesTool {
             return Ok(ToolResult {
                 call_id: String::new(),
                 output: "Code graph is not yet indexed. The graph will be available after the \
-                    background indexer completes. Try again shortly.".to_string(),
+                    background indexer completes. Try again shortly."
+                    .to_string(),
                 success: false,
             });
         }
@@ -92,8 +109,10 @@ impl Tool for FileDependenciesTool {
             None => {
                 return Ok(ToolResult {
                     call_id: String::new(),
-                    output: format!("File '{}' not found in code graph. Check the path or wait for indexing.",
-                        parsed.file),
+                    output: format!(
+                        "File '{}' not found in code graph. Check the path or wait for indexing.",
+                        parsed.file
+                    ),
                     success: false,
                 });
             }

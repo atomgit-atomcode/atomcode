@@ -20,8 +20,18 @@ fn shorten_path(path: &Path) -> String {
     if components.len() <= 3 {
         return path.display().to_string();
     }
-    let last3: Vec<_> = components[components.len() - 3..].iter().map(|c| c.as_os_str()).collect();
-    format!(".../{}", last3.iter().map(|s| s.to_string_lossy()).collect::<Vec<_>>().join("/"))
+    let last3: Vec<_> = components[components.len() - 3..]
+        .iter()
+        .map(|c| c.as_os_str())
+        .collect();
+    format!(
+        ".../{}",
+        last3
+            .iter()
+            .map(|s| s.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/")
+    )
 }
 
 #[async_trait]
@@ -32,7 +42,8 @@ impl Tool for BlastRadiusTool {
             description: "Estimate the blast radius of changing a file. Shows direct dependents \
                 (depth 1), indirect dependents (depth 2-3), and total impacted file count.\n\
                 Use before refactoring to understand the scope of changes.\n\
-                Example: {\"file\": \"src/tool/mod.rs\"}".to_string(),
+                Example: {\"file\": \"src/tool/mod.rs\"}"
+                .to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -56,7 +67,11 @@ impl Tool for BlastRadiusTool {
             Ok(wd) => wd.clone(),
             Err(_) => return self.approval(args),
         };
-        match super::approval_for_path(&parsed.file, &working_dir, super::ExternalPathAction::Enumerate) {
+        match super::approval_for_path(
+            &parsed.file,
+            &working_dir,
+            super::ExternalPathAction::Enumerate,
+        ) {
             Ok(approval) => approval,
             Err(_) => self.approval(args),
         }
@@ -82,7 +97,8 @@ impl Tool for BlastRadiusTool {
             return Ok(ToolResult {
                 call_id: String::new(),
                 output: "Code graph is not yet indexed. The graph will be available after the \
-                    background indexer completes. Try again shortly.".to_string(),
+                    background indexer completes. Try again shortly."
+                    .to_string(),
                 success: false,
             });
         }
@@ -92,8 +108,10 @@ impl Tool for BlastRadiusTool {
             None => {
                 return Ok(ToolResult {
                     call_id: String::new(),
-                    output: format!("File '{}' not found in code graph. Check the path or wait for indexing.",
-                        parsed.file),
+                    output: format!(
+                        "File '{}' not found in code graph. Check the path or wait for indexing.",
+                        parsed.file
+                    ),
                     success: false,
                 });
             }
@@ -137,7 +155,10 @@ impl Tool for BlastRadiusTool {
             }
         }
 
-        out.push_str(&format!("\nINDIRECT DEPENDENTS ({} files):\n", indirect.len()));
+        out.push_str(&format!(
+            "\nINDIRECT DEPENDENTS ({} files):\n",
+            indirect.len()
+        ));
         if indirect.is_empty() {
             out.push_str("  (none)\n");
         } else {

@@ -76,10 +76,7 @@ pub fn write_line(cat: &str, args: std::fmt::Arguments<'_>) {
         return;
     };
     let us = origin().elapsed().as_micros();
-    let tid = std::thread::current()
-        .name()
-        .unwrap_or("?")
-        .to_string();
+    let tid = std::thread::current().name().unwrap_or("?").to_string();
     let line = format!("+{:>10}us [{:>3}] {:>14} {}\n", us, cat, tid, args);
     if let Ok(mut f) = sink.lock() {
         let _ = f.write_all(line.as_bytes());

@@ -30,6 +30,7 @@
 //   - `default_provider` is set to the first model in the API order.
 
 use anyhow::Result;
+use std::sync::Arc;
 
 use super::client::Client;
 use super::types::StatusResponse;
@@ -107,7 +108,11 @@ impl SetupReport {
             StepResult::Ok(info) => {
                 out.push_str(&format!(
                     "  ✔ CodingPlan claimed — {}\n",
-                    if info.message.is_empty() { "success" } else { &info.message },
+                    if info.message.is_empty() {
+                        "success"
+                    } else {
+                        &info.message
+                    },
                 ));
             }
             StepResult::Skipped(reason) => {
@@ -124,7 +129,11 @@ impl SetupReport {
                 out.push_str(&format!(
                     "  ✔ Added {} provider{}:\n",
                     info.provider_names.len(),
-                    if info.provider_names.len() == 1 { "" } else { "s" },
+                    if info.provider_names.len() == 1 {
+                        ""
+                    } else {
+                        "s"
+                    },
                 ));
                 for (pname, model) in info.provider_names.iter().zip(info.display_names.iter()) {
                     let suffix = if pname == &info.default_provider {
@@ -228,11 +237,21 @@ pub struct ModelsInfo {
 /// the caller is responsible for persisting it to disk after a successful
 /// run. This keeps the core free of I/O concerns — tests can call `run`
 /// against a `Config::default()` without touching the filesystem.
-pub fn run(config: &mut Config) -> Result<SetupReport> {
+///
+/// Emits exactly one `TakeCodingplan { Success | Fail }` event at each exit path.
+pub fn run(
+    config: &mut Config,
+    tel: Option<&Arc<atomcode_telemetry::Telemetry>>,
+) -> Result<SetupReport> {
     // Step 1: login
     let login = step_login();
     if login.is_err() {
         // No point continuing — every downstream call needs a token.
+        if let Some(t) = tel {
+            t.track(atomcode_telemetry::Event::TakeCodingplan {
+                type_: atomcode_telemetry::CodingplanResult::Fail,
+            });
+        }
         return Ok(SetupReport {
             login,
             claim: StepResult::Err("skipped: login failed".into()),
@@ -247,6 +266,11 @@ pub fn run(config: &mut Config) -> Result<SetupReport> {
     // Step 3: models — critical. Without models there's nothing to set up.
     let models = step_models_and_register(config);
     if models.is_err() {
+        if let Some(t) = tel {
+            t.track(atomcode_telemetry::Event::TakeCodingplan {
+                type_: atomcode_telemetry::CodingplanResult::Fail,
+            });
+        }
         return Ok(SetupReport {
             login,
             claim,
@@ -257,6 +281,13 @@ pub fn run(config: &mut Config) -> Result<SetupReport> {
 
     // Step 4: status — warn-only.
     let status = step_status();
+
+    // All critical steps (login + models) succeeded. Emit success event.
+    if let Some(t) = tel {
+        t.track(atomcode_telemetry::Event::TakeCodingplan {
+            type_: atomcode_telemetry::CodingplanResult::Success,
+        });
+    }
 
     Ok(SetupReport {
         login,
@@ -288,7 +319,7 @@ fn step_login() -> StepResult<LoginInfo> {
     // Not logged in — run OAuth. This prints to stdout + opens a browser.
     // Callers in TUI context must have already suspended raw mode before
     // calling `run`.
-    match auth::login().and_then(|a| auth::save_auth(&a).map(|_| a)) {
+    match auth::login(None).and_then(|a| auth::save_auth(&a).map(|_| a)) {
         Ok(auth_info) => StepResult::Ok(LoginInfo {
             username: auth_info.user.username.clone(),
             display_name: auth_info.user.name.clone(),
@@ -433,7 +464,7 @@ fn build_codingplan_provider(model: &str) -> ProviderConfig {
         max_tokens: None,
         thinking_type: None,
         thinking_keep: None,
-            reasoning_history: None,
+        reasoning_history: None,
         ephemeral: false,
     }
 }
@@ -452,6 +483,7 @@ mod tests {
             auto_update: true,
             reflection_cadence: 7,
             notifications: Default::default(),
+            telemetry: Default::default(),
         }
     }
 
@@ -533,14 +565,25 @@ mod tests {
         }
         let provider_names = provider_names_for(&names);
         for (pname, m) in provider_names.iter().zip(names.iter()) {
-            config.providers.insert(pname.clone(), build_codingplan_provider(m));
+            config
+                .providers
+                .insert(pname.clone(), build_codingplan_provider(m));
         }
         config.default_provider = provider_names[0].clone();
 
         assert_eq!(config.providers.len(), 2, "claude + one fresh AtomGit");
-        assert!(config.providers.contains_key("claude"), "unrelated entry kept");
-        assert!(config.providers.contains_key("AtomGit"), "fresh AtomGit added");
-        assert!(!config.providers.contains_key("AtomGit-legacy"), "stale removed");
+        assert!(
+            config.providers.contains_key("claude"),
+            "unrelated entry kept"
+        );
+        assert!(
+            config.providers.contains_key("AtomGit"),
+            "fresh AtomGit added"
+        );
+        assert!(
+            !config.providers.contains_key("AtomGit-legacy"),
+            "stale removed"
+        );
         let fresh = &config.providers["AtomGit"];
         assert_eq!(fresh.model, "meta-llama/Llama-3-70B");
         assert_eq!(fresh.base_url.as_deref(), Some(LLM_BASE_URL));
@@ -554,7 +597,10 @@ mod tests {
         assert_eq!(p.provider_type, "openai");
         assert_eq!(p.base_url.as_deref(), Some("https://api-ai.gitcode.com/v1"));
         assert_eq!(p.context_window, 64_000);
-        assert!(p.api_key.is_none(), "token loaded at runtime from auth.toml");
+        assert!(
+            p.api_key.is_none(),
+            "token loaded at runtime from auth.toml"
+        );
         assert!(!p.ephemeral);
     }
 
@@ -654,7 +700,10 @@ mod tests {
         };
         let out = report.render();
         assert!(out.contains("✘ Login failed"));
-        assert!(!report.should_persist_config(), "don't write config on login failure");
+        assert!(
+            !report.should_persist_config(),
+            "don't write config on login failure"
+        );
     }
 
     /// Render exercise: multi-model report. Verifies each provider
@@ -684,8 +733,15 @@ mod tests {
         };
         let out = report.render();
         assert!(out.contains("Added 3 providers"));
-        assert!(out.contains("AtomGit-moonshotai-Kimi-K2-Instruct  →  moonshotai/Kimi-K2-Instruct  (default)"));
-        assert!(out.contains("AtomGit-anthropic-claude-3.5-sonnet  →  anthropic/claude-3.5-sonnet\n"));
-        assert!(!out.contains("anthropic/claude-3.5-sonnet  (default)"), "only first is default");
+        assert!(out.contains(
+            "AtomGit-moonshotai-Kimi-K2-Instruct  →  moonshotai/Kimi-K2-Instruct  (default)"
+        ));
+        assert!(
+            out.contains("AtomGit-anthropic-claude-3.5-sonnet  →  anthropic/claude-3.5-sonnet\n")
+        );
+        assert!(
+            !out.contains("anthropic/claude-3.5-sonnet  (default)"),
+            "only first is default"
+        );
     }
 }

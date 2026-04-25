@@ -54,12 +54,17 @@ impl Tool for GlobTool {
             Ok(wd) => wd.clone(),
             Err(_) => return self.approval(args),
         };
-        let base_dir = match super::inspect_path_access(parsed.path.as_deref().unwrap_or("."), &working_dir) {
-            Ok(access) => access.path.to_string_lossy().to_string(),
-            Err(_) => return self.approval(args),
-        };
+        let base_dir =
+            match super::inspect_path_access(parsed.path.as_deref().unwrap_or("."), &working_dir) {
+                Ok(access) => access.path.to_string_lossy().to_string(),
+                Err(_) => return self.approval(args),
+            };
         let search_dir = derive_search_dir(&base_dir, &parsed.pattern);
-        match super::approval_for_path(&search_dir, &working_dir, super::ExternalPathAction::Enumerate) {
+        match super::approval_for_path(
+            &search_dir,
+            &working_dir,
+            super::ExternalPathAction::Enumerate,
+        ) {
             Ok(approval) => approval,
             Err(_) => self.approval(args),
         }
@@ -68,7 +73,8 @@ impl Tool for GlobTool {
     async fn execute(&self, args: &str, ctx: &ToolContext) -> Result<ToolResult> {
         let parsed: GlobArgs = serde_json::from_str(args)?;
         let wd = ctx.working_dir.read().await.clone();
-        let base_dir = match super::inspect_path_access(parsed.path.as_deref().unwrap_or("."), &wd) {
+        let base_dir = match super::inspect_path_access(parsed.path.as_deref().unwrap_or("."), &wd)
+        {
             Ok(access) => access.path.to_string_lossy().to_string(),
             Err(err) => {
                 return Ok(ToolResult {
@@ -110,11 +116,15 @@ impl Tool for GlobTool {
                     max_depth: usize,
                     results: &mut Vec<String>,
                 ) {
-                    if depth > max_depth || results.len() >= 20 { return; }
+                    if depth > max_depth || results.len() >= 20 {
+                        return;
+                    }
                     if let Ok(entries) = std::fs::read_dir(dir) {
                         for entry in entries.flatten() {
                             let name = entry.file_name().to_string_lossy().to_string();
-                            if name.starts_with('.') || super::should_skip_dir(&name) { continue; }
+                            if name.starts_with('.') || super::should_skip_dir(&name) {
+                                continue;
+                            }
                             let p = entry.path();
                             if p.is_dir() {
                                 if name == target {
@@ -125,18 +135,28 @@ impl Tool for GlobTool {
                         }
                     }
                 }
-                find_dir(std::path::Path::new(&wd), &target_basename, 0, 5, &mut dir_matches);
+                find_dir(
+                    std::path::Path::new(&wd),
+                    &target_basename,
+                    0,
+                    5,
+                    &mut dir_matches,
+                );
             }
             let hint = if dir_matches.is_empty() {
                 String::new()
             } else {
-                dir_matches.sort_by_key(|d| std::cmp::Reverse(super::shared_prefix_len(&search_dir, d)));
+                dir_matches
+                    .sort_by_key(|d| std::cmp::Reverse(super::shared_prefix_len(&search_dir, d)));
                 let shown: Vec<String> = dir_matches
                     .iter()
                     .take(3)
                     .map(|d| format!("  {}", d))
                     .collect();
-                format!("\n\nSimilar directories found — did you mean one of these?\n{}", shown.join("\n"))
+                format!(
+                    "\n\nSimilar directories found — did you mean one of these?\n{}",
+                    shown.join("\n")
+                )
             };
             return Ok(ToolResult {
                 call_id: String::new(),
@@ -199,14 +219,20 @@ fn derive_search_dir(base_dir: &str, pattern: &str) -> String {
         } else if std::path::Path::new(dir_part).is_absolute() {
             dir_part.to_string()
         } else {
-            std::path::Path::new(base_dir).join(dir_part).to_string_lossy().to_string()
+            std::path::Path::new(base_dir)
+                .join(dir_part)
+                .to_string_lossy()
+                .to_string()
         }
     } else if let Some(last_slash) = pattern.rfind('/') {
         let dir_part = &pattern[..last_slash];
         if std::path::Path::new(dir_part).is_absolute() {
             dir_part.to_string()
         } else {
-            std::path::Path::new(base_dir).join(dir_part).to_string_lossy().to_string()
+            std::path::Path::new(base_dir)
+                .join(dir_part)
+                .to_string_lossy()
+                .to_string()
         }
     } else {
         base_dir.to_string()
@@ -216,7 +242,11 @@ fn derive_search_dir(base_dir: &str, pattern: &str) -> String {
 fn derive_name_pattern(pattern: &str) -> String {
     if let Some(star_pos) = pattern.find("**/") {
         let after_stars = &pattern[star_pos + 3..];
-        after_stars.rsplit('/').next().unwrap_or(after_stars).to_string()
+        after_stars
+            .rsplit('/')
+            .next()
+            .unwrap_or(after_stars)
+            .to_string()
     } else if let Some(last_slash) = pattern.rfind('/') {
         pattern[last_slash + 1..].to_string()
     } else {
@@ -244,17 +274,15 @@ mod tests {
         std::fs::write(
             dir.path().join("hermes/presentation/app.vue"),
             "<template></template>",
-        ).unwrap();
+        )
+        .unwrap();
 
         let ctx = ToolContext::new(dir.path().to_path_buf());
         let tool = GlobTool;
         // Agent asks for `.vue` files under the WRONG path — `hermes/frontend/presentation`
         // doesn't exist, but `hermes/presentation` does.
         let wrong = dir.path().join("hermes/frontend/presentation");
-        let args = format!(
-            r#"{{"pattern":"{}/**/*.vue"}}"#,
-            wrong.display()
-        );
+        let args = format!(r#"{{"pattern":"{}/**/*.vue"}}"#, wrong.display());
 
         let r = tool.execute(&args, &ctx).await.unwrap();
         assert!(r.success);
@@ -288,11 +316,17 @@ mod tests {
 
         let ctx = ToolContext::new(dir.path().to_path_buf());
         let tool = GlobTool;
-        let args = format!(r#"{{"pattern":"{}/**/*.ts"}}"#, dir.path().join("src").display());
+        let args = format!(
+            r#"{{"pattern":"{}/**/*.ts"}}"#,
+            dir.path().join("src").display()
+        );
 
         let r = tool.execute(&args, &ctx).await.unwrap();
         assert!(r.success);
-        assert!(!r.output.contains("Similar directories found"),
-            "no hint should fire when dir exists: {}", r.output);
+        assert!(
+            !r.output.contains("Similar directories found"),
+            "no hint should fire when dir exists: {}",
+            r.output
+        );
     }
 }

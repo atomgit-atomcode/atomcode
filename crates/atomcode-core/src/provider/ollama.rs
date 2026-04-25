@@ -171,9 +171,10 @@ impl LlmProvider for OllamaProvider {
             if !response.status().is_success() {
                 let status = response.status();
                 let body = response.text().await.unwrap_or_default();
-                let _ = tx.send(Ok(StreamEvent::Error(
-                    format!("Ollama error ({}): {}", status, body),
-                )));
+                let _ = tx.send(Ok(StreamEvent::Error(format!(
+                    "Ollama error ({}): {}",
+                    status, body
+                ))));
                 return;
             }
 
@@ -227,13 +228,12 @@ impl LlmProvider for OllamaProvider {
 
                         if chunk.done {
                             if chunk.eval_count > 0 || chunk.prompt_eval_count > 0 {
-                                let _ = tx.send(Ok(StreamEvent::Usage(
-                                    crate::stream::TokenUsage {
+                                let _ =
+                                    tx.send(Ok(StreamEvent::Usage(crate::stream::TokenUsage {
                                         prompt_tokens: chunk.prompt_eval_count,
                                         completion_tokens: chunk.eval_count,
                                         cached_tokens: 0,
-                                    }
-                                )));
+                                    })));
                             }
                             let _ = tx.send(Ok(StreamEvent::Done { truncated: false }));
                             return;
@@ -250,7 +250,9 @@ impl LlmProvider for OllamaProvider {
             let _ = tx.send(Ok(StreamEvent::Done { truncated: false }));
         });
 
-        Ok(Box::pin(tokio_stream::wrappers::UnboundedReceiverStream::new(rx)))
+        Ok(Box::pin(
+            tokio_stream::wrappers::UnboundedReceiverStream::new(rx),
+        ))
     }
 
     fn model_name(&self) -> &str {

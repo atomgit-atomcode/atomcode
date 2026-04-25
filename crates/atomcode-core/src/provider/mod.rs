@@ -249,7 +249,8 @@ fn refresh_and_save(refresh_token: &str, auth_path: &std::path::Path) -> Result<
         avatar_url: Option<String>,
     }
 
-    let token: RefreshedAuth = resp.json()
+    let token: RefreshedAuth = resp
+        .json()
         .map_err(|e| anyhow::anyhow!("Token refresh parse error: {} — please /login", e))?;
 
     // Preserve original token_type or use default
@@ -305,14 +306,18 @@ mod tests {
             .join(".atomcode")
             .join("auth.toml");
 
-        assert_eq!(auth_module_path, expected_path,
-            "auth_file_path() should always return ~/.atomcode/auth.toml");
+        assert_eq!(
+            auth_module_path, expected_path,
+            "auth_file_path() should always return ~/.atomcode/auth.toml"
+        );
 
         // Verify the path ends with the expected directory structure
-        assert!(auth_module_path.ends_with(".atomcode/auth.toml") ||
-                auth_module_path.ends_with(".atomcode\\auth.toml"), // Windows compatibility
-                "Path should end with .atomcode/auth.toml, got: {}",
-                auth_module_path.display());
+        assert!(
+            auth_module_path.ends_with(".atomcode/auth.toml")
+                || auth_module_path.ends_with(".atomcode\\auth.toml"), // Windows compatibility
+            "Path should end with .atomcode/auth.toml, got: {}",
+            auth_module_path.display()
+        );
     }
 
     use crate::config::provider::ProviderConfig;

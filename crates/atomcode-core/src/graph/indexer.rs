@@ -78,7 +78,9 @@ impl GraphIndexer {
             return;
         }
 
-        if cancel.is_cancelled() { return; }
+        if cancel.is_cancelled() {
+            return;
+        }
 
         // Walk + stat the tree on the blocking-thread pool rather than on
         // an async worker. `WalkBuilder` is pure sync I/O; leaving it on
@@ -96,14 +98,15 @@ impl GraphIndexer {
         // Snapshot mtimes under a short read lock to determine dirty files.
         let (deleted, dirty_files) = {
             let graph = self.graph.read().await;
-            let deleted: Vec<PathBuf> = graph.file_mtimes.keys()
+            let deleted: Vec<PathBuf> = graph
+                .file_mtimes
+                .keys()
                 .filter(|p| !current_paths.contains(*p))
                 .cloned()
                 .collect();
-            let dirty: Vec<(PathBuf, u64)> = files.into_iter()
-                .filter(|(path, mtime)| {
-                    graph.file_mtimes.get(path) != Some(mtime)
-                })
+            let dirty: Vec<(PathBuf, u64)> = files
+                .into_iter()
+                .filter(|(path, mtime)| graph.file_mtimes.get(path) != Some(mtime))
                 .collect();
             (deleted, dirty)
         };
@@ -129,7 +132,9 @@ impl GraphIndexer {
         const CPU_BREATHE_MS: u64 = 5;
         let mut all_results: Vec<(PathBuf, u64, FileParseResult)> = Vec::new();
         for (i, (path, mtime)) in dirty_files.into_iter().enumerate() {
-            if cancel.is_cancelled() { return; }
+            if cancel.is_cancelled() {
+                return;
+            }
             if let Some(result) = self.parse_file(&path) {
                 all_results.push((path, mtime, result));
             }
@@ -146,7 +151,9 @@ impl GraphIndexer {
         // Final cancel check: skip the write-lock critical section if
         // a newer indexer has been spawned. Contention on graph.write()
         // would otherwise delay the new indexer's own write.
-        if cancel.is_cancelled() { return; }
+        if cancel.is_cancelled() {
+            return;
+        }
 
         // Single write lock for ALL mutations — atomic from readers' perspective.
         // Grep/trace_callees will block briefly here but never see partial state.
@@ -178,7 +185,11 @@ impl GraphIndexer {
                     {
                         graph.add_edge(
                             caller_id,
-                            Edge { to: callee_id, kind: EdgeKind::Calls, line: raw_call.line },
+                            Edge {
+                                to: callee_id,
+                                kind: EdgeKind::Calls,
+                                line: raw_call.line,
+                            },
                         );
                     }
                 }
@@ -257,10 +268,7 @@ impl GraphIndexer {
         let symbols = self.extract_symbols(path, &source, lang, &tree);
         let raw_calls = self.extract_calls(path, &source, lang, &tree, &symbols);
 
-        Some(FileParseResult {
-            symbols,
-            raw_calls,
-        })
+        Some(FileParseResult { symbols, raw_calls })
     }
 
     /// Extract symbol definitions from a parsed tree using the language's symbols_query.
@@ -396,10 +404,8 @@ impl GraphIndexer {
                     let caller_name = symbols
                         .iter()
                         .filter(|s| {
-                            matches!(
-                                s.kind,
-                                SymbolKind::Function | SymbolKind::Method
-                            ) && s.start_line <= call_line
+                            matches!(s.kind, SymbolKind::Function | SymbolKind::Method)
+                                && s.start_line <= call_line
                                 && call_line <= s.end_line
                         })
                         .last()
@@ -498,7 +504,9 @@ fn is_home_or_root(path: &Path) -> bool {
 /// Scan is capped at 200 immediate entries so the guard itself stays
 /// cheap. Returns on the third match.
 fn is_umbrella_dir(dir: &Path) -> bool {
-    let Ok(entries) = std::fs::read_dir(dir) else { return false; };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
     let mut project_children = 0;
     for entry in entries.flatten().take(200) {
         let p = entry.path();
@@ -610,8 +618,10 @@ mod tests {
         mk(tmp.path(), "b", &[".git"]);
         mk(tmp.path(), "c", &["package.json"]);
         mk(tmp.path(), "d", &["Cargo.toml"]);
-        assert!(!should_index(tmp.path()),
-            "umbrella of 4 projects without own marker must be skipped");
+        assert!(
+            !should_index(tmp.path()),
+            "umbrella of 4 projects without own marker must be skipped"
+        );
     }
 
     #[test]
@@ -624,8 +634,10 @@ mod tests {
         mk(tmp.path(), "a", &[".git"]);
         mk(tmp.path(), "b", &[".git"]);
         mk(tmp.path(), "c", &[".git"]);
-        assert!(should_index(tmp.path()),
-            "user-placed marker must override umbrella detection");
+        assert!(
+            should_index(tmp.path()),
+            "user-placed marker must override umbrella detection"
+        );
     }
 
     /// Regression: `.atomcode` is atomcode's own storage dir (it gets
@@ -660,8 +672,10 @@ mod tests {
         mk(tmp.path(), "a", &[".git"]);
         mk(tmp.path(), "b", &[".git"]);
         mk(tmp.path(), "other", &[]); // not a project
-        assert!(should_index(tmp.path()),
-            "2 child projects < umbrella threshold");
+        assert!(
+            should_index(tmp.path()),
+            "2 child projects < umbrella threshold"
+        );
     }
 
     /// Regression: a pre-cancelled token must cause index_all to bail

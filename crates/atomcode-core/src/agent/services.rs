@@ -133,10 +133,7 @@ impl AgentLoop {
                         .to_string(),
                 ));
             }
-            let _ = self
-                .event_tx
-                .send(AgentEvent::WorkingDirChanged(resolved));
+            let _ = self.event_tx.send(AgentEvent::WorkingDirChanged(resolved));
         }
     }
 }
-

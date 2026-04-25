@@ -93,7 +93,10 @@ fn content_hash(content: &str) -> String {
 
 /// Generate a one-line summary of tool output.
 fn make_summary(output: &str, success: bool) -> String {
-    let first_line = output.lines().next().unwrap_or(if success { "OK" } else { "Error" });
+    let first_line = output
+        .lines()
+        .next()
+        .unwrap_or(if success { "OK" } else { "Error" });
     if success {
         if first_line.chars().count() > 100 {
             format!("{}...", first_line.chars().take(97).collect::<String>())

@@ -9,6 +9,8 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use atomcode_telemetry::{Event, Telemetry};
+
 /// Platform OAuth Broker URL (client_secret is kept on the broker)
 pub const PLATFORM_BROKER_URL: &str = "https://acs.atomgit.com";
 pub const PLATFORM_LOGIN_URL: &str = "https://acs.atomgit.com/auth/login";
@@ -96,8 +98,12 @@ struct PlatformTokenResponse {
     user: PlatformUserInfo,
 }
 
-/// Perform OAuth login flow via Platform broker
-pub fn login() -> Result<AuthInfo> {
+/// Perform OAuth login flow via Platform broker.
+///
+/// `tel` is optional so non-CLI callers (TUI `/login`, coding_plan setup,
+/// tests) can pass `None` when they don't hold a telemetry handle. The CLI
+/// main path passes `Some(&telemetry)` to emit `login_success` once.
+pub fn login(tel: Option<&Arc<Telemetry>>) -> Result<AuthInfo> {
     // println!("\n  AtomCode Login");
     // println!("  ==============\n");
 
@@ -180,6 +186,10 @@ pub fn login() -> Result<AuthInfo> {
     //     "  Logged in as: {} ({})\n",
     //     auth_info.user.username, auth_info.user.id
     // );
+
+    if let Some(t) = tel {
+        t.track(Event::LoginSuccess);
+    }
 
     Ok(auth_info)
 }
@@ -361,9 +371,7 @@ fn await_callback(port: u16) -> Result<(String, String)> {
 /// gets it, and a blocked `read_line` stays in line for the next input.
 #[cfg(not(target_os = "windows"))]
 #[allow(dead_code)]
-fn read_callback_from_stdin_until_stopped(
-    stop: &AtomicBool,
-) -> Result<(String, String)> {
+fn read_callback_from_stdin_until_stopped(stop: &AtomicBool) -> Result<(String, String)> {
     use std::os::unix::io::AsRawFd;
 
     let stdin = io::stdin();
@@ -419,8 +427,7 @@ fn read_callback_from_stdin_until_stopped(
         }
         // Data available; drain what's there. read(2) in non-blocking
         // mode returns up to one pipe buffer in a single call.
-        let n =
-            unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+        let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
         if n < 0 {
             let err = io::Error::last_os_error();
             if err.kind() == io::ErrorKind::WouldBlock || err.kind() == io::ErrorKind::Interrupted {
@@ -586,9 +593,7 @@ pub fn refresh_access_token(auth: &AuthInfo) -> Result<AuthInfo> {
         user: Option<PlatformUserInfo>,
     }
 
-    let broker_resp: BrokerResponse = response
-        .json()
-        .context("Failed to parse broker response")?;
+    let broker_resp: BrokerResponse = response.json().context("Failed to parse broker response")?;
 
     let created_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -597,17 +602,24 @@ pub fn refresh_access_token(auth: &AuthInfo) -> Result<AuthInfo> {
 
     let new_auth = AuthInfo {
         access_token: broker_resp.access_token,
-        refresh_token: broker_resp.refresh_token.or_else(|| auth.refresh_token.clone()),
-        token_type: broker_resp.token_type.unwrap_or_else(|| auth.token_type.clone()),
+        refresh_token: broker_resp
+            .refresh_token
+            .or_else(|| auth.refresh_token.clone()),
+        token_type: broker_resp
+            .token_type
+            .unwrap_or_else(|| auth.token_type.clone()),
         expires_in: broker_resp.expires_in.or(auth.expires_in),
         created_at,
-        user: broker_resp.user.map(|u| UserInfo {
-            id: u.id,
-            username: u.username,
-            name: u.name,
-            email: u.email,
-            avatar_url: u.avatar_url,
-        }).unwrap_or_else(|| auth.user.clone()),
+        user: broker_resp
+            .user
+            .map(|u| UserInfo {
+                id: u.id,
+                username: u.username,
+                name: u.name,
+                email: u.email,
+                avatar_url: u.avatar_url,
+            })
+            .unwrap_or_else(|| auth.user.clone()),
     };
 
     save_auth(&new_auth)?;

@@ -48,7 +48,11 @@ impl Tool for ReadSymbolTool {
             Ok(wd) => wd.clone(),
             Err(_) => return self.approval(args),
         };
-        match super::approval_for_path(&parsed.file_path, &working_dir, super::ExternalPathAction::Read) {
+        match super::approval_for_path(
+            &parsed.file_path,
+            &working_dir,
+            super::ExternalPathAction::Read,
+        ) {
             Ok(approval) => approval,
             Err(_) => self.approval(args),
         }
@@ -100,10 +104,15 @@ impl Tool for ReadSymbolTool {
                         let names: Vec<String> = symbols.iter().map(|s| s.name.clone()).collect();
                         format!(
                             "Symbol '{}' not found in {}.\nAvailable symbols: {}",
-                            parsed.symbol, parsed.file_path, names.join(", ")
+                            parsed.symbol,
+                            parsed.file_path,
+                            names.join(", ")
                         )
                     }
-                    None => format!("Symbol '{}' not found in {}", parsed.symbol, parsed.file_path),
+                    None => format!(
+                        "Symbol '{}' not found in {}",
+                        parsed.symbol, parsed.file_path
+                    ),
                 };
                 Ok(ToolResult {
                     call_id: String::new(),

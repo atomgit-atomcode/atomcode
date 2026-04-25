@@ -122,6 +122,10 @@ AtomCode 是一款住在你终端里的 AI 编码助手。用自然语言给它�
 
 完整设计与当前边界见 [权限模型](./docs/security/permission-model.md)。
 
+### 隐私
+
+- 📊 匿名遥测（默认开启，可关闭）— 详见 [docs/telemetry.md](docs/telemetry.md)
+
 ## 安装
 
 ### 从源码构建（推荐）

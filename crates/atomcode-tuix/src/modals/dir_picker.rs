@@ -109,13 +109,7 @@ impl Modal for DirPicker {
         }
     }
 
-    fn draw(
-        &self,
-        buf: &Buffer,
-        state: &UiState,
-        ctx: &LoopCtx,
-        renderer: &mut dyn Renderer,
-    ) {
+    fn draw(&self, buf: &Buffer, state: &UiState, ctx: &LoopCtx, renderer: &mut dyn Renderer) {
         let payload = build_menu_payload(self);
         renderer.render(UiLine::InputPrompt {
             buf: buf.text.clone(),

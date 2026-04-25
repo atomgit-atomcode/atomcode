@@ -18,8 +18,18 @@ fn shorten_path(path: &std::path::Path) -> String {
     if components.len() <= 3 {
         return path.display().to_string();
     }
-    let last3: Vec<_> = components[components.len() - 3..].iter().map(|c| c.as_os_str()).collect();
-    format!(".../{}", last3.iter().map(|s| s.to_string_lossy()).collect::<Vec<_>>().join("/"))
+    let last3: Vec<_> = components[components.len() - 3..]
+        .iter()
+        .map(|c| c.as_os_str())
+        .collect();
+    format!(
+        ".../{}",
+        last3
+            .iter()
+            .map(|s| s.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/")
+    )
 }
 
 #[async_trait]
@@ -29,7 +39,8 @@ impl Tool for TraceChainTool {
             name: "trace_chain",
             description: "Find the shortest call chain between two symbols. Uses BFS to discover \
                 the path from `from` to `to` through function calls (max 10 hops).\n\
-                Example: {\"from\": \"handle_request\", \"to\": \"save_to_db\"}".to_string(),
+                Example: {\"from\": \"handle_request\", \"to\": \"save_to_db\"}"
+                .to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -54,7 +65,8 @@ impl Tool for TraceChainTool {
             return Ok(ToolResult {
                 call_id: String::new(),
                 output: "Code graph is not yet indexed. The graph will be available after the \
-                    background indexer completes. Try again shortly.".to_string(),
+                    background indexer completes. Try again shortly."
+                    .to_string(),
                 success: false,
             });
         }
@@ -85,13 +97,22 @@ impl Tool for TraceChainTool {
             for to_sym in &to_matches {
                 if let Some(path) = graph.shortest_path(from_sym.id, to_sym.id) {
                     found_any = true;
-                    out.push_str(&format!("Call chain from '{}' to '{}' ({} hops):\n",
-                        parsed.from, parsed.to, path.len() - 1));
+                    out.push_str(&format!(
+                        "Call chain from '{}' to '{}' ({} hops):\n",
+                        parsed.from,
+                        parsed.to,
+                        path.len() - 1
+                    ));
                     for (i, &sym_id) in path.iter().enumerate() {
                         if let Some(node) = graph.node(sym_id) {
                             let arrow = if i == 0 { ">" } else { "→" };
-                            out.push_str(&format!("  {} {} ({:?}) — {}\n",
-                                arrow, node.name, node.kind, shorten_path(&node.file)));
+                            out.push_str(&format!(
+                                "  {} {} ({:?}) — {}\n",
+                                arrow,
+                                node.name,
+                                node.kind,
+                                shorten_path(&node.file)
+                            ));
                         }
                     }
                     out.push('\n');
@@ -100,8 +121,10 @@ impl Tool for TraceChainTool {
         }
 
         if !found_any {
-            out.push_str(&format!("No call chain found from '{}' to '{}' (max 10 hops).\n",
-                parsed.from, parsed.to));
+            out.push_str(&format!(
+                "No call chain found from '{}' to '{}' (max 10 hops).\n",
+                parsed.from, parsed.to
+            ));
         }
 
         Ok(ToolResult {

@@ -121,6 +121,10 @@ Connect to any LLM that supports OpenAI's function-calling API:
 
 See [Permission Model](./docs/security/permission-model.md) for the full design and current boundaries.
 
+### Privacy
+
+- 📊 Anonymous telemetry (opt-out) — see [docs/telemetry.md](docs/telemetry.md)
+
 ## Installation
 
 ### From Source (recommended)

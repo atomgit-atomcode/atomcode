@@ -1,5 +1,5 @@
-pub mod provider;
 pub mod prompt_sections;
+pub mod provider;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use atomcode_telemetry::TelemetryConfig;
 use provider::ProviderConfig;
 
 // DEFAULT_SYSTEM_PROMPT removed — single source of truth is now
@@ -78,6 +79,12 @@ pub struct Config {
     /// 7 catches early loops in 1-2 retries without disturbing focused work.
     #[serde(default = "default_reflection_cadence")]
     pub reflection_cadence: usize,
+    /// Telemetry configuration. Missing from older configs → defaults to
+    /// enabled=None (consent-pending), endpoint=None (use the built-in default).
+    /// Uses `#[serde(default)]` because `TelemetryConfig` has its own `Default`
+    /// impl that matches the no-section-present semantics.
+    #[serde(default, skip_serializing)]
+    pub telemetry: TelemetryConfig,
 }
 
 /// Controls the per-turn markdown datalog writer.
@@ -118,13 +125,22 @@ pub struct NotificationConfig {
     pub background_only: bool,
 }
 
-fn default_true() -> bool { true }
-fn default_reflection_cadence() -> usize { 7 }
-fn default_notification_min_duration_secs() -> u64 { 8 }
+fn default_true() -> bool {
+    true
+}
+fn default_reflection_cadence() -> usize {
+    7
+}
+fn default_notification_min_duration_secs() -> u64 {
+    8
+}
 
 impl Default for DatalogConfig {
     fn default() -> Self {
-        Self { enabled: true, dir: None }
+        Self {
+            enabled: true,
+            dir: None,
+        }
     }
 }
 
@@ -174,7 +190,9 @@ fn render_notifications_section(cfg: &NotificationConfig) -> String {
     let mut out = String::new();
     out.push_str("\n# Long-running task completion notifications.\n");
     out.push_str("# Strategy: terminal-native notifications first (kitty / WezTerm / iTerm2),\n");
-    out.push_str("# then OS-native fallback when available (macOS osascript, Linux notify-send).\n");
+    out.push_str(
+        "# then OS-native fallback when available (macOS osascript, Linux notify-send).\n",
+    );
     out.push_str("# Windows mainly relies on BEL + terminal attention/taskbar flash.\n");
     out.push_str("# `background_only` is best-effort: focus-aware terminal protocols honor it,\n");
     out.push_str("# while some OS fallbacks may still notify even if AtomCode is focused.\n");
@@ -216,7 +234,12 @@ impl Config {
         let mut persistent = self.clone();
         persistent.providers.retain(|_, v| !v.ephemeral);
         // If default_provider is ephemeral, don't change the saved default
-        if !self.providers.get(&self.default_provider).map(|p| !p.ephemeral).unwrap_or(true) {
+        if !self
+            .providers
+            .get(&self.default_provider)
+            .map(|p| !p.ephemeral)
+            .unwrap_or(true)
+        {
             // Restore original default from disk if possible
             if let Ok(disk) = Config::load(path) {
                 persistent.default_provider = disk.default_provider;
@@ -244,9 +267,7 @@ impl Config {
                 .min()
                 .map(String::as_str)
                 .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "No providers configured — run /codingplan or /provider"
-                    )
+                    anyhow::anyhow!("No providers configured — run /codingplan or /provider")
                 })?
         } else {
             name
@@ -258,20 +279,18 @@ impl Config {
 
     /// Resolve the atomcode config dir. Pure function for testability —
     /// `config_dir()` is a thin wrapper that injects real env + real home.
-    fn resolve_config_dir(
-        env_atomcode_home: Option<String>,
-        home: Option<PathBuf>,
-    ) -> PathBuf {
+    fn resolve_config_dir(env_atomcode_home: Option<String>, home: Option<PathBuf>) -> PathBuf {
         if let Some(p) = env_atomcode_home {
             return PathBuf::from(p);
         }
-        home.unwrap_or_else(|| PathBuf::from("."))
-            .join(".atomcode")
+        home.unwrap_or_else(|| PathBuf::from(".")).join(".atomcode")
     }
 
     pub fn config_dir() -> PathBuf {
         Self::resolve_config_dir(
-            std::env::var("ATOMCODE_HOME").ok().filter(|s| !s.is_empty()),
+            std::env::var("ATOMCODE_HOME")
+                .ok()
+                .filter(|s| !s.is_empty()),
             dirs::home_dir(),
         )
     }
@@ -296,10 +315,7 @@ mod tests {
 
     #[test]
     fn test_resolve_config_dir_falls_back_to_home() {
-        let result = Config::resolve_config_dir(
-            None,
-            Some(PathBuf::from("/Users/foo")),
-        );
+        let result = Config::resolve_config_dir(None, Some(PathBuf::from("/Users/foo")));
         assert_eq!(result, PathBuf::from("/Users/foo/.atomcode"));
     }
 
@@ -352,7 +368,10 @@ mod tests {
         let config: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(config.default_provider, "openai");
         assert_eq!(config.providers.len(), 3);
-        assert_eq!(config.providers["ollama"].base_url.as_deref(), Some("http://localhost:11434"));
+        assert_eq!(
+            config.providers["ollama"].base_url.as_deref(),
+            Some("http://localhost:11434")
+        );
         assert!(config.providers["ollama"].api_key.is_none());
     }
 
@@ -377,12 +396,18 @@ mod tests {
         assert!(rendered.contains("[datalog]"));
         assert!(rendered.contains("enabled = true"));
         assert!(rendered.contains("# dir = "));
-        assert!(!rendered.contains("\ndir = "), "default must not emit active dir line");
+        assert!(
+            !rendered.contains("\ndir = "),
+            "default must not emit active dir line"
+        );
     }
 
     #[test]
     fn render_datalog_section_with_dir_emits_real_value() {
-        let cfg = DatalogConfig { enabled: false, dir: Some("~/.atomcode/logs".to_string()) };
+        let cfg = DatalogConfig {
+            enabled: false,
+            dir: Some("~/.atomcode/logs".to_string()),
+        };
         let rendered = render_datalog_section(&cfg);
         assert!(rendered.contains("enabled = false"));
         assert!(rendered.contains("dir = \"~/.atomcode/logs\""));
@@ -395,25 +420,32 @@ mod tests {
             default_provider: "p".to_string(),
             default_workdir: None,
             providers: HashMap::new(),
-            datalog: DatalogConfig { enabled: false, dir: Some("/var/log/ac".to_string()) },
+            datalog: DatalogConfig {
+                enabled: false,
+                dir: Some("/var/log/ac".to_string()),
+            },
             notifications: NotificationConfig::default(),
             auto_update: true,
             reflection_cadence: 7,
+            telemetry: Default::default(),
         };
-        cfg.providers.insert("p".to_string(), ProviderConfig {
-            provider_type: "openai".to_string(),
-            api_key: Some("k".to_string()),
-            model: "m".to_string(),
-            base_url: None,
-            system_prompt: None,
-            user_agent: None,
-            context_window: 16000,
-            max_tokens: None,
-            thinking_type: None,
-            thinking_keep: None,
-            reasoning_history: None,
-            ephemeral: false,
-        });
+        cfg.providers.insert(
+            "p".to_string(),
+            ProviderConfig {
+                provider_type: "openai".to_string(),
+                api_key: Some("k".to_string()),
+                model: "m".to_string(),
+                base_url: None,
+                system_prompt: None,
+                user_agent: None,
+                context_window: 16000,
+                max_tokens: None,
+                thinking_type: None,
+                thinking_keep: None,
+                reasoning_history: None,
+                ephemeral: false,
+            },
+        );
         cfg.save(&tmp).unwrap();
         let text = std::fs::read_to_string(&tmp).unwrap();
         assert!(text.contains("[datalog]"));
@@ -558,5 +590,37 @@ default_provider = "claude"
         assert!(cfg.notifications.system);
         assert!(cfg.notifications.bell);
         assert!(cfg.notifications.background_only);
+    }
+}
+
+#[cfg(test)]
+mod telemetry_section_tests {
+    use super::*;
+
+    #[test]
+    fn missing_telemetry_section_uses_defaults() {
+        let s = r#"
+default_provider = "claude"
+[providers]
+"#;
+        let c: Config = toml::from_str(s).unwrap();
+        assert!(c.telemetry.enabled.is_none());
+    }
+
+    #[test]
+    fn telemetry_section_roundtrip() {
+        let s = r#"
+default_provider = "claude"
+[providers]
+[telemetry]
+enabled = false
+endpoint = "https://test.example/v1"
+"#;
+        let c: Config = toml::from_str(s).unwrap();
+        assert_eq!(c.telemetry.enabled, Some(false));
+        assert_eq!(
+            c.telemetry.endpoint.as_deref(),
+            Some("https://test.example/v1")
+        );
     }
 }

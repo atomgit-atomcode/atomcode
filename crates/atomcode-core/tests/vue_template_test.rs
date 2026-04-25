@@ -44,8 +44,16 @@ const handleClick = () => { console.log('click'); }
     let symbols = with_searcher(|s| s.list_symbols(&path).unwrap());
 
     let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
-    assert!(names.contains(&"fetchData"), "Should find fetchData, got: {:?}", names);
-    assert!(names.contains(&"handleClick"), "Should find handleClick, got: {:?}", names);
+    assert!(
+        names.contains(&"fetchData"),
+        "Should find fetchData, got: {:?}",
+        names
+    );
+    assert!(
+        names.contains(&"handleClick"),
+        "Should find handleClick, got: {:?}",
+        names
+    );
 }
 
 #[test]
@@ -67,10 +75,22 @@ function setup() {}
 
     let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
     // Should find custom components from template
-    assert!(names.contains(&"<TaskCard>"), "Should find <TaskCard>, got: {:?}", names);
-    assert!(names.contains(&"<UserProfile>"), "Should find <UserProfile>, got: {:?}", names);
+    assert!(
+        names.contains(&"<TaskCard>"),
+        "Should find <TaskCard>, got: {:?}",
+        names
+    );
+    assert!(
+        names.contains(&"<UserProfile>"),
+        "Should find <UserProfile>, got: {:?}",
+        names
+    );
     // button with @click should be included
-    assert!(names.contains(&"<button>"), "Should find <button> with @click, got: {:?}", names);
+    assert!(
+        names.contains(&"<button>"),
+        "Should find <button> with @click, got: {:?}",
+        names
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -99,9 +119,17 @@ fn vue_filters_plain_divs() {
     assert!(!names.contains(&"<span>"), "Should NOT find plain <span>");
     assert!(!names.contains(&"<p>"), "Should NOT find plain <p>");
     // div with v-if should be kept
-    assert!(names.contains(&"<div>"), "Should find <div v-if>, got: {:?}", names);
+    assert!(
+        names.contains(&"<div>"),
+        "Should find <div v-if>, got: {:?}",
+        names
+    );
     // Custom component always kept
-    assert!(names.contains(&"<CustomComponent>"), "Should find <CustomComponent>, got: {:?}", names);
+    assert!(
+        names.contains(&"<CustomComponent>"),
+        "Should find <CustomComponent>, got: {:?}",
+        names
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -124,8 +152,11 @@ function setup() {}
 
     let comp = symbols.iter().find(|s| s.name == "<MyComponent>").unwrap();
     // MyComponent is on line 6 (1-indexed)
-    assert!(comp.start_line >= 5 && comp.start_line <= 7,
-        "Expected line ~6, got {}", comp.start_line);
+    assert!(
+        comp.start_line >= 5 && comp.start_line <= 7,
+        "Expected line ~6, got {}",
+        comp.start_line
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -143,7 +174,11 @@ function init() { return 42; }
     let symbols = with_searcher(|s| s.list_symbols(&path).unwrap());
 
     let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
-    assert!(names.contains(&"init"), "Should find init from script, got: {:?}", names);
+    assert!(
+        names.contains(&"init"),
+        "Should find init from script, got: {:?}",
+        names
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -168,8 +203,14 @@ function deleteUser(id: number) { return true; }
     let skeleton = with_searcher(|s| s.skeleton(&path).unwrap());
 
     // Skeleton should mention both script functions and template components
-    assert!(skeleton.contains("fetchUsers"), "Skeleton should contain fetchUsers");
-    assert!(skeleton.contains("deleteUser"), "Skeleton should contain deleteUser");
+    assert!(
+        skeleton.contains("fetchUsers"),
+        "Skeleton should contain fetchUsers"
+    );
+    assert!(
+        skeleton.contains("deleteUser"),
+        "Skeleton should contain deleteUser"
+    );
     // Template components should appear in symbol list (used by skeleton)
 }
 
@@ -202,7 +243,14 @@ fn html_file_extracts_elements() {
     assert!(!symbols.is_empty(), "Should find HTML elements");
     let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
     // Should find structural elements
-    assert!(names.contains(&"html") || names.contains(&"body") || names.contains(&"nav")
-        || names.contains(&"main") || names.contains(&"section") || names.contains(&"form"),
-        "Should find structural HTML elements, got: {:?}", names);
+    assert!(
+        names.contains(&"html")
+            || names.contains(&"body")
+            || names.contains(&"nav")
+            || names.contains(&"main")
+            || names.contains(&"section")
+            || names.contains(&"form"),
+        "Should find structural HTML elements, got: {:?}",
+        names
+    );
 }

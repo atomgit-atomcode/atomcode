@@ -521,7 +521,7 @@ impl AgentLoop {
                     max_tokens: None,
                     thinking_type: None,
                     thinking_keep: None,
-            reasoning_history: None,
+                    reasoning_history: None,
                     ephemeral: true,
                 }),
             };
@@ -689,7 +689,7 @@ impl AgentLoop {
                         self.session_files.clear();
                     }
 
-if let Some(provider_config) = self.config.providers.get(&new_provider_name) {
+                    if let Some(provider_config) = self.config.providers.get(&new_provider_name) {
                         // Rebuild the context strategy for the new provider.
                         // Selected once per provider; per-model customizations
                         // (e.g. Ollama schema trimming, Claude cache markers)
@@ -727,11 +727,10 @@ if let Some(provider_config) = self.config.providers.get(&new_provider_name) {
                             }
                         }
                     } else {
-                        self.turn_runner.provider = std::sync::Arc::from(
-                            crate::provider::unavailable_provider(
-                                "未配置 provider。请使用 /provider 添加 provider 后再试。"
-                            ),
-                        );
+                        self.turn_runner.provider =
+                            std::sync::Arc::from(crate::provider::unavailable_provider(
+                                "未配置 provider。请使用 /provider 添加 provider 后再试。",
+                            ));
                         self.turn_runner.config = self.config.clone();
                     }
                 }
@@ -1837,8 +1836,7 @@ if let Some(provider_config) = self.config.providers.get(&new_provider_name) {
                 (d.name.len() + d.description.len() + params.len()) / 4
             })
             .sum();
-        let cold_zone_tokens: usize =
-            conv.cold_summaries.iter().map(|s| s.len() / 4 + 4).sum();
+        let cold_zone_tokens: usize = conv.cold_summaries.iter().map(|s| s.len() / 4 + 4).sum();
         let actual_system_prompt = msgs
             .iter()
             .find(|m| matches!(m.role, crate::conversation::message::Role::System))
@@ -2481,7 +2479,12 @@ fn build_post_compress_state(
         parts.push(format!("FILES EDITED: {}", files_edited.join(", ")));
     }
     if !files_read.is_empty() {
-        let recent: Vec<&str> = files_read.iter().rev().take(5).map(|s| s.as_str()).collect();
+        let recent: Vec<&str> = files_read
+            .iter()
+            .rev()
+            .take(5)
+            .map(|s| s.as_str())
+            .collect();
         parts.push(format!("RECENTLY READ: {}", recent.join(", ")));
     }
     if parts.is_empty() {
@@ -2723,18 +2726,17 @@ mod post_compress_state_tests {
         // rev().take(5) → newest first, at most 5.
         let read: Vec<String> = (1..=8).map(|i| format!("f{}.rs", i)).collect();
         let out = build_post_compress_state("", &[], &read).unwrap();
-        let line = out.lines().find(|l| l.starts_with("RECENTLY READ: ")).unwrap();
+        let line = out
+            .lines()
+            .find(|l| l.starts_with("RECENTLY READ: "))
+            .unwrap();
         assert_eq!(line, "RECENTLY READ: f8.rs, f7.rs, f6.rs, f5.rs, f4.rs");
     }
 
     #[test]
     fn all_three_parts_combined() {
-        let out = build_post_compress_state(
-            "task x",
-            &["a.rs".to_string()],
-            &["b.rs".to_string()],
-        )
-        .unwrap();
+        let out = build_post_compress_state("task x", &["a.rs".to_string()], &["b.rs".to_string()])
+            .unwrap();
         assert!(out.contains("TASK: task x"));
         assert!(out.contains("FILES EDITED: a.rs"));
         assert!(out.contains("RECENTLY READ: b.rs"));

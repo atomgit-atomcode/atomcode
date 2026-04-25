@@ -46,7 +46,11 @@ impl Tool for CdTool {
             Ok(wd) => wd.clone(),
             Err(_) => return self.approval(args),
         };
-        match super::approval_for_path(&parsed.path, &working_dir, super::ExternalPathAction::Enumerate) {
+        match super::approval_for_path(
+            &parsed.path,
+            &working_dir,
+            super::ExternalPathAction::Enumerate,
+        ) {
             Ok(approval) => approval,
             Err(_) => self.approval(args),
         }

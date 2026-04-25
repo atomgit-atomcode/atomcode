@@ -1,8 +1,8 @@
 use anyhow::Result;
 use async_trait::async_trait;
+use ignore::WalkBuilder;
 use serde::Deserialize;
 use serde_json::json;
-use ignore::WalkBuilder;
 
 use super::{ApprovalRequirement, Tool, ToolContext, ToolDef, ToolResult};
 
@@ -83,16 +83,17 @@ impl Tool for SearchReplaceTool {
     async fn execute(&self, args: &str, ctx: &ToolContext) -> Result<ToolResult> {
         let parsed: SearchReplaceArgs = serde_json::from_str(args)?;
         let wd = ctx.working_dir.read().await.clone();
-        let search_dir = match super::inspect_path_access(parsed.path.as_deref().unwrap_or("."), &wd) {
-            Ok(access) => access.path,
-            Err(err) => {
-                return Ok(ToolResult {
-                    call_id: String::new(),
-                    output: err.to_string(),
-                    success: false,
-                });
-            }
-        };
+        let search_dir =
+            match super::inspect_path_access(parsed.path.as_deref().unwrap_or("."), &wd) {
+                Ok(access) => access.path,
+                Err(err) => {
+                    return Ok(ToolResult {
+                        call_id: String::new(),
+                        output: err.to_string(),
+                        success: false,
+                    });
+                }
+            };
 
         if !search_dir.exists() {
             return Ok(ToolResult {
@@ -142,9 +143,7 @@ impl Tool for SearchReplaceTool {
 
             // Apply glob filter
             if let Some(ref glob_pat) = parsed.glob {
-                let name = file_path.file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("");
+                let name = file_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
                 if !glob_match(glob_pat, name) {
                     continue;
                 }
@@ -165,12 +164,17 @@ impl Tool for SearchReplaceTool {
 
             // Count and replace
             let count = re.find_iter(&content).count();
-            let new_content = re.replace_all(&content, parsed.replace.as_str()).to_string();
+            let new_content = re
+                .replace_all(&content, parsed.replace.as_str())
+                .to_string();
 
             if new_content != content {
                 // Backup before write
-                ctx.file_history.lock().await
-                    .backup_before_write(&file_path.to_string_lossy()).await;
+                ctx.file_history
+                    .lock()
+                    .await
+                    .backup_before_write(&file_path.to_string_lossy())
+                    .await;
                 // Write back
                 if let Err(e) = std::fs::write(file_path, &new_content) {
                     return Ok(ToolResult {
@@ -180,7 +184,11 @@ impl Tool for SearchReplaceTool {
                     });
                 }
                 total_replacements += count;
-                files_modified.push(format!("  {} ({} replacements)", file_path.display(), count));
+                files_modified.push(format!(
+                    "  {} ({} replacements)",
+                    file_path.display(),
+                    count
+                ));
             }
         }
 

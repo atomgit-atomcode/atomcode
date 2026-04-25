@@ -151,10 +151,18 @@ impl UiState {
         ctx_name: &str,
         system_prompt: &str,
     ) {
-        let snap = self.last_context.get_or_insert_with(ContextSnapshot::default);
-        if system_tokens > 0 { snap.system_tokens = system_tokens; }
-        if sent_tokens > 0 { snap.sent_tokens = sent_tokens; }
-        if tool_defs_tokens > 0 { snap.tool_defs_tokens = tool_defs_tokens; }
+        let snap = self
+            .last_context
+            .get_or_insert_with(ContextSnapshot::default);
+        if system_tokens > 0 {
+            snap.system_tokens = system_tokens;
+        }
+        if sent_tokens > 0 {
+            snap.sent_tokens = sent_tokens;
+        }
+        if tool_defs_tokens > 0 {
+            snap.tool_defs_tokens = tool_defs_tokens;
+        }
         // cold_zone can be 0 legitimately (no compression yet) — the rich
         // emission always sends an accurate value, so only overwrite when
         // the emission carries the ctx_window signal (rich path).
@@ -162,11 +170,17 @@ impl UiState {
             snap.cold_zone_tokens = cold_zone_tokens;
             snap.ctx_window = ctx_window;
         }
-        if total_messages > 0 { snap.total_messages = total_messages; }
-        if !ctx_name.is_empty() { snap.ctx_name = ctx_name.to_string(); }
+        if total_messages > 0 {
+            snap.total_messages = total_messages;
+        }
+        if !ctx_name.is_empty() {
+            snap.ctx_name = ctx_name.to_string();
+        }
         // system_prompt — only the rich path sends non-empty bytes;
         // narrow path passes "" and we keep whatever was cached last.
-        if !system_prompt.is_empty() { snap.system_prompt = system_prompt.to_string(); }
+        if !system_prompt.is_empty() {
+            snap.system_prompt = system_prompt.to_string();
+        }
     }
 
     /// Elapsed wall time since the current turn began, if a turn is

@@ -14,8 +14,8 @@
 //! keeping `Conversation` as a pure data container — no render logic
 //! leaks back into the data layer.
 
-use crate::conversation::{Conversation, ContextStats, KEEP_MESSAGES};
 use crate::conversation::message::{self, Message, MessageContent, Role};
+use crate::conversation::{ContextStats, Conversation, KEEP_MESSAGES};
 
 /// Append model-specific behavioral directives to a system prompt.
 ///
@@ -86,7 +86,10 @@ pub fn build_messages(
     turn_reminder: &str,
 ) -> (Vec<Message>, ContextStats) {
     if conv.messages.is_empty() {
-        return (vec![Message::new(Role::System, system_prompt)], ContextStats::default());
+        return (
+            vec![Message::new(Role::System, system_prompt)],
+            ContextStats::default(),
+        );
     }
 
     let system_msg = Message::new(Role::System, system_prompt);
@@ -96,7 +99,10 @@ pub fn build_messages(
 
     if turns.is_empty() {
         let remaining = token_budget.saturating_sub(system_tokens);
-        return (build_messages_fallback(conv, system_msg, remaining), ContextStats::default());
+        return (
+            build_messages_fallback(conv, system_msg, remaining),
+            ContextStats::default(),
+        );
     }
 
     let mut result = Vec::with_capacity(conv.messages.len() + 3);
@@ -107,7 +113,11 @@ pub fn build_messages(
         let cold_text = format!(
             "[Earlier conversation history ({} compression{})]\n{}",
             conv.cold_summaries.len(),
-            if conv.cold_summaries.len() > 1 { "s" } else { "" },
+            if conv.cold_summaries.len() > 1 {
+                "s"
+            } else {
+                ""
+            },
             conv.cold_summaries.join("\n---\n")
         );
         result.push(Message::new(Role::System, cold_text));
@@ -138,7 +148,8 @@ pub fn build_messages(
         // would settle on `conv.messages.len()` → NO messages survive → sent=0 → agent
         // goes blind and repeats searches forever (2026-04-12 21:25 session pathology).
         let last_turn_idx = turns.len().saturating_sub(1);
-        let last_turn_start = turns.get(last_turn_idx)
+        let last_turn_start = turns
+            .get(last_turn_idx)
             .map(|t| t.start_idx)
             .unwrap_or(0)
             .min(conv.messages.len());
@@ -149,10 +160,14 @@ pub fn build_messages(
         let mut drop_count = 0usize;
 
         for ti in 0..turns.len().saturating_sub(1) {
-            if dropped_tokens >= tokens_to_drop { break; }
+            if dropped_tokens >= tokens_to_drop {
+                break;
+            }
             let turn = &turns[ti];
             let end = turn.end_idx().min(conv.messages.len());
-            if turn.start_idx >= conv.messages.len() { continue; }
+            if turn.start_idx >= conv.messages.len() {
+                continue;
+            }
 
             // Extract model reasoning and tool calls before dropping
             let turn_msgs = &conv.messages[turn.start_idx..end];
@@ -165,15 +180,17 @@ pub fn build_messages(
                             parts.push(short);
                         }
                     }
-                    MessageContent::AssistantWithToolCalls { text, tool_calls, .. } => {
+                    MessageContent::AssistantWithToolCalls {
+                        text, tool_calls, ..
+                    } => {
                         if let Some(t) = text {
                             let short: String = t.chars().take(150).collect();
                             if !short.trim().is_empty() {
                                 parts.push(short);
                             }
                         }
-                        let tools: Vec<&str> = tool_calls.iter()
-                            .map(|tc| tc.name.as_str()).collect();
+                        let tools: Vec<&str> =
+                            tool_calls.iter().map(|tc| tc.name.as_str()).collect();
                         if !tools.is_empty() {
                             parts.push(format!("tools: {}", tools.join(", ")));
                         }
@@ -185,8 +202,7 @@ pub fn build_messages(
                 drop_summaries.push(parts.join(" | "));
             }
 
-            dropped_tokens += turn_msgs.iter()
-                .map(|m| m.estimate_tokens()).sum::<usize>();
+            dropped_tokens += turn_msgs.iter().map(|m| m.estimate_tokens()).sum::<usize>();
             drop_count += 1;
         }
 
@@ -199,7 +215,9 @@ pub fn build_messages(
             let digest = format!(
                 "[Context overflow: {} earlier turns compressed]\n{}",
                 drop_count,
-                drop_summaries.iter().enumerate()
+                drop_summaries
+                    .iter()
+                    .enumerate()
                     .map(|(i, s)| format!("{}. {}", i + 1, s))
                     .collect::<Vec<_>>()
                     .join("\n")
@@ -213,9 +231,13 @@ pub fn build_messages(
         for ti in 0..turns.len() {
             let turn = &turns[ti];
             let end = turn.end_idx().min(conv.messages.len());
-            if turn.start_idx >= conv.messages.len() { continue; }
+            if turn.start_idx >= conv.messages.len() {
+                continue;
+            }
             let t: usize = conv.messages[turn.start_idx..end]
-                .iter().map(|m| m.estimate_tokens()).sum();
+                .iter()
+                .map(|m| m.estimate_tokens())
+                .sum();
             skipped += t;
             if skipped >= dropped_tokens {
                 survived_start = if ti + 1 < turns.len() {
@@ -255,10 +277,15 @@ pub fn build_messages(
     // the last user message so the LLM has *something* to respond to. This is the
     // strictest possible invariant: whenever conv.messages is non-empty, the result
     // must contain at least one non-system message.
-    let non_system_count = result.iter().filter(|m| !matches!(m.role, Role::System)).count();
+    let non_system_count = result
+        .iter()
+        .filter(|m| !matches!(m.role, Role::System))
+        .count();
     if non_system_count == 0 {
-        if let Some(last_user) = conv.messages.iter().rev()
-            .find(|m| matches!(m.role, Role::User) && matches!(m.content, MessageContent::Text(..)))
+        if let Some(last_user) =
+            conv.messages.iter().rev().find(|m| {
+                matches!(m.role, Role::User) && matches!(m.content, MessageContent::Text(..))
+            })
         {
             result.push(Message::new(
                 Role::System,
@@ -287,17 +314,22 @@ pub fn build_messages(
     // first-line). Without this, `condensed` would have had to guess
     // from output shape — a substring heuristic that false-positived
     // on bash outputs with `"  N| ..."` lines.
-    let call_id_to_tool: std::collections::HashMap<String, String> = result.iter()
+    let call_id_to_tool: std::collections::HashMap<String, String> = result
+        .iter()
         .filter_map(|m| {
             if let MessageContent::AssistantWithToolCalls { tool_calls, .. } = &m.content {
                 Some(tool_calls.iter().map(|tc| (tc.id.clone(), tc.name.clone())))
-            } else { None }
+            } else {
+                None
+            }
         })
         .flatten()
         .collect();
     for i in 1..shrinkable_end {
         let total: usize = result.iter().map(|m| m.estimate_tokens()).sum();
-        if total <= token_ceiling { break; }
+        if total <= token_ceiling {
+            break;
+        }
         let tool_name = match &result[i].content {
             MessageContent::ToolResult(r) => call_id_to_tool
                 .get(&r.call_id)
@@ -326,15 +358,21 @@ pub fn build_messages(
         }
     }
 
-    let sent_tokens: usize = result.iter().map(|m| m.estimate_tokens()).sum::<usize>()
+    let sent_tokens: usize = result
+        .iter()
+        .map(|m| m.estimate_tokens())
+        .sum::<usize>()
         .saturating_sub(system_tokens);
     let msg_count = result.len();
-    (result, ContextStats {
-        system_tokens,
-        sent_tokens,
-        dropped_tokens,
-        total_messages: msg_count,
-    })
+    (
+        result,
+        ContextStats {
+            system_tokens,
+            sent_tokens,
+            dropped_tokens,
+            total_messages: msg_count,
+        },
+    )
 }
 
 /// Check if context needs compression.
@@ -352,9 +390,15 @@ pub fn needs_compression(
     // USER MESSAGES (1 user msg = 1 turn), but a single user message can
     // produce 15+ LLM calls with 35+ messages. The old `turns.len() < 6`
     // guard caused compression to NEVER trigger in agent-loop scenarios.
-    if conv.messages.len() < 12 { return false; }
-    let total: usize = system_prompt_tokens + conv.messages.iter()
-        .map(|m| m.estimate_tokens()).sum::<usize>();
+    if conv.messages.len() < 12 {
+        return false;
+    }
+    let total: usize = system_prompt_tokens
+        + conv
+            .messages
+            .iter()
+            .map(|m| m.estimate_tokens())
+            .sum::<usize>();
     let threshold = (token_budget * 50 / 100).min(50000);
     total > threshold
 }
@@ -388,8 +432,7 @@ pub fn build_compression_content(conv: &Conversation) -> (String, usize) {
     // so the summary captures these results too.
     while compress_end_idx < conv.messages.len() {
         match &conv.messages[compress_end_idx].content {
-            message::MessageContent::ToolResult(_)
-            | message::MessageContent::ToolResultRef(_) => {
+            message::MessageContent::ToolResult(_) | message::MessageContent::ToolResultRef(_) => {
                 compress_end_idx += 1;
             }
             _ => break,
@@ -448,7 +491,8 @@ fn compress_turn(turn_num: usize, turn_msgs: &[Message]) -> String {
     for msg in turn_msgs {
         match (&msg.role, &msg.content) {
             (Role::User, MessageContent::Text(s)) => {
-                if !s.starts_with('[') { // skip system-injected messages
+                if !s.starts_with('[') {
+                    // skip system-injected messages
                     user_text = if s.chars().count() > 60 {
                         format!("{}...", s.chars().take(57).collect::<String>())
                     } else {
@@ -456,7 +500,12 @@ fn compress_turn(turn_num: usize, turn_msgs: &[Message]) -> String {
                     };
                 }
             }
-            (_, MessageContent::AssistantWithToolCalls { text, tool_calls, .. }) => {
+            (
+                _,
+                MessageContent::AssistantWithToolCalls {
+                    text, tool_calls, ..
+                },
+            ) => {
                 // Preserve assistant's diagnostic conclusion (first 80 chars).
                 if let Some(t) = text {
                     let trimmed = t.trim();
@@ -469,21 +518,27 @@ fn compress_turn(turn_num: usize, turn_msgs: &[Message]) -> String {
                     }
                 }
                 for tc in tool_calls {
-                    let short = if let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
-                        let fp = args.get("file_path").and_then(|v| v.as_str())
-                            .map(|p| std::path::Path::new(p).file_name()
+                    let short = if let Ok(args) =
+                        serde_json::from_str::<serde_json::Value>(&tc.arguments)
+                    {
+                        let fp = args.get("file_path").and_then(|v| v.as_str()).map(|p| {
+                            std::path::Path::new(p)
+                                .file_name()
                                 .map(|n| n.to_string_lossy().to_string())
-                                .unwrap_or_else(|| p.to_string()));
+                                .unwrap_or_else(|| p.to_string())
+                        });
                         match (tc.name.as_str(), fp) {
                             ("read_file", Some(f)) => format!("read {}", f),
                             ("edit_file", Some(f)) => format!("edit {}", f),
                             ("write_file", Some(f)) => format!("write {}", f),
                             ("grep", _) => {
-                                let pat = args.get("pattern").and_then(|v| v.as_str()).unwrap_or("?");
+                                let pat =
+                                    args.get("pattern").and_then(|v| v.as_str()).unwrap_or("?");
                                 format!("grep({})", pat)
                             }
                             ("bash", _) => {
-                                let cmd = args.get("command").and_then(|v| v.as_str()).unwrap_or("?");
+                                let cmd =
+                                    args.get("command").and_then(|v| v.as_str()).unwrap_or("?");
                                 let short_cmd: String = cmd.chars().take(30).collect();
                                 format!("bash({})", short_cmd)
                             }
@@ -516,7 +571,11 @@ fn compress_turn(turn_num: usize, turn_msgs: &[Message]) -> String {
         }
     }
 
-    let tools_str = if tools.is_empty() { "no tools".to_string() } else { tools.join(", ") };
+    let tools_str = if tools.is_empty() {
+        "no tools".to_string()
+    } else {
+        tools.join(", ")
+    };
 
     let prefix = if !user_text.is_empty() {
         format!("\"{}\" ", user_text)
@@ -528,7 +587,10 @@ fn compress_turn(turn_num: usize, turn_msgs: &[Message]) -> String {
     } else {
         String::new()
     };
-    format!("- Turn {}: {}{}→ {}", turn_num, prefix, conclusion, tools_str)
+    format!(
+        "- Turn {}: {}{}→ {}",
+        turn_num, prefix, conclusion, tools_str
+    )
 }
 
 /// Fallback windowing when no turns are tracked.
@@ -609,19 +671,25 @@ fn snap_to_valid_boundary(messages: &[Message], idx: usize) -> usize {
 fn microcompact(msgs: &mut Vec<Message>, total_msg_count: usize, threshold_chars: usize) {
     const OTHER_KEEP: usize = 20;
 
-    let total_chars: usize = msgs.iter().map(|m| {
-        match &m.content {
+    let total_chars: usize = msgs
+        .iter()
+        .map(|m| match &m.content {
             MessageContent::ToolResult(r) => r.output.len(),
             MessageContent::Text(t) => t.len(),
             _ => 100,
-        }
-    }).sum();
-    if total_chars < threshold_chars { return; }
-    if total_msg_count <= OTHER_KEEP { return; }
+        })
+        .sum();
+    if total_chars < threshold_chars {
+        return;
+    }
+    if total_msg_count <= OTHER_KEEP {
+        return;
+    }
 
     let other_cutoff = total_msg_count.saturating_sub(OTHER_KEEP);
 
-    let mut call_id_to_tool: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut call_id_to_tool: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     for msg in msgs.iter() {
         if let MessageContent::AssistantWithToolCalls { tool_calls, .. } = &msg.content {
             for tc in tool_calls {
@@ -630,7 +698,8 @@ fn microcompact(msgs: &mut Vec<Message>, total_msg_count: usize, threshold_chars
         }
     }
 
-    let cold_msgs = msgs.iter()
+    let cold_msgs = msgs
+        .iter()
         .position(|m| !matches!(m.role, Role::System))
         .unwrap_or(0);
 
@@ -638,16 +707,22 @@ fn microcompact(msgs: &mut Vec<Message>, total_msg_count: usize, threshold_chars
 
     for i in cold_msgs..condense_end.min(msgs.len()) {
         if let MessageContent::ToolResult(ref r) = msgs[i].content {
-            let _tool_name = call_id_to_tool.get(&r.call_id)
+            let _tool_name = call_id_to_tool
+                .get(&r.call_id)
                 .map(|s| s.as_str())
                 .unwrap_or("tool");
 
             let msg_idx = i.saturating_sub(cold_msgs);
-            if msg_idx >= other_cutoff { continue; }
+            if msg_idx >= other_cutoff {
+                continue;
+            }
 
-            if r.output.len() <= 500 { continue; }
+            if r.output.len() <= 500 {
+                continue;
+            }
 
-            let tool_name = call_id_to_tool.get(&r.call_id)
+            let tool_name = call_id_to_tool
+                .get(&r.call_id)
                 .map(|s| s.as_str())
                 .unwrap_or("tool");
 
@@ -701,24 +776,42 @@ fn replace_stale_reads(msgs: &mut Vec<Message>) {
         offset: Option<usize>,
         limit: Option<usize>,
     }
-    let mut call_id_to_read: std::collections::HashMap<String, ReadInfo> = std::collections::HashMap::new();
-    let mut edit_call_to_file: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut call_id_to_read: std::collections::HashMap<String, ReadInfo> =
+        std::collections::HashMap::new();
+    let mut edit_call_to_file: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     let mut edited_files: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for msg in msgs.iter() {
         if let MessageContent::AssistantWithToolCalls { tool_calls, .. } = &msg.content {
             for tc in tool_calls {
                 if let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
-                    let file_path = args.get("file_path")
+                    let file_path = args
+                        .get("file_path")
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_string();
                     if tc.name == "read_file" && !file_path.is_empty() {
-                        let offset = args.get("offset").and_then(|v| v.as_u64()).map(|v| v as usize);
-                        let limit = args.get("limit").and_then(|v| v.as_u64()).map(|v| v as usize);
-                        call_id_to_read.insert(tc.id.clone(), ReadInfo { file_path: file_path.clone(), offset, limit });
+                        let offset = args
+                            .get("offset")
+                            .and_then(|v| v.as_u64())
+                            .map(|v| v as usize);
+                        let limit = args
+                            .get("limit")
+                            .and_then(|v| v.as_u64())
+                            .map(|v| v as usize);
+                        call_id_to_read.insert(
+                            tc.id.clone(),
+                            ReadInfo {
+                                file_path: file_path.clone(),
+                                offset,
+                                limit,
+                            },
+                        );
                     }
-                    if matches!(tc.name.as_str(), "edit_file" | "write_file" | "create_file") && !file_path.is_empty() {
+                    if matches!(tc.name.as_str(), "edit_file" | "write_file" | "create_file")
+                        && !file_path.is_empty()
+                    {
                         edit_call_to_file.insert(tc.id.clone(), file_path);
                     }
                 }
@@ -740,7 +833,9 @@ fn replace_stale_reads(msgs: &mut Vec<Message>) {
     for msg in msgs.iter_mut() {
         if let MessageContent::ToolResult(ref mut r) = msg.content {
             if let Some(info) = call_id_to_read.get(&r.call_id) {
-                if !edited_files.contains(&info.file_path) { continue; }
+                if !edited_files.contains(&info.file_path) {
+                    continue;
+                }
                 if let Ok(content) = std::fs::read_to_string(&info.file_path) {
                     let all_lines: Vec<&str> = content.lines().collect();
                     let total = all_lines.len();
@@ -749,13 +844,17 @@ fn replace_stale_reads(msgs: &mut Vec<Message>) {
                         let start = info.offset.unwrap_or(1).max(1) - 1;
                         let start = start.min(total);
                         let end = info.limit.map(|l| (start + l).min(total)).unwrap_or(total);
-                        let display: String = all_lines[start..end].iter().enumerate()
+                        let display: String = all_lines[start..end]
+                            .iter()
+                            .enumerate()
                             .map(|(i, l)| format!("{:>4}| {}", start + i + 1, l))
                             .collect::<Vec<_>>()
                             .join("\n");
                         r.output = display;
                     } else if total <= 300 {
-                        r.output = all_lines.iter().enumerate()
+                        r.output = all_lines
+                            .iter()
+                            .enumerate()
                             .map(|(i, l)| format!("{:>4}| {}", i + 1, l))
                             .collect::<Vec<_>>()
                             .join("\n");
@@ -872,8 +971,8 @@ fn clean_message_pipeline(msgs: &mut Vec<Message>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::conversation::Conversation;
     use crate::conversation::message::{Message, Role};
+    use crate::conversation::Conversation;
 
     #[test]
     fn apply_model_directives_noop_for_generic_model() {
@@ -892,7 +991,10 @@ mod tests {
                 out.contains("用户可见的输出请用中文"),
                 "model {id} missing CN lock"
             );
-            assert!(!out.contains("THINKING 简洁纪律"), "model {id} got MiniMax directive erroneously");
+            assert!(
+                !out.contains("THINKING 简洁纪律"),
+                "model {id} got MiniMax directive erroneously"
+            );
         }
     }
 
@@ -923,19 +1025,18 @@ mod tests {
         assert!(matches!(msgs[0].role, Role::System));
     }
 
-
     #[test]
     fn test_budgeted_includes_recent_messages() {
         let mut conv = Conversation::new();
         conv.add_user_message("hello");
-        conv.messages.push(Message::new(Role::Assistant, "hi there"));
+        conv.messages
+            .push(Message::new(Role::Assistant, "hi there"));
         conv.add_user_message("do something");
 
         let (msgs, _stats) = build_messages(&conv, "sys", 8000, "");
         assert_eq!(msgs.len(), 4); // system + 3 messages
         assert!(matches!(msgs[0].role, Role::System));
     }
-
 
     #[test]
     fn test_budgeted_sends_all_when_under_80pct() {
@@ -968,7 +1069,6 @@ mod tests {
         assert_eq!(stats.dropped_tokens, 0, "Nothing should be dropped");
     }
 
-
     #[test]
     fn test_budgeted_drops_oldest_turns_when_over_budget() {
         use crate::tool::{ToolCall, ToolResult};
@@ -997,13 +1097,15 @@ mod tests {
 
         let (msgs, stats) = build_messages(&conv, "sys", 4000, "");
         // Oldest turns should be dropped
-        assert!(stats.dropped_tokens > 0, "Some turns should have been dropped");
+        assert!(
+            stats.dropped_tokens > 0,
+            "Some turns should have been dropped"
+        );
         // Most recent user message must survive
         assert_eq!(msgs.last().unwrap().text(), Some("now what?"));
         // System prompt must be first
         assert!(matches!(msgs[0].role, Role::System));
     }
-
 
     #[test]
     fn test_budgeted_always_keeps_latest_turn() {
@@ -1029,7 +1131,6 @@ mod tests {
         assert!(!msgs.is_empty(), "Must at least have system prompt");
         assert!(matches!(msgs[0].role, Role::System));
     }
-
 
     #[test]
     fn test_budgeted_never_returns_system_only_when_messages_exist() {
@@ -1075,14 +1176,16 @@ mod tests {
         // Budget too small to fit the huge output — compaction MUST still leave
         // at least one non-system message.
         let (msgs, _stats) = build_messages(&conv, "sys", 10_000, "");
-        let non_system = msgs.iter().filter(|m| !matches!(m.role, Role::System)).count();
+        let non_system = msgs
+            .iter()
+            .filter(|m| !matches!(m.role, Role::System))
+            .count();
         assert!(
             non_system > 0,
             "never return system-only result when messages exist — got msgs.len()={}",
             msgs.len()
         );
     }
-
 
     #[test]
     fn test_budgeted_emergency_restores_last_user_when_all_else_dropped() {
@@ -1094,11 +1197,15 @@ mod tests {
         // Add 20 turns of huge assistant+tool content to force aggressive drop
         for i in 0..20 {
             use crate::tool::{ToolCall, ToolResult};
-            conv.add_assistant_tool_calls(Some(&format!("reasoning {}", i)), vec![ToolCall {
-                id: format!("c{}", i),
-                name: "bash".to_string(),
-                arguments: "{}".to_string(),
-            }], None);
+            conv.add_assistant_tool_calls(
+                Some(&format!("reasoning {}", i)),
+                vec![ToolCall {
+                    id: format!("c{}", i),
+                    name: "bash".to_string(),
+                    arguments: "{}".to_string(),
+                }],
+                None,
+            );
             conv.add_tool_result(ToolResult {
                 call_id: format!("c{}", i),
                 output: "y".repeat(10_000),
@@ -1108,9 +1215,12 @@ mod tests {
 
         let (msgs, _stats) = build_messages(&conv, "sys", 5_000, "");
         let has_user = msgs.iter().any(|m| matches!(m.role, Role::User));
-        assert!(has_user, "last user message must always survive, got {} msgs", msgs.len());
+        assert!(
+            has_user,
+            "last user message must always survive, got {} msgs",
+            msgs.len()
+        );
     }
-
 
     #[test]
     fn test_cold_zone_compression() {
@@ -1144,11 +1254,11 @@ mod tests {
         // Budget check: cold zone should appear in output
         let (msgs, _stats) = build_messages(&conv, "sys", 100000, "");
         let has_cold = msgs.iter().any(|m| {
-            m.text().map_or(false, |t| t.contains("Earlier conversation history"))
+            m.text()
+                .map_or(false, |t| t.contains("Earlier conversation history"))
         });
         assert!(has_cold, "Cold zone summary should appear in output");
     }
-
 
     #[test]
     fn test_budgeted_drops_when_no_summary_and_over_budget() {
@@ -1173,10 +1283,12 @@ mod tests {
 
         // Small budget — force dropping
         let (msgs, stats) = build_messages(&conv, "sys", 2000, "");
-        assert!(stats.dropped_tokens > 0, "Should drop turns when over budget");
+        assert!(
+            stats.dropped_tokens > 0,
+            "Should drop turns when over budget"
+        );
         assert!(matches!(msgs[0].role, Role::System));
     }
-
 
     /// Bug b regression: after compression has run once, `cold_summaries`
     /// is non-empty, which disables the 80% drop cap above (legacy
@@ -1200,11 +1312,15 @@ mod tests {
         // which exceeds the 80% ceiling of the chosen budget.
         for turn in 0..20 {
             conv.add_user_message(&format!("task {}", turn));
-            conv.add_assistant_tool_calls(Some("ok"), vec![ToolCall {
-                id: format!("c{}", turn),
-                name: "bash".to_string(),
-                arguments: "{}".to_string(),
-            }], None);
+            conv.add_assistant_tool_calls(
+                Some("ok"),
+                vec![ToolCall {
+                    id: format!("c{}", turn),
+                    name: "bash".to_string(),
+                    arguments: "{}".to_string(),
+                }],
+                None,
+            );
             conv.add_tool_result(ToolResult {
                 call_id: format!("c{}", turn),
                 output: "x".repeat(6000),
@@ -1222,23 +1338,24 @@ mod tests {
             total_tokens,
         );
         // The newest turn's tool result must survive in full (not condensed).
-        let newest_still_full = msgs.iter().any(|m| {
-            m.text().map_or(false, |t| t.contains(&"x".repeat(100)))
-        });
+        let newest_still_full = msgs
+            .iter()
+            .any(|m| m.text().map_or(false, |t| t.contains(&"x".repeat(100))));
         assert!(
             newest_still_full,
             "Newest turn's full-size tool result must be preserved",
         );
     }
 
-
     #[test]
     fn test_budgeted_preserves_message_order() {
         let mut conv = Conversation::new();
         conv.add_user_message("first");
-        conv.messages.push(Message::new(Role::Assistant, "response 1"));
+        conv.messages
+            .push(Message::new(Role::Assistant, "response 1"));
         conv.add_user_message("second");
-        conv.messages.push(Message::new(Role::Assistant, "response 2"));
+        conv.messages
+            .push(Message::new(Role::Assistant, "response 2"));
         conv.add_user_message("third");
 
         let (msgs, _stats) = build_messages(&conv, "sys", 100000, "");
@@ -1250,7 +1367,6 @@ mod tests {
         assert_eq!(msgs[4].text(), Some("response 2"));
         assert_eq!(msgs[5].text(), Some("third"));
     }
-
 
     #[test]
     fn test_sanitize_removes_orphan_tool_results() {
@@ -1274,7 +1390,6 @@ mod tests {
         assert!(matches!(msgs[0].role, Role::System));
         assert!(matches!(msgs[1].role, Role::User));
     }
-
 
     #[test]
     fn test_sanitize_preserves_valid_pairs() {
@@ -1351,10 +1466,12 @@ mod tests {
         }
 
         fn total_tool_bytes(msgs: &[Message]) -> usize {
-            msgs.iter().map(|m| match &m.content {
-                MessageContent::ToolResult(r) => r.output.len(),
-                _ => 0,
-            }).sum()
+            msgs.iter()
+                .map(|m| match &m.content {
+                    MessageContent::ToolResult(r) => r.output.len(),
+                    _ => 0,
+                })
+                .sum()
         }
 
         // High threshold (100K) → total 25K < 100K → no-op.
@@ -1363,9 +1480,16 @@ mod tests {
         let before_high_bytes = total_tool_bytes(&msgs_high);
         let msg_count_high = msgs_high.len();
         microcompact(&mut msgs_high, msg_count_high, 100_000);
-        assert_eq!(msgs_high.len(), before_high_len, "high-threshold run must not drop msgs");
-        assert_eq!(total_tool_bytes(&msgs_high), before_high_bytes,
-            "high threshold (25K < 100K) must leave tool_result bytes untouched");
+        assert_eq!(
+            msgs_high.len(),
+            before_high_len,
+            "high-threshold run must not drop msgs"
+        );
+        assert_eq!(
+            total_tool_bytes(&msgs_high),
+            before_high_bytes,
+            "high threshold (25K < 100K) must leave tool_result bytes untouched"
+        );
 
         // Low threshold (10K) → total 25K >= 10K → microcompact kicks
         // in and shrinks older ToolResults.
@@ -1374,9 +1498,12 @@ mod tests {
         let msg_count_low = msgs_low.len();
         microcompact(&mut msgs_low, msg_count_low, 10_000);
         let after_low_bytes = total_tool_bytes(&msgs_low);
-        assert!(after_low_bytes < before_low_bytes,
+        assert!(
+            after_low_bytes < before_low_bytes,
             "low threshold (25K > 10K) must shrink tool_result bytes, before={} after={}",
-            before_low_bytes, after_low_bytes);
+            before_low_bytes,
+            after_low_bytes
+        );
     }
 
     /// Regression: `build_compression_content` must not cut between an
@@ -1419,13 +1546,19 @@ mod tests {
             // Position 20 would be the next user msg. But we want ATC here
             // (msg[20]) and ToolResult at msg[21]. Problem: ATC must be
             // preceded by a User in a normal turn. Use a real tool round.
-            conv.add_user_message("trigger tool");                   // msg[20]
-            conv.add_assistant_tool_calls(Some("r"), vec![ToolCall { // msg[21]
-                id: "call_would_orphan".to_string(),
-                name: "bash".to_string(),
-                arguments: "{}".to_string(),
-            }], None);
-            conv.add_tool_result(ToolResult {                        // msg[22]
+            conv.add_user_message("trigger tool"); // msg[20]
+            conv.add_assistant_tool_calls(
+                Some("r"),
+                vec![ToolCall {
+                    // msg[21]
+                    id: "call_would_orphan".to_string(),
+                    name: "bash".to_string(),
+                    arguments: "{}".to_string(),
+                }],
+                None,
+            );
+            conv.add_tool_result(ToolResult {
+                // msg[22]
                 call_id: "call_would_orphan".to_string(),
                 output: "tool output that must not be lost".to_string(),
                 success: true,

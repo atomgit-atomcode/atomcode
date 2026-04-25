@@ -18,7 +18,9 @@ pub struct CommandRegistry {
 
 impl CommandRegistry {
     pub fn builtin() -> Self {
-        Self { commands: BUILTIN_COMMANDS }
+        Self {
+            commands: BUILTIN_COMMANDS,
+        }
     }
 
     pub fn all(&self) -> &'static [Command] {
@@ -46,7 +48,12 @@ impl CommandRegistry {
     }
 
     pub fn help_text(&self) -> String {
-        let max_name = self.commands.iter().map(|c| c.name.len()).max().unwrap_or(6);
+        let max_name = self
+            .commands
+            .iter()
+            .map(|c| c.name.len())
+            .max()
+            .unwrap_or(6);
         let mut out = String::from("  Available commands:\n");
         for c in self.commands {
             out.push_str(&format!(

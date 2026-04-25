@@ -72,8 +72,7 @@ impl Modal for IssueWizard {
             // would look wrong on AtomGit anyway.
             KeyCode::Enter
                 if self.step == Step::Description
-                    && (mods.contains(KeyModifiers::SHIFT)
-                        || mods.contains(KeyModifiers::ALT)) =>
+                    && (mods.contains(KeyModifiers::SHIFT) || mods.contains(KeyModifiers::ALT)) =>
             {
                 buf.text.push('\n');
                 buf.cursor = buf.text.len();
@@ -87,7 +86,10 @@ impl Modal for IssueWizard {
                         Step::Title => "title",
                         Step::Description => "description",
                     };
-                    push(renderer, &format!("(required — type a {} or Esc to cancel)", what));
+                    push(
+                        renderer,
+                        &format!("(required — type a {} or Esc to cancel)", what),
+                    );
                     return Ok(ModalAction::Continue);
                 }
                 buf.text.clear();
@@ -140,13 +142,7 @@ impl Modal for IssueWizard {
         }
     }
 
-    fn draw(
-        &self,
-        buf: &Buffer,
-        state: &UiState,
-        ctx: &LoopCtx,
-        renderer: &mut dyn Renderer,
-    ) {
+    fn draw(&self, buf: &Buffer, state: &UiState, ctx: &LoopCtx, renderer: &mut dyn Renderer) {
         renderer.render(UiLine::InputPrompt {
             buf: buf.text.clone(),
             cursor_byte: buf.cursor,
@@ -170,7 +166,10 @@ impl IssueWizard {
             renderer,
             &format!("New issue on atomgit.com/{}/{}", self.owner, self.repo),
         );
-        push(renderer, "Step 1/2 — enter title (required, Esc to cancel):");
+        push(
+            renderer,
+            "Step 1/2 — enter title (required, Esc to cancel):",
+        );
     }
 
     fn emit_description_prompt(&mut self, renderer: &mut dyn Renderer) {

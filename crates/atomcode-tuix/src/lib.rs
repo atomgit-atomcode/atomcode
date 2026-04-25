@@ -21,11 +21,11 @@ use atomcode_core::agent::AgentHandle;
 use atomcode_core::config::Config;
 use atomcode_core::tool::ToolContext;
 use crossterm::{
-    execute,
     event::{
         DisableBracketedPaste, EnableBracketedPaste, KeyboardEnhancementFlags,
         PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
+    execute,
 };
 use std::io;
 use tokio::sync::mpsc;
@@ -34,7 +34,9 @@ use crate::commands::CommandRegistry;
 use crate::event_loop::{run_loop, LoopCtx};
 use crate::input::history::History;
 use crate::input::reader;
-use crate::render::{plain::PlainRenderer, retained::RetainedRenderer, worker::TaskRenderer, Renderer};
+use crate::render::{
+    plain::PlainRenderer, retained::RetainedRenderer, worker::TaskRenderer, Renderer,
+};
 use crate::terminal::TerminalCaps;
 
 /// RAII guard: enables raw mode + bracketed paste on construction,
@@ -162,6 +164,7 @@ pub async fn run(
     _session_to_continue: Option<atomcode_core::session::Session>,
     mcp_registry: Option<std::sync::Arc<atomcode_core::mcp::McpRegistry>>,
     mcp_connect_rx: Option<tokio::sync::mpsc::UnboundedReceiver<atomcode_core::mcp::McpConnectEvent>>,
+    telemetry: std::sync::Arc<atomcode_telemetry::Telemetry>,
 ) -> Result<()> {
     let caps = TerminalCaps::probe();
     let _guard = TerminalGuard::activate(caps)?;
@@ -338,6 +341,7 @@ pub async fn run(
         mcp_registry,
         mcp_connect_rx,
         mcp_reload: None,
+        telemetry,
     };
 
     // CodingPlan drift monitor — kick off a startup check if the current

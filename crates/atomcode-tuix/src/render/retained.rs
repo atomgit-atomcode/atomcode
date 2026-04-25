@@ -1091,9 +1091,12 @@ impl<W: Write + Send> RetainedRenderer<W> {
         while let Some(nl) = self.assistant_line_buf.find('\n') {
             let line: String = self.assistant_line_buf.drain(..=nl).collect();
             let content = line[..line.len() - 1].to_string();
-            if let Some(rendered) =
-                crate::markdown::render_line_with_width(&content, &mut self.md_state, self.caps, md_width)
-            {
+            if let Some(rendered) = crate::markdown::render_line_with_width(
+                &content,
+                &mut self.md_state,
+                self.caps,
+                md_width,
+            ) {
                 completed.push(rendered);
             }
         }
@@ -1110,13 +1113,18 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let md_width = (self.screen.width() as usize).saturating_sub(PAD_COL * 2);
         if !self.assistant_line_buf.is_empty() {
             let line = std::mem::take(&mut self.assistant_line_buf);
-            if let Some(rendered) =
-                crate::markdown::render_line_with_width(&line, &mut self.md_state, self.caps, md_width)
-            {
+            if let Some(rendered) = crate::markdown::render_line_with_width(
+                &line,
+                &mut self.md_state,
+                self.caps,
+                md_width,
+            ) {
                 self.push_markdown_body(&rendered);
             }
         }
-        if let Some(block) = crate::markdown::finalize_with_width(&mut self.md_state, self.caps, md_width) {
+        if let Some(block) =
+            crate::markdown::finalize_with_width(&mut self.md_state, self.caps, md_width)
+        {
             self.push_markdown_body(&block);
         }
     }
@@ -2462,7 +2470,9 @@ mod tests {
                 w <= term_w as usize,
                 "body row {} has display width {} > terminal {}; \
                  table rendered without width-aware truncation",
-                i, w, term_w
+                i,
+                w,
+                term_w
             );
         }
     }
@@ -3095,7 +3105,9 @@ mod tests {
         drain_into_vterm(&buf, &mut vterm);
 
         let row_idx = (0..vterm.height() as usize)
-            .find(|&i| vterm.row_text(i).contains('\u{276f}') && vterm.row_text(i).contains("hello"))
+            .find(|&i| {
+                vterm.row_text(i).contains('\u{276f}') && vterm.row_text(i).contains("hello")
+            })
             .unwrap_or_else(|| panic!("user echo row missing\ndump:\n{}", vterm.dump()));
         assert_eq!(
             vterm.cell_at(row_idx, 0).ch,
@@ -3502,8 +3514,7 @@ mod tests {
 
         // Spinner must be GONE from the visible grid — assistant
         // text has overwritten its row.
-        let has_spinner =
-            vterm.any_row(|row| row.contains("⠋") && row.contains("Pondering"));
+        let has_spinner = vterm.any_row(|row| row.contains("⠋") && row.contains("Pondering"));
         let has_text = vterm.any_row(|row| row.contains("Hello world"));
         assert!(
             !has_spinner,
@@ -3716,8 +3727,7 @@ mod tests {
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
 
-        let has_spinner =
-            vterm.any_row(|row| row.contains("⠋") && row.contains("Pondering"));
+        let has_spinner = vterm.any_row(|row| row.contains("⠋") && row.contains("Pondering"));
         assert!(
             !has_spinner,
             "spinner still visible after returning to input prompt:\n{}",

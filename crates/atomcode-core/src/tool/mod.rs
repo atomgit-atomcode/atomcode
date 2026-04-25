@@ -14,8 +14,8 @@ pub mod read;
 pub mod read_symbol;
 pub mod result_store;
 pub mod search_replace;
-pub mod trace_callers;
 pub mod trace_callees;
+pub mod trace_callers;
 pub mod trace_chain;
 pub mod use_skill;
 pub mod web_fetch;
@@ -29,11 +29,27 @@ use std::sync::Arc;
 /// Directories to skip when scanning file trees (build artifacts, caches, VCS).
 /// Used by glob, list_dir, and collect_project_files.
 pub const SKIP_DIRS: &[&str] = &[
-    "node_modules", ".git", "target", "__pycache__", ".next",
-    "dist", "build", ".cache", "vendor", ".venv", "venv",
-    ".idea", ".vscode", ".DS_Store", ".env",
-    "datalog", "logs", "log", ".atomcode",
-    ".claude", "runs",
+    "node_modules",
+    ".git",
+    "target",
+    "__pycache__",
+    ".next",
+    "dist",
+    "build",
+    ".cache",
+    "vendor",
+    ".venv",
+    "venv",
+    ".idea",
+    ".vscode",
+    ".DS_Store",
+    ".env",
+    "datalog",
+    "logs",
+    "log",
+    ".atomcode",
+    ".claude",
+    "runs",
 ];
 
 /// Prefixes — any directory whose name starts with one of these is skipped.
@@ -43,8 +59,7 @@ pub const SKIP_DIR_PREFIXES: &[&str] = &[".venv-"];
 /// Check if a directory name should be skipped (exact match OR prefix match).
 /// Use this instead of `SKIP_DIRS.contains()` for complete coverage.
 pub fn should_skip_dir(name: &str) -> bool {
-    SKIP_DIRS.contains(&name)
-        || SKIP_DIR_PREFIXES.iter().any(|p| name.starts_with(p))
+    SKIP_DIRS.contains(&name) || SKIP_DIR_PREFIXES.iter().any(|p| name.starts_with(p))
 }
 
 /// Count of leading characters shared between two paths. Used by read_file
@@ -56,7 +71,7 @@ pub fn shared_prefix_len(a: &str, b: &str) -> usize {
     a.chars().zip(b.chars()).take_while(|(x, y)| x == y).count()
 }
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use tokio::sync::{Mutex, RwLock};
 
@@ -143,8 +158,12 @@ pub enum ExternalPathAction {
 }
 
 pub fn inspect_path_access(raw_path: &str, working_dir: &Path) -> Result<ResolvedPath> {
-    let workspace_root = std::fs::canonicalize(working_dir)
-        .with_context(|| format!("Failed to resolve working directory {}", working_dir.display()))?;
+    let workspace_root = std::fs::canonicalize(working_dir).with_context(|| {
+        format!(
+            "Failed to resolve working directory {}",
+            working_dir.display()
+        )
+    })?;
     let expanded = expand_user_path(raw_path);
     let candidate = if expanded.is_absolute() {
         expanded
@@ -200,18 +219,30 @@ fn is_sensitive_path(path: &Path) -> bool {
     ];
     const SECRET_HOME_DIRS: &[&str] = &[".ssh", ".aws", ".gnupg", ".config"];
     const SECRET_FILE_NAMES: &[&str] = &[
-        ".bashrc", ".bash_profile", ".zshrc", ".zprofile", ".zshenv",
-        ".npmrc", ".pypirc", ".env", ".env.local", "credentials", "config",
-        "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519",
+        ".bashrc",
+        ".bash_profile",
+        ".zshrc",
+        ".zprofile",
+        ".zshenv",
+        ".npmrc",
+        ".pypirc",
+        ".env",
+        ".env.local",
+        "credentials",
+        "config",
+        "id_rsa",
+        "id_dsa",
+        "id_ecdsa",
+        "id_ed25519",
     ];
     const SECRET_EXTS: &[&str] = &["pem", "key", "p12", "pfx", "der", "crt", "cer"];
 
-    let has_protected_prefix = SYSTEM_PROTECTED_PREFIXES.iter().any(|prefix| {
-        path == Path::new(prefix) || path.starts_with(prefix)
-    });
-    let has_exception_prefix = SYSTEM_PROTECTED_EXCEPTIONS.iter().any(|prefix| {
-        path == Path::new(prefix) || path.starts_with(prefix)
-    });
+    let has_protected_prefix = SYSTEM_PROTECTED_PREFIXES
+        .iter()
+        .any(|prefix| path == Path::new(prefix) || path.starts_with(prefix));
+    let has_exception_prefix = SYSTEM_PROTECTED_EXCEPTIONS
+        .iter()
+        .any(|prefix| path == Path::new(prefix) || path.starts_with(prefix));
 
     if has_protected_prefix && !has_exception_prefix {
         return true;
@@ -231,15 +262,21 @@ fn is_sensitive_path(path: &Path) -> bool {
         }
     }
 
-    if path.file_name().and_then(|n| n.to_str()).is_some_and(|name| {
-        SECRET_FILE_NAMES.contains(&name)
-    }) {
+    if path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|name| SECRET_FILE_NAMES.contains(&name))
+    {
         return true;
     }
 
     path.extension()
         .and_then(|ext| ext.to_str())
-        .is_some_and(|ext| SECRET_EXTS.iter().any(|candidate| ext.eq_ignore_ascii_case(candidate)))
+        .is_some_and(|ext| {
+            SECRET_EXTS
+                .iter()
+                .any(|candidate| ext.eq_ignore_ascii_case(candidate))
+        })
 }
 
 pub fn approval_for_path(
@@ -454,14 +491,28 @@ pub struct ToolContext {
     ///
     /// Stays set once captured — "original failure" anchor, not rolling.
     pub first_error_signatures: Arc<RwLock<Vec<String>>>,
+    /// Shared telemetry handle. Always present (possibly in disabled state).
+    pub telemetry: std::sync::Arc<atomcode_telemetry::Telemetry>,
 }
 
 impl ToolContext {
+    /// Create a `ToolContext` with a disabled (no-op) telemetry handle.
+    /// Prefer `with_telemetry` in production so real events are emitted.
     pub fn new(working_dir: PathBuf) -> Self {
-        Self::with_session(working_dir, "default")
+        let telemetry = disabled_telemetry();
+        Self::with_telemetry(working_dir, "default", telemetry)
     }
 
     pub fn with_session(working_dir: PathBuf, session_id: &str) -> Self {
+        let telemetry = disabled_telemetry();
+        Self::with_telemetry(working_dir, session_id, telemetry)
+    }
+
+    pub fn with_telemetry(
+        working_dir: PathBuf,
+        session_id: &str,
+        telemetry: std::sync::Arc<atomcode_telemetry::Telemetry>,
+    ) -> Self {
         Self {
             working_dir: Arc::new(RwLock::new(working_dir)),
             semantic: Arc::new(Mutex::new(crate::semantic::SemanticSearcher::new())),
@@ -471,6 +522,7 @@ impl ToolContext {
             graph: Arc::new(RwLock::new(crate::graph::CodeGraph::new())),
             read_cache: Arc::new(RwLock::new(std::collections::HashMap::new())),
             first_error_signatures: Arc::new(RwLock::new(Vec::new())),
+            telemetry,
         }
     }
 
@@ -480,8 +532,20 @@ impl ToolContext {
         let wd = self.working_dir.read().await.clone();
         let mut ctx = Self::new(wd);
         ctx.graph = self.graph.clone();
+        ctx.telemetry = self.telemetry.clone();
         ctx
     }
+}
+
+/// Build a disabled (no-op) `Telemetry` handle — zero overhead, no I/O.
+/// Used by `ToolContext::new` and in tests that don't care about telemetry.
+fn disabled_telemetry() -> std::sync::Arc<atomcode_telemetry::Telemetry> {
+    let cfg = atomcode_telemetry::ResolvedConfig {
+        state: atomcode_telemetry::TelemetryState::Disabled("default"),
+        endpoint: "http://localhost/v1/events".into(),
+        atomcode_dir: std::path::PathBuf::from("/tmp"),
+    };
+    atomcode_telemetry::Telemetry::init(cfg, env!("CARGO_PKG_VERSION").into())
 }
 
 /// Extract up to 5 distinctive diagnostic lines from a failed bash/tool
@@ -712,7 +776,8 @@ mod tests {
         let link = workspace.path().join("secret-link");
         std::os::unix::fs::symlink(&target, &link).unwrap();
 
-        let err = resolve_workspace_path(link.to_string_lossy().as_ref(), workspace.path()).unwrap_err();
+        let err =
+            resolve_workspace_path(link.to_string_lossy().as_ref(), workspace.path()).unwrap_err();
         assert!(err.to_string().contains("outside working directory"));
     }
 
@@ -737,7 +802,8 @@ mod tests {
             &outside.path().to_string_lossy(),
             workspace.path(),
             ExternalPathAction::Enumerate,
-        ).unwrap();
+        )
+        .unwrap();
         assert!(matches!(approval, ApprovalRequirement::AutoApprove));
     }
 
@@ -752,7 +818,8 @@ mod tests {
             &target.to_string_lossy(),
             workspace.path(),
             ExternalPathAction::Read,
-        ).unwrap();
+        )
+        .unwrap();
         assert!(matches!(approval, ApprovalRequirement::RequireApproval(_)));
     }
 
@@ -767,13 +834,19 @@ mod tests {
             &target.to_string_lossy(),
             workspace.path(),
             ExternalPathAction::Read,
-        ).unwrap();
-        assert!(matches!(approval, ApprovalRequirement::RequireApprovalAlways(_)));
+        )
+        .unwrap();
+        assert!(matches!(
+            approval,
+            ApprovalRequirement::RequireApprovalAlways(_)
+        ));
     }
 
     #[test]
     fn approval_for_system_protected_prefix_requires_always() {
-        assert!(is_sensitive_path(Path::new("/System/Library/CoreServices/boot.efi")));
+        assert!(is_sensitive_path(Path::new(
+            "/System/Library/CoreServices/boot.efi"
+        )));
     }
 
     #[test]
@@ -788,7 +861,9 @@ mod tests {
 
     #[test]
     fn approval_for_private_var_folders_exception_is_not_sensitive() {
-        assert!(!is_sensitive_path(Path::new("/private/var/folders/xx/yy/T/file.txt")));
+        assert!(!is_sensitive_path(Path::new(
+            "/private/var/folders/xx/yy/T/file.txt"
+        )));
     }
 
     #[test]
@@ -801,8 +876,12 @@ mod tests {
             &target.to_string_lossy(),
             workspace.path(),
             ExternalPathAction::Write,
-        ).unwrap();
-        assert!(matches!(approval, ApprovalRequirement::RequireApprovalAlways(_)));
+        )
+        .unwrap();
+        assert!(matches!(
+            approval,
+            ApprovalRequirement::RequireApprovalAlways(_)
+        ));
     }
 
     #[tokio::test]
@@ -854,7 +933,10 @@ mod tests {
     #[test]
     fn test_permission_store_require_approval() {
         let store = PermissionStore::new();
-        let decision = store.check("bash", &ApprovalRequirement::RequireApproval("Destructive".into()));
+        let decision = store.check(
+            "bash",
+            &ApprovalRequirement::RequireApproval("Destructive".into()),
+        );
         assert!(matches!(decision, PermissionDecision::Ask(_)));
     }
 
@@ -865,7 +947,10 @@ mod tests {
         // its own destructive-command detection as a separate safety layer.
         let mut store = PermissionStore::new();
         store.grant_session("bash");
-        let decision = store.check("bash", &ApprovalRequirement::RequireApproval("Destructive".into()));
+        let decision = store.check(
+            "bash",
+            &ApprovalRequirement::RequireApproval("Destructive".into()),
+        );
         assert!(matches!(decision, PermissionDecision::Allow));
     }
 
@@ -873,7 +958,10 @@ mod tests {
     fn test_permission_store_session_grant_does_not_bypass_require_approval_always() {
         let mut store = PermissionStore::new();
         store.grant_session("bash");
-        let decision = store.check("bash", &ApprovalRequirement::RequireApprovalAlways("Sensitive".into()));
+        let decision = store.check(
+            "bash",
+            &ApprovalRequirement::RequireApprovalAlways("Sensitive".into()),
+        );
         assert!(matches!(decision, PermissionDecision::Ask(_)));
     }
 
@@ -900,7 +988,10 @@ mod tests {
         // Even AlwaysAllow override must NOT bypass RequireApproval.
         let mut store = PermissionStore::new();
         store.set_override("bash", PermissionLevel::AlwaysAllow);
-        let decision = store.check("bash", &ApprovalRequirement::RequireApproval("Destructive".into()));
+        let decision = store.check(
+            "bash",
+            &ApprovalRequirement::RequireApproval("Destructive".into()),
+        );
         assert!(matches!(decision, PermissionDecision::Ask(_)));
     }
 
@@ -939,7 +1030,10 @@ mod tests {
         let mut store = PermissionStore::new();
         store.grant_session("bash");
         // Other tools are unaffected.
-        let decision = store.check("create_file", &ApprovalRequirement::RequireApproval("write".into()));
+        let decision = store.check(
+            "create_file",
+            &ApprovalRequirement::RequireApproval("write".into()),
+        );
         assert!(matches!(decision, PermissionDecision::Ask(_)));
     }
 

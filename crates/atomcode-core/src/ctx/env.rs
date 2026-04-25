@@ -61,11 +61,9 @@ impl EnvSnapshot {
             return Self::default();
         }
 
-        let branch = run_git(wd, &["branch", "--show-current"])
-            .filter(|s| !s.is_empty());
+        let branch = run_git(wd, &["branch", "--show-current"]).filter(|s| !s.is_empty());
 
-        let head_oneline = run_git(wd, &["log", "-1", "--format=%h %s"])
-            .filter(|s| !s.is_empty());
+        let head_oneline = run_git(wd, &["log", "-1", "--format=%h %s"]).filter(|s| !s.is_empty());
 
         let status_raw = run_git(wd, &["status", "--short"]).unwrap_or_default();
         let is_dirty = !status_raw.trim().is_empty();
@@ -108,9 +106,7 @@ impl EnvSnapshot {
             return String::new();
         };
 
-        let mut out = String::from(
-            "\n=== GIT STATUS (snapshot at session start, not live) ===\n",
-        );
+        let mut out = String::from("\n=== GIT STATUS (snapshot at session start, not live) ===\n");
 
         if let Some(branch) = git.branch.as_deref() {
             out.push_str(&format!("Branch: {}\n", branch));
@@ -229,7 +225,7 @@ mod tests {
     fn detached_head_shown_explicitly() {
         let snap = EnvSnapshot {
             git: Some(GitSnapshot {
-                branch: None,  // detached
+                branch: None, // detached
                 head_oneline: Some("deadbee detached state".into()),
                 status_short: String::new(),
                 is_dirty: false,

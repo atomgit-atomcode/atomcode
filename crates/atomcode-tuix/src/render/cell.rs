@@ -395,7 +395,11 @@ mod tests {
     fn diff_cell_frames_produces_one_indexed_coords() {
         let row: Vec<Cell> = "ab"
             .chars()
-            .map(|ch| Cell { ch, style: Default::default(), width: 1 })
+            .map(|ch| Cell {
+                ch,
+                style: Default::default(),
+                width: 1,
+            })
             .collect();
         let mut changed = row.clone();
         changed[0].ch = 'X';
@@ -421,11 +425,19 @@ mod tests {
         // blanking patches so leftover glyphs get overwritten.
         let prev_row: Vec<Cell> = "hello"
             .chars()
-            .map(|ch| Cell { ch, style: Default::default(), width: 1 })
+            .map(|ch| Cell {
+                ch,
+                style: Default::default(),
+                width: 1,
+            })
             .collect();
         let next_row: Vec<Cell> = "he"
             .chars()
-            .map(|ch| Cell { ch, style: Default::default(), width: 1 })
+            .map(|ch| Cell {
+                ch,
+                style: Default::default(),
+                width: 1,
+            })
             .collect();
         let prev = vec![prev_row];
         let next = vec![next_row];
@@ -487,12 +499,20 @@ mod tests {
         let p1 = Patch {
             row: 5,
             col: 1,
-            cell: Cell { ch: 'a', style: Default::default(), width: 1 },
+            cell: Cell {
+                ch: 'a',
+                style: Default::default(),
+                width: 1,
+            },
         };
         let p2 = Patch {
             row: 5,
             col: 2,
-            cell: Cell { ch: 'b', style: Default::default(), width: 1 },
+            cell: Cell {
+                ch: 'b',
+                style: Default::default(),
+                width: 1,
+            },
         };
         let bytes = serialize_patches(&[p1, p2]);
         let s = String::from_utf8(bytes).unwrap();
@@ -507,14 +527,22 @@ mod tests {
         let p1 = Patch {
             row: 5,
             col: 1,
-            cell: Cell { ch: 'a', style: Default::default(), width: 1 },
+            cell: Cell {
+                ch: 'a',
+                style: Default::default(),
+                width: 1,
+            },
         };
         let p2 = Patch {
             row: 5,
             col: 2,
             cell: Cell {
                 ch: 'b',
-                style: CellStyle { fg: None, bold: true, reverse: false },
+                style: CellStyle {
+                    fg: None,
+                    bold: true,
+                    reverse: false,
+                },
                 width: 1,
             },
         };
@@ -631,7 +659,8 @@ mod tests {
         let real_cells = row.iter().filter(|c| c.width > 0).count();
         eprintln!(
             "[UNICODE DIAG] skin-tone emoji: real={} cells total={}",
-            real_cells, row.len()
+            real_cells,
+            row.len()
         );
         // 2 real cells, each advancing cursor by 2 = 4 cols model.
         // Terminal advances 2. Drift = 2.
@@ -732,16 +761,34 @@ mod tests {
     #[test]
     fn unicode_diff_narrow_to_wide_at_same_position() {
         let prev_row: Vec<Cell> = vec![
-            Cell { ch: 'a', style: CellStyle::default(), width: 1 },
-            Cell { ch: 'b', style: CellStyle::default(), width: 1 },
+            Cell {
+                ch: 'a',
+                style: CellStyle::default(),
+                width: 1,
+            },
+            Cell {
+                ch: 'b',
+                style: CellStyle::default(),
+                width: 1,
+            },
         ];
         let next_row: Vec<Cell> = vec![
-            Cell { ch: '你', style: CellStyle::default(), width: 2 },
+            Cell {
+                ch: '你',
+                style: CellStyle::default(),
+                width: 2,
+            },
             Cell::continuation(),
         ];
         // Row 9 in the slice (index) → ANSI row 10 in the patch.
-        let prev: Vec<Vec<Cell>> = (0..9).map(|_| Vec::new()).chain(std::iter::once(prev_row)).collect();
-        let next: Vec<Vec<Cell>> = (0..9).map(|_| Vec::new()).chain(std::iter::once(next_row)).collect();
+        let prev: Vec<Vec<Cell>> = (0..9)
+            .map(|_| Vec::new())
+            .chain(std::iter::once(prev_row))
+            .collect();
+        let next: Vec<Vec<Cell>> = (0..9)
+            .map(|_| Vec::new())
+            .chain(std::iter::once(next_row))
+            .collect();
 
         let patches = diff_cell_frames(&prev, &next);
         assert_eq!(patches.len(), 2, "both cols changed");
@@ -764,15 +811,33 @@ mod tests {
     #[test]
     fn unicode_diff_wide_to_narrow_erases_right_half() {
         let prev_row: Vec<Cell> = vec![
-            Cell { ch: '你', style: CellStyle::default(), width: 2 },
+            Cell {
+                ch: '你',
+                style: CellStyle::default(),
+                width: 2,
+            },
             Cell::continuation(),
         ];
         let next_row: Vec<Cell> = vec![
-            Cell { ch: 'a', style: CellStyle::default(), width: 1 },
-            Cell { ch: 'b', style: CellStyle::default(), width: 1 },
+            Cell {
+                ch: 'a',
+                style: CellStyle::default(),
+                width: 1,
+            },
+            Cell {
+                ch: 'b',
+                style: CellStyle::default(),
+                width: 1,
+            },
         ];
-        let prev: Vec<Vec<Cell>> = (0..4).map(|_| Vec::new()).chain(std::iter::once(prev_row)).collect();
-        let next: Vec<Vec<Cell>> = (0..4).map(|_| Vec::new()).chain(std::iter::once(next_row)).collect();
+        let prev: Vec<Vec<Cell>> = (0..4)
+            .map(|_| Vec::new())
+            .chain(std::iter::once(prev_row))
+            .collect();
+        let next: Vec<Vec<Cell>> = (0..4)
+            .map(|_| Vec::new())
+            .chain(std::iter::once(next_row))
+            .collect();
 
         let patches = diff_cell_frames(&prev, &next);
         assert_eq!(patches.len(), 2);

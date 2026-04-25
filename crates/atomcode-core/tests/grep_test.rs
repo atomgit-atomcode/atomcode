@@ -1,6 +1,6 @@
-use std::path::PathBuf;
-use atomcode_core::tool::{Tool, ToolContext};
 use atomcode_core::tool::grep::GrepTool;
+use atomcode_core::tool::{Tool, ToolContext};
+use std::path::PathBuf;
 
 async fn run_grep(pattern: &str, path: &str, wd: &str) -> atomcode_core::tool::ToolResult {
     let tool = GrepTool;
@@ -8,7 +8,8 @@ async fn run_grep(pattern: &str, path: &str, wd: &str) -> atomcode_core::tool::T
     let args = serde_json::json!({
         "pattern": pattern,
         "path": path,
-    }).to_string();
+    })
+    .to_string();
     tool.execute(&args, &ctx).await.unwrap()
 }
 
@@ -17,7 +18,8 @@ async fn run_grep_no_path(pattern: &str, wd: &str) -> atomcode_core::tool::ToolR
     let ctx = ToolContext::new(PathBuf::from(wd));
     let args = serde_json::json!({
         "pattern": pattern,
-    }).to_string();
+    })
+    .to_string();
     tool.execute(&args, &ctx).await.unwrap()
 }
 
@@ -28,43 +30,74 @@ fn wd() -> String {
 #[tokio::test]
 async fn test_simple_pattern() {
     let result = run_grep("fn ", "src/tool", &wd()).await;
-    assert!(result.success, "should find 'fn ' in src/tool. Output: {}", result.output);
+    assert!(
+        result.success,
+        "should find 'fn ' in src/tool. Output: {}",
+        result.output
+    );
 }
 
 #[tokio::test]
 async fn test_regex_or() {
     // First: verify rg works directly via Command
     let direct = tokio::process::Command::new("rg")
-        .args(&["--line-number", "--no-heading", "--color=never",
-                "GrepTool|BashTool", "src/tool"])
+        .args(&[
+            "--line-number",
+            "--no-heading",
+            "--color=never",
+            "GrepTool|BashTool",
+            "src/tool",
+        ])
         .current_dir(&wd())
-        .output().await.unwrap();
+        .output()
+        .await
+        .unwrap();
     let direct_out = String::from_utf8_lossy(&direct.stdout);
-    eprintln!("DIRECT rg: {} lines, exit={:?}", direct_out.lines().count(), direct.status.code());
+    eprintln!(
+        "DIRECT rg: {} lines, exit={:?}",
+        direct_out.lines().count(),
+        direct.status.code()
+    );
     assert!(!direct_out.is_empty(), "direct rg should find results");
 
     // Then: verify via grep tool
     let result = run_grep("GrepTool|BashTool", "src/tool", &wd()).await;
-    assert!(result.success, "grep tool should also find results. Output: {}", result.output);
+    assert!(
+        result.success,
+        "grep tool should also find results. Output: {}",
+        result.output
+    );
 }
 
 #[tokio::test]
 async fn test_relative_path() {
     let result = run_grep("fn ", "src", &wd()).await;
-    assert!(result.success, "relative path should work. Output: {}", result.output);
+    assert!(
+        result.success,
+        "relative path should work. Output: {}",
+        result.output
+    );
 }
 
 #[tokio::test]
 async fn test_absolute_path() {
     let abs = format!("{}/src/tool", env!("CARGO_MANIFEST_DIR"));
     let result = run_grep("fn ", &abs, &wd()).await;
-    assert!(result.success, "absolute path should work. Output: {}", result.output);
+    assert!(
+        result.success,
+        "absolute path should work. Output: {}",
+        result.output
+    );
 }
 
 #[tokio::test]
 async fn test_default_path() {
     let result = run_grep_no_path("GrepTool", &wd()).await;
-    assert!(result.success, "default path (.) should work. Output: {}", result.output);
+    assert!(
+        result.success,
+        "default path (.) should work. Output: {}",
+        result.output
+    );
 }
 
 #[tokio::test]
@@ -85,7 +118,11 @@ async fn test_excludes_target() {
         let path = l.split(':').next().unwrap_or("");
         path.contains("/target/") || path.starts_with("target/")
     });
-    assert!(!has_target, "target/ should be excluded. Output: {}", result.output);
+    assert!(
+        !has_target,
+        "target/ should be excluded. Output: {}",
+        result.output
+    );
 }
 
 #[tokio::test]
@@ -97,7 +134,11 @@ async fn test_nonexistent_path() {
 #[tokio::test]
 async fn test_mixed_cjk_ascii_or() {
     let result = run_grep("搜索|search|keyword", "src", &wd()).await;
-    assert!(result.success, "CJK|ASCII OR should find 'search'. Output: {}", result.output);
+    assert!(
+        result.success,
+        "CJK|ASCII OR should find 'search'. Output: {}",
+        result.output
+    );
 }
 
 #[tokio::test]
@@ -105,15 +146,26 @@ async fn test_with_path_always_returns_code_lines() {
     // When `path` is specified, grep must return actual matching code lines,
     // never a Graph-only summary. Verify output contains `:` line-number format.
     let result = run_grep("GrepTool", "src/tool/grep.rs", &wd()).await;
-    assert!(result.success, "should find GrepTool in grep.rs. Output: {}", result.output);
-    assert!(!result.output.starts_with("[Graph:"),
-        "with path specified, output must not be Graph-only. Output: {}", result.output);
+    assert!(
+        result.success,
+        "should find GrepTool in grep.rs. Output: {}",
+        result.output
+    );
+    assert!(
+        !result.output.starts_with("[Graph:"),
+        "with path specified, output must not be Graph-only. Output: {}",
+        result.output
+    );
     let has_line_ref = result.output.lines().any(|l| {
         // ripgrep output format: "file:line:content"
         let parts: Vec<&str> = l.splitn(3, ':').collect();
         parts.len() >= 3 && parts[1].parse::<usize>().is_ok()
     });
-    assert!(has_line_ref, "output must contain file:line:content format. Output: {}", result.output);
+    assert!(
+        has_line_ref,
+        "output must contain file:line:content format. Output: {}",
+        result.output
+    );
 }
 
 #[tokio::test]
@@ -125,6 +177,9 @@ async fn test_no_path_still_returns_code_lines() {
         let parts: Vec<&str> = l.splitn(3, ':').collect();
         parts.len() >= 3 && parts[1].parse::<usize>().is_ok()
     });
-    assert!(has_line_ref,
-        "output must contain ripgrep line results even when graph is active. Output: {}", result.output);
+    assert!(
+        has_line_ref,
+        "output must contain ripgrep line results even when graph is active. Output: {}",
+        result.output
+    );
 }

@@ -19,8 +19,7 @@ pub struct RepoRef {
 
 impl RepoRef {
     pub fn matches(&self, other: &RepoRef) -> bool {
-        self.owner.eq_ignore_ascii_case(&other.owner)
-            && self.repo.eq_ignore_ascii_case(&other.repo)
+        self.owner.eq_ignore_ascii_case(&other.owner) && self.repo.eq_ignore_ascii_case(&other.repo)
     }
 }
 
@@ -120,7 +119,10 @@ fn strip_port(host: &str) -> &str {
 }
 
 fn split_owner_repo(path: &str) -> Option<RepoRef> {
-    let mut parts = path.trim_start_matches('/').split('/').filter(|s| !s.is_empty());
+    let mut parts = path
+        .trim_start_matches('/')
+        .split('/')
+        .filter(|s| !s.is_empty());
     let owner = parts.next()?.to_string();
     let repo = parts.next()?.to_string();
     let repo = repo.strip_suffix(".git").unwrap_or(&repo).to_string();
@@ -365,8 +367,14 @@ mod tests {
 
     #[test]
     fn repo_ref_matches_case_insensitive() {
-        let a = RepoRef { owner: "Atomgit_Atomcode".into(), repo: "AtomCode".into() };
-        let b = RepoRef { owner: "atomgit_atomcode".into(), repo: "atomcode".into() };
+        let a = RepoRef {
+            owner: "Atomgit_Atomcode".into(),
+            repo: "AtomCode".into(),
+        };
+        let b = RepoRef {
+            owner: "atomgit_atomcode".into(),
+            repo: "atomcode".into(),
+        };
         assert!(a.matches(&b));
     }
 

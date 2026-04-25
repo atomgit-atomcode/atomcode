@@ -68,9 +68,7 @@ impl Client {
             .with_context(|| format!("POST {} failed", url))?;
 
         let status = resp.status();
-        if status == reqwest::StatusCode::UNAUTHORIZED
-            || status == reqwest::StatusCode::FORBIDDEN
-        {
+        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
             return Err(anyhow!(
                 "authentication failed ({}) — run `atomcode login` again",
                 status.as_u16()
@@ -80,8 +78,12 @@ impl Client {
         if !status.is_success() {
             return Err(anyhow!("{}", format_api_error("claim", status, &body)));
         }
-        serde_json::from_str::<ClaimResponse>(&body)
-            .with_context(|| format!("parse claim response (body: {})", truncate_for_error(&body, 200)))
+        serde_json::from_str::<ClaimResponse>(&body).with_context(|| {
+            format!(
+                "parse claim response (body: {})",
+                truncate_for_error(&body, 200)
+            )
+        })
     }
 
     /// `GET /coding-plan/models` — returns the list of models the current
@@ -97,9 +99,7 @@ impl Client {
             .with_context(|| format!("GET {} failed", url))?;
 
         let status = resp.status();
-        if status == reqwest::StatusCode::UNAUTHORIZED
-            || status == reqwest::StatusCode::FORBIDDEN
-        {
+        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
             return Err(anyhow!(
                 "authentication failed ({}) — run `atomcode login` again",
                 status.as_u16()
@@ -109,8 +109,12 @@ impl Client {
         if !status.is_success() {
             return Err(anyhow!("{}", format_api_error("models", status, &body)));
         }
-        serde_json::from_str::<Vec<ModelEntry>>(&body)
-            .with_context(|| format!("parse models response (body: {})", truncate_for_error(&body, 200)))
+        serde_json::from_str::<Vec<ModelEntry>>(&body).with_context(|| {
+            format!(
+                "parse models response (body: {})",
+                truncate_for_error(&body, 200)
+            )
+        })
     }
 
     /// `GET /coding-plan/status` — audit/quota/expiry snapshot.
@@ -124,9 +128,7 @@ impl Client {
             .with_context(|| format!("GET {} failed", url))?;
 
         let status = resp.status();
-        if status == reqwest::StatusCode::UNAUTHORIZED
-            || status == reqwest::StatusCode::FORBIDDEN
-        {
+        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
             return Err(anyhow!(
                 "authentication failed ({}) — run `atomcode login` again",
                 status.as_u16()
@@ -136,8 +138,12 @@ impl Client {
         if !status.is_success() {
             return Err(anyhow!("{}", format_api_error("status", status, &body)));
         }
-        serde_json::from_str::<StatusResponse>(&body)
-            .with_context(|| format!("parse status response (body: {})", truncate_for_error(&body, 200)))
+        serde_json::from_str::<StatusResponse>(&body).with_context(|| {
+            format!(
+                "parse status response (body: {})",
+                truncate_for_error(&body, 200)
+            )
+        })
     }
 }
 
@@ -173,11 +179,7 @@ fn format_api_error(descriptor: &str, status: reqwest::StatusCode, body: &str) -
         }
         // Shape 2: Spring error body with `path` (and no usable message).
         if let Some(path) = val.get("path").and_then(|v| v.as_str()) {
-            return format!(
-                "HTTP {} — 接口暂不可用 ({})",
-                status.as_u16(),
-                path
-            );
+            return format!("HTTP {} — 接口暂不可用 ({})", status.as_u16(), path);
         }
     }
     // Shape 3: raw text fallback.
@@ -219,8 +221,16 @@ mod tests {
         let body = "<html>502 Bad Gateway</html>";
         let msg = format_api_error("status", reqwest::StatusCode::BAD_GATEWAY, body);
         assert!(msg.contains("502"), "status code missing: {}", msg);
-        assert!(msg.contains("CodingPlan status"), "descriptor missing: {}", msg);
-        assert!(msg.contains("502 Bad Gateway"), "body should be echoed: {}", msg);
+        assert!(
+            msg.contains("CodingPlan status"),
+            "descriptor missing: {}",
+            msg
+        );
+        assert!(
+            msg.contains("502 Bad Gateway"),
+            "body should be echoed: {}",
+            msg
+        );
     }
 
     #[test]
@@ -228,7 +238,11 @@ mod tests {
         let body = r#"{"foo":"bar"}"#;
         let msg = format_api_error("claim", reqwest::StatusCode::INTERNAL_SERVER_ERROR, body);
         assert!(msg.contains("500"), "status code missing: {}", msg);
-        assert!(msg.contains("CodingPlan claim"), "descriptor missing: {}", msg);
+        assert!(
+            msg.contains("CodingPlan claim"),
+            "descriptor missing: {}",
+            msg
+        );
     }
 
     #[test]

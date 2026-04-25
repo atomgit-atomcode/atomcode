@@ -14,14 +14,14 @@
 
 use std::path::PathBuf;
 
-use anyhow::Result;
-use atomcode_core::agent::AgentCommand;
-use atomcode_core::config::Config;
 use super::{save_and_reload, LoopCtx};
 use crate::modals::{DirPicker, IssueWizard, Modal, ModelPicker, ProviderWizard, SessionPicker};
 use crate::render::{Renderer, UiLine};
 use crate::state::UiState;
+use anyhow::Result;
+use atomcode_core::agent::AgentCommand;
 use atomcode_core::config::provider::ProviderConfig;
+use atomcode_core::config::Config;
 
 /// Maximum recent project dirs we keep in memory + persist to disk.
 const MAX_RECENT_DIRS: usize = 5;
@@ -38,7 +38,7 @@ fn build_oauth_provider() -> ProviderConfig {
         max_tokens: None,
         thinking_type: None,
         thinking_keep: None,
-            reasoning_history: None,
+        reasoning_history: None,
         ephemeral: false,
     }
 }
@@ -73,6 +73,15 @@ pub(super) fn execute_slash_command(
     // case-sensitive in general.
     let cmd_lower = cmd.to_ascii_lowercase();
     let cmd = cmd_lower.as_str();
+
+    // Emit use_command telemetry before dispatch so the event fires
+    // regardless of whether the command succeeds or errors out.
+    {
+        use atomcode_telemetry::Event;
+        let cmd_name = cmd.trim_start_matches('/').to_string();
+        ctx.telemetry.track(Event::UseCommand { type_: cmd_name });
+    }
+
     match cmd {
         "quit" | "exit" => {
             ctx.agent.cmd_tx.send(AgentCommand::Shutdown).ok();
@@ -172,9 +181,12 @@ pub(super) fn execute_slash_command(
             // New session = new session file on disk. Old session
             // (already saved at its last TurnComplete) stays on disk so
             // it can still be `/resume`d; we just stop writing into it.
-            ctx.current_session = atomcode_core::session::Session::default_session(
-                ctx.working_dir.clone(),
-            );
+            ctx.current_session =
+                atomcode_core::session::Session::default_session(ctx.working_dir.clone());
+            // Bind telemetry session_id to the new session's UUID.
+            if let Ok(uuid) = uuid::Uuid::parse_str(ctx.current_session.id.as_str()) {
+                ctx.telemetry.set_session_id(uuid);
+            }
             // `reset()` wipes the terminal AND the renderer's cached
             // footer/stream state, so the next Welcome renders against
             // a known (row 1, col 1) anchor. This is what makes
@@ -190,9 +202,7 @@ pub(super) fn execute_slash_command(
         }
         "model" => {
             if ctx.config.providers.is_empty() {
-                renderer.render(UiLine::CommandOutput(
-                    "  No providers configured.\n".into(),
-                ));
+                renderer.render(UiLine::CommandOutput("  No providers configured.\n".into()));
                 renderer.flush();
             } else {
                 *active_modal = Some(Box::new(ModelPicker::open(&ctx.config)));
@@ -256,7 +266,9 @@ pub(super) fn execute_slash_command(
             renderer.flush();
         }
         "undo" => {
-            renderer.render(UiLine::CommandOutput("  Undo is not yet supported.\n".into()));
+            renderer.render(UiLine::CommandOutput(
+                "  Undo is not yet supported.\n".into(),
+            ));
             renderer.flush();
         }
         "cost" => {
@@ -296,10 +308,7 @@ pub(super) fn execute_slash_command(
             // ("nothing to compact" / "compacted — dropped N messages").
             // Don't pre-render a placeholder — the agent's reply could
             // contradict it when the conversation is too short.
-            ctx.agent
-                .cmd_tx
-                .send(AgentCommand::Compact { prompt })
-                .ok();
+            ctx.agent.cmd_tx.send(AgentCommand::Compact { prompt }).ok();
         }
         "login" => {
             run_login_flow(renderer, ctx)?;
@@ -369,9 +378,12 @@ pub(super) fn execute_slash_command(
                         );
                     }
                     Err(e) => {
-                        let _ = ctx.upgrade_tx.send(
-                            atomcode_core::self_update::UpgradeEvent::Failed(format!("{:#}", e)),
-                        );
+                        let _ =
+                            ctx.upgrade_tx
+                                .send(atomcode_core::self_update::UpgradeEvent::Failed(format!(
+                                    "{:#}",
+                                    e
+                                )));
                     }
                 }
             } else {
@@ -384,9 +396,7 @@ pub(super) fn execute_slash_command(
                     renderer.flush();
                     return Ok(());
                 }
-                renderer.render(UiLine::CommandOutput(
-                    "  正在检查更新...\n".into(),
-                ));
+                renderer.render(UiLine::CommandOutput("  正在检查更新...\n".into()));
                 renderer.flush();
                 let current = format!("v{}", env!("CARGO_PKG_VERSION"));
                 let tx = ctx.upgrade_tx.clone();
@@ -397,9 +407,10 @@ pub(super) fn execute_slash_command(
                     if let Err(e) =
                         atomcode_core::self_update::run_upgrade(current, force, tx.clone()).await
                     {
-                        let _ = tx.send(atomcode_core::self_update::UpgradeEvent::Failed(
-                            format!("{:#}", e),
-                        ));
+                        let _ = tx.send(atomcode_core::self_update::UpgradeEvent::Failed(format!(
+                            "{:#}",
+                            e
+                        )));
                     }
                 });
             }
@@ -705,7 +716,8 @@ fn format_context_report(
         return "  Context Usage\n  \n  (run at least one turn first — stats are captured per turn)\n".into();
     };
     if snap.ctx_window == 0 {
-        return "  Context Usage\n  \n  (waiting for first complete turn — partial stats only)\n".into();
+        return "  Context Usage\n  \n  (waiting for first complete turn — partial stats only)\n"
+            .into();
     }
 
     let window = snap.ctx_window;
@@ -719,14 +731,19 @@ fn format_context_report(
     // Cold zone is injected as a System message inside `sent`, so we avoid
     // double-counting: subtract cold from sent for the "messages" bucket.
     let messages = snap.sent_tokens.saturating_sub(cold);
-    let total_used = sys.saturating_add(tools).saturating_add(cold).saturating_add(messages);
+    let total_used = sys
+        .saturating_add(tools)
+        .saturating_add(cold)
+        .saturating_add(messages);
     let free = window.saturating_sub(total_used);
 
     // Horizontal bar: 40 cells, one segment per category with a distinct glyph.
     // Terminals universally render these blocks, no ANSI color required.
     const BAR_WIDTH: usize = 40;
     let cells = |tokens: usize| -> usize {
-        if window == 0 { return 0; }
+        if window == 0 {
+            return 0;
+        }
         (tokens as u128 * BAR_WIDTH as u128 / window as u128) as usize
     };
     let sys_cells = cells(sys);
@@ -738,14 +755,16 @@ fn format_context_report(
     let free_cells = BAR_WIDTH.saturating_sub(used_cells.min(BAR_WIDTH));
 
     let mut bar = String::with_capacity(BAR_WIDTH * 3);
-    bar.push_str(&"▒".repeat(sys_cells));       // system prompt
-    bar.push_str(&"▓".repeat(tools_cells));     // tool defs
-    bar.push_str(&"░".repeat(cold_cells));      // cold zone
-    bar.push_str(&"█".repeat(msg_cells));       // messages
-    bar.push_str(&"·".repeat(free_cells));      // free
+    bar.push_str(&"▒".repeat(sys_cells)); // system prompt
+    bar.push_str(&"▓".repeat(tools_cells)); // tool defs
+    bar.push_str(&"░".repeat(cold_cells)); // cold zone
+    bar.push_str(&"█".repeat(msg_cells)); // messages
+    bar.push_str(&"·".repeat(free_cells)); // free
 
     let pct = |t: usize| -> String {
-        if window == 0 { return "  —".to_string(); }
+        if window == 0 {
+            return "  —".to_string();
+        }
         format!("{:>4.1}%", (t as f64 * 100.0) / window as f64)
     };
     let k = |t: usize| -> String {
@@ -778,12 +797,21 @@ fn format_context_report(
         window = k(window),
         used_pct = used_pct,
         model = model_name,
-        ctx_name = if snap.ctx_name.is_empty() { "default" } else { snap.ctx_name.as_str() },
-        sys_s = k(sys), sys_p = pct(sys),
-        tools_s = k(tools), tools_p = pct(tools),
-        cold_s = k(cold), cold_p = pct(cold),
-        msgs_s = k(messages), msgs_p = pct(messages),
-        free_s = k(free), free_p = pct(free),
+        ctx_name = if snap.ctx_name.is_empty() {
+            "default"
+        } else {
+            snap.ctx_name.as_str()
+        },
+        sys_s = k(sys),
+        sys_p = pct(sys),
+        tools_s = k(tools),
+        tools_p = pct(tools),
+        cold_s = k(cold),
+        cold_p = pct(cold),
+        msgs_s = k(messages),
+        msgs_p = pct(messages),
+        free_s = k(free),
+        free_p = pct(free),
         n_msgs = snap.total_messages,
     );
 
@@ -986,7 +1014,7 @@ pub(crate) fn run_login_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx) -> 
     // The OAuth flow owns the terminal until it returns.
     renderer.suspend_for_external();
 
-    let result = atomcode_core::auth::login()
+    let result = atomcode_core::auth::login(None)
         .and_then(|auth| atomcode_core::auth::save_auth(&auth).map(|()| auth));
 
     // Resume: re-enable raw + bracketed-paste AND reset cached state
@@ -1016,7 +1044,10 @@ pub(crate) fn run_login_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx) -> 
                 .unwrap_or(&auth.user.username)
                 .to_string();
             let had_provider = !ctx.config.providers.is_empty()
-                && ctx.config.providers.contains_key(&ctx.config.default_provider);
+                && ctx
+                    .config
+                    .providers
+                    .contains_key(&ctx.config.default_provider);
             if !had_provider {
                 let provider_name = "AtomGit".to_string();
                 let provider = build_oauth_provider();
@@ -1052,10 +1083,7 @@ pub(crate) fn run_login_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx) -> 
 /// orchestrator with `atomcode codingplan` (CLI). Suspends raw mode so
 /// the OAuth browser callback and any stdout from `auth::login()` don't
 /// collide with the footer-managing renderer.
-pub(crate) fn run_codingplan_flow(
-    renderer: &mut dyn Renderer,
-    ctx: &mut LoopCtx,
-) -> Result<()> {
+pub(crate) fn run_codingplan_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx) -> Result<()> {
     // Same pause / suspend / resume / unpause choreography as /login —
     // the orchestrator may call `auth::login()` which prints to stdout
     // and spawns a browser; that needs cooked stdout + no reader racing
@@ -1067,7 +1095,7 @@ pub(crate) fn run_codingplan_flow(
     }
     renderer.suspend_for_external();
 
-    let report = atomcode_core::coding_plan::run(&mut ctx.config);
+    let report = atomcode_core::coding_plan::run(&mut ctx.config, Some(&ctx.telemetry));
 
     renderer.resume_from_external();
     if let Some(reader) = ctx.reader.as_ref() {
@@ -1087,8 +1115,7 @@ pub(crate) fn run_codingplan_flow(
                 // Also bump our own last-seen timestamp so the cross-process
                 // sync-check on the next keystroke doesn't redundantly
                 // reload the config we just saved ourselves.
-                ctx.monitor_last_sync_seen =
-                    atomcode_core::coding_plan::read_last_sync();
+                ctx.monitor_last_sync_seen = atomcode_core::coding_plan::read_last_sync();
                 // Sync ctx.model_name with the freshly-picked default so the
                 // status line and the next turn use the right model without
                 // requiring a /reload.
@@ -1143,8 +1170,7 @@ mod tests {
     fn absolute_path_ignores_cwd() {
         let (_tmp, _cwd, sub) = make_dirs();
         let alt_cwd = PathBuf::from("/"); // unrelated cwd
-        let got = resolve_cd(sub.to_str().unwrap(), &alt_cwd, None)
-            .expect("absolute resolves");
+        let got = resolve_cd(sub.to_str().unwrap(), &alt_cwd, None).expect("absolute resolves");
         assert_eq!(got, sub);
     }
 
@@ -1165,8 +1191,7 @@ mod tests {
     #[test]
     fn nonexistent_path_errors() {
         let (_tmp, cwd, _sub) = make_dirs();
-        let err = resolve_cd("nope-does-not-exist", &cwd, None)
-            .expect_err("nonexistent errors");
+        let err = resolve_cd("nope-does-not-exist", &cwd, None).expect_err("nonexistent errors");
         assert!(err.contains("nope-does-not-exist"), "got: {}", err);
     }
 
@@ -1175,8 +1200,7 @@ mod tests {
         let (_tmp, cwd, _sub) = make_dirs();
         let file = cwd.join("a.txt");
         std::fs::write(&file, "hi").expect("write");
-        let err = resolve_cd(file.to_str().unwrap(), &cwd, None)
-            .expect_err("file is not a dir");
+        let err = resolve_cd(file.to_str().unwrap(), &cwd, None).expect_err("file is not a dir");
         assert!(err.contains("Not a directory"), "got: {}", err);
     }
 
@@ -1223,7 +1247,7 @@ mod tests {
     fn context_report_renders_full_breakdown() {
         let snap = crate::state::ContextSnapshot {
             system_tokens: 8_000,
-            sent_tokens: 30_000,  // includes cold
+            sent_tokens: 30_000, // includes cold
             tool_defs_tokens: 14_500,
             cold_zone_tokens: 2_000,
             total_messages: 42,
@@ -1244,11 +1268,11 @@ mod tests {
         assert!(out.contains("Messages"));
         assert!(out.contains("Free"));
         // Token values (K formatting)
-        assert!(out.contains("8.0K"));   // system
-        assert!(out.contains("14.5K"));  // tool defs
-        assert!(out.contains("2.0K"));   // cold zone
+        assert!(out.contains("8.0K")); // system
+        assert!(out.contains("14.5K")); // tool defs
+        assert!(out.contains("2.0K")); // cold zone
         assert!(out.contains("128.0K")); // window
-        // Messages count
+                                         // Messages count
         assert!(out.contains("42"));
         // ctx name + model
         assert!(out.contains("default"));
@@ -1272,10 +1296,15 @@ mod tests {
         };
         let out = format_context_report(Some(&snap), "m", false);
         // Messages bucket should be 10K - 3K = 7K, not 10K.
-        let messages_line = out.lines().find(|l| l.contains("Messages"))
+        let messages_line = out
+            .lines()
+            .find(|l| l.contains("Messages"))
             .expect("messages line must exist");
-        assert!(messages_line.contains("7.0K"),
-            "expected Messages=7.0K (sent-cold), got line: {}", messages_line);
+        assert!(
+            messages_line.contains("7.0K"),
+            "expected Messages=7.0K (sent-cold), got line: {}",
+            messages_line
+        );
     }
 
     #[test]
@@ -1297,7 +1326,9 @@ mod tests {
         //      = 120_000 - (20_000 + 20_000 + 0 + 80_000) = 0
         assert!(out.contains("Free"));
         // Should not panic and should render — look for "0" tokens on the Free line
-        let free_line = out.lines().find(|l| l.contains("Free"))
+        let free_line = out
+            .lines()
+            .find(|l| l.contains("Free"))
             .expect("free line must exist");
         assert!(free_line.contains("0"), "free line: {}", free_line);
     }
@@ -1318,10 +1349,14 @@ mod tests {
             system_prompt: "You are AtomCode.\nSOME SENTINEL BYTES".into(),
         };
         let out = format_context_report(Some(&snap), "m", false);
-        assert!(!out.contains("SYSTEM PROMPT"),
-            "SYSTEM PROMPT header must not appear in default /context output");
-        assert!(!out.contains("SOME SENTINEL BYTES"),
-            "raw prompt body must not leak into default /context output");
+        assert!(
+            !out.contains("SYSTEM PROMPT"),
+            "SYSTEM PROMPT header must not appear in default /context output"
+        );
+        assert!(
+            !out.contains("SOME SENTINEL BYTES"),
+            "raw prompt body must not leak into default /context output"
+        );
     }
 
     #[test]
@@ -1340,8 +1375,10 @@ mod tests {
         assert!(out.contains("=== SYSTEM PROMPT ==="));
         // Each line indented with leading 2 spaces — verify one line
         // survives through the gutter indentation.
-        assert!(out.contains("  RULE_LINE_ABC"),
-            "prompt lines should keep content after 2-space indent");
+        assert!(
+            out.contains("  RULE_LINE_ABC"),
+            "prompt lines should keep content after 2-space indent"
+        );
         // Breakdown still present (append, not replace)
         assert!(out.contains("Context Usage"));
         assert!(out.contains("System prompt"));
@@ -1364,8 +1401,10 @@ mod tests {
         };
         let out = format_context_report(Some(&snap), "m", true);
         assert!(out.contains("=== SYSTEM PROMPT ==="));
-        assert!(out.contains("(empty"),
-            "empty cached prompt must show an explanation, got: {}", out);
+        assert!(
+            out.contains("(empty"),
+            "empty cached prompt must show an explanation, got: {}",
+            out
+        );
     }
-
 }

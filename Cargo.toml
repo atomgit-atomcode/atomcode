@@ -5,6 +5,7 @@ members = [
     "crates/atomcode-tuix",
     "crates/atomcode-cli",
     "crates/atomcode-daemon",
+    "crates/atomcode-telemetry",
 ]
 
 [profile.release]

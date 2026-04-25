@@ -22,9 +22,15 @@ pub enum ProviderWizard {
     /// Initial picker: Add / Edit / Delete / Set Default.
     MainMenu { selected: usize },
     /// Sequential `Add` prompts. `draft` accumulates answered fields.
-    Add { step: WizardStep, draft: DraftProvider },
+    Add {
+        step: WizardStep,
+        draft: DraftProvider,
+    },
     /// Pick which provider to edit.
-    EditPick { providers: Vec<String>, selected: usize },
+    EditPick {
+        providers: Vec<String>,
+        selected: usize,
+    },
     /// Editing a specific provider; same flow as `Add` but prompts show
     /// the existing value as a hint and an empty Enter keeps it.
     Edit {
@@ -33,11 +39,17 @@ pub enum ProviderWizard {
         draft: DraftProvider,
     },
     /// Pick which provider to delete.
-    DeletePick { providers: Vec<String>, selected: usize },
+    DeletePick {
+        providers: Vec<String>,
+        selected: usize,
+    },
     /// Final y/N confirmation before a delete actually lands.
     DeleteConfirm { target: String },
     /// Pick which provider to make default.
-    SetDefaultPick { providers: Vec<String>, selected: usize },
+    SetDefaultPick {
+        providers: Vec<String>,
+        selected: usize,
+    },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -172,7 +184,15 @@ fn handle_key(
                                 step: WizardStep::Name,
                                 draft: DraftProvider::default(),
                             };
-                            show_step_prompt(WizardStep::Name, None, buf, state, ctx, &new, renderer);
+                            show_step_prompt(
+                                WizardStep::Name,
+                                None,
+                                buf,
+                                state,
+                                ctx,
+                                &new,
+                                renderer,
+                            );
                             *wizard = new;
                         }
                         "edit" | "delete" | "set-default" if providers.is_empty() => {
@@ -180,17 +200,26 @@ fn handle_key(
                             return Ok(ModalAction::Close);
                         }
                         "edit" => {
-                            let new = ProviderWizard::EditPick { providers, selected: 0 };
+                            let new = ProviderWizard::EditPick {
+                                providers,
+                                selected: 0,
+                            };
                             redraw(buf, state, ctx, &new, renderer);
                             *wizard = new;
                         }
                         "delete" => {
-                            let new = ProviderWizard::DeletePick { providers, selected: 0 };
+                            let new = ProviderWizard::DeletePick {
+                                providers,
+                                selected: 0,
+                            };
                             redraw(buf, state, ctx, &new, renderer);
                             *wizard = new;
                         }
                         "set-default" => {
-                            let new = ProviderWizard::SetDefaultPick { providers, selected: 0 };
+                            let new = ProviderWizard::SetDefaultPick {
+                                providers,
+                                selected: 0,
+                            };
                             redraw(buf, state, ctx, &new, renderer);
                             *wizard = new;
                         }
@@ -208,7 +237,10 @@ fn handle_key(
         }
 
         // ── Picker states share Up/Down/Enter logic. ──
-        ProviderWizard::EditPick { providers, mut selected } => {
+        ProviderWizard::EditPick {
+            providers,
+            mut selected,
+        } => {
             match code {
                 KeyCode::Up => selected = selected.saturating_sub(1),
                 KeyCode::Down => {
@@ -238,12 +270,18 @@ fn handle_key(
                 }
                 _ => {}
             }
-            *wizard = ProviderWizard::EditPick { providers, selected };
+            *wizard = ProviderWizard::EditPick {
+                providers,
+                selected,
+            };
             redraw(buf, state, ctx, wizard, renderer);
             Ok(ModalAction::Continue)
         }
 
-        ProviderWizard::DeletePick { providers, mut selected } => {
+        ProviderWizard::DeletePick {
+            providers,
+            mut selected,
+        } => {
             match code {
                 KeyCode::Up => selected = selected.saturating_sub(1),
                 KeyCode::Down => {
@@ -260,12 +298,18 @@ fn handle_key(
                 }
                 _ => {}
             }
-            *wizard = ProviderWizard::DeletePick { providers, selected };
+            *wizard = ProviderWizard::DeletePick {
+                providers,
+                selected,
+            };
             redraw(buf, state, ctx, wizard, renderer);
             Ok(ModalAction::Continue)
         }
 
-        ProviderWizard::SetDefaultPick { providers, mut selected } => {
+        ProviderWizard::SetDefaultPick {
+            providers,
+            mut selected,
+        } => {
             match code {
                 KeyCode::Up => selected = selected.saturating_sub(1),
                 KeyCode::Down => {
@@ -285,7 +329,10 @@ fn handle_key(
                 }
                 _ => {}
             }
-            *wizard = ProviderWizard::SetDefaultPick { providers, selected };
+            *wizard = ProviderWizard::SetDefaultPick {
+                providers,
+                selected,
+            };
             redraw(buf, state, ctx, wizard, renderer);
             Ok(ModalAction::Continue)
         }
@@ -297,8 +344,13 @@ fn handle_key(
                     // If we just dropped the default, fall back to any
                     // remaining provider or blank.
                     if ctx.config.default_provider == target {
-                        ctx.config.default_provider =
-                            ctx.config.providers.keys().next().cloned().unwrap_or_default();
+                        ctx.config.default_provider = ctx
+                            .config
+                            .providers
+                            .keys()
+                            .next()
+                            .cloned()
+                            .unwrap_or_default();
                     }
                     save_and_reload(ctx, renderer);
                     push(renderer, &format!("Removed \"{}\".", target));
@@ -355,14 +407,22 @@ fn handle_key(
             Ok(ModalAction::Continue)
         }
 
-        ProviderWizard::Edit { target, step, mut draft } => {
+        ProviderWizard::Edit {
+            target,
+            step,
+            mut draft,
+        } => {
             if matches!(code, KeyCode::Enter) {
                 let answer = buf.text.clone();
                 push(
                     renderer,
                     &format!(
                         "  ↳ {}",
-                        if answer.is_empty() { "(keep)" } else { answer.as_str() }
+                        if answer.is_empty() {
+                            "(keep)"
+                        } else {
+                            answer.as_str()
+                        }
                     ),
                 );
                 buf.text.clear();
@@ -391,7 +451,11 @@ fn handle_key(
                 }
             }
             forward_to_buffer(code, _mods, buf, ctx);
-            *wizard = ProviderWizard::Edit { target, step, draft };
+            *wizard = ProviderWizard::Edit {
+                target,
+                step,
+                draft,
+            };
             redraw(buf, state, ctx, wizard, renderer);
             Ok(ModalAction::Continue)
         }
@@ -418,9 +482,18 @@ fn redraw(
             ],
             selected: *selected,
         }),
-        ProviderWizard::EditPick { providers, selected }
-        | ProviderWizard::DeletePick { providers, selected }
-        | ProviderWizard::SetDefaultPick { providers, selected } => {
+        ProviderWizard::EditPick {
+            providers,
+            selected,
+        }
+        | ProviderWizard::DeletePick {
+            providers,
+            selected,
+        }
+        | ProviderWizard::SetDefaultPick {
+            providers,
+            selected,
+        } => {
             let items: Vec<(String, String)> = providers
                 .iter()
                 .map(|name| {
@@ -467,18 +540,23 @@ fn step_prompt_text(step: WizardStep, existing: Option<&ProviderConfig>) -> Stri
         (WizardStep::Name, _) => "Provider name?".into(),
         (WizardStep::ProviderType, None) => "Type? (openai / claude / ollama)".into(),
         (WizardStep::ProviderType, Some(p)) => {
-            format!("Type? [{}] (openai / claude / ollama, blank to keep)", p.provider_type)
+            format!(
+                "Type? [{}] (openai / claude / ollama, blank to keep)",
+                p.provider_type
+            )
         }
-        (WizardStep::BaseUrl, None) => {
-            "Base URL? (blank to use provider default)".into()
-        }
+        (WizardStep::BaseUrl, None) => "Base URL? (blank to use provider default)".into(),
         (WizardStep::BaseUrl, Some(p)) => {
             let hint = p.base_url.as_deref().unwrap_or("provider default");
             format!("Base URL? [{}] (blank to keep)", hint)
         }
         (WizardStep::ApiKey, None) => "API key? (blank to leave unset)".into(),
         (WizardStep::ApiKey, Some(p)) => {
-            let hint = if p.api_key.is_some() { "set — blank to keep" } else { "unset" };
+            let hint = if p.api_key.is_some() {
+                "set — blank to keep"
+            } else {
+                "unset"
+            };
             format!("API key? [{}]", hint)
         }
         (WizardStep::Model, None) => "Model?".into(),
@@ -588,12 +666,7 @@ fn advance_edit(
 
 /// Route a keystroke into `Buffer::apply` so text-input wizard steps
 /// support the usual editing shortcuts (Backspace / Left / Right / etc).
-fn forward_to_buffer(
-    code: KeyCode,
-    modifiers: KeyModifiers,
-    buf: &mut Buffer,
-    ctx: &LoopCtx,
-) {
+fn forward_to_buffer(code: KeyCode, modifiers: KeyModifiers, buf: &mut Buffer, ctx: &LoopCtx) {
     let action = classify(code, modifiers);
     let _ = buf.apply(action, ctx.history.entries(), &ctx.commands);
 }

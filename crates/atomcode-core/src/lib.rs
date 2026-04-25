@@ -11,13 +11,14 @@ pub mod input_history;
 pub mod mcp;
 pub mod notify;
 pub mod provider;
+pub mod self_update;
 pub mod semantic;
 pub mod session;
 pub mod skill;
 pub mod stream;
+pub mod telemetry_bootstrap;
 pub mod tool;
 pub mod turn;
-pub mod self_update;
 pub mod version_check;
 
 /// User-Agent identifier for every outbound HTTP request the app makes.

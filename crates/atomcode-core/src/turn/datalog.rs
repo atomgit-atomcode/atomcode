@@ -74,7 +74,11 @@ impl DatalogWriter {
             }
             Some(s) => {
                 let p = PathBuf::from(s);
-                if p.is_absolute() { p } else { base_dir.join(p) }
+                if p.is_absolute() {
+                    p
+                } else {
+                    base_dir.join(p)
+                }
             }
         }
     }
@@ -103,7 +107,9 @@ impl DatalogWriter {
 
     /// Start a new turn: create log file, write env info + user message.
     pub fn begin_turn(&mut self, user_message: &str, model_name: &str, context_window: usize) {
-        if !self.enabled { return; }
+        if !self.enabled {
+            return;
+        }
         self.buf.clear();
         self.step = 0;
         self.active = true;
@@ -117,8 +123,13 @@ impl DatalogWriter {
 
         let build_id = option_env!("ATOMCODE_BUILD_ID").unwrap_or("dev");
         let _ = writeln!(&mut self.buf, "# Turn {} [build:{}]", timestamp, build_id);
-        let _ = writeln!(&mut self.buf, "**env:** model={}, ctx_window={}, cwd={}",
-            model_name, context_window, self.base_dir.display());
+        let _ = writeln!(
+            &mut self.buf,
+            "**env:** model={}, ctx_window={}, cwd={}",
+            model_name,
+            context_window,
+            self.base_dir.display()
+        );
         let _ = writeln!(&mut self.buf);
         let _ = writeln!(&mut self.buf, "## User");
         let _ = writeln!(&mut self.buf, "```");
@@ -133,7 +144,9 @@ impl DatalogWriter {
     /// Log start of a new LLM round-trip (increments the turn counter).
     /// Records the duration of the previous LLM turn.
     pub fn log_llm_call(&mut self) {
-        if !self.active { return; }
+        if !self.active {
+            return;
+        }
         // Log previous turn's duration
         if let Some(prev_start) = self.llm_turn_start {
             let dur = prev_start.elapsed();
@@ -148,12 +161,20 @@ impl DatalogWriter {
     }
 
     /// Log context statistics for debugging.
-    pub fn log_context_stats(&mut self, system_tokens: usize, sent_tokens: usize,
-                              dropped_tokens: usize, _working_set_tokens: usize,
-                              total_messages: usize) {
-        if !self.active { return; }
+    pub fn log_context_stats(
+        &mut self,
+        system_tokens: usize,
+        sent_tokens: usize,
+        dropped_tokens: usize,
+        _working_set_tokens: usize,
+        total_messages: usize,
+    ) {
+        if !self.active {
+            return;
+        }
         let total = system_tokens + sent_tokens;
-        let _ = writeln!(&mut self.buf,
+        let _ = writeln!(
+            &mut self.buf,
             "  _[ctx: {}tok = sys:{}+sent:{}+dropped:{}, msgs:{}]_",
             total, system_tokens, sent_tokens, dropped_tokens, total_messages
         );
@@ -162,9 +183,16 @@ impl DatalogWriter {
 
     /// Log prompt cache hit info (only when provider reports cached_tokens > 0).
     pub fn log_cache_hit(&mut self, prompt_tokens: usize, cached_tokens: usize) {
-        if !self.active { return; }
-        let pct = if prompt_tokens > 0 { cached_tokens * 100 / prompt_tokens } else { 0 };
-        let _ = writeln!(&mut self.buf,
+        if !self.active {
+            return;
+        }
+        let pct = if prompt_tokens > 0 {
+            cached_tokens * 100 / prompt_tokens
+        } else {
+            0
+        };
+        let _ = writeln!(
+            &mut self.buf,
             "  _[cache: {}/{}tok = {}% hit]_",
             cached_tokens, prompt_tokens, pct
         );
@@ -172,14 +200,22 @@ impl DatalogWriter {
     }
 
     /// Log token usage for the current LLM round-trip.
-    pub fn log_token_usage(&mut self, prompt_tokens: usize, completion_tokens: usize, cached_tokens: usize) {
-        if !self.active { return; }
+    pub fn log_token_usage(
+        &mut self,
+        prompt_tokens: usize,
+        completion_tokens: usize,
+        cached_tokens: usize,
+    ) {
+        if !self.active {
+            return;
+        }
         let cache_str = if cached_tokens > 0 {
             format!(", cache={}tok", cached_tokens)
         } else {
             String::new()
         };
-        let _ = writeln!(&mut self.buf,
+        let _ = writeln!(
+            &mut self.buf,
             "  _[tokens: prompt={}+completion={}{}]_",
             prompt_tokens, completion_tokens, cache_str
         );
@@ -190,18 +226,23 @@ impl DatalogWriter {
     /// Appends to a single JSONL file (one JSON object per line) colocated
     /// with the turn .md file: `<turn_timestamp>_requests.jsonl`.
     /// Each line has the step number so you can correlate with the md.
-    pub fn log_llm_dump(&mut self, messages: &[crate::conversation::message::Message],
-                         tool_count: usize, model: &str, context_window: usize) {
-        if !self.active { return; }
+    pub fn log_llm_dump(
+        &mut self,
+        messages: &[crate::conversation::message::Message],
+        tool_count: usize,
+        model: &str,
+        context_window: usize,
+    ) {
+        if !self.active {
+            return;
+        }
 
         // Derive JSONL path from the md file path: same name but .jsonl extension
-        let jsonl_path = self.file_path.as_ref()
-            .map(|p| p.with_extension("jsonl"));
+        let jsonl_path = self.file_path.as_ref().map(|p| p.with_extension("jsonl"));
 
         if let Some(ref path) = jsonl_path {
             let msgs_json = serde_json::to_value(messages).unwrap_or(serde_json::json!([]));
-            let total_tokens: usize = messages.iter()
-                .map(|m| m.estimate_tokens()).sum();
+            let total_tokens: usize = messages.iter().map(|m| m.estimate_tokens()).sum();
             let dump = serde_json::json!({
                 "step": self.step,
                 "model": model,
@@ -215,14 +256,19 @@ impl DatalogWriter {
             if let Ok(json_line) = serde_json::to_string(&dump) {
                 use std::io::Write;
                 if let Ok(mut f) = std::fs::OpenOptions::new()
-                    .create(true).append(true).open(path)
+                    .create(true)
+                    .append(true)
+                    .open(path)
                 {
                     let _ = writeln!(f, "{}", json_line);
                 }
             }
-            let _ = writeln!(&mut self.buf,
+            let _ = writeln!(
+                &mut self.buf,
                 "  _[request: {}msgs · {}tok · {}tools]_",
-                messages.len(), total_tokens, tool_count
+                messages.len(),
+                total_tokens,
+                tool_count
             );
             self.flush();
         }
@@ -230,20 +276,28 @@ impl DatalogWriter {
 
     /// Log a tool call start (within the current LLM turn).
     pub fn log_tool_call(&mut self, name: &str, args: &str) {
-        if !self.active { return; }
+        if !self.active {
+            return;
+        }
 
         let detail = format_tool_args(name, args);
         let _ = writeln!(&mut self.buf, "- {} {}", capitalize(name), detail);
         // Log raw args when JSON is invalid (for debugging model output)
         if serde_json::from_str::<serde_json::Value>(args).is_err() {
-            let _ = writeln!(&mut self.buf, "  [RAW ARGS: {}]", args.chars().take(200).collect::<String>());
+            let _ = writeln!(
+                &mut self.buf,
+                "  [RAW ARGS: {}]",
+                args.chars().take(200).collect::<String>()
+            );
         }
         self.flush();
     }
 
     /// Log a tool call result.
     pub fn log_tool_result(&mut self, output: &str, success: bool) {
-        if !self.active { return; }
+        if !self.active {
+            return;
+        }
         let icon = if success { "+" } else { "x" };
         let first_line = output.lines().next().unwrap_or("");
         let summary = if first_line.len() > 100 {
@@ -253,7 +307,11 @@ impl DatalogWriter {
         };
         let total_lines = output.lines().count();
         if total_lines > 1 {
-            let _ = writeln!(&mut self.buf, "  {} {} ({} lines)", icon, summary, total_lines);
+            let _ = writeln!(
+                &mut self.buf,
+                "  {} {} ({} lines)",
+                icon, summary, total_lines
+            );
         } else {
             let _ = writeln!(&mut self.buf, "  {} {}", icon, summary);
         }
@@ -263,9 +321,13 @@ impl DatalogWriter {
 
     /// Log model text output between tool calls (plan, thinking, explanation).
     pub fn log_model_text(&mut self, text: &str) {
-        if !self.active { return; }
+        if !self.active {
+            return;
+        }
         let trimmed = text.trim();
-        if trimmed.is_empty() { return; }
+        if trimmed.is_empty() {
+            return;
+        }
         // Cap at 500 chars to avoid bloating datalog
         let display = if trimmed.chars().count() > 500 {
             format!("{}...", trimmed.chars().take(497).collect::<String>())
@@ -279,8 +341,12 @@ impl DatalogWriter {
 
     /// Log final assistant text output (response/summary).
     pub fn log_text(&mut self, text: &str) {
-        if !self.active { return; }
-        if text.trim().is_empty() { return; }
+        if !self.active {
+            return;
+        }
+        if text.trim().is_empty() {
+            return;
+        }
         let _ = writeln!(&mut self.buf, "**Response:**");
         let _ = writeln!(&mut self.buf, "{}", text.trim());
         let _ = writeln!(&mut self.buf);
@@ -289,7 +355,9 @@ impl DatalogWriter {
 
     /// Log an error.
     pub fn log_error(&mut self, error: &str) {
-        if !self.active { return; }
+        if !self.active {
+            return;
+        }
         let _ = writeln!(&mut self.buf, "**Error:** {}", error);
         let _ = writeln!(&mut self.buf);
         self.flush();
@@ -297,7 +365,9 @@ impl DatalogWriter {
 
     /// End the turn: write duration and final flush.
     pub fn end_turn(&mut self, total_tokens: usize, tool_call_count: usize) {
-        if !self.active { return; }
+        if !self.active {
+            return;
+        }
         self.active = false;
 
         // Log last LLM turn duration
@@ -356,7 +426,11 @@ fn format_tool_args(tool_name: &str, args_json: &str) -> String {
         }
         "create_file" => {
             let path = args.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
-            let size = args.get("content").and_then(|v| v.as_str()).map(|s| s.len()).unwrap_or(0);
+            let size = args
+                .get("content")
+                .and_then(|v| v.as_str())
+                .map(|s| s.len())
+                .unwrap_or(0);
             format!("{} ({} bytes)", short_path(path), size)
         }
         "edit_file" => {
@@ -365,7 +439,11 @@ fn format_tool_args(tool_name: &str, args_json: &str) -> String {
         }
         "bash" => {
             let cmd = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
-            if cmd.chars().count() > 80 { format!("`{}...`", cmd.chars().take(77).collect::<String>()) } else { format!("`{}`", cmd) }
+            if cmd.chars().count() > 80 {
+                format!("`{}...`", cmd.chars().take(77).collect::<String>())
+            } else {
+                format!("`{}`", cmd)
+            }
         }
         "list_directory" => {
             let path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
@@ -385,7 +463,9 @@ fn format_tool_args(tool_name: &str, args_json: &str) -> String {
                 obj.iter()
                     .map(|(k, v)| {
                         let val = match v {
-                            serde_json::Value::String(s) if s.chars().count() > 30 => format!("{}...", s.chars().take(27).collect::<String>()),
+                            serde_json::Value::String(s) if s.chars().count() > 30 => {
+                                format!("{}...", s.chars().take(27).collect::<String>())
+                            }
                             serde_json::Value::String(s) => s.clone(),
                             other => other.to_string(),
                         };
@@ -470,7 +550,10 @@ mod tests {
     fn disabled_writer_never_creates_files() {
         let dir = std::env::temp_dir().join("atomcode_test_datalog_disabled");
         let _ = std::fs::remove_dir_all(&dir);
-        let cfg = DatalogConfig { enabled: false, dir: None };
+        let cfg = DatalogConfig {
+            enabled: false,
+            dir: None,
+        };
         let mut log = DatalogWriter::new(&dir, &cfg);
         log.begin_turn("hello", "m", 1000);
         log.log_llm_call();

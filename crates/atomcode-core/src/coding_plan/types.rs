@@ -113,9 +113,8 @@ impl UsageInfo {
             if self.usage_percent > 0.0 {
                 self.usage_percent.round() as i64
             } else {
-                (self.window_tokens_used as f64 * 100.0
-                    / self.window_token_limit as f64)
-                    .round() as i64
+                (self.window_tokens_used as f64 * 100.0 / self.window_token_limit as f64).round()
+                    as i64
             }
         } else {
             0

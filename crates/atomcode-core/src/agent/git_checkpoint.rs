@@ -34,4 +34,3 @@ pub fn create_checkpoint(working_dir: &Path) -> Option<String> {
         Some(sha)
     }
 }
-

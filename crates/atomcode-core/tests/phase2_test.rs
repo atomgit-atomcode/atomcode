@@ -1,7 +1,7 @@
 //! Phase 2 tests — unified prompt + subtask driver.
 
-use atomcode_core::config::prompt_sections::build_rules;
 use atomcode_core::agent::subtask_driver::SubtaskDriver;
+use atomcode_core::config::prompt_sections::build_rules;
 
 // ═══════════════════════════════════════════════════════════════
 // 1. Unified prompt — minimal but complete
@@ -22,9 +22,18 @@ fn unified_prompt_has_all_sections() {
 #[test]
 fn unified_prompt_has_key_guidance() {
     let prompt = build_rules();
-    assert!(prompt.contains("### File:"), "Must guide EXECUTE mode format");
-    assert!(prompt.contains("old_string/new_string"), "Must guide text-match editing");
-    assert!(prompt.contains("NEVER write_file on existing"), "Must ban write_file on existing files");
+    assert!(
+        prompt.contains("### File:"),
+        "Must guide EXECUTE mode format"
+    );
+    assert!(
+        prompt.contains("old_string/new_string"),
+        "Must guide text-match editing"
+    );
+    assert!(
+        prompt.contains("NEVER write_file on existing"),
+        "Must ban write_file on existing files"
+    );
 }
 
 #[test]
@@ -32,8 +41,16 @@ fn unified_prompt_size_reasonable() {
     let prompt = build_rules();
     let tokens = prompt.len() / 4;
     // After "Less is More" refactor: ~80-200 tokens. Keep it minimal.
-    assert!(tokens > 50, "Too short: {} tokens — rules may be missing", tokens);
-    assert!(tokens < 500, "Too long: {} tokens — violates Less is More principle", tokens);
+    assert!(
+        tokens > 50,
+        "Too short: {} tokens — rules may be missing",
+        tokens
+    );
+    assert!(
+        tokens < 500,
+        "Too long: {} tokens — violates Less is More principle",
+        tokens
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -76,6 +93,8 @@ fn subtask_advance_and_complete() {
 #[test]
 fn subtask_empty_plan() {
     let mut driver = SubtaskDriver::new();
-    driver.extract_from_plan("\u{6211}\u{89C9}\u{5F97}\u{9700}\u{8981}\u{4FEE}\u{6539}\u{4E00}\u{4E9B}\u{4EE3}\u{7801}");
+    driver.extract_from_plan(
+        "\u{6211}\u{89C9}\u{5F97}\u{9700}\u{8981}\u{4FEE}\u{6539}\u{4E00}\u{4E9B}\u{4EE3}\u{7801}",
+    );
     assert!(!driver.active);
 }
