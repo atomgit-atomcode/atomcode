@@ -118,13 +118,11 @@ pub fn login(tel: Option<&Arc<Telemetry>>) -> Result<AuthInfo> {
         .json()
         .context("Failed to parse /auth/login response")?;
 
-    // println!("  Opening browser for authorization...");
-    // println!("  If browser doesn't open, visit this URL:\n");
-    // println!("  {}\n", login_resp.login_url);
-
     // Open browser (best-effort)
     if let Err(e) = open_browser(&login_resp.login_url) {
         println!("  Failed to open browser: {}", e);
+        // missing xdg-open on ohos
+        println!("  {}\n", login_resp.login_url);
         println!("  (please open the URL above manually)\n");
     }
 
