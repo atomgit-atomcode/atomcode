@@ -38,6 +38,7 @@ bincode = "1"
 # Used by read_file's fallback path.
 encoding_rs = "0.8"
 sha2 = "0.10"
+atomcode-telemetry = { path = "../atomcode-telemetry" }
 
 # Non-blocking poll on stdin in the OAuth callback path so the stdin
 # reader thread can exit cleanly when the HTTP listener wins — otherwise
@@ -45,8 +46,6 @@ sha2 = "0.10"
 # after login returns.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
-
-atomcode-telemetry = { path = "../atomcode-telemetry" }
 
 [dev-dependencies]
 tempfile = "3"
