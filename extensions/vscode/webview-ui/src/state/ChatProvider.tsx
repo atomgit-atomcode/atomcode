@@ -112,6 +112,15 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
             },
           });
           break;
+        case 'permissionRequest':
+          dispatch({
+            type: 'PERMISSION_REQUEST',
+            id: msg.id,
+            toolName: msg.toolName,
+            args: msg.args,
+            isDestructive: msg.isDestructive,
+          });
+          break;
         case 'focusInput':
           // Handled by a component, not state
           break;

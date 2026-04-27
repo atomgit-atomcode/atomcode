@@ -182,6 +182,39 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
       return { ...state, messages };
     }
 
+    case 'PERMISSION_REQUEST': {
+      const msgs = [...state.messages];
+      const last = msgs[msgs.length - 1];
+      if (last?.role === 'assistant') {
+        msgs[msgs.length - 1] = {
+          ...last,
+          permissionRequest: {
+            id: action.id,
+            toolName: action.toolName,
+            args: action.args,
+            isDestructive: action.isDestructive,
+            status: 'pending',
+          },
+        };
+      }
+      return { ...state, messages: msgs };
+    }
+
+    case 'PERMISSION_RESPOND': {
+      const msgs = [...state.messages];
+      const last = msgs[msgs.length - 1];
+      if (last?.role === 'assistant' && last.permissionRequest?.id === action.id) {
+        msgs[msgs.length - 1] = {
+          ...last,
+          permissionRequest: {
+            ...last.permissionRequest,
+            status: action.allowed ? 'allowed' : 'denied',
+          },
+        };
+      }
+      return { ...state, messages: msgs };
+    }
+
     // ─── Init ───────────────────────────────────────
     case 'INIT':
       return {

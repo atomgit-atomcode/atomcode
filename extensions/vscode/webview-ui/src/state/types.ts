@@ -39,12 +39,21 @@ export interface ToolCallData {
   status: 'running' | 'done' | 'error';
 }
 
+export interface PermissionRequestData {
+  id: string;
+  toolName: string;
+  args: string;
+  isDestructive: boolean;
+  status: 'pending' | 'allowed' | 'denied';
+}
+
 /** A single chat message (user or assistant) */
 export interface ChatMessage {
   id: string;
   role: 'user' | 'assistant' | 'error';
   text: string;
   toolCalls?: ToolCallData[];
+  permissionRequest?: PermissionRequestData;
   contextFiles?: ContextFile[];
   streaming?: boolean;
   timestamp: number;
@@ -83,6 +92,8 @@ export type ChatAction =
   | { type: 'REMOVE_CONTEXT_FILE'; path: string }
   | { type: 'CLEAR_CONTEXT' }
   | { type: 'TOGGLE_HISTORY' }
+  | { type: 'PERMISSION_REQUEST'; id: string; toolName: string; args: string; isDestructive: boolean }
+  | { type: 'PERMISSION_RESPOND'; id: string; allowed: boolean }
   | { type: 'INIT'; generating: boolean; currentModel?: string };
 
 // ─── Messages from the VS Code extension host ──────────────────
@@ -104,4 +115,5 @@ export type ExtensionMessage =
   | { type: 'focusInput' }
   | { type: 'sessions'; sessions: SessionMeta[] }
   | { type: 'models'; models: ModelInfo[] }
-  | { type: 'context'; filePath: string; fileName: string; selection?: string; language?: string };
+  | { type: 'context'; filePath: string; fileName: string; selection?: string; language?: string }
+  | { type: 'permissionRequest'; id: string; toolName: string; args: string; isDestructive: boolean };
