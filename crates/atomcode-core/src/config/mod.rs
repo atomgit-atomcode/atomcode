@@ -1,3 +1,4 @@
+pub mod instructions;
 pub mod prompt_sections;
 pub mod provider;
 
