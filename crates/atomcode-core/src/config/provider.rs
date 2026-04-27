@@ -43,6 +43,16 @@ pub struct ProviderConfig {
     /// Lets users work around new provider quirks without a code change.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_history: Option<String>,
+    /// Whether extended thinking is enabled for this provider.
+    /// For Claude: sends `thinking.type = "enabled"` in request body.
+    /// Default: not set (thinking disabled).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_enabled: Option<bool>,
+    /// Maximum tokens allocated to the thinking phase.
+    /// Claude: sent as `thinking.budget_tokens`.
+    /// Default: 10000 when thinking is enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_budget: Option<u32>,
     /// If true, this provider was added at runtime (e.g. OAuth /login)
     /// and should NOT be persisted to config.toml on save.
     #[serde(skip)]
@@ -57,5 +67,38 @@ pub fn default_context_window_for(provider_type: &str) -> usize {
     match provider_type {
         "ollama" => 8000,
         _ => 128000,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn thinking_fields_default_to_none() {
+        let toml_str = r#"
+            type = "claude"
+            model = "claude-sonnet-4"
+            base_url = "https://api.anthropic.com"
+            context_window = 128000
+        "#;
+        let cfg: ProviderConfig = toml::from_str(toml_str).expect("parse");
+        assert!(cfg.thinking_enabled.is_none());
+        assert!(cfg.thinking_budget.is_none());
+    }
+
+    #[test]
+    fn thinking_fields_parse_correctly() {
+        let toml_str = r#"
+            type = "claude"
+            model = "claude-sonnet-4"
+            base_url = "https://api.anthropic.com"
+            context_window = 128000
+            thinking_enabled = true
+            thinking_budget = 20000
+        "#;
+        let cfg: ProviderConfig = toml::from_str(toml_str).expect("parse");
+        assert_eq!(cfg.thinking_enabled, Some(true));
+        assert_eq!(cfg.thinking_budget, Some(20000));
     }
 }

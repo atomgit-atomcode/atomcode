@@ -549,8 +549,7 @@ pub struct AppliedUpgrade {
 /// time. Kept under the same root as `history` / `recent_dirs` so nothing
 /// new appears in `$HOME`.
 pub fn staged_dir() -> PathBuf {
-    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-    home.join(".atomcode").join("staged")
+    crate::config::Config::config_dir().join("staged")
 }
 
 fn pending_json_path() -> PathBuf {

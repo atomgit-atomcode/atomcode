@@ -51,7 +51,12 @@ struct TerminalGuard {
 }
 
 impl TerminalGuard {
-    fn activate(caps: TerminalCaps) -> Result<Self> {
+    /// Activate terminal capabilities. Returns `(guard, kbd_enhanced)` where
+    /// `kbd_enhanced` indicates whether the Kitty keyboard protocol (CSI u)
+    /// was successfully enabled. When false, terminals cannot distinguish
+    /// Shift+Enter from plain Enter, and users should use Alt+Enter or
+    /// Ctrl+Enter for newline insertion instead.
+    fn activate(caps: TerminalCaps) -> Result<(Self, bool)> {
         use std::io::Write as _;
         let mut g = Self {
             raw_enabled: false,
@@ -80,11 +85,12 @@ impl TerminalGuard {
         // `KeyEventKind::Repeat` and are filtered out in `event_loop/mod.rs`.
         //
         // `execute!` is best-effort — terminals that don't support CSI u
-        // (notably Apple Terminal.app) ignore the sequence; we just don't
-        // set `kbd_flags_pushed` and Drop won't try to pop. Terminals that
-        // support DISAMBIGUATE but not REPORT_EVENT_TYPES ignore the extra
-        // bit silently — this never makes things worse than before.
-        if caps.tty
+        // (notably Apple Terminal.app, some Linux terminals) ignore the
+        // sequence; we just don't set `kbd_flags_pushed` and Drop won't try
+        // to pop. Terminals that support DISAMBIGUATE but not
+        // REPORT_EVENT_TYPES ignore the extra bit silently — this never
+        // makes things worse than before.
+        let kbd_enhanced = caps.tty
             && execute!(
                 io::stdout(),
                 PushKeyboardEnhancementFlags(
@@ -92,8 +98,8 @@ impl TerminalGuard {
                         | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
                 )
             )
-            .is_ok()
-        {
+            .is_ok();
+        if kbd_enhanced {
             g.kbd_flags_pushed = true;
         }
         // FIXED-FOOTER via DECSTBM. Scroll region `[1, H - footer_rows]`
@@ -124,7 +130,7 @@ impl TerminalGuard {
             let _ = out.write_all(seq.as_bytes());
             let _ = out.flush();
         }
-        Ok(g)
+        Ok((g, kbd_enhanced))
     }
 }
 
@@ -167,7 +173,15 @@ pub async fn run(
     telemetry: std::sync::Arc<atomcode_telemetry::Telemetry>,
 ) -> Result<()> {
     let caps = TerminalCaps::probe();
-    let _guard = TerminalGuard::activate(caps)?;
+    let (_guard, kbd_enhanced) = TerminalGuard::activate(caps)?;
+
+    // If the terminal doesn't support Kitty keyboard protocol (CSI u),
+    // set an env var so the event loop can show a hint on startup.
+    // Shift+Enter won't work for newline insertion; users should use
+    // Alt+Enter or Ctrl+Enter instead.
+    if !kbd_enhanced {
+        std::env::set_var("ATOMCODE_KBD_NOT_ENHANCED", "1");
+    }
 
     // Pick the inner renderer by terminal capability, then wrap it in
     // a `TaskRenderer` so all ANSI I/O happens on a dedicated OS thread.
@@ -342,6 +356,7 @@ pub async fn run(
         mcp_connect_rx,
         mcp_reload: None,
         telemetry,
+        caps,
     };
 
     // CodingPlan drift monitor — kick off a startup check if the current

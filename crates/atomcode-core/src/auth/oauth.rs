@@ -720,10 +720,7 @@ pub fn save_auth(auth: &AuthInfo) -> Result<()> {
 
 /// Get path to auth file
 pub fn auth_file_path() -> std::path::PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join(".atomcode")
-        .join("auth.toml")
+    crate::config::Config::config_dir().join("auth.toml")
 }
 
 /// Check if user is logged in

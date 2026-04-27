@@ -2117,12 +2117,10 @@ mod tests {
     fn caps_with_color() -> TerminalCaps {
         TerminalCaps::from_env(EnvView {
             is_stdout_tty: true,
-            no_color: false,
             term: Some("xterm-256color".into()),
             colorterm: Some("truecolor".into()),
-            force_ascii: false,
             lang: Some("en_US.UTF-8".into()),
-            lc_all: None,
+            ..Default::default()
         })
     }
 

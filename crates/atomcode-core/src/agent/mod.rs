@@ -448,6 +448,27 @@ impl AgentLoop {
             }));
         }
 
+        // LSP integration: create manager and register diagnostics tool.
+        let lsp_manager = {
+            let mut registry = if config.lsp.auto_detect {
+                crate::lsp::registry::LspServerRegistry::with_defaults()
+            } else {
+                crate::lsp::registry::LspServerRegistry::empty()
+            };
+            registry.merge_user_config(config.lsp.servers.clone());
+            let mgr = crate::lsp::manager::LspManager::new(
+                working_dir.clone(),
+                registry,
+                config.lsp.enabled,
+                config.lsp.diagnostics_settle_delay_ms,
+            );
+            std::sync::Arc::new(mgr)
+        };
+        tool_context.lsp = Some(lsp_manager.clone());
+        if internal_enabled("diagnostics") {
+            tool_registry.register_sync(Box::new(crate::tool::diagnostics::DiagnosticsTool));
+        }
+
         // Graph query tools: not exposed to model (adds 5 tool definitions that
         // weak models never use correctly). Graph data is still injected automatically
         // via grep's graph header and auto_inject_graph_context — the model benefits
@@ -517,6 +538,8 @@ impl AgentLoop {
                     thinking_type: None,
                     thinking_keep: None,
                     reasoning_history: None,
+                    thinking_enabled: None,
+                    thinking_budget: None,
                     ephemeral: true,
                 }),
             };
