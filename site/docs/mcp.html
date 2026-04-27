@@ -72,11 +72,12 @@
       <p>两份可同时存在;<strong>同名 server 以项目级为准</strong>(覆盖用户级)。仓库根目录的 <code>.mcp.json.example</code> 自带 stdio 与 HTTP 双模板和详细注释,推荐从它开始改。</p>
 
       <h2>配置 schema</h2>
-      <p>顶层键固定为 <code>mcpServers</code>(旧键 <code>servers</code> 仍兼容)。每个 server <strong>二选一</strong>:</p>
+      <p>顶层键固定为 <code>mcpServers</code>(旧键 <code>servers</code> 仍兼容)。每个 server 建议只写一种 transport:</p>
       <ul>
         <li><strong>stdio</strong>:<code>command</code>(必填)+ 可选 <code>args</code>、<code>env</code>、<code>timeout_ms</code>、<code>disabled</code></li>
         <li><strong>HTTP</strong>:<code>url</code>(必填)+ 可选 <code>headers</code>、<code>timeout_ms</code>、<code>disabled</code></li>
       </ul>
+      <p>如果同一个 server 同时写了 <code>command</code> 和 <code>url</code>,当前实现会优先按 stdio(<code>command</code>)处理;为避免歧义,对外配置请不要双写。</p>
       <p>字符串里支持 <code>${VAR}</code> 与 <code>${VAR:-默认值}</code> 的环境变量展开;敏感令牌不要写死,放到环境变量里。<code>disabled: true</code> 可临时关掉某个 server 而不删条目。</p>
 
       <h3>stdio 示例(本地子进程)</h3>
@@ -126,7 +127,7 @@ atomcode mcp add playwright npx @playwright/mcp@latest -C /path/to/repo</code></
         </thead>
         <tbody>
           <tr><td>TUI</td><td>后台并行连接,不阻塞界面</td><td>每个 server 连上后陆续注册,可能略晚于首屏</td></tr>
-          <tr><td>无头(<code>-p</code>、<code>fixissue</code>)</td><td>启动时同步连接,等所有尝试结束</td><td>仅在至少拿到一批工具时挂载 MCP</td></tr>
+          <tr><td>无头(<code>-p</code>、<code>--prompt-file</code>、<code>fixissue</code>)</td><td>启动时同步连接,等启用中的 server 尝试结束</td><td>仅在至少拿到一批工具时挂载 MCP</td></tr>
         </tbody>
       </table>
       <p>TUI 下可在会话区看到 <code>✓ MCP server 'github' connected</code> 或 <code>✗ MCP server '…' failed: …</code>。<strong>单个 server 失败不会拖垮其他 server 与主程序。</strong></p>
@@ -157,7 +158,7 @@ atomcode mcp add playwright npx @playwright/mcp@latest -C /path/to/repo</code></
         <tbody>
           <tr><td><code>/mcp</code></td><td>列出<strong>已成功连接</strong>的 server 及状态(失败的 server 不在列表里,只在会话区有红色错误行)</td></tr>
           <tr><td><code>/mcp tools &lt;server&gt;</code></td><td>异步列出某个 server 实际暴露的远端 tools</td></tr>
-          <tr><td><code>/mcp reload</code></td><td>重新读取 <code>.mcp.json</code> / <code>~/.atomcode/mcp.json</code> 并后台重连所有 server</td></tr>
+          <tr><td><code>/mcp reload</code></td><td>重新读取 <code>.mcp.json</code> / <code>~/.atomcode/mcp.json</code> 并后台重连启用中的 server</td></tr>
         </tbody>
       </table>
 
@@ -178,11 +179,11 @@ atomcode mcp add playwright npx @playwright/mcp@latest -C /path/to/repo</code></
         <tbody>
           <tr><td>AtomCode</td><td><code>.mcp.json</code> 的 <code>mcpServers</code> 块</td><td>当前实现 tools-only</td></tr>
           <tr><td>Claude Code</td><td><code>.mcp.json</code></td><td>OAuth、resources、prompts 更全</td></tr>
-          <tr><td>Cursor</td><td><code>.mcp.json</code></td><td>与 AtomCode 配置完全互通</td></tr>
+          <tr><td>Cursor</td><td><code>.mcp.json</code></td><td>常见 command / url 配置通常可复用</td></tr>
           <tr><td>Codex</td><td>CLI 添加</td><td>OpenAI 生态</td></tr>
         </tbody>
       </table>
-      <p>已经在用 Cursor 配 MCP server 的话,直接把 <code>.mcp.json</code> 复制过来即可,无需改字段。</p>
+      <p>已经在用 Cursor 配 MCP server 的话,常见 <code>command</code> / <code>url</code> 类型配置通常可复用;超出当前字段或能力范围的配置需按 AtomCode 当前实现确认。</p>
 
       <h2>下一步</h2>
       <ul>

@@ -14,9 +14,9 @@
 - **兼容性细节**：当某个请求不需要参数时，客户端会**省略** `params` 字段（不会发送 `"params": null`），避免部分 JS SDK 服务端在收到 `null` 时卡住（例如 `tools/list`）。
 - **工具注册**：每个远端 tool 映射为 `mcp__{server_key}__{tool_name}`，经 `McpToolAdapter` 注册到 `ToolRegistry`。
 - **权限**：MCP 适配器对每次调用返回 `RequireApproval`（说明里带 server / tool / 参数摘要），走现有交互式审批；`PermissionStore` 的 session grant / override 按键为 **完整工具名** `mcp__...`（与内建工具相同），**不是** `mcp:server:tool` 形式。
-- **无头模式**（`-p` / `--prompt-file` / `fixissue`）：启动时 **`McpRegistry::from_config` 同步连接**所有 server，连接成功后再 `list_tools` 并一次性注册 MCP 工具。
+- **无头模式**（`-p` / `--prompt-file` / `fixissue`）：启动时 **`McpRegistry::from_config` 同步连接**启用中的 server，连接成功后再 `list_tools` 并一次性注册 MCP 工具。
 - **TUI 模式**：**后台并行连接**（`from_config_background_with_events`），不阻塞进入界面；连接成功或失败通过 `McpConnectEvent` 写入会话区；**每连上一个 server 就 `register_mcp_tools_async` 动态追加**该 server 的工具。
-- **`/mcp`**：列出当前 registry 中 **已成功 `initialize` 并入表** 的 server 及其 `ServerStatus`（见下节限制）；`/mcp reload` 重新加载 `.mcp.json` / `~/.atomcode/mcp.json` 并后台重连；`/mcp tools <server>` 异步列出该 server 的远端 tools（若超时/失败会提示）。
+- **`/mcp`**：列出当前 registry 中 **已成功 `initialize` 并入表** 的 server 及其 `ServerStatus`（见下节限制）；`/mcp reload` 重新加载 `.mcp.json` / `~/.atomcode/mcp.json` 并后台重连启用中的 server；`/mcp tools <server>` 异步列出该 server 的远端 tools（若超时/失败会提示）。
 
 ### 1.2 未实现 / 限制（与代码一致）
 
@@ -68,10 +68,12 @@ CLI 入口（`crates/atomcode-cli/src/main.rs`）根据是否无头选择阻塞�
 
 ### 5.1 Schema 要点
 
-顶层为 `{ "mcpServers": { "<name>": { ... } } }`（亦兼容旧键 `"servers"`）。每个 server **必须**二选一：
+顶层为 `{ "mcpServers": { "<name>": { ... } } }`（亦兼容旧键 `"servers"`）。每个 server 建议只写一种 transport：
 
 - **stdio**：`command`（必填）+ 可选 `args`、`env`、`timeout_ms`、`disabled`
 - **HTTP**：`url`（必填）+ 可选 `headers`、`timeout_ms`、`disabled`
+
+如果同一个 server 同时写了 `command` 和 `url`，当前实现会优先按 stdio（`command`）处理；为避免歧义，对外配置请不要双写。
 
 ### 5.2 项目级 `.mcp.json` 示例
 
@@ -129,7 +131,7 @@ atomcode mcp add playwright npx @playwright/mcp@latest -C /path/to/repo
 | 模式 | MCP 加载 | 工具出现时机 |
 |------|------------|----------------|
 | TUI | 后台 `tokio::spawn` 并行连接 | 各 server `initialize` 成功后陆续注册 |
-| 无头 | `from_config().await` 阻塞至各连接尝试结束 | 仅在至少拿到一批工具时挂载 `McpRegistry`；若全部失败则无 MCP 工具 |
+| 无头（`-p` / `--prompt-file` / `fixissue`） | `from_config().await` 阻塞至各连接尝试结束 | 仅在至少拿到一批工具时挂载 `McpRegistry`；若全部失败则无 MCP 工具 |
 
 单个 server 连接失败 **不会**拖垮进程；错误打到 stderr 或 TUI 会话中的 `McpConnectEvent::Failed`。
 
@@ -228,4 +230,4 @@ EOF
 | Cursor | `.mcp.json` | stdio/HTTP | roots、elicitation 等 |
 | Codex | CLI 添加 | stdio/HTTP | OpenAI 生态 |
 
-AtomCode 使用 **`.mcp.json` 的 `mcpServers` 块**（与 Cursor 等一致，并兼容旧 `servers` 键），便于复用现有 MCP server 配置；具体能力与上表「未实现」一节以本仓库代码为准。
+AtomCode 使用 **`.mcp.json` 的 `mcpServers` 块**（与 Cursor 等一致，并兼容旧 `servers` 键），常见 `command` / `url` 类型的 MCP server 配置通常可直接复用；超出当前字段或能力范围的配置需按本仓库代码与上表「未实现」一节确认。
