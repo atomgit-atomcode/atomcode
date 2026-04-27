@@ -14,10 +14,10 @@ function ChatApp() {
     <div className="app">
       <Header />
       {state.historyOpen && <SessionList />}
-      <div className="main-content">
+      <div className="session-body">
         {hasMessages ? <MessageList /> : <WelcomeScreen />}
+        <InputArea />
       </div>
-      <InputArea />
     </div>
   );
 }
