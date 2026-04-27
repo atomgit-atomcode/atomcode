@@ -11,7 +11,7 @@
 
 use std::fmt::Write as FmtWrite;
 use std::path::{Path, PathBuf};
-use std::time::{Instant, SystemTime};
+use std::time::Instant;
 
 use crate::config::DatalogConfig;
 
@@ -491,19 +491,7 @@ fn short_path(path: &str) -> String {
 
 /// Format current local time as "YYYY-MM-DD HH:MM:SS".
 fn format_timestamp() -> String {
-    std::process::Command::new("date")
-        .arg("+%Y-%m-%d %H:%M:%S")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|| {
-            let secs = SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            format!("{}", secs)
-        })
+    chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
 #[cfg(test)]
@@ -544,6 +532,36 @@ mod tests {
         let p = DatalogWriter::resolve_log_dir(&base, Some("~/.atomcode/logs"));
         let expected = dirs::home_dir().unwrap().join(".atomcode/logs");
         assert_eq!(p, expected);
+    }
+
+    #[test]
+    fn format_timestamp_produces_correct_format() {
+        let ts = format_timestamp();
+        // Should match format: YYYY-MM-DD HH:MM:SS
+        let parts: Vec<&str> = ts.split(' ').collect();
+        assert_eq!(parts.len(), 2, "Timestamp should have date and time parts");
+
+        // Check date format: YYYY-MM-DD
+        let date_parts: Vec<&str> = parts[0].split('-').collect();
+        assert_eq!(date_parts.len(), 3, "Date should have 3 parts");
+        assert_eq!(date_parts[0].len(), 4, "Year should be 4 digits");
+        assert_eq!(date_parts[1].len(), 2, "Month should be 2 digits");
+        assert_eq!(date_parts[2].len(), 2, "Day should be 2 digits");
+
+        // Check time format: HH:MM:SS
+        let time_parts: Vec<&str> = parts[1].split(':').collect();
+        assert_eq!(time_parts.len(), 3, "Time should have 3 parts");
+        assert_eq!(time_parts[0].len(), 2, "Hour should be 2 digits");
+        assert_eq!(time_parts[1].len(), 2, "Minute should be 2 digits");
+        assert_eq!(time_parts[2].len(), 2, "Second should be 2 digits");
+
+        // Verify numeric values are in valid ranges
+        let hour: u32 = time_parts[0].parse().expect("Hour should be numeric");
+        let minute: u32 = time_parts[1].parse().expect("Minute should be numeric");
+        let second: u32 = time_parts[2].parse().expect("Second should be numeric");
+        assert!(hour < 24, "Hour should be 0-23");
+        assert!(minute < 60, "Minute should be 0-59");
+        assert!(second < 60, "Second should be 0-59");
     }
 
     #[test]
