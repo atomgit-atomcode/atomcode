@@ -210,14 +210,59 @@ fn render_notifications_section(cfg: &NotificationConfig) -> String {
 }
 
 fn render_hooks_section(hooks: &[crate::hook::HookConfig]) -> String {
-    if hooks.is_empty() {
-        return String::new();
-    }
     let mut out = String::new();
-    out.push_str("\n# Hook configurations.\n");
-    out.push_str("# event: pre_tool_use | post_tool_use | session_start | session_end | notification\n");
-    out.push_str("# matcher: tool name pattern (\"bash\", \"edit_*\", \"*\"). Only for tool events.\n");
-    out.push_str("# timeout_ms: max execution time in milliseconds (default 10000).\n");
+    out.push_str("\n# Lifecycle hooks — shell commands that run at key points in the session.\n");
+    out.push_str("# Each [[hooks]] entry defines one hook.\n");
+    out.push_str("#\n");
+    out.push_str("# Fields:\n");
+    out.push_str("#   event      = \"pre_tool_use\"   # when to fire (see below)\n");
+    out.push_str("#   matcher    = \"bash\"           # tool name filter (optional, only for tool events)\n");
+    out.push_str("#   command    = \"your-script.sh\" # shell command to run\n");
+    out.push_str("#   timeout_ms = 10000           # kill after this many ms (default 10000)\n");
+    out.push_str("#\n");
+    out.push_str("# Events:\n");
+    out.push_str("#   pre_tool_use  — runs before a tool executes. stdout JSON controls behavior:\n");
+    out.push_str("#                   {\"action\":\"allow\"}  → proceed (default if no JSON output)\n");
+    out.push_str("#                   {\"action\":\"block\",\"reason\":\"...\"} → reject the tool call\n");
+    out.push_str("#   post_tool_use — runs after a tool completes (fire-and-forget, non-blocking)\n");
+    out.push_str("#   session_start — runs once when atomcode starts\n");
+    out.push_str("#   session_end   — runs once when atomcode exits\n");
+    out.push_str("#\n");
+    out.push_str("# Matcher patterns:\n");
+    out.push_str("#   \"bash\"   → exact tool name match\n");
+    out.push_str("#   \"edit_*\" → prefix wildcard (matches edit_file, edit_symbol, etc.)\n");
+    out.push_str("#   \"*\"      → match all tools\n");
+    out.push_str("#   (omit)   → same as \"*\"\n");
+    out.push_str("#\n");
+    out.push_str("# Environment variables available to hook scripts:\n");
+    out.push_str("#   ATOMCODE_HOOK_EVENT   — event name (e.g. \"pre_tool_use\")\n");
+    out.push_str("#   ATOMCODE_TOOL_NAME    — tool name (e.g. \"bash\", \"read_file\")\n");
+    out.push_str("#   ATOMCODE_HOOK_CONTEXT — full JSON context (session_id, working_dir, tool_args, etc.)\n");
+    out.push_str("#\n");
+    out.push_str("# Examples:\n");
+    out.push_str("#\n");
+    out.push_str("# Audit all tool calls to a log file:\n");
+    out.push_str("# [[hooks]]\n");
+    out.push_str("# event = \"pre_tool_use\"\n");
+    out.push_str("# command = \"echo \\\"$(date) $ATOMCODE_TOOL_NAME\\\" >> ~/.atomcode/audit.log\"\n");
+    out.push_str("#\n");
+    out.push_str("# Block dangerous bash commands (rm -rf, DROP TABLE, etc.):\n");
+    out.push_str("# [[hooks]]\n");
+    out.push_str("# event = \"pre_tool_use\"\n");
+    out.push_str("# matcher = \"bash\"\n");
+    out.push_str("# command = \"if echo $ATOMCODE_HOOK_CONTEXT | grep -q 'rm -rf'; then echo '{\\\"action\\\":\\\"block\\\",\\\"reason\\\":\\\"rm -rf blocked by hook\\\"}'; fi\"\n");
+    out.push_str("# timeout_ms = 5000\n");
+    out.push_str("#\n");
+    out.push_str("# Auto-format edited files:\n");
+    out.push_str("# [[hooks]]\n");
+    out.push_str("# event = \"post_tool_use\"\n");
+    out.push_str("# matcher = \"edit_*\"\n");
+    out.push_str("# command = \"cargo fmt 2>/dev/null || true\"\n");
+
+    if hooks.is_empty() {
+        return out;
+    }
+
     for hook in hooks {
         let event_str = serde_json::to_value(&hook.event)
             .ok()
@@ -229,7 +274,7 @@ fn render_hooks_section(hooks: &[crate::hook::HookConfig]) -> String {
         }
         out.push_str(&format!(
             "command = \"{}\"\n",
-            hook.command.replace('"', "\\\"")
+            hook.command.replace('\\', "\\\\").replace('"', "\\\"")
         ));
         if hook.timeout_ms != 10_000 {
             out.push_str(&format!("timeout_ms = {}\n", hook.timeout_ms));
