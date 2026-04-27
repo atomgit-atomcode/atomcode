@@ -244,6 +244,20 @@ pub(super) fn execute_slash_command(
                 state.total_tokens,
             );
             txt.push_str(&render_codingplan_status_for_status_cmd());
+
+            // Instruction files status
+            let instructions =
+                atomcode_core::config::instructions::LayeredInstructions::load(&ctx.working_dir);
+            txt.push_str("\n  Instruction files:\n");
+            for (level, path) in instructions.status_lines() {
+                match path {
+                    Some(p) => {
+                        txt.push_str(&format!("    ✓ {} ({})\n", p.display(), level.label()))
+                    }
+                    None => txt.push_str(&format!("    ✗ {} — not found\n", level.label())),
+                }
+            }
+
             renderer.render(UiLine::CommandOutput(txt));
             renderer.flush();
         }
