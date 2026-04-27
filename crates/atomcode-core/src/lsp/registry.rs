@@ -16,6 +16,12 @@ pub struct LspServerRegistry {
 }
 
 impl LspServerRegistry {
+    pub fn empty() -> Self {
+        Self {
+            servers: HashMap::new(),
+        }
+    }
+
     pub fn with_defaults() -> Self {
         let mut servers = HashMap::new();
         servers.insert(

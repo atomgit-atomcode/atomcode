@@ -9,6 +9,10 @@ use serde_json::json;
 use super::{ApprovalRequirement, Tool, ToolContext, ToolDef, ToolResult};
 use crate::lsp::types::DiagnosticSeverity;
 
+/// Time to wait after file sync before reading diagnostics cache.
+/// LSP servers need time to process notifications and publish diagnostics.
+const DIAGNOSTICS_SETTLE_DELAY_MS: u64 = 150;
+
 pub struct DiagnosticsTool;
 
 #[derive(Deserialize)]
@@ -67,10 +71,17 @@ impl Tool for DiagnosticsTool {
 
         let severity_filter = parsed.severity.as_deref().unwrap_or("error");
 
-        // If a file path is given, ensure the server is running for it.
+        // If a file path is given, sync the current file contents before reading
+        // the diagnostics cache. LSP diagnostics are notification-driven.
         if let Some(ref fp) = parsed.file_path {
             let path = std::path::Path::new(fp);
-            let _ = lsp.ensure_server(path).await;
+            if let Ok(content) = tokio::fs::read_to_string(path).await {
+                if lsp.notify_file_changed(path, &content).await? {
+                    tokio::time::sleep(std::time::Duration::from_millis(DIAGNOSTICS_SETTLE_DELAY_MS)).await;
+                }
+            } else {
+                let _ = lsp.ensure_server(path).await;
+            }
         }
 
         // Collect diagnostics.

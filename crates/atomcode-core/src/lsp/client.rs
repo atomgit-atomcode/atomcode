@@ -18,12 +18,25 @@ use tokio::sync::{oneshot, Mutex, RwLock};
 use super::jsonrpc;
 use super::types::{Diagnostic, DiagnosticSeverity};
 
+/// Convert a file:// URI to a PathBuf, handling platform differences and URL encoding.
+fn uri_to_path(uri: &str) -> PathBuf {
+    if uri.starts_with("file://") {
+        // Use the url crate for proper URI parsing (handles Windows paths and % encoding).
+        url::Url::parse(uri)
+            .ok()
+            .and_then(|url| url.to_file_path().ok())
+            .unwrap_or_else(|| PathBuf::from(uri))
+    } else {
+        PathBuf::from(uri)
+    }
+}
+
 /// A running language server client.
 pub struct LspClient {
     /// Next JSON-RPC request id.
     next_id: AtomicU64,
     /// Pending request id → response sender.
-    pending: Arc<RwLock<HashMap<u64, oneshot::Sender<Value>>>>,
+    pending: Arc<RwLock<HashMap<u64, oneshot::Sender<Result<Value, Value>>>>>,
     /// Cached diagnostics per file path.
     diagnostics_cache: Arc<RwLock<HashMap<PathBuf, Vec<Diagnostic>>>>,
     /// Writer half of the server's stdin (behind Mutex for Send safety).
@@ -63,7 +76,7 @@ impl LspClient {
             .context("Failed to open LSP server stdout")?;
 
         let writer = Arc::new(Mutex::new(BufWriter::new(stdin)));
-        let pending: Arc<RwLock<HashMap<u64, oneshot::Sender<Value>>>> =
+        let pending: Arc<RwLock<HashMap<u64, oneshot::Sender<Result<Value, Value>>>>> =
             Arc::new(RwLock::new(HashMap::new()));
         let diagnostics_cache: Arc<RwLock<HashMap<PathBuf, Vec<Diagnostic>>>> =
             Arc::new(RwLock::new(HashMap::new()));
@@ -132,7 +145,9 @@ impl LspClient {
             })?;
 
         // Send initialized notification.
-        client.send_notification("initialized", Some(json!({}))).await?;
+        client
+            .send_notification("initialized", Some(json!({})))
+            .await?;
 
         Ok(client)
     }
@@ -240,7 +255,8 @@ impl LspClient {
         let response = tokio::time::timeout(std::time::Duration::from_secs(30), rx)
             .await
             .context("LSP request timed out after 30s")?
-            .context("LSP response channel closed")?;
+            .context("LSP response channel closed")?
+            .map_err(|error| anyhow::anyhow!("LSP request '{}' failed: {}", method, error))?;
 
         Ok(response)
     }
@@ -266,19 +282,19 @@ impl LspClient {
     /// Dispatch a received message to the appropriate handler.
     async fn dispatch_message(
         msg: Value,
-        pending: &RwLock<HashMap<u64, oneshot::Sender<Value>>>,
+        pending: &RwLock<HashMap<u64, oneshot::Sender<Result<Value, Value>>>>,
         diagnostics_cache: &RwLock<HashMap<PathBuf, Vec<Diagnostic>>>,
     ) {
         // Check if it's a response (has "id" and "result" or "error").
         if let Some(id) = msg.get("id").and_then(|v| v.as_u64()) {
             let mut pending = pending.write().await;
             if let Some(tx) = pending.remove(&id) {
-                let result = if let Some(r) = msg.get("result") {
-                    r.clone()
+                let result = if let Some(result) = msg.get("result") {
+                    Ok(result.clone())
                 } else if let Some(e) = msg.get("error") {
-                    e.clone()
+                    Err(e.clone())
                 } else {
-                    Value::Null
+                    Ok(Value::Null)
                 };
                 let _ = tx.send(result);
             }
@@ -307,11 +323,7 @@ impl LspClient {
         };
 
         // Convert file:// URI to path.
-        let file_path = if let Some(p) = uri.strip_prefix("file://") {
-            PathBuf::from(p)
-        } else {
-            PathBuf::from(uri)
-        };
+        let file_path = uri_to_path(uri);
 
         let display_path = file_path.display().to_string();
 
@@ -350,18 +362,13 @@ impl LspClient {
                             .unwrap_or("")
                             .to_string();
 
-                        let source = d
-                            .get("source")
-                            .and_then(|v| v.as_str())
-                            .map(String::from);
+                        let source = d.get("source").and_then(|v| v.as_str()).map(String::from);
 
-                        let code = d
-                            .get("code")
-                            .and_then(|v| {
-                                v.as_str()
-                                    .map(String::from)
-                                    .or_else(|| v.as_u64().map(|n| n.to_string()))
-                            });
+                        let code = d.get("code").and_then(|v| {
+                            v.as_str()
+                                .map(String::from)
+                                .or_else(|| v.as_u64().map(|n| n.to_string()))
+                        });
 
                         Some(Diagnostic {
                             file: display_path.clone(),
@@ -394,7 +401,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_response_resolves_pending() {
-        let pending: Arc<RwLock<HashMap<u64, oneshot::Sender<Value>>>> =
+        let pending: Arc<RwLock<HashMap<u64, oneshot::Sender<Result<Value, Value>>>>> =
             Arc::new(RwLock::new(HashMap::new()));
         let diags: Arc<RwLock<HashMap<PathBuf, Vec<Diagnostic>>>> =
             Arc::new(RwLock::new(HashMap::new()));
@@ -410,14 +417,41 @@ mod tests {
 
         LspClient::dispatch_message(msg, &pending, &diags).await;
 
-        let result = rx.await.unwrap();
+        let result = rx.await.unwrap().unwrap();
         assert!(result.get("capabilities").is_some());
         assert!(pending.read().await.is_empty());
     }
 
     #[tokio::test]
+    async fn dispatch_error_response_rejects_pending() {
+        let pending: Arc<RwLock<HashMap<u64, oneshot::Sender<Result<Value, Value>>>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        let diags: Arc<RwLock<HashMap<PathBuf, Vec<Diagnostic>>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+
+        let (tx, rx) = oneshot::channel();
+        pending.write().await.insert(7, tx);
+
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "error": {
+                "code": -32602,
+                "message": "invalid initialize params"
+            }
+        });
+
+        LspClient::dispatch_message(msg, &pending, &diags).await;
+
+        let error = rx.await.unwrap().unwrap_err();
+        assert_eq!(error["code"], -32602);
+        assert_eq!(error["message"], "invalid initialize params");
+        assert!(pending.read().await.is_empty());
+    }
+
+    #[tokio::test]
     async fn dispatch_diagnostics_notification_caches() {
-        let pending: Arc<RwLock<HashMap<u64, oneshot::Sender<Value>>>> =
+        let pending: Arc<RwLock<HashMap<u64, oneshot::Sender<Result<Value, Value>>>>> =
             Arc::new(RwLock::new(HashMap::new()));
         let diags: Arc<RwLock<HashMap<PathBuf, Vec<Diagnostic>>>> =
             Arc::new(RwLock::new(HashMap::new()));
@@ -457,7 +491,7 @@ mod tests {
 
     #[tokio::test]
     async fn empty_diagnostics_clears_cache() {
-        let pending: Arc<RwLock<HashMap<u64, oneshot::Sender<Value>>>> =
+        let pending: Arc<RwLock<HashMap<u64, oneshot::Sender<Result<Value, Value>>>>> =
             Arc::new(RwLock::new(HashMap::new()));
         let diags: Arc<RwLock<HashMap<PathBuf, Vec<Diagnostic>>>> =
             Arc::new(RwLock::new(HashMap::new()));
@@ -497,5 +531,24 @@ mod tests {
 
         let cache = diags.read().await;
         assert!(cache.get(&path).is_none());
+    }
+
+    #[test]
+    fn uri_to_path_handles_unix_path() {
+        let path = uri_to_path("file:///tmp/test.rs");
+        assert_eq!(path, PathBuf::from("/tmp/test.rs"));
+    }
+
+    #[test]
+    fn uri_to_path_handles_encoded_spaces() {
+        let path = uri_to_path("file:///tmp/my%20file.rs");
+        assert_eq!(path, PathBuf::from("/tmp/my file.rs"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn uri_to_path_handles_windows_path() {
+        let path = uri_to_path("file:///C:/Users/test.rs");
+        assert_eq!(path, PathBuf::from("C:/Users/test.rs"));
     }
 }

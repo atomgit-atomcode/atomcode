@@ -450,10 +450,12 @@ impl AgentLoop {
 
         // LSP integration: create manager and register diagnostics tool.
         let lsp_manager = {
-            let mut registry = crate::lsp::registry::LspServerRegistry::with_defaults();
-            if config.lsp.auto_detect {
-                registry.merge_user_config(config.lsp.servers.clone());
-            }
+            let mut registry = if config.lsp.auto_detect {
+                crate::lsp::registry::LspServerRegistry::with_defaults()
+            } else {
+                crate::lsp::registry::LspServerRegistry::empty()
+            };
+            registry.merge_user_config(config.lsp.servers.clone());
             let mgr = crate::lsp::manager::LspManager::new(
                 working_dir.clone(),
                 registry,

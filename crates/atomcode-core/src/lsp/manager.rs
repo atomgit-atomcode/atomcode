@@ -37,6 +37,12 @@ fn extension_to_language_id(ext: &str) -> &str {
     }
 }
 
+/// Manages lifecycle of multiple language server clients.
+///
+/// Lazily starts LSP servers on-demand based on file extension.
+/// Each extension maps to at most one running server instance.
+/// Servers are started when first needed and remain running until
+/// explicitly shut down or the manager is dropped.
 pub struct LspManager {
     /// Running clients keyed by file extension.
     clients: Arc<RwLock<HashMap<String, Arc<LspClient>>>>,
@@ -72,7 +78,7 @@ impl LspManager {
             None => return Ok(false),
         };
 
-        // Already running?
+        // Fast path: check under read lock first.
         {
             let clients = self.clients.read().await;
             if clients.contains_key(&ext) {
@@ -93,23 +99,32 @@ impl LspManager {
 
         let language_id = extension_to_language_id(&ext);
 
-        // Start the client.
+        // Acquire write lock and double-check to prevent TOCTOU race.
+        let mut clients = self.clients.write().await;
+        if clients.contains_key(&ext) {
+            return Ok(true);
+        }
+
+        // Start the client while holding the write lock.
         match LspClient::start(&config, &self.project_root, language_id).await {
             Ok(client) => {
                 let arc = Arc::new(client);
-                let mut clients = self.clients.write().await;
                 clients.insert(ext, arc);
                 Ok(true)
             }
             Err(e) => {
                 // Log but don't propagate — LSP is best-effort.
-                eprintln!("[lsp] Failed to start {} for .{}: {}", config.command, ext, e);
+                eprintln!(
+                    "[lsp] Failed to start {} for .{}: {}",
+                    config.command, ext, e
+                );
                 Ok(false)
             }
         }
     }
 
     /// Get diagnostics for a specific file.
+    /// Returns an empty vector if no server is running for that file type.
     pub async fn diagnostics(&self, path: &Path) -> Vec<Diagnostic> {
         let ext = match path.extension().and_then(|e| e.to_str()) {
             Some(e) => e.to_string(),
@@ -124,6 +139,7 @@ impl LspManager {
     }
 
     /// Get all diagnostics from all running servers.
+    /// Aggregates diagnostics across all file types with active servers.
     pub async fn all_diagnostics(&self) -> Vec<Diagnostic> {
         let clients = self.clients.read().await;
         let mut all = Vec::new();
@@ -133,11 +149,17 @@ impl LspManager {
         all
     }
 
-    /// Notify the appropriate server that a file changed.
-    pub async fn notify_file_changed(&self, path: &Path, content: &str) -> Result<()> {
+    /// Ensure the appropriate server is running, then notify it that a file changed.
+    /// This triggers the server to re-analyze the file and publish updated diagnostics.
+    /// Returns `Ok(true)` if a server received the notification, `Ok(false)` otherwise.
+    pub async fn notify_file_changed(&self, path: &Path, content: &str) -> Result<bool> {
+        if !self.ensure_server(path).await? {
+            return Ok(false);
+        }
+
         let ext = match path.extension().and_then(|e| e.to_str()) {
             Some(e) => e.to_string(),
-            None => return Ok(()),
+            None => return Ok(false),
         };
 
         let clients = self.clients.read().await;
@@ -145,12 +167,14 @@ impl LspManager {
             let language_id = extension_to_language_id(&ext);
             // Use did_open as a simple full-document sync.
             client.did_open(path, content, language_id).await?;
+            return Ok(true);
         }
 
-        Ok(())
+        Ok(false)
     }
 
     /// List the file extensions that have active servers.
+    /// Useful for debugging and status display.
     pub async fn active_servers(&self) -> Vec<String> {
         let clients = self.clients.read().await;
         let mut exts: Vec<String> = clients.keys().cloned().collect();
@@ -158,7 +182,9 @@ impl LspManager {
         exts
     }
 
-    /// Shutdown all running language servers.
+    /// Shutdown all running language servers gracefully.
+    /// Sends shutdown request, exit notification, then kills the process.
+    /// Errors are logged but not propagated.
     pub async fn shutdown(&self) {
         let mut clients = self.clients.write().await;
         for (ext, client) in clients.drain() {
