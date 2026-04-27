@@ -311,6 +311,9 @@ pub async fn run(
         dirs
     };
 
+    let custom_commands =
+        atomcode_core::commands::CustomCommandRegistry::load(&working_dir);
+
     let ctx = LoopCtx {
         config,
         model_name,
@@ -342,6 +345,7 @@ pub async fn run(
         mcp_connect_rx,
         mcp_reload: None,
         telemetry,
+        custom_commands,
     };
 
     // CodingPlan drift monitor — kick off a startup check if the current
