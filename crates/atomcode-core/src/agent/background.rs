@@ -77,12 +77,15 @@ async fn run_background_inner(
         provider,
         tools: Arc::new(bg_tools),
         context: bg_context,
-        config,
+        config: config.clone(),
         ctx,
         permission,
         recently_edited_files: Vec::new(),
         recent_calls: Vec::new(),
         file_read_counts: std::collections::HashMap::new(),
+        hook_executor: std::sync::Arc::new(
+            crate::hook::executor::HookExecutor::new(config.hooks.clone())
+        ),
     };
 
     let mut conversation = Conversation::new();
