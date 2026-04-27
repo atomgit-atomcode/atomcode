@@ -52,17 +52,30 @@ pub struct LspManager {
     project_root: PathBuf,
     /// Whether LSP integration is enabled.
     enabled: bool,
+    /// Time in milliseconds to wait after file sync before reading diagnostics.
+    diagnostics_settle_delay_ms: u64,
 }
 
 impl LspManager {
     /// Create a new LSP manager.
-    pub fn new(project_root: PathBuf, registry: LspServerRegistry, enabled: bool) -> Self {
+    pub fn new(
+        project_root: PathBuf,
+        registry: LspServerRegistry,
+        enabled: bool,
+        diagnostics_settle_delay_ms: u64,
+    ) -> Self {
         Self {
             clients: Arc::new(RwLock::new(HashMap::new())),
             registry,
             project_root,
             enabled,
+            diagnostics_settle_delay_ms,
         }
+    }
+
+    /// Get the configured diagnostics settle delay in milliseconds.
+    pub fn diagnostics_settle_delay_ms(&self) -> u64 {
+        self.diagnostics_settle_delay_ms
     }
 
     /// Ensure a language server is running for the given file's extension.
@@ -218,7 +231,7 @@ mod tests {
     #[tokio::test]
     async fn disabled_manager_returns_false() {
         let registry = LspServerRegistry::with_defaults();
-        let mgr = LspManager::new(PathBuf::from("/tmp"), registry, false);
+        let mgr = LspManager::new(PathBuf::from("/tmp"), registry, false, 150);
         let result = mgr.ensure_server(Path::new("test.rs")).await.unwrap();
         assert!(!result);
     }
@@ -226,7 +239,7 @@ mod tests {
     #[tokio::test]
     async fn no_config_for_extension_returns_false() {
         let registry = LspServerRegistry::with_defaults();
-        let mgr = LspManager::new(PathBuf::from("/tmp"), registry, true);
+        let mgr = LspManager::new(PathBuf::from("/tmp"), registry, true, 150);
         let result = mgr.ensure_server(Path::new("test.xyz")).await.unwrap();
         assert!(!result);
     }
@@ -234,7 +247,7 @@ mod tests {
     #[tokio::test]
     async fn no_extension_returns_false() {
         let registry = LspServerRegistry::with_defaults();
-        let mgr = LspManager::new(PathBuf::from("/tmp"), registry, true);
+        let mgr = LspManager::new(PathBuf::from("/tmp"), registry, true, 150);
         let result = mgr.ensure_server(Path::new("Makefile")).await.unwrap();
         assert!(!result);
     }
@@ -242,7 +255,7 @@ mod tests {
     #[tokio::test]
     async fn empty_diagnostics_for_unknown_file() {
         let registry = LspServerRegistry::with_defaults();
-        let mgr = LspManager::new(PathBuf::from("/tmp"), registry, true);
+        let mgr = LspManager::new(PathBuf::from("/tmp"), registry, true, 150);
         let diags = mgr.diagnostics(Path::new("test.xyz")).await;
         assert!(diags.is_empty());
     }
@@ -250,21 +263,21 @@ mod tests {
     #[tokio::test]
     async fn active_servers_empty_initially() {
         let registry = LspServerRegistry::with_defaults();
-        let mgr = LspManager::new(PathBuf::from("/tmp"), registry, true);
+        let mgr = LspManager::new(PathBuf::from("/tmp"), registry, true, 150);
         assert!(mgr.active_servers().await.is_empty());
     }
 
     #[tokio::test]
     async fn all_diagnostics_empty_initially() {
         let registry = LspServerRegistry::with_defaults();
-        let mgr = LspManager::new(PathBuf::from("/tmp"), registry, true);
+        let mgr = LspManager::new(PathBuf::from("/tmp"), registry, true, 150);
         assert!(mgr.all_diagnostics().await.is_empty());
     }
 
     #[tokio::test]
     async fn shutdown_on_empty_is_noop() {
         let registry = LspServerRegistry::with_defaults();
-        let mgr = LspManager::new(PathBuf::from("/tmp"), registry, true);
+        let mgr = LspManager::new(PathBuf::from("/tmp"), registry, true, 150);
         mgr.shutdown().await; // Should not panic.
     }
 }

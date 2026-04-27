@@ -140,6 +140,15 @@ pub struct LspConfig {
     /// Custom server configurations keyed by file extension.
     #[serde(default)]
     pub servers: std::collections::HashMap<String, crate::lsp::registry::LspServerConfig>,
+    /// Time in milliseconds to wait after file sync before reading diagnostics.
+    /// LSP servers need time to process notifications and publish diagnostics.
+    /// Larger files or slower servers may need higher values.
+    #[serde(default = "default_diagnostics_settle_delay_ms")]
+    pub diagnostics_settle_delay_ms: u64,
+}
+
+fn default_diagnostics_settle_delay_ms() -> u64 {
+    150
 }
 
 impl Default for LspConfig {
@@ -148,6 +157,7 @@ impl Default for LspConfig {
             enabled: true,
             auto_detect: true,
             servers: Default::default(),
+            diagnostics_settle_delay_ms: default_diagnostics_settle_delay_ms(),
         }
     }
 }

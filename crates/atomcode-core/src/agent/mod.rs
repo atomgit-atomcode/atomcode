@@ -460,6 +460,7 @@ impl AgentLoop {
                 working_dir.clone(),
                 registry,
                 config.lsp.enabled,
+                config.lsp.diagnostics_settle_delay_ms,
             );
             std::sync::Arc::new(mgr)
         };
