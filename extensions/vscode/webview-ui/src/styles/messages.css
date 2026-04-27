@@ -5,7 +5,7 @@
   flex: 1;
   overflow-y: auto;
   overflow-x: hidden;
-  padding: 20px 20px 40px;
+  padding: 20px 20px 120px;
   gap: 0;
   min-width: 0;
   background-color: var(--app-primary-background);
