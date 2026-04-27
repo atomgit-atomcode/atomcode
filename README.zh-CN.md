@@ -237,8 +237,9 @@ atomcode --prompt-file task.md
 | 键位 | 动作 |
 |-----|--------|
 | `Enter` | 发送消息 |
-| `Shift+Enter` | 换行 |
-| `Alt+Enter` / `Ctrl+Enter` | 换行 |
+| `Shift+Enter` | 换行（需要终端支持 Kitty 键盘协议） |
+| `Ctrl+Enter` | 换行（所有终端通用，macOS 推荐） |
+| `Alt+Enter` | 换行（Linux/Windows 终端可用） |
 | `Esc` | 清空输入 / 取消流式输出 |
 | `Up/Down` | 浏览输入历史 |
 | `Tab` | 接受补全 |

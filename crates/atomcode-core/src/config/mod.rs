@@ -85,6 +85,9 @@ pub struct Config {
     /// impl that matches the no-section-present semantics.
     #[serde(default, skip_serializing)]
     pub telemetry: TelemetryConfig,
+    /// LSP integration configuration.
+    #[serde(default)]
+    pub lsp: LspConfig,
 }
 
 /// Controls the per-turn markdown datalog writer.
@@ -123,6 +126,40 @@ pub struct NotificationConfig {
     /// Best-effort background-only behavior where the terminal protocol supports it.
     #[serde(default = "default_true")]
     pub background_only: bool,
+}
+
+/// Controls LSP (Language Server Protocol) integration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LspConfig {
+    /// Master switch for LSP diagnostics.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Automatically detect and start language servers from the built-in registry.
+    #[serde(default = "default_true")]
+    pub auto_detect: bool,
+    /// Custom server configurations keyed by file extension.
+    #[serde(default)]
+    pub servers: std::collections::HashMap<String, crate::lsp::registry::LspServerConfig>,
+    /// Time in milliseconds to wait after file sync before reading diagnostics.
+    /// LSP servers need time to process notifications and publish diagnostics.
+    /// Larger files or slower servers may need higher values.
+    #[serde(default = "default_diagnostics_settle_delay_ms")]
+    pub diagnostics_settle_delay_ms: u64,
+}
+
+fn default_diagnostics_settle_delay_ms() -> u64 {
+    150
+}
+
+impl Default for LspConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            auto_detect: true,
+            servers: Default::default(),
+            diagnostics_settle_delay_ms: default_diagnostics_settle_delay_ms(),
+        }
+    }
 }
 
 fn default_true() -> bool {
@@ -291,7 +328,7 @@ impl Config {
             std::env::var("ATOMCODE_HOME")
                 .ok()
                 .filter(|s| !s.is_empty()),
-            dirs::home_dir(),
+            crate::tool::real_home_dir(),
         )
     }
 
@@ -428,6 +465,7 @@ mod tests {
             auto_update: true,
             reflection_cadence: 7,
             telemetry: Default::default(),
+            lsp: Default::default(),
         };
         cfg.providers.insert(
             "p".to_string(),
@@ -443,6 +481,8 @@ mod tests {
                 thinking_type: None,
                 thinking_keep: None,
                 reasoning_history: None,
+                thinking_enabled: None,
+                thinking_budget: None,
                 ephemeral: false,
             },
         );

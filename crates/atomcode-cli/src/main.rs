@@ -10,7 +10,7 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 mod telemetry_cmd;
@@ -629,7 +629,7 @@ async fn run() -> Result<i32> {
     } else {
         Default::default()
     };
-    let atomcode_dir = dirs::home_dir().unwrap_or_default().join(".atomcode");
+    let atomcode_dir = Config::config_dir();
     let cli_override = CliOverride {
         disabled: cli.no_telemetry,
     };
@@ -739,7 +739,7 @@ async fn run() -> Result<i32> {
             }
             Commands::Telemetry { action } => {
                 HEADLESS_MODE.store(true, Ordering::Relaxed);
-                let config_file_path = atomcode_dir.join("config.toml");
+                let config_file_path = Config::default_path();
                 match action {
                     TelemetryAction::Status => {
                         telemetry_cmd::status(&atomcode_dir, &telemetry_cfg)?
@@ -775,6 +775,7 @@ async fn run() -> Result<i32> {
                 auto_update: true,
                 reflection_cadence: 7,
                 telemetry: Default::default(),
+                lsp: Default::default(),
             }
         })
     } else {
@@ -788,6 +789,7 @@ async fn run() -> Result<i32> {
             auto_update: true,
             reflection_cadence: 7,
             telemetry: Default::default(),
+            lsp: Default::default(),
         }
     };
 
@@ -811,6 +813,8 @@ async fn run() -> Result<i32> {
                 thinking_type: None,
                 thinking_keep: None,
                 reasoning_history: None,
+                thinking_enabled: None,
+                thinking_budget: None,
                 ephemeral: false,
             },
             String::new(),
@@ -1399,8 +1403,7 @@ async fn handle_command(cmd: Commands) -> Result<()> {
         }) => {
             let base = resolve_working_dir(dir);
             let path = if global {
-                let home = dirs::home_dir().context("Cannot resolve home directory for --global")?;
-                home.join(".atomcode").join("mcp.json")
+                Config::config_dir().join("mcp.json")
             } else {
                 base.join(".mcp.json")
             };
@@ -1538,6 +1541,7 @@ fn run_codingplan_core(
             reflection_cadence: 7,
             notifications: Default::default(),
             telemetry: Default::default(),
+            lsp: Default::default(),
         },
     };
 
@@ -1571,7 +1575,7 @@ fn install_panic_hook(telemetry: std::sync::Arc<atomcode_telemetry::Telemetry>) 
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         restore_terminal_if_tui();
-        let home = dirs::home_dir();
+        let home = atomcode_core::tool::real_home_dir();
         let cwd = std::env::current_dir().ok();
         let loc = info
             .location()

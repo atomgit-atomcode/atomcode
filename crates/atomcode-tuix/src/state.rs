@@ -83,6 +83,11 @@ pub struct UiState {
     pub phase: UiPhase,
     pub spinner_label: String,
     pub spinner_frame: usize,
+    /// Mirrors `TerminalCaps::unicode_symbols` — frozen at construction.
+    /// When false, `tick_spinner` and the spinner-label ellipsis fall
+    /// back to ASCII so terminals whose font lacks `◐` / `…` (notably
+    /// Windows legacy conhost) don't show `□` tofu.
+    pub unicode_symbols: bool,
     pub total_tokens: usize,
     /// When Suspended, holds the phase to restore on resume.
     pub prior_phase: Option<UiPhase>,
@@ -121,10 +126,18 @@ impl Default for UiState {
 
 impl UiState {
     pub fn new() -> Self {
+        Self::with_unicode(true)
+    }
+
+    /// Construct a `UiState` with an explicit Unicode capability.
+    /// Production code calls this from `App::new` with the value the
+    /// terminal-capability probe produced; tests stick with `new()`.
+    pub fn with_unicode(unicode_symbols: bool) -> Self {
         Self {
             phase: UiPhase::Idle,
             spinner_label: String::new(),
             spinner_frame: 0,
+            unicode_symbols,
             total_tokens: 0,
             prior_phase: None,
             thinking_idx: 0,
@@ -132,6 +145,17 @@ impl UiState {
             last_context: None,
             last_submitted_message: None,
             pending_context_render: None,
+        }
+    }
+
+    /// Single-character horizontal ellipsis (`…`, U+2026) when Unicode
+    /// is available, three ASCII dots (`...`) otherwise. Used by the
+    /// spinner label and any other "still working…" suffix.
+    pub fn ellipsis(&self) -> &'static str {
+        if self.unicode_symbols {
+            "…"
+        } else {
+            "..."
         }
     }
 
@@ -272,18 +296,61 @@ impl UiState {
     }
 
     pub fn tick_spinner(&mut self) -> &'static str {
-        // Half-moon rotation — renders cleanly in almost every terminal font.
-        // Previously used Braille U+28xx, which fonts without that block
-        // fall back to ":" or similar visible garbage.
-        const FRAMES: &[&str] = &["◐", "◓", "◑", "◒"];
-        self.spinner_frame = (self.spinner_frame + 1) % FRAMES.len();
-        FRAMES[self.spinner_frame]
+        // Two frame sets, picked once at construction:
+        //   Unicode → half-moon rotation; Braille was prettier but
+        //   Windows fonts often lack that block and fall back to ":".
+        //   ASCII   → classic `|/-\` for terminals whose font also
+        //   lacks the Geometric Shapes block (notably Windows legacy
+        //   conhost with NSimSun / Consolas variants).
+        const UNICODE_FRAMES: &[&str] = &["◐", "◓", "◑", "◒"];
+        const ASCII_FRAMES: &[&str] = &["|", "/", "-", "\\"];
+        let frames = if self.unicode_symbols {
+            UNICODE_FRAMES
+        } else {
+            ASCII_FRAMES
+        };
+        self.spinner_frame = (self.spinner_frame + 1) % frames.len();
+        frames[self.spinner_frame]
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Regression: terminals whose font lacks `◐` / `…` (Windows legacy
+    // conhost with default Consolas) used to show `□` tofu for both.
+    // ASCII fallback gives them readable `|/-\` and `...` instead.
+    #[test]
+    fn ascii_spinner_uses_pipe_slash_dash_backslash() {
+        let mut s = UiState::with_unicode(false);
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            seen.push(s.tick_spinner());
+        }
+        // Order is implementation detail; the SET must match.
+        let mut sorted = seen.clone();
+        sorted.sort();
+        assert_eq!(sorted, vec!["-", "/", "\\", "|"]);
+    }
+
+    #[test]
+    fn unicode_spinner_uses_half_moons() {
+        let mut s = UiState::with_unicode(true);
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            seen.push(s.tick_spinner());
+        }
+        let mut sorted = seen.clone();
+        sorted.sort();
+        assert_eq!(sorted, vec!["◐", "◑", "◒", "◓"]);
+    }
+
+    #[test]
+    fn ellipsis_falls_back_to_three_ascii_dots() {
+        assert_eq!(UiState::with_unicode(false).ellipsis(), "...");
+        assert_eq!(UiState::with_unicode(true).ellipsis(), "…");
+    }
 
     #[test]
     fn new_state_is_idle() {
