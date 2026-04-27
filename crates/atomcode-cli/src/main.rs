@@ -10,7 +10,7 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 mod telemetry_cmd;
@@ -629,7 +629,7 @@ async fn run() -> Result<i32> {
     } else {
         Default::default()
     };
-    let atomcode_dir = dirs::home_dir().unwrap_or_default().join(".atomcode");
+    let atomcode_dir = Config::config_dir();
     let cli_override = CliOverride {
         disabled: cli.no_telemetry,
     };
@@ -739,7 +739,7 @@ async fn run() -> Result<i32> {
             }
             Commands::Telemetry { action } => {
                 HEADLESS_MODE.store(true, Ordering::Relaxed);
-                let config_file_path = atomcode_dir.join("config.toml");
+                let config_file_path = Config::default_path();
                 match action {
                     TelemetryAction::Status => {
                         telemetry_cmd::status(&atomcode_dir, &telemetry_cfg)?
@@ -1401,8 +1401,7 @@ async fn handle_command(cmd: Commands) -> Result<()> {
         }) => {
             let base = resolve_working_dir(dir);
             let path = if global {
-                let home = dirs::home_dir().context("Cannot resolve home directory for --global")?;
-                home.join(".atomcode").join("mcp.json")
+                Config::config_dir().join("mcp.json")
             } else {
                 base.join(".mcp.json")
             };

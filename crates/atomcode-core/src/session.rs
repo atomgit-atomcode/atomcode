@@ -141,10 +141,7 @@ pub struct SessionManager {
 impl SessionManager {
     /// Get the root directory for all sessions (~/.atomcode/sessions/).
     pub fn sessions_root_dir() -> PathBuf {
-        dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(".atomcode")
-            .join("sessions")
+        crate::config::Config::config_dir().join("sessions")
     }
 
     /// Get the legacy sessions directory (used on macOS before v4.16).

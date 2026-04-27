@@ -72,12 +72,10 @@ use serde::Deserialize;
 /// Load and merge MCP configurations from project and user levels.
 ///
 /// Project config (`.mcp.json` in project root) overrides user config
-/// (`~/.atomcode/mcp.json`) for servers with the same name.
+/// (`ATOMCODE_HOME/mcp.json`) for servers with the same name.
 pub fn load_mcp_config(project_dir: &Path) -> Result<Vec<McpServerConfig>> {
     let user_config = load_config_file(
-        &dirs::home_dir()
-            .map(|h| h.join(".atomcode/mcp.json"))
-            .unwrap_or_default(),
+        &crate::config::Config::config_dir().join("mcp.json"),
         McpConfigSource::User,
     )
     .unwrap_or_default();

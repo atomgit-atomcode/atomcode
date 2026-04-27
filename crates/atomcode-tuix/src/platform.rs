@@ -43,14 +43,9 @@ pub fn collapse_home(path: &str) -> String {
 }
 
 /// Path for the per-user input history file.
-/// `~/.atomcode/history` when home is known, `<tempdir>/atomcode-history`
-/// as a last-resort fallback (beats writing to a hardcoded `/tmp` that
-/// doesn't exist on Windows).
+/// Uses ATOMCODE_HOME if set, otherwise falls back to home directory.
 pub fn history_path() -> PathBuf {
-    if let Some(home) = home_dir() {
-        return home.join(".atomcode").join("history");
-    }
-    std::env::temp_dir().join("atomcode-history")
+    atomcode_core::config::Config::config_dir().join("history")
 }
 
 #[cfg(test)]
