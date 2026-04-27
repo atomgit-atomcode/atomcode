@@ -67,8 +67,7 @@ export async function activate(context: vscode.ExtensionContext) {
     }),
 
     vscode.commands.registerCommand('atomcode.openTab', () => {
-      // Open chat in a new editor tab (future: separate webview panel)
-      vscode.commands.executeCommand('atomcode.chatView.focus');
+      chatProvider.openInTab();
     }),
 
     vscode.commands.registerCommand('atomcode.focusInput', () => {

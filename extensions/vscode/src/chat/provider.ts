@@ -7,6 +7,7 @@ import { ChatRequest } from '../daemon/types';
 export class ChatViewProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = 'atomcode.chatView';
   private _view?: vscode.WebviewView;
+  private _panel?: vscode.WebviewPanel;
   private _currentAbort?: AbortController;
   private _sessionId?: string;
   private _isGenerating = false;
@@ -18,6 +19,34 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     private readonly _client: DaemonClient,
   ) {}
 
+  public openInTab() {
+    if (this._panel) {
+      this._panel.reveal();
+      return;
+    }
+
+    this._panel = vscode.window.createWebviewPanel(
+      'atomcode.chatTab',
+      'AtomCode',
+      vscode.ViewColumn.One,
+      {
+        enableScripts: true,
+        retainContextWhenHidden: true,
+        localResourceRoots: [
+          vscode.Uri.joinPath(this._extensionUri, 'webview'),
+          vscode.Uri.joinPath(this._extensionUri, 'node_modules', 'highlight.js'),
+        ],
+      },
+    );
+
+    this._panel.webview.html = this._getHtml(this._panel.webview);
+    this._setupWebviewMessageHandler(this._panel.webview);
+
+    this._panel.onDidDispose(() => {
+      this._panel = undefined;
+    });
+  }
+
   resolveWebviewView(webviewView: vscode.WebviewView) {
     this._view = webviewView;
     webviewView.webview.options = {
@@ -28,9 +57,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       ],
     };
     webviewView.webview.html = this._getHtml(webviewView.webview);
+    this._setupWebviewMessageHandler(webviewView.webview);
 
-    // Handle messages from webview
-    webviewView.webview.onDidReceiveMessage(async (msg) => {
+    webviewView.onDidChangeVisibility(() => {
+      vscode.commands.executeCommand('setContext', 'atomcode.chatFocused', webviewView.visible);
+    });
+  }
+
+  private _setupWebviewMessageHandler(webview: vscode.Webview) {
+    webview.onDidReceiveMessage(async (msg) => {
       switch (msg.type) {
         case 'send':
           await this._handleSend(msg.text, msg.context?.map((c: { path: string }) => c.path));
@@ -42,7 +77,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           this.newConversation();
           break;
         case 'ready':
-          // Webview loaded, send initial state
           await this._sendInitialState();
           break;
         case 'selectModel':
@@ -76,7 +110,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           await this._searchSessions(msg.query);
           break;
         case 'popout':
-          vscode.commands.executeCommand('atomcode.openTab');
+          this.openInTab();
           break;
         case 'attachFile': {
           const uris = await vscode.window.showOpenDialog({
@@ -97,11 +131,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           break;
         }
       }
-    });
-
-    // Set context for keybindings
-    webviewView.onDidChangeVisibility(() => {
-      vscode.commands.executeCommand('setContext', 'atomcode.chatFocused', webviewView.visible);
     });
   }
 
@@ -338,6 +367,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   private _postMessage(msg: unknown) {
     this._view?.webview.postMessage(msg);
+    this._panel?.webview.postMessage(msg);
   }
 
   private _getHtml(webview: vscode.Webview): string {
