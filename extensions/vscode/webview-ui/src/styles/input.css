@@ -1,198 +1,164 @@
-/* ─── Input Area ─────────────────────────────────────────────── */
-
-.input-area {
-  flex-shrink: 0;
-  padding: 8px 16px 8px;
-  border-top: 1px solid var(--vscode-panel-border);
-  background: var(--vscode-sideBar-background, var(--vscode-editor-background));
-}
-
-/* ─── Context Tags ───────────────────────────────────────────── */
-
-.context-tags {
+.input-container {
+  position: absolute;
+  z-index: 20;
+  bottom: 16px;
+  left: 16px;
+  right: 16px;
   display: flex;
-  flex-wrap: wrap;
-  gap: 4px;
-  margin-bottom: 8px;
+  flex-direction: column;
 }
 
-.context-tag {
+.input-box {
+  background: var(--app-input-secondary-background);
+  border: 1px solid var(--app-input-border);
+  border-radius: var(--corner-radius-large);
+  box-shadow: 0 1px 2px #0000001a;
+  display: flex;
+  flex-direction: column;
+  position: relative;
+  color: var(--app-input-foreground);
+}
+
+.input-box:focus-within {
+  --focus-ring-color: var(--app-brand);
+  border-color: var(--focus-ring-color);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--focus-ring-color) 12%, transparent), 0 1px 2px color-mix(in srgb, var(--focus-ring-color), transparent 80%);
+}
+
+.input-box.bypass-permissions:focus-within {
+  --focus-ring-color: var(--app-error-foreground);
+}
+
+.attached-files {
+  padding: 6px;
+  border-bottom: 1px solid var(--app-input-border);
+  display: flex;
+  gap: 6px;
+  overflow-x: auto;
+  scrollbar-width: thin;
+}
+
+.attached-file-pill {
   display: inline-flex;
   align-items: center;
   gap: 4px;
-  padding: 2px 6px;
-  border-radius: 4px;
-  background: var(--vscode-sideBarSectionHeader-background, rgba(128, 128, 128, 0.15));
+  background: var(--app-input-background);
+  border: 1px solid var(--app-input-border);
+  border-radius: var(--corner-radius-small);
+  padding: 2px 8px;
   font-size: 11px;
-  color: var(--vscode-foreground);
-  max-width: 200px;
-}
-
-.context-tag-icon {
-  font-size: 12px;
+  color: var(--app-primary-foreground);
+  white-space: nowrap;
   flex-shrink: 0;
-}
-
-.context-tag-name {
+  max-width: 180px;
   overflow: hidden;
   text-overflow: ellipsis;
-  white-space: nowrap;
+  height: 24px;
 }
 
-.context-tag-close {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 14px;
-  height: 14px;
-  border: none;
-  border-radius: 2px;
-  background: transparent;
-  color: var(--vscode-descriptionForeground);
-  font-size: 12px;
+.attached-file-pill .pill-close {
   cursor: pointer;
-  flex-shrink: 0;
+  opacity: 0.6;
+  margin-left: 2px;
+  background: none;
+  border: none;
+  color: inherit;
+  font-size: 12px;
   padding: 0;
   line-height: 1;
 }
 
-.context-tag-close:hover {
-  background: var(--vscode-toolbar-hoverBackground);
-  color: var(--vscode-foreground);
-}
+.attached-file-pill .pill-close:hover { opacity: 1; }
 
-/* ─── Input Wrapper ──────────────────────────────────────────── */
-
-.input-wrapper {
-  position: relative;
-  display: flex;
-  align-items: flex-end;
-  gap: 6px;
-  border: 1px solid var(--vscode-input-border, var(--vscode-panel-border));
-  border-radius: 8px;
-  background: var(--vscode-input-background);
-  padding: 4px;
-  transition: border-color 0.15s;
-}
-
-.input-wrapper:focus-within {
-  border-color: var(--vscode-focusBorder);
-}
-
-.input-textarea {
-  flex: 1;
-  resize: none;
+.message-input {
+  background: transparent;
   border: none;
   outline: none;
-  background: transparent;
-  color: var(--vscode-input-foreground);
-  font-family: var(--vscode-font-family, inherit);
-  font-size: 13px;
+  resize: none;
+  color: var(--app-input-foreground);
+  font-family: inherit;
+  font-size: inherit;
   line-height: 1.5;
-  padding: 6px 8px;
+  min-height: 1.5em;
   max-height: 200px;
-  min-height: 22px;
+  overflow-y: auto;
+  padding: 10px 36px 10px 14px;
+  scrollbar-gutter: stable;
+  width: 100%;
 }
 
-.input-textarea::placeholder {
-  color: var(--vscode-descriptionForeground);
-}
-
-.input-textarea:disabled {
-  opacity: 0.5;
-}
-
-/* ─── Send / Stop Buttons ────────────────────────────────────── */
-
-.input-buttons {
-  display: flex;
-  align-items: center;
-  flex-shrink: 0;
-  padding-bottom: 2px;
-}
-
-.btn-send {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 28px;
-  height: 28px;
-  border: none;
-  border-radius: 50%;
-  background: var(--vscode-button-background);
-  color: var(--vscode-button-foreground);
-  cursor: pointer;
-  transition: background 0.15s;
-}
-
-.btn-send:hover {
-  background: var(--vscode-button-hoverBackground);
-}
-
-.btn-send:disabled {
-  opacity: 0.35;
-  cursor: default;
-}
-
-.btn-stop {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 28px;
-  height: 28px;
-  border: 1px solid var(--vscode-panel-border);
-  border-radius: 50%;
-  background: transparent;
-  color: var(--vscode-foreground);
-  cursor: pointer;
-}
-
-.btn-stop:hover {
-  background: var(--vscode-toolbar-hoverBackground);
-}
-
-/* ─── Input Footer ───────────────────────────────────────────── */
+.message-input::placeholder { color: var(--app-input-placeholder-foreground); }
+.message-input:disabled { opacity: 0.5; }
 
 .input-footer {
   display: flex;
   align-items: center;
-  gap: 8px;
-  margin-top: 6px;
-  padding: 0 2px;
+  gap: 6px;
+  min-width: 0;
+  border-top: 0.5px solid var(--app-input-border);
+  z-index: 6;
+  padding: 5px 8px;
+  color: var(--app-secondary-foreground);
+  font-size: 11px;
 }
 
 .footer-attach-btn {
-  display: inline-flex;
+  display: flex;
   align-items: center;
   gap: 4px;
-  padding: 2px 6px;
-  border: none;
-  border-radius: 4px;
   background: transparent;
-  color: var(--vscode-descriptionForeground);
-  font-size: 11px;
+  border: none;
+  color: var(--app-secondary-foreground);
   cursor: pointer;
+  padding: 2px 4px;
+  border-radius: var(--corner-radius-small);
+  font-size: 11px;
 }
 
 .footer-attach-btn:hover {
-  background: var(--vscode-toolbar-hoverBackground);
-  color: var(--vscode-foreground);
+  background: var(--app-ghost-button-hover-background);
+  color: var(--app-primary-foreground);
 }
 
-.footer-hint {
-  font-size: 11px;
-  color: var(--vscode-descriptionForeground);
-  flex: 1;
-  text-align: center;
+.footer-spacer { flex: 1; }
+.footer-tokens { opacity: 0.6; font-size: 11px; }
+
+.btn-send {
+  width: 26px;
+  height: 26px;
+  border-radius: 5px;
+  border: none;
+  background: var(--app-brand-button);
+  color: var(--app-brand-ivory);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
 }
 
-.footer-tokens {
-  font-size: 11px;
-  color: var(--vscode-descriptionForeground);
-  white-space: nowrap;
+.btn-send:disabled { opacity: 0.4; cursor: default; }
+.btn-send:not(:disabled):hover { filter: brightness(1.1); }
+.vscode-light .btn-send:not(:disabled):hover { filter: brightness(0.95); }
+
+.btn-stop {
+  width: 26px;
+  height: 26px;
+  border-radius: 5px;
+  border: 1.5px solid var(--app-secondary-foreground);
+  background: transparent;
+  color: var(--app-secondary-foreground);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
 }
 
-/* ─── Slash Picker ───────────────────────────────────────────── */
+.btn-stop:hover {
+  border-color: var(--app-primary-foreground);
+  color: var(--app-primary-foreground);
+}
 
 .slash-picker {
   position: absolute;
@@ -200,12 +166,12 @@
   left: 0;
   right: 0;
   margin-bottom: 4px;
-  background: var(--vscode-sideBar-background, var(--vscode-editor-background));
-  border: 1px solid var(--vscode-panel-border);
-  border-radius: 6px;
-  box-shadow: 0 -4px 12px rgba(0, 0, 0, 0.25);
-  padding: 4px;
-  z-index: 50;
+  background: var(--app-menu-background);
+  border: 1px solid var(--app-menu-border);
+  border-radius: var(--corner-radius-medium);
+  box-shadow: 0 4px 12px #0000004d;
+  overflow: hidden;
+  z-index: 30;
 }
 
 .slash-item {
@@ -213,36 +179,15 @@
   align-items: center;
   gap: 8px;
   width: 100%;
-  padding: 6px 10px;
+  padding: 6px 8px;
   border: none;
-  border-radius: 4px;
   background: transparent;
-  color: var(--vscode-foreground);
-  font-size: 13px;
+  color: var(--app-menu-foreground);
   cursor: pointer;
+  font-size: 12px;
   text-align: left;
 }
 
-.slash-item:hover {
-  background: var(--vscode-toolbar-hoverBackground);
-}
-
-.slash-item.active {
-  background: var(--vscode-button-background);
-  color: var(--vscode-button-foreground);
-}
-
-.slash-item-label {
-  font-weight: 600;
-  font-family: var(--vscode-editor-font-family, monospace);
-}
-
-.slash-item-desc {
-  font-size: 12px;
-  color: var(--vscode-descriptionForeground);
-}
-
-.slash-item.active .slash-item-desc {
-  color: var(--vscode-button-foreground);
-  opacity: 0.8;
-}
+.slash-item:hover, .slash-item.active { background: var(--app-menu-selection-background); }
+.slash-item-label { color: var(--app-brand); font-weight: 600; }
+.slash-item-desc { color: var(--app-secondary-foreground); }
