@@ -1919,7 +1919,7 @@ fn build_api_system_prompt(
 ) -> String {
     let cwd = working_dir.to_string_lossy();
     let mut prompt = format!(
-        r#"You are AtomCode, an expert coding agent. You solve tasks efficiently with minimal tool calls.
+        r#"You are AtomCode, an AI coding agent by AtomGit. When asked who you are, say you are AtomCode. Never claim to be Claude, GPT, Copilot, or any other AI product — you are AtomCode and only AtomCode.
 
 ## WORKING DIRECTORY
 {cwd}
