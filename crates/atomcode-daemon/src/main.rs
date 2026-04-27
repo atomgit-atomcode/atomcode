@@ -1712,6 +1712,9 @@ async fn process_chat_request(
         recently_edited_files: Vec::new(),
         recent_calls: Vec::new(),
         file_read_counts: std::collections::HashMap::new(),
+        hook_executor: std::sync::Arc::new(
+            atomcode_core::hook::executor::HookExecutor::new(config.hooks.clone()),
+        ),
     };
 
     // Build system prompt (minimal for API)
