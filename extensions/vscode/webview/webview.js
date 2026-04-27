@@ -21816,11 +21816,12 @@
         if (last?.role === "assistant") {
           msgs[msgs.length - 1] = { ...last, streaming: false };
         }
+        const tokenCount = typeof action.tokens === "number" ? { prompt: 0, completion: 0, total: action.tokens } : state.tokenCount;
         return {
           ...state,
           isGenerating: false,
           messages: msgs,
-          tokenCount: action.tokens ?? state.tokenCount
+          tokenCount
         };
       }
       case "GENERATION_STOPPED": {
@@ -21866,6 +21867,17 @@
         };
       case "TOGGLE_HISTORY":
         return { ...state, historyOpen: !state.historyOpen };
+      case "LOAD_SESSION_MESSAGES": {
+        const messages = action.messages.filter((m) => m.role === "user" || m.role === "assistant").map((m) => ({
+          id: nextId(),
+          role: m.role,
+          text: m.content || "",
+          toolCalls: [],
+          streaming: false,
+          timestamp: Date.now()
+        }));
+        return { ...state, messages };
+      }
       // ─── Init ───────────────────────────────────────
       case "INIT":
         return {
@@ -21965,6 +21977,9 @@
             break;
           case "models":
             dispatch({ type: "SET_MODELS", models: msg.models });
+            break;
+          case "sessionMessages":
+            dispatch({ type: "LOAD_SESSION_MESSAGES", messages: msg.messages });
             break;
           case "context":
             dispatch({

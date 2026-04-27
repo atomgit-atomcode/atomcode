@@ -70,7 +70,8 @@ export type ChatAction =
   | { type: 'TOOL_START'; id: string; name: string; args: string }
   | { type: 'TOOL_RESULT'; id: string; name: string; output: string; success: boolean; durationMs: number }
   | { type: 'SET_TOKENS'; prompt: number; completion: number; total: number }
-  | { type: 'GENERATION_DONE'; tokens?: { prompt: number; completion: number; total: number } }
+  | { type: 'GENERATION_DONE'; tokens?: number }
+  | { type: 'LOAD_SESSION_MESSAGES'; messages: Array<{ role: string; content: string }> }
   | { type: 'GENERATION_STOPPED' }
   | { type: 'GENERATION_ERROR'; message: string }
   | { type: 'CLEAR_CHAT' }
@@ -92,7 +93,8 @@ export type ExtensionMessage =
   | { type: 'toolStart'; name: string; args: string }
   | { type: 'toolResult'; name: string; output: string; success: boolean; durationMs: number }
   | { type: 'tokens'; prompt: number; completion: number; total: number }
-  | { type: 'done'; tokens?: { prompt: number; completion: number; total: number }; toolCalls?: number }
+  | { type: 'done'; tokens?: number; toolCalls?: number }
+  | { type: 'sessionMessages'; messages: Array<{ role: string; content: string }> }
   | { type: 'stopped' }
   | { type: 'error'; message: string }
   | { type: 'generationStopped' }

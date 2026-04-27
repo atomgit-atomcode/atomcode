@@ -97,6 +97,9 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
         case 'models':
           dispatch({ type: 'SET_MODELS', models: msg.models });
           break;
+        case 'sessionMessages':
+          dispatch({ type: 'LOAD_SESSION_MESSAGES', messages: msg.messages });
+          break;
         case 'context':
           dispatch({
             type: 'ADD_CONTEXT_FILE',

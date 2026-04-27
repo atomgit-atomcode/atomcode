@@ -33,7 +33,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     webviewView.webview.onDidReceiveMessage(async (msg) => {
       switch (msg.type) {
         case 'send':
-          await this._handleSend(msg.text);
+          await this._handleSend(msg.text, msg.context?.map((c: { path: string }) => c.path));
           break;
         case 'stop':
           this.stopGeneration();
@@ -129,15 +129,36 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   // Private
-  private async _handleSend(text: string) {
+  private async _handleSend(text: string, contextPaths?: string[]) {
     if (!text.trim() || this._isGenerating) return;
 
     this._isGenerating = true;
     this._postMessage({ type: 'generationStarted' });
 
+    // Build message with file context
+    let fullMessage = text;
+    if (contextPaths && contextPaths.length > 0) {
+      const parts: string[] = [];
+      for (const filePath of contextPaths) {
+        try {
+          const uri = vscode.Uri.file(filePath);
+          const content = await vscode.workspace.fs.readFile(uri);
+          const decoded = Buffer.from(content).toString('utf-8');
+          const fileName = path.basename(filePath);
+          const ext = path.extname(filePath).slice(1);
+          parts.push(`File: ${fileName}\n\`\`\`${ext}\n${decoded}\n\`\`\``);
+        } catch {
+          // Skip files that can't be read
+        }
+      }
+      if (parts.length > 0) {
+        fullMessage = parts.join('\n\n') + '\n\n' + text;
+      }
+    }
+
     const workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
     const request: ChatRequest = {
-      message: text,
+      message: fullMessage,
       working_dir: workspaceFolder,
       session_id: this._sessionId,
     };
@@ -222,10 +243,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   private async _loadSession(sessionId: string) {
-    // TODO: need to find projectHash for the session
-    // For now, just start a new conversation with the session ID
     this._sessionId = sessionId;
     this._postMessage({ type: 'clearChat' });
+
+    try {
+      const detail = await this._client.getSession(sessionId);
+      if (detail && detail.messages) {
+        this._postMessage({ type: 'sessionMessages', messages: detail.messages });
+      }
+    } catch {
+      // Session load failed -- user will see empty chat with session ID set
+    }
   }
 
   private async _applyCode(code: string, _language: string) {

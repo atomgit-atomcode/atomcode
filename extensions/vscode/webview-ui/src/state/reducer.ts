@@ -100,11 +100,15 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
       if (last?.role === 'assistant') {
         msgs[msgs.length - 1] = { ...last, streaming: false };
       }
+      // action.tokens is a number (total), not a tokenCount object
+      const tokenCount = typeof action.tokens === 'number'
+        ? { prompt: 0, completion: 0, total: action.tokens }
+        : state.tokenCount;
       return {
         ...state,
         isGenerating: false,
         messages: msgs,
-        tokenCount: action.tokens ?? state.tokenCount,
+        tokenCount,
       };
     }
 
@@ -159,6 +163,21 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
 
     case 'TOGGLE_HISTORY':
       return { ...state, historyOpen: !state.historyOpen };
+
+    case 'LOAD_SESSION_MESSAGES': {
+      // Convert daemon message format to our ChatMessage format
+      const messages: ChatMessage[] = action.messages
+        .filter((m: { role: string }) => m.role === 'user' || m.role === 'assistant')
+        .map((m: { role: string; content: string }) => ({
+          id: nextId(),
+          role: m.role as 'user' | 'assistant',
+          text: m.content || '',
+          toolCalls: [],
+          streaming: false,
+          timestamp: Date.now(),
+        }));
+      return { ...state, messages };
+    }
 
     // ─── Init ───────────────────────────────────────
     case 'INIT':
