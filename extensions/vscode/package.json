@@ -5,42 +5,97 @@
   "version": "0.1.0",
   "publisher": "atomgit",
   "license": "MIT",
-  "engines": { "vscode": "^1.85.0" },
-  "categories": ["AI", "Programming Languages", "Other"],
-  "keywords": ["ai", "coding", "agent", "atomcode", "llm"],
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "AI",
+    "Programming Languages",
+    "Other"
+  ],
+  "keywords": [
+    "ai",
+    "coding",
+    "agent",
+    "atomcode",
+    "llm"
+  ],
   "icon": "resources/icon.png",
   "main": "./out/extension.js",
-  "activationEvents": ["onStartupFinished"],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
   "contributes": {
     "commands": [
-      { "command": "atomcode.openSidebar", "title": "AtomCode: Open in Side Bar", "icon": "$(hubot)" },
-      { "command": "atomcode.openTab", "title": "AtomCode: Open in New Tab" },
-      { "command": "atomcode.focusInput", "title": "AtomCode: Focus Input" },
-      { "command": "atomcode.newConversation", "title": "AtomCode: New Conversation" },
-      { "command": "atomcode.explain", "title": "AtomCode: Explain Selection" },
-      { "command": "atomcode.fix", "title": "AtomCode: Fix Selection" },
-      { "command": "atomcode.optimize", "title": "AtomCode: Optimize Selection" },
-      { "command": "atomcode.stop", "title": "AtomCode: Stop Generation" }
+      {
+        "command": "atomcode.openSidebar",
+        "title": "AtomCode: Open in Side Bar",
+        "icon": "$(hubot)"
+      },
+      {
+        "command": "atomcode.openTab",
+        "title": "AtomCode: Open in New Tab"
+      },
+      {
+        "command": "atomcode.focusInput",
+        "title": "AtomCode: Focus Input"
+      },
+      {
+        "command": "atomcode.newConversation",
+        "title": "AtomCode: New Conversation"
+      },
+      {
+        "command": "atomcode.explain",
+        "title": "AtomCode: Explain Selection"
+      },
+      {
+        "command": "atomcode.fix",
+        "title": "AtomCode: Fix Selection"
+      },
+      {
+        "command": "atomcode.optimize",
+        "title": "AtomCode: Optimize Selection"
+      },
+      {
+        "command": "atomcode.stop",
+        "title": "AtomCode: Stop Generation"
+      }
     ],
     "viewsContainers": {
-      "activitybar": [{
-        "id": "atomcode",
-        "title": "AtomCode",
-        "icon": "resources/icon.svg"
-      }]
+      "activitybar": [
+        {
+          "id": "atomcode",
+          "title": "AtomCode",
+          "icon": "resources/icon.svg"
+        }
+      ]
     },
     "views": {
-      "atomcode": [{
-        "type": "webview",
-        "id": "atomcode.chatView",
-        "name": "Chat"
-      }]
+      "atomcode": [
+        {
+          "type": "webview",
+          "id": "atomcode.chatView",
+          "name": "Chat"
+        }
+      ]
     },
     "menus": {
       "editor/context": [
-        { "command": "atomcode.explain", "group": "atomcode@1", "when": "editorHasSelection" },
-        { "command": "atomcode.fix", "group": "atomcode@2", "when": "editorHasSelection" },
-        { "command": "atomcode.optimize", "group": "atomcode@3", "when": "editorHasSelection" }
+        {
+          "command": "atomcode.explain",
+          "group": "atomcode@1",
+          "when": "editorHasSelection"
+        },
+        {
+          "command": "atomcode.fix",
+          "group": "atomcode@2",
+          "when": "editorHasSelection"
+        },
+        {
+          "command": "atomcode.optimize",
+          "group": "atomcode@3",
+          "when": "editorHasSelection"
+        }
       ]
     },
     "configuration": {
@@ -63,7 +118,10 @@
         },
         "atomcode.preferredLocation": {
           "type": "string",
-          "enum": ["sidebar", "panel"],
+          "enum": [
+            "sidebar",
+            "panel"
+          ],
           "default": "sidebar",
           "description": "Where to open the chat panel"
         },
@@ -90,25 +148,51 @@
       }
     },
     "keybindings": [
-      { "command": "atomcode.focusInput", "key": "ctrl+escape", "mac": "cmd+escape" },
-      { "command": "atomcode.openTab", "key": "ctrl+shift+escape", "mac": "cmd+shift+escape" },
-      { "command": "atomcode.explain", "key": "ctrl+shift+e", "mac": "cmd+shift+e", "when": "editorHasSelection" },
-      { "command": "atomcode.newConversation", "key": "ctrl+n", "mac": "cmd+n", "when": "atomcode.chatFocused" }
+      {
+        "command": "atomcode.focusInput",
+        "key": "ctrl+escape",
+        "mac": "cmd+escape"
+      },
+      {
+        "command": "atomcode.openTab",
+        "key": "ctrl+shift+escape",
+        "mac": "cmd+shift+escape"
+      },
+      {
+        "command": "atomcode.explain",
+        "key": "ctrl+shift+e",
+        "mac": "cmd+shift+e",
+        "when": "editorHasSelection"
+      },
+      {
+        "command": "atomcode.newConversation",
+        "key": "ctrl+n",
+        "mac": "cmd+n",
+        "when": "atomcode.chatFocused"
+      }
     ]
   },
   "scripts": {
-    "compile": "tsc -p ./",
-    "watch": "tsc -watch -p ./",
+    "build:webview": "node webview-ui/esbuild.js",
+    "watch:webview": "node webview-ui/esbuild.js --watch",
+    "compile": "tsc -p ./ && npm run build:webview",
+    "watch": "npx concurrently \"tsc -watch -p ./\" \"npm run watch:webview\"",
     "lint": "eslint src --ext ts",
     "package": "npx @vscode/vsce package --no-dependencies"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
     "@types/vscode": "^1.85.0",
+    "concurrently": "^9.2.1",
+    "esbuild": "^0.28.0",
     "typescript": "^5.3.0"
   },
   "dependencies": {
+    "highlight.js": "^11.9.0",
     "marked": "^12.0.0",
-    "highlight.js": "^11.9.0"
+    "react": "^19.2.5",
+    "react-dom": "^19.2.5"
   }
 }

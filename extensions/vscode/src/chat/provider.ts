@@ -305,16 +305,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const htmlPath = vscode.Uri.joinPath(this._extensionUri, 'webview', 'index.html');
     let html = fs.readFileSync(htmlPath.fsPath, 'utf-8');
 
-    const styleUri = webview.asWebviewUri(
-      vscode.Uri.joinPath(this._extensionUri, 'webview', 'styles.css'),
+    const webviewJsUri = webview.asWebviewUri(
+      vscode.Uri.joinPath(this._extensionUri, 'webview', 'webview.js'),
     );
-    const scriptUri = webview.asWebviewUri(
-      vscode.Uri.joinPath(this._extensionUri, 'webview', 'main.js'),
+    const webviewCssUri = webview.asWebviewUri(
+      vscode.Uri.joinPath(this._extensionUri, 'webview', 'webview.css'),
     );
     const nonce = getNonce();
 
-    html = html.replace(/\{\{styleUri\}\}/g, styleUri.toString());
-    html = html.replace(/\{\{scriptUri\}\}/g, scriptUri.toString());
+    html = html.replace(/\{\{webviewJsUri\}\}/g, webviewJsUri.toString());
+    html = html.replace(/\{\{webviewCssUri\}\}/g, webviewCssUri.toString());
     html = html.replace(/\{\{nonce\}\}/g, nonce);
     html = html.replace(/\{\{cspSource\}\}/g, webview.cspSource);
 

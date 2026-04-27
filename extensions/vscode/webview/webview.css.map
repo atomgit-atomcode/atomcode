@@ -1,0 +1,7 @@
+{
+  "version": 3,
+  "sources": ["../webview-ui/src/styles/index.css"],
+  "sourcesContent": ["*, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }\n\nbody {\n  font-family: var(--vscode-font-family, -apple-system, BlinkMacSystemFont, sans-serif);\n  font-size: var(--vscode-font-size, 13px);\n  color: var(--vscode-foreground);\n  background: var(--vscode-sideBar-background, var(--vscode-editor-background));\n  height: 100vh;\n  overflow: hidden;\n}\n\n.app {\n  display: flex;\n  flex-direction: column;\n  height: 100vh;\n}\n"],
+  "mappings": ";AAAA;AAAG,CAAC;AAAU,CAAC;AAAU,UAAQ;AAAG,WAAS;AAAG,cAAY;AAAY;AAExE;AACE,eAAa,IAAI,oBAAoB,EAAE,aAAa,EAAE,kBAAkB,EAAE;AAC1E,aAAW,IAAI,kBAAkB,EAAE;AACnC,SAAO,IAAI;AACX,cAAY,IAAI,2BAA2B,EAAE,IAAI;AACjD,UAAQ;AACR,YAAU;AACZ;AAEA,CAAC;AACC,WAAS;AACT,kBAAgB;AAChB,UAAQ;AACV;",
+  "names": []
+}
