@@ -334,7 +334,7 @@
       return;
     }
     models.forEach((model) => {
-      const name = typeof model === 'string' ? model : model.id || model.name || model;
+      const name = typeof model === 'string' ? model : model.model || model.provider || model.name || String(model);
       const item = document.createElement('div');
       item.className = 'dropdown-item' + (name === currentModel ? ' active' : '');
       item.textContent = name;
@@ -396,8 +396,8 @@
         const item = document.createElement('div');
         item.className = 'history-item';
         item.innerHTML =
-          '<span class="history-item-title">' + escapeHtml(s.title || 'Untitled') + '</span>' +
-          '<span class="history-item-time">' + formatTimeAgo(s.updatedAt || s.createdAt) + '</span>';
+          '<span class="history-item-title">' + escapeHtml(s.name || s.title || 'Untitled') + '</span>' +
+          '<span class="history-item-time">' + formatTimeAgo(s.updated_at || s.updatedAt || s.created_at || s.createdAt) + '</span>';
         item.addEventListener('click', () => {
           vscode.postMessage({ type: 'loadSession', sessionId: s.id });
           closeHistory();
@@ -414,7 +414,7 @@
       return;
     }
     const filtered = state.sessions.filter(
-      (s) => (s.title || '').toLowerCase().includes(query)
+      (s) => (s.name || s.title || '').toLowerCase().includes(query)
     );
     renderHistoryList(filtered);
   }
@@ -425,7 +425,7 @@
     const oneDay = 86400000;
 
     sessions.forEach((s) => {
-      const ts = new Date(s.updatedAt || s.createdAt || now).getTime();
+      const ts = new Date(s.updated_at || s.updatedAt || s.created_at || s.createdAt || now).getTime();
       const diff = now - ts;
       let label;
       if (diff < oneDay) label = 'Today';

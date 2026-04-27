@@ -1,0 +1,5 @@
+2026-04-27_06-44-08_393  deepseek-v4-flash  step=0  msgs=16/7232tok  →  1773ms  tools=1 [bash]
+2026-04-27_06-44-11_014  deepseek-v4-flash  step=0  msgs=18/7433tok  →  2993ms  tools=2 [read_file, bash]
+2026-04-27_06-44-14_090  deepseek-v4-flash  step=0  msgs=21/8462tok  →  1638ms  tools=1 [read_file]
+2026-04-27_06-44-15_735  deepseek-v4-flash  step=0  msgs=23/10660tok  →  3472ms  tools=2 [read_file, read_file]
+2026-04-27_06-44-19_229  deepseek-v4-flash  step=0  msgs=26/18881tok  →  7704ms  tools=0 text_only

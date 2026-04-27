@@ -75,6 +75,27 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         case 'searchSessions':
           await this._searchSessions(msg.query);
           break;
+        case 'popout':
+          vscode.commands.executeCommand('atomcode.openTab');
+          break;
+        case 'attachFile': {
+          const uris = await vscode.window.showOpenDialog({
+            canSelectFiles: true,
+            canSelectMany: false,
+            openLabel: 'Attach to AtomCode',
+          });
+          if (uris && uris.length > 0) {
+            const filePath = uris[0].fsPath;
+            const fileName = path.basename(filePath);
+            this._postMessage({
+              type: 'context',
+              filePath,
+              fileName,
+              language: '',
+            });
+          }
+          break;
+        }
       }
     });
 
@@ -156,11 +177,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   // New protocol methods
 
   private async _sendInitialState() {
+    let currentModelName = '';
+
     // Send models
     try {
       const models = await this._client.listModels();
       this._postMessage({ type: 'models', models });
-    } catch {}
+      const defaultModel = models.find((m: { is_default: boolean }) => m.is_default);
+      if (defaultModel) {
+        currentModelName = (defaultModel as { model: string }).model || '';
+      }
+    } catch {
+      // daemon not available
+    }
 
     // Send sessions
     try {
@@ -171,7 +200,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     // Send editor context
     this._sendEditorContext();
 
-    this._postMessage({ type: 'init', generating: this._isGenerating });
+    this._postMessage({
+      type: 'init',
+      generating: this._isGenerating,
+      currentModel: currentModelName,
+    });
   }
 
   private _sendEditorContext() {
