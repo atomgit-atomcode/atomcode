@@ -569,6 +569,7 @@ mod tests {
             reflection_cadence: 7,
             notifications: Default::default(),
             telemetry: Default::default(),
+            lsp: Default::default(),
         }
     }
 

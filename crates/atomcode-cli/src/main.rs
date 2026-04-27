@@ -775,6 +775,7 @@ async fn run() -> Result<i32> {
                 auto_update: true,
                 reflection_cadence: 7,
                 telemetry: Default::default(),
+                lsp: Default::default(),
             }
         })
     } else {
@@ -788,6 +789,7 @@ async fn run() -> Result<i32> {
             auto_update: true,
             reflection_cadence: 7,
             telemetry: Default::default(),
+            lsp: Default::default(),
         }
     };
 
@@ -1539,6 +1541,7 @@ fn run_codingplan_core(
             reflection_cadence: 7,
             notifications: Default::default(),
             telemetry: Default::default(),
+            lsp: Default::default(),
         },
     };
 

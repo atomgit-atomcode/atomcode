@@ -216,6 +216,7 @@ fn test_config() -> Config {
         auto_update: false,
         reflection_cadence: 7,
         telemetry: Default::default(),
+        lsp: Default::default(),
     }
 }
 
