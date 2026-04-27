@@ -127,7 +127,7 @@ atomcode mcp add playwright npx @playwright/mcp@latest -C /path/to/repo</code></
         </thead>
         <tbody>
           <tr><td>TUI</td><td>后台并行连接,不阻塞界面</td><td>每个 server 连上后陆续注册,可能略晚于首屏</td></tr>
-          <tr><td>无头(<code>-p</code>、<code>--prompt-file</code>、<code>fixissue</code>)</td><td>启动时同步连接,等启用中的 server 尝试结束</td><td>仅在至少拿到一批工具时挂载 MCP</td></tr>
+          <tr><td>无头(<code>-p</code>)</td><td>启动时同步连接,等启用中的 server 尝试结束</td><td>仅在至少拿到一批工具时挂载 MCP</td></tr>
         </tbody>
       </table>
       <p>TUI 下可在会话区看到 <code>✓ MCP server 'github' connected</code> 或 <code>✗ MCP server '…' failed: …</code>。<strong>单个 server 失败不会拖垮其他 server 与主程序。</strong></p>
