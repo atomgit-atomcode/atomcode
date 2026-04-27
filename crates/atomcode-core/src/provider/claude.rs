@@ -21,6 +21,8 @@ pub struct ClaudeProvider {
     model: String,
     base_url: String,
     max_tokens: usize,
+    thinking_enabled: bool,
+    thinking_budget: u32,
 }
 
 impl ClaudeProvider {
@@ -29,6 +31,8 @@ impl ClaudeProvider {
             .api_key
             .clone()
             .context("Claude provider requires an api_key")?;
+        let thinking_enabled = config.thinking_enabled.unwrap_or(false);
+        let thinking_budget = config.thinking_budget.unwrap_or(10_000);
         Ok(Self {
             client: super::build_http_client(config.user_agent.as_deref()),
             api_key,
@@ -40,6 +44,8 @@ impl ClaudeProvider {
             max_tokens: config
                 .max_tokens
                 .unwrap_or((config.context_window / 4).clamp(8_000, 16_384)),
+            thinking_enabled,
+            thinking_budget,
         })
     }
 
@@ -177,6 +183,8 @@ impl ClaudeProvider {
         system: Option<String>,
         msgs: Vec<serde_json::Value>,
         tools: Option<&[ToolDef]>,
+        thinking_enabled: bool,
+        thinking_budget: u32,
     ) -> serde_json::Value {
         let mut body = json!({
             "model": model,
@@ -184,6 +192,18 @@ impl ClaudeProvider {
             "max_tokens": max_tokens,
             "stream": true,
         });
+
+        if thinking_enabled {
+            body["thinking"] = json!({
+                "type": "enabled",
+                "budget_tokens": thinking_budget
+            });
+            // Anthropic requires max_tokens >= budget when thinking enabled
+            let min_max = thinking_budget as usize + 4096;
+            if max_tokens < min_max {
+                body["max_tokens"] = json!(min_max);
+            }
+        }
 
         if let Some(sys) = system {
             // System prompt as array with cache_control breakpoint.
@@ -232,7 +252,15 @@ impl LlmProvider for ClaudeProvider {
         tools: Option<&[ToolDef]>,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
         let (system, msgs) = Self::format_messages(messages);
-        let body = Self::build_request_body(&self.model, self.max_tokens, system, msgs, tools);
+        let body = Self::build_request_body(
+            &self.model,
+            self.max_tokens,
+            system,
+            msgs,
+            tools,
+            self.thinking_enabled,
+            self.thinking_budget,
+        );
 
         let url = normalize_claude_base_url(&self.base_url);
         // Local Claude-compatible servers (e.g. oMLX) sometimes authenticate via
@@ -280,6 +308,10 @@ impl LlmProvider for ClaudeProvider {
             let mut tc_id = String::new();
             let mut tc_name = String::new();
             let mut tc_json = String::new();
+            // Whether the current content block is a thinking block.
+            // Tracked for potential future use (e.g., block-level state);
+            // thinking deltas are dispatched by delta_type alone for now.
+            let mut _in_thinking_block = false;
 
             loop {
                 let chunk = match tokio::time::timeout(
@@ -352,6 +384,8 @@ impl LlmProvider for ClaudeProvider {
                                         id: tc_id.clone(),
                                         name: tc_name.clone(),
                                     }));
+                                } else if block.block_type == "thinking" {
+                                    _in_thinking_block = true;
                                 }
                             }
                         }
@@ -361,6 +395,11 @@ impl LlmProvider for ClaudeProvider {
                                     "text_delta" => {
                                         if let Some(text) = &delta.text {
                                             let _ = tx.send(Ok(StreamEvent::Delta(text.clone())));
+                                        }
+                                    }
+                                    "thinking_delta" => {
+                                        if let Some(text) = &delta.text {
+                                            let _ = tx.send(Ok(StreamEvent::Reasoning(text.clone())));
                                         }
                                     }
                                     "input_json_delta" => {
@@ -386,6 +425,7 @@ impl LlmProvider for ClaudeProvider {
                                 tc_name.clear();
                                 tc_json.clear();
                             }
+                            _in_thinking_block = false;
                         }
                         "message_start" => {
                             // message_start nests usage under message.usage
@@ -501,6 +541,8 @@ mod tests {
             Some("You are a helpful assistant.".to_string()),
             vec![json!({"role": "user", "content": "hello"})],
             None,
+            false,
+            10000,
         );
 
         let system = &body["system"];
@@ -532,6 +574,8 @@ mod tests {
             Some("sys".to_string()),
             vec![],
             Some(&tools),
+            false,
+            10000,
         );
 
         let tools_json = &body["tools"];
@@ -560,7 +604,7 @@ mod tests {
             parameters: json!({"type": "object"}),
         }];
 
-        let body = ClaudeProvider::build_request_body("model", 8192, None, vec![], Some(&tools));
+        let body = ClaudeProvider::build_request_body("model", 8192, None, vec![], Some(&tools), false, 10000);
 
         let arr = body["tools"].as_array().unwrap();
         assert_eq!(arr.len(), 1);
@@ -570,7 +614,7 @@ mod tests {
     #[test]
     fn test_empty_tools_no_tools_field() {
         let tools: Vec<ToolDef> = vec![];
-        let body = ClaudeProvider::build_request_body("model", 8192, None, vec![], Some(&tools));
+        let body = ClaudeProvider::build_request_body("model", 8192, None, vec![], Some(&tools), false, 10000);
         assert!(
             body.get("tools").is_none(),
             "Empty tools should not add tools field"
@@ -579,10 +623,40 @@ mod tests {
 
     #[test]
     fn test_no_system_no_system_field() {
-        let body = ClaudeProvider::build_request_body("model", 8192, None, vec![], None);
+        let body = ClaudeProvider::build_request_body("model", 8192, None, vec![], None, false, 10000);
         assert!(
             body.get("system").is_none(),
             "No system prompt should not add system field"
         );
+    }
+
+    #[test]
+    fn build_request_body_with_thinking() {
+        let body = ClaudeProvider::build_request_body(
+            "claude-sonnet-4", 16384,
+            Some("system".into()), vec![json!({"role":"user","content":"hi"})],
+            None, true, 10000,
+        );
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert_eq!(body["thinking"]["budget_tokens"], 10000);
+        assert_eq!(body["max_tokens"], 16384); // 16384 > 10000+4096, no adjustment
+    }
+
+    #[test]
+    fn build_request_body_adjusts_max_tokens_for_thinking() {
+        let body = ClaudeProvider::build_request_body(
+            "claude-sonnet-4", 8000,
+            None, vec![], None, true, 10000,
+        );
+        assert_eq!(body["max_tokens"], 14096); // bumped: 10000+4096 > 8000
+    }
+
+    #[test]
+    fn build_request_body_without_thinking() {
+        let body = ClaudeProvider::build_request_body(
+            "claude-sonnet-4", 16384,
+            None, vec![], None, false, 10000,
+        );
+        assert!(body.get("thinking").is_none());
     }
 }

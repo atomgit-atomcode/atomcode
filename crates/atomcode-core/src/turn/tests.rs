@@ -202,6 +202,8 @@ fn test_config() -> Config {
             thinking_type: None,
             thinking_keep: None,
             reasoning_history: None,
+            thinking_enabled: None,
+            thinking_budget: None,
             ephemeral: false,
         },
     );
@@ -240,6 +242,8 @@ fn make_runner(
         thinking_type: None,
         thinking_keep: None,
         reasoning_history: None,
+        thinking_enabled: None,
+        thinking_budget: None,
         ephemeral: true,
     };
     let test_ctx: std::sync::Arc<dyn crate::ctx::CtxBuilder> =
@@ -1316,6 +1320,8 @@ mod telemetry_tests {
             thinking_type: None,
             thinking_keep: None,
             reasoning_history: None,
+            thinking_enabled: None,
+            thinking_budget: None,
             ephemeral: true,
         };
         let test_ctx: std::sync::Arc<dyn crate::ctx::CtxBuilder> =

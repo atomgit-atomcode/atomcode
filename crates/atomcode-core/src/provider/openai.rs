@@ -888,6 +888,8 @@ mod tests {
             thinking_type: None,
             thinking_keep: None,
             reasoning_history: Some("exclude".into()),
+            thinking_enabled: None,
+            thinking_budget: None,
             ephemeral: false,
         };
         let p = OpenAiProvider::new(&cfg).expect("provider builds");
@@ -923,6 +925,8 @@ mod tests {
             thinking_type: None,
             thinking_keep: None,
             reasoning_history: Some("always".into()),
+            thinking_enabled: None,
+            thinking_budget: None,
             ephemeral: false,
         };
         let err = match OpenAiProvider::new(&cfg) {

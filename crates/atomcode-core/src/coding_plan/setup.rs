@@ -548,6 +548,8 @@ fn build_codingplan_provider(model: &str) -> ProviderConfig {
         thinking_type: None,
         thinking_keep: None,
         reasoning_history: None,
+        thinking_enabled: None,
+        thinking_budget: None,
         ephemeral: false,
     }
 }

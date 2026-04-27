@@ -443,6 +443,8 @@ mod tests {
                 thinking_type: None,
                 thinking_keep: None,
                 reasoning_history: None,
+                thinking_enabled: None,
+                thinking_budget: None,
                 ephemeral: false,
             },
         );

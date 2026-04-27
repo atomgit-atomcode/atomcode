@@ -1698,6 +1698,8 @@ async fn process_chat_request(
                 thinking_type: None,
                 thinking_keep: None,
                 reasoning_history: None,
+                thinking_enabled: None,
+                thinking_budget: None,
                 ephemeral: true,
             })
         }
