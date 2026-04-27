@@ -207,6 +207,34 @@ fn render_notifications_section(cfg: &NotificationConfig) -> String {
     out
 }
 
+/// Render a documentation comment about the layered instruction file system.
+/// Always emitted (even on first save) so users discover the feature.
+fn render_instructions_section() -> String {
+    let mut out = String::new();
+    out.push_str("\n# Project instructions — customize AI behavior via Markdown files.\n");
+    out.push_str("# AtomCode loads instructions from three levels (low → high priority):\n");
+    out.push_str("#\n");
+    out.push_str("#   1. ~/.atomcode/ATOMCODE.md           (global — your personal defaults)\n");
+    out.push_str("#   2. <project>/.atomcode.md            (project — team-shared, commit to git)\n");
+    out.push_str("#      or <project>/ATOMCODE.md\n");
+    out.push_str("#   3. <project>/.atomcode.user.md       (user — personal per-project, .gitignore)\n");
+    out.push_str("#\n");
+    out.push_str("# Higher priority files appear later in the prompt (recency effect).\n");
+    out.push_str("# Use /status to see which files are loaded. Use /init to generate a template.\n");
+    out.push_str("#\n");
+    out.push_str("# Example ~/.atomcode/ATOMCODE.md:\n");
+    out.push_str("#   ## Global Preferences\n");
+    out.push_str("#   - Reply in Chinese\n");
+    out.push_str("#   - Don't add AI co-author tags to commits\n");
+    out.push_str("#\n");
+    out.push_str("# Example <project>/.atomcode.md:\n");
+    out.push_str("#   ## Project Rules\n");
+    out.push_str("#   - This is a Rust workspace with 5 crates\n");
+    out.push_str("#   - Use anyhow::Result for error handling\n");
+    out.push_str("#   - All public APIs must have doc comments\n");
+    out
+}
+
 impl Config {
     /// Context window of the currently-selected default provider.
     /// Falls back to 128_000 when the default_provider is missing or
@@ -249,6 +277,7 @@ impl Config {
         let mut content = toml::to_string_pretty(&persistent)?;
         content.push_str(&render_datalog_section(&self.datalog));
         content.push_str(&render_notifications_section(&self.notifications));
+        content.push_str(&render_instructions_section());
         std::fs::write(path, content)?;
         Ok(())
     }
