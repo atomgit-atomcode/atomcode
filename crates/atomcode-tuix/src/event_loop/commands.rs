@@ -39,6 +39,8 @@ fn build_oauth_provider() -> ProviderConfig {
         thinking_type: None,
         thinking_keep: None,
         reasoning_history: None,
+        thinking_enabled: None,
+        thinking_budget: None,
         ephemeral: false,
     }
 }
@@ -689,6 +691,79 @@ pub(super) fn execute_slash_command(
         }
         "worktree" => {
             handle_worktree(arg, ctx, renderer)?;
+        }
+        "think" => {
+            let sub = arg.trim().to_ascii_lowercase();
+            let provider_name = ctx.config.default_provider.clone();
+            let provider = ctx.config.providers.get_mut(&provider_name);
+            match provider {
+                None => {
+                    renderer.render(UiLine::Error(
+                        "No active provider configured. Use /provider to add one.".into(),
+                    ));
+                    renderer.flush();
+                }
+                Some(p) => {
+                    if sub.is_empty() {
+                        // Show current status
+                        let enabled = p.thinking_enabled.unwrap_or(false);
+                        let budget = p.thinking_budget.unwrap_or(10_000);
+                        let status = if enabled { "enabled" } else { "disabled" };
+                        renderer.render(UiLine::CommandOutput(format!(
+                            "  Extended thinking: {}\n  Budget: {} tokens\n  Provider: {}\n\n  Usage: /think on | off | budget <N>\n",
+                            status, budget, provider_name,
+                        )));
+                        renderer.flush();
+                    } else if sub == "on" {
+                        p.thinking_enabled = Some(true);
+                        let budget = p.thinking_budget.unwrap_or(10_000);
+                        save_and_reload(ctx, renderer);
+                        renderer.render(UiLine::CommandOutput(format!(
+                            "  Extended thinking enabled (budget: {} tokens).\n",
+                            budget,
+                        )));
+                        renderer.flush();
+                    } else if sub == "off" {
+                        p.thinking_enabled = Some(false);
+                        save_and_reload(ctx, renderer);
+                        renderer.render(UiLine::CommandOutput(
+                            "  Extended thinking disabled.\n".into(),
+                        ));
+                        renderer.flush();
+                    } else if let Some(rest) = sub.strip_prefix("budget") {
+                        let num_str = rest.trim();
+                        match num_str.parse::<u32>() {
+                            Ok(n) if n >= 1024 => {
+                                p.thinking_budget = Some(n);
+                                save_and_reload(ctx, renderer);
+                                renderer.render(UiLine::CommandOutput(format!(
+                                    "  Thinking budget set to {} tokens.\n",
+                                    n,
+                                )));
+                                renderer.flush();
+                            }
+                            Ok(n) => {
+                                renderer.render(UiLine::Error(format!(
+                                    "Budget must be >= 1024 (got {})",
+                                    n
+                                )));
+                                renderer.flush();
+                            }
+                            Err(_) => {
+                                renderer.render(UiLine::Error(
+                                    "Usage: /think budget <number>".into(),
+                                ));
+                                renderer.flush();
+                            }
+                        }
+                    } else {
+                        renderer.render(UiLine::CommandOutput(
+                            "  Usage: /think [on | off | budget <N>]\n".into(),
+                        ));
+                        renderer.flush();
+                    }
+                }
+            }
         }
         other => {
             renderer.render(UiLine::Error(format!("Unknown command: /{}", other)));

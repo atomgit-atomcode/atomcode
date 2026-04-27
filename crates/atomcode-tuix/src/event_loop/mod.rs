@@ -148,6 +148,12 @@ pub struct LoopCtx {
     pub telemetry: std::sync::Arc<atomcode_telemetry::Telemetry>,
     /// Original working dir before `/worktree create`, for `/worktree done`.
     pub worktree_original_dir: Option<PathBuf>,
+    /// Snapshot of the terminal's rendering capabilities. Probed once at
+    /// startup in `lib.rs`; threaded into `App::new` so `UiState` knows
+    /// whether to use Unicode or ASCII fallbacks for the spinner glyph
+    /// and ellipsis. Same value as `RetainedRenderer` was constructed
+    /// with — single source of truth.
+    pub caps: crate::terminal::TerminalCaps,
 }
 
 /// What the `/issue` wizard hands back to the event loop after the user
@@ -200,6 +206,17 @@ impl Buffer {
             stash: String::new(),
             pastes: Vec::new(),
         }
+    }
+
+    /// True while the user is scrolling input history (Up/Down on an
+    /// empty / non-empty buffer). The slash-command menu suppresses
+    /// itself in this state so that recalling a previous `/session foo`
+    /// from history doesn't immediately re-pop the menu and trap Up
+    /// inside it. Cleared automatically by `Insert` / `Cancel` (typing
+    /// or Esc) and by `HistoryNext` returning past the newest entry
+    /// to the user's stashed draft.
+    pub fn is_in_history(&self) -> bool {
+        self.history_idx.is_some()
     }
 
     /// Insert a pasted block. Folds into a `[Pasted …]` placeholder if
@@ -406,20 +423,35 @@ impl Buffer {
                 self.history_idx = new_idx;
                 if let Some(i) = new_idx {
                     self.text = history[i].clone();
-                    self.cursor = self.text.len();
+                    // Park cursor at column 0 — recalled history is for
+                    // re-running, not editing in place. A `/session foo`
+                    // pulled from history would otherwise leave the
+                    // cursor at end and re-trigger the slash menu via
+                    // `is_in_history()`-gated logic; keeping it at 0
+                    // mirrors Claude Code's behaviour and feels
+                    // consistent with "this is recalled text, scroll
+                    // again to keep going".
+                    self.cursor = 0;
                 }
                 BufferResult::Redraw
             }
             Action::HistoryNext => {
                 if let Some(i) = self.history_idx {
                     if i + 1 < history.len() {
+                        // Still inside history — same cursor-at-0 rule
+                        // as HistoryPrev.
                         self.history_idx = Some(i + 1);
                         self.text = history[i + 1].clone();
+                        self.cursor = 0;
                     } else {
+                        // Past the newest entry — restore the user's
+                        // stashed draft. Cursor goes to end so they
+                        // can keep typing where they left off before
+                        // they started scrolling.
                         self.history_idx = None;
                         self.text = self.stash.clone();
+                        self.cursor = self.text.len();
                     }
-                    self.cursor = self.text.len();
                 }
                 BufferResult::Redraw
             }
@@ -562,6 +594,59 @@ mod menu_tests {
     fn slash_with_no_matches_returns_none() {
         let reg = CommandRegistry::builtin();
         assert!(build_menu_items("/zzznomatch", &reg).is_none());
+    }
+
+    // Regression: HistoryPrev used to leave the cursor at end-of-text,
+    // so a recalled `/session foo` from history would `is_in_history()`
+    // true AND have the slash prefix — without the call-site gate, the
+    // menu would auto-pop, trapping Up/Down inside it. The fix is twofold
+    // (caller skips menu while in history; cursor parks at 0 to signal
+    // "this is recalled, scroll again"). These two unit tests pin both.
+    #[test]
+    fn history_prev_parks_cursor_at_zero_and_marks_history_mode() {
+        let mut buf = Buffer::new();
+        let reg = CommandRegistry::builtin();
+        let history = vec!["/session foo".to_string()];
+
+        let _ = buf.apply(Action::HistoryPrev, &history, &reg);
+
+        assert_eq!(buf.text, "/session foo");
+        assert_eq!(buf.cursor, 0, "cursor must park at 0 to suppress menu");
+        assert!(buf.is_in_history(), "buffer must report history mode");
+    }
+
+    #[test]
+    fn history_next_back_to_stash_restores_cursor_to_end() {
+        let mut buf = Buffer::new();
+        let reg = CommandRegistry::builtin();
+        let history = vec!["/session foo".to_string()];
+
+        // Type a partial draft, then scroll into history and back out.
+        let _ = buf.apply(Action::Insert('h'), &history, &reg);
+        let _ = buf.apply(Action::Insert('i'), &history, &reg);
+        let _ = buf.apply(Action::HistoryPrev, &history, &reg);
+        assert!(buf.is_in_history());
+        let _ = buf.apply(Action::HistoryNext, &history, &reg);
+
+        // Past newest entry → restored stash with cursor at the end so
+        // the user can keep typing where they left off.
+        assert_eq!(buf.text, "hi");
+        assert_eq!(buf.cursor, 2);
+        assert!(!buf.is_in_history());
+    }
+
+    #[test]
+    fn typing_clears_history_mode() {
+        // Sanity check — Insert resets history_idx, so the menu can
+        // re-appear naturally once the user starts editing the recall.
+        let mut buf = Buffer::new();
+        let reg = CommandRegistry::builtin();
+        let history = vec!["/session foo".to_string()];
+
+        let _ = buf.apply(Action::HistoryPrev, &history, &reg);
+        assert!(buf.is_in_history());
+        let _ = buf.apply(Action::Insert('x'), &history, &reg);
+        assert!(!buf.is_in_history());
     }
 }
 
@@ -727,9 +812,9 @@ pub struct App {
 const CTRL_C_EXIT_WINDOW: Duration = Duration::from_secs(2);
 
 impl App {
-    fn new() -> Self {
+    fn new(caps: &crate::terminal::TerminalCaps) -> Self {
         Self {
-            state: UiState::new(),
+            state: UiState::with_unicode(caps.unicode_symbols),
             buf: Buffer::new(),
             menu: MenuState::new(),
             active_modal: None,
@@ -744,7 +829,7 @@ impl App {
 }
 
 pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<()> {
-    let mut app = App::new();
+    let mut app = App::new(&ctx.caps);
 
     crate::tuix_trace!(
         "SES",
@@ -780,6 +865,24 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<(
         if !report.is_empty() {
             renderer.render(UiLine::CommandOutput(report));
         }
+    }
+
+    // Terminal keyboard hint: when the terminal doesn't support Kitty
+    // keyboard protocol (CSI u), Shift+Enter is indistinguishable from
+    // plain Enter. Show a hint so users know to use Alt+Enter or
+    // Ctrl+Enter for newline insertion instead.
+    if std::env::var("ATOMCODE_KBD_NOT_ENHANCED").is_ok() {
+        std::env::remove_var("ATOMCODE_KBD_NOT_ENHANCED");
+        // Show platform-appropriate hint. On macOS, Option+Enter may not work
+        // in all terminals, so we recommend Ctrl+Enter as the primary fallback.
+        #[cfg(target_os = "macos")]
+        renderer.render(UiLine::CommandOutput(
+            "  ⚠ Terminal does not support enhanced keyboard protocol.\n    Use Ctrl+Enter for newline (Shift+Enter won't work).\n\n".into(),
+        ));
+        #[cfg(not(target_os = "macos"))]
+        renderer.render(UiLine::CommandOutput(
+            "  ⚠ Terminal does not support enhanced keyboard protocol.\n    Use Alt+Enter or Ctrl+Enter for newline (Shift+Enter won't work).\n\n".into(),
+        ));
     }
 
     // First-run onboarding: no providers configured AND no OAuth login
@@ -1586,7 +1689,13 @@ fn handle_idle_key(
     modifiers: crossterm::event::KeyModifiers,
 ) -> Result<()> {
     // If the menu is active (buf starts with '/'), intercept navigation keys.
-    let menu_items = build_menu_items(&app.buf.text, &ctx.commands);
+    // Suppress while scrolling history — otherwise a recalled `/se…` from
+    // history immediately re-pops the menu and traps Up inside it.
+    let menu_items = if app.buf.is_in_history() {
+        None
+    } else {
+        build_menu_items(&app.buf.text, &ctx.commands)
+    };
     if let Some(items) = &menu_items {
         // Clamp selection in range.
         if app.menu.selected >= items.len() {
@@ -1594,28 +1703,27 @@ fn handle_idle_key(
         }
         match (code, modifiers) {
             (KeyCode::Up, _) => {
-                // At the top of the menu, close it and navigate history
-                // instead of wrapping to the bottom. This prevents the user
-                // from getting stuck in the slash-command menu when a
-                // partial command like `/se` is in history.
-                if app.menu.selected == 0 {
-                    // Close menu and trigger history navigation
-                    app.buf.text.clear();
-                    app.buf.cursor = 0;
-                    app.menu.selected = 0;
-                    // Fall through to normal history navigation below
+                // Wrap to the last item (mirror Down's modular wrap below).
+                // The menu is fully modal — to reach input history with a
+                // partial slash buffer like `/se`, press Esc or Backspace
+                // to clear the buffer first.  Previously Up at index 0
+                // cleared the buffer and fell through to history nav,
+                // which felt like the menu had silently swallowed your
+                // text and dumped you somewhere unexpected.
+                app.menu.selected = if app.menu.selected == 0 {
+                    items.len() - 1
                 } else {
-                    app.menu.selected -= 1;
-                    redraw_with_menu(
-                        &app.buf,
-                        items,
-                        app.menu.selected,
-                        &app.state,
-                        ctx,
-                        renderer,
-                    );
-                    return Ok(());
-                }
+                    app.menu.selected - 1
+                };
+                redraw_with_menu(
+                    &app.buf,
+                    items,
+                    app.menu.selected,
+                    &app.state,
+                    ctx,
+                    renderer,
+                );
+                return Ok(());
             }
             (KeyCode::Down, _) => {
                 app.menu.selected = (app.menu.selected + 1) % items.len();
@@ -1715,8 +1823,14 @@ fn handle_idle_key(
     match result {
         BufferResult::NoOp => {}
         BufferResult::Redraw => {
-            // Rebuild menu after buf change.
-            let items = build_menu_items(&app.buf.text, &ctx.commands);
+            // Rebuild menu after buf change. Same is_in_history gate
+            // as above so a HistoryPrev that just landed on `/se…`
+            // doesn't immediately re-show the slash menu.
+            let items = if app.buf.is_in_history() {
+                None
+            } else {
+                build_menu_items(&app.buf.text, &ctx.commands)
+            };
             if let Some(items) = items {
                 if app.menu.selected >= items.len() {
                     app.menu.selected = 0;
@@ -2681,7 +2795,7 @@ fn draw_spinner_now(
 /// every call site.
 fn format_spinner_label(state: &UiState, queue_len: usize) -> String {
     let base = &state.spinner_label;
-    let mut out = format!("{}…", base);
+    let mut out = format!("{}{}", base, state.ellipsis());
     if let Some(d) = state.turn_elapsed() {
         out.push_str(&format!(" · {}", crate::render::fmt_dur(d)));
     }

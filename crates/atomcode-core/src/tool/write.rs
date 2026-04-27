@@ -10,7 +10,7 @@ pub struct WriteFileTool;
 /// Check if a file path is a sensitive system location that should require user approval.
 fn is_sensitive_path(path: &str) -> bool {
     let expanded = if path.starts_with("~/") {
-        if let Some(home) = dirs::home_dir() {
+        if let Some(home) = super::real_home_dir() {
             home.join(&path[2..]).to_string_lossy().to_string()
         } else {
             path.to_string()
@@ -27,7 +27,7 @@ fn is_sensitive_path(path: &str) -> bool {
     }
 
     // Check ~/.ssh (expanded)
-    if let Some(home) = dirs::home_dir() {
+    if let Some(home) = super::real_home_dir() {
         let ssh_dir = home.join(".ssh");
         let bashrc = home.join(".bashrc");
         let bash_profile = home.join(".bash_profile");
