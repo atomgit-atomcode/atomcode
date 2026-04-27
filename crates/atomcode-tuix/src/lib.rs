@@ -356,6 +356,7 @@ pub async fn run(
         mcp_connect_rx,
         mcp_reload: None,
         telemetry,
+        caps,
     };
 
     // CodingPlan drift monitor — kick off a startup check if the current
