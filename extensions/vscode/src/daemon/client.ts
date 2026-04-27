@@ -132,8 +132,8 @@ export class DaemonClient {
     return this.get<SessionMeta[]>('/sessions');
   }
 
-  getSession(id: string): Promise<SessionDetail> {
-    return this.get<SessionDetail>(`/sessions/${id}`);
+  getSession(projectHash: string, id: string): Promise<SessionDetail> {
+    return this.get<SessionDetail>(`/projects/${projectHash}/sessions/${id}`);
   }
 
   createSession(name?: string, workingDir?: string): Promise<CreateSessionResponse> {

@@ -22019,8 +22019,8 @@
       dispatch({ type: "SET_CURRENT_MODEL", model });
       postMessage({ type: "selectModel", model });
     }, []);
-    const loadSession = (0, import_react.useCallback)((sessionId) => {
-      postMessage({ type: "loadSession", sessionId });
+    const loadSession = (0, import_react.useCallback)((sessionId, projectHash) => {
+      postMessage({ type: "loadSession", sessionId, projectHash });
     }, []);
     const value = {
       state,
@@ -22610,8 +22610,8 @@
       );
     }, [state.sessions, search]);
     const groups = (0, import_react8.useMemo)(() => groupSessionsByDate(filteredSessions), [filteredSessions]);
-    function handleSelect(sessionId) {
-      loadSession(sessionId);
+    function handleSelect(session) {
+      loadSession(session.id, session.project_hash);
       dispatch({ type: "TOGGLE_HISTORY" });
     }
     return /* @__PURE__ */ (0, import_jsx_runtime12.jsx)("div", { className: "session-overlay", onClick: () => dispatch({ type: "TOGGLE_HISTORY" }), children: /* @__PURE__ */ (0, import_jsx_runtime12.jsxs)("div", { className: "session-list", onClick: (e) => e.stopPropagation(), children: [
@@ -22638,7 +22638,7 @@
             "button",
             {
               className: "session-item",
-              onClick: () => handleSelect(s.id),
+              onClick: () => handleSelect(s),
               children: [
                 /* @__PURE__ */ (0, import_jsx_runtime12.jsx)("span", { className: "session-item-name", children: s.name || s.title || "Untitled" }),
                 /* @__PURE__ */ (0, import_jsx_runtime12.jsx)("span", { className: "session-item-time", children: formatTimeAgo(s.updated_at ?? s.created_at) })

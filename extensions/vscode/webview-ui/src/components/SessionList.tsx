@@ -1,6 +1,7 @@
 import React, { useState, useMemo } from 'react';
 import { useChatContext } from '../state/ChatProvider';
 import { groupSessionsByDate, formatTimeAgo } from '../utils/format';
+import type { SessionMeta } from '../state/types';
 
 const DATE_ORDER = ['Today', 'Yesterday', 'This Week', 'Older'];
 
@@ -20,8 +21,8 @@ export function SessionList() {
 
   const groups = useMemo(() => groupSessionsByDate(filteredSessions), [filteredSessions]);
 
-  function handleSelect(sessionId: string) {
-    loadSession(sessionId);
+  function handleSelect(session: SessionMeta) {
+    loadSession(session.id, session.project_hash);
     dispatch({ type: 'TOGGLE_HISTORY' });
   }
 
@@ -53,7 +54,7 @@ export function SessionList() {
                     <button
                       key={s.id}
                       className="session-item"
-                      onClick={() => handleSelect(s.id)}
+                      onClick={() => handleSelect(s)}
                     >
                       <span className="session-item-name">
                         {s.name || s.title || 'Untitled'}

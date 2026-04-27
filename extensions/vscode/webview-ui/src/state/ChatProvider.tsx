@@ -12,7 +12,7 @@ interface ChatContextValue {
   stop: () => void;
   newConversation: () => void;
   selectModel: (model: string) => void;
-  loadSession: (sessionId: string) => void;
+  loadSession: (sessionId: string, projectHash?: string) => void;
 }
 
 const ChatContext = createContext<ChatContextValue | null>(null);
@@ -150,8 +150,8 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
     postMessage({ type: 'selectModel', model });
   }, []);
 
-  const loadSession = useCallback((sessionId: string) => {
-    postMessage({ type: 'loadSession', sessionId });
+  const loadSession = useCallback((sessionId: string, projectHash?: string) => {
+    postMessage({ type: 'loadSession', sessionId, projectHash });
   }, []);
 
   const value: ChatContextValue = {

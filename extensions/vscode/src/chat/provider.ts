@@ -49,7 +49,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           this.onModelSelected?.(msg.model);
           break;
         case 'loadSession':
-          await this._loadSession(msg.sessionId);
+          await this._loadSession(msg.sessionId, msg.projectHash);
           break;
         case 'openSettings':
           vscode.commands.executeCommand('workbench.action.openSettings', 'atomcode');
@@ -242,17 +242,27 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  private async _loadSession(sessionId: string) {
+  private async _loadSession(sessionId: string, projectHash?: string) {
     this._sessionId = sessionId;
     this._postMessage({ type: 'clearChat' });
 
     try {
-      const detail = await this._client.getSession(sessionId);
+      // If projectHash not provided, search sessions to find it
+      let hash = projectHash;
+      if (!hash) {
+        const allSessions = await this._client.listSessions();
+        const match = (allSessions as Array<{ project_hash?: string; meta?: { id?: string }; id?: string }>)
+          .find(s => (s.meta?.id || s.id) === sessionId);
+        hash = match?.project_hash;
+      }
+      if (!hash) return;
+
+      const detail = await this._client.getSession(hash, sessionId);
       if (detail && detail.messages) {
         this._postMessage({ type: 'sessionMessages', messages: detail.messages });
       }
     } catch {
-      // Session load failed -- user will see empty chat with session ID set
+      // Session load failed
     }
   }
 

@@ -16,6 +16,7 @@ export interface SessionMeta {
   title?: string;
   created_at?: string;
   updated_at?: string;
+  project_hash?: string;
 }
 
 /** A file or selection attached as context */
