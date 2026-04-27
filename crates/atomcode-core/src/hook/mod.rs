@@ -1,5 +1,6 @@
 pub mod config;
 pub mod executor;
+pub mod json_config;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

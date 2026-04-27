@@ -775,7 +775,6 @@ async fn run() -> Result<i32> {
                 auto_update: true,
                 reflection_cadence: 7,
                 telemetry: Default::default(),
-                hooks: vec![],
             }
         })
     } else {
@@ -789,7 +788,6 @@ async fn run() -> Result<i32> {
             auto_update: true,
             reflection_cadence: 7,
             telemetry: Default::default(),
-            hooks: vec![],
         }
     };
 
@@ -1540,7 +1538,6 @@ fn run_codingplan_core(
             reflection_cadence: 7,
             notifications: Default::default(),
             telemetry: Default::default(),
-            hooks: vec![],
         },
     };
 

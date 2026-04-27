@@ -567,7 +567,6 @@ mod tests {
             reflection_cadence: 7,
             notifications: Default::default(),
             telemetry: Default::default(),
-            hooks: Vec::new(),
         }
     }
 

@@ -524,8 +524,9 @@ impl AgentLoop {
                 }),
             };
 
+        let hooks = crate::hook::json_config::load_hooks_config(&working_dir);
         let hook_executor = std::sync::Arc::new(
-            crate::hook::executor::HookExecutor::new(config.hooks.clone())
+            crate::hook::executor::HookExecutor::new(hooks)
         );
 
         let turn_runner = TurnRunner {
@@ -685,9 +686,14 @@ impl AgentLoop {
                         .get(&old_provider_name)
                         .map(|p| p.provider_type.clone());
                     self.config = new_config;
-                    // Rebuild hook executor from new config.
+                    // Rebuild hook executor from JSON config files.
+                    let wd = self.turn_runner.context.working_dir
+                        .try_read()
+                        .map(|g| g.clone())
+                        .unwrap_or_else(|_| std::path::PathBuf::from("."));
+                    let hooks = crate::hook::json_config::load_hooks_config(&wd);
                     self.hook_executor = std::sync::Arc::new(
-                        crate::hook::executor::HookExecutor::new(self.config.hooks.clone())
+                        crate::hook::executor::HookExecutor::new(hooks)
                     );
                     self.turn_runner.hook_executor = self.hook_executor.clone();
                     let new_provider_name = self.config.default_provider.clone();

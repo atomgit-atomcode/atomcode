@@ -107,6 +107,7 @@ impl SubAgentTask {
             }),
         };
 
+        let hooks = crate::hook::json_config::load_hooks_config(working_dir);
         let mut runner = TurnRunner {
             provider,
             tools,
@@ -118,7 +119,7 @@ impl SubAgentTask {
             recent_calls: Vec::new(),
             file_read_counts: std::collections::HashMap::new(),
             hook_executor: std::sync::Arc::new(
-                crate::hook::executor::HookExecutor::new(config.hooks.clone())
+                crate::hook::executor::HookExecutor::new(hooks)
             ),
         };
 

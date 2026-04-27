@@ -85,9 +85,6 @@ pub struct Config {
     /// impl that matches the no-section-present semantics.
     #[serde(default, skip_serializing)]
     pub telemetry: TelemetryConfig,
-    /// Hook configurations. Missing from older configs → defaults to empty vec.
-    #[serde(default, skip_serializing)]
-    pub hooks: Vec<crate::hook::HookConfig>,
 }
 
 /// Controls the per-turn markdown datalog writer.
@@ -209,77 +206,31 @@ fn render_notifications_section(cfg: &NotificationConfig) -> String {
     out
 }
 
-fn render_hooks_section(hooks: &[crate::hook::HookConfig]) -> String {
+fn render_hooks_json_section() -> String {
     let mut out = String::new();
-    out.push_str("\n# Lifecycle hooks — shell commands that run at key points in the session.\n");
-    out.push_str("# Each [[hooks]] entry defines one hook.\n");
+    out.push_str("\n# Lifecycle hooks — configure in separate JSON files:\n");
+    out.push_str("#   ~/.atomcode/hooks.json       (global hooks)\n");
+    out.push_str("#   <project>/.hooks.json         (project hooks, override global by name)\n");
     out.push_str("#\n");
-    out.push_str("# Fields:\n");
-    out.push_str("#   event      = \"pre_tool_use\"   # when to fire (see below)\n");
-    out.push_str("#   matcher    = \"bash\"           # tool name filter (optional, only for tool events)\n");
-    out.push_str("#   command    = \"your-script.sh\" # shell command to run\n");
-    out.push_str("#   timeout_ms = 10000           # kill after this many ms (default 10000)\n");
+    out.push_str("# Example hooks.json:\n");
+    out.push_str("#   {\n");
+    out.push_str("#     \"hooks\": {\n");
+    out.push_str("#       \"audit-all\": {\n");
+    out.push_str("#         \"event\": \"pre_tool_use\",\n");
+    out.push_str("#         \"command\": \"echo \\\"$(date) $ATOMCODE_TOOL_NAME\\\" >> ~/.atomcode/audit.log\"\n");
+    out.push_str("#       },\n");
+    out.push_str("#       \"block-rm\": {\n");
+    out.push_str("#         \"event\": \"pre_tool_use\",\n");
+    out.push_str("#         \"matcher\": \"bash\",\n");
+    out.push_str("#         \"command\": \"your-safety-check.sh\",\n");
+    out.push_str("#         \"timeout_ms\": 5000\n");
+    out.push_str("#       }\n");
+    out.push_str("#     }\n");
+    out.push_str("#   }\n");
     out.push_str("#\n");
-    out.push_str("# Events:\n");
-    out.push_str("#   pre_tool_use  — runs before a tool executes. stdout JSON controls behavior:\n");
-    out.push_str("#                   {\"action\":\"allow\"}  → proceed (default if no JSON output)\n");
-    out.push_str("#                   {\"action\":\"block\",\"reason\":\"...\"} → reject the tool call\n");
-    out.push_str("#   post_tool_use — runs after a tool completes (fire-and-forget, non-blocking)\n");
-    out.push_str("#   session_start — runs once when atomcode starts\n");
-    out.push_str("#   session_end   — runs once when atomcode exits\n");
-    out.push_str("#\n");
-    out.push_str("# Matcher patterns:\n");
-    out.push_str("#   \"bash\"   → exact tool name match\n");
-    out.push_str("#   \"edit_*\" → prefix wildcard (matches edit_file, edit_symbol, etc.)\n");
-    out.push_str("#   \"*\"      → match all tools\n");
-    out.push_str("#   (omit)   → same as \"*\"\n");
-    out.push_str("#\n");
-    out.push_str("# Environment variables available to hook scripts:\n");
-    out.push_str("#   ATOMCODE_HOOK_EVENT   — event name (e.g. \"pre_tool_use\")\n");
-    out.push_str("#   ATOMCODE_TOOL_NAME    — tool name (e.g. \"bash\", \"read_file\")\n");
-    out.push_str("#   ATOMCODE_HOOK_CONTEXT — full JSON context (session_id, working_dir, tool_args, etc.)\n");
-    out.push_str("#\n");
-    out.push_str("# Examples:\n");
-    out.push_str("#\n");
-    out.push_str("# Audit all tool calls to a log file:\n");
-    out.push_str("# [[hooks]]\n");
-    out.push_str("# event = \"pre_tool_use\"\n");
-    out.push_str("# command = \"echo \\\"$(date) $ATOMCODE_TOOL_NAME\\\" >> ~/.atomcode/audit.log\"\n");
-    out.push_str("#\n");
-    out.push_str("# Block dangerous bash commands (rm -rf, DROP TABLE, etc.):\n");
-    out.push_str("# [[hooks]]\n");
-    out.push_str("# event = \"pre_tool_use\"\n");
-    out.push_str("# matcher = \"bash\"\n");
-    out.push_str("# command = \"if echo $ATOMCODE_HOOK_CONTEXT | grep -q 'rm -rf'; then echo '{\\\"action\\\":\\\"block\\\",\\\"reason\\\":\\\"rm -rf blocked by hook\\\"}'; fi\"\n");
-    out.push_str("# timeout_ms = 5000\n");
-    out.push_str("#\n");
-    out.push_str("# Auto-format edited files:\n");
-    out.push_str("# [[hooks]]\n");
-    out.push_str("# event = \"post_tool_use\"\n");
-    out.push_str("# matcher = \"edit_*\"\n");
-    out.push_str("# command = \"cargo fmt 2>/dev/null || true\"\n");
-
-    if hooks.is_empty() {
-        return out;
-    }
-
-    for hook in hooks {
-        let event_str = serde_json::to_value(&hook.event)
-            .ok()
-            .and_then(|v| v.as_str().map(String::from))
-            .unwrap_or_else(|| "pre_tool_use".to_string());
-        out.push_str(&format!("\n[[hooks]]\nevent = \"{}\"\n", event_str));
-        if let Some(ref m) = hook.matcher {
-            out.push_str(&format!("matcher = \"{}\"\n", m));
-        }
-        out.push_str(&format!(
-            "command = \"{}\"\n",
-            hook.command.replace('\\', "\\\\").replace('"', "\\\"")
-        ));
-        if hook.timeout_ms != 10_000 {
-            out.push_str(&format!("timeout_ms = {}\n", hook.timeout_ms));
-        }
-    }
+    out.push_str("# Events: pre_tool_use, post_tool_use, session_start, session_end\n");
+    out.push_str("# Env vars: ATOMCODE_HOOK_EVENT, ATOMCODE_TOOL_NAME, ATOMCODE_HOOK_CONTEXT\n");
+    out.push_str("# PreToolUse stdout: {\"action\":\"allow\"} or {\"action\":\"block\",\"reason\":\"...\"}\n");
     out
 }
 
@@ -325,7 +276,7 @@ impl Config {
         let mut content = toml::to_string_pretty(&persistent)?;
         content.push_str(&render_datalog_section(&self.datalog));
         content.push_str(&render_notifications_section(&self.notifications));
-        content.push_str(&render_hooks_section(&self.hooks));
+        content.push_str(&render_hooks_json_section());
         std::fs::write(path, content)?;
         Ok(())
     }
@@ -506,7 +457,6 @@ mod tests {
             auto_update: true,
             reflection_cadence: 7,
             telemetry: Default::default(),
-            hooks: Vec::new(),
         };
         cfg.providers.insert(
             "p".to_string(),
@@ -619,48 +569,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_parse_config_with_hooks() {
-        let toml_str = r#"
-            default_provider = "claude"
-
-            [providers.claude]
-            type = "claude"
-            api_key = "sk-ant-test"
-            model = "claude-opus-4-6"
-
-            [[hooks]]
-            event = "pre_tool_use"
-            matcher = "bash"
-            command = "echo audit"
-            timeout_ms = 5000
-
-            [[hooks]]
-            event = "post_tool_use"
-            command = "echo log"
-        "#;
-        let config: Config = toml::from_str(toml_str).unwrap();
-        assert_eq!(config.hooks.len(), 2);
-        assert_eq!(config.hooks[0].event, crate::hook::HookEvent::PreToolUse);
-        assert_eq!(config.hooks[0].matcher.as_deref(), Some("bash"));
-        assert_eq!(config.hooks[0].timeout_ms, 5000);
-        assert_eq!(config.hooks[1].event, crate::hook::HookEvent::PostToolUse);
-        assert!(config.hooks[1].matcher.is_none());
-        assert_eq!(config.hooks[1].timeout_ms, 10_000);
-    }
-
-    #[test]
-    fn test_parse_config_without_hooks_defaults_empty() {
-        let toml_str = r#"
-            default_provider = "claude"
-            [providers.claude]
-            type = "claude"
-            api_key = "sk-ant-test"
-            model = "claude-opus-4-6"
-        "#;
-        let config: Config = toml::from_str(toml_str).unwrap();
-        assert!(config.hooks.is_empty());
-    }
 }
 
 #[cfg(test)]

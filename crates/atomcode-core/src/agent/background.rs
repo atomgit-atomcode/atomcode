@@ -73,6 +73,12 @@ async fn run_background_inner(
         }
     }
 
+    let bg_working_dir = bg_context.working_dir
+        .try_read()
+        .map(|g| g.clone())
+        .unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let hooks = crate::hook::json_config::load_hooks_config(&bg_working_dir);
+
     let mut runner = TurnRunner {
         provider,
         tools: Arc::new(bg_tools),
@@ -84,7 +90,7 @@ async fn run_background_inner(
         recent_calls: Vec::new(),
         file_read_counts: std::collections::HashMap::new(),
         hook_executor: std::sync::Arc::new(
-            crate::hook::executor::HookExecutor::new(config.hooks.clone())
+            crate::hook::executor::HookExecutor::new(hooks)
         ),
     };
 

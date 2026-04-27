@@ -1713,7 +1713,9 @@ async fn process_chat_request(
         recent_calls: Vec::new(),
         file_read_counts: std::collections::HashMap::new(),
         hook_executor: std::sync::Arc::new(
-            atomcode_core::hook::executor::HookExecutor::new(config.hooks.clone()),
+            atomcode_core::hook::executor::HookExecutor::new(
+                atomcode_core::hook::json_config::load_hooks_config(&working_dir),
+            ),
         ),
     };
 
