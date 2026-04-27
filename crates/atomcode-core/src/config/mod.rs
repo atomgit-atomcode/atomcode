@@ -291,7 +291,7 @@ impl Config {
             std::env::var("ATOMCODE_HOME")
                 .ok()
                 .filter(|s| !s.is_empty()),
-            dirs::home_dir(),
+            crate::tool::real_home_dir(),
         )
     }
 

@@ -832,7 +832,7 @@ async fn change_dir(
     } else {
         // Expand ~ and make absolute
         let expanded = if req.path.starts_with('~') {
-            dirs::home_dir()
+            atomcode_core::tool::real_home_dir()
                 .map(|h| {
                     h.join(
                         req.path
@@ -977,7 +977,7 @@ async fn create_session(
     // Ensure working directory exists
     if !working_dir.exists() {
         // Create atomchat directory in user's home if default
-        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        let home = atomcode_core::tool::real_home_dir().unwrap_or_else(|| PathBuf::from("."));
         let atomchat_dir = home.join("atomchat");
         if atomchat_dir.exists() || std::fs::create_dir_all(&atomchat_dir).is_ok() {
             // Use atomchat directory as working dir

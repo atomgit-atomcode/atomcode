@@ -12,11 +12,14 @@ use std::path::PathBuf;
 /// - macOS / Linux: `$HOME`, falling back to `getpwuid_r`
 /// - Windows: `%USERPROFILE%` (via `dirs`)
 ///
+/// This function accounts for sudo scenarios where $HOME might be /root
+/// but we want the actual user's home directory.
+///
 /// Prefer this over `std::env::var("HOME")` — the latter returns `None`
 /// on stock Windows and sends us down a fallback path that then hits
 /// `/tmp` (also nonexistent on Windows).
 pub fn home_dir() -> Option<PathBuf> {
-    dirs::home_dir()
+    atomcode_core::tool::real_home_dir()
 }
 
 /// Replace a leading `$HOME` in `path` with `~`. Returns `path`

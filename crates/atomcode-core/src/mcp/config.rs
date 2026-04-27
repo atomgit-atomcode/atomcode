@@ -293,14 +293,14 @@ fn expand_env_vars(s: &str) -> String {
 /// - Other forms (e.g. `~user/...`) are left unchanged.
 fn expand_tilde(s: &str) -> String {
     if s == "~" {
-        return dirs::home_dir()
+        return crate::tool::real_home_dir()
             .map(|h| h.to_string_lossy().to_string())
             .unwrap_or_else(|| s.to_string());
     }
     let Some(rest) = s.strip_prefix("~/") else {
         return s.to_string();
     };
-    let Some(home) = dirs::home_dir() else {
+    let Some(home) = crate::tool::real_home_dir() else {
         return s.to_string();
     };
     home.join(rest).to_string_lossy().to_string()
@@ -349,7 +349,7 @@ mod tests {
 
     #[test]
     fn test_expand_tilde_home_only() {
-        let Some(home) = dirs::home_dir() else {
+        let Some(home) = crate::tool::real_home_dir() else {
             return;
         };
         assert_eq!(expand_tilde("~"), home.to_string_lossy());
@@ -357,7 +357,7 @@ mod tests {
 
     #[test]
     fn test_expand_tilde_home_prefix() {
-        let Some(home) = dirs::home_dir() else {
+        let Some(home) = crate::tool::real_home_dir() else {
             return;
         };
         assert_eq!(

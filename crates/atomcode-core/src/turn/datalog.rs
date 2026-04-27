@@ -68,7 +68,7 @@ impl DatalogWriter {
             None => base_dir.join("datalog"),
             Some(s) if s.starts_with("~/") || s == "~" => {
                 let rest = s.strip_prefix("~/").unwrap_or("");
-                dirs::home_dir()
+                crate::tool::real_home_dir()
                     .unwrap_or_else(|| PathBuf::from("."))
                     .join(rest)
             }
@@ -530,7 +530,7 @@ mod tests {
     fn resolve_log_dir_tilde_expands_home() {
         let base = PathBuf::from("/tmp/work");
         let p = DatalogWriter::resolve_log_dir(&base, Some("~/.atomcode/logs"));
-        let expected = dirs::home_dir().unwrap().join(".atomcode/logs");
+        let expected = crate::tool::real_home_dir().unwrap().join(".atomcode/logs");
         assert_eq!(p, expected);
     }
 

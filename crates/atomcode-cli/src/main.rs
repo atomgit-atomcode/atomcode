@@ -1572,7 +1572,7 @@ fn install_panic_hook(telemetry: std::sync::Arc<atomcode_telemetry::Telemetry>) 
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         restore_terminal_if_tui();
-        let home = dirs::home_dir();
+        let home = atomcode_core::tool::real_home_dir();
         let cwd = std::env::current_dir().ok();
         let loc = info
             .location()

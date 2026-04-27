@@ -166,7 +166,7 @@ impl Tool for BashTool {
                     let resolved = if new_dir.starts_with('/') {
                         std::path::PathBuf::from(&new_dir)
                     } else if new_dir.starts_with('~') {
-                        dirs::home_dir()
+                        super::real_home_dir()
                             .map(|h| h.join(new_dir.strip_prefix("~/").unwrap_or(&new_dir[1..])))
                             .unwrap_or_else(|| std::path::PathBuf::from(&new_dir))
                     } else {
@@ -1335,7 +1335,7 @@ fn detect_cd_target(cmd: &str) -> Option<String> {
     }
     if trimmed == "cd" {
         // bare `cd` goes to $HOME
-        return dirs::home_dir().map(|h| h.to_string_lossy().to_string());
+        return super::real_home_dir().map(|h| h.to_string_lossy().to_string());
     }
     // Extract the path after `cd `, stopping at `&&`, `;`, `||`, `|`, or end.
     let after_cd = trimmed[3..].trim_start();
@@ -1343,7 +1343,7 @@ fn detect_cd_target(cmd: &str) -> Option<String> {
         .unwrap_or(after_cd.len());
     let path = after_cd[..end].trim().trim_matches('"').trim_matches('\'');
     if path.is_empty() {
-        return dirs::home_dir().map(|h| h.to_string_lossy().to_string());
+        return super::real_home_dir().map(|h| h.to_string_lossy().to_string());
     }
     Some(path.to_string())
 }
@@ -2465,7 +2465,7 @@ fn approval_for_command_paths(
         }
         let expanded = if arg.starts_with('~') {
             // Expand ~/path
-            dirs::home_dir().map(|h| {
+            super::real_home_dir().map(|h| {
                 let rest = arg.strip_prefix('~').unwrap_or(arg);
                 let rest = rest.strip_prefix('/').unwrap_or(rest);
                 h.join(rest)
