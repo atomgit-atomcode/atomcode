@@ -81,6 +81,7 @@ export type ChatAction =
   | { type: 'SET_SESSIONS'; sessions: SessionMeta[] }
   | { type: 'ADD_CONTEXT_FILE'; file: ContextFile }
   | { type: 'REMOVE_CONTEXT_FILE'; path: string }
+  | { type: 'CLEAR_CONTEXT' }
   | { type: 'TOGGLE_HISTORY' }
   | { type: 'INIT'; generating: boolean; currentModel?: string };
 

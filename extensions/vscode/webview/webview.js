@@ -21865,6 +21865,8 @@
           ...state,
           contextFiles: state.contextFiles.filter((f) => f.path !== action.path)
         };
+      case "CLEAR_CONTEXT":
+        return { ...state, contextFiles: [] };
       case "TOGGLE_HISTORY":
         return { ...state, historyOpen: !state.historyOpen };
       case "LOAD_SESSION_MESSAGES": {
@@ -22006,6 +22008,7 @@
         const ctx = stateRef.current.contextFiles.length > 0 ? stateRef.current.contextFiles.map((f) => ({ path: f.path, type: f.type })) : void 0;
         dispatch({ type: "ADD_USER_MESSAGE", text, contextFiles: stateRef.current.contextFiles });
         postMessage({ type: "send", text, context: ctx });
+        dispatch({ type: "CLEAR_CONTEXT" });
       },
       []
     );

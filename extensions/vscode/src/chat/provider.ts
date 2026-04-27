@@ -152,7 +152,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         }
       }
       if (parts.length > 0) {
-        fullMessage = parts.join('\n\n') + '\n\n' + text;
+        fullMessage = 'The user has attached the following file(s) for context. The content is provided inline below — DO NOT use read_file to re-read them.\n\n'
+          + parts.join('\n\n') + '\n\n' + 'User question: ' + text;
       }
     }
 

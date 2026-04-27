@@ -133,6 +133,8 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
         : undefined;
       dispatch({ type: 'ADD_USER_MESSAGE', text, contextFiles: stateRef.current.contextFiles });
       postMessage({ type: 'send', text, context: ctx });
+      // Clear context after sending
+      dispatch({ type: 'CLEAR_CONTEXT' });
     },
     [],
   );

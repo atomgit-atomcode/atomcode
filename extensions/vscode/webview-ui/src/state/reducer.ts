@@ -161,6 +161,9 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         contextFiles: state.contextFiles.filter((f) => f.path !== action.path),
       };
 
+    case 'CLEAR_CONTEXT':
+      return { ...state, contextFiles: [] };
+
     case 'TOGGLE_HISTORY':
       return { ...state, historyOpen: !state.historyOpen };
 
