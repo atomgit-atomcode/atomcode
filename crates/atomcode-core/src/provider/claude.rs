@@ -273,6 +273,8 @@ impl LlmProvider for ClaudeProvider {
 
             let mut buffer = String::new();
             let mut byte_stream = response.bytes_stream();
+            // Use byte buffer to properly handle UTF-8 characters that span chunk boundaries
+            let mut byte_buffer: Vec<u8> = Vec::with_capacity(4096);
 
             // Per-message state for the current tool_use content block.
             let mut tc_id = String::new();
@@ -296,11 +298,30 @@ impl LlmProvider for ClaudeProvider {
                     }
                 };
 
-                let text = match chunk {
-                    Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
+                match chunk {
+                    Ok(bytes) => {
+                        byte_buffer.extend_from_slice(&bytes);
+                    }
                     Err(e) => {
                         let _ = tx.send(Ok(StreamEvent::Error(e.to_string())));
                         return;
+                    }
+                }
+
+                // Convert bytes to string, keeping incomplete UTF-8 sequences for next chunk
+                let text = match String::from_utf8(byte_buffer.clone()) {
+                    Ok(s) => {
+                        byte_buffer.clear();
+                        s
+                    }
+                    Err(e) => {
+                        let valid_len = e.utf8_error().valid_up_to();
+                        if valid_len == 0 {
+                            continue;
+                        }
+                        let valid = String::from_utf8_lossy(&byte_buffer[..valid_len]).to_string();
+                        byte_buffer = byte_buffer[valid_len..].to_vec();
+                        valid
                     }
                 };
 
