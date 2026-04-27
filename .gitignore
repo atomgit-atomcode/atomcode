@@ -40,6 +40,9 @@ site/index-new.html
 # Config with secrets
 config.toml
 
+# Personal project instructions (loaded by AtomCode, never committed)
+.atomcode.user.md
+
 # Logs
 /datalog/
 /test-report.md
