@@ -7,9 +7,8 @@ interface UserMessageProps {
 
 export function UserMessage({ message }: UserMessageProps) {
   return (
-    <div className="message user-message">
-      <div className="message-role">You</div>
-      <div className="message-text">{message.text}</div>
+    <div className="timeline-message user-message-wrapper dot-brand">
+      <div className="user-message-bubble">{message.text}</div>
     </div>
   );
 }

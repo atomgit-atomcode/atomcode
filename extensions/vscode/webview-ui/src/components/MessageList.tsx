@@ -12,25 +12,23 @@ export function MessageList() {
   }, [state.messages, state.isGenerating]);
 
   return (
-    <div className="message-list">
-      {state.messages.map((msg) => {
-        if (msg.role === 'user') {
-          return <UserMessage key={msg.id} message={msg} />;
-        }
-        if (msg.role === 'assistant') {
-          return <AssistantMessage key={msg.id} message={msg} />;
-        }
-        if (msg.role === 'error') {
-          return (
-            <div key={msg.id} className="message error-message">
-              <div className="message-role">Error</div>
-              <div className="message-text">{msg.text}</div>
-            </div>
-          );
-        }
-        return null;
-      })}
-      <div ref={bottomRef} />
-    </div>
+    <>
+      <div className="messages-container">
+        {state.messages.map((msg) => {
+          if (msg.role === 'user') return <UserMessage key={msg.id} message={msg} />;
+          if (msg.role === 'assistant') return <AssistantMessage key={msg.id} message={msg} />;
+          if (msg.role === 'error') {
+            return (
+              <div key={msg.id} className="timeline-message dot-error">
+                <div className="error-message-content">{msg.text}</div>
+              </div>
+            );
+          }
+          return null;
+        })}
+        <div ref={bottomRef} />
+      </div>
+      <div className="message-gradient" />
+    </>
   );
 }
