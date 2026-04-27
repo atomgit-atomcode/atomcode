@@ -378,7 +378,7 @@ impl SkillRegistry {
         self.skills.clear();
 
         // System home directory (for Claude Code compat paths)
-        let system_home = dirs::home_dir();
+        let system_home = crate::tool::real_home_dir();
 
         // AtomCode home directory (respects ATOMCODE_HOME env var)
         let atomcode_home: Option<PathBuf> = std::env::var("ATOMCODE_HOME")

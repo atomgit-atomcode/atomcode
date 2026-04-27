@@ -102,12 +102,12 @@ impl Tool for BashTool {
     fn approval(&self, args: &str) -> ApprovalRequirement {
         let parsed = match serde_json::from_str::<BashArgs>(args) {
             Ok(p) => p,
-            Err(_) => {
-                // Fail-closed: unparseable args require approval.
-                return ApprovalRequirement::RequireApproval(
-                    "Could not parse bash arguments for safety check.".to_string(),
-                );
-            }
+            // Unparseable args (e.g. weak model sends `{}` or omits `command`)
+            // can't be destructive — `execute()` rejects them with a tool
+            // error before any shell runs. Prompting here surfaces a useless
+            // `Bash()` confirmation with no command to inspect; auto-approve
+            // and let the executor return the parse error to the model.
+            Err(_) => return ApprovalRequirement::AutoApprove,
         };
         if let Some(reason) = check_destructive_command(&parsed.command) {
             return ApprovalRequirement::RequireApproval(reason);
@@ -166,7 +166,7 @@ impl Tool for BashTool {
                     let resolved = if new_dir.starts_with('/') {
                         std::path::PathBuf::from(&new_dir)
                     } else if new_dir.starts_with('~') {
-                        dirs::home_dir()
+                        super::real_home_dir()
                             .map(|h| h.join(new_dir.strip_prefix("~/").unwrap_or(&new_dir[1..])))
                             .unwrap_or_else(|| std::path::PathBuf::from(&new_dir))
                     } else {
@@ -1335,7 +1335,7 @@ fn detect_cd_target(cmd: &str) -> Option<String> {
     }
     if trimmed == "cd" {
         // bare `cd` goes to $HOME
-        return dirs::home_dir().map(|h| h.to_string_lossy().to_string());
+        return super::real_home_dir().map(|h| h.to_string_lossy().to_string());
     }
     // Extract the path after `cd `, stopping at `&&`, `;`, `||`, `|`, or end.
     let after_cd = trimmed[3..].trim_start();
@@ -1343,7 +1343,7 @@ fn detect_cd_target(cmd: &str) -> Option<String> {
         .unwrap_or(after_cd.len());
     let path = after_cd[..end].trim().trim_matches('"').trim_matches('\'');
     if path.is_empty() {
-        return dirs::home_dir().map(|h| h.to_string_lossy().to_string());
+        return super::real_home_dir().map(|h| h.to_string_lossy().to_string());
     }
     Some(path.to_string())
 }
@@ -2347,6 +2347,29 @@ mod sanitize_tests {
 
         assert!(approval.is_none());
     }
+
+    // Regression: weak models occasionally send malformed bash args
+    // (`{}`, missing `command`, wrong type). We must NOT prompt — the
+    // UI would render `Bash()` with empty parens because format_tool_detail
+    // can't find a command to display. execute() rejects these args with
+    // a tool error before any shell runs, so AutoApprove is safe.
+    #[test]
+    fn bash_unparseable_args_auto_approve_to_avoid_empty_prompt() {
+        let cases = [
+            "{}",                          // missing required `command`
+            r#"{"foo":"bar"}"#,            // unknown key, no command
+            r#"{"command":null}"#,         // wrong type
+            "",                            // not JSON at all
+            "not json",                    // not JSON at all
+        ];
+        for args in cases {
+            assert!(
+                matches!(BashTool.approval(args), ApprovalRequirement::AutoApprove),
+                "args {args:?} should AutoApprove (executor will reject), \
+                 not trigger an empty Bash() prompt"
+            );
+        }
+    }
 }
 
 // ───────────────────────────────────────────────────────────────────
@@ -2442,7 +2465,7 @@ fn approval_for_command_paths(
         }
         let expanded = if arg.starts_with('~') {
             // Expand ~/path
-            dirs::home_dir().map(|h| {
+            super::real_home_dir().map(|h| {
                 let rest = arg.strip_prefix('~').unwrap_or(arg);
                 let rest = rest.strip_prefix('/').unwrap_or(rest);
                 h.join(rest)

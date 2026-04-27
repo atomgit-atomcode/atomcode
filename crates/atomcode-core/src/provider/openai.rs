@@ -413,6 +413,8 @@ impl LlmProvider for OpenAiProvider {
                 return;
             }
 
+            // Use byte buffer to properly handle UTF-8 characters that span chunk boundaries
+            let mut byte_buffer: Vec<u8> = Vec::with_capacity(4096);
             let mut buffer = String::new();
             let mut byte_stream = response.bytes_stream();
             // Track multiple tool calls by index: Vec<(id, name, args)>
@@ -442,11 +444,31 @@ impl LlmProvider for OpenAiProvider {
                     }
                 };
 
-                let text = match chunk {
-                    Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
+                match chunk {
+                    Ok(bytes) => {
+                        byte_buffer.extend_from_slice(&bytes);
+                    }
                     Err(e) => {
                         let _ = tx.send(Ok(StreamEvent::Error(e.to_string())));
                         return;
+                    }
+                }
+
+                // Convert bytes to string, keeping incomplete UTF-8 sequences for next chunk
+                let text = match String::from_utf8(byte_buffer.clone()) {
+                    Ok(s) => {
+                        byte_buffer.clear();
+                        s
+                    }
+                    Err(e) => {
+                        let valid_len = e.utf8_error().valid_up_to();
+                        if valid_len == 0 {
+                            // No valid UTF-8 yet, wait for more bytes
+                            continue;
+                        }
+                        let valid = String::from_utf8_lossy(&byte_buffer[..valid_len]).to_string();
+                        byte_buffer = byte_buffer[valid_len..].to_vec();
+                        valid
                     }
                 };
 
@@ -866,6 +888,8 @@ mod tests {
             thinking_type: None,
             thinking_keep: None,
             reasoning_history: Some("exclude".into()),
+            thinking_enabled: None,
+            thinking_budget: None,
             ephemeral: false,
         };
         let p = OpenAiProvider::new(&cfg).expect("provider builds");
@@ -901,6 +925,8 @@ mod tests {
             thinking_type: None,
             thinking_keep: None,
             reasoning_history: Some("always".into()),
+            thinking_enabled: None,
+            thinking_budget: None,
             ephemeral: false,
         };
         let err = match OpenAiProvider::new(&cfg) {

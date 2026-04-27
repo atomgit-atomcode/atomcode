@@ -71,7 +71,13 @@ impl Tool for GrepTool {
             Err(_) => return self.approval(args),
         };
         let raw_path = parsed.path.as_deref().unwrap_or(".");
-        match super::approval_for_path(raw_path, &working_dir, super::ExternalPathAction::Read) {
+        // Use Enumerate (not Read): grep is a search, not a targeted read.
+        // Read action prompts on every non-sensitive out-of-workspace path,
+        // which fires on routine searches like `~/Documents/other-project`.
+        // Enumerate keeps the safety net for sensitive paths (~/.ssh, /etc,
+        // id_rsa, .env, …) but auto-approves ordinary cross-project searches.
+        match super::approval_for_path(raw_path, &working_dir, super::ExternalPathAction::Enumerate)
+        {
             Ok(approval) => approval,
             Err(_) => self.approval(args),
         }
@@ -408,6 +414,54 @@ fn extract_graph_candidates(pattern: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::extract_graph_candidates;
+    use super::GrepTool;
+    use crate::tool::{ApprovalRequirement, Tool, ToolContext};
+    use tempfile::TempDir;
+
+    // Regression: a routine grep over a path outside the workspace
+    // (e.g. `~/Documents/other-project`) used to prompt every time. Now
+    // we only escalate for sensitive paths — non-sensitive cross-project
+    // searches auto-approve.
+    #[test]
+    fn grep_outside_workspace_non_sensitive_auto_approves() {
+        let workspace = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let ctx = ToolContext::new(workspace.path().to_path_buf());
+        let args = format!(
+            r#"{{"pattern":"foo","path":"{}"}}"#,
+            outside.path().display()
+        );
+        assert!(matches!(
+            GrepTool.approval_with_context(&args, &ctx),
+            ApprovalRequirement::AutoApprove
+        ));
+    }
+
+    // Sensitive paths must still prompt — this is the safety net we
+    // intentionally kept when switching from Read to Enumerate semantics.
+    #[test]
+    fn grep_sensitive_path_still_requires_always() {
+        let workspace = TempDir::new().unwrap();
+        let ctx = ToolContext::new(workspace.path().to_path_buf());
+        // /etc is in the system-protected prefixes list.
+        let args = r#"{"pattern":"PermitRoot","path":"/etc"}"#;
+        assert!(matches!(
+            GrepTool.approval_with_context(args, &ctx),
+            ApprovalRequirement::RequireApprovalAlways(_)
+        ));
+    }
+
+    // Default path "." resolves to the workspace itself — must auto-approve.
+    #[test]
+    fn grep_default_path_auto_approves() {
+        let workspace = TempDir::new().unwrap();
+        let ctx = ToolContext::new(workspace.path().to_path_buf());
+        let args = r#"{"pattern":"foo"}"#;
+        assert!(matches!(
+            GrepTool.approval_with_context(args, &ctx),
+            ApprovalRequirement::AutoApprove
+        ));
+    }
 
     #[test]
     fn snake_case_identifier() {

@@ -301,7 +301,7 @@ mod tests {
     fn test_auth_token_path_consistency() {
         // Both paths should resolve to the same location: ~/.atomcode/auth.toml
         let auth_module_path = crate::auth::auth_file_path();
-        let expected_path = dirs::home_dir()
+        let expected_path = crate::tool::real_home_dir()
             .unwrap_or_else(|| std::path::PathBuf::from("."))
             .join(".atomcode")
             .join("auth.toml");
@@ -335,6 +335,8 @@ mod tests {
             thinking_type: None,
             thinking_keep: None,
             reasoning_history: None,
+            thinking_enabled: None,
+            thinking_budget: None,
             ephemeral: false,
         }
     }
