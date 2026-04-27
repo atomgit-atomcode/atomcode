@@ -792,9 +792,20 @@ fn handle_worktree(arg: &str, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) ->
                     return Ok(());
                 }
             };
-            let base = parts.get(2).copied().unwrap_or("main");
-            let mgr = WorktreeManager::new(ctx.working_dir.clone());
-            match mgr.create(branch, base) {
+            let base = parts
+                .get(2)
+                .map(|s| (*s).to_string())
+                .or_else(|| detect_current_branch(&ctx.working_dir))
+                .unwrap_or_else(|| "HEAD".to_string());
+            let mgr = match WorktreeManager::from_dir(ctx.working_dir.clone()) {
+                Ok(mgr) => mgr,
+                Err(e) => {
+                    renderer.render(UiLine::Error(format!("worktree create failed: {:#}", e)));
+                    renderer.flush();
+                    return Ok(());
+                }
+            };
+            match mgr.create(branch, &base) {
                 Ok(wt) => {
                     // Save original dir before switching
                     ctx.worktree_original_dir = Some(ctx.working_dir.clone());
@@ -811,7 +822,14 @@ fn handle_worktree(arg: &str, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) ->
             renderer.flush();
         }
         Some("list") => {
-            let mgr = WorktreeManager::new(ctx.working_dir.clone());
+            let mgr = match WorktreeManager::from_dir(ctx.working_dir.clone()) {
+                Ok(mgr) => mgr,
+                Err(e) => {
+                    renderer.render(UiLine::Error(format!("worktree list failed: {:#}", e)));
+                    renderer.flush();
+                    return Ok(());
+                }
+            };
             match mgr.list() {
                 Ok(worktrees) => {
                     if worktrees.is_empty() {
@@ -879,19 +897,46 @@ fn handle_worktree(arg: &str, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) ->
                 .get(2)
                 .map(|s| *s == "--force" || *s == "-f")
                 .unwrap_or(false);
-            // Determine repo root: use original dir if set, else current
-            let repo_root = ctx
+            let manager_dir = ctx
                 .worktree_original_dir
                 .as_ref()
                 .cloned()
                 .unwrap_or_else(|| ctx.working_dir.clone());
-            let mgr = WorktreeManager::new(repo_root);
+            let mgr = match WorktreeManager::from_dir(manager_dir) {
+                Ok(mgr) => mgr,
+                Err(e) => {
+                    renderer.render(UiLine::Error(format!("worktree cleanup failed: {:#}", e)));
+                    renderer.flush();
+                    return Ok(());
+                }
+            };
+            let cleanup_path = mgr
+                .find_worktree_path(branch)
+                .unwrap_or_else(|_| None)
+                .unwrap_or_else(|| mgr.worktree_path(branch));
+            let removing_current = paths_same(&cleanup_path, &ctx.working_dir);
             match mgr.remove(branch, force) {
                 Ok(()) => {
+                    let switched_to = if removing_current {
+                        let target = ctx
+                            .worktree_original_dir
+                            .take()
+                            .unwrap_or_else(|| mgr.repo_root().to_path_buf());
+                        apply_cd(ctx, target.clone());
+                        Some(target)
+                    } else {
+                        None
+                    };
                     renderer.render(UiLine::CommandOutput(format!(
                         "  \u{2713} 工作树 '{}' 已清理\n",
                         branch,
                     )));
+                    if let Some(target) = switched_to {
+                        renderer.render(UiLine::CommandOutput(format!(
+                            "  工作目录已切回: {}\n",
+                            target.display(),
+                        )));
+                    }
                 }
                 Err(e) => {
                     let err_msg = format!("{:#}", e);
@@ -938,6 +983,16 @@ fn detect_current_branch(dir: &std::path::Path) -> Option<String> {
                 None
             }
         })
+}
+
+fn paths_same(a: &std::path::Path, b: &std::path::Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
 }
 
 /// Build the `/context` report — horizontal bar + category breakdown,
@@ -1514,6 +1569,14 @@ mod tests {
         let (_tmp, cwd, _sub) = make_dirs();
         let got = resolve_cd("~", &cwd, None).expect("~ resolves");
         assert_eq!(got, canon_home);
+    }
+
+    #[test]
+    fn paths_same_accepts_canonical_equivalents() {
+        let (_tmp, cwd, sub) = make_dirs();
+        let via_parent = sub.join("..").join("sub");
+        assert!(paths_same(&sub, &via_parent));
+        assert!(!paths_same(&cwd, &sub));
     }
 
     #[test]

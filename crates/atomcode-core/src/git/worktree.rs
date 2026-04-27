@@ -18,6 +18,24 @@ impl WorktreeManager {
         Self { repo_root }
     }
 
+    pub fn from_dir(dir: PathBuf) -> Result<Self> {
+        let output = Command::new("git")
+            .args(["rev-parse", "--show-toplevel"])
+            .current_dir(&dir)
+            .output()
+            .context("Failed to resolve git repository root")?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "git rev-parse --show-toplevel failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        let root = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        Ok(Self {
+            repo_root: PathBuf::from(root),
+        })
+    }
+
     /// Create a new worktree with a new branch based on `base`.
     pub fn create(&self, branch: &str, base: &str) -> Result<Worktree> {
         let worktree_dir = self.worktree_base_dir();
@@ -84,7 +102,9 @@ impl WorktreeManager {
 
     /// Remove a worktree by branch name. Fails if there are uncommitted changes (use force).
     pub fn remove(&self, branch: &str, force: bool) -> Result<()> {
-        let worktree_path = self.worktree_base_dir().join(branch);
+        let worktree_path = self
+            .find_worktree_path(branch)?
+            .unwrap_or_else(|| self.worktree_path(branch));
         let mut args = vec!["worktree", "remove"];
         if force {
             args.push("--force");
@@ -124,6 +144,17 @@ impl WorktreeManager {
             .join(repo_name.as_ref())
     }
 
+    pub fn worktree_path(&self, branch: &str) -> PathBuf {
+        self.worktree_base_dir().join(branch)
+    }
+
+    pub fn find_worktree_path(&self, branch: &str) -> Result<Option<PathBuf>> {
+        Ok(self
+            .list()?
+            .into_iter()
+            .find_map(|(candidate, path, _)| (candidate == branch).then_some(path)))
+    }
+
     pub fn repo_root(&self) -> &Path {
         &self.repo_root
     }
@@ -154,5 +185,33 @@ mod tests {
         // Must not panic when repo_root is "/".
         let mgr = WorktreeManager::new(PathBuf::from("/"));
         let _base = mgr.worktree_base_dir();
+    }
+
+    #[test]
+    fn from_dir_resolves_repository_root_from_subdir() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        run_git(tmp.path(), &["init"]);
+        let subdir = tmp.path().join("nested").join("crate");
+        std::fs::create_dir_all(&subdir).expect("mkdir subdir");
+
+        let mgr = WorktreeManager::from_dir(subdir).expect("resolve root");
+        assert_eq!(
+            mgr.repo_root().canonicalize().expect("canon mgr root"),
+            tmp.path().canonicalize().expect("canon tmp")
+        );
+    }
+
+    fn run_git(dir: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("run git");
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }
