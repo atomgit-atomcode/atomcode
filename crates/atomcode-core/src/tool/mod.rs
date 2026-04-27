@@ -166,13 +166,13 @@ fn is_windows_sensitive_path(path: &str) -> bool {
         r"\program files (x86)",
         r"\programdata",
     ];
-    let Some(path_without_drive) = strip_windows_drive_prefix(&lowercase) else {
+    let Some(path_root) = windows_rooted_path(&lowercase) else {
         return false;
     };
 
     sensitive_roots
         .iter()
-        .any(|root| windows_path_starts_with(path_without_drive, root))
+        .any(|root| windows_path_starts_with(path_root, root))
 }
 
 fn windows_path_starts_with(path: &str, root: &str) -> bool {
@@ -180,6 +180,18 @@ fn windows_path_starts_with(path: &str, root: &str) -> bool {
         || path
             .strip_prefix(root)
             .is_some_and(|rest| rest.starts_with('\\'))
+}
+
+fn windows_rooted_path(path: &str) -> Option<&str> {
+    if let Some(path_without_drive) = strip_windows_drive_prefix(path) {
+        return Some(path_without_drive);
+    }
+
+    if path.starts_with('\\') && !path.starts_with(r"\\") {
+        return Some(path);
+    }
+
+    None
 }
 
 fn strip_windows_drive_prefix(path: &str) -> Option<&str> {
@@ -883,6 +895,11 @@ mod tests {
             None,
         ));
         assert!(is_sensitive_input_path_with_context(
+            r"\Windows\System32\drivers\etc\hosts",
+            None,
+            None,
+        ));
+        assert!(is_sensitive_input_path_with_context(
             r"C:\Program Files\AtomCode\config.toml",
             None,
             None,
@@ -908,6 +925,16 @@ mod tests {
         ));
         assert!(!is_sensitive_input_path_with_context(
             r"D:\Windows.old\system.ini",
+            None,
+            None,
+        ));
+        assert!(!is_sensitive_input_path_with_context(
+            r"\Windows.old\system.ini",
+            None,
+            None,
+        ));
+        assert!(!is_sensitive_input_path_with_context(
+            r"\\server\share\Windows\system.ini",
             None,
             None,
         ));
