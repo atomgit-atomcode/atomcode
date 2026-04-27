@@ -586,10 +586,6 @@ fn short_path(path: &str) -> String {
         _ => format!(".../{}/{}", parts[1], parts[0]),
     }
 }
-fn sessions_dir() -> PathBuf {
-    SessionManager::sessions_root_dir()
-}
-
 fn daemon_addr() -> String {
     std::env::var(DAEMON_ADDR_ENV).unwrap_or_else(|_| DEFAULT_DAEMON_ADDR.to_string())
 }
