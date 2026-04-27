@@ -447,6 +447,12 @@ enum Commands {
     /// Manage MCP server entries in `.mcp.json` (similar to `claude mcp add`)
     #[command(subcommand)]
     Mcp(McpCli),
+    /// Start the HTTP daemon for IDE integration (VS Code extension connects to this)
+    Daemon {
+        /// Port to listen on (default: 13456)
+        #[arg(long, default_value = "13456")]
+        port: u16,
+    },
     /// Telemetry controls
     Telemetry {
         #[command(subcommand)]
@@ -733,6 +739,34 @@ async fn run() -> Result<i32> {
                     }
                     Err(e) => {
                         eprintln!("fixissue failed: {:#}", e);
+                        return Ok(1);
+                    }
+                }
+            }
+            Commands::Daemon { port } => {
+                HEADLESS_MODE.store(true, Ordering::Relaxed);
+                eprintln!("Starting AtomCode daemon on port {}...", port);
+                eprintln!("Press Ctrl+C to stop.");
+                // Re-exec into the atomcode-daemon binary with matching port.
+                // This keeps the daemon as a separate compilation unit while
+                // providing a user-friendly `atomcode daemon` subcommand.
+                let daemon_bin = std::env::current_exe()
+                    .ok()
+                    .and_then(|p| {
+                        let dir = p.parent()?;
+                        let daemon = dir.join("atomcode-daemon");
+                        if daemon.exists() { Some(daemon) } else { None }
+                    });
+                match daemon_bin {
+                    Some(bin) => {
+                        let status = std::process::Command::new(bin)
+                            .status()
+                            .context("Failed to start atomcode-daemon")?;
+                        return Ok(if status.success() { 0 } else { 1 });
+                    }
+                    None => {
+                        eprintln!("Error: atomcode-daemon binary not found next to atomcode.");
+                        eprintln!("Make sure both binaries are installed together.");
                         return Ok(1);
                     }
                 }
@@ -1390,6 +1424,9 @@ async fn handle_command(cmd: Commands) -> Result<()> {
         }
         Commands::Telemetry { .. } => {
             unreachable!("Telemetry is handled inline in run() before handle_command")
+        }
+        Commands::Daemon { .. } => {
+            unreachable!("Daemon is handled inline in run() before handle_command")
         }
         Commands::Mcp(McpCli::Add {
             name,

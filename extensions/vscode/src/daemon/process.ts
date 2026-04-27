@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import * as child_process from 'child_process';
 import * as path from 'path';
 import * as fs from 'fs';
+import * as os from 'os';
 import { DaemonClient } from './client';
 
 export class DaemonProcess {
@@ -29,62 +30,93 @@ export class DaemonProcess {
     const binary = this.findBinary();
     if (!binary) {
       vscode.window.showErrorMessage(
-        'AtomCode binary not found. Install atomcode or set atomcode.daemon.binaryPath.'
+        'AtomCode not found. Install atomcode (cargo install atomcode) or set atomcode.daemon.binaryPath in settings.'
       );
       return false;
     }
 
-    // Spawn detached daemon.
-    // atomcode-daemon is a separate binary (not a subcommand of atomcode).
-    // It does not accept --port; it listens on the port hardcoded at build time.
-    this.process = child_process.spawn(binary, [], {
+    // `atomcode daemon` starts the HTTP daemon as a subcommand.
+    // The daemon listens on port 13456 by default.
+    this.process = child_process.spawn(binary.path, binary.args, {
       detached: true,
       stdio: 'ignore',
     });
     this.process.unref();
 
-    // Wait up to 5s for daemon to be ready
-    for (let i = 0; i < 50; i++) {
+    // Wait up to 10s for daemon to be ready
+    for (let i = 0; i < 100; i++) {
       await new Promise((r) => setTimeout(r, 100));
       if (await this.client.isRunning()) {
         return true;
       }
     }
 
+    vscode.window.showWarningMessage(
+      'AtomCode daemon started but not responding. Check if port 13456 is available.'
+    );
     return false;
   }
 
-  private findBinary(): string | undefined {
+  /**
+   * Find the atomcode binary. Returns the path and args to start the daemon.
+   *
+   * Search order:
+   * 1. User-configured binaryPath
+   * 2. `atomcode` in PATH (uses `atomcode daemon` subcommand)
+   * 3. Common install locations
+   * 4. Workspace build outputs (for developers)
+   */
+  private findBinary(): { path: string; args: string[] } | undefined {
     const config = vscode.workspace.getConfiguration('atomcode');
     const configured = config.get<string>('daemon.binaryPath', '');
+
+    // 1. User-configured path (could be atomcode or atomcode-daemon)
     if (configured && fs.existsSync(configured)) {
-      return configured;
+      const name = path.basename(configured);
+      if (name.includes('daemon')) {
+        return { path: configured, args: [] };
+      }
+      return { path: configured, args: ['daemon'] };
     }
 
-    const home = process.env.HOME || '';
+    // 2. Check PATH via `which`
+    try {
+      const resolved = child_process.execSync('which atomcode 2>/dev/null', { encoding: 'utf-8' }).trim();
+      if (resolved) {
+        return { path: resolved, args: ['daemon'] };
+      }
+    } catch {
+      // not in PATH
+    }
 
-    // Search common paths
-    const candidates = [
-      'atomcode-daemon', // PATH — daemon is a separate binary
-      path.join(home, '.atomcode', 'bin', 'atomcode-daemon'),
-      '/usr/local/bin/atomcode-daemon',
-      path.join(home, '.cargo', 'bin', 'atomcode-daemon'),
+    const home: string = os.homedir();
+    const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '';
+
+    // 3. Common install locations (atomcode main binary with daemon subcommand)
+    const atomcodePaths = [
+      path.join(home, '.atomcode', 'bin', 'atomcode'),
+      path.join(home, '.cargo', 'bin', 'atomcode'),
+      '/usr/local/bin/atomcode',
     ];
-
-    // Try `which` for PATH-based lookup
-    for (const c of candidates) {
-      try {
-        child_process.execSync(`which ${c} 2>/dev/null`);
-        return c;
-      } catch {
-        // not found, continue
+    for (const p of atomcodePaths) {
+      if (fs.existsSync(p)) {
+        return { path: p, args: ['daemon'] };
       }
     }
 
-    // Try direct existence check for absolute paths
-    for (const c of candidates.slice(1)) {
-      if (fs.existsSync(c)) {
-        return c;
+    // 4. Standalone atomcode-daemon binary (fallback)
+    const daemonPaths = [
+      path.join(home, '.atomcode', 'bin', 'atomcode-daemon'),
+      path.join(home, '.cargo', 'bin', 'atomcode-daemon'),
+      '/usr/local/bin/atomcode-daemon',
+      // Developer build outputs
+      path.join(workspaceRoot, 'target', 'release', 'atomcode-daemon'),
+      path.join(workspaceRoot, 'target', 'debug', 'atomcode-daemon'),
+      path.join(home, 'Desktop', 'atomcode', 'target', 'release', 'atomcode-daemon'),
+    ];
+    for (const p of daemonPaths) {
+      if (fs.existsSync(p)) {
+        return { path: p, args: [] };
       }
     }
 
@@ -92,6 +124,6 @@ export class DaemonProcess {
   }
 
   dispose(): void {
-    // Don't kill daemon on extension deactivate — it may be shared
+    // Don't kill daemon on extension deactivate — it may be shared with other windows
   }
 }
