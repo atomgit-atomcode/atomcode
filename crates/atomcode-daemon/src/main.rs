@@ -22,6 +22,7 @@ use tower_http::cors::{Any, CorsLayer};
 
 use atomcode_core::config::Config;
 use atomcode_core::conversation::Conversation;
+use atomcode_core::mcp::{McpRegistry, register_mcp_tools};
 use atomcode_core::provider;
 use atomcode_core::session::{Session, SessionId, SessionManager, SessionMeta};
 use atomcode_core::tool::{ToolContext, ToolRegistry};
@@ -136,6 +137,8 @@ pub struct AppState {
     pub chat_tasks: ChatTasksStore,
     /// Sessions that were stopped - their messages should not be saved
     pub stopped_sessions: StoppedSessionsStore,
+    /// MCP server registry (shared across chat requests)
+    pub mcp_registry: Arc<RwLock<Arc<McpRegistry>>>,
 }
 
 /// Get default working directory
@@ -1543,11 +1546,12 @@ async fn chat_stream(
     // Clone state for the spawned task
     let chat_tasks = state.chat_tasks.clone();
     let stopped_sessions = state.stopped_sessions.clone();
+    let mcp_registry = state.mcp_registry.read().await.clone();
 
     // Spawn the chat processing task
     tokio::spawn(async move {
         if let Err(e) =
-            process_chat_request(req, tx.clone(), cancel_token, stopped_sessions.clone()).await
+            process_chat_request(req, tx.clone(), cancel_token, stopped_sessions.clone(), mcp_registry).await
         {
             let _ = tx.send(ChatEvent::Error {
                 message: e.to_string(),
@@ -1577,6 +1581,7 @@ async fn process_chat_request(
     event_tx: mpsc::UnboundedSender<ChatEvent>,
     cancel_token: CancellationToken,
     stopped_sessions: StoppedSessionsStore,
+    mcp_registry: Arc<McpRegistry>,
 ) -> anyhow::Result<()> {
     use atomcode_core::tool::{
         bash::BashTool, edit::EditFileTool, glob::GlobTool, grep::GrepTool, list_dir::ListDirTool,
@@ -1675,6 +1680,12 @@ async fn process_chat_request(
         tool_registry.register_sync(Box::new(atomcode_core::tool::use_skill::UseSkillTool {
             registry: skill_registry.clone(),
         }));
+    }
+
+    // Register MCP tools from connected servers
+    let mcp_tools = mcp_registry.list_all_tools().await;
+    if !mcp_tools.is_empty() {
+        register_mcp_tools(&mut tool_registry, mcp_registry.clone(), mcp_tools);
     }
 
     let shared_tools = Arc::new(tool_registry);
@@ -2014,6 +2025,57 @@ async fn stop_chat(
     }
 }
 
+// --- MCP API handlers ---
+
+#[derive(Serialize)]
+struct McpServerStatus {
+    name: String,
+    status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+#[derive(Serialize)]
+struct McpStatusResponse {
+    servers: Vec<McpServerStatus>,
+}
+
+async fn mcp_status(State(state): State<AppState>) -> Json<McpStatusResponse> {
+    let registry = state.mcp_registry.read().await.clone();
+    let statuses = registry.server_statuses().await;
+    let mut servers = Vec::new();
+    for (name, status) in statuses {
+        let (status_str, error) = match &status {
+            atomcode_core::mcp::ServerStatus::Connecting => ("connecting".to_string(), None),
+            atomcode_core::mcp::ServerStatus::Connected => ("connected".to_string(), None),
+            atomcode_core::mcp::ServerStatus::Failed(e) => ("error".to_string(), Some(e.clone())),
+            atomcode_core::mcp::ServerStatus::Disconnected => ("disconnected".to_string(), None),
+        };
+        let tool_count = if matches!(status, atomcode_core::mcp::ServerStatus::Connected) {
+            let tools = registry.list_all_tools().await;
+            Some(tools.iter().filter(|t| t.server_name == name).count())
+        } else {
+            None
+        };
+        servers.push(McpServerStatus {
+            name,
+            status: status_str,
+            tool_count,
+            error,
+        });
+    }
+    Json(McpStatusResponse { servers })
+}
+
+async fn mcp_reload(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let home_dir = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    let new_registry = McpRegistry::from_config_background(&home_dir);
+    *state.mcp_registry.write().await = Arc::new(new_registry);
+    Json(serde_json::json!({"status": "reloading"}))
+}
+
 #[tokio::main]
 async fn main() {
     use axum::routing::patch;
@@ -2022,11 +2084,16 @@ async fn main() {
     // are migrated to the canonical location (~/.atomcode/sessions) before any handler reads it.
     SessionManager::migrate_from_legacy();
 
+    // Initialize MCP registry from user config (~/.atomcode/mcp.json)
+    let home_dir = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    let mcp_registry = McpRegistry::from_config_background(&home_dir);
+
     let state = AppState {
         sessions: Arc::new(RwLock::new(std::collections::HashMap::new())),
         project: Arc::new(RwLock::new(init_project_state())),
         chat_tasks: Arc::new(RwLock::new(HashMap::new())),
         stopped_sessions: Arc::new(RwLock::new(HashSet::new())),
+        mcp_registry: Arc::new(RwLock::new(Arc::new(mcp_registry))),
     };
 
     let app = Router::new()
@@ -2051,6 +2118,9 @@ async fn main() {
         // Chat API
         .route("/chat", post(chat_stream))
         .route("/chat/stop", post(stop_chat))
+        // MCP API
+        .route("/mcp/status", get(mcp_status))
+        .route("/mcp/reload", post(mcp_reload))
         .with_state(state)
         .layer(CorsLayer::new().allow_origin(Any).allow_methods(Any));
 
