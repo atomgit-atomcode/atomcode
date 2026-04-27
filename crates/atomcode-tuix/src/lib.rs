@@ -356,6 +356,7 @@ pub async fn run(
         mcp_connect_rx,
         mcp_reload: None,
         telemetry,
+        worktree_original_dir: None,
         caps,
     };
 

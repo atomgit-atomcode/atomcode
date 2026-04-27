@@ -146,6 +146,8 @@ pub struct LoopCtx {
     pub mcp_reload: Option<McpReloadProgress>,
     /// Telemetry handle — used to emit `UseCommand` at each slash dispatch.
     pub telemetry: std::sync::Arc<atomcode_telemetry::Telemetry>,
+    /// Original working dir before `/worktree create`, for `/worktree done`.
+    pub worktree_original_dir: Option<PathBuf>,
     /// Snapshot of the terminal's rendering capabilities. Probed once at
     /// startup in `lib.rs`; threaded into `App::new` so `UiState` knows
     /// whether to use Unicode or ASCII fallbacks for the spinner glyph
