@@ -81,7 +81,7 @@ CLI 入口（`crates/atomcode-cli/src/main.rs`）根据是否无头选择阻塞�
 {
   "mcpServers": {
     "github": {
-      "url": "https://api.github.com/mcp/",
+      "url": "https://api.githubcopilot.com/mcp/",
       "headers": {
         "Authorization": "Bearer ${GITHUB_TOKEN}"
       },
