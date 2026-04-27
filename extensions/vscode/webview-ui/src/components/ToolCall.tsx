@@ -1,14 +1,22 @@
 import React, { useState } from 'react';
 import { ToolCallData } from '../state/types';
 import { formatToolArgs } from '../utils/format';
+import { DiffView } from './DiffView';
 
 interface ToolCallProps {
   tool: ToolCallData;
 }
 
+function isDiffContent(output: string): boolean {
+  return output.includes('@@') && (output.includes('+') || output.includes('-'));
+}
+
 export function ToolCall({ tool }: ToolCallProps) {
   const [expanded, setExpanded] = useState(false);
   const secondary = formatToolArgs(tool.name, tool.args);
+
+  const isEditTool = /edit|write/i.test(tool.name);
+  const showDiff = isEditTool && tool.output && isDiffContent(tool.output);
 
   const annotationClass =
     tool.status === 'error' ? 'error' :
@@ -17,6 +25,7 @@ export function ToolCall({ tool }: ToolCallProps) {
   const annotationText =
     tool.status === 'running' ? undefined :
     tool.status === 'error' ? 'error' :
+    isEditTool && tool.status === 'done' ? 'applied' :
     tool.durationMs !== undefined ? `${(tool.durationMs / 1000).toFixed(1)}s` : 'done';
 
   return (
@@ -43,7 +52,9 @@ export function ToolCall({ tool }: ToolCallProps) {
           {tool.output !== undefined && (
             <div className="tool-body-row">
               <div className="tool-body-row-label">OUT</div>
-              <div className="tool-body-row-content clipped">{tool.output}</div>
+              <div className="tool-body-row-content" style={showDiff ? { maxHeight: 'none' } : undefined}>
+                {showDiff ? <DiffView content={tool.output} /> : tool.output}
+              </div>
             </div>
           )}
         </div>
