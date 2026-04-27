@@ -15,11 +15,11 @@ let healthCheckInterval: ReturnType<typeof setInterval>;
 
 export async function activate(context: vscode.ExtensionContext) {
   const config = vscode.workspace.getConfiguration('atomcode');
-  const port = config.get<number>('daemon.port', 23462);
+  const port = config.get<number>('daemon.port', 13456);
 
   // 1. Initialize daemon client and process manager
   client = new DaemonClient(port);
-  daemonProcess = new DaemonProcess(client, port);
+  daemonProcess = new DaemonProcess(client);
 
   // 2. Initialize status bar
   statusBar = new StatusBarManager();
@@ -113,7 +113,7 @@ export async function activate(context: vscode.ExtensionContext) {
     vscode.workspace.onDidChangeConfiguration((e) => {
       if (e.affectsConfiguration('atomcode')) {
         const newConfig = vscode.workspace.getConfiguration('atomcode');
-        const newPort = newConfig.get<number>('daemon.port', 23462);
+        const newPort = newConfig.get<number>('daemon.port', 13456);
         if (newPort !== port) {
           vscode.window.showInformationMessage('AtomCode: Restart VS Code to apply port change.');
         }

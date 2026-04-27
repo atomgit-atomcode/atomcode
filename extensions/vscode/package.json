@@ -48,7 +48,7 @@
       "properties": {
         "atomcode.daemon.port": {
           "type": "number",
-          "default": 23462,
+          "default": 13456,
           "description": "AtomCode daemon HTTP port"
         },
         "atomcode.daemon.autoStart": {

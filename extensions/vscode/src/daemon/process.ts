@@ -7,11 +7,9 @@ import { DaemonClient } from './client';
 export class DaemonProcess {
   private process?: child_process.ChildProcess;
   private client: DaemonClient;
-  private port: number;
 
-  constructor(client: DaemonClient, port: number) {
+  constructor(client: DaemonClient) {
     this.client = client;
-    this.port = port;
   }
 
   async ensureRunning(): Promise<boolean> {
@@ -36,8 +34,10 @@ export class DaemonProcess {
       return false;
     }
 
-    // Spawn detached daemon
-    this.process = child_process.spawn(binary, ['daemon', '--port', String(this.port)], {
+    // Spawn detached daemon.
+    // atomcode-daemon is a separate binary (not a subcommand of atomcode).
+    // It does not accept --port; it listens on the port hardcoded at build time.
+    this.process = child_process.spawn(binary, [], {
       detached: true,
       stdio: 'ignore',
     });
@@ -65,10 +65,10 @@ export class DaemonProcess {
 
     // Search common paths
     const candidates = [
-      'atomcode', // PATH
-      path.join(home, '.atomcode', 'bin', 'atomcode'),
-      '/usr/local/bin/atomcode',
-      path.join(home, '.cargo', 'bin', 'atomcode'),
+      'atomcode-daemon', // PATH — daemon is a separate binary
+      path.join(home, '.atomcode', 'bin', 'atomcode-daemon'),
+      '/usr/local/bin/atomcode-daemon',
+      path.join(home, '.cargo', 'bin', 'atomcode-daemon'),
     ];
 
     // Try `which` for PATH-based lookup
