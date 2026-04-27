@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src {{cspSource}} 'unsafe-inline'; script-src 'nonce-{{nonce}}'; font-src {{cspSource}};">
+  <link rel="stylesheet" href="{{styleUri}}">
+  <title>AtomCode</title>
+</head>
+<body>
+  <div id="app">
+    <div id="header">
+      <span class="title">AtomCode</span>
+      <div class="header-actions">
+        <button id="btn-new" title="New Conversation">&#10022;</button>
+      </div>
+    </div>
+    <div id="messages"></div>
+    <div id="input-area">
+      <div id="generating-indicator" class="hidden">
+        <span class="spinner"></span> Generating...
+        <button id="btn-stop">Stop</button>
+      </div>
+      <div id="input-wrapper">
+        <textarea id="input" placeholder="Ask AtomCode..." rows="1"></textarea>
+        <button id="btn-send" title="Send (Enter)">&uarr;</button>
+      </div>
+      <div id="footer-info">
+        <span id="token-count"></span>
+      </div>
+    </div>
+  </div>
+  <script nonce="{{nonce}}" src="{{scriptUri}}"></script>
+</body>
+</html>
