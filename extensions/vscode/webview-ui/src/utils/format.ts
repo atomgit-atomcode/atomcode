@@ -1,10 +1,8 @@
-/** Format a token count for display (e.g. 1234 -> "1.2k") */
 export function formatTokenCount(total: number): string {
   if (total < 1000) return `${total} tokens`;
   return `${(total / 1000).toFixed(1)}k tokens`;
 }
 
-/** Human-readable time-ago string */
 export function formatTimeAgo(dateStr?: string): string {
   if (!dateStr) return '';
   const diff = Date.now() - new Date(dateStr).getTime();
@@ -14,10 +12,10 @@ export function formatTimeAgo(dateStr?: string): string {
   const hours = Math.floor(mins / 60);
   if (hours < 24) return `${hours}h ago`;
   const days = Math.floor(hours / 24);
-  return `${days}d ago`;
+  if (days < 7) return `${days}d ago`;
+  return 'older';
 }
 
-/** Escape HTML entities */
 export function escapeHtml(text: string): string {
   return text
     .replace(/&/g, '&amp;')
@@ -27,14 +25,12 @@ export function escapeHtml(text: string): string {
     .replace(/'/g, '&#39;');
 }
 
-/** Group sessions by date category */
 export function groupSessionsByDate<T extends { updated_at?: string; created_at?: string }>(
   sessions: T[],
 ): Record<string, T[]> {
   const groups: Record<string, T[]> = {};
   const now = Date.now();
   const oneDay = 86400000;
-
   sessions.forEach((s) => {
     const ts = new Date(s.updated_at ?? s.created_at ?? now).getTime();
     const diff = now - ts;
@@ -49,29 +45,14 @@ export function groupSessionsByDate<T extends { updated_at?: string; created_at?
   return groups;
 }
 
-/** Get a display-friendly icon for a tool name */
-export function getToolIcon(name: string): string {
-  const icons: Record<string, string> = {
-    read_file: '📄',
-    write_file: '✍️',
-    edit_file: '✍️',
-    bash: '💻',
-    grep: '🔍',
-    list_dir: '📁',
-    search: '🔍',
-  };
-  return icons[name] ?? '🔧';
-}
-
-/** Format tool args into a short summary */
 export function formatToolArgs(name: string, argsJson: string): string {
   try {
     const args = JSON.parse(argsJson) as Record<string, string>;
-    if (name === 'read_file' || name === 'write_file' || name === 'edit_file') {
-      return args.file_path ?? args.path ?? '';
-    }
-    if (name === 'bash') return (args.command ?? '').substring(0, 80);
-    if (name === 'grep') return `${args.pattern ?? ''} in ${args.path ?? '.'}`;
+    if (name === 'read_file' || name === 'Read') return args.file_path ?? args.path ?? '';
+    if (name === 'write_file' || name === 'Write') return args.file_path ?? args.path ?? '';
+    if (name === 'edit_file' || name === 'Edit') return args.file_path ?? args.path ?? '';
+    if (name === 'bash' || name === 'Bash') return (args.command ?? '').substring(0, 80);
+    if (name === 'grep' || name === 'Grep') return `${args.pattern ?? ''} in ${args.path ?? '.'}`;
     if (name === 'list_dir') return args.path ?? '.';
     return '';
   } catch {
