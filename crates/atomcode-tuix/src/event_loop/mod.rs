@@ -780,6 +780,24 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<(
         }
     }
 
+    // Terminal keyboard hint: when the terminal doesn't support Kitty
+    // keyboard protocol (CSI u), Shift+Enter is indistinguishable from
+    // plain Enter. Show a hint so users know to use Alt+Enter or
+    // Ctrl+Enter for newline insertion instead.
+    if std::env::var("ATOMCODE_KBD_NOT_ENHANCED").is_ok() {
+        std::env::remove_var("ATOMCODE_KBD_NOT_ENHANCED");
+        // Show platform-appropriate hint. On macOS, Option+Enter may not work
+        // in all terminals, so we recommend Ctrl+Enter as the primary fallback.
+        #[cfg(target_os = "macos")]
+        renderer.render(UiLine::CommandOutput(
+            "  ⚠ Terminal does not support enhanced keyboard protocol.\n    Use Ctrl+Enter for newline (Shift+Enter won't work).\n\n".into(),
+        ));
+        #[cfg(not(target_os = "macos"))]
+        renderer.render(UiLine::CommandOutput(
+            "  ⚠ Terminal does not support enhanced keyboard protocol.\n    Use Alt+Enter or Ctrl+Enter for newline (Shift+Enter won't work).\n\n".into(),
+        ));
+    }
+
     // First-run onboarding: no providers configured AND no OAuth login
     // on disk means the user has never set this up. Show the legacy-tui
     // 3-choice wizard (Login / Configure manually / Skip) as a modal —
