@@ -687,12 +687,182 @@ pub(super) fn execute_slash_command(
             }
             renderer.flush();
         }
+        "worktree" => {
+            handle_worktree(arg, ctx, renderer)?;
+        }
         other => {
             renderer.render(UiLine::Error(format!("Unknown command: /{}", other)));
             renderer.flush();
         }
     }
     Ok(())
+}
+
+/// Handle `/worktree` subcommands: create, list, done, cleanup.
+fn handle_worktree(arg: &str, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) -> Result<()> {
+    use atomcode_core::git::worktree::WorktreeManager;
+
+    let parts: Vec<&str> = arg.split_whitespace().collect();
+    let sub = parts.first().map(|s| s.to_ascii_lowercase());
+
+    match sub.as_deref() {
+        Some("create") => {
+            let branch = match parts.get(1) {
+                Some(b) => *b,
+                None => {
+                    renderer.render(UiLine::CommandOutput(
+                        "  用法: /worktree create <branch> [base]\n  示例: /worktree create fix-bug main\n".into(),
+                    ));
+                    renderer.flush();
+                    return Ok(());
+                }
+            };
+            let base = parts.get(2).copied().unwrap_or("main");
+            let mgr = WorktreeManager::new(ctx.working_dir.clone());
+            match mgr.create(branch, base) {
+                Ok(wt) => {
+                    // Save original dir before switching
+                    ctx.worktree_original_dir = Some(ctx.working_dir.clone());
+                    apply_cd(ctx, wt.path.clone());
+                    renderer.render(UiLine::CommandOutput(format!(
+                        "  \u{2713} 工作树已创建\n    分支: {} (基于 {})\n    路径: {}\n    工作目录已切换\n",
+                        wt.branch, wt.base_branch, wt.path.display(),
+                    )));
+                }
+                Err(e) => {
+                    renderer.render(UiLine::Error(format!("worktree create failed: {:#}", e)));
+                }
+            }
+            renderer.flush();
+        }
+        Some("list") => {
+            let mgr = WorktreeManager::new(ctx.working_dir.clone());
+            match mgr.list() {
+                Ok(worktrees) => {
+                    if worktrees.is_empty() {
+                        renderer.render(UiLine::CommandOutput(
+                            "  没有活跃的工作树。\n".into(),
+                        ));
+                    } else {
+                        let mut txt = String::from("  活跃工作树:\n");
+                        for (branch, path, has_changes) in &worktrees {
+                            let is_current = path == &ctx.working_dir;
+                            let marker = if is_current { "\u{25cf}" } else { "\u{25cb}" };
+                            let change_label = if *has_changes { "(有变更)" } else { "(clean)" };
+                            let current_hint = if is_current { " \u{2190} 当前" } else { "" };
+                            txt.push_str(&format!(
+                                "    {} {:<16} {}  {}{}\n",
+                                marker,
+                                branch,
+                                path.display(),
+                                change_label,
+                                current_hint,
+                            ));
+                        }
+                        renderer.render(UiLine::CommandOutput(txt));
+                    }
+                }
+                Err(e) => {
+                    renderer.render(UiLine::Error(format!("worktree list failed: {:#}", e)));
+                }
+            }
+            renderer.flush();
+        }
+        Some("done") => {
+            if let Some(original) = ctx.worktree_original_dir.take() {
+                let current_branch = detect_current_branch(&ctx.working_dir);
+                apply_cd(ctx, original.clone());
+                renderer.render(UiLine::CommandOutput(format!(
+                    "  \u{2713} 工作目录已切回: {}\n",
+                    original.display(),
+                )));
+                if let Some(branch) = current_branch {
+                    renderer.render(UiLine::CommandOutput(format!(
+                        "  提示: 使用 'git merge {}' 或创建 PR 合入主分支\n",
+                        branch,
+                    )));
+                }
+            } else {
+                renderer.render(UiLine::CommandOutput(
+                    "  没有活跃的工作树会话。先使用 /worktree create 创建一个。\n".into(),
+                ));
+            }
+            renderer.flush();
+        }
+        Some("cleanup") => {
+            let branch = match parts.get(1) {
+                Some(b) => *b,
+                None => {
+                    renderer.render(UiLine::CommandOutput(
+                        "  用法: /worktree cleanup <branch> [--force]\n".into(),
+                    ));
+                    renderer.flush();
+                    return Ok(());
+                }
+            };
+            let force = parts
+                .get(2)
+                .map(|s| *s == "--force" || *s == "-f")
+                .unwrap_or(false);
+            // Determine repo root: use original dir if set, else current
+            let repo_root = ctx
+                .worktree_original_dir
+                .as_ref()
+                .cloned()
+                .unwrap_or_else(|| ctx.working_dir.clone());
+            let mgr = WorktreeManager::new(repo_root);
+            match mgr.remove(branch, force) {
+                Ok(()) => {
+                    renderer.render(UiLine::CommandOutput(format!(
+                        "  \u{2713} 工作树 '{}' 已清理\n",
+                        branch,
+                    )));
+                }
+                Err(e) => {
+                    let err_msg = format!("{:#}", e);
+                    if !force
+                        && (err_msg.contains("untracked")
+                            || err_msg.contains("modified")
+                            || err_msg.contains("changes"))
+                    {
+                        renderer.render(UiLine::CommandOutput(format!(
+                            "  \u{26a0} 工作树 '{}' 有未提交的变更。\n  使用 /worktree cleanup {} --force 强制清理\n",
+                            branch, branch,
+                        )));
+                    } else {
+                        renderer.render(UiLine::Error(format!(
+                            "worktree cleanup failed: {}",
+                            err_msg
+                        )));
+                    }
+                }
+            }
+            renderer.flush();
+        }
+        _ => {
+            renderer.render(UiLine::CommandOutput(
+                "  用法:\n    /worktree create <branch> [base]  创建工作树并切换\n    /worktree list                     列出所有工作树\n    /worktree done                     切回原始目录\n    /worktree cleanup <branch>         清理工作树\n".into(),
+            ));
+            renderer.flush();
+        }
+    }
+    Ok(())
+}
+
+/// Detect the current branch name in a directory.
+fn detect_current_branch(dir: &std::path::Path) -> Option<String> {
+    std::process::Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .current_dir(dir)
+        .output()
+        .ok()
+        .and_then(|o| {
+            if o.status.success() {
+                Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
+            } else {
+                None
+            }
+        })
 }
 
 /// Build the `/context` report — horizontal bar + category breakdown,

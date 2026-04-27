@@ -146,6 +146,8 @@ pub struct LoopCtx {
     pub mcp_reload: Option<McpReloadProgress>,
     /// Telemetry handle — used to emit `UseCommand` at each slash dispatch.
     pub telemetry: std::sync::Arc<atomcode_telemetry::Telemetry>,
+    /// Original working dir before `/worktree create`, for `/worktree done`.
+    pub worktree_original_dir: Option<PathBuf>,
 }
 
 /// What the `/issue` wizard hands back to the event loop after the user

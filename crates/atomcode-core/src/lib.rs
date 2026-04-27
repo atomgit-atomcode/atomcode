@@ -5,6 +5,7 @@ pub mod coding_plan;
 pub mod config;
 pub mod conversation;
 pub mod ctx;
+pub mod git;
 pub mod graph;
 pub mod init;
 pub mod input_history;

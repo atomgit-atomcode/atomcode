@@ -342,6 +342,7 @@ pub async fn run(
         mcp_connect_rx,
         mcp_reload: None,
         telemetry,
+        worktree_original_dir: None,
     };
 
     // CodingPlan drift monitor — kick off a startup check if the current
