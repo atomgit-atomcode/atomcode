@@ -85,6 +85,9 @@ pub struct Config {
     /// impl that matches the no-section-present semantics.
     #[serde(default, skip_serializing)]
     pub telemetry: TelemetryConfig,
+    /// Hook configurations. Missing from older configs → defaults to empty vec.
+    #[serde(default, skip_serializing)]
+    pub hooks: Vec<crate::hook::HookConfig>,
 }
 
 /// Controls the per-turn markdown datalog writer.
@@ -206,6 +209,35 @@ fn render_notifications_section(cfg: &NotificationConfig) -> String {
     out
 }
 
+fn render_hooks_section(hooks: &[crate::hook::HookConfig]) -> String {
+    if hooks.is_empty() {
+        return String::new();
+    }
+    let mut out = String::new();
+    out.push_str("\n# Hook configurations.\n");
+    out.push_str("# event: pre_tool_use | post_tool_use | session_start | session_end | notification\n");
+    out.push_str("# matcher: tool name pattern (\"bash\", \"edit_*\", \"*\"). Only for tool events.\n");
+    out.push_str("# timeout_ms: max execution time in milliseconds (default 10000).\n");
+    for hook in hooks {
+        let event_str = serde_json::to_value(&hook.event)
+            .ok()
+            .and_then(|v| v.as_str().map(String::from))
+            .unwrap_or_else(|| "pre_tool_use".to_string());
+        out.push_str(&format!("\n[[hooks]]\nevent = \"{}\"\n", event_str));
+        if let Some(ref m) = hook.matcher {
+            out.push_str(&format!("matcher = \"{}\"\n", m));
+        }
+        out.push_str(&format!(
+            "command = \"{}\"\n",
+            hook.command.replace('"', "\\\"")
+        ));
+        if hook.timeout_ms != 10_000 {
+            out.push_str(&format!("timeout_ms = {}\n", hook.timeout_ms));
+        }
+    }
+    out
+}
+
 impl Config {
     /// Context window of the currently-selected default provider.
     /// Falls back to 128_000 when the default_provider is missing or
@@ -248,6 +280,7 @@ impl Config {
         let mut content = toml::to_string_pretty(&persistent)?;
         content.push_str(&render_datalog_section(&self.datalog));
         content.push_str(&render_notifications_section(&self.notifications));
+        content.push_str(&render_hooks_section(&self.hooks));
         std::fs::write(path, content)?;
         Ok(())
     }
@@ -428,6 +461,7 @@ mod tests {
             auto_update: true,
             reflection_cadence: 7,
             telemetry: Default::default(),
+            hooks: Vec::new(),
         };
         cfg.providers.insert(
             "p".to_string(),
@@ -538,6 +572,49 @@ mod tests {
             err.to_string().contains("No providers configured"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn test_parse_config_with_hooks() {
+        let toml_str = r#"
+            default_provider = "claude"
+
+            [providers.claude]
+            type = "claude"
+            api_key = "sk-ant-test"
+            model = "claude-opus-4-6"
+
+            [[hooks]]
+            event = "pre_tool_use"
+            matcher = "bash"
+            command = "echo audit"
+            timeout_ms = 5000
+
+            [[hooks]]
+            event = "post_tool_use"
+            command = "echo log"
+        "#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.hooks.len(), 2);
+        assert_eq!(config.hooks[0].event, crate::hook::HookEvent::PreToolUse);
+        assert_eq!(config.hooks[0].matcher.as_deref(), Some("bash"));
+        assert_eq!(config.hooks[0].timeout_ms, 5000);
+        assert_eq!(config.hooks[1].event, crate::hook::HookEvent::PostToolUse);
+        assert!(config.hooks[1].matcher.is_none());
+        assert_eq!(config.hooks[1].timeout_ms, 10_000);
+    }
+
+    #[test]
+    fn test_parse_config_without_hooks_defaults_empty() {
+        let toml_str = r#"
+            default_provider = "claude"
+            [providers.claude]
+            type = "claude"
+            api_key = "sk-ant-test"
+            model = "claude-opus-4-6"
+        "#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert!(config.hooks.is_empty());
     }
 }
 
