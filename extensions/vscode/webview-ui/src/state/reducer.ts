@@ -14,6 +14,8 @@ export const initialState: ChatState = {
   contextFiles: [],
   tokenCount: undefined,
   historyOpen: false,
+  searchQuery: '',
+  searchOpen: false,
 };
 
 export function chatReducer(state: ChatState, action: ChatAction): ChatState {
@@ -181,6 +183,12 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         }));
       return { ...state, messages };
     }
+
+    case 'SET_SEARCH_QUERY':
+      return { ...state, searchQuery: action.query };
+
+    case 'TOGGLE_SEARCH':
+      return { ...state, searchOpen: !state.searchOpen, searchQuery: state.searchOpen ? '' : state.searchQuery };
 
     case 'PERMISSION_REQUEST': {
       const msgs = [...state.messages];

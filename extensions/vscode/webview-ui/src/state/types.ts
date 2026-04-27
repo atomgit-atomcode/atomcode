@@ -69,6 +69,8 @@ export interface ChatState {
   contextFiles: ContextFile[];
   tokenCount?: { prompt: number; completion: number; total: number };
   historyOpen: boolean;
+  searchQuery: string;
+  searchOpen: boolean;
 }
 
 // ─── Actions dispatched by the reducer ──────────────────────────
@@ -94,6 +96,8 @@ export type ChatAction =
   | { type: 'TOGGLE_HISTORY' }
   | { type: 'PERMISSION_REQUEST'; id: string; toolName: string; args: string; isDestructive: boolean }
   | { type: 'PERMISSION_RESPOND'; id: string; allowed: boolean }
+  | { type: 'SET_SEARCH_QUERY'; query: string }
+  | { type: 'TOGGLE_SEARCH' }
   | { type: 'INIT'; generating: boolean; currentModel?: string };
 
 // ─── Messages from the VS Code extension host ──────────────────
