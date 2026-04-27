@@ -85,6 +85,9 @@ pub struct Config {
     /// impl that matches the no-section-present semantics.
     #[serde(default, skip_serializing)]
     pub telemetry: TelemetryConfig,
+    /// LSP integration configuration.
+    #[serde(default)]
+    pub lsp: LspConfig,
 }
 
 /// Controls the per-turn markdown datalog writer.
@@ -123,6 +126,30 @@ pub struct NotificationConfig {
     /// Best-effort background-only behavior where the terminal protocol supports it.
     #[serde(default = "default_true")]
     pub background_only: bool,
+}
+
+/// Controls LSP (Language Server Protocol) integration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LspConfig {
+    /// Master switch for LSP diagnostics.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Automatically detect and start language servers from the built-in registry.
+    #[serde(default = "default_true")]
+    pub auto_detect: bool,
+    /// Custom server configurations keyed by file extension.
+    #[serde(default)]
+    pub servers: std::collections::HashMap<String, crate::lsp::registry::LspServerConfig>,
+}
+
+impl Default for LspConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            auto_detect: true,
+            servers: Default::default(),
+        }
+    }
 }
 
 fn default_true() -> bool {
@@ -428,6 +455,7 @@ mod tests {
             auto_update: true,
             reflection_cadence: 7,
             telemetry: Default::default(),
+            lsp: Default::default(),
         };
         cfg.providers.insert(
             "p".to_string(),

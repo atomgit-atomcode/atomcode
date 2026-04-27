@@ -1,0 +1,244 @@
+//! LspManager — lazily starts and manages LSP clients per file extension.
+//!
+//! Provides a unified interface for diagnostics, file notifications, and
+//! lifecycle management across multiple language servers.
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use anyhow::Result;
+use tokio::sync::RwLock;
+
+use super::client::LspClient;
+use super::registry::LspServerRegistry;
+use super::types::Diagnostic;
+
+/// Extension-to-language_id mapping for LSP `textDocument/didOpen`.
+fn extension_to_language_id(ext: &str) -> &str {
+    match ext {
+        "rs" => "rust",
+        "ts" => "typescript",
+        "tsx" => "typescriptreact",
+        "js" => "javascript",
+        "jsx" => "javascriptreact",
+        "py" => "python",
+        "go" => "go",
+        "java" => "java",
+        "c" => "c",
+        "cpp" | "cc" | "cxx" => "cpp",
+        "cs" => "csharp",
+        "rb" => "ruby",
+        "php" => "php",
+        "swift" => "swift",
+        "kt" | "kts" => "kotlin",
+        "scala" => "scala",
+        _ => ext,
+    }
+}
+
+pub struct LspManager {
+    /// Running clients keyed by file extension.
+    clients: Arc<RwLock<HashMap<String, Arc<LspClient>>>>,
+    /// Server registry (default + user overrides).
+    registry: LspServerRegistry,
+    /// Project root for LSP initialize.
+    project_root: PathBuf,
+    /// Whether LSP integration is enabled.
+    enabled: bool,
+}
+
+impl LspManager {
+    /// Create a new LSP manager.
+    pub fn new(project_root: PathBuf, registry: LspServerRegistry, enabled: bool) -> Self {
+        Self {
+            clients: Arc::new(RwLock::new(HashMap::new())),
+            registry,
+            project_root,
+            enabled,
+        }
+    }
+
+    /// Ensure a language server is running for the given file's extension.
+    /// Returns `Ok(true)` if a server is (now) running, `Ok(false)` if no
+    /// server is configured or the command is not installed.
+    pub async fn ensure_server(&self, file_path: &Path) -> Result<bool> {
+        if !self.enabled {
+            return Ok(false);
+        }
+
+        let ext = match file_path.extension().and_then(|e| e.to_str()) {
+            Some(e) => e.to_string(),
+            None => return Ok(false),
+        };
+
+        // Already running?
+        {
+            let clients = self.clients.read().await;
+            if clients.contains_key(&ext) {
+                return Ok(true);
+            }
+        }
+
+        // Look up server config.
+        let config = match self.registry.get(&ext) {
+            Some(c) => c.clone(),
+            None => return Ok(false),
+        };
+
+        // Check if the command exists on PATH.
+        if which::which(&config.command).is_err() {
+            return Ok(false);
+        }
+
+        let language_id = extension_to_language_id(&ext);
+
+        // Start the client.
+        match LspClient::start(&config, &self.project_root, language_id).await {
+            Ok(client) => {
+                let arc = Arc::new(client);
+                let mut clients = self.clients.write().await;
+                clients.insert(ext, arc);
+                Ok(true)
+            }
+            Err(e) => {
+                // Log but don't propagate — LSP is best-effort.
+                eprintln!("[lsp] Failed to start {} for .{}: {}", config.command, ext, e);
+                Ok(false)
+            }
+        }
+    }
+
+    /// Get diagnostics for a specific file.
+    pub async fn diagnostics(&self, path: &Path) -> Vec<Diagnostic> {
+        let ext = match path.extension().and_then(|e| e.to_str()) {
+            Some(e) => e.to_string(),
+            None => return Vec::new(),
+        };
+
+        let clients = self.clients.read().await;
+        match clients.get(&ext) {
+            Some(client) => client.diagnostics(path).await,
+            None => Vec::new(),
+        }
+    }
+
+    /// Get all diagnostics from all running servers.
+    pub async fn all_diagnostics(&self) -> Vec<Diagnostic> {
+        let clients = self.clients.read().await;
+        let mut all = Vec::new();
+        for client in clients.values() {
+            all.extend(client.all_diagnostics().await);
+        }
+        all
+    }
+
+    /// Notify the appropriate server that a file changed.
+    pub async fn notify_file_changed(&self, path: &Path, content: &str) -> Result<()> {
+        let ext = match path.extension().and_then(|e| e.to_str()) {
+            Some(e) => e.to_string(),
+            None => return Ok(()),
+        };
+
+        let clients = self.clients.read().await;
+        if let Some(client) = clients.get(&ext) {
+            let language_id = extension_to_language_id(&ext);
+            // Use did_open as a simple full-document sync.
+            client.did_open(path, content, language_id).await?;
+        }
+
+        Ok(())
+    }
+
+    /// List the file extensions that have active servers.
+    pub async fn active_servers(&self) -> Vec<String> {
+        let clients = self.clients.read().await;
+        let mut exts: Vec<String> = clients.keys().cloned().collect();
+        exts.sort();
+        exts
+    }
+
+    /// Shutdown all running language servers.
+    pub async fn shutdown(&self) {
+        let mut clients = self.clients.write().await;
+        for (ext, client) in clients.drain() {
+            if let Err(e) = client.shutdown().await {
+                eprintln!("[lsp] Error shutting down server for .{}: {}", ext, e);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extension_to_language_id_maps_common_langs() {
+        assert_eq!(extension_to_language_id("rs"), "rust");
+        assert_eq!(extension_to_language_id("ts"), "typescript");
+        assert_eq!(extension_to_language_id("tsx"), "typescriptreact");
+        assert_eq!(extension_to_language_id("py"), "python");
+        assert_eq!(extension_to_language_id("go"), "go");
+        assert_eq!(extension_to_language_id("java"), "java");
+        assert_eq!(extension_to_language_id("js"), "javascript");
+    }
+
+    #[test]
+    fn extension_to_language_id_unknown_returns_self() {
+        assert_eq!(extension_to_language_id("xyz"), "xyz");
+    }
+
+    #[tokio::test]
+    async fn disabled_manager_returns_false() {
+        let registry = LspServerRegistry::with_defaults();
+        let mgr = LspManager::new(PathBuf::from("/tmp"), registry, false);
+        let result = mgr.ensure_server(Path::new("test.rs")).await.unwrap();
+        assert!(!result);
+    }
+
+    #[tokio::test]
+    async fn no_config_for_extension_returns_false() {
+        let registry = LspServerRegistry::with_defaults();
+        let mgr = LspManager::new(PathBuf::from("/tmp"), registry, true);
+        let result = mgr.ensure_server(Path::new("test.xyz")).await.unwrap();
+        assert!(!result);
+    }
+
+    #[tokio::test]
+    async fn no_extension_returns_false() {
+        let registry = LspServerRegistry::with_defaults();
+        let mgr = LspManager::new(PathBuf::from("/tmp"), registry, true);
+        let result = mgr.ensure_server(Path::new("Makefile")).await.unwrap();
+        assert!(!result);
+    }
+
+    #[tokio::test]
+    async fn empty_diagnostics_for_unknown_file() {
+        let registry = LspServerRegistry::with_defaults();
+        let mgr = LspManager::new(PathBuf::from("/tmp"), registry, true);
+        let diags = mgr.diagnostics(Path::new("test.xyz")).await;
+        assert!(diags.is_empty());
+    }
+
+    #[tokio::test]
+    async fn active_servers_empty_initially() {
+        let registry = LspServerRegistry::with_defaults();
+        let mgr = LspManager::new(PathBuf::from("/tmp"), registry, true);
+        assert!(mgr.active_servers().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn all_diagnostics_empty_initially() {
+        let registry = LspServerRegistry::with_defaults();
+        let mgr = LspManager::new(PathBuf::from("/tmp"), registry, true);
+        assert!(mgr.all_diagnostics().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn shutdown_on_empty_is_noop() {
+        let registry = LspServerRegistry::with_defaults();
+        let mgr = LspManager::new(PathBuf::from("/tmp"), registry, true);
+        mgr.shutdown().await; // Should not panic.
+    }
+}
