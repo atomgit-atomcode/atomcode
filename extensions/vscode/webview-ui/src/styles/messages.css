@@ -1,0 +1,319 @@
+/* ─── Message List ────────────────────────────────────────────── */
+
+.message-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 12px 0;
+}
+
+/* ─── Message Container ──────────────────────────────────────── */
+
+.message {
+  padding: 8px 16px;
+  margin-bottom: 4px;
+}
+
+.message-role {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+  color: var(--vscode-descriptionForeground);
+  margin-bottom: 4px;
+}
+
+.message-text {
+  font-size: 13px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* ─── User Message ───────────────────────────────────────────── */
+
+.user-message {
+  background: var(--vscode-sideBarSectionHeader-background, rgba(128, 128, 128, 0.08));
+  border-radius: 6px;
+  margin-left: 16px;
+  margin-right: 16px;
+}
+
+/* ─── Assistant Message ──────────────────────────────────────── */
+
+.assistant-message {
+  padding: 8px 16px;
+}
+
+.assistant-message .markdown-body {
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.assistant-message .markdown-body p {
+  margin-bottom: 8px;
+}
+
+.assistant-message .markdown-body p:last-child {
+  margin-bottom: 0;
+}
+
+.assistant-message .markdown-body h1,
+.assistant-message .markdown-body h2,
+.assistant-message .markdown-body h3,
+.assistant-message .markdown-body h4 {
+  margin-top: 16px;
+  margin-bottom: 8px;
+  font-weight: 600;
+}
+
+.assistant-message .markdown-body h1 { font-size: 18px; }
+.assistant-message .markdown-body h2 { font-size: 16px; }
+.assistant-message .markdown-body h3 { font-size: 14px; }
+.assistant-message .markdown-body h4 { font-size: 13px; }
+
+.assistant-message .markdown-body ul,
+.assistant-message .markdown-body ol {
+  padding-left: 20px;
+  margin-bottom: 8px;
+}
+
+.assistant-message .markdown-body li {
+  margin-bottom: 4px;
+}
+
+.assistant-message .markdown-body blockquote {
+  border-left: 3px solid var(--vscode-panel-border);
+  padding-left: 12px;
+  margin: 8px 0;
+  color: var(--vscode-descriptionForeground);
+}
+
+.assistant-message .markdown-body code {
+  font-family: var(--vscode-editor-font-family, 'Menlo', 'Monaco', 'Courier New', monospace);
+  font-size: var(--vscode-editor-font-size, 12px);
+  background: var(--vscode-textCodeBlock-background, rgba(128, 128, 128, 0.15));
+  padding: 1px 4px;
+  border-radius: 3px;
+}
+
+.assistant-message .markdown-body a {
+  color: var(--vscode-textLink-foreground, #3794ff);
+  text-decoration: none;
+}
+
+.assistant-message .markdown-body a:hover {
+  text-decoration: underline;
+}
+
+.assistant-message .markdown-body hr {
+  border: none;
+  border-top: 1px solid var(--vscode-panel-border);
+  margin: 12px 0;
+}
+
+/* ─── Code Blocks ────────────────────────────────────────────── */
+
+.code-block,
+.code-block-wrapper {
+  border-radius: 6px;
+  overflow: hidden;
+  margin: 8px 0;
+  background: var(--vscode-textCodeBlock-background, rgba(0, 0, 0, 0.25));
+  border: 1px solid var(--vscode-panel-border);
+}
+
+.code-block-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 4px 8px;
+  background: var(--vscode-sideBarSectionHeader-background, rgba(128, 128, 128, 0.1));
+  border-bottom: 1px solid var(--vscode-panel-border);
+}
+
+.code-block-lang {
+  font-size: 11px;
+  color: var(--vscode-descriptionForeground);
+  text-transform: lowercase;
+}
+
+.code-block-actions {
+  display: flex;
+  gap: 2px;
+}
+
+.code-action-btn {
+  padding: 2px 8px;
+  border: none;
+  border-radius: 3px;
+  background: transparent;
+  color: var(--vscode-descriptionForeground);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.code-action-btn:hover {
+  background: var(--vscode-toolbar-hoverBackground);
+  color: var(--vscode-foreground);
+}
+
+.code-block-content pre,
+.code-block-wrapper pre {
+  margin: 0;
+  padding: 12px;
+  overflow-x: auto;
+}
+
+.code-block-content code,
+.code-block-wrapper code {
+  font-family: var(--vscode-editor-font-family, 'Menlo', 'Monaco', 'Courier New', monospace);
+  font-size: var(--vscode-editor-font-size, 12px);
+  line-height: 1.5;
+  background: transparent;
+  padding: 0;
+  border-radius: 0;
+}
+
+/* ─── Tool Calls ─────────────────────────────────────────────── */
+
+.tool-calls-list {
+  margin-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.tool-call {
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.tool-call-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 6px 10px;
+  border: none;
+  background: var(--vscode-sideBarSectionHeader-background, rgba(128, 128, 128, 0.08));
+  color: var(--vscode-foreground);
+  cursor: pointer;
+  text-align: left;
+  font-size: 12px;
+}
+
+.tool-call-header:hover {
+  background: var(--vscode-toolbar-hoverBackground);
+}
+
+.tool-call-icon {
+  flex-shrink: 0;
+  font-size: 14px;
+}
+
+.tool-call-name {
+  font-weight: 600;
+  flex-shrink: 0;
+}
+
+.tool-call-args {
+  color: var(--vscode-descriptionForeground);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.tool-call-spacer {
+  flex: 1;
+}
+
+.tool-call-duration {
+  font-size: 11px;
+  color: var(--vscode-descriptionForeground);
+  flex-shrink: 0;
+}
+
+.tool-status {
+  flex-shrink: 0;
+  font-size: 12px;
+}
+
+.tool-status-running {
+  animation: spin 1s linear infinite;
+}
+
+.tool-status-done {
+  color: #4caf50;
+}
+
+.tool-status-error {
+  color: #f44336;
+}
+
+.tool-call-chevron {
+  font-size: 10px;
+  color: var(--vscode-descriptionForeground);
+  flex-shrink: 0;
+}
+
+.tool-call-body {
+  display: none;
+}
+
+.tool-call.expanded .tool-call-body {
+  display: block;
+  border-top: 1px solid var(--vscode-panel-border);
+}
+
+.tool-call-output {
+  margin: 0;
+  padding: 8px 10px;
+  font-family: var(--vscode-editor-font-family, 'Menlo', 'Monaco', 'Courier New', monospace);
+  font-size: 11px;
+  line-height: 1.4;
+  overflow-x: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-height: 300px;
+  overflow-y: auto;
+  color: var(--vscode-foreground);
+  background: var(--vscode-textCodeBlock-background, rgba(0, 0, 0, 0.15));
+}
+
+/* ─── Error Message ──────────────────────────────────────────── */
+
+.error-message {
+  margin-left: 16px;
+  margin-right: 16px;
+  border-radius: 6px;
+  border: 1px solid rgba(244, 67, 54, 0.3);
+  background: rgba(244, 67, 54, 0.08);
+}
+
+.error-message .message-role {
+  color: #f44336;
+}
+
+/* ─── Streaming Cursor ───────────────────────────────────────── */
+
+.streaming-cursor {
+  display: inline-block;
+  width: 7px;
+  height: 14px;
+  background: var(--vscode-foreground);
+  margin-left: 2px;
+  vertical-align: text-bottom;
+  animation: blink 1s step-end infinite;
+}
+
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}

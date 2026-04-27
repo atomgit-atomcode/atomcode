@@ -13,6 +13,7 @@ export const initialState: ChatState = {
   sessions: [],
   contextFiles: [],
   tokenCount: undefined,
+  historyOpen: false,
 };
 
 export function chatReducer(state: ChatState, action: ChatAction): ChatState {
@@ -155,6 +156,9 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         ...state,
         contextFiles: state.contextFiles.filter((f) => f.path !== action.path),
       };
+
+    case 'TOGGLE_HISTORY':
+      return { ...state, historyOpen: !state.historyOpen };
 
     // ─── Init ───────────────────────────────────────
     case 'INIT':

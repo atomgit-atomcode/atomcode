@@ -1330,7 +1330,7 @@
           return dispatcher;
         }
         "undefined" !== typeof __REACT_DEVTOOLS_GLOBAL_HOOK__ && "function" === typeof __REACT_DEVTOOLS_GLOBAL_HOOK__.registerInternalModuleStart && __REACT_DEVTOOLS_GLOBAL_HOOK__.registerInternalModuleStart(Error());
-        var React2 = require_react(), Internals = {
+        var React9 = require_react(), Internals = {
           d: {
             f: noop,
             r: function() {
@@ -1348,7 +1348,7 @@
           },
           p: 0,
           findDOMNode: null
-        }, REACT_PORTAL_TYPE = /* @__PURE__ */ Symbol.for("react.portal"), ReactSharedInternals = React2.__CLIENT_INTERNALS_DO_NOT_USE_OR_WARN_USERS_THEY_CANNOT_UPGRADE;
+        }, REACT_PORTAL_TYPE = /* @__PURE__ */ Symbol.for("react.portal"), ReactSharedInternals = React9.__CLIENT_INTERNALS_DO_NOT_USE_OR_WARN_USERS_THEY_CANNOT_UPGRADE;
         "function" === typeof Map && null != Map.prototype && "function" === typeof Map.prototype.forEach && "function" === typeof Set && null != Set.prototype && "function" === typeof Set.prototype.clear && "function" === typeof Set.prototype.forEach || console.error(
           "React depends on Map and Set built-in types. Make sure that you load a polyfill in older browsers. https://reactjs.org/link/react-polyfills"
         );
@@ -2883,7 +2883,7 @@
           "number" === type && getActiveElement(node.ownerDocument) === node || node.defaultValue === "" + value || (node.defaultValue = "" + value);
         }
         function validateOptionProps(element, props) {
-          null == props.value && ("object" === typeof props.children && null !== props.children ? React2.Children.forEach(props.children, function(child) {
+          null == props.value && ("object" === typeof props.children && null !== props.children ? React9.Children.forEach(props.children, function(child) {
             null == child || "string" === typeof child || "number" === typeof child || "bigint" === typeof child || didWarnInvalidChild || (didWarnInvalidChild = true, console.error(
               "Cannot infer the option value of complex children. Pass a `value` prop or use a plain string as children to <option>."
             ));
@@ -18515,14 +18515,14 @@
           ));
         }
         "undefined" !== typeof __REACT_DEVTOOLS_GLOBAL_HOOK__ && "function" === typeof __REACT_DEVTOOLS_GLOBAL_HOOK__.registerInternalModuleStart && __REACT_DEVTOOLS_GLOBAL_HOOK__.registerInternalModuleStart(Error());
-        var Scheduler = require_scheduler(), React2 = require_react(), ReactDOM = require_react_dom(), assign = Object.assign, REACT_LEGACY_ELEMENT_TYPE = /* @__PURE__ */ Symbol.for("react.element"), REACT_ELEMENT_TYPE = /* @__PURE__ */ Symbol.for("react.transitional.element"), REACT_PORTAL_TYPE = /* @__PURE__ */ Symbol.for("react.portal"), REACT_FRAGMENT_TYPE = /* @__PURE__ */ Symbol.for("react.fragment"), REACT_STRICT_MODE_TYPE = /* @__PURE__ */ Symbol.for("react.strict_mode"), REACT_PROFILER_TYPE = /* @__PURE__ */ Symbol.for("react.profiler"), REACT_CONSUMER_TYPE = /* @__PURE__ */ Symbol.for("react.consumer"), REACT_CONTEXT_TYPE = /* @__PURE__ */ Symbol.for("react.context"), REACT_FORWARD_REF_TYPE = /* @__PURE__ */ Symbol.for("react.forward_ref"), REACT_SUSPENSE_TYPE = /* @__PURE__ */ Symbol.for("react.suspense"), REACT_SUSPENSE_LIST_TYPE = /* @__PURE__ */ Symbol.for("react.suspense_list"), REACT_MEMO_TYPE = /* @__PURE__ */ Symbol.for("react.memo"), REACT_LAZY_TYPE = /* @__PURE__ */ Symbol.for("react.lazy");
+        var Scheduler = require_scheduler(), React9 = require_react(), ReactDOM = require_react_dom(), assign = Object.assign, REACT_LEGACY_ELEMENT_TYPE = /* @__PURE__ */ Symbol.for("react.element"), REACT_ELEMENT_TYPE = /* @__PURE__ */ Symbol.for("react.transitional.element"), REACT_PORTAL_TYPE = /* @__PURE__ */ Symbol.for("react.portal"), REACT_FRAGMENT_TYPE = /* @__PURE__ */ Symbol.for("react.fragment"), REACT_STRICT_MODE_TYPE = /* @__PURE__ */ Symbol.for("react.strict_mode"), REACT_PROFILER_TYPE = /* @__PURE__ */ Symbol.for("react.profiler"), REACT_CONSUMER_TYPE = /* @__PURE__ */ Symbol.for("react.consumer"), REACT_CONTEXT_TYPE = /* @__PURE__ */ Symbol.for("react.context"), REACT_FORWARD_REF_TYPE = /* @__PURE__ */ Symbol.for("react.forward_ref"), REACT_SUSPENSE_TYPE = /* @__PURE__ */ Symbol.for("react.suspense"), REACT_SUSPENSE_LIST_TYPE = /* @__PURE__ */ Symbol.for("react.suspense_list"), REACT_MEMO_TYPE = /* @__PURE__ */ Symbol.for("react.memo"), REACT_LAZY_TYPE = /* @__PURE__ */ Symbol.for("react.lazy");
         /* @__PURE__ */ Symbol.for("react.scope");
         var REACT_ACTIVITY_TYPE = /* @__PURE__ */ Symbol.for("react.activity");
         /* @__PURE__ */ Symbol.for("react.legacy_hidden");
         /* @__PURE__ */ Symbol.for("react.tracing_marker");
         var REACT_MEMO_CACHE_SENTINEL = /* @__PURE__ */ Symbol.for("react.memo_cache_sentinel");
         /* @__PURE__ */ Symbol.for("react.view_transition");
-        var MAYBE_ITERATOR_SYMBOL = Symbol.iterator, REACT_CLIENT_REFERENCE = /* @__PURE__ */ Symbol.for("react.client.reference"), isArrayImpl = Array.isArray, ReactSharedInternals = React2.__CLIENT_INTERNALS_DO_NOT_USE_OR_WARN_USERS_THEY_CANNOT_UPGRADE, ReactDOMSharedInternals = ReactDOM.__DOM_INTERNALS_DO_NOT_USE_OR_WARN_USERS_THEY_CANNOT_UPGRADE, NotPending = Object.freeze({
+        var MAYBE_ITERATOR_SYMBOL = Symbol.iterator, REACT_CLIENT_REFERENCE = /* @__PURE__ */ Symbol.for("react.client.reference"), isArrayImpl = Array.isArray, ReactSharedInternals = React9.__CLIENT_INTERNALS_DO_NOT_USE_OR_WARN_USERS_THEY_CANNOT_UPGRADE, ReactDOMSharedInternals = ReactDOM.__DOM_INTERNALS_DO_NOT_USE_OR_WARN_USERS_THEY_CANNOT_UPGRADE, NotPending = Object.freeze({
           pending: false,
           data: null,
           method: null,
@@ -21310,7 +21310,7 @@
           }
         };
         (function() {
-          var isomorphicReactPackageVersion = React2.version;
+          var isomorphicReactPackageVersion = React9.version;
           if ("19.2.5" !== isomorphicReactPackageVersion)
             throw Error(
               'Incompatible React versions: The "react" and "react-dom" packages must have the exact same version. Instead got:\n  - react:      ' + (isomorphicReactPackageVersion + "\n  - react-dom:  19.2.5\nLearn more: https://react.dev/warnings/version-mismatch")
@@ -21664,18 +21664,18 @@
         function isValidElement(object) {
           return "object" === typeof object && null !== object && object.$$typeof === REACT_ELEMENT_TYPE;
         }
-        var React2 = require_react(), REACT_ELEMENT_TYPE = /* @__PURE__ */ Symbol.for("react.transitional.element"), REACT_PORTAL_TYPE = /* @__PURE__ */ Symbol.for("react.portal"), REACT_FRAGMENT_TYPE = /* @__PURE__ */ Symbol.for("react.fragment"), REACT_STRICT_MODE_TYPE = /* @__PURE__ */ Symbol.for("react.strict_mode"), REACT_PROFILER_TYPE = /* @__PURE__ */ Symbol.for("react.profiler"), REACT_CONSUMER_TYPE = /* @__PURE__ */ Symbol.for("react.consumer"), REACT_CONTEXT_TYPE = /* @__PURE__ */ Symbol.for("react.context"), REACT_FORWARD_REF_TYPE = /* @__PURE__ */ Symbol.for("react.forward_ref"), REACT_SUSPENSE_TYPE = /* @__PURE__ */ Symbol.for("react.suspense"), REACT_SUSPENSE_LIST_TYPE = /* @__PURE__ */ Symbol.for("react.suspense_list"), REACT_MEMO_TYPE = /* @__PURE__ */ Symbol.for("react.memo"), REACT_LAZY_TYPE = /* @__PURE__ */ Symbol.for("react.lazy"), REACT_ACTIVITY_TYPE = /* @__PURE__ */ Symbol.for("react.activity"), REACT_CLIENT_REFERENCE = /* @__PURE__ */ Symbol.for("react.client.reference"), ReactSharedInternals = React2.__CLIENT_INTERNALS_DO_NOT_USE_OR_WARN_USERS_THEY_CANNOT_UPGRADE, hasOwnProperty = Object.prototype.hasOwnProperty, isArrayImpl = Array.isArray, createTask = console.createTask ? console.createTask : function() {
+        var React9 = require_react(), REACT_ELEMENT_TYPE = /* @__PURE__ */ Symbol.for("react.transitional.element"), REACT_PORTAL_TYPE = /* @__PURE__ */ Symbol.for("react.portal"), REACT_FRAGMENT_TYPE = /* @__PURE__ */ Symbol.for("react.fragment"), REACT_STRICT_MODE_TYPE = /* @__PURE__ */ Symbol.for("react.strict_mode"), REACT_PROFILER_TYPE = /* @__PURE__ */ Symbol.for("react.profiler"), REACT_CONSUMER_TYPE = /* @__PURE__ */ Symbol.for("react.consumer"), REACT_CONTEXT_TYPE = /* @__PURE__ */ Symbol.for("react.context"), REACT_FORWARD_REF_TYPE = /* @__PURE__ */ Symbol.for("react.forward_ref"), REACT_SUSPENSE_TYPE = /* @__PURE__ */ Symbol.for("react.suspense"), REACT_SUSPENSE_LIST_TYPE = /* @__PURE__ */ Symbol.for("react.suspense_list"), REACT_MEMO_TYPE = /* @__PURE__ */ Symbol.for("react.memo"), REACT_LAZY_TYPE = /* @__PURE__ */ Symbol.for("react.lazy"), REACT_ACTIVITY_TYPE = /* @__PURE__ */ Symbol.for("react.activity"), REACT_CLIENT_REFERENCE = /* @__PURE__ */ Symbol.for("react.client.reference"), ReactSharedInternals = React9.__CLIENT_INTERNALS_DO_NOT_USE_OR_WARN_USERS_THEY_CANNOT_UPGRADE, hasOwnProperty = Object.prototype.hasOwnProperty, isArrayImpl = Array.isArray, createTask = console.createTask ? console.createTask : function() {
           return null;
         };
-        React2 = {
+        React9 = {
           react_stack_bottom_frame: function(callStackForError) {
             return callStackForError();
           }
         };
         var specialPropKeyWarningShown;
         var didWarnAboutElementRef = {};
-        var unknownOwnerDebugStack = React2.react_stack_bottom_frame.bind(
-          React2,
+        var unknownOwnerDebugStack = React9.react_stack_bottom_frame.bind(
+          React9,
           UnknownOwner
         )();
         var unknownOwnerDebugTask = createTask(getTaskName(UnknownOwner));
@@ -21737,7 +21737,8 @@
     models: [],
     sessions: [],
     contextFiles: [],
-    tokenCount: void 0
+    tokenCount: void 0,
+    historyOpen: false
   };
   function chatReducer(state, action) {
     switch (action.type) {
@@ -21863,6 +21864,8 @@
           ...state,
           contextFiles: state.contextFiles.filter((f) => f.path !== action.path)
         };
+      case "TOGGLE_HISTORY":
+        return { ...state, historyOpen: !state.historyOpen };
       // ─── Init ───────────────────────────────────────
       case "INIT":
         return {
@@ -21890,6 +21893,11 @@
   // webview-ui/src/state/ChatProvider.tsx
   var import_jsx_runtime = __toESM(require_jsx_runtime());
   var ChatContext = (0, import_react.createContext)(null);
+  function useChatContext() {
+    const ctx = (0, import_react.useContext)(ChatContext);
+    if (!ctx) throw new Error("useChatContext must be used inside <ChatProvider>");
+    return ctx;
+  }
   var _toolIdCounter = 0;
   function ChatProvider({ children }) {
     const [state, dispatch] = (0, import_react.useReducer)(chatReducer, initialState);
@@ -22011,17 +22019,644 @@
     return /* @__PURE__ */ (0, import_jsx_runtime.jsx)(ChatContext.Provider, { value, children });
   }
 
-  // webview-ui/src/App.tsx
+  // webview-ui/src/components/ModelSelector.tsx
+  var import_react2 = __toESM(require_react());
   var import_jsx_runtime2 = __toESM(require_jsx_runtime());
+  function ModelSelector() {
+    const { state, selectModel } = useChatContext();
+    const [open, setOpen] = (0, import_react2.useState)(false);
+    const containerRef = (0, import_react2.useRef)(null);
+    (0, import_react2.useEffect)(() => {
+      function handleClickOutside(e) {
+        if (containerRef.current && !containerRef.current.contains(e.target)) {
+          setOpen(false);
+        }
+      }
+      if (open) {
+        document.addEventListener("mousedown", handleClickOutside);
+      }
+      return () => document.removeEventListener("mousedown", handleClickOutside);
+    }, [open]);
+    function handleSelect(model) {
+      selectModel(model);
+      setOpen(false);
+    }
+    const currentLabel = state.models.find((m) => m.model === state.currentModel)?.model ?? state.currentModel;
+    return /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("div", { className: "model-selector", ref: containerRef, children: [
+      /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)(
+        "button",
+        {
+          className: "model-selector-trigger",
+          onClick: () => setOpen(!open),
+          title: "Select model",
+          children: [
+            /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("span", { className: "model-selector-label", children: currentLabel }),
+            /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("span", { className: "model-selector-chevron", children: open ? "\u25B4" : "\u25BE" })
+          ]
+        }
+      ),
+      open && /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("div", { className: "model-dropdown", children: [
+        state.models.length === 0 && /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("div", { className: "model-item model-item-empty", children: "No models available" }),
+        state.models.map((m) => /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)(
+          "button",
+          {
+            className: `model-item${m.model === state.currentModel ? " active" : ""}`,
+            onClick: () => handleSelect(m.model),
+            children: [
+              /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("span", { children: m.model }),
+              m.is_default && /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("span", { className: "model-default-badge", children: "default" })
+            ]
+          },
+          m.model
+        ))
+      ] })
+    ] });
+  }
+
+  // webview-ui/src/components/Header.tsx
+  var import_jsx_runtime3 = __toESM(require_jsx_runtime());
+  function Header() {
+    const { dispatch, newConversation } = useChatContext();
+    return /* @__PURE__ */ (0, import_jsx_runtime3.jsxs)("header", { className: "header", children: [
+      /* @__PURE__ */ (0, import_jsx_runtime3.jsxs)("div", { className: "header-left", children: [
+        /* @__PURE__ */ (0, import_jsx_runtime3.jsx)(
+          "button",
+          {
+            className: "header-btn",
+            onClick: () => dispatch({ type: "TOGGLE_HISTORY" }),
+            title: "Toggle history",
+            children: /* @__PURE__ */ (0, import_jsx_runtime3.jsxs)("svg", { width: "16", height: "16", viewBox: "0 0 16 16", fill: "currentColor", children: [
+              /* @__PURE__ */ (0, import_jsx_runtime3.jsx)("rect", { x: "2", y: "3", width: "12", height: "1.5", rx: "0.5" }),
+              /* @__PURE__ */ (0, import_jsx_runtime3.jsx)("rect", { x: "2", y: "7.25", width: "12", height: "1.5", rx: "0.5" }),
+              /* @__PURE__ */ (0, import_jsx_runtime3.jsx)("rect", { x: "2", y: "11.5", width: "12", height: "1.5", rx: "0.5" })
+            ] })
+          }
+        ),
+        /* @__PURE__ */ (0, import_jsx_runtime3.jsx)("span", { className: "header-title", children: "AtomCode" })
+      ] }),
+      /* @__PURE__ */ (0, import_jsx_runtime3.jsx)("div", { className: "header-center", children: /* @__PURE__ */ (0, import_jsx_runtime3.jsx)(ModelSelector, {}) }),
+      /* @__PURE__ */ (0, import_jsx_runtime3.jsxs)("div", { className: "header-actions", children: [
+        /* @__PURE__ */ (0, import_jsx_runtime3.jsx)(
+          "button",
+          {
+            className: "header-btn",
+            onClick: () => newConversation(),
+            title: "New conversation",
+            children: /* @__PURE__ */ (0, import_jsx_runtime3.jsx)("svg", { width: "16", height: "16", viewBox: "0 0 16 16", fill: "currentColor", children: /* @__PURE__ */ (0, import_jsx_runtime3.jsx)("path", { d: "M8 1.5a.75.75 0 01.75.75v5h5a.75.75 0 010 1.5h-5v5a.75.75 0 01-1.5 0v-5h-5a.75.75 0 010-1.5h5v-5A.75.75 0 018 1.5z" }) })
+          }
+        ),
+        /* @__PURE__ */ (0, import_jsx_runtime3.jsx)(
+          "button",
+          {
+            className: "header-btn",
+            onClick: () => postMessage({ type: "openSettings" }),
+            title: "Settings",
+            children: /* @__PURE__ */ (0, import_jsx_runtime3.jsx)("svg", { width: "16", height: "16", viewBox: "0 0 16 16", fill: "currentColor", children: /* @__PURE__ */ (0, import_jsx_runtime3.jsx)("path", { d: "M9.1 4.4L8.6 2H7.4l-.5 2.4-.7.3-2-1.3-.9.8 1.3 2-.3.7L2 7.4v1.2l2.4.5.3.7-1.3 2 .8.9 2-1.3.7.3.5 2.4h1.2l.5-2.4.7-.3 2 1.3.9-.8-1.3-2 .3-.7L14 8.6V7.4l-2.4-.5-.3-.7 1.3-2-.8-.9-2 1.3-.7-.3zM8 10a2 2 0 110-4 2 2 0 010 4z" }) })
+          }
+        ),
+        /* @__PURE__ */ (0, import_jsx_runtime3.jsx)(
+          "button",
+          {
+            className: "header-btn",
+            onClick: () => postMessage({ type: "popout" }),
+            title: "Open in editor",
+            children: /* @__PURE__ */ (0, import_jsx_runtime3.jsx)("svg", { width: "16", height: "16", viewBox: "0 0 16 16", fill: "currentColor", children: /* @__PURE__ */ (0, import_jsx_runtime3.jsx)("path", { d: "M2 3.5A1.5 1.5 0 013.5 2H6v1.5H3.5v9h9V10H14v2.5a1.5 1.5 0 01-1.5 1.5h-9A1.5 1.5 0 012 12.5v-9zM9 2h5v5h-1.5V4.06L7.28 9.28 6.22 8.22 11.44 3H9V2z" }) })
+          }
+        )
+      ] })
+    ] });
+  }
+
+  // webview-ui/src/components/WelcomeScreen.tsx
+  var import_jsx_runtime4 = __toESM(require_jsx_runtime());
+  var quickActions = [
+    { id: "explain", label: "Explain Code", icon: "\u{1F4A1}" },
+    { id: "fix", label: "Fix Issues", icon: "\u{1F527}" },
+    { id: "test", label: "Write Tests", icon: "\u{1F9EA}" },
+    { id: "refactor", label: "Refactor", icon: "\u267B\uFE0F" },
+    { id: "docs", label: "Add Docs", icon: "\u{1F4DD}" },
+    { id: "review", label: "Code Review", icon: "\u{1F50D}" }
+  ];
+  function WelcomeScreen() {
+    function handleAction(action) {
+      postMessage({ type: "quickAction", action });
+    }
+    return /* @__PURE__ */ (0, import_jsx_runtime4.jsx)("div", { className: "welcome-screen", children: /* @__PURE__ */ (0, import_jsx_runtime4.jsxs)("div", { className: "welcome-content", children: [
+      /* @__PURE__ */ (0, import_jsx_runtime4.jsx)("h1", { className: "welcome-title", children: "AtomCode" }),
+      /* @__PURE__ */ (0, import_jsx_runtime4.jsx)("p", { className: "welcome-subtitle", children: "AI-powered coding assistant" }),
+      /* @__PURE__ */ (0, import_jsx_runtime4.jsx)("div", { className: "quick-actions", children: quickActions.map((a) => /* @__PURE__ */ (0, import_jsx_runtime4.jsxs)(
+        "button",
+        {
+          className: "quick-action-card",
+          onClick: () => handleAction(a.id),
+          children: [
+            /* @__PURE__ */ (0, import_jsx_runtime4.jsx)("span", { className: "quick-action-icon", children: a.icon }),
+            /* @__PURE__ */ (0, import_jsx_runtime4.jsx)("span", { className: "quick-action-label", children: a.label })
+          ]
+        },
+        a.id
+      )) })
+    ] }) });
+  }
+
+  // webview-ui/src/components/MessageList.tsx
+  var import_react5 = __toESM(require_react());
+
+  // webview-ui/src/components/UserMessage.tsx
+  var import_jsx_runtime5 = __toESM(require_jsx_runtime());
+  function UserMessage({ message }) {
+    return /* @__PURE__ */ (0, import_jsx_runtime5.jsxs)("div", { className: "message user-message", children: [
+      /* @__PURE__ */ (0, import_jsx_runtime5.jsx)("div", { className: "message-role", children: "You" }),
+      /* @__PURE__ */ (0, import_jsx_runtime5.jsx)("div", { className: "message-text", children: message.text })
+    ] });
+  }
+
+  // webview-ui/src/components/Markdown.tsx
+  var import_react3 = __toESM(require_react());
+
+  // webview-ui/src/utils/format.ts
+  function formatTokenCount(total) {
+    if (total < 1e3) return `${total} tokens`;
+    return `${(total / 1e3).toFixed(1)}k tokens`;
+  }
+  function formatTimeAgo(dateStr) {
+    if (!dateStr) return "";
+    const diff = Date.now() - new Date(dateStr).getTime();
+    const mins = Math.floor(diff / 6e4);
+    if (mins < 1) return "just now";
+    if (mins < 60) return `${mins}m ago`;
+    const hours = Math.floor(mins / 60);
+    if (hours < 24) return `${hours}h ago`;
+    const days = Math.floor(hours / 24);
+    return `${days}d ago`;
+  }
+  function escapeHtml(text) {
+    return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+  }
+  function groupSessionsByDate(sessions) {
+    const groups = {};
+    const now = Date.now();
+    const oneDay = 864e5;
+    sessions.forEach((s) => {
+      const ts = new Date(s.updated_at ?? s.created_at ?? now).getTime();
+      const diff = now - ts;
+      let label;
+      if (diff < oneDay) label = "Today";
+      else if (diff < 2 * oneDay) label = "Yesterday";
+      else if (diff < 7 * oneDay) label = "This Week";
+      else label = "Older";
+      if (!groups[label]) groups[label] = [];
+      groups[label].push(s);
+    });
+    return groups;
+  }
+  function getToolIcon(name) {
+    const icons = {
+      read_file: "\u{1F4C4}",
+      write_file: "\u270D\uFE0F",
+      edit_file: "\u270D\uFE0F",
+      bash: "\u{1F4BB}",
+      grep: "\u{1F50D}",
+      list_dir: "\u{1F4C1}",
+      search: "\u{1F50D}"
+    };
+    return icons[name] ?? "\u{1F527}";
+  }
+  function formatToolArgs(name, argsJson) {
+    try {
+      const args = JSON.parse(argsJson);
+      if (name === "read_file" || name === "write_file" || name === "edit_file") {
+        return args.file_path ?? args.path ?? "";
+      }
+      if (name === "bash") return (args.command ?? "").substring(0, 80);
+      if (name === "grep") return `${args.pattern ?? ""} in ${args.path ?? "."}`;
+      if (name === "list_dir") return args.path ?? ".";
+      return "";
+    } catch {
+      return "";
+    }
+  }
+
+  // webview-ui/src/utils/markdown.ts
+  function renderMarkdown(text) {
+    if (!text) return "";
+    const segments = [];
+    const codeBlockRegex = /```(\w*)\n([\s\S]*?)```/g;
+    let lastIndex = 0;
+    let match;
+    while ((match = codeBlockRegex.exec(text)) !== null) {
+      if (match.index > lastIndex) {
+        segments.push({ type: "text", content: text.slice(lastIndex, match.index) });
+      }
+      segments.push({ type: "code", lang: match[1], content: match[2] });
+      lastIndex = match.index + match[0].length;
+    }
+    if (lastIndex < text.length) {
+      segments.push({ type: "text", content: text.slice(lastIndex) });
+    }
+    return segments.map((seg) => seg.type === "code" ? renderCodeBlock(seg.lang ?? "", seg.content) : renderInlineMarkdown(seg.content)).join("");
+  }
+  function renderCodeBlock(lang, code) {
+    const langLabel = lang || "code";
+    const escapedCode = escapeHtml(code.replace(/\n$/, ""));
+    const id = `cb-${Math.random().toString(36).slice(2, 8)}`;
+    return `<div class="code-block-wrapper" data-code-id="${id}"><div class="code-block-header"><span class="code-block-lang">${escapeHtml(langLabel)}</span><div class="code-block-actions"><button class="code-action-btn" data-action="copy" title="Copy code">Copy</button><button class="code-action-btn" data-action="apply" title="Apply to file">Apply</button><button class="code-action-btn" data-action="insert" title="Insert at cursor">Insert</button></div></div><pre><code class="language-${escapeHtml(lang)}">${escapedCode}</code></pre></div>`;
+  }
+  function renderInlineMarkdown(text) {
+    let html = escapeHtml(text);
+    html = html.replace(/^#### (.+)$/gm, "<h4>$1</h4>");
+    html = html.replace(/^### (.+)$/gm, "<h3>$1</h3>");
+    html = html.replace(/^## (.+)$/gm, "<h2>$1</h2>");
+    html = html.replace(/^# (.+)$/gm, "<h1>$1</h1>");
+    html = html.replace(/^---$/gm, "<hr>");
+    html = html.replace(/^&gt; (.+)$/gm, "<blockquote>$1</blockquote>");
+    html = html.replace(/^[\s]*[-*] (.+)$/gm, "<li>$1</li>");
+    html = html.replace(/((?:<li>.*<\/li>\n?)+)/g, "<ul>$1</ul>");
+    html = html.replace(/^[\s]*\d+\. (.+)$/gm, "<li>$1</li>");
+    html = html.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+    html = html.replace(/\*([^*]+)\*/g, "<em>$1</em>");
+    html = html.replace(/`([^`]+)`/g, "<code>$1</code>");
+    html = html.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" title="$2">$1</a>');
+    html = html.replace(/\n\n/g, "</p><p>");
+    html = html.replace(/\n/g, "<br>");
+    if (html && !html.startsWith("<h") && !html.startsWith("<ul") && !html.startsWith("<ol") && !html.startsWith("<hr")) {
+      html = `<p>${html}</p>`;
+    }
+    return html;
+  }
+
+  // webview-ui/src/components/Markdown.tsx
+  var import_jsx_runtime6 = __toESM(require_jsx_runtime());
+  function Markdown({ content }) {
+    const containerRef = (0, import_react3.useRef)(null);
+    const handleCodeActions = (0, import_react3.useCallback)((e) => {
+      const target = e.target;
+      if (!target.classList.contains("code-action-btn")) return;
+      const action = target.dataset.action;
+      const wrapper = target.closest(".code-block-wrapper");
+      if (!wrapper) return;
+      const codeEl = wrapper.querySelector("pre code");
+      if (!codeEl) return;
+      const code = codeEl.textContent ?? "";
+      if (action === "copy") {
+        navigator.clipboard.writeText(code).then(() => {
+          target.textContent = "Copied!";
+          setTimeout(() => {
+            target.textContent = "Copy";
+          }, 2e3);
+        });
+      } else if (action === "apply") {
+        postMessage({ type: "applyCode", code });
+      } else if (action === "insert") {
+        postMessage({ type: "insertCode", code });
+      }
+    }, []);
+    (0, import_react3.useEffect)(() => {
+      const el = containerRef.current;
+      if (!el) return;
+      el.addEventListener("click", handleCodeActions);
+      return () => el.removeEventListener("click", handleCodeActions);
+    }, [handleCodeActions]);
+    const html = renderMarkdown(content);
+    return /* @__PURE__ */ (0, import_jsx_runtime6.jsx)(
+      "div",
+      {
+        ref: containerRef,
+        className: "markdown-body",
+        dangerouslySetInnerHTML: { __html: html }
+      }
+    );
+  }
+
+  // webview-ui/src/components/ToolCall.tsx
+  var import_react4 = __toESM(require_react());
+  var import_jsx_runtime7 = __toESM(require_jsx_runtime());
+  function ToolCall({ tool }) {
+    const [expanded, setExpanded] = (0, import_react4.useState)(false);
+    const icon = getToolIcon(tool.name);
+    const argsSummary = formatToolArgs(tool.name, tool.args);
+    const statusIcon = tool.status === "running" ? "\u27F3" : tool.status === "error" ? "\u2717" : "\u2713";
+    const statusClass = `tool-status tool-status-${tool.status}`;
+    const duration = tool.durationMs !== void 0 ? `${(tool.durationMs / 1e3).toFixed(1)}s` : "";
+    return /* @__PURE__ */ (0, import_jsx_runtime7.jsxs)("div", { className: `tool-call${expanded ? " expanded" : ""}`, children: [
+      /* @__PURE__ */ (0, import_jsx_runtime7.jsxs)("button", { className: "tool-call-header", onClick: () => setExpanded(!expanded), children: [
+        /* @__PURE__ */ (0, import_jsx_runtime7.jsx)("span", { className: "tool-call-icon", children: icon }),
+        /* @__PURE__ */ (0, import_jsx_runtime7.jsx)("span", { className: "tool-call-name", children: tool.name }),
+        argsSummary && /* @__PURE__ */ (0, import_jsx_runtime7.jsx)("span", { className: "tool-call-args", children: argsSummary }),
+        /* @__PURE__ */ (0, import_jsx_runtime7.jsx)("span", { className: "tool-call-spacer" }),
+        duration && /* @__PURE__ */ (0, import_jsx_runtime7.jsx)("span", { className: "tool-call-duration", children: duration }),
+        /* @__PURE__ */ (0, import_jsx_runtime7.jsx)("span", { className: statusClass, children: statusIcon }),
+        /* @__PURE__ */ (0, import_jsx_runtime7.jsx)("span", { className: "tool-call-chevron", children: expanded ? "\u25B4" : "\u25BE" })
+      ] }),
+      expanded && /* @__PURE__ */ (0, import_jsx_runtime7.jsx)("div", { className: "tool-call-body", children: /* @__PURE__ */ (0, import_jsx_runtime7.jsx)("pre", { className: "tool-call-output", children: tool.output ?? "No output yet..." }) })
+    ] });
+  }
+
+  // webview-ui/src/components/AssistantMessage.tsx
+  var import_jsx_runtime8 = __toESM(require_jsx_runtime());
+  function AssistantMessage({ message }) {
+    return /* @__PURE__ */ (0, import_jsx_runtime8.jsxs)("div", { className: "message assistant-message", children: [
+      /* @__PURE__ */ (0, import_jsx_runtime8.jsx)("div", { className: "message-role", children: "AtomCode" }),
+      message.text && /* @__PURE__ */ (0, import_jsx_runtime8.jsx)(Markdown, { content: message.text }),
+      message.streaming && !message.text && /* @__PURE__ */ (0, import_jsx_runtime8.jsx)("span", { className: "streaming-cursor" }),
+      message.toolCalls && message.toolCalls.length > 0 && /* @__PURE__ */ (0, import_jsx_runtime8.jsx)("div", { className: "tool-calls-list", children: message.toolCalls.map((tool) => /* @__PURE__ */ (0, import_jsx_runtime8.jsx)(ToolCall, { tool }, tool.id)) }),
+      message.streaming && message.text && /* @__PURE__ */ (0, import_jsx_runtime8.jsx)("span", { className: "streaming-cursor" })
+    ] });
+  }
+
+  // webview-ui/src/components/MessageList.tsx
+  var import_jsx_runtime9 = __toESM(require_jsx_runtime());
+  function MessageList() {
+    const { state } = useChatContext();
+    const bottomRef = (0, import_react5.useRef)(null);
+    (0, import_react5.useEffect)(() => {
+      bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+    }, [state.messages, state.isGenerating]);
+    return /* @__PURE__ */ (0, import_jsx_runtime9.jsxs)("div", { className: "message-list", children: [
+      state.messages.map((msg) => {
+        if (msg.role === "user") {
+          return /* @__PURE__ */ (0, import_jsx_runtime9.jsx)(UserMessage, { message: msg }, msg.id);
+        }
+        if (msg.role === "assistant") {
+          return /* @__PURE__ */ (0, import_jsx_runtime9.jsx)(AssistantMessage, { message: msg }, msg.id);
+        }
+        if (msg.role === "error") {
+          return /* @__PURE__ */ (0, import_jsx_runtime9.jsxs)("div", { className: "message error-message", children: [
+            /* @__PURE__ */ (0, import_jsx_runtime9.jsx)("div", { className: "message-role", children: "Error" }),
+            /* @__PURE__ */ (0, import_jsx_runtime9.jsx)("div", { className: "message-text", children: msg.text })
+          ] }, msg.id);
+        }
+        return null;
+      }),
+      /* @__PURE__ */ (0, import_jsx_runtime9.jsx)("div", { ref: bottomRef })
+    ] });
+  }
+
+  // webview-ui/src/components/InputArea.tsx
+  var import_react7 = __toESM(require_react());
+
+  // webview-ui/src/components/SlashPicker.tsx
+  var import_react6 = __toESM(require_react());
+  var import_jsx_runtime10 = __toESM(require_jsx_runtime());
+  var slashCommands = [
+    { name: "explain", label: "/explain", description: "Explain selected code" },
+    { name: "fix", label: "/fix", description: "Fix issues in code" },
+    { name: "test", label: "/test", description: "Write tests" },
+    { name: "refactor", label: "/refactor", description: "Refactor code" },
+    { name: "docs", label: "/docs", description: "Add documentation" },
+    { name: "review", label: "/review", description: "Review code" },
+    { name: "optimize", label: "/optimize", description: "Optimize performance" }
+  ];
+  function SlashPicker({ filter, onSelect, onClose }) {
+    const [activeIndex, setActiveIndex] = (0, import_react6.useState)(0);
+    const filtered = slashCommands.filter(
+      (cmd) => cmd.name.startsWith(filter.toLowerCase())
+    );
+    (0, import_react6.useEffect)(() => {
+      setActiveIndex(0);
+    }, [filter]);
+    const handleKeyDown = (0, import_react6.useCallback)(
+      (e) => {
+        if (filtered.length === 0) return;
+        if (e.key === "ArrowDown") {
+          e.preventDefault();
+          setActiveIndex((i) => (i + 1) % filtered.length);
+        } else if (e.key === "ArrowUp") {
+          e.preventDefault();
+          setActiveIndex((i) => (i - 1 + filtered.length) % filtered.length);
+        } else if (e.key === "Enter" || e.key === "Tab") {
+          e.preventDefault();
+          onSelect(filtered[activeIndex].label);
+        } else if (e.key === "Escape") {
+          e.preventDefault();
+          onClose();
+        }
+      },
+      [filtered, activeIndex, onSelect, onClose]
+    );
+    (0, import_react6.useEffect)(() => {
+      document.addEventListener("keydown", handleKeyDown);
+      return () => document.removeEventListener("keydown", handleKeyDown);
+    }, [handleKeyDown]);
+    if (filtered.length === 0) return null;
+    return /* @__PURE__ */ (0, import_jsx_runtime10.jsx)("div", { className: "slash-picker", children: filtered.map((cmd, i) => /* @__PURE__ */ (0, import_jsx_runtime10.jsxs)(
+      "button",
+      {
+        className: `slash-item${i === activeIndex ? " active" : ""}`,
+        onMouseEnter: () => setActiveIndex(i),
+        onClick: () => onSelect(cmd.label),
+        children: [
+          /* @__PURE__ */ (0, import_jsx_runtime10.jsx)("span", { className: "slash-item-label", children: cmd.label }),
+          /* @__PURE__ */ (0, import_jsx_runtime10.jsx)("span", { className: "slash-item-desc", children: cmd.description })
+        ]
+      },
+      cmd.name
+    )) });
+  }
+
+  // webview-ui/src/components/InputArea.tsx
+  var import_jsx_runtime11 = __toESM(require_jsx_runtime());
+  function InputArea() {
+    const { state, send, stop, dispatch } = useChatContext();
+    const [text, setText] = (0, import_react7.useState)("");
+    const [showSlash, setShowSlash] = (0, import_react7.useState)(false);
+    const [slashFilter, setSlashFilter] = (0, import_react7.useState)("");
+    const textareaRef = (0, import_react7.useRef)(null);
+    (0, import_react7.useEffect)(() => {
+      const el = textareaRef.current;
+      if (!el) return;
+      el.style.height = "auto";
+      el.style.height = `${Math.min(el.scrollHeight, 200)}px`;
+    }, [text]);
+    (0, import_react7.useEffect)(() => {
+      function handleMessage(e) {
+        if (e.data?.type === "focusInput") {
+          textareaRef.current?.focus();
+        }
+      }
+      window.addEventListener("message", handleMessage);
+      return () => window.removeEventListener("message", handleMessage);
+    }, []);
+    const handleChange = (0, import_react7.useCallback)((e) => {
+      const val = e.target.value;
+      setText(val);
+      if (val.startsWith("/")) {
+        const afterSlash = val.slice(1).split(/\s/)[0];
+        setSlashFilter(afterSlash);
+        setShowSlash(true);
+      } else {
+        setShowSlash(false);
+      }
+    }, []);
+    const handleSend = (0, import_react7.useCallback)(() => {
+      const trimmed = text.trim();
+      if (!trimmed || state.isGenerating) return;
+      send(trimmed);
+      setText("");
+      setShowSlash(false);
+    }, [text, state.isGenerating, send]);
+    const handleKeyDown = (0, import_react7.useCallback)(
+      (e) => {
+        if (showSlash) return;
+        if (e.key === "Enter" && !e.shiftKey) {
+          e.preventDefault();
+          handleSend();
+        }
+      },
+      [handleSend, showSlash]
+    );
+    const handleSlashSelect = (0, import_react7.useCallback)((command) => {
+      setText(command + " ");
+      setShowSlash(false);
+      textareaRef.current?.focus();
+    }, []);
+    const handleSlashClose = (0, import_react7.useCallback)(() => {
+      setShowSlash(false);
+    }, []);
+    const handleRemoveContext = (0, import_react7.useCallback)(
+      (path) => {
+        dispatch({ type: "REMOVE_CONTEXT_FILE", path });
+      },
+      [dispatch]
+    );
+    const handleAttach = (0, import_react7.useCallback)(() => {
+      postMessage({ type: "attachFile" });
+    }, []);
+    return /* @__PURE__ */ (0, import_jsx_runtime11.jsxs)("div", { className: "input-area", children: [
+      state.contextFiles.length > 0 && /* @__PURE__ */ (0, import_jsx_runtime11.jsx)("div", { className: "context-tags", children: state.contextFiles.map((f) => /* @__PURE__ */ (0, import_jsx_runtime11.jsxs)("span", { className: "context-tag", title: f.path, children: [
+        /* @__PURE__ */ (0, import_jsx_runtime11.jsx)("span", { className: "context-tag-icon", children: f.type === "selection" ? "\u{1F4CB}" : "\u{1F4C4}" }),
+        /* @__PURE__ */ (0, import_jsx_runtime11.jsx)("span", { className: "context-tag-name", children: f.fileName }),
+        /* @__PURE__ */ (0, import_jsx_runtime11.jsx)(
+          "button",
+          {
+            className: "context-tag-close",
+            onClick: () => handleRemoveContext(f.path),
+            title: "Remove",
+            children: "\xD7"
+          }
+        )
+      ] }, f.path)) }),
+      /* @__PURE__ */ (0, import_jsx_runtime11.jsxs)("div", { className: "input-wrapper", children: [
+        showSlash && /* @__PURE__ */ (0, import_jsx_runtime11.jsx)(
+          SlashPicker,
+          {
+            filter: slashFilter,
+            onSelect: handleSlashSelect,
+            onClose: handleSlashClose
+          }
+        ),
+        /* @__PURE__ */ (0, import_jsx_runtime11.jsx)(
+          "textarea",
+          {
+            ref: textareaRef,
+            className: "input-textarea",
+            value: text,
+            onChange: handleChange,
+            onKeyDown: handleKeyDown,
+            placeholder: "Ask AtomCode...",
+            rows: 1,
+            disabled: state.isGenerating
+          }
+        ),
+        /* @__PURE__ */ (0, import_jsx_runtime11.jsx)("div", { className: "input-buttons", children: state.isGenerating ? /* @__PURE__ */ (0, import_jsx_runtime11.jsx)("button", { className: "btn-stop", onClick: stop, title: "Stop generation", children: /* @__PURE__ */ (0, import_jsx_runtime11.jsx)("svg", { width: "14", height: "14", viewBox: "0 0 14 14", fill: "currentColor", children: /* @__PURE__ */ (0, import_jsx_runtime11.jsx)("rect", { x: "2", y: "2", width: "10", height: "10", rx: "1.5" }) }) }) : /* @__PURE__ */ (0, import_jsx_runtime11.jsx)(
+          "button",
+          {
+            className: "btn-send",
+            onClick: handleSend,
+            disabled: !text.trim(),
+            title: "Send message",
+            children: /* @__PURE__ */ (0, import_jsx_runtime11.jsx)("svg", { width: "14", height: "14", viewBox: "0 0 14 14", fill: "currentColor", children: /* @__PURE__ */ (0, import_jsx_runtime11.jsx)("path", { d: "M1.5 1.2L13 7 1.5 12.8V8.3L9 7 1.5 5.7V1.2z" }) })
+          }
+        ) })
+      ] }),
+      /* @__PURE__ */ (0, import_jsx_runtime11.jsxs)("div", { className: "input-footer", children: [
+        /* @__PURE__ */ (0, import_jsx_runtime11.jsxs)("button", { className: "footer-attach-btn", onClick: handleAttach, title: "Attach file", children: [
+          /* @__PURE__ */ (0, import_jsx_runtime11.jsx)("svg", { width: "14", height: "14", viewBox: "0 0 16 16", fill: "currentColor", children: /* @__PURE__ */ (0, import_jsx_runtime11.jsx)("path", { d: "M11.5 1A3.5 3.5 0 0115 4.5v6a4.5 4.5 0 01-9 0V4a2 2 0 114 0v6.5a.5.5 0 01-1 0V4H7.5v6.5a2 2 0 004 0V4.5a2 2 0 00-4 0v6a3 3 0 006 0v-6A3.5 3.5 0 0011.5 1z" }) }),
+          /* @__PURE__ */ (0, import_jsx_runtime11.jsx)("span", { children: "Attach" })
+        ] }),
+        /* @__PURE__ */ (0, import_jsx_runtime11.jsx)("span", { className: "footer-hint", children: "Enter \u21B5 Send" }),
+        state.tokenCount && /* @__PURE__ */ (0, import_jsx_runtime11.jsx)("span", { className: "footer-tokens", children: formatTokenCount(state.tokenCount.total) })
+      ] })
+    ] });
+  }
+
+  // webview-ui/src/components/SessionList.tsx
+  var import_react8 = __toESM(require_react());
+  var import_jsx_runtime12 = __toESM(require_jsx_runtime());
+  var DATE_ORDER = ["Today", "Yesterday", "This Week", "Older"];
+  function SessionList() {
+    const { state, dispatch, loadSession } = useChatContext();
+    const [search, setSearch] = (0, import_react8.useState)("");
+    const filteredSessions = (0, import_react8.useMemo)(() => {
+      if (!search.trim()) return state.sessions;
+      const q = search.toLowerCase();
+      return state.sessions.filter(
+        (s) => (s.name ?? "").toLowerCase().includes(q) || (s.title ?? "").toLowerCase().includes(q)
+      );
+    }, [state.sessions, search]);
+    const groups = (0, import_react8.useMemo)(() => groupSessionsByDate(filteredSessions), [filteredSessions]);
+    function handleSelect(sessionId) {
+      loadSession(sessionId);
+      dispatch({ type: "TOGGLE_HISTORY" });
+    }
+    return /* @__PURE__ */ (0, import_jsx_runtime12.jsx)("div", { className: "session-overlay", onClick: () => dispatch({ type: "TOGGLE_HISTORY" }), children: /* @__PURE__ */ (0, import_jsx_runtime12.jsxs)("div", { className: "session-list", onClick: (e) => e.stopPropagation(), children: [
+      /* @__PURE__ */ (0, import_jsx_runtime12.jsxs)("div", { className: "session-list-header", children: [
+        /* @__PURE__ */ (0, import_jsx_runtime12.jsx)("h3", { children: "History" }),
+        /* @__PURE__ */ (0, import_jsx_runtime12.jsx)(
+          "input",
+          {
+            className: "session-search",
+            type: "text",
+            placeholder: "Search sessions...",
+            value: search,
+            onChange: (e) => setSearch(e.target.value),
+            autoFocus: true
+          }
+        )
+      ] }),
+      /* @__PURE__ */ (0, import_jsx_runtime12.jsx)("div", { className: "session-list-body", children: filteredSessions.length === 0 ? /* @__PURE__ */ (0, import_jsx_runtime12.jsx)("div", { className: "session-empty", children: "No sessions yet" }) : DATE_ORDER.map((label) => {
+        const items = groups[label];
+        if (!items || items.length === 0) return null;
+        return /* @__PURE__ */ (0, import_jsx_runtime12.jsxs)("div", { children: [
+          /* @__PURE__ */ (0, import_jsx_runtime12.jsx)("div", { className: "session-group-label", children: label }),
+          items.map((s) => /* @__PURE__ */ (0, import_jsx_runtime12.jsxs)(
+            "button",
+            {
+              className: "session-item",
+              onClick: () => handleSelect(s.id),
+              children: [
+                /* @__PURE__ */ (0, import_jsx_runtime12.jsx)("span", { className: "session-item-name", children: s.name || s.title || "Untitled" }),
+                /* @__PURE__ */ (0, import_jsx_runtime12.jsx)("span", { className: "session-item-time", children: formatTimeAgo(s.updated_at ?? s.created_at) })
+              ]
+            },
+            s.id
+          ))
+        ] }, label);
+      }) })
+    ] }) });
+  }
+
+  // webview-ui/src/App.tsx
+  var import_jsx_runtime13 = __toESM(require_jsx_runtime());
+  function ChatApp() {
+    const { state } = useChatContext();
+    const hasMessages = state.messages.length > 0 || state.isGenerating;
+    return /* @__PURE__ */ (0, import_jsx_runtime13.jsxs)("div", { className: "app", children: [
+      /* @__PURE__ */ (0, import_jsx_runtime13.jsx)(Header, {}),
+      state.historyOpen && /* @__PURE__ */ (0, import_jsx_runtime13.jsx)(SessionList, {}),
+      /* @__PURE__ */ (0, import_jsx_runtime13.jsx)("div", { className: "main-content", children: hasMessages ? /* @__PURE__ */ (0, import_jsx_runtime13.jsx)(MessageList, {}) : /* @__PURE__ */ (0, import_jsx_runtime13.jsx)(WelcomeScreen, {}) }),
+      /* @__PURE__ */ (0, import_jsx_runtime13.jsx)(InputArea, {})
+    ] });
+  }
   function App() {
-    return /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(ChatProvider, { children: /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("div", { className: "app", children: "AtomCode React Webview Loading..." }) });
+    return /* @__PURE__ */ (0, import_jsx_runtime13.jsx)(ChatProvider, { children: /* @__PURE__ */ (0, import_jsx_runtime13.jsx)(ChatApp, {}) });
   }
 
   // webview-ui/src/index.tsx
-  var import_jsx_runtime3 = __toESM(require_jsx_runtime());
+  var import_jsx_runtime14 = __toESM(require_jsx_runtime());
   var root = document.getElementById("root");
   if (root) {
-    (0, import_client.createRoot)(root).render(/* @__PURE__ */ (0, import_jsx_runtime3.jsx)(App, {}));
+    (0, import_client.createRoot)(root).render(/* @__PURE__ */ (0, import_jsx_runtime14.jsx)(App, {}));
   }
 })();
 /*! Bundled license information:

@@ -58,6 +58,7 @@ export interface ChatState {
   sessions: SessionMeta[];
   contextFiles: ContextFile[];
   tokenCount?: { prompt: number; completion: number; total: number };
+  historyOpen: boolean;
 }
 
 // ─── Actions dispatched by the reducer ──────────────────────────
@@ -78,6 +79,7 @@ export type ChatAction =
   | { type: 'SET_SESSIONS'; sessions: SessionMeta[] }
   | { type: 'ADD_CONTEXT_FILE'; file: ContextFile }
   | { type: 'REMOVE_CONTEXT_FILE'; path: string }
+  | { type: 'TOGGLE_HISTORY' }
   | { type: 'INIT'; generating: boolean; currentModel?: string };
 
 // ─── Messages from the VS Code extension host ──────────────────
