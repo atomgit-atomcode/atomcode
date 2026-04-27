@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="zh-CN" class="scroll-smooth">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MCP 集成 · AtomCode 文档</title>
+  <link rel="icon" type="image/png" href="https://cdn-static.gitcode.host/static/images/logo-favicon.png">
+  <link rel="stylesheet" href="../dist.css">
+  <link rel="stylesheet" href="./docs.css">
+  <script>(function(){var t=localStorage.getItem('atomcode-theme')||'dark';document.documentElement.setAttribute('data-theme',t);})();</script>
+</head>
+<body class="antialiased">
+  <nav class="docs-nav fixed top-0 w-full z-50 border-b border-white/5">
+    <div class="max-w-7xl mx-auto px-4 md:px-6 h-14 md:h-16 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 md:gap-3">
+        <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode" class="w-7 h-7 md:w-8 md:h-8 rounded-lg">
+        <span class="text-base md:text-lg font-semibold tracking-tight">AtomCode</span>
+        <span class="text-xs text-slate-500 hidden sm:inline">· 使用指南</span>
+      </a>
+      <div class="flex items-center gap-2 md:gap-4">
+        <a href="../index.html" class="hidden md:inline text-sm text-slate-400 hover:text-brand-400 transition">← 返回首页</a>
+        <a href="https://atomgit.com/atomgit_atomcode/atomcode" target="_blank" class="hidden md:inline text-sm text-slate-400 hover:text-brand-400 transition">AtomGit 仓库</a>
+        <button onclick="toggleDocsTheme()" class="w-9 h-9 rounded-lg bg-white/5 hover:bg-white/10 transition flex items-center justify-center text-slate-300" title="切换主题"><span id="themeIcon">☼</span></button>
+        <button id="sidebarToggle" class="md:hidden w-9 h-9 rounded-lg bg-white/5 flex items-center justify-center text-slate-300" aria-label="目录">☰</button>
+      </div>
+    </div>
+  </nav>
+
+  <div class="max-w-7xl mx-auto px-4 md:px-6 pt-20 md:pt-24 pb-24 md:grid md:grid-cols-[220px_1fr] md:gap-10">
+    <aside id="docsSidebar" class="docs-sidebar md:sticky md:top-24 md:self-start mb-8 md:mb-0">
+      <div class="text-xs uppercase text-slate-500 font-semibold mb-3 tracking-wider">使用指南</div>
+      <div id="docsSearch"></div>
+      <nav class="flex flex-col gap-0.5">
+        <a href="./index.html">概览</a>
+        <a href="./getting-started.html">快速开始</a>
+        <a href="./configuration.html">配置文件</a>
+        <a href="./login.html">登录方式</a>
+        <a href="./basic-usage.html">基本使用</a>
+        <a href="./slash-commands.html">斜杠命令</a>
+        <a href="./keybindings.html">快捷键</a>
+        <a href="./tools.html">内置工具</a>
+        <a href="./sessions.html">会话与撤销</a>
+        <a href="./project-instructions.html">项目指令文件</a>
+        <a href="./skills.html">Skills 扩展</a>
+        <a href="./mcp.html" aria-current="page">MCP 集成</a>
+        <a href="./faq.html">常见问题</a>
+      </nav>
+    </aside>
+
+    <main class="prose-docs min-w-0">
+      <h1>MCP 集成</h1>
+      <p class="lede">MCP（Model Context Protocol）是一个开放协议,把外部程序或 HTTP 服务的「工具」接到 AtomCode,让模型像调用内置工具一样使用它们。从 v4.20.4 起 AtomCode 内置 MCP 客户端,直接复用 Cursor 等同样使用 <code>mcpServers</code> 配置块的生态。</p>
+
+      <h2>它能做什么</h2>
+      <ul>
+        <li>通过官方 MCP server 操作 GitHub、GitLab、Jira 等外部服务</li>
+        <li>接 Postgres / MySQL / DuckDB 等数据库</li>
+        <li>使用文件系统、Playwright 浏览器、Slack 消息等社区生态 server</li>
+        <li>把团队内部的领域工具暴露给模型,无需改 atomcode 源码</li>
+      </ul>
+
+      <h2>两个配置位置</h2>
+      <table>
+        <thead>
+          <tr><th>路径</th><th>作用域</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>&lt;项目根&gt;/.mcp.json</code></td><td>仅当前项目可见,适合跟代码同仓库</td></tr>
+          <tr><td><code>~/.atomcode/mcp.json</code></td><td>用户全局,跨所有项目共享</td></tr>
+        </tbody>
+      </table>
+      <p>两份可同时存在;<strong>同名 server 以项目级为准</strong>(覆盖用户级)。仓库根目录的 <code>.mcp.json.example</code> 自带 stdio 与 HTTP 双模板和详细注释,推荐从它开始改。</p>
+
+      <h2>配置 schema</h2>
+      <p>顶层键固定为 <code>mcpServers</code>(旧键 <code>servers</code> 仍兼容)。每个 server <strong>二选一</strong>:</p>
+      <ul>
+        <li><strong>stdio</strong>:<code>command</code>(必填)+ 可选 <code>args</code>、<code>env</code>、<code>timeout_ms</code>、<code>disabled</code></li>
+        <li><strong>HTTP</strong>:<code>url</code>(必填)+ 可选 <code>headers</code>、<code>timeout_ms</code>、<code>disabled</code></li>
+      </ul>
+      <p>字符串里支持 <code>${VAR}</code> 与 <code>${VAR:-默认值}</code> 的环境变量展开;敏感令牌不要写死,放到环境变量里。<code>disabled: true</code> 可临时关掉某个 server 而不删条目。</p>
+
+      <h3>stdio 示例(本地子进程)</h3>
+      <pre><code>{
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"],
+      "timeout_ms": 10000
+    }
+  }
+}</code></pre>
+
+      <h3>HTTP 示例(远程端点)</h3>
+      <pre><code>{
+  "mcpServers": {
+    "github": {
+      "url": "https://api.github.com/mcp/",
+      "headers": {
+        "Authorization": "Bearer ${GITHUB_TOKEN}"
+      },
+      "timeout_ms": 30000
+    }
+  }
+}</code></pre>
+
+      <h2>一行命令添加 stdio server</h2>
+      <p><code>atomcode mcp add</code> 自动把 stdio 配置写入 JSON,不用手动编辑:</p>
+      <pre><code># 写入项目根 .mcp.json(默认当前目录)
+atomcode mcp add playwright npx @playwright/mcp@latest
+
+# 写入用户全局 ~/.atomcode/mcp.json
+atomcode mcp add playwright npx @playwright/mcp@latest --global
+
+# 指定项目目录
+atomcode mcp add playwright npx @playwright/mcp@latest -C /path/to/repo</code></pre>
+      <p>第一个参数是 server 键名(将出现在工具名里),后面跟可执行文件 + 参数。</p>
+      <div class="callout callout-info">
+        <strong>注意</strong>
+        <p>同名会<strong>整段覆盖</strong>该 server(只保留 <code>command</code> / <code>args</code>,原来的 <code>env</code> 等字段会被清空)。HTTP 类型的 server 仍需手写 JSON。</p>
+      </div>
+
+      <h2>启动后会发生什么</h2>
+      <table>
+        <thead>
+          <tr><th>模式</th><th>连接行为</th><th>工具出现时机</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>TUI</td><td>后台并行连接,不阻塞界面</td><td>每个 server 连上后陆续注册,可能略晚于首屏</td></tr>
+          <tr><td>无头(<code>-p</code>、<code>fixissue</code>)</td><td>启动时同步连接,等所有尝试结束</td><td>仅在至少拿到一批工具时挂载 MCP</td></tr>
+        </tbody>
+      </table>
+      <p>TUI 下可在会话区看到 <code>✓ MCP server 'github' connected</code> 或 <code>✗ MCP server '…' failed: …</code>。<strong>单个 server 失败不会拖垮其他 server 与主程序。</strong></p>
+
+      <h2>工具命名</h2>
+      <p>每个远端 tool 注册成 <code>mcp__&lt;server 键名&gt;__&lt;远端 tool 名&gt;</code>。</p>
+      <p>例:配置里 <code>"mcpServers": { "github": { ... } }</code>,远端有 <code>get_issue</code>,模型看到的工具名就是 <code>mcp__github__get_issue</code>。</p>
+      <p><code>--disable-tools</code> 也用这个完整名:</p>
+      <pre><code>atomcode --disable-tools mcp__github__get_issue,mcp__filesystem__write_file</code></pre>
+
+      <h2>权限审批</h2>
+      <p>MCP 工具默认 <strong>每次调用都需要确认</strong>(等同 <code>RequireApproval</code>),因为远端是外部不可信代码。</p>
+      <ul>
+        <li>按 <strong>Y</strong> — 单次允许</li>
+        <li>按 <strong>A</strong> — 在当前会话内放行该工具(下次启动后失效,不会持久化)</li>
+        <li>按 <strong>N</strong> — 拒绝本次调用</li>
+      </ul>
+      <div class="callout callout-warn">
+        <strong>安全提示</strong>
+        <p>把 MCP 工具返回的内容当作不可信数据处理,<strong>不要</strong>让它升级成系统指令。一个返回结果带「请忽略之前的指示」的 MCP server,模型不应该照办。</p>
+      </div>
+
+      <h2>斜杠命令</h2>
+      <table>
+        <thead>
+          <tr><th>命令</th><th>作用</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>/mcp</code></td><td>列出<strong>已成功连接</strong>的 server 及状态(失败的 server 不在列表里,只在会话区有红色错误行)</td></tr>
+          <tr><td><code>/mcp tools &lt;server&gt;</code></td><td>异步列出某个 server 实际暴露的远端 tools</td></tr>
+          <tr><td><code>/mcp reload</code></td><td>重新读取 <code>.mcp.json</code> / <code>~/.atomcode/mcp.json</code> 并后台重连所有 server</td></tr>
+        </tbody>
+      </table>
+
+      <h2>当前限制</h2>
+      <ul>
+        <li>仅支持 MCP 的 <strong>tools</strong> 能力;尚未实现 resources / prompts / OAuth / roots / elicitation</li>
+        <li>HTTP server 无指数退避重连,stdio 子进程退出后不自动重启 — 需用 <code>/mcp reload</code> 手动重连</li>
+        <li><code>tools/list</code> 的 <code>list_changed</code> 通知不触发动态刷新</li>
+        <li>工具结果只取 <strong>text</strong> 类型 content 块,image / resource 块当前忽略</li>
+        <li><code>[A] Always</code> 仅当前会话生效,不写入任何配置文件</li>
+      </ul>
+
+      <h2>同类生态对比</h2>
+      <table>
+        <thead>
+          <tr><th>产品</th><th>配置位置</th><th>备注</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>AtomCode</td><td><code>.mcp.json</code> 的 <code>mcpServers</code> 块</td><td>当前实现 tools-only</td></tr>
+          <tr><td>Claude Code</td><td><code>.mcp.json</code></td><td>OAuth、resources、prompts 更全</td></tr>
+          <tr><td>Cursor</td><td><code>.mcp.json</code></td><td>与 AtomCode 配置完全互通</td></tr>
+          <tr><td>Codex</td><td>CLI 添加</td><td>OpenAI 生态</td></tr>
+        </tbody>
+      </table>
+      <p>已经在用 Cursor 配 MCP server 的话,直接把 <code>.mcp.json</code> 复制过来即可,无需改字段。</p>
+
+      <h2>下一步</h2>
+      <ul>
+        <li>仓库根目录的 <a href="https://atomgit.com/atomgit_atomcode/atomcode/blob/main/.mcp.json.example" target="_blank"><code>.mcp.json.example</code></a> —— 带详细注释的 stdio + HTTP 双模板</li>
+        <li><a href="./configuration.html">配置文件</a> —— 整体配置概览</li>
+        <li><a href="./slash-commands.html">斜杠命令</a> —— 含 <code>/mcp</code> 系列在内的完整命令列表</li>
+      </ul>
+    </main>
+  </div>
+
+  <script src="./docs.js"></script>
+</body>
+</html>
