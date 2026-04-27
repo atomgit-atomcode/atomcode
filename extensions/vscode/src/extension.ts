@@ -102,13 +102,28 @@ export async function activate(context: vscode.ExtensionContext) {
     }),
   );
 
-  // 8. Periodic health check (every 30s)
+  // 8. Wire model selection to status bar
+  chatProvider.onModelSelected = (model: string) => {
+    statusBar.update(true, model);
+  };
+
+  // 9. Listen for active editor changes → send context to webview
+  context.subscriptions.push(
+    vscode.window.onDidChangeActiveTextEditor(() => {
+      chatProvider.sendEditorContext();
+    }),
+    vscode.window.onDidChangeTextEditorSelection(() => {
+      chatProvider.sendEditorContext();
+    })
+  );
+
+  // 10. Periodic health check (every 30s)
   healthCheckInterval = setInterval(async () => {
     const isRunning = await client.isRunning();
     statusBar.update(isRunning, undefined, undefined);
   }, 30000);
 
-  // 9. Listen for config changes
+  // 11. Listen for config changes
   context.subscriptions.push(
     vscode.workspace.onDidChangeConfiguration((e) => {
       if (e.affectsConfiguration('atomcode')) {

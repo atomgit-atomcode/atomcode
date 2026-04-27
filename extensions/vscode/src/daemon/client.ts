@@ -151,6 +151,10 @@ export class DaemonClient {
     return this.delete<{ success: boolean }>(`/sessions/${id}`);
   }
 
+  searchSessions(query: string): Promise<SessionMeta[]> {
+    return this.get<SessionMeta[]>(`/sessions/search?q=${encodeURIComponent(query)}`);
+  }
+
   // ── Chat (SSE) ────────────────────────────────────────────────
 
   streamChat(req: ChatRequest, callbacks: ChatStreamCallbacks): AbortController {

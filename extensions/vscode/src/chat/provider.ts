@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import * as path from 'path';
 import * as fs from 'fs';
 import { DaemonClient } from '../daemon/client';
 import { ChatRequest } from '../daemon/types';
@@ -9,6 +10,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private _currentAbort?: AbortController;
   private _sessionId?: string;
   private _isGenerating = false;
+
+  public onModelSelected?: (model: string) => void;
 
   constructor(
     private readonly _extensionUri: vscode.Uri,
@@ -40,7 +43,37 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           break;
         case 'ready':
           // Webview loaded, send initial state
-          this._postMessage({ type: 'init', generating: this._isGenerating });
+          await this._sendInitialState();
+          break;
+        case 'selectModel':
+          this.onModelSelected?.(msg.model);
+          break;
+        case 'loadSession':
+          await this._loadSession(msg.sessionId);
+          break;
+        case 'openSettings':
+          vscode.commands.executeCommand('workbench.action.openSettings', 'atomcode');
+          break;
+        case 'openFile':
+          if (msg.path) {
+            const uri = vscode.Uri.file(msg.path);
+            vscode.window.showTextDocument(uri);
+          }
+          break;
+        case 'applyCode':
+          await this._applyCode(msg.code, msg.language);
+          break;
+        case 'copyCode':
+          vscode.env.clipboard.writeText(msg.code);
+          break;
+        case 'quickAction':
+          await this._handleQuickAction(msg.action);
+          break;
+        case 'slashCommand':
+          await this._handleSlashCommand(msg.command);
+          break;
+        case 'searchSessions':
+          await this._searchSessions(msg.query);
           break;
       }
     });
@@ -114,6 +147,121 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         this._postMessage({ type: 'error', message });
       },
     });
+  }
+
+  public sendEditorContext() {
+    this._sendEditorContext();
+  }
+
+  // New protocol methods
+
+  private async _sendInitialState() {
+    // Send models
+    try {
+      const models = await this._client.listModels();
+      this._postMessage({ type: 'models', models });
+    } catch {}
+
+    // Send sessions
+    try {
+      const sessions = await this._client.listSessions();
+      this._postMessage({ type: 'sessions', sessions });
+    } catch {}
+
+    // Send editor context
+    this._sendEditorContext();
+
+    this._postMessage({ type: 'init', generating: this._isGenerating });
+  }
+
+  private _sendEditorContext() {
+    const editor = vscode.window.activeTextEditor;
+    if (editor) {
+      const selection = editor.selection;
+      this._postMessage({
+        type: 'context',
+        filePath: editor.document.uri.fsPath,
+        fileName: path.basename(editor.document.uri.fsPath),
+        selection: !selection.isEmpty ? editor.document.getText(selection) : undefined,
+        language: editor.document.languageId,
+      });
+    }
+  }
+
+  private async _loadSession(sessionId: string) {
+    // TODO: need to find projectHash for the session
+    // For now, just start a new conversation with the session ID
+    this._sessionId = sessionId;
+    this._postMessage({ type: 'clearChat' });
+  }
+
+  private async _applyCode(code: string, _language: string) {
+    const editor = vscode.window.activeTextEditor;
+    if (!editor) {
+      vscode.window.showInformationMessage('No active editor to apply code to');
+      return;
+    }
+    const selection = editor.selection;
+    await editor.edit((editBuilder) => {
+      if (selection.isEmpty) {
+        editBuilder.insert(selection.active, code);
+      } else {
+        editBuilder.replace(selection, code);
+      }
+    });
+  }
+
+  private async _handleQuickAction(action: string) {
+    const ctx = this._getEditorContext();
+    const prompts: Record<string, string> = {
+      explain: 'Please explain this code. What does it do and why?',
+      fix: 'Please fix any bugs or issues in this code.',
+      test: 'Please generate unit tests for this code.',
+      refactor: 'Please refactor this code for better readability and maintainability.',
+      docs: 'Please add documentation comments to this code.',
+      review: 'Please review this code for issues, improvements, and best practices.',
+    };
+    const prompt = prompts[action] || action;
+    const text = ctx.selection
+      ? `File: ${ctx.fileName} (${ctx.language})\nSelected code:\n\`\`\`${ctx.language}\n${ctx.selection}\n\`\`\`\n\n${prompt}`
+      : prompt;
+
+    this._postMessage({ type: 'userMessage', text: prompt });
+    await this._handleSend(text);
+  }
+
+  private async _handleSlashCommand(command: string) {
+    const mapping: Record<string, string> = {
+      '/explain': 'explain',
+      '/fix': 'fix',
+      '/test': 'test',
+      '/refactor': 'refactor',
+      '/docs': 'docs',
+      '/review': 'review',
+    };
+    const action = mapping[command];
+    if (action) {
+      await this._handleQuickAction(action);
+    }
+  }
+
+  private async _searchSessions(query: string) {
+    try {
+      const sessions = await this._client.searchSessions(query);
+      this._postMessage({ type: 'sessions', sessions });
+    } catch {}
+  }
+
+  private _getEditorContext() {
+    const editor = vscode.window.activeTextEditor;
+    if (!editor) return {};
+    const selection = editor.selection;
+    return {
+      filePath: editor.document.uri.fsPath,
+      fileName: path.basename(editor.document.uri.fsPath),
+      selection: !selection.isEmpty ? editor.document.getText(selection) : undefined,
+      language: editor.document.languageId,
+    };
   }
 
   private _postMessage(msg: unknown) {
