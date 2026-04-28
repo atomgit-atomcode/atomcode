@@ -128,8 +128,6 @@ type ChatTasksStore = Arc<RwLock<HashMap<String, CancellationToken>>>;
 /// Stopped sessions (session_id) - used to prevent saving stopped chats
 type StoppedSessionsStore = Arc<RwLock<HashSet<String>>>;
 
-const DEFAULT_DAEMON_ADDR: &str = "127.0.0.1:13456";
-const DAEMON_ADDR_ENV: &str = "ATOMCODE_DAEMON_ADDR";
 const DANGEROUS_TOOLS_ENV: &str = "ATOMCODE_DAEMON_ENABLE_DANGEROUS_TOOLS";
 
 /// Combined app state for Axum
@@ -589,10 +587,6 @@ fn short_path(path: &str) -> String {
         _ => format!(".../{}/{}", parts[1], parts[0]),
     }
 }
-fn daemon_addr() -> String {
-    std::env::var(DAEMON_ADDR_ENV).unwrap_or_else(|_| DEFAULT_DAEMON_ADDR.to_string())
-}
-
 fn dangerous_tools_enabled() -> bool {
     std::env::var(DANGEROUS_TOOLS_ENV).ok().as_deref() == Some("1")
 }
@@ -2226,15 +2220,16 @@ async fn main() {
         .with_state(state)
         .layer(cors_layer());
 
+    // Bind loopback-only by design. The daemon hosts chat / file-edit /
+    // tool-execution endpoints that must NEVER be reachable from another
+    // host on the LAN (PR #82 briefly broke this by hard-coding 0.0.0.0;
+    // see commit `tianchang fix(daemon): harden daemon chat access` for
+    // the original loopback-default rationale). If LAN access is ever
+    // genuinely needed, run a reverse proxy in front — don't let the
+    // daemon bind public interfaces directly.
     let port = daemon_port_from_args();
-    let addr = format!("0.0.0.0:{port}");
+    let addr = format!("127.0.0.1:{port}");
     println!("AtomCode API server listening on http://{}", addr);
-    if addr.starts_with("0.0.0.0:") || addr.starts_with("[::]:") {
-        eprintln!(
-            "Warning: {} exposes atomcode-daemon beyond localhost. Use only on trusted networks.",
-            DAEMON_ADDR_ENV
-        );
-    }
     if dangerous_tools_enabled() {
         eprintln!(
             "Warning: {}=1 enables bash and write-capable daemon tools.",

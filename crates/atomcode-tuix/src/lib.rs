@@ -209,6 +209,26 @@ pub async fn run(
         .ok()
         .filter(|v| !v.is_empty())
         .is_some();
+    // JetBrains' JediTerm (Android Studio, IntelliJ, PyCharm, GoLand,
+    // etc. — all share the same terminal emulator) doesn't fully honour
+    // DECSTBM scroll regions or LF-within-region semantics in raw mode.
+    // Symptom in the wild: pinned footer renders in the middle of the
+    // viewport instead of bottom, and per-character input redraws
+    // stair-step diagonally because LF at body_bottom isn't constrained
+    // to the scroll region. JediTerm advertises itself with
+    // `TERMINAL_EMULATOR=JetBrains-JediTerm`. Treat its presence the
+    // same as ATOMCODE_PLAIN=1 — same escape hatch, same trade-off
+    // (no pinned input box / live spinner / slash-menu palette, but
+    // text and commands all work). Users who'd rather try the retained
+    // path anyway can unset the env var or set ATOMCODE_RETAIN=1.
+    let force_retain = std::env::var("ATOMCODE_RETAIN")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .is_some();
+    let is_jediterm = std::env::var("TERMINAL_EMULATOR")
+        .map(|v| v == "JetBrains-JediTerm")
+        .unwrap_or(false);
+    let force_plain = force_plain || (is_jediterm && !force_retain);
     let inner: Box<dyn Renderer> = if caps.tty && !force_plain {
         Box::new(RetainedRenderer::new(caps))
     } else {
