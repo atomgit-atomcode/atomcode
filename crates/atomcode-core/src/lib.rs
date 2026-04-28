@@ -12,6 +12,7 @@ pub mod input_history;
 pub mod lsp;
 pub mod mcp;
 pub mod notify;
+pub mod pricing;
 pub mod provider;
 pub mod self_update;
 pub mod semantic;
