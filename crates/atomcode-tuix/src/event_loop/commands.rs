@@ -89,7 +89,31 @@ pub(super) fn execute_slash_command(
             ctx.agent.cmd_tx.send(AgentCommand::Shutdown).ok();
         }
         "help" => {
-            renderer.render(UiLine::CommandOutput(ctx.commands.help_text()));
+            if arg.trim() == "commands" {
+                let config_dir = Config::config_dir();
+                let cmds = ctx.custom_commands.list();
+                let mut out = String::from("  Custom commands:\n");
+                for cmd in &cmds {
+                    let source_label = if cmd.source.starts_with(&config_dir) {
+                        "global"
+                    } else {
+                        "project"
+                    };
+                    out.push_str(&format!(
+                        "    /{}  — {} ({})\n",
+                        cmd.name, cmd.description, source_label
+                    ));
+                }
+                if cmds.is_empty() {
+                    out.push_str("    (none)\n\n");
+                    out.push_str(
+                        "  Create: ~/.atomcode/commands/<name>.md or .atomcode/commands/<name>.md\n",
+                    );
+                }
+                renderer.render(UiLine::CommandOutput(out));
+            } else {
+                renderer.render(UiLine::CommandOutput(ctx.commands.help_text()));
+            }
             renderer.flush();
         }
         "config" => {
@@ -780,8 +804,17 @@ pub(super) fn execute_slash_command(
             }
         }
         other => {
-            renderer.render(UiLine::Error(format!("Unknown command: /{}", other)));
-            renderer.flush();
+            // Before reporting "unknown", check user-defined custom commands.
+            if let Some(rendered) = ctx.custom_commands.render(other, arg) {
+                ctx.agent
+                    .cmd_tx
+                    .send(AgentCommand::SendMessage(rendered))
+                    .ok();
+                state.on_submit();
+            } else {
+                renderer.render(UiLine::Error(format!("Unknown command: /{}", other)));
+                renderer.flush();
+            }
         }
     }
     Ok(())

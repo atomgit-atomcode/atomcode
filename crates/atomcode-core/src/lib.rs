@@ -2,6 +2,7 @@ pub mod agent;
 pub mod atomgit;
 pub mod auth;
 pub mod coding_plan;
+pub mod commands;
 pub mod config;
 pub mod conversation;
 pub mod ctx;
