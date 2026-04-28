@@ -332,6 +332,12 @@ impl LoginSession {
         };
 
         if let Some(t) = tel {
+            // Push account_id onto the telemetry handle BEFORE emitting
+            // login_success so the event itself — and every subsequent event in
+            // this process — carries the id. The handle-level setter outlives
+            // any task-local scope, so events emitted outside the main scope
+            // (e.g. before scope is entered, or from spawned tasks) inherit it.
+            t.set_account_id(Some(auth_info.user.id.to_string()));
             t.track(Event::LoginSuccess);
         }
 

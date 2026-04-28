@@ -16,12 +16,15 @@ use tracing::warn;
 use uuid::Uuid;
 
 /// Per-event context auto-filled by `track`. Set with `CurrentContext::scope(...)`.
+///
+/// Note: `account_id` lives on `Telemetry` itself (see `set_account_id`) rather
+/// than here, because login state outlives any single scope and must apply to
+/// all events emitted after sign-in, including `login_success` itself.
 #[derive(Debug, Clone, Default)]
 pub struct CurrentContext {
     pub turn_id: Option<Uuid>,
     pub provider: Option<String>,
     pub model: Option<String>,
-    pub account_id: Option<String>,
     pub repo_origin: Option<RepoOrigin>,
     pub mode: Option<crate::event::SessionMode>,
 }
@@ -98,6 +101,7 @@ pub struct Telemetry {
     device_id: Uuid,
     launch_id: Uuid,
     session_id: std::sync::Arc<std::sync::RwLock<Uuid>>,
+    account_id: std::sync::Arc<std::sync::RwLock<Option<String>>>,
     app_version: String,
     os: &'static str,
     arch: &'static str,
@@ -123,6 +127,7 @@ impl Telemetry {
                 device_id: Uuid::nil(),
                 launch_id,
                 session_id: std::sync::Arc::new(std::sync::RwLock::new(launch_id)),
+                account_id: std::sync::Arc::new(std::sync::RwLock::new(None)),
                 app_version,
                 os,
                 arch,
@@ -153,6 +158,7 @@ impl Telemetry {
                     device_id: Uuid::nil(),
                     launch_id,
                     session_id: std::sync::Arc::new(std::sync::RwLock::new(launch_id)),
+                    account_id: std::sync::Arc::new(std::sync::RwLock::new(None)),
                     app_version,
                     os,
                     arch,
@@ -189,6 +195,7 @@ impl Telemetry {
             device_id,
             launch_id,
             session_id: std::sync::Arc::new(std::sync::RwLock::new(launch_id)),
+            account_id: std::sync::Arc::new(std::sync::RwLock::new(None)),
             app_version,
             os,
             arch,
@@ -214,7 +221,7 @@ impl Telemetry {
         let env = Envelope {
             device_id: self.device_id,
             launch_id: self.launch_id,
-            account_id: ctx.account_id,
+            account_id: self.account_id.read().ok().and_then(|g| g.clone()),
             session_id: self.session_id.read().map(|g| *g).unwrap_or(self.launch_id),
             turn_id: ctx.turn_id,
             ts: now_ms(),
@@ -267,6 +274,16 @@ impl Telemetry {
         // Persist final health snapshot regardless of send outcome.
         self.persist_health();
         tracing::info!("telemetry shutdown complete");
+    }
+
+    /// Update the active account ID. Pass `Some(id)` after a successful login
+    /// (call this *before* emitting `login_success` so the event itself carries
+    /// the id) and `None` after logout. All subsequent events emitted by this
+    /// process will carry the new value via the envelope.
+    pub fn set_account_id(&self, id: Option<String>) {
+        if let Ok(mut g) = self.account_id.write() {
+            *g = id;
+        }
     }
 
     /// Update the active session ID (e.g. when a new AtomCode session is
@@ -324,6 +341,7 @@ impl Telemetry {
             device_id: Uuid::nil(),
             launch_id,
             session_id: std::sync::Arc::new(std::sync::RwLock::new(launch_id)),
+            account_id: std::sync::Arc::new(std::sync::RwLock::new(None)),
             app_version,
             os: os_str(),
             arch: arch_str(),

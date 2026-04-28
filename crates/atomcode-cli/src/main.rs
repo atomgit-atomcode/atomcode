@@ -689,10 +689,11 @@ async fn run() -> Result<i32> {
                 let repo = atomcode_core::telemetry_bootstrap::detect_repo_origin(
                     &std::env::current_dir().unwrap_or_default(),
                 );
-                let account_id = auth::get_stored_auth().map(|a| a.user.id.to_string());
+                telemetry.set_account_id(
+                    auth::get_stored_auth().map(|a| a.user.id.to_string()),
+                );
                 let scope_ctx = CurrentContext {
                     repo_origin: Some(repo),
-                    account_id,
                     mode: Some(SessionMode::Headless),
                     ..CurrentContext::current()
                 };
@@ -798,7 +799,12 @@ async fn run() -> Result<i32> {
                 return Ok(0);
             }
             other => {
-                return handle_command(other).await.map(|_| 0);
+                let result = handle_command(other, &telemetry).await.map(|_| 0);
+                // Flush any events emitted by the subcommand (e.g. login_success)
+                // before the process exits. Bounded by the same 500ms budget as
+                // other exit paths.
+                telemetry.shutdown(std::time::Duration::from_millis(500)).await;
+                return result;
             }
         }
     }
@@ -1085,16 +1091,17 @@ async fn run() -> Result<i32> {
         }
     };
 
-    // Build the session-scope context: repo_origin, account_id, mode.
-    // session_id is now managed on Telemetry directly via set_session_id().
-    // account_id is seeded from stored auth so events from this session are
-    // correlated to the user even before any explicit login action this run.
+    // Build the session-scope context: repo_origin, mode.
+    // session_id and account_id are managed on Telemetry directly via
+    // set_session_id() / set_account_id(). Seed account_id from stored auth so
+    // events from this session correlate to the user even before any explicit
+    // login action this run; login()/logout() update it later as needed.
     // mode: Headless when a prompt is supplied (-p / --prompt-file / fixissue);
     //       Tui when the user launches the interactive terminal UI.
     let repo = atomcode_core::telemetry_bootstrap::detect_repo_origin(
         &std::env::current_dir().unwrap_or_else(|_| working_dir.clone()),
     );
-    let account_id = auth::get_stored_auth().map(|a| a.user.id.to_string());
+    telemetry.set_account_id(auth::get_stored_auth().map(|a| a.user.id.to_string()));
     let session_mode = if effective_prompt.is_some() {
         SessionMode::Headless
     } else {
@@ -1110,7 +1117,6 @@ async fn run() -> Result<i32> {
     }
     let scope_ctx = CurrentContext {
         repo_origin: Some(repo),
-        account_id,
         mode: Some(session_mode),
         ..CurrentContext::current()
     };
@@ -1421,7 +1427,7 @@ async fn run_headless(
 }
 
 /// Handle subcommands (login, logout, status)
-async fn handle_command(cmd: Commands) -> Result<()> {
+async fn handle_command(cmd: Commands, telemetry: &std::sync::Arc<Telemetry>) -> Result<()> {
     // Subcommands never enter TUI, so tell the panic hook to skip terminal
     // cleanup — otherwise `disable_raw_mode` panics on Windows with
     // "initial console mode not set" because raw mode was never enabled.
@@ -1429,15 +1435,17 @@ async fn handle_command(cmd: Commands) -> Result<()> {
 
     match cmd {
         Commands::Login => {
-            // handle_command is for the standalone `atomcode login` exit path —
-            // no telemetry handle available here; login_success is not emitted.
-            let auth = auth::login(None)?;
+            // Pass the telemetry handle through so login() can both stamp the
+            // handle's account_id AND emit login_success. The caller flushes
+            // telemetry on return so the event actually leaves the process.
+            let auth = auth::login(Some(telemetry))?;
             auth::save_auth(&auth)?;
             println!("  Login successful! You can now use AtomCode.");
             Ok(())
         }
         Commands::Logout => {
             auth::logout()?;
+            telemetry.set_account_id(None);
             println!("  You have been logged out.");
             Ok(())
         }
