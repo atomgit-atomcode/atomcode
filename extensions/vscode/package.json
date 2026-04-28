@@ -1,0 +1,200 @@
+{
+  "name": "atomcode-vscode",
+  "displayName": "AtomCode",
+  "description": "AI coding agent powered by AtomCode — terminal-grade AI inside VS Code",
+  "version": "0.1.0",
+  "publisher": "atomgit",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "AI",
+    "Programming Languages",
+    "Other"
+  ],
+  "keywords": [
+    "ai",
+    "coding",
+    "agent",
+    "atomcode",
+    "llm"
+  ],
+  "icon": "resources/icon.png",
+  "main": "./out/extension.js",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "atomcode.openSidebar",
+        "title": "AtomCode: Open in Side Bar",
+        "icon": "$(hubot)"
+      },
+      {
+        "command": "atomcode.openTab",
+        "title": "AtomCode: Open in New Tab"
+      },
+      {
+        "command": "atomcode.focusInput",
+        "title": "AtomCode: Focus Input"
+      },
+      {
+        "command": "atomcode.newConversation",
+        "title": "AtomCode: New Conversation"
+      },
+      {
+        "command": "atomcode.explain",
+        "title": "AtomCode: Explain Selection"
+      },
+      {
+        "command": "atomcode.fix",
+        "title": "AtomCode: Fix Selection"
+      },
+      {
+        "command": "atomcode.optimize",
+        "title": "AtomCode: Optimize Selection"
+      },
+      {
+        "command": "atomcode.stop",
+        "title": "AtomCode: Stop Generation"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "atomcode",
+          "title": "AtomCode",
+          "icon": "resources/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "atomcode": [
+        {
+          "type": "webview",
+          "id": "atomcode.chatView",
+          "name": "Chat"
+        }
+      ]
+    },
+    "menus": {
+      "editor/context": [
+        {
+          "command": "atomcode.explain",
+          "group": "atomcode@1",
+          "when": "editorHasSelection"
+        },
+        {
+          "command": "atomcode.fix",
+          "group": "atomcode@2",
+          "when": "editorHasSelection"
+        },
+        {
+          "command": "atomcode.optimize",
+          "group": "atomcode@3",
+          "when": "editorHasSelection"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "AtomCode",
+      "properties": {
+        "atomcode.daemon.port": {
+          "type": "number",
+          "default": 13456,
+          "description": "AtomCode daemon HTTP port"
+        },
+        "atomcode.daemon.autoStart": {
+          "type": "boolean",
+          "default": true,
+          "description": "Auto-start daemon if not running"
+        },
+        "atomcode.daemon.binaryPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to atomcode binary (auto-detected if empty)"
+        },
+        "atomcode.preferredLocation": {
+          "type": "string",
+          "enum": [
+            "sidebar",
+            "panel"
+          ],
+          "default": "sidebar",
+          "description": "Where to open the chat panel"
+        },
+        "atomcode.autoSave": {
+          "type": "boolean",
+          "default": true,
+          "description": "Auto-save files before AI reads them"
+        },
+        "atomcode.sendWithCtrlEnter": {
+          "type": "boolean",
+          "default": false,
+          "description": "Use Ctrl+Enter instead of Enter to send messages"
+        },
+        "atomcode.fontSize": {
+          "type": "number",
+          "default": 13,
+          "description": "Font size in chat panel"
+        },
+        "atomcode.showInlineHints": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show inline diff hints when AI edits files"
+        }
+      }
+    },
+    "keybindings": [
+      {
+        "command": "atomcode.focusInput",
+        "key": "ctrl+escape",
+        "mac": "cmd+escape"
+      },
+      {
+        "command": "atomcode.openTab",
+        "key": "ctrl+shift+escape",
+        "mac": "cmd+shift+escape"
+      },
+      {
+        "command": "atomcode.explain",
+        "key": "ctrl+shift+e",
+        "mac": "cmd+shift+e",
+        "when": "editorHasSelection"
+      },
+      {
+        "command": "atomcode.newConversation",
+        "key": "ctrl+n",
+        "mac": "cmd+n",
+        "when": "atomcode.chatFocused"
+      }
+    ]
+  },
+  "scripts": {
+    "build:webview": "node webview-ui/esbuild.js",
+    "watch:webview": "node webview-ui/esbuild.js --watch",
+    "compile": "tsc -p ./ && npm run build:webview",
+    "watch": "npx concurrently \"tsc -watch -p ./\" \"npm run watch:webview\"",
+    "lint": "eslint src --ext ts",
+    "package": "npx @vscode/vsce package --no-dependencies"
+  },
+  "devDependencies": {
+    "@types/dompurify": "^3.0.5",
+    "@types/node": "^20.0.0",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "@types/vscode": "^1.85.0",
+    "concurrently": "^9.2.1",
+    "esbuild": "^0.28.0",
+    "typescript": "^5.3.0"
+  },
+  "dependencies": {
+    "dompurify": "^3.4.1",
+    "highlight.js": "^11.9.0",
+    "marked": "^12.0.0",
+    "react": "^19.2.5",
+    "react-dom": "^19.2.5"
+  }
+}

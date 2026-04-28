@@ -45,6 +45,7 @@ config.toml
 
 # Logs
 /datalog/
+/site/datalog/
 /test-report.md
 
 # Local docs (not pushed to remote)
