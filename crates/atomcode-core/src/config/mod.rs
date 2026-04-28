@@ -276,6 +276,34 @@ fn render_instructions_section() -> String {
     out
 }
 
+fn render_hooks_json_section() -> String {
+    let mut out = String::new();
+    out.push_str("\n# Lifecycle hooks — configure in separate JSON files:\n");
+    out.push_str("#   ~/.atomcode/hooks.json       (global hooks)\n");
+    out.push_str("#   <project>/.hooks.json         (project hooks, override global by name)\n");
+    out.push_str("#\n");
+    out.push_str("# Example hooks.json:\n");
+    out.push_str("#   {\n");
+    out.push_str("#     \"hooks\": {\n");
+    out.push_str("#       \"audit-all\": {\n");
+    out.push_str("#         \"event\": \"pre_tool_use\",\n");
+    out.push_str("#         \"command\": \"echo \\\"$(date) $ATOMCODE_TOOL_NAME\\\" >> ~/.atomcode/audit.log\"\n");
+    out.push_str("#       },\n");
+    out.push_str("#       \"block-rm\": {\n");
+    out.push_str("#         \"event\": \"pre_tool_use\",\n");
+    out.push_str("#         \"matcher\": \"bash\",\n");
+    out.push_str("#         \"command\": \"your-safety-check.sh\",\n");
+    out.push_str("#         \"timeout_ms\": 5000\n");
+    out.push_str("#       }\n");
+    out.push_str("#     }\n");
+    out.push_str("#   }\n");
+    out.push_str("#\n");
+    out.push_str("# Events: pre_tool_use, post_tool_use, session_start, session_end\n");
+    out.push_str("# Env vars: ATOMCODE_HOOK_EVENT, ATOMCODE_TOOL_NAME, ATOMCODE_HOOK_CONTEXT\n");
+    out.push_str("# PreToolUse stdout: {\"action\":\"allow\"} or {\"action\":\"block\",\"reason\":\"...\"}\n");
+    out
+}
+
 impl Config {
     /// Context window of the currently-selected default provider.
     /// Falls back to 128_000 when the default_provider is missing or
@@ -319,6 +347,7 @@ impl Config {
         content.push_str(&render_datalog_section(&self.datalog));
         content.push_str(&render_notifications_section(&self.notifications));
         content.push_str(&render_instructions_section());
+        content.push_str(&render_hooks_json_section());
         std::fs::write(path, content)?;
         Ok(())
     }
@@ -517,6 +546,7 @@ mod tests {
                 reasoning_history: None,
                 thinking_enabled: None,
                 thinking_budget: None,
+                skip_tls_verify: false,
                 ephemeral: false,
             },
         );
@@ -613,6 +643,7 @@ mod tests {
             "unexpected error: {err}"
         );
     }
+
 }
 
 #[cfg(test)]

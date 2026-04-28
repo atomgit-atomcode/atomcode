@@ -154,6 +154,7 @@ mod tests {
             reasoning_history: None,
             thinking_enabled: None,
             thinking_budget: None,
+            skip_tls_verify: false,
             ephemeral: false,
         }
     }

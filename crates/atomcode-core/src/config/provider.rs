@@ -53,6 +53,12 @@ pub struct ProviderConfig {
     /// Default: 10000 when thinking is enabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking_budget: Option<u32>,
+    /// Skip TLS certificate verification for this provider.
+    /// Useful for self-signed certificates in enterprise/internal environments.
+    /// Default: false (TLS verification enabled).
+    /// WARNING: Setting this to true reduces security by accepting any certificate.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub skip_tls_verify: bool,
     /// If true, this provider was added at runtime (e.g. OAuth /login)
     /// and should NOT be persisted to config.toml on save.
     #[serde(skip)]
@@ -100,5 +106,81 @@ mod tests {
         let cfg: ProviderConfig = toml::from_str(toml_str).expect("parse");
         assert_eq!(cfg.thinking_enabled, Some(true));
         assert_eq!(cfg.thinking_budget, Some(20000));
+    }
+
+    #[test]
+    fn skip_tls_verify_defaults_to_false() {
+        let toml_str = r#"
+            type = "openai"
+            model = "gpt-4o"
+            api_key = "sk-test"
+        "#;
+        let cfg: ProviderConfig = toml::from_str(toml_str).expect("parse");
+        assert!(!cfg.skip_tls_verify, "skip_tls_verify should default to false");
+    }
+
+    #[test]
+    fn skip_tls_verify_can_be_set_true() {
+        let toml_str = r#"
+            type = "openai"
+            model = "gpt-4o"
+            api_key = "sk-test"
+            base_url = "https://self-signed.example.com/v1"
+            skip_tls_verify = true
+        "#;
+        let cfg: ProviderConfig = toml::from_str(toml_str).expect("parse");
+        assert!(cfg.skip_tls_verify, "skip_tls_verify should be true");
+    }
+
+    #[test]
+    fn skip_tls_verify_not_serialized_when_false() {
+        let cfg = ProviderConfig {
+            provider_type: "openai".into(),
+            api_key: Some("sk-test".into()),
+            model: "gpt-4o".into(),
+            base_url: None,
+            system_prompt: None,
+            user_agent: None,
+            context_window: 128000,
+            max_tokens: None,
+            thinking_type: None,
+            thinking_keep: None,
+            reasoning_history: None,
+            thinking_enabled: None,
+            thinking_budget: None,
+            skip_tls_verify: false,
+            ephemeral: false,
+        };
+        let serialized = toml::to_string(&cfg).expect("serialize");
+        assert!(
+            !serialized.contains("skip_tls_verify"),
+            "skip_tls_verify should not be serialized when false"
+        );
+    }
+
+    #[test]
+    fn skip_tls_verify_serialized_when_true() {
+        let cfg = ProviderConfig {
+            provider_type: "openai".into(),
+            api_key: Some("sk-test".into()),
+            model: "gpt-4o".into(),
+            base_url: Some("https://self-signed.example.com/v1".into()),
+            system_prompt: None,
+            user_agent: None,
+            context_window: 128000,
+            max_tokens: None,
+            thinking_type: None,
+            thinking_keep: None,
+            reasoning_history: None,
+            thinking_enabled: None,
+            thinking_budget: None,
+            skip_tls_verify: true,
+            ephemeral: false,
+        };
+        let serialized = toml::to_string(&cfg).expect("serialize");
+        assert!(
+            serialized.contains("skip_tls_verify = true"),
+            "skip_tls_verify should be serialized when true"
+        );
     }
 }

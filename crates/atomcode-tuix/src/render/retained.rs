@@ -1951,10 +1951,30 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
     }
 
     fn suspend_for_external(&mut self) {
-        // Release any DECSTBM we set, disable bracketed paste + raw
-        // mode for the child process.
-        let _ = self.out.write_all(b"\x1b[r\x1b[?7h\r\n");
+        // Position cursor at the top of where the footer (input box +
+        // status + menu) used to be, then clear from there to end of
+        // screen. Without this, cursor stays wherever the last paint
+        // left it — usually inside the footer area — and the child's
+        // first stdout write lands ON TOP of footer rows, with later
+        // writes scrolling existing body content up through the
+        // overlap. Symptom: `/login`'s OAuth URL printed at row 1
+        // overlapping prior scrollback ("Press ESC to cancelh lines?"
+        // — our line glued onto an old conversation row).
+        //
+        // Sequence: release DECSTBM, CUP to (body_bottom+1, col 1),
+        // ED 0 (cursor → end of screen), enable autowrap. After this
+        // the child writes into a clean rectangle below the body,
+        // and as it produces more lines the terminal scrolls naturally
+        // (no scroll region active, autowrap on) — which is exactly
+        // the cooked-mode shell experience users expect.
+        let body_bottom = self.body_bottom_row();
+        let position_row = body_bottom.saturating_add(1);
+        let seq = format!("\x1b[r\x1b[{};1H\x1b[J\x1b[?7h", position_row);
+        let _ = self.out.write_all(seq.as_bytes());
         self.scroll_region_bottom = None;
+        // Footer is wiped — record that so the next paint after
+        // resume doesn't try to diff against stale footer state.
+        self.last_painted_footer_rows = 0;
         let _ = self.out.flush();
         // Pop Kitty keyboard enhancement flags if they were pushed at
         // startup. Without this, the child (OAuth browser output, a
