@@ -326,6 +326,32 @@ pub(super) fn execute_slash_command(
             // contradict it when the conversation is too short.
             ctx.agent.cmd_tx.send(AgentCommand::Compact { prompt }).ok();
         }
+        "remember" => {
+            let text = arg.trim();
+            if text.is_empty() {
+                renderer.render(UiLine::Error("Usage: /remember <fact to remember>  (--global for global scope)".to_string()));
+                renderer.flush();
+            } else {
+                let (content, global) = if text.starts_with("--global ") {
+                    (text[9..].trim().to_string(), true)
+                } else {
+                    (text.to_string(), false)
+                };
+                ctx.agent.cmd_tx.send(AgentCommand::Remember { content, global }).ok();
+            }
+        }
+        "forget" => {
+            let keyword = arg.trim();
+            if keyword.is_empty() {
+                renderer.render(UiLine::Error("Usage: /forget <keyword>".to_string()));
+                renderer.flush();
+            } else {
+                ctx.agent.cmd_tx.send(AgentCommand::Forget { keyword: keyword.to_string() }).ok();
+            }
+        }
+        "memory" => {
+            ctx.agent.cmd_tx.send(AgentCommand::ShowMemory).ok();
+        }
         "login" => {
             run_login_flow(renderer, ctx)?;
         }
