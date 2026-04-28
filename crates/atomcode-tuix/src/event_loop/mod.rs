@@ -2381,6 +2381,11 @@ fn handle_agent_event(
         } => {
             // Close any in-flight assistant line before emitting the pair.
             renderer.render(UiLine::AssistantLineBreak);
+            // Freeze the animated in-flight tool-call row to its final
+            // static `▸` icon before the `⎿ result` body row lands beneath
+            // it. No-op when nothing is in flight (plain mode, or the
+            // matching Start never fired).
+            renderer.render(UiLine::ToolCallCommit);
 
             // Prefer the display-name we stored at ToolCallStarted time;
             // fall back to converting the raw name if we missed the Start

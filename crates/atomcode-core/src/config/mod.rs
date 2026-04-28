@@ -1,4 +1,5 @@
 pub mod instructions;
+pub mod memory;
 pub mod prompt_sections;
 pub mod provider;
 

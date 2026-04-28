@@ -203,6 +203,9 @@ pub(super) fn execute_slash_command(
             // brand-new session. Ports `/session` from the legacy TUI.
             ctx.agent.cmd_tx.send(AgentCommand::ClearConversation).ok();
             state.total_tokens = 0;
+            state.prompt_tokens = 0;
+            state.completion_tokens = 0;
+            state.cached_tokens = 0;
             state.thinking_idx = 0;
             state.on_turn_complete();
             // New session = new session file on disk. Old session
@@ -313,9 +316,24 @@ pub(super) fn execute_slash_command(
             renderer.flush();
         }
         "cost" => {
+            let total = state.prompt_tokens + state.completion_tokens;
+            let cache_rate = if state.prompt_tokens > 0 {
+                ((state.cached_tokens as f64 / state.prompt_tokens as f64 * 100.0) + 0.5) as usize
+            } else {
+                0
+            };
+            let cost = atomcode_core::pricing::calculate_cost(
+                &ctx.model_name, state.prompt_tokens, state.completion_tokens, state.cached_tokens,
+            );
+            let cost_str = atomcode_core::pricing::format_cost(cost);
             renderer.render(UiLine::CommandOutput(format!(
-                "  Session tokens: {}\n",
-                state.total_tokens
+                "  Prompt tokens:     {}\n  Completion tokens: {}\n  Cached tokens:     {} ({}% hit rate)\n  Total tokens:      {}\n  Estimated cost:    {}\n",
+                state.prompt_tokens,
+                state.completion_tokens,
+                state.cached_tokens,
+                cache_rate,
+                total,
+                cost_str,
             )));
             renderer.flush();
         }
@@ -350,6 +368,37 @@ pub(super) fn execute_slash_command(
             // Don't pre-render a placeholder — the agent's reply could
             // contradict it when the conversation is too short.
             ctx.agent.cmd_tx.send(AgentCommand::Compact { prompt }).ok();
+        }
+        "remember" => {
+            let text = arg.trim();
+            if text.is_empty() {
+                renderer.render(UiLine::Error("Usage: /remember <fact to remember>  (--global for global scope)".to_string()));
+                renderer.flush();
+            } else {
+                let (content, global) = if text.starts_with("--global ") {
+                    (text[9..].trim().to_string(), true)
+                } else {
+                    (text.to_string(), false)
+                };
+                if content.is_empty() {
+                    renderer.render(UiLine::Error("Usage: /remember <fact to remember>  (--global for global scope)".to_string()));
+                    renderer.flush();
+                } else {
+                    ctx.agent.cmd_tx.send(AgentCommand::Remember { content, global }).ok();
+                }
+            }
+        }
+        "forget" => {
+            let keyword = arg.trim();
+            if keyword.is_empty() {
+                renderer.render(UiLine::Error("Usage: /forget <keyword>".to_string()));
+                renderer.flush();
+            } else {
+                ctx.agent.cmd_tx.send(AgentCommand::Forget { keyword: keyword.to_string() }).ok();
+            }
+        }
+        "memory" => {
+            ctx.agent.cmd_tx.send(AgentCommand::ShowMemory).ok();
         }
         "login" => {
             run_login_flow(renderer, ctx)?;
