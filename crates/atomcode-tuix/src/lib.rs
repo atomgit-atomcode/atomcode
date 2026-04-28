@@ -325,6 +325,9 @@ pub async fn run(
         dirs
     };
 
+    let custom_commands =
+        atomcode_core::commands::CustomCommandRegistry::load(&working_dir);
+
     let ctx = LoopCtx {
         config,
         model_name,
@@ -357,6 +360,7 @@ pub async fn run(
         mcp_reload: None,
         telemetry,
         worktree_original_dir: None,
+        custom_commands,
         caps,
     };
 
