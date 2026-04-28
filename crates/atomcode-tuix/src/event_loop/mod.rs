@@ -2453,19 +2453,12 @@ fn handle_agent_event(
             // Display reasoning/thinking content in verbose mode (Ctrl+O)
             // Only show when the user has enabled it
             if state.show_reasoning {
-                let is_first_chunk = reasoning_buffer.is_empty();
                 reasoning_buffer.push_str(&text);
                 // Flush on newline or when buffer gets large
                 if reasoning_buffer.contains('\n') || reasoning_buffer.len() > 80 {
                     let output = std::mem::take(reasoning_buffer);
-                    // Add "Thinking: " prefix on the first chunk
-                    let display_text = if is_first_chunk {
-                        format!("Thinking: {}", output)
-                    } else {
-                        output
-                    };
                     // Render as gray/dimmed text with automatic line wrapping
-                    renderer.render(UiLine::ReasoningText(display_text));
+                    renderer.render(UiLine::ReasoningText(output));
                     renderer.flush();
                 }
             }
@@ -2490,13 +2483,6 @@ fn handle_agent_event(
                 name: display.clone(),
                 detail: detail.clone(),
             });
-            
-            // Show hint for bash commands if real-time output is disabled
-            if name == "bash" && !state.show_tool_output {
-                renderer.render(UiLine::CommandOutput(
-                    "  ◯ Press Ctrl+O to show real-time output\n".to_string()
-                ));
-            }
             renderer.flush();
 
             // Mark as rendered so ToolCallResult doesn't emit it again.
@@ -2578,6 +2564,13 @@ fn handle_agent_event(
                 .collect();
             if !diff_entries.is_empty() {
                 renderer.render(UiLine::DiffBlock(diff_entries));
+            }
+            // Show hint for bash commands if real-time output is disabled
+            // Display AFTER the result so user sees the command first
+            if name == "bash" && !state.show_tool_output {
+                renderer.render(UiLine::CommandOutput(
+                    "  ◯ Press Ctrl+O to show real-time output\n".to_string()
+                ));
             }
             renderer.flush();
             let _ = name;
