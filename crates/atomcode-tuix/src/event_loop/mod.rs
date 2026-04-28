@@ -2417,7 +2417,7 @@ fn handle_agent_event(
 
             // Close any in-flight assistant line before emitting the tool call.
             renderer.render(UiLine::AssistantLineBreak);
-            renderer.render(UiLine::ToolCall {
+            renderer.render(UiLine::ToolCallInFlight {
                 name: display.clone(),
                 detail: detail.clone(),
             });
@@ -2442,6 +2442,11 @@ fn handle_agent_event(
         } => {
             // Close any in-flight assistant line before emitting the pair.
             renderer.render(UiLine::AssistantLineBreak);
+            // Freeze the animated in-flight tool-call row to its final
+            // static `▸` icon before the `⎿ result` body row lands beneath
+            // it. No-op when nothing is in flight (plain mode, or the
+            // matching Start never fired).
+            renderer.render(UiLine::ToolCallCommit);
 
             // Prefer the display-name we stored at ToolCallStarted time;
             // fall back to converting the raw name if we missed the Start
@@ -2679,6 +2684,9 @@ fn handle_agent_event(
             think.reset();
         }
         AgentEvent::TokenUsage(u) => {
+            state.prompt_tokens += u.prompt_tokens;
+            state.completion_tokens += u.completion_tokens;
+            state.cached_tokens += u.cached_tokens;
             state.total_tokens += u.completion_tokens;
         }
         AgentEvent::WorkingDirChanged(new_dir) => {

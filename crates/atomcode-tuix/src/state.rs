@@ -89,6 +89,9 @@ pub struct UiState {
     /// Windows legacy conhost) don't show `□` tofu.
     pub unicode_symbols: bool,
     pub total_tokens: usize,
+    pub prompt_tokens: usize,
+    pub completion_tokens: usize,
+    pub cached_tokens: usize,
     /// When Suspended, holds the phase to restore on resume.
     pub prior_phase: Option<UiPhase>,
     /// Round-robin index into THINKING_LABELS; bumped on each on_submit.
@@ -139,6 +142,9 @@ impl UiState {
             spinner_frame: 0,
             unicode_symbols,
             total_tokens: 0,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            cached_tokens: 0,
             prior_phase: None,
             thinking_idx: 0,
             turn_started_at: None,

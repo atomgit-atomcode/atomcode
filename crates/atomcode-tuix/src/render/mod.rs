@@ -25,6 +25,22 @@ pub enum UiLine {
         name: String,
         detail: String,
     },
+    /// Animated tool-call line. Pushed on `AgentEvent::ToolCallStarted`
+    /// instead of the static `ToolCall`, so the user sees the call land
+    /// the moment the model commits to it AND its leading icon ticks in
+    /// lockstep with the footer spinner via the live-row mechanism (see
+    /// `RetainedRenderer::push_or_update_inflight_tool`). Switched to a
+    /// static `▸` icon by `ToolCallCommit` once the matching result
+    /// lands, freeing the live-row slot for the spinner to resume.
+    ToolCallInFlight {
+        name: String,
+        detail: String,
+    },
+    /// Freeze the most recent `ToolCallInFlight` row to its final
+    /// static `▸` icon. Emitted right before `ToolResult` so the
+    /// bottom body row stops animating exactly when the result is
+    /// about to be appended below it.
+    ToolCallCommit,
     ToolResult {
         success: bool,
         summary: String,

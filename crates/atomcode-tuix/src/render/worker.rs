@@ -265,6 +265,8 @@ fn ui_line_tag(l: &UiLine) -> &'static str {
         UiLine::AssistantText(_) => "AssistantText",
         UiLine::AssistantLineBreak => "AssistantLineBreak",
         UiLine::ToolCall { .. } => "ToolCall",
+        UiLine::ToolCallInFlight { .. } => "ToolCallInFlight",
+        UiLine::ToolCallCommit => "ToolCallCommit",
         UiLine::ToolResult { .. } => "ToolResult",
         UiLine::DiffLine { .. } => "DiffLine",
         UiLine::DiffBlock(_) => "DiffBlock",

@@ -61,6 +61,22 @@ impl AgentLoop {
             prompt.push_str(&format!("\n{}\n", merged_instructions));
         }
 
+        // Persistent memory
+        {
+            use crate::config::memory::MemoryStore;
+            let wd = self.turn_runner.context.working_dir.try_read()
+                .map(|g| g.clone()).unwrap_or_default();
+            let project_name = wd.file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "project".to_string());
+            let global = MemoryStore::global();
+            let project = MemoryStore::project(&wd);
+            let memory_block = MemoryStore::merged_for_prompt(&global, &project, &project_name);
+            if !memory_block.is_empty() {
+                prompt.push_str(&format!("\n{}\n", memory_block));
+            }
+        }
+
         // Available skills — inject skill descriptions so LLM knows what skills exist.
         // Only inject skills that allow model invocation (disable_model_invocation = false).
         if let Ok(registry) = self.skill_registry.read() {
