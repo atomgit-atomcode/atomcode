@@ -869,6 +869,9 @@ pub struct App {
     /// fixissue turn, verbatim. Sent as the AtomGit comment body on
     /// successful completion.
     pub fixissue_buffer: String,
+    /// Accumulates reasoning/thinking content for display in verbose mode.
+    /// Flushed on newline or when buffer exceeds threshold.
+    pub reasoning_buffer: String,
 }
 
 /// How long the "press Ctrl+C again to exit" confirmation stays armed.
@@ -887,6 +890,7 @@ impl App {
             exit_pending: None,
             fixissue_pending: None,
             fixissue_buffer: String::new(),
+            reasoning_buffer: String::new(),
         }
     }
 }
@@ -1261,7 +1265,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<(
             maybe = ctx.agent.event_rx.recv() => {
                 let Some(ev) = maybe else { break };
                 let pre_phase = app.state.phase;
-                handle_agent_event(ev, &mut app.state, &mut app.think, renderer, &mut app.pending_tools, &mut ctx, &mut app.fixissue_pending, &mut app.fixissue_buffer);
+                handle_agent_event(ev, &mut app.state, &mut app.think, renderer, &mut app.pending_tools, &mut ctx, &mut app.fixissue_pending, &mut app.fixissue_buffer, &mut app.reasoning_buffer);
                 if pre_phase != app.state.phase {
                     crate::tuix_trace!("PH", "{:?} -> {:?}", pre_phase, app.state.phase);
                 }
@@ -1461,7 +1465,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<(
             maybe = ctx.agent.event_rx.recv() => {
                 let Some(ev) = maybe else { break };
                 let pre_phase = app.state.phase;
-                handle_agent_event(ev, &mut app.state, &mut app.think, renderer, &mut app.pending_tools, &mut ctx, &mut app.fixissue_pending, &mut app.fixissue_buffer);
+                handle_agent_event(ev, &mut app.state, &mut app.think, renderer, &mut app.pending_tools, &mut ctx, &mut app.fixissue_pending, &mut app.fixissue_buffer, &mut app.reasoning_buffer);
                 if pre_phase != app.state.phase {
                     crate::tuix_trace!("PH", "{:?} -> {:?}", pre_phase, app.state.phase);
                 }
@@ -2432,6 +2436,7 @@ fn handle_agent_event(
     ctx: &mut LoopCtx,
     fixissue_pending: &mut Option<atomcode_core::atomgit::IssueRef>,
     fixissue_buffer: &mut String,
+    reasoning_buffer: &mut String,
 ) {
     match ev {
         AgentEvent::TextDelta(text) => {
@@ -2448,10 +2453,15 @@ fn handle_agent_event(
             // Display reasoning/thinking content in verbose mode (Ctrl+O)
             // Only show when the user has enabled it
             if state.show_reasoning {
-                // Prepend a dimmed prefix to distinguish from regular output
-                let reasoning_text = format!("\x1b[2m[thinking]\x1b[0m {}", text);
-                renderer.render(UiLine::CommandOutput(reasoning_text));
-                renderer.flush();
+                reasoning_buffer.push_str(&text);
+                // Flush on newline or when buffer gets large
+                if reasoning_buffer.contains('\n') || reasoning_buffer.len() > 80 {
+                    let output = std::mem::take(reasoning_buffer);
+                    // Prepend a dimmed prefix to distinguish from regular output
+                    let reasoning_text = format!("\x1b[2m[thinking]\x1b[0m {}", output.trim_end());
+                    renderer.render(UiLine::CommandOutput(reasoning_text));
+                    renderer.flush();
+                }
             }
         }
         AgentEvent::ToolCallStreaming { name, .. } => {
@@ -2657,6 +2667,9 @@ fn handle_agent_event(
             // TextDelta of the NEXT turn — user sees blank assistant bubbles
             // while datalog proves the model did return text.
             think.reset();
+
+            // Clear reasoning buffer between turns
+            reasoning_buffer.clear();
 
             // Persist session after every completed turn so /resume can
             // find it after a clean exit — the whole point of sessions.
