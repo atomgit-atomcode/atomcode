@@ -237,7 +237,22 @@ impl Tool for EditFileTool {
         }
     }
 
-    fn approval(&self, _args: &str) -> ApprovalRequirement {
+    fn approval(&self, args: &str) -> ApprovalRequirement {
+        let parsed = match serde_json::from_str::<EditFileArgs>(args) {
+            Ok(p) => p,
+            Err(_) => {
+                return ApprovalRequirement::RequireApproval(
+                    "Could not parse edit_file arguments for safety check.".to_string(),
+                );
+            }
+        };
+
+        if super::is_sensitive_input_path(&parsed.file_path) {
+            return ApprovalRequirement::RequireApproval(
+                format!("Editing sensitive system path: {}", parsed.file_path),
+            );
+        }
+
         ApprovalRequirement::AutoApprove
     }
 
@@ -1500,4 +1515,47 @@ fn find_closest_match_inner(
          The content may have changed. Use read_file to re-read the file.",
         content_lines.len()
     )
+}
+#[cfg(test)]
+mod security_tests {
+    use super::*;
+    use crate::tool::{ApprovalRequirement, Tool};
+
+    #[test]
+    fn edit_file_requires_approval_for_sensitive_paths() {
+        let tool = EditFileTool;
+        let args = serde_json::json!({
+            "file_path": "/etc/hosts",
+            "old_string": "old",
+            "new_string": "new"
+        })
+        .to_string();
+
+        assert!(matches!(
+            tool.approval(&args),
+            ApprovalRequirement::RequireApproval(_)
+        ));
+    }
+
+    #[test]
+    fn edit_file_auto_approves_regular_paths() {
+        let tool = EditFileTool;
+        let args = serde_json::json!({
+            "file_path": "src/main.rs",
+            "old_string": "old",
+            "new_string": "new"
+        })
+        .to_string();
+
+        assert!(matches!(tool.approval(&args), ApprovalRequirement::AutoApprove));
+    }
+
+    #[test]
+    fn edit_file_requires_approval_when_args_do_not_parse() {
+        let tool = EditFileTool;
+        assert!(matches!(
+            tool.approval("{not valid json"),
+            ApprovalRequirement::RequireApproval(_)
+        ));
+    }
 }
