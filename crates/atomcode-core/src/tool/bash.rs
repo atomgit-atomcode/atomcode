@@ -399,6 +399,21 @@ async fn bash_execute(args: &str, ctx: &ToolContext) -> Result<ToolResult> {
     let has_any_output = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let has_out_1 = has_any_output.clone();
     let has_out_2 = has_any_output.clone();
+    
+    // Clone event sender for streaming output (if available)
+    let event_tx = ctx.event_tx.clone();
+    let call_id = ctx.current_call_id.clone();
+    
+    // Helper to send output chunk event
+    let send_chunk = |chunk: &str| {
+        if let (Some(tx), Some(id)) = (&event_tx, &call_id) {
+            let _ = tx.send(crate::turn::event::TurnEvent::ToolOutputChunk {
+                call_id: id.clone(),
+                chunk: chunk.to_string(),
+            });
+        }
+    };
+    
     let result = tokio::time::timeout(Duration::from_secs(timeout_secs), async {
         let (_, _) = tokio::join!(
             async {
@@ -407,8 +422,11 @@ async fn bash_execute(args: &str, ctx: &ToolContext) -> Result<ToolResult> {
                     match tokio::time::timeout(idle_timeout, stdout.read(&mut buf)).await {
                         Ok(Ok(0)) => break,
                         Ok(Ok(n)) => {
+                            let chunk = String::from_utf8_lossy(&buf[..n]).to_string();
                             stdout_buf.extend_from_slice(&buf[..n]);
                             has_out_1.store(true, std::sync::atomic::Ordering::Relaxed);
+                            // Send real-time output chunk
+                            send_chunk(&chunk);
                         }
                         Ok(Err(_)) => break,
                         Err(_) => {
@@ -426,8 +444,11 @@ async fn bash_execute(args: &str, ctx: &ToolContext) -> Result<ToolResult> {
                     match tokio::time::timeout(idle_timeout, stderr.read(&mut buf)).await {
                         Ok(Ok(0)) => break,
                         Ok(Ok(n)) => {
+                            let chunk = String::from_utf8_lossy(&buf[..n]).to_string();
                             stderr_buf.extend_from_slice(&buf[..n]);
                             has_out_2.store(true, std::sync::atomic::Ordering::Relaxed);
+                            // Send real-time output chunk (stderr marked with prefix)
+                            send_chunk(&format!("[stderr] {}", chunk));
                         }
                         Ok(Err(_)) => break,
                         Err(_) => {

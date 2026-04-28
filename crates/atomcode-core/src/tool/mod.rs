@@ -560,6 +560,11 @@ pub struct ToolContext {
     pub telemetry: std::sync::Arc<atomcode_telemetry::Telemetry>,
     /// Shared LSP manager for diagnostics tool. `None` when LSP is disabled.
     pub lsp: Option<std::sync::Arc<crate::lsp::manager::LspManager>>,
+    /// Optional event sender for real-time tool output streaming (e.g., bash stdout).
+    /// When set, tools like bash can send output chunks as they're produced.
+    pub event_tx: Option<Arc<tokio::sync::mpsc::UnboundedSender<crate::turn::event::TurnEvent>>>,
+    /// Current tool call ID for event correlation.
+    pub current_call_id: Option<String>,
 }
 
 impl ToolContext {
@@ -591,6 +596,8 @@ impl ToolContext {
             first_error_signatures: Arc::new(RwLock::new(Vec::new())),
             telemetry,
             lsp: None,
+            event_tx: None,
+            current_call_id: None,
         }
     }
 

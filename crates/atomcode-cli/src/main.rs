@@ -859,6 +859,7 @@ async fn run() -> Result<i32> {
                 reasoning_history: None,
                 thinking_enabled: None,
                 thinking_budget: None,
+                skip_tls_verify: false,
                 ephemeral: false,
             },
             String::new(),
@@ -1272,6 +1273,11 @@ async fn run_headless(
                 if verbose {
                     let args = truncate_log_line(&arguments, 200);
                     eprintln!("[tool→ {} args={}]", name, args);
+                }
+            }
+            AgentEvent::ToolOutputChunk { call_id: _, chunk } => {
+                if verbose {
+                    eprint!("{}", chunk);
                 }
             }
             AgentEvent::ToolCallResult {

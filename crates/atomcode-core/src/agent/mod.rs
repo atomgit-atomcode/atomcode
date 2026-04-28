@@ -122,6 +122,12 @@ pub enum AgentEvent {
         name: String,
         arguments: String,
     },
+    /// Real-time output chunk from a running tool (e.g., bash command).
+    /// Sent during tool execution before ToolCallResult.
+    ToolOutputChunk {
+        call_id: String,
+        chunk: String,
+    },
     /// A tool call completed with a result.
     ToolCallResult {
         call_id: String,
@@ -451,27 +457,6 @@ impl AgentLoop {
             }));
         }
 
-        // LSP integration: create manager and register diagnostics tool.
-        let lsp_manager = {
-            let mut registry = if config.lsp.auto_detect {
-                crate::lsp::registry::LspServerRegistry::with_defaults()
-            } else {
-                crate::lsp::registry::LspServerRegistry::empty()
-            };
-            registry.merge_user_config(config.lsp.servers.clone());
-            let mgr = crate::lsp::manager::LspManager::new(
-                working_dir.clone(),
-                registry,
-                config.lsp.enabled,
-                config.lsp.diagnostics_settle_delay_ms,
-            );
-            std::sync::Arc::new(mgr)
-        };
-        tool_context.lsp = Some(lsp_manager.clone());
-        if internal_enabled("diagnostics") {
-            tool_registry.register_sync(Box::new(crate::tool::diagnostics::DiagnosticsTool));
-        }
-
         // Graph query tools: not exposed to model (adds 5 tool definitions that
         // weak models never use correctly). Graph data is still injected automatically
         // via grep's graph header and auto_inject_graph_context — the model benefits
@@ -543,6 +528,7 @@ impl AgentLoop {
                     reasoning_history: None,
                     thinking_enabled: None,
                     thinking_budget: None,
+                    skip_tls_verify: false,
                     ephemeral: true,
                 }),
             };
@@ -1286,6 +1272,10 @@ impl AgentLoop {
                                     }
 
                                     let _ = event_tx.send(AgentEvent::ToolCallStarted { id: id.clone(), name: name.clone(), arguments: arguments.clone() });
+                                }
+                                TurnEvent::ToolOutputChunk { call_id, chunk } => {
+                                    // Forward real-time tool output to UI
+                                    let _ = event_tx.send(AgentEvent::ToolOutputChunk { call_id, chunk });
                                 }
                                 TurnEvent::ToolCallResult { call_id, name, output, success, duration } => {
                                     // Track files for discipline
