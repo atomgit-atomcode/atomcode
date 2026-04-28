@@ -119,6 +119,10 @@ pub struct UiState {
     /// loop. The bool is the `prompt` sub-arg (include full system
     /// prompt body).
     pub pending_context_render: Option<bool>,
+    /// Whether to show real-time tool output (e.g., bash stdout/stderr).
+    /// Toggled by Ctrl+O. When false (default), tool output is hidden
+    /// during execution and only shown in the final result.
+    pub show_tool_output: bool,
 }
 
 impl Default for UiState {
@@ -151,6 +155,7 @@ impl UiState {
             last_context: None,
             last_submitted_message: None,
             pending_context_render: None,
+            show_tool_output: false,
         }
     }
 
@@ -299,6 +304,11 @@ impl UiState {
         // Reuse thinking_idx rotation so done/think move together.
         let idx = self.thinking_idx.wrapping_sub(1) % DONE_LABELS.len();
         DONE_LABELS[idx]
+    }
+
+    /// Toggle real-time tool output visibility.
+    pub fn toggle_tool_output(&mut self) {
+        self.show_tool_output = !self.show_tool_output;
     }
 
     pub fn tick_spinner(&mut self) -> &'static str {

@@ -473,6 +473,7 @@ impl Buffer {
                 BufferResult::Redraw
             }
             Action::NoOp => BufferResult::NoOp,
+            Action::ToggleToolOutput => BufferResult::NoOp,
         }
     }
 }
@@ -2151,6 +2152,28 @@ fn handle_streaming_key(
     code: KeyCode,
     modifiers: crossterm::event::KeyModifiers,
 ) -> Result<()> {
+    // Ctrl+O toggles real-time tool output visibility during streaming.
+    if code == KeyCode::Char('o') && modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
+        app.state.toggle_tool_output();
+        // Show feedback to the user about the current state
+        let status = if app.state.show_tool_output {
+            "  ○ Real-time output enabled (Ctrl+O to hide)\n"
+        } else {
+            "  ◯ Real-time output hidden (Ctrl+O to show)\n"
+        };
+        renderer.render(UiLine::CommandOutput(status.to_string()));
+        renderer.flush();
+        draw_spinner_now(
+            &mut app.state,
+            &app.buf,
+            ctx,
+            renderer,
+            app.message_queue.len(),
+            app.menu.selected,
+        );
+        return Ok(());
+    }
+
     // Ctrl+C always cancels the running turn — highest priority so
     // users have a reliable escape hatch even mid-edit. Also drops
     // the type-ahead queue: a user yanking the escape cord doesn't
@@ -2441,6 +2464,13 @@ fn handle_agent_event(
                 name: display.clone(),
                 detail: detail.clone(),
             });
+            
+            // Show hint for bash commands if real-time output is disabled
+            if name == "bash" && !state.show_tool_output {
+                renderer.render(UiLine::CommandOutput(
+                    "  ◯ Press Ctrl+O to show real-time output\n".to_string()
+                ));
+            }
             renderer.flush();
 
             // Mark as rendered so ToolCallResult doesn't emit it again.
@@ -2449,9 +2479,12 @@ fn handle_agent_event(
         }
         AgentEvent::ToolOutputChunk { call_id: _, chunk } => {
             // Display real-time tool output (e.g., bash stdout/stderr)
-            // Append to the scrollback as command output
-            renderer.render(UiLine::CommandOutput(chunk));
-            renderer.flush();
+            // Only show when the user has enabled it via Ctrl+O
+            if state.show_tool_output {
+                // Append to the scrollback as command output
+                renderer.render(UiLine::CommandOutput(chunk));
+                renderer.flush();
+            }
         }
         AgentEvent::ToolCallResult {
             call_id,
