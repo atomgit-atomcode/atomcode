@@ -175,7 +175,59 @@ pub async fn run(
     mcp_connect_rx: Option<tokio::sync::mpsc::UnboundedReceiver<atomcode_core::mcp::McpConnectEvent>>,
     telemetry: std::sync::Arc<atomcode_telemetry::Telemetry>,
 ) -> Result<()> {
-    let caps = TerminalCaps::probe();
+    let mut caps = TerminalCaps::probe();
+
+    // Decide force_plain BEFORE activating TerminalGuard. Plain mode
+    // is incompatible with raw-mode setup: PlainRenderer emits `\n`
+    // (LF only) via `writeln!`, but raw mode disables the kernel's
+    // ONLCR translation, so LF moves down without returning to col 1.
+    // Result: every printed line stair-steps diagonally to the right,
+    // exactly matching the bug observed in JediTerm where the welcome
+    // banner ends near col 68 and subsequent MCP status lines start
+    // there instead of at col 0.
+    //
+    // `ATOMCODE_PLAIN=1` (or any non-empty value) is the user-facing
+    // escape hatch — forces PlainRenderer even on a TTY for terminals
+    // where the retained path's DECSTBM scroll region / cursor
+    // positioning misbehaves (legacy Windows conhost: footer scrolls
+    // off-screen, content duplicated, viewport drifts upward on each
+    // redraw).
+    //
+    // JetBrains' JediTerm (Android Studio, IntelliJ, PyCharm, GoLand —
+    // all share the same emulator) doesn't fully honour DECSTBM scroll
+    // regions or LF-within-region semantics in raw mode, so we treat
+    // `TERMINAL_EMULATOR=JetBrains-JediTerm` the same as
+    // `ATOMCODE_PLAIN=1`. `ATOMCODE_RETAIN=1` overrides the auto-fall-back
+    // for users who'd rather try the retained path.
+    //
+    // The trade-off when force_plain is on: no pinned input box, no
+    // live spinner, no slash-menu palette — but text + commands +
+    // agent flow all work, which is the floor.
+    let force_plain_env = std::env::var("ATOMCODE_PLAIN")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .is_some();
+    let force_retain = std::env::var("ATOMCODE_RETAIN")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .is_some();
+    let is_jediterm = std::env::var("TERMINAL_EMULATOR")
+        .map(|v| v == "JetBrains-JediTerm")
+        .unwrap_or(false);
+    let force_plain = force_plain_env || (is_jediterm && !force_retain);
+
+    // When force_plain wins, strip raw-mode-related capabilities so
+    // every downstream branch (TerminalGuard activate, reader spawn,
+    // renderer choice) consistently picks the cooked-mode / Plain
+    // path. `tty=false` also skips Kitty enhancement push and the
+    // startup screen clear (both emit CSI sequences that JediTerm
+    // mishandles, and PlainRenderer doesn't need either).
+    if force_plain {
+        caps.raw_mode = false;
+        caps.bracketed_paste = false;
+        caps.tty = false;
+    }
+
     let (_guard, kbd_enhanced) = TerminalGuard::activate(caps)?;
 
     // If the terminal doesn't support Kitty keyboard protocol (CSI u),
@@ -192,44 +244,9 @@ pub async fn run(
     // no longer block the event loop — the event loop sends `UiLine`s
     // through a channel and moves on.
     // TTY → retained-mode Ink-style cell-diff renderer.
-    // Non-TTY (pipe, CI, dumb terminal) → PlainRenderer, which
-    // just writes plain text without ANSI cursor positioning.
-    //
-    // `ATOMCODE_PLAIN=1` (or any non-empty value) forces PlainRenderer
-    // even on a TTY — escape hatch for terminals where the retained
-    // path's DECSTBM scroll region / cursor positioning misbehaves
-    // (notably reported on legacy Windows conhost: the fixed footer
-    // scrolls off-screen, content appears duplicated, viewport drifts
-    // upward on each redraw). PlainRenderer does no cursor positioning
-    // and no scroll-region tricks, so it works on any terminal that
-    // can print bytes — at the cost of losing the pinned input box,
-    // live spinner, and slash-menu palette. All commands and agent
-    // functionality are unchanged.
-    let force_plain = std::env::var("ATOMCODE_PLAIN")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .is_some();
-    // JetBrains' JediTerm (Android Studio, IntelliJ, PyCharm, GoLand,
-    // etc. — all share the same terminal emulator) doesn't fully honour
-    // DECSTBM scroll regions or LF-within-region semantics in raw mode.
-    // Symptom in the wild: pinned footer renders in the middle of the
-    // viewport instead of bottom, and per-character input redraws
-    // stair-step diagonally because LF at body_bottom isn't constrained
-    // to the scroll region. JediTerm advertises itself with
-    // `TERMINAL_EMULATOR=JetBrains-JediTerm`. Treat its presence the
-    // same as ATOMCODE_PLAIN=1 — same escape hatch, same trade-off
-    // (no pinned input box / live spinner / slash-menu palette, but
-    // text and commands all work). Users who'd rather try the retained
-    // path anyway can unset the env var or set ATOMCODE_RETAIN=1.
-    let force_retain = std::env::var("ATOMCODE_RETAIN")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .is_some();
-    let is_jediterm = std::env::var("TERMINAL_EMULATOR")
-        .map(|v| v == "JetBrains-JediTerm")
-        .unwrap_or(false);
-    let force_plain = force_plain || (is_jediterm && !force_retain);
-    let inner: Box<dyn Renderer> = if caps.tty && !force_plain {
+    // Non-TTY (pipe, CI, dumb terminal, force_plain) → PlainRenderer,
+    // which just writes plain text without ANSI cursor positioning.
+    let inner: Box<dyn Renderer> = if caps.tty {
         Box::new(RetainedRenderer::new(caps))
     } else {
         Box::new(PlainRenderer::new())
