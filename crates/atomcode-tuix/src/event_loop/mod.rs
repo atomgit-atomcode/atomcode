@@ -2152,14 +2152,14 @@ fn handle_streaming_key(
     code: KeyCode,
     modifiers: crossterm::event::KeyModifiers,
 ) -> Result<()> {
-    // Ctrl+O toggles real-time tool output visibility during streaming.
+    // Ctrl+O toggles verbose mode (real-time tool output + reasoning visibility)
     if code == KeyCode::Char('o') && modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
         app.state.toggle_tool_output();
         // Show feedback to the user about the current state
         let status = if app.state.show_tool_output {
-            "  ○ Real-time output enabled (Ctrl+O to hide)\n"
+            "  ○ Verbose mode enabled (tool output + reasoning visible) (Ctrl+O to hide)\n"
         } else {
-            "  ◯ Real-time output hidden (Ctrl+O to show)\n"
+            "  ◯ Verbose mode disabled (Ctrl+O to show tool output + reasoning)\n"
         };
         renderer.render(UiLine::CommandOutput(status.to_string()));
         renderer.flush();
@@ -2441,6 +2441,16 @@ fn handle_agent_event(
                     fixissue_buffer.push_str(&visible);
                 }
                 renderer.render(UiLine::AssistantText(visible));
+                renderer.flush();
+            }
+        }
+        AgentEvent::ReasoningDelta(text) => {
+            // Display reasoning/thinking content in verbose mode (Ctrl+O)
+            // Only show when the user has enabled it
+            if state.show_reasoning {
+                // Prepend a dimmed prefix to distinguish from regular output
+                let reasoning_text = format!("\x1b[2m[thinking]\x1b[0m {}", text);
+                renderer.render(UiLine::CommandOutput(reasoning_text));
                 renderer.flush();
             }
         }

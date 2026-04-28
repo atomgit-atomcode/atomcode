@@ -123,6 +123,10 @@ pub struct UiState {
     /// Toggled by Ctrl+O. When false (default), tool output is hidden
     /// during execution and only shown in the final result.
     pub show_tool_output: bool,
+    /// Whether to show LLM reasoning/thinking content (e.g., DeepSeek-R1,
+    /// MiniMax-M2.7). Toggled by Ctrl+O together with `show_tool_output`.
+    /// When false (default), reasoning content is hidden during streaming.
+    pub show_reasoning: bool,
 }
 
 impl Default for UiState {
@@ -156,6 +160,7 @@ impl UiState {
             last_submitted_message: None,
             pending_context_render: None,
             show_tool_output: false,
+            show_reasoning: false,
         }
     }
 
@@ -306,9 +311,17 @@ impl UiState {
         DONE_LABELS[idx]
     }
 
-    /// Toggle real-time tool output visibility.
+    /// Toggle real-time tool output and reasoning visibility.
+    /// Both are controlled by Ctrl+O (verbose mode).
     pub fn toggle_tool_output(&mut self) {
         self.show_tool_output = !self.show_tool_output;
+        self.show_reasoning = !self.show_reasoning;
+    }
+
+    /// Toggle verbose mode (alias for toggle_tool_output).
+    /// Shows/hides both tool output and reasoning content.
+    pub fn toggle_verbose(&mut self) {
+        self.toggle_tool_output();
     }
 
     pub fn tick_spinner(&mut self) -> &'static str {

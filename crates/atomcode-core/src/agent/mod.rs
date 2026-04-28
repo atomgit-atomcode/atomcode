@@ -114,6 +114,10 @@ impl TurnStopReason {
 pub enum AgentEvent {
     /// LLM text delta (streaming).
     TextDelta(String),
+    /// LLM reasoning/thinking content (e.g., DeepSeek-R1, MiniMax-M2.7, o1-series).
+    /// Emitted when the model produces thinking content separately from the final response.
+    /// UI can optionally display this in verbose mode (Ctrl+O).
+    ReasoningDelta(String),
     /// LLM has started emitting a tool call — only the name is known so far,
     /// arguments are still streaming. UI uses this to display the tool name
     /// immediately instead of waiting for the full args.
@@ -1306,6 +1310,9 @@ impl AgentLoop {
                                     *model_produced_text = true;
                                     datalog_text_accum.push_str(&text);
                                     let _ = event_tx.send(AgentEvent::TextDelta(text));
+                                }
+                                TurnEvent::ReasoningDelta(text) => {
+                                    let _ = event_tx.send(AgentEvent::ReasoningDelta(text));
                                 }
                                 TurnEvent::ToolCallStarted { ref id, ref name, ref arguments } => {
                                     // Forward tool name immediately for UI spinner
