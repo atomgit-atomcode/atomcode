@@ -112,11 +112,6 @@ fn expand_home_path(path: &str, home_dir: Option<&Path>) -> PathBuf {
     PathBuf::from(path)
 }
 
-fn expand_user_path(path: &str) -> PathBuf {
-    let home_dir = dirs::home_dir();
-    expand_home_path(path, home_dir.as_deref())
-}
-
 fn lexical_normalize(path: &Path) -> PathBuf {
     let mut prefix: Option<OsString> = None;
     let mut has_root = false;
