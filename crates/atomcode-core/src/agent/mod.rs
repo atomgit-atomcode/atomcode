@@ -3,6 +3,7 @@
 //! via channels. Decoupled from any TUI concerns.
 
 pub mod background;
+pub mod git_auto_commit;
 pub mod git_checkpoint;
 pub mod sub_agent;
 pub mod subtask_driver;
@@ -2133,6 +2134,21 @@ impl AgentLoop {
             self.conversation.cancel_current_turn();
         } else {
             self.conversation.turn_tracker.complete_current();
+        }
+
+        // Auto-commit edited files if enabled
+        if self.config.auto_commit
+            && !matches!(stop_reason, TurnStopReason::Error)
+            && !self.files_edited_this_turn.is_empty()
+        {
+            let wd = self
+                .turn_runner
+                .context
+                .working_dir
+                .try_read()
+                .map(|g| g.clone())
+                .unwrap_or_default();
+            let _ = git_auto_commit::auto_commit_edited_files(&wd, &self.files_edited_this_turn);
         }
 
         // Flush datalog with final stats
