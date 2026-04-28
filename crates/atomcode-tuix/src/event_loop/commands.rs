@@ -178,6 +178,9 @@ pub(super) fn execute_slash_command(
             // brand-new session. Ports `/session` from the legacy TUI.
             ctx.agent.cmd_tx.send(AgentCommand::ClearConversation).ok();
             state.total_tokens = 0;
+            state.prompt_tokens = 0;
+            state.completion_tokens = 0;
+            state.cached_tokens = 0;
             state.thinking_idx = 0;
             state.on_turn_complete();
             // New session = new session file on disk. Old session
@@ -288,9 +291,24 @@ pub(super) fn execute_slash_command(
             renderer.flush();
         }
         "cost" => {
+            let total = state.prompt_tokens + state.completion_tokens;
+            let cache_rate = if state.prompt_tokens > 0 {
+                ((state.cached_tokens as f64 / state.prompt_tokens as f64 * 100.0) + 0.5) as usize
+            } else {
+                0
+            };
+            let cost = atomcode_core::pricing::calculate_cost(
+                &ctx.model_name, state.prompt_tokens, state.completion_tokens, state.cached_tokens,
+            );
+            let cost_str = atomcode_core::pricing::format_cost(cost);
             renderer.render(UiLine::CommandOutput(format!(
-                "  Session tokens: {}\n",
-                state.total_tokens
+                "  Prompt tokens:     {}\n  Completion tokens: {}\n  Cached tokens:     {} ({}% hit rate)\n  Total tokens:      {}\n  Estimated cost:    {}\n",
+                state.prompt_tokens,
+                state.completion_tokens,
+                state.cached_tokens,
+                cache_rate,
+                total,
+                cost_str,
             )));
             renderer.flush();
         }
