@@ -7,6 +7,10 @@ use std::time::Duration;
 pub enum TurnEvent {
     /// LLM streaming text output
     TextDelta(String),
+    /// LLM reasoning/thinking content (e.g., DeepSeek-R1, MiniMax-M2.7, o1-series).
+    /// Emitted when the model produces thinking content separately from the final response.
+    /// UI can optionally display this in verbose mode (Ctrl+O).
+    ReasoningDelta(String),
     /// LLM has started emitting a tool call — name is known, arguments still streaming.
     /// Fires once per tool call, BEFORE the full args have arrived. Lets the UI surface
     /// the tool name immediately so users see "⠋ Write File…" instead of an opaque

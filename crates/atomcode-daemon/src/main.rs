@@ -1276,6 +1276,9 @@ pub enum ChatEvent {
     /// LLM text delta
     #[serde(rename = "text")]
     TextDelta { content: String },
+    /// LLM reasoning/thinking content
+    #[serde(rename = "reasoning")]
+    ReasoningDelta { content: String },
     /// Tool call started
     #[serde(rename = "tool_start")]
     ToolCallStarted { name: String, arguments: String },
@@ -1866,6 +1869,10 @@ async fn process_chat_request(
                 for chat_event in artifact_detector.process(&text) {
                     let _ = event_tx.send(chat_event);
                 }
+            }
+            TurnEvent::ReasoningDelta(text) => {
+                // Forward reasoning/thinking content to client
+                let _ = event_tx.send(ChatEvent::ReasoningDelta { content: text });
             }
             TurnEvent::ToolCallStarted {
                 id: _,

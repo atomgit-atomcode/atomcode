@@ -473,6 +473,7 @@ impl Buffer {
                 BufferResult::Redraw
             }
             Action::NoOp => BufferResult::NoOp,
+            Action::ToggleToolOutput => BufferResult::NoOp,
         }
     }
 }
@@ -868,6 +869,9 @@ pub struct App {
     /// fixissue turn, verbatim. Sent as the AtomGit comment body on
     /// successful completion.
     pub fixissue_buffer: String,
+    /// Accumulates reasoning/thinking content for display in verbose mode.
+    /// Flushed on newline or when buffer exceeds threshold.
+    pub reasoning_buffer: String,
 }
 
 /// How long the "press Ctrl+C again to exit" confirmation stays armed.
@@ -886,6 +890,7 @@ impl App {
             exit_pending: None,
             fixissue_pending: None,
             fixissue_buffer: String::new(),
+            reasoning_buffer: String::new(),
         }
     }
 }
@@ -1260,7 +1265,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<(
             maybe = ctx.agent.event_rx.recv() => {
                 let Some(ev) = maybe else { break };
                 let pre_phase = app.state.phase;
-                handle_agent_event(ev, &mut app.state, &mut app.think, renderer, &mut app.pending_tools, &mut ctx, &mut app.fixissue_pending, &mut app.fixissue_buffer);
+                handle_agent_event(ev, &mut app.state, &mut app.think, renderer, &mut app.pending_tools, &mut ctx, &mut app.fixissue_pending, &mut app.fixissue_buffer, &mut app.reasoning_buffer);
                 if pre_phase != app.state.phase {
                     crate::tuix_trace!("PH", "{:?} -> {:?}", pre_phase, app.state.phase);
                 }
@@ -1460,7 +1465,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<(
             maybe = ctx.agent.event_rx.recv() => {
                 let Some(ev) = maybe else { break };
                 let pre_phase = app.state.phase;
-                handle_agent_event(ev, &mut app.state, &mut app.think, renderer, &mut app.pending_tools, &mut ctx, &mut app.fixissue_pending, &mut app.fixissue_buffer);
+                handle_agent_event(ev, &mut app.state, &mut app.think, renderer, &mut app.pending_tools, &mut ctx, &mut app.fixissue_pending, &mut app.fixissue_buffer, &mut app.reasoning_buffer);
                 if pre_phase != app.state.phase {
                     crate::tuix_trace!("PH", "{:?} -> {:?}", pre_phase, app.state.phase);
                 }
@@ -2151,6 +2156,28 @@ fn handle_streaming_key(
     code: KeyCode,
     modifiers: crossterm::event::KeyModifiers,
 ) -> Result<()> {
+    // Ctrl+O toggles verbose mode (real-time tool output + reasoning visibility)
+    if code == KeyCode::Char('o') && modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
+        app.state.toggle_tool_output();
+        // Show feedback to the user about the current state
+        let status = if app.state.show_tool_output {
+            "  ○ Verbose mode enabled (tool output + reasoning visible) (Ctrl+O to hide)\n"
+        } else {
+            "  ◯ Verbose mode disabled (Ctrl+O to show tool output + reasoning)\n"
+        };
+        renderer.render(UiLine::CommandOutput(status.to_string()));
+        renderer.flush();
+        draw_spinner_now(
+            &mut app.state,
+            &app.buf,
+            ctx,
+            renderer,
+            app.message_queue.len(),
+            app.menu.selected,
+        );
+        return Ok(());
+    }
+
     // Ctrl+C always cancels the running turn — highest priority so
     // users have a reliable escape hatch even mid-edit. Also drops
     // the type-ahead queue: a user yanking the escape cord doesn't
@@ -2409,6 +2436,7 @@ fn handle_agent_event(
     ctx: &mut LoopCtx,
     fixissue_pending: &mut Option<atomcode_core::atomgit::IssueRef>,
     fixissue_buffer: &mut String,
+    reasoning_buffer: &mut String,
 ) {
     match ev {
         AgentEvent::TextDelta(text) => {
@@ -2419,6 +2447,20 @@ fn handle_agent_event(
                 }
                 renderer.render(UiLine::AssistantText(visible));
                 renderer.flush();
+            }
+        }
+        AgentEvent::ReasoningDelta(text) => {
+            // Display reasoning/thinking content in verbose mode (Ctrl+O)
+            // Only show when the user has enabled it
+            if state.show_reasoning {
+                reasoning_buffer.push_str(&text);
+                // Flush on newline or when buffer gets large
+                if reasoning_buffer.contains('\n') || reasoning_buffer.len() > 80 {
+                    let output = std::mem::take(reasoning_buffer);
+                    // Render as gray/dimmed text with automatic line wrapping
+                    renderer.render(UiLine::ReasoningText(output));
+                    renderer.flush();
+                }
             }
         }
         AgentEvent::ToolCallStreaming { name, .. } => {
@@ -2438,6 +2480,7 @@ fn handle_agent_event(
             // Close any in-flight assistant line before emitting the tool call.
             renderer.render(UiLine::AssistantLineBreak);
             renderer.render(UiLine::ToolCallInFlight {
+                id: id.clone(),
                 name: display.clone(),
                 detail: detail.clone(),
             });
@@ -2449,9 +2492,12 @@ fn handle_agent_event(
         }
         AgentEvent::ToolOutputChunk { call_id: _, chunk } => {
             // Display real-time tool output (e.g., bash stdout/stderr)
-            // Append to the scrollback as command output
-            renderer.render(UiLine::CommandOutput(chunk));
-            renderer.flush();
+            // Only show when the user has enabled it via Ctrl+O
+            if state.show_tool_output {
+                // Append to the scrollback as command output
+                renderer.render(UiLine::CommandOutput(chunk));
+                renderer.flush();
+            }
         }
         AgentEvent::ToolCallResult {
             call_id,
@@ -2464,9 +2510,12 @@ fn handle_agent_event(
             renderer.render(UiLine::AssistantLineBreak);
             // Freeze the animated in-flight tool-call row to its final
             // static `▸` icon before the `⎿ result` body row lands beneath
-            // it. No-op when nothing is in flight (plain mode, or the
-            // matching Start never fired).
-            renderer.render(UiLine::ToolCallCommit);
+            // it. Pass the call_id so we only freeze if the inflight_tool matches.
+            // This prevents freezing a different tool's spinner when multiple
+            // tools are in flight (e.g., WriteFile result arrives while Bash spinner is active).
+            renderer.render(UiLine::ToolCallCommit {
+                call_id: Some(call_id.clone()),
+            });
 
             // Prefer the display-name we stored at ToolCallStarted time;
             // fall back to converting the raw name if we missed the Start
@@ -2520,6 +2569,13 @@ fn handle_agent_event(
             if !diff_entries.is_empty() {
                 renderer.render(UiLine::DiffBlock(diff_entries));
             }
+            // Show hint for bash commands if real-time output is disabled
+            // Display AFTER the result so user sees the command first
+            if name == "bash" && !state.show_tool_output {
+                renderer.render(UiLine::CommandOutput(
+                    "  ◯ Press Ctrl+O to show real-time output\n".to_string()
+                ));
+            }
             renderer.flush();
             let _ = name;
         }
@@ -2527,17 +2583,24 @@ fn handle_agent_event(
             tool_name, call, ..
         } => {
             // Emit the `▸ Tool(detail)` row BEFORE the approval prompt
-            // so the user sees what they're approving. If the matching
-            // ToolCallStarted already populated pending_tools, reuse
-            // its stored display/detail and flag the entry as rendered
-            // so ToolCallResult won't re-emit. If not (race condition
-            // where Approval arrives first), fall back to deriving
-            // display/detail from the event itself.
+            // so the user sees what they're approving.
             let display = display_tool_name(&tool_name);
             let detail = format_tool_detail(&tool_name, &call.arguments);
+            
+            // Check if ToolCallStarted already rendered this tool call as a
+            // dynamic ToolCallInFlight spinner. If so, we need to freeze it
+            // to a static `▸` row before showing the approval prompt.
             if let Some(entry) = pending_tools.get_mut(&call.id) {
                 let (disp, det, rendered) = entry;
-                if !*rendered {
+                if *rendered {
+                    // ToolCallInFlight is animating — commit it to a static row
+                    // so the approval prompt appears below a frozen `▸ Bash(...)`.
+                    // Pass the call_id to ensure we only freeze the matching tool.
+                    renderer.render(UiLine::ToolCallCommit {
+                        call_id: Some(call.id.clone()),
+                    });
+                } else {
+                    // Not yet rendered, emit it now
                     renderer.render(UiLine::ToolCall {
                         name: disp.clone(),
                         detail: det.clone(),
@@ -2545,15 +2608,17 @@ fn handle_agent_event(
                     *rendered = true;
                 }
             } else {
+                // No entry from ToolCallStarted, render and insert
                 renderer.render(UiLine::ToolCall {
                     name: display.clone(),
                     detail: detail.clone(),
                 });
                 pending_tools.insert(call.id.clone(), (display.clone(), detail.clone(), true));
             }
+            
             renderer.render(UiLine::ApprovalPrompt {
-                tool: display,
-                detail,
+                tool: display.clone(),
+                detail: detail.clone(),
             });
             renderer.flush();
             atomcode_core::notify::notify(
@@ -2614,6 +2679,9 @@ fn handle_agent_event(
             // TextDelta of the NEXT turn — user sees blank assistant bubbles
             // while datalog proves the model did return text.
             think.reset();
+
+            // Clear reasoning buffer between turns
+            reasoning_buffer.clear();
 
             // Persist session after every completed turn so /resume can
             // find it after a clean exit — the whole point of sessions.

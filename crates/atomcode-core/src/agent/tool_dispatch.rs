@@ -10,6 +10,9 @@ impl AgentLoop {
                 self.discipline_state.model_produced_text = true;
                 let _ = self.event_tx.send(AgentEvent::TextDelta(text));
             }
+            TurnEvent::ReasoningDelta(text) => {
+                let _ = self.event_tx.send(AgentEvent::ReasoningDelta(text));
+            }
             TurnEvent::ToolCallStreaming { name, hint } => {
                 let _ = self
                     .event_tx
@@ -89,16 +92,18 @@ impl AgentLoop {
                     if !full_path_str.is_empty() {
                         self.active_file = Some(PathBuf::from(full_path_str));
                     }
-                    if let Some(end) = rest.find(|c: char| c == '\n' || c == '.') {
-                        let file = short_path(&rest[..end]);
+                    if !full_path_str.is_empty() {
+                        let file = full_path_str.to_string();
                         if !self.files_edited_this_turn.contains(&file) {
                             self.files_edited_this_turn.push(file);
                         }
                     }
                 }
-                if let Some(pos) = output.find("Wrote ").or_else(|| output.find("Overwrote ")) {
+                if let Some(pos) = output.find("Wrote ").or_else(|| output.find("Overwrote ")).or_else(|| output.find("Created new file ")) {
                     let keyword_len = if output[pos..].starts_with("Overwrote ") {
                         10
+                    } else if output[pos..].starts_with("Created new file ") {
+                        17
                     } else {
                         6
                     };
@@ -110,12 +115,20 @@ impl AgentLoop {
                     if !full_path_str.is_empty() {
                         self.active_file = Some(PathBuf::from(full_path_str));
                     }
-                    if let Some(end) = rest.find(|c: char| c == '\n' || c == ' ') {
-                        let file = short_path(&rest[..end]);
+                    if !full_path_str.is_empty() {
+                        let file = full_path_str.to_string();
                         if !self.files_edited_this_turn.contains(&file) {
                             self.files_edited_this_turn.push(file);
                         }
                     }
+                }
+                if success {
+                    track_tool_modified_files(
+                        &name,
+                        &self.discipline_state.last_bash_cmd,
+                        &output,
+                        &mut self.files_edited_this_turn,
+                    );
                 }
                 if matches!(
                     name.as_str(),

@@ -103,11 +103,15 @@ impl<W: Write + Send> Renderer for PlainRenderer<W> {
                 self.drop_transient();
                 let _ = self.out.write_all(scrub_controls(&text).as_bytes());
             }
+            UiLine::ReasoningText(text) => {
+                // Display reasoning in gray/dimmed style
+                let _ = write!(self.out, "\x1b[2m{}\x1b[0m", scrub_controls(&text));
+            }
             UiLine::AssistantLineBreak => {
                 self.drop_transient();
                 let _ = self.out.write_all(b"\n");
             }
-            UiLine::ToolCall { name, detail } | UiLine::ToolCallInFlight { name, detail } => {
+            UiLine::ToolCall { name, detail } | UiLine::ToolCallInFlight { id: _, name, detail } => {
                 // Plain mode has no in-place rewrite, so the in-flight
                 // variant degrades to the same single static line that
                 // the static `ToolCall` produces — the user just sees
@@ -127,7 +131,7 @@ impl<W: Write + Send> Renderer for PlainRenderer<W> {
                     );
                 }
             }
-            UiLine::ToolCallCommit => {
+            UiLine::ToolCallCommit { call_id: _ } => {
                 // Plain mode never animated the row, so there is
                 // nothing to freeze. Skip silently.
             }

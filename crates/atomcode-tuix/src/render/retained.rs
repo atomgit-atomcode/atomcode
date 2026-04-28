@@ -279,8 +279,8 @@ pub struct RetainedRenderer<W: Write + Send> {
     /// Cleared by `ToolCallCommit`, which freezes the row to a static
     /// `▸` icon (no longer live) so the next push_body_row appends
     /// cleanly below it and the spinner can resume on the next tick.
-    /// (name, detail).
-    inflight_tool: Option<(String, String)>,
+    /// (call_id, name, detail).
+    inflight_tool: Option<(String, String, String)>,
 }
 
 impl RetainedRenderer<BufWriter<Stdout>> {
@@ -1483,7 +1483,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 // When a tool call is in flight, the live row instead
                 // carries the tool-call shape (`<frame> Bash(cmd)`),
                 // so the same animation cadence drives the tool icon.
-                let cells = if let Some((name, detail)) = self.inflight_tool.clone() {
+                let cells = if let Some((_id, name, detail)) = self.inflight_tool.clone() {
                     self.build_inflight_tool_row(frame, &name, &detail)
                 } else {
                     self.build_spinner_body_row(frame, &label)
@@ -1491,7 +1491,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 self.push_or_update_live_spinner(cells);
             }
             UiLine::Spinner { frame, label } => {
-                let cells = if let Some((name, detail)) = self.inflight_tool.clone() {
+                let cells = if let Some((_id, name, detail)) = self.inflight_tool.clone() {
                     self.build_inflight_tool_row(frame, &name, &detail)
                 } else {
                     self.build_spinner_body_row(frame, &label)
@@ -1566,6 +1566,13 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 self.assistant_line_buf.push_str(&scrub_controls(&text));
                 self.flush_assistant_lines();
             }
+            UiLine::ReasoningText(text) => {
+                // Display reasoning in gray/dimmed style with word wrapping
+                let text = scrub_controls(&text);
+                // Use ANSI dim/gray escape codes
+                let dimmed = format!("\x1b[2m{}\x1b[0m", text);
+                self.push_body_text(&dimmed, &CellStyle::default());
+            }
             UiLine::AssistantLineBreak => {
                 self.flush_assistant_remainder();
             }
@@ -1576,7 +1583,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 // protocol bug) would otherwise leave inflight_tool
                 // set and the next user turn's spinner would mistake
                 // the stale tool detail for the in-flight payload.
-                if let Some((name, detail)) = self.inflight_tool.take() {
+                if let Some((_id, name, detail)) = self.inflight_tool.take() {
                     let frozen = self.build_inflight_tool_row("\u{25b8}", &name, &detail);
                     self.push_or_update_live_spinner(frozen);
                     self.live_spinner_active = false;
@@ -1584,7 +1591,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
             }
             UiLine::TurnCancelled => {
                 self.flush_assistant_remainder();
-                if let Some((name, detail)) = self.inflight_tool.take() {
+                if let Some((_id, name, detail)) = self.inflight_tool.take() {
                     let frozen = self.build_inflight_tool_row("\u{25b8}", &name, &detail);
                     self.push_or_update_live_spinner(frozen);
                     self.live_spinner_active = false;
@@ -1596,7 +1603,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
             }
 
             // ── body: tools & diffs ──
-            UiLine::ToolCallInFlight { name, detail } => {
+            UiLine::ToolCallInFlight { id, name, detail } => {
                 self.flush_assistant_remainder();
                 // Parallel tool calls are rare but not impossible. If
                 // one is already animating, freeze it before starting
@@ -1604,7 +1611,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 // simplification (see field doc).
                 if self.inflight_tool.is_some() {
                     let prev = std::mem::take(&mut self.inflight_tool).unwrap();
-                    let frozen = self.build_inflight_tool_row("\u{25b8}", &prev.0, &prev.1);
+                    let frozen = self.build_inflight_tool_row("\u{25b8}", &prev.1, &prev.2);
                     self.push_or_update_live_spinner(frozen);
                     self.live_spinner_active = false;
                 }
@@ -1614,18 +1621,27 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 // animation seamlessly.
                 let initial = if self.caps.unicode_symbols { "\u{2819}" } else { "*" };
                 let row = self.build_inflight_tool_row(initial, &name, &detail);
-                self.inflight_tool = Some((name, detail));
+                self.inflight_tool = Some((id, name, detail));
                 self.push_or_update_live_spinner(row);
             }
-            UiLine::ToolCallCommit => {
-                if let Some((name, detail)) = self.inflight_tool.take() {
-                    let frozen = self.build_inflight_tool_row("\u{25b8}", &name, &detail);
-                    self.push_or_update_live_spinner(frozen);
-                    // Drop the live flag so the next push_body_row
-                    // appends BELOW this frozen row instead of popping
-                    // it — the in-flight indicator becomes a permanent
-                    // historical paragraph header.
-                    self.live_spinner_active = false;
+            UiLine::ToolCallCommit { call_id } => {
+                // Only commit if the inflight_tool matches the expected call_id,
+                // or if no call_id was provided (legacy behavior).
+                let should_commit = match (call_id, &self.inflight_tool) {
+                    (Some(expected_id), Some((actual_id, _, _))) => &expected_id == actual_id,
+                    (None, Some(_)) => true,
+                    _ => false,
+                };
+                if should_commit {
+                    if let Some((_id, name, detail)) = self.inflight_tool.take() {
+                        let frozen = self.build_inflight_tool_row("\u{25b8}", &name, &detail);
+                        self.push_or_update_live_spinner(frozen);
+                        // Drop the live flag so the next push_body_row
+                        // appends BELOW this frozen row instead of popping
+                        // it — the in-flight indicator becomes a permanent
+                        // historical paragraph header.
+                        self.live_spinner_active = false;
+                    }
                 }
             }
             UiLine::ToolCall { name, detail } => {
@@ -1658,7 +1674,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 // merge collapse), freeze the in-flight row now so
                 // the upcoming `⎿ ...` body push doesn't itself become
                 // the next animation target on the next spinner tick.
-                if let Some((name, detail)) = self.inflight_tool.take() {
+                if let Some((_id, name, detail)) = self.inflight_tool.take() {
                     let frozen = self.build_inflight_tool_row("\u{25b8}", &name, &detail);
                     self.push_or_update_live_spinner(frozen);
                     self.live_spinner_active = false;
@@ -1771,22 +1787,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
 
             // ── body: approval / errors / command output ──
             UiLine::ApprovalPrompt { tool, detail } => {
-                // The preceding ToolCall body row already shows
-                // `▸ name(detail)`, so this row is a pure action prompt
-                // with colour-chip key hints (legacy-tuix style).
-                //
-                // Header was Role::Warning (SGR 93 / yellow) — invisible
-                // on light themes (#fce94f-class pastels on white). It's
-                // semantically a blocking state ("must act before
-                // continuing"), so Error red + bold is more appropriate
-                // and reads on every theme. The ▶ glyph keeps it
-                // visually distinct from regular Error rows.
-                let _ = (tool, detail);
-                // "Waiting for approval" is a pending action, not a
-                // failure — using Role::Error (red) made it read as a
-                // tool failure and collide with real Error rows nearby.
-                // Warning (yellow) restores the pending/attention-needed
-                // semantic and keeps red reserved for actual errors.
+                let _ = (tool, detail);  // ToolCall row already shows the command
                 let warn = self.style_bold(Role::Warning);
                 let plain = CellStyle::default();
                 let chip = |c: Color| CellStyle {

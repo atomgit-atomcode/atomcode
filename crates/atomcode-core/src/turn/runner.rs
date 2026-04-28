@@ -386,10 +386,10 @@ impl TurnRunner {
                                     }
                                     Some(Ok(StreamEvent::Reasoning(text))) => {
                                         got_any_event = true;
-                                        // Accumulate only. Don't push into conversation / emit
-                                        // TextDelta here — default UX is to hide reasoning.
-                                        // If `content` ends up empty, the `Done` arm below
-                                        // promotes `reasoning_buf` to the answer.
+                                        // Emit to UI for verbose mode (Ctrl+O) display.
+                                        // Still accumulate for the fallback case where
+                                        // content ends up empty.
+                                        let _ = event_tx.send(TurnEvent::ReasoningDelta(text.clone()));
                                         reasoning_buf.push_str(&text);
                                     }
                                     Some(Ok(StreamEvent::ToolCallStart { id, name })) => {

@@ -6,45 +6,69 @@
 use std::path::Path;
 use std::process::Command;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AutoCommitOutcome {
+    Committed { sha: String, message: String },
+    Skipped { reason: String },
+    Failed { reason: String },
+}
+
 /// Auto-commit files edited during the agent turn.
-/// Returns the commit SHA on success, or None if nothing to commit / not a git repo.
-pub fn auto_commit_edited_files(working_dir: &Path, edited_files: &[String]) -> Option<String> {
+pub fn auto_commit_edited_files(working_dir: &Path, edited_files: &[String]) -> AutoCommitOutcome {
     if edited_files.is_empty() {
-        return None;
+        return AutoCommitOutcome::Skipped {
+            reason: "no edited files".to_string(),
+        };
     }
 
     if !is_git_repo(working_dir) {
-        return None;
+        return AutoCommitOutcome::Skipped {
+            reason: "not a git repository".to_string(),
+        };
     }
 
     // Do not mix user-staged changes into an automatic commit. `git commit`
     // commits the whole index, so auto-commit is only safe when the index is
     // clean before we stage this turn's edited files.
     if has_staged_changes(working_dir) {
-        return None;
-    }
-
-    // Stage only the files that were actually edited
-    let mut added = 0;
-    for file in edited_files {
-        let file_path = if Path::new(file).is_absolute() {
-            file.to_string()
-        } else {
-            working_dir.join(file).to_string_lossy().to_string()
+        return AutoCommitOutcome::Skipped {
+            reason: "index has pre-existing staged changes".to_string(),
         };
-        if let Ok(output) = Command::new("git")
-            .args(["add", &file_path])
-            .current_dir(working_dir)
-            .output()
-        {
-            if output.status.success() {
-                added += 1;
-            }
-        }
     }
 
-    if added == 0 {
-        return None;
+    let file_paths: Vec<String> = edited_files
+        .iter()
+        .map(|file| {
+            if Path::new(file).is_absolute() {
+                file.to_string()
+            } else {
+                working_dir.join(file).to_string_lossy().to_string()
+            }
+        })
+        .collect();
+
+    // Stage only the files that were actually edited.
+    let mut add_cmd = Command::new("git");
+    add_cmd.arg("add").arg("--").args(&file_paths).current_dir(working_dir);
+    let output = match add_cmd.output() {
+        Ok(output) => output,
+        Err(e) => {
+            return AutoCommitOutcome::Failed {
+                reason: format!("git add failed to start: {e}"),
+            };
+        }
+    };
+
+    if !output.status.success() {
+        return AutoCommitOutcome::Failed {
+            reason: format!("git add failed: {}", command_output_message(&output)),
+        };
+    }
+
+    if file_paths.is_empty() {
+        return AutoCommitOutcome::Skipped {
+            reason: "no edited files".to_string(),
+        };
     }
 
     // Check if there are staged changes
@@ -55,37 +79,73 @@ pub fn auto_commit_edited_files(working_dir: &Path, edited_files: &[String]) -> 
     if let Ok(status) = diff_output {
         if status.success() {
             // Exit code 0 means no staged changes
-            return None;
+            return AutoCommitOutcome::Skipped {
+                reason: "no staged changes after git add".to_string(),
+            };
         }
+    } else if let Err(e) = diff_output {
+        return AutoCommitOutcome::Failed {
+            reason: format!("git diff --cached failed to start: {e}"),
+        };
     }
 
     let message = generate_commit_message(edited_files);
 
-    let output = Command::new("git")
+    let output = match Command::new("git")
         .args(["commit", "-m", &message])
         .current_dir(working_dir)
         .output()
-        .ok()?;
+    {
+        Ok(output) => output,
+        Err(e) => {
+            return AutoCommitOutcome::Failed {
+                reason: format!("git commit failed to start: {e}"),
+            };
+        }
+    };
 
     if !output.status.success() {
-        return None;
+        return AutoCommitOutcome::Failed {
+            reason: format!("git commit failed: {}", command_output_message(&output)),
+        };
     }
 
     // Extract commit SHA
-    let sha_output = Command::new("git")
+    let sha_output = match Command::new("git")
         .args(["rev-parse", "--short", "HEAD"])
         .current_dir(working_dir)
         .output()
-        .ok()?;
+    {
+        Ok(output) => output,
+        Err(e) => {
+            return AutoCommitOutcome::Failed {
+                reason: format!("git rev-parse failed to start: {e}"),
+            };
+        }
+    };
 
     let sha = String::from_utf8_lossy(&sha_output.stdout)
         .trim()
         .to_string();
     if sha.is_empty() {
-        None
+        AutoCommitOutcome::Failed {
+            reason: "git rev-parse returned an empty sha".to_string(),
+        }
     } else {
-        Some(sha)
+        AutoCommitOutcome::Committed { sha, message }
     }
+}
+
+fn command_output_message(output: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if !stderr.is_empty() {
+        return stderr;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if !stdout.is_empty() {
+        return stdout;
+    }
+    format!("exit status {}", output.status)
 }
 
 fn generate_commit_message(files: &[String]) -> String {
@@ -165,8 +225,8 @@ mod tests {
         let edited = dir.path().join("edited.txt");
         fs::write(&edited, "hello\n").unwrap();
 
-        let sha = auto_commit_edited_files(dir.path(), &["edited.txt".to_string()]);
-        assert!(sha.is_some());
+        let outcome = auto_commit_edited_files(dir.path(), &["edited.txt".to_string()]);
+        assert!(matches!(outcome, AutoCommitOutcome::Committed { .. }));
 
         let log = Command::new("git")
             .args(["log", "--oneline", "-1"])
@@ -183,9 +243,9 @@ mod tests {
         run_git(dir.path(), &["add", "pre_staged.txt"]);
 
         fs::write(dir.path().join("edited.txt"), "agent work\n").unwrap();
-        let sha = auto_commit_edited_files(dir.path(), &["edited.txt".to_string()]);
+        let outcome = auto_commit_edited_files(dir.path(), &["edited.txt".to_string()]);
 
-        assert!(sha.is_none());
+        assert!(matches!(outcome, AutoCommitOutcome::Skipped { .. }));
         let status = Command::new("git")
             .args(["diff", "--cached", "--name-only"])
             .current_dir(dir.path())

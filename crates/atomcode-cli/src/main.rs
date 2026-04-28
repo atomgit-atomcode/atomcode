@@ -1282,6 +1282,12 @@ async fn run_headless(
                 print!("{}", text);
                 io::stdout().flush()?;
             }
+            AgentEvent::ReasoningDelta(text) => {
+                // In CLI verbose mode, show reasoning/thinking content
+                if verbose {
+                    eprintln!("[thinking] {}", text);
+                }
+            }
             AgentEvent::ToolCallStreaming { name, hint } => {
                 if verbose {
                     let detail = if hint.is_empty() {

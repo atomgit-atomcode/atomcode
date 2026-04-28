@@ -114,6 +114,10 @@ impl TurnStopReason {
 pub enum AgentEvent {
     /// LLM text delta (streaming).
     TextDelta(String),
+    /// LLM reasoning/thinking content (e.g., DeepSeek-R1, MiniMax-M2.7, o1-series).
+    /// Emitted when the model produces thinking content separately from the final response.
+    /// UI can optionally display this in verbose mode (Ctrl+O).
+    ReasoningDelta(String),
     /// LLM has started emitting a tool call — only the name is known so far,
     /// arguments are still streaming. UI uses this to display the tool name
     /// immediately instead of waiting for the full args.
@@ -890,6 +894,7 @@ impl AgentLoop {
                         let provider = self.turn_runner.provider.clone();
                         let tools = self.turn_runner.tools.clone();
                         let context = self.turn_runner.context.clone();
+                        let context_for_commit = context.clone();
                         let config = self.config.clone();
                         let ctx = self.ctx.clone();
                         let event_tx = self.event_tx.clone();
@@ -905,6 +910,37 @@ impl AgentLoop {
                                 event_tx.clone(),
                             )
                             .await;
+                            if let AgentEvent::BackgroundComplete {
+                                files_edited,
+                                success: true,
+                                ..
+                            } = &result
+                            {
+                                if !files_edited.is_empty() {
+                                    let wd = context_for_commit
+                                        .working_dir
+                                        .try_read()
+                                        .map(|g| g.clone())
+                                        .unwrap_or_default();
+                                    match git_auto_commit::auto_commit_edited_files(&wd, files_edited)
+                                    {
+                                        git_auto_commit::AutoCommitOutcome::Committed {
+                                            sha,
+                                            message,
+                                        } => {
+                                            let _ = event_tx.send(AgentEvent::TextDelta(format!(
+                                                "\n[auto-commit {sha}] {message}\n"
+                                            )));
+                                        }
+                                        git_auto_commit::AutoCommitOutcome::Failed { reason } => {
+                                            let _ = event_tx.send(AgentEvent::TextDelta(format!(
+                                                "\n[auto-commit skipped] {reason}\n"
+                                            )));
+                                        }
+                                        git_auto_commit::AutoCommitOutcome::Skipped { .. } => {}
+                                    }
+                                }
+                            }
                             let _ = event_tx.send(result);
                             flag.store(false, Ordering::Release);
                         });
@@ -1253,6 +1289,7 @@ impl AgentLoop {
                 let file_read_counts = &mut self.discipline_state.file_read_counts;
                 let consecutive_reads = &mut self.discipline_state.consecutive_reads;
                 let targeted_read_count = &mut self.discipline_state.targeted_read_count;
+                let last_bash_cmd = &mut self.discipline_state.last_bash_cmd;
                 let session_files = &mut self.session_files;
                 let reindex_tx = &self.reindex_tx;
 
@@ -1307,6 +1344,9 @@ impl AgentLoop {
                                     datalog_text_accum.push_str(&text);
                                     let _ = event_tx.send(AgentEvent::TextDelta(text));
                                 }
+                                TurnEvent::ReasoningDelta(text) => {
+                                    let _ = event_tx.send(AgentEvent::ReasoningDelta(text));
+                                }
                                 TurnEvent::ToolCallStarted { ref id, ref name, ref arguments } => {
                                     // Forward tool name immediately for UI spinner
                                     let _ = event_tx.send(AgentEvent::ToolCallStreaming { name: name.clone(), hint: String::new() });
@@ -1320,6 +1360,16 @@ impl AgentLoop {
                                     *current_tool_name = name.clone();
                                     *phase = AgentPhase::CallingTool(name.clone());
                                     let _ = event_tx.send(AgentEvent::PhaseChange(phase.clone()));
+
+                                    if name == "bash" {
+                                        if let Ok(args) = serde_json::from_str::<serde_json::Value>(arguments) {
+                                            *last_bash_cmd = args
+                                                .get("command")
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or("")
+                                                .to_string();
+                                        }
+                                    }
 
                                     // Track files for Working Set + read counts
                                     if matches!(name.as_str(), "read_file" | "edit_file" | "create_file" | "search_replace" | "glob" | "grep") {
@@ -1368,8 +1418,8 @@ impl AgentLoop {
                                         if !fp.is_empty() {
                                             *active_file = Some(PathBuf::from(fp));
                                         }
-                                        if let Some(end) = rest.find(|c: char| c == '\n' || c == '.') {
-                                            let file = short_path(&rest[..end]);
+                                        if !fp.is_empty() {
+                                            let file = fp.to_string();
                                             if !files_edited_this_turn.contains(&file) {
                                                 files_edited_this_turn.push(file);
                                             }
@@ -1385,12 +1435,20 @@ impl AgentLoop {
                                         if !fp.is_empty() {
                                             *active_file = Some(PathBuf::from(fp));
                                         }
-                                        if let Some(end) = rest.find(|c: char| c == '\n' || c == ' ') {
-                                            let file = short_path(&rest[..end]);
+                                        if !fp.is_empty() {
+                                            let file = fp.to_string();
                                             if !files_edited_this_turn.contains(&file) {
                                                 files_edited_this_turn.push(file);
                                             }
                                         }
+                                    }
+                                    if success {
+                                        track_tool_modified_files(
+                                            &name,
+                                            last_bash_cmd,
+                                            &output,
+                                            files_edited_this_turn,
+                                        );
                                     }
                                     if matches!(name.as_str(), "read_file" | "list_directory" | "glob" | "grep") {
                                         *consecutive_reads += 1;
@@ -2148,7 +2206,22 @@ impl AgentLoop {
                 .try_read()
                 .map(|g| g.clone())
                 .unwrap_or_default();
-            let _ = git_auto_commit::auto_commit_edited_files(&wd, &self.files_edited_this_turn);
+            match git_auto_commit::auto_commit_edited_files(&wd, &self.files_edited_this_turn) {
+                git_auto_commit::AutoCommitOutcome::Committed { sha, message } => {
+                    let notice = format!("\n[auto-commit {sha}] {message}\n");
+                    self.datalog.log_model_text(&notice);
+                    let _ = self.event_tx.send(AgentEvent::TextDelta(notice));
+                }
+                git_auto_commit::AutoCommitOutcome::Failed { reason } => {
+                    let notice = format!("\n[auto-commit skipped] {reason}\n");
+                    self.datalog.log_error(&notice);
+                    let _ = self.event_tx.send(AgentEvent::TextDelta(notice));
+                }
+                git_auto_commit::AutoCommitOutcome::Skipped { reason } => {
+                    self.datalog
+                        .log_model_text(&format!("[auto-commit skipped] {reason}"));
+                }
+            }
         }
 
         // Flush datalog with final stats
@@ -2320,12 +2393,8 @@ impl AgentLoop {
             }
             // Track edited files
             if r.success {
-                let short_name = std::path::Path::new(&r.file_path)
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_default();
-                if !self.files_edited_this_turn.contains(&short_name) {
-                    self.files_edited_this_turn.push(short_name);
+                if !self.files_edited_this_turn.contains(&r.file_path) {
+                    self.files_edited_this_turn.push(r.file_path.clone());
                 }
             }
         }
@@ -2477,13 +2546,143 @@ fn find_build_command(wd: &std::path::Path) -> Option<(String, std::path::PathBu
     None
 }
 
-fn short_path(path: &str) -> String {
-    let parts: Vec<&str> = path.rsplitn(3, '/').collect();
-    match parts.len() {
-        0 | 1 => path.to_string(),
-        2 => format!("{}/{}", parts[1], parts[0]),
-        _ => format!(".../{}/{}", parts[1], parts[0]),
+fn track_tool_modified_files(
+    tool_name: &str,
+    bash_command: &str,
+    output: &str,
+    edited_files: &mut Vec<String>,
+) {
+    if tool_name == "bash" {
+        track_bash_modified_files(bash_command, output, edited_files);
+    } else if tool_name == "search_replace" {
+        track_search_replace_files(output, edited_files);
     }
+}
+
+fn track_bash_modified_files(command: &str, output: &str, edited_files: &mut Vec<String>) {
+    let Some(cwd) = bash_output_cwd(output) else {
+        return;
+    };
+
+    for file in rm_file_targets(command, &cwd) {
+        push_edited_file(edited_files, file);
+    }
+    for file in bash_workspace_modified_files(output, &cwd) {
+        push_edited_file(edited_files, file);
+    }
+}
+
+fn bash_output_cwd(output: &str) -> Option<PathBuf> {
+    output.lines().rev().find_map(|line| {
+        line.strip_prefix("[cwd: ")
+            .and_then(|rest| rest.strip_suffix(']'))
+            .map(PathBuf::from)
+    })
+}
+
+fn bash_workspace_modified_files(output: &str, cwd: &std::path::Path) -> Vec<String> {
+    let Some(line) = output
+        .lines()
+        .find(|line| line.starts_with("[workspace modified via bash: "))
+    else {
+        return Vec::new();
+    };
+    let Some(rest) = line.strip_prefix("[workspace modified via bash: ") else {
+        return Vec::new();
+    };
+    let changed = rest.split(". If ").next().unwrap_or(rest);
+    changed
+        .split(',')
+        .map(str::trim)
+        .filter(|file| !file.is_empty() && !file.starts_with('+'))
+        .map(|file| {
+            let path = std::path::Path::new(file);
+            if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                cwd.join(path)
+            }
+            .to_string_lossy()
+            .to_string()
+        })
+        .collect()
+}
+
+fn track_search_replace_files(output: &str, edited_files: &mut Vec<String>) {
+    for line in output.lines() {
+        let trimmed = line.trim_start();
+        let Some((path, _summary)) = trimmed.split_once(" (") else {
+            continue;
+        };
+        if path.is_empty() {
+            continue;
+        }
+        push_edited_file(edited_files, path.to_string());
+    }
+}
+
+fn rm_file_targets(command: &str, cwd: &std::path::Path) -> Vec<String> {
+    let tokens = shell_words(command);
+    let mut targets = Vec::new();
+    let mut i = 0;
+    while i < tokens.len() {
+        if tokens[i] != "rm" {
+            i += 1;
+            continue;
+        }
+
+        i += 1;
+        let mut rm_targets = Vec::new();
+        let mut recursive = false;
+        while i < tokens.len() {
+            let token = &tokens[i];
+            if matches!(token.as_str(), "&&" | "||" | ";" | "|") {
+                break;
+            }
+            if token.starts_with('-') {
+                if token.contains('r') || token.contains('R') {
+                    recursive = true;
+                }
+                i += 1;
+                continue;
+            }
+
+            let path = std::path::Path::new(token);
+            let full_path = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                cwd.join(path)
+            };
+            rm_targets.push(full_path.to_string_lossy().to_string());
+            i += 1;
+        }
+
+        if !recursive {
+            targets.extend(rm_targets);
+        }
+    }
+    targets
+}
+
+fn push_edited_file(edited_files: &mut Vec<String>, file: String) {
+    if !edited_files.contains(&file) {
+        edited_files.push(file);
+    }
+}
+
+fn shell_words(raw: &str) -> Vec<String> {
+    raw.split_whitespace()
+        .map(|token| {
+            token.trim_matches(|c| {
+                matches!(
+                    c,
+                    '"' | '\'' | '`' | '(' | ')' | '[' | ']' | '{' | '}' | ','
+                )
+            })
+        })
+        .filter(|token| !token.is_empty())
+        .map(|token| token.to_string())
+        .collect()
 }
 
 /// Whether a `ReloadConfig` should wipe the existing conversation history.
@@ -2912,5 +3111,69 @@ mod fmt_k_tokens_tests {
         assert_eq!(fmt_k_tokens(3700), "3.7K");
         assert_eq!(fmt_k_tokens(9800), "9.8K");
         assert_eq!(fmt_k_tokens(64000), "64.0K");
+    }
+}
+
+#[cfg(test)]
+mod bash_deleted_file_tracking_tests {
+    use super::{
+        bash_workspace_modified_files, rm_file_targets, track_search_replace_files,
+        track_tool_modified_files,
+    };
+    use std::path::Path;
+
+    #[test]
+    fn tracks_simple_rm_target_from_cwd() {
+        let targets = rm_file_targets("rm numbers.txt", Path::new("/tmp/project"));
+        assert_eq!(targets, vec!["/tmp/project/numbers.txt"]);
+    }
+
+    #[test]
+    fn skips_recursive_rm_targets() {
+        let targets = rm_file_targets("rm -rf dist", Path::new("/tmp/project"));
+        assert!(targets.is_empty());
+    }
+
+    #[test]
+    fn tracks_successful_bash_rm_from_output_cwd() {
+        let mut edited = Vec::new();
+        track_tool_modified_files(
+            "bash",
+            "rm numbers.txt",
+            "[elapsed: 0.0s, exit: 0]\n[cwd: /tmp/project]",
+            &mut edited,
+        );
+        assert_eq!(edited, vec!["/tmp/project/numbers.txt"]);
+    }
+
+    #[test]
+    fn tracks_workspace_modified_bash_output() {
+        let files = bash_workspace_modified_files(
+            "[workspace modified via bash: src/a.rs, /tmp/project/b.txt. If you meant to edit source, use edit_file next time]\n[cwd: /tmp/project]",
+            Path::new("/tmp/project"),
+        );
+        assert_eq!(
+            files,
+            vec![
+                "/tmp/project/src/a.rs".to_string(),
+                "/tmp/project/b.txt".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn tracks_search_replace_output_files() {
+        let mut edited = Vec::new();
+        track_search_replace_files(
+            "Replaced 'old' -> 'new': 2 replacements across 2 files.\n  /tmp/project/a.rs (1 replacements)\n  /tmp/project/b.rs (1 replacements)",
+            &mut edited,
+        );
+        assert_eq!(
+            edited,
+            vec![
+                "/tmp/project/a.rs".to_string(),
+                "/tmp/project/b.rs".to_string()
+            ]
+        );
     }
 }
