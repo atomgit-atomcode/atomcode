@@ -399,11 +399,11 @@ async fn bash_execute(args: &str, ctx: &ToolContext) -> Result<ToolResult> {
     let has_any_output = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let has_out_1 = has_any_output.clone();
     let has_out_2 = has_any_output.clone();
-    
+
     // Clone event sender for streaming output (if available)
     let event_tx = ctx.event_tx.clone();
     let call_id = ctx.current_call_id.clone();
-    
+
     // Helper to send output chunk event
     let send_chunk = |chunk: &str| {
         if let (Some(tx), Some(id)) = (&event_tx, &call_id) {
@@ -413,7 +413,7 @@ async fn bash_execute(args: &str, ctx: &ToolContext) -> Result<ToolResult> {
             });
         }
     };
-    
+
     let result = tokio::time::timeout(Duration::from_secs(timeout_secs), async {
         let (_, _) = tokio::join!(
             async {

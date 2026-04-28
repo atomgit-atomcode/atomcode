@@ -977,7 +977,7 @@ impl TurnRunner {
         // `WorkingDirChanged` event so the TUI footer can track the cwd
         // without polling the `Arc<RwLock<PathBuf>>` every frame.
         let wd_before = self.context.working_dir.read().await.clone();
-        
+
         // Set up event sender for real-time tool output streaming
         self.context.event_tx = Some(std::sync::Arc::new(event_tx.clone()));
         self.context.current_call_id = Some(call.id.clone());
@@ -995,7 +995,7 @@ impl TurnRunner {
                 // Clean up event sender
                 self.context.event_tx = None;
                 self.context.current_call_id = None;
-                
+
                 let duration = start.elapsed();
                 let output = "[Cancelled by user]".to_string();
                 let _ = event_tx.send(TurnEvent::ToolCallResult {
@@ -1012,11 +1012,11 @@ impl TurnRunner {
                 };
             }
         };
-        
+
         // Clean up event sender after tool execution
         self.context.event_tx = None;
         self.context.current_call_id = None;
-        
+
         let duration = start.elapsed();
 
         // If the tool mutated the shared working directory, surface it as

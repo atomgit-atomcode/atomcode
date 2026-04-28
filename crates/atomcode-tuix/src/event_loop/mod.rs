@@ -2353,7 +2353,7 @@ fn handle_agent_event(
             // The line will be shown before the command completes.
             let detail = format_tool_detail(&name, &arguments);
             let display = display_tool_name(&name);
-            
+
             // Close any in-flight assistant line before emitting the tool call.
             renderer.render(UiLine::AssistantLineBreak);
             renderer.render(UiLine::ToolCall {
@@ -2361,7 +2361,7 @@ fn handle_agent_event(
                 detail: detail.clone(),
             });
             renderer.flush();
-            
+
             // Mark as rendered so ToolCallResult doesn't emit it again.
             pending_tools.insert(id, (display.clone(), detail, true));
             state.on_tool_call_started(&display);
