@@ -355,7 +355,12 @@ pub(super) fn execute_slash_command(
                 } else {
                     (text.to_string(), false)
                 };
-                ctx.agent.cmd_tx.send(AgentCommand::Remember { content, global }).ok();
+                if content.is_empty() {
+                    renderer.render(UiLine::Error("Usage: /remember <fact to remember>  (--global for global scope)".to_string()));
+                    renderer.flush();
+                } else {
+                    ctx.agent.cmd_tx.send(AgentCommand::Remember { content, global }).ok();
+                }
             }
         }
         "forget" => {

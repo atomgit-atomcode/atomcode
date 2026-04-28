@@ -33,7 +33,12 @@ impl MemoryStore {
                 if meta.len() > MAX_MEMORY_FILE_SIZE {
                     let bytes = fs::read(&self.path).unwrap_or_default();
                     let start = bytes.len().saturating_sub(MAX_MEMORY_FILE_SIZE as usize);
-                    String::from_utf8_lossy(&bytes[start..]).to_string()
+                    // Scan forward to the next newline to avoid splitting UTF-8 chars
+                    let safe_start = bytes[start..].iter()
+                        .position(|&b| b == b'\n')
+                        .map(|pos| start + pos + 1)
+                        .unwrap_or(start);
+                    String::from_utf8_lossy(&bytes[safe_start..]).to_string()
                 } else {
                     fs::read_to_string(&self.path).unwrap_or_default()
                 }
@@ -57,17 +62,15 @@ impl MemoryStore {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
         }
+
+        // Read existing content to check if we need a leading newline
+        let existing = fs::read_to_string(&self.path).unwrap_or_default();
+        let needs_newline = !existing.is_empty() && !existing.ends_with('\n');
+
         let mut file = fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&self.path)?;
-
-        let needs_newline = fs::metadata(&self.path)
-            .map(|m| m.len() > 0)
-            .unwrap_or(false)
-            && fs::read_to_string(&self.path)
-                .map(|s| !s.ends_with('\n'))
-                .unwrap_or(false);
 
         if needs_newline {
             writeln!(file)?;

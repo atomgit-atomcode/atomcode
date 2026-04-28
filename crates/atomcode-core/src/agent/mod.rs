@@ -821,8 +821,11 @@ impl AgentLoop {
                         for entry in &p_matches {
                             msg.push_str(&format!("  [project] - {}\n", entry));
                         }
-                        let _ = global.remove_matching(&keyword);
-                        let _ = project.remove_matching(&keyword);
+                        let g_result = global.remove_matching(&keyword);
+                        let p_result = project.remove_matching(&keyword);
+                        if g_result.is_err() || p_result.is_err() {
+                            msg.push_str("(warning: some entries could not be removed from disk)\n");
+                        }
                         let total = g_matches.len() + p_matches.len();
                         msg.push_str(&format!("(removed {} matching entr{})\n", total, if total == 1 { "y" } else { "ies" }));
                         let _ = self.event_tx.send(AgentEvent::TextDelta(msg));
