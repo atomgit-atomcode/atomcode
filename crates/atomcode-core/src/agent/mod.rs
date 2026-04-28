@@ -1883,13 +1883,8 @@ impl AgentLoop {
     // forward_turn_event → tool_dispatch.rs
     // post_process_tool_results → tool_dispatch.rs
 
-    /// Auto-summarize old turns when context exceeds 70% of budget.
-    /// Makes a lightweight LLM call to compress old turn content into a
-    /// short summary, so the model retains awareness of prior work without
-    /// the full message cost.
-    /// Compress old turns when context > 70% budget.
-    /// Pauses the task, calls LLM to summarize, stores in cold zone.
-    /// Falls back to mechanical compression if LLM fails.
+    /// Compress old turns when context > threshold.
+    /// Uses LLM to summarize, falls back to mechanical compression.
     async fn maybe_compress_history(&mut self, system_prompt: &str) {
         let sys_tokens = system_prompt.len() / 4 + 4;
         if !self.ctx.needs_compression(&self.conversation, sys_tokens) {
@@ -1901,56 +1896,12 @@ impl AgentLoop {
             None => return,
         };
 
-        // Try LLM compression
-        let summarize_prompt = format!(
-            "Summarize this conversation history in 3-5 concise sentences. \
-             Keep: file names, what was changed, key decisions, errors encountered. \
-             Drop: exact code content, tool arguments, line numbers.\n\n{}",
-            content
-        );
+        let summarize_prompt = Self::default_summarize_prompt(&content);
 
-        let mut mini_conv = crate::conversation::Conversation::new();
-        mini_conv.add_user_message(&summarize_prompt);
-        let msgs = mini_conv
-            .to_provider_messages("You are a conversation summarizer. Output ONLY the summary.");
+        let summary = self.run_llm_summary(&summarize_prompt).await;
+        let final_summary = if summary.trim().is_empty() { content } else { summary };
 
-        let mut summary = String::new();
-        if let Ok(mut stream) = self.turn_runner.provider.chat_stream(&msgs, None) {
-            use futures::StreamExt;
-            // 30s first token + 30s between tokens. OpenRouter can be slow.
-            let first_timeout = std::time::Duration::from_secs(30);
-            let stream_timeout = std::time::Duration::from_secs(30);
-            let mut got_token = false;
-            loop {
-                let timeout = if got_token {
-                    stream_timeout
-                } else {
-                    first_timeout
-                };
-                match tokio::time::timeout(timeout, stream.next()).await {
-                    Ok(Some(Ok(crate::stream::StreamEvent::Delta(text)))) => {
-                        got_token = true;
-                        // Strip model thinking tags (compression doesn't go through TurnRunner)
-                        let clean = text
-                            .replace("<think>", "")
-                            .replace("</think>", "")
-                            .replace("<|im_start|>", "")
-                            .replace("<|im_end|>", "");
-                        summary.push_str(&clean);
-                    }
-                    Ok(Some(Ok(crate::stream::StreamEvent::Done { .. }))) => break,
-                    Ok(Some(Ok(_))) => continue,
-                    _ => break,
-                }
-            }
-        }
-
-        // Fallback: if LLM failed, use mechanical compression
-        if summary.trim().is_empty() {
-            summary = content; // mechanical one-liners from build_compression_content
-        }
-
-        self.conversation.apply_compression(n_turns, summary);
+        self.conversation.apply_compression(n_turns, final_summary);
         self.inject_post_compress_state();
     }
 
@@ -2035,12 +1986,6 @@ impl AgentLoop {
     /// projection was tried first but too many render-pipeline branches
     /// made it unreliable.
     async fn run_compact(&mut self, prompt: Option<String>) {
-        if prompt.is_some() {
-            let _ = self.event_tx.send(AgentEvent::TextDelta(
-                "(note: custom compaction prompt accepted but not yet implemented — running mechanical compact)\n"
-                    .to_string(),
-            ));
-        }
         let system_prompt = self.build_system_prompt();
         let before_msg_count = self.conversation.messages.len();
         let before_tokens: usize = self
@@ -2050,17 +1995,37 @@ impl AgentLoop {
             .iter()
             .map(|m| m.estimate_tokens())
             .sum();
-        let Some((content, n_msgs)) = self.ctx.compression_plan(&self.conversation) else {
+        let Some((mechanical_content, n_msgs)) = self.ctx.compression_plan(&self.conversation) else {
             let _ = self.event_tx.send(AgentEvent::TextDelta(
                 "(nothing to compact — conversation is short)\n".to_string(),
             ));
             return;
         };
 
-        // Rollback snapshot. Only the three fields `apply_compression` +
-        // `inject_post_compress_state` mutate need to survive — the
-        // stream / tool_call buffers are ephemeral and always None
-        // between turns, so we skip them.
+        let _ = self.event_tx.send(AgentEvent::TextDelta(
+            "(compacting with LLM summary...)\n".to_string(),
+        ));
+
+        // Try LLM summarization (with optional custom prompt)
+        let summarize_prompt = if let Some(ref custom) = prompt {
+            format!(
+                "Summarize this conversation history, focusing on: {}.\n\
+                 Keep: file names, what was changed, key decisions, errors encountered.\n\
+                 Drop: exact code content, tool arguments, line numbers.\n\n{}",
+                custom, mechanical_content
+            )
+        } else {
+            Self::default_summarize_prompt(&mechanical_content)
+        };
+
+        let summary = self.run_llm_summary(&summarize_prompt).await;
+        let content = if summary.trim().is_empty() {
+            mechanical_content
+        } else {
+            summary
+        };
+
+        // Rollback snapshot
         let msgs_snapshot = self.conversation.messages.clone();
         let cold_snapshot = self.conversation.cold_summaries.clone();
         let turns_snapshot = self.conversation.turn_tracker.clone();
@@ -2085,9 +2050,6 @@ impl AgentLoop {
                 fmt_k_tokens(before_tokens),
                 fmt_k_tokens(after_tokens),
             )));
-            // Still refresh stats so `/context` reports the current
-            // (unchanged, now-correct) state and the user doesn't think
-            // the abort left them with stale numbers.
             let (msgs, _) =
                 self.ctx
                     .build_messages(&self.conversation, &system_prompt, "");
@@ -2095,9 +2057,6 @@ impl AgentLoop {
             return;
         }
 
-        // Report the actually-removed count measured from before/after,
-        // not from n_msgs, so the UI count stays accurate if
-        // apply_compression's clamping or retention policy changes.
         let removed = before_msg_count.saturating_sub(self.conversation.messages.len());
         let _ = self.event_tx.send(AgentEvent::TextDelta(format!(
             "(compacted — dropped {} message{}, {} → {} tokens)\n",
@@ -2107,13 +2066,53 @@ impl AgentLoop {
             fmt_k_tokens(after_tokens),
         )));
 
-        // Refresh the cached ContextStats so `/context` reflects the new
-        // post-compaction shape. Without this, TUI still shows the
-        // pre-compact numbers until the next user turn fires build_messages.
         let (msgs, _) = self
             .ctx
             .build_messages(&self.conversation, &system_prompt, "");
         self.emit_rich_context_stats(&self.conversation, &msgs).await;
+    }
+
+    fn default_summarize_prompt(content: &str) -> String {
+        format!(
+            "Summarize this conversation history in 3-5 concise sentences. \
+             Keep: file names, what was changed, key decisions, errors encountered. \
+             Drop: exact code content, tool arguments, line numbers.\n\n{}",
+            content
+        )
+    }
+
+    /// Run a lightweight LLM call to summarize content. Returns empty string on failure.
+    async fn run_llm_summary(&self, prompt: &str) -> String {
+        let mut mini_conv = crate::conversation::Conversation::new();
+        mini_conv.add_user_message(prompt);
+        let msgs = mini_conv
+            .to_provider_messages("You are a conversation summarizer. Output ONLY the summary.");
+
+        let mut summary = String::new();
+        if let Ok(mut stream) = self.turn_runner.provider.chat_stream(&msgs, None) {
+            use futures::StreamExt;
+            let first_timeout = std::time::Duration::from_secs(30);
+            let stream_timeout = std::time::Duration::from_secs(30);
+            let mut got_token = false;
+            loop {
+                let timeout = if got_token { stream_timeout } else { first_timeout };
+                match tokio::time::timeout(timeout, stream.next()).await {
+                    Ok(Some(Ok(crate::stream::StreamEvent::Delta(text)))) => {
+                        got_token = true;
+                        let clean = text
+                            .replace("<think>", "")
+                            .replace("</think>", "")
+                            .replace("<|im_start|>", "")
+                            .replace("<|im_end|>", "");
+                        summary.push_str(&clean);
+                    }
+                    Ok(Some(Ok(crate::stream::StreamEvent::Done { .. }))) => break,
+                    Ok(Some(Ok(_))) => continue,
+                    _ => break,
+                }
+            }
+        }
+        summary
     }
 
     fn finish_turn(&mut self, stop_reason: TurnStopReason) {
