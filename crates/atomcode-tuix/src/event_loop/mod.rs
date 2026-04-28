@@ -2579,15 +2579,20 @@ fn handle_agent_event(
             tool_name, call, ..
         } => {
             // Emit the `▸ Tool(detail)` row BEFORE the approval prompt
-            // so the user sees what they're approving. But only if
-            // ToolCallStarted hasn't already rendered it.
+            // so the user sees what they're approving.
             let display = display_tool_name(&tool_name);
             let detail = format_tool_detail(&tool_name, &call.arguments);
             
-            // Check if ToolCallStarted already rendered this tool call
+            // Check if ToolCallStarted already rendered this tool call as a
+            // dynamic ToolCallInFlight spinner. If so, we need to freeze it
+            // to a static `▸` row before showing the approval prompt.
             if let Some(entry) = pending_tools.get_mut(&call.id) {
                 let (disp, det, rendered) = entry;
-                if !*rendered {
+                if *rendered {
+                    // ToolCallInFlight is animating — commit it to a static row
+                    // so the approval prompt appears below a frozen `▸ Bash(...)`.
+                    renderer.render(UiLine::ToolCallCommit);
+                } else {
                     // Not yet rendered, emit it now
                     renderer.render(UiLine::ToolCall {
                         name: disp.clone(),
@@ -2595,7 +2600,6 @@ fn handle_agent_event(
                     });
                     *rendered = true;
                 }
-                // If already rendered by ToolCallStarted, skip
             } else {
                 // No entry from ToolCallStarted, render and insert
                 renderer.render(UiLine::ToolCall {
