@@ -2578,34 +2578,16 @@ fn handle_agent_event(
         AgentEvent::ApprovalNeeded {
             tool_name, call, ..
         } => {
-            // Emit the `▸ Tool(detail)` row BEFORE the approval prompt
-            // so the user sees what they're approving. If the matching
-            // ToolCallStarted already populated pending_tools, reuse
-            // its stored display/detail and flag the entry as rendered
-            // so ToolCallResult won't re-emit. If not (race condition
-            // where Approval arrives first), fall back to deriving
-            // display/detail from the event itself.
+            // The ApprovalPrompt now shows the tool name and detail,
+            // so we don't need to emit a separate ToolCall row here.
+            // Just store the pending tool info for ToolCallResult to use.
             let display = display_tool_name(&tool_name);
             let detail = format_tool_detail(&tool_name, &call.arguments);
-            if let Some(entry) = pending_tools.get_mut(&call.id) {
-                let (disp, det, rendered) = entry;
-                if !*rendered {
-                    renderer.render(UiLine::ToolCall {
-                        name: disp.clone(),
-                        detail: det.clone(),
-                    });
-                    *rendered = true;
-                }
-            } else {
-                renderer.render(UiLine::ToolCall {
-                    name: display.clone(),
-                    detail: detail.clone(),
-                });
-                pending_tools.insert(call.id.clone(), (display.clone(), detail.clone(), true));
-            }
+            // Store in pending_tools marked as rendered so ToolCallResult won't re-emit
+            pending_tools.insert(call.id.clone(), (display.clone(), detail.clone(), true));
             renderer.render(UiLine::ApprovalPrompt {
-                tool: display,
-                detail,
+                tool: display.clone(),
+                detail: detail.clone(),
             });
             renderer.flush();
             atomcode_core::notify::notify(
