@@ -288,9 +288,23 @@ pub(super) fn execute_slash_command(
             renderer.flush();
         }
         "cost" => {
+            let cache_rate = if state.prompt_tokens > 0 {
+                (state.cached_tokens as f64 / state.prompt_tokens as f64 * 100.0) as usize
+            } else {
+                0
+            };
+            let cost = atomcode_core::pricing::calculate_cost(
+                "", state.prompt_tokens, state.completion_tokens, state.cached_tokens,
+            );
+            let cost_str = atomcode_core::pricing::format_cost(cost);
             renderer.render(UiLine::CommandOutput(format!(
-                "  Session tokens: {}\n",
-                state.total_tokens
+                "  Prompt tokens:     {}\n  Completion tokens: {}\n  Cached tokens:     {} ({}% hit rate)\n  Total tokens:      {}\n  Estimated cost:    {}\n",
+                state.prompt_tokens,
+                state.completion_tokens,
+                state.cached_tokens,
+                cache_rate,
+                state.total_tokens,
+                cost_str,
             )));
             renderer.flush();
         }

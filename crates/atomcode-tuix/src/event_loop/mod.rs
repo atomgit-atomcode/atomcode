@@ -2591,6 +2591,9 @@ fn handle_agent_event(
         }
         AgentEvent::TokenUsage(u) => {
             state.total_tokens += u.completion_tokens;
+            state.prompt_tokens += u.prompt_tokens;
+            state.completion_tokens += u.completion_tokens;
+            state.cached_tokens += u.cached_tokens;
         }
         AgentEvent::WorkingDirChanged(new_dir) => {
             // Fires when a tool (change_dir / bash cd) or an AgentCommand::ChangeDir
