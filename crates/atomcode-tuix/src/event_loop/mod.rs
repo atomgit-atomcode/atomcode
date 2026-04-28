@@ -2579,18 +2579,31 @@ fn handle_agent_event(
             tool_name, call, ..
         } => {
             // Emit the `▸ Tool(detail)` row BEFORE the approval prompt
-            // so the user sees what they're approving.
+            // so the user sees what they're approving. But only if
+            // ToolCallStarted hasn't already rendered it.
             let display = display_tool_name(&tool_name);
             let detail = format_tool_detail(&tool_name, &call.arguments);
             
-            // Render the tool call row
-            renderer.render(UiLine::ToolCall {
-                name: display.clone(),
-                detail: detail.clone(),
-            });
-            
-            // Store in pending_tools marked as rendered so ToolCallResult won't re-emit
-            pending_tools.insert(call.id.clone(), (display.clone(), detail.clone(), true));
+            // Check if ToolCallStarted already rendered this tool call
+            if let Some(entry) = pending_tools.get_mut(&call.id) {
+                let (disp, det, rendered) = entry;
+                if !*rendered {
+                    // Not yet rendered, emit it now
+                    renderer.render(UiLine::ToolCall {
+                        name: disp.clone(),
+                        detail: det.clone(),
+                    });
+                    *rendered = true;
+                }
+                // If already rendered by ToolCallStarted, skip
+            } else {
+                // No entry from ToolCallStarted, render and insert
+                renderer.render(UiLine::ToolCall {
+                    name: display.clone(),
+                    detail: detail.clone(),
+                });
+                pending_tools.insert(call.id.clone(), (display.clone(), detail.clone(), true));
+            }
             
             renderer.render(UiLine::ApprovalPrompt {
                 tool: display.clone(),
