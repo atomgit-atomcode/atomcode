@@ -972,6 +972,27 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<(
         ));
     }
 
+    // Legacy Windows console (cmd.exe / classic conhost) auto-fallback
+    // hint: lib.rs detected Windows + neither WT_SESSION nor
+    // TERM_PROGRAM, which means the user is on stock conhost where
+    // DECSTBM scroll regions misbehave — rows that scroll out of the
+    // region get re-emitted into scrollback, so Page-Up shows the
+    // same content twice (verified by user report). Plain mode
+    // sidesteps that entirely. Mutually exclusive with the JediTerm
+    // hint (lib.rs gates legacy_conhost on `!is_jediterm`).
+    if std::env::var("ATOMCODE_LEGACY_CONHOST_FALLBACK").is_ok() {
+        std::env::remove_var("ATOMCODE_LEGACY_CONHOST_FALLBACK");
+        renderer.render(UiLine::CommandOutput(
+            "  ⓘ Legacy Windows console detected — running in plain mode.\n    \
+             The full UI (input box, slash menu, spinner) needs a more capable\n    \
+             terminal. Install Windows Terminal (free, Microsoft Store) or\n    \
+             use ConEmu / Alacritty / WezTerm for the complete experience.\n    \
+             Set ATOMCODE_RETAIN=1 to bypass this fallback (may show duplicated\n    \
+             content on Page-Up).\n\n"
+                .into(),
+        ));
+    }
+
     // First-run onboarding: no providers configured AND no OAuth login
     // on disk means the user has never set this up. Show the legacy-tui
     // 3-choice wizard (Login / Configure manually / Skip) as a modal —

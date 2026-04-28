@@ -214,16 +214,54 @@ pub async fn run(
     let is_jediterm = std::env::var("TERMINAL_EMULATOR")
         .map(|v| v == "JetBrains-JediTerm")
         .unwrap_or(false);
-    let force_plain = force_plain_env || (is_jediterm && !force_retain);
 
-    // Marker env var so the event loop can render a one-line hint
+    // Legacy Windows console (cmd.exe / classic conhost) detection.
+    // Windows conhost has supported VT processing since the 2016
+    // Anniversary Update — but its DECSTBM scroll-region implementation
+    // diverges from xterm in ways that break our retained renderer:
+    // body rows that scroll out of the region get re-emitted into
+    // scrollback on the next paint, so users see the SAME content
+    // pair-up TWICE when they Page-Up. Same comment block in
+    // terminal.rs already names this for the unicode-symbols fallback;
+    // we now also use it to gate retained vs plain.
+    //
+    // Distinguishing legacy conhost from modern Windows terminals:
+    //   * Windows Terminal sets `WT_SESSION` (well-behaved, retained OK)
+    //   * VS Code / Hyper / WezTerm / mintty / etc. set `TERM_PROGRAM`
+    //   * Plain cmd.exe / PowerShell-in-conhost set neither → legacy
+    //
+    // Skip when JediTerm is already detected — JetBrains' embedded
+    // terminal on Windows would otherwise match BOTH heuristics
+    // (no TERM_PROGRAM either) and we'd print two hints.
+    let is_legacy_conhost = cfg!(windows)
+        && !is_jediterm
+        && std::env::var("WT_SESSION").is_err()
+        && std::env::var("TERM_PROGRAM").is_err();
+
+    let force_plain = force_plain_env
+        || (is_jediterm && !force_retain)
+        || (is_legacy_conhost && !force_retain);
+
+    // Marker env vars so the event loop can render a one-line hint
     // explaining what just happened and how to recover. Only set
-    // when the JediTerm auto-fallback fired — if the user explicitly
-    // opted in via ATOMCODE_PLAIN they already know; lecturing them
-    // would be noise.
+    // when the auto-fallback fired — if the user explicitly opted
+    // in via ATOMCODE_PLAIN they already know; lecturing would be
+    // noise. Mutually exclusive (legacy_conhost is gated on
+    // !is_jediterm above) so at most one hint fires.
     if is_jediterm && !force_retain && !force_plain_env {
         std::env::set_var("ATOMCODE_JEDITERM_FALLBACK", "1");
     }
+    if is_legacy_conhost && !force_retain && !force_plain_env {
+        std::env::set_var("ATOMCODE_LEGACY_CONHOST_FALLBACK", "1");
+    }
+
+    // Capture whether stdout was a real TTY BEFORE we mutate caps.
+    // PlainRenderer needs this to know whether the kernel will echo
+    // user input (cooked-mode, real TTY) or not (pipe / CI). Used
+    // below when constructing PlainRenderer so the User-line render
+    // doesn't duplicate cooked-mode echoes on JediTerm / conhost /
+    // ATOMCODE_PLAIN=1 force_plain paths.
+    let was_real_tty = caps.tty;
 
     // When force_plain wins, strip raw-mode-related capabilities so
     // every downstream branch (TerminalGuard activate, reader spawn,
@@ -258,16 +296,18 @@ pub async fn run(
     let inner: Box<dyn Renderer> = if caps.tty {
         Box::new(RetainedRenderer::new(caps))
     } else {
-        // Pass caps explicitly so PlainRenderer can gate colours,
-        // unicode chevron, and the `\r`-overwrite spinner on the
-        // terminal's actual capabilities (caps.colors / .unicode_symbols
-        // / .spinner). Even though we cleared caps.tty above for the
-        // force_plain branch, the colour/unicode/spinner flags stay
-        // at their probe-time values — JediTerm supports all three,
-        // CI / pipe / dumb terminals don't, and we render appropriately.
-        Box::new(PlainRenderer::with_writer_and_caps(
+        // Pass caps + the ORIGINAL tty value so PlainRenderer can:
+        // (a) gate colours / unicode / spinner on caps.{colors,
+        //     unicode_symbols, spinner} (these survive the force_plain
+        //     mutation; JediTerm supports all three, CI / pipe don't);
+        // (b) decide whether to suppress UiLine::User echo based on
+        //     `was_real_tty` — true means the kernel does cooked-mode
+        //     echo for us (so re-rendering would duplicate the line),
+        //     false means we're piping and need to render it ourselves.
+        Box::new(PlainRenderer::with_writer_caps_and_interactive(
             std::io::BufWriter::new(std::io::stdout()),
             caps,
+            was_real_tty,
         ))
     };
     let mut renderer: Box<dyn Renderer> = Box::new(TaskRenderer::new(inner));

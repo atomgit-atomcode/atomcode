@@ -32,6 +32,29 @@ const SGR_DIM: &str = "\x1b[2m";
 pub struct PlainRenderer<W: Write + Send> {
     out: W,
     caps: TerminalCaps,
+    /// True iff stdout was a real TTY at probe time, i.e. the user
+    /// is interacting through a cooked-mode terminal (rather than
+    /// piping input from a script / CI runner / dumb sink).
+    ///
+    /// This is DISTINCT from `caps.tty` — `lib.rs` mutates `caps.tty`
+    /// to `false` whenever `force_plain` wins on a real TTY (JediTerm
+    /// auto-fallback, legacy Windows conhost auto-fallback, manual
+    /// `ATOMCODE_PLAIN=1`) so downstream branches consistently take
+    /// the cooked-mode path. The original tty value still tells us
+    /// whether the kernel will echo the user's typing for us.
+    ///
+    /// Behavioural impact:
+    /// - `interactive_terminal=true`: cooked-mode terminal does the
+    ///   echo. We write `❯ ` once on `InputPrompt`, the kernel glues
+    ///   the user's keystrokes onto it, and `UiLine::User` is
+    ///   SUPPRESSED — re-rendering would print `❯ 你好` a second
+    ///   time directly below the cooked echo (the duplicate-line bug
+    ///   from real-world reports).
+    /// - `interactive_terminal=false`: pipe / CI / dumb. Kernel does
+    ///   no echo. We SUPPRESS `InputPrompt` (no human reading) and
+    ///   render `UiLine::User` so log readers can correlate input
+    ///   with the assistant's reply.
+    interactive_terminal: bool,
     last_prompt_written: bool,
     /// True iff the last write was a transient (spinner) line that
     /// hasn't been wiped yet. The next non-transient render needs to
@@ -56,15 +79,34 @@ impl Default for PlainRenderer<BufWriter<Stdout>> {
 impl<W: Write + Send> PlainRenderer<W> {
     /// Backwards-compat constructor used by older test paths. Probes
     /// caps from the environment — fine for production, but tests that
-    /// want predictable behaviour should use `with_writer_and_caps`.
+    /// want predictable behaviour should use `with_writer_and_caps` or
+    /// the explicit `with_writer_caps_and_interactive`.
     pub fn with_writer(out: W) -> Self {
         Self::with_writer_and_caps(out, TerminalCaps::probe())
     }
 
+    /// Defaults `interactive_terminal` to `caps.tty`. Production
+    /// callers in `lib.rs` use `with_writer_caps_and_interactive`
+    /// instead because the `force_plain` branch needs to pass the
+    /// PRE-mutation tty value (caps.tty has already been zeroed by
+    /// then so the renderer would otherwise think it's in pipe mode).
     pub fn with_writer_and_caps(out: W, caps: TerminalCaps) -> Self {
+        let interactive = caps.tty;
+        Self::with_writer_caps_and_interactive(out, caps, interactive)
+    }
+
+    /// Explicit constructor that decouples `caps.tty` from the
+    /// echo-handling decision. Used by `lib.rs` to pass the original
+    /// tty value alongside a force_plain-mutated `caps`.
+    pub fn with_writer_caps_and_interactive(
+        out: W,
+        caps: TerminalCaps,
+        interactive_terminal: bool,
+    ) -> Self {
         Self {
             out,
             caps,
+            interactive_terminal,
             last_prompt_written: false,
             transient_active: false,
         }
@@ -96,8 +138,20 @@ impl<W: Write + Send> Renderer for PlainRenderer<W> {
             }
             UiLine::User(text) => {
                 self.drop_transient();
-                let chev = self.caps.prompt_chevron();
-                let _ = writeln!(self.out, "{}{}", chev, scrub_controls(&text));
+                if !self.interactive_terminal {
+                    // Pipe / CI / dumb: kernel didn't echo the user's
+                    // input, so we render it here as the only source of
+                    // input visibility for log readers correlating
+                    // request ↔ response.
+                    let chev = self.caps.prompt_chevron();
+                    let _ = writeln!(self.out, "{}{}", chev, scrub_controls(&text));
+                }
+                // Interactive force_plain (JediTerm / legacy conhost /
+                // ATOMCODE_PLAIN=1 on a real TTY): cooked-mode kernel
+                // already echoed the user's keystrokes inline after the
+                // `❯ ` prefix that InputPrompt printed. Rendering
+                // `❯ {text}\n` here would produce the duplicate
+                // `❯ 你好` / `❯ 你好` pair that real-world users hit.
             }
             UiLine::AssistantText(text) => {
                 self.drop_transient();
@@ -258,8 +312,15 @@ impl<W: Write + Send> Renderer for PlainRenderer<W> {
             UiLine::InputPrompt { buf, .. } => {
                 if !self.last_prompt_written {
                     self.drop_transient();
-                    let chev = self.caps.prompt_chevron();
-                    let _ = write!(self.out, "{}{}", chev, scrub_controls(&buf));
+                    if self.interactive_terminal {
+                        // Real TTY — write `❯ ` so the user can see we
+                        // are ready and the kernel will overlay their
+                        // typed input on top of this prefix.
+                        let chev = self.caps.prompt_chevron();
+                        let _ = write!(self.out, "{}{}", chev, scrub_controls(&buf));
+                    }
+                    // Pipe mode: no human watching, prompt is just noise.
+                    // Input arrives via stdin, gets echoed via UiLine::User.
                     self.last_prompt_written = true;
                 }
             }
@@ -446,9 +507,17 @@ mod tests {
 
     #[test]
     fn input_prompt_chevron_unicode_or_ascii_per_caps() {
+        // Test the chevron *output* path — InputPrompt only writes
+        // when interactive_terminal=true, so force it on for the
+        // chevron-rendering subject under test (the alternative path
+        // is covered by `input_prompt_suppressed_in_pipe_mode` below).
         // Unicode caps → `❯ ` (U+276F + space, two display columns).
         let mut buf = Vec::new();
-        let mut r = PlainRenderer::with_writer_and_caps(&mut buf, caps_jediterm_ish());
+        let mut r = PlainRenderer::with_writer_caps_and_interactive(
+            &mut buf,
+            caps_jediterm_ish(),
+            true,
+        );
         r.render(UiLine::InputPrompt {
             buf: "hi".into(),
             cursor_byte: 2,
@@ -461,7 +530,7 @@ mod tests {
 
         // Dumb caps → ASCII `> ` fallback.
         let mut buf = Vec::new();
-        let mut r = PlainRenderer::with_writer_and_caps(&mut buf, caps_dumb());
+        let mut r = PlainRenderer::with_writer_caps_and_interactive(&mut buf, caps_dumb(), true);
         r.render(UiLine::InputPrompt {
             buf: "hi".into(),
             cursor_byte: 2,
@@ -471,6 +540,104 @@ mod tests {
         r.flush();
         let s = String::from_utf8(buf).unwrap();
         assert!(s.starts_with("> "), "dumb caps must use ASCII chevron. got: {:?}", s);
+    }
+
+    /// Real-TTY force_plain (JediTerm / conhost / ATOMCODE_PLAIN=1):
+    /// kernel cooked-mode does its own echo of user input, so we must
+    /// NOT render UiLine::User — otherwise the user sees `❯ 你好`
+    /// twice in a row (the duplicate-line bug from the screenshot).
+    #[test]
+    fn user_echo_suppressed_on_interactive_terminal() {
+        let mut buf = Vec::new();
+        let mut r = PlainRenderer::with_writer_caps_and_interactive(
+            &mut buf,
+            caps_jediterm_ish(),
+            true, // interactive — terminal will echo
+        );
+        r.render(UiLine::User("hello".into()));
+        r.flush();
+        let s = String::from_utf8(buf).unwrap();
+        assert!(
+            s.is_empty(),
+            "interactive force_plain must suppress UiLine::User to avoid \
+             duplicating the kernel's cooked-mode echo. got: {:?}",
+            s
+        );
+    }
+
+    /// Pipe / CI / dumb: kernel does NOT echo, so UiLine::User is
+    /// the only source of input visibility for log readers.
+    #[test]
+    fn user_echo_rendered_in_pipe_mode() {
+        let mut buf = Vec::new();
+        let mut r = PlainRenderer::with_writer_caps_and_interactive(
+            &mut buf,
+            caps_dumb(),
+            false, // non-interactive (pipe)
+        );
+        r.render(UiLine::User("hello".into()));
+        r.flush();
+        let s = String::from_utf8(buf).unwrap();
+        assert!(
+            s.contains("hello"),
+            "pipe mode must render UiLine::User as the only input echo. got: {:?}",
+            s
+        );
+    }
+
+    /// Pipe mode has no human watching the screen, so InputPrompt's
+    /// `❯ ` prefix is noise. UiLine::User (which we DO render in
+    /// pipe mode, asserted above) handles input visibility.
+    #[test]
+    fn input_prompt_suppressed_in_pipe_mode() {
+        let mut buf = Vec::new();
+        let mut r = PlainRenderer::with_writer_caps_and_interactive(
+            &mut buf,
+            caps_dumb(),
+            false, // non-interactive (pipe)
+        );
+        r.render(UiLine::InputPrompt {
+            buf: "".into(),
+            cursor_byte: 0,
+            menu: None,
+            status: crate::render::StatusLine::default(),
+        });
+        r.flush();
+        let s = String::from_utf8(buf).unwrap();
+        assert!(
+            s.is_empty(),
+            "pipe mode must suppress InputPrompt — there's no human to read it. got: {:?}",
+            s
+        );
+    }
+
+    /// `with_writer_and_caps` (without explicit `interactive` arg)
+    /// derives the flag from caps.tty: caps.tty=true → interactive,
+    /// caps.tty=false → pipe. Lets test fixtures stay terse for
+    /// non-User / non-InputPrompt scenarios.
+    #[test]
+    fn with_writer_and_caps_defaults_interactive_from_caps_tty() {
+        // caps.tty=true → interactive=true → User suppressed.
+        let mut tty_caps = caps_jediterm_ish();
+        tty_caps.tty = true;
+        let mut buf = Vec::new();
+        let mut r = PlainRenderer::with_writer_and_caps(&mut buf, tty_caps);
+        r.render(UiLine::User("x".into()));
+        r.flush();
+        assert!(
+            String::from_utf8(buf).unwrap().is_empty(),
+            "caps.tty=true should default to interactive (suppress User)"
+        );
+
+        // caps.tty=false (already in caps_dumb) → interactive=false → User rendered.
+        let mut buf = Vec::new();
+        let mut r = PlainRenderer::with_writer_and_caps(&mut buf, caps_dumb());
+        r.render(UiLine::User("x".into()));
+        r.flush();
+        assert!(
+            String::from_utf8(buf).unwrap().contains('x'),
+            "caps.tty=false should default to pipe (render User)"
+        );
     }
 
     #[test]
