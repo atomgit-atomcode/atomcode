@@ -2458,12 +2458,13 @@ fn handle_agent_event(
                 // Flush on newline or when buffer gets large
                 if reasoning_buffer.contains('\n') || reasoning_buffer.len() > 80 {
                     let output = std::mem::take(reasoning_buffer);
-                    // Show "Thinking" header only on first chunk
-                    if is_first_chunk {
-                        renderer.render(UiLine::CommandOutput("\x1b[1mThinking\x1b[0m".to_string()));
-                    }
-                    // Render content as gray/dimmed text
-                    renderer.render(UiLine::ReasoningText(output));
+                    // Show "Thinking: " prefix on first chunk, then dimmed content
+                    let display_text = if is_first_chunk {
+                        format!("\x1b[1mThinking:\x1b[0m \x1b[2m{}\x1b[0m", output.trim_end())
+                    } else {
+                        format!("\x1b[2m{}\x1b[0m", output.trim_end())
+                    };
+                    renderer.render(UiLine::CommandOutput(display_text));
                     renderer.flush();
                 }
             }
