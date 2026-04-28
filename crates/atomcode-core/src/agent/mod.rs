@@ -1772,12 +1772,7 @@ impl AgentLoop {
             None => return,
         };
 
-        let summarize_prompt = format!(
-            "Summarize this conversation history in 3-5 concise sentences. \
-             Keep: file names, what was changed, key decisions, errors encountered. \
-             Drop: exact code content, tool arguments, line numbers.\n\n{}",
-            content
-        );
+        let summarize_prompt = Self::default_summarize_prompt(&content);
 
         let summary = self.run_llm_summary(&summarize_prompt).await;
         let final_summary = if summary.trim().is_empty() { content } else { summary };
@@ -1896,12 +1891,7 @@ impl AgentLoop {
                 custom, mechanical_content
             )
         } else {
-            format!(
-                "Summarize this conversation history in 3-5 concise sentences. \
-                 Keep: file names, what was changed, key decisions, errors encountered. \
-                 Drop: exact code content, tool arguments, line numbers.\n\n{}",
-                mechanical_content
-            )
+            Self::default_summarize_prompt(&mechanical_content)
         };
 
         let summary = self.run_llm_summary(&summarize_prompt).await;
@@ -1956,6 +1946,15 @@ impl AgentLoop {
             .ctx
             .build_messages(&self.conversation, &system_prompt, "");
         self.emit_rich_context_stats(&self.conversation, &msgs).await;
+    }
+
+    fn default_summarize_prompt(content: &str) -> String {
+        format!(
+            "Summarize this conversation history in 3-5 concise sentences. \
+             Keep: file names, what was changed, key decisions, errors encountered. \
+             Drop: exact code content, tool arguments, line numbers.\n\n{}",
+            content
+        )
     }
 
     /// Run a lightweight LLM call to summarize content. Returns empty string on failure.
