@@ -98,100 +98,310 @@ struct PlatformTokenResponse {
     user: PlatformUserInfo,
 }
 
-/// Perform OAuth login flow via Platform broker.
+// ============================================================================
+// ESC-cancel support for the OAuth poll loop
+// ============================================================================
+//
+// The poll loop in `login()` historically did `loop { http_check; sleep(2s) }`
+// with no input handling — Linux/WSL users with broken `xdg-open` had no way
+// to exit short of Ctrl+C (which kills the whole CLI/TUI). We now print the
+// auth URL up-front for those users and accept ESC during the wait.
+//
+// Cooked mode (set by `suspend_for_external` in the TUI, default everywhere
+// in CLI mode) line-buffers stdin — ESC alone won't reach `read()` until the
+// user hits Enter. So while waiting, we temporarily switch stdin to cbreak
+// (non-canonical, no echo) via an RAII `CbreakGuard`, restoring the original
+// termios on every drop path. If `tcgetattr`/`tcsetattr` fail (non-tty stdin
+// from a pipe or CI), the guard returns `None` and the loop falls back to a
+// plain sleep — login still works, ESC just has no effect.
+//
+// Windows has no `poll(2)` over stdin and the existing
+// `read_callback_from_stdin_until_stopped` path is already gated off there
+// for the same reason. We follow the same pattern: `CbreakGuard` is a
+// zero-sized stub that always returns `None`, and `wait_for_esc_or_timeout`
+// degrades to `thread::sleep`.
+
+/// Outcome of waiting for stdin activity during the OAuth poll loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EscOutcome {
+    /// Bare ESC keypress — user cancelled.
+    Cancelled,
+    /// poll(2) timed out, or `read` returned 0 / error.
+    Timeout,
+    /// Some bytes arrived but it wasn't a bare ESC (escape sequence,
+    /// stray letter / Enter, paste). Treated identically to Timeout
+    /// at the call site — fall through to the HTTP check.
+    OtherInput,
+}
+
+/// Classify a freshly-read stdin buffer as cancel / timeout / ignore.
 ///
-/// `tel` is optional so non-CLI callers (TUI `/login`, coding_plan setup,
-/// tests) can pass `None` when they don't hold a telemetry handle. The CLI
-/// main path passes `Some(&telemetry)` to emit `login_success` once.
-pub fn login(tel: Option<&Arc<Telemetry>>) -> Result<AuthInfo> {
-    // println!("\n  AtomCode Login");
-    // println!("  ==============\n");
+/// Bare ESC = single 0x1B byte. Anything else (escape sequence, normal
+/// keystroke, pasted text) is `OtherInput`. Empty buffer = `Timeout`.
+///
+/// Terminals batch escape sequences (e.g. arrow up = `\x1B[A`) into a
+/// single write to the master pty, so a 32-byte non-blocking read sees
+/// the whole sequence at once and we never mistake its prefix for bare
+/// ESC. See spec `2026-04-28-show-oauth-url-design.md` §5.
+fn classify_input(bytes: &[u8]) -> EscOutcome {
+    match bytes {
+        [] => EscOutcome::Timeout,
+        [0x1B] => EscOutcome::Cancelled,
+        _ => EscOutcome::OtherInput,
+    }
+}
 
+#[cfg(not(target_os = "windows"))]
+struct CbreakGuard {
+    fd: std::os::unix::io::RawFd,
+    orig: libc::termios,
+}
+
+#[cfg(target_os = "windows")]
+struct CbreakGuard;
+
+impl CbreakGuard {
+    /// Try to switch stdin to cbreak. Returns `None` if stdin isn't a
+    /// tty (ENOTTY) or if `tcsetattr` fails. On Windows always returns
+    /// `None` — no equivalent of the Unix poll-based path.
+    #[cfg(not(target_os = "windows"))]
+    fn new() -> Option<Self> {
+        use std::os::unix::io::AsRawFd;
+        let fd = io::stdin().as_raw_fd();
+        let mut orig: libc::termios = unsafe { std::mem::zeroed() };
+        if unsafe { libc::tcgetattr(fd, &mut orig) } != 0 {
+            return None;
+        }
+        let mut new = orig;
+        new.c_lflag &= !(libc::ICANON | libc::ECHO);
+        new.c_cc[libc::VMIN] = 0;
+        new.c_cc[libc::VTIME] = 0;
+        if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &new) } != 0 {
+            return None;
+        }
+        Some(Self { fd, orig })
+    }
+
+    #[cfg(target_os = "windows")]
+    fn new() -> Option<Self> {
+        None
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+impl Drop for CbreakGuard {
+    fn drop(&mut self) {
+        // Best-effort restore. If this somehow fails the terminal is
+        // stuck in cbreak — `stty sane` recovers it. Drop runs on every
+        // exit path including panic so the common case is always clean.
+        unsafe {
+            libc::tcsetattr(self.fd, libc::TCSANOW, &self.orig);
+        }
+    }
+}
+
+/// Wait up to `timeout` for stdin activity (ESC keypress) or sleep
+/// until the timeout expires. Used to interleave ESC-cancel checks
+/// with the OAuth `/auth/check` poll cadence.
+///
+/// On Windows or when the cbreak guard couldn't be established, this
+/// just sleeps and returns `Timeout` — ESC never fires but login still
+/// works.
+#[cfg(not(target_os = "windows"))]
+fn wait_for_esc_or_timeout(guard: &Option<CbreakGuard>, timeout: Duration) -> EscOutcome {
+    let Some(g) = guard.as_ref() else {
+        thread::sleep(timeout);
+        return EscOutcome::Timeout;
+    };
+
+    let mut pfd = libc::pollfd {
+        fd: g.fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let timeout_ms = timeout.as_millis().min(i32::MAX as u128) as i32;
+    let rc = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+    if rc <= 0 {
+        // 0 = timeout (no data); <0 = poll error (EINTR etc.). Either
+        // way the right move is "fall through to HTTP check"; the
+        // outer loop's HTTP round-trip is the natural rate limit.
+        return EscOutcome::Timeout;
+    }
+    let mut buf = [0u8; 32];
+    let n = unsafe { libc::read(g.fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+    if n <= 0 {
+        return EscOutcome::Timeout;
+    }
+    classify_input(&buf[..n as usize])
+}
+
+#[cfg(target_os = "windows")]
+fn wait_for_esc_or_timeout(_guard: &Option<CbreakGuard>, timeout: Duration) -> EscOutcome {
+    thread::sleep(timeout);
+    EscOutcome::Timeout
+}
+
+/// Outcome of one `LoginSession::poll_once` call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PollOutcome {
+    /// User hasn't completed the browser sign-in yet — wait and retry.
+    Pending,
+    /// `/auth/check` reported `valid=true`. Caller should call `finish()`.
+    Authorized,
+}
+
+/// In-flight OAuth session. Returned by `start_login()`. The caller
+/// drives the flow:
+///
+/// 1. Display `session.url()` and (best-effort) `open_browser()`.
+/// 2. Loop `poll_once()` until `Authorized`, sleeping between calls
+///    AT THE CALLER'S CADENCE — this lets the TUI interleave UI events
+///    (ESC for cancel) and the CLI use a simple `thread::sleep`.
+/// 3. Call `finish()` to exchange `state` → token.
+pub struct LoginSession {
+    state: String,
+    login_url: String,
+    client: reqwest::blocking::Client,
+}
+
+impl LoginSession {
+    /// Authorization URL the user must visit. Stable for the lifetime
+    /// of the session — safe to show once and reuse.
+    pub fn url(&self) -> &str {
+        &self.login_url
+    }
+
+    /// Best-effort browser launch. Always silent — failures are expected
+    /// on Linux/WSL where the URL on screen is the user's actual path.
+    pub fn open_browser_best_effort(&self) {
+        let _ = open_browser(&self.login_url);
+    }
+
+    /// One non-blocking HTTP check against `/auth/check`. Returns
+    /// `Pending` until the user finishes the browser flow, then
+    /// `Authorized`. Errors only on transport/parse failures; a
+    /// "not yet" answer is `Ok(Pending)`, never `Err`.
+    pub fn poll_once(&self) -> Result<PollOutcome> {
+        let resp = self
+            .client
+            .get(PLATFORM_CHECK_URL)
+            .query(&[("state", &self.state)])
+            .send()
+            .context("Failed to call /auth/check")?;
+        if resp.status().is_success() {
+            if let Ok(check) = resp.json::<PlatformCheckResponse>() {
+                if check.valid {
+                    return Ok(PollOutcome::Authorized);
+                }
+            }
+        }
+        Ok(PollOutcome::Pending)
+    }
+
+    /// Final step: `/auth/token` exchange + `LoginSuccess` telemetry.
+    /// Consumes the session — only call after `poll_once` returned
+    /// `Authorized`.
+    pub fn finish(self, tel: Option<&Arc<Telemetry>>) -> Result<AuthInfo> {
+        let token_resp: PlatformTokenResponse = self
+            .client
+            .get(PLATFORM_TOKEN_URL)
+            .query(&[("state", &self.state)])
+            .send()
+            .context("Failed to call /auth/token")?
+            .json()
+            .context("Failed to parse /auth/token response")?;
+
+        let created_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        let auth_info = AuthInfo {
+            access_token: token_resp.access_token,
+            refresh_token: token_resp.refresh_token,
+            token_type: token_resp.token_type,
+            expires_in: token_resp.expires_in,
+            created_at,
+            user: UserInfo {
+                id: token_resp.user.id,
+                username: token_resp.user.username,
+                name: token_resp.user.name,
+                email: token_resp.user.email,
+                avatar_url: token_resp.user.avatar_url,
+            },
+        };
+
+        if let Some(t) = tel {
+            t.track(Event::LoginSuccess);
+        }
+
+        Ok(auth_info)
+    }
+}
+
+/// Begin OAuth login: call `/auth/login`, return a session containing
+/// the auth URL + state. Cheap (one HTTP round-trip), never blocks on
+/// user action — separated from polling so callers can render the URL
+/// before yielding control to the wait loop.
+pub fn start_login() -> Result<LoginSession> {
     let client = reqwest::blocking::Client::new();
-
-    // Step 1: Call Platform /auth/login to get the authorization URL
-    let login_resp: PlatformLoginResponse = client
+    let resp: PlatformLoginResponse = client
         .get(PLATFORM_LOGIN_URL)
         .query(&[("provider", "atomgit")])
         .send()
         .context("Failed to call /auth/login")?
         .json()
         .context("Failed to parse /auth/login response")?;
+    Ok(LoginSession {
+        state: resp.state,
+        login_url: resp.login_url,
+        client,
+    })
+}
 
-    // println!("  Opening browser for authorization...");
-    // println!("  If browser doesn't open, visit this URL:\n");
-    // println!("  {}\n", login_resp.login_url);
+/// Stdout-driven OAuth login: prints the URL, opens the browser,
+/// polls `/auth/check` with stdin-driven ESC cancel. Used by the CLI
+/// (`atomcode login`, `atomcode codingplan`) and by `setup.rs`'s
+/// `step_login` when the TUI hasn't already pre-flighted login.
+///
+/// TUI callers should NOT use this — render via `start_login()` +
+/// `LoginSession::poll_once()` so the input box stays visible and ESC
+/// is captured through `input_rx` (no termios manipulation needed).
+///
+/// `tel` is optional so non-CLI callers (tests, coding_plan setup) can
+/// pass `None` when they don't hold a telemetry handle.
+pub fn login(tel: Option<&Arc<Telemetry>>) -> Result<AuthInfo> {
+    let session = start_login()?;
 
-    // Open browser (best-effort)
-    if let Err(e) = open_browser(&login_resp.login_url) {
-        println!("  Failed to open browser: {}", e);
-        println!("  (please open the URL above manually)\n");
+    // Always print the URL — `xdg-open` on Linux/WSL silently fails
+    // often enough that we can't rely on it. On the desktop happy path
+    // the browser opens *and* the URL stays in scrollback as a backup.
+    println!("  Browser didn't open? Open the URL below in any browser to sign in:");
+    println!("  {}", session.url());
+
+    // Try to enter cbreak so we can detect a bare-ESC keypress. None
+    // (non-tty stdin / tcsetattr failure) → fall back to plain sleep,
+    // and don't advertise an ESC affordance that wouldn't work.
+    let cbreak = CbreakGuard::new();
+    if cbreak.is_some() {
+        println!();
+        println!("  Press ESC to cancel");
     }
 
-    // Step 2: Poll /auth/check until login is complete
-    // println!("  Waiting for authorization (open browser if it didn't open)...\n");
+    session.open_browser_best_effort();
 
-    let check_resp = loop {
-        // Poll /auth/check
-        let resp = client
-            .get(PLATFORM_CHECK_URL)
-            .query(&[("state", &login_resp.state)])
-            .send()
-            .context("Failed to call /auth/check")?;
-
-        if resp.status().is_success() {
-            if let Ok(check) = resp.json::<PlatformCheckResponse>() {
-                if check.valid {
-                    break login_resp.state;
-                }
-            }
+    loop {
+        match session.poll_once()? {
+            PollOutcome::Authorized => break,
+            PollOutcome::Pending => {}
         }
-
-        // println!("  Waiting for browser authorization...");
-        thread::sleep(Duration::from_secs(2));
-    };
-
-    // Step 3: Get token from Platform
-    // println!("  Authorization complete, fetching token...\n");
-
-    let token_resp: PlatformTokenResponse = client
-        .get(PLATFORM_TOKEN_URL)
-        .query(&[("state", &check_resp)])
-        .send()
-        .context("Failed to call /auth/token")?
-        .json()
-        .context("Failed to parse /auth/token response")?;
-
-    let created_at = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64;
-
-    let auth_info = AuthInfo {
-        access_token: token_resp.access_token,
-        refresh_token: token_resp.refresh_token,
-        token_type: token_resp.token_type,
-        expires_in: token_resp.expires_in,
-        created_at,
-        user: UserInfo {
-            id: token_resp.user.id,
-            username: token_resp.user.username,
-            name: token_resp.user.name,
-            email: token_resp.user.email,
-            avatar_url: token_resp.user.avatar_url,
-        },
-    };
-
-    // println!(
-    //     "  Logged in as: {} ({})\n",
-    //     auth_info.user.username, auth_info.user.id
-    // );
-
-    if let Some(t) = tel {
-        t.track(Event::LoginSuccess);
+        match wait_for_esc_or_timeout(&cbreak, Duration::from_secs(2)) {
+            EscOutcome::Cancelled => anyhow::bail!("login cancelled by user"),
+            EscOutcome::Timeout | EscOutcome::OtherInput => {}
+        }
     }
 
-    Ok(auth_info)
+    session.finish(tel)
 }
 
 /// Extract state from a pasted callback URL (kept for potential future fallback use)
@@ -865,5 +1075,46 @@ mod tests {
                 .unwrap();
         assert_eq!(code, "abc");
         assert_eq!(state, "xyz");
+    }
+
+    // ----- classify_input (ESC vs escape-sequence disambiguation) -----
+
+    #[test]
+    fn classify_input_bare_esc_cancels() {
+        assert_eq!(classify_input(&[0x1B]), EscOutcome::Cancelled);
+    }
+
+    #[test]
+    fn classify_input_arrow_key_ignored() {
+        // Up arrow = ESC [ A — three bytes arriving in a single read.
+        assert_eq!(classify_input(b"\x1B[A"), EscOutcome::OtherInput);
+    }
+
+    #[test]
+    fn classify_input_alt_letter_ignored() {
+        // Alt+a delivered as ESC + 'a' on most terminals.
+        assert_eq!(classify_input(b"\x1Ba"), EscOutcome::OtherInput);
+    }
+
+    #[test]
+    fn classify_input_normal_byte_ignored() {
+        assert_eq!(classify_input(b"q"), EscOutcome::OtherInput);
+    }
+
+    #[test]
+    fn classify_input_empty_is_timeout() {
+        assert_eq!(classify_input(&[]), EscOutcome::Timeout);
+    }
+
+    #[test]
+    fn classify_input_pasted_text_ignored() {
+        assert_eq!(classify_input(b"hello\n"), EscOutcome::OtherInput);
+    }
+
+    #[test]
+    fn classify_input_csi_color_code_ignored() {
+        // Bracketed-paste / OSC sequences and other CSI fragments must
+        // not be mistaken for ESC. `\x1B[31m` = SGR red.
+        assert_eq!(classify_input(b"\x1B[31m"), EscOutcome::OtherInput);
     }
 }
