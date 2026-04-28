@@ -146,6 +146,13 @@ pub struct LoopCtx {
     pub mcp_reload: Option<McpReloadProgress>,
     /// Telemetry handle — used to emit `UseCommand` at each slash dispatch.
     pub telemetry: std::sync::Arc<atomcode_telemetry::Telemetry>,
+    /// Original working dir before `/worktree create`, for `/worktree done`.
+    pub worktree_original_dir: Option<PathBuf>,
+    /// User-defined custom commands loaded from `~/.atomcode/commands/` and
+    /// `<project>/.atomcode/commands/`. Queried by the slash-command
+    /// dispatcher as a fallback when the entered name doesn't match a
+    /// built-in command.
+    pub custom_commands: atomcode_core::commands::CustomCommandRegistry,
     /// Snapshot of the terminal's rendering capabilities. Probed once at
     /// startup in `lib.rs`; threaded into `App::new` so `UiState` knows
     /// whether to use Unicode or ASCII fallbacks for the spinner glyph
@@ -546,25 +553,29 @@ mod buffer_tests {
 #[cfg(test)]
 mod menu_tests {
     use super::*;
+    use atomcode_core::commands::CustomCommandRegistry;
 
     #[test]
     fn non_slash_input_returns_no_menu() {
         let reg = CommandRegistry::builtin();
-        assert!(build_menu_items("hello world", &reg).is_none());
+        let custom = CustomCommandRegistry::empty();
+        assert!(build_menu_items("hello world", &reg, &custom).is_none());
     }
 
     #[test]
     fn slash_prefix_returns_all_commands() {
         let reg = CommandRegistry::builtin();
-        let items = build_menu_items("/", &reg).expect("menu should show for '/'");
+        let custom = CustomCommandRegistry::empty();
+        let items = build_menu_items("/", &reg, &custom).expect("menu should show for '/'");
         assert!(!items.is_empty(), "builtin registry should have commands");
     }
 
     #[test]
     fn slash_with_filter_narrows_list() {
         let reg = CommandRegistry::builtin();
-        let all = build_menu_items("/", &reg).unwrap();
-        let filtered = build_menu_items("/he", &reg).unwrap_or_default();
+        let custom = CustomCommandRegistry::empty();
+        let all = build_menu_items("/", &reg, &custom).unwrap();
+        let filtered = build_menu_items("/he", &reg, &custom).unwrap_or_default();
         assert!(
             filtered.len() < all.len(),
             "prefix '/he' should filter builtin commands"
@@ -584,14 +595,16 @@ mod menu_tests {
         // Once the user types args, menu goes away so arrow keys don't
         // start navigating a stale palette.
         let reg = CommandRegistry::builtin();
-        assert!(build_menu_items("/cd ", &reg).is_none());
-        assert!(build_menu_items("/cd /tmp", &reg).is_none());
+        let custom = CustomCommandRegistry::empty();
+        assert!(build_menu_items("/cd ", &reg, &custom).is_none());
+        assert!(build_menu_items("/cd /tmp", &reg, &custom).is_none());
     }
 
     #[test]
     fn slash_with_no_matches_returns_none() {
         let reg = CommandRegistry::builtin();
-        assert!(build_menu_items("/zzznomatch", &reg).is_none());
+        let custom = CustomCommandRegistry::empty();
+        assert!(build_menu_items("/zzznomatch", &reg, &custom).is_none());
     }
 
     // Regression: HistoryPrev used to leave the cursor at end-of-text,
@@ -1658,7 +1671,13 @@ pub use crate::modals::ProviderWizard;
 /// Filter the command registry by the buf's prefix after '/'. Returns the
 /// (name, desc) pairs matching, or None if menu shouldn't show (buf doesn't
 /// start with '/' or has whitespace, meaning the user has moved on to args).
-fn build_menu_items(buf: &str, commands: &CommandRegistry) -> Option<Vec<(String, String)>> {
+/// Custom commands are appended after built-in matches; duplicates (custom
+/// command with the same name as a built-in) are suppressed.
+fn build_menu_items(
+    buf: &str,
+    commands: &CommandRegistry,
+    custom: &atomcode_core::commands::CustomCommandRegistry,
+) -> Option<Vec<(String, String)>> {
     if !buf.starts_with('/') {
         return None;
     }
@@ -1667,11 +1686,19 @@ fn build_menu_items(buf: &str, commands: &CommandRegistry) -> Option<Vec<(String
     if rest.contains(char::is_whitespace) {
         return None;
     }
-    let matches: Vec<(String, String)> = commands
+    let prefix_lower = rest.to_ascii_lowercase();
+    let mut matches: Vec<(String, String)> = commands
         .matching_prefix(rest)
         .into_iter()
         .map(|c| (c.name.to_string(), c.desc.to_string()))
         .collect();
+    // Append custom commands whose names match the prefix, skipping any
+    // that collide with a built-in name.
+    for (name, desc) in custom.command_names_and_descriptions() {
+        if name.starts_with(&prefix_lower) && !matches.iter().any(|(n, _)| *n == name) {
+            matches.push((name, desc));
+        }
+    }
     if matches.is_empty() {
         None
     } else {
@@ -1692,7 +1719,7 @@ fn handle_idle_key(
     let menu_items = if app.buf.is_in_history() {
         None
     } else {
-        build_menu_items(&app.buf.text, &ctx.commands)
+        build_menu_items(&app.buf.text, &ctx.commands, &ctx.custom_commands)
     };
     if let Some(items) = &menu_items {
         // Clamp selection in range.
@@ -1827,7 +1854,7 @@ fn handle_idle_key(
             let items = if app.buf.is_in_history() {
                 None
             } else {
-                build_menu_items(&app.buf.text, &ctx.commands)
+                build_menu_items(&app.buf.text, &ctx.commands, &ctx.custom_commands)
             };
             if let Some(items) = items {
                 if app.menu.selected >= items.len() {
@@ -1862,8 +1889,10 @@ fn handle_idle_key(
             // `/test`, or just `/test` as a question) falls through to
             // the regular message path — better than the old
             // "Unknown command: /foo" dead-end.
-            let as_slash =
-                parse_slash_line(&line).filter(|(cmd, _)| ctx.commands.find(cmd).is_some());
+            let as_slash = parse_slash_line(&line).filter(|(cmd, _)| {
+                ctx.commands.find(cmd).is_some()
+                    || ctx.custom_commands.get(&cmd.to_ascii_lowercase()).is_some()
+            });
             if let Some((cmd, arg)) = as_slash {
                 execute_slash_command(
                     cmd,
@@ -2065,7 +2094,7 @@ fn handle_streaming_key(
     // so the user can browse candidate commands mid-stream. Execution
     // is still blocked below — Enter falls through to the commit arm,
     // which emits the "disabled while a turn is running" hint.
-    let menu_items = build_menu_items(&app.buf.text, &ctx.commands);
+    let menu_items = build_menu_items(&app.buf.text, &ctx.commands, &ctx.custom_commands);
     if let Some(items) = &menu_items {
         if app.menu.selected >= items.len() {
             app.menu.selected = items.len() - 1;
@@ -2121,7 +2150,7 @@ fn handle_streaming_key(
         BufferResult::Redraw => {
             // Menu shape may have changed — reset selection if it
             // now points past the (possibly shorter) list.
-            if let Some(items) = build_menu_items(&app.buf.text, &ctx.commands) {
+            if let Some(items) = build_menu_items(&app.buf.text, &ctx.commands, &ctx.custom_commands) {
                 if app.menu.selected >= items.len() {
                     app.menu.selected = 0;
                 }
@@ -2319,16 +2348,29 @@ fn handle_agent_event(
             name,
             arguments,
         } => {
-            // Don't emit the ▸ line yet; hold it in pending_tools until
-            // either (a) an ApprovalNeeded for this call arrives and
-            // renders the line eagerly so the user can see what they're
-            // approving, or (b) the matching ToolCallResult arrives and
-            // renders the pair. `call_rendered=false` means no one has
-            // emitted the line yet.
+            // Emit the ▸ line immediately so users can see what command
+            // is running, especially for long-running bash commands.
+            // The line will be shown before the command completes.
             let detail = format_tool_detail(&name, &arguments);
             let display = display_tool_name(&name);
-            pending_tools.insert(id, (display.clone(), detail, false));
+
+            // Close any in-flight assistant line before emitting the tool call.
+            renderer.render(UiLine::AssistantLineBreak);
+            renderer.render(UiLine::ToolCall {
+                name: display.clone(),
+                detail: detail.clone(),
+            });
+            renderer.flush();
+
+            // Mark as rendered so ToolCallResult doesn't emit it again.
+            pending_tools.insert(id, (display.clone(), detail, true));
             state.on_tool_call_started(&display);
+        }
+        AgentEvent::ToolOutputChunk { call_id: _, chunk } => {
+            // Display real-time tool output (e.g., bash stdout/stderr)
+            // Append to the scrollback as command output
+            renderer.render(UiLine::CommandOutput(chunk));
+            renderer.flush();
         }
         AgentEvent::ToolCallResult {
             call_id,
@@ -2771,7 +2813,7 @@ fn draw_spinner_now(
     let frame = state.tick_spinner();
     let label = format_spinner_label(state, queue_len);
     let status = build_status(state, ctx);
-    let menu = build_menu_items(&buf.text, &ctx.commands).map(|items| {
+    let menu = build_menu_items(&buf.text, &ctx.commands, &ctx.custom_commands).map(|items| {
         let selected = menu_selected.min(items.len().saturating_sub(1));
         crate::render::MenuPayload { items, selected }
     });

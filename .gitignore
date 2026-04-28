@@ -23,6 +23,7 @@ __pycache__/
 node_modules/
 **/node_modules/
 package-lock.json
+!extensions/vscode/package-lock.json
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
@@ -40,8 +41,12 @@ site/index-new.html
 # Config with secrets
 config.toml
 
+# Personal project instructions (loaded by AtomCode, never committed)
+.atomcode.user.md
+
 # Logs
 /datalog/
+/site/datalog/
 /test-report.md
 
 # Local docs (not pushed to remote)
@@ -66,3 +71,6 @@ scripts/eval/
 dist/
 docs/superpowers
 .mcp.json
+
+# Superpowers plugin state
+.superpowers/

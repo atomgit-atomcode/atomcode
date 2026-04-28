@@ -2,6 +2,7 @@ pub mod auto_fix;
 pub mod bash;
 pub mod blast_radius;
 pub mod cd;
+pub mod diagnostics;
 pub mod edit;
 pub mod file_deps;
 pub mod file_history;
@@ -557,6 +558,13 @@ pub struct ToolContext {
     pub first_error_signatures: Arc<RwLock<Vec<String>>>,
     /// Shared telemetry handle. Always present (possibly in disabled state).
     pub telemetry: std::sync::Arc<atomcode_telemetry::Telemetry>,
+    /// Shared LSP manager for diagnostics tool. `None` when LSP is disabled.
+    pub lsp: Option<std::sync::Arc<crate::lsp::manager::LspManager>>,
+    /// Optional event sender for real-time tool output streaming (e.g., bash stdout).
+    /// When set, tools like bash can send output chunks as they're produced.
+    pub event_tx: Option<Arc<tokio::sync::mpsc::UnboundedSender<crate::turn::event::TurnEvent>>>,
+    /// Current tool call ID for event correlation.
+    pub current_call_id: Option<String>,
 }
 
 impl ToolContext {
@@ -587,6 +595,9 @@ impl ToolContext {
             read_cache: Arc::new(RwLock::new(std::collections::HashMap::new())),
             first_error_signatures: Arc::new(RwLock::new(Vec::new())),
             telemetry,
+            lsp: None,
+            event_tx: None,
+            current_call_id: None,
         }
     }
 
@@ -597,6 +608,7 @@ impl ToolContext {
         let mut ctx = Self::new(wd);
         ctx.graph = self.graph.clone();
         ctx.telemetry = self.telemetry.clone();
+        ctx.lsp = self.lsp.clone();
         ctx
     }
 }

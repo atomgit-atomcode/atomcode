@@ -54,7 +54,7 @@ impl OpenAiProvider {
             },
         };
         Ok(Self {
-            client: super::build_http_client(config.user_agent.as_deref()),
+            client: super::build_http_client(config.user_agent.as_deref(), config.skip_tls_verify),
             api_key,
             model: config.model.clone(),
             base_url: config
@@ -895,6 +895,7 @@ mod tests {
             reasoning_history: Some("exclude".into()),
             thinking_enabled: None,
             thinking_budget: None,
+            skip_tls_verify: false,
             ephemeral: false,
         };
         let p = OpenAiProvider::new(&cfg).expect("provider builds");
@@ -932,6 +933,7 @@ mod tests {
             reasoning_history: Some("always".into()),
             thinking_enabled: None,
             thinking_budget: None,
+            skip_tls_verify: false,
             ephemeral: false,
         };
         let err = match OpenAiProvider::new(&cfg) {

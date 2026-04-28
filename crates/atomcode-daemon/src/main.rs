@@ -22,6 +22,7 @@ use tower_http::cors::{Any, CorsLayer};
 
 use atomcode_core::config::Config;
 use atomcode_core::conversation::Conversation;
+use atomcode_core::mcp::{register_mcp_tools, McpRegistry};
 use atomcode_core::provider;
 use atomcode_core::session::{Session, SessionId, SessionManager, SessionMeta};
 use atomcode_core::tool::{ToolContext, ToolRegistry};
@@ -136,6 +137,8 @@ pub struct AppState {
     pub chat_tasks: ChatTasksStore,
     /// Sessions that were stopped - their messages should not be saved
     pub stopped_sessions: StoppedSessionsStore,
+    /// MCP server registry (shared across chat requests)
+    pub mcp_registry: Arc<RwLock<Arc<McpRegistry>>>,
 }
 
 /// Get default working directory
@@ -1241,6 +1244,9 @@ pub enum ChatEvent {
     /// Tool call started
     #[serde(rename = "tool_start")]
     ToolCallStarted { name: String, arguments: String },
+    /// Real-time tool output chunk
+    #[serde(rename = "tool_output")]
+    ToolOutputChunk { chunk: String },
     /// Tool call completed
     #[serde(rename = "tool_result")]
     ToolCallResult {
@@ -1543,11 +1549,18 @@ async fn chat_stream(
     // Clone state for the spawned task
     let chat_tasks = state.chat_tasks.clone();
     let stopped_sessions = state.stopped_sessions.clone();
+    let mcp_registry = state.mcp_registry.read().await.clone();
 
     // Spawn the chat processing task
     tokio::spawn(async move {
-        if let Err(e) =
-            process_chat_request(req, tx.clone(), cancel_token, stopped_sessions.clone()).await
+        if let Err(e) = process_chat_request(
+            req,
+            tx.clone(),
+            cancel_token,
+            stopped_sessions.clone(),
+            mcp_registry,
+        )
+        .await
         {
             let _ = tx.send(ChatEvent::Error {
                 message: e.to_string(),
@@ -1577,6 +1590,7 @@ async fn process_chat_request(
     event_tx: mpsc::UnboundedSender<ChatEvent>,
     cancel_token: CancellationToken,
     stopped_sessions: StoppedSessionsStore,
+    mcp_registry: Arc<McpRegistry>,
 ) -> anyhow::Result<()> {
     use atomcode_core::tool::{
         bash::BashTool, edit::EditFileTool, glob::GlobTool, grep::GrepTool, list_dir::ListDirTool,
@@ -1655,16 +1669,36 @@ async fn process_chat_request(
         })
         .unwrap_or_default();
     let enabled = |name: &str| !disabled_tools.contains(name);
-    if enabled("read_file") { tool_registry.register_sync(Box::new(ReadFileTool)); }
-    if enabled("write_file") { tool_registry.register_sync(Box::new(WriteFileTool)); }
-    if enabled("edit_file") { tool_registry.register_sync(Box::new(EditFileTool)); }
-    if enabled("bash") { tool_registry.register_sync(Box::new(BashTool)); }
-    if enabled("grep") { tool_registry.register_sync(Box::new(GrepTool)); }
-    if enabled("glob") { tool_registry.register_sync(Box::new(GlobTool)); }
-    if enabled("list_directory") { tool_registry.register_sync(Box::new(ListDirTool)); }
-    if enabled("web_search") { tool_registry.register_sync(Box::new(WebSearchTool)); }
-    if enabled("web_fetch") { tool_registry.register_sync(Box::new(WebFetchTool)); }
-    if enabled("search_replace") { tool_registry.register_sync(Box::new(SearchReplaceTool)); }
+    if enabled("read_file") {
+        tool_registry.register_sync(Box::new(ReadFileTool));
+    }
+    if enabled("write_file") {
+        tool_registry.register_sync(Box::new(WriteFileTool));
+    }
+    if enabled("edit_file") {
+        tool_registry.register_sync(Box::new(EditFileTool));
+    }
+    if enabled("bash") {
+        tool_registry.register_sync(Box::new(BashTool));
+    }
+    if enabled("grep") {
+        tool_registry.register_sync(Box::new(GrepTool));
+    }
+    if enabled("glob") {
+        tool_registry.register_sync(Box::new(GlobTool));
+    }
+    if enabled("list_directory") {
+        tool_registry.register_sync(Box::new(ListDirTool));
+    }
+    if enabled("web_search") {
+        tool_registry.register_sync(Box::new(WebSearchTool));
+    }
+    if enabled("web_fetch") {
+        tool_registry.register_sync(Box::new(WebFetchTool));
+    }
+    if enabled("search_replace") {
+        tool_registry.register_sync(Box::new(SearchReplaceTool));
+    }
 
     // Load skills and register use_skill tool
     let mut skill_registry = atomcode_core::skill::SkillRegistry::new();
@@ -1675,6 +1709,12 @@ async fn process_chat_request(
         tool_registry.register_sync(Box::new(atomcode_core::tool::use_skill::UseSkillTool {
             registry: skill_registry.clone(),
         }));
+    }
+
+    // Register MCP tools from connected servers
+    let mcp_tools = mcp_registry.list_all_tools().await;
+    if !mcp_tools.is_empty() {
+        register_mcp_tools(&mut tool_registry, mcp_registry.clone(), mcp_tools);
     }
 
     let shared_tools = Arc::new(tool_registry);
@@ -1700,6 +1740,7 @@ async fn process_chat_request(
                 reasoning_history: None,
                 thinking_enabled: None,
                 thinking_budget: None,
+                skip_tls_verify: false,
                 ephemeral: true,
             })
         }
@@ -1714,6 +1755,9 @@ async fn process_chat_request(
         recently_edited_files: Vec::new(),
         recent_calls: Vec::new(),
         file_read_counts: std::collections::HashMap::new(),
+        hook_executor: std::sync::Arc::new(atomcode_core::hook::executor::HookExecutor::new(
+            atomcode_core::hook::json_config::load_hooks_config(&working_dir),
+        )),
     };
 
     // Build system prompt (minimal for API)
@@ -1835,6 +1879,10 @@ async fn process_chat_request(
                     }
                 }
             }
+            TurnEvent::ToolOutputChunk { call_id: _, chunk } => {
+                // Send real-time tool output to client
+                let _ = event_tx.send(ChatEvent::ToolOutputChunk { chunk });
+            }
             TurnEvent::ToolCallResult {
                 call_id: _,
                 name,
@@ -1921,7 +1969,7 @@ fn build_api_system_prompt(
 ) -> String {
     let cwd = working_dir.to_string_lossy();
     let mut prompt = format!(
-        r#"You are AtomCode, an expert coding agent. You solve tasks efficiently with minimal tool calls.
+        r#"You are AtomCode, an AI coding agent by AtomGit. When asked who you are, say you are AtomCode. Never claim to be Claude, GPT, Copilot, or any other AI product — you are AtomCode and only AtomCode.
 
 ## WORKING DIRECTORY
 {cwd}
@@ -2016,6 +2064,77 @@ async fn stop_chat(
     }
 }
 
+// --- MCP API handlers ---
+
+#[derive(Serialize)]
+struct McpServerStatus {
+    name: String,
+    status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+#[derive(Serialize)]
+struct McpStatusResponse {
+    servers: Vec<McpServerStatus>,
+}
+
+async fn mcp_status(State(state): State<AppState>) -> Json<McpStatusResponse> {
+    let registry = state.mcp_registry.read().await.clone();
+    let statuses = registry.server_statuses().await;
+    let mut servers = Vec::new();
+    for (name, status) in statuses {
+        let (status_str, error) = match &status {
+            atomcode_core::mcp::ServerStatus::Connecting => ("connecting".to_string(), None),
+            atomcode_core::mcp::ServerStatus::Connected => ("connected".to_string(), None),
+            atomcode_core::mcp::ServerStatus::Failed(e) => ("error".to_string(), Some(e.clone())),
+            atomcode_core::mcp::ServerStatus::Disconnected => ("disconnected".to_string(), None),
+        };
+        let tool_count = if matches!(status, atomcode_core::mcp::ServerStatus::Connected) {
+            let tools = registry.list_all_tools().await;
+            Some(tools.iter().filter(|t| t.server_name == name).count())
+        } else {
+            None
+        };
+        servers.push(McpServerStatus {
+            name,
+            status: status_str,
+            tool_count,
+            error,
+        });
+    }
+    Json(McpStatusResponse { servers })
+}
+
+async fn mcp_reload(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let home_dir = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    let new_registry = McpRegistry::from_config_background(&home_dir);
+    *state.mcp_registry.write().await = Arc::new(new_registry);
+    Json(serde_json::json!({"status": "reloading"}))
+}
+
+fn daemon_port_from_args() -> u16 {
+    const DEFAULT_PORT: u16 = 13456;
+
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == "--port" {
+            if let Some(value) = args.next() {
+                return value.parse().unwrap_or(DEFAULT_PORT);
+            }
+            return DEFAULT_PORT;
+        }
+
+        if let Some(value) = arg.strip_prefix("--port=") {
+            return value.parse().unwrap_or(DEFAULT_PORT);
+        }
+    }
+
+    DEFAULT_PORT
+}
+
 #[tokio::main]
 async fn main() {
     use axum::routing::patch;
@@ -2024,11 +2143,16 @@ async fn main() {
     // are migrated to the canonical location (~/.atomcode/sessions) before any handler reads it.
     SessionManager::migrate_from_legacy();
 
+    // Initialize MCP registry from user config (~/.atomcode/mcp.json)
+    let home_dir = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    let mcp_registry = McpRegistry::from_config_background(&home_dir);
+
     let state = AppState {
         sessions: Arc::new(RwLock::new(std::collections::HashMap::new())),
         project: Arc::new(RwLock::new(init_project_state())),
         chat_tasks: Arc::new(RwLock::new(HashMap::new())),
         stopped_sessions: Arc::new(RwLock::new(HashSet::new())),
+        mcp_registry: Arc::new(RwLock::new(Arc::new(mcp_registry))),
     };
 
     let app = Router::new()
@@ -2053,10 +2177,14 @@ async fn main() {
         // Chat API
         .route("/chat", post(chat_stream))
         .route("/chat/stop", post(stop_chat))
+        // MCP API
+        .route("/mcp/status", get(mcp_status))
+        .route("/mcp/reload", post(mcp_reload))
         .with_state(state)
         .layer(CorsLayer::new().allow_origin(Any).allow_methods(Any));
 
-    let addr = "0.0.0.0:13456";
+    let port = daemon_port_from_args();
+    let addr = format!("0.0.0.0:{port}");
     println!("AtomCode API server listening on http://{}", addr);
     println!("\nAPI endpoints:");
     println!("  GET    /health                        - Health check");
@@ -2078,6 +2206,6 @@ async fn main() {
     println!("\nChat request body:");
     println!("  {{\"message\": \"your question\", \"provider\": \"optional\"}}");
 
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
 }

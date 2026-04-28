@@ -1,3 +1,4 @@
+pub mod instructions;
 pub mod prompt_sections;
 pub mod provider;
 
@@ -85,6 +86,9 @@ pub struct Config {
     /// impl that matches the no-section-present semantics.
     #[serde(default, skip_serializing)]
     pub telemetry: TelemetryConfig,
+    /// LSP integration configuration.
+    #[serde(default)]
+    pub lsp: LspConfig,
 }
 
 /// Controls the per-turn markdown datalog writer.
@@ -123,6 +127,40 @@ pub struct NotificationConfig {
     /// Best-effort background-only behavior where the terminal protocol supports it.
     #[serde(default = "default_true")]
     pub background_only: bool,
+}
+
+/// Controls LSP (Language Server Protocol) integration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LspConfig {
+    /// Master switch for LSP diagnostics.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Automatically detect and start language servers from the built-in registry.
+    #[serde(default = "default_true")]
+    pub auto_detect: bool,
+    /// Custom server configurations keyed by file extension.
+    #[serde(default)]
+    pub servers: std::collections::HashMap<String, crate::lsp::registry::LspServerConfig>,
+    /// Time in milliseconds to wait after file sync before reading diagnostics.
+    /// LSP servers need time to process notifications and publish diagnostics.
+    /// Larger files or slower servers may need higher values.
+    #[serde(default = "default_diagnostics_settle_delay_ms")]
+    pub diagnostics_settle_delay_ms: u64,
+}
+
+fn default_diagnostics_settle_delay_ms() -> u64 {
+    150
+}
+
+impl Default for LspConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            auto_detect: true,
+            servers: Default::default(),
+            diagnostics_settle_delay_ms: default_diagnostics_settle_delay_ms(),
+        }
+    }
 }
 
 fn default_true() -> bool {
@@ -206,6 +244,62 @@ fn render_notifications_section(cfg: &NotificationConfig) -> String {
     out
 }
 
+/// Render a documentation comment about the layered instruction file system.
+/// Always emitted (even on first save) so users discover the feature.
+fn render_instructions_section() -> String {
+    let mut out = String::new();
+    out.push_str("\n# Project instructions — customize AI behavior via Markdown files.\n");
+    out.push_str("# AtomCode loads instructions from three levels (low → high priority):\n");
+    out.push_str("#\n");
+    out.push_str("#   1. ~/.atomcode/ATOMCODE.md           (global — your personal defaults)\n");
+    out.push_str("#   2. <project>/.atomcode.md            (project — team-shared, commit to git)\n");
+    out.push_str("#      or <project>/ATOMCODE.md\n");
+    out.push_str("#   3. <project>/.atomcode.user.md       (user — personal per-project, .gitignore)\n");
+    out.push_str("#\n");
+    out.push_str("# Higher priority files appear later in the prompt (recency effect).\n");
+    out.push_str("# Use /status to see which files are loaded. Use /init to generate a template.\n");
+    out.push_str("#\n");
+    out.push_str("# Example ~/.atomcode/ATOMCODE.md:\n");
+    out.push_str("#   ## Global Preferences\n");
+    out.push_str("#   - Reply in Chinese\n");
+    out.push_str("#   - Don't add AI co-author tags to commits\n");
+    out.push_str("#\n");
+    out.push_str("# Example <project>/.atomcode.md:\n");
+    out.push_str("#   ## Project Rules\n");
+    out.push_str("#   - This is a Rust workspace with 5 crates\n");
+    out.push_str("#   - Use anyhow::Result for error handling\n");
+    out.push_str("#   - All public APIs must have doc comments\n");
+    out
+}
+
+fn render_hooks_json_section() -> String {
+    let mut out = String::new();
+    out.push_str("\n# Lifecycle hooks — configure in separate JSON files:\n");
+    out.push_str("#   ~/.atomcode/hooks.json       (global hooks)\n");
+    out.push_str("#   <project>/.hooks.json         (project hooks, override global by name)\n");
+    out.push_str("#\n");
+    out.push_str("# Example hooks.json:\n");
+    out.push_str("#   {\n");
+    out.push_str("#     \"hooks\": {\n");
+    out.push_str("#       \"audit-all\": {\n");
+    out.push_str("#         \"event\": \"pre_tool_use\",\n");
+    out.push_str("#         \"command\": \"echo \\\"$(date) $ATOMCODE_TOOL_NAME\\\" >> ~/.atomcode/audit.log\"\n");
+    out.push_str("#       },\n");
+    out.push_str("#       \"block-rm\": {\n");
+    out.push_str("#         \"event\": \"pre_tool_use\",\n");
+    out.push_str("#         \"matcher\": \"bash\",\n");
+    out.push_str("#         \"command\": \"your-safety-check.sh\",\n");
+    out.push_str("#         \"timeout_ms\": 5000\n");
+    out.push_str("#       }\n");
+    out.push_str("#     }\n");
+    out.push_str("#   }\n");
+    out.push_str("#\n");
+    out.push_str("# Events: pre_tool_use, post_tool_use, session_start, session_end\n");
+    out.push_str("# Env vars: ATOMCODE_HOOK_EVENT, ATOMCODE_TOOL_NAME, ATOMCODE_HOOK_CONTEXT\n");
+    out.push_str("# PreToolUse stdout: {\"action\":\"allow\"} or {\"action\":\"block\",\"reason\":\"...\"}\n");
+    out
+}
+
 impl Config {
     /// Context window of the currently-selected default provider.
     /// Falls back to 128_000 when the default_provider is missing or
@@ -248,6 +342,8 @@ impl Config {
         let mut content = toml::to_string_pretty(&persistent)?;
         content.push_str(&render_datalog_section(&self.datalog));
         content.push_str(&render_notifications_section(&self.notifications));
+        content.push_str(&render_instructions_section());
+        content.push_str(&render_hooks_json_section());
         std::fs::write(path, content)?;
         Ok(())
     }
@@ -428,6 +524,7 @@ mod tests {
             auto_update: true,
             reflection_cadence: 7,
             telemetry: Default::default(),
+            lsp: Default::default(),
         };
         cfg.providers.insert(
             "p".to_string(),
@@ -445,6 +542,7 @@ mod tests {
                 reasoning_history: None,
                 thinking_enabled: None,
                 thinking_budget: None,
+                skip_tls_verify: false,
                 ephemeral: false,
             },
         );
@@ -541,6 +639,7 @@ mod tests {
             "unexpected error: {err}"
         );
     }
+
 }
 
 #[cfg(test)]

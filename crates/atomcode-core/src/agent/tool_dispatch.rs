@@ -15,6 +15,11 @@ impl AgentLoop {
                     .event_tx
                     .send(AgentEvent::ToolCallStreaming { name, hint });
             }
+            TurnEvent::ToolOutputChunk { call_id, chunk } => {
+                let _ = self
+                    .event_tx
+                    .send(AgentEvent::ToolOutputChunk { call_id, chunk });
+            }
             TurnEvent::ToolCallStarted {
                 ref id,
                 ref name,

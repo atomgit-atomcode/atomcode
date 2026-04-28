@@ -29,14 +29,9 @@ impl AgentLoop {
             .map(|g| g.clone())
             .unwrap_or_default();
 
-        // Load project-level instructions (.atomcode.md or ATOMCODE.md)
-        let project_instructions = [".atomcode.md", "ATOMCODE.md"]
-            .iter()
-            .find_map(|name| {
-                let path = wd.join(name);
-                std::fs::read_to_string(&path).ok()
-            })
-            .unwrap_or_default();
+        // Load layered instructions (global → project → user)
+        let instructions = crate::config::instructions::LayeredInstructions::load(&wd);
+        let merged_instructions = instructions.merged();
 
         // Stable environment metadata (no date — changes every day, breaks cache)
         let shell = if cfg!(target_os = "windows") {
@@ -61,12 +56,9 @@ impl AgentLoop {
             model_display, wd = wd.display(), env_info = env_info,
         );
 
-        // Project instructions (if any)
-        if !project_instructions.is_empty() {
-            prompt.push_str(&format!(
-                "\n=== PROJECT INSTRUCTIONS (.atomcode.md) ===\n{}\n",
-                project_instructions
-            ));
+        // Layered instructions (global / project / user)
+        if !merged_instructions.is_empty() {
+            prompt.push_str(&format!("\n{}\n", merged_instructions));
         }
 
         // Available skills — inject skill descriptions so LLM knows what skills exist.

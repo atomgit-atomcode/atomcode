@@ -41,6 +41,7 @@ fn build_oauth_provider() -> ProviderConfig {
         reasoning_history: None,
         thinking_enabled: None,
         thinking_budget: None,
+        skip_tls_verify: false,
         ephemeral: false,
     }
 }
@@ -89,7 +90,31 @@ pub(super) fn execute_slash_command(
             ctx.agent.cmd_tx.send(AgentCommand::Shutdown).ok();
         }
         "help" => {
-            renderer.render(UiLine::CommandOutput(ctx.commands.help_text()));
+            if arg.trim() == "commands" {
+                let config_dir = Config::config_dir();
+                let cmds = ctx.custom_commands.list();
+                let mut out = String::from("  Custom commands:\n");
+                for cmd in &cmds {
+                    let source_label = if cmd.source.starts_with(&config_dir) {
+                        "global"
+                    } else {
+                        "project"
+                    };
+                    out.push_str(&format!(
+                        "    /{}  — {} ({})\n",
+                        cmd.name, cmd.description, source_label
+                    ));
+                }
+                if cmds.is_empty() {
+                    out.push_str("    (none)\n\n");
+                    out.push_str(
+                        "  Create: ~/.atomcode/commands/<name>.md or .atomcode/commands/<name>.md\n",
+                    );
+                }
+                renderer.render(UiLine::CommandOutput(out));
+            } else {
+                renderer.render(UiLine::CommandOutput(ctx.commands.help_text()));
+            }
             renderer.flush();
         }
         "config" => {
@@ -244,6 +269,20 @@ pub(super) fn execute_slash_command(
                 state.total_tokens,
             );
             txt.push_str(&render_codingplan_status_for_status_cmd());
+
+            // Instruction files status
+            let instructions =
+                atomcode_core::config::instructions::LayeredInstructions::load(&ctx.working_dir);
+            txt.push_str("\n  Instruction files:\n");
+            for (level, path) in instructions.status_lines() {
+                match path {
+                    Some(p) => {
+                        txt.push_str(&format!("    ✓ {} ({})\n", p.display(), level.label()))
+                    }
+                    None => txt.push_str(&format!("    ✗ {} — not found\n", level.label())),
+                }
+            }
+
             renderer.render(UiLine::CommandOutput(txt));
             renderer.flush();
         }
@@ -689,6 +728,9 @@ pub(super) fn execute_slash_command(
             }
             renderer.flush();
         }
+        "worktree" => {
+            handle_worktree(arg, ctx, renderer)?;
+        }
         "think" => {
             let sub = arg.trim().to_ascii_lowercase();
             let provider_name = ctx.config.default_provider.clone();
@@ -763,11 +805,242 @@ pub(super) fn execute_slash_command(
             }
         }
         other => {
-            renderer.render(UiLine::Error(format!("Unknown command: /{}", other)));
+            // Before reporting "unknown", check user-defined custom commands.
+            if let Some(rendered) = ctx.custom_commands.render(other, arg) {
+                ctx.agent
+                    .cmd_tx
+                    .send(AgentCommand::SendMessage(rendered))
+                    .ok();
+                state.on_submit();
+            } else {
+                renderer.render(UiLine::Error(format!("Unknown command: /{}", other)));
+                renderer.flush();
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Handle `/worktree` subcommands: create, list, done, cleanup.
+fn handle_worktree(arg: &str, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) -> Result<()> {
+    use atomcode_core::git::worktree::WorktreeManager;
+
+    let parts: Vec<&str> = arg.split_whitespace().collect();
+    let sub = parts.first().map(|s| s.to_ascii_lowercase());
+
+    match sub.as_deref() {
+        Some("create") => {
+            let branch = match parts.get(1) {
+                Some(b) => *b,
+                None => {
+                    renderer.render(UiLine::CommandOutput(
+                        "  用法: /worktree create <branch> [base]\n  示例: /worktree create fix-bug main\n".into(),
+                    ));
+                    renderer.flush();
+                    return Ok(());
+                }
+            };
+            let base = parts
+                .get(2)
+                .map(|s| (*s).to_string())
+                .or_else(|| detect_current_branch(&ctx.working_dir))
+                .unwrap_or_else(|| "HEAD".to_string());
+            let mgr = match WorktreeManager::from_dir(ctx.working_dir.clone()) {
+                Ok(mgr) => mgr,
+                Err(e) => {
+                    renderer.render(UiLine::Error(format!("worktree create failed: {:#}", e)));
+                    renderer.flush();
+                    return Ok(());
+                }
+            };
+            match mgr.create(branch, &base) {
+                Ok(wt) => {
+                    // Save original dir before switching
+                    ctx.worktree_original_dir = Some(ctx.working_dir.clone());
+                    apply_cd(ctx, wt.path.clone());
+                    renderer.render(UiLine::CommandOutput(format!(
+                        "  \u{2713} 工作树已创建\n    分支: {} (基于 {})\n    路径: {}\n    工作目录已切换\n",
+                        wt.branch, wt.base_branch, wt.path.display(),
+                    )));
+                }
+                Err(e) => {
+                    renderer.render(UiLine::Error(format!("worktree create failed: {:#}", e)));
+                }
+            }
+            renderer.flush();
+        }
+        Some("list") => {
+            let mgr = match WorktreeManager::from_dir(ctx.working_dir.clone()) {
+                Ok(mgr) => mgr,
+                Err(e) => {
+                    renderer.render(UiLine::Error(format!("worktree list failed: {:#}", e)));
+                    renderer.flush();
+                    return Ok(());
+                }
+            };
+            match mgr.list() {
+                Ok(worktrees) => {
+                    if worktrees.is_empty() {
+                        renderer.render(UiLine::CommandOutput(
+                            "  没有活跃的工作树。\n".into(),
+                        ));
+                    } else {
+                        let mut txt = String::from("  活跃工作树:\n");
+                        for (branch, path, has_changes) in &worktrees {
+                            let is_current = path == &ctx.working_dir;
+                            let marker = if is_current { "\u{25cf}" } else { "\u{25cb}" };
+                            let change_label = if *has_changes { "(有变更)" } else { "(clean)" };
+                            let current_hint = if is_current { " \u{2190} 当前" } else { "" };
+                            txt.push_str(&format!(
+                                "    {} {:<16} {}  {}{}\n",
+                                marker,
+                                branch,
+                                path.display(),
+                                change_label,
+                                current_hint,
+                            ));
+                        }
+                        renderer.render(UiLine::CommandOutput(txt));
+                    }
+                }
+                Err(e) => {
+                    renderer.render(UiLine::Error(format!("worktree list failed: {:#}", e)));
+                }
+            }
+            renderer.flush();
+        }
+        Some("done") => {
+            if let Some(original) = ctx.worktree_original_dir.take() {
+                let current_branch = detect_current_branch(&ctx.working_dir);
+                apply_cd(ctx, original.clone());
+                renderer.render(UiLine::CommandOutput(format!(
+                    "  \u{2713} 工作目录已切回: {}\n",
+                    original.display(),
+                )));
+                if let Some(branch) = current_branch {
+                    renderer.render(UiLine::CommandOutput(format!(
+                        "  提示: 使用 'git merge {}' 或创建 PR 合入主分支\n",
+                        branch,
+                    )));
+                }
+            } else {
+                renderer.render(UiLine::CommandOutput(
+                    "  没有活跃的工作树会话。先使用 /worktree create 创建一个。\n".into(),
+                ));
+            }
+            renderer.flush();
+        }
+        Some("cleanup") => {
+            let branch = match parts.get(1) {
+                Some(b) => *b,
+                None => {
+                    renderer.render(UiLine::CommandOutput(
+                        "  用法: /worktree cleanup <branch> [--force]\n".into(),
+                    ));
+                    renderer.flush();
+                    return Ok(());
+                }
+            };
+            let force = parts
+                .get(2)
+                .map(|s| *s == "--force" || *s == "-f")
+                .unwrap_or(false);
+            let manager_dir = ctx
+                .worktree_original_dir
+                .as_ref()
+                .cloned()
+                .unwrap_or_else(|| ctx.working_dir.clone());
+            let mgr = match WorktreeManager::from_dir(manager_dir) {
+                Ok(mgr) => mgr,
+                Err(e) => {
+                    renderer.render(UiLine::Error(format!("worktree cleanup failed: {:#}", e)));
+                    renderer.flush();
+                    return Ok(());
+                }
+            };
+            let cleanup_path = mgr
+                .find_worktree_path(branch)
+                .unwrap_or_else(|_| None)
+                .unwrap_or_else(|| mgr.worktree_path(branch));
+            let removing_current = paths_same(&cleanup_path, &ctx.working_dir);
+            match mgr.remove(branch, force) {
+                Ok(()) => {
+                    let switched_to = if removing_current {
+                        let target = ctx
+                            .worktree_original_dir
+                            .take()
+                            .unwrap_or_else(|| mgr.repo_root().to_path_buf());
+                        apply_cd(ctx, target.clone());
+                        Some(target)
+                    } else {
+                        None
+                    };
+                    renderer.render(UiLine::CommandOutput(format!(
+                        "  \u{2713} 工作树 '{}' 已清理\n",
+                        branch,
+                    )));
+                    if let Some(target) = switched_to {
+                        renderer.render(UiLine::CommandOutput(format!(
+                            "  工作目录已切回: {}\n",
+                            target.display(),
+                        )));
+                    }
+                }
+                Err(e) => {
+                    let err_msg = format!("{:#}", e);
+                    if !force
+                        && (err_msg.contains("untracked")
+                            || err_msg.contains("modified")
+                            || err_msg.contains("changes"))
+                    {
+                        renderer.render(UiLine::CommandOutput(format!(
+                            "  \u{26a0} 工作树 '{}' 有未提交的变更。\n  使用 /worktree cleanup {} --force 强制清理\n",
+                            branch, branch,
+                        )));
+                    } else {
+                        renderer.render(UiLine::Error(format!(
+                            "worktree cleanup failed: {}",
+                            err_msg
+                        )));
+                    }
+                }
+            }
+            renderer.flush();
+        }
+        _ => {
+            renderer.render(UiLine::CommandOutput(
+                "  用法:\n    /worktree create <branch> [base]  创建工作树并切换\n    /worktree list                     列出所有工作树\n    /worktree done                     切回原始目录\n    /worktree cleanup <branch>         清理工作树\n".into(),
+            ));
             renderer.flush();
         }
     }
     Ok(())
+}
+
+/// Detect the current branch name in a directory.
+fn detect_current_branch(dir: &std::path::Path) -> Option<String> {
+    std::process::Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .current_dir(dir)
+        .output()
+        .ok()
+        .and_then(|o| {
+            if o.status.success() {
+                Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
+            } else {
+                None
+            }
+        })
+}
+
+fn paths_same(a: &std::path::Path, b: &std::path::Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
 }
 
 /// Build the `/context` report — horizontal bar + category breakdown,
@@ -1386,6 +1659,14 @@ mod tests {
         let (_tmp, cwd, _sub) = make_dirs();
         let got = resolve_cd("~", &cwd, None).expect("~ resolves");
         assert_eq!(got, canon_home);
+    }
+
+    #[test]
+    fn paths_same_accepts_canonical_equivalents() {
+        let (_tmp, cwd, sub) = make_dirs();
+        let via_parent = sub.join("..").join("sub");
+        assert!(paths_same(&sub, &via_parent));
+        assert!(!paths_same(&cwd, &sub));
     }
 
     #[test]

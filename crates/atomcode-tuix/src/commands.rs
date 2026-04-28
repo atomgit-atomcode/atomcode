@@ -89,12 +89,54 @@ const BUILTIN_COMMANDS: &[Command] = &[
     Command { name: "compact", desc: "Compact conversation history", needs_args: false },
     Command { name: "mcp",     desc: "Show MCP server status (subcommand: reload)", needs_args: false },
     Command { name: "undo",    desc: "Undo last change (not yet supported)", needs_args: false },
+    Command { name: "worktree", desc: "Git worktree isolation (create/list/done/cleanup)", needs_args: true },
     Command { name: "upgrade", desc: "Upgrade atomcode to latest (subcommand: rollback)", needs_args: false },
     Command { name: "issue",   desc: "Report a bug / request a feature for AtomCode itself (interactive wizard)", needs_args: false },
     Command { name: "think",   desc: "Extended thinking control (on/off/budget N)", needs_args: false },
     Command { name: "help",    desc: "Show this help", needs_args: false },
     Command { name: "quit",    desc: "Exit AtomCode", needs_args: false },
 ];
+
+/// A completion candidate for slash-command Tab completion, merging built-in
+/// and user-defined custom commands.
+#[derive(Debug, Clone)]
+pub struct CompletionCandidate {
+    pub name: String,
+    pub description: String,
+    pub is_custom: bool,
+}
+
+/// Merge built-in and custom command completions for a given prefix.
+/// Results are sorted with built-ins first, then custom commands, each
+/// group sorted by name. Custom commands whose names collide with a
+/// built-in are suppressed.
+pub fn complete_commands(
+    prefix: &str,
+    custom_names: &[(String, String)],
+) -> Vec<CompletionCandidate> {
+    let prefix = prefix.strip_prefix('/').unwrap_or(prefix);
+    let mut candidates = Vec::new();
+    for cmd in BUILTIN_COMMANDS {
+        if cmd.name.starts_with(prefix) {
+            candidates.push(CompletionCandidate {
+                name: cmd.name.to_string(),
+                description: cmd.desc.to_string(),
+                is_custom: false,
+            });
+        }
+    }
+    for (name, desc) in custom_names {
+        if name.starts_with(prefix) && !candidates.iter().any(|c| c.name == *name) {
+            candidates.push(CompletionCandidate {
+                name: name.clone(),
+                description: desc.clone(),
+                is_custom: true,
+            });
+        }
+    }
+    candidates.sort_by_key(|c| (c.is_custom, c.name.clone()));
+    candidates
+}
 
 /// Parse `"/cmd args..."` into `(cmd, args)` when the leading `/` is a
 /// command invocation. Returns `None` when the `/` is actually part of a
@@ -218,6 +260,74 @@ mod tests {
         let help = reg.help_text();
         for c in reg.all() {
             assert!(help.contains(c.name), "help missing {}", c.name);
+        }
+    }
+
+    #[test]
+    fn complete_builtin_commands() {
+        let candidates = complete_commands("mo", &[]);
+        assert!(
+            candidates.iter().any(|c| c.name == "model"),
+            "\"mo\" should match built-in \"model\""
+        );
+        assert!(
+            candidates.iter().all(|c| !c.is_custom),
+            "built-in-only query should have no custom candidates"
+        );
+    }
+
+    #[test]
+    fn complete_custom_commands() {
+        let custom = vec![("review".to_string(), "Code review".to_string())];
+        let candidates = complete_commands("rev", &custom);
+        assert!(
+            candidates.iter().any(|c| c.name == "review" && c.is_custom),
+            "\"rev\" should match custom \"review\""
+        );
+    }
+
+    #[test]
+    fn builtin_takes_precedence() {
+        // Custom "help" should NOT appear because built-in "help" exists.
+        let custom = vec![("help".to_string(), "Custom help".to_string())];
+        let candidates = complete_commands("help", &custom);
+        let help_count = candidates.iter().filter(|c| c.name == "help").count();
+        assert_eq!(
+            help_count, 1,
+            "custom \"help\" must not duplicate built-in \"help\""
+        );
+        assert!(
+            !candidates.iter().any(|c| c.name == "help" && c.is_custom),
+            "the surviving \"help\" must be the built-in, not custom"
+        );
+    }
+
+    #[test]
+    fn empty_prefix_returns_all() {
+        let custom = vec![
+            ("review".to_string(), "Code review".to_string()),
+            ("deploy".to_string(), "Deploy app".to_string()),
+        ];
+        let candidates = complete_commands("", &custom);
+        // At least all 25 built-in commands + 2 custom
+        assert!(
+            candidates.len() >= 20,
+            "empty prefix should return at least 20 results, got {}",
+            candidates.len()
+        );
+        // Custom commands should be present
+        assert!(candidates.iter().any(|c| c.name == "review"));
+        assert!(candidates.iter().any(|c| c.name == "deploy"));
+    }
+
+    #[test]
+    fn complete_commands_strips_leading_slash() {
+        // Calling with "/mo" should behave identically to "mo".
+        let with_slash = complete_commands("/mo", &[]);
+        let without_slash = complete_commands("mo", &[]);
+        assert_eq!(with_slash.len(), without_slash.len());
+        for (a, b) in with_slash.iter().zip(without_slash.iter()) {
+            assert_eq!(a.name, b.name);
         }
     }
 }
