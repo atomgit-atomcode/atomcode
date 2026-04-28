@@ -109,6 +109,7 @@ impl SubAgentTask {
             }),
         };
 
+        let hooks = crate::hook::json_config::load_hooks_config(working_dir);
         let mut runner = TurnRunner {
             provider,
             tools,
@@ -119,6 +120,9 @@ impl SubAgentTask {
             recently_edited_files: Vec::new(),
             recent_calls: Vec::new(),
             file_read_counts: std::collections::HashMap::new(),
+            hook_executor: std::sync::Arc::new(
+                crate::hook::executor::HookExecutor::new(hooks)
+            ),
         };
 
         // 4. Event channel (we drain but don't forward — sub-agent is silent)

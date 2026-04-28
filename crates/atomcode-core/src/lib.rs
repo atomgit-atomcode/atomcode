@@ -8,6 +8,7 @@ pub mod conversation;
 pub mod ctx;
 pub mod git;
 pub mod graph;
+pub mod hook;
 pub mod init;
 pub mod input_history;
 pub mod lsp;

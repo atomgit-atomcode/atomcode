@@ -377,6 +377,9 @@ pub struct AgentLoop {
     // Skill registry — provides descriptions for system prompt and powers use_skill tool
     skill_registry: std::sync::Arc<std::sync::RwLock<SkillRegistry>>,
 
+    /// Hook executor for lifecycle events.
+    hook_executor: std::sync::Arc<crate::hook::executor::HookExecutor>,
+
     // Code graph background indexer channel
     reindex_tx: Option<mpsc::UnboundedSender<PathBuf>>,
 
@@ -544,6 +547,11 @@ impl AgentLoop {
                 }),
             };
 
+        let hooks = crate::hook::json_config::load_hooks_config(&working_dir);
+        let hook_executor = std::sync::Arc::new(
+            crate::hook::executor::HookExecutor::new(hooks)
+        );
+
         let turn_runner = TurnRunner {
             provider,
             tools: shared_tools.clone(),
@@ -554,6 +562,7 @@ impl AgentLoop {
             recently_edited_files: Vec::new(),
             recent_calls: Vec::new(),
             file_read_counts: std::collections::HashMap::new(),
+            hook_executor: hook_executor.clone(),
         };
 
         // Capture session-start env snapshot (git status, branch, HEAD).
@@ -601,6 +610,7 @@ impl AgentLoop {
             plan_text: None,
             session_files: std::collections::HashMap::new(),
             skill_registry,
+            hook_executor,
             reindex_tx: None,
             datalog,
             cmd_rx,
@@ -651,6 +661,22 @@ impl AgentLoop {
             self.reindex_tx = Some(reindex_tx);
         }
 
+        // --- SessionStart Hook ---
+        if self.hook_executor.has_hooks() {
+            let wd = self.turn_runner.context.working_dir
+                .try_read()
+                .map(|g| g.display().to_string())
+                .unwrap_or_default();
+            let ctx = crate::hook::HookContext {
+                event: "session_start".into(),
+                tool_name: None, tool_args: None,
+                tool_result: None, tool_success: None,
+                session_id: String::new(),
+                working_dir: wd,
+            };
+            self.hook_executor.run_session_event(crate::hook::HookEvent::SessionStart, &ctx).await;
+        }
+
         while let Some(cmd) = self.cmd_rx.recv().await {
             match cmd {
                 AgentCommand::SendMessage(content) => {
@@ -683,6 +709,16 @@ impl AgentLoop {
                         .get(&old_provider_name)
                         .map(|p| p.provider_type.clone());
                     self.config = new_config;
+                    // Rebuild hook executor from JSON config files.
+                    let wd = self.turn_runner.context.working_dir
+                        .try_read()
+                        .map(|g| g.clone())
+                        .unwrap_or_else(|_| std::path::PathBuf::from("."));
+                    let hooks = crate::hook::json_config::load_hooks_config(&wd);
+                    self.hook_executor = std::sync::Arc::new(
+                        crate::hook::executor::HookExecutor::new(hooks)
+                    );
+                    self.turn_runner.hook_executor = self.hook_executor.clone();
                     let new_provider_name = self.config.default_provider.clone();
                     let new_type = self
                         .config
@@ -813,7 +849,24 @@ impl AgentLoop {
                         .build_messages(&self.conversation, &system_prompt, "");
                     self.emit_rich_context_stats(&self.conversation, &msgs).await;
                 }
-                AgentCommand::Shutdown => break,
+                AgentCommand::Shutdown => {
+                    // --- SessionEnd Hook ---
+                    if self.hook_executor.has_hooks() {
+                        let wd = self.turn_runner.context.working_dir
+                            .try_read()
+                            .map(|g| g.display().to_string())
+                            .unwrap_or_default();
+                        let ctx = crate::hook::HookContext {
+                            event: "session_end".into(),
+                            tool_name: None, tool_args: None,
+                            tool_result: None, tool_success: None,
+                            session_id: String::new(),
+                            working_dir: wd,
+                        };
+                        self.hook_executor.run_session_event(crate::hook::HookEvent::SessionEnd, &ctx).await;
+                    }
+                    break;
+                }
             }
         }
     }

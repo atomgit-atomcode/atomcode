@@ -54,6 +54,8 @@ pub struct TurnRunner {
     /// treated as a panic loop (typical of Office binaries, encoding mismatches,
     /// or the model cycling offset/limit on an unreadable file).
     pub file_read_counts: std::collections::HashMap<(String, u64), u32>,
+    /// Hook executor — runs user-configured lifecycle hooks at tool execution boundaries.
+    pub hook_executor: std::sync::Arc<crate::hook::executor::HookExecutor>,
 }
 
 /// Line-granularity of the read-region bucket used in `file_read_counts`.
@@ -936,6 +938,39 @@ impl TurnRunner {
             }
         }
 
+        // --- PreToolUse Hook ---
+        if self.hook_executor.has_hooks() {
+            let hook_ctx = self.build_hook_context(
+                "pre_tool_use",
+                Some(&call.name),
+                Some(&call.arguments),
+                None,
+                None,
+            );
+            let pre_result = self.hook_executor.run_pre_tool_use(&call.name, &hook_ctx).await;
+            match pre_result {
+                crate::hook::PreHookResult::Block { reason } => {
+                    let output = format!("Blocked by hook: {}", reason);
+                    let _ = event_tx.send(TurnEvent::ToolCallResult {
+                        call_id: call.id.clone(),
+                        name: call.name.clone(),
+                        output: output.clone(),
+                        success: false,
+                        duration: std::time::Duration::ZERO,
+                    });
+                    return ToolResult {
+                        call_id: call.id.clone(),
+                        output,
+                        success: false,
+                    };
+                }
+                crate::hook::PreHookResult::Modify { .. } => {
+                    // Modify support deferred — treat as Allow
+                }
+                crate::hook::PreHookResult::Allow => {}
+            }
+        }
+
         // Snapshot the shared working directory before executing. Tools like
         // `change_dir` and `bash` (when the command starts with `cd`) mutate
         // `ctx.working_dir` in place; we compare before/after to emit a
@@ -992,6 +1027,18 @@ impl TurnRunner {
             },
         };
 
+        // --- PostToolUse Hook ---
+        if self.hook_executor.has_hooks() {
+            let hook_ctx = self.build_hook_context(
+                "post_tool_use",
+                Some(&call.name),
+                Some(&call.arguments),
+                Some(&tool_result.output),
+                Some(tool_result.success),
+            );
+            self.hook_executor.run_post_tool_use(&call.name, &hook_ctx).await;
+        }
+
         let _ = event_tx.send(TurnEvent::ToolCallResult {
             call_id: call.id.clone(),
             name: call.name.clone(),
@@ -1001,6 +1048,31 @@ impl TurnRunner {
         });
 
         tool_result
+    }
+
+    fn build_hook_context(
+        &self,
+        event: &str,
+        tool_name: Option<&str>,
+        tool_args: Option<&str>,
+        tool_result: Option<&str>,
+        tool_success: Option<bool>,
+    ) -> crate::hook::HookContext {
+        let wd = self
+            .context
+            .working_dir
+            .try_read()
+            .map(|g| g.display().to_string())
+            .unwrap_or_default();
+        crate::hook::HookContext {
+            event: event.into(),
+            tool_name: tool_name.map(String::from),
+            tool_args: tool_args.and_then(|a| serde_json::from_str(a).ok()),
+            tool_result: tool_result.map(String::from),
+            tool_success,
+            session_id: String::new(),
+            working_dir: wd,
+        }
     }
 
     /// Detect tool-call loops and return a recovery message when one should be
