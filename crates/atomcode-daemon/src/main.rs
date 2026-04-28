@@ -4,8 +4,8 @@
 
 use axum::{
     extract::{Path, Query, State},
-    http::StatusCode,
-    response::{sse::Sse, IntoResponse, Json},
+    http::{header, request::Parts as RequestParts, HeaderValue, Method, StatusCode},
+    response::{IntoResponse, Json, sse::Sse},
     routing::{get, post},
     Router,
 };
@@ -18,7 +18,7 @@ use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_util::sync::CancellationToken;
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use atomcode_core::config::Config;
 use atomcode_core::conversation::Conversation;
@@ -127,6 +127,10 @@ type ChatTasksStore = Arc<RwLock<HashMap<String, CancellationToken>>>;
 
 /// Stopped sessions (session_id) - used to prevent saving stopped chats
 type StoppedSessionsStore = Arc<RwLock<HashSet<String>>>;
+
+const DEFAULT_DAEMON_ADDR: &str = "127.0.0.1:13456";
+const DAEMON_ADDR_ENV: &str = "ATOMCODE_DAEMON_ADDR";
+const DANGEROUS_TOOLS_ENV: &str = "ATOMCODE_DAEMON_ENABLE_DANGEROUS_TOOLS";
 
 /// Combined app state for Axum
 #[derive(Clone)]
@@ -585,7 +589,44 @@ fn short_path(path: &str) -> String {
         _ => format!(".../{}/{}", parts[1], parts[0]),
     }
 }
+fn daemon_addr() -> String {
+    std::env::var(DAEMON_ADDR_ENV).unwrap_or_else(|_| DEFAULT_DAEMON_ADDR.to_string())
+}
 
+fn dangerous_tools_enabled() -> bool {
+    std::env::var(DANGEROUS_TOOLS_ENV).ok().as_deref() == Some("1")
+}
+
+fn cors_layer() -> CorsLayer {
+    CorsLayer::new()
+        .allow_origin(AllowOrigin::predicate(is_loopback_origin))
+        .allow_methods([Method::GET, Method::POST, Method::PATCH, Method::DELETE])
+        .allow_headers([header::CONTENT_TYPE])
+}
+
+fn is_loopback_origin(origin: &HeaderValue, _request_parts: &RequestParts) -> bool {
+    let Ok(origin) = origin.to_str() else {
+        return false;
+    };
+
+    let Some(authority) = origin
+        .strip_prefix("http://")
+        .or_else(|| origin.strip_prefix("https://"))
+    else {
+        return false;
+    };
+
+    is_loopback_authority(authority)
+}
+
+fn is_loopback_authority(authority: &str) -> bool {
+    if let Some(rest) = authority.strip_prefix("[::1]") {
+        return rest.is_empty() || rest.starts_with(':');
+    }
+
+    let host = authority.split(':').next().unwrap_or(authority);
+    matches!(host, "localhost" | "127.0.0.1" | "::1")
+}
 fn hash_path(path: &std::path::Path) -> String {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
@@ -1669,6 +1710,7 @@ async fn process_chat_request(
         })
         .unwrap_or_default();
     let enabled = |name: &str| !disabled_tools.contains(name);
+
     if enabled("read_file") {
         tool_registry.register_sync(Box::new(ReadFileTool));
     }
@@ -1719,8 +1761,9 @@ async fn process_chat_request(
 
     let shared_tools = Arc::new(tool_registry);
 
-    // Create turn runner with auto-bypass permission (API mode - no interactive approval)
-    let permission = Box::new(AutoPermissionDecider::new(AutoPermissionMode::BypassAll));
+    // API mode has no interactive approval channel. Auto-approved tools can run,
+    // but anything that explicitly requires approval is denied by default.
+    let permission = Box::new(AutoPermissionDecider::new(AutoPermissionMode::DenyAll));
     // Same ctx selection as interactive AgentLoop: walk config.providers
     // for the active provider, fallback to synthetic 128K config if absent.
     let daemon_ctx = match config.providers.get(&config.default_provider) {
@@ -2181,11 +2224,23 @@ async fn main() {
         .route("/mcp/status", get(mcp_status))
         .route("/mcp/reload", post(mcp_reload))
         .with_state(state)
-        .layer(CorsLayer::new().allow_origin(Any).allow_methods(Any));
+        .layer(cors_layer());
 
     let port = daemon_port_from_args();
     let addr = format!("0.0.0.0:{port}");
     println!("AtomCode API server listening on http://{}", addr);
+    if addr.starts_with("0.0.0.0:") || addr.starts_with("[::]:") {
+        eprintln!(
+            "Warning: {} exposes atomcode-daemon beyond localhost. Use only on trusted networks.",
+            DAEMON_ADDR_ENV
+        );
+    }
+    if dangerous_tools_enabled() {
+        eprintln!(
+            "Warning: {}=1 enables bash and write-capable daemon tools.",
+            DANGEROUS_TOOLS_ENV
+        );
+    }
     println!("\nAPI endpoints:");
     println!("  GET    /health                        - Health check");
     println!("  GET    /project                        - Get current working directory");
@@ -2208,4 +2263,32 @@ async fn main() {
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn origin_is_allowed(origin: &str) -> bool {
+        let origin = HeaderValue::from_str(origin).unwrap();
+        let request = axum::http::Request::builder().body(()).unwrap();
+        let (parts, _) = request.into_parts();
+        is_loopback_origin(&origin, &parts)
+    }
+
+    #[test]
+    fn cors_allows_loopback_origins() {
+        assert!(origin_is_allowed("http://localhost:3000"));
+        assert!(origin_is_allowed("http://127.0.0.1:3000"));
+        assert!(origin_is_allowed("http://[::1]:3000"));
+        assert!(origin_is_allowed("https://localhost"));
+    }
+
+    #[test]
+    fn cors_rejects_remote_and_opaque_origins() {
+        assert!(!origin_is_allowed("http://192.168.1.10:3000"));
+        assert!(!origin_is_allowed("http://localhost.evil.example"));
+        assert!(!origin_is_allowed("null"));
+        assert!(!origin_is_allowed("file://local/index.html"));
+    }
 }

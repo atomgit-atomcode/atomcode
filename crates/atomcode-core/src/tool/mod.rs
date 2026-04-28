@@ -24,6 +24,7 @@ pub mod web_search;
 pub mod write;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::ffi::{OsStr, OsString};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
@@ -63,11 +64,152 @@ pub fn should_skip_dir(name: &str) -> bool {
     SKIP_DIRS.contains(&name) || SKIP_DIR_PREFIXES.iter().any(|p| name.starts_with(p))
 }
 
+/// Lightweight sensitive-path precheck for raw tool arguments before a
+/// workspace-aware approval pass is available.
+pub(crate) fn is_sensitive_input_path(path: &str) -> bool {
+    let base_dir = std::env::current_dir().ok();
+    let home_dir = dirs::home_dir();
+    is_sensitive_input_path_with_context(path, base_dir.as_deref(), home_dir.as_deref())
+}
+
+fn is_sensitive_input_path_with_context(
+    path: &str,
+    base_dir: Option<&Path>,
+    home_dir: Option<&Path>,
+) -> bool {
+    if is_windows_sensitive_path(path) {
+        return true;
+    }
+
+    let mut expanded = expand_home_path(path, home_dir);
+    if !expanded.is_absolute() {
+        if let Some(base_dir) = base_dir {
+            expanded = base_dir.join(expanded);
+        }
+    }
+
+    let normalized = lexical_normalize(&expanded);
+    if is_windows_sensitive_path(&normalized.to_string_lossy()) {
+        return true;
+    }
+
+    is_sensitive_path(&normalized)
+}
+
+fn expand_home_path(path: &str, home_dir: Option<&Path>) -> PathBuf {
+    if let Some(stripped) = path.strip_prefix("~/") {
+        if let Some(home_dir) = home_dir {
+            return home_dir.join(stripped);
+        }
+    }
+
+    if path == "~" {
+        if let Some(home_dir) = home_dir {
+            return home_dir.to_path_buf();
+        }
+    }
+
+    PathBuf::from(path)
+}
+
+fn expand_user_path(path: &str) -> PathBuf {
+    let home_dir = dirs::home_dir();
+    expand_home_path(path, home_dir.as_deref())
+}
+
+fn lexical_normalize(path: &Path) -> PathBuf {
+    let mut prefix: Option<OsString> = None;
+    let mut has_root = false;
+    let mut parts: Vec<OsString> = Vec::new();
+
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix_component) => {
+                prefix = Some(prefix_component.as_os_str().to_os_string());
+                parts.clear();
+            }
+            Component::RootDir => {
+                has_root = true;
+                parts.clear();
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if parts.last().is_some_and(|part| part != OsStr::new("..")) {
+                    parts.pop();
+                } else if !has_root {
+                    parts.push(OsString::from(".."));
+                }
+            }
+            Component::Normal(part) => parts.push(part.to_os_string()),
+        }
+    }
+
+    let mut normalized = PathBuf::new();
+    if let Some(prefix) = prefix {
+        normalized.push(prefix);
+    }
+    if has_root {
+        normalized.push(std::path::MAIN_SEPARATOR.to_string());
+    }
+    for part in parts {
+        normalized.push(part);
+    }
+    normalized
+}
+
+fn is_windows_sensitive_path(path: &str) -> bool {
+    let normalized = path.replace('/', "\\");
+    let normalized = normalized.strip_prefix(r"\\?\").unwrap_or(&normalized);
+    let lowercase = normalized.to_ascii_lowercase();
+    let sensitive_roots = [
+        r"\windows",
+        r"\program files",
+        r"\program files (x86)",
+        r"\programdata",
+    ];
+    let Some(path_root) = windows_rooted_path(&lowercase) else {
+        return false;
+    };
+
+    sensitive_roots
+        .iter()
+        .any(|root| windows_path_starts_with(path_root, root))
+}
+
+fn windows_path_starts_with(path: &str, root: &str) -> bool {
+    path == root
+        || path
+            .strip_prefix(root)
+            .is_some_and(|rest| rest.starts_with('\\'))
+}
+
+fn windows_rooted_path(path: &str) -> Option<&str> {
+    if let Some(path_without_drive) = strip_windows_drive_prefix(path) {
+        return Some(path_without_drive);
+    }
+
+    if path.starts_with('\\') && !path.starts_with(r"\\") {
+        return Some(path);
+    }
+
+    None
+}
+
+fn strip_windows_drive_prefix(path: &str) -> Option<&str> {
+    let bytes = path.as_bytes();
+    if bytes.len() < 3
+        || !bytes[0].is_ascii_alphabetic()
+        || bytes[1] != b':'
+        || bytes[2] != b'\\'
+    {
+        return None;
+    }
+
+    Some(&path[2..])
+}
+
 /// Count of leading characters shared between two paths. Used by read_file
-/// and glob 404 recovery to rank candidate suggestions: the match with the
-/// longest shared prefix with what the agent actually asked for is almost
-/// always the one it wanted. Pure character count, tech-neutral — no path
-/// segment parsing (avoids per-OS separator logic).
+/// and glob 404 recovery to rank candidate suggestions.
 pub fn shared_prefix_len(a: &str, b: &str) -> usize {
     a.chars().zip(b.chars()).take_while(|(x, y)| x == y).count()
 }
@@ -153,7 +295,6 @@ fn expand_user_path(path: &str) -> PathBuf {
 
     PathBuf::from(path)
 }
-
 fn normalize_path(path: &Path) -> PathBuf {
     let mut normalized = PathBuf::new();
 
@@ -334,7 +475,6 @@ fn is_sensitive_path(path: &Path) -> bool {
     {
         return true;
     }
-
     path.extension()
         .and_then(|ext| ext.to_str())
         .is_some_and(|ext| {
@@ -820,6 +960,73 @@ mod tests {
         let defs = reg.get_definitions().await;
         assert_eq!(defs.len(), 1);
         assert_eq!(defs[0].name, "dummy");
+    }
+
+    #[test]
+    fn sensitive_path_detects_relative_traversal_to_unix_root() {
+        assert!(is_sensitive_input_path_with_context(
+            "../../../etc/passwd",
+            Some(Path::new("/home/alice/project")),
+            Some(Path::new("/home/alice")),
+        ));
+    }
+
+    #[test]
+    fn sensitive_path_detects_windows_system_roots() {
+        assert!(is_sensitive_input_path_with_context(
+            r"C:\Windows\System32\drivers\etc\hosts",
+            None,
+            None,
+        ));
+        assert!(is_sensitive_input_path_with_context(
+            r"D:\Windows\System32\drivers\etc\hosts",
+            None,
+            None,
+        ));
+        assert!(is_sensitive_input_path_with_context(
+            r"\Windows\System32\drivers\etc\hosts",
+            None,
+            None,
+        ));
+        assert!(is_sensitive_input_path_with_context(
+            r"C:\Program Files\AtomCode\config.toml",
+            None,
+            None,
+        ));
+        assert!(is_sensitive_input_path_with_context(
+            r"C:\ProgramData\AtomCode\config.toml",
+            None,
+            None,
+        ));
+    }
+
+    #[test]
+    fn sensitive_path_uses_path_boundaries() {
+        assert!(!is_sensitive_input_path_with_context(
+            "/etc-old/passwd",
+            None,
+            None,
+        ));
+        assert!(!is_sensitive_input_path_with_context(
+            r"C:\Windows.old\system.ini",
+            None,
+            None,
+        ));
+        assert!(!is_sensitive_input_path_with_context(
+            r"D:\Windows.old\system.ini",
+            None,
+            None,
+        ));
+        assert!(!is_sensitive_input_path_with_context(
+            r"\Windows.old\system.ini",
+            None,
+            None,
+        ));
+        assert!(!is_sensitive_input_path_with_context(
+            r"\\server\share\Windows\system.ini",
+            None,
+            None,
+        ));
     }
 
     #[tokio::test]
