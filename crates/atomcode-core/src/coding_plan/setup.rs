@@ -571,6 +571,7 @@ mod tests {
             notifications: Default::default(),
             telemetry: Default::default(),
             lsp: Default::default(),
+            auto_commit: false,
         }
     }
 
