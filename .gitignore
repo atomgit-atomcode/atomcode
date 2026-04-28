@@ -23,6 +23,7 @@ __pycache__/
 node_modules/
 **/node_modules/
 package-lock.json
+!extensions/vscode/package-lock.json
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*

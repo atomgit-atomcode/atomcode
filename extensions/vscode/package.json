@@ -5,6 +5,11 @@
   "version": "0.1.0",
   "publisher": "atomgit",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://gitcode.com/atomgit_atomcode/atomcode.git",
+    "directory": "extensions/vscode"
+  },
   "engines": {
     "vscode": "^1.85.0"
   },
@@ -176,9 +181,10 @@
     "build:webview": "node webview-ui/esbuild.js",
     "watch:webview": "node webview-ui/esbuild.js --watch",
     "compile": "tsc -p ./ && npm run build:webview",
+    "vscode:prepublish": "npm run compile",
     "watch": "npx concurrently \"tsc -watch -p ./\" \"npm run watch:webview\"",
     "lint": "eslint src --ext ts",
-    "package": "npx @vscode/vsce package --no-dependencies"
+    "package": "vsce package --no-dependencies"
   },
   "devDependencies": {
     "@types/dompurify": "^3.0.5",
@@ -186,6 +192,7 @@
     "@types/react": "^19.2.14",
     "@types/react-dom": "^19.2.3",
     "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "^3.9.1",
     "concurrently": "^9.2.1",
     "esbuild": "^0.28.0",
     "typescript": "^5.3.0"
