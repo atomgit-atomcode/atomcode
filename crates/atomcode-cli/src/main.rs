@@ -815,6 +815,7 @@ async fn run() -> Result<i32> {
                 reasoning_history: None,
                 thinking_enabled: None,
                 thinking_budget: None,
+                skip_tls_verify: false,
                 ephemeral: false,
             },
             String::new(),

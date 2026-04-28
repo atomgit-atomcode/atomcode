@@ -1703,6 +1703,7 @@ async fn process_chat_request(
                 reasoning_history: None,
                 thinking_enabled: None,
                 thinking_budget: None,
+                skip_tls_verify: false,
                 ephemeral: true,
             })
         }
