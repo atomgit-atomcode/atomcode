@@ -258,7 +258,17 @@ pub async fn run(
     let inner: Box<dyn Renderer> = if caps.tty {
         Box::new(RetainedRenderer::new(caps))
     } else {
-        Box::new(PlainRenderer::new())
+        // Pass caps explicitly so PlainRenderer can gate colours,
+        // unicode chevron, and the `\r`-overwrite spinner on the
+        // terminal's actual capabilities (caps.colors / .unicode_symbols
+        // / .spinner). Even though we cleared caps.tty above for the
+        // force_plain branch, the colour/unicode/spinner flags stay
+        // at their probe-time values — JediTerm supports all three,
+        // CI / pipe / dumb terminals don't, and we render appropriately.
+        Box::new(PlainRenderer::with_writer_and_caps(
+            std::io::BufWriter::new(std::io::stdout()),
+            caps,
+        ))
     };
     let mut renderer: Box<dyn Renderer> = Box::new(TaskRenderer::new(inner));
 
