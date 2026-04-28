@@ -13,6 +13,6 @@ pub mod sender;
 
 pub use config::{CliOverride, ResolvedConfig, TelemetryConfig, TelemetryState};
 pub use event::{CodingplanResult, Envelope, Event, Record, RepoHost, RepoOrigin, SessionMode};
-pub use runtime::{Counters, CountersSnapshot, CurrentContext, Telemetry};
+pub use runtime::{resolve_provider_host, Counters, CountersSnapshot, CurrentContext, Telemetry};
 
 pub const SCHEMA_VERSION: u32 = 1;

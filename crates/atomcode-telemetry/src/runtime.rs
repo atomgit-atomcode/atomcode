@@ -24,6 +24,7 @@ use uuid::Uuid;
 pub struct CurrentContext {
     pub turn_id: Option<Uuid>,
     pub provider: Option<String>,
+    pub provider_host: Option<String>,
     pub model: Option<String>,
     pub repo_origin: Option<RepoOrigin>,
     pub mode: Option<crate::event::SessionMode>,
@@ -31,6 +32,35 @@ pub struct CurrentContext {
 
 tokio::task_local! {
     static CTX: CurrentContext;
+}
+
+/// Resolve the `provider_host` envelope field from a vendor type and an
+/// optional configured `base_url`.
+///
+/// 1. If `base_url` parses as a URL with a host → that host (no scheme,
+///    no port, no path; path/query are dropped because they may carry
+///    tokens or tenant ids).
+/// 2. Otherwise fall back to each vendor's well-known host.
+/// 3. Unknown vendor with no parseable URL → `None`.
+pub fn resolve_provider_host(vendor: &str, base_url: Option<&str>) -> Option<String> {
+    if let Some(raw) = base_url {
+        if let Some(host) = url::Url::parse(raw)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_string))
+        {
+            return Some(host);
+        }
+    }
+    default_host_for_vendor(vendor)
+}
+
+fn default_host_for_vendor(vendor: &str) -> Option<String> {
+    match vendor {
+        "claude" => Some("api.anthropic.com".into()),
+        "openai" => Some("api.openai.com".into()),
+        "ollama" => Some("localhost".into()),
+        _ => None,
+    }
 }
 
 impl CurrentContext {
@@ -231,6 +261,7 @@ impl Telemetry {
             arch: self.arch.to_string(),
             locale: self.locale.clone(),
             provider: ctx.provider,
+            provider_host: ctx.provider_host,
             model: ctx.model,
             repo_origin: ctx.repo_origin,
             mode: ctx.mode,
@@ -449,5 +480,55 @@ mod sys_locale {
             .ok()
             .or_else(|| std::env::var("LC_ALL").ok())
             .map(|s| s.split('.').next().unwrap_or(&s).replace('_', "-"))
+    }
+}
+
+#[cfg(test)]
+mod resolve_host_tests {
+    use super::resolve_provider_host;
+
+    #[test]
+    fn parses_host_from_full_url() {
+        assert_eq!(
+            resolve_provider_host("openai", Some("https://api-ai.gitcode.com/v1")),
+            Some("api-ai.gitcode.com".into())
+        );
+    }
+
+    #[test]
+    fn drops_port_path_userinfo() {
+        // Port and path are stripped — only the bare host remains.
+        assert_eq!(
+            resolve_provider_host("openai", Some("https://user:pass@api.example.com:8443/v1/foo?bar=baz")),
+            Some("api.example.com".into())
+        );
+    }
+
+    #[test]
+    fn falls_back_to_vendor_default_when_url_missing() {
+        assert_eq!(resolve_provider_host("claude", None), Some("api.anthropic.com".into()));
+        assert_eq!(resolve_provider_host("openai", None), Some("api.openai.com".into()));
+        assert_eq!(resolve_provider_host("ollama", None), Some("localhost".into()));
+    }
+
+    #[test]
+    fn falls_back_to_vendor_default_when_url_unparseable() {
+        assert_eq!(
+            resolve_provider_host("claude", Some("not a url")),
+            Some("api.anthropic.com".into())
+        );
+    }
+
+    #[test]
+    fn unknown_vendor_with_no_url_yields_none() {
+        assert_eq!(resolve_provider_host("unknown_vendor", None), None);
+    }
+
+    #[test]
+    fn unknown_vendor_with_url_still_uses_url_host() {
+        assert_eq!(
+            resolve_provider_host("unknown_vendor", Some("https://api.example.com")),
+            Some("api.example.com".into())
+        );
     }
 }
