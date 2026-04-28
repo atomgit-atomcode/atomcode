@@ -57,7 +57,7 @@ impl<W: Write + Send> Renderer for PlainRenderer<W> {
             UiLine::AssistantLineBreak => {
                 let _ = self.out.write_all(b"\n");
             }
-            UiLine::ToolCall { name, detail } | UiLine::ToolCallInFlight { name, detail } => {
+            UiLine::ToolCall { name, detail } | UiLine::ToolCallInFlight { id: _, name, detail } => {
                 // Plain mode has no in-place rewrite, so the in-flight
                 // variant degrades to the same single static line that
                 // the static `ToolCall` produces — the user just sees
@@ -69,7 +69,7 @@ impl<W: Write + Send> Renderer for PlainRenderer<W> {
                     let _ = writeln!(self.out, "▸ {}({})", name, scrub_controls(&detail));
                 }
             }
-            UiLine::ToolCallCommit => {
+            UiLine::ToolCallCommit { call_id: _ } => {
                 // Plain mode never animated the row, so there is
                 // nothing to freeze. Skip silently.
             }

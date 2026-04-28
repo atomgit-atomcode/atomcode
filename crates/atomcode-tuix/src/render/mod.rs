@@ -35,6 +35,7 @@ pub enum UiLine {
     /// static `▸` icon by `ToolCallCommit` once the matching result
     /// lands, freeing the live-row slot for the spinner to resume.
     ToolCallInFlight {
+        id: String,
         name: String,
         detail: String,
     },
@@ -42,7 +43,10 @@ pub enum UiLine {
     /// static `▸` icon. Emitted right before `ToolResult` so the
     /// bottom body row stops animating exactly when the result is
     /// about to be appended below it.
-    ToolCallCommit,
+    /// If `call_id` is provided, only commits if the inflight_tool matches.
+    ToolCallCommit {
+        call_id: Option<String>,
+    },
     ToolResult {
         success: bool,
         summary: String,

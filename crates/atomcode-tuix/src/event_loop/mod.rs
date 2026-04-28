@@ -2480,6 +2480,7 @@ fn handle_agent_event(
             // Close any in-flight assistant line before emitting the tool call.
             renderer.render(UiLine::AssistantLineBreak);
             renderer.render(UiLine::ToolCallInFlight {
+                id: id.clone(),
                 name: display.clone(),
                 detail: detail.clone(),
             });
@@ -2509,9 +2510,12 @@ fn handle_agent_event(
             renderer.render(UiLine::AssistantLineBreak);
             // Freeze the animated in-flight tool-call row to its final
             // static `▸` icon before the `⎿ result` body row lands beneath
-            // it. No-op when nothing is in flight (plain mode, or the
-            // matching Start never fired).
-            renderer.render(UiLine::ToolCallCommit);
+            // it. Pass the call_id so we only freeze if the inflight_tool matches.
+            // This prevents freezing a different tool's spinner when multiple
+            // tools are in flight (e.g., WriteFile result arrives while Bash spinner is active).
+            renderer.render(UiLine::ToolCallCommit {
+                call_id: Some(call_id.clone()),
+            });
 
             // Prefer the display-name we stored at ToolCallStarted time;
             // fall back to converting the raw name if we missed the Start
@@ -2591,7 +2595,10 @@ fn handle_agent_event(
                 if *rendered {
                     // ToolCallInFlight is animating — commit it to a static row
                     // so the approval prompt appears below a frozen `▸ Bash(...)`.
-                    renderer.render(UiLine::ToolCallCommit);
+                    // Pass the call_id to ensure we only freeze the matching tool.
+                    renderer.render(UiLine::ToolCallCommit {
+                        call_id: Some(call.id.clone()),
+                    });
                 } else {
                     // Not yet rendered, emit it now
                     renderer.render(UiLine::ToolCall {
