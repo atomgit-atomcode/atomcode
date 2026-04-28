@@ -82,7 +82,10 @@ impl TerminalGuard {
         // without it, every 30ms autorepeat tick reports as `KeyEventKind::Press`,
         // so holding Shift+Enter for a normal 150ms press-down inserts 5-10
         // newlines instead of one. With it enabled, autorepeats report as
-        // `KeyEventKind::Repeat` and are filtered out in `event_loop/mod.rs`.
+        // `KeyEventKind::Repeat`, which `event_loop/mod.rs` treats the same
+        // as `Press` so navigation keys (Left/Right/Backspace) auto-repeat
+        // when held — Submit-on-Enter still fires only once because Submit
+        // transitions phases.
         //
         // `execute!` is best-effort — terminals that don't support CSI u
         // (notably Apple Terminal.app, some Linux terminals) ignore the

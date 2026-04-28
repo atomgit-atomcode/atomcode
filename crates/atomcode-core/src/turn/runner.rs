@@ -1126,6 +1126,9 @@ impl TurnRunner {
                         return Some(format!(
                             "BLOCKED: read_file '{}' hit its {}-call cap for the SAME region of this file. \
                              You keep requesting the same slice and getting the same output. \
+                             First, check that the path itself is right — if you're using a relative \
+                             or basename-only path, the user may have mentioned a specific absolute \
+                             path (e.g. ~/some/dir/file) that you should be using instead. \
                              If you need more of this file, pass a different offset to jump elsewhere. \
                              If you're stuck because the file is unreadable (Office binary, PDF, \
                              encoding mismatch), switch to a bash converter \

@@ -1544,15 +1544,25 @@ fn handle_input(
             }
         }
         InputEvent::Eof => {}
-        // Only act on Press events. On Unix tty crossterm only emits Press
-        // so this guard is a no-op there; on Windows crossterm emits all
-        // three kinds (Press / Repeat / Release). Without filtering to
-        // Press we double-fired on every keystroke (Press + Release both
-        // ran the handler) and a held-down key fired again on every
-        // Repeat tick, producing "ghost characters" / runaway backspace
-        // the moment the OS autorepeat kicked in.
+        // Act on Press AND Repeat. Release is dropped (it would double-fire
+        // every handler on Windows, where crossterm emits all three kinds
+        // per keystroke).
+        //
+        // Repeat is what the Kitty protocol's `REPORT_EVENT_TYPES` bit
+        // (enabled in lib.rs) turns OS key autorepeat into — without
+        // accepting it, holding Left/Right/Backspace only moves one step
+        // because every autorepeat tick gets dropped here. Accepting it
+        // also doesn't cause runaway Submit on a held Enter: Submit
+        // transitions to Streaming phase, and Streaming's Enter handler
+        // doesn't submit again.
+        //
+        // Terminals that don't support `REPORT_EVENT_TYPES` (iTerm2 3.5+,
+        // Apple Terminal) leak autorepeat as repeated Press events
+        // instead; the reader-level `MODIFIER_ENTER_DEDUP` handles the
+        // one case where that's harmful (modifier+Enter → spurious
+        // newlines).
         InputEvent::Key(KeyEvent {
-            kind: KeyEventKind::Press,
+            kind: KeyEventKind::Press | KeyEventKind::Repeat,
             code,
             modifiers,
             ..
@@ -1637,8 +1647,8 @@ fn handle_input(
                 UiPhase::Suspended => {}
             }
         }
-        // Release / Repeat key events: drop on the floor. Press is handled
-        // above; everything else is noise on Windows.
+        // Release key events: drop on the floor. Press / Repeat are handled
+        // above; Release is noise on Windows.
         InputEvent::Key(_) => {}
     }
     Ok(())
