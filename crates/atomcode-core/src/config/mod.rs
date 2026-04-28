@@ -54,12 +54,12 @@ pub struct Config {
     pub default_workdir: Option<String>,
     pub providers: HashMap<String, ProviderConfig>,
     /// Per-turn datalog settings. Missing from older configs → defaults to
-    /// enabled=true, dir=None (writes to `<cwd>/datalog/`).
+    /// enabled=true, dir="~/.atomcode/datalog" (project slug appended underneath).
     ///
     /// `skip_serializing` intentionally suppresses serde's automatic output;
     /// `save()` writes this section manually with explanatory comments and
-    /// the default `dir` line commented-out so users can edit the file
-    /// without needing to know the field names in advance.
+    /// the resolved default `dir` value so users can see and edit it without
+    /// having to know the field names in advance.
     #[serde(default, skip_serializing)]
     pub datalog: DatalogConfig,
     /// Task-finished notifications. Saved manually with help comments so users
@@ -102,11 +102,13 @@ pub struct DatalogConfig {
     /// When false, `DatalogWriter` becomes a no-op and no files are created.
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// Where to write datalog files. Accepted forms:
-    /// - `None` (or omitted) → `<working_dir>/datalog/` (default, current behavior)
-    /// - Absolute path → used as-is, not affected by /cd
-    /// - `~/...` → expanded relative to home, not affected by /cd
-    /// - Relative path → resolved against working_dir, follows /cd
+    /// Root directory under which datalog files are written. The per-project
+    /// slug (`<basename>-<hash8>`) is always appended underneath, so two
+    /// projects never collide. Accepted forms:
+    /// - `None` (or omitted) → `~/.atomcode/datalog/` (default)
+    /// - Absolute path        → used as-is, not affected by /cd
+    /// - `~/...`              → expanded relative to home, not affected by /cd
+    /// - Relative path        → resolved against working_dir, follows /cd
     #[serde(default)]
     pub dir: Option<String>,
 }
@@ -182,7 +184,11 @@ impl Default for DatalogConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            dir: None,
+            // Pre-fill the default root so it round-trips into config.toml on
+            // first save — users see exactly where logs go without having to
+            // discover that "unset == ~/.atomcode/datalog". Resolver still
+            // treats this string the same as `None` (project slug appended).
+            dir: Some("~/.atomcode/datalog".to_string()),
         }
     }
 }
@@ -202,30 +208,24 @@ impl Default for NotificationConfig {
 
 /// Serialize the `[datalog]` section with help comments so users editing
 /// config.toml by hand can discover the options without reading the source.
-/// When `dir` is unset, emit a commented-out example; when set, emit it as
-/// a real TOML string.
+/// `enabled` and `dir` are always emitted as real values — the default `dir`
+/// (`~/.atomcode/datalog`) is shown explicitly so users see exactly where
+/// logs go without having to discover that "unset == default".
 fn render_datalog_section(cfg: &DatalogConfig) -> String {
     let mut out = String::new();
-    out.push_str("\n# Per-turn datalog settings. Each turn writes a markdown file\n");
-    out.push_str("# (plus a .jsonl of raw LLM requests) into `dir`.\n");
+    out.push_str("\n# Per-turn datalog. Each turn writes a markdown summary; each LLM\n");
+    out.push_str("# round writes a JSON request/response pair under `<dir>/<project>/llm/`.\n");
+    out.push_str("# A per-project subdirectory is always appended under `dir` so multiple\n");
+    out.push_str("# projects never share a bucket.\n");
     out.push_str("# - enabled = false        -> disable logging entirely\n");
-    out.push_str("# - dir unset (default)    -> writes to <working_dir>/datalog/ (follows /cd)\n");
+    out.push_str("# - dir = \"~/.atomcode/datalog\" -> default (follows $HOME, ignores /cd)\n");
     out.push_str("# - dir = \"/abs/path\"      -> absolute, fixed (unaffected by /cd)\n");
-    out.push_str("# - dir = \"~/sub\"          -> expanded from $HOME, fixed\n");
     out.push_str("# - dir = \"rel/path\"       -> joined with current working_dir, follows /cd\n");
     out.push_str("[datalog]\n");
     out.push_str(&format!("enabled = {}\n", cfg.enabled));
-    match &cfg.dir {
-        Some(d) => {
-            let escaped = d.replace('\\', "\\\\").replace('"', "\\\"");
-            out.push_str(&format!("dir = \"{}\"\n", escaped));
-        }
-        None => {
-            // Leave dir unset so behavior stays <cwd>/datalog/. The line below is
-            // ONLY an example of the string form — not the actual default.
-            out.push_str("# dir = \"~/.atomcode/datalog\"  # example: uncomment to redirect\n");
-        }
-    }
+    let dir_value = cfg.dir.as_deref().unwrap_or("~/.atomcode/datalog");
+    let escaped = dir_value.replace('\\', "\\\\").replace('"', "\\\"");
+    out.push_str(&format!("dir = \"{}\"\n", escaped));
     out
 }
 
@@ -492,15 +492,28 @@ mod tests {
     }
 
     #[test]
-    fn render_datalog_section_default_has_commented_dir() {
+    fn render_datalog_section_default_emits_active_dir() {
         let rendered = render_datalog_section(&DatalogConfig::default());
         assert!(rendered.contains("[datalog]"));
         assert!(rendered.contains("enabled = true"));
-        assert!(rendered.contains("# dir = "));
         assert!(
-            !rendered.contains("\ndir = "),
-            "default must not emit active dir line"
+            rendered.contains("\ndir = \"~/.atomcode/datalog\"\n"),
+            "default must emit the resolved dir as a real, uncommented value: {}",
+            rendered
         );
+    }
+
+    #[test]
+    fn render_datalog_section_unset_dir_still_shows_default() {
+        // Belt-and-suspenders: even if some caller hands us a Config where
+        // `dir` somehow ended up None (older config file, manual deserialize),
+        // render still emits the default value rather than omitting the line.
+        let cfg = DatalogConfig {
+            enabled: true,
+            dir: None,
+        };
+        let rendered = render_datalog_section(&cfg);
+        assert!(rendered.contains("\ndir = \"~/.atomcode/datalog\"\n"));
     }
 
     #[test]

@@ -213,11 +213,17 @@ impl TurnRunner {
             }
         }
 
-        // Log the request to <working_dir>/datalog/llm/<ts>.json right
-        // before send. `pending_request_log` holds the path so the
-        // response call below can merge into the same file — passed
-        // explicitly to avoid the old process-wide-static approach that
-        // bled across concurrent daemon sessions.
+        // Log the request to <datalog_dir>/llm/<ts>.json right before send.
+        // `pending_request_log` holds the path so the response call below
+        // can merge into the same file — passed explicitly to avoid the old
+        // process-wide-static approach that bled across concurrent daemon
+        // sessions.
+        //
+        // `datalog_dir` is resolved from `[datalog].dir` (default
+        // `~/.atomcode/datalog/<project-slug>/`) — the same root the
+        // markdown writer uses, so request JSON, response JSON, calls.log,
+        // and the markdown summary all live next to each other for any
+        // given project.
         let pending_request_log = {
             let wd = self
                 .context
@@ -225,8 +231,12 @@ impl TurnRunner {
                 .try_read()
                 .map(|g| g.clone())
                 .unwrap_or_default();
-            super::log::log_llm_request(
+            let datalog_dir = crate::turn::datalog::DatalogWriter::resolve_log_dir(
                 &wd,
+                self.config.datalog.dir.as_deref(),
+            );
+            super::log::log_llm_request(
+                &datalog_dir,
                 &messages,
                 &tool_defs,
                 self.provider.model_name(),
@@ -561,7 +571,9 @@ impl TurnRunner {
                         }
         }
 
-        // Log LLM response (text + tool calls) to <working_dir>/datalog/llm/
+        // Log LLM response (text + tool calls) into the same per-project
+        // datalog dir as the request — see comment on the matching
+        // `log_llm_request` call above.
         let response_duration = stream_start.elapsed().as_millis() as u64;
         let wd = self
             .context
@@ -569,8 +581,12 @@ impl TurnRunner {
             .try_read()
             .map(|g| g.clone())
             .unwrap_or_default();
-        super::log::log_llm_response(
+        let datalog_dir = crate::turn::datalog::DatalogWriter::resolve_log_dir(
             &wd,
+            self.config.datalog.dir.as_deref(),
+        );
+        super::log::log_llm_response(
+            &datalog_dir,
             pending_request_log,
             &text_buf,
             &tool_calls_buf,
