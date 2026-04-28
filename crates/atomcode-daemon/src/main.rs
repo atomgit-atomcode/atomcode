@@ -1241,6 +1241,9 @@ pub enum ChatEvent {
     /// Tool call started
     #[serde(rename = "tool_start")]
     ToolCallStarted { name: String, arguments: String },
+    /// Real-time tool output chunk
+    #[serde(rename = "tool_output")]
+    ToolOutputChunk { chunk: String },
     /// Tool call completed
     #[serde(rename = "tool_result")]
     ToolCallResult {
@@ -1839,6 +1842,10 @@ async fn process_chat_request(
                         }
                     }
                 }
+            }
+            TurnEvent::ToolOutputChunk { call_id: _, chunk } => {
+                // Send real-time tool output to client
+                let _ = event_tx.send(ChatEvent::ToolOutputChunk { chunk });
             }
             TurnEvent::ToolCallResult {
                 call_id: _,

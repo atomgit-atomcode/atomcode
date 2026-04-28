@@ -2348,16 +2348,29 @@ fn handle_agent_event(
             name,
             arguments,
         } => {
-            // Don't emit the ▸ line yet; hold it in pending_tools until
-            // either (a) an ApprovalNeeded for this call arrives and
-            // renders the line eagerly so the user can see what they're
-            // approving, or (b) the matching ToolCallResult arrives and
-            // renders the pair. `call_rendered=false` means no one has
-            // emitted the line yet.
+            // Emit the ▸ line immediately so users can see what command
+            // is running, especially for long-running bash commands.
+            // The line will be shown before the command completes.
             let detail = format_tool_detail(&name, &arguments);
             let display = display_tool_name(&name);
-            pending_tools.insert(id, (display.clone(), detail, false));
+            
+            // Close any in-flight assistant line before emitting the tool call.
+            renderer.render(UiLine::AssistantLineBreak);
+            renderer.render(UiLine::ToolCall {
+                name: display.clone(),
+                detail: detail.clone(),
+            });
+            renderer.flush();
+            
+            // Mark as rendered so ToolCallResult doesn't emit it again.
+            pending_tools.insert(id, (display.clone(), detail, true));
             state.on_tool_call_started(&display);
+        }
+        AgentEvent::ToolOutputChunk { call_id: _, chunk } => {
+            // Display real-time tool output (e.g., bash stdout/stderr)
+            // Append to the scrollback as command output
+            renderer.render(UiLine::CommandOutput(chunk));
+            renderer.flush();
         }
         AgentEvent::ToolCallResult {
             call_id,

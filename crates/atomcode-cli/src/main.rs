@@ -1207,6 +1207,11 @@ async fn run_headless(
                     eprintln!("[tool→ {} args={}]", name, args);
                 }
             }
+            AgentEvent::ToolOutputChunk { call_id: _, chunk } => {
+                if verbose {
+                    eprint!("{}", chunk);
+                }
+            }
             AgentEvent::ToolCallResult {
                 call_id: _,
                 name,
