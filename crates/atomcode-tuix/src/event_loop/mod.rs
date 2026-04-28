@@ -2453,18 +2453,12 @@ fn handle_agent_event(
             // Display reasoning/thinking content in verbose mode (Ctrl+O)
             // Only show when the user has enabled it
             if state.show_reasoning {
-                let is_first_chunk = reasoning_buffer.is_empty();
                 reasoning_buffer.push_str(&text);
                 // Flush on newline or when buffer gets large
                 if reasoning_buffer.contains('\n') || reasoning_buffer.len() > 80 {
                     let output = std::mem::take(reasoning_buffer);
-                    // Show "Thinking: " prefix on first chunk, then dimmed content
-                    let display_text = if is_first_chunk {
-                        format!("\x1b[1mThinking:\x1b[0m \x1b[2m{}\x1b[0m", output.trim_end())
-                    } else {
-                        format!("\x1b[2m{}\x1b[0m", output.trim_end())
-                    };
-                    renderer.render(UiLine::CommandOutput(display_text));
+                    // Render as gray/dimmed text with automatic line wrapping
+                    renderer.render(UiLine::ReasoningText(output));
                     renderer.flush();
                 }
             }
