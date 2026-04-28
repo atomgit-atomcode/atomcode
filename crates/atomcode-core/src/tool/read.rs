@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::json;
@@ -184,12 +184,21 @@ impl Tool for ReadFileTool {
         // the requested project — agent ignored the suggestion and started
         // manual `ls` (see 426-atom 2026-04-21 session).
         if !path_ref.exists() {
+            // Always return a clean NotFound message (with resolved path
+            // surfaced) — never fall through to `tokio::fs::read` on a
+            // missing file. Falling through used to leak a bare
+            // `"No such file or directory (os error 2)"` from the OS,
+            // which (a) didn't say WHICH path was tried, and (b) was
+            // indistinguishable from EACCES leaks. The agent often
+            // misread it as a permission issue and looped on read_file
+            // hitting the call-loop cap (see runner.rs detect_call_loop)
+            // instead of correcting the path.
             let filename = path_ref
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_default();
+            let mut matches: Vec<String> = Vec::new();
             if !filename.is_empty() {
-                let mut matches: Vec<String> = Vec::new();
                 fn find_file(
                     dir: &std::path::Path,
                     target: &str,
@@ -220,29 +229,52 @@ impl Tool for ReadFileTool {
                     }
                 }
                 find_file(&working_dir, &filename, 0, 7, &mut matches);
-                if !matches.is_empty() {
-                    // Rank by shared-path-prefix length with the requested path.
-                    // The correct match almost always shares the most segments
-                    // with what the agent asked for.
-                    matches.sort_by_key(|m| {
-                        std::cmp::Reverse(super::shared_prefix_len(&parsed.file_path, m))
-                    });
-                    let shown: Vec<String> =
-                        matches.iter().take(5).map(|m| format!("  {}", m)).collect();
-                    return Ok(ToolResult {
-                        call_id: String::new(),
-                        output: format!(
-                            "Error: No such file: {}\n\nDid you mean:\n{}",
-                            parsed.file_path,
-                            shown.join("\n")
-                        ),
-                        success: false,
-                    });
-                }
+                // Rank by shared-path-prefix length with the requested
+                // path. The correct match almost always shares the most
+                // segments with what the agent asked for.
+                matches.sort_by_key(|m| {
+                    std::cmp::Reverse(super::shared_prefix_len(&parsed.file_path, m))
+                });
             }
+
+            // Build the message. Always include the resolved path so the
+            // agent sees what was actually attempted (raw input might be
+            // relative — the resolved path is what hit the filesystem).
+            let mut output = format!(
+                "Error: No such file: {} (resolved to {})",
+                parsed.file_path,
+                path_ref.display()
+            );
+            if !matches.is_empty() {
+                let shown: Vec<String> =
+                    matches.iter().take(5).map(|m| format!("  {}", m)).collect();
+                output.push_str("\n\nDid you mean:\n");
+                output.push_str(&shown.join("\n"));
+            }
+            // Nudge the agent toward absolute paths when it passed a
+            // relative one. The most common cause of this branch is the
+            // agent ignoring an absolute path the user mentioned in
+            // their message and passing a bare basename instead.
+            if !std::path::Path::new(&parsed.file_path).is_absolute()
+                && !parsed.file_path.starts_with('~')
+            {
+                output.push_str(&format!(
+                    "\n\nHint: file_path was relative and resolved against working dir {}. \
+                     If the user mentioned a different location (e.g. ~/some/path), retry \
+                     with the absolute path.",
+                    working_dir.display()
+                ));
+            }
+            return Ok(ToolResult {
+                call_id: String::new(),
+                output,
+                success: false,
+            });
         }
 
-        let bytes = tokio::fs::read(&path).await?;
+        let bytes = tokio::fs::read(&path)
+            .await
+            .with_context(|| format!("Failed to read {}", path.display()))?;
 
         // Decode: UTF-8 first (the vast majority of text files), then GBK
         // fallback for plain-text extensions (Chinese Windows legacy files
@@ -829,6 +861,77 @@ mod tests {
         assert!(
             wanted_pos < other_pos,
             "proj-wanted match must rank above proj-other. output:\n{}",
+            r.output
+        );
+    }
+
+    /// The key UX case behind option B in the OAuth-fix follow-up:
+    /// agent passes a relative basename for a file that doesn't exist
+    /// in the working dir AND no fuzzy match turns up. Pre-fix this
+    /// fell through to `tokio::fs::read?` and the agent saw a bare
+    /// `"No such file or directory (os error 2)"` (or, when a parent
+    /// directory's perms tripped the kernel, a misleading
+    /// `"Permission denied (os error 13)"`). The fix:
+    ///   1. Always early-return a clean `Error: No such file: <input>
+    ///      (resolved to <abs path>)` so the agent sees what was tried
+    ///   2. Add the absolute-path hint when input was relative —
+    ///      pushing the agent to use the path the user actually
+    ///      mentioned (e.g. `~/.atomcode/MEMORY.md`) on the next call
+    ///      instead of looping.
+    #[tokio::test]
+    async fn read_404_relative_path_includes_resolved_path_and_absolute_hint() {
+        let dir = TempDir::new().unwrap();
+        // Working dir has no MEMORY.md and no fuzzy match — so the
+        // suggestion list must come back empty and we exercise the
+        // "no candidates" branch that previously fell through.
+        let ctx = ToolContext::new(dir.path().to_path_buf());
+        let tool = ReadFileTool;
+        let args = r#"{"file_path":"MEMORY.md"}"#;
+
+        let r = tool.execute(args, &ctx).await.unwrap();
+        assert!(!r.success);
+        assert!(
+            r.output.contains("No such file: MEMORY.md"),
+            "must surface the raw input. output:\n{}",
+            r.output
+        );
+        assert!(
+            r.output.contains("resolved to"),
+            "must surface the resolved absolute path so the agent sees \
+             what was actually attempted. output:\n{}",
+            r.output
+        );
+        assert!(
+            r.output.contains("absolute path"),
+            "relative-input path must include the absolute-path hint. output:\n{}",
+            r.output
+        );
+        // We expect this branch to NEVER leak a bare OS error.
+        assert!(
+            !r.output.contains("os error"),
+            "must not leak the raw OS error string. output:\n{}",
+            r.output
+        );
+    }
+
+    /// Mirror of the relative-path test for absolute input: the
+    /// resolved-path line is still useful (shows canonicalisation),
+    /// but the absolute-path hint must be suppressed — the agent
+    /// already gave us an absolute path.
+    #[tokio::test]
+    async fn read_404_absolute_path_omits_relative_hint() {
+        let dir = TempDir::new().unwrap();
+        let ctx = ToolContext::new(dir.path().to_path_buf());
+        let tool = ReadFileTool;
+        let asked = dir.path().join("MEMORY.md");
+        let args = format!(r#"{{"file_path":"{}"}}"#, asked.display());
+
+        let r = tool.execute(&args, &ctx).await.unwrap();
+        assert!(!r.success);
+        assert!(r.output.contains("No such file"));
+        assert!(
+            !r.output.contains("absolute path"),
+            "absolute-input path must NOT show the relative-path hint. output:\n{}",
             r.output
         );
     }
