@@ -10,7 +10,7 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 mod telemetry_cmd;
@@ -91,6 +91,16 @@ fn truncate_log_line(s: &str, max_chars: usize) -> String {
     }
 }
 
+/// True if `--dev` is present in argv. Used to skip every auto-update
+/// path (pre-parse `apply_pending_upgrade`, sync stage+apply, and the
+/// post-parse detached stager). Scanned manually because two of those
+/// paths run before clap touches argv. The flag is also declared on
+/// `Cli` so `clap::Parser` accepts it without erroring after the early
+/// scan.
+fn is_dev_mode() -> bool {
+    std::env::args().skip(1).any(|a| a == "--dev")
+}
+
 /// True when the currently-running binary's filename ends in `.bak`.
 /// `self_update::replace_binary` renames the previous version to
 /// `atomcode.bak` (or `atomcode.exe.bak`) during an upgrade so the user
@@ -127,6 +137,9 @@ fn is_running_as_backup() -> bool {
 /// in main(), and we need to decide before any slower setup happens.
 fn should_try_sync_upgrade() -> bool {
     if is_running_as_backup() {
+        return false;
+    }
+    if is_dev_mode() {
         return false;
     }
 
@@ -403,6 +416,14 @@ struct Cli {
     #[arg(long, value_name = "N")]
     reflection_cadence: Option<usize>,
 
+    /// Disable auto-update for this launch. Skips applying any staged
+    /// upgrade, skips the sync stage+apply on startup, and skips the
+    /// detached background stager. Use during local development so a
+    /// fresh `cargo run` build isn't silently overwritten by the
+    /// released binary.
+    #[arg(long)]
+    dev: bool,
+
     /// Comma-separated list of tool names to exclude from the registry.
     /// Use this to disable tools that are useless or harmful in a particular
     /// environment — e.g. `--disable-tools bash,web_fetch` for SWE-bench eval
@@ -538,6 +559,10 @@ async fn main() {
     // still reachable from a `.bak` launch is the explicit `/upgrade`
     // slash command inside the TUI — that's user-initiated and fine.
     let is_backup = is_running_as_backup();
+    let dev_mode = is_dev_mode();
+    if dev_mode {
+        eprintln!("[dev] auto-update disabled");
+    }
 
     // Bootstrap: if a prior session staged an upgrade, apply it NOW — before
     // we spin up tokio, the TUI, or any other heavy state. On success we
@@ -546,7 +571,7 @@ async fn main() {
     // normal. On failure we log and carry on with the current binary; the
     // circuit-breaker in `apply_pending_upgrade` ensures a broken release
     // can't wedge this loop indefinitely.
-    if !is_backup {
+    if !is_backup && !dev_mode {
         // Capture current version BEFORE applying upgrade, so we can pass it to the re-exec'd child
         let current_version = format!("v{}", env!("CARGO_PKG_VERSION"));
         match atomcode_core::self_update::apply_pending_upgrade() {
@@ -629,7 +654,7 @@ async fn run() -> Result<i32> {
     } else {
         Default::default()
     };
-    let atomcode_dir = dirs::home_dir().unwrap_or_default().join(".atomcode");
+    let atomcode_dir = Config::config_dir();
     let cli_override = CliOverride {
         disabled: cli.no_telemetry,
     };
@@ -739,7 +764,7 @@ async fn run() -> Result<i32> {
             }
             Commands::Telemetry { action } => {
                 HEADLESS_MODE.store(true, Ordering::Relaxed);
-                let config_file_path = atomcode_dir.join("config.toml");
+                let config_file_path = Config::default_path();
                 match action {
                     TelemetryAction::Status => {
                         telemetry_cmd::status(&atomcode_dir, &telemetry_cfg)?
@@ -775,6 +800,7 @@ async fn run() -> Result<i32> {
                 auto_update: true,
                 reflection_cadence: 7,
                 telemetry: Default::default(),
+                lsp: Default::default(),
             }
         })
     } else {
@@ -788,6 +814,7 @@ async fn run() -> Result<i32> {
             auto_update: true,
             reflection_cadence: 7,
             telemetry: Default::default(),
+            lsp: Default::default(),
         }
     };
 
@@ -811,6 +838,8 @@ async fn run() -> Result<i32> {
                 thinking_type: None,
                 thinking_keep: None,
                 reasoning_history: None,
+                thinking_enabled: None,
+                thinking_budget: None,
                 ephemeral: false,
             },
             String::new(),
@@ -1107,7 +1136,7 @@ async fn run() -> Result<i32> {
             // the user hasn't opted out via `auto_update = false` AND we're not
             // running as `atomcode.bak` (backup should stay pinned; see the
             // `is_running_as_backup` guard up top).
-            if config.auto_update && !is_running_as_backup() {
+            if config.auto_update && !is_running_as_backup() && !cli.dev {
                 spawn_detached_upgrade_prep();
             }
 
@@ -1399,8 +1428,7 @@ async fn handle_command(cmd: Commands) -> Result<()> {
         }) => {
             let base = resolve_working_dir(dir);
             let path = if global {
-                let home = dirs::home_dir().context("Cannot resolve home directory for --global")?;
-                home.join(".atomcode").join("mcp.json")
+                Config::config_dir().join("mcp.json")
             } else {
                 base.join(".mcp.json")
             };
@@ -1538,6 +1566,7 @@ fn run_codingplan_core(
             reflection_cadence: 7,
             notifications: Default::default(),
             telemetry: Default::default(),
+            lsp: Default::default(),
         },
     };
 
@@ -1571,7 +1600,7 @@ fn install_panic_hook(telemetry: std::sync::Arc<atomcode_telemetry::Telemetry>) 
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         restore_terminal_if_tui();
-        let home = dirs::home_dir();
+        let home = atomcode_core::tool::real_home_dir();
         let cwd = std::env::current_dir().ok();
         let loc = info
             .location()

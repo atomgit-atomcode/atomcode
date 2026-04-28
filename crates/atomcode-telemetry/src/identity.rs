@@ -1,6 +1,7 @@
 //! Device identity. `device_id` persists in `$HOME/.atomcode/device_id`.
 
 use anyhow::{Context, Result};
+use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
@@ -22,8 +23,36 @@ pub fn load_or_create(atomcode_dir: &Path) -> Result<Uuid> {
     }
 }
 
+/// Get the real user's home directory, accounting for sudo scenarios.
+/// 
+/// When running under sudo, `dirs::home_dir()` returns root's home directory
+/// because $HOME is set to /root. This function checks for SUDO_USER and
+/// attempts to use that information.
+/// 
+/// Note: This crate forbids unsafe code, so we cannot use getpwnam_r.
+/// Instead, we use environment variables and construct the path.
+pub fn real_home_dir() -> Option<PathBuf> {
+    // Check if we're running under sudo
+    if let Ok(sudo_user) = env::var("SUDO_USER") {
+        // Try to construct the home path from SUDO_USER
+        // On Linux: /home/{user} or /root for root
+        // On macOS: /Users/{user}
+        if cfg!(target_os = "macos") {
+            return Some(PathBuf::from("/Users").join(sudo_user));
+        } else if cfg!(target_os = "linux") {
+            if sudo_user == "root" {
+                return Some(PathBuf::from("/root"));
+            }
+            return Some(PathBuf::from("/home").join(sudo_user));
+        }
+    }
+    
+    // Fall back to the standard home directory
+    dirs::home_dir()
+}
+
 pub fn default_atomcode_dir() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".atomcode"))
+    real_home_dir().map(|h| h.join(".atomcode"))
 }
 
 #[cfg(test)]

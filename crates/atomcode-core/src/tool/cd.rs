@@ -63,7 +63,7 @@ impl Tool for CdTool {
         // Resolve the path (expand ~ if needed, resolve relative to current working_dir)
         let current_wd = ctx.working_dir.read().await.clone();
         let target = if path.starts_with('~') {
-            dirs::home_dir()
+            super::real_home_dir()
                 .map(|h| h.join(path.strip_prefix("~/").unwrap_or(&path[1..])))
                 .unwrap_or_else(|| PathBuf::from(path))
         } else if path.starts_with('/') {

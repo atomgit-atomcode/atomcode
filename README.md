@@ -240,7 +240,9 @@ Then just type what you want:
 | Key | Action |
 |-----|--------|
 | `Enter` | Send message |
-| `Shift+Enter` | New line |
+| `Shift+Enter` | New line (requires terminal with Kitty keyboard protocol) |
+| `Ctrl+Enter` | New line (works on all terminals, recommended on macOS) |
+| `Alt+Enter` | New line (works on Linux/Windows terminals) |
 | `Esc` | Clear input / Cancel stream |
 | `Up/Down` | Browse input history |
 | `Tab` | Accept suggestion |

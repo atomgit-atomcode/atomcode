@@ -5,7 +5,7 @@ impl AgentLoop {
         let new_path = if path.starts_with('/') {
             std::path::PathBuf::from(path)
         } else if path.starts_with('~') {
-            dirs::home_dir()
+            crate::tool::real_home_dir()
                 .map(|h| h.join(path.strip_prefix("~/").unwrap_or(&path[1..])))
                 .unwrap_or_else(|| std::path::PathBuf::from(path))
         } else {

@@ -456,12 +456,10 @@ mod tests {
     fn caps() -> TerminalCaps {
         TerminalCaps::from_env(EnvView {
             is_stdout_tty: true,
-            no_color: false,
             term: Some("xterm-256color".to_string()),
             colorterm: Some("truecolor".to_string()),
-            force_ascii: false,
             lang: Some("en_US.UTF-8".to_string()),
-            lc_all: None,
+            ..Default::default()
         })
     }
     fn plain_caps() -> TerminalCaps {
@@ -469,10 +467,8 @@ mod tests {
             is_stdout_tty: true,
             no_color: true,
             term: Some("xterm".to_string()),
-            colorterm: None,
-            force_ascii: false,
             lang: Some("en_US.UTF-8".to_string()),
-            lc_all: None,
+            ..Default::default()
         })
     }
 
