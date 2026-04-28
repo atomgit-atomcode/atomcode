@@ -89,6 +89,10 @@ pub struct Config {
     /// LSP integration configuration.
     #[serde(default)]
     pub lsp: LspConfig,
+    /// Automatically commit edited files after each agent turn completes.
+    /// Only applies when working inside a git repository.
+    #[serde(default)]
+    pub auto_commit: bool,
 }
 
 /// Controls the per-turn markdown datalog writer.
