@@ -38,3 +38,14 @@ terminal = true
 system = true
 bell = true
 background_only = true
+
+# Network proxy policy shared by every outbound HTTP client.
+# - "follow_system" -> follow the launch environment / system proxy state
+# - "default_proxy" -> pin the values below and reuse them on later launches
+# - "no_proxy"      -> disable proxy resolution entirely
+[network.proxy]
+mode = "no_proxy"
+# http = "http://127.0.0.1:7890"
+# https = "http://127.0.0.1:7890"
+# all = "socks5://127.0.0.1:7890"
+# no_proxy = "localhost,127.0.0.1"

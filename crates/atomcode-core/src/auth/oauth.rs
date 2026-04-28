@@ -35,7 +35,7 @@ fn blocking_client() -> reqwest::blocking::Client {
     // `Client::from_stored_auth` → `/status`, drift monitor, etc.).
     // Without a cap, a slow or unreachable OAuth server would hang
     // the UI indefinitely. Same budget as the coding-plan client.
-    reqwest::blocking::Client::builder()
+    crate::proxy::apply_blocking_proxy_policy(reqwest::blocking::Client::builder())
         .connect_timeout(std::time::Duration::from_secs(5))
         .timeout(std::time::Duration::from_secs(10))
         .user_agent(crate::ATOMCODE_USER_AGENT)
@@ -350,7 +350,7 @@ impl LoginSession {
 /// user action — separated from polling so callers can render the URL
 /// before yielding control to the wait loop.
 pub fn start_login() -> Result<LoginSession> {
-    let client = reqwest::blocking::Client::new();
+    let client = blocking_client();
     let resp: PlatformLoginResponse = client
         .get(PLATFORM_LOGIN_URL)
         .query(&[("provider", "atomgit")])

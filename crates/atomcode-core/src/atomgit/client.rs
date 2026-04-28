@@ -29,7 +29,7 @@ impl Client {
         // — every request here must carry `atomcode/<ver>`. Builder() with
         // `.user_agent(...)` is the blocking-client equivalent of what
         // `provider/mod.rs::build_http_client` does.
-        let http = reqwest::blocking::Client::builder()
+        let http = crate::proxy::apply_blocking_proxy_policy(reqwest::blocking::Client::builder())
             .user_agent(crate::ATOMCODE_USER_AGENT)
             .build()
             .unwrap_or_else(|_| reqwest::blocking::Client::new());

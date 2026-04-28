@@ -569,6 +569,7 @@ mod tests {
             auto_update: true,
             reflection_cadence: 7,
             notifications: Default::default(),
+            network: Default::default(),
             telemetry: Default::default(),
             lsp: Default::default(),
             auto_commit: false,

@@ -849,6 +849,7 @@ async fn run() -> Result<i32> {
                 providers: HashMap::new(),
                 datalog: Default::default(),
                 notifications: Default::default(),
+                network: Default::default(),
                 auto_update: true,
                 reflection_cadence: 7,
                 telemetry: Default::default(),
@@ -864,6 +865,7 @@ async fn run() -> Result<i32> {
             providers: HashMap::new(),
             datalog: Default::default(),
             notifications: Default::default(),
+            network: Default::default(),
             auto_update: true,
             reflection_cadence: 7,
             telemetry: Default::default(),
@@ -871,6 +873,7 @@ async fn run() -> Result<i32> {
             auto_commit: false,
         }
     };
+    atomcode_core::proxy::apply_process_proxy_config(&config.network.proxy);
 
     let unavailable_reason = if config.providers.is_empty() {
         Some("未配置 provider。请使用 /provider 添加 provider 后再试。".to_string())
@@ -1683,11 +1686,13 @@ fn run_codingplan_core(
             auto_update: true,
             reflection_cadence: 7,
             notifications: Default::default(),
+            network: Default::default(),
             telemetry: Default::default(),
             lsp: Default::default(),
             auto_commit: false,
         },
     };
+    atomcode_core::proxy::apply_process_proxy_config(&config.network.proxy);
 
     let report = atomcode_core::coding_plan::run(&mut config, telemetry)?;
 

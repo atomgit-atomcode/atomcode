@@ -1644,6 +1644,7 @@ async fn process_chat_request(
     // Load config
     let config_path = Config::default_path();
     let config = Config::load(&config_path)?;
+    atomcode_core::proxy::apply_process_proxy_config(&config.network.proxy);
 
     // Determine provider
     let provider_name = req

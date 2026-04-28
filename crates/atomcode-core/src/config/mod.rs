@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use atomcode_telemetry::TelemetryConfig;
 use provider::ProviderConfig;
+use crate::proxy::ProxyConfig;
 
 // DEFAULT_SYSTEM_PROMPT removed — single source of truth is now
 // config/prompt_sections.rs::UNIFIED_PROMPT (~500 tok).
@@ -66,6 +67,9 @@ pub struct Config {
     /// can discover the terminal-first strategy and platform fallbacks.
     #[serde(default, skip_serializing)]
     pub notifications: NotificationConfig,
+    /// Network behavior shared by every outbound HTTP client.
+    #[serde(default, skip_serializing)]
+    pub network: NetworkConfig,
     /// When true (default), atomcode polls for new releases every hour
     /// while running and stages any newer version it finds. The stage is
     /// applied on the next startup (see `self_update::apply_pending_upgrade`).
@@ -134,6 +138,13 @@ pub struct NotificationConfig {
     /// Best-effort background-only behavior where the terminal protocol supports it.
     #[serde(default = "default_true")]
     pub background_only: bool,
+}
+
+/// Controls workspace-wide outbound network behavior.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct NetworkConfig {
+    #[serde(default)]
+    pub proxy: ProxyConfig,
 }
 
 /// Controls LSP (Language Server Protocol) integration.
@@ -249,6 +260,38 @@ fn render_notifications_section(cfg: &NotificationConfig) -> String {
     out
 }
 
+fn render_network_section(cfg: &NetworkConfig) -> String {
+    let mut out = String::new();
+    out.push_str("\n# Network proxy policy shared by all outbound HTTP clients.\n");
+    out.push_str("# Modes:\n");
+    out.push_str("# - follow_system  -> follow the launch environment / system proxy state\n");
+    out.push_str("# - default_proxy  -> pin the proxy values below and reuse them on future launches\n");
+    out.push_str("# - no_proxy       -> disable proxy resolution entirely (acv2 default)\n");
+    out.push_str("[network.proxy]\n");
+    out.push_str(&format!("mode = \"{}\"\n", cfg.proxy.mode.label()));
+    match &cfg.proxy.http {
+        Some(v) => out.push_str(&format!("http = \"{}\"\n", escape_toml(v))),
+        None => out.push_str("# http = \"http://127.0.0.1:7890\"\n"),
+    }
+    match &cfg.proxy.https {
+        Some(v) => out.push_str(&format!("https = \"{}\"\n", escape_toml(v))),
+        None => out.push_str("# https = \"http://127.0.0.1:7890\"\n"),
+    }
+    match &cfg.proxy.all {
+        Some(v) => out.push_str(&format!("all = \"{}\"\n", escape_toml(v))),
+        None => out.push_str("# all = \"socks5://127.0.0.1:7890\"\n"),
+    }
+    match &cfg.proxy.no_proxy {
+        Some(v) => out.push_str(&format!("no_proxy = \"{}\"\n", escape_toml(v))),
+        None => out.push_str("# no_proxy = \"localhost,127.0.0.1\"\n"),
+    }
+    out
+}
+
+fn escape_toml(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
 /// Render a documentation comment about the layered instruction file system.
 /// Always emitted (even on first save) so users discover the feature.
 fn render_instructions_section() -> String {
@@ -347,6 +390,7 @@ impl Config {
         let mut content = toml::to_string_pretty(&persistent)?;
         content.push_str(&render_datalog_section(&self.datalog));
         content.push_str(&render_notifications_section(&self.notifications));
+        content.push_str(&render_network_section(&self.network));
         content.push_str(&render_instructions_section());
         content.push_str(&render_hooks_json_section());
         std::fs::write(path, content)?;
@@ -539,6 +583,7 @@ mod tests {
                 dir: Some("/var/log/ac".to_string()),
             },
             notifications: NotificationConfig::default(),
+            network: NetworkConfig::default(),
             auto_update: true,
             reflection_cadence: 7,
             telemetry: Default::default(),
@@ -574,6 +619,7 @@ mod tests {
         assert!(!reloaded.datalog.enabled);
         assert_eq!(reloaded.datalog.dir.as_deref(), Some("/var/log/ac"));
         assert!(reloaded.notifications.enabled);
+        assert_eq!(reloaded.network.proxy.mode, crate::proxy::ProxyMode::NoProxy);
         let _ = std::fs::remove_file(&tmp);
     }
 
@@ -584,6 +630,13 @@ mod tests {
         assert!(rendered.contains("enabled = true"));
         assert!(rendered.contains("min_duration_secs = 8"));
         assert!(rendered.contains("background_only = true"));
+    }
+
+    #[test]
+    fn render_network_section_emits_proxy_mode() {
+        let rendered = render_network_section(&NetworkConfig::default());
+        assert!(rendered.contains("[network.proxy]"));
+        assert!(rendered.contains("mode = \"no_proxy\""));
     }
 
     #[test]

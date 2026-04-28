@@ -15,7 +15,9 @@
 use std::path::PathBuf;
 
 use super::{save_and_reload, LoopCtx};
-use crate::modals::{DirPicker, IssueWizard, Modal, ModelPicker, ProviderWizard, SessionPicker};
+use crate::modals::{
+    DirPicker, IssueWizard, Modal, ModelPicker, ProviderWizard, ProxyPicker, SessionPicker,
+};
 use crate::render::{Renderer, UiLine};
 use crate::state::{AgentMode, UiState};
 use anyhow::Result;
@@ -179,6 +181,7 @@ pub(super) fn execute_slash_command(
                         .get(&new_default)
                         .map(|p| p.model.clone())
                         .unwrap_or_else(|| new_default.clone());
+                    atomcode_core::proxy::apply_process_proxy_config(&new_cfg.network.proxy);
                     ctx.config = new_cfg.clone();
                     ctx.model_name = new_model.clone();
                     ctx.agent
@@ -279,12 +282,16 @@ pub(super) fn execute_slash_command(
             ));
             renderer.flush();
         }
+        "proxy" => {
+            *active_modal = Some(Box::new(ProxyPicker::open(&ctx.config)));
+        }
         "status" => {
             let mut txt = format!(
-                "  Model:  {}\n  Dir:    {}\n  Config: {}\n  Tokens: {}\n",
+                "  Model:  {}\n  Dir:    {}\n  Config: {}\n  Proxy:  {}\n  Tokens: {}\n",
                 ctx.model_name,
                 ctx.working_dir.display(),
                 Config::default_path().display(),
+                ctx.config.network.proxy.summary(),
                 state.total_tokens,
             );
             txt.push_str(&render_codingplan_status_for_status_cmd());

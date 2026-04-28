@@ -214,6 +214,7 @@ fn test_config() -> Config {
         providers,
         datalog: Default::default(),
         notifications: Default::default(),
+        network: Default::default(),
         auto_update: false,
         reflection_cadence: 7,
         telemetry: Default::default(),

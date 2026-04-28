@@ -223,7 +223,7 @@ impl Tool for WebFetchTool {
         };
         let max = parsed.max_chars.min(50000);
 
-        let client = match reqwest::Client::builder()
+        let client = match crate::proxy::apply_async_proxy_policy(reqwest::Client::builder())
             // Handle redirects manually so every hop re-runs scheme + IP checks.
             // reqwest's built-in follower would let a 302 rebind to 127.0.0.1
             // after we've already validated the start URL's host.

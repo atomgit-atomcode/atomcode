@@ -3,10 +3,19 @@
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use reqwest::{Client, StatusCode};
+use std::env;
 use std::io::Write;
 use std::path::Path;
 use std::time::Duration;
 use thiserror::Error;
+
+fn apply_proxy_policy(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    if env::var("ATOMCODE_PROXY_MODE").ok().as_deref() == Some("no_proxy") {
+        builder.no_proxy()
+    } else {
+        builder
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum SendError {
@@ -35,7 +44,7 @@ pub struct HttpSender {
 
 impl HttpSender {
     pub fn new(endpoint: String, app_version: String) -> Self {
-        let client = Client::builder()
+        let client = apply_proxy_policy(Client::builder())
             .timeout(Duration::from_secs(10))
             .user_agent(format!("atomcode-telemetry/{}", app_version))
             .build()

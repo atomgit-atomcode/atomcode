@@ -41,7 +41,7 @@ impl HttpClient {
     ) -> Self {
         let timeout = Duration::from_millis(timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS));
 
-        let client = reqwest::Client::builder()
+        let client = crate::proxy::apply_async_proxy_policy(reqwest::Client::builder())
             .timeout(timeout)
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());

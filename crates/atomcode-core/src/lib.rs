@@ -15,6 +15,7 @@ pub mod lsp;
 pub mod mcp;
 pub mod notify;
 pub mod pricing;
+pub mod proxy;
 pub mod provider;
 pub mod self_update;
 pub mod semantic;

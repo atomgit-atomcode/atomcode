@@ -43,7 +43,7 @@ impl Client {
         // latency for a healthy path and fails fast otherwise — the
         // error surfaces as a benign "status fetch failed" line next to
         // the rest of the status report.
-        let http = reqwest::blocking::Client::builder()
+        let http = crate::proxy::apply_blocking_proxy_policy(reqwest::blocking::Client::builder())
             .connect_timeout(std::time::Duration::from_secs(5))
             .timeout(std::time::Duration::from_secs(10))
             .user_agent(crate::ATOMCODE_USER_AGENT)
