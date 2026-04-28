@@ -50,6 +50,10 @@ impl<W: Write + Send> Renderer for PlainRenderer<W> {
             UiLine::AssistantText(text) => {
                 let _ = self.out.write_all(scrub_controls(&text).as_bytes());
             }
+            UiLine::ReasoningText(text) => {
+                // Display reasoning in gray/dimmed style
+                let _ = write!(self.out, "\x1b[2m{}\x1b[0m", scrub_controls(&text));
+            }
             UiLine::AssistantLineBreak => {
                 let _ = self.out.write_all(b"\n");
             }

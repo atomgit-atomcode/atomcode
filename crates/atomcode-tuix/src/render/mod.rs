@@ -20,6 +20,8 @@ pub enum UiLine {
     },
     User(String),
     AssistantText(String),
+    /// LLM reasoning/thinking content (displayed in gray/dimmed style)
+    ReasoningText(String),
     AssistantLineBreak,
     ToolCall {
         name: String,

@@ -262,8 +262,9 @@ fn ui_line_tag(l: &UiLine) -> &'static str {
     match l {
         UiLine::Welcome { .. } => "Welcome",
         UiLine::User(_) => "User",
-        UiLine::AssistantText(_) => "AssistantText",
-        UiLine::AssistantLineBreak => "AssistantLineBreak",
+            UiLine::AssistantText(_) => "AssistantText",
+            UiLine::ReasoningText(_) => "ReasoningText",
+            UiLine::AssistantLineBreak => "AssistantLineBreak",
         UiLine::ToolCall { .. } => "ToolCall",
         UiLine::ToolCallInFlight { .. } => "ToolCallInFlight",
         UiLine::ToolCallCommit => "ToolCallCommit",

@@ -1566,6 +1566,13 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 self.assistant_line_buf.push_str(&scrub_controls(&text));
                 self.flush_assistant_lines();
             }
+            UiLine::ReasoningText(text) => {
+                // Display reasoning in gray/dimmed style with word wrapping
+                let text = scrub_controls(&text);
+                // Use ANSI dim/gray escape codes
+                let dimmed = format!("\x1b[2m{}\x1b[0m", text);
+                self.push_body_text(&dimmed, &CellStyle::default());
+            }
             UiLine::AssistantLineBreak => {
                 self.flush_assistant_remainder();
             }

@@ -2457,9 +2457,8 @@ fn handle_agent_event(
                 // Flush on newline or when buffer gets large
                 if reasoning_buffer.contains('\n') || reasoning_buffer.len() > 80 {
                     let output = std::mem::take(reasoning_buffer);
-                    // Prepend a dimmed prefix to distinguish from regular output
-                    let reasoning_text = format!("\x1b[2m[thinking]\x1b[0m {}", output.trim_end());
-                    renderer.render(UiLine::CommandOutput(reasoning_text));
+                    // Render as gray/dimmed text with automatic line wrapping
+                    renderer.render(UiLine::ReasoningText(output));
                     renderer.flush();
                 }
             }
