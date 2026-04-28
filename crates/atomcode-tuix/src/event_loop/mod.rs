@@ -947,6 +947,26 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<(
         ));
     }
 
+    // JediTerm auto-fallback hint: lib.rs detected
+    // `TERMINAL_EMULATOR=JetBrains-JediTerm` (Android Studio, IntelliJ,
+    // PyCharm, etc.) and dropped to PlainRenderer because retained
+    // mode misrenders DECSTBM-pinned footers there (verified empirically:
+    // input box ends up offset from the status bar by ~20 rows of
+    // dead space). Tell the user what happened and how to get the
+    // full UI back. Only set by lib.rs when the user did NOT explicitly
+    // opt in via ATOMCODE_PLAIN — informed choices don't get lectured.
+    if std::env::var("ATOMCODE_JEDITERM_FALLBACK").is_ok() {
+        std::env::remove_var("ATOMCODE_JEDITERM_FALLBACK");
+        renderer.render(UiLine::CommandOutput(
+            "  ⓘ JetBrains IDE terminal detected — running in plain mode.\n    \
+             The full UI (input box, slash menu, spinner) needs a more capable\n    \
+             terminal. Run atomcode in iTerm2, Terminal.app, Alacritty, WezTerm,\n    \
+             or Windows Terminal for the complete experience.\n    \
+             Set ATOMCODE_RETAIN=1 to bypass this fallback (may misalign).\n\n"
+                .into(),
+        ));
+    }
+
     // First-run onboarding: no providers configured AND no OAuth login
     // on disk means the user has never set this up. Show the legacy-tui
     // 3-choice wizard (Login / Configure manually / Skip) as a modal —

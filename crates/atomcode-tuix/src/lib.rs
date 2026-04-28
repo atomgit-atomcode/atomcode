@@ -216,6 +216,15 @@ pub async fn run(
         .unwrap_or(false);
     let force_plain = force_plain_env || (is_jediterm && !force_retain);
 
+    // Marker env var so the event loop can render a one-line hint
+    // explaining what just happened and how to recover. Only set
+    // when the JediTerm auto-fallback fired — if the user explicitly
+    // opted in via ATOMCODE_PLAIN they already know; lecturing them
+    // would be noise.
+    if is_jediterm && !force_retain && !force_plain_env {
+        std::env::set_var("ATOMCODE_JEDITERM_FALLBACK", "1");
+    }
+
     // When force_plain wins, strip raw-mode-related capabilities so
     // every downstream branch (TerminalGuard activate, reader spawn,
     // renderer choice) consistently picks the cooked-mode / Plain
