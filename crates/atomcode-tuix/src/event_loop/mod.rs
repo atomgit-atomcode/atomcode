@@ -2356,7 +2356,7 @@ fn handle_agent_event(
 
             // Close any in-flight assistant line before emitting the tool call.
             renderer.render(UiLine::AssistantLineBreak);
-            renderer.render(UiLine::ToolCall {
+            renderer.render(UiLine::ToolCallInFlight {
                 name: display.clone(),
                 detail: detail.clone(),
             });
@@ -2623,6 +2623,9 @@ fn handle_agent_event(
             think.reset();
         }
         AgentEvent::TokenUsage(u) => {
+            state.prompt_tokens += u.prompt_tokens;
+            state.completion_tokens += u.completion_tokens;
+            state.cached_tokens += u.cached_tokens;
             state.total_tokens += u.completion_tokens;
         }
         AgentEvent::WorkingDirChanged(new_dir) => {
