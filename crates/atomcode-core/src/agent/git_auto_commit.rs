@@ -28,12 +28,14 @@ pub fn auto_commit_edited_files(
         } else {
             working_dir.join(file).to_string_lossy().to_string()
         };
-        let status = Command::new("git")
+        if let Ok(output) = Command::new("git")
             .args(["add", &file_path])
             .current_dir(working_dir)
-            .output();
-        if status.is_ok() {
-            added += 1;
+            .output()
+        {
+            if output.status.success() {
+                added += 1;
+            }
         }
     }
 

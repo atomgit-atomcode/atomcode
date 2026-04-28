@@ -2014,7 +2014,10 @@ impl AgentLoop {
         }
 
         // Auto-commit edited files if enabled
-        if self.config.auto_commit && !self.files_edited_this_turn.is_empty() {
+        if self.config.auto_commit
+            && !matches!(stop_reason, TurnStopReason::Error)
+            && !self.files_edited_this_turn.is_empty()
+        {
             let wd = self
                 .turn_runner
                 .context
