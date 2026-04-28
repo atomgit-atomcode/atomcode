@@ -2321,15 +2321,22 @@ fn handle_agent_event(
             name,
             arguments,
         } => {
-            // Don't emit the ▸ line yet; hold it in pending_tools until
-            // either (a) an ApprovalNeeded for this call arrives and
-            // renders the line eagerly so the user can see what they're
-            // approving, or (b) the matching ToolCallResult arrives and
-            // renders the pair. `call_rendered=false` means no one has
-            // emitted the line yet.
+            // Push an animated ▸ line immediately via `ToolCallInFlight`
+            // so the user sees exactly what's running during long-blocking
+            // tools (bash with multi-minute commands, large write_file
+            // streams, etc.). The retained renderer parks it in the
+            // live-row slot, so the row's leading icon ticks in lockstep
+            // with the spinner; `ToolCallCommit` (emitted on the matching
+            // result) freezes it to a static `▸`. `call_rendered=true` so
+            // ApprovalNeeded / ToolCallResult won't double-emit the line.
             let detail = format_tool_detail(&name, &arguments);
             let display = display_tool_name(&name);
-            pending_tools.insert(id, (display.clone(), detail, false));
+            renderer.render(UiLine::ToolCallInFlight {
+                name: display.clone(),
+                detail: detail.clone(),
+            });
+            renderer.flush();
+            pending_tools.insert(id, (display.clone(), detail, true));
             state.on_tool_call_started(&display);
         }
         AgentEvent::ToolCallResult {
@@ -2341,6 +2348,11 @@ fn handle_agent_event(
         } => {
             // Close any in-flight assistant line before emitting the pair.
             renderer.render(UiLine::AssistantLineBreak);
+            // Freeze the animated in-flight tool-call row to its final
+            // static `▸` icon before the `⎿ result` body row lands beneath
+            // it. No-op when nothing is in flight (plain mode, or the
+            // matching Start never fired).
+            renderer.render(UiLine::ToolCallCommit);
 
             // Prefer the display-name we stored at ToolCallStarted time;
             // fall back to converting the raw name if we missed the Start

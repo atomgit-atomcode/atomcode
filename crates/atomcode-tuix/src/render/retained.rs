@@ -271,6 +271,16 @@ pub struct RetainedRenderer<W: Write + Send> {
     /// the row (flag flips to false) so the last animation frame
     /// stays frozen as a historical paragraph header.
     live_spinner_active: bool,
+    /// When `Some`, the live row at body_bottom is the animated
+    /// in-flight tool-call line (`<frame> Bash(cmd)`), not the generic
+    /// spinner. The Spinner / StreamingBox tick handlers consult this:
+    /// if Some they build a tool-call row with the new frame as icon;
+    /// if None they build the generic `<frame> Pondering…` spinner row.
+    /// Cleared by `ToolCallCommit`, which freezes the row to a static
+    /// `▸` icon (no longer live) so the next push_body_row appends
+    /// cleanly below it and the spinner can resume on the next tick.
+    /// (name, detail).
+    inflight_tool: Option<(String, String)>,
 }
 
 impl RetainedRenderer<BufWriter<Stdout>> {
@@ -300,6 +310,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             welcome_banner: None,
             welcome_line_count: 0,
             live_spinner_active: false,
+            inflight_tool: None,
         }
     }
 
@@ -359,6 +370,36 @@ impl<W: Write + Send> RetainedRenderer<W> {
         push_str_cells(&mut row, " ", &CellStyle::default());
         let label_style = self.style_bold(Role::Secondary);
         push_str_cells(&mut row, &scrub_controls(label), &label_style);
+        row
+    }
+
+    /// Build a single in-flight tool-call body row: `<icon> Name(detail)`.
+    /// `icon` is supplied by the caller — typically the current spinner
+    /// frame (animated ticks) or `▸` (`ToolCallCommit`, frozen
+    /// post-result). Layout matches the static `UiLine::ToolCall` arm so
+    /// the row is visually identical pre-commit and post-commit; only
+    /// the icon glyph differs. Caller is responsible for staying within
+    /// terminal width — for typical bash detail (truncated to 55 chars
+    /// in `format_tool_detail`) the row fits in one physical line; an
+    /// over-wide row would visually wrap via the terminal's autowrap
+    /// and the live-row repaint mechanism would only redraw the bottom
+    /// physical row.
+    fn build_inflight_tool_row(&self, icon: &str, name: &str, detail: &str) -> Vec<Cell> {
+        let mut row = Vec::new();
+        let pad = CellStyle::default();
+        let muted = self.style_for(Role::Muted);
+        let tool_name_style = self.style_bold(Role::ToolName);
+        let safe_name = scrub_controls(name);
+        let safe_detail = scrub_controls(detail);
+        let body_str = if safe_detail.is_empty() {
+            safe_name
+        } else {
+            format!("{}({})", safe_name, safe_detail)
+        };
+        push_str_cells(&mut row, &" ".repeat(PAD_COL), &pad);
+        push_str_cells(&mut row, icon, &muted);
+        push_str_cells(&mut row, " ", &pad);
+        push_str_cells(&mut row, &body_str, &tool_name_style);
         row
     }
 
@@ -1438,11 +1479,23 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 // paragraph header — each tick replaces the same row
                 // via `push_or_update_live_spinner`, so animation
                 // doesn't push a new row every 80ms.
-                let cells = self.build_spinner_body_row(frame, &label);
+                //
+                // When a tool call is in flight, the live row instead
+                // carries the tool-call shape (`<frame> Bash(cmd)`),
+                // so the same animation cadence drives the tool icon.
+                let cells = if let Some((name, detail)) = self.inflight_tool.clone() {
+                    self.build_inflight_tool_row(frame, &name, &detail)
+                } else {
+                    self.build_spinner_body_row(frame, &label)
+                };
                 self.push_or_update_live_spinner(cells);
             }
             UiLine::Spinner { frame, label } => {
-                let cells = self.build_spinner_body_row(frame, &label);
+                let cells = if let Some((name, detail)) = self.inflight_tool.clone() {
+                    self.build_inflight_tool_row(frame, &name, &detail)
+                } else {
+                    self.build_spinner_body_row(frame, &label)
+                };
                 self.push_or_update_live_spinner(cells);
             }
             UiLine::ClearTransient | UiLine::InputCommit => {
@@ -1518,9 +1571,24 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
             }
             UiLine::TurnComplete => {
                 self.flush_assistant_remainder();
+                // Defense in depth: a turn that ended without a
+                // matching ToolCallCommit (interrupted, forced stop,
+                // protocol bug) would otherwise leave inflight_tool
+                // set and the next user turn's spinner would mistake
+                // the stale tool detail for the in-flight payload.
+                if let Some((name, detail)) = self.inflight_tool.take() {
+                    let frozen = self.build_inflight_tool_row("\u{25b8}", &name, &detail);
+                    self.push_or_update_live_spinner(frozen);
+                    self.live_spinner_active = false;
+                }
             }
             UiLine::TurnCancelled => {
                 self.flush_assistant_remainder();
+                if let Some((name, detail)) = self.inflight_tool.take() {
+                    let frozen = self.build_inflight_tool_row("\u{25b8}", &name, &detail);
+                    self.push_or_update_live_spinner(frozen);
+                    self.live_spinner_active = false;
+                }
                 // (cancelled) is a state-change marker — must remain
                 // visible. Default fg, not Muted.
                 let label = self.style_for(Role::Secondary);
@@ -1528,6 +1596,38 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
             }
 
             // ── body: tools & diffs ──
+            UiLine::ToolCallInFlight { name, detail } => {
+                self.flush_assistant_remainder();
+                // Parallel tool calls are rare but not impossible. If
+                // one is already animating, freeze it before starting
+                // a new one — single-at-a-time animation is a deliberate
+                // simplification (see field doc).
+                if self.inflight_tool.is_some() {
+                    let prev = std::mem::take(&mut self.inflight_tool).unwrap();
+                    let frozen = self.build_inflight_tool_row("\u{25b8}", &prev.0, &prev.1);
+                    self.push_or_update_live_spinner(frozen);
+                    self.live_spinner_active = false;
+                }
+                // Use a plausible "still" frame for the initial paint;
+                // the next Spinner / StreamingBox tick (within ~80ms)
+                // overwrites with the real frame, picking up the
+                // animation seamlessly.
+                let initial = if self.caps.unicode_symbols { "\u{2819}" } else { "*" };
+                let row = self.build_inflight_tool_row(initial, &name, &detail);
+                self.inflight_tool = Some((name, detail));
+                self.push_or_update_live_spinner(row);
+            }
+            UiLine::ToolCallCommit => {
+                if let Some((name, detail)) = self.inflight_tool.take() {
+                    let frozen = self.build_inflight_tool_row("\u{25b8}", &name, &detail);
+                    self.push_or_update_live_spinner(frozen);
+                    // Drop the live flag so the next push_body_row
+                    // appends BELOW this frozen row instead of popping
+                    // it — the in-flight indicator becomes a permanent
+                    // historical paragraph header.
+                    self.live_spinner_active = false;
+                }
+            }
             UiLine::ToolCall { name, detail } => {
                 self.flush_assistant_remainder();
                 let muted = self.style_for(Role::Muted);
@@ -1553,6 +1653,16 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
             }
             UiLine::ToolResult { success, summary } => {
                 self.flush_assistant_remainder();
+                // Defense in depth: if the event loop didn't send
+                // ToolCallCommit before this Result (error path /
+                // merge collapse), freeze the in-flight row now so
+                // the upcoming `⎿ ...` body push doesn't itself become
+                // the next animation target on the next spinner tick.
+                if let Some((name, detail)) = self.inflight_tool.take() {
+                    let frozen = self.build_inflight_tool_row("\u{25b8}", &name, &detail);
+                    self.push_or_update_live_spinner(frozen);
+                    self.live_spinner_active = false;
+                }
                 // Style policy (header line of a failure body):
                 //   * `Error: ...` — bold red. Tool-dispatch failures
                 //     (bad JSON args, unknown tool name, etc.) are real

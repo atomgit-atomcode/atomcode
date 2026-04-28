@@ -53,13 +53,21 @@ impl<W: Write + Send> Renderer for PlainRenderer<W> {
             UiLine::AssistantLineBreak => {
                 let _ = self.out.write_all(b"\n");
             }
-            UiLine::ToolCall { name, detail } => {
+            UiLine::ToolCall { name, detail } | UiLine::ToolCallInFlight { name, detail } => {
+                // Plain mode has no in-place rewrite, so the in-flight
+                // variant degrades to the same single static line that
+                // the static `ToolCall` produces — the user just sees
+                // `▸ Name(detail)` once, when the call lands.
                 let name = scrub_controls(&name);
                 if detail.is_empty() {
                     let _ = writeln!(self.out, "▸ {}", name);
                 } else {
                     let _ = writeln!(self.out, "▸ {}({})", name, scrub_controls(&detail));
                 }
+            }
+            UiLine::ToolCallCommit => {
+                // Plain mode never animated the row, so there is
+                // nothing to freeze. Skip silently.
             }
             UiLine::ToolResult { success, summary } => {
                 let icon = if success { "✓" } else { "✗" };
