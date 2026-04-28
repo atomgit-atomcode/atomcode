@@ -236,13 +236,13 @@ fn replay_session(renderer: &mut dyn Renderer, session: &Session) {
             (Role::Tool, MessageContent::ToolResult(r)) => {
                 renderer.render(UiLine::ToolResult {
                     success: r.success,
-                    summary: summarise(&r.output),
+                    summary: summarise(&r.output, r.success),
                 });
             }
             (Role::Tool, MessageContent::ToolResultRef(r)) => {
                 renderer.render(UiLine::ToolResult {
                     success: true,
-                    summary: summarise(&r.summary),
+                    summary: summarise(&r.summary, true),
                 });
             }
             _ => {}

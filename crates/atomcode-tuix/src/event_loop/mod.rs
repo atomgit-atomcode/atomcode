@@ -726,22 +726,73 @@ mod tool_format_tests {
 
     #[test]
     fn summarise_single_line_returned_as_is() {
-        assert_eq!(summarise("ok"), "ok");
+        assert_eq!(summarise("ok", true), "ok");
     }
 
     #[test]
     fn summarise_multi_line_adds_line_count() {
-        let out = summarise("first line\nsecond line\nthird line");
+        let out = summarise("first line\nsecond line\nthird line", true);
         assert!(out.starts_with("first line"));
         assert!(out.contains("(3 lines)"));
     }
 
     #[test]
     fn summarise_empty_string_has_fallback() {
-        let out = summarise("");
+        let out = summarise("", true);
         // Empty input: `lines()` yields nothing, so first falls back
         // to "(no output)" and n==0 means no " (N lines)" suffix.
         assert!(out.contains("(no output)"), "got: {}", out);
+    }
+
+    /// Reproduces the bug: a long error message ending in a deep WSL
+    /// path used to silently truncate to 80 cols, leaving `f_stor`
+    /// instead of `f_store` with no `…` to indicate the cut. Failures
+    /// now get a 200-col budget so the path stays intact, and any
+    /// truncation that does happen is visibly marked with `…`.
+    #[test]
+    fn summarise_failure_keeps_long_path_intact() {
+        let err = "Error: old_string not found in \
+                   /mnt/d/docs/work/cangjie/projects/fountain/f_store.";
+        let out = summarise(err, false);
+        assert!(
+            out.contains("/mnt/d/docs/work/cangjie/projects/fountain/f_store"),
+            "the full path must survive the summary. got: {}",
+            out
+        );
+        assert!(
+            !out.contains("f_stor "),
+            "must not produce mid-token truncation like `f_stor ` (note the \
+             trailing space — that's where (N lines) would attach). got: {}",
+            out
+        );
+    }
+
+    /// Sanity check: success summaries still respect the tighter
+    /// 80-col cap (we don't want to flood the body with full status
+    /// output on every successful tool call). When that cap *does*
+    /// truncate, the ellipsis must appear — that was the second leg
+    /// of the fix beyond just enlarging the budget.
+    #[test]
+    fn summarise_success_truncates_with_ellipsis_at_80() {
+        let long: String = "x".repeat(200);
+        let out = summarise(&long, true);
+        // 80 col cap means at most 80 chars of x, plus the ellipsis.
+        assert!(
+            out.ends_with('…'),
+            "ellipsis is the visible-truncation marker. got: {}",
+            out
+        );
+        assert!(out.chars().count() <= 80);
+    }
+
+    /// Failure summaries keep the line-count suffix when the original
+    /// was multi-line — the budget bump shouldn't change that behaviour.
+    #[test]
+    fn summarise_failure_multi_line_still_appends_count() {
+        let err = "Error: foo\nbar\nbaz";
+        let out = summarise(err, false);
+        assert!(out.starts_with("Error: foo"));
+        assert!(out.contains("(3 lines)"));
     }
 }
 
@@ -2416,7 +2467,7 @@ fn handle_agent_event(
                     detail: detail.clone(),
                 });
             }
-            let summary = summarise(&output);
+            let summary = summarise(&output, success);
             renderer.render(UiLine::ToolResult { success, summary });
             // Collect diff lines into a single batch — N individual
             // DiffLine renders each trigger a full footer redraw and
@@ -2956,10 +3007,21 @@ pub(crate) fn format_tool_detail(name: &str, args_json: &str) -> String {
     }
 }
 
-pub(crate) fn summarise(output: &str) -> String {
+pub(crate) fn summarise(output: &str, success: bool) -> String {
     let first = output.lines().next().unwrap_or("(no output)");
     let n = output.lines().count();
-    let trimmed = crate::width::truncate_to_width(first, 80);
+    // Failures get a larger budget because the first line is usually
+    // diagnostic ("Error: old_string not found in /mnt/d/.../f_store.")
+    // and the path is the load-bearing piece of info — silently
+    // chopping it at 80 cols turned `f_store` into `f_stor` and made
+    // the agent loop on the wrong file. 200 cols comfortably fits a
+    // typical WSL-style absolute path; anything beyond that probably
+    // is too long to read inline anyway.
+    let budget = if success { 80 } else { 200 };
+    // `truncate_with_ellipsis` (instead of bare `truncate_to_width`)
+    // so that whenever the budget IS exceeded, the user / agent sees
+    // a `…` marker — silent mid-token chops were the actual UX bug.
+    let trimmed = crate::width::truncate_with_ellipsis(first, budget);
     if n > 1 {
         format!("{} ({} lines)", trimmed, n)
     } else {
