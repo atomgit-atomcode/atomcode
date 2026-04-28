@@ -61,6 +61,9 @@ pub enum AgentCommand {
     /// forward-compat with an eventual LLM-backed summarize-with-instruction
     /// path; currently unused — this is the mechanical path only.
     Compact { prompt: Option<String> },
+    Remember { content: String, global: bool },
+    Forget { keyword: String },
+    ShowMemory,
     /// Run a one-shot task in an isolated background context (read-only-ish
     /// tool subset, independent conversation, capped turns + timeout).
     /// Result is returned via `AgentEvent::BackgroundComplete`.
@@ -774,6 +777,81 @@ impl AgentLoop {
                 }
                 AgentCommand::Compact { prompt } => {
                     self.run_compact(prompt).await;
+                }
+                AgentCommand::Remember { content, global } => {
+                    use crate::config::memory::MemoryStore;
+                    let store = if global {
+                        MemoryStore::global()
+                    } else {
+                        let wd = self.turn_runner.context.working_dir.try_read()
+                            .map(|g| g.clone()).unwrap_or_default();
+                        MemoryStore::project(&wd)
+                    };
+                    match store.append(&content) {
+                        Ok(_) => {
+                            let scope = if global { "global" } else { "project" };
+                            let _ = self.event_tx.send(AgentEvent::TextDelta(
+                                format!("(remembered in {} memory: {})\n", scope, content)
+                            ));
+                        }
+                        Err(e) => {
+                            let _ = self.event_tx.send(AgentEvent::TextDelta(
+                                format!("(failed to save memory: {})\n", e)
+                            ));
+                        }
+                    }
+                }
+                AgentCommand::Forget { keyword } => {
+                    use crate::config::memory::MemoryStore;
+                    let wd = self.turn_runner.context.working_dir.try_read()
+                        .map(|g| g.clone()).unwrap_or_default();
+                    let global = MemoryStore::global();
+                    let project = MemoryStore::project(&wd);
+                    let g_matches = global.find_matching(&keyword);
+                    let p_matches = project.find_matching(&keyword);
+                    if g_matches.is_empty() && p_matches.is_empty() {
+                        let _ = self.event_tx.send(AgentEvent::TextDelta(
+                            format!("(no memory entries matching '{}')\n", keyword)
+                        ));
+                    } else {
+                        let mut msg = String::new();
+                        for entry in &g_matches {
+                            msg.push_str(&format!("  [global] - {}\n", entry));
+                        }
+                        for entry in &p_matches {
+                            msg.push_str(&format!("  [project] - {}\n", entry));
+                        }
+                        let _ = global.remove_matching(&keyword);
+                        let _ = project.remove_matching(&keyword);
+                        let total = g_matches.len() + p_matches.len();
+                        msg.push_str(&format!("(removed {} matching entr{})\n", total, if total == 1 { "y" } else { "ies" }));
+                        let _ = self.event_tx.send(AgentEvent::TextDelta(msg));
+                    }
+                }
+                AgentCommand::ShowMemory => {
+                    use crate::config::memory::MemoryStore;
+                    let wd = self.turn_runner.context.working_dir.try_read()
+                        .map(|g| g.clone()).unwrap_or_default();
+                    let global = MemoryStore::global();
+                    let project = MemoryStore::project(&wd);
+                    let g_entries = global.load();
+                    let p_entries = project.load();
+                    if g_entries.is_empty() && p_entries.is_empty() {
+                        let _ = self.event_tx.send(AgentEvent::TextDelta(
+                            "(no memories saved yet — use /remember <fact> to add one)\n".to_string()
+                        ));
+                    } else {
+                        let mut msg = String::new();
+                        if !g_entries.is_empty() {
+                            msg.push_str(&format!("  [Global] ({})\n", global.path().display()));
+                            for e in &g_entries { msg.push_str(&format!("    - {}\n", e)); }
+                        }
+                        if !p_entries.is_empty() {
+                            msg.push_str(&format!("  [Project] ({})\n", project.path().display()));
+                            for e in &p_entries { msg.push_str(&format!("    - {}\n", e)); }
+                        }
+                        let _ = self.event_tx.send(AgentEvent::TextDelta(msg));
+                    }
                 }
                 AgentCommand::Background { task } => {
                     // AcqRel: pair with the spawned task's Release store on
