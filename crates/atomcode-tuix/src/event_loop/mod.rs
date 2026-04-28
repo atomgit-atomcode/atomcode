@@ -2578,13 +2578,20 @@ fn handle_agent_event(
         AgentEvent::ApprovalNeeded {
             tool_name, call, ..
         } => {
-            // The ApprovalPrompt now shows the tool name and detail,
-            // so we don't need to emit a separate ToolCall row here.
-            // Just store the pending tool info for ToolCallResult to use.
+            // Emit the `▸ Tool(detail)` row BEFORE the approval prompt
+            // so the user sees what they're approving.
             let display = display_tool_name(&tool_name);
             let detail = format_tool_detail(&tool_name, &call.arguments);
+            
+            // Render the tool call row
+            renderer.render(UiLine::ToolCall {
+                name: display.clone(),
+                detail: detail.clone(),
+            });
+            
             // Store in pending_tools marked as rendered so ToolCallResult won't re-emit
             pending_tools.insert(call.id.clone(), (display.clone(), detail.clone(), true));
+            
             renderer.render(UiLine::ApprovalPrompt {
                 tool: display.clone(),
                 detail: detail.clone(),

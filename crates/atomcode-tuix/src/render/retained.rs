@@ -1778,21 +1778,9 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
 
             // ── body: approval / errors / command output ──
             UiLine::ApprovalPrompt { tool, detail } => {
-                // The preceding ToolCall body row already shows
-                // `▸ name(detail)`, but we also show the detail here
-                // for clarity so users can see exactly what they're approving.
-                //
-                // Header was Role::Warning (SGR 93 / yellow) — invisible
-                // on light themes (#fce94f-class pastels on white). It's
-                // semantically a blocking state ("must act before
-                // continuing"), so Error red + bold is more appropriate
-                // and reads on every theme. The ▶ glyph keeps it
-                // visually distinct from regular Error rows.
-                
-                // Show the tool name and detail as context
+                let _ = (tool, detail);  // ToolCall row already shows the command
                 let warn = self.style_bold(Role::Warning);
                 let plain = CellStyle::default();
-                let dimmed = CellStyle { fg: Some(Color::Black), faint: true, ..CellStyle::default() };
                 let chip = |c: Color| CellStyle {
                     fg: Some(c),
                     bold: true,
@@ -1803,18 +1791,8 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 let chip_a = chip(Color::Cyan);
                 let chip_n = chip(Color::Red);
 
-                // First row: show what command will be executed
-                if !detail.is_empty() {
-                    let mut context_row = Vec::new();
-                    push_str_cells(&mut context_row, "▶ ", &warn);
-                    push_str_cells(&mut context_row, &format!("{}: ", tool), &plain);
-                    push_str_cells(&mut context_row, &detail, &dimmed);
-                    self.push_body_row(context_row);
-                }
-
-                // Second row: the approval prompt
                 let mut row = Vec::new();
-                push_str_cells(&mut row, "  Waiting for approval: ", &plain);
+                push_str_cells(&mut row, "▶ Waiting for approval: ", &warn);
                 push_str_cells(&mut row, " Y ", &chip_y);
                 push_str_cells(&mut row, " Allow  ", &plain);
                 push_str_cells(&mut row, " A ", &chip_a);
