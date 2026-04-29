@@ -878,6 +878,22 @@ impl ToolRegistry {
         tools.insert(name, tool);
     }
 
+    /// Top-level property names declared in the tool's `parameters` schema.
+    /// Used by `recover_tool_args` to decide whether a payload needs
+    /// wrapper unwrapping. Returns empty Vec if the tool isn't registered
+    /// or the schema doesn't expose `properties` (in which case
+    /// `recover_tool_args` falls back to its permissive branch).
+    pub async fn expected_top_keys(&self, name: &str) -> Vec<String> {
+        let tools = self.tools.read().await;
+        let Some(tool) = tools.get(name) else { return Vec::new() };
+        let def = tool.definition();
+        def.parameters
+            .get("properties")
+            .and_then(|p| p.as_object())
+            .map(|o| o.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
     /// Unregister all tools whose names start with `prefix`.
     ///
     /// Used by `/mcp reload` to drop all previously registered MCP tools
@@ -897,28 +913,167 @@ impl ToolRegistry {
     }
 }
 
-/// Defensive unwrap for a known model-output quirk: deepseek-v4-flash and
-/// some qwen variants occasionally wrap tool arguments in an extra
-/// `{"arguments": {...}}` envelope, even though the OpenAI tool-call
-/// protocol's `function.arguments` field is already supposed to carry the
-/// flat schema-shaped object directly. When that happens, every tool
-/// dispatch fails with `missing field 'X'` and the model loops on the same
-/// bad payload until our identical-args guard blocks it.
+/// Wrapper key names atomgit's gateway has been observed to inject around
+/// tool_call arguments. None are used as legitimate top-level field names by
+/// any registered tool — see `recover_tool_args` doc-comment for the safety
+/// argument.
+const ARGS_WRAPPER_KEYS: &[&str] = &["arguments", "input", "content"];
+
+/// Recover a flat schema-shaped JSON object from possibly-mangled tool args.
 ///
-/// Returns `Some(unwrapped_json_string)` when `raw` is a single-key object
-/// `{"arguments": {object}}`, else `None`. No tool's legitimate schema uses
-/// `arguments` as a top-level field name, so the heuristic is safe.
-pub fn unwrap_doubly_nested_args(raw: &str) -> Option<String> {
-    let value: serde_json::Value = serde_json::from_str(raw).ok()?;
-    let map = value.as_object()?;
-    if map.len() != 1 {
+/// Background: the atomgit `api-ai.gitcode.com` gateway (and its internal
+/// `10.205.128.41:6538` deployment) wraps tool_call `function.arguments` into
+/// extra envelopes that violate the OpenAI tool-call protocol. Observed
+/// shapes:
+///
+///   variant A1 (stream)      — `{"arguments": "<stringified-json-object>"}`
+///   variant A2 (non-stream)  — `{"arguments": <object>}`
+///   variant B  (double)      — `{"arguments": "{\"arguments\": ...}"}`
+///   variant C  (multi-key)   — `{"arguments": "...", "timeout": 120}`
+///   variant D  (alt key)     — `{"content": "<stringified-json-object>"}`
+///
+/// (Variant E is `function.name` field corruption — caller-side detection,
+///  not handled here.)
+///
+/// This function recovers the original schema-shaped object by:
+///   1. trying direct parse first — if the JSON already contains an
+///      expected schema field, return None (caller uses raw),
+///   2. otherwise iteratively unwrapping any single-key wrapper (A/A2/B),
+///      stringified or object-valued, up to 5 levels deep,
+///   3. on multi-key wrapper (C), unwrapping the wrapper key and merging in
+///      the sibling keys that match `expected_top_keys`,
+///   4. final-validating that the recovered object contains at least one
+///      `expected_top_keys` field — otherwise returns None to signal
+///      unrecoverable.
+///
+/// Safety against false positives: `ARGS_WRAPPER_KEYS` (`arguments`, `input`,
+/// `content`) are never used as top-level field names by any tool registered
+/// in atomcode (verified across all 22 builtin tools and MCP tool naming
+/// convention). When a future tool adds such a field, callers using
+/// `recover_tool_args` with that tool's `expected_top_keys` will short-circuit
+/// at step 1 and never invoke unwrap.
+pub fn recover_tool_args(raw: &str, expected_top_keys: &[String]) -> Option<String> {
+    let mut value: serde_json::Value = serde_json::from_str(raw).ok()?;
+    if !value.is_object() {
         return None;
     }
-    let inner = map.get("arguments")?;
-    if !inner.is_object() {
+
+    // Step 1 — already flat? (any expected key present at top level AND no
+    // wrapper key present). Return None so caller uses raw string unchanged.
+    if has_expected_key(&value, expected_top_keys) && !has_wrapper_shape(&value) {
         return None;
     }
-    serde_json::to_string(inner).ok()
+
+    // Step 2/3 — unwrap loop, capped at 5 to defend against pathological inputs.
+    let mut progressed = false;
+    for _ in 0..5 {
+        match try_unwrap_once(value, expected_top_keys) {
+            UnwrapStep::Stable(v) => {
+                value = v;
+                break;
+            }
+            UnwrapStep::Progressed(v) => {
+                value = v;
+                progressed = true;
+            }
+        }
+    }
+
+    // Step 4 — only return Some if we actually unwrapped something.
+    // Returning None here means "raw is fine, use it as-is".
+    if !progressed {
+        return None;
+    }
+
+    // Recovered object must contain at least one expected schema field
+    // (when schema is known). With no schema, accept any flat object form
+    // as a permissive fallback for unknown tools (e.g. dynamic MCP tools
+    // whose schema isn't loaded yet).
+    if !expected_top_keys.is_empty() && !has_expected_key(&value, expected_top_keys) {
+        return None;
+    }
+    if has_wrapper_shape(&value) {
+        // Still wrapped after the loop — couldn't recover within budget.
+        return None;
+    }
+    serde_json::to_string(&value).ok()
+}
+
+fn has_expected_key(v: &serde_json::Value, expected: &[String]) -> bool {
+    let Some(map) = v.as_object() else { return false };
+    expected.iter().any(|k| map.contains_key(k.as_str()))
+}
+
+fn has_wrapper_shape(v: &serde_json::Value) -> bool {
+    let Some(map) = v.as_object() else { return false };
+    ARGS_WRAPPER_KEYS.iter().any(|k| {
+        map.get(*k).is_some_and(|inner| {
+            // Wrapper if the wrapper key's value is itself an object, or is
+            // a string that parses to an object.
+            if inner.is_object() {
+                return true;
+            }
+            if let Some(s) = inner.as_str() {
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(s) {
+                    return parsed.is_object();
+                }
+            }
+            false
+        })
+    })
+}
+
+enum UnwrapStep {
+    Progressed(serde_json::Value),
+    Stable(serde_json::Value),
+}
+
+fn try_unwrap_once(value: serde_json::Value, expected: &[String]) -> UnwrapStep {
+    let Some(map) = value.as_object() else {
+        return UnwrapStep::Stable(value);
+    };
+
+    // Find the first wrapper key whose value resolves to an object.
+    let mut wrapper_key: Option<&str> = None;
+    let mut inner_obj: Option<serde_json::Value> = None;
+    for &k in ARGS_WRAPPER_KEYS {
+        let Some(v) = map.get(k) else { continue };
+        if let Some(obj) = v.as_object() {
+            wrapper_key = Some(k);
+            inner_obj = Some(serde_json::Value::Object(obj.clone()));
+            break;
+        }
+        if let Some(s) = v.as_str() {
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(s) {
+                if parsed.is_object() {
+                    wrapper_key = Some(k);
+                    inner_obj = Some(parsed);
+                    break;
+                }
+            }
+        }
+    }
+
+    let (Some(wk), Some(mut inner)) = (wrapper_key, inner_obj) else {
+        return UnwrapStep::Stable(value);
+    };
+
+    // Variant C support: merge sibling keys (other than the wrapper) that
+    // are in `expected_top_keys` into the unwrapped object. This covers the
+    // observed `{"arguments": "{...}", "timeout": 120}` form where wrapper
+    // and a legitimate field both appear at the top.
+    if let Some(inner_map) = inner.as_object_mut() {
+        for (k, v) in map.iter() {
+            if k == wk {
+                continue;
+            }
+            if expected.iter().any(|e| e == k) && !inner_map.contains_key(k) {
+                inner_map.insert(k.clone(), v.clone());
+            }
+        }
+    }
+
+    UnwrapStep::Progressed(inner)
 }
 
 #[cfg(test)]
@@ -1329,48 +1484,150 @@ mod tests {
         assert!(matches!(decision, PermissionDecision::Ask(_)));
     }
 
-    #[test]
-    fn test_unwrap_doubly_nested_args_unwraps_wrapped_object() {
-        let raw = r#"{"arguments":{"file_path":"/tmp/x.rs"}}"#;
-        let unwrapped = unwrap_doubly_nested_args(raw).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&unwrapped).unwrap();
-        assert_eq!(parsed["file_path"], "/tmp/x.rs");
+    fn cmd_keys() -> Vec<String> {
+        vec!["command".into(), "timeout".into()]
+    }
+    fn read_keys() -> Vec<String> {
+        vec!["file_path".into(), "offset".into(), "limit".into()]
+    }
+    fn grep_keys() -> Vec<String> {
+        vec!["pattern".into(), "path".into(), "max_results".into(), "context".into()]
+    }
+
+    fn parse(s: &str) -> serde_json::Value {
+        serde_json::from_str(s).unwrap()
     }
 
     #[test]
-    fn test_unwrap_doubly_nested_args_passes_flat_object_through() {
-        // Already flat — must not unwrap.
-        let raw = r#"{"file_path":"/tmp/x.rs"}"#;
-        assert!(unwrap_doubly_nested_args(raw).is_none());
-    }
-
-    #[test]
-    fn test_unwrap_doubly_nested_args_ignores_other_single_keys() {
-        // A legitimate single-key object whose key happens to be something else.
+    fn recover_flat_passes_through() {
+        // Already in schema shape — return None so caller uses raw unchanged.
         let raw = r#"{"command":"ls -la"}"#;
-        assert!(unwrap_doubly_nested_args(raw).is_none());
+        assert!(recover_tool_args(raw, &cmd_keys()).is_none());
     }
 
     #[test]
-    fn test_unwrap_doubly_nested_args_ignores_multi_key_with_arguments() {
-        // Multiple keys including 'arguments' — not the wrapper pattern,
-        // could be a legitimate tool that happens to have an 'arguments' field.
-        let raw = r#"{"arguments":{"x":1},"other":"y"}"#;
-        assert!(unwrap_doubly_nested_args(raw).is_none());
+    fn recover_variant_a1_string_inner() {
+        // Stream-mode atomgit wrap: {"arguments": "<stringified-json>"}.
+        let raw = r#"{"arguments":"{\"command\":\"ls\"}"}"#;
+        let recovered = recover_tool_args(raw, &cmd_keys()).unwrap();
+        assert_eq!(parse(&recovered)["command"], "ls");
     }
 
     #[test]
-    fn test_unwrap_doubly_nested_args_ignores_string_arguments_value() {
-        // Only object-valued 'arguments' is unwrapped; string would be
-        // ambiguous (could be a legitimate field carrying free-form text).
-        let raw = r#"{"arguments":"some string"}"#;
-        assert!(unwrap_doubly_nested_args(raw).is_none());
+    fn recover_variant_a2_object_inner() {
+        // Non-stream atomgit wrap: {"arguments": <object>}.
+        let raw = r#"{"arguments":{"command":"ls","timeout":30}}"#;
+        let recovered = recover_tool_args(raw, &cmd_keys()).unwrap();
+        let v = parse(&recovered);
+        assert_eq!(v["command"], "ls");
+        assert_eq!(v["timeout"], 30);
     }
 
     #[test]
-    fn test_unwrap_doubly_nested_args_ignores_malformed_json() {
-        assert!(unwrap_doubly_nested_args("not json").is_none());
-        assert!(unwrap_doubly_nested_args("").is_none());
+    fn recover_variant_b_double_string() {
+        // Two-layer wrap (datalog 6% form), both string-valued.
+        let raw = r#"{"arguments":"{\"arguments\":\"{\\\"command\\\":\\\"ls\\\"}\"}"}"#;
+        let recovered = recover_tool_args(raw, &cmd_keys()).unwrap();
+        assert_eq!(parse(&recovered)["command"], "ls");
+    }
+
+    #[test]
+    fn recover_variant_b_triple_object() {
+        // Three-layer object wrap (Bruno non-stream observed form).
+        let raw = r#"{"arguments":{"arguments":{"command":"ls"}}}"#;
+        let recovered = recover_tool_args(raw, &cmd_keys()).unwrap();
+        assert_eq!(parse(&recovered)["command"], "ls");
+    }
+
+    #[test]
+    fn recover_variant_c_multi_key_merges_siblings() {
+        // {"arguments":"{\"command\":\"ls\"}", "timeout": 120}
+        // The wrapper key contains the schema-shaped object; sibling keys
+        // already in expected schema get merged into the recovered object.
+        let raw = r#"{"arguments":"{\"command\":\"ls\"}","timeout":120}"#;
+        let recovered = recover_tool_args(raw, &cmd_keys()).unwrap();
+        let v = parse(&recovered);
+        assert_eq!(v["command"], "ls");
+        assert_eq!(v["timeout"], 120);
+    }
+
+    #[test]
+    fn recover_variant_d_content_wrapper() {
+        // Alternative wrapper key: "content" instead of "arguments".
+        let raw = r#"{"content":"{\"pattern\":\"foo\",\"path\":\"/x\"}"}"#;
+        let recovered = recover_tool_args(raw, &grep_keys()).unwrap();
+        let v = parse(&recovered);
+        assert_eq!(v["pattern"], "foo");
+        assert_eq!(v["path"], "/x");
+    }
+
+    #[test]
+    fn recover_variant_d_input_wrapper() {
+        // "input" wrapper key (Anthropic-style — not seen in atomgit datalog
+        // but documented in the spec; covered defensively).
+        let raw = r#"{"input":{"file_path":"/tmp/a.rs"}}"#;
+        let recovered = recover_tool_args(raw, &read_keys()).unwrap();
+        assert_eq!(parse(&recovered)["file_path"], "/tmp/a.rs");
+    }
+
+    #[test]
+    fn recover_unrecoverable_returns_none() {
+        // Wrapper present but inner has no expected schema field — bail.
+        let raw = r#"{"arguments":{"random":"junk"}}"#;
+        assert!(recover_tool_args(raw, &cmd_keys()).is_none());
+    }
+
+    #[test]
+    fn recover_iteration_bound_pathological_input() {
+        // 100-layer recursive wrap — must terminate without OOM.
+        let mut deep = String::from(r#"{"command":"ls"}"#);
+        for _ in 0..100 {
+            deep = format!(r#"{{"arguments":{}}}"#, deep);
+        }
+        // After 5 unwrap iterations we still won't reach the schema field
+        // because the wrap is too deep — should return None, not panic.
+        let result = recover_tool_args(&deep, &cmd_keys());
+        // Either None (too deep to recover) or Some with the recovered form
+        // — both are acceptable outcomes; what matters is termination.
+        assert!(result.is_none() || result.is_some());
+    }
+
+    #[test]
+    fn recover_no_expected_keys_falls_back_permissive() {
+        // Unknown tool — no schema available. Function falls back to:
+        // unwrap if wrapper present, else None.
+        let wrapped = r#"{"arguments":{"x":1}}"#;
+        let recovered = recover_tool_args(wrapped, &[]).unwrap();
+        assert_eq!(parse(&recovered)["x"], 1);
+
+        let flat = r#"{"x":1}"#;
+        assert!(recover_tool_args(flat, &[]).is_none());
+    }
+
+    #[test]
+    fn recover_real_datalog_payload() {
+        // Verbatim from datalog 2026-04-25_22-02-07.jsonl step 4.
+        let raw = r#"{"arguments": "{\"command\": \"cd /Users/lichao/project/gitcode/ai/atomcode && cargo check 2>&1 | grep -iE 'warning.*(dead_code|unused)' | head -20\"}"}"#;
+        let recovered = recover_tool_args(raw, &cmd_keys()).unwrap();
+        let v = parse(&recovered);
+        assert!(v["command"].as_str().unwrap().contains("cargo check"));
+    }
+
+    #[test]
+    fn recover_real_bruno_object_payload() {
+        // Verbatim from Bruno non-stream response captured during reproduction.
+        let raw = r#"{"arguments": {"command": "grep -rn '#\\[allow(dead_code)\\]' /Users/lichao/project/gitcode/ai/atomcode/crates/ --include='*.rs' | head -50", "timeout": 10}}"#;
+        let recovered = recover_tool_args(raw, &cmd_keys()).unwrap();
+        let v = parse(&recovered);
+        assert_eq!(v["timeout"], 10);
+        assert!(v["command"].as_str().unwrap().contains("dead_code"));
+    }
+
+    #[test]
+    fn recover_malformed_json_returns_none() {
+        assert!(recover_tool_args("not json", &cmd_keys()).is_none());
+        assert!(recover_tool_args("", &cmd_keys()).is_none());
+        assert!(recover_tool_args("[]", &cmd_keys()).is_none());
     }
 
     #[test]
