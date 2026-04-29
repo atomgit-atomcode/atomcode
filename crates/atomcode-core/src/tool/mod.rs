@@ -958,9 +958,20 @@ pub fn recover_tool_args(raw: &str, expected_top_keys: &[String]) -> Option<Stri
         return None;
     }
 
-    // Step 1 — already flat? (any expected key present at top level AND no
-    // wrapper key present). Return None so caller uses raw string unchanged.
-    if has_expected_key(&value, expected_top_keys) && !has_wrapper_shape(&value) {
+    // Step 1 — already flat schema shape? When all top-level keys are
+    // declared in the tool's schema, the payload is legitimate as-is and
+    // we must NOT touch it. This is the strict guard that protects tools
+    // whose schema legitimately uses one of the wrapper key names
+    // (e.g. write/todo declare `content`): if the model writes
+    // {"file_path": "/x.json", "content": "{\"foo\": 1}"}, both keys are
+    // schema-declared so we return None, leaving the JSON-shaped content
+    // string untouched. Without this guard, has_wrapper_shape would
+    // misidentify `content` as a wrapper and corrupt the payload.
+    //
+    // When schema is unknown (expected_top_keys empty — e.g. dynamic MCP
+    // tools whose definition isn't loaded), we can't make this judgement,
+    // so fall through to the permissive unwrap loop.
+    if !expected_top_keys.is_empty() && all_keys_in_expected(&value, expected_top_keys) {
         return None;
     }
 
@@ -1002,6 +1013,19 @@ pub fn recover_tool_args(raw: &str, expected_top_keys: &[String]) -> Option<Stri
 fn has_expected_key(v: &serde_json::Value, expected: &[String]) -> bool {
     let Some(map) = v.as_object() else { return false };
     expected.iter().any(|k| map.contains_key(k.as_str()))
+}
+
+/// Strict legitimacy check: every top-level key of `v` is declared in the
+/// tool's schema. Used by the Step 1 short-circuit to identify payloads
+/// that are already in valid schema shape and must be passed through
+/// untouched, even if some of those keys happen to overlap with
+/// `ARGS_WRAPPER_KEYS` (e.g. `content` in write/todo).
+fn all_keys_in_expected(v: &serde_json::Value, expected: &[String]) -> bool {
+    let Some(map) = v.as_object() else { return false };
+    if map.is_empty() {
+        return false;
+    }
+    map.keys().all(|k| expected.iter().any(|e| e == k))
 }
 
 fn has_wrapper_shape(v: &serde_json::Value) -> bool {
@@ -1496,6 +1520,12 @@ mod tests {
     fn grep_keys() -> Vec<String> {
         vec!["pattern".into(), "path".into(), "max_results".into(), "context".into()]
     }
+    fn write_keys() -> Vec<String> {
+        vec!["file_path".into(), "content".into()]
+    }
+    fn todo_keys() -> Vec<String> {
+        vec!["action".into(), "content".into(), "id".into()]
+    }
 
     fn parse(s: &str) -> serde_json::Value {
         serde_json::from_str(s).unwrap()
@@ -1631,6 +1661,67 @@ mod tests {
         assert!(recover_tool_args("not json", &cmd_keys()).is_none());
         assert!(recover_tool_args("", &cmd_keys()).is_none());
         assert!(recover_tool_args("[]", &cmd_keys()).is_none());
+    }
+
+    // -------- Regression: schema fields overlapping ARGS_WRAPPER_KEYS --------
+    //
+    // The write tool's schema declares `content`, which is also one of the
+    // wrapper keys. Earlier versions of recover_tool_args used a Step 1
+    // short-circuit `has_expected_key && !has_wrapper_shape`. When a model
+    // wrote a JSON-shaped string to a file, has_wrapper_shape misidentified
+    // the legitimate `content` field as a wrapper, the unwrap loop stripped
+    // it, and Variant C merge dropped the actual content value. The fix
+    // changed Step 1 to an "all top-level keys are schema-declared" check,
+    // which passes through legitimate payloads even when their values
+    // happen to look like wrappers.
+
+    #[test]
+    fn recover_write_with_json_object_content_passthrough() {
+        // The classic break: writing a JSON file whose content is a JSON
+        // object literal. content's string value parses to an object, so
+        // the old short-circuit failed and Variant D unwrap corrupted the
+        // payload. Must return None now (legitimate, all keys schema-declared).
+        let raw = r#"{"file_path":"/tmp/x.json","content":"{\"foo\":1}"}"#;
+        assert!(recover_tool_args(raw, &write_keys()).is_none());
+    }
+
+    #[test]
+    fn recover_write_with_nested_json_content_passthrough() {
+        // Deeply-nested JSON content — would have unwrapped multiple layers
+        // under the old logic.
+        let raw = r#"{"file_path":"/tmp/cfg.json","content":"{\"a\":{\"b\":{\"c\":1}}}"}"#;
+        assert!(recover_tool_args(raw, &write_keys()).is_none());
+    }
+
+    #[test]
+    fn recover_todo_with_json_content_passthrough() {
+        // Same class of bug for the todo tool — task description that
+        // happens to be a JSON snippet.
+        let raw = r#"{"action":"add","content":"{\"task\":\"refactor\"}"}"#;
+        assert!(recover_tool_args(raw, &todo_keys()).is_none());
+    }
+
+    #[test]
+    fn recover_write_genuine_wrap_still_recovered() {
+        // Sanity: a genuinely wrapped write payload (atomgit gateway A2)
+        // must still recover. The wrapper key here is `arguments` (not
+        // declared in write schema), so all_keys_in_expected fails and
+        // we fall through to unwrap.
+        let raw = r#"{"arguments":{"file_path":"/tmp/x","content":"hello"}}"#;
+        let recovered = recover_tool_args(raw, &write_keys()).unwrap();
+        let v = parse(&recovered);
+        assert_eq!(v["file_path"], "/tmp/x");
+        assert_eq!(v["content"], "hello");
+    }
+
+    #[test]
+    fn recover_partial_keys_still_recoverable_via_wrapper() {
+        // Payload with a wrapper key + sibling that's NOT in schema:
+        // {"arguments": "...", "foo": 1} — top-level keys {arguments, foo},
+        // neither schema-declared, so all_keys_in_expected=false → unwrap.
+        let raw = r#"{"arguments":"{\"command\":\"ls\"}","foo":1}"#;
+        let recovered = recover_tool_args(raw, &cmd_keys()).unwrap();
+        assert_eq!(parse(&recovered)["command"], "ls");
     }
 
     #[test]
