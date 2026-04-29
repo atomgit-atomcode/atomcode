@@ -105,13 +105,11 @@ impl DatalogWriter {
     }
 
     /// `~/.atomcode/datalog` — the built-in root used when `[datalog].dir`
-    /// is unset. Falls back to a CWD-relative path on the (vanishingly rare)
+    /// is unset. Respects `ATOMCODE_HOME` environment variable if set.
+    /// Falls back to a CWD-relative path on the (vanishingly rare)
     /// platforms where `$HOME` can't be resolved.
     fn default_root() -> PathBuf {
-        crate::tool::real_home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(".atomcode")
-            .join("datalog")
+        crate::config::Config::config_dir().join("datalog")
     }
 
     /// Clear the current turn log state and delete the log file if it exists.
