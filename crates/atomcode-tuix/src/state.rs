@@ -460,4 +460,34 @@ mod tests {
         s.on_error();
         assert_eq!(s.phase, UiPhase::Idle);
     }
+
+    #[test]
+    fn agent_mode_default_is_build() {
+        assert_eq!(AgentMode::default(), AgentMode::Build);
+    }
+
+    #[test]
+    fn agent_mode_build_label() {
+        assert_eq!(AgentMode::Build.label(), "Build");
+    }
+
+    #[test]
+    fn agent_mode_plan_label() {
+        assert_eq!(AgentMode::Plan.label(), "Plan");
+    }
+
+    #[test]
+    fn agent_mode_build_toggles_to_plan() {
+        assert_eq!(AgentMode::Build.toggle(), AgentMode::Plan);
+    }
+
+    #[test]
+    fn agent_mode_plan_toggles_to_build() {
+        assert_eq!(AgentMode::Plan.toggle(), AgentMode::Build);
+    }
+
+    #[test]
+    fn agent_mode_double_toggle_returns_to_original() {
+        assert_eq!(AgentMode::Build.toggle().toggle(), AgentMode::Build);
+    }
 }
