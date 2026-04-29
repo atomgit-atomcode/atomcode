@@ -1540,10 +1540,17 @@ fn resolve_cd(
 /// display it and the rendered block fits the current width.
 ///
 /// Style selection (Unicode-capable terminals only):
-/// * `ATOMCODE_QR_DENSE=1` → `Dense1x2` half-block (≈ 45 cols).
-///   Conservative fallback for any scanner that can't read braille
-///   QR codes.
-/// * Otherwise → braille (≈ 23 cols). The compact default.
+/// * Default → `Dense1x2` half-block `▀▄█` (≈ 45 cols). Universally
+///   compatible because U+2580–U+259F are Unicode-Neutral width — no
+///   terminal renders them at double width, so QR aspect stays 1:1
+///   and scanners decode reliably.
+/// * `ATOMCODE_QR_BRAILLE=1` → braille (≈ 23 cols). About half size,
+///   but Braille (U+2800–U+28FF) is Unicode-Ambiguous width and gets
+///   stretched 2× horizontally on any terminal that defaults
+///   ambiguous-width to double (notably iTerm2's "Treat
+///   ambiguous-width characters as double width" preference, which is
+///   on by default in many profiles). Opt-in only when you know your
+///   terminal renders braille at single cell width.
 ///
 /// On terminals without Unicode block-glyph support
 /// (`TerminalCaps::unicode_symbols == false` — POSIX locale, dumb
@@ -1554,14 +1561,14 @@ fn resolve_cd(
 fn compose_login_chrome(url: &str, unicode: bool) -> String {
     let qr_block = if unicode {
         use crate::render::qr::QrStyle;
-        let style = if std::env::var("ATOMCODE_QR_DENSE")
+        let style = if std::env::var("ATOMCODE_QR_BRAILLE")
             .ok()
             .filter(|v| !v.is_empty())
             .is_some()
         {
-            QrStyle::Dense1x2
-        } else {
             QrStyle::Braille
+        } else {
+            QrStyle::Dense1x2
         };
         let term_cols = crossterm::terminal::size().map(|(c, _)| c).unwrap_or(80);
         crate::render::qr::render_login_qr(url, style).and_then(|s| {

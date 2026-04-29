@@ -2,14 +2,18 @@
 //! flow (`/login`, `/codingplan`).
 //!
 //! Two styles, both Unicode:
-//! * `Braille` (default): packs 2×4 modules into one U+2800–U+28FF
-//!   char. A typical OAuth URL renders as ≈ 23 cols × 12 rows. The
-//!   2:4 packing maps to ≈ 1:1 visual modules at typical 1:2
-//!   monospace cell ratios, so modern QR scanners decode it
-//!   reliably.
-//! * `Dense1x2` (fallback): 1×2 modules per char using `▀▄█`.
-//!   ≈ 45 cols × 23 rows. Wider scanner compatibility — opt in via
-//!   `ATOMCODE_QR_DENSE=1` if the braille form fails to scan.
+//! * `Dense1x2` (default): 1×2 modules per char using `▀▄█`.
+//!   ≈ 45 cols × 23 rows. Block elements (U+2580–U+259F) are
+//!   Unicode-Neutral width, so no terminal renders them at double
+//!   width. QR aspect stays 1:1 and scanners decode reliably under
+//!   any configuration.
+//! * `Braille` (opt-in): packs 2×4 modules into one U+2800–U+28FF
+//!   char. ≈ 23 cols × 12 rows — about half the size. But Braille
+//!   is Unicode-Ambiguous width and gets stretched 2× horizontally
+//!   on terminals that default ambiguous-width to double (iTerm2's
+//!   "Treat ambiguous-width characters as double width", on by
+//!   default in many profiles). Use only when you know your
+//!   terminal renders braille at single cell width.
 //!
 //! There is no ASCII rendering: at typical 1:2 monospace cell
 //! ratios, an ASCII QR with `module_dimensions(2, 1)` exceeds 90
