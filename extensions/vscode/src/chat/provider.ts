@@ -206,9 +206,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         this._postMessage({ type: 'artifactContent', id, content }),
       onArtifactEnd: (id) =>
         this._postMessage({ type: 'artifactEnd', id }),
-      onDone: (tokens, toolCalls) => {
+      onDone: (tokens, toolCalls, sessionId) => {
+        if (sessionId) {
+          this._sessionId = sessionId;
+        }
         this._isGenerating = false;
-        this._postMessage({ type: 'done', tokens, toolCalls });
+        this._postMessage({ type: 'done', tokens, toolCalls, sessionId });
+        void this._refreshSessions();
       },
       onStopped: () => {
         this._isGenerating = false;
@@ -349,6 +353,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private async _searchSessions(query: string) {
     try {
       const sessions = await this._client.searchSessions(query);
+      this._postMessage({ type: 'sessions', sessions });
+    } catch {}
+  }
+
+  private async _refreshSessions() {
+    try {
+      const sessions = await this._client.listSessions();
       this._postMessage({ type: 'sessions', sessions });
     } catch {}
   }

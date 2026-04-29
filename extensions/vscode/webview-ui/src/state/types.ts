@@ -110,7 +110,7 @@ export type ExtensionMessage =
   | { type: 'toolStart'; name: string; args: string }
   | { type: 'toolResult'; name: string; output: string; success: boolean; durationMs: number }
   | { type: 'tokens'; prompt: number; completion: number; total: number }
-  | { type: 'done'; tokens?: number; toolCalls?: number }
+  | { type: 'done'; tokens?: number; toolCalls?: number; sessionId?: string }
   | { type: 'sessionMessages'; messages: Array<{ role: string; content: string }> }
   | { type: 'stopped' }
   | { type: 'error'; message: string }

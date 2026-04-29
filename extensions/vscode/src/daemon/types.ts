@@ -14,7 +14,7 @@ export type ChatEvent =
   | { type: 'artifact_start'; id: string; artifact_type: string; language?: string; title?: string }
   | { type: 'artifact_content'; id: string; content: string }
   | { type: 'artifact_end'; id: string }
-  | { type: 'done'; tokens: number; tool_calls: number }
+  | { type: 'done'; tokens: number; tool_calls: number; session_id?: string }
   | { type: 'stopped' }
   | { type: 'error'; message: string };
 
@@ -114,7 +114,7 @@ export interface ChatStreamCallbacks {
   onArtifactStart: (id: string, type: string, language?: string, title?: string) => void;
   onArtifactContent: (id: string, content: string) => void;
   onArtifactEnd: (id: string) => void;
-  onDone: (tokens: number, toolCalls: number) => void;
+  onDone: (tokens: number, toolCalls: number, sessionId?: string) => void;
   onStopped: () => void;
   onError: (message: string) => void;
 }

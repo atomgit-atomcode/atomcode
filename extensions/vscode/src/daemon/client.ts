@@ -276,7 +276,7 @@ export class DaemonClient {
         callbacks.onArtifactEnd(event.id);
         break;
       case 'done':
-        callbacks.onDone(event.tokens, event.tool_calls);
+        callbacks.onDone(event.tokens, event.tool_calls, event.session_id);
         break;
       case 'stopped':
         callbacks.onStopped();

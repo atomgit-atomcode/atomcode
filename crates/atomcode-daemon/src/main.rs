@@ -1318,7 +1318,11 @@ pub enum ChatEvent {
     ArtifactEnd { id: String },
     /// Chat completed
     #[serde(rename = "done")]
-    Done { tokens: usize, tool_calls: usize },
+    Done {
+        tokens: usize,
+        tool_calls: usize,
+        session_id: String,
+    },
     /// Chat was stopped by user
     #[serde(rename = "stopped")]
     Stopped,
@@ -1827,6 +1831,7 @@ async fn process_chat_request(
         let _ = event_tx.send(ChatEvent::Done {
             tokens: 0,
             tool_calls: 0,
+            session_id: session.id.to_string(),
         });
         return Ok(());
     }
@@ -2011,6 +2016,7 @@ async fn process_chat_request(
     let _ = event_tx.send(ChatEvent::Done {
         tokens: total_tokens,
         tool_calls: tool_call_count,
+        session_id: session.id.to_string(),
     });
     Ok(())
 }
