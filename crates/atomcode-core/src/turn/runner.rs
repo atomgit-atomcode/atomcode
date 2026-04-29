@@ -107,16 +107,27 @@ impl TurnRunner {
         // Emitted on every exit path via the `tel_return!` macro below.
         let turn_id = uuid::Uuid::new_v4();
         let parent = CurrentContext::current();
-        // model_name() returns the model string (e.g. "claude-opus-4-7"). We use
-        // it for both provider and model fields since LlmProvider has no separate
-        // provider_id() accessor yet. TODO(telemetry): add provider_id() to
-        // LlmProvider so the two fields can be filled independently.
+        // Telemetry envelope fields:
+        //   provider      = vendor type ("claude" / "openai" / "ollama"),
+        //                   read directly from ProviderConfig — analytics
+        //                   want the vendor label, not the user's named alias.
+        //   provider_host = host parsed from base_url, with vendor default
+        //                   fallback. Resolved by the telemetry crate so the
+        //                   default-host table lives next to the schema.
+        //   model         = LlmProvider::model_name() — the wire-level model
+        //                   string sent to the API.
+        let pcfg = self
+            .config
+            .providers
+            .get(&self.config.default_provider);
+        let vendor = pcfg.map(|p| p.provider_type.clone());
+        let host = pcfg.and_then(|p| {
+            atomcode_telemetry::resolve_provider_host(&p.provider_type, p.base_url.as_deref())
+        });
         let scope_ctx = CurrentContext {
             turn_id: Some(turn_id),
-            provider: parent
-                .provider
-                .clone()
-                .or_else(|| Some(self.provider.model_name().to_string())),
+            provider: parent.provider.clone().or(vendor),
+            provider_host: parent.provider_host.clone().or(host),
             model: parent
                 .model
                 .clone()

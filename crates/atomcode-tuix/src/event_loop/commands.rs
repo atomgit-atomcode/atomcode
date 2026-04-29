@@ -431,6 +431,7 @@ pub(super) fn execute_slash_command(
             // `default_provider` got cleared.
             match atomcode_core::auth::logout() {
                 Ok(()) => {
+                    ctx.telemetry.set_account_id(None);
                     let _ = ctx
                         .agent
                         .cmd_tx

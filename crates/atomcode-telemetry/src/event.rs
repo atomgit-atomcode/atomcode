@@ -37,6 +37,11 @@ pub struct Envelope {
     pub locale: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
+    /// Vendor host (e.g. `api.openai.com`). Derived from the configured
+    /// `base_url` host part — falls back to each vendor's official host
+    /// when missing/unparseable. See `resolve_provider_host`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_host: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -155,6 +160,7 @@ mod tests {
             arch: "x86_64".into(),
             locale: "en-US".into(),
             provider: None,
+            provider_host: None,
             model: None,
             repo_origin: None,
             mode: None,
