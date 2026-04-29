@@ -95,6 +95,8 @@ const BUILTIN_COMMANDS: &[Command] = &[
     Command { name: "worktree", desc: "Git worktree isolation (create/list/done/cleanup)", needs_args: true },
     Command { name: "upgrade", desc: "Upgrade atomcode to latest (subcommand: rollback)", needs_args: false },
     Command { name: "issue",   desc: "Report a bug / request a feature for AtomCode itself (interactive wizard)", needs_args: false },
+    Command { name: "plan",    desc: "Switch to Plan mode (read-only exploration)", needs_args: false },
+    Command { name: "build",   desc: "Switch to Build mode (full execution)", needs_args: false },
     Command { name: "think",   desc: "Extended thinking control (on/off/budget N)", needs_args: false },
     Command { name: "help",    desc: "Show this help", needs_args: false },
     Command { name: "quit",    desc: "Exit AtomCode", needs_args: false },

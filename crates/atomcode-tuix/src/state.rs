@@ -1,4 +1,34 @@
 // crates/atomcode-tuix/src/state.rs
+
+/// Plan vs Build execution mode. Plan is read-only exploration (no file
+/// writes, no shell commands); Build is full execution with all tools.
+/// Toggled by the Tab key (when the input buffer is empty) or the
+/// `/plan` and `/build` slash commands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AgentMode {
+    #[default]
+    Build,
+    Plan,
+}
+
+impl AgentMode {
+    /// Human-readable label for status bar display.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Build => "Build",
+            Self::Plan => "Plan",
+        }
+    }
+
+    /// Return the opposite mode.
+    pub fn toggle(self) -> Self {
+        match self {
+            Self::Build => Self::Plan,
+            Self::Plan => Self::Build,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UiPhase {
     Idle,
@@ -81,6 +111,7 @@ pub struct ContextSnapshot {
 
 pub struct UiState {
     pub phase: UiPhase,
+    pub agent_mode: AgentMode,
     pub spinner_label: String,
     pub spinner_frame: usize,
     /// Mirrors `TerminalCaps::unicode_symbols` — frozen at construction.
@@ -146,6 +177,7 @@ impl UiState {
     pub fn with_unicode(unicode_symbols: bool) -> Self {
         Self {
             phase: UiPhase::Idle,
+            agent_mode: AgentMode::default(),
             spinner_label: String::new(),
             spinner_frame: 0,
             unicode_symbols,
@@ -456,5 +488,35 @@ mod tests {
         s.on_submit();
         s.on_error();
         assert_eq!(s.phase, UiPhase::Idle);
+    }
+
+    #[test]
+    fn agent_mode_default_is_build() {
+        assert_eq!(AgentMode::default(), AgentMode::Build);
+    }
+
+    #[test]
+    fn agent_mode_build_label() {
+        assert_eq!(AgentMode::Build.label(), "Build");
+    }
+
+    #[test]
+    fn agent_mode_plan_label() {
+        assert_eq!(AgentMode::Plan.label(), "Plan");
+    }
+
+    #[test]
+    fn agent_mode_build_toggles_to_plan() {
+        assert_eq!(AgentMode::Build.toggle(), AgentMode::Plan);
+    }
+
+    #[test]
+    fn agent_mode_plan_toggles_to_build() {
+        assert_eq!(AgentMode::Plan.toggle(), AgentMode::Build);
+    }
+
+    #[test]
+    fn agent_mode_double_toggle_returns_to_original() {
+        assert_eq!(AgentMode::Build.toggle().toggle(), AgentMode::Build);
     }
 }
