@@ -2,6 +2,7 @@
 //! `docs/superpowers/specs/2026-04-29-plugin-marketplace-design.md`.
 
 pub mod installer;
+pub mod loader;
 pub mod manifest;
 pub mod marketplace;
 pub mod paths;
