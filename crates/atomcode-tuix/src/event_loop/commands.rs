@@ -872,6 +872,9 @@ pub(super) fn execute_slash_command(
                 }
             }
         }
+        "plugin" => {
+            handle_plugin(arg, ctx, renderer);
+        }
         "skills" => {
             // Gateway command. With no arg, list user-invocable skills
             // so the user knows what's available without opening the
@@ -968,6 +971,153 @@ fn expand_skill(ctx: &LoopCtx, name: &str, arg: &str) -> Option<String> {
         return None;
     }
     Some(skill.expand(arg, ctx.current_session.id.as_str()))
+}
+
+/// Handle `/plugin` subcommands: marketplace add/remove/update/list,
+/// install <plugin>@<marketplace>, uninstall <plugin>@<marketplace>, list.
+/// On success each mutating subcommand calls `super::reload_plugins(ctx)`
+/// so newly-installed skill/command assets are visible immediately.
+fn handle_plugin(arg: &str, ctx: &mut super::LoopCtx, renderer: &mut dyn Renderer) {
+    let rest = arg.trim();
+    let mut parts = rest.splitn(3, char::is_whitespace);
+    let sub = parts.next().unwrap_or("");
+
+    let ok = |renderer: &mut dyn Renderer, msg: String| {
+        renderer.render(UiLine::CommandOutput(format!("  {}\n", msg)));
+        renderer.flush();
+    };
+    let err = |renderer: &mut dyn Renderer, msg: String| {
+        renderer.render(UiLine::Error(msg));
+        renderer.flush();
+    };
+
+    match sub {
+        "marketplace" => {
+            let action = parts.next().unwrap_or("");
+            let arg = parts.next().unwrap_or("").trim();
+            match action {
+                "add" => match atomcode_core::plugin::marketplace::add_marketplace(arg) {
+                    Ok(info) => {
+                        super::reload_plugins(ctx);
+                        ok(
+                            renderer,
+                            format!(
+                                "marketplace `{}` added at {} ({} plugins)",
+                                info.name,
+                                &info.git_commit[..7.min(info.git_commit.len())],
+                                info.plugins.len()
+                            ),
+                        );
+                    }
+                    Err(e) => err(renderer, format!("add marketplace: {}", e)),
+                },
+                "remove" => match atomcode_core::plugin::marketplace::remove_marketplace(arg) {
+                    Ok(()) => {
+                        super::reload_plugins(ctx);
+                        ok(renderer, format!("marketplace `{}` removed", arg));
+                    }
+                    Err(e) => err(renderer, format!("remove marketplace: {}", e)),
+                },
+                "update" => match atomcode_core::plugin::marketplace::update_marketplace(arg) {
+                    Ok(info) => {
+                        super::reload_plugins(ctx);
+                        ok(
+                            renderer,
+                            format!(
+                                "marketplace `{}` updated to {}",
+                                info.name,
+                                &info.git_commit[..7.min(info.git_commit.len())]
+                            ),
+                        );
+                    }
+                    Err(e) => err(renderer, format!("update marketplace: {}", e)),
+                },
+                "list" => match atomcode_core::plugin::marketplace::list_marketplaces() {
+                    Ok(items) if items.is_empty() => {
+                        ok(renderer, "no marketplaces registered".into());
+                    }
+                    Ok(items) => {
+                        let mut lines = vec!["registered marketplaces:".to_string()];
+                        for m in items {
+                            lines.push(format!(
+                                "  {}  {}  {}  ({} plugins)",
+                                m.name,
+                                m.source,
+                                &m.git_commit[..7.min(m.git_commit.len())],
+                                m.plugins.len()
+                            ));
+                        }
+                        renderer.render(UiLine::CommandOutput(format!(
+                            "  {}\n",
+                            lines.join("\n  ")
+                        )));
+                        renderer.flush();
+                    }
+                    Err(e) => err(renderer, format!("list marketplaces: {}", e)),
+                },
+                _ => err(
+                    renderer,
+                    "usage: /plugin marketplace [add|remove|update|list] <args>".into(),
+                ),
+            }
+        }
+        "install" => match parse_plugin_at_marketplace(parts.next().unwrap_or("").trim()) {
+            Some((plugin, mp)) => match atomcode_core::plugin::installer::install(&plugin, &mp) {
+                Ok(info) => {
+                    super::reload_plugins(ctx);
+                    ok(
+                        renderer,
+                        format!("installed `{}@{}`", info.plugin, info.marketplace),
+                    );
+                }
+                Err(e) => err(renderer, format!("install: {}", e)),
+            },
+            None => err(renderer, "usage: /plugin install <plugin>@<marketplace>".into()),
+        },
+        "uninstall" => match parse_plugin_at_marketplace(parts.next().unwrap_or("").trim()) {
+            Some((plugin, mp)) => match atomcode_core::plugin::installer::uninstall(&plugin, &mp) {
+                Ok(()) => {
+                    super::reload_plugins(ctx);
+                    ok(renderer, format!("uninstalled `{}@{}`", plugin, mp));
+                }
+                Err(e) => err(renderer, format!("uninstall: {}", e)),
+            },
+            None => err(
+                renderer,
+                "usage: /plugin uninstall <plugin>@<marketplace>".into(),
+            ),
+        },
+        "list" => match atomcode_core::plugin::installer::list_installed() {
+            Ok(items) if items.is_empty() => {
+                ok(renderer, "no installed plugins".into());
+            }
+            Ok(items) => {
+                let mut lines = vec!["installed plugins:".to_string()];
+                for p in items {
+                    lines.push(format!("  {}@{}  {}", p.plugin, p.marketplace, p.plugin_dir));
+                }
+                renderer.render(UiLine::CommandOutput(format!(
+                    "  {}\n",
+                    lines.join("\n  ")
+                )));
+                renderer.flush();
+            }
+            Err(e) => err(renderer, format!("list plugins: {}", e)),
+        },
+        _ => err(
+            renderer,
+            "usage: /plugin [marketplace add|remove|update|list | install <p>@<m> | uninstall <p>@<m> | list]"
+                .into(),
+        ),
+    }
+}
+
+fn parse_plugin_at_marketplace(s: &str) -> Option<(String, String)> {
+    let (plugin, mp) = s.split_once('@')?;
+    if plugin.is_empty() || mp.is_empty() {
+        return None;
+    }
+    Some((plugin.to_string(), mp.to_string()))
 }
 
 /// Handle `/worktree` subcommands: create, list, done, cleanup.

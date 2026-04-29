@@ -106,6 +106,7 @@ const BUILTIN_COMMANDS: &[Command] = &[
     // skill list. Selecting a skill commits as `/skills <name>` →
     // dispatched by the `skills` arm in execute_slash_command.
     Command { name: "skills",  desc: "Browse loaded skills", needs_args: true },
+    Command { name: "plugin",  desc: "Plugin marketplace (subcommands: marketplace, install, uninstall, list)", needs_args: true },
 ];
 
 /// A completion candidate for slash-command Tab completion, merging built-in
