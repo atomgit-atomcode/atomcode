@@ -122,6 +122,89 @@ fn now_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339()
 }
 
+pub fn remove_marketplace(name: &str) -> Result<()> {
+    let mp_file = paths::marketplaces_file().ok_or_else(|| anyhow!("no plugin home"))?;
+    let mut state = load_marketplaces_file(&mp_file)?;
+    if !state.marketplaces.contains_key(name) {
+        bail!("marketplace `{}` not found", name);
+    }
+    // Refuse if any installed plugin still references this marketplace.
+    let installed = super::state::load_installed_plugins_file(
+        &paths::installed_plugins_file().unwrap(),
+    )?;
+    if installed
+        .plugins
+        .values()
+        .any(|p| p.marketplace == name)
+    {
+        bail!(
+            "marketplace `{}` has installed plugins; uninstall them first",
+            name
+        );
+    }
+    let target = paths::marketplaces_root().unwrap().join(name);
+    if target.exists() {
+        std::fs::remove_dir_all(&target).ok();
+    }
+    state.marketplaces.remove(name);
+    save_marketplaces_file(&mp_file, &state)?;
+    Ok(())
+}
+
+pub fn update_marketplace(name: &str) -> Result<MarketplaceInfo> {
+    let mp_file = paths::marketplaces_file().ok_or_else(|| anyhow!("no plugin home"))?;
+    let mut state = load_marketplaces_file(&mp_file)?;
+    let entry = state
+        .marketplaces
+        .get(name)
+        .ok_or_else(|| anyhow!("marketplace `{}` not found", name))?
+        .clone();
+    let target = paths::marketplaces_root().unwrap().join(name);
+    let out = Command::new("git")
+        .args(["pull", "--ff-only"])
+        .current_dir(&target)
+        .output()
+        .context("spawn git pull")?;
+    if !out.status.success() {
+        bail!("git pull failed: {}", String::from_utf8_lossy(&out.stderr));
+    }
+    let commit = git_rev_parse(&target)?;
+    let manifest = load_marketplace_manifest(&target)?;
+    let (_mp_name, plugins) = resolve_marketplace_identity(&manifest, name);
+    let plugins_list: Vec<String> = plugins.iter().map(|p| p.name.clone()).collect();
+    state.marketplaces.insert(
+        name.to_string(),
+        MarketplaceEntry {
+            source: entry.source.clone(),
+            added_at: entry.added_at.clone(),
+            git_commit: commit.clone(),
+            plugins: plugins_list.clone(),
+        },
+    );
+    save_marketplaces_file(&mp_file, &state)?;
+    Ok(MarketplaceInfo {
+        name: name.to_string(),
+        source: entry.source,
+        git_commit: commit,
+        plugins: plugins_list,
+    })
+}
+
+pub fn list_marketplaces() -> Result<Vec<MarketplaceInfo>> {
+    let mp_file = paths::marketplaces_file().ok_or_else(|| anyhow!("no plugin home"))?;
+    let state = load_marketplaces_file(&mp_file)?;
+    Ok(state
+        .marketplaces
+        .into_iter()
+        .map(|(name, e)| MarketplaceInfo {
+            name,
+            source: e.source,
+            git_commit: e.git_commit,
+            plugins: e.plugins,
+        })
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -186,5 +269,28 @@ mod tests {
         add_marketplace(&url).unwrap();
         let err = add_marketplace(&url).unwrap_err();
         assert!(err.to_string().contains("already exists"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn remove_marketplace_works() {
+        let _home = isolated_home();
+        let repo = make_bare_repo_with_manifest("rm-mp", None);
+        let url = format!("file://{}", repo.display());
+        add_marketplace(&url).unwrap();
+        remove_marketplace("rm-mp").unwrap();
+        assert!(list_marketplaces().unwrap().is_empty());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn list_marketplaces_returns_added() {
+        let _home = isolated_home();
+        let repo = make_bare_repo_with_manifest("list-mp", None);
+        let url = format!("file://{}", repo.display());
+        add_marketplace(&url).unwrap();
+        let list = list_marketplaces().unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].name, "list-mp");
     }
 }
