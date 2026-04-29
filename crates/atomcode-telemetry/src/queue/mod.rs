@@ -280,6 +280,7 @@ mod tests {
                 arch: "x86_64".into(),
                 locale: "en".into(),
                 provider: None,
+                provider_host: None,
                 model: None,
                 repo_origin: None,
                 mode: None,
