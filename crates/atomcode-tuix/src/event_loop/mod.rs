@@ -704,6 +704,34 @@ mod menu_tests {
     }
 
     #[test]
+    fn colon_namespaced_skill_filters_correctly() {
+        // Production loader prefixes loose skills with `skills:` so they
+        // are visually distinct from built-ins. The menu must filter them
+        // when the user types the prefix character-by-character.
+        let reg = CommandRegistry::builtin();
+        let custom = CustomCommandRegistry::empty();
+        let mut skills = atomcode_core::skill::SkillRegistry::new();
+        skills.register(skill_fixture("skills:brainstorming", "Brainstorm", true));
+        skills.register(skill_fixture("skills:web-access", "Web", true));
+        let lock = std::sync::RwLock::new(skills);
+
+        // After typing `/skills:` the menu should contain both prefixed
+        // skills. Built-in entries do not start with `skills:` so they
+        // drop out naturally.
+        let items = build_menu_items("/skills:", &reg, &custom, Some(&lock))
+            .expect("skills:-prefix should produce a menu");
+        assert!(items.iter().any(|(n, _)| n == "skills:brainstorming"));
+        assert!(items.iter().any(|(n, _)| n == "skills:web-access"));
+        for (n, _) in &items {
+            assert!(
+                n.starts_with("skills:"),
+                "non-skill entry leaked: {}",
+                n
+            );
+        }
+    }
+
+    #[test]
     fn no_skill_registry_is_no_op() {
         // Ensures the legacy call path (None) keeps working.
         let reg = CommandRegistry::builtin();
@@ -1708,6 +1736,9 @@ fn handle_input(
             InputEvent::Key(k) => format!("key({:?},{:?})", k.kind, k.code),
             InputEvent::Resize(w, h) => format!("resize({}x{})", w, h),
             InputEvent::MouseScroll(d) => format!("mouse_scroll({})", d),
+            InputEvent::MouseDown { col, row } => format!("mouse_down({},{})", col, row),
+            InputEvent::MouseDrag { col, row } => format!("mouse_drag({},{})", col, row),
+            InputEvent::MouseUp => "mouse_up".into(),
         }
     );
 
@@ -1718,6 +1749,18 @@ fn handle_input(
             // their scrollback natively, mouse capture isn't enabled
             // for them anyway).
             renderer.scroll_body(delta);
+        }
+        InputEvent::MouseDown { col, row } => {
+            // Anchor a new selection. Only AltScreenRenderer responds
+            // (it owns mouse capture); other backends no-op since the
+            // host terminal still does native drag-to-select for them.
+            renderer.begin_selection(col, row);
+        }
+        InputEvent::MouseDrag { col, row } => {
+            renderer.update_selection(col, row);
+        }
+        InputEvent::MouseUp => {
+            renderer.end_selection();
         }
         InputEvent::Resize(cols, rows) => {
             // Forward to the renderer so DECSTBM-based backends can

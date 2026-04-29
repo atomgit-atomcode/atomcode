@@ -152,8 +152,13 @@ pub fn complete_commands(
 /// agent dispatch.
 pub fn parse_slash_line(s: &str) -> Option<(&str, &str)> {
     let rest = s.strip_prefix('/')?;
+    // Allow `:` in command names so namespaced skills like
+    // `/skills:brainstorming` (loose skill, atomcode prefix) and
+    // `/superpowers:writing-plans` (Claude Code plugin convention)
+    // parse as a single command name. Paths like `/Users/me/...` are
+    // still rejected by the non-whitespace follow-on check below.
     let name_end = rest
-        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-'))
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == ':'))
         .unwrap_or(rest.len());
     if name_end == 0 {
         return None;
@@ -163,7 +168,7 @@ pub fn parse_slash_line(s: &str) -> Option<(&str, &str)> {
     match after.chars().next() {
         None => Some((name, "")),
         Some(c) if c.is_whitespace() => Some((name, after.trim_start())),
-        // Non-space follow-on (`/`, `.`, `:`, etc.) means the `/` was
+        // Non-space follow-on (`/`, `.`, etc.) means the `/` was
         // a literal character in a path / URL — not a command.
         _ => None,
     }
@@ -220,6 +225,23 @@ mod tests {
         assert!(parse_slash_line("/Users/me/file.txt").is_none());
         assert!(parse_slash_line("/tmp/x").is_none());
         assert!(parse_slash_line("/path/with/中文/pic.png").is_none());
+    }
+
+    #[test]
+    fn parse_accepts_colon_namespaced_command() {
+        // Skills load under a `skills:` namespace; plugins (future) use
+        // their manifest name. The parser must keep the colon segment as
+        // part of the command name, not split on it.
+        let (cmd, arg) = parse_slash_line("/skills:brainstorming").unwrap();
+        assert_eq!(cmd, "skills:brainstorming");
+        assert_eq!(arg, "");
+
+        let (cmd, arg) = parse_slash_line("/skills:brainstorming why is X").unwrap();
+        assert_eq!(cmd, "skills:brainstorming");
+        assert_eq!(arg, "why is X");
+
+        let (cmd, _) = parse_slash_line("/superpowers:writing-plans").unwrap();
+        assert_eq!(cmd, "superpowers:writing-plans");
     }
 
     #[test]
