@@ -81,6 +81,55 @@ fn truncate_to_width_sgr_aware(s: &str, max_cols: usize) -> String {
     acc
 }
 
+/// Soft-wrap `s` into chunks each ≤ `max_cols` display columns, using
+/// the same CSI-aware parser as `truncate_to_width_sgr_aware`. Used by
+/// `push_command_output` so long single-line content (notably the OAuth
+/// URL printed during `/login`) survives `paint_body`'s width-truncation
+/// step instead of being clipped at the right edge — clipped lines can't
+/// be selected for copy in alt-screen mode.
+///
+/// Wraps at character boundaries (no word-break logic): URLs are the
+/// motivating case, and they have no whitespace anyway. SGR spans that
+/// straddle a wrap point are not re-emitted on the next chunk; for the
+/// uncoloured content this fn is currently fed (URLs, plain log lines)
+/// that's a non-issue, and `paint_body` writes a trailing `\x1b[0m` per
+/// row so dangling spans don't bleed into adjacent rows.
+///
+/// Empty input returns `vec![String::new()]` so callers preserve blank
+/// lines (the previous `for line in safe.split('\n')` invariant).
+fn wrap_to_width_sgr_aware(s: &str, max_cols: usize) -> Vec<String> {
+    if max_cols == 0 {
+        return vec![String::new()];
+    }
+    let mut chunks: Vec<String> = Vec::new();
+    let mut acc = String::new();
+    let mut cols = 0usize;
+    let mut iter = s.chars().peekable();
+    while let Some(c) = iter.next() {
+        if c == '\x1b' && iter.peek() == Some(&'[') {
+            // CSI: zero visible width, copy verbatim into current chunk.
+            acc.push(c);
+            acc.push(iter.next().unwrap());
+            for nc in iter.by_ref() {
+                acc.push(nc);
+                if nc.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+            continue;
+        }
+        let w = UnicodeWidthChar::width(c).unwrap_or(0);
+        if w > 0 && cols + w > max_cols {
+            chunks.push(std::mem::take(&mut acc));
+            cols = 0;
+        }
+        acc.push(c);
+        cols += w;
+    }
+    chunks.push(acc);
+    chunks
+}
+
 /// Walk `s` and return the visible-text display width, treating CSI
 /// escape sequences as zero-width spans (same parser as
 /// `truncate_to_width_sgr_aware`). Used to clamp selection columns
@@ -1106,8 +1155,16 @@ impl<W: Write + Send> AltScreenRenderer<W> {
     fn push_command_output(&mut self, text: &str) {
         self.flush_assistant_remainder();
         let safe = scrub_controls(text);
+        // Soft-wrap each line at the current terminal width. Without this,
+        // `paint_body` truncates long lines (e.g. the OAuth URL in
+        // /login) at the right edge — invisible content can't be
+        // selected for copy. Wrapping splits one logical row into N body
+        // rows so every glyph stays on screen and selectable.
+        let max_w = (self.width as usize).max(1);
         for line in safe.split('\n') {
-            self.push_body_row(line.to_string());
+            for chunk in wrap_to_width_sgr_aware(line, max_w) {
+                self.push_body_row(chunk);
+            }
         }
     }
 }
@@ -1902,6 +1959,92 @@ mod tests {
         );
         // Cyan colour applied to the rule.
         assert!(s.contains("\x1b[36m"), "rule should be cyan. got: {:?}", s);
+    }
+
+    /// `wrap_to_width_sgr_aware` is the soft-wrap helper that keeps long
+    /// CommandOutput lines (notably the `/login` OAuth URL) selectable
+    /// in alt-screen mode. Direct tests on the helper since it owns the
+    /// CSI / Unicode-width edge cases.
+    #[test]
+    fn wrap_to_width_sgr_aware_handles_url_and_csi_and_wide_chars() {
+        // Empty input still produces one (empty) chunk so callers
+        // preserve the blank-line invariant.
+        assert_eq!(wrap_to_width_sgr_aware("", 10), vec![String::new()]);
+
+        // Short line under width → single chunk, untouched.
+        assert_eq!(
+            wrap_to_width_sgr_aware("hello", 10),
+            vec!["hello".to_string()]
+        );
+
+        // Realistic OAuth URL ≈ 200 chars on an 80-col terminal: must
+        // produce ≥ 3 chunks, every chunk ≤ 80 display cols, and the
+        // concatenation must reproduce the input byte-for-byte.
+        let url = "https://atomgit.com/oauth/authorize?client_id=85a8b0099b4144a19a7542d5cc90fdcc&redirect_uri=https%3A%2F%2Facs.atomgit.com%2Fcallback&response_type=code&state=atomcode_1777469916784730326_e2d348c6072a47beb1b0b414f25c8ef6&scope=user_info+projects";
+        let chunks = wrap_to_width_sgr_aware(url, 80);
+        assert!(chunks.len() >= 3, "URL must wrap into ≥3 chunks, got {}", chunks.len());
+        for c in &chunks {
+            assert!(
+                line_display_width_sgr_aware(c) <= 80,
+                "chunk exceeds width: {:?}",
+                c
+            );
+        }
+        assert_eq!(chunks.join(""), url, "wrapped chunks must round-trip");
+
+        // CSI sequences contribute zero width and stay attached to
+        // their current chunk (no spurious wraps mid-escape).
+        let with_sgr = format!("\x1b[31m{}\x1b[0m", "x".repeat(10));
+        let chunks = wrap_to_width_sgr_aware(&with_sgr, 5);
+        assert_eq!(chunks.len(), 2, "10 visible chars at width 5 → 2 chunks");
+        assert!(chunks[0].contains("\x1b[31m"), "opening SGR stays in first chunk");
+        assert_eq!(chunks.iter().map(|c| c.len()).sum::<usize>(), with_sgr.len());
+
+        // Wide CJK glyph (2 cells) at the boundary wraps cleanly
+        // instead of being split across chunks.
+        let cjk = "ab中文de"; // widths: 1 1 2 2 1 1 = 8
+        let chunks = wrap_to_width_sgr_aware(cjk, 3);
+        for c in &chunks {
+            assert!(line_display_width_sgr_aware(c) <= 3);
+        }
+        assert_eq!(chunks.join(""), cjk);
+    }
+
+    /// Long `CommandOutput` (e.g. the OAuth URL) must end up as multiple
+    /// body rows so the entire content is visible AND selectable in
+    /// alt-screen mode. Regression: previously a 200-char URL became
+    /// one body row that `paint_body` truncated at the right edge,
+    /// making the tail uncopyable.
+    #[test]
+    fn command_output_wraps_long_url_into_multiple_body_rows() {
+        let mut buf = Vec::new();
+        let mut r = AltScreenRenderer::with_writer(&mut buf, caps_default(), 80, 24);
+        let url = "https://atomgit.com/oauth/authorize?client_id=85a8b0099b4144a19a7542d5cc90fdcc&redirect_uri=https%3A%2F%2Facs.atomgit.com%2Fcallback&response_type=code&state=atomcode_1777469916784730326_e2d348c6072a47beb1b0b414f25c8ef6&scope=user_info+projects";
+        let body = format!("  Open this URL in any browser to sign in to AtomGit:\n  {}\n", url);
+        r.render(UiLine::CommandOutput(body));
+        r.flush();
+        // Header line + ≥3 wrapped URL rows + trailing blank.
+        assert!(
+            r.body_lines.len() >= 4,
+            "long URL must wrap into ≥4 body rows, got {}: {:#?}",
+            r.body_lines.len(),
+            r.body_lines
+        );
+        for line in &r.body_lines {
+            assert!(
+                line_display_width_sgr_aware(line) <= 80,
+                "body row exceeds 80 cols: {:?}",
+                line
+            );
+        }
+        // Every byte of the URL must survive somewhere in body_lines so
+        // the user can still select-and-copy the whole thing.
+        let joined: String = r.body_lines.iter().cloned().collect::<Vec<_>>().join("");
+        assert!(
+            joined.contains(url),
+            "wrapped body rows must reconstruct the full URL"
+        );
+        drop(r);
     }
 
     /// Phase 4.5: slash menu palette grows the footer dynamically.
