@@ -412,6 +412,11 @@ impl SkillRegistry {
         self.load_flat_commands(&working_dir.join(".atomcode").join("commands"), LOOSE_NS);
         self.load_skills_dir(&working_dir.join(".claude").join("skills"), LOOSE_NS);
         self.load_skills_dir(&working_dir.join(".atomcode").join("skills"), LOOSE_NS);
+
+        // Plugin layer — installed plugins contribute namespaced skills.
+        for assets in crate::plugin::loader::iter_installed_plugin_assets() {
+            self.load_skills_dir(&assets.skills_dir(), Some(&assets.plugin));
+        }
     }
 
     /// Register a pre-built skill directly (used by plugin system).
@@ -681,5 +686,35 @@ mod tests {
 
         assert!(reg.get("skills:commit").is_some());
         assert!(reg.get("commit").is_none());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn reload_picks_up_installed_plugin_skills() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMCODE_HOME", tmp.path());
+
+        // Fake a registered + installed plugin on disk.
+        let plugins_root = tmp.path().join(".atomcode/plugins");
+        let plugin_dir = plugins_root.join("marketplaces/p");
+        let skill_dir = plugin_dir.join("skills/hello");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: hello\ndescription: hi\n---\nhi",
+        )
+        .unwrap();
+        std::fs::write(
+            plugins_root.join("installed_plugins.json"),
+            r#"{"version":1,"plugins":{"p@p":{"marketplace":"p","plugin":"p","plugin_dir":"marketplaces/p","installed_at":"x"}}}"#,
+        )
+        .unwrap();
+
+        let working = tempfile::tempdir().unwrap();
+        let mut reg = SkillRegistry::new();
+        reg.reload(working.path());
+        assert!(reg.get("p:hello").is_some(), "expected namespaced plugin skill");
+
+        std::env::remove_var("ATOMCODE_HOME");
     }
 }
