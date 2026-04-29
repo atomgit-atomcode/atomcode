@@ -917,6 +917,10 @@ fn sanitize_messages(msgs: &mut Vec<Message>) {
 /// - Empty/whitespace-only assistant messages
 /// - Orphaned tool results (no matching tool_use)
 /// - Consecutive same-role user messages (merge into one)
+/// - Consecutive system messages (merge into one) — MiniMax-M2.7 rejects
+///   adjacent `system` turns with `2013 invalid chat setting`; the
+///   post-compression layout (orig system + cold-zone + drop-digest) is
+///   the trigger.
 fn clean_message_pipeline(msgs: &mut Vec<Message>) {
     // 1. Remove empty assistant messages (e.g., after <think> stripping)
     msgs.retain(|m| {
@@ -959,6 +963,25 @@ fn clean_message_pipeline(msgs: &mut Vec<Message>) {
                 (&msgs[i - 1].content, &msgs[i].content)
             {
                 let merged = format!("{}\n{}", prev, curr);
+                msgs[i - 1].content = MessageContent::Text(merged);
+                msgs.remove(i);
+                continue;
+            }
+        }
+        i += 1;
+    }
+
+    // 5. Merge consecutive system messages into one. After compression the
+    // wire layout is `system(orig) + system(cold-zone) [+ system(drop-digest)]`,
+    // which MiniMax-M2.7's chat-setting validator rejects (empty stream then
+    // 400 / 2013). Blank line between blocks preserves visual separation.
+    let mut i = 1;
+    while i < msgs.len() {
+        if msgs[i].role == Role::System && msgs[i - 1].role == Role::System {
+            if let (MessageContent::Text(prev), MessageContent::Text(curr)) =
+                (&msgs[i - 1].content, &msgs[i].content)
+            {
+                let merged = format!("{}\n\n{}", prev, curr);
                 msgs[i - 1].content = MessageContent::Text(merged);
                 msgs.remove(i);
                 continue;
@@ -1258,6 +1281,59 @@ mod tests {
                 .map_or(false, |t| t.contains("Earlier conversation history"))
         });
         assert!(has_cold, "Cold zone summary should appear in output");
+    }
+
+    /// Regression: MiniMax-M2.7 returns empty content + 400 (`2013 invalid
+    /// chat setting`) when the request contains adjacent `system` messages.
+    /// Post-compression layout used to ship `system(orig) + system(cold-zone)`
+    /// straight to the wire — `clean_message_pipeline` now coalesces them.
+    #[test]
+    fn test_no_consecutive_system_messages_after_compression() {
+        use crate::tool::{ToolCall, ToolResult};
+        let mut conv = Conversation::new();
+
+        for turn in 0..8 {
+            conv.add_user_message(&format!("task {}", turn));
+            let call = ToolCall {
+                id: format!("c{}", turn),
+                name: "bash".to_string(),
+                arguments: "{}".to_string(),
+            };
+            conv.add_assistant_tool_calls(Some("ok"), vec![call], None);
+            conv.add_tool_result(ToolResult {
+                call_id: format!("c{}", turn),
+                output: "x".repeat(100),
+                success: true,
+            });
+        }
+
+        conv.apply_compression(9, "User ran tasks 0, 1, 2 with bash.".to_string());
+        assert_eq!(conv.cold_summaries.len(), 1);
+
+        let (msgs, _stats) = build_messages(&conv, "you are atomcode", 100_000, "");
+
+        for pair in msgs.windows(2) {
+            assert!(
+                !(pair[0].role == Role::System && pair[1].role == Role::System),
+                "consecutive system messages found at the wire boundary"
+            );
+        }
+
+        // The merged system message must still carry both the original
+        // prompt and the cold-zone summary so the model retains context.
+        let merged = msgs
+            .iter()
+            .find(|m| matches!(m.role, Role::System))
+            .and_then(|m| m.text())
+            .expect("at least one system message");
+        assert!(
+            merged.contains("you are atomcode"),
+            "merged system must keep original prompt"
+        );
+        assert!(
+            merged.contains("Earlier conversation history"),
+            "merged system must keep cold-zone summary"
+        );
     }
 
     #[test]
