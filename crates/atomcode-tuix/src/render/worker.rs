@@ -62,6 +62,12 @@ enum RenderCmd {
     /// Jump body viewport to absolute top / bottom of scrollback.
     ScrollBodyToTop,
     ScrollBodyToBottom,
+    /// Mouse-drag selection lifecycle. Forwarded to the inner renderer;
+    /// only AltScreenRenderer acts on these. `(col, row)` are 0-indexed
+    /// terminal cells.
+    BeginSelection(u16, u16),
+    UpdateSelection(u16, u16),
+    EndSelection,
     /// Lifecycle operation requiring an ACK — the worker performs the
     /// op then sends `()` back so the caller can proceed.
     Ack {
@@ -184,6 +190,18 @@ impl Renderer for TaskRenderer {
     fn scroll_body_to_bottom(&mut self) {
         let _ = self.cmd_tx.send(RenderCmd::ScrollBodyToBottom);
     }
+
+    fn begin_selection(&mut self, col: u16, row: u16) {
+        let _ = self.cmd_tx.send(RenderCmd::BeginSelection(col, row));
+    }
+
+    fn update_selection(&mut self, col: u16, row: u16) {
+        let _ = self.cmd_tx.send(RenderCmd::UpdateSelection(col, row));
+    }
+
+    fn end_selection(&mut self) {
+        let _ = self.cmd_tx.send(RenderCmd::EndSelection);
+    }
 }
 
 impl Drop for TaskRenderer {
@@ -251,6 +269,15 @@ fn run_worker(mut inner: Box<dyn Renderer>, cmd_rx: mpsc::Receiver<RenderCmd>) {
             }
             RenderCmd::ScrollBodyToBottom => {
                 inner.scroll_body_to_bottom();
+            }
+            RenderCmd::BeginSelection(col, row) => {
+                inner.begin_selection(col, row);
+            }
+            RenderCmd::UpdateSelection(col, row) => {
+                inner.update_selection(col, row);
+            }
+            RenderCmd::EndSelection => {
+                inner.end_selection();
             }
             RenderCmd::Ack { op, ack } => {
                 let t0 = Instant::now();

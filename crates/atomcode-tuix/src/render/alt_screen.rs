@@ -81,6 +81,175 @@ fn truncate_to_width_sgr_aware(s: &str, max_cols: usize) -> String {
     acc
 }
 
+/// Walk `s` and return the visible-text display width, treating CSI
+/// escape sequences as zero-width spans (same parser as
+/// `truncate_to_width_sgr_aware`). Used to clamp selection columns
+/// against the actual painted content of a body line — clicks past the
+/// end of the visible row should select nothing in the gap, not extend
+/// to the column the user happened to drop on.
+fn line_display_width_sgr_aware(s: &str) -> usize {
+    let mut cols = 0usize;
+    let mut iter = s.chars().peekable();
+    while let Some(c) = iter.next() {
+        if c == '\x1b' && iter.peek() == Some(&'[') {
+            iter.next(); // consume `[`
+            for nc in iter.by_ref() {
+                if nc.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+            continue;
+        }
+        cols += UnicodeWidthChar::width(c).unwrap_or(0);
+    }
+    cols
+}
+
+/// Walk `line` and emit it clipped to `max_cols` display columns, with
+/// chars whose display column falls in `[sel_start, sel_end)` wrapped
+/// in reverse-video (`\x1b[7m` … `\x1b[0m`). CSI escapes outside the
+/// selection pass through verbatim so existing colours render; CSI
+/// escapes INSIDE the selection are dropped so reverse-video stays
+/// solid (otherwise an inline `\x1b[0m` from markdown styling would
+/// reset the highlight mid-span).
+///
+/// Wide chars (CJK, emoji): a single char that straddles `sel_start`
+/// or `sel_end` is treated as fully inside if its first column is in
+/// range — matches what the user expects when they click on the left
+/// half of a wide char.
+fn render_line_with_selection(
+    line: &str,
+    max_cols: usize,
+    sel_start: usize,
+    sel_end: usize,
+) -> String {
+    if max_cols == 0 || sel_end <= sel_start {
+        return truncate_to_width_sgr_aware(line, max_cols);
+    }
+    let mut out = String::with_capacity(line.len() + 16);
+    let mut cols = 0usize;
+    let mut in_sel = false;
+    let mut iter = line.chars().peekable();
+    while let Some(c) = iter.next() {
+        if c == '\x1b' && iter.peek() == Some(&'[') {
+            // Capture the full CSI span first so we can decide whether
+            // to drop it (inside selection) or keep it (outside).
+            let mut csi = String::with_capacity(8);
+            csi.push(c);
+            csi.push(iter.next().unwrap());
+            for nc in iter.by_ref() {
+                csi.push(nc);
+                if nc.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+            if !in_sel {
+                out.push_str(&csi);
+            }
+            continue;
+        }
+        let w = UnicodeWidthChar::width(c).unwrap_or(0);
+        if cols >= max_cols {
+            break;
+        }
+        let want_in_sel = cols >= sel_start && cols < sel_end;
+        if want_in_sel && !in_sel {
+            // Reset existing colours then enable reverse video so the
+            // selection highlight is visually consistent regardless of
+            // the underlying line styling.
+            out.push_str("\x1b[0m\x1b[7m");
+            in_sel = true;
+        } else if !want_in_sel && in_sel {
+            out.push_str("\x1b[0m");
+            in_sel = false;
+        }
+        if cols + w > max_cols {
+            break;
+        }
+        out.push(c);
+        cols += w;
+    }
+    if in_sel {
+        out.push_str("\x1b[0m");
+    }
+    out
+}
+
+/// Extract the plain-text characters of `line` whose display column
+/// falls in `[sel_start, sel_end)`, dropping all CSI escapes. Used by
+/// `extract_selection_text` to assemble what gets written to the
+/// clipboard. Wide-char rule matches `render_line_with_selection`.
+fn extract_line_selection_text(
+    line: &str,
+    sel_start: usize,
+    sel_end: usize,
+) -> String {
+    if sel_end <= sel_start {
+        return String::new();
+    }
+    let mut out = String::new();
+    let mut cols = 0usize;
+    let mut iter = line.chars().peekable();
+    while let Some(c) = iter.next() {
+        if c == '\x1b' && iter.peek() == Some(&'[') {
+            iter.next(); // `[`
+            for nc in iter.by_ref() {
+                if nc.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+            continue;
+        }
+        let w = UnicodeWidthChar::width(c).unwrap_or(0);
+        if cols >= sel_end {
+            break;
+        }
+        if cols >= sel_start {
+            out.push(c);
+        }
+        cols += w;
+    }
+    out
+}
+
+/// Standard-alphabet base64 encoder. Inline implementation (~30 lines)
+/// instead of pulling in the `base64` crate just for OSC 52: the
+/// payload is one user-selected text blob per drag-release, kilobytes
+/// at most, and the alphabet is fixed.
+fn base64_encode(input: &[u8]) -> String {
+    const ALPHA: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((input.len() + 2) / 3 * 4);
+    let mut chunks = input.chunks_exact(3);
+    for chunk in &mut chunks {
+        let n = ((chunk[0] as u32) << 16) | ((chunk[1] as u32) << 8) | (chunk[2] as u32);
+        out.push(ALPHA[((n >> 18) & 0x3f) as usize] as char);
+        out.push(ALPHA[((n >> 12) & 0x3f) as usize] as char);
+        out.push(ALPHA[((n >> 6) & 0x3f) as usize] as char);
+        out.push(ALPHA[(n & 0x3f) as usize] as char);
+    }
+    let rem = chunks.remainder();
+    match rem.len() {
+        0 => {}
+        1 => {
+            let n = (rem[0] as u32) << 16;
+            out.push(ALPHA[((n >> 18) & 0x3f) as usize] as char);
+            out.push(ALPHA[((n >> 12) & 0x3f) as usize] as char);
+            out.push('=');
+            out.push('=');
+        }
+        2 => {
+            let n = ((rem[0] as u32) << 16) | ((rem[1] as u32) << 8);
+            out.push(ALPHA[((n >> 18) & 0x3f) as usize] as char);
+            out.push(ALPHA[((n >> 12) & 0x3f) as usize] as char);
+            out.push(ALPHA[((n >> 6) & 0x3f) as usize] as char);
+            out.push('=');
+        }
+        _ => unreachable!(),
+    }
+    out
+}
+
 // SGR sequences used inline in body strings. Same set PlainRenderer
 // already uses; keeping them duplicated rather than re-exported because
 // alt_screen will diverge from plain on more dimensions in later phases
@@ -174,6 +343,49 @@ pub struct AltScreenRenderer<W: Write + Send> {
     /// True when footer state changed since the last paint. Same role
     /// as `body_dirty` but for the footer strip.
     footer_dirty: bool,
+    /// Active mouse-drag selection, or completed selection still
+    /// visible until the next interaction. `anchor` is the press
+    /// point, `head` is the current drag (or release) point. Both
+    /// reference `body_lines` directly: `(line_idx, display_col)` —
+    /// so a viewport scroll doesn't desync the selection from its
+    /// underlying text. None means no selection rendered. Cleared
+    /// on `reset` / `clear_screen` / `on_resize` since each can
+    /// invalidate either the line indices (reset) or the display
+    /// columns (resize → re-flow at paint time).
+    selection: Option<Selection>,
+    /// True only between `begin_selection` and `end_selection`. Used
+    /// to gate `update_selection` so a stray drag event after the
+    /// user already released doesn't move a stale selection. Some
+    /// terminals (notably JediTerm) emit a final coalesced motion
+    /// event right after Up; without this flag that event would
+    /// shift `head` to wherever the cursor was when the buffered
+    /// frame arrived.
+    selection_active: bool,
+}
+
+/// Mouse-drag selection range. See `AltScreenRenderer::selection` for
+/// semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Selection {
+    /// (body_line_idx, display_col) anchor — where the press landed.
+    anchor: (usize, usize),
+    /// (body_line_idx, display_col) head — current drag point.
+    /// Equal to anchor immediately after `begin_selection` (zero-
+    /// width selection); diverges as drag events extend the range.
+    head: (usize, usize),
+}
+
+impl Selection {
+    /// Return (low, high) where `low <= high` lexicographically. Used
+    /// when computing per-line column ranges so paint and copy don't
+    /// have to care which way the user dragged.
+    fn ordered(&self) -> ((usize, usize), (usize, usize)) {
+        if self.anchor <= self.head {
+            (self.anchor, self.head)
+        } else {
+            (self.head, self.anchor)
+        }
+    }
 }
 
 impl AltScreenRenderer<BufWriter<Stdout>> {
@@ -203,6 +415,8 @@ impl<W: Write + Send> AltScreenRenderer<W> {
             pending_spinner: None,
             pending_menu: None,
             footer_dirty: true,
+            selection: None,
+            selection_active: false,
         };
         r.enter_alt_screen();
         r
@@ -240,17 +454,20 @@ impl<W: Write + Send> AltScreenRenderer<W> {
     /// capture. Sequences:
     ///   * `\x1b[?1049h` — save main screen + switch to alt
     ///   * `\x1b[H\x1b[2J` — home cursor + clear screen
-    ///   * `\x1b[?1000h` — basic mouse-event mode (X10) so the
-    ///     terminal reports button presses (incl. scroll wheel
-    ///     buttons 4/5) instead of the default "translate wheel
-    ///     to arrow keys" fallback
+    ///   * `\x1b[?1002h` — button-event tracking: report button
+    ///     presses, releases, AND motion-while-button-held. This is
+    ///     a strict superset of `?1000h` (which only reports presses)
+    ///     and is what we need so drag-selection sees per-cell motion
+    ///     instead of just the down + up endpoints. Scroll-wheel
+    ///     events (buttons 4/5) ride the same channel and are
+    ///     unaffected by the upgrade.
     ///   * `\x1b[?1006h` — SGR-extended coordinates (replaces the
     ///     legacy fixed-byte format that breaks past col 223)
     ///
     /// Best-effort: if the writer fails, `alt_screen_active` stays
     /// false and Drop won't try to pop.
     fn enter_alt_screen(&mut self) {
-        let seq = "\x1b[?1049h\x1b[H\x1b[2J\x1b[?1000h\x1b[?1006h";
+        let seq = "\x1b[?1049h\x1b[H\x1b[2J\x1b[?1002h\x1b[?1006h";
         if self.out.write_all(seq.as_bytes()).is_ok() && self.out.flush().is_ok() {
             self.alt_screen_active = true;
         }
@@ -266,7 +483,7 @@ impl<W: Write + Send> AltScreenRenderer<W> {
             // Disable mouse capture FIRST — if alt-screen pops while
             // mouse mode is still on, some terminals leak `\x1b[<...M`
             // events into the main screen until something resets them.
-            let _ = self.out.write_all(b"\x1b[?1006l\x1b[?1000l\x1b[?1049l");
+            let _ = self.out.write_all(b"\x1b[?1006l\x1b[?1002l\x1b[?1049l");
             let _ = self.out.flush();
             self.alt_screen_active = false;
         }
@@ -327,6 +544,11 @@ impl<W: Write + Send> AltScreenRenderer<W> {
         // and stale colour spans don't bleed). For rows past the end
         // of body_lines, just EL (clear). 1-indexed rows.
         let max_cols = self.width as usize;
+        // Snapshot the ordered selection bounds once so the per-row
+        // loop doesn't re-borrow `self.selection` while we hold a
+        // reference to `self.body_lines[i]`. Cheap (Copy) and only
+        // computed when a selection exists.
+        let sel_bounds = self.selection.as_ref().map(|s| s.ordered());
         for row_idx in 0..body_height {
             let abs_row = (row_idx + 1) as u16;
             let cup_el = format!("\x1b[{};1H\x1b[K", abs_row);
@@ -340,8 +562,13 @@ impl<W: Write + Send> AltScreenRenderer<W> {
                 // SGR pair eat into the visible-content budget — a
                 // 80-col line with one colour span would lose 5+
                 // trailing visible chars.
-                let clipped = truncate_to_width_sgr_aware(line, max_cols);
-                let _ = self.out.write_all(clipped.as_bytes());
+                let painted = match sel_bounds.and_then(|(lo, hi)| {
+                    selection_col_range_for_line(body_idx, lo, hi, line)
+                }) {
+                    Some((s, e)) => render_line_with_selection(line, max_cols, s, e),
+                    None => truncate_to_width_sgr_aware(line, max_cols),
+                };
+                let _ = self.out.write_all(painted.as_bytes());
                 // Trailing SGR reset: in case the row had an open SGR
                 // span at the truncation point (e.g. `\x1b[31mlong red
                 // text...` cut mid-span), reset so the next row's
@@ -352,6 +579,96 @@ impl<W: Write + Send> AltScreenRenderer<W> {
         }
         let _ = self.out.flush();
         self.body_dirty = false;
+    }
+
+    /// Map a screen-cell `(col, row)` (0-indexed) to a body-line
+    /// position `(line_idx, display_col)`. Returns `None` when the
+    /// row falls past the last body line (footer area, or the empty
+    /// strip below content in early-session views) — used by
+    /// `begin_selection` to refuse to anchor a selection in the
+    /// footer. `update_selection` calls `screen_to_body_clamped`
+    /// instead so dragging past the body still extends the head.
+    fn screen_to_body(&self, col: u16, row: u16) -> Option<(usize, usize)> {
+        let body_height = self.body_height() as usize;
+        if (row as usize) >= body_height {
+            return None;
+        }
+        let total = self.body_lines.len();
+        if total == 0 {
+            return None;
+        }
+        let viewport_start = if self.sticky_bottom {
+            total.saturating_sub(body_height)
+        } else {
+            self.viewport_top.min(total.saturating_sub(body_height))
+        };
+        let line_idx = viewport_start + row as usize;
+        if line_idx >= total {
+            return None;
+        }
+        Some((line_idx, col as usize))
+    }
+
+    /// Same as `screen_to_body` but clamps `(col, row)` to the
+    /// nearest valid body cell instead of returning `None`. Used by
+    /// `update_selection` so a drag that overshoots into the footer
+    /// or past the last row still extends the head sensibly.
+    fn screen_to_body_clamped(&self, col: u16, row: u16) -> Option<(usize, usize)> {
+        let body_height = self.body_height() as usize;
+        let total = self.body_lines.len();
+        if total == 0 {
+            return None;
+        }
+        let viewport_start = if self.sticky_bottom {
+            total.saturating_sub(body_height)
+        } else {
+            self.viewport_top.min(total.saturating_sub(body_height))
+        };
+        let row_clamped = (row as usize).min(body_height.saturating_sub(1));
+        let line_idx = (viewport_start + row_clamped).min(total.saturating_sub(1));
+        Some((line_idx, col as usize))
+    }
+
+    /// Walk the active selection from `start.line` to `end.line` (both
+    /// inclusive) and return the concatenated plain text — CSI escapes
+    /// stripped, lines joined with `\n`. Returns an empty string when
+    /// no selection or when the selection covers no visible chars
+    /// (e.g. clicked past end-of-line on a single-line selection).
+    fn extract_selection_text(&self) -> String {
+        let Some(sel) = self.selection else {
+            return String::new();
+        };
+        let (lo, hi) = sel.ordered();
+        let total = self.body_lines.len();
+        if lo.0 >= total {
+            return String::new();
+        }
+        let mut parts = Vec::with_capacity(hi.0 - lo.0 + 1);
+        for line_idx in lo.0..=hi.0.min(total - 1) {
+            let line = &self.body_lines[line_idx];
+            let Some((s, e)) =
+                selection_col_range_for_line(line_idx, lo, hi, line)
+            else {
+                parts.push(String::new());
+                continue;
+            };
+            parts.push(extract_line_selection_text(line, s, e));
+        }
+        parts.join("\n")
+    }
+
+    /// Emit OSC 52 (`\x1b]52;c;<base64>\x07`) carrying `text` so the
+    /// host terminal copies it to the system clipboard. Empty text is
+    /// a no-op to avoid clearing whatever the user previously had.
+    /// Best-effort — terminals that don't honour OSC 52 (Terminal.app
+    /// without explicit opt-in) silently ignore the sequence.
+    fn write_osc52_clipboard(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let encoded = base64_encode(text.as_bytes());
+        let _ = write!(self.out, "\x1b]52;c;{}\x07", encoded);
+        let _ = self.out.flush();
     }
 
     /// Paint the footer strip. Layout (top to bottom, 1-indexed rows
@@ -795,6 +1112,43 @@ impl<W: Write + Send> AltScreenRenderer<W> {
     }
 }
 
+/// Compute the half-open column range `[start, end)` of `line` that
+/// falls inside the ordered selection bounds `(lo, hi)`. Returns
+/// `None` if the line is outside the row range. Bounds within the
+/// line are clamped to the visible display width so a click past the
+/// end doesn't extend selection into thin air.
+///
+/// Free function (rather than a method) so the body-paint loop can
+/// call it while holding a borrow of `self.body_lines[i]` without
+/// re-borrowing `self`.
+fn selection_col_range_for_line(
+    line_idx: usize,
+    lo: (usize, usize),
+    hi: (usize, usize),
+    line: &str,
+) -> Option<(usize, usize)> {
+    if line_idx < lo.0 || line_idx > hi.0 {
+        return None;
+    }
+    let line_w = line_display_width_sgr_aware(line);
+    let start_col = if line_idx == lo.0 { lo.1 } else { 0 };
+    // Line containing the head: include the cell under the head —
+    // half-open `end_col` = head_col + 1. Middle lines select to
+    // end of line; the bottom line of a multi-line selection uses
+    // the same `hi.1 + 1` rule as a same-line selection.
+    let end_col_exclusive = if line_idx == hi.0 {
+        hi.1.saturating_add(1)
+    } else {
+        line_w
+    };
+    let s = start_col.min(line_w);
+    let e = end_col_exclusive.min(line_w);
+    if e <= s {
+        return None;
+    }
+    Some((s, e))
+}
+
 impl<W: Write + Send> Renderer for AltScreenRenderer<W> {
     fn render(&mut self, line: UiLine) {
         match line {
@@ -953,6 +1307,11 @@ impl<W: Write + Send> Renderer for AltScreenRenderer<W> {
         self.sticky_bottom = true;
         self.body_dirty = true;
         self.footer_dirty = true;
+        // Selection indices reference `body_lines`, which we just
+        // wiped — keep them around and they'd point past end-of-
+        // buffer on the next paint.
+        self.selection = None;
+        self.selection_active = false;
         let _ = self.out.write_all(b"\x1b[2J\x1b[H");
         self.paint_frame();
     }
@@ -1059,10 +1418,63 @@ impl<W: Write + Send> Renderer for AltScreenRenderer<W> {
         self.viewport_top = self
             .viewport_top
             .min(self.body_lines.len().saturating_sub(new_body_height));
+        // Selection's display-column anchors were taken at the old
+        // width; after a resize they'd land in the wrong spot of the
+        // re-flowed line. Cleanest is to drop the selection entirely
+        // — the user can drag-select again at the new geometry.
+        self.selection = None;
+        self.selection_active = false;
         let _ = self.out.write_all(b"\x1b[2J\x1b[H");
         self.body_dirty = true;
         self.footer_dirty = true;
         self.paint_frame();
+    }
+
+    fn begin_selection(&mut self, col: u16, row: u16) {
+        // Only anchor a selection when the press lands inside the
+        // body region. Footer / blank-area presses clear any prior
+        // selection (so a stray click also acts as "deselect").
+        match self.screen_to_body(col, row) {
+            Some(pos) => {
+                self.selection = Some(Selection { anchor: pos, head: pos });
+                self.selection_active = true;
+            }
+            None => {
+                self.selection = None;
+                self.selection_active = false;
+            }
+        }
+        self.body_dirty = true;
+        self.paint_frame();
+    }
+
+    fn update_selection(&mut self, col: u16, row: u16) {
+        // Guard against terminals that emit a coalesced motion event
+        // right after Up — without this, that stale motion would
+        // shift `head` of an already-finalised selection.
+        if !self.selection_active {
+            return;
+        }
+        let Some(pos) = self.screen_to_body_clamped(col, row) else {
+            return;
+        };
+        if let Some(sel) = self.selection.as_mut() {
+            if sel.head == pos {
+                return; // no-op move (cell-granularity, drag jitter)
+            }
+            sel.head = pos;
+            self.body_dirty = true;
+            self.paint_frame();
+        }
+    }
+
+    fn end_selection(&mut self) {
+        // Mark the selection as finalised but keep it visible so the
+        // user can see what they captured. A subsequent press starts
+        // a fresh selection (or deselects on footer/empty hit).
+        self.selection_active = false;
+        let text = self.extract_selection_text();
+        self.write_osc52_clipboard(&text);
     }
 }
 
@@ -1103,10 +1515,10 @@ mod tests {
         drop(r);
         let s = String::from_utf8_lossy(&buf);
         assert!(s.contains("\x1b[?1049h"), "alt-screen ENTER missing. got: {:?}", s);
-        assert!(s.contains("\x1b[?1000h"), "mouse-mode ENTER (1000h) missing. got: {:?}", s);
+        assert!(s.contains("\x1b[?1002h"), "mouse-mode ENTER (1002h) missing. got: {:?}", s);
         assert!(s.contains("\x1b[?1006h"), "mouse-mode ENTER (1006h) missing. got: {:?}", s);
         assert!(s.contains("\x1b[?1049l"), "alt-screen LEAVE missing. got: {:?}", s);
-        assert!(s.contains("\x1b[?1000l"), "mouse-mode LEAVE (1000l) missing. got: {:?}", s);
+        assert!(s.contains("\x1b[?1002l"), "mouse-mode LEAVE (1002l) missing. got: {:?}", s);
         assert!(s.contains("\x1b[?1006l"), "mouse-mode LEAVE (1006l) missing. got: {:?}", s);
     }
 
@@ -1961,6 +2373,312 @@ mod tests {
         // body_height = 5 (height 10 - footer 5), max_top = 15. -3
         // from sticky-bottom origin → 12.
         assert_eq!(r.viewport_top, 12);
+        drop(r);
+    }
+
+    // ── selection / clipboard ──
+
+    /// `line_display_width_sgr_aware` returns the visible-width of a
+    /// styled line. SGR escapes are zero-cost; CJK chars are 2 cols.
+    /// Sanity check that the helpers used by the selection paint
+    /// don't double-count colour escapes.
+    #[test]
+    fn line_display_width_skips_sgr() {
+        assert_eq!(line_display_width_sgr_aware("hello"), 5);
+        assert_eq!(line_display_width_sgr_aware("\x1b[31mhello\x1b[0m"), 5);
+        assert_eq!(line_display_width_sgr_aware("中文"), 4);
+        assert_eq!(line_display_width_sgr_aware("\x1b[1m中\x1b[0m文"), 4);
+    }
+
+    /// `extract_line_selection_text` should return only the chars
+    /// whose display column falls in `[start, end)`, with all CSI
+    /// escapes dropped — that's what gets written to the clipboard.
+    /// Visible cols of `"\x1b[31mhello\x1b[0m world"` are
+    /// `h=0 e=1 l=2 l=3 o=4 ' '=5 w=6 o=7 r=8 l=9 d=10`.
+    #[test]
+    fn extract_line_selection_strips_sgr_and_clips_to_range() {
+        let line = "\x1b[31mhello\x1b[0m world";
+        assert_eq!(extract_line_selection_text(line, 0, 5), "hello");
+        assert_eq!(extract_line_selection_text(line, 6, 11), "world");
+        // crosses the SGR boundary: cols 3..8 = "lo wo"
+        assert_eq!(extract_line_selection_text(line, 3, 8), "lo wo");
+        // empty range
+        assert_eq!(extract_line_selection_text(line, 5, 5), "");
+        // out-of-bounds end clips to last visible col
+        assert_eq!(extract_line_selection_text(line, 7, 100), "orld");
+    }
+
+    /// `render_line_with_selection` wraps the selected range in
+    /// reverse-video and ends it with a reset. CSI escapes outside
+    /// the selection pass through verbatim; CSI escapes inside the
+    /// selection are dropped so the highlight stays solid.
+    #[test]
+    fn render_line_with_selection_emits_reverse_video() {
+        let line = "hello world";
+        let out = render_line_with_selection(line, 80, 0, 5);
+        assert!(out.starts_with("\x1b[0m\x1b[7m"), "should open with reset+reverse. got: {:?}", out);
+        assert!(out.contains("hello"), "selected text missing. got: {:?}", out);
+        assert!(out.contains("\x1b[0m world"), "post-selection plain text missing. got: {:?}", out);
+    }
+
+    /// A CSI escape *inside* the selection range must be dropped
+    /// (otherwise an inline `\x1b[0m` from markdown styling would
+    /// tear a hole in the highlight by closing the reverse-video
+    /// span mid-selection).
+    ///
+    /// Visible cols of `"he\x1b[31mre\x1b[0m"` are `h=0 e=1 r=2 e=3`.
+    /// Select [0, 4) — both interior CSI escapes (`\x1b[31m` between
+    /// cols 1-2 and `\x1b[0m` after col 3) must be stripped.
+    #[test]
+    fn render_line_with_selection_drops_inline_csi_inside_range() {
+        let line = "he\x1b[31mre\x1b[0m";
+        let out = render_line_with_selection(line, 80, 0, 4);
+        assert!(
+            !out.contains("\x1b[31m"),
+            "inline red CSI inside selection should be dropped. got: {:?}",
+            out
+        );
+        // Reset count: open-reset at selection start + close-reset
+        // at selection end. The interior `\x1b[0m` from the source
+        // line MUST be dropped; if it leaked through we'd see 3.
+        let resets = out.matches("\x1b[0m").count();
+        assert_eq!(resets, 2, "expected open-reset + close-reset only. got: {:?}", out);
+    }
+
+    /// Empty selection range collapses to a plain SGR-aware truncate.
+    /// Guards `selection_col_range_for_line` returning `None` from
+    /// upstream — the path that calls `render_line_with_selection`
+    /// shouldn't, but if it ever did the visual would just be the
+    /// unhighlighted line.
+    #[test]
+    fn render_line_with_empty_selection_is_plain_truncate() {
+        let line = "hello world";
+        assert_eq!(render_line_with_selection(line, 80, 5, 5), "hello world");
+    }
+
+    /// `selection_col_range_for_line` clamps to the visible width
+    /// of the line — clicking past EOL on a one-line selection
+    /// shouldn't extend the range past the last visible col.
+    #[test]
+    fn selection_range_clamps_to_line_width() {
+        // 5-col line. Anchor at col 0, head at col 100 → [0, 5).
+        let r = selection_col_range_for_line(0, (0, 0), (0, 100), "hello");
+        assert_eq!(r, Some((0, 5)));
+        // Anchor past EOL → None.
+        let r = selection_col_range_for_line(0, (0, 50), (0, 100), "hello");
+        assert_eq!(r, None);
+    }
+
+    /// Multi-line selection: first line covers [start_col, EOL],
+    /// middle lines fully selected, last line covers [0, head_col+1].
+    #[test]
+    fn selection_range_multi_line_shape() {
+        // Three lines, anchor at (0, 3), head at (2, 2). Lines are
+        // "first", "middle", "last".
+        let lo = (0, 3);
+        let hi = (2, 2);
+        assert_eq!(
+            selection_col_range_for_line(0, lo, hi, "first"),
+            Some((3, 5)),
+            "first line [3, 5) — from col 3 to EOL",
+        );
+        assert_eq!(
+            selection_col_range_for_line(1, lo, hi, "middle"),
+            Some((0, 6)),
+            "middle line fully selected",
+        );
+        assert_eq!(
+            selection_col_range_for_line(2, lo, hi, "last"),
+            Some((0, 3)),
+            "last line [0, head+1) = [0, 3)",
+        );
+        // Lines outside [lo.0, hi.0] return None.
+        assert_eq!(selection_col_range_for_line(3, lo, hi, "outside"), None);
+    }
+
+    /// Base64 round-trip on the standard alphabet, including padding
+    /// for non-multiple-of-3 inputs. OSC 52 expects exactly this
+    /// encoding (the `c` selector is the system clipboard).
+    #[test]
+    fn base64_encode_matches_standard_alphabet() {
+        // Empty.
+        assert_eq!(base64_encode(b""), "");
+        // 1 byte → 2 chars + 2 pad.
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        // 2 bytes → 3 chars + 1 pad.
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        // 3 bytes → no pad.
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        // 4 bytes → 6 chars + 2 pad.
+        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
+        // RFC 4648 vector.
+        assert_eq!(base64_encode(b"hello world"), "aGVsbG8gd29ybGQ=");
+    }
+
+    /// Begin → drag → end emits OSC 52 with the selected text.
+    ///
+    /// `UiLine::User` pushes a body row prefixed with the 2-col
+    /// chevron `❯ `, so the visible cols of "hello there" are:
+    /// `❯=0 space=1 h=2 e=3 l=4 l=5 o=6 ' '=7 t=8 …`. Drag cols
+    /// 2..=6 captures "hello".
+    #[test]
+    fn drag_select_writes_osc52_to_writer() {
+        let mut buf = Vec::new();
+        let mut r = AltScreenRenderer::with_writer(&mut buf, caps_default(), 80, 10);
+        r.render(UiLine::User("hello there".into()));
+        r.begin_selection(2, 0);
+        r.update_selection(6, 0);
+        r.end_selection();
+        r.flush();
+        drop(r);
+        let s = String::from_utf8_lossy(&buf);
+        let expected = format!("\x1b]52;c;{}\x07", base64_encode(b"hello"));
+        assert!(
+            s.contains(&expected),
+            "OSC 52 with base64('hello') missing. got: {:?}",
+            s
+        );
+    }
+
+    /// Drag end with empty selection (begin only, no movement, head
+    /// landed past EOL) writes nothing. We don't want a release that
+    /// captured zero chars to clobber the user's existing clipboard.
+    #[test]
+    fn drag_end_does_not_emit_osc52_when_selection_empty() {
+        let mut buf = Vec::new();
+        let mut r = AltScreenRenderer::with_writer(&mut buf, caps_default(), 80, 10);
+        r.render(UiLine::User("hi".into()));
+        // Begin at col 50 (way past EOL "hi" which is 2 cols wide).
+        // selection_col_range_for_line clamps both ends to width 2,
+        // so the effective range is empty.
+        r.begin_selection(50, 0);
+        r.end_selection();
+        r.flush();
+        drop(r);
+        let s = String::from_utf8_lossy(&buf);
+        assert!(
+            !s.contains("\x1b]52;c;"),
+            "no OSC 52 should be emitted for empty selection. got: {:?}",
+            s
+        );
+    }
+
+    /// Begin in the footer area should refuse to anchor a selection.
+    /// Anchoring there would bind to a line index that doesn't
+    /// exist in body_lines (or worse, points at a row no longer
+    /// shown after a scroll), yielding a phantom highlight.
+    #[test]
+    fn begin_selection_in_footer_does_not_anchor() {
+        let mut buf = Vec::new();
+        let mut r = AltScreenRenderer::with_writer(&mut buf, caps_default(), 80, 10);
+        r.render(UiLine::User("hi".into()));
+        // body_height = 5, footer starts at row 5. Press at row 7
+        // (in the input box / status area).
+        r.begin_selection(0, 7);
+        assert!(r.selection.is_none(), "footer press must not start a selection");
+        assert!(!r.selection_active);
+        drop(r);
+    }
+
+    /// `update_selection` after `end_selection` is a no-op. JediTerm /
+    /// Windows conhost can emit a final coalesced motion event right
+    /// after the Up; without `selection_active` gating the head
+    /// would jump to that stale point.
+    #[test]
+    fn update_after_end_does_not_move_head() {
+        let mut buf = Vec::new();
+        let mut r = AltScreenRenderer::with_writer(&mut buf, caps_default(), 80, 10);
+        r.render(UiLine::User("hello there".into()));
+        r.begin_selection(0, 0);
+        r.update_selection(4, 0);
+        let head_before_end = r.selection.unwrap().head;
+        r.end_selection();
+        // Stray motion after release.
+        r.update_selection(10, 0);
+        let head_after_stray = r.selection.unwrap().head;
+        assert_eq!(
+            head_before_end, head_after_stray,
+            "post-end motion must not move head",
+        );
+        drop(r);
+    }
+
+    /// Selection survives a `end_selection` (so the user can see what
+    /// they captured) but a subsequent `reset` (e.g. /clear) wipes it
+    /// since body_lines have been emptied — leaving stale indices
+    /// would point past end-of-buffer on the next paint.
+    #[test]
+    fn reset_clears_selection() {
+        let mut buf = Vec::new();
+        let mut r = AltScreenRenderer::with_writer(&mut buf, caps_default(), 80, 10);
+        r.render(UiLine::User("hello".into()));
+        r.begin_selection(0, 0);
+        r.update_selection(3, 0);
+        r.end_selection();
+        assert!(r.selection.is_some());
+        r.reset();
+        assert!(r.selection.is_none(), "reset should clear selection");
+        drop(r);
+    }
+
+    /// `on_resize` clears selection — display columns were anchored
+    /// against the old width, after reflow they'd land in the wrong
+    /// spots of the painted line.
+    #[test]
+    fn resize_clears_selection() {
+        let mut buf = Vec::new();
+        let mut r = AltScreenRenderer::with_writer(&mut buf, caps_default(), 80, 10);
+        r.render(UiLine::User("hello".into()));
+        r.begin_selection(0, 0);
+        r.update_selection(3, 0);
+        assert!(r.selection.is_some());
+        r.on_resize(40, 10);
+        assert!(r.selection.is_none(), "resize should clear selection");
+        drop(r);
+    }
+
+    /// During an active drag, paint emits the reverse-video sequence
+    /// over the selected cells. End-to-end check that the click →
+    /// drag path actually decorates the body row.
+    ///
+    /// No menu is rendered in this test, so the only source of
+    /// `\x1b[7m` in the buffer is the selection paint.
+    #[test]
+    fn drag_paints_reverse_video_in_body() {
+        let mut buf = Vec::new();
+        let mut r = AltScreenRenderer::with_writer(&mut buf, caps_default(), 80, 10);
+        r.render(UiLine::User("hello there".into()));
+        r.begin_selection(0, 0);
+        r.update_selection(4, 0);
+        r.flush();
+        drop(r);
+        let s = String::from_utf8_lossy(&buf);
+        assert!(
+            s.contains("\x1b[7m"),
+            "drag must emit reverse-video. got: {:?}",
+            s
+        );
+    }
+
+    /// Multi-line selection: drag from line 0 col 2 to line 1 col 3
+    /// across two body rows. Extracted text should be the cross-row
+    /// slice joined by `\n`.
+    #[test]
+    fn multi_line_drag_extracts_across_rows() {
+        let mut buf = Vec::new();
+        let mut r = AltScreenRenderer::with_writer(&mut buf, caps_default(), 80, 10);
+        // Two body rows. body_height = 5; both fit.
+        r.body_lines.push("first row".into());
+        r.body_lines.push("second row".into());
+        r.body_dirty = true;
+        // Begin on row 0 of body (= screen row 0 since body_lines.len=2
+        // < body_height=5, so viewport_start=0). Drag to row 1, col 3.
+        r.begin_selection(2, 0);
+        r.update_selection(3, 1);
+        let text = r.extract_selection_text();
+        // Line 0: from col 2 to EOL of "first row" (9 cols) = "rst row"
+        // Line 1: from col 0 to col 4 (head+1) of "second row" = "seco"
+        assert_eq!(text, "rst row\nseco", "multi-line extract mismatch: {:?}", text);
         drop(r);
     }
 }
