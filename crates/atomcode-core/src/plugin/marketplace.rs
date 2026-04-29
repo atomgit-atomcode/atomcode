@@ -208,14 +208,7 @@ pub fn list_marketplaces() -> Result<Vec<MarketplaceInfo>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Set up an isolated fake home, return its path. Caller must keep the
-    /// `tempfile::TempDir` alive for the duration of the test.
-    fn isolated_home() -> tempfile::TempDir {
-        let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var("ATOMCODE_HOME", tmp.path());
-        tmp
-    }
+    use crate::plugin::test_support::isolated_home;
 
     fn make_bare_repo_with_manifest(name: &str, manifest: Option<&str>) -> PathBuf {
         let work = tempfile::tempdir().unwrap().into_path();

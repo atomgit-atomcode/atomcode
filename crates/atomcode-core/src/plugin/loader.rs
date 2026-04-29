@@ -62,14 +62,9 @@ mod tests {
     use super::*;
     use crate::plugin::installer::install;
     use crate::plugin::marketplace::add_marketplace;
+    use crate::plugin::test_support::isolated_home;
     use std::path::PathBuf;
     use std::process::Command;
-
-    fn isolated_home() -> tempfile::TempDir {
-        let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var("ATOMCODE_HOME", tmp.path());
-        tmp
-    }
 
     fn make_repo(name: &str) -> PathBuf {
         let work = tempfile::tempdir().unwrap().into_path();

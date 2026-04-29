@@ -27,11 +27,10 @@ mod tests {
     use super::*;
 
     #[test]
+    #[serial_test::serial]
     fn plugins_root_uses_atomcode_home_override() {
-        let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var("ATOMCODE_HOME", tmp.path());
+        let _home = crate::plugin::test_support::isolated_home();
         let root = plugins_root().unwrap();
-        assert_eq!(root, tmp.path().join(".atomcode").join("plugins"));
-        std::env::remove_var("ATOMCODE_HOME");
+        assert_eq!(root, _home.path().join(".atomcode").join("plugins"));
     }
 }

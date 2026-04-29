@@ -8,3 +8,6 @@ pub mod marketplace;
 pub mod paths;
 pub mod state;
 pub mod url;
+
+#[cfg(test)]
+pub(crate) mod test_support;

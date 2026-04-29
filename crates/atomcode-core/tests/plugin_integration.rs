@@ -14,8 +14,18 @@ use std::process::Command;
 #[test]
 #[serial_test::serial]
 fn add_install_reload_flow() {
+    // Set + unset on drop via this guard mirrors the in-tree
+    // `plugin::test_support::isolated_home`. Test files outside the crate
+    // can't see `pub(crate)` items so we inline the small guard here.
+    struct Guard(tempfile::TempDir);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            std::env::remove_var("ATOMCODE_HOME");
+        }
+    }
     let home = tempfile::tempdir().unwrap();
     std::env::set_var("ATOMCODE_HOME", home.path());
+    let _guard = Guard(home);
 
     // Build a minimal plugin repo with a skill and a command.
     let workspace = tempfile::tempdir().unwrap();
@@ -71,6 +81,4 @@ fn add_install_reload_flow() {
     // Verify CustomCommandRegistry sees `e2e:c`.
     let creg = atomcode_core::commands::CustomCommandRegistry::load(working.path());
     assert!(creg.get("e2e:c").is_some(), "missing command e2e:c");
-
-    std::env::remove_var("ATOMCODE_HOME");
 }
