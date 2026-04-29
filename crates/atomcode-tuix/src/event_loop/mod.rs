@@ -1546,6 +1546,25 @@ fn handle_input(
             // No modal: paste goes into the type-ahead buffer just like
             // keyboard input (Idle or Streaming, both consume it).
             if matches!(app.state.phase, UiPhase::Idle | UiPhase::Streaming) {
+                // When the pasted text is empty (clipboard holds an image,
+                // not text), try to grab the image via arboard. This is the
+                // primary path on terminals with bracketed paste enabled —
+                // Ctrl+V never arrives as a key event there.
+                if text.trim().is_empty() {
+                    if let Some(img) = try_paste_clipboard_image() {
+                        let n = app.state.pending_images.len() + 1;
+                        app.state.pending_images.push(img);
+                        renderer.render(UiLine::CommandOutput(format!(
+                            "  [image #{}] pasted from clipboard",
+                            n
+                        )));
+                        renderer.flush();
+                        if matches!(app.state.phase, UiPhase::Idle) {
+                            redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+                        }
+                        return Ok(());
+                    }
+                }
                 app.buf.insert_paste(text);
                 if matches!(app.state.phase, UiPhase::Streaming) {
                     draw_spinner_now(
