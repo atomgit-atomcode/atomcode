@@ -153,6 +153,12 @@ pub struct LoopCtx {
     /// dispatcher as a fallback when the entered name doesn't match a
     /// built-in command.
     pub custom_commands: atomcode_core::commands::CustomCommandRegistry,
+    /// Loaded skills (`.claude/skills/*/SKILL.md`, etc.). Same `Arc`
+    /// the agent loop holds, so `reload(...)` there is visible here
+    /// without extra plumbing. Used by the slash-command palette to
+    /// surface user-invocable skills, and by the dispatcher to expand
+    /// `/skill_name [args]` into a SendMessage.
+    pub skill_registry: std::sync::Arc<std::sync::RwLock<atomcode_core::skill::SkillRegistry>>,
     /// Snapshot of the terminal's rendering capabilities. Probed once at
     /// startup in `lib.rs`; threaded into `App::new` so `UiState` knows
     /// whether to use Unicode or ASCII fallbacks for the spinner glyph
@@ -560,14 +566,14 @@ mod menu_tests {
     fn non_slash_input_returns_no_menu() {
         let reg = CommandRegistry::builtin();
         let custom = CustomCommandRegistry::empty();
-        assert!(build_menu_items("hello world", &reg, &custom).is_none());
+        assert!(build_menu_items("hello world", &reg, &custom, None).is_none());
     }
 
     #[test]
     fn slash_prefix_returns_all_commands() {
         let reg = CommandRegistry::builtin();
         let custom = CustomCommandRegistry::empty();
-        let items = build_menu_items("/", &reg, &custom).expect("menu should show for '/'");
+        let items = build_menu_items("/", &reg, &custom, None).expect("menu should show for '/'");
         assert!(!items.is_empty(), "builtin registry should have commands");
     }
 
@@ -575,8 +581,8 @@ mod menu_tests {
     fn slash_with_filter_narrows_list() {
         let reg = CommandRegistry::builtin();
         let custom = CustomCommandRegistry::empty();
-        let all = build_menu_items("/", &reg, &custom).unwrap();
-        let filtered = build_menu_items("/he", &reg, &custom).unwrap_or_default();
+        let all = build_menu_items("/", &reg, &custom, None).unwrap();
+        let filtered = build_menu_items("/he", &reg, &custom, None).unwrap_or_default();
         assert!(
             filtered.len() < all.len(),
             "prefix '/he' should filter builtin commands"
@@ -597,15 +603,119 @@ mod menu_tests {
         // start navigating a stale palette.
         let reg = CommandRegistry::builtin();
         let custom = CustomCommandRegistry::empty();
-        assert!(build_menu_items("/cd ", &reg, &custom).is_none());
-        assert!(build_menu_items("/cd /tmp", &reg, &custom).is_none());
+        assert!(build_menu_items("/cd ", &reg, &custom, None).is_none());
+        assert!(build_menu_items("/cd /tmp", &reg, &custom, None).is_none());
     }
 
     #[test]
     fn slash_with_no_matches_returns_none() {
         let reg = CommandRegistry::builtin();
         let custom = CustomCommandRegistry::empty();
-        assert!(build_menu_items("/zzznomatch", &reg, &custom).is_none());
+        assert!(build_menu_items("/zzznomatch", &reg, &custom, None).is_none());
+    }
+
+    fn skill_fixture(name: &str, desc: &str, user_invocable: bool) -> atomcode_core::skill::Skill {
+        atomcode_core::skill::Skill {
+            name: name.to_string(),
+            description: desc.to_string(),
+            template: "do thing".to_string(),
+            disable_model_invocation: false,
+            user_invocable,
+            argument_hint: None,
+            allowed_tools: vec![],
+            skill_dir: std::path::PathBuf::new(),
+            source_path: std::path::PathBuf::new(),
+        }
+    }
+
+    #[test]
+    fn skill_appears_in_menu_under_unique_name() {
+        let reg = CommandRegistry::builtin();
+        let custom = CustomCommandRegistry::empty();
+        let mut skills = atomcode_core::skill::SkillRegistry::new();
+        skills.register(skill_fixture(
+            "atomcode-unique-skill-xyz",
+            "test skill",
+            true,
+        ));
+        let lock = std::sync::RwLock::new(skills);
+
+        let items = build_menu_items("/atomcode-unique", &reg, &custom, Some(&lock))
+            .expect("skill prefix should populate menu");
+        assert!(
+            items.iter().any(|(n, _)| n == "atomcode-unique-skill-xyz"),
+            "skill should appear in menu, got {:?}",
+            items
+        );
+    }
+
+    #[test]
+    fn skill_marked_not_user_invocable_is_hidden() {
+        let reg = CommandRegistry::builtin();
+        let custom = CustomCommandRegistry::empty();
+        let mut skills = atomcode_core::skill::SkillRegistry::new();
+        skills.register(skill_fixture("hidden-skill-zzz", "hidden", false));
+        let lock = std::sync::RwLock::new(skills);
+
+        // Either no menu (no matches) or the hidden name absent — both are pass.
+        let items = build_menu_items("/hidden-skill-zzz", &reg, &custom, Some(&lock));
+        assert!(
+            items
+                .as_ref()
+                .map(|v| !v.iter().any(|(n, _)| n == "hidden-skill-zzz"))
+                .unwrap_or(true),
+            "hidden skill must not leak into the / menu"
+        );
+    }
+
+    #[test]
+    fn builtin_shadows_skill_of_same_name() {
+        // Pick a built-in we know exists. `help` is a stable built-in.
+        let reg = CommandRegistry::builtin();
+        let builtin_name = reg
+            .matching_prefix("help")
+            .first()
+            .map(|c| c.name.to_string())
+            .expect("built-in registry should expose /help");
+
+        let custom = CustomCommandRegistry::empty();
+        let mut skills = atomcode_core::skill::SkillRegistry::new();
+        // Skill with same name as the built-in.
+        skills.register(skill_fixture(&builtin_name, "skill desc", true));
+        let lock = std::sync::RwLock::new(skills);
+
+        let items = build_menu_items(&format!("/{}", builtin_name), &reg, &custom, Some(&lock))
+            .expect("menu should include built-in");
+        let count = items.iter().filter(|(n, _)| *n == builtin_name).count();
+        assert_eq!(
+            count, 1,
+            "skill named '{}' must not duplicate same-name built-in",
+            builtin_name
+        );
+        // And the description retained should be the built-in's, not "skill desc".
+        let (_, desc) = items
+            .iter()
+            .find(|(n, _)| *n == builtin_name)
+            .expect("entry present");
+        assert_ne!(
+            desc, "skill desc",
+            "built-in description should win over shadowed skill"
+        );
+    }
+
+    #[test]
+    fn no_skill_registry_is_no_op() {
+        // Ensures the legacy call path (None) keeps working.
+        let reg = CommandRegistry::builtin();
+        let custom = CustomCommandRegistry::empty();
+        let with_none = build_menu_items("/", &reg, &custom, None).unwrap();
+        let empty_skills = std::sync::RwLock::new(atomcode_core::skill::SkillRegistry::new());
+        let with_empty = build_menu_items("/", &reg, &custom, Some(&empty_skills)).unwrap();
+        assert_eq!(
+            with_none.len(),
+            with_empty.len(),
+            "empty registry must produce same menu as None"
+        );
     }
 
     // Regression: HistoryPrev used to leave the cursor at end-of-text,
@@ -1873,6 +1983,7 @@ fn build_menu_items(
     buf: &str,
     commands: &CommandRegistry,
     custom: &atomcode_core::commands::CustomCommandRegistry,
+    skill_registry: Option<&std::sync::RwLock<atomcode_core::skill::SkillRegistry>>,
 ) -> Option<Vec<(String, String)>> {
     if !buf.starts_with('/') {
         return None;
@@ -1883,16 +1994,32 @@ fn build_menu_items(
         return None;
     }
     let prefix_lower = rest.to_ascii_lowercase();
+    // Priority order: built-in > custom > skill. Same-name shadowing
+    // means a built-in `/login` always wins over a `login` skill from
+    // user space, and a custom command wins over a same-name skill.
     let mut matches: Vec<(String, String)> = commands
         .matching_prefix(rest)
         .into_iter()
         .map(|c| (c.name.to_string(), c.desc.to_string()))
         .collect();
-    // Append custom commands whose names match the prefix, skipping any
-    // that collide with a built-in name.
     for (name, desc) in custom.command_names_and_descriptions() {
         if name.starts_with(&prefix_lower) && !matches.iter().any(|(n, _)| *n == name) {
             matches.push((name, desc));
+        }
+    }
+    // Skills last so they shadow nothing. `user_invocable()` already
+    // filters out skills marked hidden from the `/` menu (the
+    // `disable_model_invocation: true` ones — those are exposed only
+    // through the use_skill tool to the LLM).
+    if let Some(reg) = skill_registry {
+        if let Ok(reg) = reg.read() {
+            for skill in reg.user_invocable() {
+                if skill.name.to_ascii_lowercase().starts_with(&prefix_lower)
+                    && !matches.iter().any(|(n, _)| n.eq_ignore_ascii_case(&skill.name))
+                {
+                    matches.push((skill.name.clone(), skill.description.clone()));
+                }
+            }
         }
     }
     if matches.is_empty() {
@@ -1915,7 +2042,7 @@ fn handle_idle_key(
     let menu_items = if app.buf.is_in_history() {
         None
     } else {
-        build_menu_items(&app.buf.text, &ctx.commands, &ctx.custom_commands)
+        build_menu_items(&app.buf.text, &ctx.commands, &ctx.custom_commands, Some(&ctx.skill_registry))
     };
     if let Some(items) = &menu_items {
         // Clamp selection in range.
@@ -2050,7 +2177,7 @@ fn handle_idle_key(
             let items = if app.buf.is_in_history() {
                 None
             } else {
-                build_menu_items(&app.buf.text, &ctx.commands, &ctx.custom_commands)
+                build_menu_items(&app.buf.text, &ctx.commands, &ctx.custom_commands, Some(&ctx.skill_registry))
             };
             if let Some(items) = items {
                 if app.menu.selected >= items.len() {
@@ -2088,6 +2215,12 @@ fn handle_idle_key(
             let as_slash = parse_slash_line(&line).filter(|(cmd, _)| {
                 ctx.commands.find(cmd).is_some()
                     || ctx.custom_commands.get(&cmd.to_ascii_lowercase()).is_some()
+                    || ctx
+                        .skill_registry
+                        .read()
+                        .ok()
+                        .and_then(|r| r.get(cmd).map(|s| s.user_invocable))
+                        .unwrap_or(false)
             });
             if let Some((cmd, arg)) = as_slash {
                 execute_slash_command(
@@ -2312,7 +2445,7 @@ fn handle_streaming_key(
     // so the user can browse candidate commands mid-stream. Execution
     // is still blocked below — Enter falls through to the commit arm,
     // which emits the "disabled while a turn is running" hint.
-    let menu_items = build_menu_items(&app.buf.text, &ctx.commands, &ctx.custom_commands);
+    let menu_items = build_menu_items(&app.buf.text, &ctx.commands, &ctx.custom_commands, Some(&ctx.skill_registry));
     if let Some(items) = &menu_items {
         if app.menu.selected >= items.len() {
             app.menu.selected = items.len() - 1;
@@ -2368,7 +2501,7 @@ fn handle_streaming_key(
         BufferResult::Redraw => {
             // Menu shape may have changed — reset selection if it
             // now points past the (possibly shorter) list.
-            if let Some(items) = build_menu_items(&app.buf.text, &ctx.commands, &ctx.custom_commands) {
+            if let Some(items) = build_menu_items(&app.buf.text, &ctx.commands, &ctx.custom_commands, Some(&ctx.skill_registry)) {
                 if app.menu.selected >= items.len() {
                     app.menu.selected = 0;
                 }
@@ -3107,7 +3240,7 @@ fn draw_spinner_now(
     let frame = state.tick_spinner();
     let label = format_spinner_label(state, queue_len);
     let status = build_status(state, ctx);
-    let menu = build_menu_items(&buf.text, &ctx.commands, &ctx.custom_commands).map(|items| {
+    let menu = build_menu_items(&buf.text, &ctx.commands, &ctx.custom_commands, Some(&ctx.skill_registry)).map(|items| {
         let selected = menu_selected.min(items.len().saturating_sub(1));
         crate::render::MenuPayload { items, selected }
     });
